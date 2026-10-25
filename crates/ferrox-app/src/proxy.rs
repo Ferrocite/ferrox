@@ -1208,6 +1208,7 @@ pub(crate) enum Outbound {
     Trojan(TrojanOut),
     Vmess(VmessOut),
     Shadowsocks(ShadowsocksOut),
+    Hysteria(Box<HysteriaOut>),
     Socks(SocksOut),
     Foxy(Box<FoxyOut>),
     Veepn(crate::veepn::VeepnOut),
@@ -1240,6 +1241,7 @@ impl Outbound {
             Self::Trojan(trojan) => resolve_outbound(&trojan.address, trojan.port),
             Self::Vmess(vmess) => resolve_outbound(&vmess.address, vmess.port),
             Self::Shadowsocks(ss) => resolve_outbound(&ss.address, ss.port),
+            Self::Hysteria(hy) => resolve_outbound(&hy.address, hy.port),
             Self::Socks(socks) => resolve_outbound(&socks.address, socks.port),
             Self::Http(http) => resolve_outbound(&http.address, http.port),
             Self::Metrics { address } => Some(*address),
@@ -2102,6 +2104,28 @@ impl FreedomDomain {
             Self::UseIp6 | Self::ForceIp6 => v6(),
             Self::UseIp46 | Self::ForceIp46 => v4().or_else(v6),
             Self::UseIp64 | Self::ForceIp64 => v6().or_else(v4),
+        }
+    }
+}
+
+/// A direct Hysteria v1 outbound: the QUIC edge, the credential and the trust bundle it dials with.
+#[derive(Debug, Clone)]
+pub(crate) struct HysteriaOut {
+    address: String,
+    port: u16,
+    host: String,
+    config: ferrox_core::hysteria::Config,
+    roots: Option<ferrox_core::tls::Anchors>,
+}
+
+impl HysteriaOut {
+    fn dial(&self) -> crate::hysteria::Dial {
+        crate::hysteria::Dial {
+            host: self.host.clone(),
+            address: self.address.clone(),
+            port: self.port,
+            config: self.config.clone(),
+            roots: self.roots.clone(),
         }
     }
 }
@@ -4922,6 +4946,7 @@ fn serve_vless_kcp_tls(
 
 /// An idle handshake is retried until the deadline; anything but silence refuses at once.
 fn shake_tls<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
+    let _quantum = KcpHandshakeRead::enter();
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
     loop {
         match session.handshake() {
@@ -6236,13 +6261,37 @@ impl KcpIo {
     }
 }
 
+// A shaped handshake cannot resume after a timeout, so handshake reads wait on the handshake clock rather than the relay quantum.
+thread_local! {
+    static KCP_HANDSHAKE_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct KcpHandshakeRead(bool);
+
+impl KcpHandshakeRead {
+    fn enter() -> Self {
+        Self(KCP_HANDSHAKE_READ.with(|read| read.replace(true)))
+    }
+}
+
+impl Drop for KcpHandshakeRead {
+    fn drop(&mut self) {
+        KCP_HANDSHAKE_READ.with(|read| read.set(self.0));
+    }
+}
+
 impl Read for KcpIo {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
         // The directions share one half-lock, so a read that never returns wedges the other's write.
-        self.conn.set_read_deadline(Instant::now() + RELAY_POLL);
+        let quantum = if KCP_HANDSHAKE_READ.with(std::cell::Cell::get) {
+            crate::quic::HANDSHAKE_TIMEOUT
+        } else {
+            RELAY_POLL
+        };
+        self.conn.set_read_deadline(Instant::now() + quantum);
         match self.conn.read(buf) {
             Ok(n) => Ok(n),
             Err(ferrox_core::kcp::ConnError::IoTimeout) => {
@@ -6361,15 +6410,15 @@ fn serve_hysteria_flow(mut flow: crate::hysteria::Flow, freedom: bool) {
     crate::hysteria::relay(&uplink, &flow);
 }
 
-/// The `hysteria` inbound: v2 over the hysteria transport, users' passwords as auths; other versions refused.
+/// The `hysteria` inbound: v2 over the hysteria transport, users' passwords as auths; v1 over the binary control stream; other versions refused.
 fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &str) -> bool {
     let settings = inbound.get("settings");
-    if settings
-        .and_then(|node| node.get("version"))
-        .and_then(Json::as_u32)
-        != Some(2)
-    {
-        eprintln!("hysteria inbound in {path} is not version 2: serves nothing");
+    let version = crate::config::hysteria_version(settings.and_then(|node| node.get("version")));
+    if version == Some(1) {
+        return serve_hysteria_v1_inbound(address, inbound, freedom, path);
+    }
+    if version != Some(2) {
+        eprintln!("hysteria inbound in {path} is not version 1 or 2: serves nothing");
         return false;
     }
     let auths: Vec<String> = settings
@@ -6430,6 +6479,111 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
     true
 }
 
+/// The v1 inbound: the binary control stream, users' `auth` strings, and the same stream/datagram shapes under ALPN `hysteria`.
+fn serve_hysteria_v1_inbound(address: &str, inbound: &Json, freedom: bool, path: &str) -> bool {
+    let settings = inbound.get("settings");
+    let auths: Vec<String> = settings
+        .and_then(|node| node.get("users"))
+        .and_then(Json::as_arr)
+        .map(|users| {
+            users
+                .iter()
+                .filter_map(|user| user.get("auth").and_then(Json::as_str).map(str::to_owned))
+                .collect()
+        })
+        .unwrap_or_default();
+    if auths.is_empty() {
+        eprintln!("hysteria inbound in {path} names no user auth: serves nothing");
+        return false;
+    }
+    let Some(stream) = inbound.get("streamSettings") else {
+        eprintln!("hysteria inbound in {path} carries no transport: serves nothing");
+        return false;
+    };
+    if stream.get("network").and_then(Json::as_str) != Some("hysteria") {
+        eprintln!("hysteria inbound in {path} is not on the hysteria transport: serves nothing");
+        return false;
+    }
+    let Some((cert_path, key_path)) = tls_cert_paths(stream) else {
+        eprintln!("unreadable hysteria identity in {path}: serves nothing");
+        return false;
+    };
+    let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
+    let obfs_password = stream
+        .get("tlsSettings")
+        .and_then(|tls| tls.get("obfs"))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let owned = address.to_owned();
+    let serve: crate::hysteria_v1::Serve = Arc::new(move |flow, host, port| {
+        serve_hysteria_v1_flow(flow, &host, port, freedom);
+    });
+    thread::spawn(move || {
+        crate::hysteria_v1::serve_loop(
+            &owned,
+            &auths,
+            ferrox_core::hysteria::Congestion::Bbr,
+            &cert_path,
+            &key_path,
+            &obfs_password,
+            &serve,
+        );
+    });
+    true
+}
+
+fn serve_hysteria_v1_flow(mut flow: crate::hysteria::Flow, host: &str, port: u16, freedom: bool) {
+    if !freedom {
+        return;
+    }
+    let Some(target) = (host, port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+    else {
+        let mut reply = Vec::with_capacity(8);
+        ferrox_core::hysteria_v1::encode_server_response(
+            &ferrox_core::hysteria_v1::ServerResponse {
+                ok: false,
+                udp_session_id: 0,
+                message: b"host resolution failure",
+            },
+            &mut reply,
+        );
+        let _ = flow.write_all(&reply);
+        flow.close();
+        return;
+    };
+    let Some(uplink) = dial_or_report(&target) else {
+        let mut reply = Vec::with_capacity(8);
+        ferrox_core::hysteria_v1::encode_server_response(
+            &ferrox_core::hysteria_v1::ServerResponse {
+                ok: false,
+                udp_session_id: 0,
+                message: b"connection failure",
+            },
+            &mut reply,
+        );
+        let _ = flow.write_all(&reply);
+        flow.close();
+        return;
+    };
+    let mut reply = Vec::with_capacity(8);
+    ferrox_core::hysteria_v1::encode_server_response(
+        &ferrox_core::hysteria_v1::ServerResponse {
+            ok: true,
+            udp_session_id: 0,
+            message: b"",
+        },
+        &mut reply,
+    );
+    if flow.write_all(&reply).is_err() {
+        return;
+    }
+    crate::hysteria::relay(&uplink, &flow);
+}
+
 fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], freedom: bool) {
     let Some((got, flow, cmd, target)) = decode_request_bounded(&mut io) else {
         return;
@@ -6469,13 +6623,14 @@ fn kcp_tls_connect(
     conn: &Arc<ferrox_core::kcp::Connection>,
     cfg: &ferrox_core::tls::TlsConfig,
 ) -> Option<ferrox_core::tls::ClientSession<KcpIo>> {
-    let mut session = ferrox_core::tls::connect(
+    let Ok(mut session) = ferrox_core::tls::connect(
         cfg,
         KcpIo {
             conn: Arc::clone(conn),
         },
-    )
-    .ok()?;
+    ) else {
+        return None;
+    };
     shake_tls(&mut session).then_some(session)
 }
 
@@ -12551,6 +12706,7 @@ fn dial_socks_outbound(
         Outbound::Shadowsocks(shadowsocks) => {
             dial_shadowsocks(client, server, shadowsocks, target, ladder);
         }
+        Outbound::Hysteria(hy) => crate::hysteria_v1::dial(client, &hy.dial(), target),
         Outbound::Http(http) => {
             dial_http_outbound(client, server, http, target, ladder);
         }
@@ -13683,6 +13839,7 @@ fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Option<&Connecti
         Outbound::Shadowsocks(ss) if matches!(ss.carrier, Carrier::Raw(_)) => {
             serve_socks_udp_shadowsocks(relay, ss);
         }
+        Outbound::Hysteria(hy) => crate::hysteria_v1::serve_udp(relay, &hy.dial()),
         Outbound::Foxy(foxy) => match foxy.carrier {
             // One tunnel for all destinations: later ones ride the first one opened.
             crate::foxy::Carrier::H3 => serve_socks_udp_foxy_ip(relay, foxy, associate),
@@ -18485,6 +18642,27 @@ fn ss_outbound_refusal(outbound: &Json, server: &Json) -> Option<String> {
     }
 }
 
+fn hysteria_outbound_refusal(outbound: &Json) -> Option<String> {
+    let settings = outbound.get("settings");
+    let version =
+        crate::config::hysteria_version(settings.and_then(|s| s.get("version"))).or_else(|| {
+            outbound
+                .get("streamSettings")
+                .and_then(|s| s.get("hysteriaSettings"))
+                .and_then(|h| h.get("version"))
+                .and_then(|version| crate::config::hysteria_version(Some(version)))
+        });
+    if version != Some(1) {
+        return Some("only the version 1 outbound is carried".to_owned());
+    }
+    if lane_server(settings, "servers").is_none()
+        && settings.and_then(|s| s.get("address")).is_none()
+    {
+        return Some("no server entry in the hysteria settings".to_owned());
+    }
+    None
+}
+
 // A lane the tree can carry when its fields are honest: the field it lacks is the refusal's word.
 fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
     let settings = outbound.get("settings");
@@ -18577,9 +18755,8 @@ fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
         // The chain's own refusals carry their one line already.
         "foxy" | "veepn" => None,
         // A lane without an outbound this binary builds: the name is xray's, not a typo to diagnose.
-        "dokodemo-door" | "hysteria" | "masque" => {
-            Some(format!("the `{protocol}` outbound is not carried"))
-        }
+        "hysteria" => hysteria_outbound_refusal(outbound),
+        "dokodemo-door" | "masque" => Some(format!("the `{protocol}` outbound is not carried")),
         _ => Some(format!("unknown outbound protocol: {protocol}")),
     }
 }
@@ -18659,6 +18836,9 @@ fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
     }
     if let Some(shadowsocks) = find_shadowsocks_outbound(root) {
         return Ok(Some(Outbound::Shadowsocks(shadowsocks)));
+    }
+    if let Some(hysteria) = find_hysteria_outbound(root) {
+        return Ok(Some(Outbound::Hysteria(Box::new(hysteria))));
     }
     if let Some(freedom) = find_freedom_outbound(root)? {
         return Ok(Some(Outbound::Freedom(Arc::new(freedom))));
@@ -19634,6 +19814,85 @@ fn find_socks_outbound(root: &Json) -> Option<SocksOut> {
             })
             .unwrap_or_default();
         return Some(SocksOut::new(&address, port, user, pass, version));
+    }
+    None
+}
+
+/// The direct Hysteria v1 outbound a config names: `settings.version: 1` and a server entry, with the stream's own `hysteriaSettings` supplying auth, congestion, obfs and hop.
+fn find_hysteria_outbound(root: &Json) -> Option<HysteriaOut> {
+    let empty = Vec::new();
+    let outbounds = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty);
+    for outbound in outbounds {
+        if canonical_protocol(
+            outbound
+                .get("protocol")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        ) != "hysteria"
+        {
+            continue;
+        }
+        let Some(settings) = outbound.get("settings") else {
+            continue;
+        };
+        let version = crate::config::hysteria_version(settings.get("version")).or_else(|| {
+            outbound
+                .get("streamSettings")
+                .and_then(|s| s.get("hysteriaSettings"))
+                .and_then(|h| h.get("version"))
+                .and_then(|version| crate::config::hysteria_version(Some(version)))
+        });
+        if version != Some(1) {
+            continue;
+        }
+        let server = settings
+            .get("servers")
+            .and_then(Json::as_arr)
+            .and_then(|servers| servers.first());
+        let field = |name: &str| {
+            server
+                .and_then(|s| s.get(name))
+                .or_else(|| settings.get(name))
+        };
+        let Some(address) = field("address").and_then(Json::as_str).map(str::to_owned) else {
+            continue;
+        };
+        let Some(port) = field("port").and_then(Json::as_port) else {
+            continue;
+        };
+        let stream = outbound.get("streamSettings");
+        if stream
+            .and_then(|s| s.get("hysteriaSettings"))
+            .and_then(|h| h.get("version"))
+            .and_then(|version| crate::config::hysteria_version(Some(version)))
+            .is_some_and(|version| version != 1)
+        {
+            continue;
+        }
+        let mut config = crate::config::hysteria_v1_config(stream);
+        if let Some(auth) = field("auth").and_then(Json::as_str) {
+            auth.clone_into(&mut config.auth);
+        }
+        let host = stream
+            .and_then(|s| s.get("tlsSettings"))
+            .and_then(|t| t.get("serverName"))
+            .and_then(Json::as_str)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(&address)
+            .to_owned();
+        let roots = crate::config::tls_ca_roots(outbound)
+            .or_else(|| Some(crate::quic::system_roots()))
+            .filter(|roots| !roots.is_empty());
+        return Some(HysteriaOut {
+            address,
+            port,
+            host,
+            config,
+            roots,
+        });
     }
     None
 }
@@ -32901,6 +33160,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port,
             config: ferrox_core::hysteria::Config {
+                version: 2,
                 auth: "lane-auth".to_owned(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: String::new(),
@@ -34618,10 +34878,52 @@ mod tests {
         assert_eq!(cfg.cc, ferrox_core::hysteria::Congestion::Brutal);
         let old = crate::json::parse(r#"{"network":"hysteria","hysteriaSettings":{"version":1}}"#)
             .expect("parses");
+        let Carrier::Hysteria(cfg) = stream_carrier(Some(&old)) else {
+            panic!("version 1 names Hysteria");
+        };
+        assert_eq!(cfg.version, 1);
+        assert_eq!(cfg.obfs_password, "");
+        let xplus = crate::json::parse(
+            r#"{"network":"hysteria","hysteriaSettings":{"version":1},"tlsSettings":{"obfs":"Vaundy"}}"#,
+        )
+        .expect("parses");
+        let Carrier::Hysteria(cfg) = stream_carrier(Some(&xplus)) else {
+            panic!("version 1 xplus parses");
+        };
+        assert_eq!(cfg.obfs_password, "Vaundy");
+        let three =
+            crate::json::parse(r#"{"network":"hysteria","hysteriaSettings":{"version":3}}"#)
+                .expect("parses");
         assert!(matches!(
-            stream_carrier(Some(&old)),
+            stream_carrier(Some(&three)),
             Carrier::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn hysteria_v1_outbound_reads_its_server_and_stream() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"hysteria","settings":{"version":1,"address":"127.0.0.1","port":443,"auth":"pw"},"streamSettings":{"network":"hysteria","security":"tls","tlsSettings":{"serverName":"example.com","obfs":"key"}}}]}"#,
+        )
+        .expect("parses");
+        let out = find_hysteria_outbound(&root).expect("v1 outbound");
+        assert_eq!(out.address, "127.0.0.1");
+        assert_eq!(out.port, 443);
+        assert_eq!(out.host, "example.com");
+        assert_eq!(out.config.version, 1);
+        assert_eq!(out.config.auth, "pw");
+        assert_eq!(out.config.obfs_password, "key");
+        let v2 = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"hysteria","settings":{"version":2,"address":"127.0.0.1","port":443}}]}"#,
+        )
+        .expect("parses");
+        assert!(find_hysteria_outbound(&v2).is_none());
+        let first = v2
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .and_then(|outbounds| outbounds.first())
+            .expect("outbound");
+        assert!(outbound_refusal(first, "hysteria").is_some());
     }
 
     fn hysteria_loop_with(auth: &str, id: [u8; 16], obfs: &str) -> (u16, Vec<Vec<u8>>) {
@@ -34692,6 +34994,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port,
             config: ferrox_core::hysteria::Config {
+                version: 2,
                 auth: auth.to_owned(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: obfs.to_owned(),
@@ -34869,6 +35172,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port,
             config: ferrox_core::hysteria::Config {
+                version: 2,
                 auth: "bisect-auth".to_owned(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: String::new(),
@@ -35649,6 +35953,7 @@ mod tests {
             port,
             id,
             carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
+                version: 2,
                 auth: "association-auth".to_owned(),
                 cc: ferrox_core::hysteria::Congestion::Bbr,
                 obfs_password: String::new(),
@@ -35726,6 +36031,222 @@ mod tests {
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn hysteria_v1_carries_a_tcp_echo_over_loopback() {
+        let _serial = quic_serial();
+        let echo_port = echo_loop();
+        let (port, roots) = hysteria_v1_loop("v1-auth");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = HysteriaOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            host: "localhost".to_owned(),
+            config: ferrox_core::hysteria::Config {
+                version: 1,
+                auth: "v1-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: String::new(),
+                hop: None,
+                gecko: None,
+            },
+            roots: Some(roots.into()),
+        };
+        let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_socks_outbound(
+                &stream,
+                &Outbound::Hysteria(Box::new(out)),
+                &server,
+                &Destination::from(target),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(b"v1").expect("writes");
+        let mut back = [0u8; 2];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"v1");
+    }
+
+    #[test]
+    fn hysteria_v1_refuses_a_wrong_password_without_relaying() {
+        let _serial = quic_serial();
+        let echo_port = echo_loop();
+        let (port, roots) = hysteria_v1_loop("v1-auth");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = HysteriaOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            host: "localhost".to_owned(),
+            config: ferrox_core::hysteria::Config {
+                version: 1,
+                auth: "wrong".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: String::new(),
+                hop: None,
+                gecko: None,
+            },
+            roots: Some(roots.into()),
+        };
+        let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_socks_outbound(
+                &stream,
+                &Outbound::Hysteria(Box::new(out)),
+                &server,
+                &Destination::from(target),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        let mut back = [0u8; 1];
+        assert!(matches!(client.read(&mut back), Ok(0) | Err(_)));
+    }
+
+    #[test]
+    fn hysteria_v1_carries_a_flow_through_xplus_over_loopback() {
+        let _serial = quic_serial();
+        let echo_port = echo_loop();
+        let (port, roots) = hysteria_v1_loop_obfs("v1-auth", "gawrgura");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = HysteriaOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            host: "localhost".to_owned(),
+            config: ferrox_core::hysteria::Config {
+                version: 1,
+                auth: "v1-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: "gawrgura".to_owned(),
+                hop: None,
+                gecko: None,
+            },
+            roots: Some(roots.into()),
+        };
+        let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_socks_outbound(
+                &stream,
+                &Outbound::Hysteria(Box::new(out)),
+                &server,
+                &Destination::from(target),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(b"xplus").expect("writes");
+        let mut back = [0u8; 5];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"xplus");
+    }
+
+    #[test]
+    fn hysteria_v1_carries_a_udp_echo_over_loopback() {
+        let _serial = quic_serial();
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = echo.recv_from(&mut buf) {
+                let _ = echo.send_to(&buf[..n], from);
+            }
+        });
+        let other = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let other_port = other.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = other.recv_from(&mut buf) {
+                let _ = other.send_to(&buf[..n], from);
+            }
+        });
+        let (port, roots) = hysteria_v1_loop("v1-auth");
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let relay_addr = relay.local_addr().expect("addr");
+        let dial = crate::hysteria::Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port,
+            config: ferrox_core::hysteria::Config {
+                version: 1,
+                auth: "v1-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: String::new(),
+                hop: None,
+                gecko: None,
+            },
+            roots: Some(roots.into()),
+        };
+        thread::spawn(move || crate::hysteria_v1::serve_udp(&relay, &dial));
+        let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        let mut packet = vec![0, 0, 0, 1, 127, 0, 0, 1];
+        packet.extend_from_slice(&echo_port.to_be_bytes());
+        packet.extend_from_slice(b"v1udp");
+        client.send_to(&packet, relay_addr).expect("sends");
+        let mut back = [0u8; 2048];
+        let (n, _) = client.recv_from(&mut back).expect("replies");
+        let (from, payload) = parse_socks_udp(&back[..n]).expect("socks frame");
+        assert_eq!(from.port(), echo_port);
+        assert_eq!(payload, b"v1udp");
+        let mut packet = vec![0, 0, 0, 1, 127, 0, 0, 1];
+        packet.extend_from_slice(&other_port.to_be_bytes());
+        packet.extend_from_slice(b"second");
+        client.send_to(&packet, relay_addr).expect("sends");
+        let (n, _) = client.recv_from(&mut back).expect("replies");
+        let (from, payload) = parse_socks_udp(&back[..n]).expect("socks frame");
+        assert_eq!(from.port(), other_port);
+        assert_eq!(payload, b"second");
+    }
+
+    fn hysteria_v1_loop(auth: &str) -> (u16, Vec<Vec<u8>>) {
+        hysteria_v1_loop_obfs(auth, "")
+    }
+
+    fn hysteria_v1_loop_obfs(auth: &str, obfs: &str) -> (u16, Vec<Vec<u8>>) {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tag = format!("ferrox-hysteria-v1-test-{}-{stamp}", std::process::id());
+        let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+        let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
+        std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
+        std::fs::write(&key_path, &key_pem).expect("stages key");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
+        let cert_path = cert_path.to_str().expect("ascii").replace('\\', "/");
+        let key_path = key_path.to_str().expect("ascii").replace('\\', "/");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"hysteria","settings":{{"version":1,"users":[{{"auth":"{auth}"}}]}},"streamSettings":{{"network":"hysteria","security":"tls","tlsSettings":{{"obfs":"{obfs}","certificates":[{{"certificateFile":"{cert_path}","keyFile":"{key_path}"}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_hysteria_inbound(&address, &inbound, true, "test"));
+        (port, roots)
     }
 
     #[test]
@@ -35868,6 +36389,41 @@ mod tests {
         let port = listener.local_addr().port();
         thread::spawn(move || serve_kcp_each(&listener, &serve));
         port
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sixteen_kcp_dials_share_one_feed_thread() {
+        fn threads() -> usize {
+            std::fs::read_dir("/proc/self/task")
+                .expect("reads the task table")
+                .count()
+        }
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let before = threads();
+        let mut conns = Vec::new();
+        for _ in 0..16 {
+            conns.push(
+                ferrox_core::kcp::dial(
+                    listener.local_addr(),
+                    ferrox_core::kcp::Config::default(),
+                    ferrox_core::kcp::fresh_conversation(),
+                )
+                .expect("dials"),
+            );
+        }
+        let after = threads();
+        assert!(
+            after - before < 8,
+            "sixteen dials added {} feed threads",
+            after - before
+        );
+        drop(conns);
+        listener.close();
     }
 
     #[cfg(target_os = "linux")]

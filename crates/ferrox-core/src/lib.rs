@@ -15,6 +15,7 @@ pub mod failure;
 pub mod finalmask;
 pub mod foxy;
 pub mod hysteria;
+pub mod hysteria_v1;
 pub mod kcp;
 pub mod mux;
 pub mod policy;

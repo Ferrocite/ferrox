@@ -390,6 +390,14 @@ while read -r id traffic connections iterations payload; do
       }
       client_args+=(--outbound-config-for "xray-rust=$(cat "$celldir/client-xray-rust.json")")
     fi
+    if engine_path sing-box >/dev/null && matrix_engine_serves sing-box "$id"; then
+      python3 scripts/xray-to-singbox.py "$celldir/client.json" "$celldir/client-sing-box.json" || {
+        cells_failed+=("$cell (could not translate the client config for sing-box)")
+        status=1
+        continue
+      }
+      client_args+=(--outbound-config-for "sing-box=$(cat "$celldir/client-sing-box.json")")
+    fi
     if ((probe_only)); then
       cells_run=$((cells_run + 1))
       {
