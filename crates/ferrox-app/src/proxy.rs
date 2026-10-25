@@ -1004,6 +1004,8 @@ pub(crate) enum Outbound {
     Http(HttpOut),
     /// The rules choose the outbound per flow; the plan holds the registry and the fallback.
     Route(Arc<RoutePlan>),
+    /// A re-inject through a named inbound, with its own sniffer applied before the dial.
+    Loopback(Box<LoopbackOut>),
     /// The rules drop the flow after the front has granted it.
     Block(ferrox_core::blackhole::Response),
     /// The wire carries DNS queries; the lane answers, drops, and forwards them.
@@ -1032,6 +1034,7 @@ impl Outbound {
             | Self::Veepn(_)
             | Self::Freedom
             | Self::Route(_)
+            | Self::Loopback(_)
             | Self::Block(_)
             | Self::Dns(_)
             | Self::ReversePortal(_) => None,
@@ -1297,6 +1300,26 @@ fn reverse_portals(root: &Json) -> Arc<crate::reverse::Portals> {
     Arc::new(portals)
 }
 
+/// One routing target, with loopback resolved to the named inbound's dial instead of refused.
+fn routed_outbound(
+    root: &Json,
+    config: &Json,
+    tag: &str,
+    freedom: bool,
+) -> Result<Outbound, String> {
+    if canonical_protocol(config.get("protocol").and_then(Json::as_str).unwrap_or("")) != "loopback"
+    {
+        return build_outbound(config, tag);
+    }
+    let inbound_tag = config
+        .get("settings")
+        .and_then(|settings| settings.get("inboundTag"))
+        .and_then(Json::as_str)
+        .filter(|tag| !tag.is_empty())
+        .ok_or_else(|| format!("outbound `{tag}` loopback has no inboundTag"))?;
+    resolve_loopback(root, inbound_tag, freedom)
+}
+
 fn route_shared(
     root: &Json,
     routing: crate::router::Routing,
@@ -1307,12 +1330,15 @@ fn route_shared(
     let Some(first) = list.first() else {
         return Err("routing has no outbound to fall back to".into());
     };
+    let freedom =
+        has_protocol(root, "outbounds", "freedom") || find_unbuilt_outbound(root).is_some();
+    let build = |config: &Json, tag: &str| routed_outbound(root, config, tag, freedom);
     let default_tag = first
         .get("tag")
         .and_then(Json::as_str)
         .filter(|tag| !tag.is_empty())
         .map(str::to_owned);
-    let default = build_outbound(first, default_tag.as_deref().unwrap_or("<default>"))?;
+    let default = build(first, default_tag.as_deref().unwrap_or("<default>"))?;
     let mut configs: HashMap<&str, &Json> = HashMap::new();
     for outbound in list {
         let tag = outbound.get("tag").and_then(Json::as_str).unwrap_or("");
@@ -1352,7 +1378,7 @@ fn route_shared(
                 "routing targets `{target}`, which no outbound names"
             ));
         };
-        let out = build_outbound(config, target)?;
+        let out = build(config, target)?;
         tagged.insert(target.to_owned(), out);
     }
     let mut balancers = HashMap::new();
@@ -1376,7 +1402,7 @@ fn route_shared(
                     balancer.tag()
                 ));
             };
-            tagged.insert(candidate.clone(), build_outbound(config, candidate)?);
+            tagged.insert(candidate.clone(), build(config, candidate)?);
         }
         if let Some(fallback) = balancer.fallback() {
             if !tagged.contains_key(fallback) && Some(fallback) != default_tag.as_deref() {
@@ -1386,7 +1412,7 @@ fn route_shared(
                         balancer.tag()
                     ));
                 };
-                tagged.insert(fallback.to_owned(), build_outbound(config, fallback)?);
+                tagged.insert(fallback.to_owned(), build(config, fallback)?);
             }
         }
         balancers.insert(balancer.tag().to_owned(), candidates);
@@ -11456,6 +11482,20 @@ fn sniff_lane<'a>(
     (dial, resolved, tag)
 }
 
+/// A loopback outbound's own sniffer runs before its named inbound sees the flow, as the
+/// reference's second dispatch does; `routeOnly` leaves the dial target at the original address.
+fn loopback_asked(
+    loopback: &LoopbackOut,
+    asked: &Destination,
+    client: &Connection,
+) -> Option<Destination> {
+    let sniffing = loopback.sniffing.as_ref()?;
+    let found = sniffing.inspect(asked, crate::router::Network::Tcp, client)?;
+    sniffing
+        .should_dial_override(&found)
+        .then(|| Destination::Name(found.domain, asked.port()))
+}
+
 /// One tunnel request from either front, already resolved to its lane: the Foxy lane grants after its tunnel opens.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn serve_connect(
@@ -11468,6 +11508,11 @@ pub(crate) fn serve_connect(
 ) {
     let tag = tag.map(str::to_owned).or_else(default_outbound_tag);
     let _outbound = OutboundTag::enter(tag.as_deref());
+    if let Outbound::Loopback(loopback) = out {
+        let overridden = loopback_asked(loopback, asked, &client);
+        let asked = overridden.as_ref().unwrap_or(asked);
+        return serve_connect(client, &loopback.dial, asked, front, prefix, tag.as_deref());
+    }
     // The rules dropped this flow: the front has granted it, so the sink answers and ends it.
     if let Outbound::Block(answer) = out {
         crate::blackhole::serve(client, answer);
@@ -11615,6 +11660,7 @@ fn dial_socks_outbound(
         | Outbound::Veepn(_)
         | Outbound::Freedom
         | Outbound::Route(_)
+        | Outbound::Loopback(_)
         | Outbound::Block(_)
         | Outbound::Dns(_)
         | Outbound::ReversePortal(_)
@@ -12709,6 +12755,8 @@ fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
 /// itself an inner relay of a split association, whose control socket the splitter owns.
 fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Option<&Connection>) {
     match out {
+        // The reference's loopback handler is TCP-only, so a datagram keeps the named dial's lane.
+        Outbound::Loopback(loopback) => serve_udp_lane(relay, &loopback.dial, associate),
         Outbound::Vless(vless)
             if matches!(vless.carrier, Carrier::Raw(_)) && vless.tls.is_none() =>
         {
@@ -17717,30 +17765,26 @@ fn is_freedom(root: &Json) -> bool {
 }
 
 /// The tag a `loopback` outbound re-injects through, or nothing when no such
-/// outbound is configured to carry. An empty tag skips it; loopback sniffing has
-/// no second routing pass here, so the dial keeps the named inbound's own sniffer.
+/// outbound is configured to carry. An empty tag skips it; its sniffing, when
+/// enabled, runs on the re-inject before the named inbound is dialled.
 fn find_loopback_outbound(root: &Json) -> Option<String> {
     let outbounds = root.get("outbounds").and_then(Json::as_arr)?;
     for outbound in outbounds {
-        if outbound.get("protocol").and_then(Json::as_str) != Some("loopback") {
+        if canonical_protocol(
+            outbound
+                .get("protocol")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        ) != "loopback"
+        {
             continue;
         }
         let settings = outbound.get("settings")?;
-        let tag = settings
+        return settings
             .get("inboundTag")
             .and_then(Json::as_str)
-            .filter(|tag| !tag.is_empty())?;
-        let sniffing = settings
-            .get("sniffing")
-            .and_then(|sniffing| sniffing.get("enabled"))
-            .and_then(Json::as_bool)
-            .unwrap_or(false);
-        if sniffing {
-            eprintln!(
-                "loopback outbound `{tag}` asks for sniffing, which this tree does not re-dispatch; its inbound sniffer decides"
-            );
-        }
-        return Some(tag.to_owned());
+            .filter(|tag| !tag.is_empty())
+            .map(str::to_owned);
     }
     None
 }
@@ -17758,6 +17802,48 @@ fn loopback_carrier(carrier: &Carrier) -> bool {
             | Carrier::Xhttp { .. }
             | Carrier::HttpHeader { .. }
     )
+}
+
+/// A loopback dial plus the outbound's own sniffing config, applied on the re-inject.
+#[derive(Debug, Clone)]
+pub(crate) struct LoopbackOut {
+    dial: Outbound,
+    sniffing: Option<Arc<crate::sniff::Sniffing>>,
+}
+
+/// The sniffing block the loopback outbound naming this inbound carries, if it enables one.
+fn loopback_sniffing(
+    root: &Json,
+    inbound_tag: &str,
+) -> Result<Option<Arc<crate::sniff::Sniffing>>, String> {
+    let empty = Vec::new();
+    for outbound in root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty)
+    {
+        if canonical_protocol(
+            outbound
+                .get("protocol")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        ) != "loopback"
+        {
+            continue;
+        }
+        let settings = outbound.get("settings");
+        if settings
+            .and_then(|settings| settings.get("inboundTag"))
+            .and_then(Json::as_str)
+            != Some(inbound_tag)
+        {
+            continue;
+        }
+        let sniffing = crate::sniff::parse(settings.and_then(|settings| settings.get("sniffing")))
+            .map_err(|error| format!("loopback `{inbound_tag}` sniffing {error}"))?;
+        return Ok(sniffing.filter(|sniffing| sniffing.enabled()));
+    }
+    Ok(None)
 }
 
 /// The client dial a `loopback` outbound desugars to: the named inbound's own
@@ -17804,7 +17890,14 @@ fn resolve_loopback(root: &Json, tag: &str, freedom: bool) -> Result<Outbound, S
         return Err(format!("names `{tag}`, which binds no port"));
     };
     let address = listen.to_owned();
-    loopback_dial(inbound, protocol, &address, port, tag)
+    let dial = loopback_dial(inbound, protocol, &address, port, tag)?;
+    Ok(match loopback_sniffing(root, tag)? {
+        Some(sniffing) => Outbound::Loopback(Box::new(LoopbackOut {
+            dial,
+            sniffing: Some(sniffing),
+        })),
+        None => dial,
+    })
 }
 
 /// The named inbound's own credentials pointed at where it listens, so the
@@ -36263,6 +36356,128 @@ mod tests {
         assert_eq!(back, payload, "a re-injected stream is byte-identical");
     }
 
+    /// The loopback outbound's own sniffer runs on the re-inject: the named
+    /// inbound dials the sniffed name, not the address the front was asked for.
+    #[test]
+    fn a_loopback_sniffing_overrides_the_re_inject_destination() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let id_bytes = uuid_bytes(id).expect("id");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = vec![0u8; 65536];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_vless_raw(stream, &one_vless_user(&id_bytes), true, None);
+        });
+        let root = crate::json::parse(&format!(
+            r#"{{"inbounds":[{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":{tunnel_port},"settings":{{"clients":[{{"id":"{id}"}}]}}}}],"outbounds":[{{"tag":"again","protocol":"loopback","settings":{{"inboundTag":"tunnel-in","sniffing":{{"enabled":true,"destOverride":["http"]}}}}}}]}}"#,
+        ))
+        .expect("parses");
+        let out = resolve_loopback(&root, "tunnel-in", true).expect("resolves");
+        assert!(
+            matches!(out, Outbound::Loopback(_)),
+            "sniffing wraps the dial"
+        );
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 2];
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        client.write_all(&request).expect("connects");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0);
+        let head =
+            format!("GET / HTTP/1.1\r\nHost: 127.0.0.1:{echo_port}\r\nConnection: close\r\n\r\n");
+        client.write_all(head.as_bytes()).expect("writes the head");
+        let mut back = vec![0u8; head.len()];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(back, head.as_bytes(), "the sniffed name is dialled");
+    }
+
+    /// A loopback outbound is a routing target, not just the single front lane:
+    /// a config whose default is loopback builds and re-injects.
+    #[test]
+    fn a_loopback_outbound_is_a_route_target() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let id_bytes = uuid_bytes(id).expect("id");
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 64];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = tunnel.accept().expect("accepts");
+            serve_vless_raw(stream, &one_vless_user(&id_bytes), true, None);
+        });
+        let out = route_outbound(
+            &format!(
+                r#"{{"inbounds":[{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":{tunnel_port},"settings":{{"clients":[{{"id":"{id}"}}]}}}}],"outbounds":[{{"tag":"again","protocol":"loopback","settings":{{"inboundTag":"tunnel-in"}}}},{{"tag":"direct","protocol":"freedom"}}],"routing":{{"rules":[]}}}}"#,
+            ),
+            None,
+            false,
+        );
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        client.write_all(&request).expect("connects");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
     /// UDP takes the same re-inject: the association frames its datagram over
     /// the redialled TCP session the way a direct dial would.
     #[test]
@@ -36288,10 +36503,12 @@ mod tests {
             let (stream, _) = tunnel.accept().expect("accepts");
             serve_vless_raw(stream, &one_vless_user(&id_bytes), true, None);
         });
-        let root = loopback_root(&format!(
-            r#"{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":{tunnel_port},"settings":{{"clients":[{{"id":"{id}"}}]}}}}"#,
-        ));
+        let root = crate::json::parse(&format!(
+            r#"{{"inbounds":[{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":{tunnel_port},"settings":{{"clients":[{{"id":"{id}"}}]}}}}],"outbounds":[{{"tag":"again","protocol":"loopback","settings":{{"inboundTag":"tunnel-in","sniffing":{{"enabled":true,"destOverride":["quic"]}}}}}}]}}"#,
+        ))
+        .expect("parses");
         let out = resolve_loopback(&root, "tunnel-in", true).expect("resolves");
+        assert!(matches!(out, Outbound::Loopback(_)));
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
