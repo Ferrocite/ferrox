@@ -21871,6 +21871,101 @@ mod tests {
         assert_eq!(&got, payload);
     }
 
+    /// Vision's direct command peels the sealed record layer but keeps the XOR header mask:
+    /// a bulk echo crosses the switch on both legs and comes back byte for byte.
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_vision_session_echoes_over_loopback() {
+        use std::os::unix::net::UnixStream;
+
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "random", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+        let (server_config, client_config) = carried_tls_configs();
+
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds the echo");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stream.write_all(&buf[..n]).expect("echoes"),
+                }
+            }
+        });
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the server");
+        let server_addr = listener.local_addr().expect("addr");
+        let id = [0x44u8; 16];
+        let users = [VlessUser {
+            id,
+            flow: Flow::Vision,
+            email: String::new(),
+            level: 0,
+            reverse: None,
+        }];
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &users,
+                true,
+                &Carrier::Raw(Chain::default()),
+                &server_config,
+                None,
+                Some(&decryption),
+            );
+        });
+
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: server_addr.port(),
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: false,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: Some(Arc::new(client_config)),
+            flow: crate::vision::FLOW.to_owned(),
+            reality: None,
+            headers: crate::config::carrier_headers(None).0,
+            heartbeat: crate::config::carrier_headers(None).1,
+            encryption: Some(Arc::clone(&client)),
+        };
+
+        let (app, mut peer) = UnixStream::pair().expect("pair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        thread::spawn(move || {
+            dial_vless_tls(
+                &Connection::from(app),
+                &server_addr,
+                &vless,
+                Some(&Destination::from(echo_addr)),
+            );
+        });
+        let payload: Vec<u8> = (0..64 * 1024u32)
+            .map(|index| (index as u8).wrapping_mul(31).wrapping_add(7))
+            .collect();
+        peer.write_all(&payload).expect("writes");
+        let mut got = vec![0u8; payload.len()];
+        peer.read_exact(&mut got).expect("reads the echo");
+        assert_eq!(got, payload);
+    }
+
     /// The driven half carries the bytes: a payload that crosses several records comes back
     /// byte for byte through the relay's own read of the transport.
     #[test]
