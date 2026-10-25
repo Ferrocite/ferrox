@@ -431,7 +431,7 @@ fn stage_at(path: &std::path::Path, bundle: &[u8]) -> Option<(std::path::PathBuf
 /// The transport shape every lane in this file shares, in one place: the initial credit, the ceiling its autotuner may grow to, and the datagram both ends are bounded to.
 ///
 /// The datagram is the whole arithmetic of a QUIC lane's syscall count. A packet carries 1350 bytes of UDP payload instead of the 1200 quiche defaults to, so a megabyte leaves in 776 datagrams rather than 874 — 11.2 percent fewer sends, fewer ACKs, and fewer receive interrupts for the same bytes, and the lane's own receive buffer is already exactly this wide, so what it advertises is what it can hold.
-fn tune_transport(config: &mut quiche::Config) {
+pub(crate) fn tune_transport(config: &mut quiche::Config) {
     config.set_max_idle_timeout(IDLE_TIMEOUT_MS);
     config.set_initial_max_data(MAX_DATA);
     config.set_initial_max_stream_data_bidi_local(MAX_STREAM_DATA);
