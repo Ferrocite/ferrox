@@ -42,6 +42,7 @@ mod reverse;
 mod router;
 mod shadowsocks;
 mod shadowsocks2022;
+mod sniff;
 mod sockopt;
 mod socks;
 mod stats;
