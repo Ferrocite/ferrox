@@ -41,6 +41,12 @@ use winunix::{
 pub(crate) enum Connection {
     Tcp(TcpStream),
     Masked(Masked),
+    /// A stream whose peer is the one a PROXY protocol header reported rather than the socket's
+    /// own peer: reads and writes still reach the socket, but routing sees the reported source.
+    Proxied {
+        inner: Box<Connection>,
+        peer: SocketAddr,
+    },
     #[cfg(any(unix, windows))]
     Unix(UnixStream),
 }
@@ -81,14 +87,31 @@ impl Connection {
                 stream,
                 chain: std::sync::Arc::new(std::sync::Mutex::new(chain.clone())),
             }),
+            (Connection::Proxied { inner, peer }, mask) => Connection::Proxied {
+                inner: Box::new(inner.with_mask(mask)),
+                peer,
+            },
             (this, _) => this,
+        }
+    }
+
+    /// The same stream with the peer a PROXY protocol header reported, which routing reads in
+    /// place of the socket's own peer.
+    pub(crate) fn with_peer(self, peer: SocketAddr) -> Self {
+        Connection::Proxied {
+            inner: Box::new(self),
+            peer,
         }
     }
 
     /// Whether a write to this stream must pass the chain, which a descriptor-level fast path
     /// addressing the socket would skip. Reads, teardown and the census are unaffected by it.
     pub(crate) fn masked(&self) -> bool {
-        matches!(self, Connection::Masked(_))
+        match self {
+            Connection::Masked(_) => true,
+            Connection::Proxied { inner, .. } => inner.masked(),
+            _ => false,
+        }
     }
 }
 
@@ -115,6 +138,7 @@ impl std::os::fd::AsRawFd for Connection {
         match self {
             Connection::Tcp(stream) => stream.as_raw_fd(),
             Connection::Masked(masked) => masked.stream.as_raw_fd(),
+            Connection::Proxied { inner, .. } => inner.as_raw_fd(),
             Connection::Unix(stream) => stream.as_raw_fd(),
         }
     }
@@ -130,6 +154,7 @@ impl std::os::windows::io::AsRawSocket for Connection {
         match self {
             Connection::Tcp(stream) => stream.as_raw_socket(),
             Connection::Masked(masked) => masked.stream.as_raw_socket(),
+            Connection::Proxied { inner, .. } => inner.as_raw_socket(),
             Connection::Unix(stream) => stream.as_raw_socket(),
         }
     }
@@ -145,6 +170,7 @@ impl Read for Connection {
         match self {
             Connection::Tcp(stream) => stream.read(buf),
             Connection::Masked(masked) => masked.stream.read(buf),
+            Connection::Proxied { inner, .. } => inner.read(buf),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.read(buf),
         }
@@ -154,6 +180,7 @@ impl Read for Connection {
         match self {
             Connection::Tcp(stream) => stream.read_vectored(bufs),
             Connection::Masked(masked) => masked.stream.read_vectored(bufs),
+            Connection::Proxied { inner, .. } => inner.read_vectored(bufs),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.read_vectored(bufs),
         }
@@ -165,6 +192,7 @@ impl Write for Connection {
         match self {
             Connection::Tcp(stream) => stream.write(buf),
             Connection::Masked(masked) => masked.send(buf),
+            Connection::Proxied { inner, .. } => inner.write(buf),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.write(buf),
         }
@@ -175,6 +203,7 @@ impl Write for Connection {
         match self {
             Connection::Tcp(stream) => stream.write_vectored(bufs),
             Connection::Masked(masked) => masked.send_vectored(bufs),
+            Connection::Proxied { inner, .. } => inner.write_vectored(bufs),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.write_vectored(bufs),
         }
@@ -184,6 +213,7 @@ impl Write for Connection {
         match self {
             Connection::Tcp(stream) => stream.flush(),
             Connection::Masked(masked) => masked.stream.flush(),
+            Connection::Proxied { inner, .. } => inner.flush(),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.flush(),
         }
@@ -202,6 +232,10 @@ impl Read for &Connection {
                 let mut inner = &masked.stream;
                 inner.read(buf)
             }
+            Connection::Proxied { inner, .. } => {
+                let mut inner = inner.as_ref();
+                inner.read(buf)
+            }
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => {
                 let mut inner = stream;
@@ -218,6 +252,10 @@ impl Read for &Connection {
             }
             Connection::Masked(masked) => {
                 let mut inner = &masked.stream;
+                inner.read_vectored(bufs)
+            }
+            Connection::Proxied { inner, .. } => {
+                let mut inner = inner.as_ref();
                 inner.read_vectored(bufs)
             }
             #[cfg(any(unix, windows))]
@@ -237,6 +275,10 @@ impl Write for &Connection {
                 inner.write(buf)
             }
             Connection::Masked(masked) => masked.send(buf),
+            Connection::Proxied { inner, .. } => {
+                let mut inner = inner.as_ref();
+                inner.write(buf)
+            }
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => {
                 let mut inner = stream;
@@ -252,6 +294,10 @@ impl Write for &Connection {
                 inner.write_vectored(bufs)
             }
             Connection::Masked(masked) => masked.send_vectored(bufs),
+            Connection::Proxied { inner, .. } => {
+                let mut inner = inner.as_ref();
+                inner.write_vectored(bufs)
+            }
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => {
                 let mut inner = stream;
@@ -268,6 +314,10 @@ impl Write for &Connection {
             }
             Connection::Masked(masked) => {
                 let mut inner = &masked.stream;
+                inner.flush()
+            }
+            Connection::Proxied { inner, .. } => {
+                let mut inner = inner.as_ref();
                 inner.flush()
             }
             #[cfg(any(unix, windows))]
@@ -292,6 +342,12 @@ impl Connection {
                     chain: std::sync::Arc::clone(&masked.chain),
                 })
             }),
+            Connection::Proxied { inner, peer } => {
+                inner.try_clone().map(|inner| Connection::Proxied {
+                    inner: Box::new(inner),
+                    peer: *peer,
+                })
+            }
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.try_clone().map(Connection::Unix),
         }
@@ -302,6 +358,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.shutdown(how),
             Connection::Masked(masked) => masked.stream.shutdown(how),
+            Connection::Proxied { inner, .. } => inner.shutdown(how),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.shutdown(how),
         }
@@ -314,6 +371,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.peek(buf),
             Connection::Masked(masked) => masked.stream.peek(buf),
+            Connection::Proxied { inner, .. } => inner.peek(buf),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => unix_peek(stream, buf),
         }
@@ -327,6 +385,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.peer_addr(),
             Connection::Masked(masked) => masked.stream.peer_addr(),
+            Connection::Proxied { peer, .. } => Ok(*peer),
             #[cfg(any(unix, windows))]
             Connection::Unix(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -341,6 +400,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.local_addr(),
             Connection::Masked(masked) => masked.stream.local_addr(),
+            Connection::Proxied { inner, .. } => inner.local_addr(),
             #[cfg(any(unix, windows))]
             Connection::Unix(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -356,6 +416,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.set_nonblocking(nonblocking),
             Connection::Masked(masked) => masked.stream.set_nonblocking(nonblocking),
+            Connection::Proxied { inner, .. } => inner.set_nonblocking(nonblocking),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.set_nonblocking(nonblocking),
         }
@@ -368,6 +429,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.set_read_timeout(timeout),
             Connection::Masked(masked) => masked.stream.set_read_timeout(timeout),
+            Connection::Proxied { inner, .. } => inner.set_read_timeout(timeout),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => set_socket_timeout(stream, SO_RCVTIMEO, timeout),
         }
@@ -378,6 +440,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.set_write_timeout(timeout),
             Connection::Masked(masked) => masked.stream.set_write_timeout(timeout),
+            Connection::Proxied { inner, .. } => inner.set_write_timeout(timeout),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => set_socket_timeout(stream, SO_SNDTIMEO, timeout),
         }
@@ -390,6 +453,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.read_timeout(),
             Connection::Masked(masked) => masked.stream.read_timeout(),
+            Connection::Proxied { inner, .. } => inner.read_timeout(),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => get_socket_timeout(stream, SO_RCVTIMEO),
         }
@@ -403,6 +467,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.set_nodelay(nodelay),
             Connection::Masked(masked) => masked.stream.set_nodelay(nodelay),
+            Connection::Proxied { inner, .. } => inner.set_nodelay(nodelay),
             #[cfg(any(unix, windows))]
             Connection::Unix(_) => Ok(()),
         }
@@ -459,6 +524,130 @@ impl Connection {
         let readable = POLLIN | POLLRDNORM | POLLHUP | POLLERR;
         Ok(ready > 0 && row.revents & readable != 0)
     }
+}
+
+/// Read the PROXY protocol header a listener's `acceptProxyProtocol` promised. A v1 text line or
+/// a v2 binary header is consumed in full and the source address it reports is returned; `None`
+/// means the header is valid but names no IP source (`UNKNOWN`, `LOCAL`, or a Unix/unspecified
+/// family), so the socket's own peer stays the source. A malformed or truncated header is an
+/// error, and the caller closes the connection rather than letting carrier bytes stand in for it.
+pub(crate) fn read_proxy_header(stream: &mut Connection) -> io::Result<Option<SocketAddr>> {
+    const V2_SIGNATURE: [u8; 12] = *b"\r\n\r\n\0\r\nQUIT\n";
+    let mut first = [0u8; 12];
+    stream.read_exact(&mut first)?;
+    if &first[..6] == b"PROXY " {
+        let mut line = [0u8; 108];
+        line[..12].copy_from_slice(&first);
+        let mut len = 12;
+        while len < line.len() {
+            if len >= 2 && &line[len - 2..len] == b"\r\n" {
+                break;
+            }
+            stream.read_exact(&mut line[len..len + 1])?;
+            len += 1;
+        }
+        if len < 2 || &line[len - 2..len] != b"\r\n" {
+            return Err(bad_proxy(
+                "the PROXY v1 line is longer than the protocol allows",
+            ));
+        }
+        return parse_proxy_v1(&line[..len]);
+    }
+    if first != V2_SIGNATURE {
+        return Err(bad_proxy(
+            "the connection does not start with a PROXY header",
+        ));
+    }
+    let mut head = [0u8; 4];
+    stream.read_exact(&mut head)?;
+    if head[0] >> 4 != 2 {
+        return Err(bad_proxy("the PROXY v2 header names another version"));
+    }
+    let command = head[0] & 0x0f;
+    let length = usize::from(u16::from_be_bytes([head[2], head[3]]));
+    let mut body = vec![0u8; length];
+    stream.read_exact(&mut body)?;
+    if command == 0 {
+        return Ok(None);
+    }
+    if command != 1 {
+        return Err(bad_proxy("the PROXY v2 header names an unknown command"));
+    }
+    let family = head[1] >> 4;
+    match family {
+        0 | 3 => Ok(None),
+        1 if body.len() >= 12 => {
+            let source = std::net::Ipv4Addr::new(body[0], body[1], body[2], body[3]);
+            let port = u16::from_be_bytes([body[8], body[9]]);
+            Ok(Some(SocketAddr::from((source, port))))
+        }
+        2 if body.len() >= 36 => {
+            let mut source = [0u8; 16];
+            source.copy_from_slice(&body[..16]);
+            let port = u16::from_be_bytes([body[32], body[33]]);
+            Ok(Some(SocketAddr::from((
+                std::net::Ipv6Addr::from(source),
+                port,
+            ))))
+        }
+        _ => Err(bad_proxy(
+            "the PROXY v2 header is shorter than its family needs",
+        )),
+    }
+}
+
+fn parse_proxy_v1(line: &[u8]) -> io::Result<Option<SocketAddr>> {
+    let text = std::str::from_utf8(&line[..line.len() - 2])
+        .map_err(|_| bad_proxy("the PROXY v1 line is not UTF-8"))?;
+    let mut fields = text.split(' ');
+    if fields.next() != Some("PROXY") {
+        return Err(bad_proxy("the PROXY v1 line has no PROXY prefix"));
+    }
+    let family = fields
+        .next()
+        .ok_or_else(|| bad_proxy("the PROXY v1 line names no family"))?;
+    if family == "UNKNOWN" {
+        return if fields.next().is_none() {
+            Ok(None)
+        } else {
+            Err(bad_proxy("the PROXY UNKNOWN line carries address fields"))
+        };
+    }
+    if family != "TCP4" && family != "TCP6" {
+        return Err(bad_proxy("the PROXY v1 line names an unknown family"));
+    }
+    let source = fields
+        .next()
+        .and_then(|field| field.parse::<std::net::IpAddr>().ok())
+        .ok_or_else(|| bad_proxy("the PROXY v1 line has no source address"))?;
+    let destination = fields
+        .next()
+        .and_then(|field| field.parse::<std::net::IpAddr>().ok())
+        .ok_or_else(|| bad_proxy("the PROXY v1 line has no destination address"))?;
+    let source_port = fields
+        .next()
+        .and_then(|field| field.parse::<u16>().ok())
+        .ok_or_else(|| bad_proxy("the PROXY v1 line has no source port"))?;
+    if fields
+        .next()
+        .and_then(|field| field.parse::<u16>().ok())
+        .is_none()
+    {
+        return Err(bad_proxy("the PROXY v1 line has no destination port"));
+    }
+    if fields.next().is_some() {
+        return Err(bad_proxy("the PROXY v1 line carries extra fields"));
+    }
+    if (family == "TCP4") != source.is_ipv4() || (family == "TCP4") != destination.is_ipv4() {
+        return Err(bad_proxy(
+            "the PROXY v1 line's family does not match its addresses",
+        ));
+    }
+    Ok(Some(SocketAddr::new(source, source_port)))
+}
+
+fn bad_proxy(message: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
 /// Set `SO_RCVTIMEO`/`SO_SNDTIMEO` the way `std` does for TCP but not Unix: one `timeval`

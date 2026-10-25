@@ -324,7 +324,11 @@ fn serve_inbounds(
                             "socks" => Role::Socks { out, accounts },
                             _ => Role::Mixed { out, accounts },
                         };
-                        spawn_role(address, role);
+                        spawn_role(
+                            address,
+                            role,
+                            crate::config::accept_proxy_protocol(inbound.get("streamSettings")),
+                        );
                         inbounds += 1;
                     }
                     "dokodemo-door" => {
@@ -410,9 +414,23 @@ fn inbound_served(protocol: &str) -> bool {
     SERVED_INBOUNDS.contains(&protocol)
 }
 
-fn spawn_role(address: &str, role: Role) {
+fn spawn_role(address: &str, role: Role, accept_proxy_protocol: bool) {
     let address = address.to_owned();
+    let role = if accept_proxy_protocol {
+        Role::Proxied(Box::new(role))
+    } else {
+        role
+    };
     thread::spawn(move || accept_loop(&address, &role));
+}
+
+/// The role a listener serves, wrapped when its config says the first bytes are a PROXY header.
+fn inbound_role(inbound: &Json, role: Role) -> Role {
+    if crate::config::accept_proxy_protocol(inbound.get("streamSettings")) {
+        Role::Proxied(Box::new(role))
+    } else {
+        role
+    }
 }
 
 fn serve_vless_inbound(
@@ -498,12 +516,15 @@ fn serve_vless_inbound(
                     return false;
                 }
             };
-            let role = Role::Vless {
-                users,
-                carrier,
-                freedom,
-                fallbacks,
-            };
+            let role = inbound_role(
+                inbound,
+                Role::Vless {
+                    users,
+                    carrier,
+                    freedom,
+                    fallbacks,
+                },
+            );
             thread::spawn(move || accept_loop(&owned, &role));
             true
         }
@@ -811,6 +832,8 @@ enum Role {
         dest: Destination,
         port_map: HashMap<u16, Destination>,
     },
+    /// The role's first bytes are a PROXY protocol header, read before the carrier handshake.
+    Proxied(Box<Role>),
 }
 
 impl Role {
@@ -829,6 +852,7 @@ impl Role {
             Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } | Role::Dokodemo { .. } => {
                 None
             }
+            Role::Proxied(inner) => inner.tcp_mask(),
         }
     }
 }
@@ -1459,10 +1483,24 @@ fn accept_loop(address: &str, role: &Role) {
     let listener = Listener::bind(&target)
         .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
     for stream in listener.incoming() {
-        let Ok(stream) = stream else { continue };
+        let Ok(mut stream) = stream else { continue };
         no_delay(&stream);
         let role = role.clone();
         thread::spawn(move || {
+            let (stream, role) = match role {
+                Role::Proxied(inner) => {
+                    let _ = stream.set_read_timeout(Some(budgets::handshake()));
+                    let source = crate::conn::read_proxy_header(&mut stream);
+                    let _ = stream.set_read_timeout(None);
+                    let Ok(source) = source else { return };
+                    let stream = match source {
+                        Some(source) => stream.with_peer(source),
+                        None => stream,
+                    };
+                    (stream, *inner)
+                }
+                role => (stream, role),
+            };
             // Armed once per accepted stream, as the reference wraps its listener's conn.
             let stream = stream.with_mask(role.tcp_mask());
             front_dispatch(stream, role);
@@ -3492,13 +3530,16 @@ fn serve_vless_tls_inbound(
         });
         return serve_kcp_bound(&owned, config, &serve);
     }
-    let role = Role::VlessTls {
-        users: Arc::clone(users),
-        freedom,
-        carrier: carrier.clone(),
-        server,
-        fallbacks,
-    };
+    let role = inbound_role(
+        inbound,
+        Role::VlessTls {
+            users: Arc::clone(users),
+            freedom,
+            carrier: carrier.clone(),
+            server,
+            fallbacks,
+        },
+    );
     thread::spawn(move || accept_loop(&owned, &role));
     true
 }
@@ -3532,13 +3573,16 @@ fn serve_vless_reality_inbound(
         });
         return serve_kcp_bound(&owned, config, &serve);
     }
-    let role = Role::VlessReality {
-        users: Arc::clone(users),
-        freedom,
-        carrier: carrier.clone(),
-        server: Arc::new(server),
-        fallbacks,
-    };
+    let role = inbound_role(
+        inbound,
+        Role::VlessReality {
+            users: Arc::clone(users),
+            freedom,
+            carrier: carrier.clone(),
+            server: Arc::new(server),
+            fallbacks,
+        },
+    );
     thread::spawn(move || accept_loop(&owned, &role));
     true
 }
@@ -6033,6 +6077,7 @@ fn kcp_parts(conn: &Arc<ferrox_core::kcp::Connection>) -> (KcpIo, KcpIo, KcpClos
 fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
     let key = trojan_key(&inbound_password(inbound));
     let sec = stream_security(inbound);
+    let accept = crate::config::accept_proxy_protocol(inbound.get("streamSettings"));
     // A REALITY inbound has no Trojan arm yet, and reading only `tls` here would serve it as plaintext.
     if sec == "reality" {
         eprintln!("trojan reality inbound on {address}: refused, not served as plaintext");
@@ -6071,6 +6116,7 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
                     freedom,
                     server,
                 },
+                accept,
             );
             true
         }
@@ -6082,6 +6128,7 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
                     carrier,
                     freedom,
                 },
+                accept,
             );
             true
         }
@@ -6091,6 +6138,7 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
 fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
     let id = inbound_id(inbound);
     let sec = stream_security(inbound);
+    let accept = crate::config::accept_proxy_protocol(inbound.get("streamSettings"));
     match inbound_carrier(inbound) {
         Carrier::Kcp(config) => {
             let serve: KcpServe = if sec == "tls" {
@@ -6126,6 +6174,7 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
                     freedom,
                     server,
                 },
+                accept,
             );
         }
         other => spawn_role(
@@ -6135,6 +6184,7 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
                 carrier: other,
                 freedom,
             },
+            accept,
         ),
     }
 }
@@ -6227,6 +6277,7 @@ fn serve_dokodemo(address: &str, inbound: &Json, out: &Outbound, label: &str) ->
                 dest: dest.clone(),
                 port_map: port_map.clone(),
             },
+            crate::config::accept_proxy_protocol(inbound.get("streamSettings")),
         );
         armed += 1;
     }
@@ -6359,6 +6410,7 @@ fn serve_ss_kcp_listener(
 fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     let password = inbound_ss_password(inbound);
     let method = inbound_method(inbound);
+    let accept = crate::config::accept_proxy_protocol(inbound.get("streamSettings"));
     let carrier = inbound_carrier(inbound);
     let udp_raw = matches!(carrier, Carrier::Raw(_));
     let udp_address = address.to_owned();
@@ -6429,6 +6481,7 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
                 carrier: other,
                 freedom,
             },
+            accept,
         ),
     }
     if udp_raw {
@@ -38137,6 +38190,7 @@ fn front_dispatch(stream: Connection, role: Role) {
             let target = out.resolved(dest, crate::router::Network::Tcp, Some(&stream));
             serve_connect(stream, target, dest, Front::Socks, &[]);
         }
+        Role::Proxied(inner) => front_dispatch(stream, *inner),
     }
 }
 
@@ -38308,7 +38362,7 @@ mod accept_proxy_protocol_tests {
         serve(port);
         let mut client = dial(port);
         client
-            .write_all(b"PROXY TCP4 1.2.3.4 5.6.7.8 1234 5678\r\n")
+            .write_all(b"PROXY TCP4 192.0.2.1 192.0.2.2 1234 5678\r\n")
             .expect("writes the header");
         client.write_all(UPGRADE).expect("writes the upgrade");
         let got = read_head(&mut client);
@@ -38332,13 +38386,69 @@ mod accept_proxy_protocol_tests {
     }
 
     #[test]
+    fn a_malformed_proxy_line_closes_the_connection() {
+        let port = free_port();
+        serve(port);
+        let mut client = dial(port);
+        client
+            .write_all(b"PROXY TCP4 nope\r\n")
+            .expect("writes the header");
+        client.write_all(UPGRADE).expect("writes the upgrade");
+        let got = read_head(&mut client);
+        assert!(
+            !got.starts_with(b"HTTP/1.1 101"),
+            "a malformed PROXY line was treated as carrier data: {got:?}"
+        );
+    }
+
+    #[test]
+    fn an_unspecified_proxy_v2_family_is_accepted() {
+        let port = free_port();
+        serve(port);
+        let mut client = dial(port);
+        let mut v2 = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+        v2.extend_from_slice(&[0x21, 0x00, 0x00, 0x0b]);
+        v2.extend_from_slice(b"example.com");
+        client.write_all(&v2).expect("writes the header");
+        client.write_all(UPGRADE).expect("writes the upgrade");
+        let got = read_head(&mut client);
+        assert!(
+            got.starts_with(b"HTTP/1.1 101"),
+            "an unspecified-family PROXY v2 header was refused: {got:?}"
+        );
+    }
+
+    #[test]
+    fn the_proxy_reported_source_reaches_the_route() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","tag":"direct"},{"protocol":"freedom","tag":"pinned"}],
+                "routing":{"rules":[{"type":"field","source":["192.0.2.1"],"outboundTag":"pinned"}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default())
+            .expect("builds the route");
+        let plan = RoutePlan::new(shared, None, true);
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let client = Connection::connect(addr)
+            .expect("connects")
+            .with_peer("192.0.2.1:1234".parse().expect("source"));
+        let asked = Destination::Address("192.0.2.9:80".parse().expect("target"));
+        let (_, tag) = plan.lane(&asked, crate::router::Network::Tcp, Some(&client));
+        assert_eq!(tag, Some("pinned"));
+    }
+
+    #[test]
     fn a_ws_inbound_with_accept_proxy_protocol_reads_the_binary_header() {
         let port = free_port();
         serve(port);
         let mut client = dial(port);
         let mut v2 = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
         v2.extend_from_slice(&[0x21, 0x11, 0x00, 0x0c]);
-        v2.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        v2.extend_from_slice(&[192, 0, 2, 1, 192, 0, 2, 2]);
         v2.extend_from_slice(&[0x12, 0x34, 0x56, 0x78]);
         client.write_all(&v2).expect("writes the header");
         client.write_all(UPGRADE).expect("writes the upgrade");

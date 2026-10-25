@@ -1065,6 +1065,34 @@ pub(crate) fn stream_security(node: &Json) -> &str {
         .unwrap_or("")
 }
 
+/// Whether a listener's first bytes are the PROXY protocol's header. The reference carries the
+/// flag per carrier and in `sockopt`; either spelling arms the same accept-side read.
+pub(crate) fn accept_proxy_protocol(settings: Option<&Json>) -> bool {
+    let Some(settings) = settings else {
+        return false;
+    };
+    let network = settings.get("network").and_then(Json::as_str).unwrap_or("");
+    let carrier = match network {
+        "ws" | "websocket" => "wsSettings",
+        "httpupgrade" => "httpupgradeSettings",
+        "grpc" => "grpcSettings",
+        "" | "raw" | "tcp" => "tcpSettings",
+        _ => "",
+    };
+    let per_carrier = !carrier.is_empty()
+        && settings
+            .get(carrier)
+            .and_then(|s| s.get("acceptProxyProtocol"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+    let sockopt = settings
+        .get("sockopt")
+        .and_then(|s| s.get("acceptProxyProtocol"))
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    per_carrier || sockopt
+}
+
 pub(crate) fn vless_security_supported(sec: &str) -> bool {
     sec.is_empty() || sec == "none"
 }
@@ -1860,6 +1888,22 @@ mod tests {
         assert_eq!(short_id("01020304"), Some([1, 2, 3, 4, 0, 0, 0, 0]));
         assert_eq!(short_id(""), Some([0, 0, 0, 0, 0, 0, 0, 0]));
         assert_eq!(short_id("abc"), None);
+    }
+
+    #[test]
+    fn accept_proxy_protocol_reads_the_carrier_and_sockopt_spellings() {
+        let carrier =
+            crate::json::parse(r#"{"network":"ws","wsSettings":{"acceptProxyProtocol":true}}"#)
+                .expect("a carrier");
+        assert!(accept_proxy_protocol(Some(&carrier)));
+        let sockopt = crate::json::parse(
+            r#"{"network":"raw","tcpSettings":{},"sockopt":{"acceptProxyProtocol":true}}"#,
+        )
+        .expect("sockopt");
+        assert!(accept_proxy_protocol(Some(&sockopt)));
+        let plain = crate::json::parse(r#"{"network":"raw"}"#).expect("plain");
+        assert!(!accept_proxy_protocol(Some(&plain)));
+        assert!(!accept_proxy_protocol(None));
     }
 
     #[test]
