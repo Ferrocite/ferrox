@@ -818,29 +818,37 @@ PY
 
 system_proxy_on() {
   command -v networksetup >/dev/null 2>&1 || { say "no networksetup: point your apps at the ports by hand."; return 0; }
-  local any=0 svc want_socks=0 want_http=0 front
+  local any=0 svc want_socks="" want_http="" front
   for front in ${FRONTS//,/ }; do
-    case "$front" in socks) want_socks=1 ;; http|mixed) want_http=1 ;; esac
+    case "$front" in
+      socks) want_socks="$SOCKS_PORT" ;;
+      http) want_http="$HTTP_PORT" ;;
+      mixed)
+        [ -n "$want_socks" ] || want_socks="$MIXED_PORT"
+        [ -n "$want_http" ] || want_http="$MIXED_PORT"
+        ;;
+    esac
   done
+  [ -n "$want_socks$want_http" ] || die "system proxy: --fronts names no socks, http or mixed front; nothing was armed."
   while IFS= read -r svc; do
     [ -z "$svc" ] && continue
     case "$svc" in *\**) continue ;; esac
-    if [ "$want_socks" = 1 ]; then
-      networksetup -setsocksfirewallproxy "$svc" 127.0.0.1 "$SOCKS_PORT" 2>/dev/null || continue
+    if [ -n "$want_socks" ]; then
+      networksetup -setsocksfirewallproxy "$svc" 127.0.0.1 "$want_socks" 2>/dev/null || continue
       networksetup -setsocksfirewallproxystate "$svc" on 2>/dev/null || true
     fi
-    if [ "$want_http" = 1 ]; then
-      networksetup -setwebproxy "$svc" 127.0.0.1 "$HTTP_PORT" 2>/dev/null || true
+    if [ -n "$want_http" ]; then
+      networksetup -setwebproxy "$svc" 127.0.0.1 "$want_http" 2>/dev/null || true
       networksetup -setwebproxystate "$svc" on 2>/dev/null || true
-      networksetup -setsecurewebproxy "$svc" 127.0.0.1 "$HTTP_PORT" 2>/dev/null || true
+      networksetup -setsecurewebproxy "$svc" 127.0.0.1 "$want_http" 2>/dev/null || true
       networksetup -setsecurewebproxystate "$svc" on 2>/dev/null || true
     fi
     any=1
   done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
   [ "$any" = 1 ] || die "no network service took the proxy"
-  printf '%s %s\n' "$SOCKS_PORT" "$HTTP_PORT" > "$PROXY_PORTS"
-  [ "$want_socks" = 1 ] && say "system proxy on: SOCKS 127.0.0.1:$SOCKS_PORT"
-  [ "$want_http" = 1 ] && say "system proxy on: HTTP and HTTPS 127.0.0.1:$HTTP_PORT"
+  printf '%s %s\n' "${want_socks:--}" "${want_http:--}" > "$PROXY_PORTS"
+  [ -n "$want_socks" ] && say "system proxy on: SOCKS 127.0.0.1:$want_socks"
+  [ -n "$want_http" ] && say "system proxy on: HTTP and HTTPS 127.0.0.1:$want_http"
   say "scope: apps that honour the system proxy. There is no utun device, so"
   say "apps that ignore it (and UDP) are not captured: ferrox-cli tun says why."
 }
