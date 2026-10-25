@@ -134,6 +134,8 @@ pub fn is_hop_port(ports: &[u16], nominal: u16, port: u16) -> bool {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
+    /// The wire version this config names: `1` for the binary control stream, `2` for the HTTP/3 handshake.
+    pub version: u8,
     pub auth: String,
     pub cc: Congestion,
     pub obfs_password: String,
@@ -149,6 +151,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            version: 2,
             auth: String::new(),
             cc: Congestion::Bbr,
             obfs_password: String::new(),

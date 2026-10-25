@@ -460,7 +460,12 @@ carrier-hysteria closed-connections-reused 0 ferrox-app-proxy::tests::hysteria_r
 carrier-hysteria request-parse-reallocations 0 ferrox-app-hysteria::tests::a_parsed_request_leaves_its_payload_where_it_landed
 carrier-hysteria request-parse-moves 0 ferrox-app-hysteria::tests::a_parsed_request_leaves_its_payload_where_it_landed
 carrier-hysteria wrong-password-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying
-carrier-hysteria non-v2-configs-carried 0 ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks
+carrier-hysteria non-v2-configs-carried 1 ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks
+carrier-hysteria hysteria-v1-tcp-echo-round-trips 1 ferrox-app-proxy::tests::hysteria_v1_carries_a_tcp_echo_over_loopback
+carrier-hysteria hysteria-v1-udp-echo-round-trips 2 ferrox-app-proxy::tests::hysteria_v1_carries_a_udp_echo_over_loopback
+carrier-hysteria hysteria-v1-xplus-round-trips 1 ferrox-app-proxy::tests::hysteria_v1_carries_a_flow_through_xplus_over_loopback
+carrier-hysteria hysteria-v1-fragments-witnessed 200 ferrox-core-hysteria_v1::tests::every_length_survives_fragment_then_defrag_intact
+carrier-hysteria hysteria-v1-xplus-masked-bytes 10 ferrox-core-hysteria_v1::tests::the_xplus_mask_matches_an_independent_sha256_computation
 carrier-hysteria datagram-lane-client-round-trips 1 ferrox-app-proxy::tests::hysteria_carries_a_udp_association_over_the_carrier
 carrier-hysteria udp-datagram-decode-copies 0 ferrox-core-hysteria::tests::a_decoded_datagram_leaves_its_payload_where_it_landed
 carrier-hysteria udp-fragments-witnessed 200 ferrox-core-hysteria::tests::every_length_survives_fragment_then_defrag_intact

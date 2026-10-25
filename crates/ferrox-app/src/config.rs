@@ -1606,21 +1606,44 @@ fn range_text(text: &str) -> Option<ferrox_core::finalmask::Range> {
     Some(Range::ordered(if leading { -low } else { low }, high))
 }
 
+/// The hysteria protocol version a node names, as a number or a decimal string; absent when it names neither.
+pub(crate) fn hysteria_version(node: Option<&Json>) -> Option<u32> {
+    node.and_then(|value| {
+        value
+            .as_u32()
+            .or_else(|| value.as_str().and_then(|text| text.parse::<u32>().ok()))
+    })
+}
+
 fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
     use ferrox_core::hysteria::{Config, Congestion};
     let hy = settings.and_then(|s| s.get("hysteriaSettings"));
-    let version = hy
-        .and_then(|h| h.get("version"))
-        .and_then(Json::as_u32)
-        .or_else(|| {
-            hy.and_then(|h| h.get("version"))
-                .and_then(Json::as_str)
-                .and_then(|text| text.parse::<u32>().ok())
-        });
-    if version.is_some_and(|v| v != 2) {
+    let version = hysteria_version(hy.and_then(|h| h.get("version"))).unwrap_or(2);
+    if version != 1 && version != 2 {
         return Carrier::Unknown {
             network: network.to_owned(),
         };
+    }
+    let auth = hy
+        .and_then(|h| h.get("auth"))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let cc = Congestion::parse(
+        hy.and_then(|h| h.get("congestion"))
+            .and_then(Json::as_str)
+            .unwrap_or(""),
+    );
+    if version == 1 {
+        // Version 1 names xplus directly: `tlsSettings.obfs` is the password, not a mask name.
+        return Carrier::Hysteria(Config {
+            version: 1,
+            auth,
+            cc,
+            obfs_password: hysteria_v1_obfs(settings).unwrap_or_default(),
+            hop: hysteria_hop(hy),
+            gecko: None,
+        });
     }
     // Salamander and its gecko fragmentation variant are the datagram obfuscations carried; any other named one, or one whose password is too short to mask with, is refused rather than silently sent in the clear.
     let obfs_password = match salamander_obfs(settings) {
@@ -1639,6 +1662,21 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
         };
     };
     Carrier::Hysteria(Config {
+        version: 2,
+        auth,
+        cc,
+        obfs_password,
+        hop: hysteria_hop(hy),
+        gecko,
+    })
+}
+
+/// The v1 outbound config a transport names, independent of which `hysteriaSettings` version it carries: auth, congestion, xplus password and hop.
+pub(crate) fn hysteria_v1_config(stream: Option<&Json>) -> ferrox_core::hysteria::Config {
+    use ferrox_core::hysteria::{Config, Congestion};
+    let hy = stream.and_then(|s| s.get("hysteriaSettings"));
+    Config {
+        version: 1,
         auth: hy
             .and_then(|h| h.get("auth"))
             .and_then(Json::as_str)
@@ -1649,10 +1687,20 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
                 .and_then(Json::as_str)
                 .unwrap_or(""),
         ),
-        obfs_password,
+        obfs_password: hysteria_v1_obfs(stream).unwrap_or_default(),
         hop: hysteria_hop(hy),
-        gecko,
-    })
+        gecko: None,
+    }
+}
+
+/// The xplus password a Hysteria v1 transport names: `tlsSettings.obfs` itself is the key.
+fn hysteria_v1_obfs(stream: Option<&Json>) -> Option<String> {
+    stream
+        .and_then(|s| s.get("tlsSettings"))
+        .and_then(|t| t.get("obfs"))
+        .and_then(Json::as_str)
+        .filter(|password| !password.is_empty())
+        .map(str::to_owned)
 }
 
 /// The port-hopping plan a hysteria dial rotates its server port on, read from its
