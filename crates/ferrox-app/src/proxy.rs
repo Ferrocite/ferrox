@@ -31553,6 +31553,7 @@ mod tests {
                 rest,
                 true,
                 None,
+                None,
             );
             serve_vless_hysteria(flow, &one_vless_user(&id), true);
         });

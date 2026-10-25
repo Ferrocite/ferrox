@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -45,6 +45,7 @@ struct Stats {
     sleep_ns: AtomicU64,
     sent: AtomicU64,
     flush: AtomicU64,
+    drain_bytes: AtomicU64,
 }
 
 static STATS: Stats = Stats {
@@ -59,6 +60,7 @@ static STATS: Stats = Stats {
     sleep_ns: AtomicU64::new(0),
     sent: AtomicU64::new(0),
     flush: AtomicU64::new(0),
+    drain_bytes: AtomicU64::new(0),
 };
 
 impl Stats {
@@ -88,6 +90,7 @@ impl Stats {
             get(&self.sent) / (1024 * 1024),
             get(&self.flush),
         );
+        eprintln!("hy-drain: bytes={}", get(&self.drain_bytes));
     }
 }
 
@@ -108,19 +111,15 @@ pub(crate) struct Session {
     udp_supported: bool,
     /// The pooled connection's one socket reader; `None` on a dial that drives the socket itself.
     driver: Option<Arc<Driver>>,
-    /// The latch bumped when this session's connection takes a datagram, so a writer waits on the update rather than on a poll; `None` where nothing bumps it.
-    wake: Option<Arc<Wake>>,
 }
 
-/// One latch: a generation and a condvar. The pump bumps a stream's when a datagram filled it, so the flow reading it parks until then instead of waiting on the shared socket with the others; the router bumps a connection's when it takes a datagram, so a writer whose stream window was full retries on the update instead of on a poll.
-pub(crate) struct Wake {
+/// One stream's latch: the pump bumps it when a datagram filled the stream, and the flow reading it parks until then instead of waiting on the shared socket with the others.
+pub(crate) struct StreamWake {
     gen: Mutex<u64>,
     cv: Condvar,
-    /// Writers parked on this latch, so a router holding a datagram skips the window scan when none wait.
-    waiting: AtomicUsize,
 }
 
-impl Wake {
+impl StreamWake {
     fn seen(&self) -> u64 {
         self.gen.lock().map_or(0, |gen| *gen)
     }
@@ -137,14 +136,8 @@ impl Wake {
             return;
         };
         if *gen == seen {
-            self.waiting.fetch_add(1, Ordering::Relaxed);
             let _ = self.cv.wait_timeout(gen, timeout);
-            self.waiting.fetch_sub(1, Ordering::Relaxed);
         }
-    }
-
-    fn waiting(&self) -> usize {
-        self.waiting.load(Ordering::Relaxed)
     }
 }
 
@@ -152,7 +145,7 @@ impl Wake {
 struct Driver {
     alive: AtomicBool,
     stop: AtomicBool,
-    streams: Mutex<HashMap<u64, Arc<Wake>>>,
+    streams: Mutex<HashMap<u64, Arc<StreamWake>>>,
 }
 
 impl Driver {
@@ -172,11 +165,10 @@ impl Driver {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    fn register(&self, stream: u64) -> Arc<Wake> {
-        let wake = Arc::new(Wake {
+    fn register(&self, stream: u64) -> Arc<StreamWake> {
+        let wake = Arc::new(StreamWake {
             gen: Mutex::new(0),
             cv: Condvar::new(),
-            waiting: AtomicUsize::new(0),
         });
         if let Ok(mut streams) = self.streams.lock() {
             streams.insert(stream, Arc::clone(&wake));
@@ -197,7 +189,6 @@ impl Driver {
                 local,
                 udp_supported: false,
                 driver: None,
-                wake: None,
             };
             let mut ready = Vec::with_capacity(16);
             while !pump.stop.load(Ordering::Relaxed) {
@@ -242,8 +233,6 @@ fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
             return true;
         }
         let want = buf.len();
-        // Read before the attempt, so a datagram that opens the window between the write and the wait is not missed.
-        let seen = session.wake.as_ref().map(|wake| wake.seen());
         let locked = Instant::now();
         let Ok(mut conn) = session.shared.lock() else {
             return false;
@@ -276,25 +265,8 @@ fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
         drop(conn);
         STATS.sleeps.fetch_add(1, Ordering::Relaxed);
         let slept = Instant::now();
-        match (session.wake.as_ref(), seen) {
-            (Some(wake), Some(seen)) => wake.wait(seen, STREAM_POLL),
-            _ => std::thread::sleep(STREAM_POLL),
-        }
+        std::thread::sleep(STREAM_POLL);
         Stats::add(&STATS.sleep_ns, slept);
-    }
-}
-
-/// Bumps the connection's latch only when the datagram opened a served stream's window, so a blocked writer retries on the update instead of on the poll.
-fn wake_writers(conn: &mut quiche::Connection, inbound: &Inbound, wake: &Wake) {
-    if wake.waiting() == 0 {
-        return;
-    }
-    if inbound
-        .served
-        .iter()
-        .any(|stream| conn.stream_capacity(*stream).is_ok_and(|cap| cap > 0))
-    {
-        wake.bump();
     }
 }
 
@@ -354,13 +326,13 @@ fn drive_once(session: &Session, wait: Duration) -> bool {
 fn recv_reply(
     session: &Session,
     stream: u64,
-    wake: Option<&Wake>,
+    wake: Option<&StreamWake>,
     deadline: Instant,
 ) -> Option<[u8; 2]> {
     let mut room = Unfilled::<2>::new();
     let mut got = 0usize;
     while got < 2 {
-        let before = wake.map_or(0, Wake::seen);
+        let before = wake.map_or(0, StreamWake::seen);
         let read = {
             let Ok(mut conn) = session.shared.lock() else {
                 return None;
@@ -512,7 +484,6 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         local,
         udp_supported: false,
         driver: None,
-        wake: None,
     };
     if !control_settings(&session) {
         return None;
@@ -531,10 +502,13 @@ pub(crate) struct Flow {
     /// Whether `read` may drive the socket itself: a flow on the server's routed socket must not, because `serve_loop` reads every datagram and routes it, and a second reader steals packets the router must see.
     drive: bool,
     /// The latch the session's pump bumps when this stream has data; `None` when this flow drives.
-    wake: Option<Arc<Wake>>,
+    wake: Option<Arc<StreamWake>>,
+    /// The server downlink queue the router drains; `None` on a client flow, which writes its own bytes.
+    sender: Option<Arc<Sender>>,
 }
 
 impl Flow {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn from_parts(
         shared: Arc<Mutex<quiche::Connection>>,
         sock: Arc<crate::quic::Datagram>,
@@ -542,7 +516,8 @@ impl Flow {
         stream: u64,
         backlog: Vec<u8>,
         drive: bool,
-        wake: Option<Arc<Wake>>,
+        wake: Option<Arc<StreamWake>>,
+        sender: Option<Arc<Sender>>,
     ) -> Self {
         Self {
             session: Session {
@@ -551,20 +526,36 @@ impl Flow {
                 local,
                 udp_supported: false,
                 driver: None,
-                wake,
             },
             stream,
             backlog,
             at: 0,
             drive,
-            wake: None,
+            wake,
+            sender,
         }
     }
 
     pub(crate) fn close(&self) {
+        if let Some(sender) = &self.sender {
+            sender.close();
+            if let Ok(mut conn) = self.session.shared.lock() {
+                drain(&mut conn, self.stream, sender);
+                crate::quic::flush_egress(&mut conn, &self.session.sock);
+            }
+            return;
+        }
         if let Ok(mut conn) = self.session.shared.lock() {
             let _ = conn.stream_send(self.stream, &[], true);
             crate::quic::flush_egress(&mut conn, &self.session.sock);
+        }
+    }
+}
+
+impl Drop for Flow {
+    fn drop(&mut self) {
+        if let Some(sender) = &self.sender {
+            sender.close();
         }
     }
 }
@@ -633,7 +624,14 @@ impl Write for Flow {
         if buf.is_empty() {
             return Ok(0);
         }
-        if send_all(&self.session, self.stream, buf, false) {
+        let Some(sender) = &self.sender else {
+            return if send_all(&self.session, self.stream, buf, false) {
+                Ok(buf.len())
+            } else {
+                Err(broken())
+            };
+        };
+        if sender.push(buf, self.stream, &self.session) {
             Ok(buf.len())
         } else {
             Err(broken())
@@ -667,6 +665,7 @@ pub(crate) fn open_flow(session: &Session, stream: u64, header: &[u8]) -> Option
         at: 0,
         drive,
         wake,
+        sender: None,
     })
 }
 
@@ -924,16 +923,181 @@ pub(crate) fn server_config(
 
 pub(crate) type Serve = Arc<dyn Fn(Flow) + Send + Sync>;
 
+/// The most one stream's downlink may buffer before its relay waits for the router to drain it, so a connection whose window stays shut never grows memory without bound.
+const QUEUE_CAP: usize = 128 * 1024;
+
+/// One stream's downlink queue: the relay appends, and whichever of the router or the relay itself finds the connection lock free sends from it. One queue and one drainer at a time, so a window credit is never split across threads that would each write a slice and then block.
+pub(crate) struct Sender {
+    queue: Mutex<SenderQueue>,
+    room: Condvar,
+    queued: AtomicUsize,
+}
+
+struct SenderQueue {
+    chunks: VecDeque<Vec<u8>>,
+    front: usize,
+    closed: bool,
+    fin: bool,
+}
+
+impl Sender {
+    fn new() -> Self {
+        Self {
+            queue: Mutex::new(SenderQueue {
+                chunks: VecDeque::new(),
+                front: 0,
+                closed: false,
+                fin: false,
+            }),
+            room: Condvar::new(),
+            queued: AtomicUsize::new(0),
+        }
+    }
+
+    /// Queues `buf` and returns once the connection has taken it, sending it here when the router does not hold the lock and waiting for the drain it will do otherwise.
+    fn push(&self, buf: &[u8], stream: u64, session: &Session) -> bool {
+        {
+            let Ok(mut queue) = self.queue.lock() else {
+                return false;
+            };
+            while !queue.closed && self.queued.load(Ordering::Relaxed) + buf.len() > QUEUE_CAP {
+                queue = match self.room.wait(queue) {
+                    Ok(queue) => queue,
+                    Err(_) => return false,
+                };
+            }
+            if queue.closed {
+                return false;
+            }
+            queue.chunks.push_back(buf.to_vec());
+            self.queued.fetch_add(buf.len(), Ordering::Relaxed);
+        }
+        loop {
+            if let Ok(mut conn) = session.shared.try_lock() {
+                if drain(&mut conn, stream, self) {
+                    crate::quic::flush_egress(&mut conn, &session.sock);
+                }
+                if self.queued.load(Ordering::Relaxed) == 0 {
+                    return true;
+                }
+            }
+            let Ok(queue) = self.queue.lock() else {
+                return false;
+            };
+            if self.queued.load(Ordering::Relaxed) == 0 {
+                return true;
+            }
+            if queue.closed {
+                return false;
+            }
+            let _ = self.room.wait_timeout(queue, STREAM_POLL);
+        }
+    }
+
+    fn close(&self) {
+        if let Ok(mut queue) = self.queue.lock() {
+            queue.closed = true;
+        }
+        self.room.notify_all();
+    }
+
+    fn done(&self) -> bool {
+        self.queue
+            .lock()
+            .map_or(true, |queue| queue.closed && queue.chunks.is_empty())
+    }
+}
+
+/// Sends as much of a stream's queue as the connection takes in one lock, and wakes the relay if that made room.
+fn drain(conn: &mut quiche::Connection, stream: u64, sender: &Sender) -> bool {
+    let Ok(mut queue) = sender.queue.lock() else {
+        return false;
+    };
+    let mut wrote = false;
+    loop {
+        let Some(chunk_len) = queue.chunks.front().map(Vec::len) else {
+            if queue.closed && !queue.fin && conn.stream_send(stream, &[], true).is_ok() {
+                queue.fin = true;
+                wrote = true;
+            }
+            break;
+        };
+        let rest = chunk_len - queue.front;
+        let fin = queue.closed && queue.chunks.len() == 1;
+        let sent = match conn.stream_send(stream, &queue.chunks[0][queue.front..], fin) {
+            Ok(0) | Err(quiche::Error::Done) => break,
+            Ok(sent) => sent,
+            Err(_) => {
+                queue.closed = true;
+                queue.chunks.clear();
+                queue.front = 0;
+                sender.queued.store(0, Ordering::Relaxed);
+                break;
+            }
+        };
+        wrote = true;
+        STATS.drain_bytes.fetch_add(sent as u64, Ordering::Relaxed);
+        queue.front += sent;
+        sender.queued.fetch_sub(sent, Ordering::Relaxed);
+        if queue.front == chunk_len {
+            queue.chunks.pop_front();
+            queue.front = 0;
+            if fin {
+                queue.fin = true;
+            }
+        }
+        if sent < rest {
+            break;
+        }
+    }
+    drop(queue);
+    if wrote {
+        sender.room.notify_all();
+    }
+    wrote
+}
+
+/// Drains every served stream's queue in one pass, so the flush that follows carries whatever the datagram opened room for.
+fn drain_all(conn: &mut quiche::Connection, inbound: &Inbound) {
+    for (stream, sender) in &inbound.out {
+        drain(conn, *stream, sender);
+    }
+}
+
+/// Starts the relay for a newly readable flow stream, which appends to the sender the router drains.
+#[allow(clippy::too_many_arguments)]
+fn spawn_stream(
+    shared: &Arc<Mutex<quiche::Connection>>,
+    sock: &Arc<crate::quic::Datagram>,
+    local: SocketAddr,
+    id: u64,
+    serve: &Serve,
+    masq: &Arc<Masquerade>,
+    sender: &Arc<Sender>,
+    peer: SocketAddr,
+) {
+    let (shared, sock, serve, masq, sender) = (
+        Arc::clone(shared),
+        Arc::clone(sock),
+        Arc::clone(serve),
+        Arc::clone(masq),
+        Arc::clone(sender),
+    );
+    std::thread::spawn(move || {
+        serve_stream(&shared, &sock, local, id, &serve, peer, &masq, &sender);
+        sender.close();
+    });
+}
+
 struct Inbound {
     conn: Arc<Mutex<quiche::Connection>>,
-    /// Bumped after every datagram the router takes, so a writer whose stream window was full retries on the update rather than on the poll.
-    wake: Arc<Wake>,
     client_cid: Vec<u8>,
     authed: bool,
     settings_sent: bool,
     settings_done: bool,
     auth_buf: Vec<u8>,
     served: HashSet<u64>,
+    out: HashMap<u64, Arc<Sender>>,
     udp: HashMap<u32, UdpFlow>,
 }
 
@@ -971,7 +1135,7 @@ fn drain_settings(conn: &mut quiche::Connection) -> bool {
     }
 }
 
-#[allow(clippy::too_many_arguments)] // the connection, its socket, the flow's own coordinates, the cover, and the latch its writer waits on
+#[allow(clippy::too_many_arguments)]
 fn serve_stream(
     shared: &Arc<Mutex<quiche::Connection>>,
     sock: &Arc<crate::quic::Datagram>,
@@ -980,7 +1144,7 @@ fn serve_stream(
     serve: &Serve,
     peer: SocketAddr,
     masq: &Masquerade,
-    wake: &Arc<Wake>,
+    sender: &Arc<Sender>,
 ) {
     let mut head = Vec::with_capacity(8);
     let mut room = Unfilled::<64>::new();
@@ -1037,7 +1201,8 @@ fn serve_stream(
         stream,
         head,
         false,
-        Some(Arc::clone(wake)),
+        None,
+        Some(Arc::clone(sender)),
     );
     // The prefix stays in the buffer and the cursor steps over it, so no payload byte is moved.
     flow.at = prefix;
@@ -1881,17 +2046,13 @@ impl Router<'_> {
             scid.to_vec(),
             Inbound {
                 conn: Arc::new(Mutex::new(conn)),
-                wake: Arc::new(Wake {
-                    gen: Mutex::new(0),
-                    cv: Condvar::new(),
-                    waiting: AtomicUsize::new(0),
-                }),
                 client_cid: client_cid.to_vec(),
                 authed: false,
                 settings_sent: false,
                 settings_done: false,
                 auth_buf: Vec::new(),
                 served: HashSet::new(),
+                out: HashMap::new(),
                 udp: HashMap::new(),
             },
         );
@@ -1907,12 +2068,10 @@ impl Router<'_> {
             masq,
             local,
         } = self;
-        let Some((inbound, shared, wake)) = routes
-            .get(dcid)
-            .map(|i| (i, Arc::clone(&i.conn), Arc::clone(&i.wake)))
-        else {
+        let Some(inbound) = routes.get(dcid) else {
             return;
         };
+        let shared = Arc::clone(&inbound.conn);
         let info = quiche::RecvInfo { from, to: *local };
         {
             let locked = Instant::now();
@@ -1924,13 +2083,17 @@ impl Router<'_> {
             if conn.recv(packet, info).is_err() {
                 return;
             }
+            drain_all(&mut conn, inbound);
             flush(sock, &mut conn, out.as_mut());
-            wake_writers(&mut conn, inbound, &wake);
             if !conn.is_established() || conn.is_closed() {
                 return;
             }
-            let (mut settings_done, settings_sent, authed) =
-                (inbound.settings_done, inbound.settings_sent, inbound.authed);
+            let Some((mut settings_done, settings_sent, authed)) = routes
+                .get(dcid)
+                .map(|i| (i.settings_done, i.settings_sent, i.authed))
+            else {
+                return;
+            };
             if !settings_done {
                 settings_done = drain_settings(&mut conn);
                 if settings_done {
@@ -1976,25 +2139,9 @@ impl Router<'_> {
                     continue;
                 }
                 inbound.served.insert(id);
-                let thread_shared = Arc::clone(&shared);
-                let thread_sock = Arc::clone(sock);
-                let thread_serve = Arc::clone(serve);
-                let thread_masq = Arc::clone(masq);
-                let thread_wake = Arc::clone(&wake);
-                let local = *local;
-                let peer = from;
-                std::thread::spawn(move || {
-                    serve_stream(
-                        &thread_shared,
-                        &thread_sock,
-                        local,
-                        id,
-                        &thread_serve,
-                        peer,
-                        &thread_masq,
-                        &thread_wake,
-                    );
-                });
+                let sender = Arc::new(Sender::new());
+                inbound.out.insert(id, Arc::clone(&sender));
+                spawn_stream(&shared, sock, *local, id, serve, masq, &sender, from);
             }
             relay_datagrams(routes, sock, &shared, dcid, &mut conn);
             flush(sock, &mut conn, out.as_mut());
@@ -2020,8 +2167,9 @@ impl Router<'_> {
                 return false;
             }
             conn.on_timeout();
+            drain_all(&mut conn, inbound);
             flush(sock, &mut conn, out.as_mut());
-            wake_writers(&mut conn, inbound, &inbound.wake);
+            inbound.out.retain(|_, sender| !sender.done());
             inbound.udp.retain(|_, flow| {
                 if now.duration_since(flow.last) > UDP_IDLE {
                     flow.stop.store(true, Ordering::Relaxed);
@@ -2189,7 +2337,6 @@ mod tests {
             local,
             udp_supported: false,
             driver: None,
-            wake: None,
         }
     }
 
@@ -2209,6 +2356,7 @@ mod tests {
             FIRST_FLOW_STREAM,
             head,
             true,
+            None,
             None,
         );
         // The state serve_stream hands over: the frame type stepped over, nothing moved.
