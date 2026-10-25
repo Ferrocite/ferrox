@@ -38240,3 +38240,112 @@ mod reverse_tests {
         assert!(state.active());
     }
 }
+
+#[cfg(test)]
+mod accept_proxy_protocol_tests {
+    use super::*;
+
+    const ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    fn inbound(port: u16) -> Json {
+        crate::json::parse(&format!(
+            r#"{{"protocol":"vless","port":{port},"settings":{{"clients":[{{"id":"{ID}"}}]}},
+                "streamSettings":{{"network":"ws","wsSettings":{{"path":"/x","acceptProxyProtocol":true}}}}}}"#
+        ))
+        .expect("parses")
+    }
+
+    fn free_port() -> u16 {
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        probe.local_addr().expect("addr").port()
+    }
+
+    fn dial(port: u16) -> Connection {
+        for _ in 0..200 {
+            if let Ok(stream) = Connection::connect(("127.0.0.1", port)) {
+                return stream;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the listener never came up");
+    }
+
+    const UPGRADE: &[u8] = b"GET /x HTTP/1.1\r\nHost: h\r\nUpgrade: websocket\r\n\
+        Connection: Upgrade\r\nSec-WebSocket-Key: aGVsbG8gd29ybGQxMjM0NQ==\r\n\
+        Sec-WebSocket-Version: 13\r\n\r\n";
+
+    fn read_head(stream: &mut Connection) -> Vec<u8> {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut got = Vec::new();
+        let mut buf = [0u8; 512];
+        loop {
+            match stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if got.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+            }
+        }
+        got
+    }
+
+    fn serve(port: u16) {
+        assert!(serve_vless_inbound(
+            &format!("127.0.0.1:{port}"),
+            &inbound(port),
+            true,
+            "test",
+            &crate::reverse::Portals::default()
+        ));
+    }
+
+    #[test]
+    fn a_ws_inbound_with_accept_proxy_protocol_reads_the_line_before_the_upgrade() {
+        let port = free_port();
+        serve(port);
+        let mut client = dial(port);
+        client
+            .write_all(b"PROXY TCP4 1.2.3.4 5.6.7.8 1234 5678\r\n")
+            .expect("writes the header");
+        client.write_all(UPGRADE).expect("writes the upgrade");
+        let got = read_head(&mut client);
+        assert!(
+            got.starts_with(b"HTTP/1.1 101"),
+            "the upgrade after a PROXY line was not answered: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_ws_inbound_with_accept_proxy_protocol_refuses_a_bare_upgrade() {
+        let port = free_port();
+        serve(port);
+        let mut client = dial(port);
+        client.write_all(UPGRADE).expect("writes the upgrade");
+        let got = read_head(&mut client);
+        assert!(
+            !got.starts_with(b"HTTP/1.1 101"),
+            "a bare upgrade was accepted where the reference waits for the PROXY line: {got:?}"
+        );
+    }
+
+    #[test]
+    fn a_ws_inbound_with_accept_proxy_protocol_reads_the_binary_header() {
+        let port = free_port();
+        serve(port);
+        let mut client = dial(port);
+        let mut v2 = b"\r\n\r\n\0\r\nQUIT\n".to_vec();
+        v2.extend_from_slice(&[0x21, 0x11, 0x00, 0x0c]);
+        v2.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        v2.extend_from_slice(&[0x12, 0x34, 0x56, 0x78]);
+        client.write_all(&v2).expect("writes the header");
+        client.write_all(UPGRADE).expect("writes the upgrade");
+        let got = read_head(&mut client);
+        assert!(
+            got.starts_with(b"HTTP/1.1 101"),
+            "the upgrade after a PROXY v2 header was not answered: {got:?}"
+        );
+    }
+}
