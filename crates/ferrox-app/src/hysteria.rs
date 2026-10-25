@@ -804,8 +804,13 @@ pub(crate) fn server_config(
     config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
     // A served connection always carries an auth validator, and the reference enables the datagram lane exactly when one is present, so the lane is on unconditionally here; the depths are the peer's unsent-datagram queue, matching `udpMessageChanSize`.
     config.enable_dgram(true, 1024, 1024);
-    // One transport shape for both roles: a server sending at quiche's 1200 default paid 12.5% more packets per byte than the client it answers, and advertised a 65527-byte receive it never buffers.
-    crate::quic::tune_transport(&mut config);
+    config.set_max_idle_timeout(crate::quic::IDLE_TIMEOUT_MS);
+    config.set_initial_max_data(crate::quic::MAX_DATA);
+    config.set_initial_max_stream_data_bidi_local(crate::quic::MAX_STREAM_DATA);
+    config.set_initial_max_stream_data_bidi_remote(crate::quic::MAX_STREAM_DATA);
+    config.set_initial_max_stream_data_uni(crate::quic::MAX_STREAM_DATA);
+    config.set_initial_max_streams_bidi(crate::quic::MAX_STREAMS);
+    config.set_initial_max_streams_uni(crate::quic::MAX_STREAMS);
     config.load_cert_chain_from_pem_file(cert_path).ok()?;
     config.load_priv_key_from_pem_file(key_path).ok()?;
     Some(config)
@@ -1426,6 +1431,7 @@ fn udp_reader(
     // One buffer for a whole target reply and one for the wire, both kept at capacity across the association's life so a steady relay never reallocates; the fragments view `buf`, so they are rebuilt each read rather than carried.
     let mut buf = vec![0u8; UDP_TARGET_BUF];
     let mut wire = Vec::new();
+    let mut out = Unfilled::<MAX_DATAGRAM>::new();
     let mut packet = 0u16;
     loop {
         let n = match target.recv(&mut buf) {
@@ -1466,7 +1472,7 @@ fn udp_reader(
                 let _ = conn.dgram_send(&wire);
             }
         }
-        crate::quic::flush_egress(&mut conn, sock);
+        flush(sock, &mut conn, out.as_mut());
     }
 }
 
@@ -1510,6 +1516,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
     let mut buf = vec![0u8; UDP_TARGET_BUF];
     // One wire buffer and one packet buffer, kept at capacity across the association's life so a steady relay never reallocates. The fragment list is born in the loop because its messages borrow the message's own bytes.
     let mut wire = Vec::with_capacity(UDP_TARGET_BUF + 64);
+    let mut out = Unfilled::<MAX_DATAGRAM>::new();
     let mut packet = 0u16;
     // Ids the lane stamps, taken in order and never reused on this connection, so a late reply to a retired flow cannot land on a new one.
     let mut next_id = 1u32;
@@ -1572,7 +1579,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
                 let _ = conn.dgram_send(&wire);
             }
         }
-        crate::quic::flush_egress(&mut conn, &session.sock);
+        flush(&session.sock, &mut conn, out.as_mut());
     }
     stop.store(true, Ordering::Relaxed);
     let _ = reader.join();
@@ -1673,14 +1680,22 @@ fn relay_datagrams(
 struct Router<'a> {
     sock: Arc<crate::quic::Datagram>,
     local: SocketAddr,
+    out: Unfilled<MAX_DATAGRAM>,
     auths: &'a [String],
     serve: &'a Serve,
     masq: Arc<Masquerade>,
     routes: HashMap<Vec<u8>, Inbound>,
 }
 
+fn flush(sock: &crate::quic::Datagram, conn: &mut quiche::Connection, out: &mut [u8]) {
+    while let Ok((written, info)) = conn.send(out) {
+        let _ = sock.send_to(&out[..written], info.to);
+    }
+}
+
 fn auth_exchange(
     sock: &crate::quic::Datagram,
+    out: &mut [u8],
     conn: &mut quiche::Connection,
     auths: &[String],
     inbound: &mut Inbound,
@@ -1712,7 +1727,7 @@ fn auth_exchange(
         if conn.stream_send(AUTH_STREAM, &reply, true).is_err() {
             return None;
         }
-        crate::quic::flush_egress(conn, sock);
+        flush(sock, conn, out);
         return Some(true);
     }
     let ok = auths
@@ -1721,7 +1736,7 @@ fn auth_exchange(
     if !answer_auth(conn, ok) {
         return None;
     }
-    crate::quic::flush_egress(conn, sock);
+    flush(sock, conn, out);
     inbound.auth_buf.clear();
     inbound.authed = true;
     Some(ok)
@@ -1750,7 +1765,7 @@ impl Router<'_> {
         if conn.recv(packet, info).is_err() {
             return;
         }
-        crate::quic::flush_egress(&mut conn, &self.sock);
+        flush(&self.sock, &mut conn, self.out.as_mut());
         self.routes.insert(
             scid.to_vec(),
             Inbound {
@@ -1770,6 +1785,7 @@ impl Router<'_> {
         let Self {
             routes,
             sock,
+            out,
             auths,
             serve,
             masq,
@@ -1786,7 +1802,7 @@ impl Router<'_> {
             if conn.recv(packet, info).is_err() {
                 return;
             }
-            crate::quic::flush_egress(&mut conn, sock);
+            flush(sock, &mut conn, out.as_mut());
             if !conn.is_established() || conn.is_closed() {
                 return;
             }
@@ -1810,7 +1826,7 @@ impl Router<'_> {
                 frames::quic_varint(&mut settings, 0x04);
                 frames::quic_varint(&mut settings, 0);
                 let _ = conn.stream_send(3, &settings, true);
-                crate::quic::flush_egress(&mut conn, sock);
+                flush(sock, &mut conn, out.as_mut());
                 if let Some(inbound) = routes.get_mut(dcid) {
                     inbound.settings_sent = true;
                 }
@@ -1819,12 +1835,14 @@ impl Router<'_> {
                 let Some(inbound) = routes.get_mut(dcid) else {
                     return;
                 };
-                let Some(ok) = auth_exchange(sock, &mut conn, auths, inbound, from, masq) else {
+                let Some(ok) =
+                    auth_exchange(sock, out.as_mut(), &mut conn, auths, inbound, from, masq)
+                else {
                     return;
                 };
                 if !ok {
                     let _ = conn.close(false, 0, b"refused");
-                    crate::quic::flush_egress(&mut conn, sock);
+                    flush(sock, &mut conn, out.as_mut());
                     return;
                 }
             }
@@ -1858,12 +1876,14 @@ impl Router<'_> {
                 });
             }
             relay_datagrams(routes, sock, &shared, dcid, &mut conn);
-            crate::quic::flush_egress(&mut conn, sock);
+            flush(sock, &mut conn, out.as_mut());
         }
     }
 
     fn idle(&mut self) {
-        let Self { routes, sock, .. } = self;
+        let Self {
+            routes, sock, out, ..
+        } = self;
         let now = Instant::now();
         // One pass, one lock per route: the dead are dropped where they are found, the living take their turn of the wheel, and a datagram association idle past the timeout is told to stop so its reader ends within one poll.
         routes.retain(|_, inbound| {
@@ -1878,7 +1898,7 @@ impl Router<'_> {
                 return false;
             }
             conn.on_timeout();
-            crate::quic::flush_egress(&mut conn, sock);
+            flush(sock, &mut conn, out.as_mut());
             inbound.udp.retain(|_, flow| {
                 if now.duration_since(flow.last) > UDP_IDLE {
                     flow.stop.store(true, Ordering::Relaxed);
@@ -1920,6 +1940,7 @@ pub(crate) fn serve_loop(
     let mut router = Router {
         sock: Arc::new(sock),
         local,
+        out: Unfilled::<MAX_DATAGRAM>::new(),
         auths,
         serve,
         masq: Arc::from(masq.clone()),
