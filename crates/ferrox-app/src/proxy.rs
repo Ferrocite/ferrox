@@ -3338,6 +3338,9 @@ fn handle_mux_udp_new(
     };
     if let Some(old) = udp.insert(frame.id, Arc::clone(&session)) {
         old.done.store(true, Ordering::Relaxed);
+        if let Some(worker) = out.worker {
+            worker.release_connection();
+        }
     }
     global.retain(|_, id| *id != frame.id);
     if let Some(identity) = identity {
@@ -3360,6 +3363,9 @@ fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
         loop {
             match read.recv_from(&mut buf) {
                 Ok((n, source)) => {
+                    if done.load(Ordering::Relaxed) {
+                        return;
+                    }
                     let keep = ferrox_core::mux::Outgoing {
                         id: id.load(Ordering::Relaxed),
                         status: ferrox_core::mux::Status::Keep,
@@ -27441,7 +27447,7 @@ mod tests {
         let second_port = second.local_addr().expect("addr").port();
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let client = Connection::connect(listener.local_addr().expect("addr")).expect("connects");
-        let (_server, _) = listener.accept().expect("accepts");
+        let (mut server, _) = listener.accept().expect("accepts");
         let wire = MuxWire::Conn(Arc::new(Mutex::new(client)));
         let worker = crate::reverse::WorkerState::new();
         let mut udp: UdpTable = HashMap::new();
@@ -27466,6 +27472,8 @@ mod tests {
             };
             handle_mux_udp_new(new(first_port), &mut udp, &mut global, &mut out);
         }
+        let old = Arc::clone(udp.get(&7).expect("first session"));
+        let old_addr = old.socket.local_addr().expect("addr");
         {
             let mut out = MuxOut {
                 wire: &wire,
@@ -27479,6 +27487,15 @@ mod tests {
             worker.connections(),
             1,
             "the replaced session kept the worker slot the new one needs"
+        );
+        server
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        first.send_to(b"stale", old_addr).expect("sends");
+        let mut probe = [0u8; 64];
+        assert!(
+            matches!(server.read(&mut probe), Err(ref error) if is_timeout(error)),
+            "the replaced session's reader forwarded a stale datagram"
         );
         for session in udp.values() {
             session.done.store(true, Ordering::Relaxed);
