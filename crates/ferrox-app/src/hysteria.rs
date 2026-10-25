@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -108,15 +108,19 @@ pub(crate) struct Session {
     udp_supported: bool,
     /// The pooled connection's one socket reader; `None` on a dial that drives the socket itself.
     driver: Option<Arc<Driver>>,
+    /// The latch bumped when this session's connection takes a datagram, so a writer waits on the update rather than on a poll; `None` where nothing bumps it.
+    wake: Option<Arc<Wake>>,
 }
 
-/// One stream's latch: the pump bumps it when a datagram filled the stream, and the flow reading it parks until then instead of waiting on the shared socket with the others.
-struct StreamWake {
+/// One latch: a generation and a condvar. The pump bumps a stream's when a datagram filled it, so the flow reading it parks until then instead of waiting on the shared socket with the others; the router bumps a connection's when it takes a datagram, so a writer whose stream window was full retries on the update instead of on a poll.
+pub(crate) struct Wake {
     gen: Mutex<u64>,
     cv: Condvar,
+    /// Writers parked on this latch, so a router holding a datagram skips the window scan when none wait.
+    waiting: AtomicUsize,
 }
 
-impl StreamWake {
+impl Wake {
     fn seen(&self) -> u64 {
         self.gen.lock().map_or(0, |gen| *gen)
     }
@@ -133,8 +137,14 @@ impl StreamWake {
             return;
         };
         if *gen == seen {
+            self.waiting.fetch_add(1, Ordering::Relaxed);
             let _ = self.cv.wait_timeout(gen, timeout);
+            self.waiting.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+
+    fn waiting(&self) -> usize {
+        self.waiting.load(Ordering::Relaxed)
     }
 }
 
@@ -142,7 +152,7 @@ impl StreamWake {
 struct Driver {
     alive: AtomicBool,
     stop: AtomicBool,
-    streams: Mutex<HashMap<u64, Arc<StreamWake>>>,
+    streams: Mutex<HashMap<u64, Arc<Wake>>>,
 }
 
 impl Driver {
@@ -162,10 +172,11 @@ impl Driver {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    fn register(&self, stream: u64) -> Arc<StreamWake> {
-        let wake = Arc::new(StreamWake {
+    fn register(&self, stream: u64) -> Arc<Wake> {
+        let wake = Arc::new(Wake {
             gen: Mutex::new(0),
             cv: Condvar::new(),
+            waiting: AtomicUsize::new(0),
         });
         if let Ok(mut streams) = self.streams.lock() {
             streams.insert(stream, Arc::clone(&wake));
@@ -186,6 +197,7 @@ impl Driver {
                 local,
                 udp_supported: false,
                 driver: None,
+                wake: None,
             };
             let mut ready = Vec::with_capacity(16);
             while !pump.stop.load(Ordering::Relaxed) {
@@ -230,6 +242,8 @@ fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
             return true;
         }
         let want = buf.len();
+        // Read before the attempt, so a datagram that opens the window between the write and the wait is not missed.
+        let seen = session.wake.as_ref().map(|wake| wake.seen());
         let locked = Instant::now();
         let Ok(mut conn) = session.shared.lock() else {
             return false;
@@ -262,8 +276,25 @@ fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
         drop(conn);
         STATS.sleeps.fetch_add(1, Ordering::Relaxed);
         let slept = Instant::now();
-        std::thread::sleep(STREAM_POLL);
+        match (session.wake.as_ref(), seen) {
+            (Some(wake), Some(seen)) => wake.wait(seen, STREAM_POLL),
+            _ => std::thread::sleep(STREAM_POLL),
+        }
         Stats::add(&STATS.sleep_ns, slept);
+    }
+}
+
+/// Bumps the connection's latch only when the datagram opened a served stream's window, so a blocked writer retries on the update instead of on the poll.
+fn wake_writers(conn: &mut quiche::Connection, inbound: &Inbound, wake: &Wake) {
+    if wake.waiting() == 0 {
+        return;
+    }
+    if inbound
+        .served
+        .iter()
+        .any(|stream| conn.stream_capacity(*stream).is_ok_and(|cap| cap > 0))
+    {
+        wake.bump();
     }
 }
 
@@ -323,13 +354,13 @@ fn drive_once(session: &Session, wait: Duration) -> bool {
 fn recv_reply(
     session: &Session,
     stream: u64,
-    wake: Option<&StreamWake>,
+    wake: Option<&Wake>,
     deadline: Instant,
 ) -> Option<[u8; 2]> {
     let mut room = Unfilled::<2>::new();
     let mut got = 0usize;
     while got < 2 {
-        let before = wake.map_or(0, StreamWake::seen);
+        let before = wake.map_or(0, Wake::seen);
         let read = {
             let Ok(mut conn) = session.shared.lock() else {
                 return None;
@@ -481,6 +512,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         local,
         udp_supported: false,
         driver: None,
+        wake: None,
     };
     if !control_settings(&session) {
         return None;
@@ -499,7 +531,7 @@ pub(crate) struct Flow {
     /// Whether `read` may drive the socket itself: a flow on the server's routed socket must not, because `serve_loop` reads every datagram and routes it, and a second reader steals packets the router must see.
     drive: bool,
     /// The latch the session's pump bumps when this stream has data; `None` when this flow drives.
-    wake: Option<Arc<StreamWake>>,
+    wake: Option<Arc<Wake>>,
 }
 
 impl Flow {
@@ -510,6 +542,7 @@ impl Flow {
         stream: u64,
         backlog: Vec<u8>,
         drive: bool,
+        wake: Option<Arc<Wake>>,
     ) -> Self {
         Self {
             session: Session {
@@ -518,6 +551,7 @@ impl Flow {
                 local,
                 udp_supported: false,
                 driver: None,
+                wake,
             },
             stream,
             backlog,
@@ -892,6 +926,8 @@ pub(crate) type Serve = Arc<dyn Fn(Flow) + Send + Sync>;
 
 struct Inbound {
     conn: Arc<Mutex<quiche::Connection>>,
+    /// Bumped after every datagram the router takes, so a writer whose stream window was full retries on the update rather than on the poll.
+    wake: Arc<Wake>,
     client_cid: Vec<u8>,
     authed: bool,
     settings_sent: bool,
@@ -935,6 +971,7 @@ fn drain_settings(conn: &mut quiche::Connection) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)] // the connection, its socket, the flow's own coordinates, the cover, and the latch its writer waits on
 fn serve_stream(
     shared: &Arc<Mutex<quiche::Connection>>,
     sock: &Arc<crate::quic::Datagram>,
@@ -943,6 +980,7 @@ fn serve_stream(
     serve: &Serve,
     peer: SocketAddr,
     masq: &Masquerade,
+    wake: &Arc<Wake>,
 ) {
     let mut head = Vec::with_capacity(8);
     let mut room = Unfilled::<64>::new();
@@ -999,6 +1037,7 @@ fn serve_stream(
         stream,
         head,
         false,
+        Some(Arc::clone(wake)),
     );
     // The prefix stays in the buffer and the cursor steps over it, so no payload byte is moved.
     flow.at = prefix;
@@ -1842,6 +1881,11 @@ impl Router<'_> {
             scid.to_vec(),
             Inbound {
                 conn: Arc::new(Mutex::new(conn)),
+                wake: Arc::new(Wake {
+                    gen: Mutex::new(0),
+                    cv: Condvar::new(),
+                    waiting: AtomicUsize::new(0),
+                }),
                 client_cid: client_cid.to_vec(),
                 authed: false,
                 settings_sent: false,
@@ -1863,7 +1907,10 @@ impl Router<'_> {
             masq,
             local,
         } = self;
-        let Some(shared) = routes.get(dcid).map(|i| Arc::clone(&i.conn)) else {
+        let Some((inbound, shared, wake)) = routes
+            .get(dcid)
+            .map(|i| (i, Arc::clone(&i.conn), Arc::clone(&i.wake)))
+        else {
             return;
         };
         let info = quiche::RecvInfo { from, to: *local };
@@ -1878,15 +1925,12 @@ impl Router<'_> {
                 return;
             }
             flush(sock, &mut conn, out.as_mut());
+            wake_writers(&mut conn, inbound, &wake);
             if !conn.is_established() || conn.is_closed() {
                 return;
             }
-            let Some((mut settings_done, settings_sent, authed)) = routes
-                .get(dcid)
-                .map(|i| (i.settings_done, i.settings_sent, i.authed))
-            else {
-                return;
-            };
+            let (mut settings_done, settings_sent, authed) =
+                (inbound.settings_done, inbound.settings_sent, inbound.authed);
             if !settings_done {
                 settings_done = drain_settings(&mut conn);
                 if settings_done {
@@ -1936,6 +1980,7 @@ impl Router<'_> {
                 let thread_sock = Arc::clone(sock);
                 let thread_serve = Arc::clone(serve);
                 let thread_masq = Arc::clone(masq);
+                let thread_wake = Arc::clone(&wake);
                 let local = *local;
                 let peer = from;
                 std::thread::spawn(move || {
@@ -1947,6 +1992,7 @@ impl Router<'_> {
                         &thread_serve,
                         peer,
                         &thread_masq,
+                        &thread_wake,
                     );
                 });
             }
@@ -1975,6 +2021,7 @@ impl Router<'_> {
             }
             conn.on_timeout();
             flush(sock, &mut conn, out.as_mut());
+            wake_writers(&mut conn, inbound, &inbound.wake);
             inbound.udp.retain(|_, flow| {
                 if now.duration_since(flow.last) > UDP_IDLE {
                     flow.stop.store(true, Ordering::Relaxed);
@@ -2142,6 +2189,7 @@ mod tests {
             local,
             udp_supported: false,
             driver: None,
+            wake: None,
         }
     }
 
@@ -2161,6 +2209,7 @@ mod tests {
             FIRST_FLOW_STREAM,
             head,
             true,
+            None,
         );
         // The state serve_stream hands over: the frame type stepped over, nothing moved.
         flow.at = hysteria::read_tcp_prefix(&flow.backlog).expect("prefix");
