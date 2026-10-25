@@ -3117,7 +3117,7 @@ fn handle_mux_frame(
                         *session
                             .dest
                             .lock()
-                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                     });
                 let _ = session.socket.send_to(data, dest);
                 return;
@@ -3356,7 +3356,7 @@ fn handle_mux_udp_new(
         *session
             .dest
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = dest;
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = dest;
         session
     } else {
         let bound = if dest.is_ipv6() {
