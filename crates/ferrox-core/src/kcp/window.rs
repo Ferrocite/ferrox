@@ -519,6 +519,35 @@ mod tests {
     }
 
     #[test]
+    fn clear_forgets_the_in_flight_count_of_acknowledged_segments() {
+        let mut w = SendingWindow::new();
+        w.push(1, b"one");
+        w.push(2, b"two");
+        w.flush(0, 100, 1, 0, 0, SegmentOption::NONE, &mut |_| {});
+        assert_eq!(w.total_in_flight, 1);
+        w.clear(2);
+        assert_eq!(w.len(), 1);
+        assert_eq!(
+            w.total_in_flight, 0,
+            "an acknowledged segment stayed in flight"
+        );
+    }
+
+    #[test]
+    fn removing_an_untransmitted_segment_keeps_the_in_flight_count() {
+        let mut w = SendingWindow::new();
+        w.push(1, b"one");
+        w.push(2, b"two");
+        w.flush(0, 100, 1, 0, 0, SegmentOption::NONE, &mut |_| {});
+        assert_eq!(w.total_in_flight, 1);
+        assert!(w.remove(2));
+        assert_eq!(
+            w.total_in_flight, 1,
+            "an unsent segment left the in-flight count"
+        );
+    }
+
+    #[test]
     fn removing_beyond_the_window_is_not_a_removal() {
         let mut w = SendingWindow::new();
         w.push(4, b"a");
