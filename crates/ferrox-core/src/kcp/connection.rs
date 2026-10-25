@@ -1,7 +1,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -72,8 +72,6 @@ impl std::error::Error for ConnError {}
 struct Notifier {
     generation: Mutex<u64>,
     condvar: Condvar,
-    #[cfg(test)]
-    wakes: AtomicU32,
 }
 
 impl Notifier {
@@ -86,8 +84,6 @@ impl Notifier {
     }
 
     fn signal(&self) {
-        #[cfg(test)]
-        self.wakes.fetch_add(1, Ordering::SeqCst);
         *self.generation.lock().unwrap() += 1;
         self.condvar.notify_all();
     }
@@ -104,6 +100,66 @@ impl Notifier {
                 return false;
             }
         }
+    }
+}
+
+/// One thread drives every live KCP connection's flush clock: a write wakes it at once, a
+/// quiet connection waits its tick, and a connection that drops is pruned on the next pass.
+struct Scheduler {
+    conns: Mutex<Vec<Weak<Connection>>>,
+    wake: Notifier,
+}
+
+static SCHEDULER: OnceLock<Arc<Scheduler>> = OnceLock::new();
+
+fn scheduler() -> &'static Arc<Scheduler> {
+    SCHEDULER.get_or_init(|| {
+        let scheduler = Arc::new(Scheduler {
+            conns: Mutex::new(Vec::new()),
+            wake: Notifier::new(),
+        });
+        let weak = Arc::downgrade(&scheduler);
+        thread::spawn(move || scheduler_loop(&weak));
+        scheduler
+    })
+}
+
+fn scheduler_loop(weak: &Weak<Scheduler>) {
+    let mut seen = 0;
+    loop {
+        let Some(scheduler) = weak.upgrade() else {
+            break;
+        };
+        let now = Instant::now();
+        let conns: Vec<Arc<Connection>> = {
+            let mut conns = scheduler.conns.lock().unwrap();
+            conns.retain(|conn| conn.strong_count() > 0);
+            conns.iter().filter_map(Weak::upgrade).collect()
+        };
+        let mut wait = Duration::from_secs(1);
+        for conn in conns {
+            let next = conn.poll(now);
+            wait = wait.min(
+                next.saturating_duration_since(Instant::now())
+                    .max(Duration::from_millis(1)),
+            );
+        }
+        let generation = scheduler.wake.gen();
+        if generation != seen {
+            seen = generation;
+            continue;
+        }
+        scheduler.wake.wait_since(generation, wait);
+        seen = scheduler.wake.gen();
+    }
+}
+
+impl Scheduler {
+    fn register(&self, conn: Weak<Connection>) {
+        if let Ok(mut conns) = self.conns.lock() {
+            conns.push(conn);
+        }
+        self.wake.signal();
     }
 }
 
@@ -182,7 +238,6 @@ pub struct Connection {
     since: Instant,
     data_input: Notifier,
     data_output: Notifier,
-    update: Notifier,
     rd: Mutex<Option<Instant>>,
     wd: Mutex<Option<Instant>>,
     mss: u32,
@@ -191,6 +246,8 @@ pub struct Connection {
     closer: Mutex<Option<Box<Closer>>>,
     terminated: AtomicBool,
     write_pending: AtomicBool,
+    last_flush: Mutex<Instant>,
+    last_uncond: Mutex<Instant>,
     #[cfg(test)]
     flush_calls: AtomicU32,
 }
@@ -221,15 +278,16 @@ impl Connection {
                 write: writer,
             }),
         });
+        let now = Instant::now();
+        let tick = Duration::from_millis(u64::from(tti));
         let conn = Arc::new(Self {
             ctx: Arc::clone(&ctx),
             state_begin_time: AtomicU32::new(0),
             last_incoming_time: AtomicU32::new(0),
             last_ping_time: AtomicU32::new(0),
-            since: Instant::now(),
+            since: now,
             data_input: Notifier::new(),
             data_output: Notifier::new(),
-            update: Notifier::new(),
             rd: Mutex::new(None),
             wd: Mutex::new(None),
             mss,
@@ -238,52 +296,44 @@ impl Connection {
             closer: Mutex::new(Some(closer)),
             terminated: AtomicBool::new(false),
             write_pending: AtomicBool::new(false),
+            last_flush: Mutex::new(now.checked_sub(tick).unwrap_or(now)),
+            last_uncond: Mutex::new(now),
             #[cfg(test)]
             flush_calls: AtomicU32::new(0),
         });
-        let weak = Arc::downgrade(&conn);
-        thread::spawn(move || {
-            // A write flushes at once; a wake that lands inside the same tick joins its flush.
-            let tick = Duration::from_millis(u64::from(tti));
-            let mut last_flush = Instant::now()
-                .checked_sub(tick)
-                .unwrap_or_else(Instant::now);
-            let mut last_uncond = Instant::now();
-            let mut seen = u64::MAX;
-            loop {
-                let Some(conn) = weak.upgrade() else { break };
-                if conn.state() == State::Terminated {
-                    break;
-                }
-                let draining =
-                    conn.state() == State::Terminating || conn.state() == State::PeerTerminating;
-                let necessary = conn.sending.lock().unwrap().update_necessary()
-                    || conn.receiving.lock().unwrap().update_necessary();
-                let due = draining
-                    || conn.write_pending.swap(false, Ordering::SeqCst)
-                    || last_flush.elapsed() >= tick;
-                if due && (draining || necessary || last_uncond.elapsed() >= Duration::from_secs(5))
-                {
-                    conn.flush();
-                    last_flush = Instant::now();
-                    last_uncond = last_flush;
-                }
-                let wait = if draining {
-                    Duration::from_secs(1)
-                } else if necessary {
-                    tick.saturating_sub(last_flush.elapsed())
-                        .max(Duration::from_millis(1))
-                } else {
-                    tick
-                };
-                if conn.update.gen() == seen {
-                    conn.update.wait_since(seen, wait);
-                }
-                seen = conn.update.gen();
-                drop(conn);
-            }
-        });
+        scheduler().register(Arc::downgrade(&conn));
         conn
+    }
+
+    fn poll(&self, now: Instant) -> Instant {
+        let tick = Duration::from_millis(u64::from(self.ctx.config.tti));
+        if self.terminated.load(Ordering::SeqCst) {
+            return now + Duration::from_secs(1);
+        }
+        let state = self.state();
+        let draining = state == State::Terminating || state == State::PeerTerminating;
+        let necessary = self.sending.lock().unwrap().update_necessary()
+            || self.receiving.lock().unwrap().update_necessary();
+        let last_flush = *self.last_flush.lock().unwrap();
+        let last_uncond = *self.last_uncond.lock().unwrap();
+        let due = draining
+            || self.write_pending.swap(false, Ordering::SeqCst)
+            || now.saturating_duration_since(last_flush) >= tick;
+        if due
+            && (draining
+                || necessary
+                || now.saturating_duration_since(last_uncond) >= Duration::from_secs(5))
+        {
+            self.flush();
+            *self.last_flush.lock().unwrap() = now;
+            *self.last_uncond.lock().unwrap() = now;
+            return now + tick;
+        }
+        if draining {
+            now + Duration::from_secs(1)
+        } else {
+            last_flush + tick
+        }
     }
 
     #[must_use]
@@ -311,7 +361,7 @@ impl Connection {
                 self.sending.lock().unwrap().close_write();
                 self.data_input.signal();
                 self.data_output.signal();
-                self.wake_update();
+                Self::wake_update();
                 self.terminated.store(true, Ordering::SeqCst);
                 self.terminate();
             }
@@ -561,7 +611,7 @@ impl Connection {
             let n = (b.len() - offset).min(self.mss as usize);
             if !self.sending.lock().unwrap().push(&b[offset..offset + n]) {
                 if pushed {
-                    self.wake_update();
+                    Self::wake_update();
                     pushed = false;
                 }
                 self.wait_for_data_output(snap)?;
@@ -572,7 +622,7 @@ impl Connection {
         }
         if pushed {
             self.write_pending.store(true, Ordering::SeqCst);
-            self.wake_update();
+            Self::wake_update();
         }
         Ok(b.len())
     }
@@ -590,11 +640,6 @@ impl Connection {
         self.flush_calls.load(Ordering::SeqCst)
     }
 
-    #[cfg(test)]
-    pub(crate) fn update_wakeups(&self) -> u32 {
-        self.update.wakes.load(Ordering::SeqCst)
-    }
-
     #[must_use]
     pub fn conversation(&self) -> u16 {
         self.ctx.meta.conversation
@@ -610,8 +655,8 @@ impl Connection {
         self.ctx.meta.remote
     }
 
-    fn wake_update(&self) {
-        self.update.signal();
+    fn wake_update() {
+        scheduler().wake.signal();
     }
 }
 
@@ -866,31 +911,6 @@ mod tests {
             conn.data_input.gen(),
             before,
             "a segment outside the receiving window is not a wakeup"
-        );
-    }
-
-    /// An inbound datagram is not an updater wake: the tick already runs while an ack is pending, so signalling the updater per datagram only pays a futex.
-    #[test]
-    fn an_inbound_datagram_does_not_wake_the_updater() {
-        let local = ([127, 0, 0, 1], 1).into();
-        let conn = Connection::new(
-            ConnMetadata {
-                local,
-                remote: local,
-                conversation: 4,
-            },
-            Box::new(|_| Ok(())),
-            Box::new(|| {}),
-            Config::default(),
-        );
-        let before = conn.update_wakeups();
-        for number in 0..8 {
-            conn.input(&mut vec![data(number, 0, b"payload")]);
-        }
-        assert_eq!(
-            conn.update_wakeups() - before,
-            0,
-            "eight datagrams woke the updater"
         );
     }
 

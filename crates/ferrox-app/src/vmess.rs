@@ -1731,7 +1731,7 @@ pub(crate) fn serve_kcp<R, W>(
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    let decoded = accept_request(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, id);
     serve_decoded(reader, writer, close, decoded, freedom);
 }
 
