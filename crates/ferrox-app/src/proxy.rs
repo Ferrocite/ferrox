@@ -4812,6 +4812,7 @@ fn serve_vless_kcp_tls(
 
 /// An idle handshake is retried until the deadline; anything but silence refuses at once.
 fn shake_tls<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
+    let _quantum = KcpHandshakeRead::enter();
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
     loop {
         match session.handshake() {
@@ -6126,13 +6127,37 @@ impl KcpIo {
     }
 }
 
+// A shaped handshake cannot resume after a timeout, so handshake reads wait on the handshake clock rather than the relay quantum.
+thread_local! {
+    static KCP_HANDSHAKE_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct KcpHandshakeRead(bool);
+
+impl KcpHandshakeRead {
+    fn enter() -> Self {
+        Self(KCP_HANDSHAKE_READ.with(|read| read.replace(true)))
+    }
+}
+
+impl Drop for KcpHandshakeRead {
+    fn drop(&mut self) {
+        KCP_HANDSHAKE_READ.with(|read| read.set(self.0));
+    }
+}
+
 impl Read for KcpIo {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
         // The directions share one half-lock, so a read that never returns wedges the other's write.
-        self.conn.set_read_deadline(Instant::now() + RELAY_POLL);
+        let quantum = if KCP_HANDSHAKE_READ.with(std::cell::Cell::get) {
+            crate::quic::HANDSHAKE_TIMEOUT
+        } else {
+            RELAY_POLL
+        };
+        self.conn.set_read_deadline(Instant::now() + quantum);
         match self.conn.read(buf) {
             Ok(n) => Ok(n),
             Err(ferrox_core::kcp::ConnError::IoTimeout) => {
@@ -6359,13 +6384,14 @@ fn kcp_tls_connect(
     conn: &Arc<ferrox_core::kcp::Connection>,
     cfg: &ferrox_core::tls::TlsConfig,
 ) -> Option<ferrox_core::tls::ClientSession<KcpIo>> {
-    let mut session = ferrox_core::tls::connect(
+    let Ok(mut session) = ferrox_core::tls::connect(
         cfg,
         KcpIo {
             conn: Arc::clone(conn),
         },
-    )
-    .ok()?;
+    ) else {
+        return None;
+    };
     shake_tls(&mut session).then_some(session)
 }
 
@@ -35594,6 +35620,41 @@ mod tests {
         let port = listener.local_addr().port();
         thread::spawn(move || serve_kcp_each(&listener, &serve));
         port
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sixteen_kcp_dials_share_one_feed_thread() {
+        fn threads() -> usize {
+            std::fs::read_dir("/proc/self/task")
+                .expect("reads the task table")
+                .count()
+        }
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let before = threads();
+        let mut conns = Vec::new();
+        for _ in 0..16 {
+            conns.push(
+                ferrox_core::kcp::dial(
+                    listener.local_addr(),
+                    ferrox_core::kcp::Config::default(),
+                    ferrox_core::kcp::fresh_conversation(),
+                )
+                .expect("dials"),
+            );
+        }
+        let after = threads();
+        assert!(
+            after - before < 8,
+            "sixteen dials added {} feed threads",
+            after - before
+        );
+        drop(conns);
+        listener.close();
     }
 
     #[cfg(target_os = "linux")]

@@ -245,6 +245,7 @@ pub struct Connection {
     sending: Mutex<SendingWorker>,
     closer: Mutex<Option<Box<Closer>>>,
     terminated: AtomicBool,
+    started: AtomicBool,
     write_pending: AtomicBool,
     last_flush: Mutex<Instant>,
     last_uncond: Mutex<Instant>,
@@ -258,9 +259,39 @@ impl std::fmt::Debug for Connection {
     }
 }
 
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let Some(closer) = self.closer.lock().unwrap().take() {
+            closer();
+        }
+    }
+}
+
 impl Connection {
     #[must_use]
     pub fn new(
+        meta: ConnMetadata,
+        writer: Writer,
+        closer: Box<dyn FnOnce() + Send>,
+        config: Config,
+    ) -> Arc<Self> {
+        let conn = Self::build(meta, writer, closer, config);
+        conn.start();
+        conn
+    }
+
+    /// A connection whose scheduler registration is deferred until its session is in the
+    /// socket's table, so a datagram cannot arrive before there is a session to feed.
+    pub(crate) fn new_unstarted(
+        meta: ConnMetadata,
+        writer: Writer,
+        closer: Box<dyn FnOnce() + Send>,
+        config: Config,
+    ) -> Arc<Self> {
+        Self::build(meta, writer, closer, config)
+    }
+
+    fn build(
         meta: ConnMetadata,
         writer: Writer,
         closer: Box<dyn FnOnce() + Send>,
@@ -280,7 +311,7 @@ impl Connection {
         });
         let now = Instant::now();
         let tick = Duration::from_millis(u64::from(tti));
-        let conn = Arc::new(Self {
+        Arc::new(Self {
             ctx: Arc::clone(&ctx),
             state_begin_time: AtomicU32::new(0),
             last_incoming_time: AtomicU32::new(0),
@@ -295,14 +326,19 @@ impl Connection {
             sending: Mutex::new(SendingWorker::new(&ctx.config, Arc::clone(&ctx))),
             closer: Mutex::new(Some(closer)),
             terminated: AtomicBool::new(false),
+            started: AtomicBool::new(false),
             write_pending: AtomicBool::new(false),
             last_flush: Mutex::new(now.checked_sub(tick).unwrap_or(now)),
             last_uncond: Mutex::new(now),
             #[cfg(test)]
             flush_calls: AtomicU32::new(0),
-        });
-        scheduler().register(Arc::downgrade(&conn));
-        conn
+        })
+    }
+
+    pub(crate) fn start(self: &Arc<Self>) {
+        if !self.started.swap(true, Ordering::SeqCst) {
+            scheduler().register(Arc::downgrade(self));
+        }
     }
 
     fn poll(&self, now: Instant) -> Instant {
