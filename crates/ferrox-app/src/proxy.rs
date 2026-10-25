@@ -27487,7 +27487,7 @@ mod tests {
         };
         let dial: MuxDial = Arc::new(|_| None);
         let udp_ok: MuxUdpOk = Arc::new(|_| true);
-        {
+        let mut feed = |frame| {
             let mut out = MuxOut {
                 wire: &wire,
                 staging: &mut staging,
@@ -27495,7 +27495,7 @@ mod tests {
                 worker: None,
             };
             handle_mux_frame(
-                new(first_port),
+                frame,
                 &table,
                 &mut udp,
                 &mut global,
@@ -27503,61 +27503,14 @@ mod tests {
                 &dial,
                 &udp_ok,
             );
-        }
-        {
-            let mut out = MuxOut {
-                wire: &wire,
-                staging: &mut staging,
-                handles: &mut handles,
-                worker: None,
-            };
-            handle_mux_frame(
-                keep(b"one"),
-                &table,
-                &mut udp,
-                &mut global,
-                &mut out,
-                &dial,
-                &udp_ok,
-            );
-        }
+        };
+        feed(new(first_port));
+        feed(keep(b"one"));
         let mut got = [0u8; 16];
         let (n, _) = first.recv_from(&mut got).expect("first target answers");
         assert_eq!(&got[..n], b"one");
-        {
-            let mut out = MuxOut {
-                wire: &wire,
-                staging: &mut staging,
-                handles: &mut handles,
-                worker: None,
-            };
-            handle_mux_frame(
-                new(second_port),
-                &table,
-                &mut udp,
-                &mut global,
-                &mut out,
-                &dial,
-                &udp_ok,
-            );
-        }
-        {
-            let mut out = MuxOut {
-                wire: &wire,
-                staging: &mut staging,
-                handles: &mut handles,
-                worker: None,
-            };
-            handle_mux_frame(
-                keep(b"two"),
-                &table,
-                &mut udp,
-                &mut global,
-                &mut out,
-                &dial,
-                &udp_ok,
-            );
-        }
+        feed(new(second_port));
+        feed(keep(b"two"));
         let (n, _) = second
             .recv_from(&mut got)
             .expect("the renewed target answers");
@@ -27569,6 +27522,7 @@ mod tests {
             matches!(first.recv_from(&mut got), Err(ref error) if is_timeout(error)),
             "the old target got the renewed session's datagram"
         );
+        drop(feed);
         for session in udp.values() {
             session.done.store(true, Ordering::Relaxed);
         }
