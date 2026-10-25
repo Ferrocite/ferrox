@@ -978,8 +978,8 @@ pub(crate) fn read_frame<'a>(
 
 /// What one decode step of a [`Wire`] did.
 enum Frame {
-    /// A frame opened, its plaintext gathered at the front of the buffer.
-    Decoded,
+    /// A frame opened in place at `at`, `len` plain bytes long.
+    Decoded { at: usize, len: usize },
     /// Nothing more can open without a wait; send the batch already gathered.
     Idle,
     /// The stream is over: its marker frame, an EOF, or a frame that will not open.
@@ -997,7 +997,9 @@ pub(crate) struct Wire<R> {
     start: usize,
     /// One past the last sealed byte read.
     end: usize,
-    /// The plaintext this batch has gathered at the front.
+    /// Where this batch's plaintext starts in `held`.
+    front: usize,
+    /// How many plaintext bytes this batch holds from `front`.
     plain: usize,
     /// A frame whose length is drawn but whose bytes have not all arrived.
     waiting: Option<(usize, usize)>,
@@ -1013,6 +1015,7 @@ impl<R: Read> Wire<R> {
             held: crate::proxy::unfilled(WIRE_LEN),
             start: 0,
             end: 0,
+            front: 0,
             plain: 0,
             waiting: None,
             last: false,
@@ -1033,11 +1036,26 @@ impl<R: Read> Wire<R> {
             return None;
         }
         self.compact();
+        self.front = 0;
         self.plain = 0;
         let mut decoded = 0;
         while decoded < FRAMES_PER_WRITE {
             match self.frame(recv, decoded == 0) {
-                Frame::Decoded => decoded += 1,
+                Frame::Decoded { at, len } => {
+                    if decoded == 0 {
+                        self.front = at;
+                        self.plain = len;
+                    } else {
+                        if self.front != 0 {
+                            self.held
+                                .copy_within(self.front..self.front + self.plain, 0);
+                            self.front = 0;
+                        }
+                        self.held.copy_within(at..at + len, self.plain);
+                        self.plain += len;
+                    }
+                    decoded += 1;
+                }
                 Frame::Idle => break,
                 Frame::Last => {
                     self.last = true;
@@ -1045,7 +1063,7 @@ impl<R: Read> Wire<R> {
                 }
             }
         }
-        Some(&self.held[..self.plain])
+        Some(&self.held[self.front..self.front + self.plain])
     }
 
     fn buffered(&self) -> usize {
@@ -1132,10 +1150,7 @@ impl<R: Read> Wire<R> {
             self.marker = true;
             return Frame::Last;
         }
-        // Every earlier frame left more bytes than it took, so gathering never reaches forward.
-        self.held.copy_within(body..body + len, self.plain);
-        self.plain += len;
-        Frame::Decoded
+        Frame::Decoded { at: body, len }
     }
 }
 
@@ -3549,6 +3564,34 @@ mod tests {
             "a carrier that gives three bytes at a time never holds a second frame, so nothing waits"
         );
         assert_eq!(got, plain, "and the bytes are the same bytes");
+    }
+
+    #[test]
+    fn a_one_frame_batch_is_handed_over_where_it_opened() {
+        let (sealed, plain, mut recv) = frames(&[1000; 3]);
+        let carrier = Sealed {
+            held: sealed,
+            at: 0,
+            grain: 3,
+            reads: 0,
+        };
+        let mut wire = Wire::new(carrier);
+        let base = wire.held.as_ptr() as usize;
+        let limit = base + wire.held.len();
+        let mut got = Vec::new();
+        while let Some(batch) = wire.batch(&mut recv) {
+            if batch.is_empty() {
+                continue;
+            }
+            let at = batch.as_ptr() as usize;
+            assert!(at > base, "a one-frame batch was gathered to the front");
+            assert!(
+                at + batch.len() <= limit,
+                "the batch left the pump's buffer"
+            );
+            got.extend_from_slice(batch);
+        }
+        assert_eq!(got, plain);
     }
 
     #[test]
