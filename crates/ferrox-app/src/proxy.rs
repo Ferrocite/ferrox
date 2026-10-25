@@ -37583,6 +37583,30 @@ mod tests {
     }
 
     #[test]
+    fn socks_inbound_falls_back_to_http_for_a_non_socks_greeting() {
+        let echo = echo_loop();
+        let port = socks_inbound_from(r#"{"auth":"noauth"}"#);
+        let mut client = connect_until(port);
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{echo}/path?q=1 HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("answers");
+        assert_eq!(
+            head,
+            format!("GET /path?q=1 HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n").into_bytes(),
+            "the socks front hands a non-socks greeting to the http front"
+        );
+    }
+
+    #[test]
     fn a_plain_http_forward_matches_the_http_protocol_selector() {
         let echo = echo_loop();
         let route = route_outbound(
