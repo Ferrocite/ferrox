@@ -195,7 +195,7 @@ pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool
     }
 }
 
-/// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling.
+/// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling. The queue already behind the datagram the turn waited for is taken in the same turn, so a reader fed back-to-back packets pays one lock and one egress sweep for up to a batch of them rather than one of each per packet.
 pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
     let timeout = {
         let Ok(conn) = session.shared.lock() else {
@@ -240,11 +240,51 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
                 to: session.local,
             };
             let _ = conn.recv(&mut room.as_mut()[..n], info);
+            take_queued(&mut conn, session);
         }
         None => conn.on_timeout(),
     }
     crate::quic::flush_egress(&mut conn, &session.sock);
     true
+}
+
+/// The datagrams already queued behind the one the turn took, never waiting for one that has not arrived: a lane whose read is the wire's own hands over a batch in one call, and a masked one reads what is there behind a tail short enough that a writer is not held behind it.
+fn take_queued(conn: &mut quiche::Connection, session: &Session) {
+    if !session.sock.refresh_read_timeout(crate::quic::PUMP_TAIL) {
+        return;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut batch = crate::quic::Batch::new();
+        match crate::quic::recv_batch(&session.sock, &mut batch) {
+            crate::quic::Drain::Read => {
+                for at in 0..batch.len() {
+                    let Some((bytes, from)) = batch.at(at) else {
+                        continue;
+                    };
+                    let info = quiche::RecvInfo {
+                        from,
+                        to: session.local,
+                    };
+                    let _ = conn.recv(bytes, info);
+                }
+                return;
+            }
+            crate::quic::Drain::Empty => return,
+            crate::quic::Drain::Unbatchable => {}
+        }
+    }
+    let mut room = Unfilled::<MAX_DATAGRAM>::new();
+    for _ in 0..crate::quic::RECV_SLOTS {
+        let Ok((n, from)) = session.sock.recv_from(room.as_mut()) else {
+            return;
+        };
+        let info = quiche::RecvInfo {
+            from,
+            to: session.local,
+        };
+        let _ = conn.recv(&mut room.as_mut()[..n], info);
+    }
 }
 
 /// The two-byte `[0, 0]` acknowledgement every flow stream opens with, read into the caller's own buffer rather than a `Vec` per flow.
@@ -2130,5 +2170,27 @@ mod tests {
             "the payload stayed where it arrived"
         );
         assert_eq!(&flow.backlog[flow.at..], payload);
+    }
+
+    #[test]
+    fn a_turn_takes_the_datagrams_queued_behind_its_first() {
+        let session = idle_session();
+        let to = session.sock.local_addr().expect("addr");
+        let peer = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
+        // Loopback delivers into the receive queue before the send returns, so the whole queue is there when the turn starts.
+        for _ in 0..crate::quic::RECV_SLOTS {
+            peer.send_to(&[0u8; 64], to).expect("sends");
+        }
+        assert!(drive_once(&session, Duration::from_millis(50)));
+        let probe = session.sock.try_clone().expect("clones");
+        probe
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("arms");
+        let mut room = Unfilled::<MAX_DATAGRAM>::new();
+        let mut left = 0usize;
+        while probe.recv_from(room.as_mut()).is_ok() {
+            left += 1;
+        }
+        assert_eq!(left, 0, "a turn left {left} queued datagrams unread");
     }
 }
