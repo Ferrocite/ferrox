@@ -35363,6 +35363,58 @@ mod tests {
     }
 
     #[test]
+    fn an_unauthenticated_trojan_probe_holds_no_online_lease() {
+        let _guard = crate::stats::test_lock();
+        crate::stats::clear();
+        crate::policy::clear();
+        let root = crate::json::parse(
+            r#"{"stats":{},"policy":{"levels":{"1":{"statsUserOnline":true}}}}"#,
+        )
+        .expect("parses");
+        crate::policy::install(&root).expect("policy installs");
+        crate::stats::install(&root).expect("stats installs");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let (stream, _) = front.accept().expect("accepts");
+        let key = trojan_key("a-password");
+        let account = InboundAccount {
+            email: "a@b.c".to_owned(),
+            level: 1,
+        };
+        let serving = thread::spawn(move || {
+            front_dispatch(
+                stream,
+                Role::Trojan {
+                    key,
+                    carrier: Carrier::Raw(Chain::default()),
+                    freedom: true,
+                    account,
+                },
+            );
+        });
+        client
+            .write_all(&[0u8; 57])
+            .expect("writes a partial header");
+        let mut online = None;
+        for _ in 0..200 {
+            online = crate::stats::snapshot().online.get("a@b.c").copied();
+            if online.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            online, None,
+            "an unauthenticated probe must not hold an online lease"
+        );
+        drop(client);
+        serving.join().expect("serves");
+        crate::stats::clear();
+        crate::policy::clear();
+    }
+
+    #[test]
     fn a_front_account_carries_the_email_and_level_its_counters_key_on() {
         use base64::Engine as _;
         let inbound = crate::json::parse(
