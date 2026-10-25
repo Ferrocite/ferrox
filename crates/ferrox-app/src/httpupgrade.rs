@@ -885,6 +885,7 @@ mod tests {
             "/tunnel",
             0,
             &[],
+            &[],
         )
         .expect("reads the bare-LF answer");
     }
@@ -901,6 +902,7 @@ mod tests {
             "oracle.example",
             "/tunnel",
             0,
+            &[],
             &[],
         )
         .expect("reads the mixed-ending answer");
@@ -1057,6 +1059,7 @@ mod tests {
             "/tunnel",
             4,
             &first,
+            &[],
         )
         .expect("upgrades");
         assert_eq!(
@@ -1096,6 +1099,7 @@ mod tests {
             "/tunnel",
             0,
             &first,
+            &[],
         )
         .expect("upgrades");
         assert!(write.calls.is_empty(), "a held-back payload was vectored");
@@ -1121,6 +1125,7 @@ mod tests {
                 &configured.path,
                 budget,
                 b"",
+                &[],
             )
             .expect("upgrades");
             assert_eq!(
@@ -1147,7 +1152,7 @@ mod tests {
         for round in 0..dials.len() * 3 {
             let (host, path) = dials[round % dials.len()];
             let mut write = Recorder::default();
-            send_request(&mut write, host, path, false, b"").expect("sends");
+            send_request(&mut write, host, path, false, b"", &[]).expect("sends");
             assert_eq!(write.plain.len(), 1, "round {round}: one write");
             assert_eq!(
                 write.plain[0],
@@ -1728,6 +1733,7 @@ mod tests {
                 &case.path,
                 case.budget,
                 &payload,
+                &[],
             );
             let write = recorder.0.lock().expect("the recorder is not poisoned");
             let reference_took = fields[0] == "accept";
