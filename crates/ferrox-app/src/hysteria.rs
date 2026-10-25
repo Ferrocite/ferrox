@@ -1,8 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::frames;
@@ -47,6 +49,106 @@ pub(crate) struct Session {
     local: SocketAddr,
     // Written once by `connect` from the auth response and read by the UDP dial that follows: a server that skips the lane header still carries TCP flows, so the flag gates datagrams only, never the connection.
     udp_supported: bool,
+    pump: Option<Arc<Pump>>,
+}
+
+/// The one reader a connected session pays: it owns the socket's wait and wakes every flow on the session, so a flow waits on the pump instead of polling the socket itself.
+struct Pump {
+    state: Arc<PumpState>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+struct PumpState {
+    shared: Arc<Mutex<quiche::Connection>>,
+    sock: Arc<crate::quic::Datagram>,
+    local: SocketAddr,
+    stop: AtomicBool,
+    ready: Mutex<()>,
+    cv: Condvar,
+}
+
+impl Pump {
+    fn start(
+        shared: Arc<Mutex<quiche::Connection>>,
+        sock: Arc<crate::quic::Datagram>,
+        local: SocketAddr,
+    ) -> Option<Arc<Self>> {
+        let state = Arc::new(PumpState {
+            shared,
+            sock,
+            local,
+            stop: AtomicBool::new(false),
+            ready: Mutex::new(()),
+            cv: Condvar::new(),
+        });
+        let driven = Arc::clone(&state);
+        let thread = std::thread::Builder::new()
+            .name("ferrox-hysteria-pump".to_owned())
+            .spawn(move || driven.run())
+            .ok()?;
+        Some(Arc::new(Self {
+            state,
+            thread: Mutex::new(Some(thread)),
+        }))
+    }
+
+    fn wait(&self, timeout: Duration) {
+        let Ok(ready) = self.state.ready.lock() else {
+            std::thread::sleep(timeout);
+            return;
+        };
+        let _ = self.state.cv.wait_timeout(ready, timeout);
+    }
+}
+
+impl Drop for Pump {
+    fn drop(&mut self) {
+        self.state.stop.store(true, Ordering::Relaxed);
+        self.state.cv.notify_all();
+        if let Ok(mut thread) = self.thread.lock() {
+            if let Some(thread) = thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+}
+
+impl PumpState {
+    fn run(&self) {
+        while !self.stop.load(Ordering::Relaxed) {
+            if drive(
+                self.shared.as_ref(),
+                self.sock.as_ref(),
+                self.local,
+                STREAM_POLL,
+            ) {
+                self.cv.notify_all();
+                continue;
+            }
+            if self.shared.lock().map_or(true, |conn| conn.is_closed()) {
+                break;
+            }
+            std::thread::sleep(STREAM_POLL);
+            self.cv.notify_all();
+        }
+        self.cv.notify_all();
+    }
+}
+
+impl Session {
+    fn wait_ready(&self, timeout: Duration) {
+        match &self.pump {
+            Some(pump) => pump.wait(timeout),
+            None => std::thread::sleep(timeout),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close_for_test(&self) {
+        if let Ok(mut conn) = self.shared.lock() {
+            let _ = conn.close(false, 0, b"pump test");
+        }
+    }
 }
 
 fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
@@ -84,8 +186,22 @@ fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
 
 /// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling.
 fn drive_once(session: &Session, wait: Duration) -> bool {
+    drive(
+        session.shared.as_ref(),
+        session.sock.as_ref(),
+        session.local,
+        wait,
+    )
+}
+
+fn drive(
+    shared: &Mutex<quiche::Connection>,
+    sock: &crate::quic::Datagram,
+    local: SocketAddr,
+    wait: Duration,
+) -> bool {
     let timeout = {
-        let Ok(conn) = session.shared.lock() else {
+        let Ok(conn) = shared.lock() else {
             return false;
         };
         if conn.is_closed() {
@@ -95,11 +211,11 @@ fn drive_once(session: &Session, wait: Duration) -> bool {
             .map_or(wait, |left| left.min(wait))
             .max(Duration::from_millis(1))
     };
-    if !session.sock.refresh_read_timeout(timeout) {
+    if !sock.refresh_read_timeout(timeout) {
         return false;
     }
     let mut room = Unfilled::<MAX_DATAGRAM>::new();
-    let incoming = match session.sock.recv_from(room.as_mut()) {
+    let incoming = match sock.recv_from(room.as_mut()) {
         Ok(found) => Some(found),
         Err(e)
             if matches!(
@@ -114,7 +230,7 @@ fn drive_once(session: &Session, wait: Duration) -> bool {
             return false;
         }
     };
-    let Ok(mut conn) = session.shared.lock() else {
+    let Ok(mut conn) = shared.lock() else {
         return false;
     };
     if conn.is_closed() {
@@ -122,15 +238,12 @@ fn drive_once(session: &Session, wait: Duration) -> bool {
     }
     match incoming {
         Some((n, from)) => {
-            let info = quiche::RecvInfo {
-                from,
-                to: session.local,
-            };
+            let info = quiche::RecvInfo { from, to: local };
             let _ = conn.recv(&mut room.as_mut()[..n], info);
         }
         None => conn.on_timeout(),
     }
-    crate::quic::flush_egress(&mut conn, &session.sock);
+    crate::quic::flush_egress(&mut conn, sock);
     true
 }
 
@@ -155,7 +268,11 @@ fn recv_reply(session: &Session, stream: u64, deadline: Instant) -> Option<[u8; 
             if Instant::now() >= deadline {
                 return None;
             }
-            let _ = drive_once(session, STREAM_POLL);
+            if session.pump.is_some() {
+                session.wait_ready(STREAM_POLL);
+            } else {
+                let _ = drive_once(session, STREAM_POLL);
+            }
         }
     }
     let reply = room.as_mut();
@@ -280,12 +397,18 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         sock: Arc::new(sock),
         local,
         udp_supported: false,
+        pump: None,
     };
     if !control_settings(&session) {
         return None;
     }
     let udp = post_auth(&session, &dial.config.auth)?;
     session.udp_supported = udp;
+    session.pump = Pump::start(
+        Arc::clone(&session.shared),
+        Arc::clone(&session.sock),
+        session.local,
+    );
     Some(session)
 }
 
@@ -314,6 +437,7 @@ impl Flow {
                 sock,
                 local,
                 udp_supported: false,
+                pump: None,
             },
             stream,
             backlog,
@@ -334,36 +458,59 @@ fn broken() -> std::io::Error {
     std::io::Error::from(std::io::ErrorKind::BrokenPipe)
 }
 
-impl Read for Flow {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+/// The flows this process's reads have driven themselves; a test watches a flow wait on the session pump instead.
+#[cfg(test)]
+pub(crate) static FLOW_DRIVES: AtomicUsize = AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn reset_flow_drives() {
+    FLOW_DRIVES.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn flow_drives() -> usize {
+    FLOW_DRIVES.load(Ordering::Relaxed)
+}
+
+impl Flow {
+    fn try_read(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
         if buf.is_empty() {
-            return Ok(0);
+            return Ok(Some(0));
         }
         if self.at < self.backlog.len() {
             let n = (self.backlog.len() - self.at).min(buf.len());
             buf[..n].copy_from_slice(&self.backlog[self.at..self.at + n]);
             self.at += n;
-            return Ok(n);
+            return Ok(Some(n));
         }
+        let Ok(mut conn) = self.session.shared.lock() else {
+            return Err(broken());
+        };
+        if conn.is_closed() {
+            return Ok(Some(0));
+        }
+        match conn.stream_recv(self.stream, buf) {
+            Ok((n, _)) => Ok(Some(n)),
+            Err(quiche::Error::Done) => Ok(None),
+            Err(_) => Err(broken()),
+        }
+    }
+}
+
+impl Read for Flow {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
-            let read = {
-                let Ok(mut conn) = self.session.shared.lock() else {
-                    return Err(broken());
-                };
-                if conn.is_closed() {
-                    return Ok(0);
-                }
-                match conn.stream_recv(self.stream, buf) {
-                    Ok((n, _)) => Some(n),
-                    Err(quiche::Error::Done) => None,
-                    Err(_) => return Err(broken()),
-                }
-            };
-            if let Some(n) = read {
+            if let Some(n) = self.try_read(buf)? {
                 return Ok(n);
             }
             if self.drive {
-                let _ = drive_once(&self.session, STREAM_POLL);
+                if self.session.pump.is_some() {
+                    self.session.wait_ready(STREAM_POLL);
+                } else {
+                    #[cfg(test)]
+                    FLOW_DRIVES.fetch_add(1, Ordering::Relaxed);
+                    let _ = drive_once(&self.session, STREAM_POLL);
+                }
                 continue;
             }
             {
@@ -470,6 +617,22 @@ const REUSE_WINDOW: Duration = Duration::from_millis(crate::quic::IDLE_TIMEOUT_M
 
 static POOL: std::sync::OnceLock<Mutex<HashMap<Server, Vec<Pooled>>>> = std::sync::OnceLock::new();
 
+/// One handshake at a time per server when it has no pooled connection: the first dial keeps the
+/// session, and every dial that arrived with it finds that session instead of paying its own.
+static CONNECTS: std::sync::OnceLock<Mutex<HashMap<Server, Arc<Mutex<()>>>>> =
+    std::sync::OnceLock::new();
+
+fn connect_lock(server: &Server) -> Arc<Mutex<()>> {
+    let Ok(mut locks) = CONNECTS.get_or_init(|| Mutex::new(HashMap::new())).lock() else {
+        return Arc::new(Mutex::new(()));
+    };
+    Arc::clone(
+        locks
+            .entry(server.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(()))),
+    )
+}
+
 fn pool() -> &'static Mutex<HashMap<Server, Vec<Pooled>>> {
     POOL.get_or_init(|| Mutex::new(HashMap::new()))
 }
@@ -559,7 +722,7 @@ pub(crate) fn close_pooled() {
 }
 
 /// A flow over the outbound's live connection when a stream opens on it, a fresh handshake otherwise; a pooled connection that stopped opening is dropped where it is found.
-fn open_pooled(dial: &Dial, header: &[u8]) -> Option<Flow> {
+fn open_from_pool(dial: &Dial, header: &[u8]) -> Option<Flow> {
     for (session, stream) in candidates(dial) {
         if let Some(flow) = open_flow(&session, stream, header) {
             return Some(flow);
@@ -568,10 +731,30 @@ fn open_pooled(dial: &Dial, header: &[u8]) -> Option<Flow> {
             evict(dial, &session);
         }
     }
+    None
+}
+
+fn open_pooled(dial: &Dial, header: &[u8]) -> Option<Flow> {
+    if let Some(flow) = open_from_pool(dial, header) {
+        return Some(flow);
+    }
+    let lock = connect_lock(&server_of(dial));
+    let Ok(connect_guard) = lock.lock() else {
+        return None;
+    };
+    if let Some(flow) = open_from_pool(dial, header) {
+        return Some(flow);
+    }
     let session = connect(dial)?;
-    let flow = open_flow(&session, FIRST_FLOW_STREAM, header)?;
-    keep(dial, session, FIRST_FLOW_STREAM + 4);
-    Some(flow)
+    keep(dial, session.clone(), FIRST_FLOW_STREAM + 4);
+    drop(connect_guard);
+    match open_flow(&session, FIRST_FLOW_STREAM, header) {
+        Some(flow) => Some(flow),
+        None => {
+            evict(dial, &session);
+            None
+        }
+    }
 }
 
 pub(crate) fn dial_vless(
@@ -587,44 +770,87 @@ pub(crate) fn dial_vless(
     relay(client, &flow);
 }
 
+fn write_tcp(tcp: &mut Connection, mut buf: &[u8], flow: &Flow) -> std::io::Result<()> {
+    while !buf.is_empty() {
+        match tcp.write(buf) {
+            Ok(0) => return Err(broken()),
+            Ok(n) => buf = &buf[n..],
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                flow.session.wait_ready(STREAM_POLL);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
-    let Ok(tcp_read) = tcp.try_clone() else {
+    let Ok(mut tcp) = tcp.try_clone() else {
         return;
     };
-    let Ok(mut tcp_write) = tcp.try_clone() else {
+    if tcp.set_nonblocking(true).is_err() {
         return;
-    };
-    let up = flow.clone();
-    let done = std::thread::spawn(move || {
-        let mut tcp_read = tcp_read;
-        let mut up = up;
-        let mut buf = crate::proxy::RelayBuf::new();
-        loop {
-            match tcp_read.read(buf.as_mut()) {
-                Ok(0) | Err(_) => break,
+    }
+    let mut flow = flow.clone();
+    let mut buf = crate::proxy::RelayBuf::new();
+    let mut up = true;
+    let mut down = true;
+    while up || down {
+        let mut progress = false;
+        if up {
+            match tcp.read(buf.as_mut()) {
+                Ok(0) => {
+                    flow.close();
+                    up = false;
+                }
                 Ok(n) => {
-                    if up.write_all(&buf.as_mut()[..n]).is_err() {
+                    if flow.write_all(&buf.as_mut()[..n]).is_err() {
                         break;
                     }
+                    progress = true;
+                }
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => {
+                    flow.close();
+                    up = false;
                 }
             }
         }
-        up.close();
-    });
-    let mut back = flow.clone();
-    let mut buf = crate::proxy::RelayBuf::new();
-    loop {
-        match back.read(buf.as_mut()) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if tcp_write.write_all(&buf.as_mut()[..n]).is_err() {
-                    break;
+        if down {
+            match flow.try_read(buf.as_mut()) {
+                Ok(Some(0)) => {
+                    down = false;
+                    let _ = tcp.shutdown(Shutdown::Write);
                 }
+                Ok(Some(n)) => {
+                    if write_tcp(&mut tcp, &buf.as_mut()[..n], &flow).is_err() {
+                        break;
+                    }
+                    progress = true;
+                }
+                Ok(None) => {}
+                Err(_) => down = false,
+            }
+        }
+        if !progress {
+            if flow.session.pump.is_some() {
+                flow.session.wait_ready(STREAM_POLL);
+            } else {
+                let _ = drive_once(&flow.session, STREAM_POLL);
             }
         }
     }
-    let _ = tcp_write.shutdown(Shutdown::Write);
-    let _ = done.join();
+    let _ = tcp.set_nonblocking(false);
+    let _ = tcp.shutdown(Shutdown::Write);
     flow.close();
 }
 
@@ -1324,7 +1550,7 @@ struct Lane {
     source: Mutex<Option<SocketAddr>>,
 }
 
-/// The client's UDP uplink over the hysteria carrier: read the relay socket, put every datagram on the connection's datagram lane, and let a companion thread drive the connection and carry replies back. One destination at a time — a change rotates the association, stamping a fresh session id that the connection has never used, over a connection of its own: the pool is a TCP instrument, its staleness caught by a flow's reply deadline a datagram send has no answer to, so a lane dials fresh and is live from the first packet. The relay's read timeout, `budgets::udp_idle()`, is already armed where the front was raised, so silence ends the loop and retires the association with its reader; a server that refused the lane in auth is answered in silence, as the references do. Salamander obfuscation, when the outbound names it, is already wrapped at the `quic::Datagram` seam by `connect`, so no byte of this path changes when the password is set.
+/// The client's UDP uplink over the hysteria carrier: read the relay socket, put every datagram on the connection's datagram lane, and let the session pump drive the connection and a companion thread carry replies back. One destination at a time — a change rotates the association, stamping a fresh session id that the connection has never used, over a connection of its own: the pool is a TCP instrument, its staleness caught by a flow's reply deadline a datagram send has no answer to, so a lane dials fresh and is live from the first packet. The relay's read timeout, `budgets::udp_idle()`, is already armed where the front was raised, so silence ends the loop and retires the association with its reader; a server that refused the lane in auth is answered in silence, as the references do. Salamander obfuscation, when the outbound names it, is already wrapped at the `quic::Datagram` seam by `connect`, so no byte of this path changes when the password is set.
 pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
     let Some(session) = connect(dial) else {
         return;
@@ -1420,16 +1646,24 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
     let _ = reader.join();
 }
 
-/// Drive the connection and hand every whole datagram of the flow being relayed back to the relay socket, re-wrapped in the socks5 UDP frame the client sent its first packet in. The drive stays `drive_once`'s, shared with the TCP pump, so writer and reader take the connection lock in the same one-turn shape and neither holds it across a socket wait; the `UDP_POLL` bound is how long a stop flag outlives the reader, since a UDP socket has no shutdown to wake a blocked read.
+/// Wait on the session's pump and hand every whole datagram of the flow being relayed back to the relay socket, re-wrapped in the socks5 UDP frame the client sent its first packet in. The pump is the only driver, so writer and reader take the connection lock in the same one-turn shape and neither holds it across a socket wait; the `UDP_POLL` bound is how long a stop flag outlives the reader, since a UDP socket has no shutdown to wake a blocked read.
 fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
     let mut reply = Vec::with_capacity(3 + 25 + UDP_TARGET_BUF);
     loop {
-        if stop.load(Ordering::Relaxed) || !drive_once(session, UDP_POLL) {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        if session.pump.is_some() {
+            session.wait_ready(UDP_POLL);
+        } else if !drive_once(session, UDP_POLL) {
             break;
         }
         let Ok(mut conn) = session.shared.lock() else {
             break;
         };
+        if conn.is_closed() {
+            break;
+        }
         while let Ok(data) = conn.dgram_recv_buf() {
             let Ok(message) = hysteria::decode_udp(&data) else {
                 continue;

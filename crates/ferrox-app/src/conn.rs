@@ -543,6 +543,33 @@ impl Connection {
         }
     }
 
+    /// Linux keeps the socket's own `O_NONBLOCK` through `fcntl`, the same flag `std` writes on the
+    /// other hosts, so the readiness seam arms every family the same way.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let fd = match self {
+            Connection::Tcp(stream) => stream.as_raw_fd(),
+            Connection::Masked(masked) => masked.stream.as_raw_fd(),
+            Connection::Proxied { inner, .. } => return inner.set_nonblocking(nonblocking),
+            #[cfg(any(unix, windows))]
+            Connection::Unix(stream) => stream.as_raw_fd(),
+        };
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let flags = if nonblocking {
+            flags | libc::O_NONBLOCK
+        } else {
+            flags & !libc::O_NONBLOCK
+        };
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     /// Arm the read side's wait bound. TCP uses `SO_RCVTIMEO`; on a Unix stream `std` omits the
     /// setter, so the same `timeval` goes through `setsockopt` at `SOL_SOCKET`, the level that
     /// carries it for `AF_UNIX` too. `None` clears the bound and lets the read block.

@@ -32249,6 +32249,50 @@ mod tests {
     }
 
     #[test]
+    fn hysteria_flow_waits_on_the_session_pump() {
+        let _serial = quic_serial();
+        let target = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let target_addr = target.local_addr().expect("addr");
+        let held = thread::spawn(move || {
+            let (stream, _) = target.accept().expect("accepts");
+            thread::sleep(Duration::from_millis(200));
+            drop(stream);
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("pump-auth", id, "");
+        let dial = crate::hysteria::Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port,
+            config: ferrox_core::hysteria::Config {
+                auth: "pump-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: String::new(),
+                hop: None,
+                gecko: None,
+            },
+            roots: Some(roots.into()),
+        };
+        let session = crate::hysteria::connect(&dial).expect("client connects");
+        let header = vless_header(&id, 1, &Destination::from(target_addr));
+        let mut flow = crate::hysteria::open_flow(&session, 4, &header).expect("flow opens");
+        crate::hysteria::reset_flow_drives();
+        let reading = thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let _ = flow.read(&mut buf);
+        });
+        thread::sleep(Duration::from_millis(50));
+        let drives = crate::hysteria::flow_drives();
+        session.close_for_test();
+        reading.join().expect("reader joins");
+        let _ = held.join();
+        assert_eq!(
+            drives, 0,
+            "a flow waits on the session pump instead of reading the socket"
+        );
+    }
+
+    #[test]
     fn hysteria_server_passes_a_hand_rolled_client() {
         let _serial = quic_serial();
         hysteria_server_once();
