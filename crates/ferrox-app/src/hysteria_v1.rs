@@ -116,6 +116,7 @@ fn connect(dial: &Dial) -> Option<Session> {
         sock: Arc::new(sock),
         local,
         udp_supported: true,
+        driver: None,
     };
     let mut hello = Vec::with_capacity(20 + dial.config.auth.len());
     wire::encode_client_hello(
