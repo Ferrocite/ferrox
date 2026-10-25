@@ -34595,6 +34595,41 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn sixteen_kcp_dials_share_one_feed_thread() {
+        fn threads() -> usize {
+            std::fs::read_dir("/proc/self/task")
+                .expect("reads the task table")
+                .count()
+        }
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let before = threads();
+        let mut conns = Vec::new();
+        for _ in 0..16 {
+            conns.push(
+                ferrox_core::kcp::dial(
+                    listener.local_addr(),
+                    ferrox_core::kcp::Config::default(),
+                    ferrox_core::kcp::fresh_conversation(),
+                )
+                .expect("dials"),
+            );
+        }
+        let after = threads();
+        assert!(
+            after - before < 8,
+            "sixteen dials added {} feed threads",
+            after - before
+        );
+        drop(conns);
+        listener.close();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn sixteen_kcp_connections_share_one_flush_thread() {
         fn threads() -> usize {
             std::fs::read_dir("/proc/self/task")

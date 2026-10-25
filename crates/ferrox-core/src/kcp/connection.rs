@@ -258,6 +258,14 @@ impl std::fmt::Debug for Connection {
     }
 }
 
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let Some(closer) = self.closer.lock().unwrap().take() {
+            closer();
+        }
+    }
+}
+
 impl Connection {
     #[must_use]
     pub fn new(

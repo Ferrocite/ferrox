@@ -2,7 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 
@@ -11,8 +11,8 @@ use super::config::Config;
 /// The room a datagram is received into: the largest a KCP datagram can be.
 const DATAGRAM_MAX: usize = 65_536;
 
-use super::connection::{ConnMetadata, Connection, State};
-use super::mask::{Encoder, Mask};
+use super::connection::{ConnMetadata, Connection};
+use super::mask::Encoder;
 use super::segment::{read_segment, Command, Segment};
 
 type Writer = Box<dyn FnMut(&[u8]) -> io::Result<()> + Send>;
@@ -54,38 +54,105 @@ fn datagram_room() -> Vec<u8> {
     buf
 }
 
-fn feed(sock: &UdpSocket, conn: &Connection, mask: &Mask) {
+/// Every conversation to one remote shares one UDP socket and one feed thread; the server keys
+/// sessions by `(source, conversation)`, so the source port is the outbound's, not the flow's.
+struct ClientSocket {
+    sock: UdpSocket,
+    local: SocketAddr,
+    remote: SocketAddr,
+    config: Config,
+    sessions: Mutex<HashMap<u16, Weak<Connection>>>,
+    live: AtomicU16,
+}
+
+static CLIENTS: Mutex<Vec<Arc<ClientSocket>>> = Mutex::new(Vec::new());
+
+fn client_for(remote: SocketAddr, config: &Config) -> io::Result<Arc<ClientSocket>> {
+    let mut clients = CLIENTS.lock().unwrap();
+    if let Some(client) = clients
+        .iter()
+        .find(|client| client.remote == remote && &client.config == config)
+    {
+        client.live.fetch_add(1, Ordering::SeqCst);
+        return Ok(Arc::clone(client));
+    }
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    sock.connect(remote)?;
+    let local = sock.local_addr()?;
+    sock.set_read_timeout(Some(Duration::from_millis(50)))?;
+    let client = Arc::new(ClientSocket {
+        sock,
+        local,
+        remote,
+        config: config.clone(),
+        sessions: Mutex::new(HashMap::new()),
+        live: AtomicU16::new(1),
+    });
+    let weak = Arc::downgrade(&client);
+    thread::Builder::new()
+        .name("kcp-feed".to_owned())
+        .spawn(move || feed_client(&weak))
+        .map_err(|e| io::Error::other(format!("kcp feed thread: {e}")))?;
+    clients.push(Arc::clone(&client));
+    Ok(client)
+}
+
+fn release_client(client: &Arc<ClientSocket>, conv: u16) {
+    client.sessions.lock().unwrap().remove(&conv);
+    let mut clients = CLIENTS.lock().unwrap();
+    if client.live.fetch_sub(1, Ordering::SeqCst) == 1 {
+        clients.retain(|held| !Arc::ptr_eq(held, client));
+    }
+}
+
+fn feed_client(weak: &Weak<ClientSocket>) {
     let mut buf = datagram_room();
     let mut segs: Vec<Segment> = Vec::new();
     loop {
-        match sock.recv_from(&mut buf) {
-            Ok((n, _)) => {
-                let Some(rest) = mask.decode_in_place(&mut buf[..n]) else {
+        let Some(client) = weak.upgrade() else {
+            break;
+        };
+        match client.sock.recv(&mut buf) {
+            Ok(n) => {
+                let Some(framed) = client.config.mask.decode_in_place(&mut buf[..n]) else {
                     continue; // fails the mask's own check: the reference drops the packet
                 };
-                parse_segments(rest, &mut segs, &|| conn.take_payload());
-                conn.input(&mut segs);
+                let Some((conv, _)) = peek_conversation(framed) else {
+                    continue;
+                };
+                let session = client
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .get(&conv)
+                    .and_then(Weak::upgrade);
+                let Some(session) = session else {
+                    continue;
+                };
+                parse_segments(framed, &mut segs, &|| session.take_payload());
+                if !segs.is_empty() {
+                    session.input(&mut segs);
+                }
             }
             Err(ref e)
                 if matches!(
                     e.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                if conn.state() == State::Terminated {
-                    return;
-                }
-            }
-            Err(_) => return,
+                ) => {}
+            Err(_) => break,
         }
     }
 }
 
 pub fn dial(addr: SocketAddr, config: Config, conv: u16) -> io::Result<Arc<Connection>> {
-    let sock = UdpSocket::bind("0.0.0.0:0")?;
-    sock.connect(addr)?;
-    let local = sock.local_addr()?;
-    let sock_w = sock.try_clone()?;
+    let client = client_for(addr, &config)?;
+    let sock_w = match client.sock.try_clone() {
+        Ok(sock) => sock,
+        Err(e) => {
+            release_client(&client, conv);
+            return Err(e);
+        }
+    };
     // A masked dial wraps the socket writer in the encoder; an unmasked dial keeps the previous closure untouched.
     let writer: Writer = if config.mask.is_empty() {
         Box::new(move |data: &[u8]| sock_w.send(data).map(|_| ()))
@@ -98,12 +165,11 @@ pub fn dial(addr: SocketAddr, config: Config, conv: u16) -> io::Result<Arc<Conne
             sock_w.send(wire).map(|_| ())
         })
     };
-    let sock_c = sock.try_clone()?;
-    let closer = Box::new(move || drop(sock_c));
-    let mask = config.mask.clone();
+    let closer_client = Arc::clone(&client);
+    let closer = Box::new(move || release_client(&closer_client, conv));
     let connection = Connection::new(
         ConnMetadata {
-            local,
+            local: client.local,
             remote: addr,
             conversation: conv,
         },
@@ -111,10 +177,11 @@ pub fn dial(addr: SocketAddr, config: Config, conv: u16) -> io::Result<Arc<Conne
         closer,
         config,
     );
-    let sock_r = sock.try_clone()?;
-    sock_r.set_read_timeout(Some(Duration::from_millis(50)))?;
-    let c2 = Arc::clone(&connection);
-    thread::spawn(move || feed(&sock_r, &c2, &mask));
+    client
+        .sessions
+        .lock()
+        .unwrap()
+        .insert(conv, Arc::downgrade(&connection));
     Ok(connection)
 }
 
@@ -282,7 +349,7 @@ mod tests {
 
     use super::*;
     use crate::kcp::connection::ConnMetadata;
-    use crate::kcp::mask::{HeaderKind, Spec};
+    use crate::kcp::mask::{HeaderKind, Mask, Spec};
 
     #[cfg_attr(miri, ignore = "binds a loopback UDP socket")]
     /// The room a datagram is received into is not zeroed: the receive writes the bytes
