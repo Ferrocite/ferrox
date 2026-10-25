@@ -27414,16 +27414,24 @@ mod tests {
     #[test]
     fn a_vmess_kcp_tls_outbound_parses_and_carries_udp() {
         let (cert, key, _) = tls_cert_json();
-        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
         let inbound = crate::json::parse(&format!(
             r#"{{"protocol": "vmess", "settings": {{"clients": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},
                 "streamSettings": {{"network": "kcp", "security": "tls",
                     "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
         ))
         .expect("parses");
-        serve_vmess_inbound(&format!("127.0.0.1:{port}"), &inbound, true, None);
+        let mut port = 0;
+        let mut served = false;
+        for _ in 0..64 {
+            let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            port = probe.local_addr().expect("addr").port();
+            drop(probe);
+            if serve_vmess_inbound(&format!("127.0.0.1:{port}"), &inbound, true, None).1 {
+                served = true;
+                break;
+            }
+        }
+        assert!(served, "binds a KCP port");
         let outbound = crate::json::parse(&format!(
             r#"{{"outbounds": [{{"protocol": "vmess",
                 "settings": {{"vnext": [{{"address": "127.0.0.1", "port": {port},
