@@ -12773,7 +12773,8 @@ fn spawn_ss_udp_reader2022(
         loop {
             match read.recv(&mut buf) {
                 Ok(n) => {
-                    let Some((target, payload)) = datagrams.open_server(&psk, method, &buf[..n])
+                    let Some((target, payload)) =
+                        datagrams.open_server(&psk, method, &mut buf[..n])
                     else {
                         continue;
                     };

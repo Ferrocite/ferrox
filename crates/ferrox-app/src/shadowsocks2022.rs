@@ -984,7 +984,6 @@ struct PeerServer {
 
 pub(crate) struct Datagrams {
     sealed: Vec<u8>,
-    opened: Vec<u8>,
     session: u64,
     packet: u64,
     sessions: HashMap<u64, ServerUdp>,
@@ -1000,7 +999,6 @@ impl Datagrams {
         let _ = getrandom::fill(&mut session);
         Self {
             sealed: Vec::new(),
-            opened: Vec::new(),
             session: u64::from_be_bytes(session),
             packet: 0,
             sessions: HashMap::new(),
@@ -1126,28 +1124,28 @@ impl Datagrams {
         body_key.seal_tail_with_nonce(&nonce, out, at)?;
         Some(out)
     }
-    pub(crate) fn open(
+    pub(crate) fn open<'a>(
         &mut self,
         psk: &[u8],
         method: Method,
-        packet: &[u8],
-    ) -> Option<(SocketAddr, &[u8], u64)> {
+        packet: &'a mut [u8],
+    ) -> Option<(SocketAddr, &'a [u8], u64)> {
         if method.is_chacha() {
             if psk.len() != 32 || packet.len() < 24 + TAG_LEN {
                 return None;
             }
             let mut nonce = [0u8; 24];
             nonce.copy_from_slice(&packet[..24]);
-            let sealed = &mut self.opened;
-            sealed.clear();
-            sealed.extend_from_slice(&packet[24..]);
-            let len = shadowsocks2022::x_open(psk, &nonce, sealed)?;
-            sealed.truncate(len);
-            if sealed.len() < 16 + 11 {
+            let len = shadowsocks2022::x_open(psk, &nonce, &mut packet[24..])?;
+            if len > packet.len() - 24 {
                 return None;
             }
-            let session = u64::from_be_bytes(sealed[..8].try_into().ok()?);
-            let packet_id = u64::from_be_bytes(sealed[8..16].try_into().ok()?);
+            let body = &packet[24..24 + len];
+            if body.len() < 16 + 11 {
+                return None;
+            }
+            let session = u64::from_be_bytes(body[..8].try_into().ok()?);
+            let packet_id = u64::from_be_bytes(body[8..16].try_into().ok()?);
             let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
                 window: shadowsocks2022::SlidingWindow::new(),
                 cipher: None,
@@ -1159,7 +1157,7 @@ impl Datagrams {
             if !entry.window.check_and_add(packet_id) {
                 return None;
             }
-            let body = &sealed[16..];
+            let body = &body[16..];
             if body[0] != 0 {
                 return None;
             }
@@ -1172,7 +1170,14 @@ impl Datagrams {
                 return None;
             }
             let (target, used) = parse_addr_header(&body[11 + pad..])?;
-            Some((target, &sealed[16 + 11 + pad + used..], session))
+            if body.len() < 11 + pad + used {
+                return None;
+            }
+            Some((
+                target,
+                &packet[24 + 16 + 11 + pad + used..24 + len],
+                session,
+            ))
         } else {
             let key_len = method.key_len();
             if psk.len() != key_len || packet.len() < 16 + TAG_LEN {
@@ -1200,18 +1205,18 @@ impl Datagrams {
             }
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&raw[4..16]);
-            let (opened, entry) = (&mut self.opened, self.sessions.get(&session)?);
-            let cipher = entry.cipher.as_ref()?;
-            let (target, payload_len) = open_body_into(cipher, &nonce, &packet[16..], opened)?;
-            Some((target, &opened[..payload_len], session))
+            let cipher = self.sessions.get(&session)?.cipher.as_ref()?;
+            let (target, total, len) =
+                open_body_in_place(cipher, &nonce, &mut packet[16..], 11, 0)?;
+            Some((target, &packet[16 + total..16 + len], session))
         }
     }
-    pub(crate) fn open_multi(
+    pub(crate) fn open_multi<'a>(
         &mut self,
         method: Method,
         psks: &[Vec<u8>],
-        packet: &[u8],
-    ) -> Option<(SocketAddr, &[u8], usize, u64)> {
+        packet: &'a mut [u8],
+    ) -> Option<(SocketAddr, &'a [u8], usize, u64)> {
         if method.is_chacha() || psks.len() < 2 {
             return None;
         }
@@ -1249,11 +1254,10 @@ impl Datagrams {
         }
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&raw[4..16]);
-        let idx = entry.user?;
-        let (opened, entry) = (&mut self.opened, self.sessions.get(&session)?);
-        let cipher = entry.cipher.as_ref()?;
-        let (target, payload_len) = open_body_into(cipher, &nonce, &packet[32..], opened)?;
-        Some((target, &opened[..payload_len], idx, session))
+        let idx = self.sessions.get(&session)?.user?;
+        let cipher = self.sessions.get(&session)?.cipher.as_ref()?;
+        let (target, total, len) = open_body_in_place(cipher, &nonce, &mut packet[32..], 11, 0)?;
+        Some((target, &packet[32 + total..32 + len], idx, session))
     }
     pub(crate) fn seal_server(
         &mut self,
@@ -1348,12 +1352,12 @@ impl Datagrams {
             Some(out)
         }
     }
-    pub(crate) fn open_server(
+    pub(crate) fn open_server<'a>(
         &mut self,
         psk: &[u8],
         method: Method,
-        packet: &[u8],
-    ) -> Option<(SocketAddr, &[u8])> {
+        packet: &'a mut [u8],
+    ) -> Option<(SocketAddr, &'a [u8])> {
         let now = now_secs();
         if method.is_chacha() {
             if psk.len() != 32 || packet.len() < 24 + TAG_LEN {
@@ -1361,20 +1365,20 @@ impl Datagrams {
             }
             let mut nonce = [0u8; 24];
             nonce.copy_from_slice(&packet[..24]);
-            let sealed = &mut self.opened;
-            sealed.clear();
-            sealed.extend_from_slice(&packet[24..]);
-            let len = shadowsocks2022::x_open(psk, &nonce, sealed)?;
-            sealed.truncate(len);
-            if sealed.len() < 16 + 19 {
+            let len = shadowsocks2022::x_open(psk, &nonce, &mut packet[24..])?;
+            if len > packet.len() - 24 {
                 return None;
             }
-            let session = u64::from_be_bytes(sealed[..8].try_into().ok()?);
-            let packet_id = u64::from_be_bytes(sealed[8..16].try_into().ok()?);
+            let body = &packet[24..24 + len];
+            if body.len() < 16 + 19 {
+                return None;
+            }
+            let session = u64::from_be_bytes(body[..8].try_into().ok()?);
+            let packet_id = u64::from_be_bytes(body[8..16].try_into().ok()?);
             if !peer_check(&mut self.peers, session, packet_id, now) {
                 return None;
             }
-            let body = &sealed[16..];
+            let body = &body[16..];
             if body[0] != 1 {
                 return None;
             }
@@ -1389,7 +1393,10 @@ impl Datagrams {
                 return None;
             }
             let (target, used) = parse_addr_header(&body[19 + pad..])?;
-            Some((target, &sealed[16 + 19 + pad + used..]))
+            if body.len() < 19 + pad + used {
+                return None;
+            }
+            Some((target, &packet[24 + 16 + 19 + pad + used..24 + len]))
         } else {
             let key_len = method.key_len();
             if psk.len() != key_len || packet.len() < 16 + TAG_LEN {
@@ -1414,37 +1421,30 @@ impl Datagrams {
             }
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&raw[4..16]);
-            let (opened, peers) = (&mut self.opened, &self.peers);
-            let cipher = peers.get(&session)?.cipher.as_ref()?;
-            opened.clear();
-            opened.extend_from_slice(&packet[16..]);
-            let mut tmp = std::mem::take(opened);
-            let len = cipher.open_with_nonce(&nonce, &mut tmp)?;
-            tmp.truncate(len);
-            *opened = tmp;
-            if opened.len() < 19 || opened[0] != 1 {
+            let cipher = self.peers.get(&session)?.cipher.as_ref()?;
+            let len = cipher.open_with_nonce(&nonce, &mut packet[16..])?;
+            if len > packet.len() - 16 {
                 return None;
             }
-            if now.abs_diff(u64::from_be_bytes(opened[1..9].try_into().ok()?)) > SKEW {
+            let body = &packet[16..16 + len];
+            if body.len() < 19 || body[0] != 1 {
                 return None;
             }
-            if u64::from_be_bytes(opened[9..17].try_into().ok()?) != self.session {
+            if now.abs_diff(u64::from_be_bytes(body[1..9].try_into().ok()?)) > SKEW {
                 return None;
             }
-            let pad = usize::from(u16::from_be_bytes([opened[17], opened[18]]));
-            if opened.len() < 19 + pad {
+            if u64::from_be_bytes(body[9..17].try_into().ok()?) != self.session {
                 return None;
             }
-            let (target, used) = parse_addr_header(&opened[19 + pad..])?;
-            let total = 19 + pad + used;
-            if opened.len() < total {
+            let pad = usize::from(u16::from_be_bytes([body[17], body[18]]));
+            if body.len() < 19 + pad {
                 return None;
             }
-            let payload_len = opened.len() - total;
-            opened.copy_within(total.., 0);
-            opened.truncate(payload_len);
-            let len = opened.len();
-            Some((target, &opened[..len]))
+            let (target, used) = parse_addr_header(&body[19 + pad..])?;
+            if body.len() < 19 + pad + used {
+                return None;
+            }
+            Some((target, &packet[16 + 19 + pad + used..16 + len]))
         }
     }
 }
@@ -1481,38 +1481,35 @@ fn peer_check(
     true
 }
 
-fn open_body_into(
+fn open_body_in_place(
     cipher: &Cipher,
     nonce: &[u8; 12],
-    packet_body: &[u8],
-    opened: &mut Vec<u8>,
-) -> Option<(SocketAddr, usize)> {
-    opened.clear();
-    opened.extend_from_slice(packet_body);
-    let mut tmp = std::mem::take(opened);
-    let len = cipher.open_with_nonce(nonce, &mut tmp)?;
-    tmp.truncate(len);
-    *opened = tmp;
-    if opened.len() < 11 || opened[0] != 0 {
+    body: &mut [u8],
+    header: usize,
+    kind: u8,
+) -> Option<(SocketAddr, usize, usize)> {
+    let len = cipher.open_with_nonce(nonce, body)?;
+    if len > body.len() {
         return None;
     }
-    let stamp = u64::from_be_bytes(opened[1..9].try_into().ok()?);
+    let body = &body[..len];
+    if body.len() < header || body[0] != kind {
+        return None;
+    }
+    let stamp = u64::from_be_bytes(body[1..9].try_into().ok()?);
     if now_secs().abs_diff(stamp) > SKEW {
         return None;
     }
-    let pad = usize::from(u16::from_be_bytes([opened[9], opened[10]]));
-    if opened.len() < 11 + pad {
+    let pad = usize::from(u16::from_be_bytes([body[9], body[10]]));
+    if body.len() < header + pad {
         return None;
     }
-    let (target, used) = parse_addr_header(&opened[11 + pad..])?;
-    let total = 11 + pad + used;
-    if opened.len() < total {
+    let (target, used) = parse_addr_header(&body[header + pad..])?;
+    let total = header + pad + used;
+    if body.len() < total {
         return None;
     }
-    let payload_len = opened.len() - total;
-    opened.copy_within(total.., 0);
-    opened.truncate(payload_len);
-    Some((target, payload_len))
+    Some((target, total, len))
 }
 
 fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
@@ -1716,7 +1713,7 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
             Ok((n, src)) => {
                 if multi {
                     if let Some((dest, payload, idx, session)) =
-                        datagrams.open_multi(method, &list, &buf[..n])
+                        datagrams.open_multi(method, &list, &mut buf[..n])
                     {
                         if table.len() >= 4096 {
                             table.clear();
@@ -1735,7 +1732,7 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
                         }
                     }
                 } else if let Some((dest, payload, session)) =
-                    datagrams.open(&psk, method, &buf[..n])
+                    datagrams.open(&psk, method, &mut buf[..n])
                 {
                     if table.len() >= 4096 {
                         table.clear();
@@ -2238,37 +2235,26 @@ mod tests {
         let mut datagrams = Datagrams::new();
         datagrams.session = 0x0102_0304_0506_0708;
         datagrams.packet = 0;
-        let warm = datagrams
+        let mut warm = datagrams
             .seal(&psk, method, &target, b"a payload worth keeping")
             .expect("seals")
             .to_vec();
         datagrams
-            .open(&psk, method, &warm)
-            .expect("warms the buffer");
-        let opened_at = datagrams.opened.as_ptr() as usize;
-        let opened_room = datagrams.opened.capacity();
+            .open(&psk, method, &mut warm)
+            .expect("warms the session");
         for round in 0..8 {
-            let packet = datagrams
+            let mut packet = datagrams
                 .seal(&psk, method, &target, b"a payload worth keeping")
                 .expect("seals")
                 .to_vec();
-            let (got, payload, _) = datagrams.open(&psk, method, &packet).expect("opens");
+            let start = packet.as_ptr() as usize;
+            let end = start + packet.len();
+            let (got, payload, _) = datagrams.open(&psk, method, &mut packet).expect("opens");
             let _ = got;
             assert_eq!(payload, b"a payload worth keeping", "round {round}");
-            let at = payload.as_ptr();
             assert!(
-                datagrams.opened.as_ptr_range().contains(&at),
+                (start..end).contains(&(payload.as_ptr() as usize)),
                 "round {round}: payload is a separate buffer"
-            );
-            assert_eq!(
-                datagrams.opened.as_ptr() as usize,
-                opened_at,
-                "round {round}: buffer moved"
-            );
-            assert_eq!(
-                datagrams.opened.capacity(),
-                opened_room,
-                "round {round}: buffer grew"
             );
         }
     }
@@ -2298,7 +2284,7 @@ mod tests {
             let mut client = Datagrams::new();
             client.session = 0x0a0b_0c0d_0e0f_1011;
             client.packet = 0;
-            let packet = client
+            let mut packet = client
                 .seal_list(method, &list, &target, b"multi-payload")
                 .expect("seals")
                 .to_vec();
@@ -2312,16 +2298,19 @@ mod tests {
                 "{method}: one EIH block rides beside the header"
             );
             let mut server = Datagrams::new();
-            let (got, payload, idx, _) = server.open_multi(method, &list, &packet).expect("opens");
+            let mut opened = packet.clone();
+            let (got, payload, idx, _) = server
+                .open_multi(method, &list, &mut opened)
+                .expect("opens");
             assert_eq!(got, target);
             assert_eq!(idx, 1);
             assert_eq!(payload, b"multi-payload");
-            assert!(server.open_multi(method, &list, &packet).is_none());
+            assert!(server.open_multi(method, &list, &mut packet).is_none());
             assert!(client
                 .seal_list(method, &list[..1], &target, b"x")
                 .is_none());
             assert!(Datagrams::new()
-                .open_multi(Method::Chacha20Poly1305, &list, &packet)
+                .open_multi(Method::Chacha20Poly1305, &list, &mut packet)
                 .is_none());
         }
         assert!(
@@ -2349,19 +2338,28 @@ mod tests {
             let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
             let mut server = Datagrams::new();
             let client_session = 0x7172_7374_7576_7778;
-            let packet = server
+            let mut packet = server
                 .seal_server(method, &psk, client_session, &target, b"reply-payload")
                 .expect("seals")
                 .to_vec();
             let mut client = Datagrams::new();
             client.session = client_session;
-            let (got, payload) = client.open_server(&psk, method, &packet).expect("opens");
+            let mut opened = packet.clone();
+            let start = opened.as_ptr() as usize;
+            let end = start + opened.len();
+            let (got, payload) = client
+                .open_server(&psk, method, &mut opened)
+                .expect("opens");
             assert_eq!(got, target, "{method}");
             assert_eq!(payload, b"reply-payload", "{method}");
+            assert!(
+                (start..end).contains(&(payload.as_ptr() as usize)),
+                "{method}: the reply is opened in the datagram"
+            );
             let mut stranger = Datagrams::new();
             stranger.session = client_session ^ 1;
             assert!(
-                stranger.open_server(&psk, method, &packet).is_none(),
+                stranger.open_server(&psk, method, &mut packet).is_none(),
                 "{method}: a forged client session is refused"
             );
             let mut tampered = packet.clone();
@@ -2369,7 +2367,7 @@ mod tests {
             tampered[last] ^= 1;
             assert!(
                 Datagrams::new()
-                    .open_server(&psk, method, &tampered)
+                    .open_server(&psk, method, &mut tampered)
                     .is_none(),
                 "{method}: damage is refused"
             );
@@ -2399,7 +2397,8 @@ mod tests {
         assert_eq!(out.len(), packet.len() - BLOCK_LEN);
         let forwarded = out.clone();
         let mut server = Datagrams::new();
-        let (target_back, payload, _) = server.open(&dest_psk, method, &forwarded).expect("opens");
+        let mut opened = forwarded.clone();
+        let (target_back, payload, _) = server.open(&dest_psk, method, &mut opened).expect("opens");
         assert_eq!(target_back, target);
         assert_eq!(payload, b"relay-payload");
         assert_eq!(session, 0x1a1b_1c1d_1e1f_2021);
@@ -2539,7 +2538,7 @@ mod tests {
         let mut buf = vec![0u8; crate::proxy::UDP_BUF];
         let (n, _) = client.recv_from(&mut buf).expect("receives");
         let (_, payload) = datagrams
-            .open_server(&client_dest, method, &buf[..n])
+            .open_server(&client_dest, method, &mut buf[..n])
             .expect("opens");
         assert_eq!(payload, b"udp-relay-ping");
     }
