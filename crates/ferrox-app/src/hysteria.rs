@@ -655,6 +655,7 @@ pub(crate) type Serve = Arc<dyn Fn(Flow) + Send + Sync>;
 struct Inbound {
     conn: Arc<Mutex<quiche::Connection>>,
     client_cid: Vec<u8>,
+    initial_dcid: Vec<u8>,
     authed: bool,
     settings_sent: bool,
     settings_done: bool,
@@ -1583,6 +1584,7 @@ impl Router<'_> {
         from: SocketAddr,
         template: &mut quiche::Config,
         client_cid: &[u8],
+        initial_dcid: &[u8],
     ) {
         let mut scid = [0u8; SCID_LEN];
         if getrandom::fill(&mut scid).is_err() {
@@ -1605,6 +1607,7 @@ impl Router<'_> {
             Inbound {
                 conn: Arc::new(Mutex::new(conn)),
                 client_cid: client_cid.to_vec(),
+                initial_dcid: initial_dcid.to_vec(),
                 authed: false,
                 settings_sent: false,
                 settings_done: false,
@@ -1807,14 +1810,22 @@ pub(crate) fn serve_loop(
                 let dcid = &dcid_buf[..dcid.len()];
                 let peer_cid = &peer_buf[..peer_cid.len()];
                 if initial {
-                    if let Some(key) = router.routes.iter().find_map(|(key, inbound)| {
-                        (inbound.client_cid.as_slice() == peer_cid).then(|| key.clone())
-                    }) {
-                        router.drive(&key, &mut packet[..n], from);
-                    } else if !router.routes.contains_key(dcid) {
-                        router.accept(&mut packet[..n], from, &mut template, peer_cid);
-                    } else {
+                    // A client that sends a zero-length source CID, as the pinned client does, has no peer CID to look up: matching the empty slice against every route sends a new connection's Initial to whichever stale route came first, and the handshake never completes. Its initial DCID is the key a retransmit carries; a new connection's random DCID matches nothing and is accepted.
+                    let known = router.routes.contains_key(dcid);
+                    let retransmit = router.routes.iter().find_map(|(key, inbound)| {
+                        ((!inbound.initial_dcid.is_empty()
+                            && inbound.initial_dcid.as_slice() == dcid)
+                            || (!peer_cid.is_empty()
+                                && !inbound.client_cid.is_empty()
+                                && inbound.client_cid.as_slice() == peer_cid))
+                            .then(|| key.clone())
+                    });
+                    if known {
                         router.drive(dcid, &mut packet[..n], from);
+                    } else if let Some(key) = retransmit {
+                        router.drive(&key, &mut packet[..n], from);
+                    } else {
+                        router.accept(&mut packet[..n], from, &mut template, peer_cid, dcid);
                     }
                 } else {
                     router.drive(dcid, &mut packet[..n], from);
