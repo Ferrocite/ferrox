@@ -35938,10 +35938,10 @@ mod tests {
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
+        let cert_path = cert_path.to_str().expect("ascii").replace('\\', "/");
+        let key_path = key_path.to_str().expect("ascii").replace('\\', "/");
         let inbound = crate::json::parse(&format!(
-            r#"{{"protocol":"hysteria","settings":{{"version":1,"users":[{{"auth":"{auth}"}}]}},"streamSettings":{{"network":"hysteria","security":"tls","tlsSettings":{{"obfs":"{obfs}","certificates":[{{"certificateFile":"{}","keyFile":"{}"}}]}}}}}}"#,
-            cert_path.display(),
-            key_path.display()
+            r#"{{"protocol":"hysteria","settings":{{"version":1,"users":[{{"auth":"{auth}"}}]}},"streamSettings":{{"network":"hysteria","security":"tls","tlsSettings":{{"obfs":"{obfs}","certificates":[{{"certificateFile":"{cert_path}","keyFile":"{key_path}"}}]}}}}}}"#
         ))
         .expect("parses");
         let address = format!("127.0.0.1:{port}");
