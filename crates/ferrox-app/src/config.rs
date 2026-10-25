@@ -1529,7 +1529,7 @@ fn tcp_mask(settings: Option<&Json>) -> Option<ferrox_core::finalmask::Chain> {
 /// One `fragment` stage. `packets` picks the writes it cuts; `lengths` and `delays` fall back to
 /// their singular spelling, and an unset one is the reference's zero range — a last width entry of 0,
 /// which is a stage this tree refuses rather than one that would spin.
-fn fragment(conf: Option<&Json>) -> Option<ferrox_core::finalmask::Fragment> {
+pub(crate) fn fragment(conf: Option<&Json>) -> Option<ferrox_core::finalmask::Fragment> {
     use ferrox_core::finalmask::Fragment;
     let packets = conf
         .and_then(|c| c.get("packets"))
@@ -1550,7 +1550,15 @@ fn fragment(conf: Option<&Json>) -> Option<ferrox_core::finalmask::Fragment> {
     };
     let widths =
         range_list(conf, "lengths").or_else(|| Some(vec![single_range(conf, "length")?]))?;
-    let waits = range_list(conf, "delays").or_else(|| Some(vec![single_range(conf, "delay")?]))?;
+    let waits = range_list(conf, "delays").or_else(|| {
+        ["delay", "interval"]
+            .into_iter()
+            .find_map(|key| conf?.get(key).and_then(int32_range))
+            .map_or_else(
+                || Some(vec![ferrox_core::finalmask::Range::ordered(0, 0)]),
+                |range| Some(vec![range]),
+            )
+    })?;
     Fragment::new(
         packets_from,
         packets_to,
