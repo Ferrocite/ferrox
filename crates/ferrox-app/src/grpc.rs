@@ -1359,7 +1359,7 @@ mod tests {
         drop(reader);
         drop(writer);
         let chunks = seen.lock().expect("writes");
-        assert_eq!(&chunks[0][..MAGIC.len()], MAGIC);
+        assert_eq!(&chunks[0][..MAGIC.len()], &MAGIC[..]);
         let window = u32::from_be_bytes(
             chunks[0][MAGIC.len() + 11..MAGIC.len() + 15]
                 .try_into()
