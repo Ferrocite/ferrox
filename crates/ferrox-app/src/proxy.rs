@@ -27432,6 +27432,59 @@ mod tests {
         );
     }
 
+    /// A repeated UDP id replaces its session, and the worker slot that session held has to come back with it.
+    #[test]
+    fn a_repeated_udp_new_id_releases_the_worker_slot_it_replaced() {
+        let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let first_port = first.local_addr().expect("addr").port();
+        let second_port = second.local_addr().expect("addr").port();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let client = Connection::connect(listener.local_addr().expect("addr")).expect("connects");
+        let (_server, _) = listener.accept().expect("accepts");
+        let wire = MuxWire::Conn(Arc::new(Mutex::new(client)));
+        let worker = crate::reverse::WorkerState::new();
+        let mut udp: UdpTable = HashMap::new();
+        let mut global: UdpGlobal = HashMap::new();
+        let mut staging = Vec::new();
+        let mut handles = Vec::new();
+        let new = |port| ferrox_core::mux::Incoming {
+            id: 7,
+            status: ferrox_core::mux::Status::New,
+            options: 0,
+            target: Some(mux_test_udp_target(port)),
+            global_id: None,
+            reflection: None,
+            data: None,
+        };
+        {
+            let mut out = MuxOut {
+                wire: &wire,
+                staging: &mut staging,
+                handles: &mut handles,
+                worker: Some(&worker),
+            };
+            handle_mux_udp_new(new(first_port), &mut udp, &mut global, &mut out);
+        }
+        {
+            let mut out = MuxOut {
+                wire: &wire,
+                staging: &mut staging,
+                handles: &mut handles,
+                worker: Some(&worker),
+            };
+            handle_mux_udp_new(new(second_port), &mut udp, &mut global, &mut out);
+        }
+        assert_eq!(
+            worker.connections(),
+            1,
+            "the replaced session kept the worker slot the new one needs"
+        );
+        for session in udp.values() {
+            session.done.store(true, Ordering::Relaxed);
+        }
+    }
+
     #[test]
     fn xudp_frames_match_the_upstream_layout() {
         let target = mux_target_of("203.0.113.7:5000".parse().expect("addr"));
