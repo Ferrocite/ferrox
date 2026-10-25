@@ -3,9 +3,12 @@
 Every cell measures one client engine against a fixed server engine on loopback.
 The grid runs both servers (`ferrox`, `xray-core`) for every scenario and every
 client the scenario's protocol and carrier admit (`ferrox`, `xray-core`,
-`xray-core-rust`, `zeronet`). `xray-core` is always the reference; a cell
-without it is not a comparison. `xray-rust` is left out while its pinned release
-refuses the harness's non-loopback SOCKS listener.
+`xray-core-rust`, `zeronet`, `sing-box`). `xray-core` is always the reference; a
+cell without it is not a comparison. `xray-rust` is left out while its pinned
+release refuses the harness's non-loopback SOCKS listener. The pinned `sing-box`
+serves every scenario except the `xhttp`, `kcp` and `hysteria` carriers, which
+are omitted from its cells rather than failed. Each sing-box cell reads the same
+client outbound translated by `scripts/xray-to-singbox.py`.
 
 Each scenario also runs the reference client against both servers, so
 `scripts/check-matrix-legs.py` can say which leg lost: a ferrox client below the
@@ -49,7 +52,9 @@ The coverage holes with no number — a client that cannot use a ferrox server a
 xray-core-rust reads 0 in hysteria and reality-grpc on both servers. The
 remaining untested lanes, including UDP, more than 16 flows and carriers
 without a cell, stay in #384, #387 and #388 rather than being inferred from
-these rows.
+these rows. `sing-box` is absent from `vless-xhttp-down-8`,
+`vless-reality-xhttp-down-8`, `vless-kcp-down-8` and `vless-hysteria-down-8`
+because its pinned dialect has no such transport.
 
 ## Every configuration
 
@@ -143,7 +148,7 @@ These are the ways a config can name a method that no cell measures. A row here 
 | any | udp dns through the socks front | request/response | no scenario |
 | any | ipv6 target | down | no scenario |
 | any | more than 16 flows | down | no scenario |
-| any | sing-box, leaf and xray-rust as clients | down | engines pinned but not in the matrix |
+| any | leaf and xray-rust as clients | down | engines pinned but not in the matrix |
 
 <!-- benchmark-matrix:start -->
 <!-- benchmark-matrix:end -->
