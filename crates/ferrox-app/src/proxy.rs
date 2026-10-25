@@ -4379,10 +4379,7 @@ fn shake_tls<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
         match session.handshake() {
             Ok(()) => return true,
             Err(ferrox_core::tls::TlsError::Timeout) if Instant::now() < deadline => {}
-            Err(error) => {
-                echo_trace(&format!("tls: shake failed: {error}"));
-                return false;
-            }
+            Err(_) => return false,
         }
     }
 }
@@ -5940,15 +5937,9 @@ fn kcp_tls_connect(
             conn: Arc::clone(conn),
         },
     ) else {
-        echo_trace("kcp-tls: connect failed");
         return None;
     };
-    if !shake_tls(&mut session) {
-        echo_trace("kcp-tls: shake failed");
-        return None;
-    }
-    echo_trace("kcp-tls: shaken");
-    Some(session)
+    shake_tls(&mut session).then_some(session)
 }
 
 /// KCP is the transport and the security rides it, as it does upstream: the session carries the header and both relay legs, not the connection.
@@ -7384,7 +7375,6 @@ fn open_vmess_udp_kcp(
     let Carrier::Kcp(config) = &vmess.carrier else {
         return None;
     };
-    echo_trace("vmess-kcp: request");
     let (request, send, recv, response_key, response_iv, auth) = vmess_udp_request(vmess, dest)?;
     let conn = ferrox_core::kcp::dial(
         server,
@@ -7392,12 +7382,9 @@ fn open_vmess_udp_kcp(
         ferrox_core::kcp::fresh_conversation(),
     )
     .ok()?;
-    echo_trace("vmess-kcp: dialed");
     if let Some(cfg) = vmess.tls.as_deref() {
         let mut session = kcp_tls_connect(&conn, cfg)?;
-        echo_trace("vmess-kcp: tls");
         if session.write_all(&request).is_err() {
-            echo_trace("vmess-kcp: write failed");
             return None;
         }
         {
@@ -7406,11 +7393,9 @@ fn open_vmess_udp_kcp(
                 until: Instant::now() + crate::quic::HANDSHAKE_TIMEOUT,
             };
             if !crate::vmess::read_response(&mut bounded, &response_key, &response_iv, auth) {
-                echo_trace("vmess-kcp: response failed");
                 return None;
             }
         }
-        echo_trace("vmess-kcp: response");
         let (reader, writer) = session_halves(
             session,
             KcpIo {
