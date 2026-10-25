@@ -167,7 +167,7 @@ pub fn dial(addr: SocketAddr, config: Config, conv: u16) -> io::Result<Arc<Conne
     };
     let closer_client = Arc::clone(&client);
     let closer = Box::new(move || release_client(&closer_client, conv));
-    let connection = Connection::new(
+    let connection = Connection::new_unstarted(
         ConnMetadata {
             local: client.local,
             remote: addr,
@@ -182,6 +182,7 @@ pub fn dial(addr: SocketAddr, config: Config, conv: u16) -> io::Result<Arc<Conne
         .lock()
         .unwrap()
         .insert(conv, Arc::downgrade(&connection));
+    connection.start();
     Ok(connection)
 }
 
