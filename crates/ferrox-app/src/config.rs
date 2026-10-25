@@ -1123,14 +1123,22 @@ fn grpc_escape(service: &str) -> String {
     out
 }
 
-pub(crate) fn tcp_http_path(settings: Option<&Json>) -> Option<String> {
-    let header = settings
-        .and_then(|s| s.get("tcpSettings"))
-        .and_then(|s| s.get("header"))?;
+/// The tcp-http request block the config names: `rawSettings` replaces `tcpSettings` whole when it is present, as the reference does before it builds the transport.
+fn tcp_http_request(settings: Option<&Json>) -> Option<&Json> {
+    let settings = settings?;
+    let block = match settings.get("rawSettings") {
+        Some(raw) if !matches!(raw, Json::Null) => raw,
+        _ => settings.get("tcpSettings")?,
+    };
+    let header = block.get("header")?;
     if header.get("type").and_then(Json::as_str) != Some("http") {
         return None;
     }
-    let request = header.get("request")?;
+    header.get("request")
+}
+
+pub(crate) fn tcp_http_path(settings: Option<&Json>) -> Option<String> {
+    let request = tcp_http_request(settings)?;
     if let Some(paths) = request.get("path").and_then(Json::as_arr) {
         let first = paths.iter().find_map(Json::as_str);
         if let Some(path) = first {
@@ -1141,6 +1149,53 @@ pub(crate) fn tcp_http_path(settings: Option<&Json>) -> Option<String> {
         return Some(path.to_owned());
     }
     Some("/".to_owned())
+}
+
+/// The headers and WebSocket heartbeat a carrier's settings carry. TCP-HTTP keeps its headers under the request block; every other carrier writes them beside the path.
+pub(crate) fn carrier_headers(settings: Option<&Json>) -> (Vec<(String, String)>, u32) {
+    let Some(settings) = settings else {
+        return (Vec::new(), 0);
+    };
+    let network = settings.get("network").and_then(Json::as_str).unwrap_or("");
+    let (headers, heartbeat) = match network {
+        "ws" | "websocket" => {
+            let block = settings.get("wsSettings");
+            let heartbeat = block
+                .and_then(|s| s.get("heartbeatPeriod"))
+                .and_then(Json::as_u32)
+                .unwrap_or(0);
+            (block.and_then(|s| s.get("headers")), heartbeat)
+        }
+        "httpupgrade" => (
+            settings
+                .get("httpupgradeSettings")
+                .and_then(|s| s.get("headers")),
+            0,
+        ),
+        "xhttp" | "splithttp" => (
+            settings
+                .get("xhttpSettings")
+                .or_else(|| settings.get("splithttpSettings"))
+                .and_then(|s| s.get("headers")),
+            0,
+        ),
+        "" | "raw" | "tcp" => (
+            tcp_http_request(Some(settings)).and_then(|r| r.get("headers")),
+            0,
+        ),
+        _ => (None, 0),
+    };
+    (masquerade_headers(headers), heartbeat)
+}
+
+/// A carrier header's value: a string, or xray's `StringList` form whose first entry is the value this tree sends.
+fn header_value(value: &Json) -> Option<String> {
+    value.as_str().map(str::to_owned).or_else(|| {
+        value
+            .as_arr()
+            .and_then(|items| items.iter().find_map(Json::as_str))
+            .map(str::to_owned)
+    })
 }
 
 pub(crate) fn stream_security(node: &Json) -> &str {
@@ -1810,13 +1865,11 @@ pub(crate) fn masquerade_from_stream(stream: Option<&Json>) -> ferrox_core::hyst
 }
 
 /// A response's headers in either dialect: xray's object maps names to values, while the flat form carries `Name: value` lines.
-fn masquerade_headers(field: Option<&Json>) -> Vec<(String, String)> {
+pub(crate) fn masquerade_headers(field: Option<&Json>) -> Vec<(String, String)> {
     match field {
         Some(Json::Obj(pairs)) => pairs
             .iter()
-            .filter_map(|(name, value)| {
-                value.as_str().map(|value| (name.clone(), value.to_owned()))
-            })
+            .filter_map(|(name, value)| header_value(value).map(|value| (name.clone(), value)))
             .collect(),
         Some(Json::Arr(items)) => items
             .iter()
@@ -1849,25 +1902,23 @@ pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, Stri
         Carrier::Xdrive { .. } => "xdriveSettings",
         Carrier::Unknown { .. } | Carrier::Raw(_) | Carrier::Http => "",
     };
-    let host = match &carrier {
-        // Hysteria's QUIC handshake carries `tlsSettings.serverName` as both SNI and the auth request's authority; `hysteriaSettings.host` is the fallback xray's own dialect never writes.
-        Carrier::Hysteria(_) => settings
-            .and_then(|s| s.get("tlsSettings"))
-            .and_then(|s| s.get("serverName"))
-            .and_then(Json::as_str)
-            .or_else(|| {
-                settings
-                    .and_then(|s| s.get(key))
-                    .and_then(|s| s.get("host"))
-                    .and_then(Json::as_str)
-            })
-            .unwrap_or(address),
-        _ => settings
-            .and_then(|s| s.get(key))
-            .and_then(|s| s.get("host"))
-            .and_then(Json::as_str)
-            .unwrap_or(address),
+    let configured = carrier_headers(settings).0;
+    let header_host = crate::headers::host(&configured);
+    let carrier_host = settings
+        .and_then(|s| s.get(key))
+        .and_then(|s| s.get("host"))
+        .and_then(Json::as_str);
+    let tls_host = settings
+        .and_then(|s| s.get("tlsSettings"))
+        .and_then(|s| s.get("serverName"))
+        .and_then(Json::as_str);
+    // The header wins over the carrier's own host, which wins over the TLS name, which wins over the dialled address. Hysteria's QUIC handshake carries the TLS name as its authority, so it keeps the TLS name ahead of `hysteriaSettings.host`.
+    let host = if matches!(carrier, Carrier::Hysteria(_)) {
+        tls_host.or(carrier_host)
+    } else {
+        header_host.or(carrier_host).or(tls_host)
     }
+    .unwrap_or(address)
     .to_owned();
     (carrier, host)
 }
@@ -2920,5 +2971,81 @@ mod tests {
             Some(4),
             "the named group's path does not leak into the unnamed one"
         );
+    }
+
+    #[test]
+    fn carrier_headers_read_every_carrier_and_the_websocket_heartbeat() {
+        let ws = crate::json::parse(
+            r#"{"network":"ws","wsSettings":{"headers":{"X-Custom":"1"},"heartbeatPeriod":5}}"#,
+        )
+        .expect("ws");
+        let (headers, heartbeat) = carrier_headers(Some(&ws));
+        assert_eq!(headers, vec![("X-Custom".to_owned(), "1".to_owned())]);
+        assert_eq!(heartbeat, 5);
+
+        let upgrade = crate::json::parse(
+            r#"{"network":"httpupgrade","httpupgradeSettings":{"headers":{"X-Upgrade":"1"}}}"#,
+        )
+        .expect("httpupgrade");
+        assert_eq!(
+            carrier_headers(Some(&upgrade)).0,
+            vec![("X-Upgrade".to_owned(), "1".to_owned())]
+        );
+
+        let xhttp = crate::json::parse(
+            r#"{"network":"xhttp","xhttpSettings":{"headers":{"X-Fetch":"1"}}}"#,
+        )
+        .expect("xhttp");
+        assert_eq!(
+            carrier_headers(Some(&xhttp)).0,
+            vec![("X-Fetch".to_owned(), "1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn raw_settings_replace_tcp_settings_whole() {
+        let settings = crate::json::parse(
+            r#"{"network":"raw","tcpSettings":{"header":{"type":"http","request":{"path":["/old"],"headers":{"X-Old":"1"}}}},"rawSettings":{"header":{"type":"http","request":{"path":["/new"],"headers":{"X-New":"1"}}}}}"#,
+        )
+        .expect("raw");
+        assert_eq!(tcp_http_path(Some(&settings)).as_deref(), Some("/new"));
+        assert_eq!(
+            carrier_headers(Some(&settings)).0,
+            vec![("X-New".to_owned(), "1".to_owned())]
+        );
+
+        let tcp = crate::json::parse(
+            r#"{"network":"tcp","tcpSettings":{"header":{"type":"http","request":{"path":["/tcp"],"headers":{"X-Tcp":"1"}}}}}"#,
+        )
+        .expect("tcp");
+        assert_eq!(tcp_http_path(Some(&tcp)).as_deref(), Some("/tcp"));
+        assert_eq!(
+            carrier_headers(Some(&tcp)).0,
+            vec![("X-Tcp".to_owned(), "1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn the_configured_host_wins_over_the_carrier_tls_and_address() {
+        let outbound = crate::json::parse(
+            r#"{"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"tls.example"},"wsSettings":{"host":"carrier.example","headers":{"Host":"header.example"}}}}"#,
+        )
+        .expect("outbound");
+        assert_eq!(outbound_carrier(&outbound, "192.0.2.4").1, "header.example");
+
+        let carrier = crate::json::parse(
+            r#"{"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"tls.example"},"wsSettings":{"host":"carrier.example"}}}"#,
+        )
+        .expect("carrier");
+        assert_eq!(outbound_carrier(&carrier, "192.0.2.4").1, "carrier.example");
+
+        let tls = crate::json::parse(
+            r#"{"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"tls.example"},"wsSettings":{}}}"#,
+        )
+        .expect("tls");
+        assert_eq!(outbound_carrier(&tls, "192.0.2.4").1, "tls.example");
+
+        let bare = crate::json::parse(r#"{"streamSettings":{"network":"ws"}}"#).expect("bare");
+        assert_eq!(outbound_carrier(&bare, "192.0.2.4").1, "192.0.2.4");
     }
 }

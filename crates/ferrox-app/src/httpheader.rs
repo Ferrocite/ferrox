@@ -94,10 +94,17 @@ pub(crate) fn accept_split<R: Read, W: Write>(
 
 const BEFORE_PATH: &[u8] = b"GET ";
 const BEFORE_HOST: &[u8] = b" HTTP/1.1\r\nHost: ";
-const AFTER_HOST: &[u8] = b"\r\nConnection: keep-alive\r\n\r\n";
+const AFTER_HOST: &[u8] = b"\r\n";
+const AFTER_HEADERS: &[u8] = b"Connection: keep-alive\r\n\r\n";
 
 // The request is written as the runs it is made of: the socket packs them into one `writev` and the session coalesces them into one record, so no byte is staged in a buffer of its own first.
-fn send_request<W: crate::proxy::FrameWrite>(write: &mut W, host: &str, path: &str) -> Option<()> {
+fn send_request<W: crate::proxy::FrameWrite>(
+    write: &mut W,
+    host: &str,
+    path: &str,
+    headers: &[(String, String)],
+) -> Option<()> {
+    let headers = crate::headers::masked(headers, &[]);
     write
         .write_slices(&[
             BEFORE_PATH,
@@ -105,6 +112,8 @@ fn send_request<W: crate::proxy::FrameWrite>(write: &mut W, host: &str, path: &s
             BEFORE_HOST,
             host.as_bytes(),
             AFTER_HOST,
+            headers.as_bytes(),
+            AFTER_HEADERS,
         ])
         .then_some(())
 }
@@ -113,9 +122,10 @@ pub(crate) fn connect(
     stream: Connection,
     host: &str,
     path: &str,
+    headers: &[(String, String)],
 ) -> Option<(HeadReader, Connection)> {
     let mut read = stream;
-    send_request(&mut read, host, path)?;
+    send_request(&mut read, host, path, headers)?;
     let (head, at) = read_head(&mut read)?;
     check_response(&head[..at])?;
     let Ok(write) = read.try_clone() else {
@@ -139,8 +149,9 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
     mut write: W,
     host: &str,
     path: &str,
+    headers: &[(String, String)],
 ) -> Option<(HeadReader<R>, W)> {
-    send_request(&mut write, host, path)?;
+    send_request(&mut write, host, path, headers)?;
     let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_response(&head[..at])?;
@@ -166,11 +177,35 @@ mod tests {
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, mut write) =
-            connect(stream, "oracle.example", "/camouflage").expect("headers");
+            connect(stream, "oracle.example", "/camouflage", &[]).expect("headers");
         write.write_all(b"ping").expect("writes");
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).expect("reads");
         assert_eq!(&buf, b"pong");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn a_configured_header_reaches_the_camouflage_request() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).expect("reads");
+                head.push(byte[0]);
+            }
+            let text = String::from_utf8(head).expect("utf8");
+            assert!(text.contains("X-Custom: 1\r\n"), "{text}");
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\n")
+                .expect("writes");
+        });
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let headers = vec![("X-Custom".to_owned(), "1".to_owned())];
+        connect(stream, "oracle.example", "/camouflage", &headers).expect("headers");
         server.join().expect("joins");
     }
 
@@ -278,6 +313,7 @@ mod tests {
             Runs::default(),
             host,
             path,
+            &[],
         )
         .expect("answers");
         assert_eq!(
@@ -294,7 +330,9 @@ mod tests {
                 path.len(),
                 BEFORE_HOST.len(),
                 host.len(),
-                AFTER_HOST.len()
+                AFTER_HOST.len(),
+                0,
+                AFTER_HEADERS.len()
             ],
             "one run per piece, gathered rather than staged"
         );
@@ -308,7 +346,7 @@ mod tests {
             host.as_ptr() as usize,
             "and the host's own"
         );
-        assert_eq!(write.calls, 1, "one gathered call carries all five runs");
+        assert_eq!(write.calls, 1, "one gathered call carries every run");
     }
 
     #[test]

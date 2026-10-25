@@ -14,6 +14,10 @@ That is the whole of the Windows failure this lane used to carry: `a_configured_
 
 The checker is `a_drained_teardown_ends_the_upgrade_with_a_fin`, witnessed on this machine: with the drain disabled it fails 3/3 with `Os { code: 54, kind: ConnectionReset }`; with it the read ends in EOF. The bare-path test cannot gate this — it passes on macOS either way — so it was retargeted to the teardown production actually has (`quiet`, then drop) rather than a shape only the test uses.
 
+## Request headers
+
+The upgrade request writes the configured `httpupgradeSettings.headers` under the same `crate::headers::masked` merge the WebSocket dial uses, with the `ws` default set when the config names none of those names. `httpupgrade::tests::a_configured_header_reaches_the_upgrade_request` holds a configured `X-Custom` and `Sec-Fetch-Mode: websocket` in the head. The configured `Host` is not written twice: it reaches the request line's single `Host` through `outbound_carrier`'s precedence, and the shared merge leaves it to the builder. The header list is a slice borrowed from the parsed settings; the request is still one gathered write.
+
 ## Data path
 
 ```mermaid

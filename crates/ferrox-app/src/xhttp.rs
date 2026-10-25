@@ -659,6 +659,7 @@ pub(crate) enum PadMethod {
 pub(crate) struct XhttpSettings {
     pub path: String,
     pub query: String,
+    pub headers: Vec<(String, String)>,
     pub mode: XhttpMode,
     pub mode_source: ModeSource,
     pub session_placement: Placement,
@@ -714,6 +715,7 @@ impl XhttpSettings {
         Self {
             path: "/".to_owned(),
             query: String::new(),
+            headers: Vec::new(),
             mode: XhttpMode::StreamOne,
             mode_source: ModeSource::Auto,
             session_placement: Placement::Path,
@@ -797,6 +799,7 @@ impl XhttpSettings {
             },
             Some(_) => return None,
         };
+        out.headers = crate::config::masquerade_headers(xhttp.get("headers"));
         out.session_placement = placement_or(
             xhttp.get("sessionIDPlacement"),
             Placement::Path,
@@ -2100,16 +2103,18 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
     write: &mut W,
     host: &str,
     path: &str,
+    headers: &[(String, String)],
 ) -> Option<()> {
     const BEFORE_PATH: &str = "POST ";
     const BEFORE_HOST: &str = " HTTP/1.1\r\nHost: ";
     const BEFORE_REFERER: &str = "\r\nReferer: http://";
     const BEFORE_PADDING: &str = "?x_padding=";
-    const TAIL: &str = "\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n";
+    const TAIL: &str = "Transfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n";
     const PADDING_MAX: usize = 1000;
     let mut raw = [0u8; 4];
     getrandom::fill(&mut raw).unwrap_or_default();
     let len = 100 + u32::from_le_bytes(raw) as usize % 901;
+    let headers_len = crate::headers::masked_len(headers, crate::headers::FETCH);
     DIAL_HEAD.with(|cell| {
         let mut head = cell.borrow_mut();
         head.clear();
@@ -2124,6 +2129,7 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
                 + path.len()
                 + BEFORE_PADDING.len()
                 + PADDING_MAX
+                + headers_len
                 + TAIL.len(),
         );
         head.extend_from_slice(BEFORE_PATH.as_bytes());
@@ -2136,6 +2142,8 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
         head.extend_from_slice(BEFORE_PADDING.as_bytes());
         let at = head.len();
         head.resize(at + len, b'X');
+        head.extend_from_slice(b"\r\n");
+        crate::headers::write_masked(&mut head, headers, crate::headers::FETCH);
         head.extend_from_slice(TAIL.as_bytes());
         write.write_all(&head).ok()
     })
@@ -2230,7 +2238,8 @@ fn dial_head(host: &str, settings: &XhttpSettings, session: &str, seq: Option<u6
     } else {
         "application/grpc"
     };
-    format!("{} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Referer: http://{host}{}?x_padding={}\r\nTransfer-Encoding: chunked\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n", settings.uplink_method, settings.path, referer_pad_value(settings))
+    let headers = crate::headers::masked(&settings.headers, crate::headers::FETCH);
+    format!("{} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Referer: http://{host}{}?x_padding={}\r\nTransfer-Encoding: chunked\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n", settings.uplink_method, settings.path, referer_pad_value(settings))
 }
 
 /// The downlink a packet-up or stream-up dial opens beside its upload (dialer.go:411).
@@ -2240,7 +2249,8 @@ fn downlink_head(host: &str, settings: &XhttpSettings, session: &str) -> String 
     let mut extra = String::new();
     meta_request(settings, session, None, &mut target, &mut query, &mut extra);
     let target = target_of(&target, &query);
-    format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Referer: http://{host}{}?x_padding={}\r\nConnection: close\r\n\r\n", settings.path, referer_pad_value(settings))
+    let headers = crate::headers::masked(&settings.headers, crate::headers::FETCH);
+    format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Referer: http://{host}{}?x_padding={}\r\nConnection: close\r\n\r\n", settings.path, referer_pad_value(settings))
 }
 
 /// The referer's pad the dial-side heads draw: a run in the configured range and method, the shape the hub's own check validates (`xpadding.go`'s `MakeXPadding`).
@@ -2319,22 +2329,26 @@ fn packet_head<'a>(
             } else {
                 "Content-Length: 0\r\n"
             };
+            let headers = crate::headers::masked(&settings.headers, crate::headers::FETCH);
             (
                 format!(
-                    "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Referer: http://{host}{}?x_padding={pad}\r\n{zero}Connection: keep-alive\r\n\r\n",
+                    "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Referer: http://{host}{}?x_padding={pad}\r\n{zero}Connection: keep-alive\r\n\r\n",
                     settings.path
                 ),
                 None,
             )
         }
-        _ => (
+        _ => {
+            let headers = crate::headers::masked(&settings.headers, crate::headers::FETCH);
+            (
             format!(
-                "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Content-Length: {}\r\nReferer: http://{host}{}?x_padding={pad}\r\nConnection: keep-alive\r\n\r\n",
+                "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Content-Length: {}\r\nReferer: http://{host}{}?x_padding={pad}\r\nConnection: keep-alive\r\n\r\n",
                 piece.len(),
                 settings.path
             ),
             Some(piece),
-        ),
+            )
+        }
     }
 }
 
@@ -2417,9 +2431,10 @@ pub(crate) fn connect(
     stream: Connection,
     host: &str,
     path: &str,
+    headers: &[(String, String)],
 ) -> Option<(XhttpReader, XhttpWriter)> {
     let mut read = stream;
-    send_dial_head(&mut read, host, path)?;
+    send_dial_head(&mut read, host, path, headers)?;
     let (head, at) = read_head(&mut read)?;
     check_response(&head[..at])?;
     split(read, head, at)
@@ -2431,8 +2446,9 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     mut write: W,
     host: &str,
     path: &str,
+    headers: &[(String, String)],
 ) -> Option<(Reader<R>, XhttpWriter)> {
-    send_dial_head(&mut write, host, path)?;
+    send_dial_head(&mut write, host, path, headers)?;
     let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_response(&head[..at])?;
@@ -2555,7 +2571,7 @@ mod tests {
             sock.shutdown(std::net::Shutdown::Write).ok();
         });
         let sock = Connection::connect(("127.0.0.1", port)).expect("connects");
-        let (mut reader, _w) = connect(sock, "h", "/share").expect("dials");
+        let (mut reader, _w) = connect(sock, "h", "/share", &[]).expect("dials");
         let mut buf = vec![0u8; CHUNK];
         let mut got = 0usize;
         loop {
@@ -2750,7 +2766,7 @@ mod tests {
             writer.finish();
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
-        let (mut reader, writer) = connect(stream, "oracle.example", "/share").expect("dials");
+        let (mut reader, writer) = connect(stream, "oracle.example", "/share", &[]).expect("dials");
         assert!(writer.send(b"ping"));
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).expect("reads");
@@ -2815,6 +2831,7 @@ mod tests {
             Sink(Arc::new(Mutex::new(Vec::new()))),
             "h",
             "/share",
+            &[],
         )
         .expect("dials the head");
         assert_eq!(reader.at, HEAD.len(), "the cursor sits past the head");
@@ -2957,7 +2974,7 @@ mod tests {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .expect("timeout");
-        let (mut reader, writer) = connect(stream, "h", "/share").expect("dials");
+        let (mut reader, writer) = connect(stream, "h", "/share", &[]).expect("dials");
         assert!(writer.send(&[1u8; 26]));
         let mut reply = [0u8; 2];
         reader.read_exact(&mut reply).expect("replies");
@@ -3186,6 +3203,25 @@ mod tests {
         XhttpSettings::from_json(node.get("streamSettings")).expect("settings")
     }
 
+    #[test]
+    fn a_configured_header_and_the_fetch_defaults_reach_every_dial_head() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/up/", "headers": {"X-Fetch": "1"}}}}"#,
+        );
+        assert_eq!(
+            settings.headers,
+            vec![("X-Fetch".to_owned(), "1".to_owned())]
+        );
+        let head = dial_head("front.example", &settings, "session", None);
+        assert!(head.contains("Sec-Fetch-Mode: cors\r\n"), "{head}");
+        assert!(head.contains("X-Fetch: 1\r\n"), "{head}");
+        assert_eq!(
+            head.matches("Host: front.example\r\n").count(),
+            1,
+            "the fixed Host line is the only one"
+        );
+    }
+
     /// The answer head is opened once for the bytes it will hold: a padded answer used to start as
     /// a seventeen-byte `String` and grow into a kilobyte, and it built the downlink header as its
     /// own `String` only to copy it in.
@@ -3345,7 +3381,7 @@ mod tests {
             };
             for _ in 0..12 {
                 sink.at = 0;
-                send_dial_head(&mut sink, "example.com", "/share").expect("writes");
+                send_dial_head(&mut sink, "example.com", "/share", &[]).expect("writes");
             }
             sink
         });
@@ -3645,7 +3681,7 @@ mod tests {
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, writer) =
-            connect(stream, "127.0.0.1", "/share").expect("the dial was answered");
+            connect(stream, "127.0.0.1", "/share", &[]).expect("the dial was answered");
         assert!(writer.send(b"ping"));
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).expect("reads the downlink");

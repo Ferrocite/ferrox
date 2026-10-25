@@ -635,15 +635,19 @@ pub(crate) fn connect(
     path: &str,
     budget: u32,
     first: &[u8],
+    headers: &[(String, String)],
+    heartbeat: u32,
 ) -> Option<(WsReader, WsWriter)> {
     let key = fresh_key()?;
     let mut read = stream;
-    let (handshake, early) = request(host, path, &key, budget, first);
+    let headers = crate::headers::masked(headers, crate::headers::WS);
+    let (handshake, early) = request(host, path, &key, budget, first, &headers);
     read.write_all(handshake.as_bytes()).ok()?;
     let (head, at) = read_head(&mut read)?;
     check_response(&head[..at], &key)?;
     // The kept read takes what rode in behind the `101`, so the first frame is already the reader's own buffer.
     let (reader, writer) = split(read, Vec::new(), head, at, true)?;
+    start_heartbeat(&writer, heartbeat);
     if !early && !first.is_empty() && !writer.send(first) {
         return None;
     }
@@ -663,6 +667,7 @@ fn check_response(head: &[u8], key: &[u8]) -> Option<()> {
 }
 
 // The same connect over halves that cannot peek: the kept read takes what rode in behind the `101`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     mut read: R,
     mut write: W,
@@ -670,24 +675,35 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     path: &str,
     budget: u32,
     first: &[u8],
+    headers: &[(String, String)],
+    heartbeat: u32,
 ) -> Option<(WsReader<R>, WsWriter)> {
     let key = fresh_key()?;
-    let (handshake, early) = request(host, path, &key, budget, first);
+    let headers = crate::headers::masked(headers, crate::headers::WS);
+    let (handshake, early) = request(host, path, &key, budget, first, &headers);
     write.write_all(handshake.as_bytes()).ok()?;
     let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_response(&head[..at], &key)?;
     let (reader, writer) = split_halves(read, write, Vec::new(), head, at, true);
+    start_heartbeat(&writer, heartbeat);
     if !early && !first.is_empty() && !writer.send(first) {
         return None;
     }
     Some((reader, writer))
 }
 
-fn request(host: &str, path: &str, key: &[u8], budget: u32, first: &[u8]) -> (String, bool) {
+fn request(
+    host: &str,
+    path: &str,
+    key: &[u8],
+    budget: u32,
+    first: &[u8],
+    headers: &str,
+) -> (String, bool) {
     const OPEN: &str = "GET ";
     const MIDDLE: &str = " HTTP/1.1\r\nHost: ";
-    const KEYS: &str = "\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ";
+    const KEYS: &str = "Upgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: ";
     const VERSION: &str = "\r\nSec-WebSocket-Version: 13";
     const END: &str = "\r\n\r\n";
     const PROTOCOL: &str = "Sec-WebSocket-Protocol: ";
@@ -697,13 +713,16 @@ fn request(host: &str, path: &str, key: &[u8], budget: u32, first: &[u8]) -> (St
     } else {
         0
     };
-    let fixed = OPEN.len() + MIDDLE.len() + KEYS.len() + VERSION.len() + END.len();
+    let fixed = OPEN.len() + MIDDLE.len() + KEYS.len() + VERSION.len() + END.len() + 2;
     let room = if early { PROTOCOL.len() + coded + 2 } else { 0 };
-    let mut request = String::with_capacity(fixed + host.len() + path.len() + key.len() + room);
+    let mut request =
+        String::with_capacity(fixed + host.len() + path.len() + key.len() + headers.len() + room);
     request.push_str(OPEN);
     request.push_str(path);
     request.push_str(MIDDLE);
     request.push_str(host);
+    request.push_str("\r\n");
+    request.push_str(headers);
     request.push_str(KEYS);
     request.push_str(base64_text(key));
     request.push_str(VERSION);
@@ -714,6 +733,29 @@ fn request(host: &str, path: &str, key: &[u8], budget: u32, first: &[u8]) -> (St
     }
     request.push_str(END);
     (request, early)
+}
+
+/// A WebSocket session asks its peer to answer every `heartbeatPeriod` seconds; the reference's loop stops when the control write fails.
+fn start_heartbeat(writer: &WsWriter, period: u32) {
+    if period == 0 {
+        return;
+    }
+    let shared = Arc::downgrade(&writer.shared);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(std::time::Duration::from_secs(u64::from(period)));
+        let Some(shared) = shared.upgrade() else {
+            return;
+        };
+        if shared.closed.load(Ordering::SeqCst) {
+            return;
+        }
+        let Ok(mut stream) = shared.stream.lock() else {
+            return;
+        };
+        if !write_frame(&mut **stream, shared.masked, OP_PING, &[]) {
+            return;
+        }
+    });
 }
 
 fn split(
@@ -1181,11 +1223,80 @@ mod tests {
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let plain = EarlyData::split("/tunnel");
-        let (mut reader, _writer) =
-            connect(stream, "127.0.0.1", &plain.path, plain.budget, b"ping").expect("upgrades");
+        let (mut reader, _writer) = connect(
+            stream,
+            "127.0.0.1",
+            &plain.path,
+            plain.budget,
+            b"ping",
+            &[],
+            0,
+        )
+        .expect("upgrades");
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).expect("reads");
         assert_eq!(&buf, b"pong");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn a_configured_header_reaches_the_handshake() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).expect("reads");
+                head.push(byte[0]);
+            }
+            let text = String::from_utf8(head.clone()).expect("utf8");
+            assert!(text.contains("X-Custom: 1\r\n"), "{text}");
+            assert!(text.contains("User-Agent: Mozilla/5.0"), "{text}");
+            let Upgrade {
+                key,
+                offered,
+                early,
+            } = check_request(&head, "/tunnel").expect("request");
+            stream
+                .write_all(&accept_response(key, offered, !early.is_empty()))
+                .expect("writes");
+        });
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let headers = vec![("X-Custom".to_owned(), "1".to_owned())];
+        connect(stream, "127.0.0.1", "/tunnel", 0, &[], &headers, 0).expect("upgrades");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn a_configured_heartbeat_writes_a_ping_on_an_idle_session() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).expect("reads");
+                head.push(byte[0]);
+            }
+            let Upgrade {
+                key,
+                offered,
+                early,
+            } = check_request(&head, "/tunnel").expect("request");
+            stream
+                .write_all(&accept_response(key, offered, !early.is_empty()))
+                .expect("writes");
+            let mut frame = [0u8; 2];
+            stream.read_exact(&mut frame).expect("reads a frame");
+            assert_eq!(frame[0] & 0x0f, OP_PING, "the idle session sends a ping");
+        });
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let (_reader, _writer) =
+            connect(stream, "127.0.0.1", "/tunnel", 0, &[], &[], 1).expect("upgrades");
+        thread::sleep(std::time::Duration::from_millis(1500));
         server.join().expect("joins");
     }
 
@@ -1199,7 +1310,7 @@ mod tests {
         );
         let plain = format!("{prefix}\r\n");
         assert_eq!(
-            request("example.com", "/tunnel", &key, 0, b"hello").0,
+            request("example.com", "/tunnel", &key, 0, b"hello", "").0,
             plain
         );
         for (payload, budget, rides) in [
@@ -1210,7 +1321,7 @@ mod tests {
             (&b"hi"[..], 2, true),
             (&b"hi"[..], 1, false),
         ] {
-            let (got, early) = request("example.com", "/tunnel", &key, budget, payload);
+            let (got, early) = request("example.com", "/tunnel", &key, budget, payload, "");
             assert_eq!(early, rides, "{payload:?} at {budget}");
             if !rides {
                 assert_eq!(got, plain, "{payload:?} at {budget}: no line at all");
@@ -1234,7 +1345,7 @@ mod tests {
         for len in [0usize, 1, 2, 3, 191, 192, 193, 2047, 2048] {
             let payload: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(61)).collect();
             for budget in [0u32, 1, len as u32, len as u32 + 1] {
-                let (got, _) = request("example.com", "/tunnel", &key, budget, &payload);
+                let (got, _) = request("example.com", "/tunnel", &key, budget, &payload, "");
                 assert_eq!(
                     got.capacity(),
                     got.len(),
@@ -1407,6 +1518,8 @@ mod tests {
                 &configured.path,
                 configured.budget,
                 b"ping",
+                &[],
+                0,
             )
             .expect("upgrades");
             server.join().expect("joins");
