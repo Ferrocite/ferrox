@@ -502,6 +502,26 @@ pub(crate) fn serve_httpheader(
     pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
+pub(crate) fn serve_session<R, W>(
+    mut reader: R,
+    writer: W,
+    password: &str,
+    method: &str,
+    freedom: bool,
+    close: &std::sync::Arc<dyn Fn() + Send + Sync>,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let Some((uplink, response, recv)) =
+        accept_on(&mut reader as &mut dyn Read, password, method, freedom)
+    else {
+        close();
+        return;
+    };
+    pump_relay_carried_with_response(&uplink, reader, writer, close, response, recv);
+}
+
 pub(crate) fn serve_kcp<R, W>(
     mut reader: R,
     writer: W,

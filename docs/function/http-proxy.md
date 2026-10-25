@@ -71,6 +71,6 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 
 <!-- scope:begin -->
 - paths: -
-- symbols: serve_http, http_proxy, http_proxy_request, http_request_parses, http_connect, connect_request, connect_grant, connect_authority, origin_head, origin_form, grant_line, direct_grant, SOCKS_GRANTED, authority_len, push_authority, authority_target, http_outbound, http_accounts, http_credential_accepted, drop_header, HTTP_AUTH_REQUIRED
+- symbols: serve_http, http_proxy, http_proxy_request, http_request_parses, http_connect, connect_request, connect_grant, connect_authority, origin_head, origin_form, grant_line, direct_grant, SOCKS_GRANTED, authority_len, push_authority, authority_target, http_outbound, http_accounts, http_credential_account, drop_header, HTTP_AUTH_REQUIRED
 - go: ./proxy/http/...
 <!-- scope:end -->
