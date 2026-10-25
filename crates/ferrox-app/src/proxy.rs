@@ -2031,10 +2031,14 @@ enum FreedomRedirect {
 impl FreedomRedirect {
     fn apply(&self, asked: &Destination) -> Destination {
         match (self, asked) {
-            (Self::Address(host, port), _) => match host.parse() {
-                Ok(ip) => Destination::Address(SocketAddr::new(ip, *port)),
-                Err(_) => Destination::Name(host.clone(), *port),
-            },
+            (Self::Address(host, port), _) => {
+                let port = if *port == 0 { asked.port() } else { *port };
+                match host.parse() {
+                    Ok(ip) => Destination::Address(SocketAddr::new(ip, port)),
+                    Err(_) => Destination::Name(host.clone(), port),
+                }
+            }
+            (Self::Port(0), _) => asked.clone(),
             (Self::Port(port), Destination::Address(address)) => {
                 Destination::Address(SocketAddr::new(address.ip(), *port))
             }
@@ -36173,13 +36177,19 @@ mod tests {
         assert_eq!(FreedomDomain::UseIp4.pick(&[v6]), None);
     }
 
-    /// An empty redirect host keeps the requested name and changes only its port.
+    /// An empty redirect host keeps the requested name and changes only its port; a zero
+    /// port is the reference's "leave the port alone".
     #[test]
     fn a_freedom_redirect_with_no_host_keeps_the_requested_host() {
         let asked = Destination::Name("example.com".to_owned(), 443);
         assert_eq!(
             FreedomRedirect::Port(8443).apply(&asked),
             Destination::Name("example.com".to_owned(), 8443)
+        );
+        assert_eq!(FreedomRedirect::Port(0).apply(&asked), asked);
+        assert_eq!(
+            FreedomRedirect::Address("127.0.0.2".to_owned(), 0).apply(&asked),
+            Destination::Address(SocketAddr::from(([127, 0, 0, 2], 443)))
         );
     }
 
