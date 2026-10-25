@@ -4378,7 +4378,10 @@ fn shake_tls<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
         match session.handshake() {
             Ok(()) => return true,
             Err(ferrox_core::tls::TlsError::Timeout) if Instant::now() < deadline => {}
-            Err(_) => return false,
+            Err(error) => {
+                echo_trace(&format!("tls: shake failed: {error}"));
+                return false;
+            }
         }
     }
 }
