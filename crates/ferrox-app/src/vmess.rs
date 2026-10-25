@@ -1561,8 +1561,23 @@ pub(crate) fn serve_ws_split<R, W>(
     serve_decoded(reader, writer, &close, decoded, freedom);
 }
 
+#[cfg(test)]
 pub(crate) fn serve_grpc(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
-    let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
+    serve_grpc_with(
+        stream,
+        &crate::config::GrpcSettings::path(path),
+        id,
+        freedom,
+    );
+}
+
+pub(crate) fn serve_grpc_with(
+    stream: Connection,
+    settings: &crate::config::GrpcSettings,
+    id: &[u8; 16],
+    freedom: bool,
+) {
+    let Some((mut reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
     let decoded = under_handshake(&mut reader, |read| accept_request(read, id));
@@ -1574,7 +1589,7 @@ pub(crate) fn serve_grpc(stream: Connection, path: &str, id: &[u8; 16], freedom:
 pub(crate) fn serve_grpc_split<R, W>(
     reader: R,
     writer: W,
-    path: &str,
+    settings: &crate::config::GrpcSettings,
     id: &[u8; 16],
     freedom: bool,
     close: &Close,
@@ -1582,7 +1597,8 @@ pub(crate) fn serve_grpc_split<R, W>(
     R: Read + Send + 'static,
     W: crate::proxy::FrameWrite + Send + 'static,
 {
-    let Some((mut reader, writer)) = crate::grpc::accept_split(reader, writer, path) else {
+    let Some((mut reader, writer)) = crate::grpc::accept_split_with(reader, writer, settings)
+    else {
         return;
     };
     let decoded = accept_request_bounded(&mut reader, id);
