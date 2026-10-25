@@ -29,6 +29,32 @@ pub(crate) struct Level {
     pub(crate) buffer: Option<i32>,
 }
 
+impl Default for Level {
+    fn default() -> Self {
+        Self {
+            handshake: Some(Duration::from_secs(60)),
+            conn_idle: Some(Duration::from_secs(300)),
+            uplink_only: Some(Duration::from_secs(1)),
+            downlink_only: Some(Duration::from_secs(1)),
+            stats: Stats::default(),
+            buffer: Some(default_buffer()),
+        }
+    }
+}
+
+/// The reference's per-connection buffer default: 512 KiB on the hosts this tree builds for,
+/// 4 KiB on a 64-bit ARM host, and unlimited where the reference leaves the pipe unbounded.
+fn default_buffer() -> i32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        4
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        512
+    }
+}
+
 impl Level {
     fn flow(&self) -> Flow {
         Flow {
@@ -71,8 +97,11 @@ pub(crate) struct Config {
 }
 
 impl Config {
-    pub(crate) fn flow(&self, level: u32) -> Option<Flow> {
-        self.levels.get(&level).map(Level::flow)
+    pub(crate) fn flow(&self, level: u32) -> Flow {
+        self.levels
+            .get(&level)
+            .map_or_else(Level::default, Level::clone)
+            .flow()
     }
 }
 
@@ -121,14 +150,7 @@ fn level_row(value: &Json, name: &str) -> Result<Level, String> {
     let Json::Obj(pairs) = value else {
         return Err(format!("policy level `{name}` is not an object"));
     };
-    let mut level = Level {
-        handshake: None,
-        conn_idle: None,
-        uplink_only: None,
-        downlink_only: None,
-        stats: Stats::default(),
-        buffer: None,
-    };
+    let mut level = Level::default();
     for (key, value) in pairs {
         match key.as_str() {
             "handshake" => level.handshake = seconds(value, "handshake")?,
@@ -208,9 +230,9 @@ pub(crate) fn configured() -> Option<Arc<Config>> {
     lock().clone()
 }
 
-/// The policy a level carries, or none when the config never named that level.
-pub(crate) fn flow(level: u32) -> Option<Flow> {
-    configured().and_then(|config| config.flow(level))
+/// The policy a level carries, with the reference's defaults for every field the config did not name.
+pub(crate) fn flow(level: u32) -> Flow {
+    configured().map_or_else(|| Level::default().flow(), |config| config.flow(level))
 }
 
 pub(crate) fn system() -> SystemStats {
@@ -259,7 +281,10 @@ mod tests {
             config.levels.get(&1).expect("level one").flow().buffer,
             Some(usize::MAX)
         );
-        assert!(config.flow(0).is_none());
+        let default = config.flow(0);
+        assert_eq!(default.handshake(), Some(Duration::from_secs(60)));
+        assert_eq!(default.conn_idle(), Some(Duration::from_secs(300)));
+        assert_eq!(default.buffer(), Some(default_buffer() as usize * 1024));
     }
 
     #[test]
@@ -285,10 +310,7 @@ mod tests {
         )
         .expect("parses");
         install(&root).expect("policy installs");
-        assert_eq!(
-            flow(2).expect("level two").conn_idle(),
-            Some(Duration::from_secs(42))
-        );
+        assert_eq!(flow(2).conn_idle(), Some(Duration::from_secs(42)));
         assert!(system().inbound_uplink);
         clear();
     }

@@ -1,5 +1,5 @@
 use crate::json::Json;
-use crate::policy::{self, Flow, SystemStats};
+use crate::policy::{self, SystemStats};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
@@ -76,15 +76,16 @@ pub(crate) struct Meter {
     read: Vec<Arc<Counter>>,
     write: Vec<Arc<Counter>>,
     online: Option<Arc<OnlineLease>>,
-    policy: Option<Flow>,
 }
 
 impl Meter {
     pub(crate) fn is_empty(&self) -> bool {
-        self.read.is_empty()
-            && self.write.is_empty()
-            && self.online.is_none()
-            && self.policy.is_none()
+        self.read.is_empty() && self.write.is_empty() && self.online.is_none()
+    }
+
+    /// Whether this meter observes bytes, which is what forbids a descriptor-level fast path.
+    pub(crate) fn counts(&self) -> bool {
+        !self.read.is_empty() || !self.write.is_empty()
     }
 
     pub(crate) fn read(&self, bytes: usize) {
@@ -99,10 +100,6 @@ impl Meter {
         }
     }
 
-    pub(crate) fn flow(&self) -> Option<Flow> {
-        self.policy
-    }
-
     /// A newer meter for the same flow keeps the counters the older one carried and adds the
     /// ones it names, so wrapping a decoded user never stops the inbound's own count.
     pub(crate) fn merged(mut self, newer: Self) -> Self {
@@ -110,9 +107,6 @@ impl Meter {
         self.write.extend(newer.write);
         if newer.online.is_some() {
             self.online = newer.online;
-        }
-        if newer.policy.is_some() {
-            self.policy = newer.policy;
         }
         self
     }
@@ -234,13 +228,9 @@ fn register_users(root: &Json) {
 }
 
 /// The inbound meter: reads are uplink, writes are downlink, exactly the reference's raw-conn wrap.
-pub(crate) fn inbound(tag: Option<&str>, level: u32) -> Meter {
-    let policy = policy::flow(level);
+pub(crate) fn inbound(tag: Option<&str>) -> Meter {
     if !enabled() {
-        return Meter {
-            policy,
-            ..Meter::default()
-        };
+        return Meter::default();
     }
     let system = system();
     let name = tag.filter(|tag| !tag.is_empty());
@@ -258,7 +248,6 @@ pub(crate) fn inbound(tag: Option<&str>, level: u32) -> Meter {
         read,
         write,
         online: None,
-        policy,
     }
 }
 
@@ -284,27 +273,19 @@ pub(crate) fn outbound(tag: Option<&str>) -> Meter {
         read,
         write,
         online: None,
-        policy: None,
     }
 }
 
 /// The user meter a decoded account adds: payload counters and the online lease the reference
 /// holds for the life of the session.
 pub(crate) fn user(email: &str, level: u32) -> Meter {
-    let flow = policy::flow(level);
     if !enabled() || email.is_empty() {
-        return Meter {
-            policy: flow,
-            ..Meter::default()
-        };
+        return Meter::default();
     }
     let Some(policy) =
         policy::configured().and_then(|config| config.levels.get(&level).map(|level| level.stats))
     else {
-        return Meter {
-            policy: flow,
-            ..Meter::default()
-        };
+        return Meter::default();
     };
     let read = policy
         .user_uplink
@@ -326,7 +307,6 @@ pub(crate) fn user(email: &str, level: u32) -> Meter {
         read,
         write,
         online,
-        policy: flow,
     }
 }
 
@@ -423,7 +403,7 @@ mod tests {
         .expect("parses");
         crate::policy::install(&root).expect("policy installs");
         install(&root).expect("stats installs");
-        let inbound = inbound(Some("in"), 0);
+        let inbound = inbound(Some("in"));
         inbound.read(12);
         inbound.write(99);
         let outbound = outbound(Some("out"));
@@ -458,7 +438,7 @@ mod tests {
         .expect("parses");
         crate::policy::install(&root).expect("policy installs");
         install(&root).expect("stats installs");
-        let meter = inbound(Some("in"), 0).merged(user("alice@example", 1));
+        let meter = inbound(Some("in")).merged(user("alice@example", 1));
         meter.read(9);
         let snapshot = snapshot();
         assert_eq!(snapshot.inbound["in"].uplink, 9);
