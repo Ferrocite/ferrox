@@ -922,7 +922,6 @@ impl Listener {
         }
     }
 
-    #[cfg(test)]
     /// The socket address a TCP listener holds. A Unix listener has no port to report, so it
     /// answers the error a caller expecting an ephemeral TCP port would get from no bind.
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {

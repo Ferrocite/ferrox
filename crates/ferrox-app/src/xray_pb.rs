@@ -88,7 +88,7 @@ fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    let (listen, ports, stream) =
+    let (listen, ports, stream, sniffing) =
         receiver.ok_or("xray.core.InboundHandlerConfig: no receiver settings")?;
     let (name, value) = settings.ok_or("xray.core.InboundHandlerConfig: no proxy settings")?;
     let (protocol, inbound_settings) = match name.as_str() {
@@ -116,6 +116,9 @@ fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
             }
             if inbound_settings != Json::Null {
                 pairs.push(("settings", inbound_settings.clone()));
+            }
+            if let Some(sniffing) = &sniffing {
+                pairs.push(("sniffing", sniffing.clone()));
             }
             if let Some(stream) = &stream {
                 pairs.push(("streamSettings", stream.clone()));
@@ -199,11 +202,14 @@ fn outbound(bytes: &[u8]) -> Result<Json, String> {
     Ok(object(pairs))
 }
 
-fn receiver_config(bytes: &[u8]) -> Result<(String, Vec<u16>, Option<Json>), String> {
+type ReceiverConfig = (String, Vec<u16>, Option<Json>, Option<Json>);
+
+fn receiver_config(bytes: &[u8]) -> Result<ReceiverConfig, String> {
     let mut reader = Reader::new(bytes, "xray.app.proxyman.ReceiverConfig");
     let mut ports = None;
     let mut listen = None;
     let mut stream = None;
+    let mut sniffing = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => ports = Some(port_list(reader.bytes()?)?),
@@ -213,7 +219,7 @@ fn receiver_config(bytes: &[u8]) -> Result<(String, Vec<u16>, Option<Json>), Str
                 stream = Some(stream_settings(reader.bytes()?)?);
             }
             (4, 0) => return Err(reader.uncarried("receive_original_destination")),
-            (6, 2) => return Err(reader.uncarried("sniffing settings")),
+            (6, 2) => sniffing = Some(sniffing_settings(reader.bytes()?)?),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
@@ -223,7 +229,43 @@ fn receiver_config(bytes: &[u8]) -> Result<(String, Vec<u16>, Option<Json>), Str
         listen.unwrap_or_else(|| "127.0.0.1".to_owned()),
         ports,
         stream,
+        sniffing,
     ))
+}
+
+fn sniffing_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.proxyman.SniffingConfig");
+    let mut enabled = false;
+    let mut destination = Vec::new();
+    let mut domains = Vec::new();
+    let mut ips = Vec::new();
+    let mut metadata_only = false;
+    let mut route_only = false;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => enabled = reader.varint()? != 0,
+            (2, 2) => destination.push(Json::Str(
+                std::str::from_utf8(reader.bytes()?)
+                    .map_err(|_| {
+                        "xray.app.proxyman.SniffingConfig: a destination is not utf-8".to_owned()
+                    })?
+                    .to_owned(),
+            )),
+            (3, 2) => domains.push(Json::Str(domain_rule(reader.bytes()?)?)),
+            (6, 2) => ips.push(Json::Str(ip_rule(reader.bytes()?)?)),
+            (4, 0) => metadata_only = reader.varint()? != 0,
+            (5, 0) => route_only = reader.varint()? != 0,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(object(vec![
+        ("enabled", Json::Bool(enabled)),
+        ("destOverride", Json::Arr(destination)),
+        ("domainsExcluded", Json::Arr(domains)),
+        ("ipsExcluded", Json::Arr(ips)),
+        ("metadataOnly", Json::Bool(metadata_only)),
+        ("routeOnly", Json::Bool(route_only)),
+    ]))
 }
 
 /// A sender's client-side stream policy: only its stream settings are carried, and a multiplex
@@ -2532,6 +2574,28 @@ mod tests {
         message(&[bytes_field(1, name.as_bytes()), bytes_field(2, value)])
     }
 
+    #[test]
+    fn a_protobuf_sniffer_reaches_the_json_inbound() {
+        let sniffing = message(&[
+            varint_field(1, 1),
+            bytes_field(2, b"tls"),
+            varint_field(4, 1),
+            varint_field(5, 1),
+        ]);
+        let range = message(&[varint_field(1, 1080), varint_field(2, 1080)]);
+        let list = message(&[bytes_field(1, &range)]);
+        let receiver = message(&[bytes_field(1, &list), bytes_field(6, &sniffing)]);
+        let decoded = receiver_config(&receiver).expect("receiver");
+        let sniffing = decoded.3.expect("sniffing");
+        assert_eq!(sniffing.get("enabled"), Some(&Json::Bool(true)));
+        assert_eq!(
+            sniffing.get("destOverride"),
+            Some(&Json::Arr(vec![Json::Str("tls".to_owned())]))
+        );
+        assert_eq!(sniffing.get("metadataOnly"), Some(&Json::Bool(true)));
+        assert_eq!(sniffing.get("routeOnly"), Some(&Json::Bool(true)));
+    }
+
     fn receiver(port: u64, listen: Option<&[u8]>) -> Vec<u8> {
         let range = message(&[varint_field(1, port), varint_field(2, port)]);
         let list = message(&[bytes_field(1, &range)]);
@@ -4006,6 +4070,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         assert_eq!(routing.route(&flow), Some("blocked"));
     }
@@ -4049,6 +4114,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         assert_eq!(routing.route(&flow), Some("blocked"));
     }

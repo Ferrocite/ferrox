@@ -260,6 +260,15 @@ fn routed_out(
 
 /// Opens every inbound the config names, proving each server inbound's rules at startup, and reports
 /// how many opened and whether a hysteria inbound wants the readiness token.
+fn inbound_sniffing(inbound: &Json, label: &str) -> Option<Arc<crate::sniff::Sniffing>> {
+    crate::sniff::parse(inbound.get("sniffing")).unwrap_or_else(|error| {
+        exit(&format!(
+            "bad config {label}: inbound {} sniffing {error}",
+            inbound_tag(inbound).as_deref().unwrap_or("<untagged>")
+        ))
+    })
+}
+
 #[allow(clippy::too_many_lines)]
 fn serve_inbounds(
     label: &str,
@@ -288,7 +297,9 @@ fn serve_inbounds(
             if let Some(shared) = route {
                 prove_server_route(shared, inbound, label);
             }
+            let sniffing = inbound_sniffing(inbound, label);
             for address in &addresses {
+                crate::sniff::register(address, sniffing.clone());
                 match protocol {
                     "vless" => {
                         if serve_vless_inbound(address, inbound, freedom, label, portals) {
@@ -973,9 +984,32 @@ impl Outbound {
         network: crate::router::Network,
         client: Option<&Connection>,
     ) -> (&Self, Option<&str>) {
+        self.resolved_lane_with_protocol(asked, network, client, None)
+    }
+
+    fn resolved_with_protocol(
+        &self,
+        asked: &Destination,
+        network: crate::router::Network,
+        client: Option<&Connection>,
+        protocol: Option<&str>,
+    ) -> &Self {
+        self.resolved_lane_with_protocol(asked, network, client, protocol)
+            .0
+    }
+
+    fn resolved_lane_with_protocol(
+        &self,
+        asked: &Destination,
+        network: crate::router::Network,
+        client: Option<&Connection>,
+        protocol: Option<&str>,
+    ) -> (&Self, Option<&str>) {
         match self {
-            Self::Route(plan) => plan.lane(asked, network, client),
+            Self::Route(plan) => plan.lane_with_protocol(asked, network, client, protocol),
             other => (other, None),
+        }
+    }
         }
     }
 }
@@ -1045,7 +1079,17 @@ impl RoutePlan {
         network: crate::router::Network,
         client: Option<&Connection>,
     ) -> &Outbound {
-        self.lane(asked, network, client).0
+        self.pick_with_protocol(asked, network, client, None)
+    }
+
+    fn pick_with_protocol(
+        &self,
+        asked: &Destination,
+        network: crate::router::Network,
+        client: Option<&Connection>,
+        protocol: Option<&str>,
+    ) -> &Outbound {
+        self.lane_with_protocol(asked, network, client, protocol).0
     }
 
     /// The outbound one flow takes and the tag that names its lane, or the default when no rule
@@ -1055,6 +1099,16 @@ impl RoutePlan {
         asked: &Destination,
         network: crate::router::Network,
         client: Option<&Connection>,
+    ) -> (&Outbound, Option<&str>) {
+        self.lane_with_protocol(asked, network, client, None)
+    }
+
+    fn lane_with_protocol(
+        &self,
+        asked: &Destination,
+        network: crate::router::Network,
+        client: Option<&Connection>,
+        protocol: Option<&str>,
     ) -> (&Outbound, Option<&str>) {
         let (domain, ip) = match asked {
             Destination::Name(host, _) => (Some(host.as_str()), None),
@@ -1072,6 +1126,7 @@ impl RoutePlan {
             source,
             local,
             inbound_tag: self.inbound_tag.as_deref(),
+            protocol,
         };
         let Some(target) = self.shared.routing.route_target(&flow) else {
             return (&self.shared.default, self.shared.default_tag.as_deref());
@@ -1563,12 +1618,15 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>) {
         .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
     let listener = Listener::bind(&target)
         .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
+    let sniffing = crate::sniff::for_listener(listener.local_addr().ok(), address);
     for stream in listener.incoming() {
         let Ok(mut stream) = stream else { continue };
         no_delay(&stream);
         let role = role.clone();
         let tag = tag.map(str::to_owned);
+        let sniffing = sniffing.clone();
         thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
             let (stream, role) = match role {
                 Role::Proxied(inner) => {
                     let _ = stream.set_read_timeout(Some(budgets::handshake()));
@@ -10635,9 +10693,11 @@ fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts)
     // The rules decide the lane first; a blocked flow is granted before it closes, so the front's reply is read.
     let destination = handshake.asked.authority();
     crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", "");
-    let (out, tag) =
-        out.resolved_lane(&handshake.asked, crate::router::Network::Tcp, Some(&client));
-    if !matches!(out, Outbound::Foxy(_) | Outbound::Veepn(_)) {
+    let first = match crate::sniff::current() {
+        Some(sniffing) if sniffing.enabled() => None,
+        _ => Some(out.resolved(&handshake.asked, crate::router::Network::Tcp, Some(&client))),
+    };
+    if !matches!(first.unwrap_or(out), Outbound::Foxy(_) | Outbound::Veepn(_)) {
         let grant = match handshake.version {
             crate::socks::Version::V5 => Front::Socks.grant_line(),
             crate::socks::Version::V4 => ferrox_core::socks::grant4(),
@@ -10646,7 +10706,9 @@ fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts)
             return;
         }
     }
-    serve_connect(client, out, &handshake.asked, Front::Socks, &[], tag);
+    let (dial, out, tag) = sniff_lane(out, &handshake.asked, &client);
+    let asked = dial.as_ref().unwrap_or(&handshake.asked);
+    serve_connect(client, out, asked, Front::Socks, &[], tag);
 }
 
 /// The device front's relay: the front layer's own dial, with the destination the
@@ -10656,7 +10718,8 @@ fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts)
 /// front reaches — the same `serve_connect` the socks and http fronts call, with the
 /// same rules and the same grant.
 pub(crate) fn serve_device_flow(client: Connection, out: &Outbound, dest: &Destination) {
-    let (lane, tag) = out.resolved_lane(dest, crate::router::Network::Tcp, Some(&client));
+    let (dial, lane, tag) = sniff_lane(out, dest, &client);
+    let dest = dial.as_ref().unwrap_or(dest);
     serve_connect(client, lane, dest, Front::Socks, &[], tag);
 }
 
@@ -10736,6 +10799,38 @@ fn serve_connect_freedom(client: &Connection, asked: &Destination, prefix: &[u8]
         return;
     }
     relay_handoff(client, &upstream);
+}
+
+/// Sniff the client's first bytes, then pick the lane the reference would: the sniffed name is the
+/// route target, and the original address stays the dial target under `routeOnly`.
+fn sniff_lane<'a>(
+    out: &'a Outbound,
+    asked: &Destination,
+    client: &Connection,
+) -> (Option<Destination>, &'a Outbound, Option<&'a str>) {
+    let Some(sniffing) = crate::sniff::current() else {
+        let (lane, tag) = out.resolved_lane(asked, crate::router::Network::Tcp, Some(client));
+        return (None, lane, tag);
+    };
+    let Some(found) = sniffing.inspect(asked, crate::router::Network::Tcp, client) else {
+        let (lane, tag) = out.resolved_lane(asked, crate::router::Network::Tcp, Some(client));
+        return (None, lane, tag);
+    };
+    let route = found
+        .override_destination
+        .then(|| Destination::Name(found.domain.clone(), asked.port()));
+    let dial = if sniffing.should_dial_override(&found) {
+        route.clone()
+    } else {
+        None
+    };
+    let (resolved, tag) = out.resolved_lane_with_protocol(
+        route.as_ref().unwrap_or(asked),
+        crate::router::Network::Tcp,
+        Some(client),
+        Some(found.protocol),
+    );
+    (dial, resolved, tag)
 }
 
 /// One tunnel request from either front, already resolved to its lane: the Foxy lane grants after its tunnel opens.
@@ -11698,19 +11793,25 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
         ProxyRequest::Connect(asked) => {
             let destination = asked.authority();
             crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", "");
-            let (out, tag) = out.resolved_lane(&asked, crate::router::Network::Tcp, Some(&client));
-            if !matches!(out, Outbound::Foxy(_) | Outbound::Veepn(_))
+            let first = match crate::sniff::current() {
+                Some(sniffing) if sniffing.enabled() => None,
+                _ => Some(out.resolved(&asked, crate::router::Network::Tcp, Some(&client))),
+            };
+            if !matches!(first.unwrap_or(out), Outbound::Foxy(_) | Outbound::Veepn(_))
                 && client.write_all(Front::Http.grant_line()).is_err()
             {
                 return;
             }
-            serve_connect(client, out, &asked, Front::Http, &[], tag);
+            let (dial, out, tag) = sniff_lane(out, &asked, &client);
+            let asked = dial.as_ref().unwrap_or(&asked);
+            serve_connect(client, out, asked, Front::Http, &[], tag);
         }
         ProxyRequest::Forward(asked, origin) => {
             let destination = asked.authority();
             crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", "");
-            let (out, tag) = out.resolved_lane(&asked, crate::router::Network::Tcp, Some(&client));
-            serve_connect(client, out, &asked, Front::Http, &origin, tag);
+            let (dial, out, tag) = sniff_lane(out, &asked, &client);
+            let asked = dial.as_ref().unwrap_or(&asked);
+            serve_connect(client, out, asked, Front::Http, &origin, tag);
         }
     }
 }
@@ -38637,7 +38738,8 @@ fn front_dispatch(stream: Connection, role: Role) {
                 .map(|bound| bound.port())
                 .unwrap_or_default();
             let dest = port_map.get(&port).unwrap_or(&dest);
-            let (target, tag) = out.resolved_lane(dest, crate::router::Network::Tcp, Some(&stream));
+            let (dial, target, tag) = sniff_lane(&out, dest, &stream);
+            let dest = dial.as_ref().unwrap_or(dest);
             serve_connect(stream, target, dest, Front::Socks, &[], tag);
         }
         Role::Proxied(inner) => front_dispatch(stream, *inner),
