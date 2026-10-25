@@ -434,7 +434,14 @@ fn burst_check(
                 let value = match probe(&outbound, &destination, &method, timeout, true) {
                     Ok(delay) => delay.as_nanos() as i64,
                     Err(_) if !connectivity.is_empty() => {
-                        if probe(&Outbound::Freedom, &connectivity, &method, timeout, true).is_ok()
+                        if probe(
+                            &Outbound::Freedom(Arc::default()),
+                            &connectivity,
+                            &method,
+                            timeout,
+                            true,
+                        )
+                        .is_ok()
                         {
                             FAILED
                         } else {
@@ -896,7 +903,7 @@ mod tests {
         });
         let url = format!("http://127.0.0.1:{port}/generate_204");
         let delay = probe(
-            &Outbound::Freedom,
+            &Outbound::Freedom(Arc::default()),
             &url,
             "GET",
             Duration::from_secs(5),
