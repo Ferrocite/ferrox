@@ -5675,6 +5675,8 @@ impl KcpIo {
     }
 }
 
+// A shaped handshake cannot resume after a timeout, and a KCP tick can outlast the relay quantum,
+// so handshake reads wait on the handshake clock instead of the relay's.
 thread_local! {
     static KCP_HANDSHAKE_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
