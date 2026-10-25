@@ -347,7 +347,7 @@ These are the pinned-tree surfaces the tables above did not name. Where one is s
 | --- | --- | --- | --- |
 | 149 | Observatory burst probes + healthcheck inbound | implemented — legacy and burst probe loops, `leastPing`/`leastLoad` status, and the `hc` front; urltest/selector outbounds remain row 81 | xray `app/observatory`; Leaf `proxy/hc`; [engine-observatory](docs/function/engine-observatory.md), [front-healthcheck](docs/function/front-healthcheck.md) |
 | 150 | Tagged outbound | planned — high priority | xray `transport/internet/tagged`; `engine-tagged`. Row 80 tags inbounds, not outbound sockets. |
-| 151 | Hysteria v1 | planned — high priority | xray `proxy/hysteria`; only v2 is carried (row 19), so a v1 config is not carried. |
+| 151 | Hysteria v1 | implemented — both roles, TCP and UDP, xplus and port hop | sing-box `sagernet/sing-quic/hysteria` v1 (`75c3ac4`), apernet `app/v1.3.5`; [carrier-hysteria](docs/function/carrier-hysteria.md). Row 19 is v2. |
 | 152 | Freedom outbound options | planned — high priority | xray `proxy/freedom`; `domainStrategy`, `fragment`/`noises`/`finalRules`. Row 121 is the PROXY-protocol head. |
 | 153 | SOCKS front HTTP fallback | planned — high priority | xray `proxy/socks` `ProcessWithFirstbyte`. `mixed` sniffs, but a `socks` inbound does not hand an HTTP request to its HTTP handler. |
 | 154 | HTTP proxy chaining (`dialerProxy` over CONNECT) | planned — high priority | xray `dialerProxy`, sing-box `detour`, Leaf `proxy/chain`. Row 108 is the graph; this is the HTTP/CONNECT hop. |

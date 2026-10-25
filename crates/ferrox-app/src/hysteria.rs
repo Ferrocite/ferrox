@@ -42,14 +42,14 @@ pub(crate) struct Dial {
 
 #[derive(Clone)]
 pub(crate) struct Session {
-    shared: Arc<Mutex<quiche::Connection>>,
-    sock: Arc<crate::quic::Datagram>,
-    local: SocketAddr,
+    pub(crate) shared: Arc<Mutex<quiche::Connection>>,
+    pub(crate) sock: Arc<crate::quic::Datagram>,
+    pub(crate) local: SocketAddr,
     // Written once by `connect` from the auth response and read by the UDP dial that follows: a server that skips the lane header still carries TCP flows, so the flag gates datagrams only, never the connection.
-    udp_supported: bool,
+    pub(crate) udp_supported: bool,
 }
 
-fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
+pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
     let deadline = Instant::now() + crate::quic::SEND_WAIT;
     loop {
         let last = buf.is_empty();
@@ -83,7 +83,7 @@ fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
 }
 
 /// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling.
-fn drive_once(session: &Session, wait: Duration) -> bool {
+pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
     let timeout = {
         let Ok(conn) = session.shared.lock() else {
             return false;
@@ -264,8 +264,15 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
             } else {
                 "0.0.0.0:0"
             };
-            crate::quic::Datagram::hopped(peer, hop.ports(), hop.interval_ms, bind, &sock, obfs)
-                .ok()?
+            crate::quic::Datagram::hopped(
+                peer,
+                hop.ports(),
+                hop.interval_ms,
+                bind,
+                &sock,
+                obfs.map(crate::quic::Mask::Salamander),
+            )
+            .ok()?
         }
         None => match (obfs, dial.config.gecko) {
             // A gecko dial fragments and pads its long-header packets, salamander still sealing each frame; a password too short to mask with is refused at parse, never here.
@@ -293,8 +300,8 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
 pub(crate) struct Flow {
     session: Session,
     stream: u64,
-    backlog: Vec<u8>,
-    at: usize,
+    pub(crate) backlog: Vec<u8>,
+    pub(crate) at: usize,
     /// Whether `read` may drive the socket itself: a flow on the server's routed socket must not, because `serve_loop` reads every datagram and routes it, and a second reader steals packets the router must see.
     drive: bool,
 }
@@ -1862,6 +1869,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: 443,
             config: hysteria::Config {
+                version: 2,
                 auth: "a".to_owned(),
                 cc: hysteria::Congestion::Bbr,
                 obfs_password: String::new(),

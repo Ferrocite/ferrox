@@ -1320,11 +1320,34 @@ fn get_buffer(sock: &UdpSocket, option: i32) -> i32 {
 /// What a datagram socket is armed to wait for: `Some(None)` blocks forever, `Some(Some(d))` waits `d`, and `None` records no arm yet.
 type Arm = Option<Option<Duration>>;
 
+/// The datagram masks this tree carries: Hysteria v2's salamander/gecko key and Hysteria v1's xplus key.
+#[derive(Clone)]
+pub(crate) enum Mask {
+    Salamander(ferrox_core::hysteria::Salamander),
+    XPlus(ferrox_core::hysteria_v1::XPlus),
+}
+
+impl Mask {
+    fn seal_into(&self, plain: &[u8], out: &mut [u8]) -> Option<usize> {
+        match self {
+            Self::Salamander(mask) => mask.seal_into(plain, out),
+            Self::XPlus(mask) => mask.seal_into(plain, out),
+        }
+    }
+
+    fn deobfuscate_in_place(&self, datagram: &mut [u8]) -> Option<usize> {
+        match self {
+            Self::Salamander(mask) => mask.deobfuscate_in_place(datagram),
+            Self::XPlus(mask) => mask.deobfuscate_in_place(datagram),
+        }
+    }
+}
+
 /// One datagram socket: a relay or an obfuscation below changes no handshake, frame or stream above, so the hops live here.
 pub(crate) struct Datagram {
     sock: UdpSocket,
     relay: Option<Relay>,
-    obfs: Option<ferrox_core::hysteria::Salamander>,
+    obfs: Option<Mask>,
     /// A hopped client dial: the server port moves on a schedule and the socket
     /// with it, so a UDP flow keeps ending and a new one starting to a filter.
     /// Shared behind an `Arc` so a writer clone and a reader clone move together.
@@ -1349,8 +1372,8 @@ struct Relay {
 /// The most one datagram costs in headers: two reserved bytes, one flag byte, the longest address and the port.
 const RELAY_HEADER: usize = 22;
 
-/// One obfuscated datagram is a salt ahead of the QUIC packet it masks, so the wire frame is a salt wider than the largest plain datagram.
-const SALAMANDER_SALT: usize = ferrox_core::hysteria::SALAMANDER_SALT;
+/// One obfuscated datagram is a salt ahead of the QUIC packet it masks, so the wire frame is the widest salt wider than the largest plain datagram.
+const SALAMANDER_SALT: usize = ferrox_core::hysteria_v1::XPLUS_SALT;
 
 /// How long a socket the schedule just left stays readable, so a reply still in
 /// flight on the old flow is not lost the instant the port moves. The reference
@@ -1479,12 +1502,7 @@ impl Hopper {
 
     /// Write one datagram on the current flow, salting it first when obfuscated. Only
     /// the server's own datagram has its port rewritten; anything else is passed on.
-    fn send(
-        &self,
-        buf: &[u8],
-        to: SocketAddr,
-        obfs: Option<&ferrox_core::hysteria::Salamander>,
-    ) -> std::io::Result<usize> {
+    fn send(&self, buf: &[u8], to: SocketAddr, obfs: Option<&Mask>) -> std::io::Result<usize> {
         let (sock, dest) = self.egress(to);
         let Some(obfs) = obfs else {
             return sock.send_to(buf, dest);
@@ -1501,11 +1519,7 @@ impl Hopper {
     /// flow is tried, then the lingering one; a hopped reply source is turned back to
     /// the nominal server port. No data on either is the same `WouldBlock` a plain
     /// socket returns, so the drive loop keeps its no-packet path.
-    fn recv(
-        &self,
-        buf: &mut [u8],
-        obfs: Option<&ferrox_core::hysteria::Salamander>,
-    ) -> std::io::Result<(usize, SocketAddr)> {
+    fn recv(&self, buf: &mut [u8], obfs: Option<&Mask>) -> std::io::Result<(usize, SocketAddr)> {
         let (current, _) = self.current();
         let previous = match self.state.lock() {
             Ok(mut state) => {
@@ -1550,7 +1564,7 @@ impl Hopper {
     fn read_into(
         sock: &UdpSocket,
         buf: &mut [u8],
-        obfs: Option<&ferrox_core::hysteria::Salamander>,
+        obfs: Option<&Mask>,
     ) -> std::io::Result<(usize, SocketAddr)> {
         let Some(obfs) = obfs else {
             return sock.recv_from(buf);
@@ -1833,7 +1847,19 @@ impl Datagram {
         Self {
             sock,
             relay: None,
-            obfs: Some(obfs),
+            obfs: Some(Mask::Salamander(obfs)),
+            hop: None,
+            gecko: None,
+            armed: Arc::default(),
+        }
+    }
+
+    /// A socket whose every datagram is xplus-masked under `obfs`, the Hysteria v1 obfuscation.
+    pub(crate) fn xplus(sock: UdpSocket, obfs: ferrox_core::hysteria_v1::XPlus) -> Self {
+        Self {
+            sock,
+            relay: None,
+            obfs: Some(Mask::XPlus(obfs)),
             hop: None,
             gecko: None,
             armed: Arc::default(),
@@ -1883,7 +1909,7 @@ impl Datagram {
         interval_ms: (u64, u64),
         bind: &'static str,
         first: &UdpSocket,
-        obfs: Option<ferrox_core::hysteria::Salamander>,
+        obfs: Option<Mask>,
     ) -> std::io::Result<Self> {
         let hopper = Hopper::open(server, ports, interval_ms, bind, first)?;
         Ok(Self {
