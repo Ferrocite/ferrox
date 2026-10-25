@@ -5907,17 +5907,14 @@ fn kcp_tls_connect(
     conn: &Arc<ferrox_core::kcp::Connection>,
     cfg: &ferrox_core::tls::TlsConfig,
 ) -> Option<ferrox_core::tls::ClientSession<KcpIo>> {
-    let mut session = match ferrox_core::tls::connect(
+    let Ok(mut session) = ferrox_core::tls::connect(
         cfg,
         KcpIo {
             conn: Arc::clone(conn),
         },
-    ) {
-        Ok(session) => session,
-        Err(_) => {
-            echo_trace("kcp-tls: connect failed");
-            return None;
-        }
+    ) else {
+        echo_trace("kcp-tls: connect failed");
+        return None;
     };
     if !shake_tls(&mut session) {
         echo_trace("kcp-tls: shake failed");
