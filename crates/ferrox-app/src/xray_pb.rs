@@ -2805,9 +2805,7 @@ fn burst_observatory_settings(bytes: &[u8]) -> Result<Json, String> {
             Json::Arr(selectors.into_iter().map(Json::Str).collect()),
         ));
     }
-    if let Some(ping) = ping {
-        pairs.push(("pingConfig", ping));
-    }
+    pairs.push(("pingConfig", ping.unwrap_or_else(|| Json::Obj(Vec::new()))));
     Ok(object(pairs))
 }
 
@@ -2879,8 +2877,15 @@ fn healthping_settings(bytes: &[u8]) -> Result<Json, String> {
     if let Some(timeout) = timeout.filter(|nanos| *nanos != 0) {
         pairs.push(("timeout", Json::Str(format!("{timeout}ns"))));
     }
-    if let Some(method) = method.filter(|method| !method.is_empty()) {
-        pairs.push(("httpMethod", Json::Str(method)));
+    if let Some(raw) = method {
+        let method = raw.trim();
+        if method.is_empty() {
+            if !raw.is_empty() {
+                pairs.push(("httpMethod", Json::Str("GET".to_owned())));
+            }
+        } else {
+            pairs.push(("httpMethod", Json::Str(method.to_owned())));
+        }
     }
     Ok(object(pairs))
 }
@@ -4603,6 +4608,41 @@ mod tests {
         let config = message(&[bytes_field(4, &typed("xray.app.stats.Config", &[]))]);
         let json = to_json(&config).expect("stats app");
         assert!(json.get("stats").is_some());
+    }
+
+    /// A protobuf burst app with no ping settings takes the nil-config defaults.
+    #[test]
+    fn a_burst_app_without_ping_settings_decodes_to_the_defaults() {
+        let burst = message(&[bytes_field(2, b"proxy")]);
+        let config = message(&[bytes_field(
+            4,
+            &typed("xray.app.observatory.burst.Config", &burst),
+        )]);
+        let json = to_json(&config).expect("the burst app decodes");
+        let ping = json
+            .get("burstObservatory")
+            .and_then(|burst| burst.get("pingConfig"))
+            .expect("the default sampler");
+        assert!(matches!(ping, Json::Obj(pairs) if pairs.is_empty()));
+    }
+
+    /// A whitespace-only protobuf method trims to `GET`, as the reference's
+    /// `http.NewRequest` does with the trimmed empty method.
+    #[test]
+    fn a_whitespace_ping_method_decodes_to_get() {
+        let ping = message(&[bytes_field(6, b" ")]);
+        let burst = message(&[bytes_field(3, &ping)]);
+        let config = message(&[bytes_field(
+            4,
+            &typed("xray.app.observatory.burst.Config", &burst),
+        )]);
+        let json = to_json(&config).expect("the burst app decodes");
+        let method = json
+            .get("burstObservatory")
+            .and_then(|burst| burst.get("pingConfig"))
+            .and_then(|ping| ping.get("httpMethod"))
+            .and_then(Json::as_str);
+        assert_eq!(method, Some("GET"));
     }
 
     /// Both observatory apps decode to the keys the probe loop reads, so a
