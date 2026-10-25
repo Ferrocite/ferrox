@@ -77,6 +77,10 @@ jobs:
         # watch-test.sh is what cuts a hung suite at the quiet limit and points at the
         # one test that never returns; nothing else runs its selftest, so gate it here.
         run: ./scripts/watch-test.sh --selftest
+      - name: the CLI's own gates
+        run: |
+          python3 scripts/check-cli-args.py
+          python3 scripts/check-cli-lane.py
       - name: the gates that do not need a toolchain
         env:
           GATES: check-leak-surface check-comments check-merge-markers check-fixture-safety check-dependency-policy check-windows-binary-paths check-method-docs check-ci-scope
