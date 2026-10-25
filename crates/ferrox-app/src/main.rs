@@ -34,6 +34,7 @@ mod headers;
 mod httpheader;
 mod httpupgrade;
 mod hysteria;
+mod hysteria_v1;
 mod json;
 mod metrics;
 mod observatory;
