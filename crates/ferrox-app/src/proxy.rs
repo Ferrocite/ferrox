@@ -758,8 +758,16 @@ fn exit(message: &str) -> ! {
 struct SocksAccounts {
     /// Whether the front asks for the credential exchange at all.
     password: bool,
-    /// The name and the password of each account the front accepts.
-    pairs: Vec<(String, String)>,
+    /// The accounts the front accepts, each with the email and level its counters key on.
+    pairs: Vec<SocksAccount>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct SocksAccount {
+    user: String,
+    pass: String,
+    email: String,
+    level: u32,
 }
 
 impl SocksAccounts {
@@ -769,11 +777,11 @@ impl SocksAccounts {
         self.password
     }
 
-    /// Whether the credential the client sent is one this front knows.
-    fn accepts(&self, user: &[u8], pass: &[u8]) -> bool {
+    /// The account the credential names, if this front knows it.
+    fn account(&self, user: &[u8], pass: &[u8]) -> Option<&SocksAccount> {
         self.pairs
             .iter()
-            .any(|(name, password)| name.as_bytes() == user && password.as_bytes() == pass)
+            .find(|account| account.user.as_bytes() == user && account.pass.as_bytes() == pass)
     }
 
     /// Whether the front has an account at all, which is what xray's HTTP side gates its 407 on.
@@ -812,7 +820,16 @@ fn socks_accounts(inbound: &Json) -> SocksAccounts {
         let Some(pass) = account.get("pass").and_then(Json::as_str) else {
             continue;
         };
-        pairs.push((user.to_owned(), pass.to_owned()));
+        pairs.push(SocksAccount {
+            user: user.to_owned(),
+            pass: pass.to_owned(),
+            email: account
+                .get("email")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            level: account.get("level").and_then(Json::as_u32).unwrap_or(0),
+        });
     }
     SocksAccounts {
         password: true,
@@ -829,10 +846,23 @@ fn http_accounts(inbound: &Json) -> SocksAccounts {
         .unwrap_or(&[]);
     let pairs = listed
         .iter()
-        .map(|account| {
-            let user = account.get("user").and_then(Json::as_str).unwrap_or("");
-            let pass = account.get("pass").and_then(Json::as_str).unwrap_or("");
-            (user.to_owned(), pass.to_owned())
+        .map(|account| SocksAccount {
+            user: account
+                .get("user")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            pass: account
+                .get("pass")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            email: account
+                .get("email")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            level: account.get("level").and_then(Json::as_u32).unwrap_or(0),
         })
         .collect::<Vec<_>>();
     SocksAccounts {
@@ -1638,7 +1668,8 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>) {
             // Armed once per accepted stream, as the reference wraps its listener's conn.
             let stream = stream
                 .with_mask(role.tcp_mask())
-                .with_meter(crate::stats::inbound(tag.as_deref(), 0));
+                .with_meter(crate::stats::inbound(tag.as_deref()))
+                .with_policy(Some(crate::policy::flow(0)));
             front_dispatch(stream, role);
         });
     }
@@ -2185,7 +2216,9 @@ fn vless_raw_reply<D, R>(
         "",
         &user.email,
     );
-    let mut stream = stream.with_meter(crate::stats::user(&user.email, user.level));
+    let mut stream = stream
+        .with_meter(crate::stats::user(&user.email, user.level))
+        .with_policy(Some(crate::policy::flow(user.level)));
     match reverse_ask(users, &got, flow, cmd) {
         ReverseAsk::Allowed(portal) => {
             if stream.write_all(&[0, 0]).is_err() {
@@ -11026,12 +11059,21 @@ fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts)
         );
         return;
     };
+    let email = handshake
+        .account
+        .as_ref()
+        .map_or("", |account| account.email.as_str());
+    if let Some(account) = &handshake.account {
+        client = client
+            .with_meter(crate::stats::user(&account.email, account.level))
+            .with_policy(Some(crate::policy::flow(account.level)));
+    }
     if handshake.cmd == 3 {
         return serve_socks_udp(client, out);
     }
     // The rules decide the lane first; a blocked flow is granted before it closes, so the front's reply is read.
     let destination = handshake.asked.authority();
-    crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", "");
+    crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
     let first = match crate::sniff::current() {
         Some(sniffing) if sniffing.enabled() => None,
         _ => Some(
@@ -12067,21 +12109,18 @@ const HTTP_AUTH_REQUIRED: &[u8] =
     b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"proxy\"\r\n\r\n";
 
 /// Whether the head carries an account this front accepts, decoded as xray decodes it: `Basic `, standard base64, the first colon.
-fn http_credential_accepted(head: &[u8], accounts: &SocksAccounts) -> bool {
+fn http_credential_account<'a>(
+    head: &[u8],
+    accounts: &'a SocksAccounts,
+) -> Option<&'a SocksAccount> {
     use base64::Engine as _;
-    let Some(value) = header_value(head, "proxy-authorization") else {
-        return false;
-    };
-    let Some(encoded) = value.strip_prefix("Basic ") else {
-        return false;
-    };
-    let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(encoded) else {
-        return false;
-    };
-    let Some(colon) = decoded.iter().position(|byte| *byte == b':') else {
-        return false;
-    };
-    accounts.accepts(&decoded[..colon], &decoded[colon + 1..])
+    let value = header_value(head, "proxy-authorization")?;
+    let encoded = value.strip_prefix("Basic ")?;
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let colon = decoded.iter().position(|byte| *byte == b':')?;
+    accounts.account(&decoded[..colon], &decoded[colon + 1..])
 }
 
 /// Removes every line naming a header, in place; the credential is the proxy's, not the origin's.
@@ -12115,18 +12154,31 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
     else {
         return;
     };
-    if accounts.names_accounts() && !http_credential_accepted(&head, accounts) {
-        crate::accesslog::record(
-            client.peer_addr().ok(),
-            false,
-            &"unknown",
-            None,
-            "rejected",
-            "",
-        );
-        let _ = client.write_all(HTTP_AUTH_REQUIRED);
-        return;
+    let account = if accounts.names_accounts() {
+        let Some(account) = http_credential_account(&head, accounts) else {
+            crate::accesslog::record(
+                client.peer_addr().ok(),
+                false,
+                &"unknown",
+                None,
+                "rejected",
+                "",
+            );
+            let _ = client.write_all(HTTP_AUTH_REQUIRED);
+            return;
+        };
+        Some(account.clone())
+    } else {
+        None
+    };
+    if let Some(account) = &account {
+        client = client
+            .with_meter(crate::stats::user(&account.email, account.level))
+            .with_policy(Some(crate::policy::flow(account.level)));
     }
+    let email = account
+        .as_ref()
+        .map_or("", |account| account.email.as_str());
     drop_header(&mut head, "proxy-authorization");
     let Some(request) = http_proxy_request(head) else {
         return;
@@ -12134,7 +12186,7 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
     match request {
         ProxyRequest::Connect(asked) => {
             let destination = asked.authority();
-            crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", "");
+            crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
             let first = match crate::sniff::current() {
                 Some(sniffing) if sniffing.enabled() => None,
                 _ => Some(
@@ -12153,7 +12205,7 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
         }
         ProxyRequest::Forward(asked, origin) => {
             let destination = asked.authority();
-            crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", "");
+            crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
             let (out, tag) = out.resolved_lane_with_protocol(
                 &asked,
                 crate::router::Network::Tcp,
@@ -16320,6 +16372,8 @@ struct Handshake {
     asked: Destination,
     /// The version the client spoke.
     version: crate::socks::Version,
+    /// The account the greeting authenticated, when the front asked for one.
+    account: Option<SocksAccount>,
 }
 
 /// The handshake that keeps the client's name: resolving here hands the edge an address it cannot route.
@@ -16359,6 +16413,7 @@ fn socks_request(
             cmd,
             asked,
             version: crate::socks::Version::V4,
+            account: None,
         });
     }
     if head[0] != 5 {
@@ -16387,9 +16442,11 @@ fn socks_request(
     if client.write_all(&[5, wanted]).is_err() {
         return None;
     }
-    if wanted == ferrox_core::socks::METHOD_USER && !socks_authenticate(client, until, accounts) {
-        return None;
-    }
+    let account = if wanted == ferrox_core::socks::METHOD_USER {
+        Some(socks_authenticate(client, until, accounts)?)
+    } else {
+        None
+    };
     let mut req = [0u8; 4];
     read_exact(
         &mut HandshakeDeadline {
@@ -16416,6 +16473,7 @@ fn socks_request(
         cmd: req[1],
         asked: target,
         version: crate::socks::Version::V5,
+        account,
     })
 }
 
@@ -16520,7 +16578,11 @@ fn read_socks4_name(client: &mut Connection, until: Instant, buf: &mut [u8]) -> 
 /// The RFC 1929 exchange: the version, the name's length, the name, the password's
 /// length, and the password. The answer is the version and a status byte — zero when
 /// the account is one the front knows.
-fn socks_authenticate(client: &mut Connection, until: Instant, accounts: &SocksAccounts) -> bool {
+fn socks_authenticate(
+    client: &mut Connection,
+    until: Instant,
+    accounts: &SocksAccounts,
+) -> Option<SocksAccount> {
     let mut head = [0u8; 2];
     if read_exact(
         &mut HandshakeDeadline {
@@ -16531,11 +16593,11 @@ fn socks_authenticate(client: &mut Connection, until: Instant, accounts: &SocksA
     )
     .is_err()
     {
-        return false;
+        return None;
     }
     if head[0] != ferrox_core::socks::AUTH_VERSION {
         let _ = client.write_all(&[ferrox_core::socks::AUTH_VERSION, 1]);
-        return false;
+        return None;
     }
     let mut user = crate::proxy::unfilled(usize::from(head[1]));
     if read_exact(
@@ -16547,7 +16609,7 @@ fn socks_authenticate(client: &mut Connection, until: Instant, accounts: &SocksA
     )
     .is_err()
     {
-        return false;
+        return None;
     }
     let mut len = [0u8; 1];
     if read_exact(
@@ -16559,7 +16621,7 @@ fn socks_authenticate(client: &mut Connection, until: Instant, accounts: &SocksA
     )
     .is_err()
     {
-        return false;
+        return None;
     }
     let mut pass = crate::proxy::unfilled(usize::from(len[0]));
     if read_exact(
@@ -16571,10 +16633,13 @@ fn socks_authenticate(client: &mut Connection, until: Instant, accounts: &SocksA
     )
     .is_err()
     {
-        return false;
+        return None;
     }
-    let accepted = accounts.accepts(&user, &pass);
-    let _ = client.write_all(&[ferrox_core::socks::AUTH_VERSION, u8::from(!accepted)]);
+    let accepted = accounts.account(&user, &pass).cloned();
+    let _ = client.write_all(&[
+        ferrox_core::socks::AUTH_VERSION,
+        u8::from(accepted.is_none()),
+    ]);
     accepted
 }
 
@@ -34090,7 +34155,12 @@ mod tests {
     fn a_front_that_asks_for_a_credential_refuses_a_socks4_request() {
         let accounts = SocksAccounts {
             password: true,
-            pairs: vec![("Test Account".to_owned(), "Test Password".to_owned())],
+            pairs: vec![SocksAccount {
+                user: "Test Account".to_owned(),
+                pass: "Test Password".to_owned(),
+                email: String::new(),
+                level: 0,
+            }],
         };
         let front = socks_front_with_accounts(Outbound::Freedom, accounts);
         let mut client = socks4_ask(front, "127.0.0.1:80".parse().expect("an address"), None);
@@ -34345,7 +34415,12 @@ mod tests {
         let echo = echo_loop();
         let accounts = SocksAccounts {
             password: true,
-            pairs: vec![("Test Account".to_owned(), "Test Password".to_owned())],
+            pairs: vec![SocksAccount {
+                user: "Test Account".to_owned(),
+                pass: "Test Password".to_owned(),
+                email: String::new(),
+                level: 0,
+            }],
         };
         let upstream = socks_front_with_accounts(Outbound::Freedom, accounts.clone());
         let lane = Outbound::Socks(SocksOut::new(
@@ -34521,7 +34596,12 @@ mod tests {
     fn a_front_refuses_a_credential_it_does_not_know() {
         let accounts = SocksAccounts {
             password: true,
-            pairs: vec![("Test Account".to_owned(), "Test Password".to_owned())],
+            pairs: vec![SocksAccount {
+                user: "Test Account".to_owned(),
+                pass: "Test Password".to_owned(),
+                email: String::new(),
+                level: 0,
+            }],
         };
         let front = socks_front_with_accounts(Outbound::Freedom, accounts);
         let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
@@ -34721,6 +34801,31 @@ mod tests {
             .expect("gets");
         let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("answers");
         assert_eq!(head, HTTP_AUTH_REQUIRED, "the http side asks the same");
+    }
+
+    #[test]
+    fn a_front_account_carries_the_email_and_level_its_counters_key_on() {
+        use base64::Engine as _;
+        let inbound = crate::json::parse(
+            r#"{"settings":{"auth":"password","accounts":[{"user":"alice","pass":"s3cr3t","email":"alice@example","level":2}]}}"#,
+        )
+        .expect("parses");
+        let socks = socks_accounts(&inbound);
+        let account = socks
+            .account(b"alice", b"s3cr3t")
+            .expect("the credential is known");
+        assert_eq!(account.email, "alice@example");
+        assert_eq!(account.level, 2);
+
+        let credential = base64::engine::general_purpose::STANDARD.encode("alice:s3cr3t");
+        let head = format!(
+            "GET http://example/ HTTP/1.1\r\nHost: example\r\nProxy-Authorization: Basic {credential}\r\n\r\n"
+        );
+        let http = http_accounts(&inbound);
+        let account =
+            http_credential_account(head.as_bytes(), &http).expect("the credential is known");
+        assert_eq!(account.email, "alice@example");
+        assert_eq!(account.level, 2);
     }
 
     /// The `users` alias xray's socks config also accepts: a front that names its account there admits the credential.

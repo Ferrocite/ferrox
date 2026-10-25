@@ -312,7 +312,7 @@ mod tests {
         .expect("parses");
         crate::policy::install(&root).expect("policy installs");
         crate::stats::install(&root).expect("stats installs");
-        crate::stats::inbound(Some("in"), 0).read(12);
+        crate::stats::inbound(Some("in")).read(12);
         let body = prometheus();
         assert!(body.contains(r#"ferrox_inbound_traffic_uplink{tag="in"} 12"#));
         crate::stats::clear();
