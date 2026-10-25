@@ -202,7 +202,7 @@ impl Driver {
             };
             let mut ready = Vec::with_capacity(16);
             while !pump.stop.load(Ordering::Relaxed) {
-                if !drive_once(&session, STREAM_POLL) {
+                if !drive_once(&session, STREAM_POLL, Some(&mut ready)) {
                     let closed = match session.shared.lock() {
                         Ok(conn) => conn.is_closed(),
                         Err(_) => true,
@@ -212,10 +212,6 @@ impl Driver {
                     }
                     std::thread::sleep(STREAM_POLL);
                     continue;
-                }
-                ready.clear();
-                if let Ok(conn) = session.shared.lock() {
-                    ready.extend(conn.readable());
                 }
                 if ready.is_empty() {
                     continue;
@@ -281,7 +277,7 @@ fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
 }
 
 /// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling.
-fn drive_once(session: &Session, wait: Duration) -> bool {
+fn drive_once(session: &Session, wait: Duration, ready: Option<&mut Vec<u64>>) -> bool {
     let timeout = {
         let Ok(conn) = session.shared.lock() else {
             return false;
@@ -329,6 +325,10 @@ fn drive_once(session: &Session, wait: Duration) -> bool {
         None => conn.on_timeout(),
     }
     crate::quic::flush_egress(&mut conn, &session.sock);
+    if let Some(ready) = ready {
+        ready.clear();
+        ready.extend(conn.readable());
+    }
     true
 }
 
@@ -370,7 +370,7 @@ fn recv_reply(
                 wake.wait(before, STREAM_POLL);
             }
             _ => {
-                let _ = drive_once(session, STREAM_POLL);
+                let _ = drive_once(session, STREAM_POLL, None);
             }
         }
     }
@@ -410,7 +410,7 @@ fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Opti
         if let Some(n) = read {
             head.extend_from_slice(&room.as_mut()[..n]);
         } else {
-            let _ = drive_once(session, STREAM_POLL);
+            let _ = drive_once(session, STREAM_POLL, None);
         }
     }
 }
@@ -607,7 +607,7 @@ impl Read for Flow {
                 return Ok(n);
             }
             if self.drive {
-                let _ = drive_once(&self.session, STREAM_POLL);
+                let _ = drive_once(&self.session, STREAM_POLL, None);
                 continue;
             }
             let pumped = self
@@ -1879,7 +1879,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
 fn client_reader(session: &Session, lane: &Lane, stop: &AtomicBool, relay: &UdpSocket) {
     let mut reply = Vec::with_capacity(3 + 25 + UDP_TARGET_BUF);
     loop {
-        if stop.load(Ordering::Relaxed) || !drive_once(session, UDP_POLL) {
+        if stop.load(Ordering::Relaxed) || !drive_once(session, UDP_POLL, None) {
             break;
         }
         let Ok(mut conn) = session.shared.lock() else {
