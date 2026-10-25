@@ -79,7 +79,7 @@ pub(crate) fn masked_len(headers: &[(String, String)], defaults: &[(&str, &str)]
         + headers
             .iter()
             .filter(|(name, value)| {
-                !fixed(name) && !(name.eq_ignore_ascii_case("user-agent") && selector(value))
+                !(fixed(name) || (name.eq_ignore_ascii_case("user-agent") && selector(value)))
             })
             .map(|(name, value)| line(name, value))
             .sum::<usize>()

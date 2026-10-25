@@ -328,7 +328,7 @@ fn send_request<W: crate::proxy::FrameWrite>(
     const BEFORE_HOST: &str = " HTTP/1.1\r\nHost: ";
     const AFTER_HOST: &str = "\r\n";
     const AFTER_HEADERS: &str = "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
-    let headers = crate::headers::masked(headers, crate::headers::WS);
+    let headers_len = crate::headers::masked_len(headers, crate::headers::WS);
     REQUEST.with(|cell| {
         let mut request = cell.borrow_mut();
         request.clear();
@@ -338,13 +338,13 @@ fn send_request<W: crate::proxy::FrameWrite>(
                 + BEFORE_HOST.len()
                 + host.len()
                 + AFTER_HOST.len()
-                + headers.len()
+                + headers_len
                 + AFTER_HEADERS.len(),
         );
         for piece in [BEFORE_PATH, path, BEFORE_HOST, host, AFTER_HOST] {
             request.extend_from_slice(piece.as_bytes());
         }
-        request.extend_from_slice(headers.as_bytes());
+        crate::headers::write_masked(&mut request, headers, crate::headers::WS);
         request.extend_from_slice(AFTER_HEADERS.as_bytes());
         let bytes = request.as_slice();
         if early {
@@ -1167,7 +1167,9 @@ mod tests {
             match held {
                 None => assert_eq!(
                     current.0,
-                    66 + long.len() + deep.len(),
+                    66 + long.len()
+                        + deep.len()
+                        + crate::headers::masked_len(&[], crate::headers::WS),
                     "the first dial reserves its own bytes"
                 ),
                 Some((capacity, pointer)) => {
