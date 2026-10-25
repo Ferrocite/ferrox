@@ -27443,6 +27443,138 @@ mod tests {
     }
 
     #[test]
+    fn a_reused_udp_global_id_follows_the_target_it_was_renewed_for() {
+        let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        first
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        second
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        let first_port = first.local_addr().expect("addr").port();
+        let second_port = second.local_addr().expect("addr").port();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let client = Connection::connect(listener.local_addr().expect("addr")).expect("connects");
+        let (_server, _) = listener.accept().expect("accepts");
+        let wire = MuxWire::Conn(Arc::new(Mutex::new(client)));
+        let table: MuxTable = Arc::new(Mutex::new(MuxState {
+            flows: HashMap::new(),
+            done: false,
+        }));
+        let mut udp: UdpTable = HashMap::new();
+        let mut global: UdpGlobal = HashMap::new();
+        let mut staging = Vec::new();
+        let mut handles = Vec::new();
+        let identity = [0x42u8; ferrox_core::mux::GLOBAL_ID];
+        let new = |port| ferrox_core::mux::Incoming {
+            id: 7,
+            status: ferrox_core::mux::Status::New,
+            options: ferrox_core::mux::DATA,
+            target: Some(mux_test_udp_target(port)),
+            global_id: Some(identity),
+            reflection: None,
+            data: None,
+        };
+        let keep = |data: &'static [u8]| ferrox_core::mux::Incoming {
+            id: 7,
+            status: ferrox_core::mux::Status::Keep,
+            options: ferrox_core::mux::DATA,
+            target: None,
+            global_id: None,
+            reflection: None,
+            data: Some(data),
+        };
+        let dial: MuxDial = Arc::new(|_| None);
+        let udp_ok: MuxUdpOk = Arc::new(|_| true);
+        {
+            let mut out = MuxOut {
+                wire: &wire,
+                staging: &mut staging,
+                handles: &mut handles,
+                worker: None,
+            };
+            handle_mux_frame(
+                new(first_port),
+                &table,
+                &mut udp,
+                &mut global,
+                &mut out,
+                &dial,
+                &udp_ok,
+            );
+        }
+        {
+            let mut out = MuxOut {
+                wire: &wire,
+                staging: &mut staging,
+                handles: &mut handles,
+                worker: None,
+            };
+            handle_mux_frame(
+                keep(b"one"),
+                &table,
+                &mut udp,
+                &mut global,
+                &mut out,
+                &dial,
+                &udp_ok,
+            );
+        }
+        let mut got = [0u8; 16];
+        let (n, _) = first.recv_from(&mut got).expect("first target answers");
+        assert_eq!(&got[..n], b"one");
+        {
+            let mut out = MuxOut {
+                wire: &wire,
+                staging: &mut staging,
+                handles: &mut handles,
+                worker: None,
+            };
+            handle_mux_frame(
+                new(second_port),
+                &table,
+                &mut udp,
+                &mut global,
+                &mut out,
+                &dial,
+                &udp_ok,
+            );
+        }
+        {
+            let mut out = MuxOut {
+                wire: &wire,
+                staging: &mut staging,
+                handles: &mut handles,
+                worker: None,
+            };
+            handle_mux_frame(
+                keep(b"two"),
+                &table,
+                &mut udp,
+                &mut global,
+                &mut out,
+                &dial,
+                &udp_ok,
+            );
+        }
+        let (n, _) = second
+            .recv_from(&mut got)
+            .expect("the renewed target answers");
+        assert_eq!(&got[..n], b"two");
+        first
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("timeout");
+        assert!(
+            matches!(first.recv_from(&mut got), Err(ref error) if is_timeout(error)),
+            "the old target got the renewed session's datagram"
+        );
+        for session in udp.values() {
+            session.done.store(true, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
     fn a_repeated_udp_new_id_stops_the_session_it_replaces() {
         let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
