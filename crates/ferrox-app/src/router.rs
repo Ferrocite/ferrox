@@ -93,14 +93,52 @@ pub(crate) struct Balancer {
     fallback: Option<String>,
     index: AtomicUsize,
     seed: AtomicU64,
+    weights: std::sync::Mutex<HashMap<String, f64>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug)]
 enum Strategy {
     Random,
     RoundRobin,
     LeastPing,
-    LeastLoad,
+    LeastLoad(LeastLoad),
+}
+
+/// One `leastLoad` reading: xray's `StrategyLeastLoadConfig`, with its weight rules compiled once
+/// at startup rather than once per flow.
+#[derive(Debug)]
+struct LeastLoad {
+    costs: Vec<Weight>,
+    baselines: Vec<i64>,
+    expected: i32,
+    max_rtt: i64,
+    tolerance: f32,
+}
+
+#[derive(Debug)]
+struct Weight {
+    regexp: bool,
+    find: String,
+    value: f32,
+    compiled: Option<regex::Regex>,
+}
+
+/// One outbound's health as the balancers read it, in the reference's units: `delay_ms` for the
+/// legacy observatory and the nanosecond fields for a burst sample.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Observed {
+    pub(crate) tag: String,
+    pub(crate) alive: bool,
+    pub(crate) delay_ms: i64,
+    pub(crate) health: Option<HealthPing>,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct HealthPing {
+    pub(crate) all: i64,
+    pub(crate) fail: i64,
+    pub(crate) deviation: i64,
+    pub(crate) average: i64,
 }
 
 impl Balancer {
@@ -118,26 +156,135 @@ impl Balancer {
         self.fallback.as_deref()
     }
 
-    /// The candidate for one flow. Without the observatory the two health strategies have no
-    /// reading to choose from, so they name nothing and the caller falls back as the reference does.
-    pub(crate) fn pick<'a>(&self, candidates: &'a [String]) -> Option<&'a str> {
-        let count = candidates.len();
-        if count == 0 {
+    /// The candidate for one flow. The two health strategies name nothing without a reading, so
+    /// the caller falls back exactly as the reference does without an observatory. `random` and
+    /// `roundRobin` drop a candidate the observatory reports dead only when a `fallbackTag` makes
+    /// the reference inject the observatory into them.
+    pub(crate) fn pick<'a>(
+        &self,
+        candidates: &'a [String],
+        observed: Option<&[Observed]>,
+    ) -> Option<&'a str> {
+        if candidates.is_empty() {
             return None;
         }
-        let at = match self.strategy {
-            Strategy::RoundRobin => self.index.fetch_add(1, Ordering::Relaxed) % count,
-            Strategy::Random => {
-                let mut state = self.seed.load(Ordering::Relaxed);
-                state ^= state << 13;
-                state ^= state >> 7;
-                state ^= state << 17;
-                self.seed.store(state, Ordering::Relaxed);
-                (state % count as u64) as usize
+        match &self.strategy {
+            Strategy::RoundRobin => {
+                let alive = self.alive_candidates(candidates, observed);
+                let count = alive.len();
+                if count == 0 {
+                    return None;
+                }
+                let at = self.index.fetch_add(1, Ordering::Relaxed) % count;
+                Some(alive[at].as_str())
             }
-            Strategy::LeastPing | Strategy::LeastLoad => return None,
+            Strategy::Random => {
+                let alive = self.alive_candidates(candidates, observed);
+                let count = alive.len();
+                if count == 0 {
+                    return None;
+                }
+                let at = self.random_index(count);
+                Some(alive[at].as_str())
+            }
+            Strategy::LeastPing => least_ping(candidates, observed),
+            Strategy::LeastLoad(settings) => self.least_load(candidates, observed, settings),
+        }
+    }
+
+    fn alive_candidates<'a>(
+        &self,
+        candidates: &'a [String],
+        observed: Option<&[Observed]>,
+    ) -> Vec<&'a String> {
+        let Some(observed) = observed.filter(|_| self.fallback.is_some()) else {
+            return candidates.iter().collect();
         };
-        Some(candidates[at].as_str())
+        candidates
+            .iter()
+            .filter(|candidate| {
+                observed
+                    .iter()
+                    .find(|status| status.tag == candidate.as_str())
+                    .is_none_or(|status| status.alive)
+            })
+            .collect()
+    }
+
+    fn random_index(&self, count: usize) -> usize {
+        let mut state = self.seed.load(Ordering::Relaxed);
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        self.seed.store(state, Ordering::Relaxed);
+        (state % count as u64) as usize
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn least_load<'a>(
+        &self,
+        candidates: &'a [String],
+        observed: Option<&[Observed]>,
+        settings: &LeastLoad,
+    ) -> Option<&'a str> {
+        let observed = observed?;
+        let mut nodes: Vec<Node> = observed
+            .iter()
+            .filter(|status| settings.selects(status, candidates))
+            .map(|status| {
+                let mut node = Node {
+                    tag: status.tag.as_str(),
+                    all: 1,
+                    fail: 1,
+                    average: status.delay_ms.saturating_mul(1_000_000),
+                    deviation: status.delay_ms.saturating_mul(1_000_000),
+                    cost: 0,
+                };
+                if let Some(health) = status.health {
+                    node.average = health.average;
+                    node.deviation = health.deviation;
+                    node.all = health.all;
+                    node.fail = health.fail;
+                }
+                let weight = self.weight_for(node.tag, settings);
+                node.cost = ((node.deviation as f64) * weight.sqrt()) as i64;
+                node
+            })
+            .collect();
+        if nodes.is_empty() {
+            return None;
+        }
+        nodes.sort_by(|left, right| {
+            left.cost
+                .cmp(&right.cost)
+                .then(left.average.cmp(&right.average))
+                .then(left.fail.cmp(&right.fail))
+                .then(right.all.cmp(&left.all))
+                .then(left.tag.cmp(right.tag))
+        });
+        let count = settings.selected(&nodes);
+        let chosen = if count > 1 {
+            self.random_index(count)
+        } else {
+            0
+        };
+        let tag = nodes[chosen].tag;
+        candidates
+            .iter()
+            .find(|candidate| candidate.as_str() == tag)
+            .map(String::as_str)
+    }
+
+    fn weight_for(&self, tag: &str, settings: &LeastLoad) -> f64 {
+        let Ok(mut cache) = self.weights.lock() else {
+            return 1.0;
+        };
+        if let Some(weight) = cache.get(tag) {
+            return *weight;
+        }
+        let weight = settings.weight(tag);
+        cache.insert(tag.to_owned(), weight);
+        weight
     }
 
     fn parse(value: &Json, at: usize) -> Result<Self, String> {
@@ -182,16 +329,18 @@ impl Balancer {
             fallback,
             index: AtomicUsize::new(0),
             seed: AtomicU64::new(seed),
+            weights: std::sync::Mutex::new(HashMap::new()),
         })
     }
 }
 
 fn parse_strategy(value: &Json) -> Result<Strategy, String> {
-    let named = match value {
+    let (named, settings) = match value {
         Json::Null => return Ok(Strategy::Random),
-        Json::Str(named) => named.as_str(),
+        Json::Str(named) => (named.as_str(), None),
         Json::Obj(pairs) => {
             let mut named = "";
+            let mut settings = None;
             for (key, field) in pairs {
                 match key.as_str() {
                     "type" => {
@@ -203,6 +352,7 @@ fn parse_strategy(value: &Json) -> Result<Strategy, String> {
                         if !matches!(field, Json::Null | Json::Obj(_)) {
                             return Err("balancer strategy settings is not an object".into());
                         }
+                        settings = Some(field);
                     }
                     other => {
                         return Err(format!(
@@ -211,7 +361,7 @@ fn parse_strategy(value: &Json) -> Result<Strategy, String> {
                     }
                 }
             }
-            named
+            (named, settings)
         }
         _ => return Err("routing balancer strategy is not a string or object".into()),
     };
@@ -219,11 +369,216 @@ fn parse_strategy(value: &Json) -> Result<Strategy, String> {
         "" | "random" => Ok(Strategy::Random),
         "roundrobin" => Ok(Strategy::RoundRobin),
         "leastping" => Ok(Strategy::LeastPing),
-        "leastload" => Ok(Strategy::LeastLoad),
+        "leastload" => Ok(Strategy::LeastLoad(LeastLoad::parse(settings)?)),
         _ => Err(format!(
             "routing balancer strategy `{named}` is not random, roundRobin, leastPing or leastLoad"
         )),
     }
+}
+
+impl LeastLoad {
+    fn parse(value: Option<&Json>) -> Result<Self, String> {
+        let empties = [];
+        let pairs = match value {
+            Some(Json::Obj(pairs)) => pairs.as_slice(),
+            Some(Json::Null) | None => &empties,
+            Some(_) => return Err("balancer strategy settings is not an object".into()),
+        };
+        let mut costs = Vec::new();
+        let mut baselines = Vec::new();
+        let mut expected = 0i32;
+        let mut max_rtt = 0i64;
+        let mut tolerance = 0.0f32;
+        for (key, field) in pairs {
+            match key.as_str() {
+                "costs" => {
+                    for cost in field.as_arr().unwrap_or(&[]) {
+                        costs.push(Weight::parse(cost));
+                    }
+                }
+                "baselines" => {
+                    for baseline in field.as_arr().unwrap_or(&[]) {
+                        if let Some(nanos) = crate::config::go_duration(baseline)? {
+                            if nanos > 0 {
+                                baselines.push(nanos);
+                            }
+                        }
+                    }
+                }
+                "expected" => {
+                    expected = field
+                        .as_u32()
+                        .and_then(|value| i32::try_from(value).ok())
+                        .unwrap_or(0)
+                        .max(0);
+                }
+                "maxRTT" => max_rtt = crate::config::go_duration(field)?.unwrap_or(0).max(0),
+                "tolerance" => {
+                    tolerance = match field {
+                        Json::Num(value) => *value as f32,
+                        _ => 0.0,
+                    }
+                    .clamp(0.0, 1.0);
+                }
+                _ => {}
+            }
+        }
+        Ok(Self {
+            costs,
+            baselines,
+            expected,
+            max_rtt,
+            tolerance,
+        })
+    }
+
+    #[allow(clippy::cast_precision_loss)]
+    fn selects(&self, status: &Observed, candidates: &[String]) -> bool {
+        if !status.alive {
+            return false;
+        }
+        if self.max_rtt != 0 && status.delay_ms >= self.max_rtt / 1_000_000 {
+            return false;
+        }
+        if !candidates.iter().any(|candidate| candidate == &status.tag) {
+            return false;
+        }
+        if let Some(health) = status.health {
+            if health.all > 0
+                && self.tolerance > 0.0
+                && health.fail as f64 / health.all as f64 > f64::from(self.tolerance)
+            {
+                return false;
+            }
+        }
+        true
+    }
+
+    fn weight(&self, tag: &str) -> f64 {
+        for cost in &self.costs {
+            let matched = cost.matched(tag);
+            if matched.is_empty() {
+                continue;
+            }
+            if cost.value > 0.0 {
+                return f64::from(cost.value);
+            }
+            if let Some(number) = first_number(matched) {
+                return number;
+            }
+            return 1.0;
+        }
+        1.0
+    }
+
+    fn selected(&self, nodes: &[Node]) -> usize {
+        let expected = usize::try_from(self.expected.max(0)).unwrap_or(usize::MAX);
+        let available = nodes.len();
+        if expected > available {
+            return available;
+        }
+        let expected = if expected == 0 { 1 } else { expected };
+        if self.baselines.is_empty() {
+            return expected;
+        }
+        let mut count = 0;
+        for baseline in &self.baselines {
+            while count < available && nodes[count].cost < *baseline {
+                count += 1;
+            }
+            if count >= expected {
+                break;
+            }
+        }
+        if self.expected > 0 && count < expected {
+            count = expected;
+        }
+        count.min(available)
+    }
+}
+
+impl Weight {
+    fn parse(value: &Json) -> Self {
+        let mut regexp = false;
+        let mut find = String::new();
+        let mut amount = 0.0f32;
+        if let Json::Obj(pairs) = value {
+            for (key, field) in pairs {
+                match key.as_str() {
+                    "regexp" => regexp = field.as_bool().unwrap_or(false),
+                    "match" => field.as_str().unwrap_or("").clone_into(&mut find),
+                    "value" => {
+                        amount = match field {
+                            Json::Num(value) => *value as f32,
+                            _ => 0.0,
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let compiled = regexp.then(|| regex::Regex::new(&find).ok()).flatten();
+        Self {
+            regexp,
+            find,
+            value: amount,
+            compiled,
+        }
+    }
+
+    fn matched<'a>(&'a self, tag: &'a str) -> &'a str {
+        if self.find.is_empty() {
+            return "";
+        }
+        if self.regexp {
+            if let Some(compiled) = &self.compiled {
+                return compiled.find(tag).map_or("", |found| found.as_str());
+            }
+            return "";
+        }
+        if tag.contains(&self.find) {
+            return &self.find;
+        }
+        ""
+    }
+}
+
+#[derive(Debug)]
+struct Node<'a> {
+    tag: &'a str,
+    all: i64,
+    fail: i64,
+    average: i64,
+    deviation: i64,
+    cost: i64,
+}
+
+fn least_ping<'a>(candidates: &'a [String], observed: Option<&[Observed]>) -> Option<&'a str> {
+    let observed = observed?;
+    let mut least = 99_999_999i64;
+    let mut selected = "";
+    for status in observed {
+        if !status.alive || status.delay_ms >= least {
+            continue;
+        }
+        if candidates.iter().any(|candidate| candidate == &status.tag) {
+            selected = status.tag.as_str();
+            least = status.delay_ms;
+        }
+    }
+    if selected.is_empty() {
+        return None;
+    }
+    candidates
+        .iter()
+        .find(|candidate| candidate.as_str() == selected)
+        .map(String::as_str)
+}
+
+fn first_number(text: &str) -> Option<f64> {
+    static FINDER: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let finder = FINDER.get_or_init(|| regex::Regex::new(r"\d+(\.\d+)?").expect("number matcher"));
+    finder.find(text)?.as_str().parse().ok()
 }
 
 /// The name a flow carries, in the form the tables store and the form a regex must see. Lowering
@@ -2972,9 +3327,9 @@ mod tests {
         assert!(balancer.selects("lane-a") && balancer.selects("lane-b"));
         assert!(!balancer.selects("direct"));
         let candidates = vec!["lane-a".to_owned(), "lane-b".to_owned()];
-        assert_eq!(balancer.pick(&candidates), Some("lane-a"));
-        assert_eq!(balancer.pick(&candidates), Some("lane-b"));
-        assert_eq!(balancer.pick(&candidates), Some("lane-a"));
+        assert_eq!(balancer.pick(&candidates, None), Some("lane-a"));
+        assert_eq!(balancer.pick(&candidates, None), Some("lane-b"));
+        assert_eq!(balancer.pick(&candidates, None), Some("lane-a"));
         let flow = Flow {
             network: Network::Tcp,
             domain: Some("echo.test"),
@@ -2985,6 +3340,132 @@ mod tests {
             inbound_tag: None,
         };
         assert_eq!(routing.route(&flow), Some("pool"));
+    }
+
+    #[test]
+    fn a_least_ping_balancer_picks_the_lowest_alive_delay() {
+        let root = object(vec![(
+            "routing",
+            object(vec![(
+                "balancers",
+                array(vec![object(vec![
+                    ("tag", text("pool")),
+                    ("selector", array(vec![text("lane")])),
+                    ("strategy", object(vec![("type", text("leastPing"))])),
+                ])]),
+            )]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let balancer = routing.balancer("pool").expect("the balancer");
+        let candidates = vec!["lane-a".to_owned(), "lane-b".to_owned()];
+        let first = [observed("lane-a", true, 30), observed("lane-b", true, 10)];
+        assert_eq!(balancer.pick(&candidates, Some(&first)), Some("lane-b"));
+        let dead = [observed("lane-a", false, 1), observed("lane-b", true, 90)];
+        assert_eq!(balancer.pick(&candidates, Some(&dead)), Some("lane-b"));
+    }
+
+    #[test]
+    fn a_least_load_balancer_honours_weight_baseline_and_tolerance() {
+        let root = object(vec![(
+            "routing",
+            object(vec![(
+                "balancers",
+                array(vec![object(vec![
+                    ("tag", text("pool")),
+                    ("selector", array(vec![text("lane")])),
+                    (
+                        "strategy",
+                        object(vec![
+                            ("type", text("leastLoad")),
+                            (
+                                "settings",
+                                object(vec![
+                                    ("expected", Json::Num(1.0)),
+                                    ("baselines", array(vec![text("15ms")])),
+                                    ("tolerance", Json::Num(0.05)),
+                                    (
+                                        "costs",
+                                        array(vec![object(vec![
+                                            ("match", text("lane-b")),
+                                            ("value", Json::Num(4.0)),
+                                        ])]),
+                                    ),
+                                ]),
+                            ),
+                        ]),
+                    ),
+                ])]),
+            )]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let balancer = routing.balancer("pool").expect("the balancer");
+        let candidates = vec!["lane-a".to_owned(), "lane-b".to_owned()];
+        let mut b = observed("lane-b", true, 10);
+        b.health = Some(HealthPing {
+            all: 10,
+            fail: 2,
+            deviation: 10_000_000,
+            average: 10_000_000,
+        });
+        let observed = [observed("lane-a", true, 10), b];
+        assert_eq!(balancer.pick(&candidates, Some(&observed)), Some("lane-a"));
+    }
+
+    #[test]
+    fn random_skips_a_dead_lane_only_when_a_fallback_exists() {
+        let parse = |fallback: bool| {
+            let mut pairs = vec![
+                ("tag", text("pool")),
+                ("selector", array(vec![text("lane")])),
+                ("strategy", object(vec![("type", text("random"))])),
+            ];
+            if fallback {
+                pairs.push(("fallbackTag", text("lane-a")));
+            }
+            object(vec![(
+                "routing",
+                object(vec![("balancers", array(vec![object(pairs)]))]),
+            )])
+        };
+        let candidates = vec!["lane-a".to_owned(), "lane-b".to_owned()];
+        let observed = [observed("lane-a", false, 1), observed("lane-b", true, 2)];
+        let plain = Routing::parse_in(&parse(false), vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let picks = (0..16)
+            .map(|_| {
+                plain
+                    .balancer("pool")
+                    .expect("balancer")
+                    .pick(&candidates, Some(&observed))
+            })
+            .collect::<Vec<_>>();
+        assert!(picks.contains(&Some("lane-a")) && picks.contains(&Some("lane-b")));
+        let filtered = Routing::parse_in(&parse(true), vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        for _ in 0..16 {
+            assert_eq!(
+                filtered
+                    .balancer("pool")
+                    .expect("balancer")
+                    .pick(&candidates, Some(&observed)),
+                Some("lane-b")
+            );
+        }
+    }
+
+    fn observed(tag: &str, alive: bool, delay_ms: i64) -> Observed {
+        Observed {
+            tag: tag.to_owned(),
+            alive,
+            delay_ms,
+            health: None,
+        }
     }
 
     #[test]

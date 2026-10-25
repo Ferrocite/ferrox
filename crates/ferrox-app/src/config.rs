@@ -1832,6 +1832,66 @@ pub(crate) fn budgets(root: &Json) -> Result<Budgets, String> {
     Ok(out)
 }
 
+/// A Go `time.ParseDuration` string, in nanoseconds, for the xray fields that carry one. A
+/// number is read as nanoseconds so the protobuf dialect reaches the same parser.
+pub(crate) fn go_duration(value: &Json) -> Result<Option<i64>, String> {
+    if let Json::Num(nanos) = value {
+        return Ok(Some(*nanos as i64));
+    }
+    let Some(text) = value.as_str() else {
+        return Ok(None);
+    };
+    let mut nanos = 0i64;
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return Err("a duration is empty".to_owned());
+    }
+    if rest == "0" {
+        return Ok(Some(0));
+    }
+    let negative = rest.starts_with('-');
+    if negative || rest.starts_with('+') {
+        rest = &rest[1..];
+    }
+    if rest.is_empty() {
+        return Err(format!("duration {text:?} is malformed"));
+    }
+    while !rest.is_empty() {
+        let end = rest
+            .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+            .unwrap_or(rest.len());
+        if end == 0 {
+            return Err(format!("duration {text:?} is malformed"));
+        }
+        let amount: f64 = rest[..end]
+            .parse()
+            .map_err(|_| format!("duration {text:?} is malformed"))?;
+        let unit = &rest[end..];
+        let (name, scale) = [
+            ("ns", 1.0),
+            ("us", 1_000.0),
+            ("\u{b5}s", 1_000.0),
+            ("\u{3bc}s", 1_000.0),
+            ("ms", 1_000_000.0),
+            ("s", 1_000_000_000.0),
+            ("m", 60_000_000_000.0),
+            ("h", 3_600_000_000_000.0),
+        ]
+        .into_iter()
+        .find(|(name, _)| unit.starts_with(name))
+        .ok_or_else(|| format!("duration {text:?} names no unit"))?;
+        let part = (amount * scale) as i64;
+        nanos = nanos
+            .checked_add(part)
+            .ok_or_else(|| format!("duration {text:?} is too large"))?;
+        rest = &unit[name.len()..];
+    }
+    if negative {
+        nanos = -nanos;
+    }
+    Ok(Some(nanos))
+}
+
 /// `"30s"` or `"2500ms"`, and nothing else: a bare number is refused because the unit a wait is measured in is not the reader's guess.
 fn duration(value: &Json, key: &str) -> Result<Duration, String> {
     let reject = |reason: String| format!("budget `{key}`: {reason}");

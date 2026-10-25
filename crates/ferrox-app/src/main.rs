@@ -32,6 +32,7 @@ mod httpheader;
 mod httpupgrade;
 mod hysteria;
 mod json;
+mod observatory;
 mod proxy;
 mod quic;
 mod reverse;
