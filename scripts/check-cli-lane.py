@@ -112,6 +112,20 @@ elif command == "-getproxyautodiscovery":
 elif command == "-setproxyautodiscovery":
     directory = service(args[1])
     write(directory, "autodiscovery", args[2])
+elif command == "-getproxybypassdomains":
+    directory = service(args[1])
+    entries = read(directory, "bypass").splitlines()
+    if entries:
+        for entry in entries:
+            print(entry)
+    else:
+        print(f"There aren't any bypass domains set on {args[1]}.")
+elif command == "-setproxybypassdomains":
+    directory = service(args[1])
+    domains = args[2:]
+    if domains == ["Empty"]:
+        domains = []
+    write(directory, "bypass", "\\n".join(domains) + ("\\n" if domains else ""))
 elif command in ("-setsocksfirewallproxy", "-setwebproxy", "-setsecurewebproxy"):
     directory = service(args[1])
     field = {
@@ -201,6 +215,7 @@ def seed_proxy_state(
     pac_url: str = "",
     pac_enabled: bool = False,
     autodiscovery: bool = False,
+    bypass: list[str] | None = None,
 ) -> pathlib.Path:
     directory = state / "fake-net" / "Wi-Fi"
     directory.mkdir(parents=True, exist_ok=True)
@@ -211,12 +226,20 @@ def seed_proxy_state(
     (directory / "autodiscovery").write_text(
         "on" if autodiscovery else "off", encoding="utf-8"
     )
+    entries = bypass or []
+    (directory / "bypass").write_text(
+        "\n".join(entries) + ("\n" if entries else ""), encoding="utf-8"
+    )
     return directory
 
 
 def proxy_field(state: pathlib.Path, field: str, default: str = "") -> str:
     path = state / "fake-net" / "Wi-Fi" / field
     return path.read_text(encoding="utf-8") if path.exists() else default
+
+
+def proxy_bypass(state: pathlib.Path) -> list[str]:
+    return proxy_field(state, "bypass").splitlines()
 
 
 def env_for(state: pathlib.Path, curl: bool = False) -> dict[str, str]:
@@ -1391,6 +1414,158 @@ def check_vpn_pac(state: pathlib.Path) -> int:
     return 0
 
 
+def check_vpn_bypass(state: pathlib.Path) -> int:
+    defaults = [
+        "localhost",
+        "127.0.0.1",
+        "::1",
+        "*.local",
+        "169.254.0.0/16",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+    ]
+    port = free_port()
+    config = state / "vpn-bypass.json"
+    config.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {"protocol": "socks", "listen": "127.0.0.1", "port": port}
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = env_for(state, curl=True)
+    env["FERROX_BIN"] = str(vpn_lane_binary(state))
+    env["FERROX_FAKE_TRACE"] = "1"
+    calls = state / "networksetup.calls"
+
+    def clear() -> None:
+        for stale in (
+            "lane.pid",
+            "lane.json",
+            "system-proxy.ports",
+            "system-proxy.state",
+            "networksetup.calls",
+            "scutil.override",
+            "fake-vpn-lane.pids",
+        ):
+            (state / stale).unlink(missing_ok=True)
+
+    def arm() -> subprocess.CompletedProcess[str]:
+        clear()
+        return subprocess.run(
+            [
+                str(CLI),
+                "up",
+                "--config",
+                str(config),
+                "--fronts",
+                "socks",
+                "--socks",
+                str(port),
+                "--vpn",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+
+    def down() -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(CLI), "down"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+
+    seed_proxy_state(state)
+    run = arm()
+    output = run.stdout + run.stderr
+    if run.returncode != 0:
+        print(
+            f"check-cli-lane: --vpn over an empty bypass list exited {run.returncode}:"
+            f"\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    if "-setproxybypassdomains Wi-Fi" not in recorded:
+        print(
+            f"check-cli-lane: --vpn left the bypass list unset:\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    armed = proxy_bypass(state)
+    if armed != defaults:
+        print(
+            f"check-cli-lane: --vpn armed the bypass list as {armed!r}, not {defaults!r}",
+            file=sys.stderr,
+        )
+        return 1
+    down_run = down()
+    output = down_run.stdout + down_run.stderr
+    if down_run.returncode != 0:
+        print(
+            f"check-cli-lane: down after a bypass arm exited {down_run.returncode}:"
+            f"\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if proxy_bypass(state) != []:
+        print(
+            f"check-cli-lane: down restored an empty bypass list as "
+            f"{proxy_bypass(state)!r}",
+            file=sys.stderr,
+        )
+        return 1
+
+    seed_proxy_state(state, bypass=["*.corp.example"])
+    run = arm()
+    output = run.stdout + run.stderr
+    if run.returncode != 0:
+        print(
+            f"check-cli-lane: --vpn over a prior bypass list exited {run.returncode}:"
+            f"\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    armed = proxy_bypass(state)
+    if armed != defaults + ["*.corp.example"]:
+        print(
+            f"check-cli-lane: --vpn lost the prior bypass entry: {armed!r}",
+            file=sys.stderr,
+        )
+        return 1
+    down_run = down()
+    output = down_run.stdout + down_run.stderr
+    if down_run.returncode != 0:
+        print(
+            f"check-cli-lane: down after a merged bypass arm exited "
+            f"{down_run.returncode}:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if proxy_bypass(state) != ["*.corp.example"]:
+        print(
+            f"check-cli-lane: down restored the bypass list as "
+            f"{proxy_bypass(state)!r}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "check-cli-lane: --vpn sets the default bypass union and down restores the exact prior list"
+    )
+    return 0
+
+
 def check_instance_ports(state: pathlib.Path) -> int:
     held = socket.socket()
     held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1547,6 +1722,8 @@ def main() -> int:
     if check_config_fronts(state) != 0:
         return 1
     if check_vpn_pac(state) != 0:
+        return 1
+    if check_vpn_bypass(state) != 0:
         return 1
     return check_instance_lifecycle(state)
 
