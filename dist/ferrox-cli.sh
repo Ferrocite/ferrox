@@ -878,6 +878,11 @@ PY
 
 proxy_pac_line() { networksetup -getautoproxyurl "$1" 2>/dev/null; }
 proxy_auto_line() { networksetup -getproxyautodiscovery "$1" 2>/dev/null; }
+proxy_bypass_line() { networksetup -getproxybypassdomains "$1" 2>/dev/null; }
+
+proxy_bypass_join() {
+  printf '%s\n' "$1" | sed '/There aren.t any bypass domains/d; /^[[:space:]]*$/d' | paste -sd, -
+}
 
 proxy_readback_has() {
   printf '%s\n' "$1" | grep -Eq "^[[:space:]]*$2[[:space:]]*:[[:space:]]*$3[[:space:]]*$"
@@ -886,7 +891,7 @@ proxy_readback_has() {
 system_proxy_on() {
   command -v networksetup >/dev/null 2>&1 || { say "no networksetup: point your apps at the ports by hand."; return 0; }
   command -v scutil >/dev/null 2>&1 || { say "system proxy: no scutil to read the proxy back; nothing was armed." >&2; return 1; }
-  local any=0 svc want_socks="" want_http="" front pac auto pac_url pac_on auto_on readback bad
+  local any=0 svc want_socks="" want_http="" front pac auto pac_url pac_on auto_on bypass readback bad
   for front in ${FRONTS//,/ }; do
     case "$front" in
       socks) want_socks="$SOCKS_PORT" ;;
@@ -915,13 +920,19 @@ system_proxy_on() {
         system_proxy_off
         return 1
       }
+      bypass="$(proxy_bypass_line "$svc")" || {
+        say "system proxy: cannot read the bypass list for '$svc'; nothing was armed." >&2
+        system_proxy_off
+        return 1
+      }
+      bypass="$(proxy_bypass_join "$bypass")"
       pac_url="$(printf '%s\n' "$pac" | sed -n 's/^URL: //p' | head -n 1)"
       case "$pac_url" in "(null)"|"(empty)") pac_url="" ;; esac
       pac_on=off
       case "$(printf '%s\n' "$pac" | sed -n 's/^Enabled: //p' | head -n 1 | tr '[:upper:]' '[:lower:]')" in yes|on) pac_on=on ;; esac
       auto_on=off
       case "$(printf '%s\n' "$auto" | sed -n 's/^Auto Proxy Discovery: //p' | head -n 1 | tr '[:upper:]' '[:lower:]')" in on|yes) auto_on=on ;; esac
-      printf '%s\t%s\t%s\t%s\n' "$svc" "$pac_on" "${pac_url:--}" "$auto_on" >> "$PROXY_STATE"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$svc" "$pac_on" "${pac_url:--}" "$auto_on" "${bypass:--}" >> "$PROXY_STATE"
     done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
   fi
   while IFS= read -r svc; do
@@ -930,6 +941,30 @@ system_proxy_on() {
     networksetup -setproxyautodiscovery "$svc" off 2>/dev/null || true
     networksetup -setautoproxyurl "$svc" "" 2>/dev/null || true
     networksetup -setautoproxystate "$svc" off 2>/dev/null || true
+    bypass="$(proxy_bypass_line "$svc")" || {
+      say "system proxy: cannot read the bypass list for '$svc'; nothing was armed." >&2
+      system_proxy_off
+      return 1
+    }
+    bypass="$(proxy_bypass_join "$bypass")"
+    local -a merged=(localhost 127.0.0.1 ::1 '*.local' 169.254.0.0/16 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16)
+    local seen=" " entry
+    for entry in "${merged[@]}"; do seen="$seen$entry "; done
+    if [ -n "$bypass" ]; then
+      local -a prior=()
+      IFS=, read -r -a prior <<< "$bypass"
+      for entry in "${prior[@]}"; do
+        [ -z "$entry" ] && continue
+        case "$seen" in *" $entry "*) continue ;; esac
+        merged+=("$entry")
+        seen="$seen$entry "
+      done
+    fi
+    if ! networksetup -setproxybypassdomains "$svc" "${merged[@]}" 2>/dev/null; then
+      say "system proxy: cannot set the bypass list for '$svc'; nothing was armed." >&2
+      system_proxy_off
+      return 1
+    fi
     if [ -n "$want_socks" ]; then
       networksetup -setsocksfirewallproxy "$svc" 127.0.0.1 "$want_socks" 2>/dev/null || continue
       networksetup -setsocksfirewallproxystate "$svc" on 2>/dev/null || true
@@ -968,10 +1003,10 @@ system_proxy_on() {
 
 system_proxy_off() {
   [ -f "$PROXY_PORTS" ] || [ -f "$PROXY_STATE" ] || return 0
-  local svc pac_on pac_url auto_on
+  local svc pac_on pac_url auto_on bypass
   if command -v networksetup >/dev/null 2>&1; then
     if [ -f "$PROXY_STATE" ]; then
-      while IFS=$'\t' read -r svc pac_on pac_url auto_on; do
+      while IFS=$'\t' read -r svc pac_on pac_url auto_on bypass; do
         [ -z "$svc" ] && continue
         case "$svc" in *\**) continue ;; esac
         [ "$pac_url" = - ] && pac_url=""
@@ -989,6 +1024,13 @@ system_proxy_off() {
           networksetup -setproxyautodiscovery "$svc" on 2>/dev/null || true
         else
           networksetup -setproxyautodiscovery "$svc" off 2>/dev/null || true
+        fi
+        if [ "$bypass" = - ]; then
+          networksetup -setproxybypassdomains "$svc" Empty 2>/dev/null || true
+        elif [ -n "$bypass" ]; then
+          local -a prior=()
+          IFS=, read -r -a prior <<< "$bypass"
+          networksetup -setproxybypassdomains "$svc" "${prior[@]}" 2>/dev/null || true
         fi
         networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null || true
         networksetup -setwebproxystate "$svc" off 2>/dev/null || true
