@@ -2944,27 +2944,99 @@ fn serve_sealed_raw<S: Read + Write + Send + ferrox_core::tls::RecordAlignment +
     if !freedom || !vless_flow_ok(user, flow, cmd, true) {
         return;
     }
-    if cmd != 1 {
-        eprintln!("vless: encrypted raw carries only tcp forward yet");
-        return;
-    }
-    let Some(uplink) = dial_or_report(&target) else {
-        return;
+    let closer = match close_sealed.as_ref() {
+        Some(raw) => connection_closer(raw),
+        None => Arc::new(|| {}),
     };
-    if sealed.write_all(&[0, 0]).is_err() {
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if !matches!(ask, ReverseAsk::NotReverse) {
+        let shared = Arc::new(SealedShared {
+            stream: Mutex::new(sealed),
+            writing: Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+        });
+        let attached = match ask {
+            ReverseAsk::Allowed(portal) => attach_reverse(
+                portal,
+                SealedHalf(Arc::clone(&shared)),
+                SealedHalf(shared),
+                closer,
+            ),
+            ReverseAsk::Refused | ReverseAsk::NotReverse => false,
+        };
+        if !attached {
+            return;
+        }
         return;
     }
-    let close = shutdown_pair(
-        close_sealed.as_ref().and_then(|raw| raw.try_clone().ok()),
-        uplink.try_clone().ok(),
-    );
-    if flow == Flow::Vision {
-        let timeout = close_sealed;
-        let link = crate::vision::Link::sealed(sealed, &got);
-        relay_link(&uplink, link, &close, timeout);
-    } else {
-        relay_sealed(&uplink, sealed, &close);
+    match cmd {
+        2 => {
+            if sealed.write_all(&[0, 0]).is_err() {
+                return;
+            }
+            let shared = Arc::new(SealedShared {
+                stream: Mutex::new(sealed),
+                writing: Mutex::new(false),
+                cv: std::sync::Condvar::new(),
+            });
+            serve_udp_stream(
+                SealedHalf(Arc::clone(&shared)),
+                SealedHalf(shared),
+                &target,
+                Vec::new(),
+                closer,
+            );
+        }
+        3 => {
+            if sealed.write_all(&[0, 0]).is_err() {
+                return;
+            }
+            serve_sealed_mux(sealed, closer);
+        }
+        1 => {
+            let Some(uplink) = dial_or_report(&target) else {
+                return;
+            };
+            if sealed.write_all(&[0, 0]).is_err() {
+                return;
+            }
+            let close = shutdown_pair(
+                close_sealed.as_ref().and_then(|raw| raw.try_clone().ok()),
+                uplink.try_clone().ok(),
+            );
+            if flow == Flow::Vision {
+                let timeout = close_sealed;
+                let link = crate::vision::Link::sealed(sealed, &got);
+                relay_link(&uplink, link, &close, timeout);
+            } else {
+                relay_sealed(&uplink, sealed, &close);
+            }
+        }
+        _ => {}
     }
+}
+
+fn serve_sealed_mux<S>(
+    sealed: ferrox_core::vless_encryption::EncryptedStream<S>,
+    close: Arc<dyn Fn() + Send + Sync>,
+) where
+    S: Read + Write + Send + 'static,
+{
+    let stream: Arc<Mutex<Box<dyn ReadWrite + Send>>> = Arc::new(Mutex::new(Box::new(sealed)));
+    let wire = MuxWire::Stream { stream, close };
+    let io = MuxIo {
+        dial: dial_or_report,
+        resolve: resolve_endpoint,
+    };
+    let dial: MuxDial = Arc::new(move |target: &MuxTarget| {
+        let address = match target {
+            MuxTarget::Address(address) => Some(*address),
+            MuxTarget::Name(host, port) => (io.resolve)(host, *port),
+        }?;
+        (io.dial)(&address)
+    });
+    let udp: MuxUdpOk = Arc::new(|_| true);
+    serve_mux_wire(&wire, &dial, &udp, None, &[]);
 }
 
 fn relay_sealed<S: Read + Write + Send + 'static>(
@@ -3957,9 +4029,16 @@ type MuxUdpOk = Arc<dyn Fn(&MuxTarget) -> bool + Send + Sync>;
 /// every flow shares. A direct mux keeps the socket's vectored write; a bridge writes the two
 /// parts under the tunnel's own lock.
 #[derive(Clone)]
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
 enum MuxWire {
     Conn(Arc<Mutex<Connection>>),
     Tunnel(crate::reverse::Tunnel),
+    Stream {
+        stream: Arc<Mutex<Box<dyn ReadWrite + Send>>>,
+        close: Arc<dyn Fn() + Send + Sync>,
+    },
 }
 
 impl MuxWire {
@@ -3970,6 +4049,7 @@ impl MuxWire {
                 Some(Box::new(conn.try_clone().ok()?))
             }
             Self::Tunnel(tunnel) => Some(Box::new(tunnel.reader())),
+            Self::Stream { stream, .. } => Some(Box::new(SharedRead(Arc::clone(stream)))),
         }
     }
 
@@ -3997,6 +4077,31 @@ impl MuxWire {
                     tunnel.write_all(staging)
                 }
             }
+            Self::Stream { stream, close } => {
+                let Ok(mut stream) = stream.lock() else {
+                    return false;
+                };
+                let written = if let Some(payload) = data {
+                    assert!(
+                        payload.len() <= ferrox_core::mux::CHUNK_MAX,
+                        "mux chunk longer than a length field"
+                    );
+                    let at = frame.encode_header_into(staging);
+                    frame.patch_payload_len(staging, at, payload.len());
+                    stream
+                        .write_all(staging)
+                        .and_then(|()| stream.write_all(payload))
+                } else {
+                    resize_scratch(staging, frame.frame_len(0));
+                    let written = frame.encode_into(None, staging);
+                    staging.truncate(written);
+                    stream.write_all(staging)
+                };
+                if written.is_err() {
+                    close();
+                }
+                written.is_ok()
+            }
         }
     }
 
@@ -4016,6 +4121,7 @@ impl MuxWire {
                 }
             }
             Self::Tunnel(tunnel) => tunnel.close(),
+            Self::Stream { close, .. } => close(),
         }
     }
 }
@@ -16339,7 +16445,7 @@ fn read_udp_datagram(stream: &mut dyn Read, buf: &mut [u8]) -> Option<usize> {
     Some(len)
 }
 
-fn write_udp_datagram(stream: &mut Connection, payload: &[u8]) -> bool {
+fn write_udp_datagram(stream: &mut dyn Write, payload: &[u8]) -> bool {
     if payload.is_empty() || payload.len() > u16::MAX as usize {
         return true;
     }
@@ -16378,6 +16484,26 @@ fn read_trojan_datagram(stream: &mut dyn Read, buf: &mut [u8]) -> Option<(Socket
 }
 
 fn serve_vless_udp(mut stream: Connection, target: &SocketAddr, carried: Vec<u8>) {
+    let Ok(read) = stream.try_clone() else {
+        return;
+    };
+    let close = connection_closer(&stream);
+    if stream.write_all(&[0, 0]).is_err() {
+        return;
+    }
+    serve_udp_stream(read, stream, target, carried, close);
+}
+
+fn serve_udp_stream<R, W>(
+    reader: R,
+    mut writer: W,
+    target: &SocketAddr,
+    carried: Vec<u8>,
+    close: Arc<dyn Fn() + Send + Sync>,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
     let bind = if target.is_ipv6() {
         "[::]:0"
     } else {
@@ -16389,21 +16515,15 @@ fn serve_vless_udp(mut stream: Connection, target: &SocketAddr, carried: Vec<u8>
     if udp.connect(target).is_err() || udp.set_read_timeout(Some(budgets::udp_idle())).is_err() {
         return;
     }
-    if stream.write_all(&[0, 0]).is_err() {
-        return;
-    }
-    let Ok(tcp_read) = stream.try_clone() else {
-        return;
-    };
     let Ok(udp_send) = udp.try_clone() else {
         return;
     };
     let done = Arc::new(AtomicBool::new(false));
     let done_in = Arc::clone(&done);
     let forward = move || {
-        let mut tcp_read = std::io::Cursor::new(carried).chain(tcp_read);
+        let mut reader = std::io::Cursor::new(carried).chain(reader);
         let mut buf = udp_buffer();
-        while let Some(n) = read_udp_datagram(&mut tcp_read, &mut buf) {
+        while let Some(n) = read_udp_datagram(&mut reader, &mut buf) {
             if udp_send.send(&buf[..n]).is_err() {
                 break;
             }
@@ -16418,7 +16538,7 @@ fn serve_vless_udp(mut stream: Connection, target: &SocketAddr, carried: Vec<u8>
                 if n == 0 {
                     continue;
                 }
-                if !write_udp_datagram(&mut stream, &buf[..n]) {
+                if !write_udp_datagram(&mut writer, &buf[..n]) {
                     break;
                 }
             }
@@ -16431,7 +16551,7 @@ fn serve_vless_udp(mut stream: Connection, target: &SocketAddr, carried: Vec<u8>
         }
     }
     done.store(true, Ordering::Relaxed);
-    let _ = stream.shutdown(Shutdown::Both);
+    close();
     join(&replied);
 }
 
