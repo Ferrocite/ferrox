@@ -4025,13 +4025,13 @@ impl MuxTarget {
 type MuxDial = Arc<dyn Fn(&MuxTarget) -> Option<Connection> + Send + Sync>;
 type MuxUdpOk = Arc<dyn Fn(&MuxTarget) -> bool + Send + Sync>;
 
+trait ReadWrite: Read + Write {}
+impl<T: Read + Write> ReadWrite for T {}
+
 /// The session's stream: a socket this server already owns, or a reverse tunnel whose writer
 /// every flow shares. A direct mux keeps the socket's vectored write; a bridge writes the two
 /// parts under the tunnel's own lock.
 #[derive(Clone)]
-trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
-
 enum MuxWire {
     Conn(Arc<Mutex<Connection>>),
     Tunnel(crate::reverse::Tunnel),
