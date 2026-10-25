@@ -12284,18 +12284,47 @@ fn serve_vmess_kcp_tls(
     crate::vmess::serve_kcp(reader, writer, users, freedom, &close);
 }
 
+/// The `socks` front is also an HTTP proxy: a first byte that is not SOCKS4/5 goes to the
+/// HTTP front, as the reference hands it to its own HTTP server.
 fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) {
-    let Some(handshake) = socks_target(&mut client, false, accounts) else {
-        crate::accesslog::record(
-            client.peer_addr().ok(),
-            false,
-            &"unknown",
-            None,
-            "rejected",
-            "",
-        );
+    let budget = budgets::handshake();
+    let _ = client.set_read_timeout(Some(budget));
+    let until = Instant::now() + budget;
+    let mut first = [0u8; 1];
+    match client.peek(&mut first) {
+        Ok(0) | Err(_) => {
+            let _ = client.set_read_timeout(None);
+            reject_socks(&client);
+            return;
+        }
+        Ok(_) => {}
+    }
+    if first[0] != 5 && first[0] != ferrox_core::socks::VERSION4 {
+        let _ = client.set_read_timeout(None);
+        serve_http(client, out, accounts);
+        return;
+    }
+    let handshake = socks_request(&mut client, false, until, accounts);
+    let _ = client.set_read_timeout(None);
+    let Some(handshake) = handshake else {
+        reject_socks(&client);
         return;
     };
+    serve_socks_connected(client, out, handshake);
+}
+
+fn reject_socks(client: &Connection) {
+    crate::accesslog::record(
+        client.peer_addr().ok(),
+        false,
+        &"unknown",
+        None,
+        "rejected",
+        "",
+    );
+}
+
+fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: Handshake) {
     let email = handshake
         .account
         .as_ref()
@@ -13562,24 +13591,9 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
     }
 }
 
-/// The `mixed` front sniffs one byte: 0x05 is SOCKS5, a method token is HTTP, and a peek consumes nothing.
+/// The `mixed` front answers the same two shapes as the `socks` front on one listener.
 fn serve_mixed(client: Connection, out: &Outbound, accounts: &SocksAccounts) {
-    // Bound only the sniff to the greeting's budget, then restore the untimed reads the fronts behind it expect.
-    let _ = client.set_read_timeout(Some(budgets::handshake()));
-    let mut first = [0u8; 1];
-    let sniffed = client.peek(&mut first);
-    let _ = client.set_read_timeout(None);
-    let Ok(n) = sniffed else {
-        return;
-    };
-    if n == 0 {
-        return;
-    }
-    if first[0] == 5 || first[0] == ferrox_core::socks::VERSION4 {
-        serve_socks(client, out, accounts);
-    } else {
-        serve_http(client, out, accounts);
-    }
+    serve_socks(client, out, accounts);
 }
 
 fn now_secs() -> u64 {
