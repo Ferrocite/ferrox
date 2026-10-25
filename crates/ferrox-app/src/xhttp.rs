@@ -3766,6 +3766,25 @@ mod tests {
         assert_eq!(packets, 0, "the replacement starts with no packets");
     }
 
+    /// A reader left over from an ended session must not remove the fresh session that reused its id:
+    /// the map's owner is the session the entry points at, not whoever drops last with the same key.
+    #[test]
+    fn a_stale_reader_drop_keeps_the_session_that_reused_its_id() {
+        let id = "reused-xhttp-session";
+        let stale = get_or_create_session(id);
+        let reader = SessionReader::new(Arc::clone(&stale), id.to_owned());
+        end_session(id);
+        let fresh = get_or_create_session(id);
+        assert!(!Arc::ptr_eq(&stale, &fresh), "the id was reused");
+        drop(reader);
+        let carried = session_is_carried(id);
+        end_session(id);
+        assert!(
+            carried,
+            "the stale reader's drop removed the replacement session"
+        );
+    }
+
     #[test]
     fn a_stream_up_session_with_no_downlink_ends_at_its_idle_budget() {
         let session = get_or_create_session("post-only-idle");
