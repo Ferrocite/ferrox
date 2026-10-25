@@ -2114,7 +2114,7 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
     let mut raw = [0u8; 4];
     getrandom::fill(&mut raw).unwrap_or_default();
     let len = 100 + u32::from_le_bytes(raw) as usize % 901;
-    let headers = crate::headers::masked(headers, crate::headers::FETCH);
+    let headers_len = crate::headers::masked_len(headers, crate::headers::FETCH);
     DIAL_HEAD.with(|cell| {
         let mut head = cell.borrow_mut();
         head.clear();
@@ -2129,7 +2129,7 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
                 + path.len()
                 + BEFORE_PADDING.len()
                 + PADDING_MAX
-                + headers.len()
+                + headers_len
                 + TAIL.len(),
         );
         head.extend_from_slice(BEFORE_PATH.as_bytes());
@@ -2143,7 +2143,7 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
         let at = head.len();
         head.resize(at + len, b'X');
         head.extend_from_slice(b"\r\n");
-        head.extend_from_slice(headers.as_bytes());
+        crate::headers::write_masked(&mut head, headers, crate::headers::FETCH);
         head.extend_from_slice(TAIL.as_bytes());
         write.write_all(&head).ok()
     })
@@ -3213,26 +3213,10 @@ mod tests {
             vec![("X-Fetch".to_owned(), "1".to_owned())]
         );
         let head = dial_head("front.example", &settings, "session", None);
-        assert!(
-            head.contains(
-                "Sec-Fetch-Mode: cors
-"
-            ),
-            "{head}"
-        );
-        assert!(
-            head.contains(
-                "X-Fetch: 1
-"
-            ),
-            "{head}"
-        );
+        assert!(head.contains("Sec-Fetch-Mode: cors\r\n"), "{head}");
+        assert!(head.contains("X-Fetch: 1\r\n"), "{head}");
         assert_eq!(
-            head.matches(
-                "Host: front.example
-"
-            )
-            .count(),
+            head.matches("Host: front.example\r\n").count(),
             1,
             "the fixed Host line is the only one"
         );

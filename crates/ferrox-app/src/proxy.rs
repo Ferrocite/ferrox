@@ -5545,6 +5545,7 @@ fn dial_vless_headed(
     true
 }
 
+#[allow(clippy::too_many_lines)]
 fn dial_vless_rung(
     client: &Connection,
     uplink: Connection,
@@ -8905,6 +8906,7 @@ impl Dialed
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tls_ws<S: Dialed>(
     server: &SocketAddr,
     session: S,
@@ -9849,6 +9851,7 @@ fn dial_vless_reality(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut, header: &[u8]) {
     let Some(cfg) = trojan.tls.as_deref() else {
         return;
@@ -10011,6 +10014,7 @@ fn vmess_tls_raw(
     crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
 }
 
+#[allow(clippy::too_many_lines)]
 fn vmess_tls_carried(
     client: &Connection,
     server: &SocketAddr,

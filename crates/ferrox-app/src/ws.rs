@@ -667,6 +667,7 @@ fn check_response(head: &[u8], key: &[u8]) -> Option<()> {
 }
 
 // The same connect over halves that cannot peek: the kept read takes what rode in behind the `101`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     mut read: R,
     mut write: W,

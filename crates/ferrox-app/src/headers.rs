@@ -1,11 +1,9 @@
-use std::fmt::Write as _;
-
 /// The browser a masked request claims to be when the config names none.
 const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36";
 const CHROME_UACH: &str =
     "\"Not:A-Brand\";v=\"99\", \"Chromium\";v=\"144\", \"Google Chrome\";v=\"144\"";
 
-/// The headers xray's WebSocket and HTTPUpgrade dials add under a custom set.
+/// The headers xray's WebSocket and `HTTPUpgrade` dials add under a custom set.
 pub(crate) const WS: &[(&str, &str)] = &[
     ("User-Agent", CHROME_UA),
     ("Accept", "*/*"),
@@ -67,21 +65,56 @@ fn suppressed(headers: &[(String, String)], name: &str) -> bool {
     })
 }
 
-/// The header lines a dial writes before its blank line: the browser defaults the config did not override, then the config's own headers.
-pub(crate) fn masked(headers: &[(String, String)], defaults: &[(&str, &str)]) -> String {
-    let mut out = String::new();
+fn line(name: &str, value: &str) -> usize {
+    name.len() + 2 + value.len() + 2
+}
+
+/// The bytes `masked` would write, without staging them first.
+pub(crate) fn masked_len(headers: &[(String, String)], defaults: &[(&str, &str)]) -> usize {
+    defaults
+        .iter()
+        .filter(|(name, _)| !suppressed(headers, name))
+        .map(|(name, value)| line(name, value))
+        .sum::<usize>()
+        + headers
+            .iter()
+            .filter(|(name, value)| {
+                !fixed(name) && !(name.eq_ignore_ascii_case("user-agent") && selector(value))
+            })
+            .map(|(name, value)| line(name, value))
+            .sum::<usize>()
+}
+
+/// Append the header lines a dial writes before its blank line: the browser defaults the config did not override, then the config's own headers.
+pub(crate) fn write_masked(
+    out: &mut Vec<u8>,
+    headers: &[(String, String)],
+    defaults: &[(&str, &str)],
+) {
     for &(name, value) in defaults {
         if !suppressed(headers, name) {
-            let _ = write!(out, "{name}: {value}\r\n");
+            out.extend_from_slice(name.as_bytes());
+            out.extend_from_slice(b": ");
+            out.extend_from_slice(value.as_bytes());
+            out.extend_from_slice(b"\r\n");
         }
     }
     for (name, value) in headers {
         if fixed(name) || (name.eq_ignore_ascii_case("user-agent") && selector(value)) {
             continue;
         }
-        let _ = write!(out, "{name}: {value}\r\n");
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
     }
-    out
+}
+
+/// The same lines as one `String` for the dials that build their head with `format!`.
+pub(crate) fn masked(headers: &[(String, String)], defaults: &[(&str, &str)]) -> String {
+    let mut out = Vec::with_capacity(masked_len(headers, defaults));
+    write_masked(&mut out, headers, defaults);
+    String::from_utf8(out).expect("header names and values are UTF-8")
 }
 
 /// The `Host` a configured header names, if any.

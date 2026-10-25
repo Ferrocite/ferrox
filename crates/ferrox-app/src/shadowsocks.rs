@@ -1550,6 +1550,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn carried_transports_relay_an_echo() {
         const PASSWORD: &str = "an-example-shared-password";
         const METHOD: &str = "aes-256-gcm";

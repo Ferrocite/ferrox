@@ -1020,8 +1020,9 @@ mod tests {
 
     // Spelled here rather than borrowed from the dial: a piece the staging shape drops still fails these.
     fn expected_request(host: &str, path: &str) -> String {
+        let headers = crate::headers::masked(&[], crate::headers::WS);
         format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\n{headers}Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
         )
     }
 
