@@ -3091,10 +3091,17 @@ fn handle_mux_frame(
             };
             if flow.pending.try_send(data.to_vec()).is_err() {
                 // A full queue is a stalled origin: end that flow and keep the session reading, so its next Keep is dropped here rather than parking every other flow.
-                if let Ok(mut table) = table.lock() {
-                    table.flows.remove(&frame.id);
-                }
+                let removed = match table.lock() {
+                    Ok(mut table) => table.flows.remove(&frame.id).is_some(),
+                    Err(_) => false,
+                };
                 flow.control.cancel();
+                if removed {
+                    if let Some(worker) = out.worker {
+                        worker.release_connection();
+                    }
+                    send_mux_end(out.wire, out.staging, frame.id);
+                }
             }
         }
         Status::End => {
@@ -27935,6 +27942,70 @@ mod tests {
         assert!(
             answered,
             "the second flow was answered, not queued behind the first"
+        );
+    }
+
+    /// A full queue drops one flow, and the client has to learn that: an End on the wire is what
+    /// stops it keeping a flow the server has already forgotten.
+    #[test]
+    fn a_full_mux_queue_ends_the_flow_it_drops() {
+        let (server, mut client) = crate::reverse::loopback_pair().expect("pair");
+        let wire = MuxWire::Conn(Arc::new(Mutex::new(server)));
+        let (pending, _queued) = std::sync::mpsc::sync_channel(1);
+        pending.send(vec![0u8; 1]).expect("fills");
+        let flow = Arc::new(MuxFlow {
+            control: Arc::new(MuxControl {
+                stop: Mutex::new(None),
+                cancelled: AtomicBool::new(false),
+            }),
+            pending,
+        });
+        let table: MuxTable = Arc::new(Mutex::new(MuxState {
+            flows: HashMap::from([(7, flow)]),
+            done: false,
+        }));
+        let mut udp = HashMap::new();
+        let mut global = HashMap::new();
+        let mut staging = Vec::new();
+        let mut handles = Vec::new();
+        let mut out = MuxOut {
+            wire: &wire,
+            staging: &mut staging,
+            handles: &mut handles,
+            worker: None,
+        };
+        let dial: MuxDial = Arc::new(|_| None);
+        let udp_ok: MuxUdpOk = Arc::new(|_| true);
+        let keep = ferrox_core::mux::Outgoing {
+            id: 7,
+            status: ferrox_core::mux::Status::Keep,
+            options: ferrox_core::mux::DATA,
+            target: None,
+            global_id: None,
+        };
+        let mut encoded = vec![0u8; keep.frame_len(1)];
+        let n = keep.encode_into(Some(b"x"), &mut encoded);
+        let (frame, _) =
+            ferrox_core::mux::decode(&encoded[..n], ferrox_core::mux::NewTail::Forward)
+                .expect("decodes");
+        handle_mux_frame(
+            frame,
+            &table,
+            &mut udp,
+            &mut global,
+            &mut out,
+            &dial,
+            &udp_ok,
+        );
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let (id, status, _) = mux_test_recv(&mut client);
+        assert_eq!(id, 7, "the dropped flow is the one named");
+        assert_eq!(
+            status,
+            ferrox_core::mux::Status::End,
+            "a dropped flow is ended on the wire"
         );
     }
 
