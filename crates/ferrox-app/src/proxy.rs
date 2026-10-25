@@ -42404,16 +42404,16 @@ mod reverse_tests {
         assert!(vless_user_allows(&forward, &id, Flow::None, 1, true));
     }
 
-    #[test]
-    fn a_portal_flow_reaches_the_bridge_and_comes_back() {
+    fn portal_echo(payload: &[u8]) {
         let echo = crate::conn::Listener::bind(&crate::conn::Target::Ip(
             "127.0.0.1:0".parse().expect("address"),
         ))
         .expect("echo listener");
         let echo_addr = echo.local_addr().expect("addr");
+        let want = payload.len();
         thread::spawn(move || {
             if let Ok((mut stream, _)) = echo.accept() {
-                let mut buf = [0u8; 5];
+                let mut buf = vec![0u8; want];
                 if stream.read_exact(&mut buf).is_ok() {
                     let _ = stream.write_all(&buf);
                 }
@@ -42447,12 +42447,12 @@ mod reverse_tests {
         thread::spawn(move || {
             serve_reverse_tcp(&server, &portal_for_flow, &Destination::Address(echo_addr));
         });
-        user.write_all(b"hello").expect("writes");
+        user.write_all(payload).expect("writes");
         user.set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
-        let mut echoed = [0u8; 5];
+        let mut echoed = vec![0u8; payload.len()];
         user.read_exact(&mut echoed).expect("reads");
-        assert_eq!(&echoed, b"hello");
+        assert_eq!(echoed, payload);
 
         thread::sleep(Duration::from_millis(2200));
         assert!(
@@ -42460,6 +42460,17 @@ mod reverse_tests {
             "the portal heartbeats the worker it attached to"
         );
         assert!(state.active());
+    }
+
+    #[test]
+    fn a_portal_flow_reaches_the_bridge_and_comes_back() {
+        portal_echo(b"hello");
+    }
+
+    #[test]
+    fn a_sixteen_kib_downlink_is_echoed_whole() {
+        let payload = vec![0x5a; 16 * 1024];
+        portal_echo(&payload);
     }
 }
 
