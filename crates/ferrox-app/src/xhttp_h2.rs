@@ -383,6 +383,7 @@ impl H2Conn {
                 state.cv.notify_all();
             }
         }
+        self.wake.notify_all();
         self.end_session_of(stream);
         let _ = self.frame(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
     }
@@ -1987,6 +1988,72 @@ mod tests {
         running.join().expect("sender thread");
         crate::budgets::clear();
         assert_eq!(verdict, Ok(false), "a sender with no credit returned");
+    }
+
+    /// A reset stream has no window left to grant, so its writer must be woken by the reset, not
+    /// left to discover the stream is gone when the relay stall expires.
+    #[test]
+    fn a_reset_stream_wakes_a_sender_waiting_on_its_window() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_secs(30)),
+            ..Default::default()
+        });
+        let (conn, _written, _slices) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(0),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, state);
+        *conn
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = 0;
+        let held = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        let (sent, got) = std::sync::mpsc::channel();
+        let sender = Arc::clone(&conn);
+        let running = thread::spawn(move || {
+            let _ = sent.send(sender.send_data(1, b"ping"));
+        });
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while conn.send_conn.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < until,
+                "the sender never took the connection window"
+            );
+            thread::yield_now();
+        }
+        drop(held);
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while conn.send_conn.try_lock().is_err() {
+            assert!(
+                std::time::Instant::now() < until,
+                "the sender never parked on its stream window"
+            );
+            thread::yield_now();
+        }
+        let began = std::time::Instant::now();
+        conn.reset_stream(1);
+        let verdict = got.recv_timeout(Duration::from_secs(2));
+        let took = began.elapsed();
+        conn.dead.store(true, Ordering::SeqCst);
+        conn.wake.notify_all();
+        running.join().expect("sender thread");
+        crate::budgets::clear();
+        assert_eq!(verdict, Ok(false), "the reset sender returned");
+        assert!(
+            took < Duration::from_secs(1),
+            "the reset stream kept its writer parked for {took:?}"
+        );
     }
 
     /// A POST that never sends its body leaves the stream's reader parked on a request no peer will finish; the relay stall ends it, and the stream is reset instead of holding its thread for the life of the connection.
