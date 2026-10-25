@@ -903,6 +903,7 @@ enum Role {
         carrier: Carrier,
         freedom: bool,
         server: Arc<ferrox_core::tls::TlsServerConfig>,
+        fallbacks: Option<Arc<[Fallback]>>,
     },
     Vmess {
         id: [u8; 16],
@@ -6576,6 +6577,17 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
         eprintln!("trojan reality inbound on {address}: refused, not served as plaintext");
         return false;
     }
+    let fallbacks = if sec == "tls" {
+        match server_fallbacks(inbound) {
+            Ok(fallbacks) => fallbacks.map(Arc::from),
+            Err(error) => {
+                eprintln!("{error} on {address}: inbound refused");
+                return false;
+            }
+        }
+    } else {
+        None
+    };
     match inbound_carrier(inbound) {
         Carrier::Kcp(config) => {
             let serve: KcpServe = if sec == "tls" {
@@ -6610,6 +6622,7 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
                         carrier,
                         freedom,
                         server,
+                        fallbacks,
                     },
                 ),
                 inbound_tag(inbound),
@@ -10652,6 +10665,7 @@ fn serve_trojan_tls(
     carrier: &Carrier,
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
+    fallbacks: Option<&[Fallback]>,
 ) {
     if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
@@ -10665,7 +10679,8 @@ fn serve_trojan_tls(
             if !shake_tls(&mut tls) {
                 return;
             }
-            relay_trojan(tls, Some(raw), None, key, freedom);
+            let front = FrontNames::of(&tls);
+            relay_trojan_with_fallbacks(tls, Some(raw), None, key, freedom, fallbacks, &front);
         }
         Carrier::Ws { path, .. } => {
             let Ok(out) = stream.try_clone() else { return };
@@ -10737,9 +10752,83 @@ fn relay_trojan<S>(
         };
         decode_trojan_request(&mut deadline, key)
     };
-    let Some((cmd, target)) = bounded else {
+    let Some(header) = bounded else {
         return;
     };
+    relay_trojan_request(session, raw, kcp, header, freedom);
+}
+
+/// A trojan front with fallbacks: the first read names the inbound or routes to the cover site.
+fn relay_trojan_with_fallbacks<S>(
+    mut session: S,
+    raw: Option<Connection>,
+    kcp: Option<Arc<ferrox_core::kcp::Connection>>,
+    key: &[u8; 56],
+    freedom: bool,
+    fallbacks: Option<&[Fallback]>,
+    front: &FrontNames,
+) where
+    S: std::io::Read
+        + std::io::Write
+        + Send
+        + ferrox_core::tls::RecordAlignment
+        + ferrox_core::tls::TlsProvider
+        + Drivable
+        + CipherOpen
+        + 'static,
+{
+    let Some(rows) = fallbacks else {
+        return relay_trojan(session, raw, kcp, key, freedom);
+    };
+    let mut window = [0u8; PROBE_READ];
+    let n = {
+        let mut deadline = HandshakeDeadline {
+            inner: &mut session,
+            until: Instant::now() + budgets::handshake(),
+        };
+        match deadline.read(&mut window) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        }
+    };
+    if n < 58 || window[56] != b'\r' || !key_agrees(&window[..56], key) {
+        let Some(raw) = raw.as_ref() else {
+            return;
+        };
+        return seize_fallback_tls(session, raw, rows, &window[..n], &[], front);
+    }
+    let mut carried = Vec::new();
+    let header = {
+        let mut replay = Prefixed {
+            head: &window[..n],
+            at: 0,
+            tail: &mut session,
+            carried: &mut carried,
+        };
+        decode_trojan_request(&mut replay, key)
+    };
+    let Some(header) = header else {
+        return;
+    };
+    relay_trojan_request(session, raw, kcp, header, freedom);
+}
+
+fn relay_trojan_request<S>(
+    mut session: S,
+    raw: Option<Connection>,
+    kcp: Option<Arc<ferrox_core::kcp::Connection>>,
+    (cmd, target): (u8, SocketAddr),
+    freedom: bool,
+) where
+    S: std::io::Read
+        + std::io::Write
+        + Send
+        + ferrox_core::tls::RecordAlignment
+        + ferrox_core::tls::TlsProvider
+        + Drivable
+        + CipherOpen
+        + 'static,
+{
     if !freedom {
         return;
     }
@@ -39563,7 +39652,15 @@ fn front_dispatch(stream: Connection, role: Role) {
             carrier,
             freedom,
             server,
-        } => serve_trojan_tls(stream, &key, &carrier, freedom, &server),
+            fallbacks,
+        } => serve_trojan_tls(
+            stream,
+            &key,
+            &carrier,
+            freedom,
+            &server,
+            fallbacks.as_deref(),
+        ),
         Role::Vmess {
             id,
             carrier,
