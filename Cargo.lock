@@ -526,6 +526,7 @@ dependencies = [
  "chacha20poly1305",
  "ferrox-core",
  "getrandom 0.4.3",
+ "hkdf",
  "libc",
  "md5",
  "quiche",

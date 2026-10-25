@@ -16,6 +16,7 @@ aes-gcm = "0.10"
 aho-corasick = "1"
 ferrox-core = { workspace = true }
 getrandom = "0.4"
+hkdf = "0.13"
 quiche = "0.30"
 libc = "0.2"
 md5 = "0.8"
