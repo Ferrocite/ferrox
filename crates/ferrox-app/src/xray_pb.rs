@@ -9,16 +9,41 @@
 
 use crate::json::Json;
 
+#[cfg(test)]
 pub(crate) fn to_json(bytes: &[u8]) -> Result<Json, String> {
+    to_json_seeded(bytes).map(|(json, _)| json)
+}
+
+/// The config's handlers as they arrived, kept beside the JSON so the management API can list a
+/// protobuf handler byte-for-byte instead of re-encoding one this tree never built.
+#[derive(Default)]
+pub(crate) struct Seed {
+    pub(crate) inbounds: Vec<(String, Vec<u8>)>,
+    pub(crate) outbounds: Vec<(String, Vec<u8>)>,
+    pub(crate) api: Option<crate::commander::ApiConfig>,
+    pub(crate) policy: Option<crate::policy::Config>,
+    pub(crate) stats: bool,
+}
+
+pub(crate) fn to_json_seeded(bytes: &[u8]) -> Result<(Json, Seed), String> {
     let mut reader = Reader::new(bytes, "xray.core.Config");
     let mut inbounds = Vec::new();
     let mut outbounds = Vec::new();
+    let mut seed = Seed::default();
     let mut routing = None;
     let mut dns = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (1, 2) => inbounds.extend(inbound(reader.bytes()?)?),
-            (2, 2) => outbounds.push(outbound(reader.bytes()?)?),
+            (1, 2) => {
+                let raw = reader.bytes()?;
+                seed.inbounds.push((handler_tag(raw), raw.to_vec()));
+                inbounds.extend(inbound(raw)?);
+            }
+            (2, 2) => {
+                let raw = reader.bytes()?;
+                seed.outbounds.push((handler_tag(raw), raw.to_vec()));
+                outbounds.push(outbound(raw)?);
+            }
             // The router's rules say which tagged outbound a flow goes to; every other app is xray's own object graph.
             (4, 2) => {
                 let (name, value) = typed_message(reader.bytes()?)?;
@@ -35,6 +60,19 @@ pub(crate) fn to_json(bytes: &[u8]) -> Result<Json, String> {
                         }
                         dns = Some(dns_settings(value)?);
                     }
+                    "xray.app.commander.Config" => {
+                        if seed.api.is_some() {
+                            return Err("xray.core.Config: two commander apps".to_owned());
+                        }
+                        seed.api = Some(crate::commander::ApiConfig::from_proto(value)?);
+                    }
+                    "xray.app.policy.Config" => {
+                        if seed.policy.is_some() {
+                            return Err("xray.core.Config: two policy apps".to_owned());
+                        }
+                        seed.policy = Some(policy_settings(value)?);
+                    }
+                    "xray.app.stats.Config" => seed.stats = true,
                     _ => {}
                 }
             }
@@ -55,12 +93,29 @@ pub(crate) fn to_json(bytes: &[u8]) -> Result<Json, String> {
     if let Some(dns) = dns {
         pairs.push(("dns", dns));
     }
-    Ok(object(pairs))
+    if seed.stats {
+        pairs.push(("stats", Json::Obj(Vec::new())));
+    }
+    Ok((object(pairs), seed))
+}
+
+/// The tag a handler config names, so a listed handler keeps the name the seed was keyed by.
+pub(crate) fn handler_tag(bytes: &[u8]) -> String {
+    let mut reader = Reader::new(bytes, "handler tag");
+    let Ok(Some((1, 2))) = reader.field() else {
+        return String::new();
+    };
+    reader
+        .bytes()
+        .ok()
+        .and_then(|tag| std::str::from_utf8(tag).ok())
+        .unwrap_or("")
+        .to_owned()
 }
 
 /// One inbound handler decodes to one JSON inbound per port it names: xray carries a whole
 /// range in one handler, and this tree binds one port per inbound.
-fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
+pub(crate) fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
     let mut reader = Reader::new(bytes, "xray.core.InboundHandlerConfig");
     let mut receiver = None;
     let mut settings = None;
@@ -88,7 +143,7 @@ fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    let (listen, ports, stream) =
+    let (listen, ports, stream, sniffing) =
         receiver.ok_or("xray.core.InboundHandlerConfig: no receiver settings")?;
     let (name, value) = settings.ok_or("xray.core.InboundHandlerConfig: no proxy settings")?;
     let (protocol, inbound_settings) = match name.as_str() {
@@ -117,6 +172,9 @@ fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
             if inbound_settings != Json::Null {
                 pairs.push(("settings", inbound_settings.clone()));
             }
+            if let Some(sniffing) = &sniffing {
+                pairs.push(("sniffing", sniffing.clone()));
+            }
             if let Some(stream) = &stream {
                 pairs.push(("streamSettings", stream.clone()));
             }
@@ -125,7 +183,7 @@ fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
         .collect())
 }
 
-fn outbound(bytes: &[u8]) -> Result<Json, String> {
+pub(crate) fn outbound(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.core.OutboundHandlerConfig");
     let mut settings = None;
     let mut tag = None;
@@ -199,11 +257,14 @@ fn outbound(bytes: &[u8]) -> Result<Json, String> {
     Ok(object(pairs))
 }
 
-fn receiver_config(bytes: &[u8]) -> Result<(String, Vec<u16>, Option<Json>), String> {
+type ReceiverConfig = (String, Vec<u16>, Option<Json>, Option<Json>);
+
+fn receiver_config(bytes: &[u8]) -> Result<ReceiverConfig, String> {
     let mut reader = Reader::new(bytes, "xray.app.proxyman.ReceiverConfig");
     let mut ports = None;
     let mut listen = None;
     let mut stream = None;
+    let mut sniffing = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => ports = Some(port_list(reader.bytes()?)?),
@@ -213,7 +274,7 @@ fn receiver_config(bytes: &[u8]) -> Result<(String, Vec<u16>, Option<Json>), Str
                 stream = Some(stream_settings(reader.bytes()?)?);
             }
             (4, 0) => return Err(reader.uncarried("receive_original_destination")),
-            (6, 2) => return Err(reader.uncarried("sniffing settings")),
+            (6, 2) => sniffing = Some(sniffing_settings(reader.bytes()?)?),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
@@ -223,7 +284,43 @@ fn receiver_config(bytes: &[u8]) -> Result<(String, Vec<u16>, Option<Json>), Str
         listen.unwrap_or_else(|| "127.0.0.1".to_owned()),
         ports,
         stream,
+        sniffing,
     ))
+}
+
+fn sniffing_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.proxyman.SniffingConfig");
+    let mut enabled = false;
+    let mut destination = Vec::new();
+    let mut domains = Vec::new();
+    let mut ips = Vec::new();
+    let mut metadata_only = false;
+    let mut route_only = false;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => enabled = reader.varint()? != 0,
+            (2, 2) => destination.push(Json::Str(
+                std::str::from_utf8(reader.bytes()?)
+                    .map_err(|_| {
+                        "xray.app.proxyman.SniffingConfig: a destination is not utf-8".to_owned()
+                    })?
+                    .to_owned(),
+            )),
+            (3, 2) => domains.push(Json::Str(domain_rule(reader.bytes()?)?)),
+            (6, 2) => ips.push(Json::Str(ip_rule(reader.bytes()?)?)),
+            (4, 0) => metadata_only = reader.varint()? != 0,
+            (5, 0) => route_only = reader.varint()? != 0,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(object(vec![
+        ("enabled", Json::Bool(enabled)),
+        ("destOverride", Json::Arr(destination)),
+        ("domainsExcluded", Json::Arr(domains)),
+        ("ipsExcluded", Json::Arr(ips)),
+        ("metadataOnly", Json::Bool(metadata_only)),
+        ("routeOnly", Json::Bool(route_only)),
+    ]))
 }
 
 /// A sender's client-side stream policy: only its stream settings are carried, and a multiplex
@@ -990,6 +1087,7 @@ fn dokodemo_settings(bytes: &[u8]) -> Result<Json, String> {
 
 /// A vmess account: the user's uuid and the cipher it asks for when the config names one.
 type VmessAccount = (String, Option<String>);
+type VmessUser = (VmessAccount, u32, String);
 
 /// A vmess inbound serves the clients its users name; xray's default level and the detour
 /// inbound are router features nothing here reads.
@@ -999,8 +1097,8 @@ fn vmess_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => {
-                let (id, security) = vmess_user(reader.bytes()?)?;
-                clients.push(vmess_client(id, security));
+                let (account, level, email) = vmess_user(reader.bytes()?)?;
+                clients.push(vmess_client(account, level, email));
             }
             (2, 2) => return Err(reader.uncarried("the default user config")),
             _ => return Err(reader.refuse(field, wire)),
@@ -1022,14 +1120,17 @@ fn vmess_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    let (address, port, (id, security)) =
+    let (address, port, (account, level, email)) =
         receiver.ok_or("xray.proxy.vmess.outbound.Config: no receiver")?;
     Ok(object(vec![(
         "vnext",
         Json::Arr(vec![object(vec![
             ("address", Json::Str(address)),
             ("port", Json::Num(f64::from(port))),
-            ("users", Json::Arr(vec![vmess_client(id, security)])),
+            (
+                "users",
+                Json::Arr(vec![vmess_client(account, level, email)]),
+            ),
         ])]),
     )]))
 }
@@ -1752,14 +1853,21 @@ fn server_endpoint<T>(
 }
 
 /// A `common.protocol.User` names its account as a typed message. Its level and email feed
-/// xray's policy and stats, which nothing in this tree reads.
-fn vmess_user(bytes: &[u8]) -> Result<VmessAccount, String> {
+/// xray's policy and stats, and the account set the inbound serves.
+fn vmess_user(bytes: &[u8]) -> Result<VmessUser, String> {
     let mut reader = Reader::new(bytes, "xray.common.protocol.User");
     let mut account = None;
+    let mut level = 0;
+    let mut email = String::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (1, 0) => return Err(reader.uncarried("user level")),
-            (2, 2) => return Err(reader.uncarried("user email")),
+            (1, 0) => level = reader.varint()?.try_into().unwrap_or(u32::MAX),
+            (2, 2) => {
+                let value = std::str::from_utf8(reader.bytes()?)
+                    .map_err(|_| "xray.common.protocol.User: email is not utf-8".to_owned())?;
+                email.clear();
+                email.push_str(value);
+            }
             (3, 2) => {
                 let (name, value) = typed_message(reader.bytes()?)?;
                 if name != "xray.proxy.vmess.Account" {
@@ -1770,7 +1878,11 @@ fn vmess_user(bytes: &[u8]) -> Result<VmessAccount, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    account.ok_or("xray.common.protocol.User: no account".to_owned())
+    Ok((
+        account.ok_or("xray.common.protocol.User: no account".to_owned())?,
+        level,
+        email,
+    ))
 }
 
 /// The account's uuid, and the cipher its client asks for when the config names one.
@@ -1819,12 +1931,114 @@ fn vmess_account(bytes: &[u8]) -> Result<VmessAccount, String> {
     ))
 }
 
-fn vmess_client(id: String, security: Option<String>) -> Json {
+fn vmess_client((id, security): VmessAccount, level: u32, email: String) -> Json {
     let mut pairs = vec![("id", Json::Str(id))];
     if let Some(security) = security {
         pairs.push(("security", Json::Str(security)));
     }
+    if level != 0 {
+        pairs.push(("level", Json::Num(f64::from(level))));
+    }
+    if !email.is_empty() {
+        pairs.push(("email", Json::Str(email)));
+    }
     object(pairs)
+}
+
+/// `xray.app.policy.Config`: the levels whose user traffic is kept and the system-level gates.
+fn policy_settings(bytes: &[u8]) -> Result<crate::policy::Config, String> {
+    let mut reader = Reader::new(bytes, "xray.app.policy.Config");
+    let mut policy = crate::policy::Config::default();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                let (level, stats) = policy_level(reader.bytes()?)?;
+                policy.levels.insert(
+                    level,
+                    crate::policy::Level {
+                        stats,
+                        ..Default::default()
+                    },
+                );
+            }
+            (2, 2) => policy.system = system_policy(reader.bytes()?)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(policy)
+}
+
+fn policy_level(bytes: &[u8]) -> Result<(u32, crate::policy::Stats), String> {
+    let mut reader = Reader::new(bytes, "xray.app.policy.Config.Level");
+    let mut level = None;
+    let mut stats = crate::policy::Stats::default();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => level = Some(reader.varint()?.try_into().unwrap_or(u32::MAX)),
+            (2, 2) => stats = user_policy_stats(reader.bytes()?)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok((
+        level.ok_or("xray.app.policy.Config: level entry has no key")?,
+        stats,
+    ))
+}
+
+fn user_policy_stats(bytes: &[u8]) -> Result<crate::policy::Stats, String> {
+    let mut reader = Reader::new(bytes, "xray.app.policy.Policy");
+    let mut stats = crate::policy::Stats::default();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1 | 3, 2) => {
+                reader.bytes()?;
+            }
+            (2, 2) => stats = user_stats(reader.bytes()?)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(stats)
+}
+
+fn user_stats(bytes: &[u8]) -> Result<crate::policy::Stats, String> {
+    let mut reader = Reader::new(bytes, "xray.app.policy.Policy.Stats");
+    let mut stats = crate::policy::Stats::default();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => stats.user_uplink = reader.varint()? != 0,
+            (2, 0) => stats.user_downlink = reader.varint()? != 0,
+            (3, 0) => stats.user_online = reader.varint()? != 0,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(stats)
+}
+
+fn system_policy(bytes: &[u8]) -> Result<crate::policy::SystemStats, String> {
+    let mut reader = Reader::new(bytes, "xray.app.policy.SystemPolicy");
+    let mut stats = crate::policy::SystemStats::default();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => stats = system_stats(reader.bytes()?)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(stats)
+}
+
+fn system_stats(bytes: &[u8]) -> Result<crate::policy::SystemStats, String> {
+    let mut reader = Reader::new(bytes, "xray.app.policy.SystemPolicy.Stats");
+    let mut stats = crate::policy::SystemStats::default();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => stats.inbound_uplink = reader.varint()? != 0,
+            (2, 0) => stats.inbound_downlink = reader.varint()? != 0,
+            (3, 0) => stats.outbound_uplink = reader.varint()? != 0,
+            (4, 0) => stats.outbound_downlink = reader.varint()? != 0,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(stats)
 }
 
 /// A vless account: its uuid, and the two strings that shape the dial when the config names them.
@@ -2532,6 +2746,28 @@ mod tests {
         message(&[bytes_field(1, name.as_bytes()), bytes_field(2, value)])
     }
 
+    #[test]
+    fn a_protobuf_sniffer_reaches_the_json_inbound() {
+        let sniffing = message(&[
+            varint_field(1, 1),
+            bytes_field(2, b"tls"),
+            varint_field(4, 1),
+            varint_field(5, 1),
+        ]);
+        let range = message(&[varint_field(1, 1080), varint_field(2, 1080)]);
+        let list = message(&[bytes_field(1, &range)]);
+        let receiver = message(&[bytes_field(1, &list), bytes_field(6, &sniffing)]);
+        let decoded = receiver_config(&receiver).expect("receiver");
+        let sniffing = decoded.3.expect("sniffing");
+        assert_eq!(sniffing.get("enabled"), Some(&Json::Bool(true)));
+        assert_eq!(
+            sniffing.get("destOverride"),
+            Some(&Json::Arr(vec![Json::Str("tls".to_owned())]))
+        );
+        assert_eq!(sniffing.get("metadataOnly"), Some(&Json::Bool(true)));
+        assert_eq!(sniffing.get("routeOnly"), Some(&Json::Bool(true)));
+    }
+
     fn receiver(port: u64, listen: Option<&[u8]>) -> Vec<u8> {
         let range = message(&[varint_field(1, port), varint_field(2, port)]);
         let list = message(&[bytes_field(1, &range)]);
@@ -3101,7 +3337,7 @@ mod tests {
     }
 
     #[test]
-    fn a_vmess_user_level_is_refused() {
+    fn a_vmess_user_level_rides_into_the_client() {
         let user = message(&[varint_field(1, 2), vmess_user(&vmess_account(b"d", None))]);
         let settings = bytes_field(1, &user);
         let inbound = message(&[
@@ -3111,8 +3347,41 @@ mod tests {
             ),
             bytes_field(3, &typed("xray.proxy.vmess.inbound.Config", &settings)),
         ]);
-        let error = to_json(&config(&inbound, &freedom_outbound())).expect_err("refused");
-        assert!(error.contains("user level"), "{error}");
+        let root = to_json(&config(&inbound, &freedom_outbound())).expect("carries the level");
+        let client = &root
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .and_then(|settings| settings.get("clients"))
+            .and_then(Json::as_arr)
+            .expect("clients")[0];
+        assert_eq!(client.get("level").and_then(Json::as_u32), Some(2));
+    }
+
+    #[test]
+    fn a_policy_app_keeps_the_user_and_inbound_uplink_counters() {
+        let level = message(&[
+            varint_field(1, 1),
+            bytes_field(
+                2,
+                &message(&[bytes_field(
+                    2,
+                    &message(&[varint_field(1, 1), varint_field(2, 1)]),
+                )]),
+            ),
+        ]);
+        let system = message(&[bytes_field(1, &message(&[varint_field(1, 1)]))]);
+        let policy = message(&[bytes_field(1, &level), bytes_field(2, &system)]);
+        let mut bytes = http_scenario(5000);
+        bytes.extend(bytes_field(4, &typed("xray.app.policy.Config", &policy)));
+        let (_, seed) = to_json_seeded(&bytes).expect("policy app");
+        let policy = seed.policy.expect("policy");
+        let level = policy.levels.get(&1).expect("level");
+        assert!(level.stats.user_uplink);
+        assert!(level.stats.user_downlink);
+        assert!(policy.system.inbound_uplink);
+        assert!(!policy.system.inbound_downlink);
     }
 
     fn vless_account(id: &[u8], flow: Option<&[u8]>, encryption: Option<&[u8]>) -> Vec<u8> {
@@ -4006,6 +4275,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         assert_eq!(routing.route(&flow), Some("blocked"));
     }
@@ -4049,6 +4319,7 @@ mod tests {
             source: None,
             local: None,
             inbound_tag: None,
+            protocol: None,
         };
         assert_eq!(routing.route(&flow), Some("blocked"));
     }
@@ -4151,6 +4422,13 @@ mod tests {
         crate::router::Routing::parse(&json)
             .expect("parses")
             .expect("routing");
+    }
+
+    #[test]
+    fn a_stats_app_enables_the_stats_manager() {
+        let config = message(&[bytes_field(4, &typed("xray.app.stats.Config", &[]))]);
+        let json = to_json(&config).expect("stats app");
+        assert!(json.get("stats").is_some());
     }
 
     /// An app this tree does not read is xray's own object graph and is

@@ -522,12 +522,17 @@ impl Shake {
     }
 }
 
+enum Aead {
+    Aes(ferrox_core::aesgcm::Aes128Gcm),
+    Chacha([u8; 32]),
+    Plain,
+}
+
 /// The sealed size field's parser, where the mask draw would be: its key is
 /// `KDF16(body_key, "auth_len")` (the same second AEAD per cipher the reference builds,
 /// `proxy/vmess/encoding/server.go`), its nonce the body's shape with a counter of its own.
 struct SizeAead {
-    aes: Option<ferrox_core::aesgcm::Aes128Gcm>,
-    chacha: Option<[u8; 32]>,
+    aead: Aead,
     nonce: [u8; 12],
     counter: u16,
 }
@@ -535,17 +540,16 @@ struct SizeAead {
 impl SizeAead {
     fn fresh(key: &[u8; 16], cipher: Cipher, iv: &[u8; 16]) -> Option<Self> {
         let len_key = kdf16(key, &[b"auth_len"]);
-        let (aes, chacha) = match cipher {
-            Cipher::Aes => (Some(ferrox_core::aesgcm::Aes128Gcm::new(&len_key)), None),
-            Cipher::Chacha => (None, Some(chacha_key(&len_key))),
+        let aead = match cipher {
+            Cipher::Aes => Aead::Aes(ferrox_core::aesgcm::Aes128Gcm::new(&len_key)),
+            Cipher::Chacha => Aead::Chacha(chacha_key(&len_key)),
             // No cipher the reference seals a length with, so no authenticated length.
             _ => return None,
         };
         let mut nonce = [0u8; 12];
         nonce[2..].copy_from_slice(&iv[2..12]);
         Some(Self {
-            aes,
-            chacha,
+            aead,
             nonce,
             counter: 0,
         })
@@ -556,16 +560,16 @@ impl SizeAead {
         let tag: [u8; TAG_LEN] = <[u8; TAG_LEN]>::try_from(tag).ok()?;
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         let nonce = &self.nonce;
-        let plain = match (&self.aes, &self.chacha) {
-            (Some(aes), None) => {
+        let plain = match &self.aead {
+            Aead::Aes(aes) => {
                 aes.open_in_place(nonce, b"", size, &tag)?;
                 size
             }
-            (None, Some(key)) => {
+            Aead::Chacha(key) => {
                 ferrox_core::aead::chacha20_poly1305_decrypt_in_place(key, nonce, b"", size, &tag)?;
                 size
             }
-            _ => return None,
+            Aead::Plain => return None,
         };
         self.counter = self.counter.wrapping_add(1);
         Some(u16::from_be_bytes([plain[0], plain[1]]).wrapping_add(TAG_LEN as u16))
@@ -575,12 +579,12 @@ impl SizeAead {
         let mut plain = total.wrapping_sub(TAG_LEN as u16).to_be_bytes();
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         let nonce = &self.nonce;
-        let tag = match (&self.aes, &self.chacha) {
-            (Some(aes), None) => aes.seal_in_place(nonce, b"", &mut plain),
-            (None, Some(key)) => {
+        let tag = match &self.aead {
+            Aead::Aes(aes) => aes.seal_in_place(nonce, b"", &mut plain),
+            Aead::Chacha(key) => {
                 ferrox_core::aead::chacha20_poly1305_seal_in_place(key, nonce, b"", &mut plain)
             }
-            _ => return,
+            Aead::Plain => return,
         };
         sealed[..HEADER_LEN].copy_from_slice(&plain);
         sealed[HEADER_LEN..].copy_from_slice(&tag);
@@ -590,8 +594,7 @@ impl SizeAead {
 
 pub(crate) struct Flow {
     cipher: Cipher,
-    aes: Option<ferrox_core::aesgcm::Aes128Gcm>,
-    chacha: Option<[u8; 32]>,
+    aead: Aead,
     nonce: [u8; 12],
     counter: u16,
     shake: Option<Shake>,
@@ -616,10 +619,10 @@ impl Flow {
         let masking = options & OPT_MASK != 0 && options & OPT_AUTH_LEN == 0;
         let padding = options & OPT_PAD != 0 && options & OPT_AUTH_LEN == 0;
         let actual = cipher.resolve();
-        let (aes, chacha) = match actual {
-            Cipher::Aes => (Some(ferrox_core::aesgcm::Aes128Gcm::new(key)), None),
-            Cipher::Chacha => (None, Some(chacha_key(key))),
-            Cipher::None => (None, None),
+        let aead = match actual {
+            Cipher::Aes => Aead::Aes(ferrox_core::aesgcm::Aes128Gcm::new(key)),
+            Cipher::Chacha => Aead::Chacha(chacha_key(key)),
+            Cipher::None => Aead::Plain,
             Cipher::Auto => return None,
         };
         let shake = masking.then(|| Shake::fresh(mask_seed, padding));
@@ -627,8 +630,7 @@ impl Flow {
         nonce[2..].copy_from_slice(&iv[2..12]);
         Some(Self {
             cipher: actual,
-            aes,
-            chacha,
+            aead,
             nonce,
             counter: 0,
             shake,
@@ -648,18 +650,17 @@ impl Flow {
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         &self.nonce
     }
-    fn seal_onto(&mut self, plain: &[u8], out: &mut Vec<u8>) -> bool {
+    fn seal_onto(&mut self, plain: &[u8], out: &mut Vec<u8>) {
         let at = out.len();
         out.extend_from_slice(plain);
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         let nonce = &self.nonce;
-        let sealed = match (&self.aes, &self.chacha) {
-            (Some(aes), None) => {
+        match &self.aead {
+            Aead::Aes(aes) => {
                 let tag = aes.seal_in_place(nonce, b"", &mut out[at..]);
                 out.extend_from_slice(&tag);
-                true
             }
-            (None, Some(key)) => {
+            Aead::Chacha(key) => {
                 let tag = ferrox_core::aead::chacha20_poly1305_seal_in_place(
                     key,
                     nonce,
@@ -667,22 +668,15 @@ impl Flow {
                     &mut out[at..],
                 );
                 out.extend_from_slice(&tag);
-                true
             }
-            (None, None) => true,
-            _ => false,
-        };
-        if !sealed {
-            out.truncate(at);
-            return false;
+            Aead::Plain => {}
         }
         // Wraps past 65535 like the reference's `GenerateChunkNonce`; see the method page.
         self.counter = self.counter.wrapping_add(1);
-        true
     }
     fn open_chunk(&mut self, chunk: &mut [u8]) -> Option<usize> {
-        let plain_len = match (&self.aes, &self.chacha) {
-            (Some(aes), None) => {
+        let plain_len = match &self.aead {
+            Aead::Aes(aes) => {
                 if chunk.len() < TAG_LEN {
                     return None;
                 }
@@ -694,7 +688,7 @@ impl Flow {
                 aes.open_in_place(nonce, b"", body, tag)?;
                 split
             }
-            (None, Some(key)) => {
+            Aead::Chacha(key) => {
                 if chunk.len() < TAG_LEN {
                     return None;
                 }
@@ -706,8 +700,7 @@ impl Flow {
                 ferrox_core::aead::chacha20_poly1305_decrypt_in_place(key, nonce, b"", body, tag)?;
                 split
             }
-            (None, None) => chunk.len(),
-            _ => return None,
+            Aead::Plain => chunk.len(),
         };
         self.counter = self.counter.wrapping_add(1);
         Some(plain_len)
@@ -895,10 +888,7 @@ fn stage_frame(send: &mut Flow, plain: &[u8], staging: &mut Vec<u8>, pad: &mut P
         };
         staging.extend_from_slice(&wire.to_be_bytes());
     }
-    if !send.seal_onto(plain, staging) {
-        staging.truncate(at);
-        return false;
-    }
+    send.seal_onto(plain, staging);
     if padding > 0 {
         let Some(bytes) = pad.take(padding) else {
             staging.truncate(at);
@@ -938,9 +928,6 @@ fn stage_frames(
             return false;
         }
     }
-    if staging.is_empty() {
-        return true;
-    }
     write_frames(stream, staging)
 }
 
@@ -969,7 +956,7 @@ pub(crate) fn read_frame<'a>(
         return Some(&scratch[..0]);
     }
     if scratch.len() < total {
-        scratch.resize(total, 0);
+        crate::proxy::grow_scratch(scratch, total);
     }
     read_exact(stream, &mut scratch[..total]).ok()?;
     let len = open_body(recv, &mut scratch[..total], padding)?;
@@ -978,8 +965,8 @@ pub(crate) fn read_frame<'a>(
 
 /// What one decode step of a [`Wire`] did.
 enum Frame {
-    /// A frame opened, its plaintext gathered at the front of the buffer.
-    Decoded,
+    /// A frame opened in place at `at`, `len` plain bytes long.
+    Decoded { at: usize, len: usize },
     /// Nothing more can open without a wait; send the batch already gathered.
     Idle,
     /// The stream is over: its marker frame, an EOF, or a frame that will not open.
@@ -997,7 +984,9 @@ pub(crate) struct Wire<R> {
     start: usize,
     /// One past the last sealed byte read.
     end: usize,
-    /// The plaintext this batch has gathered at the front.
+    /// Where this batch's plaintext starts in `held`.
+    front: usize,
+    /// How many plaintext bytes this batch holds from `front`.
     plain: usize,
     /// A frame whose length is drawn but whose bytes have not all arrived.
     waiting: Option<(usize, usize)>,
@@ -1013,6 +1002,7 @@ impl<R: Read> Wire<R> {
             held: crate::proxy::unfilled(WIRE_LEN),
             start: 0,
             end: 0,
+            front: 0,
             plain: 0,
             waiting: None,
             last: false,
@@ -1033,11 +1023,26 @@ impl<R: Read> Wire<R> {
             return None;
         }
         self.compact();
+        self.front = 0;
         self.plain = 0;
         let mut decoded = 0;
         while decoded < FRAMES_PER_WRITE {
             match self.frame(recv, decoded == 0) {
-                Frame::Decoded => decoded += 1,
+                Frame::Decoded { at, len } => {
+                    if decoded == 0 {
+                        self.front = at;
+                        self.plain = len;
+                    } else {
+                        if self.front != 0 {
+                            self.held
+                                .copy_within(self.front..self.front + self.plain, 0);
+                            self.front = 0;
+                        }
+                        self.held.copy_within(at..at + len, self.plain);
+                        self.plain += len;
+                    }
+                    decoded += 1;
+                }
                 Frame::Idle => break,
                 Frame::Last => {
                     self.last = true;
@@ -1045,7 +1050,7 @@ impl<R: Read> Wire<R> {
                 }
             }
         }
-        Some(&self.held[..self.plain])
+        Some(&self.held[self.front..self.front + self.plain])
     }
 
     fn buffered(&self) -> usize {
@@ -1132,10 +1137,7 @@ impl<R: Read> Wire<R> {
             self.marker = true;
             return Frame::Last;
         }
-        // Every earlier frame left more bytes than it took, so gathering never reaches forward.
-        self.held.copy_within(body..body + len, self.plain);
-        self.plain += len;
-        Frame::Decoded
+        Frame::Decoded { at: body, len }
     }
 }
 
@@ -1301,18 +1303,91 @@ fn decode_header(header: &[u8]) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)>
     }
     Some((target, send, recv, prefix, cmd))
 }
-pub(crate) fn accept_request(
-    stream: &mut dyn Read,
-    id: &[u8; 16],
-) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)> {
+/// The accounts one vmess inbound serves. A mutation lands on the next handshake; a flow already
+/// admitted keeps running, so `AlterInbound` never drops a session.
+#[derive(Debug, Default)]
+pub(crate) struct Users {
+    entries: std::sync::Mutex<Vec<User>>,
+}
+
+/// One vmess account: the id the wire names, the email that names it to `RemoveUser`, and its level.
+#[derive(Clone, Debug)]
+pub(crate) struct User {
+    pub(crate) level: u32,
+    pub(crate) email: String,
+    pub(crate) id: [u8; 16],
+}
+
+pub(crate) type UsersRef = std::sync::Arc<Users>;
+
+impl Users {
+    pub(crate) fn with(entries: Vec<User>) -> UsersRef {
+        std::sync::Arc::new(Self {
+            entries: std::sync::Mutex::new(entries),
+        })
+    }
+
+    pub(crate) fn single(id: [u8; 16]) -> UsersRef {
+        Self::with(vec![User {
+            level: 0,
+            email: String::new(),
+            id,
+        }])
+    }
+
+    fn snapshot(&self) -> Vec<User> {
+        self.entries.lock().map(|e| e.clone()).unwrap_or_default()
+    }
+
+    fn authenticate(&self, auth_id: &[u8; AUTH_LEN]) -> Option<([u8; 16], User)> {
+        let entries = self.entries.lock().ok()?;
+        entries.iter().find_map(|user| {
+            let (instruction, auth_key) = cached_keys(&user.id);
+            (valid_auth_id(&auth_key, auth_id) && !replay_seen(auth_id))
+                .then(|| (instruction, user.clone()))
+        })
+    }
+
+    pub(crate) fn add(&self, user: User) -> bool {
+        let Ok(mut entries) = self.entries.lock() else {
+            return false;
+        };
+        if entries.iter().any(|held| held.id == user.id) {
+            return false;
+        }
+        entries.push(user);
+        true
+    }
+
+    pub(crate) fn remove_email(&self, email: &str) -> bool {
+        let Ok(mut entries) = self.entries.lock() else {
+            return false;
+        };
+        let before = entries.len();
+        entries.retain(|held| held.email != email);
+        entries.len() != before
+    }
+
+    pub(crate) fn list(&self) -> Vec<User> {
+        self.snapshot()
+    }
+}
+
+pub(crate) fn accept_request(stream: &mut dyn Read, users: &Users) -> Option<Accepted> {
     let mut auth_id = [0u8; AUTH_LEN];
     read_exact(stream, &mut auth_id).ok()?;
-    let (instruction, auth_key) = cached_keys(id);
-    if !valid_auth_id(&auth_key, &auth_id) || replay_seen(&auth_id) {
-        return None;
-    }
+    let (instruction, user) = users.authenticate(&auth_id)?;
     let header = read_open_header(stream, &instruction, &auth_id)?;
-    decode_header(&header)
+    let (target, send, recv, prefix, cmd) = decode_header(&header)?;
+    let meter = crate::stats::user(&user.email, user.level);
+    Some(Accepted {
+        target,
+        send,
+        recv,
+        prefix,
+        cmd,
+        user: meter,
+    })
 }
 
 /// The relay leg's read window: a read fills every byte the leg reads, so the zero pass
@@ -1324,7 +1399,7 @@ fn relay_window() -> Vec<u8> {
 pub(crate) fn pump_relay_carried<R, W>(
     plain: &Connection,
     reader: R,
-    mut writer: W,
+    writer: W,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
     send: Flow,
     recv: Flow,
@@ -1341,6 +1416,7 @@ pub(crate) fn pump_relay_carried<R, W>(
     };
     let mut plain_read = plain_read;
     let mut plain_write = plain_write;
+    let mut writer = writer;
 
     let mut send = send;
     let thread_close = std::sync::Arc::clone(close);
@@ -1430,15 +1506,22 @@ pub(crate) fn pump_relay_carried<R, W>(
     let _ = plain_write.shutdown(Shutdown::Both);
 }
 
-type Accepted = (SocketAddr, Flow, Flow, Vec<u8>, u8);
+pub(crate) struct Accepted {
+    pub(crate) target: SocketAddr,
+    pub(crate) send: Flow,
+    pub(crate) recv: Flow,
+    pub(crate) prefix: Vec<u8>,
+    pub(crate) cmd: u8,
+    pub(crate) user: crate::stats::Meter,
+}
 type Close = std::sync::Arc<dyn Fn() + Send + Sync>;
 
-fn accept_request_bounded(reader: &mut dyn Read, id: &[u8; 16]) -> Option<Accepted> {
+fn accept_request_bounded(reader: &mut dyn Read, users: &Users) -> Option<Accepted> {
     let mut bounded = crate::proxy::HandshakeDeadline {
         inner: reader,
         until: std::time::Instant::now() + crate::budgets::handshake(),
     };
-    accept_request(&mut bounded, id)
+    accept_request(&mut bounded, users)
 }
 
 fn serve_decoded<R, W>(
@@ -1451,7 +1534,15 @@ fn serve_decoded<R, W>(
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    let Some((target, send, recv, prefix, cmd)) = decoded else {
+    let Some(Accepted {
+        target,
+        send,
+        recv,
+        prefix,
+        cmd,
+        user,
+    }) = decoded
+    else {
         close();
         return;
     };
@@ -1459,19 +1550,21 @@ fn serve_decoded<R, W>(
         close();
         return;
     }
+    crate::accesslog::record_current(&target);
     match cmd {
         1 => {
             let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
                 close();
                 return;
             };
+            let uplink = uplink.with_meter(user.reversed());
             if !write_prefix(&mut writer, &prefix) {
                 close();
                 return;
             }
             pump_relay_carried(&uplink, reader, writer, close, send, recv, None);
         }
-        2 => serve_udp_carried(reader, writer, close, &target, &prefix, send, recv),
+        2 => serve_udp_carried(reader, writer, close, &target, &prefix, send, recv, &user),
         _ => {}
     }
 }
@@ -1480,6 +1573,7 @@ fn write_prefix<W: Write>(writer: &mut W, prefix: &[u8]) -> bool {
     prefix.is_empty() || (writer.write_all(prefix).is_ok() && writer.flush().is_ok())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_udp_carried<R, W>(
     reader: R,
     mut writer: W,
@@ -1488,6 +1582,7 @@ fn serve_udp_carried<R, W>(
     prefix: &[u8],
     send: Flow,
     recv: Flow,
+    user: &crate::stats::Meter,
 ) where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
@@ -1509,14 +1604,14 @@ fn serve_udp_carried<R, W>(
         close();
         return;
     }
-    crate::proxy::pump_vmess_udp(reader, writer, close, &udp, send, recv);
+    crate::proxy::pump_vmess_udp(reader, writer, close, &udp, send, recv, user);
 }
 
-pub(crate) fn serve_ws(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve_ws(stream: Connection, path: &str, users: &Users, freedom: bool) {
     let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
         return;
     };
-    let decoded = accept_request(&mut reader, id);
+    let decoded = accept_request(&mut reader, users);
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.close());
     serve_decoded(reader, writer, &close, decoded, freedom);
@@ -1526,7 +1621,7 @@ pub(crate) fn serve_ws_split<R, W>(
     reader: R,
     writer: W,
     path: &str,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
     close: &Close,
 ) where
@@ -1536,7 +1631,7 @@ pub(crate) fn serve_ws_split<R, W>(
     let Some((mut reader, writer)) = crate::ws::accept_split(reader, writer, path) else {
         return;
     };
-    let decoded = accept_request_bounded(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, users);
     let closer = writer.clone();
     let shutdown = std::sync::Arc::clone(close);
     let close: Close = std::sync::Arc::new(move || {
@@ -1546,11 +1641,26 @@ pub(crate) fn serve_ws_split<R, W>(
     serve_decoded(reader, writer, &close, decoded, freedom);
 }
 
-pub(crate) fn serve_grpc(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
-    let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
+#[cfg(test)]
+pub(crate) fn serve_grpc(stream: Connection, path: &str, users: &Users, freedom: bool) {
+    serve_grpc_with(
+        stream,
+        &crate::config::GrpcSettings::path(path),
+        users,
+        freedom,
+    );
+}
+
+pub(crate) fn serve_grpc_with(
+    stream: Connection,
+    settings: &crate::config::GrpcSettings,
+    users: &Users,
+    freedom: bool,
+) {
+    let Some((mut reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
-    let decoded = under_handshake(&mut reader, |read| accept_request(read, id));
+    let decoded = under_handshake(&mut reader, |read| accept_request(read, users));
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.close());
     serve_decoded(reader, writer, &close, decoded, freedom);
@@ -1559,18 +1669,19 @@ pub(crate) fn serve_grpc(stream: Connection, path: &str, id: &[u8; 16], freedom:
 pub(crate) fn serve_grpc_split<R, W>(
     reader: R,
     writer: W,
-    path: &str,
-    id: &[u8; 16],
+    settings: &crate::config::GrpcSettings,
+    users: &Users,
     freedom: bool,
     close: &Close,
 ) where
     R: Read + Send + 'static,
     W: crate::proxy::FrameWrite + Send + 'static,
 {
-    let Some((mut reader, writer)) = crate::grpc::accept_split(reader, writer, path) else {
+    let Some((mut reader, writer)) = crate::grpc::accept_split_with(reader, writer, settings)
+    else {
         return;
     };
-    let decoded = accept_request_bounded(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, users);
     let closer = writer.clone();
     let shutdown = std::sync::Arc::clone(close);
     let close: Close = std::sync::Arc::new(move || {
@@ -1580,11 +1691,11 @@ pub(crate) fn serve_grpc_split<R, W>(
     serve_decoded(reader, writer, &close, decoded, freedom);
 }
 
-pub(crate) fn serve_xhttp(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve_xhttp(stream: Connection, path: &str, users: &Users, freedom: bool) {
     let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
-    let decoded = accept_request(&mut reader, id);
+    let decoded = accept_request(&mut reader, users);
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.finish());
     serve_decoded(reader, writer, &close, decoded, freedom);
@@ -1594,7 +1705,7 @@ pub(crate) fn serve_xhttp_split<R, W>(
     reader: R,
     writer: W,
     settings: &crate::xhttp::XhttpSettings,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
     close: &Close,
 ) where
@@ -1606,7 +1717,7 @@ pub(crate) fn serve_xhttp_split<R, W>(
     else {
         return;
     };
-    let decoded = accept_request_bounded(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, users);
     let closer = writer.clone();
     let shutdown = std::sync::Arc::clone(close);
     let close: Close = std::sync::Arc::new(move || {
@@ -1616,11 +1727,11 @@ pub(crate) fn serve_xhttp_split<R, W>(
     serve_decoded(reader, writer, &close, decoded, freedom);
 }
 
-pub(crate) fn serve_httpheader(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve_httpheader(stream: Connection, path: &str, users: &Users, freedom: bool) {
     let Some((mut reader, write)) = crate::httpheader::accept(stream, path) else {
         return;
     };
-    let decoded = accept_request(&mut reader, id);
+    let decoded = accept_request(&mut reader, users);
     let Ok(closer) = write.try_clone() else {
         return;
     };
@@ -1634,7 +1745,7 @@ pub(crate) fn serve_httpheader_split<R, W>(
     reader: R,
     writer: W,
     path: &str,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
     close: &Close,
 ) where
@@ -1644,7 +1755,7 @@ pub(crate) fn serve_httpheader_split<R, W>(
     let Some((mut reader, writer)) = crate::httpheader::accept_split(reader, writer, path) else {
         return;
     };
-    let decoded = accept_request_bounded(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, users);
     serve_decoded(reader, writer, close, decoded, freedom);
 }
 
@@ -1652,13 +1763,13 @@ pub(crate) fn serve_httpupgrade(
     stream: Connection,
     path: &str,
     host: &str,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
 ) {
     let Some((mut reader, write)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
-    let decoded = accept_request(&mut reader, id);
+    let decoded = accept_request(&mut reader, users);
     let Ok(closer) = write.try_clone() else {
         return;
     };
@@ -1673,7 +1784,7 @@ pub(crate) fn serve_httpupgrade_split<R, W>(
     writer: W,
     path: &str,
     host: &str,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
     close: &Close,
 ) where
@@ -1684,39 +1795,39 @@ pub(crate) fn serve_httpupgrade_split<R, W>(
     else {
         return;
     };
-    let decoded = accept_request_bounded(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, users);
     serve_decoded(reader, writer, close, decoded, freedom);
 }
 
 pub(crate) fn serve_raw_split<R, W>(
     mut reader: R,
     writer: W,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
     close: &Close,
 ) where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    let decoded = accept_request_bounded(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, users);
     serve_decoded(reader, writer, close, decoded, freedom);
 }
 
 pub(crate) fn serve_kcp<R, W>(
     mut reader: R,
     writer: W,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
 ) where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    let decoded = accept_request(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, users);
     serve_decoded(reader, writer, close, decoded, freedom);
 }
 
-pub(crate) fn serve(mut stream: Connection, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve(mut stream: Connection, users: &Users, freedom: bool) {
     // Bound the opening request read like the raw VLESS handshake, then restore the relay's blocking reads.
     let budget = crate::budgets::handshake();
     let _ = stream.set_read_timeout(Some(budget));
@@ -1725,17 +1836,26 @@ pub(crate) fn serve(mut stream: Connection, id: &[u8; 16], freedom: bool) {
             inner: &mut stream,
             until: std::time::Instant::now() + budget,
         };
-        accept_request(&mut bounded, id)
+        accept_request(&mut bounded, users)
     };
     let _ = stream.set_read_timeout(None);
-    let Some((target, send, recv, prefix, cmd)) = request else {
+    let Some(Accepted {
+        target,
+        send,
+        recv,
+        prefix,
+        cmd,
+        user,
+    }) = request
+    else {
         return;
     };
     if !freedom {
         return;
     }
+    crate::accesslog::record_current(&target);
     if cmd == 2 {
-        return serve_vmess_udp(stream, &target, send, recv, &prefix);
+        return serve_vmess_udp(stream, &target, send, recv, &prefix, &user);
     }
     if cmd != 1 {
         return;
@@ -1743,6 +1863,7 @@ pub(crate) fn serve(mut stream: Connection, id: &[u8; 16], freedom: bool) {
     let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
+    let uplink = uplink.with_meter(user.reversed());
     if stream.write_all(&prefix).is_err() {
         return;
     }
@@ -1755,6 +1876,7 @@ pub(crate) fn serve_vmess_udp(
     send: Flow,
     recv: Flow,
     prefix: &[u8],
+    user: &crate::stats::Meter,
 ) {
     let bind = if target.is_ipv6() {
         "[::]:0"
@@ -1779,7 +1901,7 @@ pub(crate) fn serve_vmess_udp(
     let close: Close = std::sync::Arc::new(move || {
         let _ = closer.shutdown(Shutdown::Both);
     });
-    crate::proxy::pump_vmess_udp(reader, stream, &close, &udp, send, recv);
+    crate::proxy::pump_vmess_udp(reader, stream, &close, &udp, send, recv, user);
 }
 
 pub(crate) type PendingResponse = ([u8; 16], [u8; 16], u8);
@@ -1904,7 +2026,13 @@ mod tests {
             &mut pad
         ));
         let mut cursor = Cursor::new([request, frame].concat());
-        let Some((got, _send, mut take, _prefix, cmd)) = accept_request(&mut cursor, &id) else {
+        let Some(Accepted {
+            target: got,
+            recv: mut take,
+            cmd,
+            ..
+        }) = accept_request(&mut cursor, &Users::single(id))
+        else {
             panic!("decodes a header");
         };
         assert_eq!(cmd, 1);
@@ -1914,6 +2042,35 @@ mod tests {
             panic!("reads a coalesced frame");
         };
         assert_eq!(back, b"ping");
+    }
+
+    #[test]
+    fn a_second_account_authenticates_on_the_same_inbound() {
+        let first = [0x31u8; 16];
+        let second = [0x32u8; 16];
+        let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let request = client_request(
+            &second,
+            Cipher::Auto,
+            &crate::proxy::Destination::from(target),
+            1,
+        )
+        .expect("builds a request")
+        .0;
+        let users = Users::with(vec![
+            User {
+                level: 0,
+                email: "first@example.com".to_owned(),
+                id: first,
+            },
+            User {
+                level: 0,
+                email: "second@example.com".to_owned(),
+                id: second,
+            },
+        ]);
+        let mut cursor = Cursor::new(request);
+        assert!(accept_request(&mut cursor, &users).is_some());
     }
 
     #[test]
@@ -1989,7 +2146,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve(stream, &id, true);
+            serve(stream, &Users::single(id), true);
             let _ = done_tx.send(());
         });
         let _peer = Connection::connect(addr).expect("connects");
@@ -2021,13 +2178,13 @@ mod tests {
         let server_path = path.to_string();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_ws(stream, &server_path, &server_id, true);
+            serve_ws(stream, &server_path, &Users::single(server_id), true);
         });
 
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("target");
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, writer) =
-            crate::ws::connect(stream, &format!("127.0.0.1:{port}"), path, 0, &[])
+            crate::ws::connect(stream, &format!("127.0.0.1:{port}"), path, 0, &[], &[], 0)
                 .expect("carries");
 
         let (request, data_key, data_iv, auth) = request_bytes(
@@ -2142,9 +2299,10 @@ mod tests {
     fn vmess_carries_over_the_xhttp_carrier_both_ways() {
         vmess_over_byte_carrier(
             "/vmess-xhttp",
-            |stream, id| serve_xhttp(stream, "/vmess-xhttp", &id, true),
+            |stream, id| serve_xhttp(stream, "/vmess-xhttp", &Users::single(id), true),
             |stream| {
-                let (reader, writer) = crate::xhttp::connect(stream, "127.0.0.1", "/vmess-xhttp")?;
+                let (reader, writer) =
+                    crate::xhttp::connect(stream, "127.0.0.1", "/vmess-xhttp", &[])?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,
@@ -2157,10 +2315,10 @@ mod tests {
     fn vmess_carries_behind_the_http_camouflage_both_ways() {
         vmess_over_byte_carrier(
             "/vmess-camouflage",
-            |stream, id| serve_httpheader(stream, "/vmess-camouflage", &id, true),
+            |stream, id| serve_httpheader(stream, "/vmess-camouflage", &Users::single(id), true),
             |stream| {
                 let (reader, writer) =
-                    crate::httpheader::connect(stream, "127.0.0.1", "/vmess-camouflage")?;
+                    crate::httpheader::connect(stream, "127.0.0.1", "/vmess-camouflage", &[])?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,
@@ -2183,7 +2341,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_grpc(stream, "/p", &id, true);
+            serve_grpc(stream, "/p", &Users::single(id), true);
             let _ = done_tx.send(());
         });
         let stream = Connection::connect(addr).expect("connects");
@@ -2213,7 +2371,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_grpc(stream, path, &id, true);
+            serve_grpc(stream, path, &Users::single(id), true);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("target");
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
@@ -2689,7 +2847,7 @@ mod tests {
         let port = server.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = server.accept().expect("accepts");
-            super::serve(stream, &id, true);
+            super::serve(stream, &Users::single(id), true);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
@@ -2791,7 +2949,7 @@ mod tests {
             )
             .expect("fresh");
             let mut sealed = Vec::new();
-            assert!(flow.seal_onto(b"hello", &mut sealed));
+            flow.seal_onto(b"hello", &mut sealed);
             assert_eq!(sealed, golden);
             let mut recv = Flow::fresh(
                 cipher,
@@ -2833,7 +2991,7 @@ mod tests {
                 )
                 .expect("recvs");
                 let mut sealed = Vec::new();
-                assert!(send.seal_onto(&plain, &mut sealed));
+                send.seal_onto(&plain, &mut sealed);
                 assert_eq!(sealed.len(), plain.len() + tag);
                 let back = recv.open_chunk(&mut sealed).expect("opens");
                 assert_eq!(back, plain.len());
@@ -2912,7 +3070,7 @@ mod tests {
                 let mut first = [0u8; 12];
                 first.copy_from_slice(send.nonce());
                 let mut sealed = Vec::new();
-                assert!(send.seal_onto(b"ping", &mut sealed));
+                send.seal_onto(b"ping", &mut sealed);
                 let back = recv.open_chunk(&mut sealed).expect("opens");
                 assert_eq!(&sealed[..back], b"ping");
                 assert_eq!(send.counter, at.wrapping_add(1));
@@ -2944,13 +3102,13 @@ mod tests {
             send.counter = u16::MAX;
             recv.counter = u16::MAX;
             let mut sealed = Vec::new();
-            assert!(send.seal_onto(b"ping", &mut sealed));
+            send.seal_onto(b"ping", &mut sealed);
             assert_eq!(send.counter, 0);
             let back = recv.open_chunk(&mut sealed).expect("opens across the wrap");
             assert_eq!(&sealed[..back], b"ping");
             assert_eq!(recv.counter, 0);
             let mut sealed = Vec::new();
-            assert!(send.seal_onto(b"pong", &mut sealed));
+            send.seal_onto(b"pong", &mut sealed);
             let back = recv.open_chunk(&mut sealed).expect("opens after the wrap");
             assert_eq!(&sealed[..back], b"pong");
         }
@@ -3019,7 +3177,7 @@ mod tests {
             )
             .expect("sends");
             let mut frame = Vec::new();
-            assert!(send.seal_onto(b"ping", &mut frame));
+            send.seal_onto(b"ping", &mut frame);
             let mut recv = Flow::fresh(
                 cipher,
                 &[0x55u8; 16],
@@ -3325,7 +3483,7 @@ mod tests {
         thread::spawn(move || {
             for stream in server.incoming().take(3) {
                 let Ok(stream) = stream else { continue };
-                thread::spawn(move || super::serve(stream, &id, true));
+                thread::spawn(move || super::serve(stream, &Users::single(id), true));
             }
         });
         let mut refused = 0;
@@ -3395,7 +3553,7 @@ mod tests {
                     "frame {frame}: counter then the iv tail"
                 );
                 let mut ours = Vec::new();
-                assert!(flow.seal_onto(&plain, &mut ours), "seals frame {len}");
+                flow.seal_onto(&plain, &mut ours);
 
                 let mut want = plain.clone();
                 let want_tag = cipher
@@ -3549,6 +3707,34 @@ mod tests {
             "a carrier that gives three bytes at a time never holds a second frame, so nothing waits"
         );
         assert_eq!(got, plain, "and the bytes are the same bytes");
+    }
+
+    #[test]
+    fn a_one_frame_batch_is_handed_over_where_it_opened() {
+        let (sealed, plain, mut recv) = frames(&[1000; 3]);
+        let carrier = Sealed {
+            held: sealed,
+            at: 0,
+            grain: 3,
+            reads: 0,
+        };
+        let mut wire = Wire::new(carrier);
+        let base = wire.held.as_ptr() as usize;
+        let limit = base + wire.held.len();
+        let mut got = Vec::new();
+        while let Some(batch) = wire.batch(&mut recv) {
+            if batch.is_empty() {
+                continue;
+            }
+            let at = batch.as_ptr() as usize;
+            assert!(at > base, "a one-frame batch was gathered to the front");
+            assert!(
+                at + batch.len() <= limit,
+                "the batch left the pump's buffer"
+            );
+            got.extend_from_slice(batch);
+        }
+        assert_eq!(got, plain);
     }
 
     #[test]
@@ -3783,6 +3969,46 @@ mod tests {
         assert_eq!(upload, b"ping");
         let end = read_frame(&mut server, &mut uploader, &mut scratch).expect("the upload marker");
         assert_eq!(end, b"");
+        relay.join().expect("joins");
+    }
+
+    #[test]
+    fn the_relay_carries_both_directions() {
+        let key = [0x77u8; 16];
+        let iv = [0x88u8; 16];
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        let send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let recv = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
+        let (plain, mut target) = socket_pair();
+        let (sealed, mut client) = socket_pair();
+        let relay = thread::spawn(move || pump_relay(&plain, &sealed, send, recv, None));
+
+        let mut uploader = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("seals");
+        let mut pad = PadSource::fresh().expect("entropy");
+        let mut wire = Vec::new();
+        assert!(
+            stage_frame(&mut uploader, b"hello", &mut wire, &mut pad),
+            "seals the upload"
+        );
+        client.write_all(&wire).expect("writes the upload");
+
+        let mut buf = [0u8; 5];
+        target
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("arms");
+        target.read_exact(&mut buf).expect("reads the upload");
+        assert_eq!(&buf, b"hello");
+
+        target.write_all(b"world").expect("writes the download");
+        target.shutdown(Shutdown::Write).expect("ends the download");
+
+        let mut decoder = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("opens");
+        let mut scratch = Vec::new();
+        let download =
+            read_frame(&mut client, &mut decoder, &mut scratch).expect("reads the download");
+        assert_eq!(download, b"world");
+
+        client.shutdown(Shutdown::Write).expect("ends the upload");
         relay.join().expect("joins");
     }
 }

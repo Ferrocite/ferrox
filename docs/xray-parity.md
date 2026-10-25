@@ -1,8 +1,8 @@
 # Ferrox vs Xray-core feature map
 
-Pinned reference: `upstream/xray-core` @ `92ccc939` (`upstream/pins.toml`). This tree: `crates/ferrox-core`, `crates/ferrox-app`, `docs/function/`.
+Pinned reference: `upstream/xray-core` @ `1b1647c` (`upstream/pins.toml`). This tree: `crates/ferrox-core`, `crates/ferrox-app`, `docs/function/`.
 
-What runs against what: `xray-rust` interop (23 tests, seam `XRAY_VLESS_FULL_BINARY`), `zeronet` `xray_oracle` (9 tests, seam `ZRAY_XRAY_BINARY`), and `xray-core`'s `testing/scenarios` built at run time and spawned with `-config=stdin: -format=pb` via `go -overlay` (`scripts/xray-scenarios.sh`), which `ferrox-app` reads in `crates/ferrox-app/src/xray_pb.rs`. The gate is four http tests; the other 68 run unmapped into the `conformance.yml` scenario map. `xray-core`'s own unit tests are in-process with no seam and stay in `xray-baseline.yml`.
+What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BINARY`), `zeronet` `xray_oracle` (9 tests, seam `ZRAY_XRAY_BINARY`), and `xray-core`'s `testing/scenarios` built at run time and spawned with `-config=stdin: -format=pb` via `go -overlay` (`scripts/xray-scenarios.sh`), which `ferrox-app` reads in `crates/ferrox-app/src/xray_pb.rs`. The gate is every scenario test the map answers green — 31 of 73 at this pin, across http, socks, dokodemo, dns, feature, policy, shadowsocks, tls, vless, vmess and masque; all 73 run into the `conformance.yml` scenario map. `xray-core`'s own unit tests are in-process with no seam and stay in `xray-baseline.yml`.
 
 ## What ferrox has that xray-core does not
 
@@ -67,7 +67,7 @@ What runs against what: `xray-rust` interop (23 tests, seam `XRAY_VLESS_FULL_BIN
 | Stats, metrics (Prometheus), policy manager | planned: policy.rs is parse-level gate only |
 | `app/commander` gRPC API (config/inbound/outbound/log/router/stats) | planned (row 84) |
 | Geodata (.dat) loader/downloader | planned (row 80) |
-| Sniffer (HTTP/TLS/QUIC/bittorrent) + dispatcher sniffer | planned (engine-sniffing) |
+| Sniffer (HTTP/TLS/QUIC/bittorrent) + dispatcher sniffer | implemented (engine-sniffing: HTTP/TLS/QUIC/FakeDNS, bittorrent, UDP, plain-HTTP protocol and loopback outbound sniffing carried; the named inbound's second routing pass is row 27) |
 | Config schema for every protocol (`infra/conf`) | ferrox-app's own JSON dialect; the protobuf `xray.core.Config` covers the shapes the http, dokodemo, vmess, vless and shadowsocks scenarios write (`xray_pb.rs`), every other field refused by number or name |
 | OCSP, antireplay, time-window caches | planned |
 | Freedom fragment, VLESS encryption fragment | planned (rows 121, 34) |

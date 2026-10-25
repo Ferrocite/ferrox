@@ -63,8 +63,7 @@ shadowsocks-2022 downlink-stage-bytes-per-connection 0 ferrox-app-shadowsocks202
 shadowsocks-2022 downlink-chunks-per-opened-batch 4 ferrox-app-shadowsocks2022::tests::a_bulk_read_serves_every_buffered_chunk
 shadowsocks-2022 target-write-syscalls-per-opened-batch 1 ferrox-app-shadowsocks2022::tests::a_bulk_read_serves_every_buffered_chunk
 shadowsocks-2022 reads-spent-waiting-for-an-incomplete-chunk 0 ferrox-app-shadowsocks2022::tests::a_batch_never_waits_for_a_chunk_that_has_not_arrived
-shadowsocks-2022 udp-payload-buffers-per-datagram 1 ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes
-shadowsocks-2022 udp-datagram-reallocations-after-the-first 0 ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes
+shadowsocks-2022 udp-payload-buffers-per-datagram 0 ferrox-app-shadowsocks2022::tests::an_opened_payload_is_the_datagrams_own_bytes
 shadowsocks-2022 subkey-heap-buffers-per-connection 1 ferrox-core-shadowsocks2022::tests::a_cipher_holds_one_heap_buffer_for_aes_and_none_for_chacha
 shadowsocks-2022 subkey-heap-buffers-per-derivation 0 ferrox-core-shadowsocks2022::tests::deriving_a_session_subkey_costs_no_heap_buffer
 shadowsocks-2022 udp-multi-user-eih-bytes-per-packet 16 ferrox-app-shadowsocks2022::tests::udp_multi_user_packs_one_eih_and_opens_with_the_pinned_psk
@@ -461,7 +460,12 @@ carrier-hysteria closed-connections-reused 0 ferrox-app-proxy::tests::hysteria_r
 carrier-hysteria request-parse-reallocations 0 ferrox-app-hysteria::tests::a_parsed_request_leaves_its_payload_where_it_landed
 carrier-hysteria request-parse-moves 0 ferrox-app-hysteria::tests::a_parsed_request_leaves_its_payload_where_it_landed
 carrier-hysteria wrong-password-bytes-relayed 0 ferrox-app-proxy::tests::hysteria_refuses_a_wrong_password_without_relaying
-carrier-hysteria non-v2-configs-carried 0 ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks
+carrier-hysteria non-v2-configs-carried 1 ferrox-app-proxy::tests::hysteria_settings_parse_with_guarded_fallbacks
+carrier-hysteria hysteria-v1-tcp-echo-round-trips 1 ferrox-app-proxy::tests::hysteria_v1_carries_a_tcp_echo_over_loopback
+carrier-hysteria hysteria-v1-udp-echo-round-trips 2 ferrox-app-proxy::tests::hysteria_v1_carries_a_udp_echo_over_loopback
+carrier-hysteria hysteria-v1-xplus-round-trips 1 ferrox-app-proxy::tests::hysteria_v1_carries_a_flow_through_xplus_over_loopback
+carrier-hysteria hysteria-v1-fragments-witnessed 200 ferrox-core-hysteria_v1::tests::every_length_survives_fragment_then_defrag_intact
+carrier-hysteria hysteria-v1-xplus-masked-bytes 10 ferrox-core-hysteria_v1::tests::the_xplus_mask_matches_an_independent_sha256_computation
 carrier-hysteria datagram-lane-client-round-trips 1 ferrox-app-proxy::tests::hysteria_carries_a_udp_association_over_the_carrier
 carrier-hysteria udp-datagram-decode-copies 0 ferrox-core-hysteria::tests::a_decoded_datagram_leaves_its_payload_where_it_landed
 carrier-hysteria udp-fragments-witnessed 200 ferrox-core-hysteria::tests::every_length_survives_fragment_then_defrag_intact
@@ -541,10 +545,21 @@ security-ech quic-dials-that-offer-the-configured-list 1 ferrox-app-quic::tests:
 security-ech quic-lanes-that-fall-back-without-an-offer 1 ferrox-app-quic::tests::an_ech_serving_lane_answers_a_client_without_an_offer
 security-ech heap-buffers-for-an-ech-cover 1 ferrox-core-tls::shaped::hello::tests::an_ech_cover_is_written_into_one_buffer
 
+# --- engine sniffing --------------------------------------------------------
+engine-sniffing-http-tls-quic-fakedns ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-sniffing-http-tls-quic-fakedns http-host-and-tls-sni-recognized 2 ferrox-app-sniff::tests::reads_http_host_and_tls_sni
+engine-sniffing-http-tls-quic-fakedns quic-initial-sni-recognized 1 ferrox-app-sniff::tests::reads_a_quic_initial_sni
+engine-sniffing-http-tls-quic-fakedns bittorrent-and-utp-recognized 2 ferrox-app-sniff::tests::reads_bittorrent_and_utp
+engine-sniffing-http-tls-quic-fakedns excluded-targets-kept 2 ferrox-app-sniff::tests::exclusions_keep_the_original_destination
+engine-sniffing-http-tls-quic-fakedns loopback-sniffed-host-overrides 1 ferrox-app-proxy::tests::a_loopback_sniffing_overrides_the_re_inject_destination
+engine-sniffing-http-tls-quic-fakedns routed-protocol-selectors 1 ferrox-app-router::tests::a_protocol_rule_reads_the_sniffed_protocol
+
 # --- loopback re-inject outbound --------------------------------------------
 loopback ops-retired-instructions UNBLESSED scripts/count-ops.sh
 loopback tcp-echo-bytes-preserved 65536 ferrox-app-proxy::tests::a_re_injected_tcp_stream_carries_an_echo
 loopback udp-datagram-bytes-preserved 4 ferrox-app-proxy::tests::a_re_injected_udp_association_carries_a_datagram
+loopback sniffed-http-host-dials-the-sniffed-name 1 ferrox-app-proxy::tests::a_loopback_sniffing_overrides_the_re_inject_destination
+loopback route-targets-resolved-at-startup 1 ferrox-app-proxy::tests::a_loopback_outbound_is_a_route_target
 
 # --- unix domain sockets ------------------------------------------------------
 unix ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -692,3 +707,16 @@ engine-dns seconds-per-lookup UNBLESSED CI bench.yml (no cell yet)
 # --- the reverse tunnel -----------------------------------------------------
 reverse ops-retired-instructions UNBLESSED scripts/count-ops.sh
 reverse tcp-echo-bytes-preserved 5 ferrox-app-proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back
+
+# --- health observatory and healthcheck inbound -----------------------------
+engine-observatory ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-observatory burst-ring-samples 10 ferrox-app-observatory::tests::a_burst_ring_holds_the_sampling_window_and_puts_without_allocating
+engine-observatory sample-allocations-per-put 0 ferrox-app-observatory::tests::a_burst_ring_holds_the_sampling_window_and_puts_without_allocating
+engine-observatory failed-legacy-delay-ms 99999999 ferrox-app-observatory::tests::a_failed_legacy_probe_keeps_the_reference_delay
+engine-observatory default-burst-samples 10 ferrox-app-observatory::tests::burst_settings_default_to_ten_samples_and_head
+front-healthcheck ops-retired-instructions UNBLESSED scripts/count-ops.sh
+front-healthcheck answer-allocations 1 ferrox-app-proxy::hc_tests::an_hc_answer_is_one_allocation
+front-healthcheck answer-bytes 85 ferrox-app-proxy::hc_tests::an_hc_answer_is_one_allocation
+
+# --- Commander gRPC management API ----------------------------------------
+engine-api ops-retired-instructions UNBLESSED scripts/count-ops.sh

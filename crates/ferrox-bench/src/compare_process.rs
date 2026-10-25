@@ -944,7 +944,7 @@ fn protocol_of(scenario: &str) -> Option<&str> {
 }
 
 fn carrier_of(scenario: &str) -> Option<&'static str> {
-    ["kcp", "hysteria"]
+    ["kcp", "hysteria", "xhttp"]
         .into_iter()
         .find(|carrier| scenario.split('-').any(|rung| rung == *carrier))
 }
@@ -952,7 +952,9 @@ fn carrier_of(scenario: &str) -> Option<&'static str> {
 fn carries(engine: &str, carrier: &str) -> bool {
     !matches!(
         (engine, carrier),
-        ("xray-rust" | "zeronet", "kcp") | ("zeronet", "hysteria")
+        ("xray-rust" | "zeronet", "kcp")
+            | ("zeronet", "hysteria")
+            | ("sing-box", "kcp" | "hysteria" | "xhttp")
     )
 }
 
@@ -1827,17 +1829,26 @@ mod tests {
         let engines = vec![
             dialect_engine("xray-rust", parity::Dialect::Xray),
             dialect_engine("zeronet", parity::Dialect::Xray),
+            dialect_engine("sing-box", parity::Dialect::SingBox),
             dialect_engine("xray-core", parity::Dialect::Xray),
         ];
         let (names, skipped) = participant_names(&engines, &scenario_workload("vless-kcp-down-8"));
         assert_eq!(names, vec!["xray-core"]);
-        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped.len(), 3);
         assert!(skipped.iter().all(|(_, reason)| reason.contains("kcp")));
         let (names, skipped) =
             participant_names(&engines, &scenario_workload("vless-hysteria-down-8"));
         assert_eq!(names, vec!["xray-rust", "xray-core"]);
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped
+            .iter()
+            .all(|(_, reason)| reason.contains("hysteria")));
+        let (names, skipped) =
+            participant_names(&engines, &scenario_workload("vless-xhttp-down-8"));
+        assert_eq!(names, vec!["xray-rust", "zeronet", "xray-core"]);
         assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].0, "zeronet");
+        assert_eq!(skipped[0].0, "sing-box");
+        assert!(skipped[0].1.contains("xhttp"));
     }
 
     #[test]

@@ -228,6 +228,18 @@ pub struct TlsServerConfig {
     /// The protocols to offer, in preference order. Empty means no ALPN, which
     /// is what a server that only ever carries one protocol leaves it at.
     pub alpn: Vec<Vec<u8>>,
+    /// The lowest protocol version the listener may negotiate, as the `0x0303`
+    /// spelling xray's `tlsSettings.minVersion` uses. `None` keeps the backend's
+    /// default floor.
+    pub min_version: Option<u16>,
+    /// The highest protocol version the listener may negotiate, as the `0x0304`
+    /// spelling xray's `tlsSettings.maxVersion` uses. `None` keeps the backend's
+    /// default ceiling.
+    pub max_version: Option<u16>,
+    /// The TLS 1.2 suites the listener may negotiate, in preference order, from
+    /// xray's `tlsSettings.cipherSuites`. Empty keeps the backend's stock set;
+    /// a non-empty list admits only the suites it names.
+    pub cipher_suites: Vec<u16>,
     /// Whether to send TLS 1.3 session tickets. REALITY declines them, as both
     /// references do, so an authenticated handshake is followed by no records.
     pub send_tickets: bool,
@@ -278,6 +290,9 @@ pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerCo
         if let Some(key_der) = pem_blocks(key_pem, label).into_iter().next() {
             return Ok(TlsServerConfig {
                 alpn: Vec::new(),
+                min_version: None,
+                max_version: None,
+                cipher_suites: Vec::new(),
                 cert_chain,
                 key_kind: key_kind(&key_der).unwrap_or(ServerKeyKind::Pkcs1),
                 key_der,
@@ -505,8 +520,8 @@ impl<S: Stream> std::io::Write for ClientSession<S> {
 
 pub mod reality;
 pub use reality::{
-    Edges, Proxied, RateLimit, RealityAccept, RealityClientConfig, RealityClientSession,
-    RealityServer, RealityServerConfig,
+    write_proxy_protocol, Edges, Proxied, RateLimit, RealityAccept, RealityClientConfig,
+    RealityClientSession, RealityServer, RealityServerConfig,
 };
 
 pub fn connect<S: Stream + RecordAlignment>(

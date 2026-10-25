@@ -3,9 +3,12 @@
 Every cell measures one client engine against a fixed server engine on loopback.
 The grid runs both servers (`ferrox`, `xray-core`) for every scenario and every
 client the scenario's protocol and carrier admit (`ferrox`, `xray-core`,
-`xray-core-rust`, `zeronet`). `xray-core` is always the reference; a cell
-without it is not a comparison. `xray-rust` is left out while its pinned release
-refuses the harness's non-loopback SOCKS listener.
+`xray-core-rust`, `zeronet`, `sing-box`). `xray-core` is always the reference; a
+cell without it is not a comparison. `xray-rust` is left out while its pinned
+release refuses the harness's non-loopback SOCKS listener. The pinned `sing-box`
+serves every scenario except the `xhttp`, `kcp` and `hysteria` carriers, which
+are omitted from its cells rather than failed. Each sing-box cell reads the same
+client outbound translated by `scripts/xray-to-singbox.py`.
 
 Each scenario also runs the reference client against both servers, so
 `scripts/check-matrix-legs.py` can say which leg lost: a ferrox client below the
@@ -20,13 +23,17 @@ cell bundles by `scripts/render-benchmark-charts.py`; CI commits the dated
 results and the latest charts here and opens a review PR. Do not edit between
 the markers by hand: a refresh replaces one runner block at a time.
 
-Each bundle carries one throughput plot per test, never one plot that merges
-every test: the comparison is only readable when each scenario has its own
-axes. The coverage grid is a markdown table, so a missing cell and its reason
-survive both text review and the artifact browser. The README block and the
-bundle's `README.md` are generated from the same `matrix-results.json`.
+Each bundle carries one image per test, never one image that merges every test:
+the panel shows throughput, CPU per GiB, peak RSS, peak threads, cold start and
+kernel asks per MiB from the same cell, so a reader never matches one test's
+bar against another test's. The coverage grid is a markdown table, so a missing
+cell and its reason survive both text review and the artifact browser. The
+README block and the bundle's `README.md` are generated from the same
+`matrix-results.json`. A scheduled refresh compares the new medians with the
+last published run and leaves the committed markdown and charts alone when no
+cell moved by more than 10%, the top of the shared runner's noise band.
 
-## Known holes (2026-10-23, standard / ubuntu-latest)
+## Known holes (2026-10-25, standard / ubuntu-latest)
 
 These are the gaps this tree still measures. `scripts/check-matrix-legs.py`
 reads the same list from `scripts/leg-gaps.txt`: a filed gap warns with its issue,
@@ -49,11 +56,13 @@ The coverage holes with no number — a client that cannot use a ferrox server a
 xray-core-rust reads 0 in hysteria and reality-grpc on both servers. The
 remaining untested lanes, including UDP, more than 16 flows and carriers
 without a cell, stay in #384, #387 and #388 rather than being inferred from
-these rows.
+these rows. `sing-box` is absent from `vless-xhttp-down-8`,
+`vless-reality-xhttp-down-8`, `vless-kcp-down-8` and `vless-hysteria-down-8`
+because its pinned dialect has no such transport.
 
-## Every configuration
+## Every standard configuration
 
-The standard tier measures these 56 configurations: one row per scenario and server. The full tier adds the 16-flow cells (`vless-raw-down-16`, `vless-raw-duplex-16`, `vless-tls-raw-duplex-16`, `vless-ws-down-16`) for eight more, for 64 in all.
+The standard tier measures these 56 configurations: one row per scenario and server. The full tier adds the 16-flow cells (`vless-raw-down-16`, `vless-raw-duplex-16`, `vless-tls-raw-duplex-16`, `vless-ws-down-16`) and the missing up/duplex lanes for every method that had only a down lane, plus `vmess-tls-raw`, for 78 more: 134 in all. The full tier runs weekly on `ubuntu-latest`, `ubuntu-24.04-arm` and `macos-15`; `windows-latest` is available by `workflow_dispatch`, because 67 scenarios across four runners is more than one matrix job may hold. The nightly standard tier runs on `ubuntu-latest` only, because a ratio is read inside one cell and four runners were measuring the same ratio four times.
 
 | scenario | server | measured |
 | --- | --- | --- |
@@ -114,9 +123,11 @@ The standard tier measures these 56 configurations: one row per scenario and ser
 | `trojan-tls-ws-down-8` | ferrox | yes |
 | `trojan-tls-ws-down-8` | xray-core | yes |
 
-## Not in the matrix yet
+## Not measured yet
 
-These are the ways a config can name a method that no cell measures. A row here is a known gap in the harness, not a claim that the method works.
+These are the ways a config can name a method that no cell measures in the
+standard tier. A row here is a known gap in the harness or a full-tier-only
+lane, not a claim that the method works.
 
 | method | carrier or security | direction | status |
 | --- | --- | --- | --- |
@@ -127,23 +138,17 @@ These are the ways a config can name a method that no cell measures. A row here 
 | vless | ws 16 flows | down | full tier only |
 | vless | raw 16 flows | down, duplex | full tier only |
 | vless | tls raw 16 flows | duplex | full tier only |
-| vmess | tls raw | down, up, duplex | no scenario |
-| vmess | ws | down, up, duplex | only `vmess-tls-ws` exists |
+| vmess | plain ws | down, up, duplex | no scenario; only `vmess-tls-ws` exists |
 | vmess | grpc, xhttp, httpupgrade, kcp, hysteria, reality | down | no scenario |
-| vmess | up and duplex | up, duplex | no scenario |
 | trojan | grpc, xhttp, httpupgrade, kcp, hysteria, reality | down | no scenario |
-| trojan | up and duplex | up, duplex | no scenario |
-| shadowsocks | tls, ws, grpc, xhttp, httpupgrade, kcp, hysteria | down | no scenario; only raw |
-| shadowsocks | up and duplex | up, duplex | no scenario |
-| shadowsocks2022 | tls, ws, grpc, xhttp, httpupgrade, kcp, hysteria | down | no scenario; only raw |
-| shadowsocks2022 | up and duplex | up, duplex | no scenario |
+| shadowsocks | tls, ws, grpc, xhttp, httpupgrade, kcp, hysteria | down | no scenario; raw up/duplex are full tier |
+| shadowsocks2022 | tls, ws, grpc, xhttp, httpupgrade, kcp, hysteria | down | no scenario; raw up/duplex are full tier |
 | httpupgrade | tls | down, up | no scenario; only `vless-httpupgrade` |
-| hysteria | up, duplex, v1 | up, duplex | no scenario; only v2 down |
-| kcp | up, duplex | up, duplex | no scenario |
+| hysteria | v1 | down, up, duplex | no scenario; only v2 is measured |
 | any | udp dns through the socks front | request/response | no scenario |
 | any | ipv6 target | down | no scenario |
 | any | more than 16 flows | down | no scenario |
-| any | sing-box, leaf and xray-rust as clients | down | engines pinned but not in the matrix |
+| any | leaf and xray-rust as clients | down | engines pinned but not in the matrix |
 
 <!-- benchmark-matrix:start -->
 <!-- benchmark-matrix:end -->

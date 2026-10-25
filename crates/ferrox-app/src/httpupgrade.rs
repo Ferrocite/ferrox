@@ -322,19 +322,30 @@ fn send_request<W: crate::proxy::FrameWrite>(
     path: &str,
     early: bool,
     first: &[u8],
+    headers: &[(String, String)],
 ) -> Option<()> {
     const BEFORE_PATH: &str = "GET ";
     const BEFORE_HOST: &str = " HTTP/1.1\r\nHost: ";
-    const AFTER_HOST: &str = "\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    const AFTER_HOST: &str = "\r\n";
+    const AFTER_HEADERS: &str = "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    let headers_len = crate::headers::masked_len(headers, crate::headers::WS);
     REQUEST.with(|cell| {
         let mut request = cell.borrow_mut();
         request.clear();
         request.reserve(
-            BEFORE_PATH.len() + path.len() + BEFORE_HOST.len() + host.len() + AFTER_HOST.len(),
+            BEFORE_PATH.len()
+                + path.len()
+                + BEFORE_HOST.len()
+                + host.len()
+                + AFTER_HOST.len()
+                + headers_len
+                + AFTER_HEADERS.len(),
         );
         for piece in [BEFORE_PATH, path, BEFORE_HOST, host, AFTER_HOST] {
             request.extend_from_slice(piece.as_bytes());
         }
+        crate::headers::write_masked(&mut request, headers, crate::headers::WS);
+        request.extend_from_slice(AFTER_HEADERS.as_bytes());
         let bytes = request.as_slice();
         if early {
             return write.write_slices(&[bytes, first]).then_some(());
@@ -349,10 +360,11 @@ pub(crate) fn connect(
     path: &str,
     budget: u32,
     first: &[u8],
+    headers: &[(String, String)],
 ) -> Option<(UpReader, Connection)> {
     let mut read = stream;
     let early = rides(budget, first);
-    send_request(&mut read, host, path, early, first)?;
+    send_request(&mut read, host, path, early, first, headers)?;
     let (head, at) = read_head(&mut read)?;
     check_response(&head[..at])?;
     let Ok(write) = read.try_clone() else {
@@ -413,9 +425,10 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
     path: &str,
     budget: u32,
     first: &[u8],
+    headers: &[(String, String)],
 ) -> Option<(UpReader<R>, W)> {
     let early = rides(budget, first);
-    send_request(&mut write, host, path, early, first)?;
+    send_request(&mut write, host, path, early, first, headers)?;
     let (head, at) = read_upgrade_head(&mut read, HEAD_LIMIT)?;
     check_response(&head[..at])?;
     if !early && !first.is_empty() {
@@ -452,11 +465,34 @@ mod tests {
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, mut write) =
-            connect(stream, "oracle.example", "/tunnel", 0, &[]).expect("upgrades");
+            connect(stream, "oracle.example", "/tunnel", 0, &[], &[]).expect("upgrades");
         write.write_all(b"ping").expect("writes");
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).expect("reads");
         assert_eq!(&buf, b"pong");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn a_configured_header_reaches_the_upgrade_request() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                stream.read_exact(&mut byte).expect("reads");
+                head.push(byte[0]);
+            }
+            let text = String::from_utf8(head).expect("utf8");
+            assert!(text.contains("X-Custom: 1\r\n"), "{text}");
+            assert!(text.contains("Sec-Fetch-Mode: websocket\r\n"), "{text}");
+            stream.write_all(SWITCH).expect("writes");
+        });
+        let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let headers = vec![("X-Custom".to_owned(), "1".to_owned())];
+        connect(stream, "oracle.example", "/tunnel", 0, &[], &headers).expect("upgrades");
         server.join().expect("joins");
     }
 
@@ -831,7 +867,8 @@ mod tests {
                 .expect("answers with a bare line feed");
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
-        connect(stream, "oracle.example", "/tunnel", 0, &[]).expect("reads the bare-LF answer");
+        connect(stream, "oracle.example", "/tunnel", 0, &[], &[])
+            .expect("reads the bare-LF answer");
         server.join().expect("joins");
     }
 
@@ -847,6 +884,7 @@ mod tests {
             "oracle.example",
             "/tunnel",
             0,
+            &[],
             &[],
         )
         .expect("reads the bare-LF answer");
@@ -864,6 +902,7 @@ mod tests {
             "oracle.example",
             "/tunnel",
             0,
+            &[],
             &[],
         )
         .expect("reads the mixed-ending answer");
@@ -917,7 +956,7 @@ mod tests {
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, _write) =
-            connect(stream, "oracle.example", "/tunnel", 4, b"ping").expect("upgrades");
+            connect(stream, "oracle.example", "/tunnel", 4, b"ping", &[]).expect("upgrades");
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).expect("reads");
         assert_eq!(&buf, b"pong");
@@ -945,7 +984,7 @@ mod tests {
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         // `budget` is one short of the payload, so the old length rule held it back; the flag rides it.
         let (_reader, _write) =
-            connect(stream, "oracle.example", "/tunnel", 3, b"ping").expect("rides ahead");
+            connect(stream, "oracle.example", "/tunnel", 3, b"ping", &[]).expect("rides ahead");
         server.join().expect("joins");
     }
 
@@ -981,8 +1020,9 @@ mod tests {
 
     // Spelled here rather than borrowed from the dial: a piece the staging shape drops still fails these.
     fn expected_request(host: &str, path: &str) -> String {
+        let headers = crate::headers::masked(&[], crate::headers::WS);
         format!(
-            "GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+            "GET {path} HTTP/1.1\r\nHost: {host}\r\n{headers}Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
         )
     }
 
@@ -1020,6 +1060,7 @@ mod tests {
             "/tunnel",
             4,
             &first,
+            &[],
         )
         .expect("upgrades");
         assert_eq!(
@@ -1059,6 +1100,7 @@ mod tests {
             "/tunnel",
             0,
             &first,
+            &[],
         )
         .expect("upgrades");
         assert!(write.calls.is_empty(), "a held-back payload was vectored");
@@ -1084,6 +1126,7 @@ mod tests {
                 &configured.path,
                 budget,
                 b"",
+                &[],
             )
             .expect("upgrades");
             assert_eq!(
@@ -1110,7 +1153,7 @@ mod tests {
         for round in 0..dials.len() * 3 {
             let (host, path) = dials[round % dials.len()];
             let mut write = Recorder::default();
-            send_request(&mut write, host, path, false, b"").expect("sends");
+            send_request(&mut write, host, path, false, b"", &[]).expect("sends");
             assert_eq!(write.plain.len(), 1, "round {round}: one write");
             assert_eq!(
                 write.plain[0],
@@ -1124,7 +1167,9 @@ mod tests {
             match held {
                 None => assert_eq!(
                     current.0,
-                    66 + long.len() + deep.len(),
+                    66 + long.len()
+                        + deep.len()
+                        + crate::headers::masked_len(&[], crate::headers::WS),
                     "the first dial reserves its own bytes"
                 ),
                 Some((capacity, pointer)) => {
@@ -1164,6 +1209,7 @@ mod tests {
             &configured.path,
             configured.budget,
             b"first",
+            &[],
         )
         .expect("upgrades");
         server.join().expect("joins");
@@ -1690,6 +1736,7 @@ mod tests {
                 &case.path,
                 case.budget,
                 &payload,
+                &[],
             );
             let write = recorder.0.lock().expect("the recorder is not poisoned");
             let reference_took = fields[0] == "accept";

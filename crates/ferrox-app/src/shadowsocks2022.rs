@@ -139,6 +139,7 @@ fn serve_single(stream: &mut Connection, method: Method, psk: &[u8], freedom: bo
     let Some((recv, salt, target, early)) = opened else {
         return;
     };
+    crate::accesslog::record_current(&target);
     let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
@@ -148,23 +149,11 @@ fn serve_single(stream: &mut Connection, method: Method, psk: &[u8], freedom: bo
     let Some(server_salt) = fresh_salt(key_len) else {
         return;
     };
-    let Some(mut send) = Cipher::from_psk(method, psk, &server_salt) else {
+    let Some(send) = Cipher::from_psk(method, psk, &server_salt) else {
         return;
     };
-    let mut fixed_resp = Vec::with_capacity(1 + 8 + key_len + 2);
-    fixed_resp.push(1);
-    fixed_resp.extend_from_slice(&now_secs().to_be_bytes());
-    fixed_resp.extend_from_slice(&salt);
-    fixed_resp.extend_from_slice(&0u16.to_be_bytes());
-    let mut out = Vec::with_capacity(server_salt.len() + fixed_resp.len() + TAG_LEN);
-    out.extend_from_slice(&server_salt);
-    if send.seal_into(&fixed_resp, &mut out).is_none() {
-        return;
-    }
-    if stream.write_all(&out).is_err() {
-        return;
-    }
-    pump_relay(&uplink, stream, send, Recv::Ready(recv));
+    let response = Response::new(send, server_salt, salt);
+    pump_relay_with_response(&uplink, stream, response, Recv::Ready(recv));
 }
 
 fn serve_multi(stream: &mut Connection, method: Method, list: &[Vec<u8>], freedom: bool) {
@@ -216,6 +205,7 @@ fn serve_multi(stream: &mut Connection, method: Method, list: &[Vec<u8>], freedo
     let Some((recv, psk, salt, target, early)) = opened else {
         return;
     };
+    crate::accesslog::record_current(&target);
     let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
@@ -225,23 +215,11 @@ fn serve_multi(stream: &mut Connection, method: Method, list: &[Vec<u8>], freedo
     let Some(server_salt) = fresh_salt(key_len) else {
         return;
     };
-    let Some(mut send) = Cipher::from_psk(method, &psk, &server_salt) else {
+    let Some(send) = Cipher::from_psk(method, &psk, &server_salt) else {
         return;
     };
-    let mut fixed_resp = Vec::with_capacity(1 + 8 + key_len + 2);
-    fixed_resp.push(1);
-    fixed_resp.extend_from_slice(&now_secs().to_be_bytes());
-    fixed_resp.extend_from_slice(&salt);
-    fixed_resp.extend_from_slice(&0u16.to_be_bytes());
-    let mut out = Vec::with_capacity(server_salt.len() + fixed_resp.len() + TAG_LEN);
-    out.extend_from_slice(&server_salt);
-    if send.seal_into(&fixed_resp, &mut out).is_none() {
-        return;
-    }
-    if stream.write_all(&out).is_err() {
-        return;
-    }
-    pump_relay(&uplink, stream, send, Recv::Ready(recv));
+    let response = Response::new(send, server_salt, salt);
+    pump_relay_with_response(&uplink, stream, response, Recv::Ready(recv));
 }
 
 pub(crate) fn serve_relay(
@@ -340,11 +318,10 @@ fn relay_raw(a: &mut Connection, b: &mut Connection) {
 
 fn accept_on(
     reader: &mut dyn Read,
-    writer: &mut dyn Write,
     password: &str,
     method: &str,
     freedom: bool,
-) -> Option<(Connection, Cipher, Recv)> {
+) -> Option<(Connection, Response, Recv)> {
     let method = Method::parse(method)?;
     if !freedom {
         return None;
@@ -370,20 +347,13 @@ fn accept_on(
             .clone();
         let mut recv = Cipher::from_psk(method, &user, &salt_probe)?;
         let target = open_handshake(reader, &mut recv)?;
+        crate::accesslog::record_current(&target.0);
         let mut uplink = crate::conn::dial_tcp(&target.0, Duration::from_secs(8)).ok()?;
         uplink.write_all(&target.1).ok()?;
         let server_salt = fresh_salt(method.key_len())?;
-        let mut send = Cipher::from_psk(method, &user, &server_salt)?;
-        let mut fixed_resp = Vec::with_capacity(1 + 8 + method.key_len() + 2);
-        fixed_resp.push(1);
-        fixed_resp.extend_from_slice(&now_secs().to_be_bytes());
-        fixed_resp.extend_from_slice(&salt_probe);
-        fixed_resp.extend_from_slice(&0u16.to_be_bytes());
-        let mut out = Vec::with_capacity(server_salt.len() + fixed_resp.len() + TAG_LEN);
-        out.extend_from_slice(&server_salt);
-        send.seal_into(&fixed_resp, &mut out)?;
-        writer.write_all(&out).ok()?;
-        return Some((uplink, send, Recv::Ready(recv)));
+        let send = Cipher::from_psk(method, &user, &server_salt)?;
+        let response = Response::new(send, server_salt, salt_probe);
+        return Some((uplink, response, Recv::Ready(recv)));
     };
     let _ = eih_len;
     let key_len = method.key_len();
@@ -394,20 +364,13 @@ fn accept_on(
     }
     let mut recv = Cipher::from_psk(method, &psk, &salt)?;
     let (target, early) = open_handshake(reader, &mut recv)?;
+    crate::accesslog::record_current(&target);
     let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
     uplink.write_all(&early).ok()?;
     let server_salt = fresh_salt(key_len)?;
-    let mut send = Cipher::from_psk(method, &psk, &server_salt)?;
-    let mut fixed_resp = Vec::with_capacity(1 + 8 + key_len + 2);
-    fixed_resp.push(1);
-    fixed_resp.extend_from_slice(&now_secs().to_be_bytes());
-    fixed_resp.extend_from_slice(&salt);
-    fixed_resp.extend_from_slice(&0u16.to_be_bytes());
-    let mut out = Vec::with_capacity(server_salt.len() + fixed_resp.len() + TAG_LEN);
-    out.extend_from_slice(&server_salt);
-    send.seal_into(&fixed_resp, &mut out)?;
-    writer.write_all(&out).ok()?;
-    Some((uplink, send, Recv::Ready(recv)))
+    let send = Cipher::from_psk(method, &psk, &server_salt)?;
+    let response = Response::new(send, server_salt, salt);
+    Some((uplink, response, Recv::Ready(recv)))
 }
 
 fn open_handshake(reader: &mut dyn Read, recv: &mut Cipher) -> Option<(SocketAddr, Vec<u8>)> {
@@ -448,16 +411,15 @@ pub(crate) fn serve_ws(
     path: &str,
     freedom: bool,
 ) {
-    let Some((mut reader, mut writer)) = crate::ws::accept(stream, path) else {
+    let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, password, method, freedom)
-    else {
+    let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
 pub(crate) fn serve_httpupgrade(
@@ -468,11 +430,10 @@ pub(crate) fn serve_httpupgrade(
     host: &str,
     freedom: bool,
 ) {
-    let Some((mut reader, mut writer)) = crate::httpupgrade::accept(stream, path, host) else {
+    let Some((mut reader, writer)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, password, method, freedom)
-    else {
+    let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
         return;
     };
     let Ok(closer) = writer.try_clone() else {
@@ -481,9 +442,10 @@ pub(crate) fn serve_httpupgrade(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(std::net::Shutdown::Both);
     });
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
+#[cfg(test)]
 pub(crate) fn serve_grpc(
     stream: Connection,
     password: &str,
@@ -491,17 +453,33 @@ pub(crate) fn serve_grpc(
     path: &str,
     freedom: bool,
 ) {
-    let Some((mut reader, mut writer)) = crate::grpc::accept(stream, path) else {
+    serve_grpc_with(
+        stream,
+        password,
+        method,
+        &crate::config::GrpcSettings::path(path),
+        freedom,
+    );
+}
+
+pub(crate) fn serve_grpc_with(
+    stream: Connection,
+    password: &str,
+    method: &str,
+    settings: &crate::config::GrpcSettings,
+    freedom: bool,
+) {
+    let Some((mut reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
-    let Some((uplink, send, recv)) = under_handshake(&mut reader, |read| {
-        accept_on(read, &mut writer, password, method, freedom)
+    let Some((uplink, response, recv)) = under_handshake(&mut reader, |read| {
+        accept_on(read, password, method, freedom)
     }) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
 pub(crate) fn serve_xhttp(
@@ -511,17 +489,16 @@ pub(crate) fn serve_xhttp(
     path: &str,
     freedom: bool,
 ) {
-    let Some((mut reader, mut writer)) = crate::xhttp::accept(stream, path) else {
+    let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, password, method, freedom)
-    else {
+    let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> =
         std::sync::Arc::new(move || closer.finish());
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
 pub(crate) fn serve_httpheader(
@@ -531,11 +508,10 @@ pub(crate) fn serve_httpheader(
     path: &str,
     freedom: bool,
 ) {
-    let Some((mut reader, mut writer)) = crate::httpheader::accept(stream, path) else {
+    let Some((mut reader, writer)) = crate::httpheader::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, password, method, freedom)
-    else {
+    let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
         return;
     };
     let Ok(closer) = writer.try_clone() else {
@@ -544,12 +520,12 @@ pub(crate) fn serve_httpheader(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(std::net::Shutdown::Both);
     });
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
-pub(crate) fn serve_kcp<R, W>(
+pub(crate) fn serve_session<R, W>(
     mut reader: R,
-    mut writer: W,
+    writer: W,
     password: &str,
     method: &str,
     freedom: bool,
@@ -558,16 +534,32 @@ pub(crate) fn serve_kcp<R, W>(
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    let Some((uplink, send, recv)) = accept_on(
-        &mut reader as &mut dyn Read,
-        &mut writer as &mut dyn Write,
-        password,
-        method,
-        freedom,
-    ) else {
+    let Some((uplink, response, recv)) =
+        accept_on(&mut reader as &mut dyn Read, password, method, freedom)
+    else {
+        close();
         return;
     };
-    pump_relay_carried(&uplink, reader, writer, close, send, recv);
+    pump_relay_carried_with_response(&uplink, reader, writer, close, response, recv);
+}
+
+pub(crate) fn serve_kcp<R, W>(
+    mut reader: R,
+    writer: W,
+    password: &str,
+    method: &str,
+    freedom: bool,
+    close: &std::sync::Arc<dyn Fn() + Send + Sync>,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    let Some((uplink, response, recv)) =
+        accept_on(&mut reader as &mut dyn Read, password, method, freedom)
+    else {
+        return;
+    };
+    pump_relay_carried_with_response(&uplink, reader, writer, close, response, recv);
 }
 
 pub(crate) fn client_send_handshake(
@@ -616,7 +608,81 @@ pub(crate) enum Recv {
     Waiting(Method, Vec<u8>, Vec<u8>),
 }
 
+struct Response {
+    send: Cipher,
+    server_salt: Vec<u8>,
+    request_salt: Vec<u8>,
+    first_owed: bool,
+}
+
+impl Response {
+    fn new(send: Cipher, server_salt: Vec<u8>, request_salt: Vec<u8>) -> Self {
+        Self {
+            send,
+            server_salt,
+            request_salt,
+            first_owed: true,
+        }
+    }
+
+    fn seal_first(&mut self, buf: &mut [u8], n: usize, out: &mut dyn Write) -> std::io::Result<()> {
+        let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidData);
+        let first = u16::try_from(n).map_err(|_| invalid())?;
+        let key_len = self.request_salt.len();
+        let mut fixed = [0u8; 1 + 8 + 32 + 2];
+        fixed[0] = 1;
+        fixed[1..9].copy_from_slice(&now_secs().to_be_bytes());
+        fixed[9..9 + key_len].copy_from_slice(&self.request_salt);
+        fixed[9 + key_len..11 + key_len].copy_from_slice(&first.to_be_bytes());
+        let mut fixed_wire = [0u8; 1 + 8 + 32 + 2 + TAG_LEN];
+        fixed_wire[..11 + key_len].copy_from_slice(&fixed[..11 + key_len]);
+        let tag = self
+            .send
+            .seal_piece_in_place(&mut fixed_wire[..11 + key_len])
+            .ok_or_else(invalid)?;
+        fixed_wire[11 + key_len..11 + key_len + TAG_LEN].copy_from_slice(&tag);
+        let payload_wire = if n == 0 {
+            &[][..]
+        } else {
+            let end = SEAL_HEAD + n;
+            let tag = self
+                .send
+                .seal_piece_in_place(&mut buf[SEAL_HEAD..end])
+                .ok_or_else(invalid)?;
+            buf[end..end + TAG_LEN].copy_from_slice(&tag);
+            &buf[SEAL_HEAD..end + TAG_LEN]
+        };
+        self.first_owed = false;
+        crate::proxy::write_all_parts::<3>(
+            out,
+            &[
+                self.server_salt.as_slice(),
+                &fixed_wire[..11 + key_len + TAG_LEN],
+                payload_wire,
+            ],
+        )
+    }
+}
+
+enum Outbound {
+    Client(Cipher),
+    Server(Response),
+}
+
 pub(crate) fn pump_relay(plain: &Connection, sealed: &Connection, send: Cipher, recv: Recv) {
+    pump_relay_outbound(plain, sealed, Outbound::Client(send), recv);
+}
+
+fn pump_relay_with_response(
+    plain: &Connection,
+    sealed: &Connection,
+    response: Response,
+    recv: Recv,
+) {
+    pump_relay_outbound(plain, sealed, Outbound::Server(response), recv);
+}
+
+fn pump_relay_outbound(plain: &Connection, sealed: &Connection, outbound: Outbound, recv: Recv) {
     let Ok(sealed_read) = sealed.try_clone() else {
         return;
     };
@@ -629,15 +695,50 @@ pub(crate) fn pump_relay(plain: &Connection, sealed: &Connection, send: Cipher, 
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(std::net::Shutdown::Both);
     });
-    pump_relay_carried(plain, sealed_read, sealed_write, &close, send, recv);
+    pump_relay_carried_inner(plain, sealed_read, sealed_write, &close, outbound, recv);
 }
 
 pub(crate) fn pump_relay_carried<R, W>(
     plain: &Connection,
     reader: R,
-    mut writer: W,
+    writer: W,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
     send: Cipher,
+    recv: Recv,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    pump_relay_carried_inner(plain, reader, writer, close, Outbound::Client(send), recv);
+}
+
+fn pump_relay_carried_with_response<R, W>(
+    plain: &Connection,
+    reader: R,
+    writer: W,
+    close: &std::sync::Arc<dyn Fn() + Send + Sync>,
+    response: Response,
+    recv: Recv,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    pump_relay_carried_inner(
+        plain,
+        reader,
+        writer,
+        close,
+        Outbound::Server(response),
+        recv,
+    );
+}
+
+fn pump_relay_carried_inner<R, W>(
+    plain: &Connection,
+    reader: R,
+    mut writer: W,
+    close: &std::sync::Arc<dyn Fn() + Send + Sync>,
+    mut outbound: Outbound,
     recv: Recv,
 ) where
     R: Read + Send + 'static,
@@ -651,15 +752,29 @@ pub(crate) fn pump_relay_carried<R, W>(
     };
     let mut plain_read = plain_read;
     let mut plain_write = plain_write;
-    let mut send = send;
     let thread_close = std::sync::Arc::clone(close);
     let done = thread::spawn(move || {
         let mut buf = crate::proxy::RelayBuf::with_len(SEAL_HEAD + READ_CHUNK + TAG_LEN);
         while let Ok(read) = plain_read.read(&mut buf.as_mut()[SEAL_HEAD..SEAL_HEAD + READ_CHUNK]) {
             if read == 0 {
+                if let Outbound::Server(response) = &mut outbound {
+                    if response.first_owed {
+                        let _ = response.seal_first(buf.as_mut(), 0, &mut writer);
+                    }
+                }
                 break;
             }
-            if seal_all(&mut send, buf.as_mut(), read, &mut writer).is_err() {
+            let sealed = match &mut outbound {
+                Outbound::Client(send) => seal_all(send, buf.as_mut(), read, &mut writer),
+                Outbound::Server(response) => {
+                    if response.first_owed {
+                        response.seal_first(buf.as_mut(), read, &mut writer)
+                    } else {
+                        seal_all(&mut response.send, buf.as_mut(), read, &mut writer)
+                    }
+                }
+            };
+            if sealed.is_err() {
                 break;
             }
         }
@@ -910,7 +1025,6 @@ struct PeerServer {
 
 pub(crate) struct Datagrams {
     sealed: Vec<u8>,
-    opened: Vec<u8>,
     session: u64,
     packet: u64,
     sessions: HashMap<u64, ServerUdp>,
@@ -926,7 +1040,6 @@ impl Datagrams {
         let _ = getrandom::fill(&mut session);
         Self {
             sealed: Vec::new(),
-            opened: Vec::new(),
             session: u64::from_be_bytes(session),
             packet: 0,
             sessions: HashMap::new(),
@@ -1052,28 +1165,28 @@ impl Datagrams {
         body_key.seal_tail_with_nonce(&nonce, out, at)?;
         Some(out)
     }
-    pub(crate) fn open(
+    pub(crate) fn open<'a>(
         &mut self,
         psk: &[u8],
         method: Method,
-        packet: &[u8],
-    ) -> Option<(SocketAddr, &[u8], u64)> {
+        packet: &'a mut [u8],
+    ) -> Option<(SocketAddr, &'a [u8], u64)> {
         if method.is_chacha() {
             if psk.len() != 32 || packet.len() < 24 + TAG_LEN {
                 return None;
             }
             let mut nonce = [0u8; 24];
             nonce.copy_from_slice(&packet[..24]);
-            let sealed = &mut self.opened;
-            sealed.clear();
-            sealed.extend_from_slice(&packet[24..]);
-            let len = shadowsocks2022::x_open(psk, &nonce, sealed)?;
-            sealed.truncate(len);
-            if sealed.len() < 16 + 11 {
+            let len = shadowsocks2022::x_open(psk, &nonce, &mut packet[24..])?;
+            if len > packet.len() - 24 {
                 return None;
             }
-            let session = u64::from_be_bytes(sealed[..8].try_into().ok()?);
-            let packet_id = u64::from_be_bytes(sealed[8..16].try_into().ok()?);
+            let body = &packet[24..24 + len];
+            if body.len() < 16 + 11 {
+                return None;
+            }
+            let session = u64::from_be_bytes(body[..8].try_into().ok()?);
+            let packet_id = u64::from_be_bytes(body[8..16].try_into().ok()?);
             let entry = self.sessions.entry(session).or_insert_with(|| ServerUdp {
                 window: shadowsocks2022::SlidingWindow::new(),
                 cipher: None,
@@ -1085,7 +1198,7 @@ impl Datagrams {
             if !entry.window.check_and_add(packet_id) {
                 return None;
             }
-            let body = &sealed[16..];
+            let body = &body[16..];
             if body[0] != 0 {
                 return None;
             }
@@ -1098,7 +1211,14 @@ impl Datagrams {
                 return None;
             }
             let (target, used) = parse_addr_header(&body[11 + pad..])?;
-            Some((target, &sealed[16 + 11 + pad + used..], session))
+            if body.len() < 11 + pad + used {
+                return None;
+            }
+            Some((
+                target,
+                &packet[24 + 16 + 11 + pad + used..24 + len],
+                session,
+            ))
         } else {
             let key_len = method.key_len();
             if psk.len() != key_len || packet.len() < 16 + TAG_LEN {
@@ -1126,18 +1246,18 @@ impl Datagrams {
             }
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&raw[4..16]);
-            let (opened, entry) = (&mut self.opened, self.sessions.get(&session)?);
-            let cipher = entry.cipher.as_ref()?;
-            let (target, payload_len) = open_body_into(cipher, &nonce, &packet[16..], opened)?;
-            Some((target, &opened[..payload_len], session))
+            let cipher = self.sessions.get(&session)?.cipher.as_ref()?;
+            let (target, total, len) =
+                open_body_in_place(cipher, &nonce, &mut packet[16..], 11, 0)?;
+            Some((target, &packet[16 + total..16 + len], session))
         }
     }
-    pub(crate) fn open_multi(
+    pub(crate) fn open_multi<'a>(
         &mut self,
         method: Method,
         psks: &[Vec<u8>],
-        packet: &[u8],
-    ) -> Option<(SocketAddr, &[u8], usize, u64)> {
+        packet: &'a mut [u8],
+    ) -> Option<(SocketAddr, &'a [u8], usize, u64)> {
         if method.is_chacha() || psks.len() < 2 {
             return None;
         }
@@ -1175,11 +1295,10 @@ impl Datagrams {
         }
         let mut nonce = [0u8; 12];
         nonce.copy_from_slice(&raw[4..16]);
-        let idx = entry.user?;
-        let (opened, entry) = (&mut self.opened, self.sessions.get(&session)?);
-        let cipher = entry.cipher.as_ref()?;
-        let (target, payload_len) = open_body_into(cipher, &nonce, &packet[32..], opened)?;
-        Some((target, &opened[..payload_len], idx, session))
+        let idx = self.sessions.get(&session)?.user?;
+        let cipher = self.sessions.get(&session)?.cipher.as_ref()?;
+        let (target, total, len) = open_body_in_place(cipher, &nonce, &mut packet[32..], 11, 0)?;
+        Some((target, &packet[32 + total..32 + len], idx, session))
     }
     pub(crate) fn seal_server(
         &mut self,
@@ -1274,12 +1393,12 @@ impl Datagrams {
             Some(out)
         }
     }
-    pub(crate) fn open_server(
+    pub(crate) fn open_server<'a>(
         &mut self,
         psk: &[u8],
         method: Method,
-        packet: &[u8],
-    ) -> Option<(SocketAddr, &[u8])> {
+        packet: &'a mut [u8],
+    ) -> Option<(SocketAddr, &'a [u8])> {
         let now = now_secs();
         if method.is_chacha() {
             if psk.len() != 32 || packet.len() < 24 + TAG_LEN {
@@ -1287,20 +1406,20 @@ impl Datagrams {
             }
             let mut nonce = [0u8; 24];
             nonce.copy_from_slice(&packet[..24]);
-            let sealed = &mut self.opened;
-            sealed.clear();
-            sealed.extend_from_slice(&packet[24..]);
-            let len = shadowsocks2022::x_open(psk, &nonce, sealed)?;
-            sealed.truncate(len);
-            if sealed.len() < 16 + 19 {
+            let len = shadowsocks2022::x_open(psk, &nonce, &mut packet[24..])?;
+            if len > packet.len() - 24 {
                 return None;
             }
-            let session = u64::from_be_bytes(sealed[..8].try_into().ok()?);
-            let packet_id = u64::from_be_bytes(sealed[8..16].try_into().ok()?);
+            let body = &packet[24..24 + len];
+            if body.len() < 16 + 19 {
+                return None;
+            }
+            let session = u64::from_be_bytes(body[..8].try_into().ok()?);
+            let packet_id = u64::from_be_bytes(body[8..16].try_into().ok()?);
             if !peer_check(&mut self.peers, session, packet_id, now) {
                 return None;
             }
-            let body = &sealed[16..];
+            let body = &body[16..];
             if body[0] != 1 {
                 return None;
             }
@@ -1315,7 +1434,10 @@ impl Datagrams {
                 return None;
             }
             let (target, used) = parse_addr_header(&body[19 + pad..])?;
-            Some((target, &sealed[16 + 19 + pad + used..]))
+            if body.len() < 19 + pad + used {
+                return None;
+            }
+            Some((target, &packet[24 + 16 + 19 + pad + used..24 + len]))
         } else {
             let key_len = method.key_len();
             if psk.len() != key_len || packet.len() < 16 + TAG_LEN {
@@ -1340,37 +1462,30 @@ impl Datagrams {
             }
             let mut nonce = [0u8; 12];
             nonce.copy_from_slice(&raw[4..16]);
-            let (opened, peers) = (&mut self.opened, &self.peers);
-            let cipher = peers.get(&session)?.cipher.as_ref()?;
-            opened.clear();
-            opened.extend_from_slice(&packet[16..]);
-            let mut tmp = std::mem::take(opened);
-            let len = cipher.open_with_nonce(&nonce, &mut tmp)?;
-            tmp.truncate(len);
-            *opened = tmp;
-            if opened.len() < 19 || opened[0] != 1 {
+            let cipher = self.peers.get(&session)?.cipher.as_ref()?;
+            let len = cipher.open_with_nonce(&nonce, &mut packet[16..])?;
+            if len > packet.len() - 16 {
                 return None;
             }
-            if now.abs_diff(u64::from_be_bytes(opened[1..9].try_into().ok()?)) > SKEW {
+            let body = &packet[16..16 + len];
+            if body.len() < 19 || body[0] != 1 {
                 return None;
             }
-            if u64::from_be_bytes(opened[9..17].try_into().ok()?) != self.session {
+            if now.abs_diff(u64::from_be_bytes(body[1..9].try_into().ok()?)) > SKEW {
                 return None;
             }
-            let pad = usize::from(u16::from_be_bytes([opened[17], opened[18]]));
-            if opened.len() < 19 + pad {
+            if u64::from_be_bytes(body[9..17].try_into().ok()?) != self.session {
                 return None;
             }
-            let (target, used) = parse_addr_header(&opened[19 + pad..])?;
-            let total = 19 + pad + used;
-            if opened.len() < total {
+            let pad = usize::from(u16::from_be_bytes([body[17], body[18]]));
+            if body.len() < 19 + pad {
                 return None;
             }
-            let payload_len = opened.len() - total;
-            opened.copy_within(total.., 0);
-            opened.truncate(payload_len);
-            let len = opened.len();
-            Some((target, &opened[..len]))
+            let (target, used) = parse_addr_header(&body[19 + pad..])?;
+            if body.len() < 19 + pad + used {
+                return None;
+            }
+            Some((target, &packet[16 + 19 + pad + used..16 + len]))
         }
     }
 }
@@ -1407,38 +1522,35 @@ fn peer_check(
     true
 }
 
-fn open_body_into(
+fn open_body_in_place(
     cipher: &Cipher,
     nonce: &[u8; 12],
-    packet_body: &[u8],
-    opened: &mut Vec<u8>,
-) -> Option<(SocketAddr, usize)> {
-    opened.clear();
-    opened.extend_from_slice(packet_body);
-    let mut tmp = std::mem::take(opened);
-    let len = cipher.open_with_nonce(nonce, &mut tmp)?;
-    tmp.truncate(len);
-    *opened = tmp;
-    if opened.len() < 11 || opened[0] != 0 {
+    body: &mut [u8],
+    header: usize,
+    kind: u8,
+) -> Option<(SocketAddr, usize, usize)> {
+    let len = cipher.open_with_nonce(nonce, body)?;
+    if len > body.len() {
         return None;
     }
-    let stamp = u64::from_be_bytes(opened[1..9].try_into().ok()?);
+    let body = &body[..len];
+    if body.len() < header || body[0] != kind {
+        return None;
+    }
+    let stamp = u64::from_be_bytes(body[1..9].try_into().ok()?);
     if now_secs().abs_diff(stamp) > SKEW {
         return None;
     }
-    let pad = usize::from(u16::from_be_bytes([opened[9], opened[10]]));
-    if opened.len() < 11 + pad {
+    let pad = usize::from(u16::from_be_bytes([body[9], body[10]]));
+    if body.len() < header + pad {
         return None;
     }
-    let (target, used) = parse_addr_header(&opened[11 + pad..])?;
-    let total = 11 + pad + used;
-    if opened.len() < total {
+    let (target, used) = parse_addr_header(&body[header + pad..])?;
+    let total = header + pad + used;
+    if body.len() < total {
         return None;
     }
-    let payload_len = opened.len() - total;
-    opened.copy_within(total.., 0);
-    opened.truncate(payload_len);
-    Some((target, payload_len))
+    Some((target, total, len))
 }
 
 fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
@@ -1642,7 +1754,7 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
             Ok((n, src)) => {
                 if multi {
                     if let Some((dest, payload, idx, session)) =
-                        datagrams.open_multi(method, &list, &buf[..n])
+                        datagrams.open_multi(method, &list, &mut buf[..n])
                     {
                         if table.len() >= 4096 {
                             table.clear();
@@ -1661,7 +1773,7 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
                         }
                     }
                 } else if let Some((dest, payload, session)) =
-                    datagrams.open(&psk, method, &buf[..n])
+                    datagrams.open(&psk, method, &mut buf[..n])
                 {
                     if table.len() >= 4096 {
                         table.clear();
@@ -1920,6 +2032,69 @@ mod tests {
     }
 
     #[test]
+    fn the_response_head_folds_the_first_downlink_chunk() {
+        let method = Method::Aes256Gcm;
+        let name = "2022-blake3-aes-256-gcm";
+        let psk = psk_b64(method.key_len());
+        let target = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let target_port = target.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("accepts");
+            stream.write_all(b"first").expect("writes");
+        });
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = server.local_addr().expect("addr").port();
+        let announced = psk.clone();
+        let named = name.to_owned();
+        thread::spawn(move || {
+            for stream in server.incoming().take(1) {
+                let Ok(stream) = stream else { continue };
+                let announced = announced.clone();
+                let named = named.clone();
+                thread::spawn(move || {
+                    serve(stream, &announced, &named, true);
+                });
+            }
+        });
+        let target_addr: SocketAddr = format!("127.0.0.1:{target_port}").parse().expect("addr");
+        let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
+        uplink
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let Some((_send, recv)) = client_send_handshake(
+            &mut uplink,
+            &psk,
+            name,
+            &crate::proxy::Destination::from(target_addr),
+        ) else {
+            panic!("handshake refused");
+        };
+        let Recv::Waiting(m, p, s) = recv else {
+            panic!("the client waits for a server salt");
+        };
+        let mut peer = vec![0u8; m.key_len()];
+        read_exact(&mut uplink, &mut peer).expect("salt");
+        let mut cipher = Cipher::from_psk(m, &p, &peer).expect("derives");
+        let fixed_len = 1 + 8 + m.key_len() + 2 + TAG_LEN;
+        let mut fixed = vec![0u8; fixed_len];
+        read_exact(&mut uplink, &mut fixed).expect("fixed");
+        cipher.open_in_place(&mut fixed).expect("opens");
+        let first = usize::from(u16::from_be_bytes([
+            fixed[9 + m.key_len()],
+            fixed[10 + m.key_len()],
+        ]));
+        assert!(
+            first > 0,
+            "the server head carries the first downlink chunk"
+        );
+        let mut chunk = vec![0u8; first + TAG_LEN];
+        read_exact(&mut uplink, &mut chunk).expect("first");
+        let got = cipher.open_in_place(&mut chunk).expect("opens first");
+        assert_eq!(&chunk[..got], b"first");
+        let _ = s;
+    }
+
+    #[test]
     fn every_named_method_relays_an_echo() {
         for (name, method) in [
             ("2022-blake3-aes-128-gcm", Method::Aes128Gcm),
@@ -1979,12 +2154,24 @@ mod tests {
                     let mut fixed = vec![0u8; fixed_len];
                     read_exact(&mut uplink, &mut fixed).expect("fixed");
                     cipher.open_in_place(&mut fixed).expect("opens");
+                    let first = usize::from(u16::from_be_bytes([
+                        fixed[9 + m.key_len()],
+                        fixed[10 + m.key_len()],
+                    ]));
+                    assert_eq!(first, 4, "{name}: the head carries the first payload");
+                    let mut chunk = vec![0u8; first + TAG_LEN];
+                    read_exact(&mut uplink, &mut chunk).expect("first");
+                    let got = cipher.open_in_place(&mut chunk).expect("opens first");
+                    assert_eq!(&chunk[..got], b"ping", "{name}");
                     let _ = s;
                     cipher
                 }
             };
+            let mut ping = [0u8; SEAL_HEAD + 4 + TAG_LEN];
+            ping[SEAL_HEAD..SEAL_HEAD + 4].copy_from_slice(b"ping");
+            seal_all(&mut send, &mut ping, 4, &mut uplink).expect("seals");
             let mut buf = wire_buffer();
-            let back = open_chunk(&mut uplink, &mut recv, &mut buf).expect("opens");
+            let back = open_chunk(&mut uplink, &mut recv, &mut buf).expect("opens body");
             assert_eq!(back, &b"ping"[..], "{name}");
         }
     }
@@ -2089,37 +2276,26 @@ mod tests {
         let mut datagrams = Datagrams::new();
         datagrams.session = 0x0102_0304_0506_0708;
         datagrams.packet = 0;
-        let warm = datagrams
+        let mut warm = datagrams
             .seal(&psk, method, &target, b"a payload worth keeping")
             .expect("seals")
             .to_vec();
         datagrams
-            .open(&psk, method, &warm)
-            .expect("warms the buffer");
-        let opened_at = datagrams.opened.as_ptr() as usize;
-        let opened_room = datagrams.opened.capacity();
+            .open(&psk, method, &mut warm)
+            .expect("warms the session");
         for round in 0..8 {
-            let packet = datagrams
+            let mut packet = datagrams
                 .seal(&psk, method, &target, b"a payload worth keeping")
                 .expect("seals")
                 .to_vec();
-            let (got, payload, _) = datagrams.open(&psk, method, &packet).expect("opens");
+            let start = packet.as_ptr() as usize;
+            let end = start + packet.len();
+            let (got, payload, _) = datagrams.open(&psk, method, &mut packet).expect("opens");
             let _ = got;
             assert_eq!(payload, b"a payload worth keeping", "round {round}");
-            let at = payload.as_ptr();
             assert!(
-                datagrams.opened.as_ptr_range().contains(&at),
+                (start..end).contains(&(payload.as_ptr() as usize)),
                 "round {round}: payload is a separate buffer"
-            );
-            assert_eq!(
-                datagrams.opened.as_ptr() as usize,
-                opened_at,
-                "round {round}: buffer moved"
-            );
-            assert_eq!(
-                datagrams.opened.capacity(),
-                opened_room,
-                "round {round}: buffer grew"
             );
         }
     }
@@ -2149,7 +2325,7 @@ mod tests {
             let mut client = Datagrams::new();
             client.session = 0x0a0b_0c0d_0e0f_1011;
             client.packet = 0;
-            let packet = client
+            let mut packet = client
                 .seal_list(method, &list, &target, b"multi-payload")
                 .expect("seals")
                 .to_vec();
@@ -2163,16 +2339,19 @@ mod tests {
                 "{method}: one EIH block rides beside the header"
             );
             let mut server = Datagrams::new();
-            let (got, payload, idx, _) = server.open_multi(method, &list, &packet).expect("opens");
+            let mut opened = packet.clone();
+            let (got, payload, idx, _) = server
+                .open_multi(method, &list, &mut opened)
+                .expect("opens");
             assert_eq!(got, target);
             assert_eq!(idx, 1);
             assert_eq!(payload, b"multi-payload");
-            assert!(server.open_multi(method, &list, &packet).is_none());
+            assert!(server.open_multi(method, &list, &mut packet).is_none());
             assert!(client
                 .seal_list(method, &list[..1], &target, b"x")
                 .is_none());
             assert!(Datagrams::new()
-                .open_multi(Method::Chacha20Poly1305, &list, &packet)
+                .open_multi(Method::Chacha20Poly1305, &list, &mut packet)
                 .is_none());
         }
         assert!(
@@ -2200,19 +2379,28 @@ mod tests {
             let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
             let mut server = Datagrams::new();
             let client_session = 0x7172_7374_7576_7778;
-            let packet = server
+            let mut packet = server
                 .seal_server(method, &psk, client_session, &target, b"reply-payload")
                 .expect("seals")
                 .to_vec();
             let mut client = Datagrams::new();
             client.session = client_session;
-            let (got, payload) = client.open_server(&psk, method, &packet).expect("opens");
+            let mut opened = packet.clone();
+            let start = opened.as_ptr() as usize;
+            let end = start + opened.len();
+            let (got, payload) = client
+                .open_server(&psk, method, &mut opened)
+                .expect("opens");
             assert_eq!(got, target, "{method}");
             assert_eq!(payload, b"reply-payload", "{method}");
+            assert!(
+                (start..end).contains(&(payload.as_ptr() as usize)),
+                "{method}: the reply is opened in the datagram"
+            );
             let mut stranger = Datagrams::new();
             stranger.session = client_session ^ 1;
             assert!(
-                stranger.open_server(&psk, method, &packet).is_none(),
+                stranger.open_server(&psk, method, &mut packet).is_none(),
                 "{method}: a forged client session is refused"
             );
             let mut tampered = packet.clone();
@@ -2220,7 +2408,7 @@ mod tests {
             tampered[last] ^= 1;
             assert!(
                 Datagrams::new()
-                    .open_server(&psk, method, &tampered)
+                    .open_server(&psk, method, &mut tampered)
                     .is_none(),
                 "{method}: damage is refused"
             );
@@ -2250,7 +2438,8 @@ mod tests {
         assert_eq!(out.len(), packet.len() - BLOCK_LEN);
         let forwarded = out.clone();
         let mut server = Datagrams::new();
-        let (target_back, payload, _) = server.open(&dest_psk, method, &forwarded).expect("opens");
+        let mut opened = forwarded.clone();
+        let (target_back, payload, _) = server.open(&dest_psk, method, &mut opened).expect("opens");
         assert_eq!(target_back, target);
         assert_eq!(payload, b"relay-payload");
         assert_eq!(session, 0x1a1b_1c1d_1e1f_2021);
@@ -2390,7 +2579,7 @@ mod tests {
         let mut buf = vec![0u8; crate::proxy::UDP_BUF];
         let (n, _) = client.recv_from(&mut buf).expect("receives");
         let (_, payload) = datagrams
-            .open_server(&client_dest, method, &buf[..n])
+            .open_server(&client_dest, method, &mut buf[..n])
             .expect("opens");
         assert_eq!(payload, b"udp-relay-ping");
     }
@@ -2448,7 +2637,7 @@ mod tests {
         let mut ping = [0u8; SEAL_HEAD + 4 + TAG_LEN];
         ping[SEAL_HEAD..SEAL_HEAD + 4].copy_from_slice(b"ping");
         seal_all(&mut send, &mut ping, 4, &mut uplink).expect("seals");
-        let mut recv = match recv {
+        let _cipher = match recv {
             Recv::Ready(cipher) => cipher,
             Recv::Waiting(m, p, s) => {
                 let mut peer = vec![0u8; m.key_len()];
@@ -2458,13 +2647,19 @@ mod tests {
                 let mut fixed = vec![0u8; fixed_len];
                 read_exact(&mut uplink, &mut fixed).expect("fixed");
                 cipher.open_in_place(&mut fixed).expect("opens");
+                let first = usize::from(u16::from_be_bytes([
+                    fixed[9 + m.key_len()],
+                    fixed[10 + m.key_len()],
+                ]));
+                assert_eq!(first, 4, "the head carries the first payload");
+                let mut chunk = vec![0u8; first + TAG_LEN];
+                read_exact(&mut uplink, &mut chunk).expect("first");
+                let got = cipher.open_in_place(&mut chunk).expect("opens first");
+                assert_eq!(&chunk[..got], b"ping");
                 let _ = s;
                 cipher
             }
         };
-        let mut buf = wire_buffer();
-        let back = open_chunk(&mut uplink, &mut recv, &mut buf).expect("opens");
-        assert_eq!(back, &b"ping"[..]);
     }
 
     /// What a stage between the carrier and the codec asks for: its own capacity.
@@ -2531,6 +2726,7 @@ mod tests {
             Vec::new(),
             "h",
             "/share",
+            &[],
         )
         .expect("dials the head");
         let widths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));

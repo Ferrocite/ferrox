@@ -2,6 +2,56 @@
 
 use std::path::Path;
 
+/// How far a row's state cell says the method has got.
+///
+/// A refusal is not a class: xray-core is the floor, so a surface it runs and this
+/// tree does not is planned work, whether the current config path refuses it or has no
+/// code for it at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gap {
+    /// The state cell asserts implemented.
+    Shipped,
+    /// A role, carrier or field is present and the rest is not.
+    Partial,
+    /// Accepted work: the row is named but not carried, including a surface whose
+    /// config path currently refuses it.
+    Planned,
+    /// Deliberately parked until another row moves; still part of the superset.
+    NotScheduled,
+    /// An open row whose state cell none of the other classes describes.
+    Unclassified,
+}
+
+impl Gap {
+    /// The word `rows` and `next` print.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Shipped => "shipped",
+            Self::Partial => "partial",
+            Self::Planned => "planned",
+            Self::NotScheduled => "not-scheduled",
+            Self::Unclassified => "unclassified",
+        }
+    }
+
+    /// Lower sorts first among open rows: a half-wired row is the cheapest parity win,
+    /// then a known planned surface, then an unclassified cell that needs triage.
+    pub fn rank(self) -> u8 {
+        match self {
+            Self::Partial => 0,
+            Self::Planned => 1,
+            Self::Unclassified => 2,
+            Self::NotScheduled => 3,
+            Self::Shipped => 4,
+        }
+    }
+
+    /// Whether the advisor may draw this row without being asked for it by name.
+    pub fn is_drawable(self) -> bool {
+        self != Self::NotScheduled
+    }
+}
+
 /// One row of the README connection-method matrix.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodRow {
@@ -15,6 +65,10 @@ pub struct MethodRow {
     pub state: String,
     /// Whether the state cell marks the method implemented.
     pub implemented: bool,
+    /// How far the state cell says the row has got.
+    pub gap: Gap,
+    /// Whether the state cell says `high priority`.
+    pub high_priority: bool,
     /// The doc page path if the row links one, else a suggested page for the slug.
     pub page: String,
     /// Whether `page` is the row's own link (live surface to finish) or only the slug's suggestion (greenfield).
@@ -28,6 +82,32 @@ impl MethodRow {
     pub fn key(&self) -> String {
         format!("{}{}", self.section, self.index)
     }
+}
+
+/// A state cell's gap class, split from [`is_implemented`] so an open row still says why it is open.
+pub fn gap_of(state: &str) -> Gap {
+    let lower = state.to_ascii_lowercase();
+    if is_implemented(state) {
+        return Gap::Shipped;
+    }
+    if lower.contains("not-scheduled") || lower.contains("not scheduled") {
+        return Gap::NotScheduled;
+    }
+    if lower.contains("partial")
+        || lower.contains("not carried")
+        || lower.contains("client only")
+        || lower.contains("server only")
+    {
+        return Gap::Partial;
+    }
+    if lower.contains("planned")
+        || lower.contains("refused")
+        || lower.contains("not implemented")
+        || lower.contains("not parsed")
+    {
+        return Gap::Planned;
+    }
+    Gap::Unclassified
 }
 
 /// One pinned reference in `upstream/pins.toml`.
@@ -96,6 +176,10 @@ fn clean_cell(cell: &str) -> String {
                 }
                 out.push_str(&text);
             }
+            '\\' if chars.peek() == Some(&'|') => {
+                chars.next();
+                out.push('|');
+            }
             '*' | '`' => {}
             other => out.push(other),
         }
@@ -104,13 +188,39 @@ fn clean_cell(cell: &str) -> String {
 }
 
 /// Split a Markdown table row into cells, dropping the empties the outer pipes create.
+/// A `\|` is cell content, not a separator: the matrix uses it for a literal pipe.
 fn cells(line: &str) -> Vec<String> {
-    line.trim()
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut escaped = false;
+    for character in line
+        .trim()
         .trim_start_matches('|')
         .trim_end_matches('|')
-        .split('|')
-        .map(|cell| cell.trim().to_owned())
-        .collect()
+        .chars()
+    {
+        if escaped {
+            if character != '|' {
+                cell.push('\\');
+            }
+            cell.push(character);
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '|' => {
+                cells.push(cell.trim().to_owned());
+                cell.clear();
+            }
+            other => cell.push(other),
+        }
+    }
+    if escaped {
+        cell.push('\\');
+    }
+    cells.push(cell.trim().to_owned());
+    cells
 }
 
 /// Whether a header line names a column exactly `state` or `binary`.
@@ -210,6 +320,8 @@ pub fn methods_from_text(text: &str) -> Vec<MethodRow> {
             index,
             method,
             implemented: is_implemented(&state),
+            gap: gap_of(&state),
+            high_priority: state.to_ascii_lowercase().contains("high priority"),
             state,
             page,
             real_page,
@@ -318,12 +430,14 @@ mod tests {
 | 1 | VLESS TCP REALITY | `vless-x` | **server only** | [vless](docs/function/vless.md) | notes |
 | 3 | VLESS TCP none | `vless-tcp-none` | implemented | [vless](docs/function/vless.md) | both roles |
 | 16 | ed httpUpgrade | — | parsed, **not carried** | [x](docs/function/carrier-httpupgrade.md) | note |
+| 17 | a half-wired row | — | partial — high priority | [x](docs/function/half.md) | note |
 
 ### C — VPN
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
 | 45 | WireGuard (UDP) | planned | Xray-core, sing-box |
+| 46 | Out of rotation | not-scheduled | configer |
 | 76 | Foxy lane | in tree, proven | configer |
 ";
 
@@ -341,6 +455,11 @@ mod tests {
         assert!(!find(&rows, 1).implemented);
         assert!(!find(&rows, 16).implemented);
         assert!(!find(&rows, 45).implemented);
+        assert_eq!(find(&rows, 1).gap, Gap::Partial);
+        assert_eq!(find(&rows, 16).gap, Gap::Partial);
+        assert_eq!(find(&rows, 45).gap, Gap::Planned);
+        assert_eq!(find(&rows, 46).gap, Gap::NotScheduled);
+        assert!(find(&rows, 17).high_priority);
     }
 
     #[test]
@@ -358,6 +477,18 @@ mod tests {
         assert_eq!(find(&rows, 1).state, "server only");
         assert_eq!(find(&rows, 45).section, 'C');
         assert_eq!(find(&rows, 45).state, "planned");
+    }
+
+    #[test]
+    fn an_escaped_pipe_stays_in_its_cell_and_still_reads_the_state() {
+        let rows = methods_from_text(
+            "### C — VPN\n\n| # | method | state | supported today by |\n| --- | --- | --- | --- |\n| 121 | freedom `proxyProtocol: 1\\|2` send | planned — high priority | ref |\n",
+        );
+        let row = &rows[0];
+        assert_eq!(row.method, "freedom proxyProtocol: 1|2 send");
+        assert_eq!(row.state, "planned — high priority");
+        assert_eq!(row.gap, Gap::Planned);
+        assert!(row.high_priority);
     }
 
     #[test]
@@ -485,5 +616,24 @@ mod tests {
         assert!(!is_implemented("refused"));
         assert!(!is_implemented("**server only**"));
         assert!(!is_implemented("parsed, **not carried**"));
+    }
+
+    #[test]
+    fn a_gap_says_what_is_missing_and_not_scheduled_stays_out_of_the_draw() {
+        assert_eq!(gap_of("implemented"), Gap::Shipped);
+        assert_eq!(gap_of("partial — raw carrier only"), Gap::Partial);
+        assert_eq!(gap_of("**server only**"), Gap::Partial);
+        assert_eq!(gap_of("refused by name"), Gap::Planned);
+        assert_eq!(gap_of("planned — high priority"), Gap::Planned);
+        assert_eq!(gap_of("not-scheduled"), Gap::NotScheduled);
+        assert_eq!(
+            gap_of("a verdict this reader has not seen"),
+            Gap::Unclassified
+        );
+        assert!(!Gap::NotScheduled.is_drawable());
+        assert!(Gap::Unclassified.is_drawable());
+        assert!(Gap::Partial.is_drawable());
+        assert!(Gap::Partial.rank() < Gap::Planned.rank());
+        assert!(Gap::Planned.rank() < Gap::Unclassified.rank());
     }
 }

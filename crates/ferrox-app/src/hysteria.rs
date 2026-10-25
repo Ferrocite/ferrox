@@ -42,13 +42,13 @@ pub(crate) struct Dial {
 
 #[derive(Clone)]
 pub(crate) struct Session {
-    shared: Arc<Mutex<quiche::Connection>>,
-    sock: Arc<crate::quic::Datagram>,
-    local: SocketAddr,
+    pub(crate) shared: Arc<Mutex<quiche::Connection>>,
+    pub(crate) sock: Arc<crate::quic::Datagram>,
+    pub(crate) local: SocketAddr,
     // Written once by `connect` from the auth response and read by the UDP dial that follows: a server that skips the lane header still carries TCP flows, so the flag gates datagrams only, never the connection.
-    udp_supported: bool,
+    pub(crate) udp_supported: bool,
     /// The pooled connection's one socket reader; `None` on a dial that drives the socket itself.
-    driver: Option<Arc<Driver>>,
+    pub(crate) driver: Option<Arc<Driver>>,
 }
 
 /// One stream's latch: the pump bumps it when a datagram filled the stream, and the flow reading it parks until then instead of waiting on the shared socket with the others.
@@ -80,7 +80,7 @@ impl StreamWake {
 }
 
 /// The session's one socket reader. A pooled connection carries every flow the client multiplexes, so a thread per flow waiting on its socket wakes all of them for every datagram; the pump takes each datagram once and wakes only the stream it filled.
-struct Driver {
+pub(crate) struct Driver {
     alive: AtomicBool,
     stop: AtomicBool,
     streams: Mutex<HashMap<u64, Arc<StreamWake>>>,
@@ -162,7 +162,7 @@ impl Driver {
     }
 }
 
-fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
+pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
     let deadline = Instant::now() + crate::quic::SEND_WAIT;
     loop {
         let last = buf.is_empty();
@@ -196,7 +196,7 @@ fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
 }
 
 /// One turn of the quiche wheel with the lock held for quiche calls only, never for the socket wait between them — the shape the pool's pump takes, so a writer's one `send_all` is never starved by a reader's polling.
-fn drive_once(session: &Session, wait: Duration) -> bool {
+pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
     let timeout = {
         let Ok(conn) = session.shared.lock() else {
             return false;
@@ -392,8 +392,15 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
             } else {
                 "0.0.0.0:0"
             };
-            crate::quic::Datagram::hopped(peer, hop.ports(), hop.interval_ms, bind, &sock, obfs)
-                .ok()?
+            crate::quic::Datagram::hopped(
+                peer,
+                hop.ports(),
+                hop.interval_ms,
+                bind,
+                &sock,
+                obfs.map(crate::quic::Mask::Salamander),
+            )
+            .ok()?
         }
         None => match (obfs, dial.config.gecko) {
             // A gecko dial fragments and pads its long-header packets, salamander still sealing each frame; a password too short to mask with is refused at parse, never here.
@@ -422,8 +429,8 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
 pub(crate) struct Flow {
     session: Session,
     stream: u64,
-    backlog: Vec<u8>,
-    at: usize,
+    pub(crate) backlog: Vec<u8>,
+    pub(crate) at: usize,
     /// Whether `read` may drive the socket itself: a flow on the server's routed socket must not, because `serve_loop` reads every datagram and routes it, and a second reader steals packets the router must see.
     drive: bool,
     /// The latch the session's pump bumps when this stream has data; `None` when this flow drives.
@@ -821,6 +828,7 @@ pub(crate) type Serve = Arc<dyn Fn(Flow) + Send + Sync>;
 struct Inbound {
     conn: Arc<Mutex<quiche::Connection>>,
     client_cid: Vec<u8>,
+    initial_dcid: Vec<u8>,
     authed: bool,
     settings_sent: bool,
     settings_done: bool,
@@ -1749,6 +1757,7 @@ impl Router<'_> {
         from: SocketAddr,
         template: &mut quiche::Config,
         client_cid: &[u8],
+        initial_dcid: &[u8],
     ) {
         let mut scid = [0u8; SCID_LEN];
         if getrandom::fill(&mut scid).is_err() {
@@ -1771,6 +1780,7 @@ impl Router<'_> {
             Inbound {
                 conn: Arc::new(Mutex::new(conn)),
                 client_cid: client_cid.to_vec(),
+                initial_dcid: initial_dcid.to_vec(),
                 authed: false,
                 settings_sent: false,
                 settings_done: false,
@@ -1973,14 +1983,22 @@ pub(crate) fn serve_loop(
                 let dcid = &dcid_buf[..dcid.len()];
                 let peer_cid = &peer_buf[..peer_cid.len()];
                 if initial {
-                    if let Some(key) = router.routes.iter().find_map(|(key, inbound)| {
-                        (inbound.client_cid.as_slice() == peer_cid).then(|| key.clone())
-                    }) {
-                        router.drive(&key, &mut packet[..n], from);
-                    } else if !router.routes.contains_key(dcid) {
-                        router.accept(&mut packet[..n], from, &mut template, peer_cid);
-                    } else {
+                    // A client that sends a zero-length source CID, as the pinned client does, has no peer CID to look up: matching the empty slice against every route sends a new connection's Initial to whichever stale route came first, and the handshake never completes. Its initial DCID is the key a retransmit carries; a new connection's random DCID matches nothing and is accepted.
+                    let known = router.routes.contains_key(dcid);
+                    let retransmit = router.routes.iter().find_map(|(key, inbound)| {
+                        ((!inbound.initial_dcid.is_empty()
+                            && inbound.initial_dcid.as_slice() == dcid)
+                            || (!peer_cid.is_empty()
+                                && !inbound.client_cid.is_empty()
+                                && inbound.client_cid.as_slice() == peer_cid))
+                            .then(|| key.clone())
+                    });
+                    if known {
                         router.drive(dcid, &mut packet[..n], from);
+                    } else if let Some(key) = retransmit {
+                        router.drive(&key, &mut packet[..n], from);
+                    } else {
+                        router.accept(&mut packet[..n], from, &mut template, peer_cid, dcid);
                     }
                 } else {
                     router.drive(dcid, &mut packet[..n], from);
@@ -2017,6 +2035,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: 443,
             config: hysteria::Config {
+                version: 2,
                 auth: "a".to_owned(),
                 cc: hysteria::Congestion::Bbr,
                 obfs_password: String::new(),

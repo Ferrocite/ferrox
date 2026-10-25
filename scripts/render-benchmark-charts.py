@@ -2,11 +2,11 @@
 
 Reads per-scenario `cell.json` documents (written by `ferrox-bench
 --json-report`, one per matrix cell) plus `manifest.txt`, assembles
-`matrix-results.json`, and draws PNGs: throughput, CPU per GiB, peak RSS,
-peak threads, cold start, harness ceiling, setup latency, binary size, and
-the coverage grid. With `--readme`, rewrites the README section between the
-benchmark-matrix markers from the same numbers, so the table cannot disagree
-with the plots.
+`matrix-results.json`, and draws one multi-metric PNG per scenario plus the
+summary charts: CPU per GiB, peak RSS, peak threads, cold start, harness
+ceiling, setup latency and binary size. With `--readme`, rewrites the README
+section between the benchmark-matrix markers from the same numbers, so the
+table cannot disagree with the plots.
 
 The chart set covers every image the two pinned harnesses publish, plus the
 two only a shipped binary has: ZeroNet's throughput / CPU / idle+peak memory
@@ -37,7 +37,7 @@ try:
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
 except ImportError:
     sys.exit(
         "matplotlib is required for charts only: "
@@ -45,6 +45,37 @@ except ImportError:
     )
 
 import benchstats
+
+plt.rcParams.update(
+    {
+        "font.family": "DejaVu Sans",
+        "axes.titlesize": 10,
+        "axes.labelsize": 8,
+        "xtick.labelsize": 8,
+        "ytick.labelsize": 9,
+        "axes.edgecolor": "#CCCCCC",
+        "axes.linewidth": 0.8,
+        "figure.facecolor": "white",
+        "axes.facecolor": "white",
+    }
+)
+
+PANELS = (
+    ("throughput_mib_s", "throughput", "MiB/s", 1.0, "higher"),
+    ("cpu_millis_per_gib", "CPU per GiB", "ms/GiB", 1.0, "lower"),
+    ("rss_mib", "peak RSS", "MiB", 1.0, "lower"),
+    ("threads_peak", "peak threads", "threads", 1.0, "lower"),
+    ("startup_seconds", "cold start", "s", 1.0, "lower"),
+    ("kernel_calls_per_gib", "kernel asks", "calls/MiB", 1.0 / 1024.0, "lower"),
+)
+SETUP_PANELS = (
+    ("total_us", "setup total", "ms", 1.0 / 1000.0, "lower"),
+    ("tcp_connect_us", "tcp connect", "ms", 1.0 / 1000.0, "lower"),
+    ("socks_setup_us", "SOCKS setup", "ms", 1.0 / 1000.0, "lower"),
+    ("rss_mib", "peak RSS", "MiB", 1.0, "lower"),
+    ("threads_peak", "peak threads", "threads", 1.0, "lower"),
+    ("startup_seconds", "cold start", "s", 1.0, "lower"),
+)
 
 ENGINE_ORDER = [
     "xray-core",
@@ -60,14 +91,15 @@ PALETTE = {
     "ferrox": "#F58518",
     "xray-core-rust": "#72B7B2",
     "zeronet": "#54A24B",
-    "sing-box": "#E45756",
-    "xray-rust": "#B279A2",
+    "sing-box": "#B279A2",
+    "xray-rust": "#E45756",
     "leaf": "#B6992D",
 }
 MISSING = "#BBBBBB"
 STATUS_TEXT = {"pass": "\u2713", "fail": "\u2717", "empty": "\u2014"}
 METRICS = ("throughput_mib_s", "cpu_millis_per_gib", "rss_mib",
-           "threads_peak", "startup_seconds", "transfer_seconds")
+           "threads_peak", "startup_seconds", "kernel_calls_per_gib",
+           "transfer_seconds")
 HARNESS_BOUND = 0.85
 
 
@@ -255,12 +287,13 @@ def summary_bars(series, unit, title, path, foot, suffix="", reference=None, per
         linewidth=0.8,
     )
     span = max(values) if values else 1.0
+    span = span if span > 0 else 1.0
     for tick, (name, value) in enumerate(zip(present, values)):
         ax.text(
             value + span * 0.02,
             tick,
             (f"{value:.0%}" if percent else f"{value:.1f}{suffix}")
-            + f"  ({len(series[name])} cells)",
+            + f"  ({len(series[name])} cell" + ("" if len(series[name]) == 1 else "s") + ")",
             va="center",
             fontsize=8,
         )
@@ -302,8 +335,9 @@ def metric_chart(scenarios, cells, metric, metric_word, unit, title, path, foot)
 def setup_chart(cells, runs_dir, path, foot):
     """Setup-stage medians for setup scenarios, milliseconds.
 
-    Each repeat's result.json already holds per-stage medians over its flows;
-    the cell value is the median of those medians, stated as such.
+    Stages and total sit on separate axes: a total several times the largest
+    stage would flatten every stage bar if they shared one scale. Stages are
+    rows and engines are bars, so long engine names never rotate into the bars.
     """
     names = sorted(s for s in cells if "setup" in s)
     if not names:
@@ -313,48 +347,66 @@ def setup_chart(cells, runs_dir, path, foot):
         ("socks_method_us", "socks method"),
         ("socks_connect_us", "socks connect"),
         ("socks_setup_us", "socks setup"),
-        ("total_us", "total"),
     ]
+    total = ("total_us", "total")
     present = engines_present(cells)
-    fig, ax = plt.subplots(figsize=(max(8.0, 1.6 * len(names)), 4.6))
-    bar_width = 0.8 / max(1, len(stages))
-    labels = []
-    for stage_index, (key, label) in enumerate(stages):
-        column = []
-        for engine in present:
-            samples = []
-            for scenario in names:
-                samples.extend(setup_medians(cells[scenario], engine, runs_dir, key))
-            column.append(benchstats.median(samples) / 1000.0 if samples else float("nan"))
-        xs = [
-            stage_index + (e - (len(present) - 1) / 2) * bar_width
-            for e in range(len(present))
-        ]
-        ax.bar(
-            xs,
-            column,
-            width=bar_width,
-            color=[PALETTE.get(e, MISSING) for e in present],
-            edgecolor="black",
-            linewidth=0.5,
-        )
-        for x, value, engine in zip(xs, column, present):
-            if value == value:
-                ax.text(x, value, engine, ha="center", va="bottom", fontsize=6, rotation=90)
-        labels.append(label)
-    ax.set_xticks(list(range(len(stages))))
-    ax.set_xticklabels(labels, fontsize=8)
-    ax.set_ylabel("ms (median of per-repeat medians)", fontsize=9)
-    ax.set_title("connection setup cost by stage", fontsize=11)
-    ax.legend(
-        handles=[Patch(color=PALETTE.get(e, MISSING), label=e) for e in present],
-        fontsize=8,
-        ncol=len(present),
+    fig, (left, right) = plt.subplots(
+        1, 2, figsize=(9.6, 4.6), gridspec_kw={"width_ratios": [3.0, 1.0]}
     )
-    ax.grid(axis="y", linestyle=":", alpha=0.6)
-    fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#666666")
-    fig.tight_layout(rect=(0, 0.06, 1, 1))
-    fig.savefig(path, dpi=110, bbox_inches="tight")
+
+    def draw(ax, specs):
+        bar_height = 0.68 / max(1, len(present))
+        row_height = 0.82 / max(1, len(present))
+        for index, engine in enumerate(present):
+            values = []
+            for key, _ in specs:
+                samples = []
+                for scenario in names:
+                    samples.extend(setup_medians(cells[scenario], engine, runs_dir, key))
+                values.append(
+                    benchstats.median(samples) / 1000.0 if samples else float("nan")
+                )
+            ys = [
+                stage + (index - (len(present) - 1) / 2) * row_height
+                for stage in range(len(specs))
+            ]
+            ax.barh(
+                ys,
+                values,
+                height=bar_height,
+                color=PALETTE.get(engine, MISSING),
+                edgecolor="#444444",
+                linewidth=0.4,
+                label=engine if specs is stages else None,
+            )
+        ax.set_yticks(range(len(specs)))
+        if len(specs) == 1:
+            ax.set_yticklabels([])
+        else:
+            ax.set_yticklabels([label for _, label in specs])
+        ax.invert_yaxis()
+        ax.set_xlabel("ms (median of per-repeat medians)", fontsize=8)
+        ax.grid(axis="x", color="#E6E6E6", linewidth=0.6)
+        ax.set_axisbelow(True)
+        for side in ("top", "right", "left"):
+            ax.spines[side].set_visible(False)
+        ax.spines["bottom"].set_color("#CCCCCC")
+        ax.tick_params(axis="y", length=0)
+
+    draw(left, stages)
+    draw(right, [total])
+    left.set_title("per stage", fontsize=10, loc="left")
+    right.set_title("total", fontsize=10, loc="left")
+    fig.legend(
+        ncol=len(present),
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.98),
+        frameon=False,
+        fontsize=8,
+    )
+    fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#777777")
+    fig.tight_layout(rect=(0, 0.06, 1, 0.93))
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -381,75 +433,180 @@ def setup_medians(cell, engine, runs_dir, stage):
     return values
 
 
-def scenario_throughput_chart(scenario, cell, path, foot):
-    """One scenario's throughput: engines side by side, never merged with another test."""
-    present = [
-        name for name in ENGINE_ORDER if run_values(cell, name, "throughput_mib_s")
-    ]
+def panel_samples(cell, engine, key, scale, runs_dir):
+    """One panel's per-repeat values, scaled into the unit the panel prints."""
+    if key.endswith("_us"):
+        values = setup_medians(cell, engine, runs_dir, key)
+    else:
+        values = run_values(cell, engine, key)
+    return [value * scale for value in values if isinstance(value, (int, float))]
+
+
+def metric_label(value, unit):
+    """The value printed beside one bar, in the panel's own unit."""
+    if unit == "threads":
+        return f"{value:.0f}"
+    if unit == "s":
+        return f"{value:.2f} s"
+    if unit == "calls/MiB":
+        return f"{value:.1f} calls/MiB" if value < 10 else f"{value:.0f} calls/MiB"
+    if unit == "MiB/s":
+        return f"{value:,.0f} MiB/s"
+    return f"{value:.1f} {unit}"
+
+
+def scenario_combined_chart(scenario, cell, path, foot, runs_dir):
+    """One image per scenario: throughput, CPU, RSS, threads, start and syscalls.
+
+    Every panel lists the same engines so a missing metric is a visible gap
+    rather than a shorter bar chart. The reference line is the same cell's
+    xray-core median; it is labelled once in the figure legend, not beside
+    every line, and the value label sits at the bar end without a ratio that
+    would compete with the next panel.
+    """
     base, _, server = scenario.partition("--srv-")
+    setup = "setup" in scenario
+    panels = SETUP_PANELS if setup else PANELS
+    present = [
+        engine
+        for engine in ENGINE_ORDER
+        if any(panel_samples(cell, engine, key, scale, runs_dir)
+               for key, _, _, scale, _ in panels)
+    ]
+    fig, axes = plt.subplots(2, 3, figsize=(16.0, 9.2), sharey=True)
+    fig.subplots_adjust(
+        left=0.115, right=0.985, top=0.86, bottom=0.085, hspace=0.52, wspace=0.12
+    )
     if not present:
-        fig, ax = plt.subplots(figsize=(7.2, 2.4))
-        ax.text(
+        for ax in axes.flat:
+            ax.set_axis_off()
+        axes.flat[0].text(
             0.5,
             0.5,
             "no engine landed a number in this cell\nsee the coverage table",
-            transform=ax.transAxes,
+            transform=axes.flat[0].transAxes,
             ha="center",
             va="center",
-            fontsize=9,
+            fontsize=10,
             color="#333333",
         )
-        ax.set_axis_off()
-        ax.set_title(f"{base} on {server}: no throughput measured", fontsize=11)
-        fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#666666")
-        fig.tight_layout(rect=(0, 0.10, 1, 1))
-        fig.savefig(path, dpi=110, bbox_inches="tight")
-        plt.close(fig)
-        return path
-    reference = benchstats.median(run_values(cell, "xray-core", "throughput_mib_s")) if run_values(cell, "xray-core", "throughput_mib_s") else None
-    values, lower, upper, edges, labels = [], [], [], [], []
-    for engine in present:
-        samples = run_values(cell, engine, "throughput_mib_s")
-        median = benchstats.median(samples)
-        values.append(median)
-        interval = bootstrap_interval(samples)
-        lower.append(median - interval[0] if interval else 0.0)
-        upper.append(interval[1] - median if interval else 0.0)
-        verdict = gated_verdict(cell, engine, "throughput")
-        edges.append({"better": "#2CA02C", "worse": "#D62728"}.get(verdict, "#555555"))
-        if engine == "ferrox" and reference:
-            labels.append(f"{median:.0f} MiB/s  ({median / reference:.2f}x xray-core)")
+    references = {}
+    for key, _, _, scale, _ in panels:
+        samples = panel_samples(cell, "xray-core", key, scale, runs_dir)
+        references[key] = benchstats.median(samples) if samples else None
+    for index, (ax, (key, title, unit, scale, direction)) in enumerate(
+        zip(axes.flat, panels)
+    ):
+        reference = references.get(key)
+        rows = []
+        for engine in present:
+            samples = panel_samples(cell, engine, key, scale, runs_dir)
+            if samples:
+                median = benchstats.median(samples)
+                rows.append((engine, median, bootstrap_interval(samples)))
+            else:
+                rows.append((engine, None, None))
+        values = [row[1] or 0.0 for row in rows]
+        lower = [
+            max(0.0, row[1] - row[2][0]) if row[1] is not None and row[2] else 0.0
+            for row in rows
+        ]
+        upper = [
+            max(0.0, row[2][1] - row[1]) if row[1] is not None and row[2] else 0.0
+            for row in rows
+        ]
+        edges = []
+        for engine, _, _ in rows:
+            verdict = (
+                gated_verdict(cell, engine, "throughput")
+                if key == "throughput_mib_s"
+                else None
+            )
+            edges.append({"better": "#2CA02C", "worse": "#D62728"}.get(verdict, "#444444"))
+        ax.barh(
+            range(len(rows)),
+            values,
+            xerr=[lower, upper],
+            height=0.58,
+            color=[PALETTE.get(engine, MISSING) for engine, _, _ in rows],
+            edgecolor=edges,
+            linewidth=0.9,
+            error_kw={"elinewidth": 0.9, "capsize": 2, "capthick": 0.9},
+        )
+        span = max(
+            max((value + up for value, up in zip(values, upper)), default=0.0),
+            reference or 0.0,
+        )
+        span = span if span > 0 else 1.0
+        for tick, (value, up, row) in enumerate(zip(values, upper, rows)):
+            if row[1] is not None:
+                ax.text(
+                    value + up + span * 0.02,
+                    tick,
+                    metric_label(value, unit),
+                    va="center",
+                    fontsize=7.5,
+                    color="#333333",
+                )
+            else:
+                ax.text(
+                    0,
+                    tick,
+                    "not measured",
+                    va="center",
+                    fontsize=7,
+                    color="#999999",
+                )
+        if reference:
+            ax.axvline(reference, color="#8A8A8A", linestyle=(0, (3, 2)), linewidth=0.9)
+        ax.set_xlim(0, span * 1.28)
+        ax.set_ylim(len(present) - 0.5, -0.5)
+        ax.set_yticks(range(len(present)))
+        if index % 3 == 0:
+            ax.set_yticklabels(present)
         else:
-            labels.append(f"{median:.0f} MiB/s")
-    height = max(2.4, 0.52 * len(present) + 1.3)
-    fig, ax = plt.subplots(figsize=(7.6, height))
-    ax.barh(
-        present,
-        values,
-        xerr=[lower, upper],
-        height=0.62,
-        color=[PALETTE.get(name, MISSING) for name in present],
-        edgecolor=edges,
-        linewidth=1.2,
-        error_kw={"elinewidth": 1, "capsize": 3},
+            ax.tick_params(axis="y", labelleft=False)
+        ax.set_xlabel(unit, fontsize=8, labelpad=2)
+        ax.set_title(title, fontsize=10, loc="left", pad=6)
+        ax.grid(axis="x", color="#E6E6E6", linewidth=0.6)
+        ax.set_axisbelow(True)
+        for side in ("top", "right", "left"):
+            ax.spines[side].set_visible(False)
+        ax.spines["bottom"].set_color("#CCCCCC")
+        ax.tick_params(axis="y", length=0, pad=4)
+        ax.tick_params(axis="x", length=2, colors="#555555")
+    fig.suptitle(
+        f"{base} · {server}",
+        x=0.011,
+        y=0.972,
+        ha="left",
+        fontsize=15,
+        fontweight="bold",
+        color="#222222",
     )
-    span = max((value + upper for value, upper in zip(values, upper)), default=1.0)
-    for tick, (value, up, label) in enumerate(zip(values, upper, labels)):
-        ax.text(value + up + span * 0.02, tick, label, va="center", fontsize=8)
-    ax.set_xlim(0, span * 1.42)
-    ax.invert_yaxis()
-    ax.set_xlabel("MiB/s", fontsize=9)
-    ax.set_title(f"{base} on {server}", fontsize=11, loc="left")
-    ax.grid(axis="x", linestyle=":", alpha=0.6)
-    ax.set_axisbelow(True)
-    for side in ("top", "right"):
-        ax.spines[side].set_visible(False)
-    ax.tick_params(axis="y", length=0)
-    fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#666666")
-    fig.tight_layout(rect=(0, 0.10, 1, 1))
-    fig.savefig(path, dpi=110, bbox_inches="tight")
+    fig.text(
+        0.011,
+        0.93,
+        "Medians of this cell's repeats. Whiskers are 95% bootstrap intervals. "
+        + ("Lower is better." if setup else "Lower is better except throughput."),
+        fontsize=8,
+        color="#666666",
+        ha="left",
+    )
+    if any(references.values()):
+        fig.legend(
+            handles=[Line2D([0], [0], color="#8A8A8A", linestyle=(0, (3, 2)), linewidth=1)],
+            labels=["xray-core"],
+            loc="upper right",
+            bbox_to_anchor=(0.985, 0.955),
+            frameon=False,
+            fontsize=8,
+        )
+    fig.text(0.011, 0.018, foot, ha="left", fontsize=7, color="#777777")
+    fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
     return path
+
 
 def coverage_table(results):
     """Markdown coverage grid: pass, fail, or the reason for a gap."""
@@ -729,11 +886,11 @@ def throughput_table(results):
 def cost_table(results):
     """CPU, RSS, thread and startup medians per scenario and engine."""
     engines = [name for name in ENGINE_ORDER if any(
-        name in scenario.get("medians", {}) for scenario in results.get("scenarios", {})
+        name in scenario.get("medians", {}) for scenario in results.get("scenarios", [])
     )]
     lines = [
-        "| scenario | server | engine | cpu | rss | threads | start |",
-        "| -------- | ------ | ------ | --- | --- | ------- | ----- |",
+        "| scenario | server | engine | cpu | rss | threads | start | kernel |",
+        "| -------- | ------ | ------ | --- | --- | ------- | ----- | ------ |",
     ]
     for scenario in results.get("scenarios", []):
         if "setup" in scenario.get("id", ""):
@@ -748,13 +905,17 @@ def cost_table(results):
                 f"{format_cost(values.get('cpu_millis_per_gib'))} | "
                 f"{format_cost(values.get('rss_mib'))} | "
                 f"{format_cost(values.get('threads_peak'))} | "
-                f"{format_cost(values.get('startup_seconds'))} |"
+                f"{format_cost(values.get('startup_seconds'))} | "
+                f"{format_cost(values.get('kernel_calls_per_gib'))} |"
             )
     return "\n".join(lines)
 
 
 def matrix_markdown(results, image_prefix):
-    """The complete bundle document: tables, one throughput plot per test, coverage text."""
+    """The complete bundle document: tables, one multi-metric image per test, coverage."""
+    scenarios = results.get("scenarios", [])
+    bulk = any("setup" not in scenario.get("id", "") for scenario in scenarios)
+    setup = any("setup" in scenario.get("id", "") for scenario in scenarios)
     lines = [
         f"# ferrox benchmark matrix \u2014 {results.get('date', '?')} on {results.get('runner', '?')}",
         "",
@@ -764,6 +925,19 @@ def matrix_markdown(results, image_prefix):
         f"load `{results.get('load', '?')}`. Bars are medians; whiskers are 95% bootstrap "
         "intervals over the engine's own repeats.",
         "",
+    ]
+    if results.get("changes") is not None:
+        lines += [
+            "## Changes since the previous run",
+            "",
+            benchstats.changes_markdown(
+                results["changes"],
+                results.get("previous_date", "the previous run"),
+                results.get("change_threshold", benchstats.CHANGE_THRESHOLD),
+            ),
+            "",
+        ]
+    lines += [
         "## Throughput by test",
         "",
         throughput_table(results),
@@ -776,17 +950,19 @@ def matrix_markdown(results, image_prefix):
         "the server leg compares xray-core as a client of the ferrox and xray-core servers. "
         "A value below 0.85 is marked `gap` and is a hole in this tree, not variance.",
         "",
-        "## One plot per test",
+        "## One image per test",
+        "",
+        "Each image is one cell: throughput, CPU per GiB, peak RSS, peak threads, cold "
+        "start and kernel asks per MiB, from the same repeats. A panel the runner cannot "
+        "see says so; it is never drawn as zero.",
         "",
     ]
     for scenario in results.get("scenarios", []):
-        if "setup" in scenario.get("id", ""):
-            continue
         base, server = scenario_name(scenario)
         lines += [
             f"### `{base}` on {server}",
             "",
-            f"![{base} on {server}]({image_prefix}/throughput/{scenario['id']}.png)",
+            f"![{base} on {server}]({image_prefix}/scenarios/{scenario['id']}.png)",
             "",
         ]
     lines += [
@@ -800,18 +976,31 @@ def matrix_markdown(results, image_prefix):
         "",
         "## Other charts",
         "",
-        f"![CPU per GiB]({image_prefix}/cpu-per-gib.png)",
-        "",
-        f"![peak RSS]({image_prefix}/memory-rss.png)",
-        "",
-        f"![peak threads]({image_prefix}/threads.png)",
-        "",
+    ]
+    if bulk:
+        lines += [
+            f"![CPU per GiB]({image_prefix}/cpu-per-gib.png)",
+            "",
+            f"![peak RSS]({image_prefix}/memory-rss.png)",
+            "",
+            f"![peak threads]({image_prefix}/threads.png)",
+            "",
+        ]
+    lines += [
         f"![cold start]({image_prefix}/startup.png)",
         "",
-        f"![cells at harness ceiling]({image_prefix}/ceiling.png)",
-        "",
-        f"![setup latency]({image_prefix}/setup-latency.png)",
-        "",
+    ]
+    if bulk:
+        lines += [
+            f"![cells at harness ceiling]({image_prefix}/ceiling.png)",
+            "",
+        ]
+    if setup:
+        lines += [
+            f"![setup latency]({image_prefix}/setup-latency.png)",
+            "",
+        ]
+    lines += [
         f"![binary size]({image_prefix}/binary-size.png)",
         "",
     ]
@@ -894,12 +1083,17 @@ def main(argv=None):
     parser.add_argument("--runner", default=None,
                         help="runner slug for README image paths "
                              "(defaults to the manifest's runner:)")
+    parser.add_argument("--previous", default=None,
+                        help="previous matrix-results.json for the change table")
+    parser.add_argument("--change-threshold", type=float,
+                        default=benchstats.CHANGE_THRESHOLD,
+                        help="fraction a median must move to count (default 0.10)")
     args = parser.parse_args(argv)
 
     input_dir = Path(args.input)
     charts_dir = Path(args.charts)
     charts_dir.mkdir(parents=True, exist_ok=True)
-    (charts_dir / "throughput").mkdir(parents=True, exist_ok=True)
+    (charts_dir / "scenarios").mkdir(parents=True, exist_ok=True)
     meta = parse_manifest(input_dir / "manifest.txt")
     runner = args.runner or meta.get("runner", "unknown")
     cells = load_cells(input_dir / "cells")
@@ -907,18 +1101,26 @@ def main(argv=None):
     runs_dir = input_dir / "cells"
 
     results = assemble(input_dir / "cells", meta)
+    if args.previous:
+        previous = json.loads(Path(args.previous).read_text())
+        results["changes"] = benchstats.compare_results(
+            results, previous, args.change_threshold
+        )
+        results["previous_date"] = previous.get("date", "the previous run")
+        results["change_threshold"] = args.change_threshold
     with open(args.results, "w") as handle:
         json.dump(results, handle, indent=2, sort_keys=True)
         handle.write("\n")
 
     bulk = sorted(s for s in cells if "setup" not in s)
     made = []
-    for scenario in bulk:
-        chart = scenario_throughput_chart(
+    for scenario in sorted(cells):
+        chart = scenario_combined_chart(
             scenario,
             cells[scenario],
-            str(charts_dir / "throughput" / f"{scenario}.png"),
+            str(charts_dir / "scenarios" / f"{scenario}.png"),
             foot,
+            runs_dir,
         )
         if chart:
             made.append(chart)

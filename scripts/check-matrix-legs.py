@@ -117,6 +117,7 @@ def main():
     grouped = cells_by_scenario(args.cells)
     holes = []
     checked = 0
+    measured = set()
     for base in sorted({key[0] for key in grouped}):
         if "setup" in base:
             continue
@@ -133,6 +134,7 @@ def main():
         )
         rust_client = median_throughput(reference, "xray-core-rust")
         checked += 1
+        measured.add(base)
         if client_leg is None and attempted(reference, FERRORX):
             holes.append({
                 "base": base,
@@ -190,7 +192,7 @@ def main():
             new.append(hole)
     seen = {(hole["base"], hole["leg"]) for hole in holes}
     for key, (ratio, issue) in sorted(baseline.items()):
-        if key not in seen:
+        if key[0] in measured and key not in seen:
             fixed.append((key, ratio, issue))
 
     for hole in new:

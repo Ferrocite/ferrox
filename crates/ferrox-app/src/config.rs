@@ -568,6 +568,11 @@ pub(crate) fn inbound_tls_identity(
     };
     let (cert_pem, key_pem) = tls_cert_pem(settings)?;
     let mut identity = ferrox_core::tls::parse_pem_identity(&cert_pem, &key_pem).ok()?;
+    let tls = settings.get("tlsSettings");
+    identity.alpn = tls_alpn(tls);
+    identity.min_version = tls_version(tls, "minVersion");
+    identity.max_version = tls_version(tls, "maxVersion");
+    identity.cipher_suites = tls_cipher_suites(tls);
     identity.ech_server_keys = ech;
     Some(Arc::new(identity))
 }
@@ -996,20 +1001,105 @@ pub(crate) fn sub_path(settings: Option<&Json>, key: &str) -> String {
         .unwrap_or("/")
         .to_owned()
 }
+#[cfg(test)]
 pub(crate) fn grpc_path(settings: Option<&Json>) -> String {
+    grpc_names(settings).0
+}
+
+/// The two stream names one `serviceName` names: the call and its multi-mode peer.
+fn grpc_names(settings: Option<&Json>) -> (String, String) {
     let service = settings
         .and_then(|s| s.get("grpcSettings"))
         .and_then(|s| s.get("serviceName"))
         .and_then(Json::as_str)
-        .unwrap_or("")
-        .trim();
+        .unwrap_or("");
     if service.is_empty() {
-        return "/Tun".to_owned();
+        return ("//Tun".to_owned(), "//TunMulti".to_owned());
     }
-    if service.starts_with('/') {
-        return service.to_owned();
+    if !service.starts_with('/') {
+        let service = grpc_escape(service);
+        return (format!("/{service}/Tun"), format!("/{service}/TunMulti"));
     }
-    format!("/{}/Tun", grpc_escape(service.trim_matches('/')))
+    let last = service.rfind('/');
+    let name_end = last.filter(|at| *at >= 1).unwrap_or(1);
+    let name = service[1..name_end]
+        .split('/')
+        .map(grpc_escape)
+        .collect::<Vec<_>>()
+        .join("/");
+    let ending = &service[last.map_or(1, |at| at + 1)..];
+    let mut streams = ending.split('|');
+    let tun = streams.next().unwrap_or("");
+    let multi = streams.next().unwrap_or(tun);
+    (
+        format!("/{name}/{}", grpc_escape(tun)),
+        format!("/{name}/{}", grpc_escape(multi)),
+    )
+}
+
+fn multi_path(path: &str) -> String {
+    path.strip_suffix("/Tun")
+        .map_or_else(|| path.to_owned(), |head| format!("{head}/TunMulti"))
+}
+
+/// The gRPC settings one carrier names, with every field the reference reads.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GrpcSettings {
+    pub(crate) path: String,
+    pub(crate) multi_path: String,
+    pub(crate) authority: String,
+    pub(crate) user_agent: String,
+    pub(crate) multi_mode: bool,
+    pub(crate) idle_timeout: u32,
+    pub(crate) health_check_timeout: u32,
+    pub(crate) permit_without_stream: bool,
+    pub(crate) initial_window_size: u32,
+}
+
+impl GrpcSettings {
+    pub(crate) fn path(path: impl Into<String>) -> Self {
+        let path = path.into();
+        let multi_path = multi_path(&path);
+        Self {
+            path,
+            multi_path,
+            ..Self::default()
+        }
+    }
+
+    fn from_json(settings: Option<&Json>) -> Self {
+        let node = settings.and_then(|s| s.get("grpcSettings"));
+        let (path, multi_path) = grpc_names(settings);
+        let text = |key: &str| {
+            node.and_then(|s| s.get(key))
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned()
+        };
+        let seconds = |key: &str| {
+            node.and_then(|s| s.get(key))
+                .and_then(as_uint)
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(0)
+        };
+        Self {
+            path,
+            multi_path,
+            authority: text("authority"),
+            user_agent: text("userAgent"),
+            multi_mode: node
+                .and_then(|s| s.get("multiMode"))
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
+            idle_timeout: seconds("idleTimeout"),
+            health_check_timeout: seconds("healthCheckTimeout"),
+            permit_without_stream: node
+                .and_then(|s| s.get("permitWithoutStream"))
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
+            initial_window_size: seconds("initialWindowsSize"),
+        }
+    }
 }
 
 /// Go's `url.PathEscape` for one segment, the way Xray escapes a service name.
@@ -1033,14 +1123,22 @@ fn grpc_escape(service: &str) -> String {
     out
 }
 
-pub(crate) fn tcp_http_path(settings: Option<&Json>) -> Option<String> {
-    let header = settings
-        .and_then(|s| s.get("tcpSettings"))
-        .and_then(|s| s.get("header"))?;
+/// The tcp-http request block the config names: `rawSettings` replaces `tcpSettings` whole when it is present, as the reference does before it builds the transport.
+fn tcp_http_request(settings: Option<&Json>) -> Option<&Json> {
+    let settings = settings?;
+    let block = match settings.get("rawSettings") {
+        Some(raw) if !matches!(raw, Json::Null) => raw,
+        _ => settings.get("tcpSettings")?,
+    };
+    let header = block.get("header")?;
     if header.get("type").and_then(Json::as_str) != Some("http") {
         return None;
     }
-    let request = header.get("request")?;
+    header.get("request")
+}
+
+pub(crate) fn tcp_http_path(settings: Option<&Json>) -> Option<String> {
+    let request = tcp_http_request(settings)?;
     if let Some(paths) = request.get("path").and_then(Json::as_arr) {
         let first = paths.iter().find_map(Json::as_str);
         if let Some(path) = first {
@@ -1053,11 +1151,86 @@ pub(crate) fn tcp_http_path(settings: Option<&Json>) -> Option<String> {
     Some("/".to_owned())
 }
 
+/// The headers and WebSocket heartbeat a carrier's settings carry. TCP-HTTP keeps its headers under the request block; every other carrier writes them beside the path.
+pub(crate) fn carrier_headers(settings: Option<&Json>) -> (Vec<(String, String)>, u32) {
+    let Some(settings) = settings else {
+        return (Vec::new(), 0);
+    };
+    let network = settings.get("network").and_then(Json::as_str).unwrap_or("");
+    let (headers, heartbeat) = match network {
+        "ws" | "websocket" => {
+            let block = settings.get("wsSettings");
+            let heartbeat = block
+                .and_then(|s| s.get("heartbeatPeriod"))
+                .and_then(Json::as_u32)
+                .unwrap_or(0);
+            (block.and_then(|s| s.get("headers")), heartbeat)
+        }
+        "httpupgrade" => (
+            settings
+                .get("httpupgradeSettings")
+                .and_then(|s| s.get("headers")),
+            0,
+        ),
+        "xhttp" | "splithttp" => (
+            settings
+                .get("xhttpSettings")
+                .or_else(|| settings.get("splithttpSettings"))
+                .and_then(|s| s.get("headers")),
+            0,
+        ),
+        "" | "raw" | "tcp" => (
+            tcp_http_request(Some(settings)).and_then(|r| r.get("headers")),
+            0,
+        ),
+        _ => (None, 0),
+    };
+    (masquerade_headers(headers), heartbeat)
+}
+
+/// A carrier header's value: a string, or xray's `StringList` form whose first entry is the value this tree sends.
+fn header_value(value: &Json) -> Option<String> {
+    value.as_str().map(str::to_owned).or_else(|| {
+        value
+            .as_arr()
+            .and_then(|items| items.iter().find_map(Json::as_str))
+            .map(str::to_owned)
+    })
+}
+
 pub(crate) fn stream_security(node: &Json) -> &str {
     node.get("streamSettings")
         .and_then(|s| s.get("security"))
         .and_then(Json::as_str)
         .unwrap_or("")
+}
+
+/// Whether a listener's first bytes are the PROXY protocol's header. The reference carries the
+/// flag per carrier and in `sockopt`; either spelling arms the same accept-side read.
+pub(crate) fn accept_proxy_protocol(settings: Option<&Json>) -> bool {
+    let Some(settings) = settings else {
+        return false;
+    };
+    let network = settings.get("network").and_then(Json::as_str).unwrap_or("");
+    let carrier = match network {
+        "ws" | "websocket" => "wsSettings",
+        "httpupgrade" => "httpupgradeSettings",
+        "grpc" => "grpcSettings",
+        "" | "raw" | "tcp" => "tcpSettings",
+        _ => "",
+    };
+    let per_carrier = !carrier.is_empty()
+        && settings
+            .get(carrier)
+            .and_then(|s| s.get("acceptProxyProtocol"))
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+    let sockopt = settings
+        .get("sockopt")
+        .and_then(|s| s.get("acceptProxyProtocol"))
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    per_carrier || sockopt
 }
 
 pub(crate) fn vless_security_supported(sec: &str) -> bool {
@@ -1076,9 +1249,7 @@ pub(crate) enum Carrier {
         host: String,
         ed: u32,
     },
-    Grpc {
-        path: String,
-    },
+    Grpc(GrpcSettings),
     Xhttp {
         settings: Box<crate::xhttp::XhttpSettings>,
     },
@@ -1107,6 +1278,14 @@ impl Carrier {
     pub(crate) fn tcp_mask(&self) -> Option<&ferrox_core::finalmask::Chain> {
         match self {
             Carrier::Raw(chain) if !chain.is_empty() => Some(chain),
+            _ => None,
+        }
+    }
+
+    /// The gRPC dial settings, which carry both stream names and the head's fields.
+    pub(crate) fn grpc_settings(&self) -> Option<&GrpcSettings> {
+        match self {
+            Carrier::Grpc(settings) => Some(settings),
             _ => None,
         }
     }
@@ -1187,9 +1366,7 @@ fn resolve_httpupgrade(settings: Option<&Json>, _: &str) -> Carrier {
 }
 
 fn resolve_grpc(settings: Option<&Json>, _: &str) -> Carrier {
-    Carrier::Grpc {
-        path: grpc_path(settings),
-    }
+    Carrier::Grpc(GrpcSettings::from_json(settings))
 }
 
 fn resolve_xhttp(settings: Option<&Json>, network: &str) -> Carrier {
@@ -1352,7 +1529,7 @@ fn tcp_mask(settings: Option<&Json>) -> Option<ferrox_core::finalmask::Chain> {
 /// One `fragment` stage. `packets` picks the writes it cuts; `lengths` and `delays` fall back to
 /// their singular spelling, and an unset one is the reference's zero range — a last width entry of 0,
 /// which is a stage this tree refuses rather than one that would spin.
-fn fragment(conf: Option<&Json>) -> Option<ferrox_core::finalmask::Fragment> {
+pub(crate) fn fragment(conf: Option<&Json>) -> Option<ferrox_core::finalmask::Fragment> {
     use ferrox_core::finalmask::Fragment;
     let packets = conf
         .and_then(|c| c.get("packets"))
@@ -1373,7 +1550,15 @@ fn fragment(conf: Option<&Json>) -> Option<ferrox_core::finalmask::Fragment> {
     };
     let widths =
         range_list(conf, "lengths").or_else(|| Some(vec![single_range(conf, "length")?]))?;
-    let waits = range_list(conf, "delays").or_else(|| Some(vec![single_range(conf, "delay")?]))?;
+    let waits = range_list(conf, "delays").or_else(|| {
+        ["delay", "interval"]
+            .into_iter()
+            .find_map(|key| conf?.get(key).and_then(int32_range))
+            .map_or_else(
+                || Some(vec![ferrox_core::finalmask::Range::ordered(0, 0)]),
+                |range| Some(vec![range]),
+            )
+    })?;
     Fragment::new(
         packets_from,
         packets_to,
@@ -1429,21 +1614,44 @@ fn range_text(text: &str) -> Option<ferrox_core::finalmask::Range> {
     Some(Range::ordered(if leading { -low } else { low }, high))
 }
 
+/// The hysteria protocol version a node names, as a number or a decimal string; absent when it names neither.
+pub(crate) fn hysteria_version(node: Option<&Json>) -> Option<u32> {
+    node.and_then(|value| {
+        value
+            .as_u32()
+            .or_else(|| value.as_str().and_then(|text| text.parse::<u32>().ok()))
+    })
+}
+
 fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
     use ferrox_core::hysteria::{Config, Congestion};
     let hy = settings.and_then(|s| s.get("hysteriaSettings"));
-    let version = hy
-        .and_then(|h| h.get("version"))
-        .and_then(Json::as_u32)
-        .or_else(|| {
-            hy.and_then(|h| h.get("version"))
-                .and_then(Json::as_str)
-                .and_then(|text| text.parse::<u32>().ok())
-        });
-    if version.is_some_and(|v| v != 2) {
+    let version = hysteria_version(hy.and_then(|h| h.get("version"))).unwrap_or(2);
+    if version != 1 && version != 2 {
         return Carrier::Unknown {
             network: network.to_owned(),
         };
+    }
+    let auth = hy
+        .and_then(|h| h.get("auth"))
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_owned();
+    let cc = Congestion::parse(
+        hy.and_then(|h| h.get("congestion"))
+            .and_then(Json::as_str)
+            .unwrap_or(""),
+    );
+    if version == 1 {
+        // Version 1 names xplus directly: `tlsSettings.obfs` is the password, not a mask name.
+        return Carrier::Hysteria(Config {
+            version: 1,
+            auth,
+            cc,
+            obfs_password: hysteria_v1_obfs(settings).unwrap_or_default(),
+            hop: hysteria_hop(hy),
+            gecko: None,
+        });
     }
     // Salamander and its gecko fragmentation variant are the datagram obfuscations carried; any other named one, or one whose password is too short to mask with, is refused rather than silently sent in the clear.
     let obfs_password = match salamander_obfs(settings) {
@@ -1462,6 +1670,21 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
         };
     };
     Carrier::Hysteria(Config {
+        version: 2,
+        auth,
+        cc,
+        obfs_password,
+        hop: hysteria_hop(hy),
+        gecko,
+    })
+}
+
+/// The v1 outbound config a transport names, independent of which `hysteriaSettings` version it carries: auth, congestion, xplus password and hop.
+pub(crate) fn hysteria_v1_config(stream: Option<&Json>) -> ferrox_core::hysteria::Config {
+    use ferrox_core::hysteria::{Config, Congestion};
+    let hy = stream.and_then(|s| s.get("hysteriaSettings"));
+    Config {
+        version: 1,
         auth: hy
             .and_then(|h| h.get("auth"))
             .and_then(Json::as_str)
@@ -1472,10 +1695,20 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
                 .and_then(Json::as_str)
                 .unwrap_or(""),
         ),
-        obfs_password,
+        obfs_password: hysteria_v1_obfs(stream).unwrap_or_default(),
         hop: hysteria_hop(hy),
-        gecko,
-    })
+        gecko: None,
+    }
+}
+
+/// The xplus password a Hysteria v1 transport names: `tlsSettings.obfs` itself is the key.
+fn hysteria_v1_obfs(stream: Option<&Json>) -> Option<String> {
+    stream
+        .and_then(|s| s.get("tlsSettings"))
+        .and_then(|t| t.get("obfs"))
+        .and_then(Json::as_str)
+        .filter(|password| !password.is_empty())
+        .map(str::to_owned)
 }
 
 /// The port-hopping plan a hysteria dial rotates its server port on, read from its
@@ -1688,13 +1921,11 @@ pub(crate) fn masquerade_from_stream(stream: Option<&Json>) -> ferrox_core::hyst
 }
 
 /// A response's headers in either dialect: xray's object maps names to values, while the flat form carries `Name: value` lines.
-fn masquerade_headers(field: Option<&Json>) -> Vec<(String, String)> {
+pub(crate) fn masquerade_headers(field: Option<&Json>) -> Vec<(String, String)> {
     match field {
         Some(Json::Obj(pairs)) => pairs
             .iter()
-            .filter_map(|(name, value)| {
-                value.as_str().map(|value| (name.clone(), value.to_owned()))
-            })
+            .filter_map(|(name, value)| header_value(value).map(|value| (name.clone(), value)))
             .collect(),
         Some(Json::Arr(items)) => items
             .iter()
@@ -1717,7 +1948,7 @@ pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, Stri
     let key = match &carrier {
         Carrier::Ws { .. } => "wsSettings",
         Carrier::HttpUpgrade { .. } => "httpupgradeSettings",
-        Carrier::Grpc { .. } => "grpcSettings",
+        Carrier::Grpc(_) => "grpcSettings",
         Carrier::Xhttp { .. } => "xhttpSettings",
         Carrier::HttpHeader { .. } => "tcpSettings",
         Carrier::Quic => "quicSettings",
@@ -1727,25 +1958,23 @@ pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, Stri
         Carrier::Xdrive { .. } => "xdriveSettings",
         Carrier::Unknown { .. } | Carrier::Raw(_) | Carrier::Http => "",
     };
-    let host = match &carrier {
-        // Hysteria's QUIC handshake carries `tlsSettings.serverName` as both SNI and the auth request's authority; `hysteriaSettings.host` is the fallback xray's own dialect never writes.
-        Carrier::Hysteria(_) => settings
-            .and_then(|s| s.get("tlsSettings"))
-            .and_then(|s| s.get("serverName"))
-            .and_then(Json::as_str)
-            .or_else(|| {
-                settings
-                    .and_then(|s| s.get(key))
-                    .and_then(|s| s.get("host"))
-                    .and_then(Json::as_str)
-            })
-            .unwrap_or(address),
-        _ => settings
-            .and_then(|s| s.get(key))
-            .and_then(|s| s.get("host"))
-            .and_then(Json::as_str)
-            .unwrap_or(address),
+    let configured = carrier_headers(settings).0;
+    let header_host = crate::headers::host(&configured);
+    let carrier_host = settings
+        .and_then(|s| s.get(key))
+        .and_then(|s| s.get("host"))
+        .and_then(Json::as_str);
+    let tls_host = settings
+        .and_then(|s| s.get("tlsSettings"))
+        .and_then(|s| s.get("serverName"))
+        .and_then(Json::as_str);
+    // The header wins over the carrier's own host, which wins over the TLS name, which wins over the dialled address. Hysteria's QUIC handshake carries the TLS name as its authority, so it keeps the TLS name ahead of `hysteriaSettings.host`.
+    let host = if matches!(carrier, Carrier::Hysteria(_)) {
+        tls_host.or(carrier_host)
+    } else {
+        header_host.or(carrier_host).or(tls_host)
     }
+    .unwrap_or(address)
     .to_owned();
     (carrier, host)
 }
@@ -1797,6 +2026,66 @@ pub(crate) fn budgets(root: &Json) -> Result<Budgets, String> {
         *slot = Some(duration(value, key)?);
     }
     Ok(out)
+}
+
+/// A Go `time.ParseDuration` string, in nanoseconds, for the xray fields that carry one. A
+/// number is read as nanoseconds so the protobuf dialect reaches the same parser.
+pub(crate) fn go_duration(value: &Json) -> Result<Option<i64>, String> {
+    if let Json::Num(nanos) = value {
+        return Ok(Some(*nanos as i64));
+    }
+    let Some(text) = value.as_str() else {
+        return Ok(None);
+    };
+    let mut nanos = 0i64;
+    let mut rest = text.trim();
+    if rest.is_empty() {
+        return Err("a duration is empty".to_owned());
+    }
+    if rest == "0" {
+        return Ok(Some(0));
+    }
+    let negative = rest.starts_with('-');
+    if negative || rest.starts_with('+') {
+        rest = &rest[1..];
+    }
+    if rest.is_empty() {
+        return Err(format!("duration {text:?} is malformed"));
+    }
+    while !rest.is_empty() {
+        let end = rest
+            .find(|ch: char| !(ch.is_ascii_digit() || ch == '.'))
+            .unwrap_or(rest.len());
+        if end == 0 {
+            return Err(format!("duration {text:?} is malformed"));
+        }
+        let amount: f64 = rest[..end]
+            .parse()
+            .map_err(|_| format!("duration {text:?} is malformed"))?;
+        let unit = &rest[end..];
+        let (name, scale) = [
+            ("ns", 1.0),
+            ("us", 1_000.0),
+            ("\u{b5}s", 1_000.0),
+            ("\u{3bc}s", 1_000.0),
+            ("ms", 1_000_000.0),
+            ("s", 1_000_000_000.0),
+            ("m", 60_000_000_000.0),
+            ("h", 3_600_000_000_000.0),
+        ]
+        .into_iter()
+        .find(|(name, _)| unit.starts_with(name))
+        .ok_or_else(|| format!("duration {text:?} names no unit"))?;
+        let part = (amount * scale) as i64;
+        nanos = nanos
+            .checked_add(part)
+            .ok_or_else(|| format!("duration {text:?} is too large"))?;
+        rest = &unit[name.len()..];
+    }
+    if negative {
+        nanos = -nanos;
+    }
+    Ok(Some(nanos))
 }
 
 /// `"30s"` or `"2500ms"`, and nothing else: a bare number is refused because the unit a wait is measured in is not the reader's guess.
@@ -1855,6 +2144,22 @@ mod tests {
         assert_eq!(short_id("01020304"), Some([1, 2, 3, 4, 0, 0, 0, 0]));
         assert_eq!(short_id(""), Some([0, 0, 0, 0, 0, 0, 0, 0]));
         assert_eq!(short_id("abc"), None);
+    }
+
+    #[test]
+    fn accept_proxy_protocol_reads_the_carrier_and_sockopt_spellings() {
+        let carrier =
+            crate::json::parse(r#"{"network":"ws","wsSettings":{"acceptProxyProtocol":true}}"#)
+                .expect("a carrier");
+        assert!(accept_proxy_protocol(Some(&carrier)));
+        let sockopt = crate::json::parse(
+            r#"{"network":"raw","tcpSettings":{},"sockopt":{"acceptProxyProtocol":true}}"#,
+        )
+        .expect("sockopt");
+        assert!(accept_proxy_protocol(Some(&sockopt)));
+        let plain = crate::json::parse(r#"{"network":"raw"}"#).expect("plain");
+        assert!(!accept_proxy_protocol(Some(&plain)));
+        assert!(!accept_proxy_protocol(None));
     }
 
     #[test]
@@ -2200,6 +2505,69 @@ mod tests {
             identity.ech_server_keys.as_deref(),
             Some(keys.as_slice()),
             "the inbound carries the parsed ECH keys into its TLS identity"
+        );
+    }
+
+    fn inbound_tls_identity_with(
+        settings: &str,
+    ) -> (Arc<ferrox_core::tls::TlsServerConfig>, Vec<u8>) {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["tls.test".to_owned()]).expect("mints");
+        let string_json = |pem: &str| -> String {
+            format!(
+                "\"{}\"",
+                pem.trim_end().replace('\r', "").replace('\n', "\\n")
+            )
+        };
+        let config = crate::json::parse(&format!(
+            r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{{settings}, "certificates": [{{"certificate": {}, "key": {}}}]}}}}}}"#,
+            string_json(&minted.cert.pem()),
+            string_json(&minted.signing_key.serialize_pem())
+        ))
+        .expect("parses");
+        let identity = inbound_tls_identity(&config).expect("the inline identity loads");
+        (identity, minted.cert.der().as_ref().to_vec())
+    }
+
+    #[test]
+    fn the_tls_listener_selects_the_configured_alpn() {
+        use ferrox_core::tls::{TlsConfig, TlsProvider as _};
+        let (identity, cert) = inbound_tls_identity_with(r#""alpn": ["h2"]"#);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut server = ferrox_core::tls::accept(&identity, stream).expect("accepts");
+                server.handshake().expect("handshakes");
+            });
+            let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let config = TlsConfig {
+                server_name: "tls.test".to_owned(),
+                alpn: vec![b"h2".to_vec()].into(),
+                roots: vec![cert].into(),
+                ..TlsConfig::default()
+            };
+            let mut client = ferrox_core::tls::connect(&config, stream).expect("configures");
+            client.handshake().expect("handshakes");
+            assert_eq!(
+                client.alpn(),
+                Some(b"h2".as_slice()),
+                "the listener advertises the configured ALPN"
+            );
+        });
+    }
+
+    #[test]
+    fn inbound_tls_identity_reads_the_version_bounds_and_suites() {
+        let (identity, _) = inbound_tls_identity_with(
+            r#""minVersion": "1.2", "maxVersion": "1.2", "cipherSuites": "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256""#,
+        );
+        assert_eq!(identity.min_version, Some(0x0303));
+        assert_eq!(identity.max_version, Some(0x0303));
+        assert!(
+            identity.cipher_suites.contains(&0xc02b),
+            "the configured TLS 1.2 suite reaches the identity"
         );
     }
 
@@ -2659,5 +3027,81 @@ mod tests {
             Some(4),
             "the named group's path does not leak into the unnamed one"
         );
+    }
+
+    #[test]
+    fn carrier_headers_read_every_carrier_and_the_websocket_heartbeat() {
+        let ws = crate::json::parse(
+            r#"{"network":"ws","wsSettings":{"headers":{"X-Custom":"1"},"heartbeatPeriod":5}}"#,
+        )
+        .expect("ws");
+        let (headers, heartbeat) = carrier_headers(Some(&ws));
+        assert_eq!(headers, vec![("X-Custom".to_owned(), "1".to_owned())]);
+        assert_eq!(heartbeat, 5);
+
+        let upgrade = crate::json::parse(
+            r#"{"network":"httpupgrade","httpupgradeSettings":{"headers":{"X-Upgrade":"1"}}}"#,
+        )
+        .expect("httpupgrade");
+        assert_eq!(
+            carrier_headers(Some(&upgrade)).0,
+            vec![("X-Upgrade".to_owned(), "1".to_owned())]
+        );
+
+        let xhttp = crate::json::parse(
+            r#"{"network":"xhttp","xhttpSettings":{"headers":{"X-Fetch":"1"}}}"#,
+        )
+        .expect("xhttp");
+        assert_eq!(
+            carrier_headers(Some(&xhttp)).0,
+            vec![("X-Fetch".to_owned(), "1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn raw_settings_replace_tcp_settings_whole() {
+        let settings = crate::json::parse(
+            r#"{"network":"raw","tcpSettings":{"header":{"type":"http","request":{"path":["/old"],"headers":{"X-Old":"1"}}}},"rawSettings":{"header":{"type":"http","request":{"path":["/new"],"headers":{"X-New":"1"}}}}}"#,
+        )
+        .expect("raw");
+        assert_eq!(tcp_http_path(Some(&settings)).as_deref(), Some("/new"));
+        assert_eq!(
+            carrier_headers(Some(&settings)).0,
+            vec![("X-New".to_owned(), "1".to_owned())]
+        );
+
+        let tcp = crate::json::parse(
+            r#"{"network":"tcp","tcpSettings":{"header":{"type":"http","request":{"path":["/tcp"],"headers":{"X-Tcp":"1"}}}}}"#,
+        )
+        .expect("tcp");
+        assert_eq!(tcp_http_path(Some(&tcp)).as_deref(), Some("/tcp"));
+        assert_eq!(
+            carrier_headers(Some(&tcp)).0,
+            vec![("X-Tcp".to_owned(), "1".to_owned())]
+        );
+    }
+
+    #[test]
+    fn the_configured_host_wins_over_the_carrier_tls_and_address() {
+        let outbound = crate::json::parse(
+            r#"{"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"tls.example"},"wsSettings":{"host":"carrier.example","headers":{"Host":"header.example"}}}}"#,
+        )
+        .expect("outbound");
+        assert_eq!(outbound_carrier(&outbound, "192.0.2.4").1, "header.example");
+
+        let carrier = crate::json::parse(
+            r#"{"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"tls.example"},"wsSettings":{"host":"carrier.example"}}}"#,
+        )
+        .expect("carrier");
+        assert_eq!(outbound_carrier(&carrier, "192.0.2.4").1, "carrier.example");
+
+        let tls = crate::json::parse(
+            r#"{"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"tls.example"},"wsSettings":{}}}"#,
+        )
+        .expect("tls");
+        assert_eq!(outbound_carrier(&tls, "192.0.2.4").1, "tls.example");
+
+        let bare = crate::json::parse(r#"{"streamSettings":{"network":"ws"}}"#).expect("bare");
+        assert_eq!(outbound_carrier(&bare, "192.0.2.4").1, "192.0.2.4");
     }
 }

@@ -659,6 +659,7 @@ pub(crate) enum PadMethod {
 pub(crate) struct XhttpSettings {
     pub path: String,
     pub query: String,
+    pub headers: Vec<(String, String)>,
     pub mode: XhttpMode,
     pub mode_source: ModeSource,
     pub session_placement: Placement,
@@ -714,6 +715,7 @@ impl XhttpSettings {
         Self {
             path: "/".to_owned(),
             query: String::new(),
+            headers: Vec::new(),
             mode: XhttpMode::StreamOne,
             mode_source: ModeSource::Auto,
             session_placement: Placement::Path,
@@ -797,6 +799,7 @@ impl XhttpSettings {
             },
             Some(_) => return None,
         };
+        out.headers = crate::config::masquerade_headers(xhttp.get("headers"));
         out.session_placement = placement_or(
             xhttp.get("sessionIDPlacement"),
             Placement::Path,
@@ -1306,7 +1309,6 @@ struct Session {
     state: Mutex<SessionState>,
     cv: Condvar,
     id: String,
-    born: std::time::Instant,
 }
 
 struct SessionState {
@@ -1315,6 +1317,7 @@ struct SessionState {
     next_seq: u64,
     ended: bool,
     downlink: bool,
+    last_seen: std::time::Instant,
 }
 
 type Sessions = Mutex<HashMap<String, Arc<Session>>>;
@@ -1329,8 +1332,8 @@ fn sweep_stalled_sessions(map: &mut HashMap<String, Arc<Session>>) {
     let stale: Vec<String> = map
         .iter()
         .filter(|(_, session)| {
-            session.born.elapsed() >= budget
-                && !session.state.lock().expect("session lock").downlink
+            let state = session.state.lock().expect("session lock");
+            !state.downlink && state.last_seen.elapsed() >= budget
         })
         .map(|(id, _)| id.clone())
         .collect();
@@ -1353,10 +1356,10 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
                     next_seq: 0,
                     ended: false,
                     downlink: false,
+                    last_seen: std::time::Instant::now(),
                 }),
                 cv: Condvar::new(),
                 id: id.to_owned(),
-                born: std::time::Instant::now(),
             })
         })
         .clone()
@@ -1366,6 +1369,16 @@ fn close_session(s: &Arc<Session>) {
     let mut st = s.state.lock().expect("session lock");
     st.ended = true;
     s.cv.notify_all();
+}
+
+fn remove_session_if_owned(id: &str, session: &Session) {
+    let mut map = sessions().lock().expect("sessions lock");
+    if map
+        .get(id)
+        .is_some_and(|carried| std::ptr::eq(Arc::as_ptr(carried), session))
+    {
+        map.remove(id);
+    }
 }
 
 // Drop is the only other way a session ends, and a waiter parked before a reader exists has no Drop to run.
@@ -1412,6 +1425,7 @@ impl Session {
     fn set_upload(&self, reader: Box<dyn Read + Send>) {
         let mut st = self.state.lock().expect("session lock");
         st.upload = Some(reader);
+        st.last_seen = std::time::Instant::now();
         self.cv.notify_all();
     }
     fn push_packet(&self, seq: u64, payload: Vec<u8>, cap: usize) -> bool {
@@ -1420,6 +1434,7 @@ impl Session {
             return false;
         }
         st.packets.insert(seq, payload);
+        st.last_seen = std::time::Instant::now();
         self.cv.notify_all();
         true
     }
@@ -1453,13 +1468,7 @@ impl Session {
         }
         drop(st);
         if expired {
-            let mut map = sessions().lock().expect("sessions lock");
-            if map
-                .get(&self.id)
-                .is_some_and(|carried| std::ptr::eq(Arc::as_ptr(carried), self))
-            {
-                map.remove(&self.id);
-            }
+            remove_session_if_owned(&self.id, self);
         }
     }
 }
@@ -1504,6 +1513,7 @@ impl Read for SessionReader {
                         Ok(0)
                     }
                     Ok(n) => {
+                        st.last_seen = std::time::Instant::now();
                         drop(st);
                         Ok(n)
                     }
@@ -1524,6 +1534,7 @@ impl Read for SessionReader {
                     self.cur.clear();
                     self.cur_at = 0;
                 }
+                st.last_seen = std::time::Instant::now();
                 return Ok(n);
             }
             if let Some(pkt) = {
@@ -1531,6 +1542,7 @@ impl Read for SessionReader {
                 st.packets.remove(&seq)
             } {
                 st.next_seq += 1;
+                st.last_seen = std::time::Instant::now();
                 if pkt.len() <= buf.len() {
                     buf[..pkt.len()].copy_from_slice(&pkt);
                     return Ok(pkt.len());
@@ -1559,8 +1571,7 @@ impl Read for SessionReader {
 impl Drop for SessionReader {
     fn drop(&mut self) {
         if !self.id.is_empty() {
-            let mut map = sessions().lock().expect("sessions lock");
-            map.remove(&self.id);
+            remove_session_if_owned(&self.id, self.session.as_ref());
         }
         close_session(&self.session);
     }
@@ -2092,16 +2103,18 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
     write: &mut W,
     host: &str,
     path: &str,
+    headers: &[(String, String)],
 ) -> Option<()> {
     const BEFORE_PATH: &str = "POST ";
     const BEFORE_HOST: &str = " HTTP/1.1\r\nHost: ";
     const BEFORE_REFERER: &str = "\r\nReferer: http://";
     const BEFORE_PADDING: &str = "?x_padding=";
-    const TAIL: &str = "\r\nTransfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n";
+    const TAIL: &str = "Transfer-Encoding: chunked\r\nContent-Type: application/octet-stream\r\nConnection: keep-alive\r\n\r\n";
     const PADDING_MAX: usize = 1000;
     let mut raw = [0u8; 4];
     getrandom::fill(&mut raw).unwrap_or_default();
     let len = 100 + u32::from_le_bytes(raw) as usize % 901;
+    let headers_len = crate::headers::masked_len(headers, crate::headers::FETCH);
     DIAL_HEAD.with(|cell| {
         let mut head = cell.borrow_mut();
         head.clear();
@@ -2116,6 +2129,7 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
                 + path.len()
                 + BEFORE_PADDING.len()
                 + PADDING_MAX
+                + headers_len
                 + TAIL.len(),
         );
         head.extend_from_slice(BEFORE_PATH.as_bytes());
@@ -2128,6 +2142,8 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
         head.extend_from_slice(BEFORE_PADDING.as_bytes());
         let at = head.len();
         head.resize(at + len, b'X');
+        head.extend_from_slice(b"\r\n");
+        crate::headers::write_masked(&mut head, headers, crate::headers::FETCH);
         head.extend_from_slice(TAIL.as_bytes());
         write.write_all(&head).ok()
     })
@@ -2222,7 +2238,8 @@ fn dial_head(host: &str, settings: &XhttpSettings, session: &str, seq: Option<u6
     } else {
         "application/grpc"
     };
-    format!("{} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Referer: http://{host}{}?x_padding={}\r\nTransfer-Encoding: chunked\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n", settings.uplink_method, settings.path, referer_pad_value(settings))
+    let headers = crate::headers::masked(&settings.headers, crate::headers::FETCH);
+    format!("{} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Referer: http://{host}{}?x_padding={}\r\nTransfer-Encoding: chunked\r\nContent-Type: {content_type}\r\nConnection: close\r\n\r\n", settings.uplink_method, settings.path, referer_pad_value(settings))
 }
 
 /// The downlink a packet-up or stream-up dial opens beside its upload (dialer.go:411).
@@ -2232,7 +2249,8 @@ fn downlink_head(host: &str, settings: &XhttpSettings, session: &str) -> String 
     let mut extra = String::new();
     meta_request(settings, session, None, &mut target, &mut query, &mut extra);
     let target = target_of(&target, &query);
-    format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Referer: http://{host}{}?x_padding={}\r\nConnection: close\r\n\r\n", settings.path, referer_pad_value(settings))
+    let headers = crate::headers::masked(&settings.headers, crate::headers::FETCH);
+    format!("GET {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Referer: http://{host}{}?x_padding={}\r\nConnection: close\r\n\r\n", settings.path, referer_pad_value(settings))
 }
 
 /// The referer's pad the dial-side heads draw: a run in the configured range and method, the shape the hub's own check validates (`xpadding.go`'s `MakeXPadding`).
@@ -2311,22 +2329,26 @@ fn packet_head<'a>(
             } else {
                 "Content-Length: 0\r\n"
             };
+            let headers = crate::headers::masked(&settings.headers, crate::headers::FETCH);
             (
                 format!(
-                    "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Referer: http://{host}{}?x_padding={pad}\r\n{zero}Connection: keep-alive\r\n\r\n",
+                    "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Referer: http://{host}{}?x_padding={pad}\r\n{zero}Connection: keep-alive\r\n\r\n",
                     settings.path
                 ),
                 None,
             )
         }
-        _ => (
+        _ => {
+            let headers = crate::headers::masked(&settings.headers, crate::headers::FETCH);
+            (
             format!(
-                "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{extra}Content-Length: {}\r\nReferer: http://{host}{}?x_padding={pad}\r\nConnection: keep-alive\r\n\r\n",
+                "{method} {target} HTTP/1.1\r\nHost: {host}\r\n{headers}{extra}Content-Length: {}\r\nReferer: http://{host}{}?x_padding={pad}\r\nConnection: keep-alive\r\n\r\n",
                 piece.len(),
                 settings.path
             ),
             Some(piece),
-        ),
+            )
+        }
     }
 }
 
@@ -2409,9 +2431,10 @@ pub(crate) fn connect(
     stream: Connection,
     host: &str,
     path: &str,
+    headers: &[(String, String)],
 ) -> Option<(XhttpReader, XhttpWriter)> {
     let mut read = stream;
-    send_dial_head(&mut read, host, path)?;
+    send_dial_head(&mut read, host, path, headers)?;
     let (head, at) = read_head(&mut read)?;
     check_response(&head[..at])?;
     split(read, head, at)
@@ -2423,8 +2446,9 @@ pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     mut write: W,
     host: &str,
     path: &str,
+    headers: &[(String, String)],
 ) -> Option<(Reader<R>, XhttpWriter)> {
-    send_dial_head(&mut write, host, path)?;
+    send_dial_head(&mut write, host, path, headers)?;
     let (head, at) =
         crate::proxy::read_exact_head(&mut read, HEAD_LIMIT, crate::budgets::head_arrival())?;
     check_response(&head[..at])?;
@@ -2547,7 +2571,7 @@ mod tests {
             sock.shutdown(std::net::Shutdown::Write).ok();
         });
         let sock = Connection::connect(("127.0.0.1", port)).expect("connects");
-        let (mut reader, _w) = connect(sock, "h", "/share").expect("dials");
+        let (mut reader, _w) = connect(sock, "h", "/share", &[]).expect("dials");
         let mut buf = vec![0u8; CHUNK];
         let mut got = 0usize;
         loop {
@@ -2742,7 +2766,7 @@ mod tests {
             writer.finish();
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
-        let (mut reader, writer) = connect(stream, "oracle.example", "/share").expect("dials");
+        let (mut reader, writer) = connect(stream, "oracle.example", "/share", &[]).expect("dials");
         assert!(writer.send(b"ping"));
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).expect("reads");
@@ -2807,6 +2831,7 @@ mod tests {
             Sink(Arc::new(Mutex::new(Vec::new()))),
             "h",
             "/share",
+            &[],
         )
         .expect("dials the head");
         assert_eq!(reader.at, HEAD.len(), "the cursor sits past the head");
@@ -2949,7 +2974,7 @@ mod tests {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(10)))
             .expect("timeout");
-        let (mut reader, writer) = connect(stream, "h", "/share").expect("dials");
+        let (mut reader, writer) = connect(stream, "h", "/share", &[]).expect("dials");
         assert!(writer.send(&[1u8; 26]));
         let mut reply = [0u8; 2];
         reader.read_exact(&mut reply).expect("replies");
@@ -3178,6 +3203,25 @@ mod tests {
         XhttpSettings::from_json(node.get("streamSettings")).expect("settings")
     }
 
+    #[test]
+    fn a_configured_header_and_the_fetch_defaults_reach_every_dial_head() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/up/", "headers": {"X-Fetch": "1"}}}}"#,
+        );
+        assert_eq!(
+            settings.headers,
+            vec![("X-Fetch".to_owned(), "1".to_owned())]
+        );
+        let head = dial_head("front.example", &settings, "session", None);
+        assert!(head.contains("Sec-Fetch-Mode: cors\r\n"), "{head}");
+        assert!(head.contains("X-Fetch: 1\r\n"), "{head}");
+        assert_eq!(
+            head.matches("Host: front.example\r\n").count(),
+            1,
+            "the fixed Host line is the only one"
+        );
+    }
+
     /// The answer head is opened once for the bytes it will hold: a padded answer used to start as
     /// a seventeen-byte `String` and grow into a kilobyte, and it built the downlink header as its
     /// own `String` only to copy it in.
@@ -3307,8 +3351,8 @@ mod tests {
         );
     }
 
-    /// The dial's head is the thread's own room: the allocator is entered on the first
-    /// dial and never again, and the head's bytes are the ones the reference writes.
+    /// The dial's head is the thread's own room: the first dial stages it, the next
+    /// twelve reuse the same buffer, and the bytes are the ones the reference writes.
     #[test]
     fn the_dial_head_is_staged_once_per_thread() {
         struct Sink {
@@ -3330,6 +3374,16 @@ mod tests {
                 parts.iter().all(|part| self.write_all(part).is_ok())
             }
         }
+        // The first access may also allocate the thread-local itself on some platforms.
+        let mut warm = Sink {
+            bytes: [0u8; 4096],
+            at: 0,
+        };
+        send_dial_head(&mut warm, "example.com", "/share", &[]).expect("writes");
+        let staged = DIAL_HEAD.with(|cell| {
+            let head = cell.borrow();
+            (head.as_ptr(), head.capacity())
+        });
         let (sink, counts) = ferrox_core::alloc_count::measure(|| {
             let mut sink = Sink {
                 bytes: [0u8; 4096],
@@ -3337,11 +3391,19 @@ mod tests {
             };
             for _ in 0..12 {
                 sink.at = 0;
-                send_dial_head(&mut sink, "example.com", "/share").expect("writes");
+                send_dial_head(&mut sink, "example.com", "/share", &[]).expect("writes");
             }
             sink
         });
-        assert_eq!(counts.allocs, 1, "one buffer for the thread, twelve dials");
+        assert_eq!(counts.allocs, 0, "twelve dials reuse the staged room");
+        DIAL_HEAD.with(|cell| {
+            let head = cell.borrow();
+            assert_eq!(
+                (head.as_ptr(), head.capacity()),
+                staged,
+                "the head's buffer did not move or grow"
+            );
+        });
         let head = String::from_utf8_lossy(&sink.bytes[..sink.at]);
         assert!(
             head.starts_with(
@@ -3637,7 +3699,7 @@ mod tests {
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, writer) =
-            connect(stream, "127.0.0.1", "/share").expect("the dial was answered");
+            connect(stream, "127.0.0.1", "/share", &[]).expect("the dial was answered");
         assert!(writer.send(b"ping"));
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).expect("reads the downlink");
@@ -3764,6 +3826,53 @@ mod tests {
             "a session with no downlink outlived the stall and kept its stale sequence"
         );
         assert_eq!(packets, 0, "the replacement starts with no packets");
+    }
+
+    /// The stall sweep is about silence, not age: a packet-up session that keeps receiving packets
+    /// past the budget is still alive and must keep the same sequence.
+    #[test]
+    fn an_active_packet_up_session_is_not_swept_by_its_age() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(std::time::Duration::from_millis(200)),
+            ..Default::default()
+        });
+        let id = "packet-up-active";
+        let session = get_or_create_session(id);
+        for seq in 0..3u64 {
+            thread::sleep(std::time::Duration::from_millis(120));
+            assert!(
+                session.push_packet(seq, vec![seq as u8], 16),
+                "the active packet is accepted"
+            );
+            let current = get_or_create_session(id);
+            assert!(
+                Arc::ptr_eq(&session, &current),
+                "an active packet-up session was swept after {}ms",
+                (seq + 1) * 120
+            );
+        }
+        end_session(id);
+        crate::budgets::clear();
+    }
+
+    /// A reader left over from an ended session must not remove the fresh session that reused its id:
+    /// the map's owner is the session the entry points at, not whoever drops last with the same key.
+    #[test]
+    fn a_stale_reader_drop_keeps_the_session_that_reused_its_id() {
+        let id = "reused-xhttp-session";
+        let stale = get_or_create_session(id);
+        let reader = SessionReader::new(Arc::clone(&stale), id.to_owned());
+        end_session(id);
+        let fresh = get_or_create_session(id);
+        assert!(!Arc::ptr_eq(&stale, &fresh), "the id was reused");
+        drop(reader);
+        let carried = session_is_carried(id);
+        end_session(id);
+        assert!(
+            carried,
+            "the stale reader's drop removed the replacement session"
+        );
     }
 
     #[test]
@@ -4161,10 +4270,10 @@ mod tests {
                 next_seq: 0,
                 ended: true,
                 downlink: false,
+                last_seen: std::time::Instant::now(),
             }),
             cv: Condvar::new(),
             id: String::new(),
-            born: std::time::Instant::now(),
         });
         let mut reader = SessionReader::new(session, String::new());
         let mut byte = [0u8; 1];
@@ -4185,10 +4294,10 @@ mod tests {
                 next_seq: 0,
                 ended: false,
                 downlink: false,
+                last_seen: std::time::Instant::now(),
             }),
             cv: Condvar::new(),
             id: String::new(),
-            born: std::time::Instant::now(),
         });
         let mut reader = SessionReader::new(session, String::new());
         let (sender, receiver) = std::sync::mpsc::channel();
