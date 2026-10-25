@@ -1807,14 +1807,23 @@ pub(crate) fn serve_loop(
                 let dcid = &dcid_buf[..dcid.len()];
                 let peer_cid = &peer_buf[..peer_cid.len()];
                 if initial {
-                    if let Some(key) = router.routes.iter().find_map(|(key, inbound)| {
-                        (inbound.client_cid.as_slice() == peer_cid).then(|| key.clone())
-                    }) {
-                        router.drive(&key, &mut packet[..n], from);
-                    } else if !router.routes.contains_key(dcid) {
-                        router.accept(&mut packet[..n], from, &mut template, peer_cid);
+                    // A client that sends a zero-length source CID, as the pinned client does, has no peer CID to look up: matching the empty slice against every route sends a new connection's Initial to whichever stale route came first, and the handshake never completes. The DCID is the only key such a client gives.
+                    let known = router.routes.contains_key(dcid);
+                    let retransmit = if peer_cid.is_empty() {
+                        None
                     } else {
+                        router.routes.iter().find_map(|(key, inbound)| {
+                            (!inbound.client_cid.is_empty()
+                                && inbound.client_cid.as_slice() == peer_cid)
+                                .then(|| key.clone())
+                        })
+                    };
+                    if known {
                         router.drive(dcid, &mut packet[..n], from);
+                    } else if let Some(key) = retransmit {
+                        router.drive(&key, &mut packet[..n], from);
+                    } else {
+                        router.accept(&mut packet[..n], from, &mut template, peer_cid);
                     }
                 } else {
                     router.drive(dcid, &mut packet[..n], from);
