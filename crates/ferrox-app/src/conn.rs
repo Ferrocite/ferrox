@@ -543,7 +543,7 @@ pub(crate) fn read_proxy_header(stream: &mut Connection) -> io::Result<Option<So
             if len >= 2 && &line[len - 2..len] == b"\r\n" {
                 break;
             }
-            stream.read_exact(&mut line[len..len + 1])?;
+            stream.read_exact(&mut line[len..=len])?;
             len += 1;
         }
         if len < 2 || &line[len - 2..len] != b"\r\n" {
@@ -865,6 +865,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.nodelay(),
             Connection::Masked(masked) => masked.stream.nodelay(),
+            Connection::Proxied { inner, .. } => inner.nodelay(),
             #[cfg(any(unix, windows))]
             Connection::Unix(_) => Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -1515,7 +1516,7 @@ mod tests {
                     error.kind()
                 );
             }
-            Connection::Tcp(_) | Connection::Masked(_) => {
+            Connection::Tcp(_) | Connection::Masked(_) | Connection::Proxied { .. } => {
                 unreachable!("a unix pair yields a unix stream")
             }
         }
