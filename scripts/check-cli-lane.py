@@ -690,6 +690,137 @@ def check_config_survives(state: pathlib.Path) -> int:
     return 0
 
 
+def vpn_lane_binary(state: pathlib.Path) -> pathlib.Path:
+    binary = state / "fake-vpn-lane"
+    binary.write_text(
+        """#!/usr/bin/env python3
+import json, socket, sys, time
+config = sys.argv[sys.argv.index("-c") + 1]
+with open(config, encoding="utf-8") as handle:
+    document = json.load(handle)
+bound = []
+for inbound in document.get("inbounds", []):
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", inbound["port"]))
+    server.listen(16)
+    bound.append(server)
+while True:
+    time.sleep(1)
+""",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    return binary
+
+
+def check_vpn_fronts(state: pathlib.Path) -> int:
+    ports = []
+    while len(ports) < 3:
+        port = free_port()
+        if port not in ports:
+            ports.append(port)
+    socks_port, http_port, mixed_port = ports
+    config = state / "vpn-fronts.json"
+    config.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {"protocol": "socks", "listen": "127.0.0.1", "port": socks_port},
+                    {"protocol": "http", "listen": "127.0.0.1", "port": http_port},
+                    {"protocol": "mixed", "listen": "127.0.0.1", "port": mixed_port},
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    env = env_for(state)
+    env["FERROX_BIN"] = str(vpn_lane_binary(state))
+    cases = [
+        ("socks", socks_port, None),
+        ("http", None, http_port),
+        ("mixed", mixed_port, mixed_port),
+        ("socks,http", socks_port, http_port),
+        ("socks,mixed", socks_port, mixed_port),
+        ("http,mixed", mixed_port, http_port),
+        ("socks,http,mixed", socks_port, http_port),
+    ]
+    calls = state / "networksetup.calls"
+    for fronts, want_socks, want_http in cases:
+        calls.unlink(missing_ok=True)
+        (state / "system-proxy.ports").unlink(missing_ok=True)
+        run = subprocess.run(
+            [
+                str(CLI),
+                "up",
+                "--config",
+                str(config),
+                "--fronts",
+                fronts,
+                "--socks",
+                str(socks_port),
+                "--http",
+                str(http_port),
+                "--mixed",
+                str(mixed_port),
+                "--vpn",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+        output = run.stdout + run.stderr
+        if run.returncode != 0:
+            print(
+                f"check-cli-lane: --fronts {fronts} exited {run.returncode}:\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+        wanted = []
+        if want_socks is not None:
+            wanted.append(f"-setsocksfirewallproxy Wi-Fi 127.0.0.1 {want_socks}")
+        if want_http is not None:
+            wanted.extend(
+                [
+                    f"-setwebproxy Wi-Fi 127.0.0.1 {want_http}",
+                    f"-setsecurewebproxy Wi-Fi 127.0.0.1 {want_http}",
+                ]
+            )
+        missing = [call for call in wanted if call not in recorded]
+        wrong_socks = want_socks is None and "-setsocksfirewallproxy" in recorded
+        wrong_http = want_http is None and (
+            "-setwebproxy" in recorded or "-setsecurewebproxy" in recorded
+        )
+        if missing or wrong_socks or wrong_http:
+            print(
+                f"check-cli-lane: --fronts {fronts} armed the wrong system proxy:"
+                f"\n{recorded}\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        down = subprocess.run(
+            [str(CLI), "down"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+        if down.returncode != 0:
+            print(
+                f"check-cli-lane: down after --fronts {fronts} exited {down.returncode}:"
+                f"\n{down.stdout + down.stderr}",
+                file=sys.stderr,
+            )
+            return 1
+    print("check-cli-lane: every front list arms the system proxy at the port it serves")
+    return 0
+
+
 def check_instance_ports(state: pathlib.Path) -> int:
     held = socket.socket()
     held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -840,6 +971,8 @@ def main() -> int:
     if check_config_survives(state) != 0:
         return 1
     if check_instance_ports(state) != 0:
+        return 1
+    if check_vpn_fronts(state) != 0:
         return 1
     return check_instance_lifecycle(state)
 
