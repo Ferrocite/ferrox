@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -31,6 +31,65 @@ const UDP_POLL: Duration = Duration::from_secs(1);
 
 /// A target reply is a whole UDP datagram, so one buffer of the wire's UDP ceiling holds any single response the association reads.
 const UDP_TARGET_BUF: usize = hysteria::MAX_UDP_PAYLOAD;
+
+/// Temporary: where the server's send path spends its time, printed every two seconds of `Router::idle` and read from the cell's `server.log`.
+struct Stats {
+    ticks: AtomicU64,
+    drive: AtomicU64,
+    drive_lock_ns: AtomicU64,
+    send_all: AtomicU64,
+    stream_send: AtomicU64,
+    short: AtomicU64,
+    send_lock_ns: AtomicU64,
+    sleeps: AtomicU64,
+    sleep_ns: AtomicU64,
+    sent: AtomicU64,
+    flush: AtomicU64,
+}
+
+static STATS: Stats = Stats {
+    ticks: AtomicU64::new(0),
+    drive: AtomicU64::new(0),
+    drive_lock_ns: AtomicU64::new(0),
+    send_all: AtomicU64::new(0),
+    stream_send: AtomicU64::new(0),
+    short: AtomicU64::new(0),
+    send_lock_ns: AtomicU64::new(0),
+    sleeps: AtomicU64::new(0),
+    sleep_ns: AtomicU64::new(0),
+    sent: AtomicU64::new(0),
+    flush: AtomicU64::new(0),
+};
+
+impl Stats {
+    fn add(counter: &AtomicU64, since: Instant) {
+        counter.fetch_add(since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    fn report(&self) {
+        if !self
+            .ticks
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(20)
+        {
+            return;
+        }
+        let get = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        eprintln!(
+            "hy-stats: drive={} drive_lock_ms={} send_all={} stream_send={} short={} send_lock_ms={} sleeps={} sleep_ms={} sent_mib={} flush={}",
+            get(&self.drive),
+            get(&self.drive_lock_ns) / 1_000_000,
+            get(&self.send_all),
+            get(&self.stream_send),
+            get(&self.short),
+            get(&self.send_lock_ns) / 1_000_000,
+            get(&self.sleeps),
+            get(&self.sleep_ns) / 1_000_000,
+            get(&self.sent) / (1024 * 1024),
+            get(&self.flush),
+        );
+    }
+}
 
 pub(crate) struct Dial {
     pub(crate) host: String,
@@ -164,16 +223,26 @@ impl Driver {
 
 fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
     let deadline = Instant::now() + crate::quic::SEND_WAIT;
+    STATS.send_all.fetch_add(1, Ordering::Relaxed);
     loop {
         let last = buf.is_empty();
         if last && !fin {
             return true;
         }
+        let want = buf.len();
+        let locked = Instant::now();
         let Ok(mut conn) = session.shared.lock() else {
             return false;
         };
+        Stats::add(&STATS.send_lock_ns, locked);
+        STATS.stream_send.fetch_add(1, Ordering::Relaxed);
         match conn.stream_send(stream, buf, fin && last) {
             Ok(written) => {
+                if written < want {
+                    STATS.short.fetch_add(1, Ordering::Relaxed);
+                }
+                STATS.sent.fetch_add(written as u64, Ordering::Relaxed);
+                STATS.flush.fetch_add(1, Ordering::Relaxed);
                 buf = &buf[written..];
                 crate::quic::flush_egress(&mut conn, &session.sock);
                 if buf.is_empty() && (!fin || last) {
@@ -191,7 +260,10 @@ fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
             Err(_) => return false,
         }
         drop(conn);
+        STATS.sleeps.fetch_add(1, Ordering::Relaxed);
+        let slept = Instant::now();
         std::thread::sleep(STREAM_POLL);
+        Stats::add(&STATS.sleep_ns, slept);
     }
 }
 
@@ -1796,9 +1868,12 @@ impl Router<'_> {
         };
         let info = quiche::RecvInfo { from, to: *local };
         {
+            let locked = Instant::now();
             let Ok(mut conn) = shared.lock() else {
                 return;
             };
+            Stats::add(&STATS.drive_lock_ns, locked);
+            STATS.drive.fetch_add(1, Ordering::Relaxed);
             if conn.recv(packet, info).is_err() {
                 return;
             }
@@ -1881,6 +1956,7 @@ impl Router<'_> {
     }
 
     fn idle(&mut self) {
+        STATS.report();
         let Self {
             routes, sock, out, ..
         } = self;
