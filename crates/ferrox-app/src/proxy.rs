@@ -22034,6 +22034,9 @@ mod tests {
     ) {
         let server = std::sync::Arc::new(ferrox_core::tls::TlsServerConfig {
             alpn: Vec::default(),
+            min_version: None,
+            max_version: None,
+            cipher_suites: Vec::new(),
             cert_chain: vec![CARRIER_CERT.to_vec()],
             key_der: CARRIER_KEY.to_vec(),
             key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
