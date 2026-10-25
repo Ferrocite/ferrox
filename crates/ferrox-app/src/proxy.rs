@@ -10814,7 +10814,7 @@ fn relay_trojan_with_fallbacks<S>(
 }
 
 fn relay_trojan_request<S>(
-    mut session: S,
+    session: S,
     raw: Option<Connection>,
     kcp: Option<Arc<ferrox_core::kcp::Connection>>,
     (cmd, target): (u8, SocketAddr),
