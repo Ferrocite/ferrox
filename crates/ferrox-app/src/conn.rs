@@ -551,6 +551,7 @@ impl Connection {
         let fd = match self {
             Connection::Tcp(stream) => stream.as_raw_fd(),
             Connection::Masked(masked) => masked.stream.as_raw_fd(),
+            Connection::Metered(metered) => metered.inner.as_raw_fd(),
             Connection::Proxied { inner, .. } => return inner.set_nonblocking(nonblocking),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.as_raw_fd(),

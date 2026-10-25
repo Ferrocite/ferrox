@@ -843,8 +843,10 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
         if !progress {
             if flow.session.pump.is_some() {
                 flow.session.wait_ready(STREAM_POLL);
-            } else {
+            } else if flow.drive {
                 let _ = drive_once(&flow.session, STREAM_POLL);
+            } else {
+                std::thread::sleep(STREAM_POLL);
             }
         }
     }
