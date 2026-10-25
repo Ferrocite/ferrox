@@ -692,3 +692,13 @@ engine-dns seconds-per-lookup UNBLESSED CI bench.yml (no cell yet)
 # --- the reverse tunnel -----------------------------------------------------
 reverse ops-retired-instructions UNBLESSED scripts/count-ops.sh
 reverse tcp-echo-bytes-preserved 5 ferrox-app-proxy::reverse_tests::a_portal_flow_reaches_the_bridge_and_comes_back
+
+# --- health observatory and healthcheck inbound -----------------------------
+engine-observatory ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-observatory burst-ring-samples 10 ferrox-app-observatory::tests::a_burst_ring_holds_the_sampling_window_and_puts_without_allocating
+engine-observatory sample-allocations-per-put 0 ferrox-app-observatory::tests::a_burst_ring_holds_the_sampling_window_and_puts_without_allocating
+engine-observatory failed-legacy-delay-ms 99999999 ferrox-app-observatory::tests::a_failed_legacy_probe_keeps_the_reference_delay
+engine-observatory default-burst-samples 10 ferrox-app-observatory::tests::burst_settings_default_to_ten_samples_and_head
+front-healthcheck ops-retired-instructions UNBLESSED scripts/count-ops.sh
+front-healthcheck answer-allocations 1 ferrox-app-proxy::hc_tests::an_hc_answer_is_one_allocation
+front-healthcheck answer-bytes 85 ferrox-app-proxy::hc_tests::an_hc_answer_is_one_allocation
