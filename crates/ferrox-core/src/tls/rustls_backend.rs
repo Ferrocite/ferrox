@@ -12,6 +12,22 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::clone(PROVIDER.get_or_init(|| Arc::new(rustls::crypto::ring::default_provider())))
 }
 
+/// A config that names TLS 1.2 suites admits only those, in its order: TLS 1.3
+/// suites are fixed by the protocol and stay whatever the config says.
+fn order_cipher_suites(provider: &mut rustls::crypto::CryptoProvider, order: &[u16]) {
+    provider.cipher_suites.retain(|suite| {
+        let id = u16::from(suite.suite());
+        matches!(id, 0x1301..=0x1305) || order.contains(&id)
+    });
+    provider.cipher_suites.sort_by_key(|suite| {
+        let id = u16::from(suite.suite());
+        order
+            .iter()
+            .position(|&want| want == id)
+            .unwrap_or(usize::MAX)
+    });
+}
+
 pub struct RustlsProvider<S: Stream> {
     conn: rustls::ClientConnection,
     io: S,
@@ -298,15 +314,8 @@ fn build_material(cfg: &TlsConfig) -> Result<Material, TlsError> {
 
     let mut provider = (*provider()).clone();
     if !cfg.cipher_suites.is_empty() {
-        // The ring backend's set is a subset of `crypto/tls`'s, so the sort only re-orders what is reachable.
-        let order = &cfg.cipher_suites;
-        provider.cipher_suites.sort_by_key(|cs| {
-            let id = u16::from(cs.suite());
-            order
-                .iter()
-                .position(|&want| want == id)
-                .unwrap_or(usize::MAX)
-        });
+        // The ring backend's set is a subset of `crypto/tls`'s, so a named suite it cannot reach is absent rather than replaced by a stock one.
+        order_cipher_suites(&mut provider, &cfg.cipher_suites);
     }
     let provider = Arc::new(provider);
 
@@ -990,9 +999,18 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
             rustls::pki_types::PrivatePkcs1KeyDer::from(cfg.key_der),
         ),
     };
-    let mut config = rustls::ServerConfig::builder_with_provider(provider())
-        .with_safe_default_protocol_versions()
-        .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?
+    let mut provider = (*provider()).clone();
+    if !cfg.cipher_suites.is_empty() {
+        order_cipher_suites(&mut provider, &cfg.cipher_suites);
+    }
+    let versions = server_versions(cfg.min_version, cfg.max_version)?;
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::new(provider));
+    let builder = match versions.as_deref() {
+        Some(versions) => builder.with_protocol_versions(versions),
+        None => builder.with_safe_default_protocol_versions(),
+    }
+    .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?;
+    let mut config = builder
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?;
@@ -1001,6 +1019,33 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
     // rustls sends two tickets by default; REALITY arrivals carry none.
     config.send_tls13_tickets = if cfg.send_tickets { 2 } else { 0 };
     Ok(config)
+}
+
+/// The protocol versions a listener may negotiate: xray clamps Go's versions onto
+/// what this backend carries, so a floor below 1.2 starts at 1.2 and a ceiling
+/// above 1.3 stops at 1.3. No bounds keeps the backend's default pair.
+fn server_versions(
+    min: Option<u16>,
+    max: Option<u16>,
+) -> Result<Option<Vec<&'static rustls::SupportedProtocolVersion>>, TlsError> {
+    if min.is_none() && max.is_none() {
+        return Ok(None);
+    }
+    let floor = min.unwrap_or(0x0303).max(0x0303);
+    let ceiling = max.unwrap_or(0x0304).min(0x0304);
+    if floor > ceiling {
+        return Err(TlsError::Other(
+            "tls server version bounds name no supported protocol".to_owned(),
+        ));
+    }
+    let mut versions = Vec::with_capacity(2);
+    if floor == 0x0303 {
+        versions.push(&rustls::version::TLS12);
+    }
+    if ceiling == 0x0304 {
+        versions.push(&rustls::version::TLS13);
+    }
+    Ok(Some(versions))
 }
 
 pub(crate) fn cached_server_config(
@@ -1083,7 +1128,7 @@ pub(crate) fn reality_server_config(
     key.keys_match()
         .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?;
     let mut config = rustls::ServerConfig::builder_with_provider(provider())
-        .with_safe_default_protocol_versions()
+        .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(key)));
@@ -2638,6 +2683,115 @@ mod tests {
             client.read_exact(&mut buf).expect("reads");
             assert_eq!(&buf, b"ping");
         });
+    }
+
+    fn plain_identity() -> crate::tls::TlsServerConfig {
+        let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
+        let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
+        crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses")
+    }
+
+    fn stock_client_with(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+        provider: rustls::crypto::CryptoProvider,
+    ) -> rustls::ClientConfig {
+        let mut roots = RootStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(ANCHOR.to_vec()))
+            .expect("anchor");
+        rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_protocol_versions(versions)
+            .expect("client versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth()
+    }
+
+    fn stock_client(
+        versions: &[&'static rustls::SupportedProtocolVersion],
+    ) -> rustls::ClientConfig {
+        stock_client_with(versions, rustls::crypto::ring::default_provider())
+    }
+
+    fn stock_session(config: rustls::ClientConfig) -> rustls::ClientConnection {
+        rustls::ClientConnection::new(
+            Arc::new(config),
+            rustls::pki_types::ServerName::try_from("tls.test").expect("name"),
+        )
+        .expect("client session")
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_tls_ceiling_refuses_a_newer_client() {
+        let mut identity = plain_identity();
+        identity.max_version = Some(0x0303);
+        let server_config = identity.server_config().expect("server config");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                let mut server = rustls::ServerConnection::new(server_config).expect("session");
+                let _ = server.complete_io(&mut stream);
+            });
+            let mut client = stock_session(stock_client(&[&rustls::version::TLS13]));
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            assert!(
+                client.complete_io(&mut stream).is_err(),
+                "a listener with maxVersion 1.2 must refuse a TLS 1.3 client"
+            );
+        });
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_tls_floor_and_suite_reach_the_negotiation() {
+        let mut identity = plain_identity();
+        identity.min_version = Some(0x0303);
+        identity.max_version = Some(0x0303);
+        identity.cipher_suites = vec![0xc02b];
+        let server_config = identity.server_config().expect("server config");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                let mut server = rustls::ServerConnection::new(server_config).expect("session");
+                server.complete_io(&mut stream).expect("handshakes");
+            });
+            let mut provider = rustls::crypto::ring::default_provider();
+            provider
+                .cipher_suites
+                .retain(|suite| u16::from(suite.suite()) == 0xc02b);
+            let mut client = stock_session(stock_client_with(&[&rustls::version::TLS12], provider));
+            let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            client.complete_io(&mut stream).expect("handshakes");
+            assert_eq!(
+                client.protocol_version(),
+                Some(rustls::ProtocolVersion::TLSv1_2),
+                "a minVersion 1.2 listener accepts a TLS 1.2 client"
+            );
+            assert_eq!(
+                client.negotiated_cipher_suite().map(|suite| suite.suite()),
+                Some(rustls::CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256),
+                "the configured suite is the one negotiated"
+            );
+        });
+    }
+
+    #[test]
+    fn a_floor_below_tls12_starts_at_tls12() {
+        let versions = server_versions(Some(0x0301), Some(0x0304))
+            .expect("supported")
+            .expect("bounded");
+        assert_eq!(versions.len(), 2);
+        assert!(server_versions(Some(0x0304), Some(0x0303)).is_err());
     }
 
     #[cfg_attr(

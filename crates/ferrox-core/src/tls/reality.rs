@@ -148,6 +148,9 @@ impl<S: Stream> RealityServer<S> {
         };
         let identity = super::TlsServerConfig {
             alpn: Vec::new(),
+            min_version: None,
+            max_version: None,
+            cipher_suites: Vec::new(),
             cert_chain: vec![bound_certificate(&auth_key, first_name(cfg))],
             key_der: ed25519_pkcs8(),
             key_kind: super::ServerKeyKind::Pkcs8,
@@ -2348,6 +2351,9 @@ mod tests {
         // rustls emits tickets only once the client's Finished arrives, which no test peer can send without forking the transcript, so the count is pinned where it is set and the flight above shows the wire stalls.
         let forged = || super::super::TlsServerConfig {
             alpn: Vec::new(),
+            min_version: None,
+            max_version: None,
+            cipher_suites: Vec::new(),
             cert_chain: vec![bound_certificate(&[9u8; 32], SNI)],
             key_der: ed25519_pkcs8(),
             key_kind: super::super::ServerKeyKind::Pkcs8,
