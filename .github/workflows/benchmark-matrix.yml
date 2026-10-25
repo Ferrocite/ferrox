@@ -144,11 +144,15 @@ jobs:
           fi
           if [[ -n "$WANT_ONLY" ]]; then
             kept=""
+            IFS=',' read -ra pats <<< "$WANT_ONLY"
             for id in $ids; do
-              keep=1
-              IFS=',' read -ra pats <<< "$WANT_ONLY"
-              for pat in "${pats[@]}"; do [[ "$id" == *"$pat"* ]] || keep=0; done
-              ((keep)) && kept="$kept $id"
+              for pat in "${pats[@]}"; do
+                [[ -n "$pat" ]] || continue
+                if [[ "$id" == *"$pat"* ]]; then
+                  kept="$kept $id"
+                  break
+                fi
+              done
             done
             ids="$kept"
           fi
