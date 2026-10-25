@@ -37,7 +37,7 @@ try:
 
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
-    from matplotlib.patches import Patch
+    from matplotlib.lines import Line2D
 except ImportError:
     sys.exit(
         "matplotlib is required for charts only: "
@@ -91,8 +91,8 @@ PALETTE = {
     "ferrox": "#F58518",
     "xray-core-rust": "#72B7B2",
     "zeronet": "#54A24B",
-    "sing-box": "#E45756",
-    "xray-rust": "#B279A2",
+    "sing-box": "#B279A2",
+    "xray-rust": "#E45756",
     "leaf": "#B6992D",
 }
 MISSING = "#BBBBBB"
@@ -293,7 +293,7 @@ def summary_bars(series, unit, title, path, foot, suffix="", reference=None, per
             value + span * 0.02,
             tick,
             (f"{value:.0%}" if percent else f"{value:.1f}{suffix}")
-            + f"  ({len(series[name])} cells)",
+            + f"  ({len(series[name])} cell" + ("" if len(series[name]) == 1 else "s") + ")",
             va="center",
             fontsize=8,
         )
@@ -335,8 +335,9 @@ def metric_chart(scenarios, cells, metric, metric_word, unit, title, path, foot)
 def setup_chart(cells, runs_dir, path, foot):
     """Setup-stage medians for setup scenarios, milliseconds.
 
-    Each repeat's result.json already holds per-stage medians over its flows;
-    the cell value is the median of those medians, stated as such.
+    Stages and total sit on separate axes: a total several times the largest
+    stage would flatten every stage bar if they shared one scale. Stages are
+    rows and engines are bars, so long engine names never rotate into the bars.
     """
     names = sorted(s for s in cells if "setup" in s)
     if not names:
@@ -346,48 +347,66 @@ def setup_chart(cells, runs_dir, path, foot):
         ("socks_method_us", "socks method"),
         ("socks_connect_us", "socks connect"),
         ("socks_setup_us", "socks setup"),
-        ("total_us", "total"),
     ]
+    total = ("total_us", "total")
     present = engines_present(cells)
-    fig, ax = plt.subplots(figsize=(max(8.0, 1.6 * len(names)), 4.6))
-    bar_width = 0.8 / max(1, len(stages))
-    labels = []
-    for stage_index, (key, label) in enumerate(stages):
-        column = []
-        for engine in present:
-            samples = []
-            for scenario in names:
-                samples.extend(setup_medians(cells[scenario], engine, runs_dir, key))
-            column.append(benchstats.median(samples) / 1000.0 if samples else float("nan"))
-        xs = [
-            stage_index + (e - (len(present) - 1) / 2) * bar_width
-            for e in range(len(present))
-        ]
-        ax.bar(
-            xs,
-            column,
-            width=bar_width,
-            color=[PALETTE.get(e, MISSING) for e in present],
-            edgecolor="black",
-            linewidth=0.5,
-        )
-        for x, value, engine in zip(xs, column, present):
-            if value == value:
-                ax.text(x, value, engine, ha="center", va="bottom", fontsize=6, rotation=90)
-        labels.append(label)
-    ax.set_xticks(list(range(len(stages))))
-    ax.set_xticklabels(labels, fontsize=8)
-    ax.set_ylabel("ms (median of per-repeat medians)", fontsize=9)
-    ax.set_title("connection setup cost by stage", fontsize=11)
-    ax.legend(
-        handles=[Patch(color=PALETTE.get(e, MISSING), label=e) for e in present],
-        fontsize=8,
-        ncol=len(present),
+    fig, (left, right) = plt.subplots(
+        1, 2, figsize=(9.6, 4.6), gridspec_kw={"width_ratios": [3.0, 1.0]}
     )
-    ax.grid(axis="y", linestyle=":", alpha=0.6)
-    fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#666666")
-    fig.tight_layout(rect=(0, 0.06, 1, 1))
-    fig.savefig(path, dpi=110, bbox_inches="tight")
+
+    def draw(ax, specs):
+        bar_height = 0.68 / max(1, len(present))
+        row_height = 0.82 / max(1, len(present))
+        for index, engine in enumerate(present):
+            values = []
+            for key, _ in specs:
+                samples = []
+                for scenario in names:
+                    samples.extend(setup_medians(cells[scenario], engine, runs_dir, key))
+                values.append(
+                    benchstats.median(samples) / 1000.0 if samples else float("nan")
+                )
+            ys = [
+                stage + (index - (len(present) - 1) / 2) * row_height
+                for stage in range(len(specs))
+            ]
+            ax.barh(
+                ys,
+                values,
+                height=bar_height,
+                color=PALETTE.get(engine, MISSING),
+                edgecolor="#444444",
+                linewidth=0.4,
+                label=engine if specs is stages else None,
+            )
+        ax.set_yticks(range(len(specs)))
+        if len(specs) == 1:
+            ax.set_yticklabels([])
+        else:
+            ax.set_yticklabels([label for _, label in specs])
+        ax.invert_yaxis()
+        ax.set_xlabel("ms (median of per-repeat medians)", fontsize=8)
+        ax.grid(axis="x", color="#E6E6E6", linewidth=0.6)
+        ax.set_axisbelow(True)
+        for side in ("top", "right", "left"):
+            ax.spines[side].set_visible(False)
+        ax.spines["bottom"].set_color("#CCCCCC")
+        ax.tick_params(axis="y", length=0)
+
+    draw(left, stages)
+    draw(right, [total])
+    left.set_title("per stage", fontsize=10, loc="left")
+    right.set_title("total", fontsize=10, loc="left")
+    fig.legend(
+        ncol=len(present),
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.98),
+        frameon=False,
+        fontsize=8,
+    )
+    fig.text(0.5, 0.01, foot, ha="center", fontsize=7, color="#777777")
+    fig.tight_layout(rect=(0, 0.06, 1, 0.93))
+    fig.savefig(path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     return path
 
@@ -423,38 +442,41 @@ def panel_samples(cell, engine, key, scale, runs_dir):
     return [value * scale for value in values if isinstance(value, (int, float))]
 
 
-def metric_label(value, unit, engine, key, reference):
-    """The value printed beside one bar, with the same-cell reference ratio."""
+def metric_label(value, unit):
+    """The value printed beside one bar, in the panel's own unit."""
     if unit == "threads":
-        text = f"{value:.0f}"
-    elif unit == "s":
-        text = f"{value:.2f} {unit}"
-    elif unit == "calls/MiB":
-        text = f"{value:.0f} {unit}"
-    else:
-        text = f"{value:.1f} {unit}"
-    if reference and engine != "xray-core" and value > 0:
-        text += f"  ({value / reference:.2f}x xray-core)"
-    return text
+        return f"{value:.0f}"
+    if unit == "s":
+        return f"{value:.2f} s"
+    if unit == "calls/MiB":
+        return f"{value:.1f} calls/MiB" if value < 10 else f"{value:.0f} calls/MiB"
+    if unit == "MiB/s":
+        return f"{value:,.0f} MiB/s"
+    return f"{value:.1f} {unit}"
 
 
 def scenario_combined_chart(scenario, cell, path, foot, runs_dir):
     """One image per scenario: throughput, CPU, RSS, threads, start and syscalls.
 
-    Every panel is the same cell and the same engines, so a reader never has to
-    match one test's bar against another test's. A metric the runner cannot see
-    (threads on a source without them, kernel asks outside Linux) says so
-    instead of drawing a zero.
+    Every panel lists the same engines so a missing metric is a visible gap
+    rather than a shorter bar chart. The reference line is the same cell's
+    xray-core median; it is labelled once in the figure legend, not beside
+    every line, and the value label sits at the bar end without a ratio that
+    would compete with the next panel.
     """
     base, _, server = scenario.partition("--srv-")
     setup = "setup" in scenario
     panels = SETUP_PANELS if setup else PANELS
-    present = []
-    for engine in ENGINE_ORDER:
+    present = [
+        engine
+        for engine in ENGINE_ORDER
         if any(panel_samples(cell, engine, key, scale, runs_dir)
-               for key, _, _, scale, _ in panels):
-            present.append(engine)
-    fig, axes = plt.subplots(2, 3, figsize=(15.5, 8.6), constrained_layout=True)
+               for key, _, _, scale, _ in panels)
+    ]
+    fig, axes = plt.subplots(2, 3, figsize=(16.0, 9.2), sharey=True)
+    fig.subplots_adjust(
+        left=0.115, right=0.985, top=0.86, bottom=0.085, hspace=0.52, wspace=0.12
+    )
     if not present:
         for ax in axes.flat:
             ax.set_axis_off()
@@ -469,100 +491,122 @@ def scenario_combined_chart(scenario, cell, path, foot, runs_dir):
             color="#333333",
         )
     references = {}
-    if not setup:
-        for key, _, _, scale, _ in panels:
-            samples = panel_samples(cell, "xray-core", key, scale, runs_dir)
-            references[key] = benchstats.median(samples) if samples else None
-    for ax, (key, title, unit, scale, direction) in zip(axes.flat, panels):
+    for key, _, _, scale, _ in panels:
+        samples = panel_samples(cell, "xray-core", key, scale, runs_dir)
+        references[key] = benchstats.median(samples) if samples else None
+    for index, (ax, (key, title, unit, scale, direction)) in enumerate(
+        zip(axes.flat, panels)
+    ):
         reference = references.get(key)
         rows = []
         for engine in present:
             samples = panel_samples(cell, engine, key, scale, runs_dir)
-            if not samples:
-                continue
-            median = benchstats.median(samples)
-            interval = bootstrap_interval(samples)
-            rows.append((engine, median, interval))
-        if not rows:
-            ax.set_axis_off()
-            ax.text(
-                0.5,
-                0.5,
-                "not measured on this runner",
-                transform=ax.transAxes,
-                ha="center",
-                va="center",
-                fontsize=9,
-                color="#777777",
-            )
-            ax.set_title(title, fontsize=10, loc="left")
-            continue
-        names = [row[0] for row in rows]
-        values = [row[1] for row in rows]
-        lower = [max(0.0, row[1] - row[2][0]) if row[2] else 0.0 for row in rows]
-        upper = [max(0.0, row[2][1] - row[1]) if row[2] else 0.0 for row in rows]
+            if samples:
+                median = benchstats.median(samples)
+                rows.append((engine, median, bootstrap_interval(samples)))
+            else:
+                rows.append((engine, None, None))
+        values = [row[1] or 0.0 for row in rows]
+        lower = [
+            max(0.0, row[1] - row[2][0]) if row[1] is not None and row[2] else 0.0
+            for row in rows
+        ]
+        upper = [
+            max(0.0, row[2][1] - row[1]) if row[1] is not None and row[2] else 0.0
+            for row in rows
+        ]
         edges = []
-        for engine in names:
-            verdict = gated_verdict(cell, engine, "throughput") if key == "throughput_mib_s" else None
-            edges.append({"better": "#2CA02C", "worse": "#D62728"}.get(verdict, "#555555"))
+        for engine, _, _ in rows:
+            verdict = (
+                gated_verdict(cell, engine, "throughput")
+                if key == "throughput_mib_s"
+                else None
+            )
+            edges.append({"better": "#2CA02C", "worse": "#D62728"}.get(verdict, "#444444"))
         ax.barh(
-            names,
+            range(len(rows)),
             values,
             xerr=[lower, upper],
-            height=0.62,
-            color=[PALETTE.get(name, MISSING) for name in names],
+            height=0.58,
+            color=[PALETTE.get(engine, MISSING) for engine, _, _ in rows],
             edgecolor=edges,
-            linewidth=1.1,
-            error_kw={"elinewidth": 1, "capsize": 2},
+            linewidth=0.9,
+            error_kw={"elinewidth": 0.9, "capsize": 2, "capthick": 0.9},
         )
         span = max(
             max((value + up for value, up in zip(values, upper)), default=0.0),
             reference or 0.0,
         )
         span = span if span > 0 else 1.0
-        for tick, (engine, value, up) in enumerate(zip(names, values, upper)):
-            ax.text(
-                value + up + span * 0.02,
-                tick,
-                metric_label(value, unit, engine, key, reference),
-                va="center",
-                fontsize=8,
-            )
+        for tick, (value, up, row) in enumerate(zip(values, upper, rows)):
+            if row[1] is not None:
+                ax.text(
+                    value + up + span * 0.02,
+                    tick,
+                    metric_label(value, unit),
+                    va="center",
+                    fontsize=7.5,
+                    color="#333333",
+                )
+            else:
+                ax.text(
+                    0,
+                    tick,
+                    "not measured",
+                    va="center",
+                    fontsize=7,
+                    color="#999999",
+                )
         if reference:
-            ax.axvline(reference, color="#999999", linestyle="--", linewidth=0.9)
-            ax.text(
-                reference,
-                -0.62,
-                f" xray-core {reference:.1f}",
-                fontsize=7,
-                color="#666666",
-                va="bottom",
-                ha="left",
-            )
-        ax.set_xlim(0, span * 1.38)
-        ax.invert_yaxis()
-        ax.set_xlabel(unit, fontsize=8)
-        suffix = " (higher is better)" if direction == "higher" else " (lower is better)"
-        ax.set_title(title + suffix, fontsize=10, loc="left")
-        ax.grid(axis="x", linestyle=":", alpha=0.6)
+            ax.axvline(reference, color="#8A8A8A", linestyle=(0, (3, 2)), linewidth=0.9)
+        ax.set_xlim(0, span * 1.28)
+        ax.set_ylim(len(present) - 0.5, -0.5)
+        ax.set_yticks(range(len(present)))
+        if index % 3 == 0:
+            ax.set_yticklabels(present)
+        else:
+            ax.tick_params(axis="y", labelleft=False)
+        ax.set_xlabel(unit, fontsize=8, labelpad=2)
+        ax.set_title(title, fontsize=10, loc="left", pad=6)
+        ax.grid(axis="x", color="#E6E6E6", linewidth=0.6)
         ax.set_axisbelow(True)
-        for side in ("top", "right"):
+        for side in ("top", "right", "left"):
             ax.spines[side].set_visible(False)
-        ax.tick_params(axis="y", length=0)
-    fig.suptitle(f"{base} on {server}", x=0.01, ha="left", fontsize=14, fontweight="bold")
+        ax.spines["bottom"].set_color("#CCCCCC")
+        ax.tick_params(axis="y", length=0, pad=4)
+        ax.tick_params(axis="x", length=2, colors="#555555")
+    fig.suptitle(
+        f"{base} · {server}",
+        x=0.011,
+        y=0.972,
+        ha="left",
+        fontsize=15,
+        fontweight="bold",
+        color="#222222",
+    )
     fig.text(
-        0.01,
-        0.935,
-        "medians of this cell's repeats; whiskers are 95% bootstrap intervals "
-        "of the engine's own repeats",
+        0.011,
+        0.93,
+        "Medians of this cell's repeats. Whiskers are 95% bootstrap intervals. "
+        + ("Lower is better." if setup else "Lower is better except throughput."),
         fontsize=8,
-        color="#555555",
+        color="#666666",
         ha="left",
     )
-    fig.text(0.5, 0.005, foot, ha="center", fontsize=7, color="#666666")
-    fig.savefig(path, dpi=150, bbox_inches="tight")
+    if any(references.values()):
+        fig.legend(
+            handles=[Line2D([0], [0], color="#8A8A8A", linestyle=(0, (3, 2)), linewidth=1)],
+            labels=["xray-core"],
+            loc="upper right",
+            bbox_to_anchor=(0.985, 0.955),
+            frameon=False,
+            fontsize=8,
+        )
+    fig.text(0.011, 0.018, foot, ha="left", fontsize=7, color="#777777")
+    fig.savefig(path, dpi=160, bbox_inches="tight")
     plt.close(fig)
     return path
+
 
 def coverage_table(results):
     """Markdown coverage grid: pass, fail, or the reason for a gap."""
