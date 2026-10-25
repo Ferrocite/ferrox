@@ -113,7 +113,7 @@ impl Meter {
 }
 
 #[derive(Debug)]
-struct OnlineLease {
+pub(crate) struct OnlineLease {
     email: String,
 }
 
@@ -276,9 +276,9 @@ pub(crate) fn outbound(tag: Option<&str>) -> Meter {
     }
 }
 
-/// The user meter a decoded account adds: payload counters and the online lease the reference
-/// holds for the life of the session.
-pub(crate) fn user(email: &str, level: u32) -> Meter {
+/// The counters a decoded account adds. The online lease is separate because the reference
+/// starts it after the protocol authenticates, not when the stream is accepted.
+pub(crate) fn user_traffic(email: &str, level: u32) -> Meter {
     if !enabled() || email.is_empty() {
         return Meter::default();
     }
@@ -297,17 +297,36 @@ pub(crate) fn user(email: &str, level: u32) -> Meter {
         .then(|| counter(&traffic("user", email, "downlink")))
         .into_iter()
         .collect();
-    let online = policy.user_online.then(|| {
-        registry().online_add(email);
-        Arc::new(OnlineLease {
-            email: email.to_owned(),
-        })
-    });
     Meter {
         read,
         write,
-        online,
+        online: None,
     }
+}
+
+/// The online lease an authenticated account holds: the reference tracks it once the protocol
+/// names the user, so an unauthenticated probe never enters the map.
+pub(crate) fn online(email: &str, level: u32) -> Option<Arc<OnlineLease>> {
+    if !enabled() || email.is_empty() {
+        return None;
+    }
+    let policy = policy::configured()
+        .and_then(|config| config.levels.get(&level).map(|level| level.stats))?;
+    if !policy.user_online {
+        return None;
+    }
+    registry().online_add(email);
+    Some(Arc::new(OnlineLease {
+        email: email.to_owned(),
+    }))
+}
+
+/// The user meter a decoded account adds: payload counters and the online lease the reference
+/// holds for the life of the session.
+pub(crate) fn user(email: &str, level: u32) -> Meter {
+    let mut meter = user_traffic(email, level);
+    meter.online = online(email, level);
+    meter
 }
 
 /// One tag's traffic, as the metrics app prints it.
