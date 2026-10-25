@@ -65,6 +65,7 @@ pub(crate) fn serve(mut stream: Connection, password: &str, method: &str, freedo
     let Some((target, used)) = parse_addr_header(chunk) else {
         return;
     };
+    crate::accesslog::record_current(&target);
     let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
@@ -126,6 +127,7 @@ fn serve_stream(mut stream: Connection, password: &str) {
     let Some((recv, (target, used), len)) = opened else {
         return;
     };
+    crate::accesslog::record_current(&target);
     let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
@@ -377,6 +379,7 @@ fn accept_stream(
             break found;
         }
     };
+    crate::accesslog::record_current(&target);
     let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
     uplink.write_all(&head[used..len]).ok()?;
     let mut iv = [0u8; IV_LEN];
@@ -409,6 +412,7 @@ fn accept_on(
     let mut head = wire_buffer();
     let chunk = open_chunk(reader, &mut recv, &mut head)?;
     let (target, used) = parse_addr_header(chunk)?;
+    crate::accesslog::record_current(&target);
     let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
     uplink.write_all(&chunk[used..]).ok()?;
     drop(head);

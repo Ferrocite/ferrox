@@ -897,6 +897,7 @@ enum Role {
         key: [u8; 56],
         carrier: Carrier,
         freedom: bool,
+        account: InboundAccount,
     },
     TrojanTls {
         key: [u8; 56],
@@ -904,17 +905,20 @@ enum Role {
         freedom: bool,
         server: Arc<ferrox_core::tls::TlsServerConfig>,
         fallbacks: Option<Arc<[Fallback]>>,
+        account: InboundAccount,
     },
     Vmess {
         id: [u8; 16],
         carrier: Carrier,
         freedom: bool,
+        account: InboundAccount,
     },
     VmessTls {
         id: [u8; 16],
         carrier: Carrier,
         freedom: bool,
         server: Arc<ferrox_core::tls::TlsServerConfig>,
+        account: InboundAccount,
     },
     Shadowsocks {
         password: String,
@@ -922,6 +926,7 @@ enum Role {
         carrier: Carrier,
         freedom: bool,
         tls: Option<Arc<ferrox_core::tls::TlsServerConfig>>,
+        account: InboundAccount,
     },
     Socks {
         out: Outbound,
@@ -963,6 +968,25 @@ impl Role {
                 None
             }
             Role::Proxied(inner) => inner.tcp_mask(),
+        }
+    }
+
+    /// The account a protocol's front authenticated, when the config names one.
+    fn account(&self) -> Option<&InboundAccount> {
+        match self {
+            Role::Trojan { account, .. }
+            | Role::TrojanTls { account, .. }
+            | Role::Vmess { account, .. }
+            | Role::VmessTls { account, .. }
+            | Role::Shadowsocks { account, .. } => Some(account),
+            Role::Vless { .. }
+            | Role::VlessTls { .. }
+            | Role::VlessReality { .. }
+            | Role::Socks { .. }
+            | Role::Http { .. }
+            | Role::Mixed { .. }
+            | Role::Dokodemo { .. } => None,
+            Role::Proxied(inner) => inner.account(),
         }
     }
 }
@@ -5953,6 +5977,7 @@ fn serve_trojan_kcp(conn: &Arc<ferrox_core::kcp::Connection>, key: &[u8; 56], fr
     if !freedom {
         return;
     }
+    crate::accesslog::record_current(&target);
     if cmd == 3 {
         let (reader, writer, close) = kcp_parts(conn);
         return serve_trojan_udp_halves(reader, writer, move || close());
@@ -6361,6 +6386,7 @@ fn serve_trojan_xdrive(mut session: crate::xdrive::Conn, key: &[u8; 56], freedom
     if !freedom || cmd != 1 {
         return;
     }
+    crate::accesslog::record_current(&target);
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -6571,6 +6597,7 @@ fn hc_content_length(head: &str) -> Option<usize> {
 
 fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
     let key = trojan_key(&inbound_password(inbound));
+    let account = inbound_account(inbound);
     let sec = stream_security(inbound);
     // A REALITY inbound has no Trojan arm yet, and reading only `tls` here would serve it as plaintext.
     if sec == "reality" {
@@ -6590,20 +6617,30 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
     };
     match inbound_carrier(inbound) {
         Carrier::Kcp(config) => {
+            let email = account.email.clone();
             let serve: KcpServe = if sec == "tls" {
                 let Some(server) = inbound_tls_identity(inbound) else {
                     eprintln!("unreadable trojan tls identity on {address}: refused, not served");
                     return false;
                 };
-                Arc::new(move |conn| serve_trojan_kcp_tls(conn, &key, freedom, &server))
+                Arc::new(move |conn| {
+                    let _flow = crate::accesslog::flow(None, &email);
+                    serve_trojan_kcp_tls(conn, &key, freedom, &server);
+                })
             } else {
-                Arc::new(move |conn| serve_trojan_kcp(conn, &key, freedom))
+                Arc::new(move |conn| {
+                    let _flow = crate::accesslog::flow(None, &email);
+                    serve_trojan_kcp(conn, &key, freedom);
+                })
             };
             serve_kcp_bound(address, config, &serve)
         }
         Carrier::Xdrive { settings } => {
-            let accept: crate::xdrive::Accept =
-                Arc::new(move |session| serve_trojan_xdrive(session, &key, freedom));
+            let email = account.email.clone();
+            let accept: crate::xdrive::Accept = Arc::new(move |session| {
+                let _flow = crate::accesslog::flow(None, &email);
+                serve_trojan_xdrive(session, &key, freedom);
+            });
             serve_xdrive_loop(&settings, address, accept);
             true
         }
@@ -6623,6 +6660,7 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
                         freedom,
                         server,
                         fallbacks,
+                        account,
                     },
                 ),
                 inbound_tag(inbound),
@@ -6638,6 +6676,7 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
                         key,
                         carrier,
                         freedom,
+                        account,
                     },
                 ),
                 inbound_tag(inbound),
@@ -6649,17 +6688,23 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
 
 fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
     let id = inbound_id(inbound);
+    let account = inbound_account(inbound);
     let sec = stream_security(inbound);
     match inbound_carrier(inbound) {
         Carrier::Kcp(config) => {
+            let email = account.email.clone();
             let serve: KcpServe = if sec == "tls" {
                 let Some(server) = inbound_tls_identity(inbound) else {
                     eprintln!("unreadable vmess tls identity on {address}: refused, not served");
                     return;
                 };
-                Arc::new(move |conn| serve_vmess_kcp_tls(conn, &id, freedom, &server))
+                Arc::new(move |conn| {
+                    let _flow = crate::accesslog::flow(None, &email);
+                    serve_vmess_kcp_tls(conn, &id, freedom, &server);
+                })
             } else {
                 Arc::new(move |conn| {
+                    let _flow = crate::accesslog::flow(None, &email);
                     let (reader, writer, close) = kcp_parts(conn);
                     crate::vmess::serve_kcp(reader, writer, &id, freedom, &close);
                 })
@@ -6668,8 +6713,11 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
             let _ = serve_kcp_bound(&owned, config, &serve);
         }
         Carrier::Xdrive { settings } => {
-            let accept: crate::xdrive::Accept =
-                Arc::new(move |session| serve_vmess_xdrive(session, &id, freedom));
+            let email = account.email.clone();
+            let accept: crate::xdrive::Accept = Arc::new(move |session| {
+                let _flow = crate::accesslog::flow(None, &email);
+                serve_vmess_xdrive(session, &id, freedom);
+            });
             serve_xdrive_loop(&settings, address, accept);
         }
         carrier if sec == "tls" => {
@@ -6686,6 +6734,7 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
                         carrier,
                         freedom,
                         server,
+                        account,
                     },
                 ),
                 inbound_tag(inbound),
@@ -6699,6 +6748,7 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
                     id,
                     carrier: other,
                     freedom,
+                    account,
                 },
             ),
             inbound_tag(inbound),
@@ -6893,6 +6943,7 @@ fn inbound_ss_destinations(inbound: &Json, method: &str) -> Vec<(Vec<u8>, Socket
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_ss_kcp_listener(
     address: &str,
     inbound: &Json,
@@ -6901,19 +6952,24 @@ fn serve_ss_kcp_listener(
     method: &str,
     freedom: bool,
     is_2022: bool,
+    email: &str,
 ) -> bool {
     let password = password.to_owned();
     let method = method.to_owned();
+    let email = email.to_owned();
     let serve: KcpServe = if stream_security(inbound) == "tls" {
         let Some(server) = inbound_tls_identity(inbound) else {
             eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
             return false;
         };
+        let email = email.clone();
         Arc::new(move |conn| {
+            let _flow = crate::accesslog::flow(None, &email);
             serve_ss_kcp_tls(conn, &password, &method, freedom, is_2022, &server);
         })
     } else {
         Arc::new(move |conn| {
+            let _flow = crate::accesslog::flow(None, &email);
             let (reader, writer, close) = kcp_parts(conn);
             if is_2022 {
                 crate::shadowsocks2022::serve_kcp(
@@ -6969,6 +7025,7 @@ fn serve_ss_relay_inbound(address: &str, inbound: &Json, password: &str, method:
 
 fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     let password = inbound_ss_password(inbound);
+    let account = inbound_account(inbound);
     let method = inbound_method(inbound);
     let carrier = inbound_carrier(inbound);
     let udp_raw = matches!(carrier, Carrier::Raw(_));
@@ -6984,7 +7041,14 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     match carrier {
         Carrier::Kcp(config) => {
             if !serve_ss_kcp_listener(
-                address, inbound, config, &password, &method, freedom, is_2022,
+                address,
+                inbound,
+                config,
+                &password,
+                &method,
+                freedom,
+                is_2022,
+                &account.email,
             ) {
                 return;
             }
@@ -6992,7 +7056,9 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
         Carrier::Xdrive { settings } => {
             let password = password.clone();
             let method = method.clone();
+            let email = account.email.clone();
             let accept: crate::xdrive::Accept = Arc::new(move |session| {
+                let _flow = crate::accesslog::flow(None, &email);
                 serve_ss_xdrive(session, &password, &method, freedom, is_2022);
             });
             serve_xdrive_loop(&settings, address, accept);
@@ -7012,6 +7078,7 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
                         carrier,
                         freedom,
                         tls: Some(server),
+                        account,
                     },
                 ),
                 inbound_tag(inbound),
@@ -7031,6 +7098,7 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
                     carrier: other,
                     freedom,
                     tls: None,
+                    account,
                 },
             ),
             inbound_tag(inbound),
@@ -10419,6 +10487,7 @@ fn serve_trojan_raw(mut stream: Connection, key: &[u8; 56], freedom: bool) {
     if !freedom {
         return;
     }
+    crate::accesslog::record_current(&target);
     if cmd == 3 {
         return serve_trojan_udp(stream);
     }
@@ -10538,6 +10607,7 @@ fn serve_trojan_ws(stream: Connection, key: &[u8; 56], path: &str, freedom: bool
     if !freedom {
         return;
     }
+    crate::accesslog::record_current(&target);
     if cmd == 3 {
         let closer = writer.clone();
         return serve_trojan_udp_halves(reader, writer, move || closer.close());
@@ -10567,6 +10637,7 @@ fn serve_trojan_httpupgrade(
     if !freedom {
         return;
     }
+    crate::accesslog::record_current(&target);
     if cmd == 3 {
         let close = write.try_clone().ok();
         return serve_trojan_udp_halves(reader, write, move || {
@@ -10595,6 +10666,7 @@ fn serve_trojan_grpc(stream: Connection, key: &[u8; 56], path: &str, freedom: bo
     if !freedom {
         return;
     }
+    crate::accesslog::record_current(&target);
     if cmd == 3 {
         let closer = writer.clone();
         return serve_trojan_udp_halves(reader, writer, move || closer.close());
@@ -10618,6 +10690,7 @@ fn serve_trojan_xhttp(stream: Connection, key: &[u8; 56], path: &str, freedom: b
     if !freedom {
         return;
     }
+    crate::accesslog::record_current(&target);
     if cmd == 3 {
         let closer = writer.clone();
         return serve_trojan_udp_halves(reader, writer, move || closer.finish());
@@ -10641,6 +10714,7 @@ fn serve_trojan_httpheader(stream: Connection, key: &[u8; 56], path: &str, freed
     if !freedom {
         return;
     }
+    crate::accesslog::record_current(&target);
     if cmd == 3 {
         let close = write.try_clone().ok();
         return serve_trojan_udp_halves(reader, write, move || {
@@ -10832,6 +10906,7 @@ fn relay_trojan_request<S>(
     if !freedom {
         return;
     }
+    crate::accesslog::record_current(&target);
     if cmd == 3 {
         if let Some(raw) = raw {
             let Ok(close) = raw.try_clone() else {
@@ -10911,6 +10986,7 @@ fn serve_session_trojan_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
         echo_trace("session ws trojan decode refused");
         return;
     };
+    crate::accesslog::record_current(&target);
     if !freedom {
         echo_trace("session ws trojan cmd refused");
         return;
@@ -10950,6 +11026,7 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
         cwriter.finish();
         return;
     };
+    crate::accesslog::record_current(&target);
     if !freedom {
         echo_trace("session xhttp trojan cmd refused");
         cwriter.finish();
@@ -11001,6 +11078,7 @@ fn serve_session_trojan_httpupgrade<R: Read + Send + 'static, W: Write + Clone +
         crate::httpupgrade::quiet(&raw);
         return;
     };
+    crate::accesslog::record_current(&target);
     if !freedom {
         echo_trace("session httpupgrade trojan cmd refused");
         crate::httpupgrade::quiet(&raw);
@@ -11054,6 +11132,7 @@ fn serve_session_trojan_httpheader<R: Read + Send + 'static, W: Write + Clone + 
         echo_trace("session httpheader trojan decode refused");
         return;
     };
+    crate::accesslog::record_current(&target);
     if !freedom {
         echo_trace("session httpheader trojan cmd refused");
         return;
@@ -11097,6 +11176,7 @@ fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
         echo_trace("session grpc trojan decode refused");
         return;
     };
+    crate::accesslog::record_current(&target);
     if !freedom {
         echo_trace("session grpc trojan cmd refused");
         return;
@@ -16926,6 +17006,30 @@ fn read_socks_addr_rest(stream: &mut dyn Read, atyp: u8) -> Option<SocketAddr> {
             ))
         }
         _ => None,
+    }
+}
+
+/// The account a single-client inbound names: its counters and the access line key on these.
+#[derive(Clone, Debug, Default)]
+struct InboundAccount {
+    email: String,
+    level: u32,
+}
+
+fn inbound_account(inbound: &Json) -> InboundAccount {
+    let client = inbound_first_client(inbound);
+    let settings = inbound.get("settings");
+    let field = |name: &str| {
+        client
+            .and_then(|client| client.get(name))
+            .or_else(|| settings.and_then(|settings| settings.get(name)))
+    };
+    InboundAccount {
+        email: field("email")
+            .and_then(Json::as_str)
+            .unwrap_or("")
+            .to_owned(),
+        level: field("level").and_then(Json::as_u32).unwrap_or(0),
     }
 }
 
@@ -30838,6 +30942,7 @@ mod tests {
             key: [0u8; 56],
             carrier: stream_carrier(Some(&settings)),
             freedom: false,
+            account: InboundAccount::default(),
         };
         assert!(role.tcp_mask().is_some(), "a raw carrier arms its chain");
         let bare = Role::Vless {
@@ -35053,6 +35158,24 @@ mod tests {
             .expect("gets");
         let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("answers");
         assert_eq!(head, HTTP_AUTH_REQUIRED, "the http side asks the same");
+    }
+
+    #[test]
+    fn a_single_client_inbound_carries_its_email_and_level() {
+        let trojan = crate::json::parse(
+            r#"{"settings":{"clients":[{"password":"p","email":"a@example","level":3}]}}"#,
+        )
+        .expect("parses");
+        let account = inbound_account(&trojan);
+        assert_eq!(account.email, "a@example");
+        assert_eq!(account.level, 3);
+
+        let shadowsocks =
+            crate::json::parse(r#"{"settings":{"password":"p","email":"b@example","level":4}}"#)
+                .expect("parses");
+        let account = inbound_account(&shadowsocks);
+        assert_eq!(account.email, "b@example");
+        assert_eq!(account.level, 4);
     }
 
     #[test]
@@ -39607,6 +39730,23 @@ fn serve_vmess_role(stream: Connection, id: &[u8; 16], carrier: &Carrier, freedo
 
 /// The inbound a role serves one front stream with.
 fn front_dispatch(stream: Connection, role: Role) {
+    let account = role.account().cloned();
+    let source = stream.peer_addr().ok();
+    let email = account
+        .as_ref()
+        .map_or("", |account| account.email.as_str());
+    let _flow = crate::accesslog::flow(source, email);
+    dispatch(stream, role, account.as_ref());
+}
+
+#[allow(clippy::too_many_lines)]
+fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
+    let stream = match account {
+        Some(account) => stream
+            .with_meter(crate::stats::user(&account.email, account.level))
+            .with_policy(Some(crate::policy::flow(account.level))),
+        None => stream,
+    };
     match role {
         Role::Vless {
             users,
@@ -39646,6 +39786,7 @@ fn front_dispatch(stream: Connection, role: Role) {
             key,
             carrier,
             freedom,
+            account: _,
         } => serve_trojan(stream, &key, &carrier, freedom),
         Role::TrojanTls {
             key,
@@ -39653,6 +39794,7 @@ fn front_dispatch(stream: Connection, role: Role) {
             freedom,
             server,
             fallbacks,
+            account: _,
         } => serve_trojan_tls(
             stream,
             &key,
@@ -39665,12 +39807,14 @@ fn front_dispatch(stream: Connection, role: Role) {
             id,
             carrier,
             freedom,
+            account: _,
         } => serve_vmess_role(stream, &id, &carrier, freedom),
         Role::VmessTls {
             id,
             carrier,
             freedom,
             server,
+            account: _,
         } => serve_vmess_tls(stream, &id, &carrier, freedom, &server),
         Role::Shadowsocks {
             password,
@@ -39678,6 +39822,7 @@ fn front_dispatch(stream: Connection, role: Role) {
             carrier,
             freedom,
             tls,
+            account: _,
         } => serve_shadowsocks(
             stream,
             &password,
@@ -39704,7 +39849,7 @@ fn front_dispatch(stream: Connection, role: Role) {
             let dest = dial.as_ref().unwrap_or(dest);
             serve_connect(stream, target, dest, Front::Socks, &[], tag);
         }
-        Role::Proxied(inner) => front_dispatch(stream, *inner),
+        Role::Proxied(inner) => dispatch(stream, *inner, None),
     }
 }
 

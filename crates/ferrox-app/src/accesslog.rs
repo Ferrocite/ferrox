@@ -1,8 +1,47 @@
 use crate::json::Json;
+use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::sync::{Mutex, MutexGuard};
+
+#[derive(Clone, Default)]
+struct Flow {
+    source: Option<SocketAddr>,
+    email: String,
+}
+
+thread_local! {
+    static FLOW: RefCell<Flow> = RefCell::new(Flow::default());
+}
+
+/// The source and account a front's flows are logged with until the session ends.
+pub(crate) struct FlowGuard;
+
+pub(crate) fn flow(source: Option<SocketAddr>, email: &str) -> FlowGuard {
+    FLOW.with(|flow| {
+        *flow.borrow_mut() = Flow {
+            source,
+            email: email.to_owned(),
+        };
+    });
+    FlowGuard
+}
+
+impl Drop for FlowGuard {
+    fn drop(&mut self) {
+        FLOW.with(|flow| *flow.borrow_mut() = Flow::default());
+    }
+}
+
+/// One accepted line for the flow the current front is serving, at the destination its request named.
+pub(crate) fn record_current(destination: &dyn std::fmt::Display) {
+    let (source, email) = FLOW.with(|flow| {
+        let flow = flow.borrow();
+        (flow.source, flow.email.clone())
+    });
+    record(source, true, destination, None, "", &email);
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Config {
@@ -172,6 +211,33 @@ mod tests {
         assert_eq!(
             text,
             "from 192.0.2.10:1234 accepted example.com:443 [proxy] accept email: a@b.c\n"
+        );
+        let _ = std::fs::remove_file(&path);
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+    }
+
+    #[test]
+    fn a_flow_records_the_fronts_source_and_email() {
+        let _guard = crate::stats::test_lock();
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-access-flow-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let mut quoted = String::new();
+        crate::json::write(&Json::Str(path.to_string_lossy().into_owned()), &mut quoted);
+        let root =
+            crate::json::parse(&format!(r#"{{"log":{{"access":{quoted}}}}}"#)).expect("parses");
+        install(&root).expect("access log installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        let flow = flow(Some(source), "a@b.c");
+        record_current(&"example.com:443");
+        drop(flow);
+        let text = std::fs::read_to_string(&path).expect("reads the line");
+        assert_eq!(
+            text,
+            "from 192.0.2.10:1234 accepted example.com:443 email: a@b.c
+"
         );
         let _ = std::fs::remove_file(&path);
         install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
