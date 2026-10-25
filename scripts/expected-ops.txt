@@ -128,10 +128,10 @@ append_pem 591
 # malformed name. The inline question and rule buffers moved it from 55544745
 # (c6099e2) to 60123580; folding the name once per question instead of once per
 # domain rule moved it to 47810992, the ops run on 86e28e9.
-# Re-blessed 47810992 by p2-vision-walk: the decide probe and dns.rs are
-# untouched; the wireguard-mac1 layout that measured 47810894 did not survive
-# the merge, and the DNS page's 47810992 is what this tree measures.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 47810992 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# Re-blessed 47810894 by the idle-scheduler test: the new test in
+# connection.rs shifts the ferrox-core test binary's CGU layout; dns.rs and the
+# DNS page's method count are untouched.
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 47810894 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
