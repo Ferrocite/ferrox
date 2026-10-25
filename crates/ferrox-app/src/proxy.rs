@@ -9945,6 +9945,7 @@ where
     true
 }
 
+#[derive(Clone, Copy)]
 struct TlsDial<'a> {
     server: &'a SocketAddr,
     cfg: &'a ferrox_core::tls::TlsConfig,
@@ -38970,6 +38971,24 @@ mod dns_lane_tests {
     }
 }
 
+fn serve_vmess_role(stream: Connection, id: &[u8; 16], carrier: &Carrier, freedom: bool) {
+    match carrier {
+        Carrier::Raw(_) => crate::vmess::serve(stream, id, freedom),
+        Carrier::Ws { path, .. } => crate::vmess::serve_ws(stream, path.as_str(), id, freedom),
+        Carrier::Xhttp { settings, .. } => {
+            crate::vmess::serve_xhttp(stream, settings.path.as_str(), id, freedom);
+        }
+        Carrier::HttpHeader { path } => {
+            crate::vmess::serve_httpheader(stream, path.as_str(), id, freedom);
+        }
+        Carrier::HttpUpgrade { path, host, .. } => {
+            crate::vmess::serve_httpupgrade(stream, path.as_str(), host, id, freedom);
+        }
+        Carrier::Grpc { path } => crate::vmess::serve_grpc(stream, path.as_str(), id, freedom),
+        refused_carriers!() => {}
+    }
+}
+
 /// The inbound a role serves one front stream with.
 fn front_dispatch(stream: Connection, role: Role) {
     match role {
@@ -39022,25 +39041,7 @@ fn front_dispatch(stream: Connection, role: Role) {
             id,
             carrier,
             freedom,
-        } => match carrier {
-            Carrier::Raw(_) => crate::vmess::serve(stream, &id, freedom),
-            Carrier::Ws { path, .. } => {
-                crate::vmess::serve_ws(stream, path.as_str(), &id, freedom);
-            }
-            Carrier::Xhttp { settings, .. } => {
-                crate::vmess::serve_xhttp(stream, settings.path.as_str(), &id, freedom);
-            }
-            Carrier::HttpHeader { path } => {
-                crate::vmess::serve_httpheader(stream, path.as_str(), &id, freedom);
-            }
-            Carrier::HttpUpgrade { path, host, .. } => {
-                crate::vmess::serve_httpupgrade(stream, path.as_str(), &host, &id, freedom);
-            }
-            Carrier::Grpc { path } => {
-                crate::vmess::serve_grpc(stream, path.as_str(), &id, freedom);
-            }
-            refused_carriers!() => {}
-        },
+        } => serve_vmess_role(stream, &id, &carrier, freedom),
         Role::VmessTls {
             id,
             carrier,
