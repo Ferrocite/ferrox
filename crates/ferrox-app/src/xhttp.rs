@@ -1368,6 +1368,16 @@ fn close_session(s: &Arc<Session>) {
     s.cv.notify_all();
 }
 
+fn remove_session_if_owned(id: &str, session: &Session) {
+    let mut map = sessions().lock().expect("sessions lock");
+    if map
+        .get(id)
+        .is_some_and(|carried| std::ptr::eq(Arc::as_ptr(carried), session))
+    {
+        map.remove(id);
+    }
+}
+
 // Drop is the only other way a session ends, and a waiter parked before a reader exists has no Drop to run.
 pub(crate) fn end_session(id: &str) {
     let carried = sessions().lock().expect("sessions lock").remove(id);
@@ -1453,13 +1463,7 @@ impl Session {
         }
         drop(st);
         if expired {
-            let mut map = sessions().lock().expect("sessions lock");
-            if map
-                .get(&self.id)
-                .is_some_and(|carried| std::ptr::eq(Arc::as_ptr(carried), self))
-            {
-                map.remove(&self.id);
-            }
+            remove_session_if_owned(&self.id, self);
         }
     }
 }
@@ -1559,8 +1563,7 @@ impl Read for SessionReader {
 impl Drop for SessionReader {
     fn drop(&mut self) {
         if !self.id.is_empty() {
-            let mut map = sessions().lock().expect("sessions lock");
-            map.remove(&self.id);
+            remove_session_if_owned(&self.id, self.session.as_ref());
         }
         close_session(&self.session);
     }
