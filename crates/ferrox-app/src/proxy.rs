@@ -25298,6 +25298,66 @@ mod tests {
         );
     }
 
+    /// A trojan client that pipelines its first payload with the request header keeps it: the
+    /// probe's first read stops at the header and the relay forwards what rode behind it.
+    #[test]
+    fn a_trojan_tls_probe_keeps_the_payload_that_rides_with_the_header() {
+        let (cert, key, client) = tls_cert_json();
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = echo.accept().expect("accepts");
+            relay(&stream, &stream);
+        });
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan",
+                "settings": {{"clients": [{{"password": "secret"}}],
+                    "fallbacks": [{{"dest": "127.0.0.1:{echo_port}"}}]}},
+                "streamSettings": {{"network": "tcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_trojan_inbound(&address, &inbound, true));
+        let waited = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "trojan listener never bound"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let addr: SocketAddr = address.parse().expect("addr");
+        let mut session = dial_tls_session(&addr, &client, None).expect("dialled");
+        let mut request = Vec::new();
+        request.extend_from_slice(&trojan_key("secret"));
+        request.extend_from_slice(b"\r\n\x01\x01\x7f\x00\x00\x01");
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        request.extend_from_slice(b"\r\nearly");
+        session.write_all(&request).expect("writes");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 16];
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            match session.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(error) if is_timeout(&error) => {}
+                Err(_) => break,
+            }
+            if got == b"early" {
+                break;
+            }
+        }
+        assert_eq!(
+            got, b"early",
+            "the pipelined payload reaches the target and returns"
+        );
+    }
+
     /// The vmess listener reads its stream settings: a tls inbound answers the handshake before any carrier.
     #[test]
     fn a_vmess_inbound_that_declares_tls_answers_every_carrier() {
