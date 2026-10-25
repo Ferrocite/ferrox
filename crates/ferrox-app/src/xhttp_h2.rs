@@ -383,6 +383,7 @@ impl H2Conn {
                 state.cv.notify_all();
             }
         }
+        self.wake.notify_all();
         self.end_session_of(stream);
         let _ = self.frame(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
     }
