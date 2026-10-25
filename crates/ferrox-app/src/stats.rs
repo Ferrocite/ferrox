@@ -104,6 +104,16 @@ impl Meter {
         }
     }
 
+    /// The same counters seen from the far side of a relay: reads there are downlink and writes
+    /// are uplink.
+    pub(crate) fn reversed(self) -> Self {
+        Self {
+            read: self.write,
+            write: self.read,
+            online: self.online,
+        }
+    }
+
     /// A newer meter for the same flow keeps the counters the older one carried and adds the
     /// ones it names, so wrapping a decoded user never stops the inbound's own count.
     pub(crate) fn merged(mut self, newer: Self) -> Self {
@@ -497,6 +507,26 @@ mod tests {
         let snapshot = snapshot();
         assert_eq!(snapshot.inbound["in"].uplink, 9);
         assert_eq!(snapshot.user["alice@example"].uplink, 9);
+        clear();
+    }
+
+    #[test]
+    fn a_reversed_user_meter_counts_the_far_side_directions() {
+        let _guard = test_lock();
+        clear();
+        let root = crate::json::parse(
+            r#"{"stats":{},"policy":{"levels":{"1":{"statsUserUplink":true,
+                "statsUserDownlink":true}}}}"#,
+        )
+        .expect("parses");
+        crate::policy::install(&root).expect("policy installs");
+        install(&root).expect("stats installs");
+        let meter = user("alice@example", 1).reversed();
+        meter.write(11);
+        meter.read(7);
+        let snapshot = snapshot();
+        assert_eq!(snapshot.user["alice@example"].uplink, 11);
+        assert_eq!(snapshot.user["alice@example"].downlink, 7);
         clear();
     }
 

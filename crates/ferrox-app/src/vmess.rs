@@ -1557,7 +1557,7 @@ fn serve_decoded<R, W>(
                 close();
                 return;
             };
-            let uplink = uplink.with_meter(user);
+            let uplink = uplink.with_meter(user.reversed());
             if !write_prefix(&mut writer, &prefix) {
                 close();
                 return;
@@ -1863,7 +1863,7 @@ pub(crate) fn serve(mut stream: Connection, users: &Users, freedom: bool) {
     let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
-    let uplink = uplink.with_meter(user);
+    let uplink = uplink.with_meter(user.reversed());
     if stream.write_all(&prefix).is_err() {
         return;
     }

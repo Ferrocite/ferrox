@@ -22,6 +22,7 @@ pub(crate) struct Seed {
     pub(crate) outbounds: Vec<(String, Vec<u8>)>,
     pub(crate) api: Option<crate::commander::ApiConfig>,
     pub(crate) policy: Option<crate::policy::Config>,
+    pub(crate) stats: bool,
 }
 
 pub(crate) fn to_json_seeded(bytes: &[u8]) -> Result<(Json, Seed), String> {
@@ -71,6 +72,7 @@ pub(crate) fn to_json_seeded(bytes: &[u8]) -> Result<(Json, Seed), String> {
                         }
                         seed.policy = Some(policy_settings(value)?);
                     }
+                    "xray.app.stats.Config" => seed.stats = true,
                     _ => {}
                 }
             }
@@ -90,6 +92,9 @@ pub(crate) fn to_json_seeded(bytes: &[u8]) -> Result<(Json, Seed), String> {
     }
     if let Some(dns) = dns {
         pairs.push(("dns", dns));
+    }
+    if seed.stats {
+        pairs.push(("stats", Json::Obj(Vec::new())));
     }
     Ok((object(pairs), seed))
 }
@@ -4417,6 +4422,13 @@ mod tests {
         crate::router::Routing::parse(&json)
             .expect("parses")
             .expect("routing");
+    }
+
+    #[test]
+    fn a_stats_app_enables_the_stats_manager() {
+        let config = message(&[bytes_field(4, &typed("xray.app.stats.Config", &[]))]);
+        let json = to_json(&config).expect("stats app");
+        assert!(json.get("stats").is_some());
     }
 
     /// An app this tree does not read is xray's own object graph and is
