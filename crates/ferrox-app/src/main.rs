@@ -9,6 +9,7 @@ macro_rules! census {
 #[global_allocator]
 static ALLOC_COUNT: ferrox_core::alloc_count::Counting = ferrox_core::alloc_count::Counting;
 
+mod accesslog;
 mod budgets;
 #[cfg(test)]
 #[macro_use]
@@ -32,7 +33,9 @@ mod httpheader;
 mod httpupgrade;
 mod hysteria;
 mod json;
+mod metrics;
 mod observatory;
+mod policy;
 mod proxy;
 mod quic;
 mod reverse;
@@ -41,6 +44,7 @@ mod shadowsocks;
 mod shadowsocks2022;
 mod sockopt;
 mod socks;
+mod stats;
 mod tun;
 mod veepn;
 mod vision;

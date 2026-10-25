@@ -41,6 +41,9 @@ use winunix::{
 pub(crate) enum Connection {
     Tcp(TcpStream),
     Masked(Masked),
+    /// The same stream with a flow's counters and policy above it; every read and write reaches
+    /// the socket through the meter, and a clone shares the counters rather than starting new ones.
+    Metered(Metered),
     /// A stream whose peer is the one a PROXY protocol header reported rather than the socket's
     /// own peer: reads and writes still reach the socket, but routing sees the reported source.
     Proxied {
@@ -49,6 +52,14 @@ pub(crate) enum Connection {
     },
     #[cfg(any(unix, windows))]
     Unix(UnixStream),
+}
+
+/// A connection under the stats manager: the inner stream keeps its family and mask, while the
+/// meter counts each direction and carries the policy the flow's level names.
+#[derive(Debug)]
+pub(crate) struct Metered {
+    inner: Box<Connection>,
+    meter: crate::stats::Meter,
 }
 
 /// A TCP stream with the `finalmask` chain under it, which is what the reference's wrapped conn
@@ -87,6 +98,10 @@ impl Connection {
                 stream,
                 chain: std::sync::Arc::new(std::sync::Mutex::new(chain.clone())),
             }),
+            (Connection::Metered(metered), mask) => Connection::Metered(Metered {
+                inner: Box::new(metered.inner.with_mask(mask)),
+                meter: metered.meter,
+            }),
             (Connection::Proxied { inner, peer }, mask) => Connection::Proxied {
                 inner: Box::new(inner.with_mask(mask)),
                 peer,
@@ -109,8 +124,52 @@ impl Connection {
     pub(crate) fn masked(&self) -> bool {
         match self {
             Connection::Masked(_) => true,
+            Connection::Metered(metered) => metered.inner.masked(),
             Connection::Proxied { inner, .. } => inner.masked(),
-            _ => false,
+            Connection::Tcp(_) => false,
+            #[cfg(any(unix, windows))]
+            Connection::Unix(_) => false,
+        }
+    }
+
+    /// Whether a descriptor-level fast path would skip the meter above this stream.
+    pub(crate) fn metered(&self) -> bool {
+        match self {
+            Connection::Metered(_) => true,
+            Connection::Proxied { inner, .. } => inner.metered(),
+            Connection::Masked(_) => false,
+            Connection::Tcp(_) => false,
+            #[cfg(any(unix, windows))]
+            Connection::Unix(_) => false,
+        }
+    }
+
+    /// Put this flow's counters and policy above the stream. A stream that already carries a
+    /// meter keeps every counter and adds the newer one's, so the inbound and the account both count.
+    pub(crate) fn with_meter(self, meter: crate::stats::Meter) -> Self {
+        if meter.is_empty() {
+            return self;
+        }
+        match self {
+            Connection::Metered(metered) => Connection::Metered(Metered {
+                inner: metered.inner,
+                meter: metered.meter.merged(meter),
+            }),
+            inner => Connection::Metered(Metered {
+                inner: Box::new(inner),
+                meter,
+            }),
+        }
+    }
+
+    /// The policy a flow's level names, if one is above this stream.
+    pub(crate) fn policy(&self) -> Option<crate::policy::Flow> {
+        match self {
+            Connection::Metered(metered) => metered.meter.flow().or_else(|| metered.inner.policy()),
+            Connection::Proxied { inner, .. } => inner.policy(),
+            Connection::Masked(_) | Connection::Tcp(_) => None,
+            #[cfg(any(unix, windows))]
+            Connection::Unix(_) => None,
         }
     }
 }
@@ -138,6 +197,7 @@ impl std::os::fd::AsRawFd for Connection {
         match self {
             Connection::Tcp(stream) => stream.as_raw_fd(),
             Connection::Masked(masked) => masked.stream.as_raw_fd(),
+            Connection::Metered(metered) => metered.inner.as_raw_fd(),
             Connection::Proxied { inner, .. } => inner.as_raw_fd(),
             Connection::Unix(stream) => stream.as_raw_fd(),
         }
@@ -154,6 +214,7 @@ impl std::os::windows::io::AsRawSocket for Connection {
         match self {
             Connection::Tcp(stream) => stream.as_raw_socket(),
             Connection::Masked(masked) => masked.stream.as_raw_socket(),
+            Connection::Metered(metered) => metered.inner.as_raw_socket(),
             Connection::Proxied { inner, .. } => inner.as_raw_socket(),
             Connection::Unix(stream) => stream.as_raw_socket(),
         }
@@ -170,6 +231,11 @@ impl Read for Connection {
         match self {
             Connection::Tcp(stream) => stream.read(buf),
             Connection::Masked(masked) => masked.stream.read(buf),
+            Connection::Metered(metered) => {
+                let n = metered.inner.read(buf)?;
+                metered.meter.read(n);
+                Ok(n)
+            }
             Connection::Proxied { inner, .. } => inner.read(buf),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.read(buf),
@@ -180,6 +246,11 @@ impl Read for Connection {
         match self {
             Connection::Tcp(stream) => stream.read_vectored(bufs),
             Connection::Masked(masked) => masked.stream.read_vectored(bufs),
+            Connection::Metered(metered) => {
+                let n = metered.inner.read_vectored(bufs)?;
+                metered.meter.read(n);
+                Ok(n)
+            }
             Connection::Proxied { inner, .. } => inner.read_vectored(bufs),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.read_vectored(bufs),
@@ -192,6 +263,11 @@ impl Write for Connection {
         match self {
             Connection::Tcp(stream) => stream.write(buf),
             Connection::Masked(masked) => masked.send(buf),
+            Connection::Metered(metered) => {
+                let n = metered.inner.write(buf)?;
+                metered.meter.write(n);
+                Ok(n)
+            }
             Connection::Proxied { inner, .. } => inner.write(buf),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.write(buf),
@@ -203,6 +279,11 @@ impl Write for Connection {
         match self {
             Connection::Tcp(stream) => stream.write_vectored(bufs),
             Connection::Masked(masked) => masked.send_vectored(bufs),
+            Connection::Metered(metered) => {
+                let n = metered.inner.write_vectored(bufs)?;
+                metered.meter.write(n);
+                Ok(n)
+            }
             Connection::Proxied { inner, .. } => inner.write_vectored(bufs),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.write_vectored(bufs),
@@ -213,6 +294,7 @@ impl Write for Connection {
         match self {
             Connection::Tcp(stream) => stream.flush(),
             Connection::Masked(masked) => masked.stream.flush(),
+            Connection::Metered(metered) => metered.inner.flush(),
             Connection::Proxied { inner, .. } => inner.flush(),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.flush(),
@@ -232,8 +314,14 @@ impl Read for &Connection {
                 let mut inner = &masked.stream;
                 inner.read(buf)
             }
-            Connection::Proxied { inner, .. } => {
-                let mut inner = inner.as_ref();
+            Connection::Metered(ref metered) => {
+                let mut inner = &*metered.inner;
+                let n = inner.read(buf)?;
+                metered.meter.read(n);
+                Ok(n)
+            }
+            Connection::Proxied { ref inner, .. } => {
+                let mut inner = &**inner;
                 inner.read(buf)
             }
             #[cfg(any(unix, windows))]
@@ -254,8 +342,14 @@ impl Read for &Connection {
                 let mut inner = &masked.stream;
                 inner.read_vectored(bufs)
             }
-            Connection::Proxied { inner, .. } => {
-                let mut inner = inner.as_ref();
+            Connection::Metered(ref metered) => {
+                let mut inner = &*metered.inner;
+                let n = inner.read_vectored(bufs)?;
+                metered.meter.read(n);
+                Ok(n)
+            }
+            Connection::Proxied { ref inner, .. } => {
+                let mut inner = &**inner;
                 inner.read_vectored(bufs)
             }
             #[cfg(any(unix, windows))]
@@ -275,8 +369,14 @@ impl Write for &Connection {
                 inner.write(buf)
             }
             Connection::Masked(masked) => masked.send(buf),
-            Connection::Proxied { inner, .. } => {
-                let mut inner = inner.as_ref();
+            Connection::Metered(ref metered) => {
+                let mut inner = &*metered.inner;
+                let n = inner.write(buf)?;
+                metered.meter.write(n);
+                Ok(n)
+            }
+            Connection::Proxied { ref inner, .. } => {
+                let mut inner = &**inner;
                 inner.write(buf)
             }
             #[cfg(any(unix, windows))]
@@ -294,8 +394,14 @@ impl Write for &Connection {
                 inner.write_vectored(bufs)
             }
             Connection::Masked(masked) => masked.send_vectored(bufs),
-            Connection::Proxied { inner, .. } => {
-                let mut inner = inner.as_ref();
+            Connection::Metered(ref metered) => {
+                let mut inner = &*metered.inner;
+                let n = inner.write_vectored(bufs)?;
+                metered.meter.write(n);
+                Ok(n)
+            }
+            Connection::Proxied { ref inner, .. } => {
+                let mut inner = &**inner;
                 inner.write_vectored(bufs)
             }
             #[cfg(any(unix, windows))]
@@ -316,8 +422,12 @@ impl Write for &Connection {
                 let mut inner = &masked.stream;
                 inner.flush()
             }
-            Connection::Proxied { inner, .. } => {
-                let mut inner = inner.as_ref();
+            Connection::Metered(ref metered) => {
+                let mut inner = &*metered.inner;
+                inner.flush()
+            }
+            Connection::Proxied { ref inner, .. } => {
+                let mut inner = &**inner;
                 inner.flush()
             }
             #[cfg(any(unix, windows))]
@@ -342,6 +452,12 @@ impl Connection {
                     chain: std::sync::Arc::clone(&masked.chain),
                 })
             }),
+            Connection::Metered(metered) => metered.inner.try_clone().map(|inner| {
+                Connection::Metered(Metered {
+                    inner: Box::new(inner),
+                    meter: metered.meter.clone(),
+                })
+            }),
             Connection::Proxied { inner, peer } => {
                 inner.try_clone().map(|inner| Connection::Proxied {
                     inner: Box::new(inner),
@@ -358,6 +474,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.shutdown(how),
             Connection::Masked(masked) => masked.stream.shutdown(how),
+            Connection::Metered(metered) => metered.inner.shutdown(how),
             Connection::Proxied { inner, .. } => inner.shutdown(how),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.shutdown(how),
@@ -371,6 +488,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.peek(buf),
             Connection::Masked(masked) => masked.stream.peek(buf),
+            Connection::Metered(metered) => metered.inner.peek(buf),
             Connection::Proxied { inner, .. } => inner.peek(buf),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => unix_peek(stream, buf),
@@ -385,6 +503,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.peer_addr(),
             Connection::Masked(masked) => masked.stream.peer_addr(),
+            Connection::Metered(metered) => metered.inner.peer_addr(),
             Connection::Proxied { peer, .. } => Ok(*peer),
             #[cfg(any(unix, windows))]
             Connection::Unix(_) => Err(io::Error::new(
@@ -400,6 +519,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.local_addr(),
             Connection::Masked(masked) => masked.stream.local_addr(),
+            Connection::Metered(metered) => metered.inner.local_addr(),
             Connection::Proxied { inner, .. } => inner.local_addr(),
             #[cfg(any(unix, windows))]
             Connection::Unix(_) => Err(io::Error::new(
@@ -416,6 +536,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.set_nonblocking(nonblocking),
             Connection::Masked(masked) => masked.stream.set_nonblocking(nonblocking),
+            Connection::Metered(metered) => metered.inner.set_nonblocking(nonblocking),
             Connection::Proxied { inner, .. } => inner.set_nonblocking(nonblocking),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.set_nonblocking(nonblocking),
@@ -429,6 +550,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.set_read_timeout(timeout),
             Connection::Masked(masked) => masked.stream.set_read_timeout(timeout),
+            Connection::Metered(metered) => metered.inner.set_read_timeout(timeout),
             Connection::Proxied { inner, .. } => inner.set_read_timeout(timeout),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => set_socket_timeout(stream, SO_RCVTIMEO, timeout),
@@ -440,6 +562,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.set_write_timeout(timeout),
             Connection::Masked(masked) => masked.stream.set_write_timeout(timeout),
+            Connection::Metered(metered) => metered.inner.set_write_timeout(timeout),
             Connection::Proxied { inner, .. } => inner.set_write_timeout(timeout),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => set_socket_timeout(stream, SO_SNDTIMEO, timeout),
@@ -453,6 +576,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.read_timeout(),
             Connection::Masked(masked) => masked.stream.read_timeout(),
+            Connection::Metered(metered) => metered.inner.read_timeout(),
             Connection::Proxied { inner, .. } => inner.read_timeout(),
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => get_socket_timeout(stream, SO_RCVTIMEO),
@@ -467,6 +591,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.set_nodelay(nodelay),
             Connection::Masked(masked) => masked.stream.set_nodelay(nodelay),
+            Connection::Metered(metered) => metered.inner.set_nodelay(nodelay),
             Connection::Proxied { inner, .. } => inner.set_nodelay(nodelay),
             #[cfg(any(unix, windows))]
             Connection::Unix(_) => Ok(()),
@@ -861,6 +986,7 @@ impl Connection {
         match self {
             Connection::Tcp(stream) => stream.nodelay(),
             Connection::Masked(masked) => masked.stream.nodelay(),
+            Connection::Metered(metered) => metered.inner.nodelay(),
             Connection::Proxied { inner, .. } => inner.nodelay(),
             #[cfg(any(unix, windows))]
             Connection::Unix(_) => Err(io::Error::new(
@@ -1512,7 +1638,10 @@ mod tests {
                     error.kind()
                 );
             }
-            Connection::Tcp(_) | Connection::Masked(_) | Connection::Proxied { .. } => {
+            Connection::Tcp(_)
+            | Connection::Masked(_)
+            | Connection::Metered(_)
+            | Connection::Proxied { .. } => {
                 unreachable!("a unix pair yields a unix stream")
             }
         }
