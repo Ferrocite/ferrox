@@ -12328,7 +12328,7 @@ fn freedom_lookup(host: &str, port: u16) -> Vec<std::net::IpAddr> {
         });
         remember_lookup(host, port, &addrs)
     });
-    addrs.iter().map(|address| address.ip()).collect()
+    addrs.iter().map(std::net::SocketAddr::ip).collect()
 }
 
 fn strategy_name(domain: FreedomDomain) -> &'static str {
