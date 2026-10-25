@@ -64,11 +64,32 @@ exit 0
     return bin_dir
 
 
-def env_for(state: pathlib.Path) -> dict[str, str]:
+def fake_curl(state: pathlib.Path) -> pathlib.Path:
+    bin_dir = state / "fake-curl-bin"
+    bin_dir.mkdir(exist_ok=True)
+    tool = bin_dir / "curl"
+    tool.write_text(
+        """#!/bin/sh
+if [ "${FERROX_FAKE_TRACE:-}" = 1 ]; then
+  printf 'ip=203.0.113.9\\nloc=US\\n'
+  exit 0
+fi
+exit 7
+""",
+        encoding="utf-8",
+    )
+    tool.chmod(0o755)
+    return bin_dir
+
+
+def env_for(state: pathlib.Path, curl: bool = False) -> dict[str, str]:
     env = dict(os.environ)
     env["FERROX_CONF_DIR"] = str(state)
     env["FERROX_BIN"] = shutil.which("true") or "/bin/true"
-    env["PATH"] = f"{fake_networksetup(state)}:{env.get('PATH', '')}"
+    path = f"{fake_networksetup(state)}:{env.get('PATH', '')}"
+    if curl:
+        path = f"{fake_curl(state)}:{path}"
+    env["PATH"] = path
     return env
 
 
@@ -735,8 +756,9 @@ def check_vpn_fronts(state: pathlib.Path) -> int:
         ),
         encoding="utf-8",
     )
-    env = env_for(state)
+    env = env_for(state, curl=True)
     env["FERROX_BIN"] = str(vpn_lane_binary(state))
+    env["FERROX_FAKE_TRACE"] = "1"
     cases = [
         ("socks", socks_port, None),
         ("http", None, http_port),
@@ -818,6 +840,217 @@ def check_vpn_fronts(state: pathlib.Path) -> int:
             )
             return 1
     print("check-cli-lane: every front list arms the system proxy at the port it serves")
+    return 0
+
+
+def config_lane(
+    state: pathlib.Path, config: pathlib.Path, trace: bool = True
+) -> tuple[subprocess.CompletedProcess[str], str]:
+    calls = state / "networksetup.calls"
+    calls.unlink(missing_ok=True)
+    (state / "system-proxy.ports").unlink(missing_ok=True)
+    env = env_for(state, curl=True)
+    env["FERROX_BIN"] = str(vpn_lane_binary(state))
+    env["FERROX_FAKE_TRACE"] = "1" if trace else ""
+    run = subprocess.run(
+        [str(CLI), "up", "--config", str(config), "--vpn"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env,
+    )
+    recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    return run, recorded
+
+
+def check_config_fronts(state: pathlib.Path) -> int:
+    http_port = free_port()
+    http = state / "config-http.json"
+    http.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {"protocol": "http", "listen": "127.0.0.1", "port": http_port}
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run, recorded = config_lane(state, http)
+    output = run.stdout + run.stderr
+    if run.returncode != 0:
+        print(
+            f"check-cli-lane: an HTTP config lane exited {run.returncode}:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    wanted = [
+        f"-setwebproxy Wi-Fi 127.0.0.1 {http_port}",
+        f"-setsecurewebproxy Wi-Fi 127.0.0.1 {http_port}",
+    ]
+    marker = state / "system-proxy.ports"
+    if (
+        any(call not in recorded for call in wanted)
+        or "-setsocksfirewallproxy" in recorded
+        or not marker.exists()
+        or marker.read_text(encoding="utf-8").strip() != f"- {http_port}"
+    ):
+        print(
+            f"check-cli-lane: an HTTP config lane armed the wrong system proxy:"
+            f"\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    subprocess.run(
+        [str(CLI), "down"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env_for(state),
+    )
+
+    mixed_port = free_port()
+    mixed = state / "config-mixed.json"
+    mixed.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {"protocol": "mixed", "listen": "127.0.0.1", "port": mixed_port}
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run, recorded = config_lane(state, mixed)
+    output = run.stdout + run.stderr
+    wanted = [
+        f"-setsocksfirewallproxy Wi-Fi 127.0.0.1 {mixed_port}",
+        f"-setwebproxy Wi-Fi 127.0.0.1 {mixed_port}",
+        f"-setsecurewebproxy Wi-Fi 127.0.0.1 {mixed_port}",
+    ]
+    if (
+        run.returncode != 0
+        or any(call not in recorded for call in wanted)
+        or not marker.exists()
+        or marker.read_text(encoding="utf-8").strip()
+        != f"{mixed_port} {mixed_port}"
+    ):
+        print(
+            f"check-cli-lane: a mixed config lane armed the wrong system proxy:"
+            f"\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    subprocess.run(
+        [str(CLI), "down"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env_for(state),
+    )
+
+    exposed = state / "config-exposed.json"
+    exposed.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {
+                        "protocol": "http",
+                        "listen": "0.0.0.0",
+                        "port": free_port(),
+                    }
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run, recorded = config_lane(state, exposed, trace=False)
+    output = run.stdout + run.stderr
+    if (
+        run.returncode == 0
+        or recorded
+        or (state / "lane.pid").exists()
+        or "loopback" not in output
+    ):
+        print(
+            f"check-cli-lane: a config on 0.0.0.0 was armed instead of refused:"
+            f"\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+
+    no_front = state / "config-no-front.json"
+    no_front.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {
+                        "protocol": "dokodemo-door",
+                        "listen": "127.0.0.1",
+                        "port": free_port(),
+                    }
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run, recorded = config_lane(state, no_front, trace=False)
+    output = run.stdout + run.stderr
+    if (
+        run.returncode == 0
+        or recorded
+        or (state / "lane.pid").exists()
+        or "no socks, http or mixed inbound" not in output
+    ):
+        print(
+            f"check-cli-lane: a config with no proxy front was armed:"
+            f"\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+
+    silent = state / "config-silent.json"
+    silent.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {
+                        "protocol": "http",
+                        "listen": "127.0.0.1",
+                        "port": free_port(),
+                    }
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    run, recorded = config_lane(state, silent, trace=False)
+    output = run.stdout + run.stderr
+    if (
+        run.returncode == 0
+        or recorded
+        or (state / "lane.pid").exists()
+        or marker.exists()
+    ):
+        print(
+            f"check-cli-lane: a config lane that answered no flow was armed:"
+            f"\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+
+    print(
+        "check-cli-lane: a config lane arms the fronts and ports it serves, and"
+        " refuses an exposed, frontless or silent one"
+    )
     return 0
 
 
@@ -973,6 +1206,8 @@ def main() -> int:
     if check_instance_ports(state) != 0:
         return 1
     if check_vpn_fronts(state) != 0:
+        return 1
+    if check_config_fronts(state) != 0:
         return 1
     return check_instance_lifecycle(state)
 
