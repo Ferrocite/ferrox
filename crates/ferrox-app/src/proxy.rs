@@ -3376,6 +3376,9 @@ fn handle_mux_udp_new(
     };
     if let Some(old) = udp.insert(frame.id, Arc::clone(&session)) {
         old.done.store(true, Ordering::Relaxed);
+        if let Some(worker) = out.worker {
+            worker.release_connection();
+        }
     }
     global.retain(|_, id| *id != frame.id);
     if let Some(identity) = identity {
@@ -3398,6 +3401,9 @@ fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
         loop {
             match read.recv_from(&mut buf) {
                 Ok((n, source)) => {
+                    if done.load(Ordering::Relaxed) {
+                        return;
+                    }
                     let keep = ferrox_core::mux::Outgoing {
                         id: id.load(Ordering::Relaxed),
                         status: ferrox_core::mux::Status::Keep,
@@ -27483,6 +27489,73 @@ mod tests {
             old.done.load(Ordering::Relaxed),
             "the session the new one replaced is told to stop"
         );
+    }
+
+    /// A repeated UDP id replaces its session, and the worker slot that session held has to come back with it.
+    #[test]
+    fn a_repeated_udp_new_id_releases_the_worker_slot_it_replaced() {
+        let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let first_port = first.local_addr().expect("addr").port();
+        let second_port = second.local_addr().expect("addr").port();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let client = Connection::connect(listener.local_addr().expect("addr")).expect("connects");
+        let (mut server, _) = listener.accept().expect("accepts");
+        let wire = MuxWire::Conn(Arc::new(Mutex::new(client)));
+        let worker = crate::reverse::WorkerState::new();
+        let mut udp: UdpTable = HashMap::new();
+        let mut global: UdpGlobal = HashMap::new();
+        let mut staging = Vec::new();
+        let mut handles = Vec::new();
+        let new = |port| ferrox_core::mux::Incoming {
+            id: 7,
+            status: ferrox_core::mux::Status::New,
+            options: 0,
+            target: Some(mux_test_udp_target(port)),
+            global_id: None,
+            reflection: None,
+            data: None,
+        };
+        {
+            let mut out = MuxOut {
+                wire: &wire,
+                staging: &mut staging,
+                handles: &mut handles,
+                worker: Some(&worker),
+            };
+            handle_mux_udp_new(new(first_port), &mut udp, &mut global, &mut out);
+        }
+        let old = Arc::clone(udp.get(&7).expect("first session"));
+        let old_addr = SocketAddr::from((
+            [127, 0, 0, 1],
+            old.socket.local_addr().expect("addr").port(),
+        ));
+        {
+            let mut out = MuxOut {
+                wire: &wire,
+                staging: &mut staging,
+                handles: &mut handles,
+                worker: Some(&worker),
+            };
+            handle_mux_udp_new(new(second_port), &mut udp, &mut global, &mut out);
+        }
+        assert_eq!(
+            worker.connections(),
+            1,
+            "the replaced session kept the worker slot the new one needs"
+        );
+        server
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        first.send_to(b"stale", old_addr).expect("sends");
+        let mut probe = [0u8; 64];
+        assert!(
+            matches!(server.read(&mut probe), Err(ref error) if is_timeout(error)),
+            "the replaced session's reader forwarded a stale datagram"
+        );
+        for session in udp.values() {
+            session.done.store(true, Ordering::Relaxed);
+        }
     }
 
     #[test]
