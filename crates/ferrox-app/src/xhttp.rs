@@ -3351,8 +3351,8 @@ mod tests {
         );
     }
 
-    /// The dial's head is the thread's own room: the allocator is entered on the first
-    /// dial and never again, and the head's bytes are the ones the reference writes.
+    /// The dial's head is the thread's own room: the first dial stages it, the next
+    /// twelve reuse the same buffer, and the bytes are the ones the reference writes.
     #[test]
     fn the_dial_head_is_staged_once_per_thread() {
         struct Sink {
@@ -3374,6 +3374,16 @@ mod tests {
                 parts.iter().all(|part| self.write_all(part).is_ok())
             }
         }
+        // The first access may also allocate the thread-local itself on some platforms.
+        let mut warm = Sink {
+            bytes: [0u8; 4096],
+            at: 0,
+        };
+        send_dial_head(&mut warm, "example.com", "/share", &[]).expect("writes");
+        let staged = DIAL_HEAD.with(|cell| {
+            let head = cell.borrow();
+            (head.as_ptr(), head.capacity())
+        });
         let (sink, counts) = ferrox_core::alloc_count::measure(|| {
             let mut sink = Sink {
                 bytes: [0u8; 4096],
@@ -3385,7 +3395,15 @@ mod tests {
             }
             sink
         });
-        assert_eq!(counts.allocs, 1, "one buffer for the thread, twelve dials");
+        assert_eq!(counts.allocs, 0, "twelve dials reuse the staged room");
+        DIAL_HEAD.with(|cell| {
+            let head = cell.borrow();
+            assert_eq!(
+                (head.as_ptr(), head.capacity()),
+                staged,
+                "the head's buffer did not move or grow"
+            );
+        });
         let head = String::from_utf8_lossy(&sink.bytes[..sink.at]);
         assert!(
             head.starts_with(
