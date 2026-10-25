@@ -496,16 +496,16 @@ impl Read for Flow {
             if let Some(n) = read {
                 return Ok(n);
             }
+            if self.drive {
+                let _ = drive_once(&self.session, STREAM_POLL);
+                continue;
+            }
             let pumped = self
                 .session
                 .driver
                 .as_ref()
                 .is_some_and(|driver| driver.running());
-            if self.drive || !pumped {
-                let _ = drive_once(&self.session, STREAM_POLL);
-                continue;
-            }
-            if let Some(wake) = &self.wake {
+            if let Some(wake) = self.wake.as_ref().filter(|_| pumped) {
                 wake.wait(before, STREAM_POLL);
                 continue;
             }
