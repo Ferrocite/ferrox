@@ -3498,12 +3498,15 @@ fn handle_mux_frame(
                     worker.release_connection();
                 }
             }
-            if let Ok(mut table) = table.lock() {
-                // Dropping the sender lets the writer drain what the client already sent, then half-close.
-                if table.flows.remove(&frame.id).is_some() {
-                    if let Some(worker) = out.worker {
-                        worker.release_connection();
-                    }
+            // Dropping the sender lets the writer drain what the client already sent, then half-close.
+            let ended = match table.lock() {
+                Ok(mut table) => table.flows.remove(&frame.id),
+                Err(_) => None,
+            };
+            if let Some(flow) = ended {
+                flow.control.cancel();
+                if let Some(worker) = out.worker {
+                    worker.release_connection();
                 }
             }
         }
