@@ -748,12 +748,11 @@ fn open_pooled(dial: &Dial, header: &[u8]) -> Option<Flow> {
     let session = connect(dial)?;
     keep(dial, session.clone(), FIRST_FLOW_STREAM + 4);
     drop(connect_guard);
-    match open_flow(&session, FIRST_FLOW_STREAM, header) {
-        Some(flow) => Some(flow),
-        None => {
-            evict(dial, &session);
-            None
-        }
+    if let Some(flow) = open_flow(&session, FIRST_FLOW_STREAM, header) {
+        Some(flow)
+    } else {
+        evict(dial, &session);
+        None
     }
 }
 
@@ -2144,6 +2143,7 @@ mod tests {
             sock: Arc::new(crate::quic::Datagram::plain(sock)),
             local,
             udp_supported: false,
+            pump: None,
         }
     }
 
