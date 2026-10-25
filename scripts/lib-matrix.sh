@@ -220,6 +220,7 @@ scenario_config() {
     vless-grpc-*) server_config "$(vless_server ", $(stream_json grpc)")" "$(vless_client ", $(stream_json grpc)" "$port")" "$port" ;;
     vless-xhttp-*) server_config "$(vless_server ", $(stream_json xhttp)")" "$(vless_client ", $(stream_json xhttp)" "$port")" "$port" ;;
     vmess-raw-*) server_config "\"protocol\": \"vmess\", \"settings\": {\"clients\": [{\"id\": \"$UUID\"}]}, \"streamSettings\": {\"network\": \"tcp\"}" "\"tag\": \"proxy\", \"protocol\": \"vmess\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"users\": [{\"id\": \"$UUID\", \"security\": \"auto\"}]}]}, \"streamSettings\": {\"network\": \"tcp\"}" "$port" ;;
+    vmess-tls-raw-*) server_config "\"protocol\": \"vmess\", \"settings\": {\"clients\": [{\"id\": \"$UUID\"}]}, $(tls_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"vmess\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"users\": [{\"id\": \"$UUID\", \"security\": \"auto\"}]}]}, $(tls_client_settings)" "$port" ;;
     trojan-raw-*) server_config "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}" "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"password\": \"$PASSWORD\"}]}" "$port" ;;
     trojan-tls-raw-*) server_config "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}, $(tls_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"password\": \"$PASSWORD\"}]}, $(tls_client_settings)" "$port" ;;
     vless-tls-ws-*) server_config "$(vless_server ", $(tls_ws_server_settings)")" "$(vless_client ", $(tls_ws_client_settings)" "$port")" "$port" ;;
@@ -285,6 +286,41 @@ scenarios() {
       echo "vless-ws-down-16 download 16 128 65536"
       echo "vless-raw-duplex-16 full-duplex 16 64 65536"
       echo "vless-tls-raw-duplex-16 full-duplex 16 64 65536"
+      echo "vmess-raw-up-1 upload 1 2048 65536"
+      echo "vmess-raw-duplex-8 full-duplex 8 128 65536"
+      echo "trojan-raw-up-1 upload 1 2048 65536"
+      echo "trojan-raw-duplex-8 full-duplex 8 128 65536"
+      echo "shadowsocks-raw-up-1 upload 1 2048 65536"
+      echo "shadowsocks-raw-duplex-8 full-duplex 8 128 65536"
+      echo "shadowsocks2022-raw-up-1 upload 1 2048 65536"
+      echo "shadowsocks2022-raw-duplex-8 full-duplex 8 128 65536"
+      echo "vless-httpupgrade-up-1 upload 1 2048 65536"
+      echo "vless-httpupgrade-duplex-8 full-duplex 8 128 65536"
+      echo "vless-grpc-up-1 upload 1 2048 65536"
+      echo "vless-grpc-duplex-8 full-duplex 8 128 65536"
+      echo "vless-xhttp-up-1 upload 1 2048 65536"
+      echo "vless-xhttp-duplex-8 full-duplex 8 128 65536"
+      echo "vless-kcp-up-1 upload 1 2048 65536"
+      echo "vless-kcp-duplex-8 full-duplex 8 128 65536"
+      echo "vless-hysteria-up-1 upload 1 2048 65536"
+      echo "vless-hysteria-duplex-8 full-duplex 8 128 65536"
+      echo "vless-reality-raw-up-1 upload 1 2048 65536"
+      echo "vless-reality-raw-duplex-8 full-duplex 8 128 65536"
+      echo "vless-vision-tls-raw-up-1 upload 1 2048 65536"
+      echo "vless-vision-tls-raw-duplex-8 full-duplex 8 128 65536"
+      echo "vless-tls-grpc-up-1 upload 1 2048 65536"
+      echo "vless-tls-grpc-duplex-8 full-duplex 8 128 65536"
+      echo "vless-tls-ws-up-1 upload 1 2048 65536"
+      echo "vless-tls-ws-duplex-8 full-duplex 8 128 65536"
+      echo "vmess-tls-ws-up-1 upload 1 2048 65536"
+      echo "vmess-tls-ws-duplex-8 full-duplex 8 128 65536"
+      echo "vmess-tls-raw-down-8 download 8 256 65536"
+      echo "vmess-tls-raw-up-1 upload 1 2048 65536"
+      echo "vmess-tls-raw-duplex-8 full-duplex 8 128 65536"
+      echo "trojan-tls-raw-up-1 upload 1 2048 65536"
+      echo "trojan-tls-raw-duplex-8 full-duplex 8 128 65536"
+      echo "trojan-tls-ws-up-1 upload 1 2048 65536"
+      echo "trojan-tls-ws-duplex-8 full-duplex 8 128 65536"
       ;;
   esac
 }

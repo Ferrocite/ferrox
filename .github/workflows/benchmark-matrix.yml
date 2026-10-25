@@ -10,12 +10,18 @@ on:
       - "scripts/lib-matrix.sh"
       - "scripts/lib-engines.sh"
       - "scripts/xray-to-singbox.py"
+      - "scripts/benchstats.py"
+      - "scripts/benchmark-delta.py"
       - "scripts/render-benchmark-charts.py"
       - "scripts/validate-benchmark-matrix.py"
+      - "scripts/check-matrix-legs.py"
+      - "scripts/requirements-benchmark.txt"
+      - "docs/function/**/*.md"
       - "docs/benchmarks/matrix.md"
       - ".github/workflows/benchmark-matrix.yml"
   schedule:
     - cron: "41 3 * * *"
+    - cron: "17 4 * * 0"
   workflow_dispatch:
     inputs:
       tier:
@@ -92,6 +98,7 @@ jobs:
           WANT_REPEATS: ${{ inputs.repeats }}
           WANT_ENGINES: ${{ inputs.engines }}
           WANT_RUNNER: ${{ inputs.runner }}
+          SCHEDULE: ${{ github.event.schedule }}
         run: |
           matrix=true
           planned=""
@@ -121,9 +128,12 @@ jobs:
               windows) oses='["windows-latest"]' ;;
               *) oses='["ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "windows-latest"]' ;;
             esac
+          elif [[ "$SCHEDULE" == "17 4 * * 0" ]]; then
+            tier="full"
+            oses='["ubuntu-latest", "ubuntu-24.04-arm", "macos-15"]'
           else
             tier="standard"
-            oses='["ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "windows-latest"]'
+            oses='["ubuntu-latest"]'
           fi
           case "$tier" in smoke | standard | full) ;; *) echo "::error::unknown tier $tier" >&2; exit 2 ;; esac
           source scripts/lib-matrix.sh
@@ -339,10 +349,19 @@ jobs:
           done
           [[ -n "$first" ]] || { echo "::error::no cell bundle for ${{ matrix.os }}" >&2; exit 1; }
           cp "$first/manifest.txt" target/benchmark-matrix/manifest.txt
+          runner="$(grep -m1 '^runner: ' target/benchmark-matrix/manifest.txt | cut -d' ' -f2)"
+          baseline=""
+          if [[ -d docs/benchmarks/results ]]; then
+            baseline="$(find docs/benchmarks/results -mindepth 2 -maxdepth 2 \
+              -type d -name "$runner" | sort | tail -1)"
+          fi
+          previous=()
+          [[ -n "$baseline" ]] && previous=(--previous "$baseline/matrix-results.json")
           python3 scripts/render-benchmark-charts.py \
             --input target/benchmark-matrix \
             --charts target/benchmark-matrix/charts \
-            --results target/benchmark-matrix/matrix-results.json
+            --results target/benchmark-matrix/matrix-results.json \
+            "${previous[@]}"
           python3 scripts/validate-benchmark-matrix.py \
             --cells target/benchmark-matrix/cells \
             --results target/benchmark-matrix/matrix-results.json \
@@ -370,7 +389,7 @@ jobs:
   refresh:
     name: publish the dated bundles
     needs: collect
-    if: github.event_name == 'schedule'
+    if: github.event_name == 'schedule' && github.event.schedule == '41 3 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:
@@ -397,31 +416,58 @@ jobs:
         run: echo "STAMP=$(date -u +%F)" >> "$GITHUB_ENV"
       - name: lay out per-runner bundles
         run: |
+          published=0
           for bundle in matrix-bundles/benchmark-matrix-standard-*/; do
             slug="$(grep -m1 '^runner: ' "$bundle/manifest.txt" | cut -d' ' -f2)"
             if [[ -z "$slug" ]]; then
               echo "::error::$bundle has no runner: line in manifest.txt"
               exit 1
             fi
+            baseline=""
+            if [[ -d docs/benchmarks/results ]]; then
+              baseline="$(find docs/benchmarks/results -mindepth 2 -maxdepth 2 \
+                -type d -name "$slug" ! -path "*/$STAMP/*" | sort | tail -1)"
+            fi
             dest="matrix-published/$STAMP/$slug"
+            mkdir -p "$dest/charts"
+            cp -r "$bundle/cells" "$dest/cells"
+            cp "$bundle/matrix-results.json" "$bundle/manifest.txt" "$bundle/README.md" "$dest/"
+            if [[ -n "$baseline" ]]; then
+              delta=0
+              python3 scripts/benchmark-delta.py \
+                --new "$bundle/matrix-results.json" \
+                --baseline "$baseline/matrix-results.json" \
+                --threshold 0.10 --require-change --quiet || delta=$?
+              if [[ "$delta" == "1" ]]; then
+                echo "$slug: within 10% of $baseline, keeping the published bundle"
+                continue
+              elif [[ "$delta" != "0" ]]; then
+                echo "::error::$slug: delta check failed with exit $delta" >&2
+                exit "$delta"
+              fi
+            fi
             results="docs/benchmarks/results/$STAMP/$slug"
             charts="docs/benchmarks/charts/latest/$slug"
-            mkdir -p "$dest/charts" "$results" "$charts"
-            cp "$bundle/matrix-results.json" "$bundle/manifest.txt" "$bundle/README.md" "$results/"
-            cp "$results/matrix-results.json" "$results/manifest.txt" "$results/README.md" "$dest/"
-            cp -r "$bundle/cells" "$dest/cells"
+            rm -rf "$charts"
+            mkdir -p "$results" "$charts"
+            previous=()
+            [[ -n "$baseline" ]] && previous=(--previous "$baseline/matrix-results.json")
             python3 scripts/render-benchmark-charts.py \
               --input "$bundle" \
               --charts "$charts" \
               --results "$results/matrix-results.json" \
               --readme docs/benchmarks/matrix.md \
-              --runner "$slug"
+              --runner "$slug" \
+              "${previous[@]}"
+            cp "$results/matrix-results.json" "$results/manifest.txt" "$results/README.md" "$dest/"
             cp -R "$charts"/. "$dest/charts/"
             python3 scripts/validate-benchmark-matrix.py \
               --cells "$dest/cells" \
               --results "$results/matrix-results.json" \
               --charts "$charts"
+            published=$((published + 1))
           done
+          echo "published $published runner bundle(s)"
       - name: commit the refreshed matrix on a review branch
         env:
           GH_TOKEN: ${{ github.token }}
@@ -429,7 +475,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git switch -C benchmark-matrix/auto
-          git add docs/benchmarks/matrix.md docs/benchmarks/charts/latest docs/benchmarks/results
+          git add -A docs/benchmarks
           if git diff --cached --quiet; then
             echo "nothing to publish"
             exit 0
