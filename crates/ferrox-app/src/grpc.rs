@@ -1,7 +1,9 @@
+use crate::config::GrpcSettings;
 use crate::conn::Connection;
 use std::io::Read;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
 use crate::h2::{
     block_encode, frame_head, read_head, write_frame, Decoder, E_REFUSED, FRAME_CAP, F_ACK, F_END,
@@ -65,6 +67,7 @@ struct Shared {
     init: Mutex<u64>,
     ended: AtomicBool,
     dead: AtomicBool,
+    pong: AtomicU64,
 }
 
 impl std::fmt::Debug for Shared {
@@ -75,6 +78,7 @@ impl std::fmt::Debug for Shared {
             .field("init", &self.init)
             .field("ended", &self.ended)
             .field("dead", &self.dead)
+            .field("pong", &self.pong)
             .finish_non_exhaustive()
     }
 }
@@ -135,8 +139,9 @@ impl Gate {
         if self.status.is_none() && name.eq_ignore_ascii_case(b":status") {
             self.status = Some(value == b"200");
         } else if self.served.is_none() && name.eq_ignore_ascii_case(b":path") {
-            self.multi = Some(value == multi_path.as_bytes());
-            self.served = Some(self.multi == Some(true) || value == path.as_bytes());
+            let multi = multi_path != path && value == multi_path.as_bytes();
+            self.multi = Some(multi);
+            self.served = Some(multi || value == path.as_bytes());
         } else if self.posted.is_none() && name.eq_ignore_ascii_case(b":method") {
             self.posted = Some(value == b"POST");
         } else if self.typed.is_none() && name.eq_ignore_ascii_case(b"content-type") {
@@ -250,8 +255,14 @@ impl<R: Read> GrpcReader<R> {
     }
 
     fn ping(&self, flags: u8, body: &[u8]) {
-        if flags & F_ACK == 0 && body.len() == 8 {
+        if body.len() != 8 {
+            return;
+        }
+        if flags & F_ACK == 0 {
             self.emit(T_PING, F_ACK, 0, body);
+        } else {
+            let seq = u64::from_be_bytes(body.try_into().unwrap());
+            self.shared.pong.fetch_max(seq, Ordering::SeqCst);
         }
     }
 
@@ -941,7 +952,15 @@ fn skip_field(msg: &[u8], at: &mut usize, wire: u8) -> Option<()> {
     Some(())
 }
 
+#[cfg(test)]
 pub(crate) fn accept(stream: Connection, path: &str) -> Option<(GrpcReader, GrpcWriter)> {
+    accept_with(stream, &GrpcSettings::path(path))
+}
+
+pub(crate) fn accept_with(
+    stream: Connection,
+    settings: &GrpcSettings,
+) -> Option<(GrpcReader, GrpcWriter)> {
     let read = stream;
     let Ok(write) = read.try_clone() else {
         return None;
@@ -949,7 +968,7 @@ pub(crate) fn accept(stream: Connection, path: &str) -> Option<(GrpcReader, Grpc
     // A head's clock only bites when a read answers it, so the preface and the request headers are polled at the relay's grain and ended by the deadline; the relay behind them waits blocking again.
     read.set_read_timeout(Some(crate::budgets::RELAY_POLL))
         .ok()?;
-    let mut accepted = accept_split(read, write, path)?;
+    let mut accepted = accept_split_with(read, write, settings)?;
     accepted.0.set_poll(None);
     Some(accepted)
 }
@@ -966,15 +985,8 @@ fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
         init: Mutex::new(65_535),
         ended: AtomicBool::new(false),
         dead: AtomicBool::new(false),
+        pong: AtomicU64::new(0),
     })
-}
-
-/// The `TunMulti` peer of a configured path: the same service prefix, the multi-mode stream name, the way Xray derives both names from one service name.
-fn multi_path(path: &str) -> String {
-    match path.rfind('/') {
-        Some(at) => format!("{}TunMulti", &path[..=at]),
-        None => "TunMulti".to_owned(),
-    }
 }
 
 /// `read_exact` under the clock a head is decoded under, which the site passes while a head arrives: past the deadline a silence is an error, so `read_exact`'s timeout-retry cannot spin a peer that never finishes speaking, and an unarmed reader waits exactly as it did.
@@ -997,6 +1009,7 @@ fn new_reader<R: Read>(
     shared: Arc<Shared>,
     server: bool,
     path: &str,
+    multi_path: &str,
     stream: u32,
 ) -> GrpcReader<R> {
     GrpcReader {
@@ -1006,7 +1019,7 @@ fn new_reader<R: Read>(
         stream,
         server,
         path: path.to_owned(),
-        multi_path: multi_path(path),
+        multi_path: multi_path.to_owned(),
         method: Method::Hunk,
         answered: false,
         head: Vec::new(),
@@ -1026,10 +1039,19 @@ fn new_reader<R: Read>(
 }
 
 // The same accept over halves that cannot clone: the preface is read, not peeked.
+#[cfg(test)]
 pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
-    mut read: R,
+    read: R,
     write: W,
     path: &str,
+) -> Option<(GrpcReader<R>, GrpcWriter)> {
+    accept_split_with(read, write, &GrpcSettings::path(path))
+}
+
+pub(crate) fn accept_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
+    mut read: R,
+    write: W,
+    settings: &GrpcSettings,
 ) -> Option<(GrpcReader<R>, GrpcWriter)> {
     let until = std::time::Instant::now() + crate::budgets::handshake();
     let mut magic = [0u8; 24];
@@ -1042,11 +1064,21 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
         let Ok(mut socket) = shared.stream.lock() else {
             return None;
         };
-        if socket.write_all(&PREFACE).is_err() {
+        if socket
+            .write_all(&preface(settings.initial_window_size))
+            .is_err()
+        {
             return None;
         }
     }
-    let mut reader = new_reader(read, Arc::clone(&shared), true, path, 0);
+    let mut reader = new_reader(
+        read,
+        Arc::clone(&shared),
+        true,
+        &settings.path,
+        &settings.multi_path,
+        0,
+    );
     // The clock the preface was read under covers the request headers too, and ends where the head ends: past it the pump is a give-up rather than a wait, and a reader handed to a caller is unarmed again.
     reader.set_handshake_budget(Some(until));
     while !reader.answered && !reader.eof {
@@ -1066,47 +1098,167 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
         shared,
         stream: reader.stream,
     };
+    start_keepalive(Arc::clone(&writer.shared), settings);
     Some((reader, writer))
 }
 
+#[cfg(test)]
 pub(crate) fn connect(
     stream: Connection,
     host: &str,
     path: &str,
 ) -> Option<(GrpcReader, GrpcWriter)> {
+    connect_with(stream, host, &GrpcSettings::path(path))
+}
+
+pub(crate) fn connect_with(
+    stream: Connection,
+    host: &str,
+    settings: &GrpcSettings,
+) -> Option<(GrpcReader, GrpcWriter)> {
     let read = stream;
     let Ok(write) = read.try_clone() else {
         return None;
     };
-    connect_split(read, write, host, path)
+    connect_split_with(read, write, host, settings)
 }
 
 // The same connect over halves that cannot clone: the preface is written, not peeked.
+#[cfg(test)]
 pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
     read: R,
-    mut write: W,
+    write: W,
     host: &str,
     path: &str,
 ) -> Option<(GrpcReader<R>, GrpcWriter)> {
-    if !write.write_slices(&[MAGIC, &PREFACE]) {
+    connect_split_with(read, write, host, &GrpcSettings::path(path))
+}
+
+pub(crate) fn connect_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
+    read: R,
+    mut write: W,
+    host: &str,
+    settings: &GrpcSettings,
+) -> Option<(GrpcReader<R>, GrpcWriter)> {
+    if !write.write_slices(&[MAGIC, &preface(settings.initial_window_size)]) {
         return None;
     }
-    let block = block_encode(&[
+    let authority = if settings.authority.is_empty() {
+        host
+    } else {
+        &settings.authority
+    };
+    let path = if settings.multi_mode {
+        &settings.multi_path
+    } else {
+        &settings.path
+    };
+    let mut headers = vec![
         (":method", "POST"),
         (":scheme", "http"),
         (":path", path),
-        (":authority", host),
+        (":authority", authority),
         ("content-type", "application/grpc"),
         ("te", "trailers"),
         ("grpc-encoding", "identity"),
         ("grpc-accept-encoding", "gzip,identity"),
-    ]);
+    ];
+    let agent = user_agent(&settings.user_agent);
+    if !agent.is_empty() {
+        headers.push(("user-agent", agent));
+    }
+    let block = block_encode(&headers);
     if !write_frame(&mut write, T_HEADERS, F_END_HEADERS, 1, &block) {
         return None;
     }
     let shared = new_shared(Box::new(write));
-    let reader = new_reader(read, Arc::clone(&shared), false, path, 1);
+    let mut reader = new_reader(
+        read,
+        Arc::clone(&shared),
+        false,
+        &settings.path,
+        &settings.multi_path,
+        1,
+    );
+    if settings.multi_mode {
+        reader.method = Method::MultiHunk;
+    }
+    start_keepalive(Arc::clone(&shared), settings);
     Some((reader, GrpcWriter { shared, stream: 1 }))
+}
+
+fn preface(initial_window: u32) -> Vec<u8> {
+    let mut out = PREFACE.to_vec();
+    if initial_window > 0 {
+        let value = initial_window.min(i32::MAX as u32);
+        out[11..15].copy_from_slice(&value.to_be_bytes());
+    }
+    out
+}
+
+const CHROME_UA: &str = concat!(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/",
+    "144",
+    ".0.0.0 Safari/537.36"
+);
+const FIREFOX_UA: &str =
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0";
+const EDGE_UA: &str = concat!(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/",
+    "144",
+    ".0.0.0 Safari/537.36 Edg/",
+    "144",
+    ".0.0.0"
+);
+
+fn user_agent(name: &str) -> &str {
+    match name {
+        "" | "chrome" => CHROME_UA,
+        "firefox" => FIREFOX_UA,
+        "edge" => EDGE_UA,
+        "golang" => "",
+        other => other,
+    }
+}
+
+fn start_keepalive(shared: Arc<Shared>, settings: &GrpcSettings) {
+    // One stream per connection, so there is no idle connection for this flag to keep alive.
+    let _ = settings.permit_without_stream;
+    if settings.idle_timeout == 0 {
+        return;
+    }
+    let every = u64::from(settings.idle_timeout);
+    let health = settings.health_check_timeout;
+    std::thread::spawn(move || {
+        let mut seq = 0u64;
+        loop {
+            std::thread::sleep(Duration::from_secs(every));
+            if shared.dead.load(Ordering::SeqCst) || shared.ended.load(Ordering::SeqCst) {
+                return;
+            }
+            seq += 1;
+            let body = seq.to_be_bytes();
+            let head = frame_head(8, T_PING, 0, 0);
+            let sent = shared
+                .stream
+                .lock()
+                .is_ok_and(|mut socket| socket.write_slices(&[&head, &body]));
+            if !sent {
+                shared.dead.store(true, Ordering::SeqCst);
+                return;
+            }
+            if health > 0 {
+                let until = Instant::now() + Duration::from_secs(u64::from(health));
+                while Instant::now() < until && shared.pong.load(Ordering::SeqCst) < seq {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                if shared.pong.load(Ordering::SeqCst) < seq {
+                    shared.dead.store(true, Ordering::SeqCst);
+                    return;
+                }
+            }
+        }
+    });
 }
 
 impl crate::proxy::CarrierSink for GrpcWriter {
@@ -1182,6 +1334,82 @@ mod tests {
             .expect("decodes");
         assert_eq!(headers.len(), 2);
         assert_eq!(headers[1].1, b"/TunnelService/Tun");
+    }
+
+    #[test]
+    fn grpc_settings_reach_the_preface_and_head() {
+        let calls = Calls::default();
+        let seen = Arc::clone(&calls.0);
+        let settings = GrpcSettings {
+            path: "/svc/tun".to_owned(),
+            multi_path: "/svc/tunmulti".to_owned(),
+            authority: "edge.example".to_owned(),
+            user_agent: "agent/1".to_owned(),
+            multi_mode: true,
+            initial_window_size: 1_000_000,
+            ..GrpcSettings::default()
+        };
+        let (reader, writer) = connect_split_with(
+            std::io::Cursor::new(Vec::new()),
+            calls,
+            "ignored",
+            &settings,
+        )
+        .expect("dials");
+        drop(reader);
+        drop(writer);
+        let chunks = seen.lock().expect("writes");
+        assert_eq!(&chunks[0][..MAGIC.len()], &MAGIC[..]);
+        let window = u32::from_be_bytes(
+            chunks[0][MAGIC.len() + 11..MAGIC.len() + 15]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(window, 1_000_000, "initialWindowsSize is the stream window");
+        let mut decoder = Decoder::default();
+        let mut headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        decoder
+            .decode(&chunks[1][9..], &mut |name, value| {
+                headers.push((name.to_vec(), value.to_vec()));
+            })
+            .expect("decodes");
+        let get = |name: &str| {
+            headers
+                .iter()
+                .find(|(key, _)| key == name.as_bytes())
+                .map(|(_, value)| value.as_slice())
+        };
+        assert_eq!(get(":path"), Some(b"/svc/tunmulti".as_slice()));
+        assert_eq!(get(":authority"), Some(b"edge.example".as_slice()));
+        assert_eq!(get("user-agent"), Some(b"agent/1".as_slice()));
+    }
+
+    #[test]
+    fn a_multi_mode_dial_reads_the_batch_it_asked_for() {
+        let settings = GrpcSettings {
+            path: "/svc/tun".to_owned(),
+            multi_path: "/svc/tunmulti".to_owned(),
+            multi_mode: true,
+            ..GrpcSettings::default()
+        };
+        let mut wire = frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[(":status", "200"), ("content-type", "application/grpc")]),
+        );
+        wire.extend_from_slice(&frame(T_DATA, F_END, 1, &multi_message(&[b"pi", b"n"])));
+        let (mut reader, writer) = connect_split_with(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "127.0.0.1",
+            &settings,
+        )
+        .expect("dials");
+        drop(writer);
+        let mut got = [0u8; 3];
+        reader.read_exact(&mut got).expect("reads the batch");
+        assert_eq!(&got, b"pin");
     }
 
     #[test]
@@ -1964,6 +2192,7 @@ mod tests {
                         init: Mutex::new(u64::from(WINDOW)),
                         ended: AtomicBool::new(false),
                         dead: AtomicBool::new(false),
+                        pong: AtomicU64::new(0),
                     });
                     let writer = GrpcWriter { shared, stream: 1 };
                     let mut batch = Gather::new();
