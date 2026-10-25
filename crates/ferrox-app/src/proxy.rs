@@ -4373,6 +4373,7 @@ fn serve_vless_kcp_tls(
 
 /// An idle handshake is retried until the deadline; anything but silence refuses at once.
 fn shake_tls<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
+    let _quantum = KcpHandshakeRead::enter();
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
     loop {
         match session.handshake() {
@@ -5677,13 +5678,36 @@ impl KcpIo {
     }
 }
 
+thread_local! {
+    static KCP_HANDSHAKE_READ: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+struct KcpHandshakeRead(bool);
+
+impl KcpHandshakeRead {
+    fn enter() -> Self {
+        Self(KCP_HANDSHAKE_READ.with(|read| read.replace(true)))
+    }
+}
+
+impl Drop for KcpHandshakeRead {
+    fn drop(&mut self) {
+        KCP_HANDSHAKE_READ.with(|read| read.set(self.0));
+    }
+}
+
 impl Read for KcpIo {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
         // The directions share one half-lock, so a read that never returns wedges the other's write.
-        self.conn.set_read_deadline(Instant::now() + RELAY_POLL);
+        let quantum = if KCP_HANDSHAKE_READ.with(std::cell::Cell::get) {
+            crate::quic::HANDSHAKE_TIMEOUT
+        } else {
+            RELAY_POLL
+        };
+        self.conn.set_read_deadline(Instant::now() + quantum);
         match self.conn.read(buf) {
             Ok(n) => Ok(n),
             Err(ferrox_core::kcp::ConnError::IoTimeout) => {
