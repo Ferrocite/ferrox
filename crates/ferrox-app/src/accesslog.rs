@@ -3,12 +3,14 @@ use std::cell::RefCell;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Clone, Default)]
 struct Flow {
     source: Option<SocketAddr>,
     email: String,
+    level: u32,
+    online: Option<Arc<crate::stats::OnlineLease>>,
 }
 
 thread_local! {
@@ -18,11 +20,13 @@ thread_local! {
 /// The source and account a front's flows are logged with until the session ends.
 pub(crate) struct FlowGuard;
 
-pub(crate) fn flow(source: Option<SocketAddr>, email: &str) -> FlowGuard {
+pub(crate) fn flow(source: Option<SocketAddr>, email: &str, level: u32) -> FlowGuard {
     FLOW.with(|flow| {
         *flow.borrow_mut() = Flow {
             source,
             email: email.to_owned(),
+            level,
+            online: None,
         };
     });
     FlowGuard
@@ -41,6 +45,15 @@ pub(crate) fn record_current(destination: &dyn std::fmt::Display) {
         (flow.source, flow.email.clone())
     });
     record(source, true, destination, None, "", &email);
+    if email.is_empty() {
+        return;
+    }
+    FLOW.with(|flow| {
+        let mut flow = flow.borrow_mut();
+        if flow.online.is_none() {
+            flow.online = crate::stats::online(&flow.email, flow.level);
+        }
+    });
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -230,7 +243,7 @@ mod tests {
             crate::json::parse(&format!(r#"{{"log":{{"access":{quoted}}}}}"#)).expect("parses");
         install(&root).expect("access log installs");
         let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
-        let flow = flow(Some(source), "a@b.c");
+        let flow = flow(Some(source), "a@b.c", 0);
         record_current(&"example.com:443");
         drop(flow);
         let text = std::fs::read_to_string(&path).expect("reads the line");
@@ -241,6 +254,28 @@ mod tests {
         );
         let _ = std::fs::remove_file(&path);
         install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+    }
+
+    #[test]
+    fn a_recorded_flow_holds_the_online_lease() {
+        let _guard = crate::stats::test_lock();
+        crate::stats::clear();
+        crate::policy::clear();
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+        let root = crate::json::parse(
+            r#"{"stats":{},"policy":{"levels":{"1":{"statsUserOnline":true}}}}"#,
+        )
+        .expect("parses");
+        crate::policy::install(&root).expect("policy installs");
+        crate::stats::install(&root).expect("stats installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        let flow = flow(Some(source), "a@b.c", 1);
+        record_current(&"example.com:443");
+        assert_eq!(crate::stats::snapshot().online.get("a@b.c"), Some(&1));
+        drop(flow);
+        assert_eq!(crate::stats::snapshot().online.get("a@b.c"), None);
+        crate::stats::clear();
+        crate::policy::clear();
     }
 
     #[test]
