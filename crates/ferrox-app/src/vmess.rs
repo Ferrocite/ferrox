@@ -2184,7 +2184,7 @@ mod tests {
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("target");
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, writer) =
-            crate::ws::connect(stream, &format!("127.0.0.1:{port}"), path, 0, &[])
+            crate::ws::connect(stream, &format!("127.0.0.1:{port}"), path, 0, &[], &[], 0)
                 .expect("carries");
 
         let (request, data_key, data_iv, auth) = request_bytes(
@@ -2301,7 +2301,8 @@ mod tests {
             "/vmess-xhttp",
             |stream, id| serve_xhttp(stream, "/vmess-xhttp", &Users::single(id), true),
             |stream| {
-                let (reader, writer) = crate::xhttp::connect(stream, "127.0.0.1", "/vmess-xhttp")?;
+                let (reader, writer) =
+                    crate::xhttp::connect(stream, "127.0.0.1", "/vmess-xhttp", &[])?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,
@@ -2317,7 +2318,7 @@ mod tests {
             |stream, id| serve_httpheader(stream, "/vmess-camouflage", &Users::single(id), true),
             |stream| {
                 let (reader, writer) =
-                    crate::httpheader::connect(stream, "127.0.0.1", "/vmess-camouflage")?;
+                    crate::httpheader::connect(stream, "127.0.0.1", "/vmess-camouflage", &[])?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,

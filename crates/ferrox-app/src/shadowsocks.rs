@@ -1337,7 +1337,7 @@ mod tests {
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, mut writer) =
-            crate::ws::connect(stream, "127.0.0.1", "/ss-ws", 0, &[]).expect("carries");
+            crate::ws::connect(stream, "127.0.0.1", "/ss-ws", 0, &[], &[], 0).expect("carries");
         let Some((mut send, recv)) = client_send_handshake(
             &mut writer,
             "an-example-shared-password",
@@ -1550,6 +1550,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn carried_transports_relay_an_echo() {
         const PASSWORD: &str = "an-example-shared-password";
         const METHOD: &str = "aes-256-gcm";
@@ -1607,9 +1608,16 @@ mod tests {
         let echo_port = echo();
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let target = Destination::from(target);
-        let (mut reader, mut writer) =
-            crate::ws::connect(tunnel(serve_ws, "/ss-ws"), "127.0.0.1", "/ss-ws", 0, &[])
-                .expect("carries");
+        let (mut reader, mut writer) = crate::ws::connect(
+            tunnel(serve_ws, "/ss-ws"),
+            "127.0.0.1",
+            "/ss-ws",
+            0,
+            &[],
+            &[],
+            0,
+        )
+        .expect("carries");
         round_trip(&mut reader, &mut writer, &target);
         // What the dial does on this carrier: the request packet is sealed before the connect, so `ed=0` leaves it whole after the answer and a budget puts it on the wire with the `GET`.
         let (packet, send, recv) = sealed(&target);
@@ -1619,6 +1627,7 @@ mod tests {
             "/ss-upgrade",
             0,
             &packet,
+            &[],
         )
         .expect("carries");
         answers(&mut reader, &mut writer, send, recv);
@@ -1629,6 +1638,7 @@ mod tests {
             "/ss-upgrade",
             64,
             &packet,
+            &[],
         )
         .expect("rides ahead of the answer");
         answers(&mut reader, &mut writer, send, recv);
@@ -1639,14 +1649,19 @@ mod tests {
         )
         .expect("carries");
         round_trip(&mut reader, &mut writer, &target);
-        let (mut reader, mut writer) =
-            crate::xhttp::connect(tunnel(serve_xhttp, "/ss-xhttp"), "127.0.0.1", "/ss-xhttp")
-                .expect("carries");
+        let (mut reader, mut writer) = crate::xhttp::connect(
+            tunnel(serve_xhttp, "/ss-xhttp"),
+            "127.0.0.1",
+            "/ss-xhttp",
+            &[],
+        )
+        .expect("carries");
         round_trip(&mut reader, &mut writer, &target);
         let (mut reader, mut writer) = crate::httpheader::connect(
             tunnel(serve_httpheader, "/ss-camouflage"),
             "127.0.0.1",
             "/ss-camouflage",
+            &[],
         )
         .expect("carries");
         round_trip(&mut reader, &mut writer, &target);
@@ -2197,6 +2212,7 @@ mod tests {
             std::io::Cursor::new(Vec::new()),
             "h",
             "/share",
+            &[],
         )
         .expect("dials the head");
         let widths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
@@ -2245,6 +2261,7 @@ mod tests {
             std::io::Cursor::new(Vec::new()),
             "h",
             "/share",
+            &[],
         )
         .expect("dials the head");
         let plain: Vec<u8> = (0..READ_CHUNK * 2 + 10).map(|i| (i % 251) as u8).collect();
