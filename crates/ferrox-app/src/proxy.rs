@@ -8597,9 +8597,10 @@ where
 }
 
 /// The carrier lanes a dialled session rides, shared by the `TLS` and `REALITY` client dials: split the sealed session into a carrier's reader and writer, read the answer, then run the plain relay. `Raw` is the caller's and is left untouched here.
-fn ride_carrier<S: Dialed>(
+fn ride_carrier<S: Dialed, D: Dialed>(
     server: &SocketAddr,
     session: S,
+    second: impl FnOnce() -> Option<D>,
     vless: &VlessOut,
     header: &[u8],
     client: &Connection,
@@ -8640,16 +8641,9 @@ fn ride_carrier<S: Dialed>(
             relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
         }
         Carrier::Xhttp { settings, .. } => {
-            let Some(cfg) = vless.tls.as_deref() else {
-                return;
-            };
-            let Some((mut reader, writer)) = tls_xhttp(
-                server,
-                session,
-                || dial_tls_session(server, cfg, vless.carrier.tcp_mask()),
-                &vless.host,
-                settings,
-            ) else {
+            let Some((mut reader, writer)) =
+                tls_xhttp(server, session, second, &vless.host, settings)
+            else {
                 return;
             };
             if !writer.send(header) {
@@ -8780,7 +8774,14 @@ fn dial_vless_tls(
             );
             relay_stream(Half::socket(downstream), half, &close);
         }
-        _ => ride_carrier(server, session, vless, &header, client),
+        _ => ride_carrier(
+            server,
+            session,
+            || tls_lane(server, vless),
+            vless,
+            &header,
+            client,
+        ),
     }
 }
 
@@ -8818,7 +8819,73 @@ fn pump_tls_answer(
         .and_then(Result::ok)
 }
 
+fn tls_lane(
+    server: &SocketAddr,
+    vless: &VlessOut,
+) -> Option<ferrox_core::tls::ClientSession<Connection>> {
+    vless
+        .tls
+        .as_deref()
+        .and_then(|cfg| dial_tls_session(server, cfg, vless.carrier.tcp_mask()))
+}
+
+fn reality_lane(
+    server: &SocketAddr,
+    vless: &VlessOut,
+) -> Option<
+    ferrox_core::tls::RealityClientSession<ferrox_core::tls::reality::RecordLimiter<Connection>>,
+> {
+    vless
+        .reality
+        .as_deref()
+        .and_then(|cfg| dial_reality_session(server, cfg, vless.carrier.tcp_mask()))
+}
+
+/// A second REALITY session for a carrier whose modes split their request and answer.
+fn dial_reality_session(
+    server: &SocketAddr,
+    cfg: &ferrox_core::tls::RealityClientConfig,
+    mask: Option<&ferrox_core::finalmask::Chain>,
+) -> Option<
+    ferrox_core::tls::RealityClientSession<ferrox_core::tls::reality::RecordLimiter<Connection>>,
+> {
+    let uplink = match dial(server) {
+        Ok(uplink) => uplink.with_mask(mask),
+        Err(failure) => {
+            note_dial_failure(server, failure);
+            return None;
+        }
+    };
+    let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
+    let limiter = ferrox_core::tls::reality::RecordLimiter::new(uplink);
+    let session = match ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter) {
+        Ok(session) => session,
+        Err(error) => {
+            let failure = Failure::new(
+                Stage::SocketConnected,
+                Kind::of(&std::io::Error::from(error)),
+            );
+            note_dial_failure(server, failure);
+            return None;
+        }
+    };
+    if session
+        .get_ref()
+        .get_ref()
+        .set_read_timeout(Some(SESSION_POLL))
+        .is_err()
+    {
+        note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
+        return None;
+    }
+    Some(session)
+}
+
 /// One REALITY dial: TCP, the sealed handshake, the VLESS header, then the relay.
+#[allow(
+    clippy::too_many_lines,
+    reason = "the REALITY dial owns the raw, vision and carried lanes in one match"
+)]
 fn dial_vless_reality(
     client: &Connection,
     server: &SocketAddr,
@@ -8922,7 +8989,14 @@ fn dial_vless_reality(
                 }
             }
         }
-        _ => ride_carrier(server, session, vless, &header, client),
+        _ => ride_carrier(
+            server,
+            session,
+            || reality_lane(server, vless),
+            vless,
+            &header,
+            client,
+        ),
     }
 }
 
@@ -20959,6 +21033,30 @@ mod tests {
         assert_eq!(
             back, payload,
             "payload came back altered through the carried REALITY session"
+        );
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+    }
+
+    #[test]
+    fn reality_xhttp_dial_reaches_echo_through_the_relay() {
+        let pair = reality_pair_with(
+            "",
+            "xhttp",
+            Carrier::Xhttp {
+                settings: xhttp_settings("/"),
+            },
+        );
+        let (mut user, dialled) = dial_pair(&pair);
+        let payload: Vec<u8> = (0..200_000u32)
+            .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let back = echo_bulk(&mut user, &payload);
+        assert_eq!(
+            back, payload,
+            "payload came back altered through the carried REALITY xhttp session"
         );
         drop(user);
         dialled.join().expect("joins");
