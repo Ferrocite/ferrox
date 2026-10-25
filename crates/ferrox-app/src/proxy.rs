@@ -6670,18 +6670,19 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
     match inbound_carrier(inbound) {
         Carrier::Kcp(config) => {
             let email = account.email.clone();
+            let level = account.level;
             let serve: KcpServe = if sec == "tls" {
                 let Some(server) = inbound_tls_identity(inbound) else {
                     eprintln!("unreadable trojan tls identity on {address}: refused, not served");
                     return false;
                 };
                 Arc::new(move |conn| {
-                    let _flow = crate::accesslog::flow(None, &email);
+                    let _flow = crate::accesslog::flow(None, &email, level);
                     serve_trojan_kcp_tls(conn, &key, freedom, &server);
                 })
             } else {
                 Arc::new(move |conn| {
-                    let _flow = crate::accesslog::flow(None, &email);
+                    let _flow = crate::accesslog::flow(None, &email, level);
                     serve_trojan_kcp(conn, &key, freedom);
                 })
             };
@@ -6689,8 +6690,9 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
         }
         Carrier::Xdrive { settings } => {
             let email = account.email.clone();
+            let level = account.level;
             let accept: crate::xdrive::Accept = Arc::new(move |session| {
-                let _flow = crate::accesslog::flow(None, &email);
+                let _flow = crate::accesslog::flow(None, &email, level);
                 serve_trojan_xdrive(session, &key, freedom);
             });
             serve_xdrive_loop(&settings, address, accept);
@@ -6745,18 +6747,19 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
     match inbound_carrier(inbound) {
         Carrier::Kcp(config) => {
             let email = account.email.clone();
+            let level = account.level;
             let serve: KcpServe = if sec == "tls" {
                 let Some(server) = inbound_tls_identity(inbound) else {
                     eprintln!("unreadable vmess tls identity on {address}: refused, not served");
                     return;
                 };
                 Arc::new(move |conn| {
-                    let _flow = crate::accesslog::flow(None, &email);
+                    let _flow = crate::accesslog::flow(None, &email, level);
                     serve_vmess_kcp_tls(conn, &id, freedom, &server);
                 })
             } else {
                 Arc::new(move |conn| {
-                    let _flow = crate::accesslog::flow(None, &email);
+                    let _flow = crate::accesslog::flow(None, &email, level);
                     let (reader, writer, close) = kcp_parts(conn);
                     crate::vmess::serve_kcp(reader, writer, &id, freedom, &close);
                 })
@@ -6766,8 +6769,9 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
         }
         Carrier::Xdrive { settings } => {
             let email = account.email.clone();
+            let level = account.level;
             let accept: crate::xdrive::Accept = Arc::new(move |session| {
-                let _flow = crate::accesslog::flow(None, &email);
+                let _flow = crate::accesslog::flow(None, &email, level);
                 serve_vmess_xdrive(session, &id, freedom);
             });
             serve_xdrive_loop(&settings, address, accept);
@@ -7005,6 +7009,7 @@ fn serve_ss_kcp_listener(
     freedom: bool,
     is_2022: bool,
     email: &str,
+    level: u32,
 ) -> bool {
     let password = password.to_owned();
     let method = method.to_owned();
@@ -7016,12 +7021,12 @@ fn serve_ss_kcp_listener(
         };
         let email = email.clone();
         Arc::new(move |conn| {
-            let _flow = crate::accesslog::flow(None, &email);
+            let _flow = crate::accesslog::flow(None, &email, level);
             serve_ss_kcp_tls(conn, &password, &method, freedom, is_2022, &server);
         })
     } else {
         Arc::new(move |conn| {
-            let _flow = crate::accesslog::flow(None, &email);
+            let _flow = crate::accesslog::flow(None, &email, level);
             let (reader, writer, close) = kcp_parts(conn);
             if is_2022 {
                 crate::shadowsocks2022::serve_kcp(
@@ -7101,6 +7106,7 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
                 freedom,
                 is_2022,
                 &account.email,
+                account.level,
             ) {
                 return;
             }
@@ -7109,8 +7115,9 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
             let password = password.clone();
             let method = method.clone();
             let email = account.email.clone();
+            let level = account.level;
             let accept: crate::xdrive::Accept = Arc::new(move |session| {
-                let _flow = crate::accesslog::flow(None, &email);
+                let _flow = crate::accesslog::flow(None, &email, level);
                 serve_ss_xdrive(session, &password, &method, freedom, is_2022);
             });
             serve_xdrive_loop(&settings, address, accept);
@@ -35485,6 +35492,58 @@ mod tests {
     }
 
     #[test]
+    fn an_unauthenticated_trojan_probe_holds_no_online_lease() {
+        let _guard = crate::stats::test_lock();
+        crate::stats::clear();
+        crate::policy::clear();
+        let root = crate::json::parse(
+            r#"{"stats":{},"policy":{"levels":{"1":{"statsUserOnline":true}}}}"#,
+        )
+        .expect("parses");
+        crate::policy::install(&root).expect("policy installs");
+        crate::stats::install(&root).expect("stats installs");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let (stream, _) = front.accept().expect("accepts");
+        let key = trojan_key("a-password");
+        let account = InboundAccount {
+            email: "a@b.c".to_owned(),
+            level: 1,
+        };
+        let serving = thread::spawn(move || {
+            front_dispatch(
+                stream,
+                Role::Trojan {
+                    key,
+                    carrier: Carrier::Raw(Chain::default()),
+                    freedom: true,
+                    account,
+                },
+            );
+        });
+        client
+            .write_all(&[0u8; 57])
+            .expect("writes a partial header");
+        let mut online = None;
+        for _ in 0..200 {
+            online = crate::stats::snapshot().online.get("a@b.c").copied();
+            if online.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            online, None,
+            "an unauthenticated probe must not hold an online lease"
+        );
+        drop(client);
+        serving.join().expect("serves");
+        crate::stats::clear();
+        crate::policy::clear();
+    }
+
+    #[test]
     fn a_front_account_carries_the_email_and_level_its_counters_key_on() {
         use base64::Engine as _;
         let inbound = crate::json::parse(
@@ -40043,7 +40102,8 @@ fn front_dispatch(stream: Connection, role: Role) {
     let email = account
         .as_ref()
         .map_or("", |account| account.email.as_str());
-    let _flow = crate::accesslog::flow(source, email);
+    let level = account.as_ref().map_or(0, |account| account.level);
+    let _flow = crate::accesslog::flow(source, email, level);
     dispatch(stream, role, account.as_ref());
 }
 
@@ -40051,7 +40111,7 @@ fn front_dispatch(stream: Connection, role: Role) {
 fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
     let stream = match account {
         Some(account) => stream
-            .with_meter(crate::stats::user(&account.email, account.level))
+            .with_meter(crate::stats::user_traffic(&account.email, account.level))
             .with_policy(Some(crate::policy::flow(account.level))),
         None => stream,
     };
