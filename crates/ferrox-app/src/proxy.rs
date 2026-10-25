@@ -31552,6 +31552,7 @@ mod tests {
                 4,
                 rest,
                 true,
+                None,
             );
             serve_vless_hysteria(flow, &one_vless_user(&id), true);
         });
