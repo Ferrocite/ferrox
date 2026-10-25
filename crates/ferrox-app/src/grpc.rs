@@ -1359,13 +1359,17 @@ mod tests {
         drop(reader);
         drop(writer);
         let chunks = seen.lock().expect("writes");
-        assert_eq!(chunks[0].as_slice(), MAGIC);
-        let window = u32::from_be_bytes(chunks[1][11..15].try_into().unwrap());
+        assert_eq!(&chunks[0][..MAGIC.len()], MAGIC);
+        let window = u32::from_be_bytes(
+            chunks[0][MAGIC.len() + 11..MAGIC.len() + 15]
+                .try_into()
+                .unwrap(),
+        );
         assert_eq!(window, 1_000_000, "initialWindowsSize is the stream window");
         let mut decoder = Decoder::default();
         let mut headers: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         decoder
-            .decode(&chunks[3], &mut |name, value| {
+            .decode(&chunks[1][9..], &mut |name, value| {
                 headers.push((name.to_vec(), value.to_vec()));
             })
             .expect("decodes");
