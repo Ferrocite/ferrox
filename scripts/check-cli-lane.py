@@ -242,11 +242,20 @@ def proxy_bypass(state: pathlib.Path) -> list[str]:
     return proxy_field(state, "bypass").splitlines()
 
 
-def env_for(state: pathlib.Path, curl: bool = False) -> dict[str, str]:
+def env_for(
+    state: pathlib.Path, curl: bool = False, darwin: bool = False
+) -> dict[str, str]:
     env = dict(os.environ)
     env["FERROX_CONF_DIR"] = str(state)
     env["FERROX_BIN"] = shutil.which("true") or "/bin/true"
     path = f"{fake_networksetup(state)}:{env.get('PATH', '')}"
+    if darwin:
+        bin_dir = state / "fake-darwin-bin"
+        bin_dir.mkdir(exist_ok=True)
+        uname = bin_dir / "uname"
+        uname.write_text("#!/bin/sh\nprintf 'Darwin\\n'\n", encoding="utf-8")
+        uname.chmod(0o755)
+        path = f"{bin_dir}:{path}"
     if curl:
         path = f"{fake_curl(state)}:{path}"
     env["PATH"] = path
@@ -919,7 +928,7 @@ def check_vpn_fronts(state: pathlib.Path) -> int:
         ),
         encoding="utf-8",
     )
-    env = env_for(state, curl=True)
+    env = env_for(state, curl=True, darwin=True)
     env["FERROX_BIN"] = str(vpn_lane_binary(state))
     env["FERROX_FAKE_TRACE"] = "1"
     cases = [
@@ -1012,7 +1021,7 @@ def config_lane(
     calls = state / "networksetup.calls"
     calls.unlink(missing_ok=True)
     (state / "system-proxy.ports").unlink(missing_ok=True)
-    env = env_for(state, curl=True)
+    env = env_for(state, curl=True, darwin=True)
     env["FERROX_BIN"] = str(vpn_lane_binary(state))
     env["FERROX_FAKE_TRACE"] = "1" if trace else ""
     run = subprocess.run(
@@ -1231,7 +1240,7 @@ def check_vpn_pac(state: pathlib.Path) -> int:
         ),
         encoding="utf-8",
     )
-    env = env_for(state, curl=True)
+    env = env_for(state, curl=True, darwin=True)
     env["FERROX_BIN"] = str(vpn_lane_binary(state))
     env["FERROX_FAKE_TRACE"] = "1"
     calls = state / "networksetup.calls"
@@ -1438,7 +1447,7 @@ def check_vpn_bypass(state: pathlib.Path) -> int:
         ),
         encoding="utf-8",
     )
-    env = env_for(state, curl=True)
+    env = env_for(state, curl=True, darwin=True)
     env["FERROX_BIN"] = str(vpn_lane_binary(state))
     env["FERROX_FAKE_TRACE"] = "1"
     calls = state / "networksetup.calls"
