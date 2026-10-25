@@ -9,6 +9,7 @@ on:
       - "scripts/run-benchmark-matrix.sh"
       - "scripts/lib-matrix.sh"
       - "scripts/lib-engines.sh"
+      - "scripts/xray-to-singbox.py"
       - "scripts/render-benchmark-charts.py"
       - "scripts/validate-benchmark-matrix.py"
       - "docs/benchmarks/matrix.md"

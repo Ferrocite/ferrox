@@ -29,6 +29,17 @@ matrix_udp_carrier() {
   esac
 }
 
+matrix_engine_serves() {
+  case "$1" in
+    sing-box)
+      case "$2" in
+        *-xhttp-*|*-kcp-*|*-hysteria-*) return 1 ;;
+      esac
+      ;;
+  esac
+  return 0
+}
+
 server_config() {
   local port="$3" cover="${4:-}"
   local extra=""
