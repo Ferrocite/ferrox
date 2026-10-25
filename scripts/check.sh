@@ -52,6 +52,9 @@ step "method docs"
 step "ci scope"
 ./scripts/check-ci-scope.sh
 
+step "benchmark delta"
+python3 scripts/benchmark-delta.py --selftest
+
 step "method matrix"
 ./scripts/check-method-superset.sh
 

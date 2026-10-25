@@ -194,8 +194,10 @@ def check_charts(charts_dir, results):
     The setup chart exists only when a setup scenario ran: requiring it
     unconditionally would fail every tier that does not measure setup.
     """
-    wanted = list(ALWAYS_CHARTS)
-    if any("setup" in scenario.get("id", "") for scenario in results.get("scenarios", [])):
+    scenarios = results.get("scenarios", [])
+    bulk = any("setup" not in scenario.get("id", "") for scenario in scenarios)
+    wanted = list(ALWAYS_CHARTS) if bulk else ["startup.png", "binary-size.png"]
+    if any("setup" in scenario.get("id", "") for scenario in scenarios):
         wanted.append(SETUP_CHART)
     for name in wanted:
         path = Path(charts_dir) / name
@@ -203,10 +205,8 @@ def check_charts(charts_dir, results):
         if path.is_file():
             check(path.stat().st_size > 0, f"empty chart {path}")
     for scenario in results.get("scenarios", []):
-        if "setup" in scenario.get("id", ""):
-            continue
-        path = Path(charts_dir) / "throughput" / f"{scenario['id']}.png"
-        check(path.is_file(), f"missing per-test throughput chart {path}")
+        path = Path(charts_dir) / "scenarios" / f"{scenario['id']}.png"
+        check(path.is_file(), f"missing per-test scenario chart {path}")
         if path.is_file():
             check(path.stat().st_size > 0, f"empty chart {path}")
 
@@ -234,6 +234,10 @@ def check_readme(readme_path, charts_dir, results):
         if any(name in scenario.get("medians", {}) for scenario in results.get("scenarios", []))
     ]
     for scenario in results.get("scenarios", []):
+        image = f"scenarios/{scenario['id']}.png"
+        check(image in section, f"README has no per-test chart for {scenario['id']}")
+        if "setup" in scenario.get("id", ""):
+            continue
         medians = scenario.get("medians", {})
         cells = []
         for engine in engines:
@@ -247,9 +251,6 @@ def check_readme(readme_path, charts_dir, results):
             f"README row for {scenario['id']} does not match "
             f"matrix-results.json ({'/'.join(cells)})",
         )
-        if "setup" not in scenario.get("id", ""):
-            image = f"throughput/{scenario['id']}.png"
-            check(image in section, f"README has no per-test chart for {scenario['id']}")
     check("## Coverage" in section, "README has no coverage table section")
     check("| scenario | server |" in section, "README has no coverage table header")
 
@@ -264,10 +265,8 @@ def check_bundle_readme(path, results):
     check("## Coverage" in text, "bundle document has no coverage table")
     check("| scenario | server |" in text, "bundle document has no coverage header")
     for scenario in results.get("scenarios", []):
-        if "setup" in scenario.get("id", ""):
-            continue
         check(
-            f"throughput/{scenario['id']}.png" in text,
+            f"scenarios/{scenario['id']}.png" in text,
             f"bundle document has no chart for {scenario['id']}",
         )
 
