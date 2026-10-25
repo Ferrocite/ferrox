@@ -226,6 +226,11 @@ pub(crate) fn install(root: &Json) -> Result<Arc<Config>, String> {
     Ok(config)
 }
 
+/// Install a policy parsed from a protobuf config rather than the JSON tree.
+pub(crate) fn install_config(config: Config) {
+    *lock() = Some(Arc::new(config));
+}
+
 pub(crate) fn configured() -> Option<Arc<Config>> {
     lock().clone()
 }

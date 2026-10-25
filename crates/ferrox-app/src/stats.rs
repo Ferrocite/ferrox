@@ -16,6 +16,10 @@ impl Counter {
     pub(crate) fn value(&self) -> i64 {
         self.0.load(Ordering::Relaxed)
     }
+
+    fn swap(&self, value: i64) -> i64 {
+        self.0.swap(value, Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Default)]
@@ -365,6 +369,37 @@ impl Snapshot {
             _ => {}
         }
     }
+}
+
+/// One counter by the name the reference registered, optionally reset by the read.
+pub(crate) fn get(name: &str, reset: bool) -> Option<i64> {
+    let registry = registry();
+    let counter = registry.counters.get(name)?;
+    Some(if reset {
+        counter.swap(0)
+    } else {
+        counter.value()
+    })
+}
+
+/// Every counter whose name contains the pattern, optionally reset by the read.
+pub(crate) fn query(pattern: &str, reset: bool) -> Vec<(String, i64)> {
+    let registry = registry();
+    let mut found: Vec<(String, i64)> = registry
+        .counters
+        .iter()
+        .filter(|(name, _)| name.contains(pattern))
+        .map(|(name, counter)| {
+            let value = if reset {
+                counter.swap(0)
+            } else {
+                counter.value()
+            };
+            (name.clone(), value)
+        })
+        .collect();
+    found.sort_by(|left, right| left.0.cmp(&right.0));
+    found
 }
 
 /// A consistent read of every counter and online map the manager holds.

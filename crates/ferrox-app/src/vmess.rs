@@ -1303,18 +1303,91 @@ fn decode_header(header: &[u8]) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)>
     }
     Some((target, send, recv, prefix, cmd))
 }
-pub(crate) fn accept_request(
-    stream: &mut dyn Read,
-    id: &[u8; 16],
-) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)> {
+/// The accounts one vmess inbound serves. A mutation lands on the next handshake; a flow already
+/// admitted keeps running, so `AlterInbound` never drops a session.
+#[derive(Debug, Default)]
+pub(crate) struct Users {
+    entries: std::sync::Mutex<Vec<User>>,
+}
+
+/// One vmess account: the id the wire names, the email that names it to `RemoveUser`, and its level.
+#[derive(Clone, Debug)]
+pub(crate) struct User {
+    pub(crate) level: u32,
+    pub(crate) email: String,
+    pub(crate) id: [u8; 16],
+}
+
+pub(crate) type UsersRef = std::sync::Arc<Users>;
+
+impl Users {
+    pub(crate) fn with(entries: Vec<User>) -> UsersRef {
+        std::sync::Arc::new(Self {
+            entries: std::sync::Mutex::new(entries),
+        })
+    }
+
+    pub(crate) fn single(id: [u8; 16]) -> UsersRef {
+        Self::with(vec![User {
+            level: 0,
+            email: String::new(),
+            id,
+        }])
+    }
+
+    fn snapshot(&self) -> Vec<User> {
+        self.entries.lock().map(|e| e.clone()).unwrap_or_default()
+    }
+
+    fn authenticate(&self, auth_id: &[u8; AUTH_LEN]) -> Option<([u8; 16], User)> {
+        let entries = self.entries.lock().ok()?;
+        entries.iter().find_map(|user| {
+            let (instruction, auth_key) = cached_keys(&user.id);
+            (valid_auth_id(&auth_key, auth_id) && !replay_seen(auth_id))
+                .then(|| (instruction, user.clone()))
+        })
+    }
+
+    pub(crate) fn add(&self, user: User) -> bool {
+        let Ok(mut entries) = self.entries.lock() else {
+            return false;
+        };
+        if entries.iter().any(|held| held.id == user.id) {
+            return false;
+        }
+        entries.push(user);
+        true
+    }
+
+    pub(crate) fn remove_email(&self, email: &str) -> bool {
+        let Ok(mut entries) = self.entries.lock() else {
+            return false;
+        };
+        let before = entries.len();
+        entries.retain(|held| held.email != email);
+        entries.len() != before
+    }
+
+    pub(crate) fn list(&self) -> Vec<User> {
+        self.snapshot()
+    }
+}
+
+pub(crate) fn accept_request(stream: &mut dyn Read, users: &Users) -> Option<Accepted> {
     let mut auth_id = [0u8; AUTH_LEN];
     read_exact(stream, &mut auth_id).ok()?;
-    let (instruction, auth_key) = cached_keys(id);
-    if !valid_auth_id(&auth_key, &auth_id) || replay_seen(&auth_id) {
-        return None;
-    }
+    let (instruction, user) = users.authenticate(&auth_id)?;
     let header = read_open_header(stream, &instruction, &auth_id)?;
-    decode_header(&header)
+    let (target, send, recv, prefix, cmd) = decode_header(&header)?;
+    let meter = crate::stats::user(&user.email, user.level);
+    Some(Accepted {
+        target,
+        send,
+        recv,
+        prefix,
+        cmd,
+        user: meter,
+    })
 }
 
 /// The relay leg's read window: a read fills every byte the leg reads, so the zero pass
@@ -1326,7 +1399,7 @@ fn relay_window() -> Vec<u8> {
 pub(crate) fn pump_relay_carried<R, W>(
     plain: &Connection,
     reader: R,
-    mut writer: W,
+    writer: W,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
     send: Flow,
     recv: Flow,
@@ -1343,6 +1416,7 @@ pub(crate) fn pump_relay_carried<R, W>(
     };
     let mut plain_read = plain_read;
     let mut plain_write = plain_write;
+    let mut writer = writer;
 
     let mut send = send;
     let thread_close = std::sync::Arc::clone(close);
@@ -1432,15 +1506,22 @@ pub(crate) fn pump_relay_carried<R, W>(
     let _ = plain_write.shutdown(Shutdown::Both);
 }
 
-type Accepted = (SocketAddr, Flow, Flow, Vec<u8>, u8);
+pub(crate) struct Accepted {
+    pub(crate) target: SocketAddr,
+    pub(crate) send: Flow,
+    pub(crate) recv: Flow,
+    pub(crate) prefix: Vec<u8>,
+    pub(crate) cmd: u8,
+    pub(crate) user: crate::stats::Meter,
+}
 type Close = std::sync::Arc<dyn Fn() + Send + Sync>;
 
-fn accept_request_bounded(reader: &mut dyn Read, id: &[u8; 16]) -> Option<Accepted> {
+fn accept_request_bounded(reader: &mut dyn Read, users: &Users) -> Option<Accepted> {
     let mut bounded = crate::proxy::HandshakeDeadline {
         inner: reader,
         until: std::time::Instant::now() + crate::budgets::handshake(),
     };
-    accept_request(&mut bounded, id)
+    accept_request(&mut bounded, users)
 }
 
 fn serve_decoded<R, W>(
@@ -1453,7 +1534,15 @@ fn serve_decoded<R, W>(
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    let Some((target, send, recv, prefix, cmd)) = decoded else {
+    let Some(Accepted {
+        target,
+        send,
+        recv,
+        prefix,
+        cmd,
+        user,
+    }) = decoded
+    else {
         close();
         return;
     };
@@ -1468,13 +1557,14 @@ fn serve_decoded<R, W>(
                 close();
                 return;
             };
+            let uplink = uplink.with_meter(user);
             if !write_prefix(&mut writer, &prefix) {
                 close();
                 return;
             }
             pump_relay_carried(&uplink, reader, writer, close, send, recv, None);
         }
-        2 => serve_udp_carried(reader, writer, close, &target, &prefix, send, recv),
+        2 => serve_udp_carried(reader, writer, close, &target, &prefix, send, recv, &user),
         _ => {}
     }
 }
@@ -1483,6 +1573,7 @@ fn write_prefix<W: Write>(writer: &mut W, prefix: &[u8]) -> bool {
     prefix.is_empty() || (writer.write_all(prefix).is_ok() && writer.flush().is_ok())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_udp_carried<R, W>(
     reader: R,
     mut writer: W,
@@ -1491,6 +1582,7 @@ fn serve_udp_carried<R, W>(
     prefix: &[u8],
     send: Flow,
     recv: Flow,
+    user: &crate::stats::Meter,
 ) where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
@@ -1512,14 +1604,14 @@ fn serve_udp_carried<R, W>(
         close();
         return;
     }
-    crate::proxy::pump_vmess_udp(reader, writer, close, &udp, send, recv);
+    crate::proxy::pump_vmess_udp(reader, writer, close, &udp, send, recv, user);
 }
 
-pub(crate) fn serve_ws(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve_ws(stream: Connection, path: &str, users: &Users, freedom: bool) {
     let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
         return;
     };
-    let decoded = accept_request(&mut reader, id);
+    let decoded = accept_request(&mut reader, users);
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.close());
     serve_decoded(reader, writer, &close, decoded, freedom);
@@ -1529,7 +1621,7 @@ pub(crate) fn serve_ws_split<R, W>(
     reader: R,
     writer: W,
     path: &str,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
     close: &Close,
 ) where
@@ -1539,7 +1631,7 @@ pub(crate) fn serve_ws_split<R, W>(
     let Some((mut reader, writer)) = crate::ws::accept_split(reader, writer, path) else {
         return;
     };
-    let decoded = accept_request_bounded(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, users);
     let closer = writer.clone();
     let shutdown = std::sync::Arc::clone(close);
     let close: Close = std::sync::Arc::new(move || {
@@ -1550,11 +1642,11 @@ pub(crate) fn serve_ws_split<R, W>(
 }
 
 #[cfg(test)]
-pub(crate) fn serve_grpc(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve_grpc(stream: Connection, path: &str, users: &Users, freedom: bool) {
     serve_grpc_with(
         stream,
         &crate::config::GrpcSettings::path(path),
-        id,
+        users,
         freedom,
     );
 }
@@ -1562,13 +1654,13 @@ pub(crate) fn serve_grpc(stream: Connection, path: &str, id: &[u8; 16], freedom:
 pub(crate) fn serve_grpc_with(
     stream: Connection,
     settings: &crate::config::GrpcSettings,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
 ) {
     let Some((mut reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
-    let decoded = under_handshake(&mut reader, |read| accept_request(read, id));
+    let decoded = under_handshake(&mut reader, |read| accept_request(read, users));
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.close());
     serve_decoded(reader, writer, &close, decoded, freedom);
@@ -1578,7 +1670,7 @@ pub(crate) fn serve_grpc_split<R, W>(
     reader: R,
     writer: W,
     settings: &crate::config::GrpcSettings,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
     close: &Close,
 ) where
@@ -1589,7 +1681,7 @@ pub(crate) fn serve_grpc_split<R, W>(
     else {
         return;
     };
-    let decoded = accept_request_bounded(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, users);
     let closer = writer.clone();
     let shutdown = std::sync::Arc::clone(close);
     let close: Close = std::sync::Arc::new(move || {
@@ -1599,11 +1691,11 @@ pub(crate) fn serve_grpc_split<R, W>(
     serve_decoded(reader, writer, &close, decoded, freedom);
 }
 
-pub(crate) fn serve_xhttp(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve_xhttp(stream: Connection, path: &str, users: &Users, freedom: bool) {
     let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
-    let decoded = accept_request(&mut reader, id);
+    let decoded = accept_request(&mut reader, users);
     let closer = writer.clone();
     let close: Close = std::sync::Arc::new(move || closer.finish());
     serve_decoded(reader, writer, &close, decoded, freedom);
@@ -1613,7 +1705,7 @@ pub(crate) fn serve_xhttp_split<R, W>(
     reader: R,
     writer: W,
     settings: &crate::xhttp::XhttpSettings,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
     close: &Close,
 ) where
@@ -1625,7 +1717,7 @@ pub(crate) fn serve_xhttp_split<R, W>(
     else {
         return;
     };
-    let decoded = accept_request_bounded(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, users);
     let closer = writer.clone();
     let shutdown = std::sync::Arc::clone(close);
     let close: Close = std::sync::Arc::new(move || {
@@ -1635,11 +1727,11 @@ pub(crate) fn serve_xhttp_split<R, W>(
     serve_decoded(reader, writer, &close, decoded, freedom);
 }
 
-pub(crate) fn serve_httpheader(stream: Connection, path: &str, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve_httpheader(stream: Connection, path: &str, users: &Users, freedom: bool) {
     let Some((mut reader, write)) = crate::httpheader::accept(stream, path) else {
         return;
     };
-    let decoded = accept_request(&mut reader, id);
+    let decoded = accept_request(&mut reader, users);
     let Ok(closer) = write.try_clone() else {
         return;
     };
@@ -1653,7 +1745,7 @@ pub(crate) fn serve_httpheader_split<R, W>(
     reader: R,
     writer: W,
     path: &str,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
     close: &Close,
 ) where
@@ -1663,7 +1755,7 @@ pub(crate) fn serve_httpheader_split<R, W>(
     let Some((mut reader, writer)) = crate::httpheader::accept_split(reader, writer, path) else {
         return;
     };
-    let decoded = accept_request_bounded(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, users);
     serve_decoded(reader, writer, close, decoded, freedom);
 }
 
@@ -1671,13 +1763,13 @@ pub(crate) fn serve_httpupgrade(
     stream: Connection,
     path: &str,
     host: &str,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
 ) {
     let Some((mut reader, write)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
-    let decoded = accept_request(&mut reader, id);
+    let decoded = accept_request(&mut reader, users);
     let Ok(closer) = write.try_clone() else {
         return;
     };
@@ -1692,7 +1784,7 @@ pub(crate) fn serve_httpupgrade_split<R, W>(
     writer: W,
     path: &str,
     host: &str,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
     close: &Close,
 ) where
@@ -1703,39 +1795,39 @@ pub(crate) fn serve_httpupgrade_split<R, W>(
     else {
         return;
     };
-    let decoded = accept_request_bounded(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, users);
     serve_decoded(reader, writer, close, decoded, freedom);
 }
 
 pub(crate) fn serve_raw_split<R, W>(
     mut reader: R,
     writer: W,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
     close: &Close,
 ) where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    let decoded = accept_request_bounded(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, users);
     serve_decoded(reader, writer, close, decoded, freedom);
 }
 
 pub(crate) fn serve_kcp<R, W>(
     mut reader: R,
     writer: W,
-    id: &[u8; 16],
+    users: &Users,
     freedom: bool,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
 ) where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    let decoded = accept_request_bounded(&mut reader, id);
+    let decoded = accept_request_bounded(&mut reader, users);
     serve_decoded(reader, writer, close, decoded, freedom);
 }
 
-pub(crate) fn serve(mut stream: Connection, id: &[u8; 16], freedom: bool) {
+pub(crate) fn serve(mut stream: Connection, users: &Users, freedom: bool) {
     // Bound the opening request read like the raw VLESS handshake, then restore the relay's blocking reads.
     let budget = crate::budgets::handshake();
     let _ = stream.set_read_timeout(Some(budget));
@@ -1744,10 +1836,18 @@ pub(crate) fn serve(mut stream: Connection, id: &[u8; 16], freedom: bool) {
             inner: &mut stream,
             until: std::time::Instant::now() + budget,
         };
-        accept_request(&mut bounded, id)
+        accept_request(&mut bounded, users)
     };
     let _ = stream.set_read_timeout(None);
-    let Some((target, send, recv, prefix, cmd)) = request else {
+    let Some(Accepted {
+        target,
+        send,
+        recv,
+        prefix,
+        cmd,
+        user,
+    }) = request
+    else {
         return;
     };
     if !freedom {
@@ -1755,7 +1855,7 @@ pub(crate) fn serve(mut stream: Connection, id: &[u8; 16], freedom: bool) {
     }
     crate::accesslog::record_current(&target);
     if cmd == 2 {
-        return serve_vmess_udp(stream, &target, send, recv, &prefix);
+        return serve_vmess_udp(stream, &target, send, recv, &prefix, &user);
     }
     if cmd != 1 {
         return;
@@ -1763,6 +1863,7 @@ pub(crate) fn serve(mut stream: Connection, id: &[u8; 16], freedom: bool) {
     let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
+    let uplink = uplink.with_meter(user);
     if stream.write_all(&prefix).is_err() {
         return;
     }
@@ -1775,6 +1876,7 @@ pub(crate) fn serve_vmess_udp(
     send: Flow,
     recv: Flow,
     prefix: &[u8],
+    user: &crate::stats::Meter,
 ) {
     let bind = if target.is_ipv6() {
         "[::]:0"
@@ -1799,7 +1901,7 @@ pub(crate) fn serve_vmess_udp(
     let close: Close = std::sync::Arc::new(move || {
         let _ = closer.shutdown(Shutdown::Both);
     });
-    crate::proxy::pump_vmess_udp(reader, stream, &close, &udp, send, recv);
+    crate::proxy::pump_vmess_udp(reader, stream, &close, &udp, send, recv, user);
 }
 
 pub(crate) type PendingResponse = ([u8; 16], [u8; 16], u8);
@@ -1924,7 +2026,13 @@ mod tests {
             &mut pad
         ));
         let mut cursor = Cursor::new([request, frame].concat());
-        let Some((got, _send, mut take, _prefix, cmd)) = accept_request(&mut cursor, &id) else {
+        let Some(Accepted {
+            target: got,
+            recv: mut take,
+            cmd,
+            ..
+        }) = accept_request(&mut cursor, &Users::single(id))
+        else {
             panic!("decodes a header");
         };
         assert_eq!(cmd, 1);
@@ -1934,6 +2042,35 @@ mod tests {
             panic!("reads a coalesced frame");
         };
         assert_eq!(back, b"ping");
+    }
+
+    #[test]
+    fn a_second_account_authenticates_on_the_same_inbound() {
+        let first = [0x31u8; 16];
+        let second = [0x32u8; 16];
+        let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+        let request = client_request(
+            &second,
+            Cipher::Auto,
+            &crate::proxy::Destination::from(target),
+            1,
+        )
+        .expect("builds a request")
+        .0;
+        let users = Users::with(vec![
+            User {
+                level: 0,
+                email: "first@example.com".to_owned(),
+                id: first,
+            },
+            User {
+                level: 0,
+                email: "second@example.com".to_owned(),
+                id: second,
+            },
+        ]);
+        let mut cursor = Cursor::new(request);
+        assert!(accept_request(&mut cursor, &users).is_some());
     }
 
     #[test]
@@ -2009,7 +2146,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve(stream, &id, true);
+            serve(stream, &Users::single(id), true);
             let _ = done_tx.send(());
         });
         let _peer = Connection::connect(addr).expect("connects");
@@ -2041,7 +2178,7 @@ mod tests {
         let server_path = path.to_string();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_ws(stream, &server_path, &server_id, true);
+            serve_ws(stream, &server_path, &Users::single(server_id), true);
         });
 
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("target");
@@ -2162,7 +2299,7 @@ mod tests {
     fn vmess_carries_over_the_xhttp_carrier_both_ways() {
         vmess_over_byte_carrier(
             "/vmess-xhttp",
-            |stream, id| serve_xhttp(stream, "/vmess-xhttp", &id, true),
+            |stream, id| serve_xhttp(stream, "/vmess-xhttp", &Users::single(id), true),
             |stream| {
                 let (reader, writer) = crate::xhttp::connect(stream, "127.0.0.1", "/vmess-xhttp")?;
                 Some((
@@ -2177,7 +2314,7 @@ mod tests {
     fn vmess_carries_behind_the_http_camouflage_both_ways() {
         vmess_over_byte_carrier(
             "/vmess-camouflage",
-            |stream, id| serve_httpheader(stream, "/vmess-camouflage", &id, true),
+            |stream, id| serve_httpheader(stream, "/vmess-camouflage", &Users::single(id), true),
             |stream| {
                 let (reader, writer) =
                     crate::httpheader::connect(stream, "127.0.0.1", "/vmess-camouflage")?;
@@ -2203,7 +2340,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_grpc(stream, "/p", &id, true);
+            serve_grpc(stream, "/p", &Users::single(id), true);
             let _ = done_tx.send(());
         });
         let stream = Connection::connect(addr).expect("connects");
@@ -2233,7 +2370,7 @@ mod tests {
         let port = listener.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_grpc(stream, path, &id, true);
+            serve_grpc(stream, path, &Users::single(id), true);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("target");
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
@@ -2709,7 +2846,7 @@ mod tests {
         let port = server.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = server.accept().expect("accepts");
-            super::serve(stream, &id, true);
+            super::serve(stream, &Users::single(id), true);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
@@ -3345,7 +3482,7 @@ mod tests {
         thread::spawn(move || {
             for stream in server.incoming().take(3) {
                 let Ok(stream) = stream else { continue };
-                thread::spawn(move || super::serve(stream, &id, true));
+                thread::spawn(move || super::serve(stream, &Users::single(id), true));
             }
         });
         let mut refused = 0;
@@ -3831,6 +3968,46 @@ mod tests {
         assert_eq!(upload, b"ping");
         let end = read_frame(&mut server, &mut uploader, &mut scratch).expect("the upload marker");
         assert_eq!(end, b"");
+        relay.join().expect("joins");
+    }
+
+    #[test]
+    fn the_relay_carries_both_directions() {
+        let key = [0x77u8; 16];
+        let iv = [0x88u8; 16];
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        let send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let recv = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
+        let (plain, mut target) = socket_pair();
+        let (sealed, mut client) = socket_pair();
+        let relay = thread::spawn(move || pump_relay(&plain, &sealed, send, recv, None));
+
+        let mut uploader = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("seals");
+        let mut pad = PadSource::fresh().expect("entropy");
+        let mut wire = Vec::new();
+        assert!(
+            stage_frame(&mut uploader, b"hello", &mut wire, &mut pad),
+            "seals the upload"
+        );
+        client.write_all(&wire).expect("writes the upload");
+
+        let mut buf = [0u8; 5];
+        target
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("arms");
+        target.read_exact(&mut buf).expect("reads the upload");
+        assert_eq!(&buf, b"hello");
+
+        target.write_all(b"world").expect("writes the download");
+        target.shutdown(Shutdown::Write).expect("ends the download");
+
+        let mut decoder = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("opens");
+        let mut scratch = Vec::new();
+        let download =
+            read_frame(&mut client, &mut decoder, &mut scratch).expect("reads the download");
+        assert_eq!(download, b"world");
+
+        client.shutdown(Shutdown::Write).expect("ends the upload");
         relay.join().expect("joins");
     }
 }
