@@ -27473,7 +27473,10 @@ mod tests {
             handle_mux_udp_new(new(first_port), &mut udp, &mut global, &mut out);
         }
         let old = Arc::clone(udp.get(&7).expect("first session"));
-        let old_addr = old.socket.local_addr().expect("addr");
+        let old_addr = SocketAddr::from((
+            [127, 0, 0, 1],
+            old.socket.local_addr().expect("addr").port(),
+        ));
         {
             let mut out = MuxOut {
                 wire: &wire,
