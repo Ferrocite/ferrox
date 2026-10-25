@@ -903,6 +903,7 @@ enum Role {
         carrier: Carrier,
         freedom: bool,
         server: Arc<ferrox_core::tls::TlsServerConfig>,
+        fallbacks: Option<Arc<[Fallback]>>,
     },
     Vmess {
         id: [u8; 16],
@@ -6576,6 +6577,17 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
         eprintln!("trojan reality inbound on {address}: refused, not served as plaintext");
         return false;
     }
+    let fallbacks = if sec == "tls" {
+        match server_fallbacks(inbound) {
+            Ok(fallbacks) => fallbacks.map(Arc::from),
+            Err(error) => {
+                eprintln!("{error} on {address}: inbound refused");
+                return false;
+            }
+        }
+    } else {
+        None
+    };
     match inbound_carrier(inbound) {
         Carrier::Kcp(config) => {
             let serve: KcpServe = if sec == "tls" {
@@ -6610,6 +6622,7 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
                         carrier,
                         freedom,
                         server,
+                        fallbacks,
                     },
                 ),
                 inbound_tag(inbound),
@@ -10652,6 +10665,7 @@ fn serve_trojan_tls(
     carrier: &Carrier,
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
+    fallbacks: Option<&[Fallback]>,
 ) {
     if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
@@ -10665,7 +10679,8 @@ fn serve_trojan_tls(
             if !shake_tls(&mut tls) {
                 return;
             }
-            relay_trojan(tls, Some(raw), None, key, freedom);
+            let front = FrontNames::of(&tls);
+            relay_trojan_with_fallbacks(tls, Some(raw), None, key, freedom, fallbacks, &front);
         }
         Carrier::Ws { path, .. } => {
             let Ok(out) = stream.try_clone() else { return };
@@ -10737,9 +10752,83 @@ fn relay_trojan<S>(
         };
         decode_trojan_request(&mut deadline, key)
     };
-    let Some((cmd, target)) = bounded else {
+    let Some(header) = bounded else {
         return;
     };
+    relay_trojan_request(session, raw, kcp, header, freedom);
+}
+
+/// A trojan front with fallbacks: the first read names the inbound or routes to the cover site.
+fn relay_trojan_with_fallbacks<S>(
+    mut session: S,
+    raw: Option<Connection>,
+    kcp: Option<Arc<ferrox_core::kcp::Connection>>,
+    key: &[u8; 56],
+    freedom: bool,
+    fallbacks: Option<&[Fallback]>,
+    front: &FrontNames,
+) where
+    S: std::io::Read
+        + std::io::Write
+        + Send
+        + ferrox_core::tls::RecordAlignment
+        + ferrox_core::tls::TlsProvider
+        + Drivable
+        + CipherOpen
+        + 'static,
+{
+    let Some(rows) = fallbacks else {
+        return relay_trojan(session, raw, kcp, key, freedom);
+    };
+    let mut window = [0u8; PROBE_READ];
+    let n = {
+        let mut deadline = HandshakeDeadline {
+            inner: &mut session,
+            until: Instant::now() + budgets::handshake(),
+        };
+        match deadline.read(&mut window) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        }
+    };
+    if n < 58 || window[56] != b'\r' || !key_agrees(&window[..56], key) {
+        let Some(raw) = raw.as_ref() else {
+            return;
+        };
+        return seize_fallback_tls(session, raw, rows, &window[..n], &[], front);
+    }
+    let mut carried = Vec::new();
+    let header = {
+        let mut replay = Prefixed {
+            head: &window[..n],
+            at: 0,
+            tail: &mut session,
+            carried: &mut carried,
+        };
+        decode_trojan_request(&mut replay, key)
+    };
+    let Some(header) = header else {
+        return;
+    };
+    relay_trojan_request(session, raw, kcp, header, freedom);
+}
+
+fn relay_trojan_request<S>(
+    session: S,
+    raw: Option<Connection>,
+    kcp: Option<Arc<ferrox_core::kcp::Connection>>,
+    (cmd, target): (u8, SocketAddr),
+    freedom: bool,
+) where
+    S: std::io::Read
+        + std::io::Write
+        + Send
+        + ferrox_core::tls::RecordAlignment
+        + ferrox_core::tls::TlsProvider
+        + Drivable
+        + CipherOpen
+        + 'static,
+{
     if !freedom {
         return;
     }
@@ -25141,6 +25230,74 @@ mod tests {
         }
     }
 
+    /// A non-trojan TLS client on a listener with fallbacks reaches the cover site, with the PROXY head its xver asks for.
+    #[test]
+    fn a_trojan_tls_fallback_reaches_the_cover_site() {
+        let (cert, key, client) = tls_cert_json();
+        let cover = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let cover_port = cover.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut socket, _) = cover.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                match socket.read(&mut buf) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => {
+                        if socket.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan",
+                "settings": {{"clients": [{{"password": "secret"}}],
+                    "fallbacks": [{{"dest": "127.0.0.1:{cover_port}", "xver": 1}}]}},
+                "streamSettings": {{"network": "tcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_trojan_inbound(&address, &inbound, true));
+        let waited = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+            assert!(
+                waited.elapsed() < Duration::from_secs(10),
+                "trojan listener never bound"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let addr: SocketAddr = address.parse().expect("addr");
+        let mut session = dial_tls_session(&addr, &client, None).expect("dialled");
+        session.write_all(b"hello\n").expect("writes");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(5) {
+            match session.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(error) if is_timeout(&error) => {}
+                Err(_) => break,
+            }
+            if got.ends_with(b"hello\n") {
+                break;
+            }
+        }
+        assert!(
+            got.starts_with(b"PROXY TCP4 "),
+            "the fallback head rides the cover-site stream: {got:?}"
+        );
+        assert!(
+            got.ends_with(b"hello\n"),
+            "the cover site echoes the probe: {got:?}"
+        );
+    }
+
     /// The vmess listener reads its stream settings: a tls inbound answers the handshake before any carrier.
     #[test]
     fn a_vmess_inbound_that_declares_tls_answers_every_carrier() {
@@ -39495,7 +39652,15 @@ fn front_dispatch(stream: Connection, role: Role) {
             carrier,
             freedom,
             server,
-        } => serve_trojan_tls(stream, &key, &carrier, freedom, &server),
+            fallbacks,
+        } => serve_trojan_tls(
+            stream,
+            &key,
+            &carrier,
+            freedom,
+            &server,
+            fallbacks.as_deref(),
+        ),
         Role::Vmess {
             id,
             carrier,
