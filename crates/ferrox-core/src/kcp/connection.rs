@@ -335,7 +335,7 @@ impl Connection {
         })
     }
 
-    pub(crate) fn start(&self) {
+    pub(crate) fn start(self: &Arc<Self>) {
         if !self.started.swap(true, Ordering::SeqCst) {
             scheduler().register(Arc::downgrade(self));
         }
