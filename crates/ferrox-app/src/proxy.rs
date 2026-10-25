@@ -35821,6 +35821,75 @@ mod tests {
         assert_eq!(&back, b"ping");
     }
 
+    fn freedom_out(root: &str) -> Outbound {
+        let root = crate::json::parse(root).expect("parses");
+        find_outbound(&root)
+            .expect("builds")
+            .expect("the config names a freedom outbound")
+    }
+
+    fn unbound_port() -> u16 {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        listener.local_addr().expect("addr").port()
+    }
+
+    /// The redirect wins over the requested destination: the requested port has no
+    /// listener, so only a dial that took the redirect can answer.
+    #[test]
+    fn a_freedom_redirect_reaches_the_redirected_service() {
+        let echo = echo_loop();
+        let dead = unbound_port();
+        let out = freedom_out(&format!(
+            r#"{{"outbounds":[{{"protocol":"freedom","settings":{{"redirect":"127.0.0.1:{echo}"}}}}]}}"#
+        ));
+        let front = socks_front_with(out);
+        let mut client = socks_ask(
+            front,
+            format!("127.0.0.1:{dead}").parse().expect("an address"),
+        );
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client
+            .read_exact(&mut back)
+            .expect("the redirected echo answers");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// A `proxyProtocol: 2` dial puts the binary header in front of the payload, with
+    /// the client as the source and the dialled service as the destination.
+    #[test]
+    fn a_freedom_proxy_protocol_writes_the_v2_header() {
+        let sink = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let sink_port = sink.local_addr().expect("addr").port();
+        let (header, got_header) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = sink.accept().expect("accepts");
+            let mut head = [0u8; 16];
+            stream.read_exact(&mut head).expect("the header");
+            let _ = header.send(head);
+            let _ = stream.write_all(b"OK");
+        });
+        let dead = unbound_port();
+        let out = freedom_out(&format!(
+            r#"{{"outbounds":[{{"protocol":"freedom","settings":{{"redirect":"127.0.0.1:{sink_port}","proxyProtocol":2}}}}]}}"#
+        ));
+        let front = socks_front_with(out);
+        let mut client = socks_ask(
+            front,
+            format!("127.0.0.1:{dead}").parse().expect("an address"),
+        );
+        client.write_all(b"ping").expect("writes");
+        let head = got_header
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the proxy header reached the redirected service");
+        assert_eq!(
+            &head[..12],
+            &[0x0d, 0x0a, 0x0d, 0x0a, 0x00, 0x0d, 0x0a, 0x51, 0x55, 0x49, 0x54, 0x0a],
+            "the v2 magic"
+        );
+        assert_eq!(head[12], 0x21, "PROXY command");
+    }
+
     /// A front that asks for a credential refuses a SOCKS4 request: the protocol
     /// carries a user id and no password, so there is nothing to check against. The
     /// pinned Go server refuses it the same way, with the same reply.
