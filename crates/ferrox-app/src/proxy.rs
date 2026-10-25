@@ -5907,14 +5907,24 @@ fn kcp_tls_connect(
     conn: &Arc<ferrox_core::kcp::Connection>,
     cfg: &ferrox_core::tls::TlsConfig,
 ) -> Option<ferrox_core::tls::ClientSession<KcpIo>> {
-    let mut session = ferrox_core::tls::connect(
+    let mut session = match ferrox_core::tls::connect(
         cfg,
         KcpIo {
             conn: Arc::clone(conn),
         },
-    )
-    .ok()?;
-    shake_tls(&mut session).then_some(session)
+    ) {
+        Ok(session) => session,
+        Err(_) => {
+            echo_trace("kcp-tls: connect failed");
+            return None;
+        }
+    };
+    if !shake_tls(&mut session) {
+        echo_trace("kcp-tls: shake failed");
+        return None;
+    }
+    echo_trace("kcp-tls: shaken");
+    Some(session)
 }
 
 /// KCP is the transport and the security rides it, as it does upstream: the session carries the header and both relay legs, not the connection.
@@ -7350,6 +7360,7 @@ fn open_vmess_udp_kcp(
     let Carrier::Kcp(config) = &vmess.carrier else {
         return None;
     };
+    echo_trace("vmess-kcp: request");
     let (request, send, recv, response_key, response_iv, auth) = vmess_udp_request(vmess, dest)?;
     let conn = ferrox_core::kcp::dial(
         server,
@@ -7357,9 +7368,12 @@ fn open_vmess_udp_kcp(
         ferrox_core::kcp::fresh_conversation(),
     )
     .ok()?;
+    echo_trace("vmess-kcp: dialed");
     if let Some(cfg) = vmess.tls.as_deref() {
         let mut session = kcp_tls_connect(&conn, cfg)?;
+        echo_trace("vmess-kcp: tls");
         if session.write_all(&request).is_err() {
+            echo_trace("vmess-kcp: write failed");
             return None;
         }
         {
@@ -7368,9 +7382,11 @@ fn open_vmess_udp_kcp(
                 until: Instant::now() + crate::quic::HANDSHAKE_TIMEOUT,
             };
             if !crate::vmess::read_response(&mut bounded, &response_key, &response_iv, auth) {
+                echo_trace("vmess-kcp: response failed");
                 return None;
             }
         }
+        echo_trace("vmess-kcp: response");
         let (reader, writer) = session_halves(
             session,
             KcpIo {
