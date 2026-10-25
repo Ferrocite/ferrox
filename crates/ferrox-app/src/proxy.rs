@@ -3419,7 +3419,7 @@ pub(crate) fn dns_stream(
     let dest = dns_destination(host, port);
     let out = dns_outbound(&dest, crate::router::Network::Tcp, tag)?;
     // Freedom is the system dial under another name, so the direct path is shorter and the same.
-    if let Outbound::Freedom(freedom) = out {
+    if let Outbound::Freedom(freedom) = &out {
         if freedom.is_plain() {
             return None;
         }
@@ -3482,7 +3482,7 @@ pub(crate) fn dns_udp(
     let target = dns_socket(host, port)?;
     let dest = Destination::Address(target);
     let out = dns_outbound(&dest, crate::router::Network::Udp, tag)?;
-    if let Outbound::Freedom(freedom) = out {
+    if let Outbound::Freedom(freedom) = &out {
         if freedom.is_plain() {
             return None;
         }
@@ -18736,7 +18736,7 @@ fn find_freedom_outbound(root: &Json) -> Result<Option<FreedomOut>, String> {
         for field in ["noise", "noises", "ipsBlocked", "finalRules", "userLevel"] {
             if settings
                 .and_then(|s| s.get(field))
-                .is_some_and(|value| !value.is_null())
+                .is_some_and(|value| !matches!(value, Json::Null))
             {
                 eprintln!("freedom: {field} is not carried; the dial keeps its own behaviour");
             }
