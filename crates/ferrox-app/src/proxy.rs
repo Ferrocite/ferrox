@@ -651,7 +651,7 @@ fn rung_of(carrier: &Carrier) -> Option<Rung> {
         Carrier::Raw(_) => Some(Rung::Raw),
         Carrier::Ws { .. } => Some(Rung::Ws),
         Carrier::Xhttp { .. } => Some(Rung::Xhttp),
-        Carrier::Grpc { .. } => Some(Rung::Grpc),
+        Carrier::Grpc(_) => Some(Rung::Grpc),
         Carrier::HttpUpgrade { .. } => Some(Rung::HttpUpgrade),
         _ => None,
     }
@@ -661,7 +661,8 @@ fn rung_of(carrier: &Carrier) -> Option<Rung> {
 fn stream_params(carrier: &Carrier) -> Option<(&str, u32)> {
     match carrier {
         Carrier::Ws { path, ed } | Carrier::HttpUpgrade { path, ed, .. } => Some((path, *ed)),
-        Carrier::Grpc { path } | Carrier::HttpHeader { path } => Some((path, 0)),
+        Carrier::Grpc(settings) => Some((settings.path.as_str(), 0)),
+        Carrier::HttpHeader { path } => Some((path, 0)),
         Carrier::Xhttp { settings, .. } => Some((settings.path.as_str(), 0)),
         _ => None,
     }
@@ -1727,13 +1728,9 @@ fn serve_shadowsocks(
                     freedom,
                 );
             }
-            Carrier::Grpc { path } => {
-                crate::shadowsocks2022::serve_grpc(
-                    stream,
-                    password,
-                    method,
-                    path.as_str(),
-                    freedom,
+            Carrier::Grpc(settings) => {
+                crate::shadowsocks2022::serve_grpc_with(
+                    stream, password, method, settings, freedom,
                 );
             }
             Carrier::Xhttp { settings, .. } => {
@@ -1773,8 +1770,8 @@ fn serve_shadowsocks(
                 freedom,
             );
         }
-        Carrier::Grpc { path } => {
-            crate::shadowsocks::serve_grpc(stream, password, method, path.as_str(), freedom);
+        Carrier::Grpc(settings) => {
+            crate::shadowsocks::serve_grpc_with(stream, password, method, settings, freedom);
         }
         Carrier::Xhttp { settings, .. } => {
             crate::shadowsocks::serve_xhttp(
@@ -1850,13 +1847,14 @@ fn serve_shadowsocks_tls(
             });
             serve_ss_tls_session(reader, writer, password, method, freedom, &close, is_2022);
         }
-        Carrier::Grpc { path } => {
+        Carrier::Grpc(settings) => {
             let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            let Some((reader, writer)) = crate::grpc::accept_split(reader, writer, path) else {
+            let Some((reader, writer)) = crate::grpc::accept_split_with(reader, writer, settings)
+            else {
                 return;
             };
             let closer = writer.clone();
@@ -1930,7 +1928,7 @@ fn serve_vless(
         Carrier::HttpUpgrade { path, host, .. } => {
             serve_vless_httpupgrade(stream, users, path, host, freedom);
         }
-        Carrier::Grpc { path } => serve_vless_grpc(stream, users, path, freedom),
+        Carrier::Grpc(settings) => serve_vless_grpc(stream, users, settings, freedom),
         Carrier::Xhttp { settings, .. } => {
             let Ok(read) = stream.try_clone() else {
                 return;
@@ -2018,8 +2016,13 @@ fn serve_vless_httpupgrade(
     crate::proxy::relay_carried(reader, &write, &uplink);
 }
 
-fn serve_vless_grpc(stream: Connection, users: &[VlessUser], path: &str, freedom: bool) {
-    let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
+fn serve_vless_grpc(
+    stream: Connection,
+    users: &[VlessUser],
+    settings: &crate::config::GrpcSettings,
+    freedom: bool,
+) {
+    let Some((mut reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
     // Past the preface the reader retries timeouts itself, so the opening request is polled at the relay's grain and bounded by the handshake budget, the way the websocket arm bounds its frames.
@@ -4202,11 +4205,11 @@ fn serve_session_httpheader<R: Read, W: Write + Clone + Send + 'static>(
 fn serve_session_grpc<R: Read, W: FrameWrite + 'static>(
     read: R,
     write: W,
-    path: &str,
+    settings: &crate::config::GrpcSettings,
     users: &[VlessUser],
     freedom: bool,
 ) {
-    let Some((mut creader, cwriter)) = crate::grpc::accept_split(read, write, path) else {
+    let Some((mut creader, cwriter)) = crate::grpc::accept_split_with(read, write, settings) else {
         echo_trace("session grpc accept refused");
         return;
     };
@@ -4309,13 +4312,13 @@ fn serve_vless_tls(
             let (reader, writer) = session_halves(session, out);
             serve_session_httpheader(reader, writer, raw, path, users, freedom);
         }
-        Carrier::Grpc { path } => {
+        Carrier::Grpc(settings) => {
             let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_grpc(reader, writer, path, users, freedom);
+            serve_session_grpc(reader, writer, settings, users, freedom);
         }
         refused_carriers!() => {}
     }
@@ -4422,14 +4425,14 @@ fn serve_vless_reality(
                 serve_session_httpheader(reader, writer, raw, path, users, freedom);
             });
         }
-        Carrier::Grpc { path } => {
+        Carrier::Grpc(settings) => {
             let Ok(out) = stream.try_clone() else { return };
             serve_carrier_reality(stream, server, |mut session| {
                 if !shake_tls(&mut session) {
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_session_grpc(reader, writer, path, users, freedom);
+                serve_session_grpc(reader, writer, settings, users, freedom);
             });
         }
         refused_carriers!() => {}
@@ -5576,8 +5579,13 @@ fn dial_vless_rung(
             true
         }
         Rung::Grpc => {
+            let settings = vless
+                .carrier
+                .grpc_settings()
+                .cloned()
+                .unwrap_or_else(|| crate::config::GrpcSettings::path(attempt.path));
             let Some((mut reader, writer)) =
-                crate::grpc::connect(uplink, &vless.host, attempt.path)
+                crate::grpc::connect_with(uplink, &vless.host, &settings)
             else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
@@ -6817,8 +6825,8 @@ fn serve_vmess_tls(
         Carrier::HttpUpgrade { path, host, .. } => {
             crate::vmess::serve_httpupgrade_split(reader, writer, path, host, id, freedom, &close);
         }
-        Carrier::Grpc { path } => {
-            crate::vmess::serve_grpc_split(reader, writer, path, id, freedom, &close);
+        Carrier::Grpc(settings) => {
+            crate::vmess::serve_grpc_split(reader, writer, settings, id, freedom, &close);
         }
         refused_carriers!() => {}
     }
@@ -7438,8 +7446,8 @@ fn open_vmess_udp_plain(
                 recv,
             })
         }
-        Carrier::Grpc { path } => {
-            let (mut reader, writer) = crate::grpc::connect(uplink, &vmess.host, path)?;
+        Carrier::Grpc(settings) => {
+            let (mut reader, writer) = crate::grpc::connect_with(uplink, &vmess.host, settings)?;
             reader.set_poll(Some(RELAY_POLL));
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
@@ -7584,8 +7592,8 @@ fn open_vmess_udp_tls(
                 recv,
             })
         }
-        Carrier::Grpc { path } => {
-            let (mut reader, writer) = tls_grpc(server, session, &vmess.host, path)?;
+        Carrier::Grpc(settings) => {
+            let (mut reader, writer) = tls_grpc(server, session, &vmess.host, settings)?;
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
             if !writer.send(&request) {
@@ -7732,7 +7740,7 @@ fn trojan_udp_carried(carrier: &Carrier) -> bool {
         Carrier::Raw(_)
             | Carrier::Ws { .. }
             | Carrier::HttpUpgrade { .. }
-            | Carrier::Grpc { .. }
+            | Carrier::Grpc(_)
             | Carrier::Xhttp { .. }
             | Carrier::HttpHeader { .. }
             | Carrier::Kcp(_)
@@ -7843,8 +7851,8 @@ fn trojan_udp_plain(
             };
             Some((Box::new(reader), Box::new(writer), Box::new(close)))
         }
-        Carrier::Grpc { path } => {
-            let (reader, writer) = crate::grpc::connect(uplink, host, path)?;
+        Carrier::Grpc(settings) => {
+            let (reader, writer) = crate::grpc::connect_with(uplink, host, settings)?;
             if !writer.send(header) {
                 return None;
             }
@@ -7910,9 +7918,9 @@ fn trojan_udp_tls<S: Dialed>(
             };
             Some((Box::new(reader), Box::new(writer), Box::new(close)))
         }
-        Carrier::Grpc { path } => {
+        Carrier::Grpc(settings) => {
             let (reader, writer, raw) = session.into_halves()?;
-            let (reader, writer) = crate::grpc::connect_split(reader, writer, host, path)?;
+            let (reader, writer) = crate::grpc::connect_split_with(reader, writer, host, settings)?;
             if !writer.send(header) {
                 return None;
             }
@@ -8219,8 +8227,13 @@ fn dial_vmess_grpc(
     ladder: &Ladder,
 ) -> bool {
     let rung = attempt.rung;
-    let path = attempt.path;
-    let Some((mut reader, writer)) = crate::grpc::connect(uplink, &vmess.host, path) else {
+    let settings = vmess
+        .carrier
+        .grpc_settings()
+        .cloned()
+        .unwrap_or_else(|| crate::config::GrpcSettings::path(attempt.path));
+    let Some((mut reader, writer)) = crate::grpc::connect_with(uplink, &vmess.host, &settings)
+    else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     let Some((request, send, recv, response_key, response_iv, auth)) =
@@ -8610,7 +8623,12 @@ fn dial_trojan_rung(
             true
         }
         Rung::Grpc => {
-            let Some((reader, writer)) = crate::grpc::connect(uplink, &trojan.host, attempt.path)
+            let settings = trojan
+                .carrier
+                .grpc_settings()
+                .cloned()
+                .unwrap_or_else(|| crate::config::GrpcSettings::path(attempt.path));
+            let Some((reader, writer)) = crate::grpc::connect_with(uplink, &trojan.host, &settings)
             else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
@@ -8848,10 +8866,11 @@ fn tls_grpc<S: Dialed>(
     server: &SocketAddr,
     session: S,
     host: &str,
-    path: &str,
+    settings: &crate::config::GrpcSettings,
 ) -> Option<(crate::grpc::GrpcReader<TlsHalf<S>>, crate::grpc::GrpcWriter)> {
     let (reader, writer, _) = session.into_halves()?;
-    crate::grpc::connect_split(reader, writer, host, path).or_else(|| tls_unreachable(server))
+    crate::grpc::connect_split_with(reader, writer, host, settings)
+        .or_else(|| tls_unreachable(server))
 }
 
 fn tls_xhttp<S: Dialed, D: Dialed>(
@@ -9333,8 +9352,9 @@ fn ride_carrier<S: Dialed, D: Dialed>(
             }
             relay_sink(reader, &sink, client, |_| {});
         }
-        Carrier::Grpc { path } => {
-            let Some((mut reader, writer)) = tls_grpc(server, session, &vless.host, path) else {
+        Carrier::Grpc(settings) => {
+            let Some((mut reader, writer)) = tls_grpc(server, session, &vless.host, settings)
+            else {
                 return;
             };
             if !writer.send(header) {
@@ -9752,8 +9772,8 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
             };
             relay_sink(reader, &sink, client, |_| {});
         }
-        Carrier::Grpc { path } => {
-            let Some((reader, writer)) = tls_grpc(server, session, &trojan.host, path) else {
+        Carrier::Grpc(settings) => {
+            let Some((reader, writer)) = tls_grpc(server, session, &trojan.host, settings) else {
                 return;
             };
             if !writer.send(header) {
@@ -9891,8 +9911,8 @@ fn vmess_tls_carried(
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
             crate::vmess::pump_relay_carried(client, reader, sink, &close, send, recv, None);
         }
-        Carrier::Grpc { path } => {
-            let Some((reader, writer)) = tls_grpc(server, session, &vmess.host, path) else {
+        Carrier::Grpc(settings) => {
+            let Some((reader, writer)) = tls_grpc(server, session, &vmess.host, settings) else {
                 return;
             };
             let mut reader = reader;
@@ -10207,7 +10227,12 @@ fn dial_ss_tls_rung(
             true
         }
         Rung::Grpc => {
-            let Some((reader, writer)) = tls_grpc(server, session, &ss.host, attempt.path) else {
+            let settings = ss
+                .carrier
+                .grpc_settings()
+                .cloned()
+                .unwrap_or_else(|| crate::config::GrpcSettings::path(attempt.path));
+            let Some((reader, writer)) = tls_grpc(server, session, &ss.host, &settings) else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
             let closer = writer.clone();
@@ -10404,7 +10429,12 @@ fn dial_ss_grpc(
     ladder: &Ladder,
 ) -> bool {
     let rung = attempt.rung;
-    let Some((reader, mut writer)) = crate::grpc::connect(uplink, &ss.host, attempt.path) else {
+    let settings = ss
+        .carrier
+        .grpc_settings()
+        .cloned()
+        .unwrap_or_else(|| crate::config::GrpcSettings::path(attempt.path));
+    let Some((reader, mut writer)) = crate::grpc::connect_with(uplink, &ss.host, &settings) else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
@@ -10483,7 +10513,7 @@ fn serve_trojan(stream: Connection, key: &[u8; 56], carrier: &Carrier, freedom: 
         Carrier::HttpUpgrade { path, host, .. } => {
             serve_trojan_httpupgrade(stream, key, path.as_str(), host, freedom);
         }
-        Carrier::Grpc { path } => serve_trojan_grpc(stream, key, path.as_str(), freedom),
+        Carrier::Grpc(settings) => serve_trojan_grpc(stream, key, settings, freedom),
         Carrier::Xhttp { settings, .. } => {
             serve_trojan_xhttp(stream, key, settings.path.as_str(), freedom);
         }
@@ -10703,8 +10733,13 @@ fn serve_trojan_httpupgrade(
     crate::proxy::relay_carried(reader, &write, &uplink);
 }
 
-fn serve_trojan_grpc(stream: Connection, key: &[u8; 56], path: &str, freedom: bool) {
-    let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
+fn serve_trojan_grpc(
+    stream: Connection,
+    key: &[u8; 56],
+    settings: &crate::config::GrpcSettings,
+    freedom: bool,
+) {
+    let Some((mut reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
     let Some((cmd, target)) = under_handshake(&mut reader, |read| decode_trojan_request(read, key))
@@ -10838,13 +10873,13 @@ fn serve_trojan_tls(
             let (reader, writer) = session_halves(session, out);
             serve_session_trojan_httpheader(reader, writer, raw, path, key, freedom);
         }
-        Carrier::Grpc { path } => {
+        Carrier::Grpc(settings) => {
             let Ok(out) = stream.try_clone() else { return };
             let Some(session) = accept_tls_session(stream, server) else {
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_trojan_grpc(reader, writer, path, key, freedom);
+            serve_session_trojan_grpc(reader, writer, settings, key, freedom);
         }
         refused_carriers!() => {}
     }
@@ -11222,11 +11257,11 @@ fn serve_session_trojan_httpheader<R: Read + Send + 'static, W: Write + Clone + 
 fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     read: R,
     write: W,
-    path: &str,
+    settings: &crate::config::GrpcSettings,
     key: &[u8; 56],
     freedom: bool,
 ) {
-    let Some((mut creader, cwriter)) = crate::grpc::accept_split(read, write, path) else {
+    let Some((mut creader, cwriter)) = crate::grpc::accept_split_with(read, write, settings) else {
         echo_trace("session grpc trojan accept refused");
         return;
     };
@@ -17754,7 +17789,7 @@ fn loopback_carrier(carrier: &Carrier) -> bool {
         Carrier::Raw(_)
             | Carrier::Ws { .. }
             | Carrier::HttpUpgrade { .. }
-            | Carrier::Grpc { .. }
+            | Carrier::Grpc(_)
             | Carrier::Xhttp { .. }
             | Carrier::HttpHeader { .. }
     )
@@ -19064,7 +19099,7 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
             Carrier::Raw(_)
                 | Carrier::Ws { .. }
                 | Carrier::HttpUpgrade { .. }
-                | Carrier::Grpc { .. }
+                | Carrier::Grpc(_)
                 | Carrier::Xhttp { .. }
                 | Carrier::HttpHeader { .. }
         ) {
@@ -19152,7 +19187,7 @@ fn find_bridges(root: &Json) -> Vec<(String, VlessOut)> {
                 Carrier::Raw(_)
                     | Carrier::Ws { .. }
                     | Carrier::HttpUpgrade { .. }
-                    | Carrier::Grpc { .. }
+                    | Carrier::Grpc(_)
                     | Carrier::HttpHeader { .. }
                     | Carrier::Xhttp { .. }
             ) {
@@ -19260,7 +19295,7 @@ fn tls_parts(
         Carrier::Raw(_)
         | Carrier::Ws { .. }
         | Carrier::HttpUpgrade { .. }
-        | Carrier::Grpc { .. }
+        | Carrier::Grpc(_)
         | Carrier::Xhttp { .. }
         | Carrier::HttpHeader { .. } => {}
         Carrier::Quic
@@ -21698,7 +21733,37 @@ mod tests {
         let plain =
             crate::json::parse(r#"{"grpcSettings": {"serviceName": "svc"}}"#).expect("parses");
         assert_eq!(grpc_path(Some(&plain)), "/svc/Tun");
-        assert_eq!(grpc_path(None), "/Tun");
+        let custom =
+            crate::json::parse(r#"{"grpcSettings": {"serviceName": "/svc/tun"}}"#).expect("parses");
+        assert_eq!(grpc_path(Some(&custom)), "/svc/tun");
+        let multi = crate::json::parse(r#"{"grpcSettings": {"serviceName": "/svc/tun|tunmulti"}}"#)
+            .expect("parses");
+        assert_eq!(
+            grpc_path(Some(&multi)),
+            "/svc/tun",
+            "a custom service name names the call, not the multi stream"
+        );
+        assert_eq!(grpc_path(None), "//Tun");
+        let one =
+            crate::json::parse(r#"{"grpcSettings": {"serviceName": "/tun"}}"#).expect("parses");
+        assert_eq!(grpc_path(Some(&one)), "//tun");
+
+        let full = crate::json::parse(
+            r#"{"network":"grpc","grpcSettings":{"serviceName":"/svc/tun|tunmulti","authority":"edge.example","userAgent":"agent/1","multiMode":true,"idleTimeout":30,"healthCheckTimeout":5,"permitWithoutStream":true,"initialWindowsSize":1000000}}"#,
+        )
+        .expect("parses");
+        let Carrier::Grpc(settings) = crate::config::stream_carrier(Some(&full)) else {
+            panic!("the config names grpc");
+        };
+        assert_eq!(settings.path, "/svc/tun");
+        assert_eq!(settings.multi_path, "/svc/tunmulti");
+        assert_eq!(settings.authority, "edge.example");
+        assert_eq!(settings.user_agent, "agent/1");
+        assert!(settings.multi_mode);
+        assert_eq!(settings.idle_timeout, 30);
+        assert_eq!(settings.health_check_timeout, 5);
+        assert!(settings.permit_without_stream);
+        assert_eq!(settings.initial_window_size, 1_000_000);
     }
 
     #[test]
@@ -23897,7 +23962,7 @@ mod tests {
             ..Default::default()
         });
         let id = [0x25u8; 16];
-        let carrier = Carrier::Grpc { path: "/p".into() };
+        let carrier = Carrier::Grpc(crate::config::GrpcSettings::path("/p"));
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -23922,7 +23987,7 @@ mod tests {
             ..Default::default()
         });
         let id = [0x26u8; 16];
-        let carrier = Carrier::Grpc { path: "/p".into() };
+        let carrier = Carrier::Grpc(crate::config::GrpcSettings::path("/p"));
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -23949,7 +24014,7 @@ mod tests {
             ..Default::default()
         });
         let id = [0x27u8; 16];
-        let carrier = Carrier::Grpc { path: "/p".into() };
+        let carrier = Carrier::Grpc(crate::config::GrpcSettings::path("/p"));
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -23977,7 +24042,7 @@ mod tests {
 
         let (server_config, client_config) = carried_tls_configs();
         let id = [0x28u8; 16];
-        let carrier = Carrier::Grpc { path: "/p".into() };
+        let carrier = Carrier::Grpc(crate::config::GrpcSettings::path("/p"));
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -24018,7 +24083,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_trojan_grpc(stream, &key, "/p", true);
+            serve_trojan_grpc(stream, &key, &crate::config::GrpcSettings::path("/p"), true);
             let _ = done_tx.send(());
         });
         let stream = Connection::connect(addr).expect("connects");
@@ -24579,7 +24644,7 @@ mod tests {
             Carrier::Raw(_) => "raw",
             Carrier::Ws { .. } => "ws",
             Carrier::HttpUpgrade { .. } => "httpupgrade",
-            Carrier::Grpc { .. } => "grpc",
+            Carrier::Grpc(_) => "grpc",
             Carrier::Xhttp { .. } => "xhttp",
             Carrier::HttpHeader { .. } => "httpheader",
             _ => "other",
@@ -26290,9 +26355,7 @@ mod tests {
                 path: "/vmess-ws".to_owned(),
                 ed: 0,
             },
-            Carrier::Grpc {
-                path: "/Tun".to_owned(),
-            },
+            Carrier::Grpc(crate::config::GrpcSettings::path("/Tun".to_owned())),
             Carrier::Xhttp {
                 settings: xhttp_settings("/vmess-xhttp"),
             },
@@ -26320,7 +26383,7 @@ mod tests {
         match carrier {
             Carrier::Raw(_) => crate::vmess::serve(stream, &id, true),
             Carrier::Ws { path, .. } => crate::vmess::serve_ws(stream, path, &id, true),
-            Carrier::Grpc { path } => crate::vmess::serve_grpc(stream, path, &id, true),
+            Carrier::Grpc(settings) => crate::vmess::serve_grpc_with(stream, settings, &id, true),
             Carrier::Xhttp { settings, .. } => {
                 crate::vmess::serve_xhttp(stream, settings.path.as_str(), &id, true);
             }
@@ -27080,9 +27143,7 @@ mod tests {
                 tls_vless_out(
                     port,
                     id,
-                    Carrier::Grpc {
-                        path: "/Tun".to_owned(),
-                    },
+                    Carrier::Grpc(crate::config::GrpcSettings::path("/Tun".to_owned())),
                     client_config,
                 )
             },
@@ -27161,9 +27222,7 @@ mod tests {
                 tls_vmess_out(
                     port,
                     id,
-                    Carrier::Grpc {
-                        path: "/Tun".to_owned(),
-                    },
+                    Carrier::Grpc(crate::config::GrpcSettings::path("/Tun".to_owned())),
                     client_config,
                 )
             },
@@ -27264,9 +27323,7 @@ mod tests {
                 tls_trojan_out(
                     port,
                     key,
-                    Carrier::Grpc {
-                        path: "/Tun".to_owned(),
-                    },
+                    Carrier::Grpc(crate::config::GrpcSettings::path("/Tun".to_owned())),
                     client_config,
                 )
             },
@@ -27656,9 +27713,9 @@ mod tests {
     #[test]
     fn socks_dials_ss_over_grpc_to_echo() {
         socks_dials_ss_via(
-            Carrier::Grpc {
-                path: "/TunnelService/Tun".to_owned(),
-            },
+            Carrier::Grpc(crate::config::GrpcSettings::path(
+                "/TunnelService/Tun".to_owned(),
+            )),
             crate::shadowsocks::serve_grpc,
             "/TunnelService/Tun",
             ("aes-256-gcm", "an-example-shared-password"),
@@ -30636,9 +30693,9 @@ mod tests {
             port: tunnel_port,
             id,
             cipher: crate::vmess::Cipher::Chacha,
-            carrier: Carrier::Grpc {
-                path: "/TunnelService/Tun".to_owned(),
-            },
+            carrier: Carrier::Grpc(crate::config::GrpcSettings::path(
+                "/TunnelService/Tun".to_owned(),
+            )),
             host: "127.0.0.1".to_owned(),
             tls: None,
         });
@@ -30819,7 +30876,12 @@ mod tests {
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
                 let Ok(stream) = stream else { continue };
-                serve_trojan_grpc(stream, &trojan_key("secret"), "/Tun", true);
+                serve_trojan_grpc(
+                    stream,
+                    &trojan_key("secret"),
+                    &crate::config::GrpcSettings::path("/Tun"),
+                    true,
+                );
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -30828,9 +30890,7 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port: tunnel_port,
             key: trojan_key("secret"),
-            carrier: Carrier::Grpc {
-                path: "/Tun".to_owned(),
-            },
+            carrier: Carrier::Grpc(crate::config::GrpcSettings::path("/Tun".to_owned())),
             host: "127.0.0.1".to_owned(),
             tls: None,
         });
@@ -31184,7 +31244,7 @@ mod tests {
                 Carrier::Raw(_) => "Raw",
                 Carrier::Ws { .. } => "Ws",
                 Carrier::HttpUpgrade { .. } => "HttpUpgrade",
-                Carrier::Grpc { .. } => "Grpc",
+                Carrier::Grpc(_) => "Grpc",
                 Carrier::Xhttp { .. } => "Xhttp",
                 Carrier::HttpHeader { .. } => "HttpHeader",
                 Carrier::Quic => "Quic",
@@ -31600,9 +31660,7 @@ mod tests {
                 Rung::Xhttp,
             ),
             (
-                Carrier::Grpc {
-                    path: "/t".to_owned(),
-                },
+                Carrier::Grpc(crate::config::GrpcSettings::path("/t".to_owned())),
                 Rung::Grpc,
             ),
             (
@@ -39907,7 +39965,9 @@ fn serve_vmess_role(stream: Connection, id: &[u8; 16], carrier: &Carrier, freedo
         Carrier::HttpUpgrade { path, host, .. } => {
             crate::vmess::serve_httpupgrade(stream, path.as_str(), host, id, freedom);
         }
-        Carrier::Grpc { path } => crate::vmess::serve_grpc(stream, path.as_str(), id, freedom),
+        Carrier::Grpc(settings) => {
+            crate::vmess::serve_grpc_with(stream, settings, id, freedom);
+        }
         refused_carriers!() => {}
     }
 }

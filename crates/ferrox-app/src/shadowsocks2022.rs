@@ -445,6 +445,7 @@ pub(crate) fn serve_httpupgrade(
     pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
+#[cfg(test)]
 pub(crate) fn serve_grpc(
     stream: Connection,
     password: &str,
@@ -452,7 +453,23 @@ pub(crate) fn serve_grpc(
     path: &str,
     freedom: bool,
 ) {
-    let Some((mut reader, writer)) = crate::grpc::accept(stream, path) else {
+    serve_grpc_with(
+        stream,
+        password,
+        method,
+        &crate::config::GrpcSettings::path(path),
+        freedom,
+    );
+}
+
+pub(crate) fn serve_grpc_with(
+    stream: Connection,
+    password: &str,
+    method: &str,
+    settings: &crate::config::GrpcSettings,
+    freedom: bool,
+) {
+    let Some((mut reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
     let Some((uplink, response, recv)) = under_handshake(&mut reader, |read| {

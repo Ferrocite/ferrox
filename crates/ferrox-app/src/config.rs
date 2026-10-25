@@ -1001,20 +1001,105 @@ pub(crate) fn sub_path(settings: Option<&Json>, key: &str) -> String {
         .unwrap_or("/")
         .to_owned()
 }
+#[cfg(test)]
 pub(crate) fn grpc_path(settings: Option<&Json>) -> String {
+    grpc_names(settings).0
+}
+
+/// The two stream names one `serviceName` names: the call and its multi-mode peer.
+fn grpc_names(settings: Option<&Json>) -> (String, String) {
     let service = settings
         .and_then(|s| s.get("grpcSettings"))
         .and_then(|s| s.get("serviceName"))
         .and_then(Json::as_str)
-        .unwrap_or("")
-        .trim();
+        .unwrap_or("");
     if service.is_empty() {
-        return "/Tun".to_owned();
+        return ("//Tun".to_owned(), "//TunMulti".to_owned());
     }
-    if service.starts_with('/') {
-        return service.to_owned();
+    if !service.starts_with('/') {
+        let service = grpc_escape(service);
+        return (format!("/{service}/Tun"), format!("/{service}/TunMulti"));
     }
-    format!("/{}/Tun", grpc_escape(service.trim_matches('/')))
+    let last = service.rfind('/');
+    let name_end = last.filter(|at| *at >= 1).unwrap_or(1);
+    let name = service[1..name_end]
+        .split('/')
+        .map(grpc_escape)
+        .collect::<Vec<_>>()
+        .join("/");
+    let ending = &service[last.map_or(1, |at| at + 1)..];
+    let mut streams = ending.split('|');
+    let tun = streams.next().unwrap_or("");
+    let multi = streams.next().unwrap_or(tun);
+    (
+        format!("/{name}/{}", grpc_escape(tun)),
+        format!("/{name}/{}", grpc_escape(multi)),
+    )
+}
+
+fn multi_path(path: &str) -> String {
+    path.strip_suffix("/Tun")
+        .map_or_else(|| path.to_owned(), |head| format!("{head}/TunMulti"))
+}
+
+/// The gRPC settings one carrier names, with every field the reference reads.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GrpcSettings {
+    pub(crate) path: String,
+    pub(crate) multi_path: String,
+    pub(crate) authority: String,
+    pub(crate) user_agent: String,
+    pub(crate) multi_mode: bool,
+    pub(crate) idle_timeout: u32,
+    pub(crate) health_check_timeout: u32,
+    pub(crate) permit_without_stream: bool,
+    pub(crate) initial_window_size: u32,
+}
+
+impl GrpcSettings {
+    pub(crate) fn path(path: impl Into<String>) -> Self {
+        let path = path.into();
+        let multi_path = multi_path(&path);
+        Self {
+            path,
+            multi_path,
+            ..Self::default()
+        }
+    }
+
+    fn from_json(settings: Option<&Json>) -> Self {
+        let node = settings.and_then(|s| s.get("grpcSettings"));
+        let (path, multi_path) = grpc_names(settings);
+        let text = |key: &str| {
+            node.and_then(|s| s.get(key))
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned()
+        };
+        let seconds = |key: &str| {
+            node.and_then(|s| s.get(key))
+                .and_then(as_uint)
+                .and_then(|n| u32::try_from(n).ok())
+                .unwrap_or(0)
+        };
+        Self {
+            path,
+            multi_path,
+            authority: text("authority"),
+            user_agent: text("userAgent"),
+            multi_mode: node
+                .and_then(|s| s.get("multiMode"))
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
+            idle_timeout: seconds("idleTimeout"),
+            health_check_timeout: seconds("healthCheckTimeout"),
+            permit_without_stream: node
+                .and_then(|s| s.get("permitWithoutStream"))
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
+            initial_window_size: seconds("initialWindowsSize"),
+        }
+    }
 }
 
 /// Go's `url.PathEscape` for one segment, the way Xray escapes a service name.
@@ -1109,9 +1194,7 @@ pub(crate) enum Carrier {
         host: String,
         ed: u32,
     },
-    Grpc {
-        path: String,
-    },
+    Grpc(GrpcSettings),
     Xhttp {
         settings: Box<crate::xhttp::XhttpSettings>,
     },
@@ -1140,6 +1223,14 @@ impl Carrier {
     pub(crate) fn tcp_mask(&self) -> Option<&ferrox_core::finalmask::Chain> {
         match self {
             Carrier::Raw(chain) if !chain.is_empty() => Some(chain),
+            _ => None,
+        }
+    }
+
+    /// The gRPC dial settings, which carry both stream names and the head's fields.
+    pub(crate) fn grpc_settings(&self) -> Option<&GrpcSettings> {
+        match self {
+            Carrier::Grpc(settings) => Some(settings),
             _ => None,
         }
     }
@@ -1220,9 +1311,7 @@ fn resolve_httpupgrade(settings: Option<&Json>, _: &str) -> Carrier {
 }
 
 fn resolve_grpc(settings: Option<&Json>, _: &str) -> Carrier {
-    Carrier::Grpc {
-        path: grpc_path(settings),
-    }
+    Carrier::Grpc(GrpcSettings::from_json(settings))
 }
 
 fn resolve_xhttp(settings: Option<&Json>, network: &str) -> Carrier {
@@ -1750,7 +1839,7 @@ pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, Stri
     let key = match &carrier {
         Carrier::Ws { .. } => "wsSettings",
         Carrier::HttpUpgrade { .. } => "httpupgradeSettings",
-        Carrier::Grpc { .. } => "grpcSettings",
+        Carrier::Grpc(_) => "grpcSettings",
         Carrier::Xhttp { .. } => "xhttpSettings",
         Carrier::HttpHeader { .. } => "tcpSettings",
         Carrier::Quic => "quicSettings",
