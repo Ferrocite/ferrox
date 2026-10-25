@@ -607,11 +607,7 @@ fn parse_proxy_v1(line: &[u8]) -> io::Result<Option<SocketAddr>> {
         .next()
         .ok_or_else(|| bad_proxy("the PROXY v1 line names no family"))?;
     if family == "UNKNOWN" {
-        return if fields.next().is_none() {
-            Ok(None)
-        } else {
-            Err(bad_proxy("the PROXY UNKNOWN line carries address fields"))
-        };
+        return Ok(None);
     }
     if family != "TCP4" && family != "TCP6" {
         return Err(bad_proxy("the PROXY v1 line names an unknown family"));

@@ -38402,6 +38402,22 @@ mod accept_proxy_protocol_tests {
     }
 
     #[test]
+    fn an_unknown_proxy_v1_line_is_accepted_with_or_without_fields() {
+        let port = free_port();
+        serve(port);
+        let mut client = dial(port);
+        client
+            .write_all(b"PROXY UNKNOWN ignored fields\r\n")
+            .expect("writes the header");
+        client.write_all(UPGRADE).expect("writes the upgrade");
+        let got = read_head(&mut client);
+        assert!(
+            got.starts_with(b"HTTP/1.1 101"),
+            "a PROXY UNKNOWN line with fields was refused: {got:?}"
+        );
+    }
+
+    #[test]
     fn an_unspecified_proxy_v2_family_is_accepted() {
         let port = free_port();
         serve(port);
