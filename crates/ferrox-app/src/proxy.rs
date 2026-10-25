@@ -10478,7 +10478,7 @@ where
     };
     let udp6 = UdpSocket::bind("[::]:0").ok();
     for sock in [&udp4].into_iter().chain(udp6.as_ref()) {
-        if sock.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        if sock.set_nonblocking(true).is_err() {
             return;
         }
     }
@@ -10502,11 +10502,11 @@ where
         while let Some((dest, n)) = read_trojan_datagram(&mut read, &mut buf) {
             let sent = if dest.is_ipv6() {
                 match &udp6_send {
-                    Some(sock) => sock.send_to(&buf[..n], dest).is_ok(),
+                    Some(sock) => send_udp(sock, &buf[..n], dest),
                     None => true,
                 }
             } else {
-                udp4_send.send_to(&buf[..n], dest).is_ok()
+                send_udp(&udp4_send, &buf[..n], dest)
             };
             if !sent {
                 break;
@@ -10521,12 +10521,23 @@ where
         if done.load(Ordering::Relaxed) {
             break;
         }
-        let mut live = pump_trojan_replies(&udp4, &mut write, &mut buf, &done, &mut trojan_head);
-        if let Some(sock) = &udp6 {
-            live &= pump_trojan_replies(sock, &mut write, &mut buf, &done, &mut trojan_head);
+        let mut idle = true;
+        if let Some(live) = pump_trojan_replies(&udp4, &mut write, &mut buf, &mut trojan_head) {
+            idle = false;
+            if !live {
+                break;
+            }
         }
-        if !live {
-            break;
+        if let Some(sock) = &udp6 {
+            if let Some(live) = pump_trojan_replies(sock, &mut write, &mut buf, &mut trojan_head) {
+                idle = false;
+                if !live {
+                    break;
+                }
+            }
+        }
+        if idle {
+            thread::sleep(RELAY_POLL);
         }
     }
     done.store(true, Ordering::Relaxed);
@@ -10534,22 +10545,34 @@ where
     join(&replied);
 }
 
+fn send_udp(sock: &UdpSocket, buf: &[u8], dest: SocketAddr) -> bool {
+    for _ in 0..100 {
+        match sock.send_to(buf, dest) {
+            Ok(_) => return true,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(RELAY_POLL);
+            }
+            Err(_) => return false,
+        }
+    }
+    false
+}
+
 fn pump_trojan_replies(
     udp: &UdpSocket,
     stream: &mut dyn Write,
     buf: &mut [u8],
-    done: &AtomicBool,
     head: &mut Vec<u8>,
-) -> bool {
+) -> Option<bool> {
     match udp.recv_from(buf) {
         Ok((n, src)) => {
             if n == 0 {
-                return true;
+                return Some(true);
             }
-            write_trojan_datagram(stream, &src, &buf[..n], head)
+            Some(write_trojan_datagram(stream, &src, &buf[..n], head))
         }
-        Err(error) if is_timeout(&error) => !done.load(Ordering::Relaxed),
-        Err(_) => false,
+        Err(error) if is_timeout(&error) || error.kind() == std::io::ErrorKind::WouldBlock => None,
+        Err(_) => Some(false),
     }
 }
 
@@ -25572,8 +25595,8 @@ mod tests {
             ),
             ("kcp", r#""network": "kcp""#),
         ];
-        for (tag, stream) in carriers {
-            for tls in [false, true] {
+        for (index, (tag, stream)) in carriers.into_iter().enumerate() {
+            for (tls_index, tls) in [false, true].into_iter().enumerate() {
                 let security = if tls {
                     format!(
                         r#", "security": "tls",
@@ -25587,9 +25610,8 @@ mod tests {
                         "streamSettings": {{{stream}{security}}}}}"#
                 ))
                 .expect("parses");
-                let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-                let port = probe.local_addr().expect("addr").port();
-                drop(probe);
+                // A fixed port outside the ephemeral range keeps a parallel suite from taking the probe's port.
+                let port = 22000 + (index * 2 + tls_index) as u16;
                 let address = format!("127.0.0.1:{port}");
                 assert!(serve_trojan_inbound(&address, &inbound, true), "{tag}");
                 // A KCP listener binds before it returns; a stream listener binds on its own thread.
