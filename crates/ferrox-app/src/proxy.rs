@@ -890,6 +890,7 @@ enum Role {
         method: String,
         carrier: Carrier,
         freedom: bool,
+        tls: Option<Arc<ferrox_core::tls::TlsServerConfig>>,
     },
     Socks {
         out: Outbound,
@@ -1648,7 +1649,12 @@ fn serve_shadowsocks(
     method: &str,
     carrier: &Carrier,
     freedom: bool,
+    tls: Option<&ferrox_core::tls::TlsServerConfig>,
 ) {
+    if let Some(server) = tls {
+        serve_shadowsocks_tls(stream, password, method, carrier, freedom, server);
+        return;
+    }
     if ferrox_core::shadowsocks2022::Method::parse(method).is_some() {
         match carrier {
             Carrier::Raw(_) => crate::shadowsocks2022::serve(stream, password, method, freedom),
@@ -1727,6 +1733,131 @@ fn serve_shadowsocks(
             crate::shadowsocks::serve_httpheader(stream, password, method, path.as_str(), freedom);
         }
         refused_carriers!() => {}
+    }
+}
+
+fn serve_shadowsocks_tls(
+    stream: Connection,
+    password: &str,
+    method: &str,
+    carrier: &Carrier,
+    freedom: bool,
+    server: &ferrox_core::tls::TlsServerConfig,
+) {
+    if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    let is_2022 = ferrox_core::shadowsocks2022::Method::parse(method).is_some();
+    match carrier {
+        Carrier::Raw(_) => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let Ok(transport) = raw.try_clone() else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, transport);
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            });
+            serve_ss_tls_session(reader, writer, password, method, freedom, &close, is_2022);
+        }
+        Carrier::Ws { path, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            let Some((reader, writer)) = crate::ws::accept_split(reader, writer, path) else {
+                return;
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            serve_ss_tls_session(reader, writer, password, method, freedom, &close, is_2022);
+        }
+        Carrier::HttpUpgrade { path, host, .. } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            let Some((reader, writer)) =
+                crate::httpupgrade::accept_split(reader, writer, path, host)
+            else {
+                crate::httpupgrade::quiet(&raw);
+                return;
+            };
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            });
+            serve_ss_tls_session(reader, writer, password, method, freedom, &close, is_2022);
+        }
+        Carrier::Grpc { path } => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            let Some((reader, writer)) = crate::grpc::accept_split(reader, writer, path) else {
+                return;
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            serve_ss_tls_session(reader, writer, password, method, freedom, &close, is_2022);
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            let Some((reader, writer)) =
+                crate::xhttp::accept_split_with_settings(reader, writer, settings)
+            else {
+                return;
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+            serve_ss_tls_session(reader, writer, password, method, freedom, &close, is_2022);
+        }
+        Carrier::HttpHeader { path } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            let Some((reader, writer)) = crate::httpheader::accept_split(reader, writer, path)
+            else {
+                return;
+            };
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            });
+            serve_ss_tls_session(reader, writer, password, method, freedom, &close, is_2022);
+        }
+        refused_carriers!() => {}
+    }
+}
+
+fn serve_ss_tls_session<R, W>(
+    reader: R,
+    writer: W,
+    password: &str,
+    method: &str,
+    freedom: bool,
+    close: &Arc<dyn Fn() + Send + Sync>,
+    is_2022: bool,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    if is_2022 {
+        crate::shadowsocks2022::serve_session(reader, writer, password, method, freedom, close);
+    } else {
+        crate::shadowsocks::serve_session(reader, writer, password, method, freedom, close);
     }
 }
 
@@ -6741,6 +6872,46 @@ fn serve_ss_kcp_listener(
     serve_kcp_bound(address, config, &serve)
 }
 
+fn serve_ss_relay_inbound(address: &str, inbound: &Json, password: &str, method: &str) -> bool {
+    let relay_dests = inbound_ss_destinations(inbound, method);
+    if relay_dests.is_empty() {
+        return false;
+    }
+    let Some(parsed) = ferrox_core::shadowsocks2022::Method::parse(method) else {
+        return false;
+    };
+    let Some(psk) = ferrox_core::shadowsocks2022::parse_psk_list(password, parsed.key_len())
+        .and_then(|mut list| list.pop())
+    else {
+        return false;
+    };
+    let tcp_address = address.to_owned();
+    let udp_address = address.to_owned();
+    let method = method.to_owned();
+    let udp_dests = relay_dests.clone();
+    let udp_psk = psk.clone();
+    thread::spawn(move || {
+        let Ok(target) = parse_target(&tcp_address) else {
+            return;
+        };
+        let Ok(listener) = Listener::bind(&target) else {
+            return;
+        };
+        for stream in listener.incoming().flatten() {
+            crate::shadowsocks2022::serve_relay(stream, &method, &psk, &relay_dests);
+        }
+    });
+    if !parsed.is_chacha() {
+        thread::spawn(move || {
+            let Ok(clients) = UdpSocket::bind(&udp_address) else {
+                return;
+            };
+            crate::shadowsocks2022::serve_udp_relay(&clients, parsed, &udp_psk, &udp_dests);
+        });
+    }
+    true
+}
+
 fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     let password = inbound_ss_password(inbound);
     let method = inbound_method(inbound);
@@ -6750,40 +6921,10 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     let udp_password = password.clone();
     let udp_method = method.clone();
     let is_2022 = ferrox_core::shadowsocks2022::Method::parse(&method).is_some();
-    let relay_dests = inbound_ss_destinations(inbound, &method);
-    if !relay_dests.is_empty() && matches!(carrier, Carrier::Raw(_)) {
-        let parsed = ferrox_core::shadowsocks2022::Method::parse(&method);
-        let relay_psk = parsed.and_then(|m| {
-            ferrox_core::shadowsocks2022::parse_psk_list(&password, m.key_len())
-                .and_then(|mut list| list.pop())
-        });
-        if let (Some(parsed), Some(psk)) = (parsed, relay_psk) {
-            let tcp_address = address.to_owned();
-            let udp_address = address.to_owned();
-            let method = method.clone();
-            let udp_dests = relay_dests.clone();
-            let udp_psk = psk.clone();
-            thread::spawn(move || {
-                let Ok(target) = parse_target(&tcp_address) else {
-                    return;
-                };
-                let Ok(listener) = Listener::bind(&target) else {
-                    return;
-                };
-                for stream in listener.incoming().flatten() {
-                    crate::shadowsocks2022::serve_relay(stream, &method, &psk, &relay_dests);
-                }
-            });
-            if !parsed.is_chacha() {
-                thread::spawn(move || {
-                    let Ok(clients) = UdpSocket::bind(&udp_address) else {
-                        return;
-                    };
-                    crate::shadowsocks2022::serve_udp_relay(&clients, parsed, &udp_psk, &udp_dests);
-                });
-            }
-            return;
-        }
+    if matches!(carrier, Carrier::Raw(_))
+        && serve_ss_relay_inbound(address, inbound, &password, &method)
+    {
+        return;
     }
     match carrier {
         Carrier::Kcp(config) => {
@@ -6801,7 +6942,26 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
             });
             serve_xdrive_loop(&settings, address, accept);
         }
-        // A carrier whose tls row this lane does not serve yet refuses it by name rather than answering plaintext.
+        carrier if stream_security(inbound) == "tls" => {
+            let Some(server) = inbound_tls_identity(inbound) else {
+                eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
+                return;
+            };
+            spawn_role(
+                address,
+                inbound_role(
+                    inbound,
+                    Role::Shadowsocks {
+                        password,
+                        method,
+                        carrier,
+                        freedom,
+                        tls: Some(server),
+                    },
+                ),
+                inbound_tag(inbound),
+            );
+        }
         _ if !matches!(stream_security(inbound), "" | "none") => {
             let security = stream_security(inbound);
             eprintln!("shadowsocks security `{security}` on {address}: refused, not served");
@@ -6815,6 +6975,7 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
                     method,
                     carrier: other,
                     freedom,
+                    tls: None,
                 },
             ),
             inbound_tag(inbound),
@@ -9672,11 +9833,17 @@ fn dial_shadowsocks(
     let params = stream_params(&ss.carrier);
     let explicit = rung_of(&ss.carrier);
     if explicit.is_none() {
-        let Some(uplink) = dial_or_report(server) else {
-            return;
-        };
-        if dial_ss_headed(client, uplink, ss, target) {
-            return;
+        if let Some(cfg) = ss.tls.as_deref() {
+            if dial_ss_tls_headed(client, server, ss, target, cfg) {
+                return;
+            }
+        } else {
+            let Some(uplink) = dial_or_report(server) else {
+                return;
+            };
+            if dial_ss_headed(client, uplink, ss, target) {
+                return;
+            }
         }
     }
     let start = ladder_start(&ss.carrier);
@@ -9707,7 +9874,7 @@ fn dial_shadowsocks(
                 return;
             }
         };
-        if dial_ss_rung(client, uplink, ss, target, &attempt, ladder) {
+        if dial_ss_rung(client, server, uplink, ss, target, &attempt, ladder) {
             return;
         }
     }
@@ -9758,14 +9925,193 @@ fn dial_ss_headed(
     true
 }
 
-fn dial_ss_rung(
+fn dial_ss_tls_headed(
+    client: &Connection,
+    server: &SocketAddr,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    cfg: &ferrox_core::tls::TlsConfig,
+) -> bool {
+    let Carrier::HttpHeader { path } = &ss.carrier else {
+        return false;
+    };
+    let Some(session) = dial_tls_session(server, cfg, ss.carrier.tcp_mask()) else {
+        return true;
+    };
+    let Some((reader, sink)) = tls_httpheader(server, session, &ss.host, path) else {
+        return true;
+    };
+    let writer = sink.clone();
+    let closer = sink.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+    ss_client_relay(client, reader, writer, &close, ss, target);
+    true
+}
+
+fn tls_session_on(
+    uplink: Connection,
+    cfg: &ferrox_core::tls::TlsConfig,
+) -> Option<ferrox_core::tls::ClientSession<Connection>> {
+    let mut session = ferrox_core::tls::connect(cfg, uplink).ok()?;
+    session.handshake().ok()?;
+    session
+        .get_ref()
+        .set_read_timeout(Some(SESSION_POLL))
+        .ok()?;
+    Some(session)
+}
+
+fn ss_client_relay<R, W>(
+    client: &Connection,
+    reader: R,
+    mut writer: W,
+    close: &Arc<dyn Fn() + Send + Sync>,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+) -> bool
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+        let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+            &mut writer,
+            &ss.password,
+            &ss.method,
+            target,
+        ) else {
+            close();
+            return false;
+        };
+        crate::shadowsocks2022::pump_relay_carried(client, reader, writer, close, send, recv);
+        return true;
+    }
+    let Some((send, recv)) =
+        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
+    else {
+        close();
+        return false;
+    };
+    crate::shadowsocks::pump_relay_carried(client, reader, writer, close, send, recv);
+    true
+}
+
+#[derive(Clone, Copy)]
+struct TlsDial<'a> {
+    server: &'a SocketAddr,
+    cfg: &'a ferrox_core::tls::TlsConfig,
+}
+
+fn dial_ss_tls_rung(
     client: &Connection,
     uplink: Connection,
     ss: &ShadowsocksOut,
     target: &Destination,
     attempt: &RungAttempt<'_>,
     ladder: &Ladder,
+    tls: TlsDial<'_>,
 ) -> bool {
+    let TlsDial { server, cfg } = tls;
+    let rung = attempt.rung;
+    if rung == Rung::Raw && !attempt.explicit {
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+    }
+    let Some(session) = tls_session_on(uplink, cfg) else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
+    };
+    match rung {
+        Rung::Raw => {
+            let Some((reader, writer, raw)) = session.into_halves() else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
+            };
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            });
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Ws => {
+            let Some((reader, writer)) =
+                tls_ws(server, session, &ss.host, attempt.path, attempt.ed, &[])
+            else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::HttpUpgrade => {
+            let Some((reader, sink)) =
+                tls_httpupgrade(server, session, &ss.host, attempt.path, attempt.ed, &[])
+            else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let writer = sink.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || sink.close());
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Grpc => {
+            let Some((reader, writer)) = tls_grpc(server, session, &ss.host, attempt.path) else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Xhttp => {
+            let Carrier::Xhttp { settings, .. } = &ss.carrier else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let Some((reader, writer)) = tls_xhttp(
+                server,
+                session,
+                || dial_tls_session(server, cfg, ss.carrier.tcp_mask()),
+                &ss.host,
+                settings,
+            ) else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+            if !ss_client_relay(client, reader, writer, &close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+    }
+}
+
+fn dial_ss_rung(
+    client: &Connection,
+    server: &SocketAddr,
+    uplink: Connection,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+) -> bool {
+    if let Some(cfg) = ss.tls.as_deref() {
+        return dial_ss_tls_rung(
+            client,
+            uplink,
+            ss,
+            target,
+            attempt,
+            ladder,
+            TlsDial { server, cfg },
+        );
+    }
     match attempt.rung {
         Rung::Raw => {
             if !attempt.explicit {
@@ -17871,8 +18217,7 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
         let (carrier, host) = outbound_carrier(outbound, &address);
         let tls = match stream_security(outbound) {
             "" | "none" => None,
-            // KCP carries the session above the connection, as the other protocols' rows do; every other carrier is refused until this lane dials it under tls.
-            "tls" if matches!(carrier, Carrier::Kcp(_)) => {
+            "tls" => {
                 let Ok(tls) = outbound_tls(outbound, &address) else {
                     continue;
                 };
@@ -25220,6 +25565,92 @@ mod tests {
         );
         drop(sock);
         let _ = pump.join();
+    }
+
+    /// A shadowsocks listener and dial that declare tls answer the handshake before any non-KCP carrier.
+    #[test]
+    fn a_shadowsocks_inbound_that_declares_tls_answers_every_carrier() {
+        let _guard = budgets::lock();
+        let (cert, key, client) = tls_cert_json();
+        let cases = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+        ];
+        for (tag, stream) in cases {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "shadowsocks", "settings": {{"password": "an-example-shared-password", "method": "aes-256-gcm"}},
+                    "streamSettings": {{{stream}, "security": "tls",
+                        "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
+            ))
+            .expect("parses");
+            let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = probe.local_addr().expect("addr").port();
+            drop(probe);
+            let address = format!("127.0.0.1:{port}");
+            serve_shadowsocks_inbound(&address, &inbound, true);
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let echo_port = echo_loop();
+            let ss = ShadowsocksOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                method: "aes-256-gcm".to_owned(),
+                password: "an-example-shared-password".to_owned(),
+                carrier: inbound_carrier(&inbound),
+                host: "127.0.0.1".to_owned(),
+                tls: Some(Arc::clone(&client)),
+            };
+            let listener: SocketAddr = address.parse().expect("addr");
+            let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let dport = downstream.local_addr().expect("addr").port();
+            let asked = Destination::from(
+                format!("127.0.0.1:{echo_port}")
+                    .parse::<SocketAddr>()
+                    .expect("addr"),
+            );
+            thread::spawn(move || {
+                let (socket, _) = downstream.accept().expect("accepts");
+                dial_shadowsocks(&socket, &listener, &ss, &asked, Ladder::global());
+            });
+            let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+            sock.set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            sock.write_all(b"ping").expect("writes");
+            assert_eq!(&read_echo(&mut sock), b"ping", "{tag} over tls echoes");
+        }
+    }
+
+    #[test]
+    fn a_shadowsocks_outbound_keeps_tls_on_a_non_kcp_carrier() {
+        let root = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "streamSettings": {"network": "ws", "security": "tls", "wsSettings": {"path": "/t"}, "tlsSettings": {"allowInsecure": true}}}]}"#,
+        )
+        .expect("parses");
+        let out = find_shadowsocks_outbound(&root).expect("finds");
+        assert!(matches!(out.carrier, Carrier::Ws { .. }));
+        assert!(out.tls.is_some(), "the tls row is kept");
     }
 
     /// The vmess dial carries its request in the session too, so a tls kcp row speaks the same bytes both roles.
@@ -38799,6 +39230,24 @@ mod dns_lane_tests {
     }
 }
 
+fn serve_vmess_role(stream: Connection, id: &[u8; 16], carrier: &Carrier, freedom: bool) {
+    match carrier {
+        Carrier::Raw(_) => crate::vmess::serve(stream, id, freedom),
+        Carrier::Ws { path, .. } => crate::vmess::serve_ws(stream, path.as_str(), id, freedom),
+        Carrier::Xhttp { settings, .. } => {
+            crate::vmess::serve_xhttp(stream, settings.path.as_str(), id, freedom);
+        }
+        Carrier::HttpHeader { path } => {
+            crate::vmess::serve_httpheader(stream, path.as_str(), id, freedom);
+        }
+        Carrier::HttpUpgrade { path, host, .. } => {
+            crate::vmess::serve_httpupgrade(stream, path.as_str(), host, id, freedom);
+        }
+        Carrier::Grpc { path } => crate::vmess::serve_grpc(stream, path.as_str(), id, freedom),
+        refused_carriers!() => {}
+    }
+}
+
 /// The inbound a role serves one front stream with.
 fn front_dispatch(stream: Connection, role: Role) {
     match role {
@@ -38851,25 +39300,7 @@ fn front_dispatch(stream: Connection, role: Role) {
             id,
             carrier,
             freedom,
-        } => match carrier {
-            Carrier::Raw(_) => crate::vmess::serve(stream, &id, freedom),
-            Carrier::Ws { path, .. } => {
-                crate::vmess::serve_ws(stream, path.as_str(), &id, freedom);
-            }
-            Carrier::Xhttp { settings, .. } => {
-                crate::vmess::serve_xhttp(stream, settings.path.as_str(), &id, freedom);
-            }
-            Carrier::HttpHeader { path } => {
-                crate::vmess::serve_httpheader(stream, path.as_str(), &id, freedom);
-            }
-            Carrier::HttpUpgrade { path, host, .. } => {
-                crate::vmess::serve_httpupgrade(stream, path.as_str(), &host, &id, freedom);
-            }
-            Carrier::Grpc { path } => {
-                crate::vmess::serve_grpc(stream, path.as_str(), &id, freedom);
-            }
-            refused_carriers!() => {}
-        },
+        } => serve_vmess_role(stream, &id, &carrier, freedom),
         Role::VmessTls {
             id,
             carrier,
@@ -38881,7 +39312,15 @@ fn front_dispatch(stream: Connection, role: Role) {
             method,
             carrier,
             freedom,
-        } => serve_shadowsocks(stream, &password, &method, &carrier, freedom),
+            tls,
+        } => serve_shadowsocks(
+            stream,
+            &password,
+            &method,
+            &carrier,
+            freedom,
+            tls.as_deref(),
+        ),
         Role::Socks { out, accounts } => serve_socks(stream, &out, &accounts),
         Role::Http { out, accounts } => serve_http(stream, &out, &accounts),
         Role::Mixed { out, accounts } => serve_mixed(stream, &out, &accounts),
