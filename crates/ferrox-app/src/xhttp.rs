@@ -1306,7 +1306,6 @@ struct Session {
     state: Mutex<SessionState>,
     cv: Condvar,
     id: String,
-    born: std::time::Instant,
 }
 
 struct SessionState {
@@ -1315,6 +1314,7 @@ struct SessionState {
     next_seq: u64,
     ended: bool,
     downlink: bool,
+    last_seen: std::time::Instant,
 }
 
 type Sessions = Mutex<HashMap<String, Arc<Session>>>;
@@ -1329,8 +1329,8 @@ fn sweep_stalled_sessions(map: &mut HashMap<String, Arc<Session>>) {
     let stale: Vec<String> = map
         .iter()
         .filter(|(_, session)| {
-            session.born.elapsed() >= budget
-                && !session.state.lock().expect("session lock").downlink
+            let state = session.state.lock().expect("session lock");
+            !state.downlink && state.last_seen.elapsed() >= budget
         })
         .map(|(id, _)| id.clone())
         .collect();
@@ -1353,10 +1353,10 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
                     next_seq: 0,
                     ended: false,
                     downlink: false,
+                    last_seen: std::time::Instant::now(),
                 }),
                 cv: Condvar::new(),
                 id: id.to_owned(),
-                born: std::time::Instant::now(),
             })
         })
         .clone()
@@ -1422,6 +1422,7 @@ impl Session {
     fn set_upload(&self, reader: Box<dyn Read + Send>) {
         let mut st = self.state.lock().expect("session lock");
         st.upload = Some(reader);
+        st.last_seen = std::time::Instant::now();
         self.cv.notify_all();
     }
     fn push_packet(&self, seq: u64, payload: Vec<u8>, cap: usize) -> bool {
@@ -1430,6 +1431,7 @@ impl Session {
             return false;
         }
         st.packets.insert(seq, payload);
+        st.last_seen = std::time::Instant::now();
         self.cv.notify_all();
         true
     }
@@ -1508,6 +1510,7 @@ impl Read for SessionReader {
                         Ok(0)
                     }
                     Ok(n) => {
+                        st.last_seen = std::time::Instant::now();
                         drop(st);
                         Ok(n)
                     }
@@ -1528,6 +1531,7 @@ impl Read for SessionReader {
                     self.cur.clear();
                     self.cur_at = 0;
                 }
+                st.last_seen = std::time::Instant::now();
                 return Ok(n);
             }
             if let Some(pkt) = {
@@ -1535,6 +1539,7 @@ impl Read for SessionReader {
                 st.packets.remove(&seq)
             } {
                 st.next_seq += 1;
+                st.last_seen = std::time::Instant::now();
                 if pkt.len() <= buf.len() {
                     buf[..pkt.len()].copy_from_slice(&pkt);
                     return Ok(pkt.len());
@@ -4211,10 +4216,10 @@ mod tests {
                 next_seq: 0,
                 ended: true,
                 downlink: false,
+                last_seen: std::time::Instant::now(),
             }),
             cv: Condvar::new(),
             id: String::new(),
-            born: std::time::Instant::now(),
         });
         let mut reader = SessionReader::new(session, String::new());
         let mut byte = [0u8; 1];
@@ -4235,10 +4240,10 @@ mod tests {
                 next_seq: 0,
                 ended: false,
                 downlink: false,
+                last_seen: std::time::Instant::now(),
             }),
             cv: Condvar::new(),
             id: String::new(),
-            born: std::time::Instant::now(),
         });
         let mut reader = SessionReader::new(session, String::new());
         let (sender, receiver) = std::sync::mpsc::channel();
