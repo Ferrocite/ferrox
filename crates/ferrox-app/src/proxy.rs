@@ -2083,10 +2083,29 @@ pub(crate) struct HandshakeDeadline<'a> {
 
 impl std::io::Read for HandshakeDeadline<'_> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if Instant::now() >= self.until {
-            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        loop {
+            if Instant::now() >= self.until {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            match self.inner.read(buf) {
+                Ok(n) => return Ok(n),
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    let left = self.until.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                    }
+                    thread::sleep(left.min(RELAY_POLL));
+                }
+                Err(error) => return Err(error),
+            }
         }
-        self.inner.read(buf)
     }
 }
 
@@ -4338,7 +4357,7 @@ fn serve_vless_kcp_tls(
     ) else {
         return;
     };
-    if tls.handshake().is_err() {
+    if !shake_tls(&mut tls) {
         return;
     }
     relay_vless(
@@ -7333,10 +7352,17 @@ fn open_vmess_udp_kcp(
     .ok()?;
     if let Some(cfg) = vmess.tls.as_deref() {
         let mut session = kcp_tls_connect(&conn, cfg)?;
-        if session.write_all(&request).is_err()
-            || !crate::vmess::read_response(&mut session, &response_key, &response_iv, auth)
-        {
+        if session.write_all(&request).is_err() {
             return None;
+        }
+        {
+            let mut bounded = HandshakeDeadline {
+                inner: &mut session,
+                until: Instant::now() + crate::quic::HANDSHAKE_TIMEOUT,
+            };
+            if !crate::vmess::read_response(&mut bounded, &response_key, &response_iv, auth) {
+                return None;
+            }
         }
         let (reader, writer) = session_halves(
             session,
@@ -7358,8 +7384,14 @@ fn open_vmess_udp_kcp(
     let mut reader = KcpIo {
         conn: Arc::clone(&conn),
     };
-    if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-        return None;
+    {
+        let mut bounded = HandshakeDeadline {
+            inner: &mut reader,
+            until: Instant::now() + crate::quic::HANDSHAKE_TIMEOUT,
+        };
+        if !crate::vmess::read_response(&mut bounded, &response_key, &response_iv, auth) {
+            return None;
+        }
     }
     let writer = KcpIo {
         conn: Arc::clone(&conn),
@@ -11307,7 +11339,7 @@ fn serve_vmess_kcp_tls(
     ) else {
         return;
     };
-    if tls.handshake().is_err() {
+    if !shake_tls(&mut tls) {
         return;
     }
     let (reader, writer) = session_halves(
@@ -34552,6 +34584,38 @@ mod tests {
         let port = listener.local_addr().port();
         thread::spawn(move || serve_kcp_each(&listener, &serve));
         port
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sixteen_kcp_connections_share_one_flush_thread() {
+        fn threads() -> usize {
+            std::fs::read_dir("/proc/self/task")
+                .expect("reads the task table")
+                .count()
+        }
+        let before = threads();
+        let local = "127.0.0.1:1".parse().expect("addr");
+        let mut conns = Vec::new();
+        for conversation in 1..=16u16 {
+            conns.push(ferrox_core::kcp::Connection::new(
+                ferrox_core::kcp::ConnMetadata {
+                    local,
+                    remote: local,
+                    conversation,
+                },
+                Box::new(|_| Ok(())),
+                Box::new(|| {}),
+                ferrox_core::kcp::Config::default(),
+            ));
+        }
+        let after = threads();
+        assert!(
+            after - before < 8,
+            "sixteen connections added {} flush threads",
+            after - before
+        );
+        drop(conns);
     }
 
     fn socks_tcp_client(front_port: u16, echo_port: u16) -> Connection {
