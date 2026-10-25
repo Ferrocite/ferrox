@@ -28634,6 +28634,84 @@ mod tests {
     }
 
     #[test]
+    fn an_end_cancels_the_tcp_flow_it_ends() {
+        let (upstream, _origin) = crate::reverse::loopback_pair().expect("pair");
+        let dialed = Arc::new(Mutex::new(Some(upstream)));
+        let dial: MuxDial = Arc::new(move |_| dialed.lock().ok().and_then(|mut slot| slot.take()));
+        let (wire_client, _wire_peer) = crate::reverse::loopback_pair().expect("pair");
+        let wire = MuxWire::Conn(Arc::new(Mutex::new(wire_client)));
+        let table: MuxTable = Arc::new(Mutex::new(MuxState {
+            flows: HashMap::new(),
+            done: false,
+        }));
+        let mut udp: UdpTable = HashMap::new();
+        let mut global: UdpGlobal = HashMap::new();
+        let mut staging = Vec::new();
+        let mut handles = Vec::new();
+        let udp_ok: MuxUdpOk = Arc::new(|_| true);
+        let target = ferrox_core::mux::Target {
+            network: ferrox_core::mux::Network::Tcp,
+            port: 443,
+            addr: ferrox_core::addr::Addr::V4([127, 0, 0, 1]),
+        };
+        {
+            let mut out = MuxOut {
+                wire: &wire,
+                staging: &mut staging,
+                handles: &mut handles,
+                worker: None,
+            };
+            handle_mux_frame(
+                ferrox_core::mux::Incoming {
+                    id: 9,
+                    status: ferrox_core::mux::Status::New,
+                    options: 0,
+                    target: Some(target),
+                    global_id: None,
+                    reflection: None,
+                    data: None,
+                },
+                &table,
+                &mut udp,
+                &mut global,
+                &mut out,
+                &dial,
+                &udp_ok,
+            );
+        }
+        assert_eq!(handles.len(), 1, "the flow is running");
+        {
+            let mut out = MuxOut {
+                wire: &wire,
+                staging: &mut staging,
+                handles: &mut handles,
+                worker: None,
+            };
+            handle_mux_frame(
+                ferrox_core::mux::Incoming {
+                    id: 9,
+                    status: ferrox_core::mux::Status::End,
+                    options: 0,
+                    target: None,
+                    global_id: None,
+                    reflection: None,
+                    data: None,
+                },
+                &table,
+                &mut udp,
+                &mut global,
+                &mut out,
+                &dial,
+                &udp_ok,
+            );
+        }
+        assert!(
+            handles[0].recv_timeout(Duration::from_secs(2)).is_ok(),
+            "the ended flow kept its origin open"
+        );
+    }
+
+    #[test]
     fn a_repeated_udp_new_id_stops_the_session_it_replaces() {
         let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
