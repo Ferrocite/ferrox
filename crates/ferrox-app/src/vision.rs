@@ -27,6 +27,7 @@ const ZERO: [u8; BUFFER] = [0u8; BUFFER];
 pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     session: S,
     raw: Option<Connection>,
+    direct: Option<fn(&mut S)>,
     uuid: [u8; 16],
     /// The framing walks the stream in place: `[..dot)` is delivered and drains away on
     /// the next read, `[dot..)` is the walk's frontier, and the window is one record
@@ -200,6 +201,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         Self {
             session,
             raw,
+            direct: None,
             uuid: *uuid,
             have: Vec::with_capacity(WINDOW),
             dot: 0,
@@ -234,6 +236,20 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 cipher: 0,
             },
         }
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> Link<ferrox_core::vless_encryption::EncryptedStream<S>> {
+    /// The direct command peels the record layer, not the transport: the sealed stream keeps the
+    /// XOR header mask the reference's `XorConn` carries across the switch.
+    pub(crate) fn sealed(
+        session: ferrox_core::vless_encryption::EncryptedStream<S>,
+        uuid: &[u8; 16],
+    ) -> Self {
+        let mut link = Self::new(session, None, uuid);
+        link.direct =
+            Some(ferrox_core::vless_encryption::EncryptedStream::<S>::enter_direct_mode);
+        link
     }
 }
 
@@ -509,6 +525,11 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             }
             // a command that is not a continue ends the framing; its tail is content
             self.read.padding = false;
+            if walk.command == VisionCommand::Direct.byte() {
+                if let Some(direct) = self.direct {
+                    direct(&mut self.session);
+                }
+            }
             self.read.raw = walk.command == VisionCommand::Direct.byte() && self.raw.is_some();
             break held;
         };
@@ -634,6 +655,11 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
             at += content;
             if command != 0 {
                 self.write.padding = false;
+                if command == VisionCommand::Direct.byte() {
+                    if let Some(direct) = self.direct {
+                        direct(&mut self.session);
+                    }
+                }
                 self.write.raw = self.raw.is_some()
                     && self.tls.enable_xtls
                     && command == VisionCommand::Direct.byte();

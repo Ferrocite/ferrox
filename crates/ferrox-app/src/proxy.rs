@@ -2926,7 +2926,7 @@ fn serve_vless_encrypted_raw(
     serve_sealed_raw(sealed, peer, users, freedom, close_sealed);
 }
 
-fn serve_sealed_raw<S: Read + Write + Send + 'static>(
+fn serve_sealed_raw<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'static>(
     mut sealed: ferrox_core::vless_encryption::EncryptedStream<S>,
     peer: Option<SocketAddr>,
     users: &[VlessUser],
@@ -2941,11 +2941,7 @@ fn serve_sealed_raw<S: Read + Write + Send + 'static>(
         return;
     };
     crate::accesslog::record(peer, true, &target, None, "", &user.email);
-    if flow == Flow::Vision {
-        eprintln!("vless: vision over encryption is not served yet");
-        return;
-    }
-    if !freedom || !vless_flow_ok(user, flow, cmd, false) {
+    if !freedom || !vless_flow_ok(user, flow, cmd, true) {
         return;
     }
     if cmd != 1 {
@@ -2958,8 +2954,17 @@ fn serve_sealed_raw<S: Read + Write + Send + 'static>(
     if sealed.write_all(&[0, 0]).is_err() {
         return;
     }
-    let close = shutdown_pair(close_sealed, uplink.try_clone().ok());
-    relay_sealed(&uplink, sealed, &close);
+    let close = shutdown_pair(
+        close_sealed.as_ref().and_then(|raw| raw.try_clone().ok()),
+        uplink.try_clone().ok(),
+    );
+    if flow == Flow::Vision {
+        let timeout = close_sealed;
+        let link = crate::vision::Link::sealed(sealed, &got);
+        relay_link(&uplink, link, &close, timeout);
+    } else {
+        relay_sealed(&uplink, sealed, &close);
+    }
 }
 
 fn relay_sealed<S: Read + Write + Send + 'static>(
@@ -2977,6 +2982,29 @@ fn relay_sealed<S: Read + Write + Send + 'static>(
     });
     relay_stream(
         Half::split(SealedHalf(Arc::clone(&shared)), SealedHalf(shared)),
+        Half::socket(plain),
+        close,
+    );
+}
+
+fn relay_link<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'static>(
+    plain: &Connection,
+    link: crate::vision::Link<ferrox_core::vless_encryption::EncryptedStream<S>>,
+    close: &Arc<dyn Fn() + Send + Sync>,
+    timeout: Option<Connection>,
+) {
+    let Ok(plain) = plain.try_clone() else {
+        return;
+    };
+    relay_stream(
+        Half::shared_armed_capped(
+            link,
+            move |_, grain| match &timeout {
+                Some(timeout) => timeout.set_read_timeout(Some(grain)),
+                None => Ok(()),
+            },
+            SESSION_POLL,
+        ),
         Half::socket(plain),
         close,
     );
@@ -6331,7 +6359,7 @@ fn dial_vless(
             dial_vless_reality(client, server, vless, target);
             return;
         }
-        dial_vless_encrypted_raw(client, server, encryption, &header);
+        dial_vless_encrypted_raw(client, server, vless, encryption, &header);
         return;
     }
     if vless.tls.is_some() {
@@ -6389,6 +6417,7 @@ fn dial_vless(
 fn dial_vless_encrypted_raw(
     client: &Connection,
     server: &SocketAddr,
+    vless: &VlessOut,
     encryption: &Arc<ferrox_core::vless_encryption::Client>,
     header: &[u8],
 ) {
@@ -6409,8 +6438,17 @@ fn dial_vless_encrypted_raw(
     if read_vless_response(&mut sealed).is_none() {
         return;
     }
-    let close = shutdown_pair(client.try_clone().ok(), sealed.get_ref().try_clone().ok());
-    relay_sealed(client, sealed, &close);
+    let timeout = sealed.get_ref().try_clone().ok();
+    let close = shutdown_pair(
+        client.try_clone().ok(),
+        timeout.as_ref().and_then(|raw| raw.try_clone().ok()),
+    );
+    if vless.flow == crate::vision::FLOW {
+        let link = crate::vision::Link::sealed(sealed, &vless.id);
+        relay_link(client, link, &close, timeout);
+    } else {
+        relay_sealed(client, sealed, &close);
+    }
 }
 
 fn dial_vless_headed(
@@ -10642,10 +10680,6 @@ fn dial_vless_tls(
     match &vless.carrier {
         Carrier::Raw(_) => {
             if let Some(encryption) = &vless.encryption {
-                if vless.flow == crate::vision::FLOW {
-                    eprintln!("vless: vision over encryption is not dialled yet");
-                    return;
-                }
                 let Ok(raw) = session.get_ref().try_clone() else {
                     return;
                 };
@@ -10678,7 +10712,12 @@ fn dial_vless_tls(
                     );
                 }
                 let close = shutdown_pair(client.try_clone().ok(), raw.try_clone().ok());
-                relay_sealed(client, sealed, &close);
+                if vless.flow == crate::vision::FLOW {
+                    let link = crate::vision::Link::sealed(sealed, &vless.id);
+                    relay_link(client, link, &close, Some(raw));
+                } else {
+                    relay_sealed(client, sealed, &close);
+                }
                 return;
             }
             if vless.flow != crate::vision::FLOW {
@@ -10911,10 +10950,6 @@ fn dial_vless_reality(
     match &vless.carrier {
         Carrier::Raw(_) => {
             if let Some(encryption) = &vless.encryption {
-                if vless.flow == crate::vision::FLOW {
-                    eprintln!("vless: vision over encryption is not dialled yet");
-                    return;
-                }
                 if raw.set_read_timeout(Some(budgets::handshake())).is_err() {
                     return;
                 }
@@ -10944,7 +10979,12 @@ fn dial_vless_reality(
                     );
                 }
                 let close = shutdown_pair(client.try_clone().ok(), raw.try_clone().ok());
-                relay_sealed(client, sealed, &close);
+                if vless.flow == crate::vision::FLOW {
+                    let link = crate::vision::Link::sealed(sealed, &vless.id);
+                    relay_link(client, link, &close, Some(raw));
+                } else {
+                    relay_sealed(client, sealed, &close);
+                }
                 return;
             }
             if session.write_all(&header).is_err() {
@@ -21029,7 +21069,10 @@ fn vless_client_encryption(
         return Ok(None);
     };
     let config = ferrox_core::vless_encryption::ClientConfig::parse(value)?;
-    Ok(Some(ferrox_core::vless_encryption::Client::new(config)))
+    Ok(Some(ferrox_core::vless_encryption::Client::with_clock(
+        config,
+        Arc::new(crate::config::unix_seconds),
+    )))
 }
 
 fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
@@ -21727,7 +21770,7 @@ mod tests {
         peer.set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
         thread::spawn(move || {
-            dial_vless_encrypted_raw(&Connection::from(app), &server_addr, &client, &header);
+            dial_vless_encrypted_raw(&Connection::from(app), &server_addr, &vless, &client, &header);
         });
         let payload = b"hello through the sealed raw session";
         peer.write_all(payload).expect("writes");

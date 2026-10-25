@@ -103,6 +103,14 @@ pub(crate) fn server_decryption_string(inbound: &Json) -> Option<&str> {
         .and_then(|settings| settings.get("decryption").and_then(Json::as_str))
 }
 
+pub(crate) fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
 /// The decryption engine an inbound names, parsed the way the reference's build does.
 pub(crate) fn server_decryption(
     inbound: &Json,
@@ -122,7 +130,10 @@ pub(crate) fn server_decryption(
         return Ok(None);
     }
     let config = ferrox_core::vless_encryption::ServerConfig::parse(decryption)?;
-    Ok(Some(ferrox_core::vless_encryption::Server::new(config)))
+    Ok(Some(ferrox_core::vless_encryption::Server::with_clock(
+        config,
+        std::sync::Arc::new(unix_seconds),
+    )))
 }
 /// The fallbacks an inbound routes; an empty decryption refuses beside them.
 pub(crate) fn server_fallbacks(inbound: &Json) -> Result<Option<Vec<Fallback>>, String> {

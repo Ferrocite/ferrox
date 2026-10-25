@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use aes::Aes256;
 use chacha20poly1305::aead::AeadInPlace as _;
@@ -31,14 +30,6 @@ fn random_bytes<const N: usize>() -> io::Result<[u8; N]> {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).map_err(|_| io::Error::other("no entropy"))?;
     Ok(bytes)
-}
-
-fn unix_seconds() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| {
-            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
-        })
 }
 
 fn rand_between(from: u32, to: u32) -> u32 {
@@ -507,9 +498,13 @@ impl Drop for Ticket {
     }
 }
 
+/// Seconds since the Unix epoch, supplied by the host: `ferrox-core` reads no clock.
+pub type Clock = Arc<dyn Fn() -> i64 + Send + Sync>;
+
 pub struct Client {
     config: ClientConfig,
     ticket: Mutex<Option<Ticket>>,
+    clock: Clock,
 }
 
 impl std::fmt::Debug for Client {
@@ -522,9 +517,15 @@ impl std::fmt::Debug for Client {
 
 impl Client {
     pub fn new(config: ClientConfig) -> Arc<Self> {
+        Self::with_clock(config, Arc::new(|| 0))
+    }
+
+    /// A client whose tickets are timed by the host's clock.
+    pub fn with_clock(config: ClientConfig, clock: Clock) -> Arc<Self> {
         Arc::new(Self {
             config,
             ticket: Mutex::new(None),
+            clock,
         })
     }
 
@@ -535,7 +536,7 @@ impl Client {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard
             .as_ref()
-            .filter(|ticket| unix_seconds() < ticket.expires)
+            .filter(|ticket| (self.clock)() < ticket.expires)
             .map(|ticket| (ticket.pfs_key.clone(), ticket.value))
     }
 
@@ -685,7 +686,7 @@ impl Client {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard = Some(Ticket {
-                expires: unix_seconds() + i64::try_from(seconds).unwrap_or(i64::MAX),
+                expires: (self.clock)() + i64::try_from(seconds).unwrap_or(i64::MAX),
                 pfs_key: pfs_key.clone(),
                 value: ticket[..16].try_into().unwrap(),
             });
@@ -750,6 +751,7 @@ impl Tickets {
 pub struct Server {
     config: ServerConfig,
     tickets: Mutex<Tickets>,
+    clock: Clock,
 }
 
 impl std::fmt::Debug for Server {
@@ -762,9 +764,15 @@ impl std::fmt::Debug for Server {
 
 impl Server {
     pub fn new(config: ServerConfig) -> Arc<Self> {
+        Self::with_clock(config, Arc::new(|| 0))
+    }
+
+    /// A server whose ticket lifetime is read from the host's clock.
+    pub fn with_clock(config: ServerConfig, clock: Clock) -> Arc<Self> {
         Arc::new(Self {
             config,
             tickets: Mutex::new(Tickets::default()),
+            clock,
         })
     }
 
@@ -889,7 +897,7 @@ impl Server {
         };
         ticket[..2].copy_from_slice(&encode_length(seconds as usize));
         if seconds > 0 {
-            let now = unix_seconds();
+            let now = (self.clock)();
             let mut tickets = self
                 .tickets
                 .lock()
@@ -976,7 +984,7 @@ impl Server {
             .try_into()
             .map_err(|_| invalid("VLESS encryption first-flight key has the wrong length"))?;
         let pfs_key = {
-            let now = unix_seconds();
+            let now = (self.clock)();
             let mut tickets = self
                 .tickets
                 .lock()
@@ -1102,6 +1110,25 @@ impl<S> std::fmt::Debug for EncryptedStream<S> {
         f.debug_struct("EncryptedStream")
             .field("direct", &self.direct)
             .finish_non_exhaustive()
+    }
+}
+
+impl<S: crate::tls::RecordAlignment + io::Write> crate::tls::RecordAlignment
+    for EncryptedStream<S>
+{
+    fn engage_record_alignment(&mut self) {
+        self.inner.engage_record_alignment();
+    }
+
+    fn disarm_record_alignment(&mut self) {
+        self.inner.disarm_record_alignment();
+    }
+
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> io::Result<()>
+    where
+        Self: io::Write,
+    {
+        self.inner.write_all_slices(parts)
     }
 }
 
@@ -1260,6 +1287,13 @@ impl<S: Read> Read for EncryptedStream<S> {
             return Ok(n);
         }
         if self.direct {
+            if !self.wire.is_empty() {
+                let n = self.wire.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.wire[..n]);
+                self.wire.drain(..n);
+                self.in_mask.apply(&mut buf[..n], false);
+                return Ok(n);
+            }
             let n = self.inner.read(buf)?;
             self.in_mask.apply(&mut buf[..n], false);
             return Ok(n);
