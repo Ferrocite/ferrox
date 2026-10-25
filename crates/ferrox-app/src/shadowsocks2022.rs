@@ -139,6 +139,7 @@ fn serve_single(stream: &mut Connection, method: Method, psk: &[u8], freedom: bo
     let Some((recv, salt, target, early)) = opened else {
         return;
     };
+    crate::accesslog::record_current(&target);
     let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
@@ -204,6 +205,7 @@ fn serve_multi(stream: &mut Connection, method: Method, list: &[Vec<u8>], freedo
     let Some((recv, psk, salt, target, early)) = opened else {
         return;
     };
+    crate::accesslog::record_current(&target);
     let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
@@ -345,6 +347,7 @@ fn accept_on(
             .clone();
         let mut recv = Cipher::from_psk(method, &user, &salt_probe)?;
         let target = open_handshake(reader, &mut recv)?;
+        crate::accesslog::record_current(&target.0);
         let mut uplink = crate::conn::dial_tcp(&target.0, Duration::from_secs(8)).ok()?;
         uplink.write_all(&target.1).ok()?;
         let server_salt = fresh_salt(method.key_len())?;
@@ -361,6 +364,7 @@ fn accept_on(
     }
     let mut recv = Cipher::from_psk(method, &psk, &salt)?;
     let (target, early) = open_handshake(reader, &mut recv)?;
+    crate::accesslog::record_current(&target);
     let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
     uplink.write_all(&early).ok()?;
     let server_salt = fresh_salt(key_len)?;

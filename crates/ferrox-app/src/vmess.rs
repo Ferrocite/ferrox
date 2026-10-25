@@ -1461,6 +1461,7 @@ fn serve_decoded<R, W>(
         close();
         return;
     }
+    crate::accesslog::record_current(&target);
     match cmd {
         1 => {
             let Ok(uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
@@ -1736,6 +1737,7 @@ pub(crate) fn serve(mut stream: Connection, id: &[u8; 16], freedom: bool) {
     if !freedom {
         return;
     }
+    crate::accesslog::record_current(&target);
     if cmd == 2 {
         return serve_vmess_udp(stream, &target, send, recv, &prefix);
     }
