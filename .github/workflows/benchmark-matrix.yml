@@ -126,7 +126,11 @@ jobs:
               ubuntu-arm) oses='["ubuntu-24.04-arm"]' ;;
               macos) oses='["macos-15"]' ;;
               windows) oses='["windows-latest"]' ;;
-              *) oses='["ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "windows-latest"]' ;;
+              *) if [[ "$tier" == "full" ]]; then
+                   oses='["ubuntu-latest", "ubuntu-24.04-arm", "macos-15"]'
+                 else
+                   oses='["ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "windows-latest"]'
+                 fi ;;
             esac
           elif [[ "$SCHEDULE" == "17 4 * * 0" ]]; then
             tier="full"
