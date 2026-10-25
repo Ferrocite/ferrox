@@ -5,7 +5,7 @@ use std::net::{Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -65,14 +65,14 @@ fn foxy_edge_row(edge: &ferrox_core::foxy::Candidate, reading: Option<u64>) -> S
 pub(crate) fn serve_json(label: &str, text: &str) -> ! {
     let root = crate::json::parse(text)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
-    serve_root(label, &root)
+    serve_root(label, &root, None)
 }
 
 /// Xray's own wire form; the pinned scenario suite spawns this binary with `-config=stdin: -format=pb`.
 pub(crate) fn serve_protobuf(label: &str, bytes: &[u8]) -> ! {
-    let root = crate::xray_pb::to_json(bytes)
+    let (root, seed) = crate::xray_pb::to_json_seeded(bytes)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
-    serve_root(label, &root)
+    serve_root(label, &root, Some(&seed))
 }
 
 /// The listen addresses an inbound names: every port its `port` field expands, on the
@@ -170,7 +170,7 @@ fn dokodemo_networks(inbound: &Json) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-fn serve_root(label: &str, root: &Json) -> ! {
+fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>) -> ! {
     // Armed before the first inbound opens, so every flow from here reads the budget the operator named.
     crate::budgets::apply(
         &crate::config::budgets(root)
@@ -180,6 +180,9 @@ fn serve_root(label: &str, root: &Json) -> ! {
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     crate::policy::install(root)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    if let Some(policy) = seed.and_then(|seed| seed.policy.clone()) {
+        crate::policy::install_config(policy);
+    }
     crate::stats::install(root)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     crate::metrics::install(root)
@@ -211,19 +214,42 @@ fn serve_root(label: &str, root: &Json) -> ! {
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     let observatory = crate::observatory::start(root)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    let api_config = match seed.and_then(|seed| seed.api.clone()) {
+        Some(config) => Some(config),
+        None => crate::commander::ApiConfig::from_json(root),
+    };
+    let api = api_config.map(crate::commander::Api::new);
+    if let Some(api) = api.as_ref() {
+        match seed {
+            Some(seed) => api.seed_outbounds(&seed.outbounds),
+            None => api.seed_json_outbounds(root),
+        }
+    }
     let route = routing.map(|routing| {
-        route_shared(root, routing, &portals, observatory)
+        route_shared_with_api(root, routing, &portals, observatory, api.as_ref())
             .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
     });
+    if let Some(api) = api.as_ref() {
+        api.set_runtime(Arc::new(Runtime::new(
+            outbound.clone(),
+            route.clone(),
+            freedom,
+            Arc::clone(&portals),
+        )));
+        api.serve_listen();
+    }
     install_dns_route(route.clone(), outbound.as_ref());
     start_bridges(root, outbound.as_ref(), route.as_ref());
-    let (inbounds, hysteria_served) = serve_inbounds(
+    let (inbounds, hysteria_served) = serve_inbounds_counted(
         label,
         root,
         outbound.as_ref(),
         route.as_ref(),
+        true,
         freedom,
         &portals,
+        api.as_deref(),
+        seed,
     );
     if inbounds == 0 {
         match refused.as_deref().unwrap_or(&[]).first() {
@@ -269,18 +295,22 @@ fn inbound_sniffing(inbound: &Json, label: &str) -> Option<Arc<crate::sniff::Sni
     })
 }
 
-#[allow(clippy::too_many_lines)]
-fn serve_inbounds(
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+fn serve_inbounds_counted(
     label: &str,
     root: &Json,
     outbound: Option<&Outbound>,
     route: Option<&Arc<RouteShared>>,
+    prove: bool,
     freedom: bool,
     portals: &crate::reverse::Portals,
+    api: Option<&crate::commander::Api>,
+    seed: Option<&crate::xray_pb::Seed>,
 ) -> (usize, bool) {
     let routed =
         |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
     let (mut inbounds, mut hysteria_served) = (0, false);
+    let mut vmess_tables: HashMap<String, crate::vmess::UsersRef> = HashMap::new();
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
         for inbound in list {
             let protocol =
@@ -293,10 +323,36 @@ fn serve_inbounds(
                 refuse_inbound(protocol, label, inbound);
                 continue;
             }
-            if let Some(shared) = route {
-                prove_server_route(shared, inbound, label);
+            if prove {
+                if let Some(shared) = route {
+                    prove_server_route(shared, inbound, label);
+                }
             }
             register_inbound_sniffing(inbound, label, &addresses);
+            let handler_stop = api.map(|_| Arc::new(Stop::new()));
+            let handler_tag = inbound_tag(inbound);
+            let handler_raw = seed.and_then(|seed| {
+                let tag = handler_tag.as_deref().unwrap_or_default();
+                seed.inbounds
+                    .iter()
+                    .find(|(candidate, _)| candidate == tag)
+                    .map(|(_, raw)| raw.clone())
+            });
+            let mut handler_stops: Vec<(Arc<Stop>, String)> = Vec::new();
+            let vmess_users = (protocol == "vmess").then(|| {
+                let tag = handler_tag.clone().unwrap_or_default();
+                if !tag.is_empty() {
+                    if let Some(users) = vmess_tables.get(&tag) {
+                        return std::sync::Arc::clone(users);
+                    }
+                }
+                let users = inbound_vmess_users(inbound);
+                if !tag.is_empty() {
+                    vmess_tables.insert(tag, std::sync::Arc::clone(&users));
+                }
+                users
+            });
+            let before = inbounds;
             for address in &addresses {
                 match protocol {
                     "vless" => {
@@ -310,8 +366,24 @@ fn serve_inbounds(
                         }
                     }
                     "vmess" => {
-                        serve_vmess_inbound(address, inbound, freedom);
-                        inbounds += 1;
+                        let users = vmess_users.as_ref().expect("a vmess table");
+                        if serve_vmess_inbound_users(
+                            address,
+                            inbound,
+                            freedom,
+                            handler_stop.as_ref().map(Arc::clone),
+                            users,
+                        ) {
+                            if let Some(stop) = &handler_stop {
+                                if !matches!(
+                                    inbound_carrier(inbound),
+                                    Carrier::Kcp(_) | Carrier::Xdrive { .. }
+                                ) {
+                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                }
+                            }
+                            inbounds += 1;
+                        }
                     }
                     "shadowsocks" => {
                         serve_shadowsocks_inbound(address, inbound, freedom);
@@ -350,7 +422,19 @@ fn serve_inbounds(
                     }
                     "dokodemo-door" => {
                         if let Some(out) = routed(inbound, true) {
-                            inbounds += serve_dokodemo(address, inbound, &out, label);
+                            let (armed, tcp) = serve_dokodemo(
+                                address,
+                                inbound,
+                                &out,
+                                label,
+                                handler_stop.as_ref(),
+                            );
+                            inbounds += armed;
+                            if tcp && !dokodemo_networks(inbound).contains(&"udp") {
+                                if let Some(stop) = &handler_stop {
+                                    handler_stops.push((Arc::clone(stop), address.clone()));
+                                }
+                            }
                         }
                     }
                     "hc" => {
@@ -379,6 +463,21 @@ fn serve_inbounds(
                     _ => eprintln!("unsupported inbound protocol `{protocol}` in {label}"),
                 }
             }
+            let handler_users = vmess_users;
+            if let Some(stop) = &handler_stop {
+                stop.expect_listeners(handler_stops.len());
+            }
+            if let Some(api) = api {
+                if inbounds > before {
+                    api.register_inbound(
+                        handler_tag.as_deref().unwrap_or_default(),
+                        handler_raw,
+                        protocol,
+                        handler_users,
+                        handler_stops,
+                    );
+                }
+            }
         }
     }
     (inbounds, hysteria_served)
@@ -389,6 +488,31 @@ fn register_inbound_sniffing(inbound: &Json, label: &str, addresses: &[String]) 
     for address in addresses {
         crate::sniff::register(address, sniffing.clone());
     }
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn serve_inbounds(
+    label: &str,
+    root: &Json,
+    outbound: Option<&Outbound>,
+    route: Option<&Arc<RouteShared>>,
+    freedom: bool,
+    portals: &crate::reverse::Portals,
+    api: Option<&std::sync::Arc<crate::commander::Api>>,
+    seed: Option<&crate::xray_pb::Seed>,
+) -> (usize, bool) {
+    serve_inbounds_counted(
+        label,
+        root,
+        outbound,
+        route,
+        true,
+        freedom,
+        portals,
+        api.map(std::sync::Arc::as_ref),
+        seed,
+    )
 }
 
 /// The listener lanes an inbound opens: the device's own (a tun names no socket), else one
@@ -444,9 +568,96 @@ fn inbound_served(protocol: &str) -> bool {
     SERVED_INBOUNDS.contains(&protocol)
 }
 
+/// A listener's stop flag: removal sets it and dials the address, so a blocked accept wakes, sees
+/// the flag, and drops the socket instead of waiting for a flow that will never come.
+#[derive(Debug, Default)]
+pub(crate) struct Stop {
+    stopped: std::sync::atomic::AtomicBool,
+    listeners: std::sync::atomic::AtomicUsize,
+    closed: std::sync::Mutex<bool>,
+    wake: std::sync::Condvar,
+}
+
+impl Stop {
+    pub(crate) fn new() -> Self {
+        Self {
+            listeners: std::sync::atomic::AtomicUsize::new(1),
+            ..Self::default()
+        }
+    }
+
+    /// The number of listener threads that must drop their sockets before the stop is closed.
+    pub(crate) fn expect_listeners(&self, count: usize) {
+        self.listeners
+            .store(count.max(1), std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub(crate) fn stop(&self) {
+        self.stopped
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn stopped(&self) -> bool {
+        self.stopped.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn mark_closed(&self) {
+        if self
+            .listeners
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            > 1
+        {
+            return;
+        }
+        if let Ok(mut closed) = self.closed.lock() {
+            *closed = true;
+            self.wake.notify_all();
+        }
+    }
+
+    /// Wait for the listener thread to drop its socket, so a caller that removes a handler does not
+    /// report success while the port still accepts.
+    pub(crate) fn wait_closed(&self) -> bool {
+        let Ok(mut closed) = self.closed.lock() else {
+            return false;
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !*closed {
+            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let Ok(next) = self.wake.wait_timeout(closed, left) else {
+                return false;
+            };
+            closed = next.0;
+        }
+        true
+    }
+}
+
+/// Wake a listener the stop flag already named; the accepted connection carries no flow.
+pub(crate) fn wake_listener(stop: &Stop, address: &str) {
+    if !stop.stopped() {
+        return;
+    }
+    if let Ok(target) = parse_target(address) {
+        let _ = crate::conn::connect(&target, std::time::Duration::from_millis(500));
+    }
+}
+
 fn spawn_role(address: &str, role: Role, tag: Option<String>) {
+    spawn_role_stopped(address, role, tag, None);
+}
+
+fn spawn_role_stopped(
+    address: &str,
+    role: Role,
+    tag: Option<String>,
+    stop: Option<std::sync::Arc<Stop>>,
+) {
     let address = address.to_owned();
-    thread::spawn(move || accept_loop(&address, &role, tag.as_deref()));
+    thread::spawn(move || accept_loop(&address, &role, tag.as_deref(), stop));
 }
 
 /// The role a listener serves, wrapped when its config says the first bytes are a PROXY header.
@@ -550,8 +761,7 @@ fn serve_vless_inbound(
                     fallbacks,
                 },
             );
-            let tag = inbound_tag(inbound);
-            thread::spawn(move || accept_loop(&owned, &role, tag.as_deref()));
+            spawn_role_stopped(&owned, role, inbound_tag(inbound), None);
             true
         }
     }
@@ -909,13 +1119,13 @@ enum Role {
         account: InboundAccount,
     },
     Vmess {
-        id: [u8; 16],
+        users: crate::vmess::UsersRef,
         carrier: Carrier,
         freedom: bool,
         account: InboundAccount,
     },
     VmessTls {
-        id: [u8; 16],
+        users: crate::vmess::UsersRef,
         carrier: Carrier,
         freedom: bool,
         server: Arc<ferrox_core::tls::TlsServerConfig>,
@@ -1018,6 +1228,8 @@ pub(crate) enum Outbound {
     Metrics {
         address: SocketAddr,
     },
+    /// The flow is the management API's own gRPC transport.
+    Api(std::sync::Arc<crate::commander::Api>),
 }
 
 impl Outbound {
@@ -1038,7 +1250,8 @@ impl Outbound {
             | Self::Loopback(_)
             | Self::Block(_)
             | Self::Dns(_)
-            | Self::ReversePortal(_) => None,
+            | Self::ReversePortal(_)
+            | Self::Api(_) => None,
         }
     }
 
@@ -1048,7 +1261,7 @@ impl Outbound {
         asked: &Destination,
         network: crate::router::Network,
         client: Option<&Connection>,
-    ) -> (&Self, Option<&str>) {
+    ) -> (Picked<'_>, Option<&str>) {
         self.resolved_lane_with_protocol(asked, network, client, None)
     }
 
@@ -1058,12 +1271,39 @@ impl Outbound {
         network: crate::router::Network,
         client: Option<&Connection>,
         protocol: Option<&str>,
-    ) -> (&Self, Option<&str>) {
+    ) -> (Picked<'_>, Option<&str>) {
         match self {
             Self::Route(plan) => plan.lane_with_protocol(asked, network, client, protocol),
-            other => (other, None),
+            other => (Picked::Static(other), None),
         }
     }
+}
+
+/// A routing answer: a configured outbound borrowed from the startup table, or an outbound the
+/// management API added after startup and keeps alive for as long as a flow holds it.
+enum Picked<'a> {
+    Static(&'a Outbound),
+    Dynamic(Arc<Outbound>),
+}
+
+impl std::ops::Deref for Picked<'_> {
+    type Target = Outbound;
+
+    fn deref(&self) -> &Outbound {
+        match self {
+            Self::Static(out) => out,
+            Self::Dynamic(out) => out,
+        }
+    }
+}
+
+/// The outbounds the management API added or removed after startup. `changed` keeps the routing
+/// fast path free of the lock until the first mutation; `closed` answers a removed tag the way a
+/// blackhole outbound does.
+#[derive(Debug, Default)]
+struct Dynamic {
+    added: HashMap<String, Arc<Outbound>>,
+    removed: HashSet<String>,
 }
 
 /// Routing once its assets are read: the rules, every outbound a rule names, and the first
@@ -1077,6 +1317,121 @@ struct RouteShared {
     observatory: Option<Arc<crate::observatory::Observatory>>,
     default: Outbound,
     default_tag: Option<String>,
+    dynamic: RwLock<Dynamic>,
+    changed: AtomicBool,
+    closed: Outbound,
+}
+
+impl RouteShared {
+    /// Register an outbound the management API added. A tag a rule already names, or the default,
+    /// is a duplicate until it was removed; a removed tag can be added again, as in the reference.
+    fn add_outbound(&self, tag: &str, out: Outbound) -> Result<(), String> {
+        let mut dynamic = self
+            .dynamic
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let static_tag = (self.tagged.contains_key(tag)
+            || Some(tag) == self.default_tag.as_deref())
+            && !dynamic.removed.contains(tag);
+        if static_tag || dynamic.added.contains_key(tag) {
+            return Err(format!("existing tag found: {tag}"));
+        }
+        dynamic.removed.remove(tag);
+        dynamic.added.insert(tag.to_owned(), Arc::new(out));
+        self.changed.store(true, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Drop a tag from routing. A flow that still names it is blocked rather than served by a lane
+    /// the operator removed; a tag nobody knows is a no-op, as in the reference.
+    fn remove_outbound(&self, tag: &str) {
+        let mut dynamic = self
+            .dynamic
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let was_added = dynamic.added.remove(tag).is_some();
+        let was_static = self.tagged.contains_key(tag) || Some(tag) == self.default_tag.as_deref();
+        if was_static {
+            dynamic.removed.insert(tag.to_owned());
+        }
+        if was_added || was_static {
+            self.changed.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+/// What an inbound added after startup needs to open: the same lanes, portals, counters and policy
+/// the configured inbounds got, kept alive for the management API's lifetime.
+#[derive(Debug)]
+pub(crate) struct Runtime {
+    outbound: Option<Outbound>,
+    route: Option<Arc<RouteShared>>,
+    freedom: bool,
+    portals: Arc<crate::reverse::Portals>,
+}
+
+impl Runtime {
+    fn new(
+        outbound: Option<Outbound>,
+        route: Option<Arc<RouteShared>>,
+        freedom: bool,
+        portals: Arc<crate::reverse::Portals>,
+    ) -> Self {
+        Self {
+            outbound,
+            route,
+            freedom,
+            portals,
+        }
+    }
+
+    /// Build the handler the request carries and put it in the routing table. Without routing the
+    /// handler is built and dropped, which is the reference's unused manager entry.
+    pub(crate) fn add_outbound(&self, tag: &str, raw: &[u8]) -> Result<(), String> {
+        let config = crate::xray_pb::outbound(raw)?;
+        let out = build_outbound(&config, tag)?;
+        if let Some(route) = &self.route {
+            route.add_outbound(tag, out)?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn remove_outbound(&self, tag: &str) {
+        if let Some(route) = &self.route {
+            route.remove_outbound(tag);
+        }
+    }
+}
+
+/// The runtime a management test starts from: the same route and outbound the config names.
+#[cfg(test)]
+pub(crate) fn test_runtime(root: &Json) -> Runtime {
+    let routing = crate::router::Routing::parse_in(root, Vec::new()).expect("routing parses");
+    let portals = Arc::new(crate::reverse::Portals::default());
+    let route = routing.map(|routing| route_shared(root, routing, &portals, None).expect("shared"));
+    let outbound = find_outbound(root).expect("outbound builds");
+    Runtime::new(outbound, route, true, portals)
+}
+
+/// Serve the handlers one management call added, through the same inbound path the startup config
+/// used; the route proof is skipped because the reference does not prove routes on an add.
+pub(crate) fn serve_dynamic_inbounds(
+    runtime: &Runtime,
+    root: &Json,
+    seed: &crate::xray_pb::Seed,
+    api: &crate::commander::Api,
+) -> (usize, bool) {
+    serve_inbounds_counted(
+        "commander",
+        root,
+        runtime.outbound.as_ref(),
+        runtime.route.as_ref(),
+        false,
+        runtime.freedom,
+        &runtime.portals,
+        Some(api),
+        Some(seed),
+    )
 }
 
 /// One inbound's view of the routes: its tag decides which rules may see a flow, and whether the
@@ -1115,14 +1470,36 @@ impl RoutePlan {
         }
     }
 
-    fn target(&self, tag: &str) -> &Outbound {
-        if Some(tag) == self.shared.default_tag.as_deref() {
-            return &self.shared.default;
+    fn target(&self, tag: &str) -> Picked<'_> {
+        if self.shared.changed.load(Ordering::Relaxed) {
+            let dynamic = self
+                .shared
+                .dynamic
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if dynamic.removed.contains(tag) {
+                return Picked::Static(&self.shared.closed);
+            }
+            if let Some(out) = dynamic.added.get(tag) {
+                return Picked::Dynamic(Arc::clone(out));
+            }
         }
-        self.shared
-            .tagged
-            .get(tag)
-            .expect("startup built every tag a rule names")
+        if Some(tag) == self.shared.default_tag.as_deref() {
+            return Picked::Static(&self.shared.default);
+        }
+        match self.shared.tagged.get(tag) {
+            Some(out) => Picked::Static(out),
+            None => Picked::Static(&self.shared.closed),
+        }
+    }
+
+    /// The fallback lane, resolved through the same dynamic table so removing the default tag
+    /// blocks it instead of serving a handler the operator dropped.
+    fn default_lane(&self) -> (Picked<'_>, Option<&str>) {
+        match self.shared.default_tag.as_deref() {
+            Some(tag) => (self.target(tag), Some(tag)),
+            None => (Picked::Static(&self.shared.default), None),
+        }
     }
 
     fn pick(
@@ -1130,7 +1507,7 @@ impl RoutePlan {
         asked: &Destination,
         network: crate::router::Network,
         client: Option<&Connection>,
-    ) -> &Outbound {
+    ) -> Picked<'_> {
         self.pick_with_protocol(asked, network, client, None)
     }
 
@@ -1140,7 +1517,7 @@ impl RoutePlan {
         network: crate::router::Network,
         client: Option<&Connection>,
         protocol: Option<&str>,
-    ) -> &Outbound {
+    ) -> Picked<'_> {
         self.lane_with_protocol(asked, network, client, protocol).0
     }
 
@@ -1152,7 +1529,7 @@ impl RoutePlan {
         asked: &Destination,
         network: crate::router::Network,
         client: Option<&Connection>,
-    ) -> (&Outbound, Option<&str>) {
+    ) -> (Picked<'_>, Option<&str>) {
         self.lane_with_protocol(asked, network, client, None)
     }
 
@@ -1162,7 +1539,7 @@ impl RoutePlan {
         network: crate::router::Network,
         client: Option<&Connection>,
         protocol: Option<&str>,
-    ) -> (&Outbound, Option<&str>) {
+    ) -> (Picked<'_>, Option<&str>) {
         let (domain, ip) = match asked {
             Destination::Name(host, _) => (Some(host.as_str()), None),
             Destination::Address(address) => (None, Some(address.ip())),
@@ -1182,7 +1559,7 @@ impl RoutePlan {
             protocol,
         };
         let Some(target) = self.shared.routing.route_target(&flow) else {
-            return (&self.shared.default, self.shared.default_tag.as_deref());
+            return self.default_lane();
         };
         let tag = match target {
             crate::router::RouteTarget::Outbound(tag) => {
@@ -1191,7 +1568,7 @@ impl RoutePlan {
             crate::router::RouteTarget::Balancer(tag) => tag,
         };
         let Some(balancer) = self.shared.routing.balancer(tag) else {
-            return (&self.shared.default, self.shared.default_tag.as_deref());
+            return self.default_lane();
         };
         let candidates = self
             .shared
@@ -1209,16 +1586,16 @@ impl RoutePlan {
         if let Some(fallback) = balancer.fallback() {
             return (self.target(fallback), Some(fallback));
         }
-        (&self.shared.default, self.shared.default_tag.as_deref())
+        self.default_lane()
     }
 
     fn split_udp(&self) -> bool {
         matches!(self.udp, Association::Split)
     }
 
-    fn udp_out(&self) -> Result<&Outbound, ()> {
+    fn udp_out(&self) -> Result<Picked<'_>, ()> {
         match &self.udp {
-            Association::Default => Ok(&self.shared.default),
+            Association::Default => Ok(self.default_lane().0),
             Association::Tag(tag) => Ok(self.target(tag)),
             Association::Split => Err(()),
         }
@@ -1321,11 +1698,25 @@ fn routed_outbound(
     resolve_loopback(root, inbound_tag, freedom)
 }
 
+#[cfg(test)]
 fn route_shared(
     root: &Json,
     routing: crate::router::Routing,
     portals: &crate::reverse::Portals,
     observatory: Option<Arc<crate::observatory::Observatory>>,
+) -> Result<Arc<RouteShared>, String> {
+    route_shared_with_api(root, routing, portals, observatory, None)
+}
+
+/// The same table with the commander's tag reachable: a rule naming it hands the flow to the
+/// in-process API rather than to a configured outbound.
+#[allow(clippy::too_many_lines)]
+fn route_shared_with_api(
+    root: &Json,
+    routing: crate::router::Routing,
+    portals: &crate::reverse::Portals,
+    observatory: Option<Arc<crate::observatory::Observatory>>,
+    api: Option<&Arc<crate::commander::Api>>,
 ) -> Result<Arc<RouteShared>, String> {
     let list = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
     let Some(first) = list.first() else {
@@ -1358,6 +1749,12 @@ fn route_shared(
         let target = target.tag();
         if tagged.contains_key(target) {
             continue;
+        }
+        if let Some(api) = api {
+            if api.routed() && target == api.tag() {
+                tagged.insert(target.to_owned(), Outbound::Api(std::sync::Arc::clone(api)));
+                continue;
+            }
         }
         if Some(target) == default_tag.as_deref() {
             tagged.insert(target.to_owned(), default.clone());
@@ -1425,6 +1822,9 @@ fn route_shared(
         observatory,
         default,
         default_tag,
+        dynamic: RwLock::new(Dynamic::default()),
+        changed: AtomicBool::new(false),
+        closed: Outbound::Block(ferrox_core::blackhole::Response::None),
     }))
 }
 
@@ -1689,13 +2089,16 @@ pub(crate) struct ShadowsocksOut {
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
 }
 
-fn accept_loop(address: &str, role: &Role, tag: Option<&str>) {
+fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::sync::Arc<Stop>>) {
     let target = parse_target(address)
         .unwrap_or_else(|error| exit(&format!("cannot resolve {address}: {error}")));
     let listener = Listener::bind(&target)
         .unwrap_or_else(|error| exit(&format!("cannot listen on {address}: {error}")));
     let sniffing = crate::sniff::for_listener(listener.local_addr().ok(), address);
     for stream in listener.incoming() {
+        if stop.as_ref().is_some_and(|stop| stop.stopped()) {
+            break;
+        }
         let Ok(mut stream) = stream else { continue };
         no_delay(&stream);
         let role = role.clone();
@@ -1724,6 +2127,10 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>) {
                 .with_policy(Some(crate::policy::flow(0)));
             front_dispatch(stream, role);
         });
+    }
+    drop(listener);
+    if let Some(stop) = stop {
+        stop.mark_closed();
     }
 }
 fn serve_shadowsocks(
@@ -3286,16 +3693,16 @@ impl BridgeLane {
         }
     }
 
-    fn pick(&self, asked: &Destination, network: crate::router::Network) -> Option<&Outbound> {
+    fn pick(&self, asked: &Destination, network: crate::router::Network) -> Option<Picked<'_>> {
         match &self.plan {
             Some(plan) => Some(plan.pick(asked, network, None)),
-            None => self.fixed.as_ref(),
+            None => self.fixed.as_ref().map(Picked::Static),
         }
     }
 
     fn tcp(&self, target: &MuxTarget) -> Option<Connection> {
         let asked = target.destination();
-        match self.pick(&asked, crate::router::Network::Tcp) {
+        match self.pick(&asked, crate::router::Network::Tcp).as_deref() {
             Some(Outbound::Freedom) => asked.socket().and_then(|address| dial_or_report(&address)),
             Some(Outbound::Block(_)) => None,
             _ => {
@@ -3307,7 +3714,7 @@ impl BridgeLane {
 
     fn udp(&self, target: &MuxTarget) -> bool {
         let asked = target.destination();
-        match self.pick(&asked, crate::router::Network::Udp) {
+        match self.pick(&asked, crate::router::Network::Udp).as_deref() {
             Some(Outbound::Freedom) => true,
             Some(Outbound::Block(_)) => false,
             _ => {
@@ -3996,8 +4403,7 @@ fn serve_vless_tls_inbound(
             fallbacks,
         },
     );
-    let tag = inbound_tag(inbound);
-    thread::spawn(move || accept_loop(&owned, &role, tag.as_deref()));
+    spawn_role_stopped(&owned, role, inbound_tag(inbound), None);
     true
 }
 
@@ -4040,8 +4446,7 @@ fn serve_vless_reality_inbound(
             fallbacks,
         },
     );
-    let tag = inbound_tag(inbound);
-    thread::spawn(move || accept_loop(&owned, &role, tag.as_deref()));
+    spawn_role_stopped(&owned, role, inbound_tag(inbound), None);
     true
 }
 
@@ -6471,9 +6876,9 @@ fn serve_trojan_xdrive(mut session: crate::xdrive::Conn, key: &[u8; 56], freedom
     xdrive_relay(&uplink, session);
 }
 
-fn serve_vmess_xdrive(session: crate::xdrive::Conn, id: &[u8; 16], freedom: bool) {
+fn serve_vmess_xdrive(session: crate::xdrive::Conn, users: &crate::vmess::Users, freedom: bool) {
     let close = xdrive_close(&session);
-    crate::vmess::serve_kcp(session.clone(), session, id, freedom, &close);
+    crate::vmess::serve_kcp(session.clone(), session, users, freedom, &close);
 }
 
 fn serve_ss_xdrive(
@@ -6766,8 +7171,26 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
     }
 }
 
-fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
-    let id = inbound_id(inbound);
+#[cfg(test)]
+fn serve_vmess_inbound(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    stop: Option<Arc<Stop>>,
+) -> (crate::vmess::UsersRef, bool) {
+    let users = inbound_vmess_users(inbound);
+    let served = serve_vmess_inbound_users(address, inbound, freedom, stop, &users);
+    (users, served)
+}
+
+/// One address of a `VMess` handler, sharing the account table every port of that handler reads.
+fn serve_vmess_inbound_users(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    stop: Option<Arc<Stop>>,
+    users: &crate::vmess::UsersRef,
+) -> bool {
     let account = inbound_account(inbound);
     let sec = stream_security(inbound);
     match inbound_carrier(inbound) {
@@ -6777,42 +7200,46 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
             let serve: KcpServe = if sec == "tls" {
                 let Some(server) = inbound_tls_identity(inbound) else {
                     eprintln!("unreadable vmess tls identity on {address}: refused, not served");
-                    return;
+                    return false;
                 };
+                let kcp_users = std::sync::Arc::clone(users);
                 Arc::new(move |conn| {
                     let _flow = crate::accesslog::flow(None, &email, level);
-                    serve_vmess_kcp_tls(conn, &id, freedom, &server);
+                    serve_vmess_kcp_tls(conn, &kcp_users, freedom, &server);
                 })
             } else {
+                let owned_users = std::sync::Arc::clone(users);
                 Arc::new(move |conn| {
                     let _flow = crate::accesslog::flow(None, &email, level);
                     let (reader, writer, close) = kcp_parts(conn);
-                    crate::vmess::serve_kcp(reader, writer, &id, freedom, &close);
+                    crate::vmess::serve_kcp(reader, writer, &owned_users, freedom, &close);
                 })
             };
             let owned = address.to_owned();
-            let _ = serve_kcp_bound(&owned, config, &serve);
+            serve_kcp_bound(&owned, config, &serve)
         }
         Carrier::Xdrive { settings } => {
             let email = account.email.clone();
             let level = account.level;
+            let xdrive_users = std::sync::Arc::clone(users);
             let accept: crate::xdrive::Accept = Arc::new(move |session| {
                 let _flow = crate::accesslog::flow(None, &email, level);
-                serve_vmess_xdrive(session, &id, freedom);
+                serve_vmess_xdrive(session, &xdrive_users, freedom);
             });
             serve_xdrive_loop(&settings, address, accept);
+            true
         }
         carrier if sec == "tls" => {
             let Some(server) = inbound_tls_identity(inbound) else {
                 eprintln!("unreadable vmess tls identity on {address}: refused, not served");
-                return;
+                return false;
             };
-            spawn_role(
+            spawn_role_stopped(
                 address,
                 inbound_role(
                     inbound,
                     Role::VmessTls {
-                        id,
+                        users: std::sync::Arc::clone(users),
                         carrier,
                         freedom,
                         server,
@@ -6820,28 +7247,34 @@ fn serve_vmess_inbound(address: &str, inbound: &Json, freedom: bool) {
                     },
                 ),
                 inbound_tag(inbound),
+                stop,
             );
+            true
         }
-        other => spawn_role(
-            address,
-            inbound_role(
-                inbound,
-                Role::Vmess {
-                    id,
-                    carrier: other,
-                    freedom,
-                    account,
-                },
-            ),
-            inbound_tag(inbound),
-        ),
+        other => {
+            spawn_role_stopped(
+                address,
+                inbound_role(
+                    inbound,
+                    Role::Vmess {
+                        users: std::sync::Arc::clone(users),
+                        carrier: other,
+                        freedom,
+                        account,
+                    },
+                ),
+                inbound_tag(inbound),
+                stop,
+            );
+            true
+        }
     }
 }
 
 /// The session a `VMess` listener that declares `security: tls` answers, over raw and every carried carrier.
 fn serve_vmess_tls(
     stream: Connection,
-    id: &[u8; 16],
+    users: &crate::vmess::Users,
     carrier: &Carrier,
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
@@ -6861,21 +7294,23 @@ fn serve_vmess_tls(
         let _ = raw.shutdown(Shutdown::Both);
     });
     match carrier {
-        Carrier::Raw(_) => crate::vmess::serve_raw_split(reader, writer, id, freedom, &close),
+        Carrier::Raw(_) => crate::vmess::serve_raw_split(reader, writer, users, freedom, &close),
         Carrier::Ws { path, .. } => {
-            crate::vmess::serve_ws_split(reader, writer, path, id, freedom, &close);
+            crate::vmess::serve_ws_split(reader, writer, path, users, freedom, &close);
         }
         Carrier::Xhttp { settings, .. } => {
-            crate::vmess::serve_xhttp_split(reader, writer, settings, id, freedom, &close);
+            crate::vmess::serve_xhttp_split(reader, writer, settings, users, freedom, &close);
         }
         Carrier::HttpHeader { path } => {
-            crate::vmess::serve_httpheader_split(reader, writer, path, id, freedom, &close);
+            crate::vmess::serve_httpheader_split(reader, writer, path, users, freedom, &close);
         }
         Carrier::HttpUpgrade { path, host, .. } => {
-            crate::vmess::serve_httpupgrade_split(reader, writer, path, host, id, freedom, &close);
+            crate::vmess::serve_httpupgrade_split(
+                reader, writer, path, host, users, freedom, &close,
+            );
         }
         Carrier::Grpc(settings) => {
-            crate::vmess::serve_grpc_split(reader, writer, settings, id, freedom, &close);
+            crate::vmess::serve_grpc_split(reader, writer, settings, users, freedom, &close);
         }
         refused_carriers!() => {}
     }
@@ -6883,10 +7318,16 @@ fn serve_vmess_tls(
 
 /// Bind a dokodemo-door flow and rewrite it to the target its config names, and say how many
 /// inbounds it armed. The tcp flow and the udp flow are served when the config names them.
-fn serve_dokodemo(address: &str, inbound: &Json, out: &Outbound, label: &str) -> usize {
+fn serve_dokodemo(
+    address: &str,
+    inbound: &Json,
+    out: &Outbound,
+    label: &str,
+    stop: Option<&Arc<Stop>>,
+) -> (usize, bool) {
     let Some(dest) = dokodemo_target(inbound) else {
         eprintln!("dokodemo-door rewrite target unusable in {label}: refused, not served");
-        return 0;
+        return (0, false);
     };
     let networks = dokodemo_networks(inbound);
     if !networks
@@ -6894,12 +7335,12 @@ fn serve_dokodemo(address: &str, inbound: &Json, out: &Outbound, label: &str) ->
         .any(|network| *network == "tcp" || *network == "udp")
     {
         eprintln!("dokodemo-door without tcp or udp in {label}: no flow to serve");
-        return 0;
+        return (0, false);
     }
     // A raw front has no tcp carrier to arm a chain on, so a masked inbound is refused rather than served unmasked.
     if crate::config::has_tcp_mask(inbound.get("streamSettings")) {
         eprintln!("dokodemo-door in {label} asks for a finalmask tcp chain it cannot arm");
-        return 0;
+        return (0, false);
     }
     // The transparent redirect is the kernel's to give: the original destination lives in a socket option this tree asks for nothing. A portMap is not that — it is a table the flow's own port indexes, and the reference replaces the rewrite with a hit (`proxy/dokodemo/dokodemo.go`), so it is carried.
     if inbound
@@ -6908,18 +7349,18 @@ fn serve_dokodemo(address: &str, inbound: &Json, out: &Outbound, label: &str) ->
         .is_some()
     {
         eprintln!("dokodemo-door in {label} asks for `followRedirect`, which this tree cannot carry: refused, not served");
-        return 0;
+        return (0, false);
     }
     let port_map = match dokodemo_port_map(inbound) {
         Ok(map) => map,
         Err(reason) => {
             eprintln!("dokodemo-door portMap in {label}: {reason}");
-            return 0;
+            return (0, false);
         }
     };
     let mut armed = 0;
     if networks.contains(&"tcp") {
-        spawn_role(
+        spawn_role_stopped(
             address,
             inbound_role(
                 inbound,
@@ -6930,6 +7371,7 @@ fn serve_dokodemo(address: &str, inbound: &Json, out: &Outbound, label: &str) ->
                 },
             ),
             inbound_tag(inbound),
+            stop.cloned(),
         );
         armed += 1;
     }
@@ -6937,13 +7379,13 @@ fn serve_dokodemo(address: &str, inbound: &Json, out: &Outbound, label: &str) ->
         // The door's own socket is bound before the inbound is armed: a port nobody holds answers a datagram with a refusal.
         let Ok(socket) = UdpSocket::bind(address) else {
             eprintln!("dokodemo-door udp: cannot bind {address} in {label}");
-            return armed;
+            return (armed, networks.contains(&"tcp"));
         };
         let door = out.clone();
         thread::spawn(move || dokodemo_udp_door(&socket, &dest, &port_map, &door));
         armed += 1;
     }
-    armed
+    (armed, networks.contains(&"tcp"))
 }
 
 /// The per-port rewrite table a dokodemo inbound names: the flow's own port is the key and the
@@ -11360,7 +11802,7 @@ fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
 
 fn serve_vmess_kcp_tls(
     conn: &Arc<ferrox_core::kcp::Connection>,
-    id: &[u8; 16],
+    users: &crate::vmess::Users,
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
 ) {
@@ -11383,7 +11825,7 @@ fn serve_vmess_kcp_tls(
     );
     let closer = Arc::clone(conn);
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
-    crate::vmess::serve_kcp(reader, writer, id, freedom, &close);
+    crate::vmess::serve_kcp(reader, writer, users, freedom, &close);
 }
 
 fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) {
@@ -11420,7 +11862,10 @@ fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts)
                 .0,
         ),
     };
-    if !matches!(first.unwrap_or(out), Outbound::Foxy(_) | Outbound::Veepn(_)) {
+    if !matches!(
+        first.as_deref().unwrap_or(out),
+        Outbound::Foxy(_) | Outbound::Veepn(_)
+    ) {
         let grant = match handshake.version {
             crate::socks::Version::V5 => Front::Socks.grant_line(),
             crate::socks::Version::V4 => ferrox_core::socks::grant4(),
@@ -11431,7 +11876,7 @@ fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts)
     }
     let (dial, out, tag) = sniff_lane(out, &handshake.asked, &client);
     let asked = dial.as_ref().unwrap_or(&handshake.asked);
-    serve_connect(client, out, asked, Front::Socks, &[], tag);
+    serve_connect(client, &out, asked, Front::Socks, &[], tag);
 }
 
 /// The device front's relay: the front layer's own dial, with the destination the
@@ -11443,7 +11888,7 @@ fn serve_socks(mut client: Connection, out: &Outbound, accounts: &SocksAccounts)
 pub(crate) fn serve_device_flow(client: Connection, out: &Outbound, dest: &Destination) {
     let (dial, lane, tag) = sniff_lane(out, dest, &client);
     let dest = dial.as_ref().unwrap_or(dest);
-    serve_connect(client, lane, dest, Front::Socks, &[], tag);
+    serve_connect(client, &lane, dest, Front::Socks, &[], tag);
 }
 
 /// One mux `New` target for a flow the portal carries.
@@ -11530,7 +11975,7 @@ fn sniff_lane<'a>(
     out: &'a Outbound,
     asked: &Destination,
     client: &Connection,
-) -> (Option<Destination>, &'a Outbound, Option<&'a str>) {
+) -> (Option<Destination>, Picked<'a>, Option<&'a str>) {
     let Some(sniffing) = crate::sniff::current() else {
         let (lane, tag) = out.resolved_lane(asked, crate::router::Network::Tcp, Some(client));
         return (None, lane, tag);
@@ -11588,6 +12033,10 @@ pub(crate) fn serve_connect(
         return serve_connect(client, &loopback.dial, asked, front, prefix, tag.as_deref());
     }
     // The rules dropped this flow: the front has granted it, so the sink answers and ends it.
+    if let Outbound::Api(api) = out {
+        api.serve_stream(client);
+        return;
+    }
     if let Outbound::Block(answer) = out {
         crate::blackhole::serve(client, answer);
         return;
@@ -11738,7 +12187,8 @@ fn dial_socks_outbound(
         | Outbound::Block(_)
         | Outbound::Dns(_)
         | Outbound::ReversePortal(_)
-        | Outbound::Metrics { .. } => {}
+        | Outbound::Metrics { .. }
+        | Outbound::Api(_) => {}
     }
 }
 
@@ -12553,14 +13003,16 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                         .0,
                 ),
             };
-            if !matches!(first.unwrap_or(out), Outbound::Foxy(_) | Outbound::Veepn(_))
-                && client.write_all(Front::Http.grant_line()).is_err()
+            if !matches!(
+                first.as_deref().unwrap_or(out),
+                Outbound::Foxy(_) | Outbound::Veepn(_)
+            ) && client.write_all(Front::Http.grant_line()).is_err()
             {
                 return;
             }
             let (dial, out, tag) = sniff_lane(out, &asked, &client);
             let asked = dial.as_ref().unwrap_or(&asked);
-            serve_connect(client, out, asked, Front::Http, &[], tag);
+            serve_connect(client, &out, asked, Front::Http, &[], tag);
         }
         ProxyRequest::Forward(asked, origin) => {
             let destination = asked.authority();
@@ -12571,7 +13023,7 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                 Some(&client),
                 Some("http/1.1"),
             );
-            serve_connect(client, out, &asked, Front::Http, &origin, tag);
+            serve_connect(client, &out, &asked, Front::Http, &origin, tag);
         }
     }
 }
@@ -12757,7 +13209,7 @@ fn serve_socks_udp(client: Connection, out: &Outbound) {
             return serve_socks_udp_split(client, plan);
         }
         if let Ok(target) = plan.udp_out() {
-            return serve_socks_udp_lane(client, target);
+            return serve_socks_udp_lane(client, &target);
         }
     }
     if !matches!(out, Outbound::Block(_))
@@ -12987,12 +13439,12 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan) {
         let (out, key) =
             plan.lane_with_protocol(&route, crate::router::Network::Udp, Some(&client), protocol);
         let key = key.map(str::to_owned);
-        if matches!(out, Outbound::Block(_)) {
+        if matches!(&*out, Outbound::Block(_)) {
             continue;
         }
         retire_finished_lane(&mut lanes, &mut replies, &key);
         if !lanes.contains_key(&key) {
-            if let Some(lane) = spawn_udp_lane(out, local) {
+            if let Some(lane) = spawn_udp_lane(&out, local) {
                 replies.insert(lane.address, key.clone());
                 lanes.insert(key.clone(), lane);
             }
@@ -15004,6 +15456,7 @@ pub(crate) fn pump_vmess_udp<R, W>(
     udp: &UdpSocket,
     send: crate::vmess::Flow,
     recv: crate::vmess::Flow,
+    user: &crate::stats::Meter,
 ) where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
@@ -15020,6 +15473,7 @@ pub(crate) fn pump_vmess_udp<R, W>(
     }
     let done = Arc::new(AtomicBool::new(false));
     let done_in = Arc::clone(&done);
+    let forward_user = user.clone();
     let forward = move || {
         let mut reader = reader;
         let mut recv = recv;
@@ -15028,6 +15482,7 @@ pub(crate) fn pump_vmess_udp<R, W>(
             if chunk.is_empty() {
                 break;
             }
+            forward_user.read(chunk.len());
             if udp_send.send(chunk).is_err() {
                 break;
             }
@@ -15049,6 +15504,7 @@ pub(crate) fn pump_vmess_udp<R, W>(
                 if n == 0 {
                     continue;
                 }
+                user.write(n);
                 if !crate::vmess::write_frame(
                     &mut writer,
                     &mut send,
@@ -17230,6 +17686,38 @@ fn inbound_id(inbound: &Json) -> [u8; 16] {
         .and_then(Json::as_str)
         .and_then(uuid_bytes)
         .unwrap_or([0u8; 16])
+}
+
+/// Every vmess account the inbound names, with the email `RemoveUser` selects.
+fn inbound_vmess_users(inbound: &Json) -> crate::vmess::UsersRef {
+    let entries = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("clients"))
+        .and_then(Json::as_arr)
+        .map(|clients| {
+            clients
+                .iter()
+                .filter_map(|client| {
+                    let id = client
+                        .get("id")
+                        .and_then(Json::as_str)
+                        .and_then(uuid_bytes)?;
+                    let email = client
+                        .get("email")
+                        .and_then(Json::as_str)
+                        .unwrap_or("")
+                        .to_owned();
+                    let level = client.get("level").and_then(Json::as_u32).unwrap_or(0);
+                    Some(crate::vmess::User { level, email, id })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if entries.is_empty() {
+        crate::vmess::Users::single(inbound_id(inbound))
+    } else {
+        crate::vmess::Users::with(entries)
+    }
 }
 
 /// One client a vless inbound serves: the id the wire names and the flow its account is bound to.
@@ -19548,6 +20036,85 @@ mod tests {
             target,
             Some(Destination::Name("example.test".to_owned(), 443))
         );
+    }
+
+    #[test]
+    fn a_dynamic_outbound_is_routable_and_removable() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"default","protocol":"freedom"},{"tag":"alt","protocol":"freedom"}],"routing":{"rules":[{"type":"field","outboundTag":"alt","domain":["example.test"]}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = crate::reverse::Portals::default();
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let plan = RoutePlan::new(Arc::clone(&shared), None, true);
+        let asked = Destination::Name("example.test".to_owned(), 443);
+        let lane = |plan: &RoutePlan| {
+            matches!(
+                &*plan.pick(&asked, crate::router::Network::Tcp, None),
+                Outbound::Freedom
+            )
+        };
+        assert!(lane(&plan));
+        assert!(shared.add_outbound("alt", Outbound::Freedom).is_err());
+        shared.remove_outbound("alt");
+        assert!(matches!(
+            &*plan.pick(&asked, crate::router::Network::Tcp, None),
+            Outbound::Block(_)
+        ));
+        assert!(shared.add_outbound("alt", Outbound::Freedom).is_ok());
+        assert!(lane(&plan));
+        shared.remove_outbound("alt");
+        assert!(matches!(
+            &*plan.pick(&asked, crate::router::Network::Tcp, None),
+            Outbound::Block(_)
+        ));
+        assert!(shared.add_outbound("alt", Outbound::Freedom).is_ok());
+        assert!(lane(&plan));
+        assert!(shared.add_outbound("new", Outbound::Freedom).is_ok());
+        assert!(matches!(&*plan.target("new"), Outbound::Freedom));
+        shared.remove_outbound("new");
+        assert!(matches!(&*plan.target("new"), Outbound::Block(_)));
+        shared.remove_outbound("nobody");
+        shared.remove_outbound("default");
+        assert!(matches!(&*plan.default_lane().0, Outbound::Block(_)));
+    }
+
+    #[test]
+    fn a_dynamic_outbound_config_builds_and_removes_through_the_runtime() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"default","protocol":"freedom"}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = Arc::new(crate::reverse::Portals::default());
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let runtime = Runtime::new(
+            Some(Outbound::Freedom),
+            Some(Arc::clone(&shared)),
+            false,
+            Arc::clone(&portals),
+        );
+        let plan = RoutePlan::new(Arc::clone(&shared), None, true);
+        let name = b"xray.proxy.freedom.Config";
+        let mut raw = vec![0x0a, 3, b'n', b'e', b'w'];
+        raw.push(0x1a);
+        raw.push((name.len() + 2) as u8);
+        raw.extend_from_slice(&[0x0a, name.len() as u8]);
+        raw.extend_from_slice(name);
+        runtime.add_outbound("new", &raw).expect("adds");
+        assert!(matches!(&*plan.target("new"), Outbound::Freedom));
+        assert!(runtime.add_outbound("new", &raw).is_err());
+        runtime.remove_outbound("new");
+        assert!(matches!(&*plan.target("new"), Outbound::Block(_)));
+        let mut unknown = vec![0x0a, 1, b'x'];
+        unknown.push(0x1a);
+        unknown.extend_from_slice(&[0x04, 0x0a, 0x02, b'n', b'o']);
+        assert!(runtime.add_outbound("x", &unknown).is_err());
     }
 
     #[test]
@@ -25820,7 +26387,7 @@ mod tests {
             let port = probe.local_addr().expect("addr").port();
             drop(probe);
             let address = format!("127.0.0.1:{port}");
-            serve_vmess_inbound(&address, &inbound, true);
+            serve_vmess_inbound(&address, &inbound, true, None);
             let waited = Instant::now();
             while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
                 assert!(
@@ -26383,7 +26950,7 @@ mod tests {
         let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
-        serve_vmess_inbound(&format!("127.0.0.1:{port}"), &inbound, true);
+        serve_vmess_inbound(&format!("127.0.0.1:{port}"), &inbound, true, None);
         let vmess = VmessOut {
             address: "127.0.0.1".to_owned(),
             port,
@@ -26508,22 +27075,25 @@ mod tests {
         carrier: &Carrier,
         server: Option<&Arc<ferrox_core::tls::TlsServerConfig>>,
     ) {
+        let users = crate::vmess::Users::single(id);
         if let Some(server) = server {
-            serve_vmess_tls(stream, &id, carrier, true, server);
+            serve_vmess_tls(stream, &users, carrier, true, server);
             return;
         }
         match carrier {
-            Carrier::Raw(_) => crate::vmess::serve(stream, &id, true),
-            Carrier::Ws { path, .. } => crate::vmess::serve_ws(stream, path, &id, true),
-            Carrier::Grpc(settings) => crate::vmess::serve_grpc_with(stream, settings, &id, true),
+            Carrier::Raw(_) => crate::vmess::serve(stream, &users, true),
+            Carrier::Ws { path, .. } => crate::vmess::serve_ws(stream, path, &users, true),
+            Carrier::Grpc(settings) => {
+                crate::vmess::serve_grpc_with(stream, settings, &users, true);
+            }
             Carrier::Xhttp { settings, .. } => {
-                crate::vmess::serve_xhttp(stream, settings.path.as_str(), &id, true);
+                crate::vmess::serve_xhttp(stream, settings.path.as_str(), &users, true);
             }
             Carrier::HttpUpgrade { path, host, .. } => {
-                crate::vmess::serve_httpupgrade(stream, path, host, &id, true);
+                crate::vmess::serve_httpupgrade(stream, path, host, &users, true);
             }
             Carrier::HttpHeader { path } => {
-                crate::vmess::serve_httpheader(stream, path, &id, true);
+                crate::vmess::serve_httpheader(stream, path, &users, true);
             }
             _ => unreachable!("the test carrier list carries a server"),
         }
@@ -26666,13 +27236,14 @@ mod tests {
         let id = [0x62u8; 16];
         let server = tls.map(|(server, _)| Arc::clone(server));
         thread::spawn(move || {
+            let users = crate::vmess::Users::single(id);
             let conn = listener.accept().expect("accepts");
             if let Some(server) = server {
-                serve_vmess_kcp_tls(&conn, &id, true, &server);
+                serve_vmess_kcp_tls(&conn, &users, true, &server);
                 return;
             }
             let (reader, writer, close) = kcp_parts(&conn);
-            crate::vmess::serve_kcp(reader, writer, &id, true, &close);
+            crate::vmess::serve_kcp(reader, writer, &users, true, &close);
         });
         let out = vmess_test_out(
             port,
@@ -26705,8 +27276,9 @@ mod tests {
         let settings = crate::xdrive::Settings::from_json(Some(&settings)).expect("settings");
         let echo_port = udp_echo_port();
         let id = [0x62u8; 16];
+        let users = crate::vmess::Users::single(id);
         let accept: crate::xdrive::Accept =
-            Arc::new(move |session| serve_vmess_xdrive(session, &id, true));
+            Arc::new(move |session| serve_vmess_xdrive(session, &users, true));
         settings
             .listen(Some(("127.0.0.1", 9)), accept)
             .expect("listens");
@@ -26772,6 +27344,8 @@ mod tests {
             None,
             true,
             &crate::reverse::Portals::default(),
+            None,
+            None,
         );
         assert_eq!(opened, 1, "a vmess inbound that names tls is served");
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
@@ -26840,16 +27414,24 @@ mod tests {
     #[test]
     fn a_vmess_kcp_tls_outbound_parses_and_carries_udp() {
         let (cert, key, _) = tls_cert_json();
-        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
         let inbound = crate::json::parse(&format!(
             r#"{{"protocol": "vmess", "settings": {{"clients": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},
                 "streamSettings": {{"network": "kcp", "security": "tls",
                     "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
         ))
         .expect("parses");
-        serve_vmess_inbound(&format!("127.0.0.1:{port}"), &inbound, true);
+        let mut port = 0;
+        let mut served = false;
+        for _ in 0..64 {
+            let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            port = probe.local_addr().expect("addr").port();
+            drop(probe);
+            if serve_vmess_inbound(&format!("127.0.0.1:{port}"), &inbound, true, None).1 {
+                served = true;
+                break;
+            }
+        }
+        assert!(served, "binds a KCP port");
         let outbound = crate::json::parse(&format!(
             r#"{{"outbounds": [{{"protocol": "vmess",
                 "settings": {{"vnext": [{{"address": "127.0.0.1", "port": {port},
@@ -26882,8 +27464,13 @@ mod tests {
             let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
             tls.handshake().expect("handshakes");
             echo_trace(&format!("srv {port} handshook"));
-            let Some((_target, mut send, mut recv, prefix, cmd)) =
-                crate::vmess::accept_request(&mut tls, &id)
+            let Some(crate::vmess::Accepted {
+                mut send,
+                mut recv,
+                prefix,
+                cmd,
+                ..
+            }) = crate::vmess::accept_request(&mut tls, &crate::vmess::Users::single(id))
             else {
                 panic!("reads a vmess header");
             };
@@ -26975,6 +27562,7 @@ mod tests {
         Vmess([u8; 16]),
     }
 
+    #[allow(clippy::too_many_lines)]
     fn tls_carried_echo(
         kind: TlsEcho,
         out: impl FnOnce(u16) -> Outbound + Send + 'static,
@@ -27039,8 +27627,14 @@ mod tests {
                     echo_trace(&format!("srv {port} echoed trojan"));
                 }
                 TlsEcho::Vmess(id) => {
-                    let Some((_target, mut send, mut recv, prefix, cmd)) =
-                        crate::vmess::accept_request(&mut reader, &id)
+                    let Some(crate::vmess::Accepted {
+                        mut send,
+                        mut recv,
+                        prefix,
+                        cmd,
+                        ..
+                    }) =
+                        crate::vmess::accept_request(&mut reader, &crate::vmess::Users::single(id))
                     else {
                         panic!("reads a vmess header");
                     };
@@ -27584,12 +28178,13 @@ mod tests {
             }
         });
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let users = crate::vmess::Users::single(id);
         let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
                 let Ok(stream) = stream else { continue };
-                crate::vmess::serve_xhttp(stream, "/share", &id, true);
+                crate::vmess::serve_xhttp(stream, "/share", &users, true);
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -28757,11 +29352,12 @@ mod tests {
             }
         });
         let id = [0x5au8; 16];
+        let users = crate::vmess::Users::single(id);
         let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            crate::vmess::serve(stream, &id, true);
+            crate::vmess::serve(stream, &users, true);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let mut uplink = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
@@ -28822,6 +29418,7 @@ mod tests {
         let first = echo();
         let second = echo();
         let id = [0x5au8; 16];
+        let users = crate::vmess::Users::single(id);
         let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
@@ -28829,7 +29426,8 @@ mod tests {
                 let Ok(stream) = stream else {
                     continue;
                 };
-                thread::spawn(move || crate::vmess::serve(stream, &id, true));
+                let users = std::sync::Arc::clone(&users);
+                thread::spawn(move || crate::vmess::serve(stream, &users, true));
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -30677,12 +31275,13 @@ mod tests {
             }
         });
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let users = crate::vmess::Users::single(id);
         let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
                 let Ok(stream) = stream else { continue };
-                crate::vmess::serve_ws(stream, "/tunnel", &id, true);
+                crate::vmess::serve_ws(stream, "/tunnel", &users, true);
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -30743,12 +31342,13 @@ mod tests {
             }
         });
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let users = crate::vmess::Users::single(id);
         let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
                 let Ok(stream) = stream else { continue };
-                crate::vmess::serve_httpupgrade(stream, "/tunnel", "", &id, true);
+                crate::vmess::serve_httpupgrade(stream, "/tunnel", "", &users, true);
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -30810,12 +31410,13 @@ mod tests {
             }
         });
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let users = crate::vmess::Users::single(id);
         let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
                 let Ok(stream) = stream else { continue };
-                crate::vmess::serve_grpc(stream, "/TunnelService/Tun", &id, true);
+                crate::vmess::serve_grpc(stream, "/TunnelService/Tun", &users, true);
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -35042,7 +35643,7 @@ mod tests {
             .and_then(Json::as_arr)
             .expect("inbounds")[0];
         assert_eq!(
-            serve_dokodemo("127.0.0.1:0", inbound, &Outbound::Freedom, "test"),
+            serve_dokodemo("127.0.0.1:0", inbound, &Outbound::Freedom, "test", None).0,
             0,
             "`followRedirect` is refused, not served as if the rewrite had been asked for"
         );
@@ -35069,6 +35670,8 @@ mod tests {
             None,
             false,
             &crate::reverse::Portals::default(),
+            None,
+            None,
         );
         assert_eq!(opened, 1, "the mapped door opens");
         let mut client = connect_until(door);
@@ -35090,7 +35693,7 @@ mod tests {
             .and_then(Json::as_arr)
             .expect("inbounds")[0];
         assert_eq!(
-            serve_dokodemo("127.0.0.1:0", inbound, &Outbound::Freedom, "test"),
+            serve_dokodemo("127.0.0.1:0", inbound, &Outbound::Freedom, "test", None).0,
             0,
             "a bad entry is the Build's refusal"
         );
@@ -35110,6 +35713,8 @@ mod tests {
             None,
             false,
             &crate::reverse::Portals::default(),
+            None,
+            None,
         );
         assert_eq!(opened, 1, "the door opens with a table that misses");
         let mut client = connect_until(door);
@@ -35139,6 +35744,8 @@ mod tests {
             None,
             false,
             &crate::reverse::Portals::default(),
+            None,
+            None,
         );
         assert_eq!(opened, 1, "the tunnel inbound opens the door");
         let mut client = connect_until(port);
@@ -35430,6 +36037,8 @@ mod tests {
             None,
             false,
             &crate::reverse::Portals::default(),
+            None,
+            None,
         );
         assert_eq!(opened, 1, "the http inbound opens");
         port
@@ -35451,6 +36060,8 @@ mod tests {
             None,
             false,
             &crate::reverse::Portals::default(),
+            None,
+            None,
         );
         assert_eq!(opened, 1, "the socks inbound opens");
         drop(connect_until(port));
@@ -37042,9 +37653,10 @@ mod tests {
     fn socks_dials_vmess_over_kcp_to_echo() {
         let echo_port = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let users = crate::vmess::Users::single(id);
         let serve: KcpServe = Arc::new(move |conn| {
             let (reader, writer, close) = kcp_parts(conn);
-            crate::vmess::serve_kcp(reader, writer, &id, true, &close);
+            crate::vmess::serve_kcp(reader, writer, &users, true, &close);
         });
         let kcp_port = kcp_loop_with(serve);
         let front_port = socks_front_with(Outbound::Vmess(VmessOut {
@@ -37372,17 +37984,17 @@ mod tests {
         let asked = Destination::Name("echo.test".to_owned(), 443);
         assert!(
             matches!(
-                plan.pick(&asked, crate::router::Network::Tcp, None),
+                &*plan.pick(&asked, crate::router::Network::Tcp, None),
                 Outbound::Freedom
             ),
             "candidates are ordered by tag, not by config order"
         );
         assert!(matches!(
-            plan.pick(&asked, crate::router::Network::Tcp, None),
+            &*plan.pick(&asked, crate::router::Network::Tcp, None),
             Outbound::Block(_)
         ));
         assert!(matches!(
-            plan.pick(&asked, crate::router::Network::Tcp, None),
+            &*plan.pick(&asked, crate::router::Network::Tcp, None),
             Outbound::Freedom
         ));
 
@@ -37397,7 +38009,7 @@ mod tests {
             panic!("a route plan");
         };
         let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None);
-        assert!(matches!(picked, Outbound::Freedom));
+        assert!(matches!(&*picked, Outbound::Freedom));
         assert_eq!(tag, Some("direct"), "an observatory-less pick falls back");
     }
 
@@ -37417,7 +38029,7 @@ mod tests {
         };
         let asked = Destination::Name("echo.test".to_owned(), 443);
         let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None);
-        assert!(matches!(picked, Outbound::Freedom));
+        assert!(matches!(&*picked, Outbound::Freedom));
         assert_eq!(tag, Some("pool"));
     }
 
@@ -37501,7 +38113,7 @@ mod tests {
         let (picked, counts) = ferrox_core::alloc_count::measure(|| {
             plan.pick(&asked, crate::router::Network::Tcp, None)
         });
-        assert!(matches!(picked, Outbound::Block(_)), "the rule decides");
+        assert!(matches!(&*picked, Outbound::Block(_)), "the rule decides");
         assert_eq!(counts.allocs, 0, "{counts:?}");
     }
 
@@ -37519,7 +38131,7 @@ mod tests {
         };
         let asked = Destination::Name("example.test".to_owned(), 80);
         assert!(matches!(
-            plan.pick(&asked, crate::router::Network::Tcp, None),
+            &*plan.pick(&asked, crate::router::Network::Tcp, None),
             Outbound::Block(_)
         ));
     }
@@ -40292,27 +40904,8 @@ mod dns_lane_tests {
     }
 }
 
-fn serve_vmess_role(stream: Connection, id: &[u8; 16], carrier: &Carrier, freedom: bool) {
-    match carrier {
-        Carrier::Raw(_) => crate::vmess::serve(stream, id, freedom),
-        Carrier::Ws { path, .. } => crate::vmess::serve_ws(stream, path.as_str(), id, freedom),
-        Carrier::Xhttp { settings, .. } => {
-            crate::vmess::serve_xhttp(stream, settings.path.as_str(), id, freedom);
-        }
-        Carrier::HttpHeader { path } => {
-            crate::vmess::serve_httpheader(stream, path.as_str(), id, freedom);
-        }
-        Carrier::HttpUpgrade { path, host, .. } => {
-            crate::vmess::serve_httpupgrade(stream, path.as_str(), host, id, freedom);
-        }
-        Carrier::Grpc(settings) => {
-            crate::vmess::serve_grpc_with(stream, settings, id, freedom);
-        }
-        refused_carriers!() => {}
-    }
-}
-
 /// The inbound a role serves one front stream with.
+#[allow(clippy::too_many_lines)]
 fn front_dispatch(stream: Connection, role: Role) {
     let account = role.account().cloned();
     let source = stream.peer_addr().ok();
@@ -40326,10 +40919,16 @@ fn front_dispatch(stream: Connection, role: Role) {
 
 #[allow(clippy::too_many_lines)]
 fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
+    let vmess = matches!(role, Role::Vmess { .. } | Role::VmessTls { .. });
     let stream = match account {
-        Some(account) => stream
-            .with_meter(crate::stats::user_traffic(&account.email, account.level))
-            .with_policy(Some(crate::policy::flow(account.level))),
+        Some(account) => {
+            let stream = stream.with_policy(Some(crate::policy::flow(account.level)));
+            if vmess {
+                stream
+            } else {
+                stream.with_meter(crate::stats::user_traffic(&account.email, account.level))
+            }
+        }
         None => stream,
     };
     match role {
@@ -40389,18 +40988,36 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             fallbacks.as_deref(),
         ),
         Role::Vmess {
-            id,
+            users,
             carrier,
             freedom,
             account: _,
-        } => serve_vmess_role(stream, &id, &carrier, freedom),
+        } => match carrier {
+            Carrier::Raw(_) => crate::vmess::serve(stream, &users, freedom),
+            Carrier::Ws { path, .. } => {
+                crate::vmess::serve_ws(stream, path.as_str(), &users, freedom);
+            }
+            Carrier::Xhttp { settings, .. } => {
+                crate::vmess::serve_xhttp(stream, settings.path.as_str(), &users, freedom);
+            }
+            Carrier::HttpHeader { path } => {
+                crate::vmess::serve_httpheader(stream, path.as_str(), &users, freedom);
+            }
+            Carrier::HttpUpgrade { path, host, .. } => {
+                crate::vmess::serve_httpupgrade(stream, path.as_str(), &host, &users, freedom);
+            }
+            Carrier::Grpc(settings) => {
+                crate::vmess::serve_grpc_with(stream, &settings, &users, freedom);
+            }
+            refused_carriers!() => {}
+        },
         Role::VmessTls {
-            id,
+            users,
             carrier,
             freedom,
             server,
             account: _,
-        } => serve_vmess_tls(stream, &id, &carrier, freedom, &server),
+        } => serve_vmess_tls(stream, &users, &carrier, freedom, &server),
         Role::Shadowsocks {
             password,
             method,
@@ -40432,7 +41049,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             let dest = port_map.get(&port).unwrap_or(&dest);
             let (dial, target, tag) = sniff_lane(&out, dest, &stream);
             let dest = dial.as_ref().unwrap_or(dest);
-            serve_connect(stream, target, dest, Front::Socks, &[], tag);
+            serve_connect(stream, &target, dest, Front::Socks, &[], tag);
         }
         Role::Proxied(inner) => dispatch(stream, *inner, None),
     }
