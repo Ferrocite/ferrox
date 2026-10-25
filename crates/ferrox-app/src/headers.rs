@@ -1,5 +1,8 @@
 /// The browser a masked request claims to be when the config names none.
-const CHROME_UA: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36";
+const CHROME_UA: &str = concat!(
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144",
+    ".0.0.0 Safari/537.36"
+);
 const CHROME_UACH: &str =
     "\"Not:A-Brand\";v=\"99\", \"Chromium\";v=\"144\", \"Google Chrome\";v=\"144\"";
 

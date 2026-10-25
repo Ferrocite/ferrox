@@ -3031,21 +3031,21 @@ mod tests {
             r#"{"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"tls.example"},"wsSettings":{"host":"carrier.example","headers":{"Host":"header.example"}}}}"#,
         )
         .expect("outbound");
-        assert_eq!(outbound_carrier(&outbound, "1.2.3.4").1, "header.example");
+        assert_eq!(outbound_carrier(&outbound, "192.0.2.4").1, "header.example");
 
         let carrier = crate::json::parse(
             r#"{"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"tls.example"},"wsSettings":{"host":"carrier.example"}}}"#,
         )
         .expect("carrier");
-        assert_eq!(outbound_carrier(&carrier, "1.2.3.4").1, "carrier.example");
+        assert_eq!(outbound_carrier(&carrier, "192.0.2.4").1, "carrier.example");
 
         let tls = crate::json::parse(
             r#"{"streamSettings":{"network":"ws","security":"tls","tlsSettings":{"serverName":"tls.example"},"wsSettings":{}}}"#,
         )
         .expect("tls");
-        assert_eq!(outbound_carrier(&tls, "1.2.3.4").1, "tls.example");
+        assert_eq!(outbound_carrier(&tls, "192.0.2.4").1, "tls.example");
 
         let bare = crate::json::parse(r#"{"streamSettings":{"network":"ws"}}"#).expect("bare");
-        assert_eq!(outbound_carrier(&bare, "1.2.3.4").1, "1.2.3.4");
+        assert_eq!(outbound_carrier(&bare, "192.0.2.4").1, "192.0.2.4");
     }
 }
