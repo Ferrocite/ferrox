@@ -875,6 +875,13 @@ enum Role {
         carrier: Carrier,
         freedom: bool,
     },
+    ShadowsocksTls {
+        password: String,
+        method: String,
+        carrier: Carrier,
+        freedom: bool,
+        server: Arc<ferrox_core::tls::TlsServerConfig>,
+    },
     Socks {
         out: Outbound,
         accounts: Arc<SocksAccounts>,
@@ -909,7 +916,8 @@ impl Role {
             | Role::TrojanTls { carrier, .. }
             | Role::Vmess { carrier, .. }
             | Role::VmessTls { carrier, .. }
-            | Role::Shadowsocks { carrier, .. } => carrier.tcp_mask(),
+            | Role::Shadowsocks { carrier, .. }
+            | Role::ShadowsocksTls { carrier, .. } => carrier.tcp_mask(),
             // A front with no tcp carrier has nowhere to arm a chain, so its inbound refuses one.
             Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } | Role::Dokodemo { .. } => {
                 None
@@ -1676,6 +1684,131 @@ fn serve_shadowsocks(
             crate::shadowsocks::serve_httpheader(stream, password, method, path.as_str(), freedom);
         }
         refused_carriers!() => {}
+    }
+}
+
+fn serve_shadowsocks_tls(
+    stream: Connection,
+    password: &str,
+    method: &str,
+    carrier: &Carrier,
+    freedom: bool,
+    server: &ferrox_core::tls::TlsServerConfig,
+) {
+    if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    let is_2022 = ferrox_core::shadowsocks2022::Method::parse(method).is_some();
+    match carrier {
+        Carrier::Raw(_) => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let Ok(transport) = raw.try_clone() else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, transport);
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            });
+            serve_ss_tls_session(reader, writer, password, method, freedom, close, is_2022);
+        }
+        Carrier::Ws { path, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            let Some((reader, writer)) = crate::ws::accept_split(reader, writer, path) else {
+                return;
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            serve_ss_tls_session(reader, writer, password, method, freedom, close, is_2022);
+        }
+        Carrier::HttpUpgrade { path, host, .. } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            let Some((reader, writer)) =
+                crate::httpupgrade::accept_split(reader, writer, path, host)
+            else {
+                crate::httpupgrade::quiet(&raw);
+                return;
+            };
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            });
+            serve_ss_tls_session(reader, writer, password, method, freedom, close, is_2022);
+        }
+        Carrier::Grpc { path } => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            let Some((reader, writer)) = crate::grpc::accept_split(reader, writer, path) else {
+                return;
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            serve_ss_tls_session(reader, writer, password, method, freedom, close, is_2022);
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            let Some((reader, writer)) =
+                crate::xhttp::accept_split_with_settings(reader, writer, settings)
+            else {
+                return;
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+            serve_ss_tls_session(reader, writer, password, method, freedom, close, is_2022);
+        }
+        Carrier::HttpHeader { path } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
+            let Some(session) = accept_tls_session(stream, server) else {
+                return;
+            };
+            let (reader, writer) = session_halves(session, out);
+            let Some((reader, writer)) = crate::httpheader::accept_split(reader, writer, path)
+            else {
+                return;
+            };
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            });
+            serve_ss_tls_session(reader, writer, password, method, freedom, close, is_2022);
+        }
+        refused_carriers!() => {}
+    }
+}
+
+fn serve_ss_tls_session<R, W>(
+    reader: R,
+    writer: W,
+    password: &str,
+    method: &str,
+    freedom: bool,
+    close: Arc<dyn Fn() + Send + Sync>,
+    is_2022: bool,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    if is_2022 {
+        crate::shadowsocks2022::serve_session(reader, writer, password, method, freedom, &close);
+    } else {
+        crate::shadowsocks::serve_session(reader, writer, password, method, freedom, &close);
     }
 }
 
@@ -6750,7 +6883,26 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
             });
             serve_xdrive_loop(&settings, address, accept);
         }
-        // A carrier whose tls row this lane does not serve yet refuses it by name rather than answering plaintext.
+        carrier if stream_security(inbound) == "tls" => {
+            let Some(server) = inbound_tls_identity(inbound) else {
+                eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
+                return;
+            };
+            spawn_role(
+                address,
+                inbound_role(
+                    inbound,
+                    Role::ShadowsocksTls {
+                        password,
+                        method,
+                        carrier,
+                        freedom,
+                        server,
+                    },
+                ),
+                inbound_tag(inbound),
+            );
+        }
         _ if !matches!(stream_security(inbound), "" | "none") => {
             let security = stream_security(inbound);
             eprintln!("shadowsocks security `{security}` on {address}: refused, not served");
@@ -9621,11 +9773,17 @@ fn dial_shadowsocks(
     let params = stream_params(&ss.carrier);
     let explicit = rung_of(&ss.carrier);
     if explicit.is_none() {
-        let Some(uplink) = dial_or_report(server) else {
-            return;
-        };
-        if dial_ss_headed(client, uplink, ss, target) {
-            return;
+        if let Some(cfg) = ss.tls.as_deref() {
+            if dial_ss_tls_headed(client, server, ss, target, cfg) {
+                return;
+            }
+        } else {
+            let Some(uplink) = dial_or_report(server) else {
+                return;
+            };
+            if dial_ss_headed(client, uplink, ss, target) {
+                return;
+            }
         }
     }
     let start = ladder_start(&ss.carrier);
@@ -9656,7 +9814,7 @@ fn dial_shadowsocks(
                 return;
             }
         };
-        if dial_ss_rung(client, uplink, ss, target, &attempt, ladder) {
+        if dial_ss_rung(client, server, uplink, ss, target, &attempt, ladder) {
             return;
         }
     }
@@ -9707,14 +9865,179 @@ fn dial_ss_headed(
     true
 }
 
+fn dial_ss_tls_headed(
+    client: &Connection,
+    server: &SocketAddr,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    cfg: &ferrox_core::tls::TlsConfig,
+) -> bool {
+    let Carrier::HttpHeader { path } = &ss.carrier else {
+        return false;
+    };
+    let Some(session) = dial_tls_session(server, cfg, ss.carrier.tcp_mask()) else {
+        return true;
+    };
+    let Some((reader, sink)) = tls_httpheader(server, session, &ss.host, path) else {
+        return true;
+    };
+    let writer = sink.clone();
+    let closer = sink.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+    ss_client_relay(client, reader, writer, close, ss, target);
+    true
+}
+
+fn tls_session_on(
+    uplink: Connection,
+    cfg: &ferrox_core::tls::TlsConfig,
+) -> Option<ferrox_core::tls::ClientSession<Connection>> {
+    let mut session = ferrox_core::tls::connect(cfg, uplink).ok()?;
+    session.handshake().ok()?;
+    session
+        .get_ref()
+        .set_read_timeout(Some(SESSION_POLL))
+        .ok()?;
+    Some(session)
+}
+
+fn ss_client_relay<R, W>(
+    client: &Connection,
+    reader: R,
+    mut writer: W,
+    close: Arc<dyn Fn() + Send + Sync>,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+) -> bool
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+        let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+            &mut writer,
+            &ss.password,
+            &ss.method,
+            target,
+        ) else {
+            close();
+            return false;
+        };
+        crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
+        return true;
+    }
+    let Some((send, recv)) =
+        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
+    else {
+        close();
+        return false;
+    };
+    crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
+    true
+}
+
+fn dial_ss_tls_rung(
+    client: &Connection,
+    server: &SocketAddr,
+    uplink: Connection,
+    ss: &ShadowsocksOut,
+    target: &Destination,
+    attempt: &RungAttempt<'_>,
+    ladder: &Ladder,
+    cfg: &ferrox_core::tls::TlsConfig,
+) -> bool {
+    let rung = attempt.rung;
+    if rung == Rung::Raw && !attempt.explicit {
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+    }
+    let Some(session) = tls_session_on(uplink, cfg) else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
+    };
+    match rung {
+        Rung::Raw => {
+            let Some((reader, writer, raw)) = session.into_halves() else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Dropped);
+            };
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            });
+            if !ss_client_relay(client, reader, writer, close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Ws => {
+            let Some((reader, writer)) =
+                tls_ws(server, session, &ss.host, attempt.path, attempt.ed, &[])
+            else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            if !ss_client_relay(client, reader, writer, close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::HttpUpgrade => {
+            let Some((reader, sink)) =
+                tls_httpupgrade(server, session, &ss.host, attempt.path, attempt.ed, &[])
+            else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let writer = sink.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || sink.close());
+            if !ss_client_relay(client, reader, writer, close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Grpc => {
+            let Some((reader, writer)) = tls_grpc(server, session, &ss.host, attempt.path) else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
+            if !ss_client_relay(client, reader, writer, close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+        Rung::Xhttp => {
+            let Carrier::Xhttp { settings, .. } = &ss.carrier else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let Some((reader, writer)) = tls_xhttp(
+                server,
+                session,
+                || dial_tls_session(server, cfg, ss.carrier.tcp_mask()),
+                &ss.host,
+                settings,
+            ) else {
+                return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            };
+            let closer = writer.clone();
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+            if !ss_client_relay(client, reader, writer, close, ss, target) {
+                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
+            }
+            true
+        }
+    }
+}
+
 fn dial_ss_rung(
     client: &Connection,
+    server: &SocketAddr,
     uplink: Connection,
     ss: &ShadowsocksOut,
     target: &Destination,
     attempt: &RungAttempt<'_>,
     ladder: &Ladder,
 ) -> bool {
+    if let Some(cfg) = ss.tls.as_deref() {
+        return dial_ss_tls_rung(client, server, uplink, ss, target, attempt, ladder, cfg);
+    }
     match attempt.rung {
         Rung::Raw => {
             if !attempt.explicit {
@@ -17698,8 +18021,7 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
         let (carrier, host) = outbound_carrier(outbound, &address);
         let tls = match stream_security(outbound) {
             "" | "none" => None,
-            // KCP carries the session above the connection, as the other protocols' rows do; every other carrier is refused until this lane dials it under tls.
-            "tls" if matches!(carrier, Carrier::Kcp(_)) => {
+            "tls" => {
                 let Ok(tls) = outbound_tls(outbound, &address) else {
                     continue;
                 };
@@ -38709,6 +39031,13 @@ fn front_dispatch(stream: Connection, role: Role) {
             carrier,
             freedom,
         } => serve_shadowsocks(stream, &password, &method, &carrier, freedom),
+        Role::ShadowsocksTls {
+            password,
+            method,
+            carrier,
+            freedom,
+            server,
+        } => serve_shadowsocks_tls(stream, &password, &method, &carrier, freedom, &server),
         Role::Socks { out, accounts } => serve_socks(stream, &out, &accounts),
         Role::Http { out, accounts } => serve_http(stream, &out, &accounts),
         Role::Mixed { out, accounts } => serve_mixed(stream, &out, &accounts),
