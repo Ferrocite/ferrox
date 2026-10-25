@@ -29,6 +29,7 @@ mod foxy_latency;
 mod foxy_live;
 mod grpc;
 mod h2;
+mod headers;
 mod httpheader;
 mod httpupgrade;
 mod hysteria;

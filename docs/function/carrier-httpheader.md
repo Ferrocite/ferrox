@@ -6,6 +6,10 @@ VLESS and VMess and Shadowsocks and Trojan all ride this carrier, which is the c
 
 The record halves, which have no `peek` to lose, took the same shape when `read_exact_head` became that loop: `HeadReader { prefix, at }` is handed the read's own buffer with the cursor past the head, so the octets behind the delimiter never leave the allocation they were read into (`head-tail-allocations 0`, witnessed by `httpheader::tests::the_record_head_hands_over_the_buffer_it_filled`, which fails the base arithmetic if the tail is `split_off` into a buffer of its own).
 
+## Request headers
+
+The camouflage request now carries the configured `header.request.headers` after its `Host` line. `tcp_http_request` resolves the request block from `rawSettings` first and `tcpSettings` second, and only when `header.type` is `http`, so a raw carrier's request is read the way the reference builds it. The configured lines reach the gathered write unchanged, and `httpheader::tests::a_configured_header_reaches_the_camouflage_request` reads a configured `X-Custom` off the wire. This carrier does not add the browser default set: the reference's tcp-http writer emits the request's own header list, and that is what this builder does.
+
 ## Data path
 
 ```mermaid

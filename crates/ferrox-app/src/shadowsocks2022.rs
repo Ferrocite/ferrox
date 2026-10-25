@@ -2726,6 +2726,7 @@ mod tests {
             Vec::new(),
             "h",
             "/share",
+            &[],
         )
         .expect("dials the head");
         let widths = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));

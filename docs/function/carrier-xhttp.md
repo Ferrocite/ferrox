@@ -8,6 +8,10 @@ The settings a server honours come from `extra` when the config carries one: the
 
 The size lines are the part worth naming. A `Size` line for a given length is a pure function of the length, so `size_lines_match_format_without_allocating` builds them into the caller's buffer and allocates nothing. The reader's half of that framing — turning a size line back into the `usize` it encodes — runs in one fused pass, and `chunk_size_fused_matches_two_pass_on_every_probe` keeps it bit-identical to the two-pass form it replaced.
 
+## Request headers
+
+Every dial head — the `stream-one` POST, the downlink GET and each `packet-up` POST — writes the configured `xhttpSettings.headers` under the `fetch` variant of the masked set: `Sec-Fetch-Mode: cors`, `Priority: u=1, i` and the rest of the Chrome names. `XhttpSettings` carries the parsed list, `crate::headers::masked` applies the defaults and the configured override, and `xhttp::tests::a_configured_header_and_the_fetch_defaults_reach_every_dial_head` holds both on `dial_head` and keeps the fixed `Host` line single. The `extra` block still replaces every knob but path and mode, so headers carried there reach the dial too.
+
 ## Data path
 
 ```mermaid

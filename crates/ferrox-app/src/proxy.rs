@@ -1565,6 +1565,8 @@ pub(crate) struct VlessOut {
     id: [u8; 16],
     carrier: Carrier,
     host: String,
+    headers: Vec<(String, String)>,
+    heartbeat: u32,
     mux: bool,
     quic_roots: Option<ferrox_core::tls::Anchors>,
     quic_ech: Option<Arc<[u8]>>,
@@ -1639,6 +1641,8 @@ pub(crate) struct VmessOut {
     cipher: crate::vmess::Cipher,
     carrier: Carrier,
     host: String,
+    headers: Vec<(String, String)>,
+    heartbeat: u32,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
 }
 
@@ -1649,6 +1653,8 @@ pub(crate) struct TrojanOut {
     key: [u8; 56],
     carrier: Carrier,
     host: String,
+    headers: Vec<(String, String)>,
+    heartbeat: u32,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
 }
 
@@ -1660,6 +1666,8 @@ pub(crate) struct ShadowsocksOut {
     password: String,
     carrier: Carrier,
     host: String,
+    headers: Vec<(String, String)>,
+    heartbeat: u32,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
 }
 
@@ -5519,7 +5527,8 @@ fn dial_vless_headed(
     let Carrier::HttpHeader { path } = &vless.carrier else {
         return true;
     };
-    let Some((mut reader, mut write)) = crate::httpheader::connect(uplink, &vless.host, path)
+    let Some((mut reader, mut write)) =
+        crate::httpheader::connect(uplink, &vless.host, path, &vless.headers)
     else {
         return !Failure::new(Stage::SocketConnected, Kind::Unreachable).worth_retrying();
     };
@@ -5547,9 +5556,15 @@ fn dial_vless_rung(
     let rung = attempt.rung;
     match rung {
         Rung::Ws => {
-            let Some((mut reader, writer)) =
-                crate::ws::connect(uplink, &vless.host, attempt.path, attempt.ed, header)
-            else {
+            let Some((mut reader, writer)) = crate::ws::connect(
+                uplink,
+                &vless.host,
+                attempt.path,
+                attempt.ed,
+                header,
+                &vless.headers,
+                vless.heartbeat,
+            ) else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
             let pump = Pump::to_sink(client, &writer);
@@ -5563,9 +5578,14 @@ fn dial_vless_rung(
             true
         }
         Rung::HttpUpgrade => {
-            let Some((mut reader, write)) =
-                crate::httpupgrade::connect(uplink, &vless.host, attempt.path, attempt.ed, header)
-            else {
+            let Some((mut reader, write)) = crate::httpupgrade::connect(
+                uplink,
+                &vless.host,
+                attempt.path,
+                attempt.ed,
+                header,
+                &vless.headers,
+            ) else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
             let pump = Pump::to_stream(client, &write);
@@ -7426,8 +7446,15 @@ fn open_vmess_udp_plain(
         Carrier::Ws { path, ed } => {
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
-            let (mut reader, writer) =
-                crate::ws::connect(uplink, &vmess.host, path, *ed, &request)?;
+            let (mut reader, writer) = crate::ws::connect(
+                uplink,
+                &vmess.host,
+                path,
+                *ed,
+                &request,
+                &vmess.headers,
+                vmess.heartbeat,
+            )?;
             reader.set_poll(Some(RELAY_POLL));
             if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
                 return None;
@@ -7498,7 +7525,8 @@ fn open_vmess_udp_plain(
             })
         }
         Carrier::HttpHeader { path } => {
-            let (mut reader, mut writer) = crate::httpheader::connect(uplink, &vmess.host, path)?;
+            let (mut reader, mut writer) =
+                crate::httpheader::connect(uplink, &vmess.host, path, &vmess.headers)?;
             reader.set_poll(Some(RELAY_POLL));
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
@@ -7519,8 +7547,14 @@ fn open_vmess_udp_plain(
         Carrier::HttpUpgrade { path, ed, .. } => {
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
-            let (mut reader, writer) =
-                crate::httpupgrade::connect(uplink, &vmess.host, path, *ed, &request)?;
+            let (mut reader, writer) = crate::httpupgrade::connect(
+                uplink,
+                &vmess.host,
+                path,
+                *ed,
+                &request,
+                &vmess.headers,
+            )?;
             reader.set_poll(Some(RELAY_POLL));
             if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
                 return None;
@@ -7574,7 +7608,16 @@ fn open_vmess_udp_tls(
         Carrier::Ws { path, ed } => {
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
-            let (mut reader, writer) = tls_ws(server, session, &vmess.host, path, *ed, &request)?;
+            let (mut reader, writer) = tls_ws(
+                server,
+                session,
+                &vmess.host,
+                path,
+                *ed,
+                &request,
+                &vmess.headers,
+                vmess.heartbeat,
+            )?;
             if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
                 return None;
             }
@@ -7648,7 +7691,8 @@ fn open_vmess_udp_tls(
             })
         }
         Carrier::HttpHeader { path } => {
-            let (reader, mut writer) = tls_httpheader(server, session, &vmess.host, path)?;
+            let (reader, mut writer) =
+                tls_httpheader(server, session, &vmess.host, path, &vmess.headers)?;
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
             if writer.write_all(&request).is_err() {
@@ -7669,8 +7713,15 @@ fn open_vmess_udp_tls(
         Carrier::HttpUpgrade { path, ed, .. } => {
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
-            let (mut reader, writer) =
-                tls_httpupgrade(server, session, &vmess.host, path, *ed, &request)?;
+            let (mut reader, writer) = tls_httpupgrade(
+                server,
+                session,
+                &vmess.host,
+                path,
+                *ed,
+                &request,
+                &vmess.headers,
+            )?;
             if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
                 return None;
             }
@@ -7835,7 +7886,15 @@ fn trojan_udp_plain(
     let host = &trojan.host;
     match carrier {
         Carrier::Ws { path, ed } => {
-            let (reader, writer) = crate::ws::connect(uplink, host, path, *ed, header)?;
+            let (reader, writer) = crate::ws::connect(
+                uplink,
+                host,
+                path,
+                *ed,
+                header,
+                &trojan.headers,
+                trojan.heartbeat,
+            )?;
             let closer = writer.clone();
             let close = move || {
                 closer.close();
@@ -7844,7 +7903,8 @@ fn trojan_udp_plain(
             Some((Box::new(reader), Box::new(writer), Box::new(close)))
         }
         Carrier::HttpUpgrade { path, ed, .. } => {
-            let (reader, writer) = crate::httpupgrade::connect(uplink, host, path, *ed, header)?;
+            let (reader, writer) =
+                crate::httpupgrade::connect(uplink, host, path, *ed, header, &trojan.headers)?;
             let socket = writer.try_clone().ok()?;
             let close = move || {
                 let _ = socket.shutdown(Shutdown::Both);
@@ -7876,7 +7936,8 @@ fn trojan_udp_plain(
             Some((Box::new(reader), Box::new(writer), Box::new(close)))
         }
         Carrier::HttpHeader { path } => {
-            let (reader, mut writer) = crate::httpheader::connect(uplink, host, path)?;
+            let (reader, mut writer) =
+                crate::httpheader::connect(uplink, host, path, &trojan.headers)?;
             writer.write_all(header).ok()?;
             let socket = writer.try_clone().ok()?;
             let close = move || {
@@ -7900,8 +7961,16 @@ fn trojan_udp_tls<S: Dialed>(
     match carrier {
         Carrier::Ws { path, ed } => {
             let (reader, writer, raw) = session.into_halves()?;
-            let (reader, writer) =
-                crate::ws::connect_split(reader, writer, host, path, *ed, header)?;
+            let (reader, writer) = crate::ws::connect_split(
+                reader,
+                writer,
+                host,
+                path,
+                *ed,
+                header,
+                &trojan.headers,
+                trojan.heartbeat,
+            )?;
             let closer = writer.clone();
             let close = move || {
                 closer.close();
@@ -7911,8 +7980,15 @@ fn trojan_udp_tls<S: Dialed>(
         }
         Carrier::HttpUpgrade { path, ed, .. } => {
             let (reader, writer, raw) = session.into_halves()?;
-            let (reader, writer) =
-                crate::httpupgrade::connect_split(reader, writer, host, path, *ed, header)?;
+            let (reader, writer) = crate::httpupgrade::connect_split(
+                reader,
+                writer,
+                host,
+                path,
+                *ed,
+                header,
+                &trojan.headers,
+            )?;
             let close = move || {
                 let _ = raw.shutdown(Shutdown::Both);
             };
@@ -7935,7 +8011,8 @@ fn trojan_udp_tls<S: Dialed>(
             let (first, up, raw) = session.into_halves()?;
             if settings.mode == crate::xhttp::XhttpMode::StreamOne {
                 let head = crate::xhttp::dial_path(settings);
-                let (reader, writer) = crate::xhttp::connect_split(first, up, host, &head)?;
+                let (reader, writer) =
+                    crate::xhttp::connect_split(first, up, host, &head, &settings.headers)?;
                 if !writer.send(header) {
                     return None;
                 }
@@ -7964,7 +8041,8 @@ fn trojan_udp_tls<S: Dialed>(
         }
         Carrier::HttpHeader { path } => {
             let (reader, writer, raw) = session.into_halves()?;
-            let (reader, writer) = crate::httpheader::connect_split(reader, writer, host, path)?;
+            let (reader, writer) =
+                crate::httpheader::connect_split(reader, writer, host, path, &trojan.headers)?;
             let mut writer = writer;
             writer.write_all(header).ok()?;
             let close = move || {
@@ -8200,7 +8278,7 @@ fn dial_vmess_httpupgrade(
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
     };
     let Some((mut reader, write)) =
-        crate::httpupgrade::connect(uplink, &vmess.host, path, ed, &request)
+        crate::httpupgrade::connect(uplink, &vmess.host, path, ed, &request, &vmess.headers)
     else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
@@ -8270,7 +8348,15 @@ fn dial_vmess_ws(
     else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
     };
-    let Some((reader, writer)) = crate::ws::connect(uplink, &vmess.host, path, ed, &request) else {
+    let Some((reader, writer)) = crate::ws::connect(
+        uplink,
+        &vmess.host,
+        path,
+        ed,
+        &request,
+        &vmess.headers,
+        vmess.heartbeat,
+    ) else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
@@ -8352,7 +8438,8 @@ fn dial_vmess_headed(
     let Carrier::HttpHeader { path } = &vmess.carrier else {
         return true;
     };
-    let Some((mut reader, mut write)) = crate::httpheader::connect(uplink, &vmess.host, path)
+    let Some((mut reader, mut write)) =
+        crate::httpheader::connect(uplink, &vmess.host, path, &vmess.headers)
     else {
         return !Failure::new(Stage::SocketConnected, Kind::Unreachable).worth_retrying();
     };
@@ -8569,7 +8656,9 @@ fn dial_trojan_headed(
     let Carrier::HttpHeader { path } = &trojan.carrier else {
         return true;
     };
-    let Some((reader, mut write)) = crate::httpheader::connect(uplink, &trojan.host, path) else {
+    let Some((reader, mut write)) =
+        crate::httpheader::connect(uplink, &trojan.host, path, &trojan.headers)
+    else {
         return !Failure::new(Stage::SocketConnected, Kind::Unreachable).worth_retrying();
     };
     if write.write_all(header).is_err() {
@@ -8591,9 +8680,15 @@ fn dial_trojan_rung(
     let rung = attempt.rung;
     match rung {
         Rung::Ws => {
-            let Some((reader, writer)) =
-                crate::ws::connect(uplink, &trojan.host, attempt.path, attempt.ed, header)
-            else {
+            let Some((reader, writer)) = crate::ws::connect(
+                uplink,
+                &trojan.host,
+                attempt.path,
+                attempt.ed,
+                header,
+                &trojan.headers,
+                trojan.heartbeat,
+            ) else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
             note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
@@ -8613,9 +8708,14 @@ fn dial_trojan_rung(
             true
         }
         Rung::HttpUpgrade => {
-            let Some((reader, write)) =
-                crate::httpupgrade::connect(uplink, &trojan.host, attempt.path, attempt.ed, header)
-            else {
+            let Some((reader, write)) = crate::httpupgrade::connect(
+                uplink,
+                &trojan.host,
+                attempt.path,
+                attempt.ed,
+                header,
+                &trojan.headers,
+            ) else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
             note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
@@ -8812,9 +8912,11 @@ fn tls_ws<S: Dialed>(
     path: &str,
     ed: u32,
     first: &[u8],
+    headers: &[(String, String)],
+    heartbeat: u32,
 ) -> Option<(crate::ws::WsReader<TlsHalf<S>>, crate::ws::WsWriter)> {
     let (reader, writer, _) = session.into_halves()?;
-    crate::ws::connect_split(reader, writer, host, path, ed, first)
+    crate::ws::connect_split(reader, writer, host, path, ed, first, headers, heartbeat)
         .or_else(|| tls_unreachable(server))
 }
 
@@ -8843,10 +8945,12 @@ fn tls_httpupgrade<S: Dialed>(
     path: &str,
     ed: u32,
     first: &[u8],
+    headers: &[(String, String)],
 ) -> Option<Upgraded<S>> {
     let (reader, writer, raw) = session.into_halves()?;
-    let (reader, writer) = crate::httpupgrade::connect_split(reader, writer, host, path, ed, first)
-        .or_else(|| tls_unreachable(server))?;
+    let (reader, writer) =
+        crate::httpupgrade::connect_split(reader, writer, host, path, ed, first, headers)
+            .or_else(|| tls_unreachable(server))?;
     Some((reader, SessionSink { half: writer, raw }))
 }
 
@@ -8855,9 +8959,10 @@ fn tls_httpheader<S: Dialed>(
     session: S,
     host: &str,
     path: &str,
+    headers: &[(String, String)],
 ) -> Option<Headed<S>> {
     let (reader, writer, raw) = session.into_halves()?;
-    let (reader, writer) = crate::httpheader::connect_split(reader, writer, host, path)
+    let (reader, writer) = crate::httpheader::connect_split(reader, writer, host, path, headers)
         .or_else(|| tls_unreachable(server))?;
     Some((reader, SessionSink { half: writer, raw }))
 }
@@ -8883,7 +8988,7 @@ fn tls_xhttp<S: Dialed, D: Dialed>(
     let (reader, writer, _) = session.into_halves()?;
     if settings.mode == crate::xhttp::XhttpMode::StreamOne {
         let head = crate::xhttp::dial_path(settings);
-        return crate::xhttp::connect_split(reader, writer, host, &head)
+        return crate::xhttp::connect_split(reader, writer, host, &head, &settings.headers)
             .map(|(reader, writer)| (Box::new(reader) as Box<dyn Read + Send>, writer))
             .or_else(|| tls_unreachable(server));
     }
@@ -8901,7 +9006,12 @@ fn xhttp_pair(
     settings: &crate::xhttp::XhttpSettings,
 ) -> Option<(crate::xhttp::Reader<Connection>, crate::xhttp::XhttpWriter)> {
     if settings.mode == crate::xhttp::XhttpMode::StreamOne {
-        return crate::xhttp::connect(uplink, host, &crate::xhttp::dial_path(settings));
+        return crate::xhttp::connect(
+            uplink,
+            host,
+            &crate::xhttp::dial_path(settings),
+            &settings.headers,
+        );
     }
     let down = dial(&uplink.peer_addr().ok()?).ok()?;
     crate::xhttp::connect_dual(down, uplink, host, settings)
@@ -9331,9 +9441,16 @@ fn ride_carrier<S: Dialed, D: Dialed>(
 ) {
     match &vless.carrier {
         Carrier::Ws { path, ed } => {
-            let Some((mut reader, writer)) =
-                tls_ws(server, session, &vless.host, path, *ed, header)
-            else {
+            let Some((mut reader, writer)) = tls_ws(
+                server,
+                session,
+                &vless.host,
+                path,
+                *ed,
+                header,
+                &vless.headers,
+                vless.heartbeat,
+            ) else {
                 return;
             };
             if read_vless_response(&mut reader).is_none() {
@@ -9342,9 +9459,15 @@ fn ride_carrier<S: Dialed, D: Dialed>(
             relay_sink(reader, &writer, client, |_| {});
         }
         Carrier::HttpUpgrade { path, ed, .. } => {
-            let Some((mut reader, sink)) =
-                tls_httpupgrade(server, session, &vless.host, path, *ed, header)
-            else {
+            let Some((mut reader, sink)) = tls_httpupgrade(
+                server,
+                session,
+                &vless.host,
+                path,
+                *ed,
+                header,
+                &vless.headers,
+            ) else {
                 return;
             };
             if read_vless_response(&mut reader).is_none() {
@@ -9380,7 +9503,8 @@ fn ride_carrier<S: Dialed, D: Dialed>(
             relay_sink_drained(reader, &writer, client);
         }
         Carrier::HttpHeader { path } => {
-            let Some((mut reader, mut sink)) = tls_httpheader(server, session, &vless.host, path)
+            let Some((mut reader, mut sink)) =
+                tls_httpheader(server, session, &vless.host, path, &vless.headers)
             else {
                 return;
             };
@@ -9758,16 +9882,30 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
             }
         }
         Carrier::Ws { path, ed } => {
-            let Some((reader, writer)) = tls_ws(server, session, &trojan.host, path, *ed, header)
-            else {
+            let Some((reader, writer)) = tls_ws(
+                server,
+                session,
+                &trojan.host,
+                path,
+                *ed,
+                header,
+                &trojan.headers,
+                trojan.heartbeat,
+            ) else {
                 return;
             };
             relay_sink(reader, &writer, client, |_| {});
         }
         Carrier::HttpUpgrade { path, ed, .. } => {
-            let Some((reader, sink)) =
-                tls_httpupgrade(server, session, &trojan.host, path, *ed, header)
-            else {
+            let Some((reader, sink)) = tls_httpupgrade(
+                server,
+                session,
+                &trojan.host,
+                path,
+                *ed,
+                header,
+                &trojan.headers,
+            ) else {
                 return;
             };
             relay_sink(reader, &sink, client, |_| {});
@@ -9797,7 +9935,8 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
             relay_sink_drained(reader, &writer, client);
         }
         Carrier::HttpHeader { path } => {
-            let Some((reader, mut sink)) = tls_httpheader(server, session, &trojan.host, path)
+            let Some((reader, mut sink)) =
+                tls_httpheader(server, session, &trojan.host, path, &trojan.headers)
             else {
                 return;
             };
@@ -9886,8 +10025,16 @@ fn vmess_tls_carried(
     };
     match &vmess.carrier {
         Carrier::Ws { path, ed } => {
-            let Some((reader, writer)) = tls_ws(server, session, &vmess.host, path, *ed, &request)
-            else {
+            let Some((reader, writer)) = tls_ws(
+                server,
+                session,
+                &vmess.host,
+                path,
+                *ed,
+                &request,
+                &vmess.headers,
+                vmess.heartbeat,
+            ) else {
                 return;
             };
             let mut reader = reader;
@@ -9899,9 +10046,15 @@ fn vmess_tls_carried(
             crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
         }
         Carrier::HttpUpgrade { path, ed, .. } => {
-            let Some((mut reader, sink)) =
-                tls_httpupgrade(server, session, &vmess.host, path, *ed, &request)
-            else {
+            let Some((mut reader, sink)) = tls_httpupgrade(
+                server,
+                session,
+                &vmess.host,
+                path,
+                *ed,
+                &request,
+                &vmess.headers,
+            ) else {
                 return;
             };
             if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
@@ -9948,7 +10101,9 @@ fn vmess_tls_carried(
             crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
         }
         Carrier::HttpHeader { path } => {
-            let Some((reader, sink)) = tls_httpheader(server, session, &vmess.host, path) else {
+            let Some((reader, sink)) =
+                tls_httpheader(server, session, &vmess.host, path, &vmess.headers)
+            else {
                 return;
             };
             let (mut reader, mut sink) = (reader, sink);
@@ -10057,7 +10212,9 @@ fn dial_ss_headed(
     let Carrier::HttpHeader { path } = &ss.carrier else {
         return true;
     };
-    let Some((reader, mut writer)) = crate::httpheader::connect(uplink, &ss.host, path) else {
+    let Some((reader, mut writer)) =
+        crate::httpheader::connect(uplink, &ss.host, path, &ss.headers)
+    else {
         return !Failure::new(Stage::SocketConnected, Kind::Unreachable).worth_retrying();
     };
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
@@ -10106,7 +10263,7 @@ fn dial_ss_tls_headed(
     let Some(session) = dial_tls_session(server, cfg, ss.carrier.tcp_mask()) else {
         return true;
     };
-    let Some((reader, sink)) = tls_httpheader(server, session, &ss.host, path) else {
+    let Some((reader, sink)) = tls_httpheader(server, session, &ss.host, path, &ss.headers) else {
         return true;
     };
     let writer = sink.clone();
@@ -10201,9 +10358,16 @@ fn dial_ss_tls_rung(
             true
         }
         Rung::Ws => {
-            let Some((reader, writer)) =
-                tls_ws(server, session, &ss.host, attempt.path, attempt.ed, &[])
-            else {
+            let Some((reader, writer)) = tls_ws(
+                server,
+                session,
+                &ss.host,
+                attempt.path,
+                attempt.ed,
+                &[],
+                &ss.headers,
+                ss.heartbeat,
+            ) else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
             let closer = writer.clone();
@@ -10214,9 +10378,15 @@ fn dial_ss_tls_rung(
             true
         }
         Rung::HttpUpgrade => {
-            let Some((reader, sink)) =
-                tls_httpupgrade(server, session, &ss.host, attempt.path, attempt.ed, &[])
-            else {
+            let Some((reader, sink)) = tls_httpupgrade(
+                server,
+                session,
+                &ss.host,
+                attempt.path,
+                attempt.ed,
+                &[],
+                &ss.headers,
+            ) else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
             let writer = sink.clone();
@@ -10332,8 +10502,15 @@ fn dial_ss_ws(
     ladder: &Ladder,
 ) -> bool {
     let rung = attempt.rung;
-    let Some((reader, mut writer)) = crate::ws::connect(uplink, &ss.host, attempt.path, 0, &[])
-    else {
+    let Some((reader, mut writer)) = crate::ws::connect(
+        uplink,
+        &ss.host,
+        attempt.path,
+        0,
+        &[],
+        &ss.headers,
+        ss.heartbeat,
+    ) else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
@@ -10384,9 +10561,14 @@ fn dial_ss_httpupgrade(
         ) else {
             return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
         };
-        let Some((reader, writer)) =
-            crate::httpupgrade::connect(uplink, &ss.host, attempt.path, attempt.ed, &packet)
-        else {
+        let Some((reader, writer)) = crate::httpupgrade::connect(
+            uplink,
+            &ss.host,
+            attempt.path,
+            attempt.ed,
+            &packet,
+            &ss.headers,
+        ) else {
             return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
         };
         note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
@@ -10404,9 +10586,14 @@ fn dial_ss_httpupgrade(
     else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
     };
-    let Some((reader, writer)) =
-        crate::httpupgrade::connect(uplink, &ss.host, attempt.path, attempt.ed, &packet)
-    else {
+    let Some((reader, writer)) = crate::httpupgrade::connect(
+        uplink,
+        &ss.host,
+        attempt.path,
+        attempt.ed,
+        &packet,
+        &ss.headers,
+    ) else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
@@ -17867,6 +18054,8 @@ fn loopback_dial(
                 tls: None,
                 flow: String::new(),
                 reality: None,
+                headers: crate::config::carrier_headers(inbound.get("streamSettings")).0,
+                heartbeat: crate::config::carrier_headers(inbound.get("streamSettings")).1,
             }))
         }
         "trojan" if matches!(stream_security(inbound), "" | "none") => {
@@ -17878,6 +18067,8 @@ fn loopback_dial(
                 carrier,
                 host,
                 tls: None,
+                headers: crate::config::carrier_headers(inbound.get("streamSettings")).0,
+                heartbeat: crate::config::carrier_headers(inbound.get("streamSettings")).1,
             }))
         }
         "vmess" if matches!(stream_security(inbound), "" | "none") => {
@@ -17896,6 +18087,8 @@ fn loopback_dial(
                 carrier,
                 host,
                 tls: None,
+                headers: crate::config::carrier_headers(inbound.get("streamSettings")).0,
+                heartbeat: crate::config::carrier_headers(inbound.get("streamSettings")).1,
             }))
         }
         "shadowsocks" if matches!(stream_security(inbound), "" | "none") => {
@@ -17914,6 +18107,8 @@ fn loopback_dial(
                 carrier,
                 host,
                 tls: None,
+                headers: crate::config::carrier_headers(inbound.get("streamSettings")).0,
+                heartbeat: crate::config::carrier_headers(inbound.get("streamSettings")).1,
             }))
         }
         _ => Err(format!(
@@ -18464,6 +18659,8 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
                 carrier,
                 host,
                 tls: Some(tls),
+                headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+                heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
             });
         }
         let stored = xdrive_carried(outbound, &address);
@@ -18478,6 +18675,8 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
             carrier,
             host,
             tls: None,
+            headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+            heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
         });
     }
     None
@@ -18575,6 +18774,8 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
                 carrier,
                 host,
                 tls: None,
+                headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+                heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
             });
         }
         let (carrier, host) = outbound_carrier(outbound, &address);
@@ -18596,6 +18797,8 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
             carrier,
             host,
             tls,
+            headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+            heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
         });
     }
     None
@@ -19122,6 +19325,8 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
             tls: None,
             flow: server.flow,
             reality: Some(reality),
+            headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+            heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
         });
     }
     if !vless_security_supported(security) && !transport_tls && (mux || stored.is_none()) {
@@ -19159,6 +19364,8 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
         tls: None,
         flow: server.flow,
         reality: None,
+        headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+        heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
     })
 }
 
@@ -19227,6 +19434,8 @@ fn tls_carried_vless(
         tls: Some(tls),
         flow: flow.to_owned(),
         reality: None,
+        headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+        heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
     })
 }
 
@@ -19261,6 +19470,8 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
                 carrier,
                 host,
                 tls: Some(tls),
+                headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+                heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
             });
         }
         // A security the tree cannot dial is refused, never silently sent plain.
@@ -19277,6 +19488,8 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
             carrier,
             host,
             tls: None,
+            headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+            heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
         });
     }
     None
@@ -22713,7 +22926,7 @@ mod tests {
         match &carrier {
             Carrier::Xhttp { .. } => {
                 let (mut reader, writer) =
-                    crate::xhttp::connect(uplink, host, path).expect("upgrades");
+                    crate::xhttp::connect(uplink, host, path, &[]).expect("upgrades");
                 writer.send(&header);
                 let mut reply = [0u8; 2];
                 reader.read_exact(&mut reply).expect("replies");
@@ -22726,7 +22939,7 @@ mod tests {
             }
             Carrier::HttpHeader { .. } => {
                 let (mut reader, mut write) =
-                    crate::httpheader::connect(uplink, host, path).expect("headers");
+                    crate::httpheader::connect(uplink, host, path, &[]).expect("headers");
                 write.write_all(&header).expect("writes");
                 let mut reply = [0u8; 2];
                 reader.read_exact(&mut reply).expect("replies");
@@ -23323,7 +23536,8 @@ mod tests {
                 ))
             },
             |stream| {
-                let (reader, writer) = crate::ws::connect(stream, "127.0.0.1", "/tunnel", 0, &[])?;
+                let (reader, writer) =
+                    crate::ws::connect(stream, "127.0.0.1", "/tunnel", 0, &[], &[], 0)?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,
@@ -23344,7 +23558,7 @@ mod tests {
                 ))
             },
             |stream| {
-                let (reader, writer) = crate::xhttp::connect(stream, "127.0.0.1", "/share")?;
+                let (reader, writer) = crate::xhttp::connect(stream, "127.0.0.1", "/share", &[])?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,
@@ -23366,7 +23580,7 @@ mod tests {
             },
             |stream| {
                 let (reader, write) =
-                    crate::httpheader::connect(stream, "127.0.0.1", "/camouflage")?;
+                    crate::httpheader::connect(stream, "127.0.0.1", "/camouflage", &[])?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(write) as Box<dyn Write + Send>,
@@ -23388,7 +23602,7 @@ mod tests {
             },
             |stream| {
                 let (reader, write) =
-                    crate::httpupgrade::connect(stream, "127.0.0.1", "/tunnel", 0, &[])?;
+                    crate::httpupgrade::connect(stream, "127.0.0.1", "/tunnel", 0, &[], &[])?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(write) as Box<dyn Write + Send>,
@@ -23704,7 +23918,8 @@ mod tests {
                 ))
             },
             |stream| {
-                let (reader, writer) = crate::ws::connect(stream, "127.0.0.1", "/tunnel", 0, &[])?;
+                let (reader, writer) =
+                    crate::ws::connect(stream, "127.0.0.1", "/tunnel", 0, &[], &[], 0)?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,
@@ -23725,7 +23940,7 @@ mod tests {
                 ))
             },
             |stream| {
-                let (reader, writer) = crate::xhttp::connect(stream, "127.0.0.1", "/share")?;
+                let (reader, writer) = crate::xhttp::connect(stream, "127.0.0.1", "/share", &[])?;
                 Some((
                     Box::new(reader) as Box<dyn Read + Send>,
                     Box::new(writer) as Box<dyn Write + Send>,
@@ -24194,6 +24409,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         };
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let relaying = thread::spawn(move || {
@@ -24265,6 +24482,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         };
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let relaying = thread::spawn(move || {
@@ -24334,6 +24553,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         };
         let asked = Destination::Name(HOST.to_owned(), 8443);
         let relaying = thread::spawn(move || {
@@ -24478,6 +24699,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         };
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let relaying = thread::spawn(move || {
@@ -24878,6 +25101,8 @@ mod tests {
                 tls: Some(Arc::new(client_config)),
                 flow: String::new(),
                 reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
             };
             dial_vless(
                 &client,
@@ -25013,6 +25238,8 @@ mod tests {
                 tls: Some(Arc::new(client_config)),
                 flow: String::new(),
                 reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
             };
             echo_trace(&format!("cli {port} dialing"));
             dial_vless(
@@ -25087,6 +25314,8 @@ mod tests {
                 tls: Some(Arc::new(client_config)),
                 flow: String::new(),
                 reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
             };
             dial_vless(
                 &client,
@@ -25270,6 +25499,8 @@ mod tests {
                 tls: Some(Arc::new(client_config)),
                 flow: crate::vision::FLOW.to_owned(),
                 reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
             };
             echo_trace(&format!("cli {port} dialing"));
             dial_vless(
@@ -25329,6 +25560,8 @@ mod tests {
                 carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
                 tls: Some(Arc::new(client_config)),
+                headers: Vec::new(),
+                heartbeat: 0,
             };
             echo_trace(&format!("cli {port} dialing"));
             dial_trojan(
@@ -25440,6 +25673,8 @@ mod tests {
                 carrier: inbound_carrier(&inbound),
                 host: "127.0.0.1".to_owned(),
                 tls: Some(Arc::clone(&client)),
+                headers: Vec::new(),
+                heartbeat: 0,
             };
             let listener: SocketAddr = address.parse().expect("addr");
             thread::spawn(move || {
@@ -25722,6 +25957,8 @@ mod tests {
                 carrier: inbound_carrier(&inbound),
                 host: "127.0.0.1".to_owned(),
                 tls: Some(Arc::clone(&client)),
+                headers: Vec::new(),
+                heartbeat: 0,
             };
             let listener: SocketAddr = address.parse().expect("addr");
             thread::spawn(move || {
@@ -25778,6 +26015,8 @@ mod tests {
             carrier: inbound_carrier(inbound),
             host: "127.0.0.1".to_owned(),
             tls: client.cloned(),
+            headers: Vec::new(),
+            heartbeat: 0,
         };
         let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("binds"));
         let relay_addr = relay.local_addr().expect("addr");
@@ -25994,6 +26233,8 @@ mod tests {
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
             tls: Some(Arc::new(client_config)),
+            headers: Vec::new(),
+            heartbeat: 0,
         };
         let target = Destination::from(
             format!("127.0.0.1:{echo_port}")
@@ -26119,6 +26360,8 @@ mod tests {
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
             tls: Some(client),
+            headers: Vec::new(),
+            heartbeat: 0,
         };
         let conn = ferrox_core::kcp::dial(
             format!("127.0.0.1:{port}").parse().expect("addr"),
@@ -26205,6 +26448,8 @@ mod tests {
                 carrier: inbound_carrier(&inbound),
                 host: "127.0.0.1".to_owned(),
                 tls: Some(Arc::clone(&client)),
+                headers: Vec::new(),
+                heartbeat: 0,
             };
             let listener: SocketAddr = address.parse().expect("addr");
             let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -26260,6 +26505,8 @@ mod tests {
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
             tls: Some(client),
+            headers: Vec::new(),
+            heartbeat: 0,
         };
         let conn = ferrox_core::kcp::dial(
             format!("127.0.0.1:{port}").parse().expect("addr"),
@@ -26414,6 +26661,8 @@ mod tests {
             carrier,
             host: "127.0.0.1".to_owned(),
             tls: tls.map(|(_, client)| Arc::new(client.clone())),
+            headers: Vec::new(),
+            heartbeat: 0,
         }
     }
 
@@ -26788,6 +27037,8 @@ mod tests {
                 carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
                 tls: Some(Arc::new(client_config)),
+                headers: Vec::new(),
+                heartbeat: 0,
             };
             echo_trace(&format!("cli {port} dialing"));
             dial_vmess(
@@ -26973,6 +27224,8 @@ mod tests {
             tls: Some(Arc::new(tls)),
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         })
     }
 
@@ -26990,6 +27243,8 @@ mod tests {
             carrier,
             host: "127.0.0.1".to_owned(),
             tls: Some(Arc::new(tls)),
+            headers: Vec::new(),
+            heartbeat: 0,
         })
     }
 
@@ -27006,6 +27261,8 @@ mod tests {
             carrier,
             host: "127.0.0.1".to_owned(),
             tls: Some(Arc::new(tls)),
+            headers: Vec::new(),
+            heartbeat: 0,
         })
     }
 
@@ -27102,7 +27359,7 @@ mod tests {
         let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
         let session = dial_tls_session(&server, &client_config, None).expect("dialled");
         let header = vless_header(&id, 1, &Destination::from(echo_addr));
-        let (mut reader, writer) = tls_ws(&server, session, "127.0.0.1", "/w", 0, &header)
+        let (mut reader, writer) = tls_ws(&server, session, "127.0.0.1", "/w", 0, &header, &[], 0)
             .expect("handshakes ws inside tls");
         read_vless_response(&mut reader).expect("answers");
         assert!(writer.send(b"ping"), "relays through tls-first ws");
@@ -27472,6 +27729,8 @@ mod tests {
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -27545,7 +27804,8 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let (mut reader, writer) =
-            crate::ws::connect(uplink, "oracle.example", "/tunnel", 0, &[]).expect("upgrades");
+            crate::ws::connect(uplink, "oracle.example", "/tunnel", 0, &[], &[], 0)
+                .expect("upgrades");
         let mut header = Vec::new();
         header.extend_from_slice(&trojan_key("secret"));
         header.extend_from_slice(b"\r\n");
@@ -27625,6 +27885,8 @@ mod tests {
             carrier,
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -28266,6 +28528,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -28570,6 +28834,8 @@ mod tests {
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -28710,6 +28976,8 @@ mod tests {
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -28833,6 +29101,8 @@ mod tests {
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -29321,6 +29591,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -30474,6 +30746,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -30512,7 +30786,8 @@ mod tests {
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let (mut reader, writer) =
-            crate::ws::connect(uplink, "oracle.example", "/tunnel", 0, &[]).expect("upgrades");
+            crate::ws::connect(uplink, "oracle.example", "/tunnel", 0, &[], &[], 0)
+                .expect("upgrades");
         let mut header = Vec::new();
         header.extend_from_slice(&trojan_key("wrong"));
         header.extend_from_slice(b"\r\n");
@@ -30566,6 +30841,8 @@ mod tests {
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -30633,6 +30910,8 @@ mod tests {
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -30698,6 +30977,8 @@ mod tests {
             )),
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -30762,6 +31043,8 @@ mod tests {
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -30827,6 +31110,8 @@ mod tests {
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -30893,6 +31178,8 @@ mod tests {
             carrier: Carrier::Grpc(crate::config::GrpcSettings::path("/Tun".to_owned())),
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -30956,6 +31243,8 @@ mod tests {
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -31019,6 +31308,8 @@ mod tests {
             },
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -31569,6 +31860,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         };
         let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let source = Arc::new(Mutex::new(None));
@@ -31749,6 +32042,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         };
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
         let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
@@ -32598,6 +32893,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -32645,6 +32942,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -33008,6 +33307,8 @@ mod tests {
             tls: Some(Arc::clone(&client)),
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         };
         let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let dport = downstream.local_addr().expect("addr").port();
@@ -33108,6 +33409,8 @@ mod tests {
                 tls: Some(client),
                 flow: String::new(),
                 reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
             };
             let target = Destination::from(
                 format!("127.0.0.1:{dport}")
@@ -34349,6 +34652,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -35539,6 +35844,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         }));
         let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
         client
@@ -35573,6 +35880,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         }));
         let mut client = http_connect(front, &format!("127.0.0.1:{echo}"));
         assert!(http_status(&mut client).starts_with("HTTP/1.1 200"));
@@ -36629,6 +36938,8 @@ mod tests {
             tls: None,
             flow: String::new(),
             reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
         client.write_all(b"ping").expect("writes");
@@ -36690,6 +37001,8 @@ mod tests {
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
         client.write_all(b"ping").expect("writes");
@@ -36715,6 +37028,8 @@ mod tests {
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
         client.write_all(b"ping").expect("writes");
@@ -37211,6 +37526,8 @@ mod tests {
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
             tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
         client.write_all(b"ping").expect("writes");
