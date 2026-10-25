@@ -2930,7 +2930,7 @@ struct MuxOut<'a> {
 
 struct UdpMux {
     socket: Arc<UdpSocket>,
-    dest: SocketAddr,
+    dest: Mutex<SocketAddr>,
     id: Arc<AtomicU16>,
     done: Arc<AtomicBool>,
     wire: MuxWire,
@@ -3113,7 +3113,12 @@ fn handle_mux_frame(
                 let dest = frame
                     .target
                     .and_then(|t| mux_target_addr(&t))
-                    .unwrap_or(session.dest);
+                    .unwrap_or_else(|| {
+                        *session
+                            .dest
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    });
                 let _ = session.socket.send_to(data, dest);
                 return;
             }
@@ -3348,6 +3353,10 @@ fn handle_mux_udp_new(
             send_mux_end(out.wire, out.staging, old);
         }
         session.id.store(frame.id, Ordering::Relaxed);
+        *session
+            .dest
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = dest;
         session
     } else {
         let bound = if dest.is_ipv6() {
@@ -3360,7 +3369,7 @@ fn handle_mux_udp_new(
         };
         let session = Arc::new(UdpMux {
             socket: Arc::new(socket),
-            dest,
+            dest: Mutex::new(dest),
             id: Arc::new(AtomicU16::new(frame.id)),
             done: Arc::new(AtomicBool::new(false)),
             wire: out.wire.clone(),
