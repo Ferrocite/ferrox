@@ -928,9 +928,6 @@ fn stage_frames(
             return false;
         }
     }
-    if staging.is_empty() {
-        return true;
-    }
     write_frames(stream, staging)
 }
 
