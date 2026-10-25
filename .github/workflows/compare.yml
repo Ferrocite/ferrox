@@ -15,6 +15,7 @@ on:
 
 concurrency:
   group: compare-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
