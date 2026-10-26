@@ -1700,7 +1700,9 @@ impl Gecko {
             let (start, end) = ferrox_core::hysteria::gecko_chunk_range(buf.len(), idx, total)
                 .ok_or(invalid(std::io::ErrorKind::InvalidInput))?;
             let chunk = &buf[start..end];
-            let base = SALAMANDER_SALT + ferrox_core::hysteria::GECKO_HEADER + chunk.len();
+            let base = ferrox_core::hysteria::SALAMANDER_SALT
+                + ferrox_core::hysteria::GECKO_HEADER
+                + chunk.len();
             let pad_len = usize::from(ferrox_core::hysteria::gecko_pad_len(
                 self.min,
                 self.max,
