@@ -13,7 +13,7 @@ const LOW_40: u64 = (1 << 40) - 1;
 #[cfg(all(test, target_arch = "aarch64"))]
 const NEON_THRESHOLD_BYTES: usize = 512;
 
-const STRIDE2_THRESHOLD_BYTES: usize = 128;
+const STRIDE2_THRESHOLD_BYTES: usize = 64;
 
 #[cfg(target_arch = "aarch64")]
 const NEON4_THRESHOLD_BYTES: usize = 1024;
