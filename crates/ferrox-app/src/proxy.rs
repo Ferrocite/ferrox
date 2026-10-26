@@ -9611,14 +9611,11 @@ fn dial_vmess_httpupgrade(
     else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
     };
-    let Some((mut reader, write)) =
+    let Some((reader, write)) =
         crate::httpupgrade::connect(uplink, &vmess.host, path, ed, &request, &vmess.headers)
     else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
-    if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
-    }
     note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
     let Ok(closer) = write.try_clone() else {
         return true;
@@ -9626,7 +9623,15 @@ fn dial_vmess_httpupgrade(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(Shutdown::Both);
     });
-    crate::vmess::pump_relay_carried(client, reader, write, &close, send, recv, None);
+    crate::vmess::pump_relay_carried(
+        client,
+        reader,
+        write,
+        &close,
+        send,
+        recv,
+        Some((response_key, response_iv, auth)),
+    );
     true
 }
 
@@ -9644,8 +9649,7 @@ fn dial_vmess_grpc(
         .grpc_settings()
         .cloned()
         .unwrap_or_else(|| crate::config::GrpcSettings::path(attempt.path));
-    let Some((mut reader, writer)) = crate::grpc::connect_with(uplink, &vmess.host, &settings)
-    else {
+    let Some((reader, writer)) = crate::grpc::connect_with(uplink, &vmess.host, &settings) else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     let Some((request, send, recv, response_key, response_iv, auth)) =
@@ -9656,13 +9660,18 @@ fn dial_vmess_grpc(
     if !writer.send(&request) {
         return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
     }
-    if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
-    }
     note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
-    crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
+    crate::vmess::pump_relay_carried(
+        client,
+        reader,
+        writer,
+        &close,
+        send,
+        recv,
+        Some((response_key, response_iv, auth)),
+    );
     true
 }
 
@@ -9772,7 +9781,7 @@ fn dial_vmess_headed(
     let Carrier::HttpHeader { path } = &vmess.carrier else {
         return true;
     };
-    let Some((mut reader, mut write)) =
+    let Some((reader, mut write)) =
         crate::httpheader::connect(uplink, &vmess.host, path, &vmess.headers)
     else {
         return !Failure::new(Stage::SocketConnected, Kind::Unreachable).worth_retrying();
@@ -9785,16 +9794,21 @@ fn dial_vmess_headed(
     if write.write_all(&request).is_err() {
         return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
     }
-    if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-        return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
-    }
     let Ok(closer) = write.try_clone() else {
         return true;
     };
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(Shutdown::Both);
     });
-    crate::vmess::pump_relay_carried(client, reader, write, &close, send, recv, None);
+    crate::vmess::pump_relay_carried(
+        client,
+        reader,
+        write,
+        &close,
+        send,
+        recv,
+        Some((response_key, response_iv, auth)),
+    );
     true
 }
 
@@ -9812,7 +9826,7 @@ fn dial_vmess_rung(
         Rung::Grpc => dial_vmess_grpc(client, uplink, vmess, target, attempt, ladder),
         Rung::Xhttp => {
             let rung = attempt.rung;
-            let Some((mut reader, writer)) =
+            let Some((reader, writer)) =
                 xhttp_rung(uplink, &vmess.host, &vmess.carrier, attempt.path)
             else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
@@ -9825,14 +9839,19 @@ fn dial_vmess_rung(
             if !writer.send(&request) {
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
-            }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
             let closer = writer.clone();
             let close: std::sync::Arc<dyn Fn() + Send + Sync> =
                 std::sync::Arc::new(move || closer.finish());
-            crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
+            crate::vmess::pump_relay_carried(
+                client,
+                reader,
+                writer,
+                &close,
+                send,
+                recv,
+                Some((response_key, response_iv, auth)),
+            );
             true
         }
         Rung::Raw => {
@@ -11386,9 +11405,6 @@ fn vmess_tls_raw(
     if session.write_all(&request).is_err() {
         return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
     }
-    if !crate::vmess::read_response(&mut session, &response_key, &response_iv, auth) {
-        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-    }
     let Ok(raw) = session.get_ref().try_clone() else {
         return;
     };
@@ -11424,7 +11440,15 @@ fn vmess_tls_raw(
     };
     let closer = writer.clone();
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
-    crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
+    crate::vmess::pump_relay_carried(
+        client,
+        reader,
+        writer,
+        &close,
+        send,
+        recv,
+        Some((response_key, response_iv, auth)),
+    );
 }
 
 #[allow(clippy::too_many_lines)]
@@ -11454,16 +11478,20 @@ fn vmess_tls_carried(
             ) else {
                 return;
             };
-            let mut reader = reader;
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
             let closer = writer.clone();
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
-            crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
+            crate::vmess::pump_relay_carried(
+                client,
+                reader,
+                writer,
+                &close,
+                send,
+                recv,
+                Some((response_key, response_iv, auth)),
+            );
         }
         Carrier::HttpUpgrade { path, ed, .. } => {
-            let Some((mut reader, sink)) = tls_httpupgrade(
+            let Some((reader, sink)) = tls_httpupgrade(
                 server,
                 session,
                 &vmess.host,
@@ -11474,27 +11502,36 @@ fn vmess_tls_carried(
             ) else {
                 return;
             };
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
             let closer = sink.clone();
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
-            crate::vmess::pump_relay_carried(client, reader, sink, &close, send, recv, None);
+            crate::vmess::pump_relay_carried(
+                client,
+                reader,
+                sink,
+                &close,
+                send,
+                recv,
+                Some((response_key, response_iv, auth)),
+            );
         }
         Carrier::Grpc(settings) => {
             let Some((reader, writer)) = tls_grpc(server, session, &vmess.host, settings) else {
                 return;
             };
-            let mut reader = reader;
             if !writer.send(&request) {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
             let closer = writer.clone();
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
-            crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
+            crate::vmess::pump_relay_carried(
+                client,
+                reader,
+                writer,
+                &close,
+                send,
+                recv,
+                Some((response_key, response_iv, auth)),
+            );
         }
         Carrier::Xhttp { settings, .. } => {
             let Some((reader, writer)) = tls_xhttp(
@@ -11509,13 +11546,17 @@ fn vmess_tls_carried(
             if !writer.send(&request) {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            let mut reader = reader;
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
             let closer = writer.clone();
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
-            crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
+            crate::vmess::pump_relay_carried(
+                client,
+                reader,
+                writer,
+                &close,
+                send,
+                recv,
+                Some((response_key, response_iv, auth)),
+            );
         }
         Carrier::HttpHeader { path } => {
             let Some((reader, sink)) =
@@ -11523,16 +11564,21 @@ fn vmess_tls_carried(
             else {
                 return;
             };
-            let (mut reader, mut sink) = (reader, sink);
+            let mut sink = sink;
             if sink.write_all(&request).is_err() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
             let closer = sink.clone();
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
-            crate::vmess::pump_relay_carried(client, reader, sink, &close, send, recv, None);
+            crate::vmess::pump_relay_carried(
+                client,
+                reader,
+                sink,
+                &close,
+                send,
+                recv,
+                Some((response_key, response_iv, auth)),
+            );
         }
         Carrier::Raw(_)
         | Carrier::Quic
@@ -29330,6 +29376,65 @@ mod tests {
         assert_eq!(&read_echo(&mut sock), b"ping");
         let _ = std::fs::remove_file(cert_path);
         let _ = std::fs::remove_file(key_path);
+    }
+
+    /// xray-core buffers the response header until the target first writes, so an upload-only
+    /// flow never flushes it. The client must start forwarding before it waits for that header,
+    /// or the server waits for an upload the client has not sent yet.
+    #[test]
+    fn a_vmess_tls_upload_starts_before_the_server_flushes_its_response_header() {
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x61u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (uploaded_tx, uploaded_rx) = std::sync::mpsc::channel();
+        let out = vmess_test_out(
+            port,
+            id,
+            Carrier::Raw(Chain::default()),
+            Some(&(Arc::clone(&server_config), client_config)),
+        );
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let raw = stream.try_clone().expect("clones");
+            let session = accept_tls_session(stream, &server_config).expect("tls");
+            let (mut reader, mut writer) = session_halves(session, raw);
+            let users = crate::vmess::Users::single(id);
+            let accepted =
+                crate::vmess::accept_request(&mut reader, &users).expect("the request decodes");
+            let mut recv = accepted.recv;
+            let mut scratch = Vec::new();
+            let frame = crate::vmess::read_frame(&mut reader, &mut recv, &mut scratch)
+                .expect("the upload arrives before the response header");
+            assert_eq!(frame, b"ping");
+            uploaded_tx.send(()).expect("signals");
+            writer.write_all(&accepted.prefix).expect("response header");
+            writer.flush().expect("flushes");
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let downstream_port = downstream.local_addr().expect("addr").port();
+        let (dialed_tx, dialed_rx) = std::sync::mpsc::channel();
+        let relaying = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target = Destination::from("127.0.0.1:1".parse::<SocketAddr>().expect("addr"));
+            dial_vmess(&client, &server, &out, &target, Ladder::global());
+            dialed_tx.send(()).expect("signals");
+        });
+
+        let mut sock = connect_until(downstream_port);
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        sock.shutdown(Shutdown::Write).expect("half-closes");
+        uploaded_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the server saw the upload before flushing the header");
+        dialed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the dial returned after the lazy header");
+        server.join().expect("joins");
+        relaying.join().expect("joins");
     }
 
     #[test]
