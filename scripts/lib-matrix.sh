@@ -5,6 +5,8 @@ PASSWORD="matrix-secret"
 SS_PASSWORD="matrix-shadowsocks-password"
 SS2022_PASSWORD="MDEyMzQ1Njc4OUFCQ0RFRg=="
 HYSTERIA_AUTH="matrix-hysteria-auth"
+VLESS_ENC_CLIENT="mlkem768x25519plus.native.1rtt.2KpP3KYKjxF9Rew2c-oAq0YdFawg9Lhc6yzMrSWfZcAzN8O2MrVQEHCAKfOVdCyDAvIEI-gcswjOvDCsZcTPiFITitJt1SGrYsjF4pc_7cua3CNgZ5qUBrZEKRGvcQkdpYswh2ozDxApJParJXa8s-h9YeEWRKG8aGhwQhBq5RVIepsFaAa2SDQA7YUn2rBWKFmJc9gngJQfDftticxhWPC0h9BMgBxx5tiU46tNu1ifyjaWOcVoIwtxfFCSv-p2btNHJJeBOAdQ61dC46qdO2CzujO4clRz0TrB2tliQBi0BKVG8mgYtxZFOGoDtre3sTYO6CS5xExmcOp9zUrHBeoFo5quBZFr5nZ84pQ0NrYBigwemDFE0htQM1YHCFESm1eY_sWSfRGkCLC2KqVXh0cClKjIF2Fazgaoy6qACttDccd0YVtVzFgyNAi1tKXKjNMhgZIyx5e_QmhjJcdDCOS0tzE-ecJRggZ31XzLlPVCeeiuliwJ_UzOWXHOJ0wYiwwtiZhQYIwF7GqHBmF6hrqbSLm0Pau5wLKSUdc3OgjGxWMs34okmnoIvTWoA1Am-IKxCISsCdy-iqFghasCdruLb7luKgMT7soJ95NY0LQOn4FSonEZPKIP_rBvmKJJWyOtl6qThFNzfYBQD2pTM4aXZKrOrYB7kbI_CPqM9dE740IM-suSyoEBCSi8NCB6feoMw5PNdTRDhnyuFPjKL3o_61gMjJwsW8Vq3CKMVByMJXq8QqCmQlyRXxhFVTcNdAYOeePA_JczfWIOGzCIc5wuuAHFxzfAfpWMtlEe3BMxYySXEBTG8meB7nYULth9XorFvYyM7giO4_h7YGqZEfe5hDxnAUpN00nLEwaWNfhaq9x4p7KkCEG6xIFzBhN__7OJUTgARjCagHAxBgSWDCY8qqHI4ZYpzxTI8qkPvTRZBylJZkOhGKdI_XCb9ulTy0cpeeAIF2Fw_UF7RKQ7IrnF1Ycza7MFQzd1i6wPE8fDgBFE1Jgfi_Fg8UsZtSS_q_xnV-pqOPAkDcK9MDt7obIejfHPaKTBZfa-_kp-67l_TRaudHCWoDQ4mtaZcTRo8kNX4BZ1ibUqytYU-IucCfnG32iOlVxCSzA_2CiQqvgiApu3KfiqekBM2YoaIoDEFzmwJVlsSvMDufCf3mo43YhkQFdEHxFLkpgS4WcGPCK59PuM8lNzlDXCvkeNY2lwN8yv7sI06YCz31Q38gqNjsmrBPRYTOQ550Ag8UoTE5dZUOUfhMMaomIYOnA2zUpU_tWy-Vq-F8AL8vVyjEtJRunGY-Q1D9qIaCI1YHmiKQLACiOwR6RDu-Ok0SmtCKeI9iNfqYgbnYyXP2VVIGcpw7uIwVeW_bVMnYqZIgzL4_kMQqGwmGImusoHKvNhRVc6wrkzCdhbXpmAK0nIhtSde4Q9JYqrTVmQBGRLLEc9tAK8-4ydcvJJ3PWCablnEASktKvInUh3g0xQ2teRoqC_fXCi--E0VySRQ7CGWmA8RxNJmvA2WakGplG5QhoK8hSNiIgXmXph_MQO6M34HQtfqyHVqeItfyOmgns747xGrPs"
+VLESS_ENC_SERVER="mlkem768x25519plus.native.600.7SIPAtLwXE0BAcgnUkP8ERcxxHc0NMa-7GE0fcqjc4b8ckDaZ2WEGg7FvAbJs_0ovWXWLWz4CYwjGoqT9TaiMw"
 
 matrix_srvport() {
   python3 -c 'import socket
@@ -33,7 +35,7 @@ matrix_engine_serves() {
   case "$1" in
     sing-box)
       case "$2" in
-        *-xhttp-*|*-kcp-*|*-hysteria-*) return 1 ;;
+        *-xhttp-*|*-kcp-*|*-hysteria-*|*-encryption-*) return 1 ;;
       esac
       ;;
   esac
@@ -68,6 +70,12 @@ vless_server() {
 }
 vless_client() {
   echo "\"tag\": \"proxy\", \"protocol\": \"vless\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $2, \"users\": [{\"id\": \"$UUID\", \"encryption\": \"none\"}]}]}$1"
+}
+vless_server_encryption() {
+  echo "\"protocol\": \"vless\", \"settings\": {\"clients\": [{\"id\": \"$UUID\"}], \"decryption\": \"$VLESS_ENC_SERVER\"}$1"
+}
+vless_client_encryption() {
+  echo "\"tag\": \"proxy\", \"protocol\": \"vless\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $2, \"users\": [{\"id\": \"$UUID\", \"encryption\": \"$VLESS_ENC_CLIENT\"}]}]}$1"
 }
 # The TLS arm's fixture: a self-signed certificate and its key, minted into the ignored target
 # tree by the harness at run time, so no private key is ever in the tree and no CA is needed in
@@ -215,6 +223,9 @@ scenario_config() {
   if [[ -n "$cover" ]]; then cover_json="$(cover_inbound "$cover")"; fi
   case "$1" in
     vless-raw-*) server_config "$(vless_server ', "streamSettings": {"network": "tcp"}')" "$(vless_client ', "streamSettings": {"network": "tcp"}' "$port")" "$port" ;;
+    vless-encryption-raw-*) server_config "$(vless_server_encryption ', "streamSettings": {"network": "tcp"}')" "$(vless_client_encryption ', "streamSettings": {"network": "tcp"}' "$port")" "$port" ;;
+    vless-encryption-tls-raw-*) server_config "$(vless_server_encryption ", $(tls_server_settings)")" "$(vless_client_encryption ", $(tls_client_settings)" "$port")" "$port" ;;
+    vless-encryption-reality-raw-*) server_config "$(vless_server_encryption ", $(reality_server_settings tcp "")")" "$(vless_client_encryption ", $(reality_client_settings tcp "")" "$port")" "$port" "$cover_json" ;;
     vless-tls-raw-*) server_config "$(vless_server ", $(tls_server_settings)")" "$(vless_client ", $(tls_client_settings)" "$port")" "$port" ;;
     vless-ws-*) server_config "$(vless_server ", $(stream_json ws)")" "$(vless_client ", $(stream_json ws)" "$port")" "$port" ;;
     vless-grpc-*) server_config "$(vless_server ", $(stream_json grpc)")" "$(vless_client ", $(stream_json grpc)" "$port")" "$port" ;;
@@ -257,7 +268,9 @@ standard_scenarios() {
   echo "trojan-raw-down-8 download 8 256 65536"
   echo "shadowsocks-raw-down-8 download 8 256 65536"
   echo "vless-raw-setup-1k download 1 1000 8"
+  echo "vless-encryption-raw-down-8 download 8 256 65536"
   echo "vless-tls-raw-down-8 download 8 256 65536"
+  echo "vless-encryption-tls-raw-down-8 download 8 256 65536"
   echo "vless-tls-raw-up-1 upload 1 2048 65536"
   echo "vless-tls-raw-duplex-8 full-duplex 8 128 65536"
   echo "vless-tls-ws-down-8 download 8 256 65536"
@@ -265,6 +278,7 @@ standard_scenarios() {
   echo "vless-httpupgrade-down-8 download 8 256 65536"
   echo "vless-tls-grpc-down-8 download 8 256 65536"
   echo "vless-reality-raw-down-8 download 8 256 65536"
+  echo "vless-encryption-reality-raw-down-8 download 8 256 65536"
   echo "vless-reality-grpc-down-8 download 8 256 65536"
   echo "vless-reality-xhttp-down-8 download 8 256 65536"
   echo "vless-vision-tls-raw-down-8 download 8 256 65536"
