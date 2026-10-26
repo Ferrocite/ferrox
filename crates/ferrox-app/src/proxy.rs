@@ -11463,6 +11463,10 @@ impl<S: CipherOpen, R: Read> Read for DrivenHalf<S, R> {
                     .map_err(|_| std::io::Error::other("tls half poisoned"))?;
                 session.open(pending, &mut buf[filled..])?
             };
+            eprintln!(
+                "ferrox-diag: open pending={} plain={plain} taken={taken}",
+                pending.len()
+            );
             self.pending_at += taken;
             filled += plain;
             if self.pending_at < self.pending_end {
@@ -11485,6 +11489,7 @@ impl<S: CipherOpen, R: Read> Read for DrivenHalf<S, R> {
                     .map_err(|_| std::io::Error::other("tls half poisoned"))?;
                 reader.read(&mut self.scratch)
             };
+            eprintln!("ferrox-diag: transport read {read:?}");
             let read = match read {
                 Ok(0) => {
                     // The peer is gone: what was read is handed over, and the next read reports the end.

@@ -650,17 +650,26 @@ impl Client {
             if *len > 0 {
                 inner.write_all(&hello[sent..sent + len])?;
                 inner.flush()?;
+                eprintln!(
+                    "ferrox-diag: client hello piece {} {} total {}",
+                    i,
+                    *len,
+                    hello.len()
+                );
                 sent += len;
             }
             if let Some(gap) = gaps.get(i) {
                 if !gap.is_zero() {
+                    eprintln!("ferrox-diag: client gap {i} {gap:?}");
                     std::thread::sleep(*gap);
                 }
             }
         }
+        eprintln!("ferrox-diag: client hello sent, reading pfs");
 
         let mut server_pfs = vec![0u8; MLKEM_CT_LEN + X25519_LEN + TAG_LEN];
         inner.read_exact(&mut server_pfs)?;
+        eprintln!("ferrox-diag: client pfs read");
         nfs_aead.open_in_place(Some(MAX_NONCE), &mut server_pfs, &[])?;
         let mlkem_key = decapsulation_key
             .decapsulate_slice(&server_pfs[..MLKEM_CT_LEN])
