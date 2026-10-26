@@ -99,6 +99,9 @@ impl SendingWindow {
             if seg.header.number >= una {
                 break;
             }
+            if seg.transmit > 0 {
+                self.total_in_flight = self.total_in_flight.saturating_sub(1);
+            }
             self.cache.pop_front();
         }
         self.trim();
@@ -123,8 +126,8 @@ impl SendingWindow {
         if self.cache[index].header.number != number {
             return false;
         }
-        if self.total_in_flight > 0 {
-            self.total_in_flight -= 1;
+        if self.cache[index].transmit > 0 {
+            self.total_in_flight = self.total_in_flight.saturating_sub(1);
         }
         self.cache.remove(index);
         self.trim();

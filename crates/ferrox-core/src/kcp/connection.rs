@@ -355,12 +355,10 @@ impl Connection {
         }
         let state = self.state();
         let draining = state == State::Terminating || state == State::PeerTerminating;
-        let sending = self.sending.lock().unwrap();
-        let necessary = sending.update_necessary();
+        let necessary = self.sending.lock().unwrap().update_necessary();
         #[cfg(test)]
         self.pass_lock_gate("poll");
         let necessary = necessary || self.receiving.lock().unwrap().update_necessary();
-        drop(sending);
         let last_flush = *self.last_flush.lock().unwrap();
         let last_uncond = *self.last_uncond.lock().unwrap();
         let due = draining
@@ -554,12 +552,10 @@ impl Connection {
     }
 
     pub fn ping(&self, current: u32, cmd: Command) {
-        let receiving = self.receiving.lock().unwrap();
-        let receiving_next = receiving.next_number();
+        let receiving_next = self.receiving.lock().unwrap().next_number();
         #[cfg(test)]
         self.pass_lock_gate("ping");
         let sending_next = self.sending.lock().unwrap().first_unacknowledged();
-        drop(receiving);
         let seg = CmdOnlySegment {
             conv: self.ctx.meta.conversation,
             cmd: cmd.to_byte(),
