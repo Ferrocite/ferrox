@@ -54,6 +54,7 @@ step "ci scope"
 
 step "benchmark delta"
 python3 scripts/benchmark-delta.py --selftest
+python3 scripts/check-matrix-legs.py --selftest
 
 step "method matrix"
 ./scripts/check-method-superset.sh

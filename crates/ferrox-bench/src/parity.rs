@@ -545,6 +545,17 @@ pub struct Quartiles {
     pub p99: u128,
 }
 
+/// The server process's side of one repeat, sampled from outside: the same counters the
+/// client reports, normalized by the bytes that repeat moved.
+#[derive(Debug, Clone, Copy)]
+pub struct Server {
+    pub cpu_millis: u64,
+    pub user_millis: Option<u64>,
+    pub sys_millis: Option<u64>,
+    pub peak_rss_kib: u64,
+    pub threads_peak: Option<u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Outcome {
     pub bytes_sent: u64,
@@ -565,6 +576,8 @@ pub struct Outcome {
     pub startup_cpu_millis: u64,
     pub startup_seconds: f64,
     pub samples: Vec<(Phase, ps::Sample)>,
+    /// The server process for this repeat, where the driver was given its pid.
+    pub server: Option<Server>,
 }
 
 #[derive(Debug)]
@@ -598,6 +611,23 @@ impl Run {
 
     pub fn rss_mib(&self) -> f64 {
         self.outcome.peak_rss_kib as f64 / KIB
+    }
+
+    /// The server's CPU over the same bytes this run moved, so the two sides of a
+    /// cell are priced against one transfer.
+    pub fn server_cpu_millis_per_gib(&self) -> Option<f64> {
+        let server = self.outcome.server?;
+        let bytes = self.bytes_moved();
+        if bytes == 0 {
+            return None;
+        }
+        Some(server.cpu_millis as f64 / (bytes as f64 / 1_073_741_824.0))
+    }
+
+    pub fn server_peak_rss_mib(&self) -> Option<f64> {
+        self.outcome
+            .server
+            .map(|server| server.peak_rss_kib as f64 / KIB)
     }
 
     /// The run's cpu split over the bytes it moved; `None` where the sampler has no split.
@@ -722,7 +752,33 @@ impl Run {
         root.insert("latency_us", Json::Null);
         root.insert("tun_fd_buffers", Json::Null);
         root.insert("samples", Json::Arr(samples));
+        root.insert("server", self.server_json());
         root
+    }
+
+    fn server_json(&self) -> Json {
+        let Some(server) = self.outcome.server else {
+            return Json::Null;
+        };
+        let mut item = Json::object();
+        let split = |value: Option<u64>| value.map_or(Json::Null, |v| Json::Num(v as f64));
+        item.insert("cpu_millis", Json::Num(server.cpu_millis as f64));
+        item.insert("cpu_user_millis", split(server.user_millis));
+        item.insert("cpu_sys_millis", split(server.sys_millis));
+        item.insert(
+            "cpu_millis_per_gib",
+            self.server_cpu_millis_per_gib()
+                .map_or(Json::Null, Json::Num),
+        );
+        item.insert("peak_rss_kib", Json::Num(server.peak_rss_kib as f64));
+        item.insert(
+            "threads_peak",
+            match server.threads_peak {
+                Some(t) => Json::Num(t as f64),
+                None => Json::Null,
+            },
+        );
+        item
     }
 }
 
@@ -919,9 +975,10 @@ pub fn measure(
     config_arg: ConfigArg,
     dialect: Dialect,
     cell: &Cell,
+    server_pid: Option<u32>,
 ) -> Result<Run, Error> {
     remeasure_disturbed(REMEASURE_ATTEMPTS, cell.budget(), || {
-        measure_once(request, config_arg, dialect)
+        measure_once(request, config_arg, dialect, server_pid)
     })
 }
 
@@ -973,7 +1030,12 @@ fn remeasure_disturbed<T>(
     }
 }
 
-fn measure_once(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> Result<Run, Error> {
+fn measure_once(
+    request: &Request,
+    config_arg: ConfigArg,
+    dialect: Dialect,
+    server_pid: Option<u32>,
+) -> Result<Run, Error> {
     let ip = local_non_loopback_ipv4()?;
     let sink = allocate_port_range(request.connections)?;
     let sink_ports = ports_of(&sink)?;
@@ -1020,6 +1082,7 @@ fn measure_once(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> R
         warmup(socks, &bulk_pattern_template(request.payload_size))?;
     }
 
+    let server = server_pid.map(ServerSampler::start).transpose()?;
     let (flows, sampler_thread, stop, rx) = start_traffic(pid, request, socks, &targets, &desync);
     let wall = Instant::now();
     // The cap is enforced inside the fan-in: a stalled flow blocks `read`, so a post-hoc check here could never fire. A stall past the cap produced no number to bank, so `measure` re-measures it inside the budget rather than banking a workload fault.
@@ -1032,40 +1095,16 @@ fn measure_once(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> R
     let mut samples = startup_samples;
     samples.extend(rx.try_iter());
     samples.extend(sample_for(pid, Phase::Settle, SETTLE)?);
+    let server = match server {
+        Some(server) => Some(server.finish()?),
+        None => None,
+    };
 
     engine.reap();
     let sink_reasons = sink_thread.reasons();
     sink_thread.join()?;
 
-    // Checked before the byte totals: a forged byte shortens the transfer too, but naming it as a desync is what lets `measure` re-measure it instead of banking a workload fault.
-    if let Some(forged) = desync.lock().ok().and_then(|slot| slot.as_ref().cloned()) {
-        return Err(Error::Desync(forged));
-    }
-
-    let expected = request.total_bytes();
-    if moved.sent + moved.received != expected {
-        let mut why = if moved.all_stopped.is_empty() {
-            vec!["no flow reported why it stopped".to_owned()]
-        } else {
-            moved.all_stopped.clone()
-        };
-        why.extend(sink_reasons);
-        let joined = why.join("; ");
-        // A short transfer explained by socket-layer transience - a saturated runner, every engine alike - is re-measured like a forged byte, never banked; one that carries no such signature is a real workload fault and stays one.
-        if is_transient_io(&joined) {
-            return Err(Error::Transient(format!(
-                "moved {} of {expected} bytes: {}",
-                moved.sent + moved.received,
-                joined
-            )));
-        }
-        return Err(Error::Workload(format!(
-            "moved {} of {expected} bytes: a short transfer is a fault in the \
-             workload, not a number to report. {}",
-            moved.sent + moved.received,
-            joined
-        )));
-    }
+    validate_transfer(&moved, request.total_bytes(), &sink_reasons, &desync)?;
 
     let summary = summarise(&samples, &moved, startup_cpu_millis);
     Ok(Run {
@@ -1087,8 +1126,110 @@ fn measure_once(request: &Request, config_arg: ConfigArg, dialect: Dialect) -> R
             startup_cpu_millis,
             startup_seconds,
             samples,
+            server,
         },
     })
+}
+
+fn validate_transfer(
+    moved: &Moved,
+    expected: u64,
+    sink_reasons: &[String],
+    desync: &Desync,
+) -> Result<(), Error> {
+    // Checked before the byte totals: a forged byte shortens the transfer too, but naming it as a desync is what lets `measure` re-measure it instead of banking a workload fault.
+    if let Some(forged) = desync.lock().ok().and_then(|slot| slot.as_ref().cloned()) {
+        return Err(Error::Desync(forged));
+    }
+    if moved.sent + moved.received == expected {
+        return Ok(());
+    }
+    let mut why = if moved.all_stopped.is_empty() {
+        vec!["no flow reported why it stopped".to_owned()]
+    } else {
+        moved.all_stopped.clone()
+    };
+    why.extend(sink_reasons.iter().cloned());
+    let joined = why.join("; ");
+    // A short transfer explained by socket-layer transience - a saturated runner, every engine alike - is re-measured like a forged byte, never banked; one that carries no such signature is a real workload fault and stays one.
+    if is_transient_io(&joined) {
+        return Err(Error::Transient(format!(
+            "moved {} of {expected} bytes: {}",
+            moved.sent + moved.received,
+            joined
+        )));
+    }
+    Err(Error::Workload(format!(
+        "moved {} of {expected} bytes: a short transfer is a fault in the \
+         workload, not a number to report. {}",
+        moved.sent + moved.received,
+        joined
+    )))
+}
+
+/// The server process beside the client: sampled from the same clock, stopped from `Drop` so a
+/// disturbed attempt cannot leave a sampler forking `ps` into the next one.
+struct ServerSampler {
+    pid: u32,
+    first: ps::Sample,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+    rx: mpsc::Receiver<(Phase, ps::Sample)>,
+}
+
+impl ServerSampler {
+    fn start(pid: u32) -> Result<Self, Error> {
+        let first = sample_at(Host::current(), pid, 0)?;
+        let stop = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = mpsc::channel();
+        let thread = spawn_sampler(pid, Arc::clone(&stop), tx);
+        Ok(Self {
+            pid,
+            first,
+            stop,
+            thread: Some(thread),
+            rx,
+        })
+    }
+
+    fn finish(mut self) -> Result<Server, Error> {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        let last = sample_at(Host::current(), self.pid, 0)?;
+        let mut samples = vec![self.first];
+        samples.extend(self.rx.try_iter().map(|(_, sample)| sample));
+        samples.push(last);
+        Ok(summarise_server(&samples))
+    }
+}
+
+impl Drop for ServerSampler {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn summarise_server(samples: &[ps::Sample]) -> Server {
+    let first = samples.first().copied();
+    let last = samples.last().copied();
+    let baseline = first.map_or(0, |s| s.cpu_millis);
+    let split =
+        |read: fn(ps::Sample) -> Option<u64>| match (first.and_then(read), last.and_then(read)) {
+            (Some(start), Some(end)) => end.checked_sub(start),
+            _ => None,
+        };
+    Server {
+        cpu_millis: last.map_or(0, |s| s.cpu_millis.saturating_sub(baseline)),
+        user_millis: split(|s| s.user_millis),
+        sys_millis: split(|s| s.sys_millis),
+        peak_rss_kib: samples.iter().map(|s| s.rss_kib).max().unwrap_or_default(),
+        threads_peak: samples.iter().filter_map(|s| s.threads).max(),
+    }
 }
 
 struct Summary {
@@ -2356,6 +2497,32 @@ mod tests {
             usize::try_from(value).expect("a non-negative lowat"),
             SEND_LOWAT
         );
+    }
+
+    fn sampled(cpu_millis: u64, threads: Option<u64>) -> ps::Sample {
+        ps::Sample {
+            elapsed_ms: 0,
+            rss_kib: 1024,
+            cpu_millis,
+            user_millis: Some(cpu_millis * 2 / 3),
+            sys_millis: Some(cpu_millis - cpu_millis * 2 / 3),
+            threads,
+            io: None,
+        }
+    }
+
+    #[test]
+    fn a_server_summary_counts_cpu_between_the_first_and_last_sample() {
+        let server = summarise_server(&[
+            sampled(100, Some(2)),
+            sampled(180, Some(5)),
+            sampled(250, Some(3)),
+        ]);
+        assert_eq!(server.cpu_millis, 150);
+        assert_eq!(server.threads_peak, Some(5));
+        assert_eq!(server.peak_rss_kib, 1024);
+        assert_eq!(server.user_millis, Some(100));
+        assert_eq!(server.sys_millis, Some(50));
     }
 
     /// A dead pid yields a target-gone error, never the `Spawn` arm; `Disconnected` on the receiver is the witness that the sampler exited via the break rather than still forking `ps` against a dead pid.

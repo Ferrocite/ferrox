@@ -16,7 +16,9 @@ rows rather than guessing a leg.
 import argparse
 import json
 import statistics
+import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 REFERENCE = "xray-core"
@@ -32,15 +34,34 @@ def load(path):
         return None
 
 
-def median_throughput(cell, engine):
+def median_metric(cell, engine, metric):
     """The engine's median over its repeats, or None when it did not run."""
     for entry in cell.get("engines", []):
         if entry.get("name") != engine:
             continue
         samples = [
-            run["throughput_mib_s"]
+            run[metric]
             for run in entry.get("runs", [])
-            if isinstance(run.get("throughput_mib_s"), (int, float))
+            if isinstance(run.get(metric), (int, float))
+        ]
+        return statistics.median(samples) if samples else None
+    return None
+
+
+def median_throughput(cell, engine):
+    return median_metric(cell, engine, "throughput_mib_s")
+
+
+def median_server_metric(cell, engine, metric):
+    """The server's median for the runs this client produced, or None."""
+    for entry in cell.get("engines", []):
+        if entry.get("name") != engine:
+            continue
+        samples = [
+            run["server"][metric]
+            for run in entry.get("runs", [])
+            if isinstance(run.get("server"), dict)
+            and isinstance(run["server"].get(metric), (int, float))
         ]
         return statistics.median(samples) if samples else None
     return None
@@ -94,27 +115,8 @@ def load_baseline(path):
     return known
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cells", required=True, help="cells/ directory")
-    parser.add_argument(
-        "--threshold",
-        type=float,
-        default=0.85,
-        help="a leg below this fraction of the reference is a hole (default 0.85)",
-    )
-    parser.add_argument(
-        "--baseline",
-        default=str(Path(__file__).with_name("leg-gaps.txt")),
-        help="holes that are filed already; new or worse holes still fail",
-    )
-    parser.add_argument(
-        "--no-baseline", action="store_true", help="fail on every hole"
-    )
-    args = parser.parse_args()
-    baseline = {} if args.no_baseline else load_baseline(args.baseline)
-
-    grouped = cells_by_scenario(args.cells)
+def check_grouped(grouped, threshold, cpu_threshold, threads_threshold):
+    """Every leg gap in the matrix, before baseline reconciliation."""
     holes = []
     checked = 0
     measured = set()
@@ -142,7 +144,7 @@ def main():
                 "ratio": 0.0,
                 "text": f"{base}: ferrox client landed no number on the xray-core server: the client leg lost",
             })
-        elif client_leg is not None and client_leg < reference_mib_s * args.threshold:
+        elif client_leg is not None and client_leg < reference_mib_s * threshold:
             holes.append({
                 "base": base,
                 "leg": "client",
@@ -158,7 +160,7 @@ def main():
                 "ratio": 0.0,
                 "text": f"{base}: xray-core client landed no number on the ferrox server: the server leg lost",
             })
-        elif server_leg is not None and server_leg < reference_mib_s * args.threshold:
+        elif server_leg is not None and server_leg < reference_mib_s * threshold:
             holes.append({
                 "base": base,
                 "leg": "server",
@@ -170,7 +172,7 @@ def main():
         if (
             rust_client is not None
             and client_leg is not None
-            and client_leg < rust_client * args.threshold
+            and client_leg < rust_client * threshold
         ):
             holes.append({
                 "base": base,
@@ -180,6 +182,203 @@ def main():
                         f"{rust_client:.1f} MiB/s (xray-core-rust client) on the "
                         f"xray-core server, {client_leg / rust_client:.2f}x",
             })
+        if server_cell is not None and attempted(server_cell, REFERENCE):
+            holes.extend(server_cost_holes(
+                base,
+                reference,
+                server_cell,
+                cpu_threshold,
+                threads_threshold,
+            ))
+    return holes, checked, measured
+
+
+def server_cost_holes(base, reference, server_cell, cpu_threshold, threads_threshold):
+    """The server leg's CPU and thread peak, both lower-is-better.
+
+    The xray-core client on each server is the control: the same client moves
+    the same bytes, so the only difference is the server process. CPU is already
+    per GiB, from the same bytes the throughput panel divides by.
+    """
+    holes = []
+    ref_cpu = median_server_metric(reference, REFERENCE, "cpu_millis_per_gib")
+    fer_cpu = median_server_metric(server_cell, REFERENCE, "cpu_millis_per_gib")
+    if ref_cpu is None or fer_cpu is None:
+        holes.append({
+            "base": base,
+            "leg": "server-cpu",
+            "ratio": 0.0,
+            "text": f"{base}: server CPU was not sampled on both legs; "
+                    f"the server cost has no measurement, so it cannot be gated",
+        })
+    elif ref_cpu > 0:
+        ratio = fer_cpu / ref_cpu
+        if ratio > cpu_threshold:
+            holes.append({
+                "base": base,
+                "leg": "server-cpu",
+                "ratio": ratio,
+                "text": f"{base}: ferrox server {fer_cpu:.1f} ms/GiB vs "
+                        f"{ref_cpu:.1f} ms/GiB (xray-core server), {ratio:.2f}x: "
+                        f"the server spent more CPU",
+            })
+    else:
+        holes.append({
+            "base": base,
+            "leg": "server-cpu",
+            "ratio": 0.0,
+            "text": f"{base}: xray-core server CPU is below the sampler's "
+                    f"resolution ({fer_cpu:.1f} ms/GiB for ferrox): no server "
+                    f"CPU ratio, so the leg cannot be gated",
+        })
+    ref_threads = median_server_metric(reference, REFERENCE, "threads_peak")
+    fer_threads = median_server_metric(server_cell, REFERENCE, "threads_peak")
+    if ref_threads is None or fer_threads is None:
+        holes.append({
+            "base": base,
+            "leg": "server-threads",
+            "ratio": 0.0,
+            "text": f"{base}: server threads were not sampled on both legs; "
+                    f"the server cost has no measurement, so it cannot be gated",
+        })
+    elif ref_threads > 0:
+        ratio = fer_threads / ref_threads
+        if ratio > threads_threshold:
+            holes.append({
+                "base": base,
+                "leg": "server-threads",
+                "ratio": ratio,
+                "text": f"{base}: ferrox server peaked at {fer_threads:.0f} threads vs "
+                        f"{ref_threads:.0f} (xray-core server), {ratio:.2f}x: "
+                        f"the server held more threads",
+            })
+    else:
+        holes.append({
+            "base": base,
+            "leg": "server-threads",
+            "ratio": 0.0,
+            "text": f"{base}: xray-core server threads are 0 while ferrox reports "
+                    f"{fer_threads:.0f}: no ratio, so the leg cannot be gated",
+        })
+    return holes
+
+
+def selftest():
+    """Prove the server CPU and thread gate fails a losing server and passes a winning one."""
+    with tempfile.TemporaryDirectory() as tmp:
+        cells = Path(tmp)
+        for server, cpu, threads, throughput in (
+            ("xray-core", 100.0, 8.0, 1000.0),
+            ("ferrox", 150.0, 12.0, 1000.0),
+        ):
+            write_fixture(cells, server, cpu, threads, throughput)
+        proc = run_self(cells)
+        if proc.returncode == 0:
+            return "a ferrox server with 1.50x CPU and 1.50x threads passed the gate"
+        for expect in ("server spent more CPU", "server held more threads"):
+            if expect not in proc.stderr:
+                return f"the losing-server gate did not report {expect!r}: {proc.stderr}"
+
+        for server, cpu, threads, throughput in (
+            ("xray-core", 100.0, 8.0, 1000.0),
+            ("ferrox", 80.0, 6.0, 1000.0),
+        ):
+            write_fixture(cells, server, cpu, threads, throughput)
+        proc = run_self(cells)
+        if proc.returncode != 0:
+            return f"a cheaper ferrox server failed the gate: {proc.stderr}"
+
+        for server, cpu, threads, throughput in (
+            ("xray-core", 100.0, 8.0, 1000.0),
+            ("ferrox", None, None, 1000.0),
+        ):
+            write_fixture(cells, server, cpu, threads, throughput)
+        proc = run_self(cells)
+        if proc.returncode == 0 or "server CPU was not sampled" not in proc.stderr:
+            return f"an unsampled ferrox server passed the gate: {proc.stderr}"
+    print("check-matrix-legs selftest: passed")
+    return None
+
+
+def write_fixture(cells, server, cpu, threads, throughput):
+    """One scenario for both servers; `cpu`/`threads` None omits the measurement."""
+    base = "selftest-vless-raw-down-8"
+    scenario = f"{base}--srv-{server}"
+    runs = []
+    for _ in range(3):
+        run = {"throughput_mib_s": throughput}
+        if cpu is not None:
+            run["server"] = {
+                "cpu_millis_per_gib": cpu,
+                "threads_peak": threads,
+            }
+        runs.append(run)
+    doc = {
+        "scenario": scenario,
+        "engines": [
+            {"name": "xray-core", "runs": runs},
+            {"name": "ferrox", "runs": [{"throughput_mib_s": throughput} for _ in range(3)]},
+        ],
+        "failures": [],
+    }
+    path = cells / scenario / "cell.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(doc))
+
+
+def run_self(cells):
+    return subprocess.run(
+        [sys.executable, __file__, "--cells", str(cells), "--no-baseline"],
+        text=True,
+        capture_output=True,
+    )
+
+
+def main():
+    if "--selftest" in sys.argv:
+        failure = selftest()
+        if failure:
+            print(f"::error::check-matrix-legs selftest: {failure}", file=sys.stderr)
+            return 1
+        return 0
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--cells", required=True, help="cells/ directory")
+    parser.add_argument(
+        "--threshold",
+        type=float,
+        default=0.85,
+        help="a leg below this fraction of the reference is a hole (default 0.85)",
+    )
+    parser.add_argument(
+        "--server-cpu-threshold",
+        type=float,
+        default=1.0,
+        help="ferrox server CPU above this fraction of xray-core's is a hole (default 1.0)",
+    )
+    parser.add_argument(
+        "--server-threads-threshold",
+        type=float,
+        default=1.0,
+        help="ferrox server threads above this fraction of xray-core's is a hole (default 1.0)",
+    )
+    parser.add_argument(
+        "--baseline",
+        default=str(Path(__file__).with_name("leg-gaps.txt")),
+        help="holes that are filed already; new or worse holes still fail",
+    )
+    parser.add_argument(
+        "--no-baseline", action="store_true", help="fail on every hole"
+    )
+    args = parser.parse_args()
+    baseline = {} if args.no_baseline else load_baseline(args.baseline)
+
+    grouped = cells_by_scenario(args.cells)
+    holes, checked, measured = check_grouped(
+        grouped,
+        args.threshold,
+        args.server_cpu_threshold,
+        args.server_threads_threshold,
+    )
 
     new, known, fixed = [], [], []
     for hole in holes:
@@ -204,7 +403,9 @@ def main():
     print(
         f"legs checked: {checked}, holes: {len(holes)} "
         f"(new {len(new)}, known {len(known)}, fixed {len(fixed)}; "
-        f"threshold {args.threshold:.2f})",
+        f"threshold {args.threshold:.2f}, server CPU "
+        f"{args.server_cpu_threshold:.2f}, server threads "
+        f"{args.server_threads_threshold:.2f})",
         file=sys.stderr,
     )
     return 1 if new else 0

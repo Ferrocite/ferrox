@@ -42,6 +42,8 @@ pub struct Workload {
     pub outbound_config: String,
     pub outbound_configs: Vec<(String, String)>,
     pub scenario: String,
+    /// The server running beside this cell, sampled on the same clock as the client.
+    pub server_pid: Option<u32>,
 }
 
 impl Workload {
@@ -155,6 +157,27 @@ fn run_cell_json(run: &Run) -> Json {
         "transfer_seconds",
         Json::Num(run.outcome.transfer.as_secs_f64()),
     );
+    let server = run.outcome.server.map_or(Json::Null, |server| {
+        let mut item = Json::object();
+        item.insert(
+            "cpu_millis_per_gib",
+            run.server_cpu_millis_per_gib()
+                .map_or(Json::Null, Json::Num),
+        );
+        item.insert(
+            "threads_peak",
+            match server.threads_peak {
+                Some(t) => Json::Num(t as f64),
+                None => Json::Null,
+            },
+        );
+        item.insert(
+            "rss_mib",
+            run.server_peak_rss_mib().map_or(Json::Null, Json::Num),
+        );
+        item
+    });
+    cell.insert("server", server);
     cell
 }
 
@@ -1067,7 +1090,13 @@ pub fn run(
                 failures.push(window_ended(&by_engine, &names, repeats));
                 break 'measures;
             }
-            match parity::measure(&request, engine.config_arg, engine.dialect, &cell) {
+            match parity::measure(
+                &request,
+                engine.config_arg,
+                engine.dialect,
+                &cell,
+                workload.server_pid,
+            ) {
                 Ok(run) => {
                     let result_path = output.join("result.json");
                     let result_text = run
@@ -1250,8 +1279,50 @@ pub fn revalidate(result_path: &Path) -> Result<Run, Error> {
             startup_cpu_millis: num("client_startup_cpu_millis")? as u64,
             startup_seconds: num("client_startup_seconds")?,
             samples,
+            server: read_server(&root, bytes_sent + bytes_received)?,
         },
     })
+}
+
+fn read_server(root: &Json, moved: f64) -> Result<Option<parity::Server>, Error> {
+    let Some(server) = root.get("server").filter(|value| **value != Json::Null) else {
+        return Ok(None);
+    };
+    let num = |key: &str| {
+        server
+            .get(key)
+            .and_then(Json::as_num)
+            .ok_or_else(|| Error::Invalid(format!("server result has no number `{key}`")))
+    };
+    let optional = |key: &str| server.get(key).and_then(Json::as_num).map(|n| n as u64);
+    let cpu_millis = num("cpu_millis")? as u64;
+    if let Some(per_gib) = server.get("cpu_millis_per_gib").and_then(Json::as_num) {
+        let rederived = if moved > 0.0 {
+            cpu_millis as f64 / (moved / 1_073_741_824.0)
+        } else {
+            0.0
+        };
+        if (rederived - per_gib).abs() > 1e-6 * per_gib.abs().max(1.0) {
+            return Err(Error::Invalid(format!(
+                "server cpu_millis_per_gib {per_gib} does not match its own fields: \
+                 {cpu_millis} ms over {moved} bytes re-derives to {rederived}"
+            )));
+        }
+    } else if moved > 0.0 {
+        return Err(Error::Invalid(
+            "server result has no number `cpu_millis_per_gib`".to_owned(),
+        ));
+    }
+    Ok(Some(parity::Server {
+        cpu_millis,
+        user_millis: optional("cpu_user_millis"),
+        sys_millis: optional("cpu_sys_millis"),
+        peak_rss_kib: num("peak_rss_kib")? as u64,
+        threads_peak: server
+            .get("threads_peak")
+            .and_then(Json::as_num)
+            .map(|n| n as u64),
+    }))
 }
 
 fn check_derived(root: &Json, moved: f64, seconds: f64, cpu_millis: f64) -> Result<(), Error> {
@@ -1640,6 +1711,7 @@ mod tests {
             outbound_config: String::new(),
             outbound_configs: Vec::new(),
             scenario: String::new(),
+            server_pid: None,
         }
     }
 
@@ -1681,8 +1753,40 @@ mod tests {
                 startup_cpu_millis: 0,
                 startup_seconds: 0.0,
                 samples: Vec::new(),
+                server: None,
             },
         }
+    }
+
+    #[test]
+    fn a_server_result_is_priced_over_the_bytes_the_run_moved() {
+        let doc = json::parse(
+            r#"{"server":{"cpu_millis":200.0,"cpu_user_millis":150.0,
+                "cpu_sys_millis":50.0,"cpu_millis_per_gib":200.0,
+                "peak_rss_kib":4096.0,"threads_peak":7.0}}"#,
+        )
+        .expect("valid json");
+        let server = read_server(&doc, 1_073_741_824.0)
+            .expect("re-derives")
+            .expect("sampled");
+        assert_eq!(server.cpu_millis, 200);
+        assert_eq!(server.user_millis, Some(150));
+        assert_eq!(server.sys_millis, Some(50));
+        assert_eq!(server.peak_rss_kib, 4096);
+        assert_eq!(server.threads_peak, Some(7));
+
+        let forged = json::parse(
+            r#"{"server":{"cpu_millis":200.0,"cpu_user_millis":150.0,
+                "cpu_sys_millis":50.0,"cpu_millis_per_gib":100.0,
+                "peak_rss_kib":4096.0,"threads_peak":7.0}}"#,
+        )
+        .expect("valid json");
+        assert!(read_server(&forged, 1_073_741_824.0).is_err());
+    }
+
+    #[test]
+    fn a_run_without_a_server_has_no_server_measurement() {
+        assert!(read_server(&Json::object(), 1.0).expect("absent").is_none());
     }
 
     /// Three repeats of one engine, so a cell's fixture stays shorter than what it asserts.
