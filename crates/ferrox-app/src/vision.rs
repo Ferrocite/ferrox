@@ -450,17 +450,16 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         self.staged += n;
     }
 
-    /// The command bytes validated by one walk. The count is the validator's row,
-    /// and the production arm folds away: the validator's own cost is in the match
-    /// it makes.
+    /// One command byte validated. The count is the validator's row, and the production
+    /// arm folds away: the validator's own cost is in the match it makes.
     #[cfg(test)]
-    fn validate(&mut self, frames: usize) {
-        self.validated += frames;
+    fn validate(&mut self) {
+        self.validated += 1;
     }
 
     #[cfg(not(test))]
     #[allow(clippy::unused_self)]
-    fn validate(&mut self, _frames: usize) {}
+    fn validate(&mut self) {}
 
     #[cfg(not(test))]
     #[allow(clippy::unused_self)]
@@ -502,78 +501,80 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             dot += 16;
         }
         let mut held = 0;
-        let mut validated = 0usize;
-        let result = loop {
+        let result = 'frames: loop {
             // the header is read whole when the window offers five bytes; the tail is byte-by-byte
-            if walk.want_header == 5 && end - dot >= 5 {
-                let frame = &self.have[dot..dot + 5];
-                let body = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
-                let command = frame[0];
-                let mut content = (body >> 16) as usize;
-                let padding = (body & 0xffff) as usize;
-                validated += 1;
-                dot += 5;
-                if content > 0 {
-                    let room = match buf.as_deref() {
-                        Some(slot) => slot.len() - held,
-                        None => usize::MAX,
-                    };
-                    let take = content.min(end - dot).min(room);
-                    if take > 0 {
-                        let fresh = &self.have[dot..dot + take];
-                        if self.tls.budget > 0 {
-                            if let Some(feed) = feed.as_deref_mut() {
-                                feed.run += take;
-                                feed_extent(fresh, feed);
-                            }
-                        }
-                        if let Some(slot) = buf.as_deref_mut() {
-                            slot[held..held + take].copy_from_slice(fresh);
-                        }
-                        dot += take;
-                        held += take;
-                        content -= take;
-                    }
+            if walk.want_header == 5 {
+                while end - dot >= 5 {
+                    let frame = &self.have[dot..dot + 5];
+                    let body = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
+                    let command = frame[0];
+                    let mut content = (body >> 16) as usize;
+                    let padding = (body & 0xffff) as usize;
+                    self.validate();
+                    dot += 5;
                     if content > 0 {
-                        walk.command = command;
-                        walk.want_content = content;
-                        walk.want_padding = padding;
-                        walk.want_header = 0;
-                        break held;
+                        let room = match buf.as_deref() {
+                            Some(slot) => slot.len() - held,
+                            None => usize::MAX,
+                        };
+                        let take = content.min(end - dot).min(room);
+                        if take > 0 {
+                            let fresh = &self.have[dot..dot + take];
+                            if self.tls.budget > 0 {
+                                if let Some(feed) = feed.as_deref_mut() {
+                                    feed.run += take;
+                                    feed_extent(fresh, feed);
+                                }
+                            }
+                            if let Some(slot) = buf.as_deref_mut() {
+                                slot[held..held + take].copy_from_slice(fresh);
+                            }
+                            dot += take;
+                            held += take;
+                            content -= take;
+                        }
+                        if content > 0 {
+                            walk.command = command;
+                            walk.want_content = content;
+                            walk.want_padding = padding;
+                            walk.want_header = 0;
+                            break 'frames held;
+                        }
                     }
-                }
-                if padding > 0 {
-                    let take = padding.min(end - dot);
-                    dot += take;
-                    if take < padding {
-                        walk.command = command;
-                        walk.want_content = 0;
-                        walk.want_padding = padding - take;
-                        walk.want_header = 0;
-                        break held;
+                    if padding > 0 {
+                        let take = padding.min(end - dot);
+                        dot += take;
+                        if take < padding {
+                            walk.command = command;
+                            walk.want_content = 0;
+                            walk.want_padding = padding - take;
+                            walk.want_header = 0;
+                            break 'frames held;
+                        }
                     }
-                }
-                if command == VisionCommand::Continue.byte() {
-                    continue;
-                }
-                self.read.padding = false;
-                if command == VisionCommand::Direct.byte() {
-                    if let Some(direct) = self.direct {
-                        direct(&mut self.session);
+                    if command == VisionCommand::Continue.byte() {
+                        continue;
                     }
+                    self.read.padding = false;
+                    if command == VisionCommand::Direct.byte() {
+                        if let Some(direct) = self.direct {
+                            direct(&mut self.session);
+                        }
+                    }
+                    self.read.raw = command == VisionCommand::Direct.byte() && self.raw.is_some();
+                    break 'frames held;
                 }
-                self.read.raw = command == VisionCommand::Direct.byte() && self.raw.is_some();
-                break held;
-            } else if walk.want_header > 0 {
+            }
+            if walk.want_header > 0 {
                 if dot == end {
                     // parked inside an incomplete header: nothing moves without bytes
-                    break held;
+                    break 'frames held;
                 }
                 let byte = self.have[dot];
                 match walk.want_header {
                     5 => {
                         walk.command = byte;
-                        validated += 1;
+                        self.validate();
                     }
                     4 => walk.want_content = usize::from(byte) << 8,
                     3 => walk.want_content |= usize::from(byte),
@@ -582,7 +583,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 }
                 dot += 1;
                 walk.want_header -= 1;
-                continue;
+                continue 'frames;
             }
             if walk.want_content > 0 {
                 let room = match buf.as_deref() {
@@ -604,7 +605,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 walk.want_content -= take;
                 held += take;
                 if walk.want_content > 0 || held == buf.as_deref().map_or(0, <[u8]>::len) {
-                    break held;
+                    break 'frames held;
                 }
             }
             if walk.want_padding > 0 {
@@ -612,12 +613,12 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 dot += take;
                 walk.want_padding -= take;
                 if walk.want_padding > 0 {
-                    break held;
+                    break 'frames held;
                 }
             }
             if walk.command == VisionCommand::Continue.byte() {
                 walk.want_header = 5;
-                continue;
+                continue 'frames;
             }
             // a command that is not a continue ends the framing; its tail is content
             self.read.padding = false;
@@ -627,9 +628,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 }
             }
             self.read.raw = walk.command == VisionCommand::Direct.byte() && self.raw.is_some();
-            break held;
+            break 'frames held;
         };
-        self.validate(validated);
         self.dot = dot;
         self.walk = walk;
         result
