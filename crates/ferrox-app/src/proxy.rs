@@ -2787,8 +2787,23 @@ fn serve_vless_httpheader(
     let mut reader = reader;
     if let Some(decryption) = decryption {
         let close = connection_closer(&write);
-        reader.set_poll(Some(RELAY_POLL));
-        return serve_sealed_carried(reader, write, users, freedom, decryption, close);
+        let mut sealed = match decryption.handshake(CarrierStream {
+            reader,
+            writer: write,
+        }) {
+            Ok(sealed) => sealed,
+            Err(error) => {
+                eprintln!("vless: encryption handshake failed: {error}");
+                close();
+                return;
+            }
+        };
+        sealed.get_mut().reader.set_poll(Some(RELAY_POLL));
+        let Some((reader, writer)) = sealed.into_split() else {
+            close();
+            return;
+        };
+        return serve_sealed_split(reader, writer, users, freedom, close);
     }
     reader.set_poll(Some(RELAY_POLL));
     let decoded = decode_request_bounded(&mut reader);
