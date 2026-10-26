@@ -248,6 +248,8 @@ pub(crate) struct WsReader<R: Read = Connection> {
     early: Vec<u8>,
     eat: usize,
     eof: bool,
+    /// A fragmented message is mid-assembly: the buffer must not compact under its offsets.
+    assembling: bool,
     /// Wall-clock end of the opening handshake: past it an idle socket is death, not a round to retry.
     handshake: Option<std::time::Instant>,
     #[cfg_attr(not(test), allow(dead_code, reason = "read by the syscall gate"))]
@@ -285,7 +287,7 @@ impl<R: Read> WsReader<R> {
 
     /// One syscall; the buffer grows only past the window and frames unmask in place. `False` means done.
     fn pull(&mut self, len: usize) -> bool {
-        if self.at > 0 {
+        if self.at > 0 && !self.assembling {
             self.have.copy_within(self.at.., 0);
             self.have.truncate(self.have.len() - self.at);
             self.msg_end = self.msg_end.saturating_sub(self.at);
@@ -331,6 +333,7 @@ impl<R: Read> WsReader<R> {
 
     /// Parse frames until a message ends: control frames answered on the spot, data unmasked where they lie.
     fn message(&mut self) -> bool {
+        self.assembling = false;
         let mut open = false;
         // Assembly coordinates: every fragment's bytes land at `filled`, so the span delivered is the message's.
         let mut whole = 0usize;
@@ -412,10 +415,17 @@ impl<R: Read> WsReader<R> {
                         self.have.copy_within(start..start + len, filled);
                     }
                     if fin {
+                        let gap = start.saturating_sub(filled);
+                        if gap > 0 {
+                            let tail = start + len;
+                            self.have.copy_within(tail.., filled + len);
+                            self.have.truncate(self.have.len() - gap);
+                        }
                         self.msg_end = filled + len;
                         self.at = whole;
                         return true;
                     }
+                    self.assembling = true;
                     filled += len;
                     open = true;
                 }
@@ -794,6 +804,7 @@ pub(crate) fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
         early,
         eat: 0,
         eof: false,
+        assembling: false,
         handshake: None,
         reads: 0,
     };
@@ -1021,6 +1032,7 @@ mod tests {
                     early: Vec::new(),
                     eat: 0,
                     eof: false,
+                    assembling: false,
                     handshake: None,
                     reads: 0,
                 };
@@ -1054,6 +1066,7 @@ mod tests {
             early: Vec::new(),
             eat: 0,
             eof: false,
+            assembling: false,
             handshake: None,
             reads: 0,
         };
@@ -1104,6 +1117,72 @@ mod tests {
         assert_eq!(whole, payload, "text-then-continuation");
     }
 
+    struct Dribble {
+        bytes: Vec<u8>,
+        at: usize,
+        chunk: usize,
+    }
+
+    impl Read for Dribble {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.at >= self.bytes.len() {
+                return Ok(0);
+            }
+            let n = self.chunk.min(buf.len()).min(self.bytes.len() - self.at);
+            buf[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    /// A fragmented message whose fragments arrive in separate reads: the assembly offsets must survive the buffer's compaction, or the first fragment is dropped and the second is delivered as the whole.
+    #[test]
+    fn a_fragmented_message_survives_a_compacting_read() {
+        let frame = |fin: bool, opcode: u8, payload: &[u8]| {
+            let mut wire = vec![u8::from(fin) * 0x80 + opcode, payload.len() as u8];
+            wire.extend_from_slice(payload);
+            wire
+        };
+        let (first, second) = ([0x11u8; 60], [0x22u8; 60]);
+        let mut wire = frame(false, OP_TEXT, &first);
+        wire.extend(frame(true, OP_CONT, &second));
+        wire.extend(frame(true, OP_DATA, b"tail"));
+        let mut reader = WsReader {
+            read: Dribble {
+                bytes: wire,
+                at: 0,
+                chunk: 62,
+            },
+            shared: Arc::new(Shared {
+                stream: Mutex::new(Box::new(Sink::default())),
+                closed: AtomicBool::new(false),
+                masked: false,
+            }),
+            have: Vec::new(),
+            at: 0,
+            msg_end: 0,
+            early: Vec::new(),
+            eat: 0,
+            eof: false,
+            assembling: false,
+            handshake: None,
+            reads: 0,
+        };
+        let mut whole = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = reader.read(&mut buf).expect("reads");
+            if n == 0 {
+                break;
+            }
+            whole.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(
+            whole,
+            [first.as_slice(), second.as_slice(), b"tail".as_slice()].concat()
+        );
+    }
+
     /// The loopback witness: a peer that answers in text and then in binary has both reach the reader, bytes for bytes.
     #[test]
     fn a_text_message_then_a_binary_one_reaches_the_reader() {
@@ -1130,6 +1209,7 @@ mod tests {
             early: Vec::new(),
             eat: 0,
             eof: false,
+            assembling: false,
             handshake: None,
             reads: 0,
         };
@@ -1181,6 +1261,7 @@ mod tests {
             early: Vec::new(),
             eat: 0,
             eof: false,
+            assembling: false,
             handshake: None,
             reads: 0,
         };
