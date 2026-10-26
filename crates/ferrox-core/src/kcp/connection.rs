@@ -37,6 +37,9 @@ impl State {
 
 type Writer = Box<dyn FnMut(&[u8]) -> io::Result<()> + Send>;
 
+#[cfg(test)]
+type LockGate = dyn Fn(&'static str) + Send + Sync;
+
 struct OutputSink {
     buf: Vec<u8>,
     write: Writer,
@@ -251,6 +254,8 @@ pub struct Connection {
     last_uncond: Mutex<Instant>,
     #[cfg(test)]
     flush_calls: AtomicU32,
+    #[cfg(test)]
+    lock_gate: Mutex<Option<Arc<LockGate>>>,
 }
 
 impl std::fmt::Debug for Connection {
@@ -332,6 +337,8 @@ impl Connection {
             last_uncond: Mutex::new(now),
             #[cfg(test)]
             flush_calls: AtomicU32::new(0),
+            #[cfg(test)]
+            lock_gate: Mutex::new(None),
         })
     }
 
@@ -348,8 +355,10 @@ impl Connection {
         }
         let state = self.state();
         let draining = state == State::Terminating || state == State::PeerTerminating;
-        let necessary = self.sending.lock().unwrap().update_necessary()
-            || self.receiving.lock().unwrap().update_necessary();
+        let necessary = self.sending.lock().unwrap().update_necessary();
+        #[cfg(test)]
+        self.pass_lock_gate("poll");
+        let necessary = necessary || self.receiving.lock().unwrap().update_necessary();
         let last_flush = *self.last_flush.lock().unwrap();
         let last_uncond = *self.last_uncond.lock().unwrap();
         let due = draining
@@ -543,6 +552,10 @@ impl Connection {
     }
 
     pub fn ping(&self, current: u32, cmd: Command) {
+        let receiving_next = self.receiving.lock().unwrap().next_number();
+        #[cfg(test)]
+        self.pass_lock_gate("ping");
+        let sending_next = self.sending.lock().unwrap().first_unacknowledged();
         let seg = CmdOnlySegment {
             conv: self.ctx.meta.conversation,
             cmd: cmd.to_byte(),
@@ -551,8 +564,8 @@ impl Connection {
             } else {
                 SegmentOption::NONE
             },
-            receiving_next: self.receiving.lock().unwrap().next_number(),
-            sending_next: self.sending.lock().unwrap().first_unacknowledged(),
+            receiving_next,
+            sending_next,
             peer_rto: self.ctx.round_trip.lock().unwrap().timeout(),
         };
         let _ = self.ctx.emit_cmd(&seg);
@@ -682,6 +695,19 @@ impl Connection {
         self.flush_calls.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_lock_gate(&self, gate: Option<Arc<LockGate>>) {
+        *self.lock_gate.lock().unwrap() = gate;
+    }
+
+    #[cfg(test)]
+    fn pass_lock_gate(&self, site: &'static str) {
+        let gate = self.lock_gate.lock().unwrap().clone();
+        if let Some(gate) = gate {
+            gate(site);
+        }
+    }
+
     #[must_use]
     pub fn conversation(&self) -> u16 {
         self.ctx.meta.conversation
@@ -789,6 +815,53 @@ mod tests {
             "idle poll returned {:?}, not a tick",
             next.saturating_duration_since(now)
         );
+    }
+
+    #[test]
+    fn poll_and_ping_do_not_hold_worker_locks_across_each_other() {
+        let local = ([127, 0, 0, 1], 1).into();
+        let conn = Connection::new_unstarted(
+            ConnMetadata {
+                local,
+                remote: local,
+                conversation: 4,
+            },
+            Box::new(|_| Ok(())),
+            Box::new(|| {}),
+            Config::default(),
+        );
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let weak = Arc::downgrade(&conn);
+        let gate_barrier = Arc::clone(&barrier);
+        conn.set_lock_gate(Some(Arc::new(move |site: &'static str| {
+            gate_barrier.wait();
+            let conn = weak.upgrade().expect("the connection is alive");
+            match site {
+                "poll" => assert!(
+                    conn.receiving.try_lock().is_ok(),
+                    "poll held the receiving lock while ping held it"
+                ),
+                "ping" => assert!(
+                    conn.sending.try_lock().is_ok(),
+                    "ping held the sending lock while poll held it"
+                ),
+                _ => unreachable!("unknown lock site"),
+            }
+        })));
+        let poller = {
+            let conn = Arc::clone(&conn);
+            std::thread::spawn(move || conn.poll(conn.since))
+        };
+        let pinger = {
+            let conn = Arc::clone(&conn);
+            std::thread::spawn(move || conn.ping(1, Command::Ping))
+        };
+        poller
+            .join()
+            .expect("poll must not wait on a lock ping holds");
+        pinger
+            .join()
+            .expect("ping must not wait on a lock poll holds");
     }
 
     fn data(number: u32, sending_next: u32, payload: &[u8]) -> Segment {

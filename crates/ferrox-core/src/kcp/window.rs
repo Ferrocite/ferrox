@@ -99,6 +99,9 @@ impl SendingWindow {
             if seg.header.number >= una {
                 break;
             }
+            if seg.transmit > 0 {
+                self.total_in_flight = self.total_in_flight.saturating_sub(1);
+            }
             self.cache.pop_front();
         }
         self.trim();
@@ -123,8 +126,8 @@ impl SendingWindow {
         if self.cache[index].header.number != number {
             return false;
         }
-        if self.total_in_flight > 0 {
-            self.total_in_flight -= 1;
+        if self.cache[index].transmit > 0 {
+            self.total_in_flight = self.total_in_flight.saturating_sub(1);
         }
         self.cache.remove(index);
         self.trim();
@@ -516,6 +519,35 @@ mod tests {
         w.release();
         assert!(w.is_empty());
         assert_eq!(w.len(), 0);
+    }
+
+    #[test]
+    fn clear_forgets_the_in_flight_count_of_acknowledged_segments() {
+        let mut w = SendingWindow::new();
+        w.push(1, b"one");
+        w.push(2, b"two");
+        w.flush(0, 100, 1, 0, 0, SegmentOption::NONE, &mut |_| {});
+        assert_eq!(w.total_in_flight, 1);
+        w.clear(2);
+        assert_eq!(w.len(), 1);
+        assert_eq!(
+            w.total_in_flight, 0,
+            "an acknowledged segment stayed in flight"
+        );
+    }
+
+    #[test]
+    fn removing_an_untransmitted_segment_keeps_the_in_flight_count() {
+        let mut w = SendingWindow::new();
+        w.push(1, b"one");
+        w.push(2, b"two");
+        w.flush(0, 100, 1, 0, 0, SegmentOption::NONE, &mut |_| {});
+        assert_eq!(w.total_in_flight, 1);
+        assert!(w.remove(2));
+        assert_eq!(
+            w.total_in_flight, 1,
+            "an unsent segment left the in-flight count"
+        );
     }
 
     #[test]
