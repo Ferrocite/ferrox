@@ -282,7 +282,10 @@ impl Comparison {
         }
         if self
             .gated
-            .filter(|candidate| self.runs(candidate).is_empty())
+            .filter(|candidate| {
+                self.runs(candidate).is_empty()
+                    && !self.failures.iter().any(|(engine, _)| engine == candidate)
+            })
             .is_some_and(|candidate| self.runner_disturbed_beyond_the_candidate(candidate))
         {
             return stats::Gate::unmeasured_by_runner(format!(
@@ -2066,10 +2069,7 @@ mod tests {
             ],
             ceilings_mib_s: vec![900.0, 950.0, 1000.0],
             gated: Some("ferrox"),
-            failures: vec![
-                ("xray-core".to_owned(), "workload: desync".to_owned()),
-                ("ferrox".to_owned(), "workload: transient".to_owned()),
-            ],
+            failures: vec![("xray-core".to_owned(), "workload: desync".to_owned())],
             skipped: Vec::new(),
             machine: "test".into(),
         };
@@ -2127,6 +2127,57 @@ mod tests {
                 .any(|line| line.contains("unmeasured by the runner")
                     && line.contains("engine under test")),
             "the window-end case names the engine under test starved by the machine: {:?}",
+            gate.lines
+        );
+    }
+
+    /// A candidate that recorded its own failures and then ran out of the cell window was measured as failing: the window ended because those retries consumed it, so it is not independent machine-wide evidence. The escape must not turn that into a pass.
+    #[test]
+    fn a_candidate_with_its_own_failures_is_not_unmeasured_when_the_cell_window_ended() {
+        let comparison = Comparison {
+            workload: workload(),
+            repeats: 3,
+            by_engine: vec![
+                synth_engine(
+                    "xray-core",
+                    [(100, 6000, 20480), (110, 6200, 20500), (120, 6400, 20600)],
+                ),
+                EngineRuns {
+                    engine: "ferrox",
+                    dialect: parity::Dialect::Xray,
+                    runs: Vec::new(),
+                },
+            ],
+            ceilings_mib_s: vec![900.0, 950.0, 1000.0],
+            gated: Some("ferrox"),
+            failures: vec![
+                (
+                    "ferrox".to_owned(),
+                    "workload: transient: upload write failed after 524288 bytes: Broken pipe"
+                        .to_owned(),
+                ),
+                (
+                    "ferrox".to_owned(),
+                    "workload: transient: upload write failed after 524288 bytes: Broken pipe"
+                        .to_owned(),
+                ),
+                (
+                    "ferrox".to_owned(),
+                    "workload: transient: upload write failed after 524288 bytes: Broken pipe"
+                        .to_owned(),
+                ),
+                (
+                    "cell".to_owned(),
+                    "the cell's window ended before every measure ran".to_owned(),
+                ),
+            ],
+            skipped: Vec::new(),
+            machine: "test".into(),
+        };
+        let gate = comparison.gate();
+        assert!(
+            !gate.passed,
+            "a candidate that failed its own repeats is not unmeasured: {:?}",
             gate.lines
         );
     }
