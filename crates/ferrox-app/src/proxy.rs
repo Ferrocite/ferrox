@@ -784,6 +784,16 @@ fn serve_vless_inbound(
 thread_local! {
     /// The lane the flow on this thread resolved to; a dial under it carries that lane's counters.
     static OUTBOUND_TAG: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+    /// The last dial this thread attempted: `Some(false)` refused, `Some(true)` connected, `None` never needed one.
+    static DIAL_REPORT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Run one front's dial and report the last attempt it made, so a caller can tell a
+/// refused proxy leg from a clean close without threading a result through every lane.
+pub(crate) fn observe_dial<T>(f: impl FnOnce() -> T) -> (T, Option<bool>) {
+    DIAL_REPORT.with(|slot| slot.set(None));
+    let value = f();
+    (value, DIAL_REPORT.with(std::cell::Cell::get))
 }
 
 /// The tag of the one outbound a config without routing uses, which is what its counters key on.
@@ -843,8 +853,12 @@ fn dial(target: &SocketAddr) -> Result<Connection, Failure> {
 
 pub(crate) fn dial_or_report(target: &SocketAddr) -> Option<Connection> {
     match dial(target) {
-        Ok(stream) => Some(stream),
+        Ok(stream) => {
+            DIAL_REPORT.with(|slot| slot.set(Some(true)));
+            Some(stream)
+        }
         Err(failure) => {
+            DIAL_REPORT.with(|slot| slot.set(Some(false)));
             note_dial_failure(target, failure);
             None
         }
@@ -9015,9 +9029,8 @@ fn serve_tun_inbound(inbound: &Json, out: &Outbound, _address: &str) -> bool {
         return false;
     };
     let outbound = out.clone();
-    let relay: crate::tun::Relay = std::sync::Arc::new(move |conn, dest| {
-        serve_device_flow(conn, &outbound, &dest);
-    });
+    let relay: crate::tun::Relay =
+        std::sync::Arc::new(move |conn, dest| serve_device_flow(conn, &outbound, &dest));
     let datagram = out.clone();
     // The device's association is the protocol's own: the front reads the greeting and the `UDP ASSOCIATE` request and answers with the relay's address.
     let associate: crate::tun::Associate =
@@ -13667,10 +13680,23 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
 /// The device does not know what an outbound is, so it asks for the dial every other
 /// front reaches — the same `serve_connect` the socks and http fronts call, with the
 /// same rules and the same grant.
-pub(crate) fn serve_device_flow(client: Connection, out: &Outbound, dest: &Destination) {
+pub(crate) fn serve_device_flow(
+    client: Connection,
+    out: &Outbound,
+    dest: &Destination,
+) -> std::io::Result<()> {
     let (dial, lane, tag) = sniff_lane(out, dest, &client);
     let dest = dial.as_ref().unwrap_or(dest);
-    serve_connect(client, &lane, dest, Front::Socks, &[], tag.as_deref());
+    let (_, dial_report) = observe_dial(|| {
+        serve_connect(client, &lane, dest, Front::Socks, &[], tag.as_deref());
+    });
+    match dial_report {
+        Some(false) => Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            "the proxy leg refused the device flow",
+        )),
+        _ => Ok(()),
+    }
 }
 
 /// One mux `New` target for a flow the portal carries.

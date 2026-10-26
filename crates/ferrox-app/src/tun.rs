@@ -401,11 +401,17 @@ struct Flow {
     /// Payload reached the proxy since the response thread's last idle expiry: a flow is alive when either direction spoke inside the budget.
     busy: Arc<AtomicBool>,
     last_acked: u32,
+    local: ([u8; 4], u16),
+    remote: ([u8; 4], u16),
+    /// One close packet — `FIN` or `RST` — leaves per flow, whichever thread sees the end first.
+    signaled: Arc<AtomicBool>,
 }
 
 /// The relay function the TUN handler calls per TCP flow: takes the proxied Connection and
-/// the destination extracted from the packet headers.
-pub(crate) type Relay = Arc<dyn Fn(Connection, crate::proxy::Destination) + Send + Sync>;
+/// the destination extracted from the packet headers. An error means the proxy leg was
+/// refused, so the device's established flow is reset rather than left silent.
+pub(crate) type Relay =
+    Arc<dyn Fn(Connection, crate::proxy::Destination) -> io::Result<()> + Send + Sync>;
 
 /// The datagram entry the TUN handler rides per UDP flow: handed the client half of an association, it runs the same SOCKS5 UDP server the SOCKS inbound reaches, `serve_socks_udp`.
 pub(crate) type Associate = Arc<dyn Fn(Connection) + Send + Sync>;
@@ -559,7 +565,7 @@ impl Handler {
             return self.accept_flow(ip, &tcp, key);
         }
         if tcp.flags & FLAG_RST != 0 {
-            self.close_flow(key);
+            self.close_flow(key, None);
             return Ok(());
         }
         let mut dead = false;
@@ -599,9 +605,9 @@ impl Handler {
                 flow.last_acked = rcv;
             }
         }
-        // The proxy half is gone: an upload into a closed lane has no flow to finish, and keeping the entry would keep its socket and its cursors.
+        // The proxy half is gone: an upload into a closed lane has no flow to finish, and keeping the entry would keep its socket and its cursors. The device still believes it is established, so it gets a reset.
         if dead {
-            self.close_flow(key);
+            self.close_flow(key, Some(FLAG_RST | FLAG_ACK));
         }
         Ok(())
     }
@@ -637,11 +643,13 @@ impl Handler {
         let tun_half = TcpStream::connect(pair_addr)?;
         let (proxy_half, _) = listener.accept()?;
         drop(listener);
+        let proxy_hold = proxy_half.try_clone()?;
 
         let write_half = tun_half.try_clone()?;
         let rcv_nxt = Arc::new(AtomicU32::new(syn_seq.wrapping_add(1)));
         let snd_nxt = Arc::new(AtomicU32::new(syn_seq.wrapping_add(2)));
         let busy = Arc::new(AtomicBool::new(false));
+        let signaled = Arc::new(AtomicBool::new(false));
         self.flows.insert(
             key,
             Flow {
@@ -650,6 +658,9 @@ impl Handler {
                 snd_nxt: Arc::clone(&snd_nxt),
                 busy: Arc::clone(&busy),
                 last_acked: syn_seq.wrapping_add(1),
+                local: (local_ip, local_port),
+                remote: (remote_ip, remote_port),
+                signaled: Arc::clone(&signaled),
             },
         );
 
@@ -658,18 +669,35 @@ impl Handler {
         read_half.set_read_timeout(Some(budgets::udp_idle()))?;
         let mut dev_writer = self.device.clone_writer()?;
         let ended_tx = self.ended_tx.clone();
+        let (outcome_tx, outcome_rx) = mpsc::channel();
 
         std::thread::spawn(move || {
             let conn = Connection::from(proxy_half);
-            relay(conn, destination);
+            let _ = outcome_tx.send(relay(conn, destination).is_ok());
+            // The duplicate holds the pair's far end open until the verdict is queued, so an EOF before it is a clean remote close, not a refusal.
+            drop(proxy_hold);
         });
 
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 4096];
             let mut pkt = Vec::with_capacity(4096 + 40);
+            let mut end = None;
             loop {
                 match read_half.read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        // A clean close ends with FIN, a refused leg with RST; a relay that never reports is dead.
+                        let clean = match outcome_rx.try_recv() {
+                            Ok(clean) => clean,
+                            Err(mpsc::TryRecvError::Empty) => true,
+                            Err(mpsc::TryRecvError::Disconnected) => false,
+                        };
+                        end = Some(if clean {
+                            FLAG_FIN | FLAG_ACK
+                        } else {
+                            FLAG_RST | FLAG_ACK
+                        });
+                        break;
+                    }
                     Ok(n) => {
                         let seq = snd_nxt.fetch_add(n as u32, Relaxed);
                         render_tcp_packet(
@@ -683,6 +711,7 @@ impl Handler {
                             &mut pkt,
                         );
                         if dev_writer.write_all(&pkt).is_err() {
+                            end = Some(FLAG_RST | FLAG_ACK);
                             break;
                         }
                     }
@@ -695,10 +724,29 @@ impl Handler {
                         ) =>
                     {
                         if !busy.swap(false, Relaxed) {
+                            end = Some(FLAG_RST | FLAG_ACK);
                             break;
                         }
                     }
-                    Err(_) => break,
+                    Err(_) => {
+                        end = Some(FLAG_RST | FLAG_ACK);
+                        break;
+                    }
+                }
+            }
+            if let Some(flags) = end {
+                if !signaled.swap(true, Relaxed) {
+                    render_tcp_packet(
+                        (local_ip, local_port),
+                        (remote_ip, remote_port),
+                        snd_nxt.load(Relaxed),
+                        rcv_nxt.load(Relaxed),
+                        flags,
+                        65535,
+                        &[],
+                        &mut pkt,
+                    );
+                    let _ = dev_writer.write_all(&pkt);
                 }
             }
             // Both halves, because the handler's write half is a clone of this descriptor and only a shutdown tells it the flow is over.
@@ -723,8 +771,27 @@ impl Handler {
         wrote
     }
 
-    fn close_flow(&mut self, key: FlowKey) {
+    fn close_flow(&mut self, key: FlowKey, signal: Option<u8>) {
         if let Some(flow) = self.flows.remove(&key) {
+            match signal {
+                Some(flags) if !flow.signaled.swap(true, Relaxed) => {
+                    let mut emit = std::mem::take(&mut self.emit);
+                    render_tcp_packet(
+                        flow.local,
+                        flow.remote,
+                        flow.snd_nxt.load(Relaxed),
+                        flow.rcv_nxt.load(Relaxed),
+                        flags,
+                        65535,
+                        &[],
+                        &mut emit,
+                    );
+                    let _ = self.device.write_packet(&emit);
+                    self.emit = emit;
+                }
+                // The device reset the flow itself: nothing has to travel back.
+                _ => flow.signaled.store(true, Relaxed),
+            }
             let _ = flow.write_half.shutdown(Shutdown::Both);
         }
     }
@@ -1034,7 +1101,7 @@ mod tests {
         let device = Device::from_handle(a, DEFAULT_MTU);
         let mut peer = b;
 
-        let relay: Relay = Arc::new(|_conn, _dest| {});
+        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
         let mut handler = Handler::new(device, relay, no_associate());
 
         let syn = build_tcp_packet(
@@ -1113,7 +1180,7 @@ mod tests {
         let (a, b) = unix_socketpair().unwrap();
         let device = Device::from_handle(a, DEFAULT_MTU);
         let mut peer = b;
-        let relay: Relay = Arc::new(|_conn, _dest| {});
+        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
         let mut handler = Handler::new(device, relay, no_associate());
 
         let request = icmp_echo([10, 0, 0, 2], [10, 0, 0, 1], 0x1234, 0x0007, b"ping data");
@@ -1291,6 +1358,7 @@ mod tests {
                     crate::proxy::Destination::Name(host, port) => format!("{host}:{port}"),
                 };
                 results.lock().unwrap().push((target, payload));
+                Ok(())
             },
         )
     }
@@ -1490,7 +1558,7 @@ mod tests {
     fn a_datagram_flow_frames_the_association_and_returns_the_echo() {
         let (a, mut peer) = peer_with_deadline().unwrap();
         let frames: Frames = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let relay: Relay = Arc::new(|_conn, _dest| {});
+        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
         let mut handler = Handler::new(
             Device::from_handle(a, DEFAULT_MTU),
             relay,
@@ -1583,7 +1651,7 @@ mod tests {
         let wanted: usize = flows.iter().map(|flow| flow.datagrams.len()).sum();
         let dials: Dials = Arc::new(std::sync::Mutex::new(Vec::new()));
         let (a, mut peer) = peer_with_deadline().unwrap();
-        let relay: Relay = Arc::new(|_conn, _dest| {});
+        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
         let mut handler = Handler::new(
             Device::from_handle(a, DEFAULT_MTU),
             relay,
@@ -1694,6 +1762,7 @@ mod tests {
         let relay: Relay = Arc::new(|mut conn: Connection, _dest| {
             use std::io::Write;
             let _ = conn.write_all(b"pong\n");
+            Ok(())
         });
         let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let flow = FlowSpec {
@@ -1753,9 +1822,8 @@ mod tests {
             "",
             crate::socks::Version::V5,
         ));
-        let relay: Relay = Arc::new(move |conn, dest| {
-            crate::proxy::serve_device_flow(conn, &out, &dest);
-        });
+        let relay: Relay =
+            Arc::new(move |conn, dest| crate::proxy::serve_device_flow(conn, &out, &dest));
         let (a, mut peer) = peer_with_deadline().unwrap();
         let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let flow = FlowSpec {
@@ -1963,6 +2031,7 @@ mod tests {
             let mut sink = Vec::new();
             let _ = conn.read_to_end(&mut sink);
             let _ = gone_tx.send(());
+            Ok(())
         });
         let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let mut buf = vec![0u8; DEFAULT_MTU + 64];
@@ -2018,6 +2087,7 @@ mod tests {
         let relay: Relay = Arc::new(|mut conn: Connection, _dest| {
             use std::io::Write;
             let _ = conn.write_all(b"reply");
+            Ok(())
         });
         let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let mut buf = vec![0u8; DEFAULT_MTU + 64];
@@ -2074,7 +2144,9 @@ mod tests {
     #[test]
     fn a_refused_proxy_leg_resets_the_device_flow() {
         let (a, mut peer) = peer_with_deadline().unwrap();
-        let relay: Relay = Arc::new(|_conn: Connection, _dest| {});
+        let relay: Relay = Arc::new(|_conn: Connection, _dest| {
+            Err(io::Error::new(io::ErrorKind::ConnectionRefused, "refused"))
+        });
         let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let mut buf = vec![0u8; DEFAULT_MTU + 64];
         let destination: SocketAddr = "203.0.113.62:443".parse().unwrap();
@@ -2155,7 +2227,7 @@ mod tests {
     #[test]
     fn the_syn_ack_numbers_wrap_at_the_sequence_space_boundary() {
         let (a, mut peer) = unix_socketpair().unwrap();
-        let relay: Relay = Arc::new(|_conn, _dest| {});
+        let relay: Relay = Arc::new(|_conn, _dest| Ok(()));
         let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let syn = build_tcp_packet(
             ([10, 0, 0, 2], 44444),
