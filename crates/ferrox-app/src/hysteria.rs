@@ -287,49 +287,6 @@ fn take_queued(conn: &mut quiche::Connection, session: &Session) {
     }
 }
 
-/// The two-byte `[0, 0]` acknowledgement every flow stream opens with, read into the caller's own buffer rather than a `Vec` per flow.
-fn recv_reply(
-    session: &Session,
-    stream: u64,
-    wake: Option<&StreamWake>,
-    deadline: Instant,
-) -> Option<[u8; 2]> {
-    let mut room = Unfilled::<2>::new();
-    let mut got = 0usize;
-    while got < 2 {
-        let before = wake.map_or(0, StreamWake::seen);
-        let read = {
-            let Ok(mut conn) = session.shared.lock() else {
-                return None;
-            };
-            match conn.stream_recv(stream, &mut room.as_mut()[got..]) {
-                Ok((n, _)) => Some(n),
-                Err(quiche::Error::Done) => None,
-                Err(_) => return None,
-            }
-        };
-        if let Some(n) = read {
-            got += n;
-            continue;
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        let pumped = session
-            .driver
-            .as_ref()
-            .is_some_and(|driver| driver.running());
-        match wake {
-            Some(wake) if pumped => wake.wait(before, STREAM_POLL),
-            _ => {
-                let _ = drive_once(session, STREAM_POLL);
-            }
-        }
-    }
-    let reply = room.as_mut();
-    Some([reply[0], reply[1]])
-}
-
 fn read_headers_block(session: &Session, stream: u64, deadline: Instant) -> Option<Vec<u8>> {
     let mut head = Vec::with_capacity(128);
     let mut room = Unfilled::<4096>::new();
@@ -475,6 +432,8 @@ pub(crate) struct Flow {
     drive: bool,
     /// The latch the session's pump bumps when this stream has data; `None` when this flow drives.
     wake: Option<Arc<StreamWake>>,
+    /// The `[0, 0]` acknowledgement still owed to the stream's first read: two on a client-opened flow, none on the server's, because the server reads the request the client already sent.
+    reply: usize,
 }
 
 impl Flow {
@@ -499,6 +458,7 @@ impl Flow {
             at: 0,
             drive,
             wake: None,
+            reply: 0,
         }
     }
 
@@ -507,6 +467,62 @@ impl Flow {
             let _ = conn.stream_send(self.stream, &[], true);
             crate::quic::flush_egress(&mut conn, &self.session.sock);
         }
+    }
+
+    /// Consumes the reply before the stream's payload: a server that buffers `[0, 0]` until its first downlink byte cannot hold an upload-only flow open, so the opening write returns before the reply and the first read pays it.
+    fn drain_reply(&mut self) -> std::io::Result<()> {
+        while self.reply > 0 {
+            let before = self.wake.as_ref().map_or(0, |wake| wake.seen());
+            let mut room = Unfilled::<2>::new();
+            let want = self.reply.min(room.as_mut().len());
+            let read = {
+                let Ok(mut conn) = self.session.shared.lock() else {
+                    return Err(broken());
+                };
+                if conn.is_closed() {
+                    return Ok(());
+                }
+                match conn.stream_recv(self.stream, &mut room.as_mut()[..want]) {
+                    Ok((0, true)) => return Err(broken()),
+                    Ok((n, _)) => {
+                        crate::quic::flush_egress(&mut conn, &self.session.sock);
+                        Some(n)
+                    }
+                    Err(quiche::Error::Done) => None,
+                    Err(_) => return Err(broken()),
+                }
+            };
+            if let Some(n) = read {
+                if room.as_mut()[..n].iter().any(|byte| *byte != 0) {
+                    return Err(broken());
+                }
+                self.reply -= n;
+                continue;
+            }
+            if self.drive {
+                let _ = drive_once(&self.session, STREAM_POLL);
+                continue;
+            }
+            let pumped = self
+                .session
+                .driver
+                .as_ref()
+                .is_some_and(|driver| driver.running());
+            if let Some(wake) = self.wake.as_ref().filter(|_| pumped) {
+                wake.wait(before, STREAM_POLL);
+                continue;
+            }
+            {
+                let Ok(conn) = self.session.shared.lock() else {
+                    return Err(broken());
+                };
+                if conn.is_closed() {
+                    return Ok(());
+                }
+            }
+            std::thread::sleep(STREAM_POLL);
+        }
+        Ok(())
     }
 }
 
@@ -519,6 +535,7 @@ impl Read for Flow {
         if buf.is_empty() {
             return Ok(0);
         }
+        self.drain_reply()?;
         if self.at < self.backlog.len() {
             let n = (self.backlog.len() - self.at).min(buf.len());
             buf[..n].copy_from_slice(&self.backlog[self.at..self.at + n]);
@@ -535,7 +552,10 @@ impl Read for Flow {
                     return Ok(0);
                 }
                 match conn.stream_recv(self.stream, buf) {
-                    Ok((n, _)) => Some(n),
+                    Ok((n, _)) => {
+                        crate::quic::flush_egress(&mut conn, &self.session.sock);
+                        Some(n)
+                    }
                     Err(quiche::Error::Done) => None,
                     Err(_) => return Err(broken()),
                 }
@@ -597,10 +617,6 @@ pub(crate) fn open_flow(session: &Session, stream: u64, header: &[u8]) -> Option
     if !send_all(session, stream, &prefix, false) {
         return None;
     }
-    let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
-    if recv_reply(session, stream, wake.as_deref(), deadline)? != [0, 0] {
-        return None;
-    }
     Some(Flow {
         session: session.clone(),
         stream,
@@ -608,6 +624,7 @@ pub(crate) fn open_flow(session: &Session, stream: u64, header: &[u8]) -> Option
         at: 0,
         drive,
         wake,
+        reply: 2,
     })
 }
 

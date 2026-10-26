@@ -7746,6 +7746,7 @@ fn serve_hysteria_v1_flow(mut flow: crate::hysteria::Flow, host: &str, port: u16
 
 fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], freedom: bool) {
     let Some((got, flow, cmd, target)) = decode_request_bounded(&mut io) else {
+        io.close();
         return;
     };
     if !users
@@ -7754,9 +7755,11 @@ fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], free
         || !freedom
         || cmd != 1
     {
+        io.close();
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
+        io.close();
         return;
     };
     if io.write_all(&[0, 0]).is_err() {
@@ -37695,7 +37698,7 @@ mod tests {
                 sock.send_to(&out[..written], info.to).expect("answers");
             }
             let rest = hysteria_test_read_prefix(&mut conn, &sock, local, &mut out);
-            let flow = crate::hysteria::Flow::from_parts(
+            let mut flow = crate::hysteria::Flow::from_parts(
                 Arc::new(Mutex::new(conn)),
                 Arc::new(sock),
                 local,
@@ -37703,7 +37706,20 @@ mod tests {
                 rest,
                 true,
             );
-            serve_vless_hysteria(flow, &one_vless_user(&id), true);
+            let Some((got, _, cmd, target)) = decode_request_bounded(&mut flow) else {
+                return;
+            };
+            assert!(same_vless_user(&got, &id) && cmd == 1);
+            let Some(uplink) = dial_or_report(&target) else {
+                return;
+            };
+            let mut first = [0u8; 1];
+            flow.read_exact(&mut first)
+                .expect("the upload arrives before the reply");
+            flow.write_all(&[0, 0])
+                .expect("acknowledges after the upload");
+            flow.write_all(&first).expect("echoes the first byte");
+            crate::hysteria::relay(&uplink, &flow);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let dial = crate::hysteria::Dial {
@@ -37780,6 +37796,28 @@ mod tests {
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
+    }
+
+    #[test]
+    fn hysteria_server_ends_a_flow_it_refuses() {
+        let _serial = quic_serial();
+        let echo_port = echo_loop();
+        let server_id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("refuse-auth", server_id, "");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let refused = uuid_bytes("ffffffff-ffff-ffff-ffff-ffffffffffff").expect("id");
+        let mut client = hysteria_tcp_pair(port, roots, "refuse-auth", refused, target, "");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 1];
+        let started = std::time::Instant::now();
+        assert!(
+            matches!(client.read(&mut back), Ok(0) | Err(_)),
+            "a refused flow ends"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "without waiting out the idle timeout"
+        );
     }
 
     fn hysteria_server_once() {
