@@ -540,11 +540,7 @@ impl Salamander {
         out.reserve(SALAMANDER_SALT + plain.len());
         out.extend_from_slice(salt);
         out.extend_from_slice(plain);
-        for dst in out[body..].chunks_mut(SALAMANDER_KEY) {
-            for (byte, key) in dst.iter_mut().zip(key.iter()) {
-                *byte ^= key;
-            }
-        }
+        crate::keystream::apply(&mut out[body..], &key);
     }
 
     /// Obfuscate `plain` under a fresh random salt appended to `out`; `None` only when the system RNG fails.
@@ -566,15 +562,7 @@ impl Salamander {
         let key = self.keystream(*salt);
         out[..SALAMANDER_SALT].copy_from_slice(salt);
         let body = &mut out[SALAMANDER_SALT..SALAMANDER_SALT + plain.len()];
-        // A keystream block is 32 bytes, so chunking both sides on it restarts the key where the modulo did and lets the XOR run a block at a time instead of a byte at a time.
-        for (dst, src) in body
-            .chunks_mut(SALAMANDER_KEY)
-            .zip(plain.chunks(SALAMANDER_KEY))
-        {
-            for ((out, plain), key) in dst.iter_mut().zip(src).zip(key.iter()) {
-                *out = plain ^ key;
-            }
-        }
+        crate::keystream::encrypt(body, plain, &key);
         SALAMANDER_SALT + plain.len()
     }
 
@@ -597,24 +585,7 @@ impl Salamander {
         let mut salt = [0u8; SALAMANDER_SALT];
         salt.copy_from_slice(&datagram[..SALAMANDER_SALT]);
         let key = self.keystream(salt);
-        let payload = datagram.len() - SALAMANDER_SALT;
-        let mut block = [0u8; SALAMANDER_KEY];
-        let mut at = 0usize;
-        while at < payload {
-            let len = SALAMANDER_KEY.min(payload - at);
-            let from = SALAMANDER_SALT + at;
-            block[..len].copy_from_slice(&datagram[from..from + len]);
-            let block = &block[..len];
-            for ((out, src), key) in datagram[at..at + len]
-                .iter_mut()
-                .zip(block)
-                .zip(&key[..len])
-            {
-                *out = *src ^ key;
-            }
-            at += len;
-        }
-        Some(payload)
+        Some(crate::keystream::unshift(datagram, SALAMANDER_SALT, &key))
     }
 }
 
