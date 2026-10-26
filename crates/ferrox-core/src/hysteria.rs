@@ -499,8 +499,15 @@ impl Salamander {
     ) -> usize {
         let key = self.keystream(*salt);
         out[..SALAMANDER_SALT].copy_from_slice(salt);
-        for (i, b) in plain.iter().enumerate() {
-            out[SALAMANDER_SALT + i] = b ^ key[i % SALAMANDER_KEY];
+        let body = &mut out[SALAMANDER_SALT..SALAMANDER_SALT + plain.len()];
+        // A keystream block is 32 bytes, so chunking both sides on it restarts the key where the modulo did and lets the XOR run a block at a time instead of a byte at a time.
+        for (dst, src) in body
+            .chunks_mut(SALAMANDER_KEY)
+            .zip(plain.chunks(SALAMANDER_KEY))
+        {
+            for ((out, plain), key) in dst.iter_mut().zip(src).zip(key.iter()) {
+                *out = plain ^ key;
+            }
         }
         SALAMANDER_SALT + plain.len()
     }
@@ -516,7 +523,7 @@ impl Salamander {
         Some(self.obfuscate_into(&salt, plain, out))
     }
 
-    /// Undo [`Salamander::obfuscate`] on one whole datagram in place, moving the payload to the front; the length is returned, or `None` when the datagram is too short to hold a salt and one payload byte. The forward loop reads always ahead of where it writes (`i + salt > i`), so nothing is overwritten before it is used — one pass, no second buffer.
+    /// Undo [`Salamander::obfuscate`] on one whole datagram in place, moving the payload to the front; the length is returned, or `None` when the datagram is too short to hold a salt and one payload byte. The payload moves toward the front by the salt's length, so a block is read out before the block behind it is written: one pass, one block of scratch, no second buffer.
     pub fn deobfuscate_in_place(&self, datagram: &mut [u8]) -> Option<usize> {
         if datagram.len() <= SALAMANDER_SALT {
             return None;
@@ -525,8 +532,21 @@ impl Salamander {
         salt.copy_from_slice(&datagram[..SALAMANDER_SALT]);
         let key = self.keystream(salt);
         let payload = datagram.len() - SALAMANDER_SALT;
-        for i in 0..payload {
-            datagram[i] = datagram[SALAMANDER_SALT + i] ^ key[i % SALAMANDER_KEY];
+        let mut block = [0u8; SALAMANDER_KEY];
+        let mut at = 0usize;
+        while at < payload {
+            let len = SALAMANDER_KEY.min(payload - at);
+            let from = SALAMANDER_SALT + at;
+            block[..len].copy_from_slice(&datagram[from..from + len]);
+            let block = &block[..len];
+            for ((out, src), key) in datagram[at..at + len]
+                .iter_mut()
+                .zip(block)
+                .zip(&key[..len])
+            {
+                *out = *src ^ key;
+            }
+            at += len;
         }
         Some(payload)
     }
