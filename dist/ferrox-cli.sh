@@ -217,7 +217,8 @@ fronts
   --instance NAME        another lane beside the unnamed one: its config, pid,
                          log, ports and remembered exit are its own; ports left
                          unnamed are the first free ones near the defaults
-  --vpn                  also point the macOS system proxy at the fronts; the
+  --vpn                  also point the macOS system proxy at the fronts; other
+                         platforms refuse and print the environment command; the
                          unnamed lane only (it is one machine-wide setting)
   --all                  with down: stop every lane
   --debug                keep the lane's dial trace in the log (FOXY_DEBUG=1)
@@ -884,12 +885,51 @@ proxy_bypass_join() {
   printf '%s\n' "$1" | sed '/There aren.t any bypass domains/d; /^[[:space:]]*$/d' | paste -sd, -
 }
 
+system_proxy_preflight() {
+  local platform https="" all=""
+  platform="$(uname -s 2>/dev/null || true)"
+  case "$platform" in
+    Darwin) ;;
+    *)
+      say "ferrox-cli: --vpn sets the macOS system proxy; on ${platform:-this platform} nothing was started." >&2
+      say "  point the app at the fronts instead: ferrox-cli ports" >&2
+      case ",$FRONTS," in *,http,*) https="http://127.0.0.1:$HTTP_PORT" ;; esac
+      case ",$FRONTS," in *,socks,*) all="socks5h://127.0.0.1:$SOCKS_PORT" ;; esac
+      case ",$FRONTS," in
+        *,mixed,*) https="http://127.0.0.1:$MIXED_PORT"; all="socks5h://127.0.0.1:$MIXED_PORT" ;;
+      esac
+      case "$platform" in
+        MINGW*|MSYS*|CYGWIN*|Windows*)
+          [ -n "$https" ] && say "  set HTTPS_PROXY=$https" >&2
+          [ -n "$all" ] && say "  set ALL_PROXY=$all" >&2
+          ;;
+        *)
+          local envs=""
+          [ -n "$https" ] && envs="HTTPS_PROXY=$https"
+          [ -n "$all" ] && envs="${envs:+$envs }ALL_PROXY=$all"
+          [ -n "$envs" ] && say "  export $envs" >&2
+          ;;
+      esac
+      return 1
+      ;;
+  esac
+  command -v networksetup >/dev/null 2>&1 || {
+    say "ferrox-cli: --vpn needs networksetup on PATH; nothing was started." >&2
+    return 1
+  }
+  command -v scutil >/dev/null 2>&1 || {
+    say "ferrox-cli: --vpn needs scutil on PATH to verify the proxy; nothing was started." >&2
+    return 1
+  }
+  return 0
+}
+
 proxy_readback_has() {
   printf '%s\n' "$1" | grep -Eq "^[[:space:]]*$2[[:space:]]*:[[:space:]]*$3[[:space:]]*$"
 }
 
 system_proxy_on() {
-  command -v networksetup >/dev/null 2>&1 || { say "no networksetup: point your apps at the ports by hand."; return 0; }
+  command -v networksetup >/dev/null 2>&1 || { say "system proxy: no networksetup; nothing was armed." >&2; return 1; }
   command -v scutil >/dev/null 2>&1 || { say "system proxy: no scutil to read the proxy back; nothing was armed." >&2; return 1; }
   local any=0 svc want_socks="" want_http="" front pac auto pac_url pac_on auto_on bypass readback bad
   for front in ${FRONTS//,/ }; do
@@ -1407,6 +1447,7 @@ verify_flow() {
 }
 
 action_up() {
+  if [ "$WANT_VPN" = 1 ] && ! system_proxy_preflight; then exit 1; fi
   choose_carrier
   start_lane
   # An attempt cut short is not a lane: Ctrl-C before it proves a flow removes what it started.
@@ -1445,6 +1486,7 @@ action_up() {
 }
 
 action_serve() {
+  if [ "$WANT_VPN" = 1 ] && ! system_proxy_preflight; then exit 1; fi
   choose_carrier
   start_lane
   # A serve that never proved a flow is an attempt too: the same interruption cleanup applies.
