@@ -3204,29 +3204,38 @@ fn serve_sealed_session<S>(
         + Send
         + 'static,
 {
+    eprintln!("ferrox-diag: session enter");
     match driven_io(session, budgets::handshake()) {
-        Ok(driven) => match decryption.handshake(driven) {
-            Ok(sealed) => {
-                if let Some(raw) = &timeout {
-                    if raw.set_read_timeout(Some(RELAY_POLL)).is_err() {
-                        return;
+        Ok(driven) => {
+            eprintln!("ferrox-diag: driven armed");
+            match decryption.handshake(driven) {
+                Ok(sealed) => {
+                    eprintln!("ferrox-diag: driven handshake done");
+                    if let Some(raw) = &timeout {
+                        if raw.set_read_timeout(Some(RELAY_POLL)).is_err() {
+                            return;
+                        }
                     }
+                    serve_sealed_raw(sealed, peer, users, freedom, closer, timeout, SplitRelay);
                 }
-                serve_sealed_raw(sealed, peer, users, freedom, closer, timeout, SplitRelay);
+                Err(error) => eprintln!("ferrox-diag: driven handshake failed: {error}"),
             }
-            Err(error) => eprintln!("vless: encryption handshake failed: {error}"),
-        },
-        Err(session) => match decryption.handshake(session) {
-            Ok(sealed) => {
-                if let Some(raw) = &timeout {
-                    if raw.set_read_timeout(Some(RELAY_POLL)).is_err() {
-                        return;
+        }
+        Err(session) => {
+            eprintln!("ferrox-diag: shared fallback");
+            match decryption.handshake(session) {
+                Ok(sealed) => {
+                    eprintln!("ferrox-diag: shared handshake done");
+                    if let Some(raw) = &timeout {
+                        if raw.set_read_timeout(Some(RELAY_POLL)).is_err() {
+                            return;
+                        }
                     }
+                    serve_sealed_raw(sealed, peer, users, freedom, closer, timeout, SharedRelay);
                 }
-                serve_sealed_raw(sealed, peer, users, freedom, closer, timeout, SharedRelay);
+                Err(error) => eprintln!("ferrox-diag: shared handshake failed: {error}"),
             }
-            Err(error) => eprintln!("vless: encryption handshake failed: {error}"),
-        },
+        }
     }
 }
 
@@ -3243,8 +3252,10 @@ fn serve_sealed_raw<
     _relay: R,
 ) {
     let Some((got, flow, cmd, target)) = decode_request_bounded(&mut sealed) else {
+        eprintln!("ferrox-diag: request decode failed");
         return;
     };
+    eprintln!("ferrox-diag: request decoded cmd={cmd}");
     let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
         crate::accesslog::record(peer, false, &target, None, "invalid user", "");
         return;
@@ -3306,6 +3317,7 @@ fn serve_sealed_raw<
                 return;
             }
             let close = close_with_uplink(closer, &uplink);
+            eprintln!("ferrox-diag: relay armed");
             if flow == Flow::Vision {
                 let link = crate::vision::Link::sealed(sealed, &got);
                 relay_link(&uplink, link, &close, timeout);
