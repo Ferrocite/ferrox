@@ -5621,6 +5621,20 @@ pub(crate) mod loopback {
         edge.join().expect("the edge finishes");
     }
 
+    /// An edge the lane let go of must finish on the reset it was sent, not on the poll deadline a pooled session would otherwise leave it waiting out.
+    fn join_edge_within(edge: std::thread::JoinHandle<()>, budget: Duration) {
+        let began = Instant::now();
+        while !edge.is_finished() {
+            assert!(
+                began.elapsed() < budget,
+                "the edge waited {:?} for its poll deadline instead of the reset",
+                began.elapsed()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        edge.join().expect("the edge finishes");
+    }
+
     /// An edge that names a 16 KiB `SETTINGS_MAX_FRAME_SIZE` for its own receives, answers the status, then pushes each piece and drains what the lane sends back until the socket ends.
     fn narrow_receive_edge(
         listener: Listener,
@@ -5659,10 +5673,6 @@ pub(crate) mod loopback {
                 let frame = frames::H2Frame::parse(&header).expect("parses");
                 let mut rest = vec![0u8; frame.length as usize];
                 if !read_exact_poll(&mut tls, &mut rest) {
-                    return;
-                }
-                // The lane resets its stream on drop while the pooled session stays open, so the reset is the edge's end.
-                if frame.kind == frames::RST_STREAM {
                     return;
                 }
             }
@@ -5718,7 +5728,7 @@ pub(crate) mod loopback {
             "the octets past the edge's own limit became the next frame's header"
         );
         drop(tunnel);
-        edge.join().expect("the edge finishes");
+        join_edge_within(edge, Duration::from_secs(5));
     }
 
     /// A length the lane never asked for is refused before it is believed: the frame buffer is never sized by a header a peer invented, so the widest body the lane will hold is the 256 KiB its own SETTINGS named.
@@ -5774,7 +5784,7 @@ pub(crate) mod loopback {
             "the frame's own length was never used to size a buffer"
         );
         drop(tunnel);
-        edge.join().expect("the edge finishes");
+        join_edge_within(edge, Duration::from_secs(5));
     }
 
     /// The census line for a leg parked at a named wait, waited for: a moment spent is not evidence the leg parked, and a flow that never reached its wait hands its lane back for free.
@@ -6527,10 +6537,6 @@ pub(crate) mod loopback {
                     let increment = u32::from_be_bytes(payload[..4].try_into().expect("four"));
                     let _ = updates.send((frame.stream, increment));
                 }
-                // The lane resets its stream on drop while the pooled session stays open, so the reset is the edge's end.
-                if frame.kind == frames::RST_STREAM {
-                    return;
-                }
             }
         })
     }
@@ -6866,11 +6872,11 @@ pub(crate) mod loopback {
             "the frames crossed the floor and the grant took every octet of them"
         );
         drop(tunnel);
+        join_edge_within(edge, Duration::from_secs(5));
         let mut tally = Vec::new();
-        while let Ok(update) = rx.recv_timeout(Duration::from_secs(20)) {
+        while let Ok(update) = rx.try_recv() {
             tally.push(update);
         }
-        edge.join().expect("the edge finishes");
         let granted: Vec<_> = tally
             .iter()
             .filter(|(_, increment)| *increment == FRAMES as u32 * wire)
@@ -6921,7 +6927,7 @@ pub(crate) mod loopback {
             "the whole payload was staged once, which is the price of taking the padding off"
         );
         drop(tunnel);
-        edge.join().expect("the edge finishes");
+        join_edge_within(edge, Duration::from_secs(5));
     }
 
     /// The other half of `carrier-foxy padded-frame-payload-octets`: the same padding read
@@ -7008,7 +7014,7 @@ pub(crate) mod loopback {
             "the frame that delivered nothing still spent six octets of window"
         );
         drop(tunnel);
-        edge.join().expect("the edge finishes");
+        join_edge_within(edge, Duration::from_secs(5));
     }
 
     /// Credit held below the floor never reaches the wire: a lane that has taken less than `CREDIT_FLOOR` owes the edge a number, not a write.

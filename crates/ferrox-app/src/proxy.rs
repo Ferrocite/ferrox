@@ -29930,6 +29930,20 @@ mod tests {
         port
     }
 
+    /// A closed association must end its listener's session on the peer's close, not on the read deadline that would otherwise park the thread.
+    fn join_thread_within(handle: thread::JoinHandle<()>, budget: Duration, what: &str) {
+        let began = Instant::now();
+        while !handle.is_finished() {
+            assert!(
+                began.elapsed() < budget,
+                "{what} waited {:?} past its {budget:?} budget",
+                began.elapsed()
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        handle.join().expect("the thread finishes");
+    }
+
     fn vmess_udp_over(
         carrier: Carrier,
         tls: Option<&(
@@ -30236,18 +30250,19 @@ mod tests {
                     "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
         ))
         .expect("parses");
-        let mut port = 0;
-        let mut served = false;
-        for _ in 0..64 {
-            let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
-            port = probe.local_addr().expect("addr").port();
-            drop(probe);
-            if serve_vmess_inbound(&format!("127.0.0.1:{port}"), &inbound, true, None).1 {
-                served = true;
-                break;
-            }
-        }
-        assert!(served, "binds a KCP port");
+        let users = inbound_vmess_users(&inbound);
+        let server = inbound_tls_identity(&inbound).expect("the inbound tls identity parses");
+        // Bind before the outbound is parsed, so the test never races another test for the port.
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let port = listener.local_addr().port();
+        let session = thread::spawn(move || {
+            let conn = listener.accept().expect("accepts");
+            serve_vmess_kcp_tls(&conn, &users, true, &server);
+        });
         let outbound = crate::json::parse(&format!(
             r#"{{"outbounds": [{{"protocol": "vmess",
                 "settings": {{"vnext": [{{"address": "127.0.0.1", "port": {port},
@@ -30259,6 +30274,7 @@ mod tests {
         let out = find_vmess_outbound(&outbound).expect("the kcp tls outbound parses");
         assert!(out.tls.is_some(), "the kcp session carries tls");
         vmess_udp_association(&out, udp_echo_port());
+        join_thread_within(session, Duration::from_secs(5), "the kcp tls session");
     }
 
     #[test]
