@@ -43,6 +43,7 @@ mod proxy;
 mod quic;
 mod reverse;
 mod router;
+mod router_script;
 mod shadowsocks;
 mod shadowsocks2022;
 mod sniff;

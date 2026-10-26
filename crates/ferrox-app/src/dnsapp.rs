@@ -76,6 +76,7 @@ struct Server {
     final_query: bool,
     policy_id: u32,
     tag: Option<String>,
+    id: String,
     timeout: Duration,
     cache: CachePolicy,
     client_ip: Option<IpAddr>,
@@ -277,6 +278,7 @@ impl Resolver {
                 final_query: false,
                 policy_id: 0,
                 tag: tag.clone(),
+                id: "localhost".to_owned(),
                 timeout: DEFAULT_TIMEOUT,
                 cache: CachePolicy {
                     disable: disable_cache,
@@ -339,9 +341,33 @@ impl Resolver {
         self.lookup_inner(name, false, false)
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn lookup_fake(self: &Arc<Self>, name: &str) -> Option<(Vec<IpAddr>, u32)> {
-        self.lookup_inner(name, true, false).records()
+    pub(crate) fn lookup_families(
+        self: &Arc<Self>,
+        name: &str,
+        v4: bool,
+        v6: bool,
+        fake: bool,
+    ) -> Option<(Vec<IpAddr>, u32)> {
+        self.lookup_with(name, v4, v6, fake, false).records()
+    }
+
+    pub(crate) fn script_servers(&self) -> Vec<(String, usize)> {
+        self.servers
+            .iter()
+            .enumerate()
+            .map(|(at, server)| (server.id.clone(), at))
+            .collect()
+    }
+
+    pub(crate) fn script_query(
+        &self,
+        index: usize,
+        name: &str,
+        v4: bool,
+        v6: bool,
+        fake: bool,
+    ) -> Lookup {
+        self.query_server(index, name, v4, v6, fake, false)
     }
 
     #[allow(dead_code)]
@@ -350,11 +376,26 @@ impl Resolver {
     }
 
     fn lookup_inner(self: &Arc<Self>, name: &str, fake_enabled: bool, force_local: bool) -> Lookup {
+        let (v4, v6) = self.strategy.families();
+        self.lookup_with(name, v4, v6, fake_enabled, force_local)
+    }
+
+    #[allow(clippy::fn_params_excessive_bools)]
+    fn lookup_with(
+        self: &Arc<Self>,
+        name: &str,
+        v4: bool,
+        v6: bool,
+        fake_enabled: bool,
+        force_local: bool,
+    ) -> Lookup {
+        if !v4 && !v6 {
+            return Lookup::Empty;
+        }
         let mut name = Cow::Borrowed(name.trim_end_matches('.'));
         if name.is_empty() {
             return Lookup::Failed;
         }
-        let (v4, v6) = self.strategy.families();
         let mut followed = 0u8;
         loop {
             match self.host_lookup(&name, v4, v6) {
@@ -1093,6 +1134,11 @@ fn parse_server(
         final_query,
         policy_id,
         tag,
+        id: item
+            .get("id")
+            .and_then(Json::as_str)
+            .unwrap_or_default()
+            .to_owned(),
         timeout,
         cache: CachePolicy {
             disable: own_cache,
@@ -1659,6 +1705,31 @@ mod resolver_tests {
     }
 
     #[test]
+    fn a_script_server_answers_from_that_server_alone() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let port = socket.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let (len, peer) = socket.recv_from(&mut buf).expect("query");
+            let question = parse_query(&buf[..len]).expect("question");
+            let answer = ip_answer(&question, 0, 60, &[vec![192, 0, 2, 9]]).expect("answer");
+            socket.send_to(&answer, peer).expect("reply");
+        });
+        let resolver = Resolver::from_root(&root(&format!(
+            r#"{{"dns":{{"servers":[{{"address":"udp://127.0.0.1:{port}","id":"primary"}}]}}}}"#
+        )))
+        .expect("resolver")
+        .expect("configured");
+        assert_eq!(
+            resolver.script_query(0, "example.com", true, false, false),
+            Lookup::Records(vec!["192.0.2.9".parse().unwrap()], 60)
+        );
+    }
+
+    #[test]
     fn a_cache_hit_copies_only_the_answer_vector() {
         let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
         socket
@@ -1707,6 +1778,34 @@ mod resolver_tests {
     }
 
     #[test]
+    fn a_script_query_asks_only_for_the_families_it_names() {
+        let resolver = Arc::new(
+            Resolver::from_root(&root(
+                r#"{"dns":{"servers":["localhost"],"hosts":{"example.com":["10.0.0.1","2001:db8::1"]}}}"#,
+            ))
+            .expect("resolver")
+            .expect("configured"),
+        );
+        assert_eq!(
+            resolver
+                .lookup_families("example.com", false, true, false)
+                .unwrap()
+                .0,
+            vec!["2001:db8::1".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            resolver
+                .lookup_families("example.com", true, false, false)
+                .unwrap()
+                .0,
+            vec!["10.0.0.1".parse::<IpAddr>().unwrap()]
+        );
+        assert!(resolver
+            .lookup_families("example.com", false, false, false)
+            .is_none());
+    }
+
+    #[test]
     fn fake_pools_allocate_and_reverse_both_families() {
         let resolver = Arc::new(
             Resolver::from_root(&root(
@@ -1715,11 +1814,15 @@ mod resolver_tests {
                 .expect("resolver")
                 .expect("configured"),
         );
-        let (ips, ttl) = resolver.lookup_fake("example.com").expect("fake");
+        let (ips, ttl) = resolver
+            .lookup_families("example.com", true, true, true)
+            .expect("fake");
         assert_eq!(ttl, 1);
         assert!(ips.iter().all(std::net::IpAddr::is_ipv4));
         assert_eq!(resolver.domain_of(ips[0]).as_deref(), Some("example.com"));
-        let again = resolver.lookup_fake("example.com").expect("stable");
+        let again = resolver
+            .lookup_families("example.com", true, true, true)
+            .expect("stable");
         assert_eq!(again.0, ips);
     }
 
@@ -2006,6 +2109,22 @@ mod resolver_tests {
         );
         assert_eq!(resolver.servers[0].tag.as_deref(), Some("server-in"));
         assert_eq!(resolver.servers[1].tag.as_deref(), Some("dns-in"));
+    }
+
+    #[test]
+    fn a_nameserver_id_is_what_the_script_table_exposes() {
+        let resolver = Resolver::from_root(&root(
+            r#"{"dns":{"servers":[
+                {"address":"udp://192.0.2.1","id":"primary","tag":"server-in"},
+                {"address":"udp://192.0.2.2"}
+            ]}}"#,
+        ))
+        .expect("resolver")
+        .expect("configured");
+        assert_eq!(
+            resolver.script_servers(),
+            [("primary".to_owned(), 0), (String::new(), 1)]
+        );
     }
 
     #[test]

@@ -1691,6 +1691,7 @@ fn router_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.app.router.Config");
     let mut rules = Vec::new();
     let mut strategy = None;
+    let mut script = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 0) => {
@@ -1704,13 +1705,23 @@ fn router_settings(bytes: &[u8]) -> Result<Json, String> {
             }
             (2, 2) => rules.push(router_rule(reader.bytes()?)?),
             (3, 2) => return Err(reader.uncarried("balancers")),
-            (4, 2) => return Err(reader.uncarried("the routing script")),
+            (4, 2) => {
+                script = std::str::from_utf8(reader.bytes()?)
+                    .map_err(|_| {
+                        "xray.app.router.Config: the routing script is not UTF-8".to_owned()
+                    })
+                    .map(str::to_owned)
+                    .map(Some)?;
+            }
             _ => return Err(reader.refuse(field, wire)),
         }
     }
     let mut pairs = Vec::new();
     if let Some(strategy) = strategy {
         pairs.push(("domainStrategy", Json::Str(strategy.to_owned())));
+    }
+    if let Some(script) = script.filter(|script| !script.is_empty()) {
+        pairs.push(("script", Json::Str(script)));
     }
     pairs.push(("rules", Json::Arr(rules)));
     Ok(object(pairs))
@@ -4540,6 +4551,28 @@ mod tests {
             response.get("customResponseData").and_then(Json::as_str),
             Some("AAEC"),
             "the answer's bytes travel as base64"
+        );
+    }
+
+    /// `xray.app.router.Config.script` is a path in the JSON the router parses.
+    #[test]
+    fn a_pb_router_script_keeps_its_path() {
+        let router = message(&[bytes_field(4, b"/etc/xray/route.lua")]);
+        let outbound = message(&[
+            bytes_field(1, b"direct"),
+            bytes_field(3, &typed("xray.proxy.blackhole.Config", &[])),
+        ]);
+        let config = message(&[
+            bytes_field(1, &socks_inbound(5000, 0, &[])),
+            bytes_field(2, &outbound),
+            bytes_field(4, &typed("xray.app.router.Config", &router)),
+        ]);
+        let json = to_json(&config).expect("decodes");
+        assert_eq!(
+            json.get("routing")
+                .and_then(|routing| routing.get("script"))
+                .and_then(Json::as_str),
+            Some("/etc/xray/route.lua")
         );
     }
 
