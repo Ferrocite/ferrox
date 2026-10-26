@@ -2889,12 +2889,17 @@ struct ServerConn {
 /// The per-stream entry point a VLESS inbound serves: one stream, one session, no shared state.
 pub(crate) type Serve = Arc<dyn Fn(QuicStream) + Send + Sync>;
 
-/// The driver's two datagram scratch buffers and the two tables one reap fills, passed as one so routing stays within the argument budget and a batch reuses its slots instead of allocating.
+/// The driver's two datagram scratch buffers and the tables one reap fills, passed as one so routing stays within the argument budget and a batch reuses its slots instead of allocating.
 struct Scratch {
     buf: [u8; MAX_DATAGRAM],
     out: [u8; MAX_DATAGRAM],
-    states: Vec<Arc<ServerConn>>,
     fresh: Vec<(Arc<Mutex<quiche::Connection>>, u64)>,
+    learned: Vec<(Vec<u8>, Arc<ServerConn>)>,
+    closed: Vec<Vec<u8>>,
+    seen: Vec<*const ServerConn>,
+    gone: Vec<*const ServerConn>,
+    /// The earliest timer a live connection wants, carried from the reap that read it to the wait it gates.
+    deadline: Option<Instant>,
 }
 
 /// The driver: one UDP socket is read by this loop alone, so no packet is fed to the wrong connection.
@@ -2912,23 +2917,26 @@ pub(crate) fn serve_loop(
     let mut scratch = Scratch {
         buf: [0u8; MAX_DATAGRAM],
         out: [0u8; MAX_DATAGRAM],
-        states: Vec::new(),
         fresh: Vec::new(),
+        learned: Vec::new(),
+        closed: Vec::new(),
+        seen: Vec::new(),
+        gone: Vec::new(),
+        deadline: None,
     };
     #[cfg(target_os = "linux")]
     let mut batch = Batch::new();
     while !stop.load(Ordering::Relaxed) {
         let start = Instant::now();
-        let mut wait = Duration::from_millis(100);
-        for state in conns.values() {
-            let Ok(conn) = state.conn.lock() else {
-                continue;
-            };
-            if let Some(left) = conn.timeout() {
-                wait = wait.min(left);
-            }
-        }
-        wait = wait.max(Duration::from_millis(1));
+        // The deadline the last reap read: the same lock pass that answers the readable streams answers when the connection next needs a timer, so no visit pays a second walk of the table.
+        let wait = scratch
+            .deadline
+            .map_or(Duration::from_millis(100), |deadline| {
+                deadline
+                    .saturating_duration_since(start)
+                    .min(Duration::from_millis(100))
+            })
+            .max(Duration::from_millis(1));
         if !sock.refresh_read_timeout(wait) {
             return;
         }
@@ -3063,38 +3071,71 @@ fn route(
     conns.insert(header.dcid.as_ref().to_vec(), state);
 }
 
-/// New peer streams to sessions, finished ones out of the table, dead connections dropped. One lock per connection covers the source-id, readable and finished questions, and the two tables live across calls so a busy connection does not pay for them again on every visit.
+/// New peer streams to sessions, finished ones out of the table, dead connections dropped. One lock per connection covers the closed, timer, source-id and readable questions, and the tables live across calls so a busy connection does not pay for them again on every visit.
 fn reap(
     serve: &Serve,
     sock: &Arc<Datagram>,
     conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
     scratch: &mut Scratch,
 ) {
-    // Closed connections drop every key they hold, so no routing entry outlives its connection.
-    conns.retain(|_, state| state.conn.lock().is_ok_and(|conn| !conn.is_closed()));
-    scratch.states.clear();
-    scratch.states.extend(conns.values().cloned());
     scratch.fresh.clear();
-    {
-        let states = &scratch.states;
-        let fresh = &mut scratch.fresh;
-        for state in states {
-            let Ok(conn) = state.conn.lock() else {
-                continue;
-            };
-            // New source IDs first: a packet carrying one must route on the next datagram.
-            learn_ids(conns, state, &conn);
-            if let Ok(mut seen) = state.seen.lock() {
-                for stream in conn.readable() {
-                    // Client bidirectional streams only: the H3 opening rides unidirectional ones.
-                    if stream % 4 != 0 || !seen.insert(stream) {
-                        continue;
-                    }
-                    fresh.push((Arc::clone(&state.conn), stream));
+    scratch.learned.clear();
+    scratch.closed.clear();
+    scratch.seen.clear();
+    scratch.gone.clear();
+    let mut deadline = None;
+    // A state is keyed once per connection id, so the pointer is what keeps one connection's questions asked once.
+    for (key, state) in conns.iter() {
+        let ptr = Arc::as_ptr(state);
+        if scratch.seen.contains(&ptr) {
+            // A closed connection still owes every key it routes: they leave together.
+            if scratch.gone.contains(&ptr) {
+                scratch.closed.push(key.to_vec());
+            }
+            continue;
+        }
+        scratch.seen.push(ptr);
+        let Ok(conn) = state.conn.lock() else {
+            continue;
+        };
+        if conn.is_closed() {
+            scratch.gone.push(ptr);
+            scratch.closed.push(key.to_vec());
+            continue;
+        }
+        if let Some(at) = conn.timeout_instant() {
+            deadline = Some(deadline.map_or(at, |soonest: Instant| soonest.min(at)));
+        }
+        // New source IDs first: a packet carrying one must route on the next datagram.
+        for id in conn.source_ids() {
+            if !conns.contains_key(id.as_ref()) {
+                scratch
+                    .learned
+                    .push((id.as_ref().to_vec(), Arc::clone(state)));
+            }
+        }
+        if let Ok(mut seen) = state.seen.lock() {
+            let mut spawned = false;
+            for stream in conn.readable() {
+                // Client bidirectional streams only: the H3 opening rides unidirectional ones.
+                if stream % 4 != 0 || !seen.insert(stream) {
+                    continue;
                 }
+                scratch.fresh.push((Arc::clone(&state.conn), stream));
+                spawned = true;
+            }
+            // Only a pass that added a stream can leave a finished one behind: an idle connection's set has nothing to sweep.
+            if spawned {
                 seen.retain(|stream| !conn.stream_finished(*stream));
             }
         }
+    }
+    scratch.deadline = deadline;
+    for (key, state) in scratch.learned.drain(..) {
+        conns.entry(key).or_insert(state);
+    }
+    for key in scratch.closed.drain(..) {
+        conns.remove(&key);
     }
     for (conn, stream) in scratch.fresh.drain(..) {
         let session = QuicStream {
