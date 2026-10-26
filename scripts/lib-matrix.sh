@@ -71,6 +71,8 @@ matrix_engine_skip_reason() {
       printf '%s\n' "leaf at this pin has no HTTPUpgrade transport" ;;
     leaf:shadowsocks2022-*)
       printf '%s\n' "leaf at this pin has no Shadowsocks 2022" ;;
+    xray-rust:*-hysteria-*)
+      printf '%s\n' "xray-rust at this pin has no VLESS over Hysteria; its Hysteria outbound is the native proxy protocol" ;;
     *)
       return 1 ;;
   esac
