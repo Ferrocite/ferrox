@@ -681,8 +681,7 @@ impl Handler {
         std::thread::spawn(move || {
             let mut buf = vec![0u8; 4096];
             let mut pkt = Vec::with_capacity(4096 + 40);
-            let mut end = None;
-            loop {
+            let end = loop {
                 match read_half.read(&mut buf) {
                     Ok(0) => {
                         // A clean close ends with FIN, a refused leg with RST; a relay that never reports is dead.
@@ -691,12 +690,11 @@ impl Handler {
                             Err(mpsc::TryRecvError::Empty) => true,
                             Err(mpsc::TryRecvError::Disconnected) => false,
                         };
-                        end = Some(if clean {
+                        break if clean {
                             FLAG_FIN | FLAG_ACK
                         } else {
                             FLAG_RST | FLAG_ACK
-                        });
-                        break;
+                        };
                     }
                     Ok(n) => {
                         let seq = snd_nxt.fetch_add(n as u32, Relaxed);
@@ -711,8 +709,7 @@ impl Handler {
                             &mut pkt,
                         );
                         if dev_writer.write_all(&pkt).is_err() {
-                            end = Some(FLAG_RST | FLAG_ACK);
-                            break;
+                            break FLAG_RST | FLAG_ACK;
                         }
                     }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
@@ -724,30 +721,24 @@ impl Handler {
                         ) =>
                     {
                         if !busy.swap(false, Relaxed) {
-                            end = Some(FLAG_RST | FLAG_ACK);
-                            break;
+                            break FLAG_RST | FLAG_ACK;
                         }
                     }
-                    Err(_) => {
-                        end = Some(FLAG_RST | FLAG_ACK);
-                        break;
-                    }
+                    Err(_) => break FLAG_RST | FLAG_ACK,
                 }
-            }
-            if let Some(flags) = end {
-                if !signaled.swap(true, Relaxed) {
-                    render_tcp_packet(
-                        (local_ip, local_port),
-                        (remote_ip, remote_port),
-                        snd_nxt.load(Relaxed),
-                        rcv_nxt.load(Relaxed),
-                        flags,
-                        65535,
-                        &[],
-                        &mut pkt,
-                    );
-                    let _ = dev_writer.write_all(&pkt);
-                }
+            };
+            if !signaled.swap(true, Relaxed) {
+                render_tcp_packet(
+                    (local_ip, local_port),
+                    (remote_ip, remote_port),
+                    snd_nxt.load(Relaxed),
+                    rcv_nxt.load(Relaxed),
+                    end,
+                    65535,
+                    &[],
+                    &mut pkt,
+                );
+                let _ = dev_writer.write_all(&pkt);
             }
             // Both halves, because the handler's write half is a clone of this descriptor and only a shutdown tells it the flow is over.
             let _ = read_half.shutdown(Shutdown::Both);
