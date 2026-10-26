@@ -25,9 +25,10 @@ Shadowsocks, and VLESS only with the Vision flow on raw TCP. It has no plain
 VLESS, `xhttp`, KCP, gRPC, HTTPUpgrade, Hysteria, VLESS encryption, or
 Shadowsocks 2022, and those cells name that in the bundle's skipped list.
 `scripts/xray-to-leaf.py` writes its TLS, REALITY and WebSocket layers as chain
-actors. `xray-rust` joins every standard and full cell its pin admits;
-`matrix_rust_client_config` removes the CA file and verify certificate it
-rejects while keeping the certificate pin.
+actors. `xray-rust` joins every standard and full cell its pin admits, except
+VLESS over Hysteria: its Hysteria outbound speaks Hysteria's own proxy protocol,
+not a transport that carries VLESS. `matrix_rust_client_config` removes the CA
+file and verify certificate it rejects while keeping the certificate pin.
 
 Each scenario that has both servers also runs the reference client against both,
 so `scripts/check-matrix-legs.py` can say which leg lost: a ferrox client below

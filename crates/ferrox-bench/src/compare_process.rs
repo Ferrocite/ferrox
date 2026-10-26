@@ -981,8 +981,7 @@ fn carrier_of(scenario: &str) -> Option<&'static str> {
 fn carries(engine: &str, carrier: &str) -> bool {
     !matches!(
         (engine, carrier),
-        ("xray-rust" | "zeronet", "kcp")
-            | ("zeronet", "hysteria")
+        ("xray-rust" | "zeronet", "kcp" | "hysteria")
             | ("sing-box" | "leaf", "kcp" | "hysteria" | "xhttp")
     )
 }
@@ -1883,6 +1882,16 @@ mod tests {
         let (names, skipped) = participant_names(&engines, &workload());
         assert_eq!(names, vec!["xray-core", "sing-box", "leaf"]);
         assert_eq!(skipped, Vec::new());
+    }
+
+    #[test]
+    fn xray_rust_does_not_carry_vless_over_hysteria() {
+        assert!(!carries("xray-rust", "hysteria"));
+        assert!(carries("xray-rust", "xhttp"), "xhttp is a carrier it has");
+        assert!(
+            carries("xray-rust", "hysteria-v1"),
+            "a protocol name is not a carrier"
+        );
     }
 
     #[test]
