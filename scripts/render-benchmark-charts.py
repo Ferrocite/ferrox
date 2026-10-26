@@ -772,6 +772,10 @@ def assemble(cells_dir, meta):
                 "rows": cell.get("rows", []),
             }
         )
+    references = sorted(
+        {scenario["reference"] for scenario in scenarios if scenario.get("reference")},
+        key=lambda name: (name != "xray-core", name),
+    )
     return {
         "version": 2,
         "tier": meta.get("tier", "?"),
@@ -782,7 +786,7 @@ def assemble(cells_dir, meta):
         "memory": meta.get("memory", "?"),
         "load": meta.get("load", "?"),
         "repeats": meta.get("repeats", "?"),
-        "reference": "xray-core",
+        "reference": ", ".join(references) or "xray-core",
         "scenarios": scenarios,
         "manifest": meta.get("raw", []),
     }

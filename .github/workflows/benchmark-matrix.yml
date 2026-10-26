@@ -180,7 +180,7 @@ jobs:
             flags="$flags --engines ferrox,$planned_engines"
             trees="$planned_engines"
           elif [[ "$tier" == "smoke" ]]; then
-            trees="xray-core,xray-core-rust"
+            trees="xray-core,xray-core-rust,sing-box"
           fi
           echo "tier=$tier" >> "$GITHUB_OUTPUT"
           echo "cells=$cells" >> "$GITHUB_OUTPUT"
