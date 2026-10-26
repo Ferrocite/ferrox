@@ -7099,7 +7099,7 @@ where
         close();
         return false;
     };
-    if vless.flow == crate::vision::FLOW {
+    if vless.flow == ferrox_core::vless::VISION_FLOW {
         eprintln!("vless: vision over a carried encrypted session is not served yet");
         close();
         return false;
