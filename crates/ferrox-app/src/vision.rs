@@ -27,6 +27,7 @@ const ZERO: [u8; BUFFER] = [0u8; BUFFER];
 pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     session: S,
     raw: Option<Connection>,
+    direct: Option<fn(&mut S)>,
     uuid: [u8; 16],
     /// The framing walks the stream in place: `[..dot)` is delivered and drains away on
     /// the next read, `[dot..)` is the walk's frontier, and the window is one record
@@ -200,6 +201,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         Self {
             session,
             raw,
+            direct: None,
             uuid: *uuid,
             have: Vec::with_capacity(WINDOW),
             dot: 0,
@@ -234,6 +236,64 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 cipher: 0,
             },
         }
+    }
+}
+
+/// A sealed session as the framer sees it: one frame is one sealed record, so the parts the
+/// walk hands over are joined before the record layer takes them.
+pub(crate) struct Sealed<S>(ferrox_core::vless_encryption::EncryptedStream<S>);
+
+impl<S: Read + Write + RecordAlignment> Sealed<S> {
+    fn enter_direct_mode(&mut self) {
+        self.0.enter_direct_mode();
+    }
+}
+
+impl<S: Read + Write> Read for Sealed<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl<S: Read + Write> Write for Sealed<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> RecordAlignment for Sealed<S> {
+    fn engage_record_alignment(&mut self) {
+        self.0.get_mut().engage_record_alignment();
+    }
+
+    fn disarm_record_alignment(&mut self) {
+        self.0.get_mut().disarm_record_alignment();
+    }
+
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        let len = parts.iter().map(|part| part.len()).sum();
+        let mut joined = Vec::with_capacity(len);
+        for part in parts {
+            joined.extend_from_slice(part);
+        }
+        self.0.write_all(&joined)
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> Link<Sealed<S>> {
+    /// The direct command peels the record layer, not the transport: the sealed stream keeps the
+    /// XOR header mask the reference's `XorConn` carries across the switch.
+    pub(crate) fn sealed(
+        session: ferrox_core::vless_encryption::EncryptedStream<S>,
+        uuid: &[u8; 16],
+    ) -> Self {
+        let mut link = Self::new(Sealed(session), None, uuid);
+        link.direct = Some(Sealed::<S>::enter_direct_mode);
+        link
     }
 }
 
@@ -509,6 +569,11 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             }
             // a command that is not a continue ends the framing; its tail is content
             self.read.padding = false;
+            if walk.command == VisionCommand::Direct.byte() {
+                if let Some(direct) = self.direct {
+                    direct(&mut self.session);
+                }
+            }
             self.read.raw = walk.command == VisionCommand::Direct.byte() && self.raw.is_some();
             break held;
         };
@@ -634,6 +699,11 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
             at += content;
             if command != 0 {
                 self.write.padding = false;
+                if command == VisionCommand::Direct.byte() {
+                    if let Some(direct) = self.direct {
+                        direct(&mut self.session);
+                    }
+                }
                 self.write.raw = self.raw.is_some()
                     && self.tls.enable_xtls
                     && command == VisionCommand::Direct.byte();
