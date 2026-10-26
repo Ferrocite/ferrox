@@ -30224,9 +30224,22 @@ mod tests {
 
     /// xray-core buffers the response header until the target first writes, so an upload-only
     /// flow never flushes it. The client must start forwarding before it waits for that header,
-    /// or the server waits for an upload the client has not sent yet.
+    /// or a bulk upload fills the socket and the server waits for bytes the client has not sent.
     #[test]
-    fn a_vmess_tls_upload_starts_before_the_server_flushes_its_response_header() {
+    fn a_vmess_tls_bulk_upload_reaches_the_peer_before_the_response_header() {
+        for carrier in [
+            Carrier::Raw(Chain::default()),
+            Carrier::Ws {
+                path: "/vmess-ws".to_owned(),
+                ed: 0,
+            },
+        ] {
+            vmess_tls_upload_before_response_header(carrier);
+        }
+    }
+
+    fn vmess_tls_upload_before_response_header(carrier: Carrier) {
+        const UPLOAD: usize = 2 * 1024 * 1024;
         let (server_config, client_config) = carried_tls_configs();
         let id = [0x61u8; 16];
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -30235,22 +30248,37 @@ mod tests {
         let out = vmess_test_out(
             port,
             id,
-            Carrier::Raw(Chain::default()),
+            carrier.clone(),
             Some(&(Arc::clone(&server_config), client_config)),
         );
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             let raw = stream.try_clone().expect("clones");
             let session = accept_tls_session(stream, &server_config).expect("tls");
-            let (mut reader, mut writer) = session_halves(session, raw);
+            let (reader, writer) = session_halves(session, raw);
+            let (mut reader, mut writer): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+                match &carrier {
+                    Carrier::Raw(_) => (Box::new(reader), Box::new(writer)),
+                    Carrier::Ws { path, .. } => {
+                        let (reader, writer) =
+                            crate::ws::accept_split(reader, writer, path).expect("ws upgrade");
+                        (Box::new(reader), Box::new(writer))
+                    }
+                    _ => unreachable!("the test drives the two tls upload cells"),
+                };
             let users = crate::vmess::Users::single(id);
             let accepted =
                 crate::vmess::accept_request(&mut reader, &users).expect("the request decodes");
             let mut recv = accepted.recv;
             let mut scratch = Vec::new();
-            let frame = crate::vmess::read_frame(&mut reader, &mut recv, &mut scratch)
-                .expect("the upload arrives before the response header");
-            assert_eq!(frame, b"ping");
+            let mut total = 0;
+            while total < UPLOAD {
+                let frame = crate::vmess::read_frame(&mut reader, &mut recv, &mut scratch)
+                    .expect("the upload arrives before the response header");
+                assert!(!frame.is_empty(), "the upload ends below its length");
+                total += frame.len();
+            }
+            assert_eq!(total, UPLOAD);
             uploaded_tx.send(()).expect("signals");
             writer.write_all(&accepted.prefix).expect("response header");
             writer.flush().expect("flushes");
@@ -30269,7 +30297,7 @@ mod tests {
         let mut sock = connect_until(downstream_port);
         sock.set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
-        sock.write_all(b"ping").expect("writes");
+        sock.write_all(&vec![0x5Au8; UPLOAD]).expect("writes");
         sock.shutdown(Shutdown::Write).expect("half-closes");
         uploaded_rx
             .recv_timeout(Duration::from_secs(10))
