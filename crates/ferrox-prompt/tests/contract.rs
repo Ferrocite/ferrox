@@ -406,3 +406,51 @@ fn every_matrix_template_draws_a_row_of_its_own_class() {
         );
     }
 }
+
+#[test]
+fn the_issue_template_takes_a_number_and_names_the_bugfix_branch() {
+    let library = library();
+    let templates: Vec<&ferrox_prompt::markdown::Prompt> = library
+        .prompts
+        .iter()
+        .filter(|prompt| {
+            prompt
+                .placeholders
+                .iter()
+                .any(|placeholder| placeholder.name == "issue")
+        })
+        .collect();
+    assert_eq!(
+        templates.len(),
+        1,
+        "`issue <number>` needs exactly one template with an {{issue}} blank"
+    );
+    let prompt = templates[0];
+    let state = ProjectState::load(&manifest_root());
+    let values = BTreeMap::from([
+        ("issue".to_owned(), "661".to_owned()),
+        ("references".to_owned(), state.references()),
+    ]);
+    let rendered = render::render(&library, prompt, &values, &[], None, Options::default());
+    assert!(
+        rendered.missing.is_empty(),
+        "P{}: {:?}",
+        prompt.id,
+        rendered.missing
+    );
+    assert!(rendered.text.contains("#661"), "{}", rendered.text);
+    assert!(
+        rendered
+            .text
+            .contains("./scripts/new-worktree.sh bugfix-661"),
+        "the issue names its own worktree"
+    );
+    assert!(
+        rendered.text.contains("P0 or P1"),
+        "the default priority names the class the slice serves"
+    );
+    assert_eq!(
+        render::suggested_command(prompt, &["issue".to_owned()], &[]),
+        "ferrox-prompt issue <number>"
+    );
+}

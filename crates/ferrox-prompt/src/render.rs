@@ -372,6 +372,9 @@ pub fn resolve_addons(prompt: &Prompt, requests: &[String]) -> Result<Vec<Addon>
 
 /// The command line that would render `prompt` with `missing` filled: one paste, not a dialog about four keys.
 pub fn suggested_command(prompt: &Prompt, missing: &[String], addons: &[String]) -> String {
+    if missing.len() == 1 && missing[0] == "issue" {
+        return "ferrox-prompt issue <number>".to_owned();
+    }
     let mut command = format!("ferrox-prompt render P{}", prompt.id);
     for name in missing {
         let _ = write!(command, " --set {name}=<value>");
@@ -653,6 +656,38 @@ with {target=core}
         assert!(rendered
             .text
             .contains("ferrox-prompt render P1 --set scope=<value> --set len=<value>"));
+    }
+
+    #[test]
+    fn a_missing_issue_points_at_the_short_command() {
+        let library = Library::parse(
+            Path::new("prompts.md"),
+            "\
+## Shared protocol
+
+```text
+p
+```
+
+## P1 · Fix an issue
+
+**When to use:** a regression
+**Status:** todo
+**Leverage:** 5
+**Effort:** medium
+**Targets:** none
+**Gates:** `cargo test`
+
+```text
+fix issue #{issue}
+```
+",
+        );
+        let prompt = library.prompt(1).unwrap();
+        assert_eq!(
+            suggested_command(prompt, &["issue".to_owned()], &[]),
+            "ferrox-prompt issue <number>"
+        );
     }
 
     #[test]
