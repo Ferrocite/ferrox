@@ -510,6 +510,7 @@ security-utls shaped-dials-that-answer-a-tls13-client-auth-request 1 ferrox-core
 security-utls shaped-dials-that-complete-a-tls12-handshake 3 ferrox-core-tls::rustls_backend::tests::a_shaped_dial_finishes_every_tls12_record_shape
 security-utls relayed-records-that-allocate-once-warm 0 ferrox-core-tls::rustls_backend::tests::a_shaped_record_relays_without_allocating_once_the_handshake_is_done
 security-utls shaped-records-resumed-after-a-poll-split 1 ferrox-core-tls::shaped::client::tests::a_record_split_by_a_timeout_is_resumed_not_lost
+security-utls pulled-records-resumed-after-a-poll-split 1 ferrox-core-tls::shaped::client::tests::a_landed_record_split_by_a_timeout_is_resumed_not_lost
 security-utls shaped-handshake-records-resumed-after-a-poll-split 1 ferrox-core-tls::shaped::client::tests::a_handshake_record_split_by_a_timeout_is_resumed_not_lost
 security-utls carrier-records-that-allocate-once-warm 0 ferrox-core-tls::rustls_backend::tests::a_carrier_record_lands_in_the_callers_window_without_a_stage
 security-utls carrier-records-staged-into-a-fitting-window 0 ferrox-core-tls::rustls_backend::tests::a_carrier_record_lands_in_the_callers_window_without_a_stage
