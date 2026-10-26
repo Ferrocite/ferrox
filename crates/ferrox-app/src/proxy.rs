@@ -11279,6 +11279,10 @@ impl<S: CipherOpen, R: Read> Read for DrivenHalf<S, R> {
                 // The session has more ciphertext to take.
                 continue;
             }
+            if filled > 0 {
+                // Plaintext is ready: the transport waits for the next read, not behind this one.
+                return Ok(filled);
+            }
             // The transport's wait happens here, with no session lock held.
             let read = {
                 let mut reader = self
@@ -22651,6 +22655,59 @@ mod tests {
             .expect("reads");
         assert_eq!(read, 4);
         assert_eq!(&buf, b"pong");
+    }
+
+    /// A record already opened is handed to the caller without asking the transport for more:
+    /// the peer's next bytes are the next read's wait, not this one's.
+    #[test]
+    fn a_driven_read_hands_over_ready_plaintext_without_another_transport_read() {
+        struct OnceOpen;
+        impl CipherOpen for OnceOpen {
+            fn open(
+                &mut self,
+                ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                let plain = ciphertext.len().min(buf.len());
+                buf[..plain].copy_from_slice(&ciphertext[..plain]);
+                Ok((plain, ciphertext.len()))
+            }
+
+            fn seal_into(
+                &mut self,
+                _plaintext: &[u8],
+                _out: &mut Vec<u8>,
+            ) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        struct OnceRead {
+            reads: usize,
+        }
+        impl Read for OnceRead {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.reads > 1 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
+                buf[..4].copy_from_slice(b"pong");
+                Ok(4)
+            }
+        }
+        let transport = Arc::new(Mutex::new(OnceRead { reads: 0 }));
+        let mut half = DrivenHalf::new(
+            Arc::new(Mutex::new(OnceOpen)),
+            Arc::clone(&transport),
+            Arc::new(Mutex::new(Sealed::new(std::io::sink()))),
+        );
+        let mut buf = [0u8; 64];
+        let read = half.read(&mut buf).expect("reads");
+        assert_eq!(&buf[..read], b"pong");
+        assert_eq!(
+            transport.lock().expect("locks").reads,
+            1,
+            "the read waited on the transport again with plaintext already in hand"
+        );
     }
 
     /// The app's own client and server speak the sealed raw session end to end: the hello,
