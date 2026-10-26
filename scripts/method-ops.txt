@@ -145,5 +145,3 @@ security-ech  tls::shaped::hello::tests::an_aes_256_only_config_seals_the_inner_
 engine-observatory  observatory::tests::a_probe_through_freedom_reads_the_headers_and_gives_the_delay  ferrox_app::observatory::probe
 front-healthcheck  proxy::hc_tests::an_hc_get_answers_the_configured_body_after_the_exact_path  ferrox_app::proxy::HcHandler::answer
 carrier-quic  proxy::tests::quic_serves_vless_echo_over_loopback  quic::serve_loop
-carrier-quic  proxy::tests::quic_serves_vless_echo_over_loopback  quic::route
-carrier-quic  proxy::tests::quic_serves_vless_echo_over_loopback  quic::reap

@@ -755,15 +755,23 @@ pub(crate) fn recv_batch(sock: &Datagram, batch: &mut Batch) -> Drain {
         iov_base: std::ptr::null_mut(),
         iov_len: MAX_DATAGRAM,
     });
-    let mut headers: [libc::mmsghdr; RECV_SLOTS] =
-        std::array::from_fn(|_| unsafe { std::mem::zeroed() });
+    let mut headers: [std::mem::MaybeUninit<libc::mmsghdr>; RECV_SLOTS] =
+        std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
     let room = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     for at in 0..RECV_SLOTS {
         parts[at].iov_base = batch.slots[at].as_mut().as_mut_ptr().cast();
-        headers[at].msg_hdr.msg_name = batch.peers[at].as_mut_ptr().cast();
-        headers[at].msg_hdr.msg_namelen = room;
-        headers[at].msg_hdr.msg_iov = (&raw mut parts[at]).cast();
-        headers[at].msg_hdr.msg_iovlen = 1;
+        headers[at].write(libc::mmsghdr {
+            msg_hdr: libc::msghdr {
+                msg_name: batch.peers[at].as_mut_ptr().cast(),
+                msg_namelen: room,
+                msg_iov: (&raw mut parts[at]).cast(),
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            },
+            msg_len: 0,
+        });
     }
     // `MSG_WAITFORONE` returns on the first datagram that is there rather than waiting for the whole batch: the caller's deadline is the socket's own arm, and a batch that waited for eight would turn one slow packet into eight slow packets.
     //
@@ -796,6 +804,8 @@ pub(crate) fn recv_batch(sock: &Datagram, batch: &mut Batch) -> Drain {
     // A read that ran dry after some datagrams is the count, not the error: the kernel answers with what it took.
     let got = usize::try_from(got).unwrap_or(0).min(RECV_SLOTS);
     for (at, header) in headers.iter().enumerate().take(got) {
+        // SAFETY: `recvmmsg` wrote `msg_len` for every message it reported, and the name length is the one the kernel filled beside it.
+        let header = unsafe { header.assume_init_ref() };
         batch.lens[at].write(header.msg_len);
         batch.names[at].write(header.msg_hdr.msg_namelen);
     }
@@ -2879,10 +2889,12 @@ struct ServerConn {
 /// The per-stream entry point a VLESS inbound serves: one stream, one session, no shared state.
 pub(crate) type Serve = Arc<dyn Fn(QuicStream) + Send + Sync>;
 
-/// The driver's two datagram scratch buffers, passed as one so routing stays within the argument budget.
+/// The driver's two datagram scratch buffers and the two tables one reap fills, passed as one so routing stays within the argument budget and a batch reuses its slots instead of allocating.
 struct Scratch {
     buf: [u8; MAX_DATAGRAM],
     out: [u8; MAX_DATAGRAM],
+    states: Vec<Arc<ServerConn>>,
+    fresh: Vec<(Arc<Mutex<quiche::Connection>>, u64)>,
 }
 
 /// The driver: one UDP socket is read by this loop alone, so no packet is fed to the wrong connection.
@@ -2900,7 +2912,11 @@ pub(crate) fn serve_loop(
     let mut scratch = Scratch {
         buf: [0u8; MAX_DATAGRAM],
         out: [0u8; MAX_DATAGRAM],
+        states: Vec::new(),
+        fresh: Vec::new(),
     };
+    #[cfg(target_os = "linux")]
+    let mut batch = Batch::new();
     while !stop.load(Ordering::Relaxed) {
         let start = Instant::now();
         let mut wait = Duration::from_millis(100);
@@ -2916,28 +2932,63 @@ pub(crate) fn serve_loop(
         if !sock.refresh_read_timeout(wait) {
             return;
         }
+        // A serving lane takes the queue in a batch where the platform has one: a burst of a dozen packets is one read and one reap, not one visit each.
+        #[cfg(target_os = "linux")]
+        match recv_batch(&sock, &mut batch) {
+            Drain::Read => {
+                for at in 0..batch.len() {
+                    let Some((bytes, from)) = batch.at(at) else {
+                        continue;
+                    };
+                    route(
+                        &sock,
+                        local,
+                        config,
+                        &mut conns,
+                        bytes,
+                        &mut scratch.out,
+                        from,
+                    );
+                }
+                reap(serve, &sock, &mut conns, &mut scratch);
+                continue;
+            }
+            Drain::Empty => {
+                run_timers(&mut conns, &sock, start.elapsed());
+                reap(serve, &sock, &mut conns, &mut scratch);
+                continue;
+            }
+            Drain::Unbatchable => {}
+        }
         match sock.recv_from(&mut scratch.buf) {
-            Ok((n, from)) => route(&sock, local, config, &mut conns, &mut scratch, n, from),
+            Ok((n, from)) => {
+                let Scratch { buf, out, .. } = &mut scratch;
+                route(&sock, local, config, &mut conns, &mut buf[..n], out, from);
+            }
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                let elapsed = start.elapsed();
-                for state in conns.values() {
-                    let Ok(mut conn) = state.conn.lock() else {
-                        continue;
-                    };
-                    if conn.timeout().is_none_or(|left| left <= elapsed) {
-                        conn.on_timeout();
-                        flush_egress(&mut conn, &sock);
-                    }
-                }
+                run_timers(&mut conns, &sock, start.elapsed());
             }
             Err(_) => return,
         }
-        reap(serve, &sock, &mut conns);
+        reap(serve, &sock, &mut conns, &mut scratch);
+    }
+}
+
+/// Run the timers whose deadline this wait passed, answering what they queued.
+fn run_timers(conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>, sock: &Datagram, elapsed: Duration) {
+    for state in conns.values() {
+        let Ok(mut conn) = state.conn.lock() else {
+            continue;
+        };
+        if conn.timeout().is_none_or(|left| left <= elapsed) {
+            conn.on_timeout();
+            flush_egress(&mut conn, sock);
+        }
     }
 }
 
@@ -2960,12 +3011,11 @@ fn route(
     local: SocketAddr,
     config: &Arc<Mutex<quiche::Config>>,
     conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
-    scratch: &mut Scratch,
-    n: usize,
+    buf: &mut [u8],
+    out: &mut [u8],
     from: SocketAddr,
 ) {
-    let Scratch { buf, out } = scratch;
-    let Ok(header) = quiche::Header::from_slice(&mut buf[..n], quiche::MAX_CONN_ID_LEN) else {
+    let Ok(header) = quiche::Header::from_slice(buf, quiche::MAX_CONN_ID_LEN) else {
         return;
     };
     if let Some(state) = conns.get(header.dcid.as_ref()).cloned() {
@@ -2973,7 +3023,7 @@ fn route(
             return;
         };
         let info = quiche::RecvInfo { from, to: local };
-        let _ = conn.recv(&mut buf[..n], info);
+        let _ = conn.recv(buf, info);
         flush_egress(&mut conn, sock);
         learn_ids(conns, &state, &conn);
         return;
@@ -3001,7 +3051,7 @@ fn route(
     };
     drop(guard);
     let info = quiche::RecvInfo { from, to: local };
-    if conn.recv(&mut buf[..n], info).is_err() {
+    if conn.recv(buf, info).is_err() {
         return;
     }
     flush_egress(&mut conn, sock);
@@ -3013,35 +3063,40 @@ fn route(
     conns.insert(header.dcid.as_ref().to_vec(), state);
 }
 
-/// New peer streams to sessions, finished ones out of the table, dead connections dropped.
-fn reap(serve: &Serve, sock: &Arc<Datagram>, conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>) {
+/// New peer streams to sessions, finished ones out of the table, dead connections dropped. One lock per connection covers the source-id, readable and finished questions, and the two tables live across calls so a busy connection does not pay for them again on every visit.
+fn reap(
+    serve: &Serve,
+    sock: &Arc<Datagram>,
+    conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
+    scratch: &mut Scratch,
+) {
     // Closed connections drop every key they hold, so no routing entry outlives its connection.
     conns.retain(|_, state| state.conn.lock().is_ok_and(|conn| !conn.is_closed()));
-    // New source IDs first: a packet carrying one must route on the next datagram.
-    for state in conns.values().cloned().collect::<Vec<_>>() {
-        let Ok(conn) = state.conn.lock() else {
-            continue;
-        };
-        learn_ids(conns, &state, &conn);
-    }
-    let mut fresh: Vec<(Arc<Mutex<quiche::Connection>>, u64)> = Vec::new();
-    for state in conns.values() {
-        let Ok(conn) = state.conn.lock() else {
-            continue;
-        };
-        let readable: Vec<u64> = conn.readable().collect();
-        if let Ok(mut seen) = state.seen.lock() {
-            for stream in readable {
-                // Client bidirectional streams only: the H3 opening rides unidirectional ones.
-                if stream % 4 != 0 || !seen.insert(stream) {
-                    continue;
+    scratch.states.clear();
+    scratch.states.extend(conns.values().cloned());
+    scratch.fresh.clear();
+    {
+        let states = &scratch.states;
+        let fresh = &mut scratch.fresh;
+        for state in states {
+            let Ok(conn) = state.conn.lock() else {
+                continue;
+            };
+            // New source IDs first: a packet carrying one must route on the next datagram.
+            learn_ids(conns, state, &conn);
+            if let Ok(mut seen) = state.seen.lock() {
+                for stream in conn.readable() {
+                    // Client bidirectional streams only: the H3 opening rides unidirectional ones.
+                    if stream % 4 != 0 || !seen.insert(stream) {
+                        continue;
+                    }
+                    fresh.push((Arc::clone(&state.conn), stream));
                 }
-                fresh.push((Arc::clone(&state.conn), stream));
+                seen.retain(|stream| !conn.stream_finished(*stream));
             }
-            seen.retain(|stream| !conn.stream_finished(*stream));
         }
     }
-    for (conn, stream) in fresh {
+    for (conn, stream) in scratch.fresh.drain(..) {
         let session = QuicStream {
             conn,
             sock: Arc::clone(sock),
