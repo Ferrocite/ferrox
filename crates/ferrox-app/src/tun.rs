@@ -1921,6 +1921,57 @@ mod tests {
         }
     }
 
+    /// One client segment, dispatched exactly as `serve` would after its device read.
+    #[cfg(unix)]
+    #[allow(clippy::too_many_arguments)] // the fields of one segment, plus the handler and the device buffer
+    fn deliver_segment(
+        handler: &mut Handler,
+        peer: &mut std::fs::File,
+        buf: &mut [u8],
+        destination: SocketAddr,
+        source_port: u16,
+        seq: u32,
+        flags: u8,
+        payload: &[u8],
+    ) {
+        let SocketAddr::V4(destination) = destination else {
+            panic!("the flow names an IPv4 destination");
+        };
+        let packet = build_tcp_packet(
+            (SCRIPT_CLIENT, source_port),
+            (destination.ip().octets(), destination.port()),
+            seq,
+            0,
+            flags,
+            65535,
+            payload,
+        );
+        peer.write_all(&packet).unwrap();
+        let n = handler.device.read_packet(buf).unwrap();
+        assert_eq!(&buf[..n], &packet[..], "one packet per device read");
+        handler.dispatch(&buf[..n]).unwrap();
+    }
+
+    /// The next packet the device wrote, waited for with a bound so a silent lane
+    /// fails the test instead of parking it.
+    #[cfg(unix)]
+    fn next_packet(peer: &mut std::fs::File, buf: &mut [u8]) -> Vec<u8> {
+        for _ in 0..2_500 {
+            match peer.read(buf) {
+                Ok(0) => break,
+                Ok(n) => return buf[..n].to_vec(),
+                Err(ref e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::Interrupted =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                Err(_) => break,
+            }
+        }
+        panic!("no packet came back to the device");
+    }
+
     /// Silence past the idle budget is death, not a leak: a flow that stops speaking on both sides hands its relay leg back at the budget, and its entry goes at the next dial.
     #[cfg(unix)]
     #[test]
@@ -1980,6 +2031,155 @@ mod tests {
             "a reset flow is still holding its relay leg"
         );
         assert!(handler.flows.is_empty(), "the reset flow's entry is gone");
+    }
+
+    /// A segment that arrives out of order is held rather than written, a repeat is
+    /// dropped, and the ACK names the highest contiguous byte — so the proxy
+    /// receives a TLS record or an HTTP body in sequence exactly once.
+    #[cfg(unix)]
+    #[test]
+    fn a_reordered_or_repeated_segment_reaches_the_proxy_once_in_order() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let dials: Dials = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut handler = Handler::new(
+            Device::from_handle(a, DEFAULT_MTU),
+            recording_relay(dials.clone()),
+            no_associate(),
+        );
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let destination: SocketAddr = "203.0.113.7:80".parse().unwrap();
+        let syn_seq = 1000;
+        open_flow(
+            &mut handler,
+            &mut peer,
+            destination,
+            51100,
+            syn_seq,
+            &mut buf,
+        );
+        let first = syn_seq.wrapping_add(1);
+
+        // The tail arrives first: it waits for the hole in front of it.
+        deliver_segment(
+            &mut handler,
+            &mut peer,
+            &mut buf,
+            destination,
+            51100,
+            first.wrapping_add(5),
+            FLAG_PSH | FLAG_ACK,
+            b"world",
+        );
+        let ack = next_packet(&mut peer, &mut buf);
+        let (_ip, ack_body) = ipv4_head(&ack).unwrap();
+        let (ack_tcp, _) = tcp_head(ack_body).unwrap();
+        assert_eq!(ack_tcp.flags, FLAG_ACK, "the hole is acknowledged at once");
+        assert_eq!(
+            u32::from_be_bytes(ack_body[8..12].try_into().unwrap()),
+            first,
+            "the ack names the highest contiguous byte, not the segment that arrived"
+        );
+
+        // The head fills the hole and drains the tail; the repeat carries nothing new.
+        deliver_segment(
+            &mut handler,
+            &mut peer,
+            &mut buf,
+            destination,
+            51100,
+            first,
+            FLAG_PSH | FLAG_ACK,
+            b"hello",
+        );
+        deliver_segment(
+            &mut handler,
+            &mut peer,
+            &mut buf,
+            destination,
+            51100,
+            first,
+            FLAG_PSH | FLAG_ACK,
+            b"hello",
+        );
+        deliver_segment(
+            &mut handler,
+            &mut peer,
+            &mut buf,
+            destination,
+            51100,
+            first.wrapping_add(10),
+            FLAG_FIN | FLAG_ACK,
+            &[],
+        );
+
+        wait_for(&dials, 1);
+        assert_eq!(
+            dials.lock().unwrap().clone(),
+            vec![("203.0.113.7:80".to_owned(), b"helloworld".to_vec())],
+            "the proxy receives the stream once and in order"
+        );
+    }
+
+    /// A gap with more payload behind it than the window holds ends the flow with
+    /// one reset, and no held byte reaches the proxy.
+    #[cfg(unix)]
+    #[test]
+    fn an_over_full_reorder_window_ends_the_flow_with_a_reset() {
+        let (a, mut peer) = peer_with_deadline().unwrap();
+        let dials: Dials = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut handler = Handler::new(
+            Device::from_handle(a, DEFAULT_MTU),
+            recording_relay(dials.clone()),
+            no_associate(),
+        );
+        let mut buf = vec![0u8; DEFAULT_MTU + 64];
+        let destination: SocketAddr = "203.0.113.8:443".parse().unwrap();
+        let syn_seq = 2000;
+        let key = open_flow(
+            &mut handler,
+            &mut peer,
+            destination,
+            51101,
+            syn_seq,
+            &mut buf,
+        );
+
+        // The published window is 64 segments (front-tun.md); one more ends the flow.
+        const WINDOW_SEGMENTS: usize = 64;
+        // The first byte of the stream is lost; every segment behind it is held.
+        for behind in 0..=WINDOW_SEGMENTS as u32 {
+            deliver_segment(
+                &mut handler,
+                &mut peer,
+                &mut buf,
+                destination,
+                51101,
+                syn_seq.wrapping_add(2 + behind),
+                FLAG_ACK,
+                b"x",
+            );
+        }
+
+        let mut resets = 0;
+        loop {
+            let packet = next_packet(&mut peer, &mut buf);
+            let (_ip, body) = ipv4_head(&packet).unwrap();
+            let (tcp, _) = tcp_head(body).unwrap();
+            if tcp.flags & FLAG_RST != 0 {
+                resets += 1;
+                break;
+            }
+        }
+        assert_eq!(resets, 1, "the overflow ends the flow with one reset");
+        wait_for(&dials, 1);
+        assert!(
+            dials.lock().unwrap()[0].1.is_empty(),
+            "no held byte reached the proxy"
+        );
+        assert!(
+            !handler.flows.contains_key(&key),
+            "the reset flow's entry is gone"
+        );
     }
 
     #[test]
