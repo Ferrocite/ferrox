@@ -614,7 +614,7 @@ impl Connection {
             if n > 0 {
                 return Ok(n);
             }
-            if self.state() == State::PeerTerminating {
+            if matches!(self.state(), State::PeerClosed | State::PeerTerminating) {
                 return Err(ConnError::Closed);
             }
             self.wait_for_data_input(snap)?;
@@ -904,6 +904,29 @@ mod tests {
         assert_eq!(read_once(&conn, &mut buf), Ok(11));
         assert_eq!(&buf[..11], b"firstsecond");
         assert_eq!(read_once(&conn, &mut buf), Err(super::ConnError::IoTimeout));
+    }
+
+    #[test]
+    fn a_peer_close_ends_the_read_after_the_data_it_sent() {
+        let conn = echoing_connection();
+        let mut close = CmdOnlySegment::new();
+        close.conv = 4;
+        close.option = super::SegmentOption::CLOSE;
+        conn.input(&mut vec![data(0, 0, b"last"), Segment::CmdOnly(close)]);
+        let mut buf = [0u8; 8];
+        assert_eq!(read_once(&conn, &mut buf), Ok(4));
+        assert_eq!(
+            &buf[..4],
+            b"last",
+            "the close did not drop the data before it"
+        );
+        conn.set_read_deadline(Instant::now() + Duration::from_secs(5));
+        let began = Instant::now();
+        assert_eq!(conn.read(&mut buf), Err(super::ConnError::Closed));
+        assert!(
+            began.elapsed() < Duration::from_millis(500),
+            "the reader waited for its deadline instead of the peer's close"
+        );
     }
 
     #[test]
