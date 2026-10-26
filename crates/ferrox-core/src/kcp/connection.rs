@@ -614,7 +614,7 @@ impl Connection {
             if n > 0 {
                 return Ok(n);
             }
-            if matches!(self.state(), State::PeerClosed | State::PeerTerminating) {
+            if self.state() == State::PeerTerminating {
                 return Err(ConnError::Closed);
             }
             self.wait_for_data_input(snap)?;
