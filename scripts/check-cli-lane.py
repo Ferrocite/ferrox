@@ -266,8 +266,11 @@ fi
 if [ "${FERROX_FAKE_SYSTEM_FAIL:-}" = 1 ]; then
   case " $* " in *" --noproxy "*) ;; *) exit 7 ;; esac
 fi
+if [ "${FERROX_FAKE_CLOUDFLARE_BLOCK:-}" = 1 ]; then
+  case " $* " in *cloudflare.com*) exit 7 ;; esac
+fi
 if [ "${FERROX_FAKE_TRACE:-}" = 1 ]; then
-  printf 'ip=203.0.113.9\\nloc=US\\n'
+  case " $* " in *example.com*) printf 'Example Domain\\n' ;; *) printf 'ip=203.0.113.9\\nloc=US\\n' ;; esac
   exit 0
 fi
 exit 7
@@ -1602,121 +1605,154 @@ def check_vpn_proxy_readback(state: pathlib.Path) -> int:
             return False
         return True
 
-    fresh()
-    arm = up()
-    output = arm.stdout + arm.stderr
-    if (
-        arm.returncode != 0
-        or proxy_field(state, "socks-proxy") != f"127.0.0.1:{port}"
-        or proxy_field(state, "socks-enabled") != "on"
-        or not (state / "system-proxy.ports").exists()
-    ):
+    try:
+        fresh()
+        arm = up()
+        output = arm.stdout + arm.stderr
+        if (
+            arm.returncode != 0
+            or proxy_field(state, "socks-proxy") != f"127.0.0.1:{port}"
+            or proxy_field(state, "socks-enabled") != "on"
+            or not (state / "system-proxy.ports").exists()
+        ):
+            print(
+                f"check-cli-lane: a successful arm did not read back its endpoint:"
+                f"\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        recorded = curl_log.read_text(encoding="utf-8") if curl_log.exists() else ""
+        probe = [
+            block
+            for block in recorded.split("end\n")
+            if "args:" in block
+            and "--noproxy" not in block
+            and f"ALL_PROXY=socks5h://127.0.0.1:{port}" in block
+        ]
+        if not probe:
+            print(
+                "check-cli-lane: a successful arm never proved a trace through the"
+                f" system proxy:\n{recorded}\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        down = run(["down"])
+        output = down.stdout + down.stderr
+        if down.returncode != 0 or not cleared(output, "down after a successful arm"):
+            return 1
         print(
-            f"check-cli-lane: a successful arm did not read back its endpoint:"
-            f"\n{output}",
-            file=sys.stderr,
+            "check-cli-lane: an arm reads its exact endpoint back and proves a trace through it"
         )
-        return 1
-    recorded = curl_log.read_text(encoding="utf-8") if curl_log.exists() else ""
-    probe = [
-        block
-        for block in recorded.split("end\n")
-        if "args:" in block
-        and "--noproxy" not in block
-        and f"ALL_PROXY=socks5h://127.0.0.1:{port}" in block
-    ]
-    if not probe:
-        print(
-            "check-cli-lane: a successful arm never proved a trace through the"
-            f" system proxy:\n{recorded}\n{output}",
-            file=sys.stderr,
-        )
-        return 1
-    down = run(["down"])
-    output = down.stdout + down.stderr
-    if down.returncode != 0 or not cleared(output, "down after a successful arm"):
-        return 1
-    print(
-        "check-cli-lane: an arm reads its exact endpoint back and proves a trace through it"
-    )
 
-    fresh()
-    denied = up({"FERROX_FAKE_DENY_SET": "1"})
-    output = denied.stdout + denied.stderr
-    if (
-        denied.returncode == 0
-        or "administrator" not in output
-        or "nothing was started" not in output
-        or (state / "fake-vpn-lane.pids").exists()
-        or not cleared(output, "a denied preflight")
-    ):
+        fresh()
+        denied = up({"FERROX_FAKE_DENY_SET": "1"})
+        output = denied.stdout + denied.stderr
+        if (
+            denied.returncode == 0
+            or "administrator" not in output
+            or "nothing was started" not in output
+            or (state / "fake-vpn-lane.pids").exists()
+            or not cleared(output, "a denied preflight")
+        ):
+            print(
+                f"check-cli-lane: a denied proxy write did not refuse before the lane:"
+                f"\n{output}",
+                file=sys.stderr,
+            )
+            return 1
         print(
-            f"check-cli-lane: a denied proxy write did not refuse before the lane:"
-            f"\n{output}",
-            file=sys.stderr,
+            "check-cli-lane: a denied proxy write refuses before the lane starts"
         )
-        return 1
-    print(
-        "check-cli-lane: a denied proxy write refuses before the lane starts"
-    )
 
-    fresh()
-    ignored = up({"FERROX_FAKE_SET_IGNORE": "1"})
-    output = ignored.stdout + ignored.stderr
-    if ignored.returncode == 0 or "read-back" not in output or not cleared(
-        output, "a write that persisted nothing"
-    ):
-        print(
-            f"check-cli-lane: a write that persisted nothing passed the arm:"
-            f"\n{output}",
-            file=sys.stderr,
-        )
-        return 1
-    print("check-cli-lane: a write that persisted nothing fails the read-back")
+        fresh()
+        ignored = up({"FERROX_FAKE_SET_IGNORE": "1"})
+        output = ignored.stdout + ignored.stderr
+        if ignored.returncode == 0 or "read-back" not in output or not cleared(
+            output, "a write that persisted nothing"
+        ):
+            print(
+                f"check-cli-lane: a write that persisted nothing passed the arm:"
+                f"\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        print("check-cli-lane: a write that persisted nothing fails the read-back")
 
-    fresh()
-    lied = up({"FERROX_FAKE_PROXY_LIE": "1"})
-    output = lied.stdout + lied.stderr
-    if lied.returncode == 0 or "read-back" not in output or not cleared(
-        output, "a service read-back at the wrong endpoint"
-    ):
-        print(
-            f"check-cli-lane: a service read-back at the wrong endpoint passed:"
-            f"\n{output}",
-            file=sys.stderr,
-        )
-        return 1
-    print("check-cli-lane: a service read-back must show the exact host and port")
+        fresh()
+        lied = up({"FERROX_FAKE_PROXY_LIE": "1"})
+        output = lied.stdout + lied.stderr
+        if lied.returncode == 0 or "read-back" not in output or not cleared(
+            output, "a service read-back at the wrong endpoint"
+        ):
+            print(
+                f"check-cli-lane: a service read-back at the wrong endpoint passed:"
+                f"\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        print("check-cli-lane: a service read-back must show the exact host and port")
 
-    fresh()
-    scutil_lie = up({"FERROX_FAKE_SCUTIL_LIE": "1"})
-    output = scutil_lie.stdout + scutil_lie.stderr
-    if scutil_lie.returncode == 0 or "read-back" not in output or not cleared(
-        output, "a scutil read-back at the wrong endpoint"
-    ):
-        print(
-            f"check-cli-lane: a scutil read-back at the wrong endpoint passed:"
-            f"\n{output}",
-            file=sys.stderr,
-        )
-        return 1
-    print("check-cli-lane: scutil's read-back must show the exact host and port")
+        fresh()
+        scutil_lie = up({"FERROX_FAKE_SCUTIL_LIE": "1"})
+        output = scutil_lie.stdout + scutil_lie.stderr
+        if scutil_lie.returncode == 0 or "read-back" not in output or not cleared(
+            output, "a scutil read-back at the wrong endpoint"
+        ):
+            print(
+                f"check-cli-lane: a scutil read-back at the wrong endpoint passed:"
+                f"\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        print("check-cli-lane: scutil's read-back must show the exact host and port")
 
-    fresh()
-    silent = up({"FERROX_FAKE_SYSTEM_FAIL": "1"})
-    output = silent.stdout + silent.stderr
-    if (
-        silent.returncode == 0
-        or "did not carry a trace" not in output
-        or not cleared(output, "a system proxy that carried no trace")
-    ):
-        print(
-            f"check-cli-lane: a system proxy that carried no trace passed:"
-            f"\n{output}",
-            file=sys.stderr,
+        fresh()
+        silent = up({"FERROX_FAKE_SYSTEM_FAIL": "1"})
+        output = silent.stdout + silent.stderr
+        if (
+            silent.returncode == 0
+            or "did not carry a trace" not in output
+            or not cleared(output, "a system proxy that carried no trace")
+        ):
+            print(
+                f"check-cli-lane: a system proxy that carried no trace passed:"
+                f"\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        print("check-cli-lane: a trace through the system proxy must pass before the arm")
+
+        fresh()
+        veepn_port = free_port()
+        veepn = run(
+            [
+                "up",
+                "--veepn",
+                "--vpn",
+                "--fronts",
+                "socks",
+                "--socks",
+                str(veepn_port),
+            ],
+            {"FERROX_FAKE_CLOUDFLARE_BLOCK": "1"},
         )
-        return 1
-    print("check-cli-lane: a trace through the system proxy must pass before the arm")
+        output = veepn.stdout + veepn.stderr
+        if (
+            veepn.returncode != 0
+            or "system proxy on" not in output
+            or not (state / "system-proxy.ports").exists()
+        ):
+            print(
+                f"check-cli-lane: a VeePN lane's system proxy fallback failed:"
+                f"\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            "check-cli-lane: a VeePN lane proves its system proxy through Example Domain"
+        )
+    finally:
+        run(["down"])
     return 0
 
 

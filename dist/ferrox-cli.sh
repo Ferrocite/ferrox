@@ -987,24 +987,30 @@ proxy_service_armed() {
   return 0
 }
 
+proxy_system_request() {
+  local endpoint="$1" url="$2"
+  env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy \
+    -u HTTPS_PROXY -u https_proxy -u NO_PROXY -u no_proxy \
+    ALL_PROXY="$endpoint" all_proxy="$endpoint" \
+    HTTP_PROXY="$endpoint" http_proxy="$endpoint" \
+    HTTPS_PROXY="$endpoint" https_proxy="$endpoint" NO_PROXY= no_proxy= \
+    curl -q -s --max-time "$PROBE_TIMEOUT" "$url" 2>/dev/null
+}
+
 proxy_system_probe() {
   local readback="$1" socks="$2" http="$3" endpoint answer
   if [ -n "$socks" ]; then
     endpoint="socks5h://$(proxy_readback_endpoint "$readback" SOCKSProxy):$(proxy_readback_endpoint "$readback" SOCKSPort)"
-    answer="$(env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy \
-      -u HTTPS_PROXY -u https_proxy -u NO_PROXY -u no_proxy \
-      ALL_PROXY="$endpoint" all_proxy="$endpoint" NO_PROXY= no_proxy= \
-      curl -q -s --max-time "$PROBE_TIMEOUT" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
   else
     endpoint="http://$(proxy_readback_endpoint "$readback" HTTPProxy):$(proxy_readback_endpoint "$readback" HTTPPort)"
-    answer="$(env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy \
-      -u HTTPS_PROXY -u https_proxy -u NO_PROXY -u no_proxy \
-      ALL_PROXY="$endpoint" all_proxy="$endpoint" \
-      HTTP_PROXY="$endpoint" http_proxy="$endpoint" \
-      HTTPS_PROXY="$endpoint" https_proxy="$endpoint" NO_PROXY= no_proxy= \
-      curl -q -s --max-time "$PROBE_TIMEOUT" https://www.cloudflare.com/cdn-cgi/trace 2>/dev/null)"
   fi
-  printf '%s\n' "$answer" | grep -qE '^(ip|loc)='
+  answer="$(proxy_system_request "$endpoint" https://www.cloudflare.com/cdn-cgi/trace)"
+  if printf '%s\n' "$answer" | grep -qE '^(ip|loc)='; then
+    return 0
+  fi
+  [ "$OUTBOUND" = veepn ] || return 1
+  answer="$(proxy_system_request "$endpoint" http://example.com/)"
+  printf '%s\n' "$answer" | grep -q 'Example Domain'
 }
 
 # Snapshot every field the arm can change, so down can put back exactly what was there.
