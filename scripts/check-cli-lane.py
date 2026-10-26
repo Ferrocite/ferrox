@@ -259,7 +259,8 @@ if [ -n "${FERROX_FAKE_CURL_LOG:-}" ]; then
     printf 'args:'
     printf ' %s' "$@"
     printf '\\n'
-    env | grep -E '^(ALL_PROXY|all_proxy|HTTP_PROXY|http_proxy|HTTPS_PROXY|https_proxy|NO_PROXY|no_proxy)=' || true
+    env | grep -E '^(ALL_PROXY|all_proxy|HTTP_PROXY|http_proxy|HTTPS_PROXY|https_proxy|NO_PROXY|no_proxy)=' |
+      sed -E 's#(=[^/:]+://)[^/@]*@#\\1#' || true
     printf 'end\\n'
   } >> "$FERROX_FAKE_CURL_LOG"
 fi
