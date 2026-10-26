@@ -3214,6 +3214,7 @@ fn serve_sealed_session<S>(
                 }
                 serve_sealed_raw(sealed, peer, users, freedom, closer, timeout, SplitRelay);
             }
+            Err(error) => eprintln!("vless: encryption handshake failed: {error}"),
         },
         Err(session) => match decryption.handshake(session) {
             Ok(sealed) => {
@@ -3224,6 +3225,7 @@ fn serve_sealed_session<S>(
                 }
                 serve_sealed_raw(sealed, peer, users, freedom, closer, timeout, SharedRelay);
             }
+            Err(error) => eprintln!("vless: encryption handshake failed: {error}"),
         },
     }
 }
