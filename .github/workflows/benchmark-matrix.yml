@@ -180,7 +180,7 @@ jobs:
             flags="$flags --engines ferrox,$planned_engines"
             trees="$planned_engines"
           elif [[ "$tier" == "smoke" ]]; then
-            trees="xray-core,xray-core-rust"
+            trees="xray-core,xray-core-rust,sing-box"
           fi
           echo "tier=$tier" >> "$GITHUB_OUTPUT"
           echo "cells=$cells" >> "$GITHUB_OUTPUT"
@@ -248,7 +248,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/parity-engines
-          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh') }}
+          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh', 'scripts/patch-sing-box.py') }}
       - name: build every engine without moving traffic
         shell: bash
         env:
@@ -298,7 +298,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/parity-engines
-          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh') }}
+          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh', 'scripts/patch-sing-box.py') }}
       - name: run one cell with handed-over binaries
         shell: bash
         env:

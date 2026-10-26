@@ -114,9 +114,9 @@ An upload *throughput* row is only evidence about the engines once the benchmark
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
 
 <!-- scope:begin -->
-- paths: crates/ferrox-core/src/vless.rs
+- paths: crates/ferrox-core/src/vless.rs, crates/ferrox-core/src/vless_encryption.rs
 - symbols: vless
-- scenarios: vless-raw, vless-tls-raw
+- scenarios: vless-raw, vless-tls-raw, vless-encryption-raw, vless-encryption-tls-raw, vless-encryption-reality-raw
 - oracle: vless
 - go: ./proxy/vless/...
 <!-- scope:end -->

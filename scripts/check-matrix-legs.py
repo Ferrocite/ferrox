@@ -10,7 +10,8 @@ each server, so the same corpus already carries the two controls a gap needs:
 When the client leg is below the reference the client has the hole; when the
 server leg is, the server does. A ferrox-vs-xray-core cell that loses while both
 controls hold its own comparison is noise, and this check leaves it to the ratio
-rows rather than guessing a leg.
+rows rather than guessing a leg. A scenario with no xray-core server cell, such
+as standalone Hysteria v1, has no legs to attribute and is skipped.
 """
 
 import argparse
