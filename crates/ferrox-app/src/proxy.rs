@@ -11337,8 +11337,7 @@ where
     R: Read,
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let out = self.reader.read(buf);
-        out
+        self.reader.read(buf)
     }
 }
 
@@ -11347,8 +11346,7 @@ where
     S: CipherOpen,
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let out = self.writer.write(buf);
-        out
+        self.writer.write(buf)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
