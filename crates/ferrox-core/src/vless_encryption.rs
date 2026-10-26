@@ -101,6 +101,10 @@ impl Aead {
         Self::with_cipher(context, key, matches!(self.cipher, Cipher::Aes(_)))
     }
 
+    fn is_aes(&self) -> bool {
+        matches!(self.cipher, Cipher::Aes(_))
+    }
+
     fn next_nonce(&mut self) -> [u8; 12] {
         inc_nonce(&mut self.nonce);
         self.nonce
@@ -616,9 +620,9 @@ impl Client {
                 let skip = hello.len();
                 let mut stream =
                     EncryptedStream::new(inner, united_key, aead, None, ReadStage::ServerRandom);
-                stream.out_mask = HeaderMask::new(out_ctr, skip);
-                stream.zero_rtt = Some((Arc::clone(self), pfs_key));
-                stream.pre_write = hello;
+                stream.set_out_mask(HeaderMask::new(out_ctr, skip));
+                stream.set_zero_rtt(Arc::clone(self), pfs_key);
+                stream.set_pre_write(hello);
                 return Ok(stream);
             }
         }
@@ -705,11 +709,11 @@ impl Client {
             ReadStage::ServerPadding(server_padding),
         );
         if config.xor_mode == 2 {
-            stream.out_mask = HeaderMask::new(Some(new_ctr(&stream.united_key, &iv)), 0);
-            stream.in_mask = HeaderMask::new(
-                Some(new_ctr(&stream.united_key, &ticket[..16])),
+            stream.set_out_mask(HeaderMask::new(Some(new_ctr(stream.united_key(), &iv)), 0));
+            stream.set_in_mask(HeaderMask::new(
+                Some(new_ctr(stream.united_key(), &ticket[..16])),
                 server_padding,
-            );
+            ));
         }
         Ok(stream)
     }
@@ -957,8 +961,11 @@ impl Server {
         let mut stream =
             EncryptedStream::new(inner, united_key, aead, Some(peer_aead), ReadStage::Records);
         if config.xor_mode == 2 {
-            stream.out_mask = HeaderMask::new(Some(new_ctr(&stream.united_key, &ticket)), 0);
-            stream.in_mask = HeaderMask::new(Some(new_ctr(&stream.united_key, &iv)), 0);
+            stream.set_out_mask(HeaderMask::new(
+                Some(new_ctr(stream.united_key(), &ticket)),
+                0,
+            ));
+            stream.set_in_mask(HeaderMask::new(Some(new_ctr(stream.united_key(), &iv)), 0));
         }
         Ok(stream)
     }
@@ -1018,13 +1025,13 @@ impl Server {
         let peer_aead = Aead::with_cipher(&encrypted_ticket, &united_key, aes);
         let mut stream =
             EncryptedStream::new(inner, united_key, aead, Some(peer_aead), ReadStage::Records);
-        stream.pre_write = pre_write.to_vec();
+        stream.set_pre_write(pre_write.to_vec());
         if config.xor_mode == 2 {
-            stream.out_mask = HeaderMask::new(
-                Some(new_ctr(&stream.united_key, &pre_write)),
+            stream.set_out_mask(HeaderMask::new(
+                Some(new_ctr(stream.united_key(), &pre_write)),
                 pre_write.len(),
-            );
-            stream.in_mask = HeaderMask::new(Some(new_ctr(&stream.united_key, iv)), 0);
+            ));
+            stream.set_in_mask(HeaderMask::new(Some(new_ctr(stream.united_key(), iv)), 0));
         }
         Ok(stream)
     }
@@ -1088,16 +1095,42 @@ enum ReadStage {
     Records,
 }
 
-pub struct EncryptedStream<S> {
-    inner: S,
-    united_key: Vec<u8>,
-    aead: Aead,
+/// The key both directions derive from; the last handle zeroes it.
+struct UnitedKey(Arc<Vec<u8>>);
+
+impl UnitedKey {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self(Arc::new(bytes))
+    }
+
+    fn as_slice(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+impl Clone for UnitedKey {
+    fn clone(&self) -> Self {
+        Self(Arc::clone(&self.0))
+    }
+}
+
+impl Drop for UnitedKey {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        if let Some(bytes) = Arc::get_mut(&mut self.0) {
+            bytes.zeroize();
+        }
+    }
+}
+
+/// The read half of a sealed session: its own AEAD state, mask and buffered record.
+struct ReadSide {
+    united_key: UnitedKey,
+    aes: bool,
     peer_aead: Option<Aead>,
-    out_mask: HeaderMask,
     in_mask: HeaderMask,
     read_stage: ReadStage,
     zero_rtt: Option<(Arc<Client>, Vec<u8>)>,
-    pre_write: Vec<u8>,
     input: Vec<u8>,
     input_pos: usize,
     wire: Vec<u8>,
@@ -1105,67 +1138,13 @@ pub struct EncryptedStream<S> {
     direct: bool,
 }
 
-impl<S> std::fmt::Debug for EncryptedStream<S> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("EncryptedStream")
-            .field("direct", &self.direct)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<S> Drop for EncryptedStream<S> {
-    fn drop(&mut self) {
-        use zeroize::Zeroize as _;
-        self.united_key.zeroize();
-    }
-}
-
-impl<S> EncryptedStream<S> {
-    fn new(
-        inner: S,
-        united_key: Vec<u8>,
-        aead: Aead,
-        peer_aead: Option<Aead>,
-        read_stage: ReadStage,
-    ) -> Self {
-        Self {
-            inner,
-            united_key,
-            aead,
-            peer_aead,
-            out_mask: HeaderMask::new(None, 0),
-            in_mask: HeaderMask::new(None, 0),
-            read_stage,
-            zero_rtt: None,
-            pre_write: Vec::new(),
-            input: Vec::new(),
-            input_pos: 0,
-            wire: Vec::new(),
-            header: None,
-            direct: false,
-        }
-    }
-
-    pub fn get_ref(&self) -> &S {
-        &self.inner
-    }
-
-    pub fn get_mut(&mut self) -> &mut S {
-        &mut self.inner
-    }
-
-    pub fn enter_direct_mode(&mut self) {
-        self.direct = true;
-    }
-}
-
-impl<S: Read> EncryptedStream<S> {
+impl ReadSide {
     /// One exact wire read that survives a timeout: the bytes already taken stay in `wire`,
     /// so a retry resumes where the kernel stopped instead of reading a record header twice.
-    fn take_wire(&mut self, len: usize) -> io::Result<Vec<u8>> {
+    fn take_wire<S: Read>(&mut self, inner: &mut S, len: usize) -> io::Result<Vec<u8>> {
         while self.wire.len() < len {
             let mut chunk = [0u8; 8192];
-            match self.inner.read(&mut chunk) {
+            match inner.read(&mut chunk) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
@@ -1180,25 +1159,30 @@ impl<S: Read> EncryptedStream<S> {
         Ok(self.wire.drain(..len).collect())
     }
 
-    fn fill_input(&mut self) -> io::Result<()> {
+    fn fill_input<S: Read>(&mut self, inner: &mut S) -> io::Result<()> {
         self.input.clear();
         self.input_pos = 0;
         match self.read_stage {
             ReadStage::ServerRandom => {
                 let random: [u8; 16] = self
-                    .take_wire(16)?
+                    .take_wire(inner, 16)?
                     .as_slice()
                     .try_into()
                     .map_err(|_| invalid("VLESS encryption server random is short"))?;
-                self.peer_aead = Some(self.aead.derive(&random, &self.united_key));
+                self.peer_aead = Some(Aead::with_cipher(
+                    &random,
+                    self.united_key.as_slice(),
+                    self.aes,
+                ));
                 if self.in_mask.ctr.is_some() {
-                    self.in_mask = HeaderMask::new(Some(new_ctr(&self.united_key, &random)), 0);
+                    self.in_mask =
+                        HeaderMask::new(Some(new_ctr(self.united_key.as_slice(), &random)), 0);
                 }
                 self.read_stage = ReadStage::Records;
-                self.fill_input()
+                self.fill_input(inner)
             }
             ReadStage::ServerPadding(len) => {
-                let mut padding = self.take_wire(len)?;
+                let mut padding = self.take_wire(inner, len)?;
                 self.in_mask.apply(&mut padding, false);
                 let peer = self
                     .peer_aead
@@ -1206,14 +1190,14 @@ impl<S: Read> EncryptedStream<S> {
                     .ok_or_else(|| invalid("VLESS encryption is missing its peer key"))?;
                 peer.open_in_place(None, &mut padding, &[])?;
                 self.read_stage = ReadStage::Records;
-                self.fill_input()
+                self.fill_input(inner)
             }
             ReadStage::Records => {
                 let header = if let Some(header) = self.header {
                     header
                 } else {
                     let mut header: [u8; HEADER_LEN] = self
-                        .take_wire(HEADER_LEN)?
+                        .take_wire(inner, HEADER_LEN)?
                         .as_slice()
                         .try_into()
                         .map_err(|_| invalid("VLESS encryption record header is short"))?;
@@ -1234,14 +1218,15 @@ impl<S: Read> EncryptedStream<S> {
                 };
                 let len = decode_header(&header)
                     .ok_or_else(|| invalid("invalid VLESS encryption record header"))?;
-                let mut body = self.take_wire(len)?;
+                let mut body = self.take_wire(inner, len)?;
                 self.header = None;
                 self.in_mask.apply(&mut body, false);
                 let peer = self
                     .peer_aead
                     .as_mut()
                     .ok_or_else(|| invalid("VLESS encryption is missing its peer key"))?;
-                let next = (peer.nonce == MAX_NONCE).then(|| peer.derive(&body, &self.united_key));
+                let next = (peer.nonce == MAX_NONCE)
+                    .then(|| peer.derive(&body, self.united_key.as_slice()));
                 let result = peer.open_in_place(None, &mut body, &header);
                 if let Some(next) = next {
                     *peer = next;
@@ -1253,10 +1238,8 @@ impl<S: Read> EncryptedStream<S> {
             }
         }
     }
-}
 
-impl<S: Read> Read for EncryptedStream<S> {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+    fn read<S: Read>(&mut self, inner: &mut S, buf: &mut [u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
@@ -1275,11 +1258,11 @@ impl<S: Read> Read for EncryptedStream<S> {
                 self.in_mask.apply(&mut buf[..n], false);
                 return Ok(n);
             }
-            let n = self.inner.read(buf)?;
+            let n = inner.read(buf)?;
             self.in_mask.apply(&mut buf[..n], false);
             return Ok(n);
         }
-        self.fill_input()?;
+        self.fill_input(inner)?;
         let n = self.input.len().min(buf.len());
         buf[..n].copy_from_slice(&self.input[..n]);
         self.input_pos = n;
@@ -1287,15 +1270,24 @@ impl<S: Read> Read for EncryptedStream<S> {
     }
 }
 
-impl<S: Write> Write for EncryptedStream<S> {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+/// The write half of a sealed session: its own AEAD state and mask.
+struct WriteSide {
+    united_key: UnitedKey,
+    aead: Aead,
+    out_mask: HeaderMask,
+    pre_write: Vec<u8>,
+    direct: bool,
+}
+
+impl WriteSide {
+    fn write<W: Write>(&mut self, inner: &mut W, buf: &[u8]) -> io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
         if self.direct {
             let mut masked = buf.to_vec();
             self.out_mask.apply(&mut masked, true);
-            self.inner.write_all(&masked)?;
+            inner.write_all(&masked)?;
             return Ok(buf.len());
         }
         let n = buf.len().min(MAX_RECORD_PLAINTEXT);
@@ -1308,11 +1300,199 @@ impl<S: Write> Write for EncryptedStream<S> {
         let rekey = self.aead.nonce == MAX_NONCE;
         self.aead.seal_into(None, &buf[..n], &header, &mut out);
         if rekey {
-            self.aead = self.aead.derive(&out[header_at..], &self.united_key);
+            self.aead = self
+                .aead
+                .derive(&out[header_at..], self.united_key.as_slice());
         }
         self.out_mask.apply(&mut out, true);
-        self.inner.write_all(&out)?;
+        inner.write_all(&out)?;
         Ok(n)
+    }
+}
+
+pub struct EncryptedStream<S> {
+    inner: S,
+    read: ReadSide,
+    write: WriteSide,
+}
+
+impl<S> std::fmt::Debug for EncryptedStream<S> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptedStream")
+            .field("direct", &self.read.direct)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<S> EncryptedStream<S> {
+    fn new(
+        inner: S,
+        united_key: Vec<u8>,
+        aead: Aead,
+        peer_aead: Option<Aead>,
+        read_stage: ReadStage,
+    ) -> Self {
+        let key = UnitedKey::new(united_key);
+        let aes = aead.is_aes();
+        Self {
+            inner,
+            read: ReadSide {
+                united_key: key.clone(),
+                aes,
+                peer_aead,
+                in_mask: HeaderMask::new(None, 0),
+                read_stage,
+                zero_rtt: None,
+                input: Vec::new(),
+                input_pos: 0,
+                wire: Vec::new(),
+                header: None,
+                direct: false,
+            },
+            write: WriteSide {
+                united_key: key,
+                aead,
+                out_mask: HeaderMask::new(None, 0),
+                pre_write: Vec::new(),
+                direct: false,
+            },
+        }
+    }
+
+    pub fn get_ref(&self) -> &S {
+        &self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+
+    pub fn enter_direct_mode(&mut self) {
+        self.read.direct = true;
+        self.write.direct = true;
+    }
+
+    fn set_out_mask(&mut self, mask: HeaderMask) {
+        self.write.out_mask = mask;
+    }
+
+    fn set_in_mask(&mut self, mask: HeaderMask) {
+        self.read.in_mask = mask;
+    }
+
+    fn set_pre_write(&mut self, bytes: Vec<u8>) {
+        self.write.pre_write = bytes;
+    }
+
+    fn set_zero_rtt(&mut self, owner: Arc<Client>, pfs_key: Vec<u8>) {
+        self.read.zero_rtt = Some((owner, pfs_key));
+    }
+
+    fn united_key(&self) -> &[u8] {
+        self.write.united_key.as_slice()
+    }
+}
+
+impl<S: Read> Read for EncryptedStream<S> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.read.read(&mut self.inner, buf)
+    }
+}
+
+impl<S: Write> Write for EncryptedStream<S> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.write.write(&mut self.inner, buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A stream that carries independent halves, so sealing can split without one lock.
+pub trait SplitIo {
+    type Reader;
+    type Writer;
+
+    fn split_io(self) -> Option<(Self::Reader, Self::Writer)>;
+}
+
+impl<S: SplitIo> EncryptedStream<S> {
+    pub fn into_split(self) -> Option<(EncryptedReader<S::Reader>, EncryptedWriter<S::Writer>)> {
+        let Self { inner, read, write } = self;
+        let (reader, writer) = inner.split_io()?;
+        Some((
+            EncryptedReader {
+                inner: reader,
+                side: read,
+            },
+            EncryptedWriter {
+                inner: writer,
+                side: write,
+            },
+        ))
+    }
+}
+
+pub struct EncryptedReader<R> {
+    inner: R,
+    side: ReadSide,
+}
+
+impl<R> std::fmt::Debug for EncryptedReader<R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptedReader")
+            .field("direct", &self.side.direct)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R> EncryptedReader<R> {
+    pub fn get_ref(&self) -> &R {
+        &self.inner
+    }
+
+    pub fn enter_direct_mode(&mut self) {
+        self.side.direct = true;
+    }
+}
+
+impl<R: Read> Read for EncryptedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.side.read(&mut self.inner, buf)
+    }
+}
+
+pub struct EncryptedWriter<W> {
+    inner: W,
+    side: WriteSide,
+}
+
+impl<W> std::fmt::Debug for EncryptedWriter<W> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptedWriter")
+            .field("direct", &self.side.direct)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<W> EncryptedWriter<W> {
+    pub fn get_ref(&self) -> &W {
+        &self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut W {
+        &mut self.inner
+    }
+
+    pub fn enter_direct_mode(&mut self) {
+        self.side.direct = true;
+    }
+}
+
+impl<W: Write> Write for EncryptedWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.side.write(&mut self.inner, buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {
