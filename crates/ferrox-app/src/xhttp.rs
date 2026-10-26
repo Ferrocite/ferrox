@@ -195,10 +195,6 @@ impl<R: Read> ChainReader<R> {
         self.prefix = carry;
         self.at = 0;
     }
-
-    pub(crate) fn inner(&self) -> &R {
-        &self.read
-    }
 }
 
 impl<R: Read> Read for ChainReader<R> {

@@ -5388,17 +5388,14 @@ fn serve_session_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     relay_sink(creader, &cwriter, &uplink, |_| {});
 }
 
-fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static, F>(
+fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static>(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
     users: &[VlessUser],
     freedom: bool,
     decryption: Option<&ferrox_core::vless_encryption::Server>,
-    after_decode: F,
-) where
-    F: FnOnce(&mut crate::xhttp::ChainReader<R>),
-{
+) {
     let Some((creader, cwriter)) = crate::xhttp::accept_split_with_settings(read, write, settings)
     else {
         echo_trace("session xhttp accept refused");
@@ -5407,17 +5404,7 @@ fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static, F>(
     if let Some(decryption) = decryption {
         let close = cwriter.clone();
         let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.finish());
-        return serve_sealed_carried_with(
-            creader,
-            cwriter,
-            users,
-            freedom,
-            decryption,
-            close,
-            |_| {},
-            |_| {},
-            after_decode,
-        );
+        return serve_sealed_carried(creader, cwriter, users, freedom, decryption, close);
     }
     serve_session_xhttp_with(creader, &cwriter, users, freedom);
 }
@@ -5452,7 +5439,7 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
     let _ = arm(
         &read,
         if decryption.is_some() {
-            Some(budgets::handshake())
+            Some(RELAY_POLL)
         } else {
             None
         },
@@ -5468,17 +5455,7 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
         }
         return crate::xhttp_h2::serve_h2(chained, write, settings, users, freedom);
     }
-    serve_session_xhttp(
-        chained,
-        write,
-        settings,
-        users,
-        freedom,
-        decryption,
-        move |reader| {
-            let _ = arm(reader.inner(), Some(RELAY_POLL));
-        },
-    );
+    serve_session_xhttp(chained, write, settings, users, freedom, decryption);
 }
 
 pub(crate) fn serve_session_xhttp_with(
