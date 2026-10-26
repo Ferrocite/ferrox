@@ -940,11 +940,145 @@ proxy_readback_has() {
   printf '%s\n' "$1" | grep -Eq "^[[:space:]]*$2[[:space:]]*:[[:space:]]*$3[[:space:]]*$"
 }
 
+# Snapshot every field the arm can change, so down can put back exactly what was there.
+proxy_service_snapshot() {
+  local svc="$1" socks web secure pac auto bypass
+  local s_on s_server s_port s_auth w_on w_server w_port w_auth
+  local x_on x_server x_port x_auth p_on p_url a_on
+  socks="$(networksetup -getsocksfirewallproxy "$svc" 2>/dev/null)" || return 1
+  web="$(networksetup -getwebproxy "$svc" 2>/dev/null)" || return 1
+  secure="$(networksetup -getsecurewebproxy "$svc" 2>/dev/null)" || return 1
+  pac="$(proxy_pac_line "$svc")" || return 1
+  auto="$(proxy_auto_line "$svc")" || return 1
+  bypass="$(proxy_bypass_line "$svc")" || return 1
+  s_on="$(proxy_field "$socks" Enabled | tr '[:upper:]' '[:lower:]')"
+  [ "$s_on" = yes ] && s_on=on || s_on=off
+  s_server="$(proxy_field "$socks" Server)"
+  s_port="$(proxy_field "$socks" Port)"
+  s_auth="$(proxy_field "$socks" 'Authenticated Proxy Enabled')"
+  [ "$s_auth" = 1 ] && s_auth=on || s_auth=off
+  w_on="$(proxy_field "$web" Enabled | tr '[:upper:]' '[:lower:]')"
+  [ "$w_on" = yes ] && w_on=on || w_on=off
+  w_server="$(proxy_field "$web" Server)"
+  w_port="$(proxy_field "$web" Port)"
+  w_auth="$(proxy_field "$web" 'Authenticated Proxy Enabled')"
+  [ "$w_auth" = 1 ] && w_auth=on || w_auth=off
+  x_on="$(proxy_field "$secure" Enabled | tr '[:upper:]' '[:lower:]')"
+  [ "$x_on" = yes ] && x_on=on || x_on=off
+  x_server="$(proxy_field "$secure" Server)"
+  x_port="$(proxy_field "$secure" Port)"
+  x_auth="$(proxy_field "$secure" 'Authenticated Proxy Enabled')"
+  [ "$x_auth" = 1 ] && x_auth=on || x_auth=off
+  p_url="$(printf '%s\n' "$pac" | sed -n 's/^URL: //p' | head -n 1)"
+  case "$p_url" in "(null)"|"(empty)") p_url="" ;; esac
+  [ -n "$p_url" ] || p_url=-
+  p_on=off
+  case "$(printf '%s\n' "$pac" | sed -n 's/^Enabled: //p' | head -n 1 | tr '[:upper:]' '[:lower:]')" in yes|on) p_on=on ;; esac
+  a_on=off
+  case "$(printf '%s\n' "$auto" | sed -n 's/^Auto Proxy Discovery: //p' | head -n 1 | tr '[:upper:]' '[:lower:]')" in on|yes) a_on=on ;; esac
+  bypass="$(proxy_bypass_join "$bypass")"
+  [ -n "$bypass" ] || bypass=-
+  [ -n "$s_server" ] || s_server=-
+  [ -n "$s_port" ] || s_port=-
+  [ -n "$w_server" ] || w_server=-
+  [ -n "$w_port" ] || w_port=-
+  [ -n "$x_server" ] || x_server=-
+  [ -n "$x_port" ] || x_port=-
+  printf '0\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$svc" "$s_on" "$s_server" "$s_port" "$s_auth" \
+    "$w_on" "$w_server" "$w_port" "$w_auth" \
+    "$x_on" "$x_server" "$x_port" "$x_auth" \
+    "$p_on" "$p_url" "$a_on" "$bypass"
+}
+
+proxy_snapshot_write() {
+  local svc tmp
+  tmp="$(mktemp "$STATE_DIR/.system-proxy.state.XXXXXX")" || return 1
+  printf 'v1\n' > "$tmp" || { rm -f "$tmp"; return 1; }
+  while IFS= read -r svc; do
+    [ -z "$svc" ] && continue
+    case "$svc" in *\**) continue ;; esac
+    proxy_service_snapshot "$svc" >> "$tmp" || { rm -f "$tmp"; return 1; }
+  done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+  mv "$tmp" "$PROXY_STATE" || { rm -f "$tmp"; return 1; }
+}
+
+proxy_mark_armed() {
+  local svc="$1" tmp
+  tmp="$(mktemp "$STATE_DIR/.system-proxy.state.XXXXXX")" || return 1
+  awk -F '\t' -v OFS='\t' -v svc="$svc" 'NR==1{print; next} $2==svc{$1="1"} {print}' "$PROXY_STATE" > "$tmp" || { rm -f "$tmp"; return 1; }
+  mv "$tmp" "$PROXY_STATE" || { rm -f "$tmp"; return 1; }
+}
+
+proxy_restore_one() {
+  local svc="$1" kind="$2" on="$3" server="$4" port="$5" auth="$6" set setstate
+  case "$kind" in
+    socks) set=-setsocksfirewallproxy; setstate=-setsocksfirewallproxystate ;;
+    web) set=-setwebproxy; setstate=-setwebproxystate ;;
+    secure) set=-setsecurewebproxy; setstate=-setsecurewebproxystate ;;
+  esac
+  if [ "$server" != - ] && [ "$port" != - ]; then
+    if [ "$auth" = on ]; then
+      networksetup "$set" "$svc" "$server" "$port" on 2>/dev/null || return 1
+    else
+      networksetup "$set" "$svc" "$server" "$port" 2>/dev/null || return 1
+    fi
+  fi
+  networksetup "$setstate" "$svc" "$on" 2>/dev/null || return 1
+}
+
+proxy_restore_service() {
+  local line="$1" armed svc s_on s_server s_port s_auth w_on w_server w_port w_auth
+  local x_on x_server x_port x_auth p_on p_url a_on bypass rc=0
+  IFS=$'\t' read -r armed svc s_on s_server s_port s_auth w_on w_server w_port w_auth \
+    x_on x_server x_port x_auth p_on p_url a_on bypass <<< "$line"
+  [ "$armed" = 1 ] || return 0
+  proxy_restore_one "$svc" socks "$s_on" "$s_server" "$s_port" "$s_auth" ||
+    { say "system proxy: could not restore SOCKS on '$svc'." >&2; rc=1; }
+  proxy_restore_one "$svc" web "$w_on" "$w_server" "$w_port" "$w_auth" ||
+    { say "system proxy: could not restore Web on '$svc'." >&2; rc=1; }
+  proxy_restore_one "$svc" secure "$x_on" "$x_server" "$x_port" "$x_auth" ||
+    { say "system proxy: could not restore Secure Web on '$svc'." >&2; rc=1; }
+  if [ "$bypass" = - ]; then
+    networksetup -setproxybypassdomains "$svc" Empty 2>/dev/null ||
+      { say "system proxy: could not clear the bypass list on '$svc'." >&2; rc=1; }
+  elif [ -n "$bypass" ]; then
+    local -a prior=()
+    IFS=, read -r -a prior <<< "$bypass"
+    networksetup -setproxybypassdomains "$svc" "${prior[@]}" 2>/dev/null ||
+      { say "system proxy: could not restore the bypass list on '$svc'." >&2; rc=1; }
+  fi
+  if [ "$p_url" != - ]; then
+    networksetup -setautoproxyurl "$svc" "$p_url" 2>/dev/null ||
+      { say "system proxy: could not restore the PAC URL on '$svc'." >&2; rc=1; }
+  else
+    networksetup -setautoproxyurl "$svc" "" 2>/dev/null ||
+      { say "system proxy: could not clear the PAC URL on '$svc'." >&2; rc=1; }
+  fi
+  networksetup -setautoproxystate "$svc" "$p_on" 2>/dev/null ||
+    { say "system proxy: could not restore the PAC state on '$svc'." >&2; rc=1; }
+  networksetup -setproxyautodiscovery "$svc" "$a_on" 2>/dev/null ||
+    { say "system proxy: could not restore auto discovery on '$svc'." >&2; rc=1; }
+  return "$rc"
+}
+
+proxy_restore_snapshot() {
+  local line armed=0 failed=0
+  while IFS= read -r line; do
+    case "$line" in v1|"") continue ;; esac
+    case "$line" in 1$'\t'*) armed=1 ;; esac
+    proxy_restore_service "$line" || failed=1
+  done < "$PROXY_STATE"
+  [ "$failed" = 0 ] || return 1
+  [ "$armed" = 1 ] && return 0
+  return 2
+}
+
 system_proxy_on() {
   command -v networksetup >/dev/null 2>&1 || { say "system proxy: no networksetup; nothing was armed." >&2; return 1; }
   command -v scutil >/dev/null 2>&1 || { say "system proxy: no scutil to read the proxy back; nothing was armed." >&2; return 1; }
   mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
-  local any=0 svc want_socks="" want_http="" front pac auto pac_url pac_on auto_on bypass readback bad
+  local any=0 svc want_socks="" want_http="" front bypass readback bad
   for front in ${FRONTS//,/ }; do
     case "$front" in
       socks) want_socks="$SOCKS_PORT" ;;
@@ -957,43 +1091,40 @@ system_proxy_on() {
   done
   [ -n "$want_socks$want_http" ] || { say "system proxy: --fronts names no socks, http or mixed front; nothing was armed." >&2; return 1; }
   # Keep the first snapshot: a re-arm must still restore what the user had before any lane touched it.
+  if [ -f "$PROXY_STATE" ] && [ "$(head -n1 "$PROXY_STATE")" != v1 ]; then
+    system_proxy_off || return 1
+  fi
   if [ ! -f "$PROXY_STATE" ]; then
     [ -f "$PROXY_PORTS" ] && { system_proxy_off || return 1; }
-    : > "$PROXY_STATE"
-    while IFS= read -r svc; do
-      [ -z "$svc" ] && continue
-      case "$svc" in *\**) continue ;; esac
-      pac="$(proxy_pac_line "$svc")" || {
-        say "system proxy: cannot read the PAC setting for '$svc'; nothing was armed." >&2
-        system_proxy_off
-        return 1
-      }
-      auto="$(proxy_auto_line "$svc")" || {
-        say "system proxy: cannot read auto discovery for '$svc'; nothing was armed." >&2
-        system_proxy_off
-        return 1
-      }
-      bypass="$(proxy_bypass_line "$svc")" || {
-        say "system proxy: cannot read the bypass list for '$svc'; nothing was armed." >&2
-        system_proxy_off
-        return 1
-      }
-      bypass="$(proxy_bypass_join "$bypass")"
-      pac_url="$(printf '%s\n' "$pac" | sed -n 's/^URL: //p' | head -n 1)"
-      case "$pac_url" in "(null)"|"(empty)") pac_url="" ;; esac
-      pac_on=off
-      case "$(printf '%s\n' "$pac" | sed -n 's/^Enabled: //p' | head -n 1 | tr '[:upper:]' '[:lower:]')" in yes|on) pac_on=on ;; esac
-      auto_on=off
-      case "$(printf '%s\n' "$auto" | sed -n 's/^Auto Proxy Discovery: //p' | head -n 1 | tr '[:upper:]' '[:lower:]')" in on|yes) auto_on=on ;; esac
-      printf '%s\t%s\t%s\t%s\t%s\n' "$svc" "$pac_on" "${pac_url:--}" "$auto_on" "${bypass:--}" >> "$PROXY_STATE"
-    done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+    if ! proxy_snapshot_write; then
+      say "system proxy: cannot read the current proxy settings; nothing was armed." >&2
+      rm -f "$PROXY_STATE"
+      return 1
+    fi
   fi
   while IFS= read -r svc; do
     [ -z "$svc" ] && continue
     case "$svc" in *\**) continue ;; esac
-    networksetup -setproxyautodiscovery "$svc" off 2>/dev/null || true
-    networksetup -setautoproxyurl "$svc" "" 2>/dev/null || true
-    networksetup -setautoproxystate "$svc" off 2>/dev/null || true
+    if ! proxy_mark_armed "$svc"; then
+      say "system proxy: cannot record the arm for '$svc'; nothing was armed." >&2
+      system_proxy_off
+      return 1
+    fi
+    if ! networksetup -setproxyautodiscovery "$svc" off 2>/dev/null; then
+      say "system proxy: cannot disable auto discovery on '$svc'; clearing." >&2
+      system_proxy_off
+      return 1
+    fi
+    if ! networksetup -setautoproxyurl "$svc" "" 2>/dev/null; then
+      say "system proxy: cannot clear the PAC URL on '$svc'; clearing." >&2
+      system_proxy_off
+      return 1
+    fi
+    if ! networksetup -setautoproxystate "$svc" off 2>/dev/null; then
+      say "system proxy: cannot disable PAC on '$svc'; clearing." >&2
+      system_proxy_off
+      return 1
+    fi
     bypass="$(proxy_bypass_line "$svc")" || {
       say "system proxy: cannot read the bypass list for '$svc'; nothing was armed." >&2
       system_proxy_off
@@ -1019,14 +1150,38 @@ system_proxy_on() {
       return 1
     fi
     if [ -n "$want_socks" ]; then
-      networksetup -setsocksfirewallproxy "$svc" 127.0.0.1 "$want_socks" 2>/dev/null || continue
-      networksetup -setsocksfirewallproxystate "$svc" on 2>/dev/null || true
+      if ! networksetup -setsocksfirewallproxy "$svc" 127.0.0.1 "$want_socks" 2>/dev/null; then
+        say "system proxy: cannot set SOCKS on '$svc'; clearing." >&2
+        system_proxy_off
+        return 1
+      fi
+      if ! networksetup -setsocksfirewallproxystate "$svc" on 2>/dev/null; then
+        say "system proxy: cannot enable SOCKS on '$svc'; clearing." >&2
+        system_proxy_off
+        return 1
+      fi
     fi
     if [ -n "$want_http" ]; then
-      networksetup -setwebproxy "$svc" 127.0.0.1 "$want_http" 2>/dev/null || true
-      networksetup -setwebproxystate "$svc" on 2>/dev/null || true
-      networksetup -setsecurewebproxy "$svc" 127.0.0.1 "$want_http" 2>/dev/null || true
-      networksetup -setsecurewebproxystate "$svc" on 2>/dev/null || true
+      if ! networksetup -setwebproxy "$svc" 127.0.0.1 "$want_http" 2>/dev/null; then
+        say "system proxy: cannot set Web on '$svc'; clearing." >&2
+        system_proxy_off
+        return 1
+      fi
+      if ! networksetup -setwebproxystate "$svc" on 2>/dev/null; then
+        say "system proxy: cannot enable Web on '$svc'; clearing." >&2
+        system_proxy_off
+        return 1
+      fi
+      if ! networksetup -setsecurewebproxy "$svc" 127.0.0.1 "$want_http" 2>/dev/null; then
+        say "system proxy: cannot set Secure Web on '$svc'; clearing." >&2
+        system_proxy_off
+        return 1
+      fi
+      if ! networksetup -setsecurewebproxystate "$svc" on 2>/dev/null; then
+        say "system proxy: cannot enable Secure Web on '$svc'; clearing." >&2
+        system_proxy_off
+        return 1
+      fi
     fi
     any=1
   done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
@@ -1099,6 +1254,22 @@ system_proxy_off() {
   fi
   if [ -e "$PROXY_STATE" ] && [ ! -r "$PROXY_STATE" ]; then
     say "system proxy: $PROXY_STATE is unreadable; probing the services." >&2
+  fi
+  if [ -r "$PROXY_STATE" ] && [ "$(head -n1 "$PROXY_STATE")" = v1 ]; then
+    proxy_restore_snapshot
+    case $? in
+      0)
+        say "system proxy cleared."
+        rm -f "$PROXY_PORTS" "$PROXY_STATE" "$PROXY_OWNER"
+        return 0 ;;
+      2)
+        say "system proxy: no ferrox endpoint was armed."
+        rm -f "$PROXY_PORTS" "$PROXY_STATE" "$PROXY_OWNER"
+        return 0 ;;
+      *)
+        say "system proxy: the restore failed; $PROXY_STATE is kept for a retry." >&2
+        return 1 ;;
+    esac
   fi
   if [ -r "$PROXY_STATE" ]; then
     while IFS=$'\t' read -r svc pac_on pac_url auto_on bypass; do
