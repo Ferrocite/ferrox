@@ -636,8 +636,10 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     }
 
     /// The walk as it stood before the whole-frame pass, kept in the test build so the
-    /// content-bearing probe prices both paths in one binary.
+    /// content-bearing probe prices both paths in one binary. Never inlined: the probe
+    /// has to name it as a frame.
     #[cfg(test)]
+    #[inline(never)]
     fn pump_baseline(
         &mut self,
         mut buf: Option<&mut [u8]>,
