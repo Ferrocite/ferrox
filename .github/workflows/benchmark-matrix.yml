@@ -10,6 +10,7 @@ on:
       - "scripts/lib-matrix.sh"
       - "scripts/lib-engines.sh"
       - "scripts/xray-to-singbox.py"
+      - "scripts/xray-to-leaf.py"
       - "scripts/benchstats.py"
       - "scripts/benchmark-delta.py"
       - "scripts/render-benchmark-charts.py"
@@ -170,7 +171,7 @@ jobs:
           fi
           flags=""
           [[ -n "$WANT_REPEATS" ]] && flags="$flags --repeats $WANT_REPEATS"
-          trees="xray-core,xray-core-rust,sing-box,zeronet,leaf"
+          trees="xray-core,xray-core-rust,sing-box,zeronet,leaf,xray-rust"
           if [[ -n "$WANT_ENGINES" ]]; then
             # A typed list is the caller's own, ferrox included or not.
             flags="$flags --engines $WANT_ENGINES"
@@ -180,7 +181,7 @@ jobs:
             flags="$flags --engines ferrox,$planned_engines"
             trees="$planned_engines"
           elif [[ "$tier" == "smoke" ]]; then
-            trees="xray-core,xray-core-rust,sing-box"
+            trees="xray-core,xray-core-rust,sing-box,zeronet"
           fi
           echo "tier=$tier" >> "$GITHUB_OUTPUT"
           echo "cells=$cells" >> "$GITHUB_OUTPUT"

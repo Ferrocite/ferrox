@@ -43,9 +43,9 @@ mkdir -p "$out" "$engine_dir" "$out/cells"
 
 if [[ -z "$engines_list" ]]; then
   if [[ "$tier" == "smoke" ]]; then
-    engines_list="ferrox,xray-core,xray-core-rust,sing-box"
+    engines_list="ferrox,xray-core,xray-core-rust,zeronet,sing-box"
   else
-    engines_list="ferrox,xray-core,xray-core-rust,zeronet,sing-box,leaf"
+    engines_list="ferrox,xray-core,xray-core-rust,zeronet,sing-box,xray-rust,leaf"
   fi
 fi
 if [[ -z "$repeats" ]]; then
@@ -330,7 +330,7 @@ matrix_stop_server() {
 trap 'matrix_stop_server' EXIT INT TERM
 
 servers=()
-for want in ferrox xray-core; do
+for want in ferrox xray-core sing-box; do
   if engine_path "$want" >/dev/null; then servers+=("$want"); fi
 done
 ((${#servers[@]})) || fail "no server engine: the grid needs ferrox or xray-core"
@@ -396,25 +396,51 @@ while read -r id traffic connections iterations payload; do
       continue
     }
     client_args=(--outbound-config "$(cat "$celldir/client.json")")
-    if engine_path xray-rust >/dev/null; then
-      matrix_rust_client_config "$celldir/client.json" "$celldir/client-xray-rust.json" || {
-        cells_failed+=("$cell (could not strip the TLS fixture for xray-rust)")
-        status=1
+    for have in ${cell_engines[@]+"${cell_engines[@]}"}; do
+      label="${have%%=*}"
+      if skip_reason="$(matrix_engine_skip_reason "$label" "$id")"; then
+        client_args+=(--skip-engine-for "$label=$skip_reason")
         continue
-      }
-      client_args+=(--outbound-config-for "xray-rust=$(cat "$celldir/client-xray-rust.json")")
-    fi
-    if engine_path sing-box >/dev/null && matrix_engine_serves sing-box "$id"; then
-      python3 scripts/xray-to-singbox.py "$celldir/client.json" "$celldir/client-sing-box.json" || {
-        cells_failed+=("$cell (could not translate the client config for sing-box)")
-        status=1
-        continue
-      }
-      if skip_reason="$(matrix_engine_skip_reason sing-box "$id" "$server")"; then
-        client_args+=(--skip-engine-for "sing-box=$skip_reason")
-      else
-        client_args+=(--outbound-config-for "sing-box=$(cat "$celldir/client-sing-box.json")")
       fi
+      case "$label" in
+        sing-box)
+          python3 scripts/xray-to-singbox.py \
+            "$celldir/client.json" "$celldir/client-sing-box.json" || {
+            cells_failed+=("$cell (could not translate the client config for sing-box)")
+            status=1
+            continue 2
+          }
+          client_args+=(--outbound-config-for "sing-box=$(cat "$celldir/client-sing-box.json")")
+          ;;
+        leaf)
+          python3 scripts/xray-to-leaf.py \
+            "$celldir/client.json" "$celldir/client-leaf.json" || {
+            cells_failed+=("$cell (could not translate the client config for leaf)")
+            status=1
+            continue 2
+          }
+          client_args+=(--outbound-config-for "leaf=$(cat "$celldir/client-leaf.json")")
+          ;;
+        xray-rust)
+          matrix_rust_client_config \
+            "$celldir/client.json" "$celldir/client-xray-rust.json" || {
+            cells_failed+=("$cell (could not strip the TLS fixture for xray-rust)")
+            status=1
+            continue 2
+          }
+          client_args+=(--outbound-config-for "xray-rust=$(cat "$celldir/client-xray-rust.json")")
+          ;;
+      esac
+    done
+    server_config="$celldir/server.json"
+    if [[ "$server" == "sing-box" ]]; then
+      python3 scripts/xray-to-singbox.py --server \
+        "$celldir/server.json" "$celldir/server-sing-box.json" || {
+        cells_failed+=("$cell (could not translate the server config for sing-box)")
+        status=1
+        continue
+      }
+      server_config="$celldir/server-sing-box.json"
     fi
     if ((probe_only)); then
       cells_run=$((cells_run + 1))
@@ -425,7 +451,7 @@ while read -r id traffic connections iterations payload; do
       continue
     fi
     server_bin="$(engine_path "$server")"
-    server_pid="$(matrix_start_server "$server" "$server_bin" "$celldir/server.json" "$celldir")"
+    server_pid="$(matrix_start_server "$server" "$server_bin" "$server_config" "$celldir")"
     if ! matrix_wait_tcp 127.0.0.1 "$readyport" || ! kill -0 "$server_pid" 2>/dev/null; then
       cells_failed+=("$cell (server $server never listened on $readyport)")
       status=1

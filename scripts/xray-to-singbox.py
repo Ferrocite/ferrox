@@ -1,4 +1,4 @@
-"""Translate one Xray-dialect client outbound document to a sing-box client config.
+"""Translate one Xray-dialect document to a sing-box client or server config.
 
 The matrix scenarios are written as Xray JSON because xray-core is the reference
 and its dialect is the one every server reads. sing-box reads the same protocols
@@ -143,14 +143,76 @@ def convert(document):
     return {"outbounds": [outbound], "route": {"final": outbound["tag"]}}
 
 
+def _certificate(settings):
+    certificate = _first(settings.get("certificates"), "`tlsSettings.certificates`")
+    if "certificateFile" not in certificate or "keyFile" not in certificate:
+        raise ValueError("`tlsSettings.certificates[0]` needs a file and a key")
+    return certificate["certificateFile"], certificate["keyFile"]
+
+
+def _server_inbound(inbound):
+    protocol = inbound.get("protocol")
+    if protocol == "socks":
+        return {
+            "type": "socks",
+            "tag": inbound.get("tag", "socks-in"),
+            "listen": inbound.get("listen", "127.0.0.1"),
+            "listen_port": inbound["port"],
+        }
+    if protocol != "hysteria":
+        raise ValueError(f"sing-box at this pin has no `{protocol}` server here")
+    settings = inbound.get("settings") or {}
+    if settings.get("version") != 1:
+        raise ValueError("sing-box at this pin carries only Hysteria v1 here")
+    stream = inbound.get("streamSettings") or {}
+    tls_settings = stream.get("tlsSettings") or {}
+    certificate, key = _certificate(tls_settings)
+    users = settings.get("users") or settings.get("clients")
+    if not isinstance(users, list) or not users:
+        raise ValueError("the Hysteria v1 server needs at least one user")
+    converted = {
+        "type": "hysteria",
+        "tag": inbound.get("tag", "hysteria-in"),
+        "listen": inbound.get("listen", "127.0.0.1"),
+        "listen_port": inbound["port"],
+        "up_mbps": 100,
+        "down_mbps": 100,
+        "users": [
+            {"auth_str": user.get("auth", user.get("auth_str", ""))}
+            for user in users
+        ],
+        "tls": {
+            "enabled": True,
+            "alpn": tls_settings.get("alpn", ["hysteria"]),
+            "certificate_path": certificate,
+            "key_path": key,
+        },
+    }
+    if tls_settings.get("obfs"):
+        converted["obfs"] = tls_settings["obfs"]
+    return converted
+
+
+def convert_server(document):
+    inbounds = document.get("inbounds")
+    if not isinstance(inbounds, list) or not inbounds:
+        raise ValueError("`inbounds` must be a non-empty array")
+    return {
+        "inbounds": [_server_inbound(inbound) for inbound in inbounds],
+        "outbounds": [{"type": "direct", "tag": "direct"}],
+        "route": {"final": "direct"},
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path)
     parser.add_argument("output", type=Path)
+    parser.add_argument("--server", action="store_true")
     args = parser.parse_args()
     try:
         document = json.loads(args.input.read_text())
-        converted = convert(document)
+        converted = convert_server(document) if args.server else convert(document)
     except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as error:
         print(f"xray-to-singbox: {error}", file=sys.stderr)
         return 2

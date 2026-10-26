@@ -1,25 +1,33 @@
 # Benchmark matrix
 
 Every cell measures one client engine against a fixed server engine on loopback.
-The grid runs both servers (`ferrox`, `xray-core`) for every scenario and every
-client the scenario's protocol and carrier admit (`ferrox`, `xray-core`,
-`xray-core-rust`, `zeronet`, `sing-box`). The one exception is the standalone
-Hysteria v1 cell: `xray-core` reads v2 only, so that cell runs the `ferrox`
-server alone and uses `sing-box` as its reference. `xray-core` is the reference
-wherever it participates; a cell without a reference is not a comparison.
-`xray-rust` is left out while its pinned release refuses the harness's
-non-loopback SOCKS listener. The pinned `sing-box` serves every scenario except
-the `xhttp` and `kcp` carriers, VLESS over `hysteria`, and the
-`vless-encryption-*` arms, which are omitted from its cells rather than failed:
-it has no such transport and its VLESS has no `encryption` field. Each remaining
-sing-box cell reads the same client outbound translated by
-`scripts/xray-to-singbox.py`; the Hysteria v1 cell translates the standalone
-proxy, which sing-box carries at its pin. At its pin sing-box strips the
-X25519MLKEM768 key share from a REALITY handshake, which xray-core's REALITY
-server requires, so `scripts/patch-sing-box.py` restores it before the build and
-the cell measures the transport rather than a TLS refusal. A wide PR's smoke
-cell also builds and runs sing-box, so the translated client is exercised
-before the nightly.
+The grid runs `ferrox` and `xray-core` as servers for every scenario they admit,
+and `sing-box` as a third server in the standalone Hysteria v1 cell, where
+`xray-core` reads v2 only. Every client the scenario's protocol and carrier
+admit is measured: `ferrox`, `xray-core`, `xray-core-rust`, `zeronet`,
+`sing-box`, and in the standard and full tiers `xray-rust` and `leaf`.
+`xray-core` is the reference wherever it participates; the standalone Hysteria
+v1 cell has no `xray-core` control and is left to its ratio row. The pinned
+`sing-box` serves every scenario except the `xhttp` and `kcp` carriers, VLESS
+over `hysteria`, and the `vless-encryption-*` arms, which are omitted from its
+cells rather than failed: it has no such transport and its VLESS has no
+`encryption` field. Each remaining sing-box cell reads the same client outbound
+translated by `scripts/xray-to-singbox.py`; the Hysteria v1 cell translates both
+the standalone client and the server, which sing-box carries at its pin. At its
+pin sing-box strips the X25519MLKEM768 key share from a REALITY handshake, which
+xray-core's REALITY server requires, so `scripts/patch-sing-box.py` restores it
+before the build and the cell measures the transport rather than a TLS refusal.
+A wide PR's smoke cell also builds and runs sing-box, so the translated client
+is exercised before the nightly.
+
+`leaf` joins where its pin has the protocol and carrier: raw, TLS and REALITY
+VLESS over TCP or WebSocket, VMess, Trojan, and legacy Shadowsocks. It has no
+`xhttp`, KCP, gRPC, HTTPUpgrade, Hysteria, VLESS flow or encryption, or
+Shadowsocks 2022, and those cells name that in the bundle's skipped list.
+`scripts/xray-to-leaf.py` writes its TLS, REALITY and WebSocket layers as chain
+actors. `xray-rust` joins every standard and full cell its pin admits;
+`matrix_rust_client_config` removes the CA file and verify certificate it
+rejects while keeping the certificate pin.
 
 Each scenario that has both servers also runs the reference client against both,
 so `scripts/check-matrix-legs.py` can say which leg lost: a ferrox client below
@@ -76,7 +84,7 @@ transport and no VLESS `encryption` field.
 
 ## Every standard configuration
 
-The standard tier measures these 63 configurations: one row per scenario and server, except the standalone Hysteria v1 row, which has only the ferrox server. The full tier adds the 16-flow cells (`vless-raw-down-16`, `vless-raw-duplex-16`, `vless-tls-raw-duplex-16`, `vless-ws-down-16`), the missing up/duplex lanes for every method that had only a down lane, plus `vmess-tls-raw`, for 78 more, and the v1 up and duplex lanes for two more: 143 in all. The full tier runs weekly on `ubuntu-latest`, `ubuntu-24.04-arm` and `macos-15`; `windows-latest` is available by `workflow_dispatch`, because 73 scenarios across four runners is more than one matrix job may hold. The nightly standard tier runs on `ubuntu-latest` only, because a ratio is read inside one cell and four runners were measuring the same ratio four times.
+The standard tier measures these 64 configurations: one row per scenario and server, except the standalone Hysteria v1 row, which runs the ferrox and sing-box servers. The full tier adds the 16-flow cells (`vless-raw-down-16`, `vless-raw-duplex-16`, `vless-tls-raw-duplex-16`, `vless-ws-down-16`), the missing up/duplex lanes for every method that had only a down lane, plus `vmess-tls-raw`, and the v1 up and duplex lanes: 146 in all. The full tier runs weekly on `ubuntu-latest`, `ubuntu-24.04-arm` and `macos-15`; `windows-latest` is available by `workflow_dispatch`, because 73 scenarios across four runners is more than one matrix job may hold. The nightly standard tier runs on `ubuntu-latest` only, because a ratio is read inside one cell and four runners were measuring the same ratio four times.
 
 | scenario | server | measured |
 | --- | --- | --- |
@@ -137,6 +145,7 @@ The standard tier measures these 63 configurations: one row per scenario and ser
 | `vless-hysteria-down-8` | ferrox | yes |
 | `vless-hysteria-down-8` | xray-core | yes |
 | `hysteria-v1-down-8` | ferrox | yes |
+| `hysteria-v1-down-8` | sing-box | yes |
 | `shadowsocks2022-raw-down-8` | ferrox | yes |
 | `shadowsocks2022-raw-down-8` | xray-core | yes |
 | `vmess-tls-ws-down-8` | ferrox | yes |
@@ -169,7 +178,6 @@ lane, not a claim that the method works.
 | any | udp dns through the socks front | request/response | no scenario |
 | any | ipv6 target | down | no scenario |
 | any | more than 16 flows | down | no scenario |
-| any | leaf and xray-rust as clients | down | engines pinned but not in the matrix |
 
 <!-- benchmark-matrix:start -->
 <!-- benchmark-matrix:end -->
