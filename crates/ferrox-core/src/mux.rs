@@ -601,7 +601,12 @@ impl<T> Sessions<T> {
                     return (None, free);
                 }
                 Slot::Live(key, _) | Slot::Closed(key) if *key == id => return (Some(at), free),
-                Slot::Live(..) | Slot::Closed(..) => {}
+                Slot::Closed(_) => {
+                    if free.is_none() {
+                        free = Some(at);
+                    }
+                }
+                Slot::Live(..) => {}
             }
             at = (at + 1) & self.mask;
         }
