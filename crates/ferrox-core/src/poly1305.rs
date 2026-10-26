@@ -18,6 +18,9 @@ const STRIDE2_THRESHOLD_BYTES: usize = 128;
 #[cfg(target_arch = "aarch64")]
 const NEON4_THRESHOLD_BYTES: usize = 1024;
 
+#[cfg(target_arch = "aarch64")]
+const SMALL26_MAX_BYTES: usize = 64;
+
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
 const M26: u64 = 0x03ff_ffff;
 
@@ -458,6 +461,11 @@ impl Poly1305 {
 
     fn absorb(&mut self, data: &[u8], hibit: u64) {
         #[cfg(target_arch = "aarch64")]
+        if hibit == HIBIT && data.len() <= SMALL26_MAX_BYTES {
+            self.absorb_small_26(data);
+            return;
+        }
+        #[cfg(target_arch = "aarch64")]
         if hibit == HIBIT && data.len() >= NEON4_THRESHOLD_BYTES {
             self.absorb_neon4(data);
             return;
@@ -515,6 +523,56 @@ impl Poly1305 {
         }
 
         self.h = [h0, h1, h2];
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn absorb_small_26(&mut self, data: &[u8]) {
+        const M: u64 = 0x03ff_ffff;
+        debug_assert!(data.len().is_multiple_of(16), "absorb takes whole blocks");
+        debug_assert!(
+            data.len() <= SMALL26_MAX_BYTES,
+            "the small path covers at most four blocks"
+        );
+        let r = to_26([self.r0, self.r1, self.r2]).map(u64::from);
+        let s = [r[1] * 5, r[2] * 5, r[3] * 5, r[4] * 5];
+        let mut h = to_26(self.h).map(u64::from);
+
+        let mut rest = data;
+        while let Some(m) = rest.first_chunk::<16>() {
+            let w = |at: usize| u32::from_le_bytes([m[at], m[at + 1], m[at + 2], m[at + 3]]);
+            let h0 = h[0] + (u64::from(w(0)) & M);
+            let h1 = h[1] + ((u64::from(w(3)) >> 2) & M);
+            let h2 = h[2] + ((u64::from(w(6)) >> 4) & M);
+            let h3 = h[3] + ((u64::from(w(9)) >> 6) & M);
+            let h4 = h[4] + ((u64::from(w(12)) >> 8) & M) + u64::from(HIBIT26);
+
+            let d0 = h0 * r[0] + h1 * s[3] + h2 * s[2] + h3 * s[1] + h4 * s[0];
+            let mut d1 = h0 * r[1] + h1 * r[0] + h2 * s[3] + h3 * s[2] + h4 * s[1];
+            let mut d2 = h0 * r[2] + h1 * r[1] + h2 * r[0] + h3 * s[3] + h4 * s[2];
+            let mut d3 = h0 * r[3] + h1 * r[2] + h2 * r[1] + h3 * r[0] + h4 * s[3];
+            let mut d4 = h0 * r[4] + h1 * r[3] + h2 * r[2] + h3 * r[1] + h4 * r[0];
+
+            let c = d0 >> 26;
+            let o0 = d0 & M;
+            d1 += c;
+            let c = d1 >> 26;
+            let o1 = d1 & M;
+            d2 += c;
+            let c = d2 >> 26;
+            let o2 = d2 & M;
+            d3 += c;
+            let c = d3 >> 26;
+            let o3 = d3 & M;
+            d4 += c;
+            let c = d4 >> 26;
+            let o4 = d4 & M;
+            let wrapped = o0 + c * 5;
+            h = [wrapped & M, o1 + (wrapped >> 26), o2, o3, o4];
+
+            rest = &rest[16..];
+        }
+
+        self.h = from_26(h.map(|limb| limb as u32));
     }
 
     #[inline]
@@ -1678,6 +1736,31 @@ mod tests {
             "the walk must include the values that need reducing before a repack, \
              or it is not testing the thing it exists for"
         );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn the_small_26_path_is_the_26_bit_horner() {
+        for seed in 0..4u8 {
+            let key: [u8; 32] =
+                std::array::from_fn(|i| (i as u8).wrapping_mul(197).wrapping_add(seed * 61));
+            for blocks in 0..=4usize {
+                let data: Vec<u8> = (0..blocks * 16)
+                    .map(|i| (i as u8).wrapping_mul(29).wrapping_add(seed))
+                    .collect();
+                let want = tag_via_26_bit_horner(&key, &data);
+
+                let mut one = Poly1305::new(&key);
+                one.absorb_small_26(&data);
+                assert_eq!(one.finish(), want, "seed {seed}, {blocks} blocks");
+
+                let mut split = Poly1305::new(&key);
+                for block in data.chunks(16) {
+                    split.absorb_small_26(block);
+                }
+                assert_eq!(split.finish(), want, "seed {seed}, {blocks} blocks split");
+            }
+        }
     }
 
     #[cfg(target_arch = "aarch64")]
