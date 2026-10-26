@@ -13,10 +13,13 @@ client outbound translated by `scripts/xray-to-singbox.py`.
 Each scenario also runs the reference client against both servers, so
 `scripts/check-matrix-legs.py` can say which leg lost: a ferrox client below the
 xray-core client on the xray-core server is a client hole, and a ferrox server
-below the xray-core server under the xray-core client is a server hole. The
-workload moves 128 MiB per flow, scaled down from the bytes a profile needs so a
-standard run finishes in minutes rather than hours; throughput, CPU and syscall
-ratios are unchanged by the size.
+below the xray-core server under the xray-core client is a server hole. The same
+control prices the server process itself: its CPU per GiB and peak threads,
+sampled beside the client over the same bytes, are lower-is-better holes when
+the ferrox server spends more than xray-core's. The workload moves 128 MiB per
+flow, scaled down from the bytes a profile needs so a standard run finishes in
+minutes rather than hours; throughput, CPU and syscall ratios are unchanged by
+the size.
 
 The tables are generated from `matrix-results.json` and the charts from the same
 cell bundles by `scripts/render-benchmark-charts.py`; CI commits the dated
@@ -24,9 +27,10 @@ results and the latest charts here and opens a review PR. Do not edit between
 the markers by hand: a refresh replaces one runner block at a time.
 
 Each bundle carries one image per test, never one image that merges every test:
-the panel shows throughput, CPU per GiB, peak RSS, peak threads, cold start and
-kernel asks per MiB from the same cell, so a reader never matches one test's
-bar against another test's. The coverage grid is a markdown table, so a missing
+the panel shows the client's throughput, CPU per GiB, peak RSS, peak threads,
+cold start and kernel asks per MiB from the same cell, so a reader never matches
+one test's bar against another test's; the server's CPU and threads live in each
+run's `server` object and the leg gate, never as a client bar. The coverage grid is a markdown table, so a missing
 cell and its reason survive both text review and the artifact browser. The
 README block and the bundle's `README.md` are generated from the same
 `matrix-results.json`. A scheduled refresh compares the new medians with the
