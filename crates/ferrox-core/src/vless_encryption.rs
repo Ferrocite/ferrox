@@ -1409,6 +1409,9 @@ impl<S: Write> Write for EncryptedStream<S> {
     }
 }
 
+/// The independently sealed halves a split stream yields.
+pub type EncryptedHalves<R, W> = (EncryptedReader<R>, EncryptedWriter<W>);
+
 /// A stream that carries independent halves, so sealing can split without one lock.
 pub trait SplitIo {
     type Reader;
@@ -1418,7 +1421,7 @@ pub trait SplitIo {
 }
 
 impl<S: SplitIo> EncryptedStream<S> {
-    pub fn into_split(self) -> Option<(EncryptedReader<S::Reader>, EncryptedWriter<S::Writer>)> {
+    pub fn into_split(self) -> Option<EncryptedHalves<S::Reader, S::Writer>> {
         let Self { inner, read, write } = self;
         let (reader, writer) = inner.split_io()?;
         Some((
