@@ -508,46 +508,61 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                     let frame = &self.have[dot..dot + 5];
                     let body = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
                     let command = frame[0];
-                    let content = (body >> 16) as usize;
+                    let mut content = (body >> 16) as usize;
                     let padding = (body & 0xffff) as usize;
                     self.validate();
                     dot += 5;
-                    let room = match buf.as_deref() {
-                        Some(slot) => slot.len() - held,
-                        None => usize::MAX,
-                    };
-                    if end - dot >= content + padding && room >= content {
-                        if content > 0 {
-                            let fresh = &self.have[dot..dot + content];
+                    if content > 0 {
+                        let room = match buf.as_deref() {
+                            Some(slot) => slot.len() - held,
+                            None => usize::MAX,
+                        };
+                        let take = content.min(end - dot).min(room);
+                        if take > 0 {
+                            let fresh = &self.have[dot..dot + take];
                             if self.tls.budget > 0 {
                                 if let Some(feed) = feed.as_deref_mut() {
-                                    feed.run += content;
+                                    feed.run += take;
                                     feed_extent(fresh, feed);
                                 }
                             }
                             if let Some(slot) = buf.as_deref_mut() {
-                                slot[held..held + content].copy_from_slice(fresh);
+                                slot[held..held + take].copy_from_slice(fresh);
                             }
-                            held += content;
+                            dot += take;
+                            held += take;
+                            content -= take;
                         }
-                        dot += content + padding;
-                        if command == VisionCommand::Continue.byte() {
-                            continue;
+                        if content > 0 {
+                            walk.command = command;
+                            walk.want_content = content;
+                            walk.want_padding = padding;
+                            walk.want_header = 0;
+                            break held;
                         }
-                        self.read.padding = false;
-                        if command == VisionCommand::Direct.byte() {
-                            if let Some(direct) = self.direct {
-                                direct(&mut self.session);
-                            }
-                        }
-                        self.read.raw =
-                            command == VisionCommand::Direct.byte() && self.raw.is_some();
-                        break held;
                     }
-                    walk.command = command;
-                    walk.want_content = content;
-                    walk.want_padding = padding;
-                    walk.want_header = 0;
+                    if padding > 0 {
+                        let take = padding.min(end - dot);
+                        dot += take;
+                        if take < padding {
+                            walk.command = command;
+                            walk.want_content = 0;
+                            walk.want_padding = padding - take;
+                            walk.want_header = 0;
+                            break held;
+                        }
+                    }
+                    if command == VisionCommand::Continue.byte() {
+                        continue;
+                    }
+                    self.read.padding = false;
+                    if command == VisionCommand::Direct.byte() {
+                        if let Some(direct) = self.direct {
+                            direct(&mut self.session);
+                        }
+                    }
+                    self.read.raw = command == VisionCommand::Direct.byte() && self.raw.is_some();
+                    break held;
                 } else if dot < end {
                     let byte = self.have[dot];
                     match walk.want_header {
