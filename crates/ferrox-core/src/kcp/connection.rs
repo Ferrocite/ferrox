@@ -589,6 +589,9 @@ impl Connection {
             State::PeerClosed => self.set_state(State::Terminating),
             State::PeerTerminating => self.set_state(State::Terminated),
         }
+        if matches!(self.state(), State::ReadyToClose | State::Terminating) {
+            self.flush();
+        }
     }
 
     pub fn terminate(&self) {
