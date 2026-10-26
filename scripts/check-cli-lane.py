@@ -1267,9 +1267,10 @@ def check_config_fronts(state: pathlib.Path) -> int:
     )
     run, recorded = config_lane(state, silent, trace=False)
     output = run.stdout + run.stderr
+    writes = [line for line in recorded.splitlines() if line.startswith("-set")]
     if (
         run.returncode == 0
-        or recorded
+        or writes
         or (state / "lane.pid").exists()
         or marker.exists()
     ):
