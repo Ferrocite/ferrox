@@ -26,7 +26,7 @@ const NETWORK_UNIX: i64 = 4;
 
 /// What a script may call back into while it runs: the resolver a `xray.dns.Query` uses, and the
 /// balancer table a `xray.router.PickOutbound` reads. Both are built once, so a call clones handles.
-pub(crate) type Resolver = dyn Fn(&str, u16) -> Vec<IpAddr> + Send + Sync;
+pub(crate) type Resolver = dyn Fn(&str, u16, bool) -> (Vec<IpAddr>, u32) + Send + Sync;
 pub(crate) type Picker = dyn Fn(&str) -> Result<String, String> + Send + Sync;
 
 #[derive(Clone)]
@@ -66,20 +66,22 @@ impl CallHooks {
             .take();
     }
 
-    fn resolve(&self, host: &str, port: u16) -> LuaResult<Vec<IpAddr>> {
-        let call = self.call.lock().unwrap_or_else(PoisonError::into_inner);
-        let call = call
-            .as_ref()
-            .ok_or_else(|| LuaError::RuntimeError("no routing context".into()))?;
-        Ok((call.resolve)(host, port))
+    fn resolve(&self, host: &str, port: u16, fake: bool) -> LuaResult<(Vec<IpAddr>, u32)> {
+        let resolve = {
+            let call = self.call.lock().unwrap_or_else(PoisonError::into_inner);
+            call.as_ref().map(|call| Arc::clone(&call.resolve))
+        }
+        .ok_or_else(|| LuaError::RuntimeError("no routing context".into()))?;
+        Ok(resolve(host, port, fake))
     }
 
     fn pick(&self, tag: &str) -> LuaResult<(Option<String>, Option<String>)> {
-        let call = self.call.lock().unwrap_or_else(PoisonError::into_inner);
-        let call = call
-            .as_ref()
-            .ok_or_else(|| LuaError::RuntimeError("no routing context".into()))?;
-        match (call.pick)(tag) {
+        let pick = {
+            let call = self.call.lock().unwrap_or_else(PoisonError::into_inner);
+            call.as_ref().map(|call| Arc::clone(&call.pick))
+        }
+        .ok_or_else(|| LuaError::RuntimeError("no routing context".into()))?;
+        match pick(tag) {
             Ok(tag) => Ok((Some(tag), None)),
             Err(error) => Ok((None, Some(error))),
         }
@@ -94,7 +96,7 @@ struct State {
 /// The compiled routing script and the states it runs in. A state is lent to one flow at a time and
 /// dropped after a failure, so a script that timed out cannot leave a half-entered call behind.
 pub(crate) struct ScriptRouter {
-    source: String,
+    source: Vec<u8>,
     name: String,
     dirs: Arc<Vec<PathBuf>>,
     idle: Mutex<Vec<State>>,
@@ -129,8 +131,8 @@ impl ScriptRouter {
     /// reported before any socket opens.
     pub(crate) fn parse_in(path: &str, dirs: Vec<PathBuf>) -> Result<Self, String> {
         let name = resolve(path, &dirs)?;
-        let source = std::fs::read_to_string(&name)
-            .map_err(|error| format!("routing script `{path}`: {error}"))?;
+        let source =
+            std::fs::read(&name).map_err(|error| format!("routing script `{path}`: {error}"))?;
         let router = Self {
             source,
             name: name.display().to_string(),
@@ -356,14 +358,57 @@ fn resolve(path: &str, dirs: &[PathBuf]) -> Result<PathBuf, String> {
         }
     }
     for candidate in &candidates {
-        if candidate.is_file() {
-            return Ok(candidate.clone());
+        let candidate = std::path::absolute(candidate)
+            .map_err(|error| format!("routing script `{path}`: {error}"))?;
+        let metadata = match std::fs::metadata(&candidate) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(format!("routing script `{path}`: {error}")),
+        };
+        if !metadata.is_file() {
+            return Err(format!(
+                "routing script `{path}` is not a regular file: {}",
+                candidate.display()
+            ));
         }
+        let resolved = std::fs::canonicalize(&candidate)
+            .map_err(|error| format!("routing script `{path}`: {error}"))?;
+        if resolved.extension() != Some(std::ffi::OsStr::new("lua")) {
+            return Err(format!(
+                "routing script `{path}` must have a .lua extension: {}",
+                resolved.display()
+            ));
+        }
+        return Ok(resolved);
     }
     Err(format!(
         "routing script `{path}` was not found in {} locations",
         candidates.len()
     ))
+}
+
+fn dns_answer(
+    lua: &Lua,
+    addrs: Vec<IpAddr>,
+    ttl: u32,
+    ipv4: bool,
+    ipv6: bool,
+) -> LuaResult<(Value, f64, Option<LuaError>)> {
+    let addrs = addrs
+        .into_iter()
+        .filter(|addr| (ipv4 && addr.is_ipv4()) || (ipv6 && addr.is_ipv6()))
+        .collect::<Vec<_>>();
+    if addrs.is_empty() {
+        return Ok((
+            Value::Nil,
+            0.0,
+            Some(LuaError::RuntimeError("empty response".to_owned())),
+        ));
+    }
+    let list = lua.create_userdata(IpList {
+        items: Arc::new(addrs),
+    })?;
+    Ok((Value::UserData(list), f64::from(ttl), None))
 }
 
 #[allow(clippy::too_many_lines)]
@@ -456,29 +501,65 @@ fn install(lua: &Lua, hooks: &Arc<CallHooks>, dirs: &Arc<Vec<PathBuf>>) -> LuaRe
     dns.set(
         "Query",
         lua.create_function(
-            move |lua, (name, ipv4, ipv6, _fake): (String, bool, bool, bool)| {
-                let resolved = match query_hooks.resolve(&name, 0) {
-                    Ok(addrs) => addrs,
+            move |lua, (name, ipv4, ipv6, fake): (String, bool, bool, bool)| {
+                let (addrs, ttl) = match query_hooks.resolve(&name, 0, fake) {
+                    Ok(answer) => answer,
                     Err(error) => return Ok((Value::Nil, 0.0, Some(error))),
                 };
-                let addrs = resolved
-                    .into_iter()
-                    .filter(|addr| (ipv4 && addr.is_ipv4()) || (ipv6 && addr.is_ipv6()))
-                    .collect::<Vec<_>>();
-                if addrs.is_empty() {
-                    return Ok((
-                        Value::Nil,
-                        0.0,
-                        Some(LuaError::RuntimeError("empty response".to_owned())),
-                    ));
-                }
-                let list = lua.create_userdata(IpList {
-                    items: Arc::new(addrs),
-                })?;
-                Ok((Value::UserData(list), 0.0, None))
+                dns_answer(lua, addrs, ttl, ipv4, ipv6)
             },
         )?,
     )?;
+    let servers = lua.create_table()?;
+    if let Some(resolver) = crate::dnsapp::installed() {
+        for (id, index) in resolver.script_servers() {
+            let server = lua.create_table()?;
+            server.set("ID", id)?;
+            let resolver = Arc::clone(&resolver);
+            server.set(
+                "Query",
+                lua.create_function(
+                    move |lua, (name, ipv4, ipv6, fake): (String, bool, bool, bool)| match resolver
+                        .script_query(index, &name, ipv4, ipv6, fake)
+                    {
+                        crate::dnsapp::Lookup::Records(addrs, ttl) => {
+                            dns_answer(lua, addrs, ttl, ipv4, ipv6)
+                        }
+                        crate::dnsapp::Lookup::Empty => Ok((
+                            Value::Nil,
+                            0.0,
+                            Some(LuaError::RuntimeError("empty response".to_owned())),
+                        )),
+                        crate::dnsapp::Lookup::Rcode(code) => Ok((
+                            Value::Nil,
+                            0.0,
+                            Some(LuaError::RuntimeError(format!("response code {code}"))),
+                        )),
+                        crate::dnsapp::Lookup::Failed => Ok((
+                            Value::Nil,
+                            0.0,
+                            Some(LuaError::RuntimeError("lookup failed".to_owned())),
+                        )),
+                    },
+                )?,
+            )?;
+            servers.set(index + 1, server)?;
+        }
+    } else {
+        let server = lua.create_table()?;
+        server.set("ID", "localhost")?;
+        server.set(
+            "Query",
+            lua.create_function(
+                |lua, (name, ipv4, ipv6, _fake): (String, bool, bool, bool)| {
+                    let (addrs, ttl) = crate::router::resolve_ips_ttl(&name, 0);
+                    dns_answer(lua, addrs, ttl, ipv4, ipv6)
+                },
+            )?,
+        )?;
+        servers.set(1, server)?;
+    }
+    dns.set("Servers", servers)?;
 
     let dns_dirs = Arc::clone(dirs);
     let geodata = lua.create_table()?;
@@ -580,23 +661,35 @@ struct IpMatcherUser {
 
 impl UserData for IpMatcherUser {
     fn add_methods<M: UserDataMethods<Self>>(methods: &mut M) {
-        methods.add_method("Match", |_, this, ip: AnyUserData| {
+        methods.add_method("Match", |_, this, ip: Option<AnyUserData>| {
+            let Some(ip) = ip else {
+                return Ok(false);
+            };
             let ip = ip.borrow::<IpUser>()?;
             Ok(this.matcher.matches(ip.0))
         });
-        methods.add_method("AnyMatch", |_, this, ips: AnyUserData| {
+        methods.add_method("AnyMatch", |_, this, ips: Option<AnyUserData>| {
+            let Some(ips) = ips else {
+                return Ok(false);
+            };
             let ips = ips.borrow::<IpList>()?;
             Ok(ips.items.iter().any(|ip| this.matcher.matches(*ip)))
         });
-        methods.add_method("Matches", |_, this, ips: AnyUserData| {
+        methods.add_method("Matches", |_, this, ips: Option<AnyUserData>| {
+            let Some(ips) = ips else {
+                return Ok(false);
+            };
             let ips = ips.borrow::<IpList>()?;
             Ok(!ips.items.is_empty() && ips.items.iter().all(|ip| this.matcher.matches(*ip)))
         });
-        methods.add_method("FilterIPs", |lua, this, ips: AnyUserData| {
-            let ips = ips.borrow::<IpList>()?;
+        methods.add_method("FilterIPs", |lua, this, ips: Option<AnyUserData>| {
+            let ips = match ips {
+                Some(ips) => ips.borrow::<IpList>()?.items.clone(),
+                None => Arc::new(Vec::<IpAddr>::new()),
+            };
             let mut matched = Vec::new();
             let mut unmatched = Vec::new();
-            for ip in ips.items.iter() {
+            for ip in ips.iter() {
                 if this.matcher.matches(*ip) {
                     matched.push(*ip);
                 } else {
@@ -952,11 +1045,11 @@ mod tests {
 
     #[test]
     fn an_ip_address_strings_the_way_go_prints_it() {
-        let mapped = IpAddr::V6(Ipv4Addr::new(1, 2, 3, 4).to_ipv6_mapped());
-        assert_eq!(addr_string(mapped), "1.2.3.4");
+        let mapped = IpAddr::V6(Ipv4Addr::new(192, 0, 2, 4).to_ipv6_mapped());
+        assert_eq!(addr_string(mapped), "192.0.2.4");
         assert_eq!(
-            addr_string(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4))),
-            "1.2.3.4"
+            addr_string(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 4))),
+            "192.0.2.4"
         );
     }
 
@@ -990,7 +1083,7 @@ mod tests {
 
     fn callbacks() -> ScriptCallbacks {
         ScriptCallbacks {
-            resolve: Arc::new(|_, _| Vec::new()),
+            resolve: Arc::new(|_, _, _| (Vec::new(), 0)),
             pick: Arc::new(|tag| Ok(format!("picked-{tag}"))),
         }
     }
@@ -1052,5 +1145,85 @@ end
         let router = ScriptRouter::parse_in("route.lua", vec![dir]).expect("parses");
         let error = router.route(&flow(), &callbacks()).expect_err("refused");
         assert!(error.contains("outboundTag"), "{error}");
+    }
+
+    #[test]
+    fn a_dns_query_returns_its_ttl_and_the_server_table_is_indexed() {
+        let dir = dir();
+        std::fs::write(
+            dir.join("route.lua"),
+            r#"
+local dns = require("xray.dns")
+function HandleRoute()
+  if #dns.Servers < 1 or type(dns.Servers[1].ID) ~= "string" then return nil end
+  local ips, ttl = dns.Query("blocked.test", true, false, false)
+  if ips == nil or ttl ~= 60 then return nil end
+  return "direct"
+end
+"#,
+        )
+        .expect("write");
+        let router = ScriptRouter::parse_in("route.lua", vec![dir]).expect("parses");
+        let callbacks = ScriptCallbacks {
+            resolve: Arc::new(|_, _, _| (vec!["192.0.2.9".parse().expect("address")], 60)),
+            pick: Arc::new(|tag| Ok(format!("picked-{tag}"))),
+        };
+        assert_eq!(
+            router.route(&flow(), &callbacks).expect("routes"),
+            Some("direct".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_script_dns_query_reads_the_resolver_ttl() {
+        let dir = dir();
+        std::fs::write(
+            dir.join("route.lua"),
+            r#"
+local dns = require("xray.dns")
+function HandleRoute()
+  local ips, ttl, err = dns.Query("example.com", true, false, true)
+  if not err and ttl == 42 and #ips == 1 then return "direct" end
+  return nil
+end
+"#,
+        )
+        .expect("write");
+        let router = ScriptRouter::parse_in("route.lua", vec![dir]).expect("parses");
+        let callbacks = ScriptCallbacks {
+            resolve: Arc::new(|host, _, fake| {
+                assert_eq!(host, "example.com");
+                assert!(fake);
+                (vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))], 42)
+            }),
+            pick: Arc::new(|tag| Ok(format!("picked-{tag}"))),
+        };
+        assert_eq!(
+            router.route(&flow(), &callbacks).expect("routes"),
+            Some("direct".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_script_path_must_end_in_lua_after_symlinks() {
+        let dir = dir();
+        std::fs::write(
+            dir.join("route.dat"),
+            "function HandleRoute() return nil end",
+        )
+        .expect("write");
+        let error = ScriptRouter::parse_in("route.dat", vec![dir.clone()]).expect_err("refused");
+        assert!(error.contains(".lua"), "{error}");
+        #[cfg(unix)]
+        {
+            std::fs::write(
+                dir.join("route.lua"),
+                "function HandleRoute() return nil end",
+            )
+            .expect("write");
+            std::os::unix::fs::symlink(dir.join("route.lua"), dir.join("alias.dat"))
+                .expect("symlink");
+            ScriptRouter::parse_in("alias.dat", vec![dir]).expect("a symlink to .lua parses");
+        }
     }
 }

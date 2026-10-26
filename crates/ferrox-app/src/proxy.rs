@@ -1872,7 +1872,7 @@ fn route_shared_with_api(
         let tags: Arc<HashSet<String>> = Arc::new(tagged.keys().cloned().collect());
         let observatory = observatory.clone();
         Some(crate::router_script::ScriptCallbacks {
-            resolve: Arc::new(crate::router::resolve_ips),
+            resolve: Arc::new(crate::router::resolve_ips_script),
             pick: Arc::new(move |tag| {
                 pick_script_outbound(&routing, &balancers, &tags, observatory.as_deref(), tag)
             }),

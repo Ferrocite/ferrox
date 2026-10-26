@@ -1008,9 +1008,6 @@ impl Routing {
 
     /// The first selector a `tun` flow cannot answer, if a rule that could reach it names one.
     pub(crate) fn source_refusal(&self, inbound: Option<&str>) -> Option<&'static str> {
-        if self.script.is_some() {
-            return Some("script");
-        }
         for rule in &self.rules {
             if !rule.reachable(inbound, Network::Tcp) || !rule.local_os_matches() {
                 continue;
@@ -1093,6 +1090,16 @@ fn rule_field_target(field: &Json, name: &str) -> Result<Option<String>, String>
         .as_str()
         .map(|tag| (!tag.is_empty()).then(|| tag.to_owned()))
         .ok_or_else(|| format!("routing rule {name} is not a string"))
+}
+
+fn optional_string<'a>(value: &'a Json, name: &str) -> Result<Option<&'a str>, String> {
+    match value {
+        Json::Null => Ok(None),
+        _ => value
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| format!("routing rule set {name} is not a string")),
+    }
 }
 
 impl Rule {
@@ -1408,10 +1415,10 @@ impl RuleSet {
                             .to_owned(),
                     );
                 }
-                "type" => kind = value.as_str().map(str::to_owned),
-                "format" => format = value.as_str().map(str::to_owned),
-                "path" => path = value.as_str().map(str::to_owned),
-                "url" => url = value.as_str().map(str::to_owned),
+                "type" => kind = optional_string(value, "type")?.map(str::to_owned),
+                "format" => format = optional_string(value, "format")?.map(str::to_owned),
+                "path" => path = optional_string(value, "path")?.map(str::to_owned),
+                "url" => url = optional_string(value, "url")?.map(str::to_owned),
                 "rules" => rules = Some(value),
                 other => return Err(format!("routing rule set field `{other}` is not carried")),
             }
@@ -1582,9 +1589,15 @@ impl SetRule {
         let mut source_ips = None;
         for (key, value) in pairs {
             match key.as_str() {
-                "type" => kind = value.as_str().map(str::to_owned),
-                "mode" => mode = value.as_str().map(str::to_owned),
-                "invert" => invert = value.as_bool().unwrap_or(false),
+                "type" => kind = optional_string(value, "rule type")?.map(str::to_owned),
+                "mode" => mode = optional_string(value, "rule mode")?.map(str::to_owned),
+                "invert" => {
+                    invert = match value {
+                        Json::Bool(flag) => *flag,
+                        Json::Null => false,
+                        _ => return Err("routing rule set rule invert is not a boolean".to_owned()),
+                    };
+                }
                 "rules" => nested = Some(value),
                 "network" => networks = network_list(value)?,
                 "domain" => {
@@ -3015,16 +3028,30 @@ fn geoip_cidr(bytes: &[u8]) -> Result<Option<(IpAddr, u32)>, String> {
 }
 
 pub(crate) fn resolve_ips(host: &str, port: u16) -> Vec<IpAddr> {
+    resolve_ips_ttl(host, port).0
+}
+
+pub(crate) fn resolve_ips_ttl(host: &str, port: u16) -> (Vec<IpAddr>, u32) {
+    resolve_ips_script(host, port, false)
+}
+
+pub(crate) fn resolve_ips_script(host: &str, port: u16, fake: bool) -> (Vec<IpAddr>, u32) {
     use std::net::ToSocketAddrs;
     if let Some(resolver) = crate::dnsapp::installed() {
-        if let Some((ips, _)) = resolver.lookup(host) {
-            return ips;
+        let answer = if fake {
+            resolver.lookup_fake(host)
+        } else {
+            resolver.lookup(host)
+        };
+        if let Some(answer) = answer {
+            return answer;
         }
     }
-    (host, port)
+    let ips = (host, port)
         .to_socket_addrs()
         .map(|addrs| addrs.map(|addr| addr.ip()).collect())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    (ips, 0)
 }
 
 #[cfg(test)]
@@ -4027,6 +4054,41 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_set_field_of_the_wrong_type_is_refused() {
+        for (field, wanted) in [("type", "type"), ("format", "format"), ("path", "path")] {
+            let set = object(vec![
+                ("tag", text("bad")),
+                (field, number(1)),
+                ("rules", array(Vec::new())),
+            ]);
+            let root = object(vec![(
+                "routing",
+                object(vec![("ruleSets", array(vec![set]))]),
+            )]);
+            let error = Routing::parse_in(&root, vec![dir()]).expect_err("refused");
+            assert!(error.contains(wanted), "{error}");
+            assert!(error.contains("not a string"), "{error}");
+        }
+        let set = object(vec![
+            ("tag", text("bad")),
+            (
+                "rules",
+                array(vec![object(vec![
+                    ("domain", text("bad.test")),
+                    ("invert", text("yes")),
+                ])]),
+            ),
+        ]);
+        let root = object(vec![(
+            "routing",
+            object(vec![("ruleSets", array(vec![set]))]),
+        )]);
+        let error = Routing::parse_in(&root, vec![dir()]).expect_err("refused");
+        assert!(error.contains("invert"), "{error}");
+        assert!(error.contains("not a boolean"), "{error}");
+    }
+
+    #[test]
     fn a_routing_script_refuses_rules_and_a_strategy() {
         let dir = dir();
         std::fs::write(
@@ -4270,6 +4332,28 @@ mod tests {
             .expect("routing");
         assert_eq!(routing.source_refusal(Some("tun")), Some("source"));
         assert_eq!(routing.source_refusal(Some("other")), None);
+    }
+
+    #[test]
+    fn a_tun_inbound_may_use_a_script_but_a_server_inbound_may_not() {
+        let dir = dir();
+        std::fs::write(
+            dir.join("route.lua"),
+            "function HandleRoute() return nil end",
+        )
+        .expect("write");
+        let root = object(vec![(
+            "routing",
+            object(vec![("script", text("route.lua"))]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(routing.source_refusal(Some("tun")), None);
+        let error = routing
+            .server_routes(Some("server"), true, |_, _| true)
+            .expect_err("a server inbound cannot evaluate a script");
+        assert!(error.contains("script"), "{error}");
     }
 
     #[test]
