@@ -1247,7 +1247,7 @@ mod tests {
             &UUID,
         );
         let mut got = Vec::new();
-        let mut buf = [0u8; 65_536];
+        let mut buf = vec![0u8; 65_536];
         loop {
             let n = link.read(&mut buf).expect("reads");
             if n == 0 {
