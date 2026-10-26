@@ -380,6 +380,7 @@ impl Resolver {
         self.lookup_with(name, v4, v6, fake_enabled, force_local)
     }
 
+    #[allow(clippy::fn_params_excessive_bools)]
     fn lookup_with(
         self: &Arc<Self>,
         name: &str,

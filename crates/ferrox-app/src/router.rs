@@ -3905,7 +3905,7 @@ mod tests {
         );
         assert_eq!(
             routing.route(&Flow {
-                domain: Some("ads.test"),
+                domain: Some("deep.ads.test"),
                 ..flow
             }),
             Some("block")
