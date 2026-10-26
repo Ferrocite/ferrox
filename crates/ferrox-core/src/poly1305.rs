@@ -472,9 +472,6 @@ impl Poly1305 {
     pub fn finish(mut self) -> [u8; 16] {
         #[cfg(target_arch = "aarch64")]
         if self.small {
-            if self.held == 0 {
-                return finish_small_26(self.h26, self.pad);
-            }
             self.flush_small();
         }
 
@@ -1316,83 +1313,6 @@ pub fn tag_via_26_bit_horner(key: &[u8; 32], data: &[u8]) -> [u8; 16] {
     let f1 = ((h1 >> 6) | (h2 << 20)) & WORD;
     let f2 = ((h2 >> 12) | (h3 << 14)) & WORD;
     let f3 = ((h3 >> 18) | (h4 << 8)) & WORD;
-
-    let mut carry = f0 + u64::from(pad[0]);
-    let f0 = carry as u32;
-    carry = f1 + u64::from(pad[1]) + (carry >> 32);
-    let f1 = carry as u32;
-    carry = f2 + u64::from(pad[2]) + (carry >> 32);
-    let f2 = carry as u32;
-    carry = f3 + u64::from(pad[3]) + (carry >> 32);
-    let f3 = carry as u32;
-
-    let mut out = [0u8; 16];
-    out[0..4].copy_from_slice(&f0.to_le_bytes());
-    out[4..8].copy_from_slice(&f1.to_le_bytes());
-    out[8..12].copy_from_slice(&f2.to_le_bytes());
-    out[12..16].copy_from_slice(&f3.to_le_bytes());
-    out
-}
-
-#[cfg(target_arch = "aarch64")]
-fn finish_small_26(h: [u64; 5], pad: [u64; 2]) -> [u8; 16] {
-    const M: u64 = 0x03ff_ffff;
-    const WORD: u64 = 0xffff_ffff;
-
-    let [mut h0, mut h1, mut h2, mut h3, mut h4] = h;
-    let mut c;
-    c = h1 >> 26;
-    h1 &= M;
-    h2 += c;
-    c = h2 >> 26;
-    h2 &= M;
-    h3 += c;
-    c = h3 >> 26;
-    h3 &= M;
-    h4 += c;
-    c = h4 >> 26;
-    h4 &= M;
-    h0 += c * 5;
-    c = h0 >> 26;
-    h0 &= M;
-    h1 += c;
-
-    let mut g0 = h0 + 5;
-    c = g0 >> 26;
-    g0 &= M;
-    let mut g1 = h1 + c;
-    c = g1 >> 26;
-    g1 &= M;
-    let mut g2 = h2 + c;
-    c = g2 >> 26;
-    g2 &= M;
-    let mut g3 = h3 + c;
-    c = g3 >> 26;
-    g3 &= M;
-    let g4 = h4.wrapping_add(c).wrapping_sub(1 << 26);
-    let mut mask = (g4 >> 63).wrapping_sub(1);
-    g0 &= mask;
-    g1 &= mask;
-    g2 &= mask;
-    g3 &= mask;
-    let g4 = g4 & mask;
-    mask = !mask;
-    h0 = (h0 & mask) | g0;
-    h1 = (h1 & mask) | g1;
-    h2 = (h2 & mask) | g2;
-    h3 = (h3 & mask) | g3;
-    let h4 = (h4 & mask) | g4;
-
-    let f0 = (h0 | (h1 << 26)) & WORD;
-    let f1 = ((h1 >> 6) | (h2 << 20)) & WORD;
-    let f2 = ((h2 >> 12) | (h3 << 14)) & WORD;
-    let f3 = ((h3 >> 18) | (h4 << 8)) & WORD;
-    let pad = [
-        pad[0] as u32,
-        (pad[0] >> 32) as u32,
-        pad[1] as u32,
-        (pad[1] >> 32) as u32,
-    ];
 
     let mut carry = f0 + u64::from(pad[0]);
     let f0 = carry as u32;
