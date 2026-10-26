@@ -983,7 +983,7 @@ fn carries(engine: &str, carrier: &str) -> bool {
         (engine, carrier),
         ("xray-rust" | "zeronet", "kcp")
             | ("zeronet", "hysteria")
-            | ("sing-box", "kcp" | "hysteria" | "xhttp")
+            | ("sing-box" | "leaf", "kcp" | "hysteria" | "xhttp")
     )
 }
 
@@ -2011,25 +2011,27 @@ mod tests {
             dialect_engine("xray-rust", parity::Dialect::Xray),
             dialect_engine("zeronet", parity::Dialect::Xray),
             dialect_engine("sing-box", parity::Dialect::SingBox),
+            dialect_engine("leaf", parity::Dialect::Leaf),
             dialect_engine("xray-core", parity::Dialect::Xray),
         ];
         let (names, skipped) = participant_names(&engines, &scenario_workload("vless-kcp-down-8"));
         assert_eq!(names, vec!["xray-core"]);
-        assert_eq!(skipped.len(), 3);
+        assert_eq!(skipped.len(), 4);
         assert!(skipped.iter().all(|(_, reason)| reason.contains("kcp")));
         let (names, skipped) =
             participant_names(&engines, &scenario_workload("vless-hysteria-down-8"));
         assert_eq!(names, vec!["xray-rust", "xray-core"]);
-        assert_eq!(skipped.len(), 2);
+        assert_eq!(skipped.len(), 3);
         assert!(skipped
             .iter()
             .all(|(_, reason)| reason.contains("hysteria")));
         let (names, skipped) =
             participant_names(&engines, &scenario_workload("vless-xhttp-down-8"));
         assert_eq!(names, vec!["xray-rust", "zeronet", "xray-core"]);
-        assert_eq!(skipped.len(), 1);
-        assert_eq!(skipped[0].0, "sing-box");
-        assert!(skipped[0].1.contains("xhttp"));
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped.iter().any(|(engine, _)| engine == "sing-box"));
+        assert!(skipped.iter().any(|(engine, _)| engine == "leaf"));
+        assert!(skipped.iter().all(|(_, reason)| reason.contains("xhttp")));
     }
 
     #[test]

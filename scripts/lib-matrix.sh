@@ -32,21 +32,11 @@ matrix_udp_carrier() {
   esac
 }
 
-matrix_engine_serves() {
-  case "$1" in
-    sing-box)
-      case "$2" in
-        hysteria-v1-*) return 0 ;;
-        *-xhttp-*|*-kcp-*|*-hysteria-*|*-encryption-*) return 1 ;;
-      esac
-      ;;
-  esac
-  return 0
-}
-
 matrix_server_serves() {
   case "$1:$2" in
     xray-core:hysteria-v1-*) return 1 ;;
+    sing-box:hysteria-v1-*) return 0 ;;
+    sing-box:*) return 1 ;;
   esac
   return 0
 }
@@ -55,7 +45,34 @@ matrix_server_serves() {
 # here rather than letting the cell fail as a workload fault: the reason reaches the bundle's
 # skipped list, so a reader sees which side is behind instead of a zero.
 matrix_engine_skip_reason() {
-  return 1
+  local engine="$1" id="$2"
+  case "$engine:$id" in
+    sing-box:*-xhttp-*|sing-box:*-kcp-*)
+      printf '%s\n' "sing-box at this pin has no xhttp or KCP transport" ;;
+    sing-box:*-hysteria-*)
+      printf '%s\n' "sing-box at this pin has no VLESS over Hysteria transport" ;;
+    sing-box:*-encryption-*)
+      printf '%s\n' "sing-box at this pin has no VLESS encryption field" ;;
+    leaf:*-xhttp-*)
+      printf '%s\n' "leaf at this pin has no xhttp transport" ;;
+    leaf:*-kcp-*)
+      printf '%s\n' "leaf at this pin has no KCP transport" ;;
+    leaf:*-hysteria-*|leaf:hysteria-v1-*)
+      printf '%s\n' "leaf at this pin has no Hysteria transport" ;;
+    leaf:*-encryption-*)
+      printf '%s\n' "leaf at this pin has no VLESS encryption" ;;
+    leaf:*-grpc-*)
+      printf '%s\n' "leaf at this pin has no gRPC transport" ;;
+    leaf:*-httpupgrade-*)
+      printf '%s\n' "leaf at this pin has no HTTPUpgrade transport" ;;
+    leaf:*-vision-*)
+      printf '%s\n' "leaf at this pin has no VLESS flow" ;;
+    leaf:shadowsocks2022-*)
+      printf '%s\n' "leaf at this pin has no Shadowsocks 2022" ;;
+    *)
+      return 1 ;;
+  esac
+  return 0
 }
 
 server_config() {
