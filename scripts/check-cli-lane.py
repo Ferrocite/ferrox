@@ -25,6 +25,7 @@ must pass through that endpoint before the arm is reported.
 
 from __future__ import annotations
 
+import concurrent.futures
 import json
 import os
 import pathlib
@@ -36,17 +37,28 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import traceback
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CLI = ROOT / "dist" / "ferrox-cli.sh"
 WATCH = 15
 
 
+_PORT_LOCK = threading.Lock()
+_PORTS: set[int] = set()
+
+
 def free_port() -> int:
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        return probe.getsockname()[1]
+    while True:
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        with _PORT_LOCK:
+            if port not in _PORTS:
+                _PORTS.add(port)
+                return port
 
 
 def fake_networksetup(state: pathlib.Path) -> pathlib.Path:
@@ -54,194 +66,217 @@ def fake_networksetup(state: pathlib.Path) -> pathlib.Path:
     bin_dir.mkdir(exist_ok=True)
     tool = bin_dir / "networksetup"
     tool.write_text(
-        '''#!/usr/bin/env python3
-import os
-import pathlib
-import signal
-import sys
+        """#!/bin/sh
+state="${FERROX_CONF_DIR:?}"
+machine="${FERROX_STATE_DIR:-$state}"
+printf '%s\n' "$*" >> "$state/networksetup.calls"
 
-state = pathlib.Path(os.environ["FERROX_CONF_DIR"])
-machine = pathlib.Path(os.environ.get("FERROX_STATE_DIR", state))
-with open(state / "networksetup.calls", "a", encoding="utf-8") as log:
-    log.write(" ".join(sys.argv[1:]) + "\\n")
+command="${1:-}"
+[ "$#" -gt 0 ] && shift
+root="$machine/fake-net"
+mkdir -p "$root"
+deny="${FERROX_FAKE_DENY_SET:-}"
+ignore="${FERROX_FAKE_SET_IGNORE:-}"
+lie="${FERROX_FAKE_PROXY_LIE:-}"
 
-args = sys.argv[1:]
-command = args[0] if args else ""
-root = machine / "fake-net"
-root.mkdir(exist_ok=True)
-deny = os.environ.get("FERROX_FAKE_DENY_SET") == "1"
-ignore = os.environ.get("FERROX_FAKE_SET_IGNORE") == "1"
-lie = os.environ.get("FERROX_FAKE_PROXY_LIE") == "1"
-if command.startswith("-set"):
-    if deny:
-        sys.exit(1)
-    if ignore:
-        sys.exit(0)
+case "$command" in
+  -set*)
+    [ "$deny" = 1 ] && exit 1
+    [ "$ignore" = 1 ] && exit 0
+    ;;
+esac
 
+directory() {
+  printf '%s/%s' "$root" "$(printf '%s' "$1" | tr ' /' '__')"
+}
+field() {
+  if [ -f "$1/$2" ]; then cat "$1/$2"; else printf '%s' "${3:-}"; fi
+}
+write() {
+  mkdir -p "$1"
+  printf '%s' "$2" > "$1/$3"
+}
 
-def service(name):
-    directory = root / name.replace(" ", "_").replace("/", "_")
-    directory.mkdir(exist_ok=True)
-    return directory
-
-
-def read(directory, field, default=""):
-    path = directory / field
-    return path.read_text(encoding="utf-8") if path.exists() else default
-
-
-def write(directory, field, value):
-    (directory / field).write_text(value, encoding="utf-8")
-
-
-if command == "-listallnetworkservices":
-    listing = machine / "fake-services"
-    names = (
-        listing.read_text(encoding="utf-8").splitlines()
-        if listing.exists()
-        else ["Wi-Fi"]
-    )
-    print("An asterisk (*) denotes that a network service is disabled.")
-    for name in names:
-        print(name)
-elif command in (
-    "-getsocksfirewallproxy",
-    "-getwebproxy",
-    "-getsecurewebproxy",
-):
-    directory = service(args[1])
-    field = {
-        "-getsocksfirewallproxy": "socks",
-        "-getwebproxy": "http",
-        "-getsecurewebproxy": "https",
-    }[command]
-    endpoint = read(directory, f"{field}-proxy")
-    server, _, port = endpoint.rpartition(":")
-    if lie and field == "socks":
-        server, port = "192.0.2.1", str(int(port or "0") + 1)
-    enabled = read(directory, f"{field}-enabled", "off") in ("on", "yes")
-    print(f"Enabled: {'Yes' if enabled else 'No'}")
-    print(f"Server: {server}")
-    print(f"Port: {port}")
-    auth = read(directory, f"{field}-auth", "0") == "1"
-    print(f"Authenticated Proxy Enabled: {1 if auth else 0}")
-elif command in (
-    "-setsocksfirewallproxystate",
-    "-setwebproxystate",
-    "-setsecurewebproxystate",
-):
-    if (machine / "fail-off").exists() and args[-1] == "off":
-        sys.exit(1)
-    directory = service(args[1])
-    field = {
-        "-setsocksfirewallproxystate": "socks",
-        "-setwebproxystate": "http",
-        "-setsecurewebproxystate": "https",
-    }[command]
-    write(directory, f"{field}-enabled", args[2])
-elif command == "-getautoproxyurl":
-    directory = service(args[1])
-    url = read(directory, "pac-url")
-    enabled = read(directory, "pac-enabled", "no") == "yes"
-    print(f"URL: {url}")
-    print(f"Enabled: {'Yes' if enabled else 'No'}")
-elif command == "-setautoproxyurl":
-    directory = service(args[1])
-    write(directory, "pac-url", args[2] if len(args) > 2 else "")
-    write(directory, "pac-enabled", "yes")
-elif command == "-setautoproxystate":
-    directory = service(args[1])
-    write(directory, "pac-enabled", "yes" if args[2] == "on" else "no")
-elif command == "-getproxyautodiscovery":
-    directory = service(args[1])
-    enabled = read(directory, "autodiscovery", "off") == "on"
-    print(f"Auto Proxy Discovery: {'On' if enabled else 'Off'}")
-elif command == "-setproxyautodiscovery":
-    directory = service(args[1])
-    write(directory, "autodiscovery", args[2])
-elif command == "-getproxybypassdomains":
-    directory = service(args[1])
-    entries = read(directory, "bypass").splitlines()
-    if entries:
-        for entry in entries:
-            print(entry)
-    else:
-        print(f"There aren't any bypass domains set on {args[1]}.")
-elif command == "-setproxybypassdomains":
-    directory = service(args[1])
-    domains = args[2:]
-    if domains == ["Empty"]:
-        domains = []
-    write(directory, "bypass", "\\n".join(domains) + ("\\n" if domains else ""))
-elif command in ("-setsocksfirewallproxy", "-setwebproxy", "-setsecurewebproxy"):
-    directory = service(args[1])
-    field = {
-        "-setsocksfirewallproxy": "socks",
-        "-setwebproxy": "http",
-        "-setsecurewebproxy": "https",
-    }[command]
-    write(directory, f"{field}-proxy", f"{args[2]}:{args[3]}")
-    if len(args) > 4:
-        write(directory, f"{field}-auth", "1" if args[4] in ("on", "yes") else "0")
-    if os.environ.get("FERROX_FAKE_INTERRUPT") == "1" and command == "-setsocksfirewallproxy":
-        os.kill(os.getppid(), signal.SIGINT)
-sys.exit(0)
-''',
+case "$command" in
+  -listallnetworkservices)
+    echo "An asterisk (*) denotes that a network service is disabled."
+    if [ -f "$machine/fake-services" ]; then
+      cat "$machine/fake-services"
+    else
+      echo "Wi-Fi"
+    fi
+    ;;
+  -getsocksfirewallproxy|-getwebproxy|-getsecurewebproxy)
+    case "$command" in
+      -getsocksfirewallproxy) kind=socks ;;
+      -getwebproxy) kind=http ;;
+      *) kind=https ;;
+    esac
+    dir="$(directory "$1")"
+    endpoint="$(field "$dir" "$kind-proxy")"
+    case "$endpoint" in
+      *:*) server="${endpoint%:*}"; port="${endpoint##*:}" ;;
+      *) server=""; port="$endpoint" ;;
+    esac
+    if [ "$lie" = 1 ] && [ "$kind" = socks ]; then
+      server=192.0.2.1
+      port=$(( ${port:-0} + 1 ))
+    fi
+    enabled=No
+    case "$(field "$dir" "$kind-enabled")" in on|yes) enabled=Yes ;; esac
+    auth=0
+    [ "$(field "$dir" "$kind-auth" 0)" = 1 ] && auth=1
+    echo "Enabled: $enabled"
+    echo "Server: $server"
+    echo "Port: $port"
+    echo "Authenticated Proxy Enabled: $auth"
+    ;;
+  -setsocksfirewallproxystate|-setwebproxystate|-setsecurewebproxystate)
+    case "$command" in
+      -setsocksfirewallproxystate) kind=socks ;;
+      -setwebproxystate) kind=http ;;
+      *) kind=https ;;
+    esac
+    last=""
+    for one in "$@"; do last="$one"; done
+    [ -f "$machine/fail-off" ] && [ "$last" = off ] && exit 1
+    write "$(directory "$1")" "$2" "$kind-enabled"
+    ;;
+  -getautoproxyurl)
+    dir="$(directory "$1")"
+    echo "URL: $(field "$dir" pac-url)"
+    enabled=No
+    [ "$(field "$dir" pac-enabled)" = yes ] && enabled=Yes
+    echo "Enabled: $enabled"
+    ;;
+  -setautoproxyurl)
+    dir="$(directory "$1")"
+    write "$dir" "${2:-}" pac-url
+    write "$dir" yes pac-enabled
+    ;;
+  -setautoproxystate)
+    dir="$(directory "$1")"
+    enabled=no
+    [ "$2" = on ] && enabled=yes
+    write "$dir" "$enabled" pac-enabled
+    ;;
+  -getproxyautodiscovery)
+    dir="$(directory "$1")"
+    state=Off
+    [ "$(field "$dir" autodiscovery off)" = on ] && state=On
+    echo "Auto Proxy Discovery: $state"
+    ;;
+  -setproxyautodiscovery)
+    write "$(directory "$1")" "$2" autodiscovery
+    ;;
+  -getproxybypassdomains)
+    dir="$(directory "$1")"
+    if [ -s "$dir/bypass" ]; then
+      cat "$dir/bypass"
+    else
+      echo "There aren't any bypass domains set on $1."
+    fi
+    ;;
+  -setproxybypassdomains)
+    dir="$(directory "$1")"
+    shift
+    mkdir -p "$dir"
+    : > "$dir/bypass"
+    if [ "$#" = 1 ] && [ "$1" = Empty ]; then
+      :
+    else
+      for one in "$@"; do printf '%s\n' "$one"; done > "$dir/bypass"
+    fi
+    ;;
+  -setsocksfirewallproxy|-setwebproxy|-setsecurewebproxy)
+    case "$command" in
+      -setsocksfirewallproxy) kind=socks ;;
+      -setwebproxy) kind=http ;;
+      *) kind=https ;;
+    esac
+    dir="$(directory "$1")"
+    write "$dir" "$2:$3" "$kind-proxy"
+    if [ "$#" -gt 3 ]; then
+      auth=0
+      case "$4" in on|yes) auth=1 ;; esac
+      write "$dir" "$auth" "$kind-auth"
+    fi
+    if [ "${FERROX_FAKE_INTERRUPT:-}" = 1 ] && [ "$kind" = socks ]; then
+      kill -s INT "$PPID"
+    fi
+    ;;
+esac
+exit 0
+""",
         encoding="utf-8",
     )
     tool.chmod(0o755)
 
     scutil = bin_dir / "scutil"
     scutil.write_text(
-        '''#!/usr/bin/env python3
-import os
-import pathlib
-import sys
+        """#!/bin/sh
+state="${FERROX_CONF_DIR:?}"
+machine="${FERROX_STATE_DIR:-$state}"
+override="$machine/scutil.override"
+if [ -f "$override" ]; then cat "$override"; exit 0; fi
+lie="${FERROX_FAKE_SCUTIL_LIE:-}"
+dir="$machine/fake-net/Wi-Fi"
 
-state = pathlib.Path(os.environ["FERROX_CONF_DIR"])
-machine = pathlib.Path(os.environ.get("FERROX_STATE_DIR", state))
-override = machine / "scutil.override"
-if override.exists():
-    sys.stdout.write(override.read_text(encoding="utf-8"))
-    sys.exit(0)
-lie = os.environ.get("FERROX_FAKE_SCUTIL_LIE") == "1"
+read_field() {
+  if [ -f "$dir/$1" ]; then cat "$dir/$1"; else printf '%s' "${2:-}"; fi
+}
+is_enabled() {
+  case "$(read_field "$1" off)" in on|yes) return 0 ;; *) return 1 ;; esac
+}
 
-directory = machine / "fake-net" / "Wi-Fi"
-
-
-def read(field, default=""):
-    path = directory / field
-    return path.read_text(encoding="utf-8") if path.exists() else default
-
-
-def enabled(field):
-    return 1 if read(field, "off") in ("on", "yes") else 0
-
-
-def endpoint(field):
-    server, _, port = read(f"{field}-proxy").rpartition(":")
-    return server, port
-
-
-print("<dictionary> {")
-print(f"  ProxyAutoConfigEnable : {enabled('pac-enabled')}")
-print(f"  ProxyAutoDiscoveryEnable : {enabled('autodiscovery')}")
-print(f"  HTTPEnable : {enabled('http-enabled')}")
-print(f"  HTTPSEnable : {enabled('https-enabled')}")
-print(f"  SOCKSEnable : {enabled('socks-enabled')}")
-for field, proxy, port in (
-    ("http", "HTTPProxy", "HTTPPort"),
-    ("https", "HTTPSProxy", "HTTPSPort"),
-    ("socks", "SOCKSProxy", "SOCKSPort"),
-):
-    if enabled(f"{field}-enabled"):
-        server, number = endpoint(field)
-        if lie:
-            server, number = "192.0.2.1", str(int(number or "0") + 1)
-        print(f"  {proxy} : {server}")
-        print(f"  {port} : {number}")
-print("}")
-''',
+echo "<dictionary> {"
+if is_enabled pac-enabled; then
+  echo "  ProxyAutoConfigEnable : 1"
+else
+  echo "  ProxyAutoConfigEnable : 0"
+fi
+if is_enabled autodiscovery; then
+  echo "  ProxyAutoDiscoveryEnable : 1"
+else
+  echo "  ProxyAutoDiscoveryEnable : 0"
+fi
+for spec in "http HTTPProxy HTTPPort" "https HTTPSProxy HTTPSPort" "socks SOCKSProxy SOCKSPort"; do
+  set -- $spec
+  kind="$1"
+  proxy="$2"
+  port="$3"
+  case "$kind" in
+    http) label=HTTP ;;
+    https) label=HTTPS ;;
+    *) label=SOCKS ;;
+  esac
+  if is_enabled "$kind-enabled"; then
+    echo "  ${label}Enable : 1"
+  else
+    echo "  ${label}Enable : 0"
+  fi
+done
+for spec in "http HTTPProxy HTTPPort" "https HTTPSProxy HTTPSPort" "socks SOCKSProxy SOCKSPort"; do
+  set -- $spec
+  kind="$1"
+  proxy="$2"
+  port="$3"
+  if is_enabled "$kind-enabled"; then
+    endpoint="$(read_field "$kind-proxy" "")"
+    case "$endpoint" in
+      *:*) server="${endpoint%:*}"; number="${endpoint##*:}" ;;
+      *) server=""; number="$endpoint" ;;
+    esac
+    if [ "$lie" = 1 ]; then
+      server=192.0.2.1
+      number=$(( ${number:-0} + 1 ))
+    fi
+    echo "  $proxy : $server"
+    echo "  $port : $number"
+  fi
+done
+echo "}"
+""",
         encoding="utf-8",
     )
     scutil.chmod(0o755)
@@ -2830,47 +2865,53 @@ def check_stale_proxy_reconciled(state: pathlib.Path) -> int:
     return 0
 
 
+CHECKS = (
+    ("picker", check_picker),
+    ("status", check_status),
+    ("locations", check_locations),
+    ("splits", check_splits),
+    ("failed lane", check_failed_lane_is_closed),
+    ("interrupted attempt", check_interrupted_attempt_leaves_nothing),
+    ("config survives", check_config_survives),
+    ("instance ports", check_instance_ports),
+    ("vpn fronts", check_vpn_fronts),
+    ("config fronts", check_config_fronts),
+    ("vpn pac", check_vpn_pac),
+    ("proxy readback", check_vpn_proxy_readback),
+    ("vpn bypass", check_vpn_bypass),
+    ("vpn platform", check_vpn_platform_refusal),
+    ("proxy transaction", check_proxy_transaction),
+    ("proxy cleanup", check_proxy_cleanup),
+    ("lane exit", check_vpn_lane_exit_clears_proxy),
+    ("hangup", check_vpn_hangup_clears_proxy),
+    ("stale proxy", check_stale_proxy_reconciled),
+    ("instance lifecycle", check_instance_lifecycle),
+)
+
+
 def main() -> int:
-    state = pathlib.Path(tempfile.mkdtemp(prefix="ferrox-cli-lane-"))
-    if check_picker(state) != 0:
+    # Every check owns its own config and state directory, so the only thing
+    # they share is the port allocator: a warm run is twenty checks waiting on
+    # fake tools rather than twenty checks one after another.
+    workers = min(8, max(4, os.cpu_count() or 4))
+    failed = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+        running = {}
+        for name, check in CHECKS:
+            state = pathlib.Path(tempfile.mkdtemp(prefix=f"ferrox-cli-{check.__name__}-"))
+            running[pool.submit(check, state)] = name
+        for job in concurrent.futures.as_completed(running):
+            name = running[job]
+            try:
+                if job.result() != 0:
+                    failed.append(name)
+            except Exception:
+                traceback.print_exc()
+                failed.append(name)
+    if failed:
+        print(f"check-cli-lane: failed: {', '.join(failed)}", file=sys.stderr)
         return 1
-    if check_status(state) != 0:
-        return 1
-    if check_locations(state) != 0:
-        return 1
-    if check_splits(state) != 0:
-        return 1
-    if check_failed_lane_is_closed(state) != 0:
-        return 1
-    if check_interrupted_attempt_leaves_nothing(state) != 0:
-        return 1
-    if check_config_survives(state) != 0:
-        return 1
-    if check_instance_ports(state) != 0:
-        return 1
-    if check_vpn_fronts(state) != 0:
-        return 1
-    if check_config_fronts(state) != 0:
-        return 1
-    if check_vpn_pac(state) != 0:
-        return 1
-    if check_vpn_proxy_readback(state) != 0:
-        return 1
-    if check_vpn_bypass(state) != 0:
-        return 1
-    if check_vpn_platform_refusal(state) != 0:
-        return 1
-    if check_proxy_transaction(state) != 0:
-        return 1
-    if check_proxy_cleanup(state) != 0:
-        return 1
-    if check_vpn_lane_exit_clears_proxy(state) != 0:
-        return 1
-    if check_vpn_hangup_clears_proxy(state) != 0:
-        return 1
-    if check_stale_proxy_reconciled(state) != 0:
-        return 1
-    return check_instance_lifecycle(state)
+    return 0
 
 
 if __name__ == "__main__":
