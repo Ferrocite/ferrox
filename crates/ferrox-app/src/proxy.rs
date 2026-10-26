@@ -2669,8 +2669,20 @@ fn serve_vless_ws(
     if let Some(decryption) = decryption {
         let close = writer.clone();
         let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-        reader.set_poll(Some(RELAY_POLL));
-        return serve_sealed_carried(reader, writer, users, freedom, decryption, close);
+        return serve_sealed_carried_with(
+            reader,
+            writer,
+            users,
+            freedom,
+            decryption,
+            close,
+            |reader| {
+                reader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
+                reader.set_poll(Some(RELAY_POLL));
+            },
+            |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
+            |reader| reader.set_handshake_budget(None),
+        );
     }
     // Past the upgrade the frame layer retries timeouts itself, so bound it by wall clock and poll the socket.
     let Some((got, flow, cmd, target)) = under_handshake(&mut reader, decode_request) else {
@@ -2708,8 +2720,17 @@ fn serve_vless_httpupgrade(
     let mut reader = reader;
     if let Some(decryption) = decryption {
         let close = connection_closer(&write);
-        reader.set_poll(Some(RELAY_POLL));
-        return serve_sealed_carried(reader, write, users, freedom, decryption, close);
+        return serve_sealed_carried_with(
+            reader,
+            write,
+            users,
+            freedom,
+            decryption,
+            close,
+            |reader| reader.set_poll(Some(budgets::handshake())),
+            |_| {},
+            |reader| reader.set_poll(Some(RELAY_POLL)),
+        );
     }
     reader.set_poll(Some(RELAY_POLL));
     let decoded = decode_request_bounded(&mut reader);
@@ -2749,8 +2770,20 @@ fn serve_vless_grpc(
     if let Some(decryption) = decryption {
         let close = writer.clone();
         let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-        reader.set_poll(Some(RELAY_POLL));
-        return serve_sealed_carried(reader, writer, users, freedom, decryption, close);
+        return serve_sealed_carried_with(
+            reader,
+            writer,
+            users,
+            freedom,
+            decryption,
+            close,
+            |reader| {
+                reader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
+                reader.set_poll(Some(RELAY_POLL));
+            },
+            |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
+            |reader| reader.set_handshake_budget(None),
+        );
     }
     // Past the preface the reader retries timeouts itself, so the opening request is polled at the relay's grain and bounded by the handshake budget, the way the websocket arm bounds its frames.
     let Some((got, flow, cmd, target)) = under_handshake(&mut reader, decode_request) else {
@@ -2787,23 +2820,17 @@ fn serve_vless_httpheader(
     let mut reader = reader;
     if let Some(decryption) = decryption {
         let close = connection_closer(&write);
-        let mut sealed = match decryption.handshake(CarrierStream {
+        return serve_sealed_carried_with(
             reader,
-            writer: write,
-        }) {
-            Ok(sealed) => sealed,
-            Err(error) => {
-                eprintln!("vless: encryption handshake failed: {error}");
-                close();
-                return;
-            }
-        };
-        sealed.get_mut().reader.set_poll(Some(RELAY_POLL));
-        let Some((reader, writer)) = sealed.into_split() else {
-            close();
-            return;
-        };
-        return serve_sealed_split(reader, writer, users, freedom, close);
+            write,
+            users,
+            freedom,
+            decryption,
+            close,
+            |reader| reader.set_poll(Some(budgets::handshake())),
+            |_| {},
+            |reader| reader.set_poll(Some(RELAY_POLL)),
+        );
     }
     reader.set_poll(Some(RELAY_POLL));
     let decoded = decode_request_bounded(&mut reader);
@@ -3182,7 +3209,39 @@ fn serve_sealed_carried<R, W>(
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    let sealed = match decryption.handshake(CarrierStream { reader, writer }) {
+    serve_sealed_carried_with(
+        reader,
+        writer,
+        users,
+        freedom,
+        decryption,
+        close,
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_sealed_carried_with<R, W, A, B, C>(
+    mut reader: R,
+    writer: W,
+    users: &[VlessUser],
+    freedom: bool,
+    decryption: &ferrox_core::vless_encryption::Server,
+    close: Arc<dyn Fn() + Send + Sync>,
+    arm: A,
+    after_handshake: B,
+    after_decode: C,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+    A: FnOnce(&mut R),
+    B: FnOnce(&mut R),
+    C: FnOnce(&mut R),
+{
+    arm(&mut reader);
+    let mut sealed = match decryption.handshake(CarrierStream { reader, writer }) {
         Ok(sealed) => sealed,
         Err(error) => {
             eprintln!("vless: encryption handshake failed: {error}");
@@ -3190,24 +3249,29 @@ fn serve_sealed_carried<R, W>(
             return;
         }
     };
+    after_handshake(&mut sealed.get_mut().reader);
     let Some((reader, writer)) = sealed.into_split() else {
         close();
         return;
     };
-    serve_sealed_split(reader, writer, users, freedom, close);
+    serve_sealed_split_with(reader, writer, users, freedom, close, after_decode);
 }
 
-fn serve_sealed_split<R, W>(
+fn serve_sealed_split_with<R, W, C>(
     mut reader: ferrox_core::vless_encryption::EncryptedReader<R>,
     mut writer: ferrox_core::vless_encryption::EncryptedWriter<W>,
     users: &[VlessUser],
     freedom: bool,
     closer: Arc<dyn Fn() + Send + Sync>,
+    after_decode: C,
 ) where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
+    C: FnOnce(&mut R),
 {
-    let Some((got, flow, cmd, target)) = decode_request_bounded(&mut reader) else {
+    let decoded = decode_request_bounded(&mut reader);
+    after_decode(reader.get_mut());
+    let Some((got, flow, cmd, target)) = decoded else {
         return;
     };
     let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
@@ -5287,7 +5351,17 @@ fn serve_session_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     if let Some(decryption) = decryption {
         let close = cwriter.clone();
         let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-        return serve_sealed_carried(creader, cwriter, users, freedom, decryption, close);
+        return serve_sealed_carried_with(
+            creader,
+            cwriter,
+            users,
+            freedom,
+            decryption,
+            close,
+            |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
+            |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
+            |reader| reader.set_handshake_budget(None),
+        );
     }
     let mut creader = creader;
     creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
@@ -5314,14 +5388,17 @@ fn serve_session_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     relay_sink(creader, &cwriter, &uplink, |_| {});
 }
 
-fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static>(
+fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static, F>(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
     users: &[VlessUser],
     freedom: bool,
     decryption: Option<&ferrox_core::vless_encryption::Server>,
-) {
+    after_decode: F,
+) where
+    F: FnOnce(&mut crate::xhttp::ChainReader<R>),
+{
     let Some((creader, cwriter)) = crate::xhttp::accept_split_with_settings(read, write, settings)
     else {
         echo_trace("session xhttp accept refused");
@@ -5330,7 +5407,17 @@ fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static>(
     if let Some(decryption) = decryption {
         let close = cwriter.clone();
         let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.finish());
-        return serve_sealed_carried(creader, cwriter, users, freedom, decryption, close);
+        return serve_sealed_carried_with(
+            creader,
+            cwriter,
+            users,
+            freedom,
+            decryption,
+            close,
+            |_| {},
+            |_| {},
+            after_decode,
+        );
     }
     serve_session_xhttp_with(creader, &cwriter, users, freedom);
 }
@@ -5365,7 +5452,7 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
     let _ = arm(
         &read,
         if decryption.is_some() {
-            Some(RELAY_POLL)
+            Some(budgets::handshake())
         } else {
             None
         },
@@ -5381,7 +5468,17 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
         }
         return crate::xhttp_h2::serve_h2(chained, write, settings, users, freedom);
     }
-    serve_session_xhttp(chained, write, settings, users, freedom, decryption);
+    serve_session_xhttp(
+        chained,
+        write,
+        settings,
+        users,
+        freedom,
+        decryption,
+        move |reader| {
+            let _ = arm(reader.inner(), Some(RELAY_POLL));
+        },
+    );
 }
 
 pub(crate) fn serve_session_xhttp_with(
@@ -5526,7 +5623,17 @@ fn serve_session_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     if let Some(decryption) = decryption {
         let close = cwriter.clone();
         let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-        return serve_sealed_carried(creader, cwriter, users, freedom, decryption, close);
+        return serve_sealed_carried_with(
+            creader,
+            cwriter,
+            users,
+            freedom,
+            decryption,
+            close,
+            |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
+            |reader| reader.set_handshake_budget(Some(Instant::now() + budgets::handshake())),
+            |reader| reader.set_handshake_budget(None),
+        );
     }
     let mut creader = creader;
     // The dispatcher already polls the socket behind a session at the relay's grain, so only the request's own clock is armed here: past it a peer that answered the head and then stopped speaking is a refusal, not a thread pinned in `read_exact`'s retry.
@@ -9857,10 +9964,10 @@ where
 /// run table lives on the stack.
 const MUX_RUNS: usize = 32;
 
-fn mux_dial_downlink_stream(down: &mut dyn Read, up: &mut dyn Write, id: u16) {
-    if mux_downlink(down, up, id) {
-        let _ = up.flush();
-    }
+fn mux_dial_downlink_stream(down: &mut dyn Read, up: &mut dyn Write, id: u16) -> bool {
+    let ended = mux_downlink(down, up, id);
+    let _ = up.flush();
+    ended
 }
 
 /// One mux session's downlink: every Keep payload of `id` reaches `write` in the order it arrived,
@@ -10063,7 +10170,9 @@ fn dial_vless_mux(client: &Connection, vless: &VlessOut, target: &Destination) {
     } = mux;
     let done = RelayPool::global().run(move || {
         let mut down = down;
-        mux_dial_downlink_stream(&mut *read, &mut down, id);
+        if mux_dial_downlink_stream(&mut *read, &mut down, id) {
+            let _ = down.shutdown(Shutdown::Write);
+        }
     });
     mux_dial_uplink(&up, &mut *write, id);
     close();

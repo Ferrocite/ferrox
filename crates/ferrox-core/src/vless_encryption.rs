@@ -1095,12 +1095,27 @@ enum ReadStage {
     Records,
 }
 
-/// The key both directions derive from; the last handle zeroes it.
-struct UnitedKey(Arc<Vec<u8>>);
+/// The key both directions derive from; the value inside the `Arc` zeroes itself when the last handle goes.
+struct KeyBytes(Vec<u8>);
+
+impl KeyBytes {
+    fn as_slice(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl Drop for KeyBytes {
+    fn drop(&mut self) {
+        use zeroize::Zeroize as _;
+        self.0.zeroize();
+    }
+}
+
+struct UnitedKey(Arc<KeyBytes>);
 
 impl UnitedKey {
     fn new(bytes: Vec<u8>) -> Self {
-        Self(Arc::new(bytes))
+        Self(Arc::new(KeyBytes(bytes)))
     }
 
     fn as_slice(&self) -> &[u8] {
@@ -1111,15 +1126,6 @@ impl UnitedKey {
 impl Clone for UnitedKey {
     fn clone(&self) -> Self {
         Self(Arc::clone(&self.0))
-    }
-}
-
-impl Drop for UnitedKey {
-    fn drop(&mut self) {
-        use zeroize::Zeroize as _;
-        if let Some(bytes) = Arc::get_mut(&mut self.0) {
-            bytes.zeroize();
-        }
     }
 }
 
@@ -1453,6 +1459,10 @@ impl<R> std::fmt::Debug for EncryptedReader<R> {
 impl<R> EncryptedReader<R> {
     pub fn get_ref(&self) -> &R {
         &self.inner
+    }
+
+    pub fn get_mut(&mut self) -> &mut R {
+        &mut self.inner
     }
 
     pub fn enter_direct_mode(&mut self) {
