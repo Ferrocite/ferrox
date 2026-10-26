@@ -35656,9 +35656,9 @@ mod tests {
                     }
                     seen.extend_from_slice(&buf[..read]);
                 }
-                // A close_notify ends the dial instead of leaving it parked on its handshake deadline.
-                let _ = conn.write(b"\x15\x03\x01\x00\x02\x02\x00");
+                // The session's own close ends the dial; a close_notify written before the handshake has no record to answer.
                 conn.close();
+                conn.flush();
                 seen
             });
             let conn = ferrox_core::kcp::dial(
