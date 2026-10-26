@@ -50,7 +50,7 @@ pub(crate) fn apply(bytes: &mut [u8], key: &[u8; WIDTH]) {
 /// into a register before the store below it, and every later source starts past that store, so
 /// `shift >= 8` needs no scratch.
 pub(crate) fn unshift(datagram: &mut [u8], shift: usize, key: &[u8; WIDTH]) -> usize {
-    debug_assert!(shift >= 8 && shift < WIDTH);
+    debug_assert!((8..WIDTH).contains(&shift));
     let payload = datagram.len().saturating_sub(shift);
     let words = key_words(key);
     let mut at = 0usize;
