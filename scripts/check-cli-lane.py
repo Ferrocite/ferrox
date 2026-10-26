@@ -240,11 +240,7 @@ if is_enabled autodiscovery; then
 else
   echo "  ProxyAutoDiscoveryEnable : 0"
 fi
-for spec in "http HTTPProxy HTTPPort" "https HTTPSProxy HTTPSPort" "socks SOCKSProxy SOCKSPort"; do
-  set -- $spec
-  kind="$1"
-  proxy="$2"
-  port="$3"
+for kind in http https socks; do
   case "$kind" in
     http) label=HTTP ;;
     https) label=HTTPS ;;
@@ -256,11 +252,12 @@ for spec in "http HTTPProxy HTTPPort" "https HTTPSProxy HTTPSPort" "socks SOCKSP
     echo "  ${label}Enable : 0"
   fi
 done
-for spec in "http HTTPProxy HTTPPort" "https HTTPSProxy HTTPSPort" "socks SOCKSProxy SOCKSPort"; do
-  set -- $spec
-  kind="$1"
-  proxy="$2"
-  port="$3"
+for kind in http https socks; do
+  case "$kind" in
+    http) proxy=HTTPProxy; port=HTTPPort ;;
+    https) proxy=HTTPSProxy; port=HTTPSPort ;;
+    *) proxy=SOCKSProxy; port=SOCKSPort ;;
+  esac
   if is_enabled "$kind-enabled"; then
     endpoint="$(read_field "$kind-proxy" "")"
     case "$endpoint" in
