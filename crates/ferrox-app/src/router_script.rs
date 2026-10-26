@@ -26,7 +26,7 @@ const NETWORK_UNIX: i64 = 4;
 
 /// What a script may call back into while it runs: the resolver a `xray.dns.Query` uses, and the
 /// balancer table a `xray.router.PickOutbound` reads. Both are built once, so a call clones handles.
-pub(crate) type Resolver = dyn Fn(&str, u16, bool) -> (Vec<IpAddr>, u32) + Send + Sync;
+pub(crate) type Resolver = dyn Fn(&str, u16, bool, bool, bool) -> (Vec<IpAddr>, u32) + Send + Sync;
 pub(crate) type Picker = dyn Fn(&str) -> Result<String, String> + Send + Sync;
 
 #[derive(Clone)]
@@ -66,13 +66,20 @@ impl CallHooks {
             .take();
     }
 
-    fn resolve(&self, host: &str, port: u16, fake: bool) -> LuaResult<(Vec<IpAddr>, u32)> {
+    fn resolve(
+        &self,
+        host: &str,
+        port: u16,
+        fake: bool,
+        v4: bool,
+        v6: bool,
+    ) -> LuaResult<(Vec<IpAddr>, u32)> {
         let resolve = {
             let call = self.call.lock().unwrap_or_else(PoisonError::into_inner);
             call.as_ref().map(|call| Arc::clone(&call.resolve))
         }
         .ok_or_else(|| LuaError::RuntimeError("no routing context".into()))?;
-        Ok(resolve(host, port, fake))
+        Ok(resolve(host, port, fake, v4, v6))
     }
 
     fn pick(&self, tag: &str) -> LuaResult<(Option<String>, Option<String>)> {
@@ -502,7 +509,7 @@ fn install(lua: &Lua, hooks: &Arc<CallHooks>, dirs: &Arc<Vec<PathBuf>>) -> LuaRe
         "Query",
         lua.create_function(
             move |lua, (name, ipv4, ipv6, fake): (String, bool, bool, bool)| {
-                let (addrs, ttl) = match query_hooks.resolve(&name, 0, fake) {
+                let (addrs, ttl) = match query_hooks.resolve(&name, 0, fake, ipv4, ipv6) {
                     Ok(answer) => answer,
                     Err(error) => return Ok((Value::Nil, 0.0, Some(error))),
                 };
@@ -1083,7 +1090,7 @@ mod tests {
 
     fn callbacks() -> ScriptCallbacks {
         ScriptCallbacks {
-            resolve: Arc::new(|_, _, _| (Vec::new(), 0)),
+            resolve: Arc::new(|_, _, _, _, _| (Vec::new(), 0)),
             pick: Arc::new(|tag| Ok(format!("picked-{tag}"))),
         }
     }
@@ -1165,7 +1172,7 @@ end
         .expect("write");
         let router = ScriptRouter::parse_in("route.lua", vec![dir]).expect("parses");
         let callbacks = ScriptCallbacks {
-            resolve: Arc::new(|_, _, _| (vec!["192.0.2.9".parse().expect("address")], 60)),
+            resolve: Arc::new(|_, _, _, _, _| (vec!["192.0.2.9".parse().expect("address")], 60)),
             pick: Arc::new(|tag| Ok(format!("picked-{tag}"))),
         };
         assert_eq!(
@@ -1191,9 +1198,11 @@ end
         .expect("write");
         let router = ScriptRouter::parse_in("route.lua", vec![dir]).expect("parses");
         let callbacks = ScriptCallbacks {
-            resolve: Arc::new(|host, _, fake| {
+            resolve: Arc::new(|host, _, fake, v4, v6| {
                 assert_eq!(host, "example.com");
                 assert!(fake);
+                assert!(v4);
+                assert!(!v6);
                 (vec![IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))], 42)
             }),
             pick: Arc::new(|tag| Ok(format!("picked-{tag}"))),

@@ -341,8 +341,14 @@ impl Resolver {
         self.lookup_inner(name, false, false)
     }
 
-    pub(crate) fn lookup_fake(self: &Arc<Self>, name: &str) -> Option<(Vec<IpAddr>, u32)> {
-        self.lookup_inner(name, true, false).records()
+    pub(crate) fn lookup_families(
+        self: &Arc<Self>,
+        name: &str,
+        v4: bool,
+        v6: bool,
+        fake: bool,
+    ) -> Option<(Vec<IpAddr>, u32)> {
+        self.lookup_with(name, v4, v6, fake, false).records()
     }
 
     pub(crate) fn script_servers(&self) -> Vec<(String, usize)> {
@@ -370,11 +376,25 @@ impl Resolver {
     }
 
     fn lookup_inner(self: &Arc<Self>, name: &str, fake_enabled: bool, force_local: bool) -> Lookup {
+        let (v4, v6) = self.strategy.families();
+        self.lookup_with(name, v4, v6, fake_enabled, force_local)
+    }
+
+    fn lookup_with(
+        self: &Arc<Self>,
+        name: &str,
+        v4: bool,
+        v6: bool,
+        fake_enabled: bool,
+        force_local: bool,
+    ) -> Lookup {
+        if !v4 && !v6 {
+            return Lookup::Empty;
+        }
         let mut name = Cow::Borrowed(name.trim_end_matches('.'));
         if name.is_empty() {
             return Lookup::Failed;
         }
-        let (v4, v6) = self.strategy.families();
         let mut followed = 0u8;
         loop {
             match self.host_lookup(&name, v4, v6) {
@@ -1757,6 +1777,34 @@ mod resolver_tests {
     }
 
     #[test]
+    fn a_script_query_asks_only_for_the_families_it_names() {
+        let resolver = Arc::new(
+            Resolver::from_root(&root(
+                r#"{"dns":{"servers":["localhost"],"hosts":{"example.com":["10.0.0.1","2001:db8::1"]}}}"#,
+            ))
+            .expect("resolver")
+            .expect("configured"),
+        );
+        assert_eq!(
+            resolver
+                .lookup_families("example.com", false, true, false)
+                .unwrap()
+                .0,
+            vec!["2001:db8::1".parse::<IpAddr>().unwrap()]
+        );
+        assert_eq!(
+            resolver
+                .lookup_families("example.com", true, false, false)
+                .unwrap()
+                .0,
+            vec!["10.0.0.1".parse::<IpAddr>().unwrap()]
+        );
+        assert!(resolver
+            .lookup_families("example.com", false, false, false)
+            .is_none());
+    }
+
+    #[test]
     fn fake_pools_allocate_and_reverse_both_families() {
         let resolver = Arc::new(
             Resolver::from_root(&root(
@@ -1765,11 +1813,15 @@ mod resolver_tests {
                 .expect("resolver")
                 .expect("configured"),
         );
-        let (ips, ttl) = resolver.lookup_fake("example.com").expect("fake");
+        let (ips, ttl) = resolver
+            .lookup_families("example.com", true, true, true)
+            .expect("fake");
         assert_eq!(ttl, 1);
         assert!(ips.iter().all(std::net::IpAddr::is_ipv4));
         assert_eq!(resolver.domain_of(ips[0]).as_deref(), Some("example.com"));
-        let again = resolver.lookup_fake("example.com").expect("stable");
+        let again = resolver
+            .lookup_families("example.com", true, true, true)
+            .expect("stable");
         assert_eq!(again.0, ips);
     }
 

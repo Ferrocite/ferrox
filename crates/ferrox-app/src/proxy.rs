@@ -1337,7 +1337,7 @@ struct RouteShared {
     script: Option<crate::router_script::ScriptCallbacks>,
     default: Outbound,
     default_tag: Option<String>,
-    dynamic: RwLock<Dynamic>,
+    dynamic: Arc<RwLock<Dynamic>>,
     changed: AtomicBool,
     closed: Outbound,
 }
@@ -1866,15 +1866,24 @@ fn route_shared_with_api(
     }
     let routing = Arc::new(routing);
     let balancers = Arc::new(balancers);
+    let dynamic = Arc::new(RwLock::new(Dynamic::default()));
     let script = if routing.script().is_some() {
         let routing = Arc::clone(&routing);
         let balancers = Arc::clone(&balancers);
         let tags: Arc<HashSet<String>> = Arc::new(tagged.keys().cloned().collect());
+        let dynamic = Arc::clone(&dynamic);
         let observatory = observatory.clone();
         Some(crate::router_script::ScriptCallbacks {
             resolve: Arc::new(crate::router::resolve_ips_script),
             pick: Arc::new(move |tag| {
-                pick_script_outbound(&routing, &balancers, &tags, observatory.as_deref(), tag)
+                pick_script_outbound(
+                    &routing,
+                    &balancers,
+                    &tags,
+                    &dynamic,
+                    observatory.as_deref(),
+                    tag,
+                )
             }),
         })
     } else {
@@ -1888,7 +1897,7 @@ fn route_shared_with_api(
         script,
         default,
         default_tag,
-        dynamic: RwLock::new(Dynamic::default()),
+        dynamic,
         changed: AtomicBool::new(false),
         closed: Outbound::Block(ferrox_core::blackhole::Response::None),
     }))
@@ -1900,6 +1909,7 @@ fn pick_script_outbound(
     routing: &crate::router::Routing,
     balancers: &HashMap<String, Vec<String>>,
     tags: &HashSet<String>,
+    dynamic: &RwLock<Dynamic>,
     observatory: Option<&crate::observatory::Observatory>,
     tag: &str,
 ) -> Result<String, String> {
@@ -1914,7 +1924,13 @@ fn pick_script_outbound(
         }
         return Err(format!("balancer `{tag}` has no outbound"));
     }
-    if tags.contains(tag) {
+    let dynamic = dynamic
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if dynamic.removed.contains(tag) {
+        return Err(format!("outbound `{tag}` not found"));
+    }
+    if dynamic.added.contains_key(tag) || tags.contains(tag) {
         Ok(tag.to_owned())
     } else {
         Err(format!("outbound `{tag}` not found"))
@@ -12956,13 +12972,10 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
     crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
     let first = match crate::sniff::current() {
         Some(sniffing) if sniffing.enabled() => None,
-        _ => Some(
-            out.resolved_lane(&handshake.asked, crate::router::Network::Tcp, Some(&client))
-                .0,
-        ),
+        _ => Some(out.resolved_lane(&handshake.asked, crate::router::Network::Tcp, Some(&client))),
     };
     if !matches!(
-        first.as_deref().unwrap_or(out),
+        first.as_ref().map_or(out, |(lane, _)| &**lane),
         Outbound::Foxy(_) | Outbound::Veepn(_)
     ) {
         let grant = match handshake.version {
@@ -12973,7 +12986,10 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
             return;
         }
     }
-    let (dial, out, tag) = sniff_lane(out, &handshake.asked, &client);
+    let (dial, out, tag) = match first {
+        Some((lane, tag)) => (None, lane, tag),
+        None => sniff_lane(out, &handshake.asked, &client),
+    };
     let asked = dial.as_ref().unwrap_or(&handshake.asked);
     serve_connect(client, &out, asked, Front::Socks, &[], tag.as_deref());
 }
@@ -14179,19 +14195,19 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
             crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
             let first = match crate::sniff::current() {
                 Some(sniffing) if sniffing.enabled() => None,
-                _ => Some(
-                    out.resolved_lane(&asked, crate::router::Network::Tcp, Some(&client))
-                        .0,
-                ),
+                _ => Some(out.resolved_lane(&asked, crate::router::Network::Tcp, Some(&client))),
             };
             if !matches!(
-                first.as_deref().unwrap_or(out),
+                first.as_ref().map_or(out, |(lane, _)| &**lane),
                 Outbound::Foxy(_) | Outbound::Veepn(_)
             ) && client.write_all(Front::Http.grant_line()).is_err()
             {
                 return;
             }
-            let (dial, out, tag) = sniff_lane(out, &asked, &client);
+            let (dial, out, tag) = match first {
+                Some((lane, tag)) => (None, lane, tag),
+                None => sniff_lane(out, &asked, &client),
+            };
             let asked = dial.as_ref().unwrap_or(&asked);
             serve_connect(client, &out, asked, Front::Http, &[], tag.as_deref());
         }
@@ -21467,6 +21483,45 @@ mod tests {
             target,
             Some(Destination::Name("example.test".to_owned(), 443))
         );
+    }
+
+    #[test]
+    fn a_script_pick_sees_an_outbound_added_after_startup() {
+        let root = crate::json::parse(r#"{"routing":{}}"#).expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let dynamic = RwLock::new(Dynamic::default());
+        dynamic
+            .write()
+            .expect("lock")
+            .added
+            .insert("api".to_owned(), Arc::new(freedom()));
+        assert_eq!(
+            pick_script_outbound(
+                &routing,
+                &HashMap::new(),
+                &HashSet::new(),
+                &dynamic,
+                None,
+                "api"
+            ),
+            Ok("api".to_owned())
+        );
+        dynamic
+            .write()
+            .expect("lock")
+            .removed
+            .insert("gone".to_owned());
+        assert!(pick_script_outbound(
+            &routing,
+            &HashMap::new(),
+            &HashSet::new(),
+            &dynamic,
+            None,
+            "gone"
+        )
+        .is_err());
     }
 
     #[test]

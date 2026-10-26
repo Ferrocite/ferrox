@@ -927,9 +927,11 @@ impl Routing {
             }
         }
         if spilled {
-            return self.rules[pending.len() * 64..]
-                .iter()
-                .find(|rule| rule.needs_ip(flow, names) && rule.matches_tail(flow, names, &addrs));
+            return self.rules[pending.len() * 64..].iter().find(|rule| {
+                rule.base_matches(flow, names)
+                    && rule.needs_ip(flow, names)
+                    && rule.matches_tail(flow, names, &addrs)
+            });
         }
         None
     }
@@ -1615,9 +1617,19 @@ impl SetRule {
                 "domain_suffix" => {
                     let matcher = domains.get_or_insert_with(DomainMatcher::new);
                     for item in string_list(value, "domain_suffix")?.unwrap_or_default() {
-                        let item = item.trim_start_matches('.');
-                        let item = if has_domain_prefix(item) {
-                            item.to_owned()
+                        if !has_domain_prefix(&item) {
+                            if let Some(rest) = item.strip_prefix('.') {
+                                if rest.is_empty() {
+                                    return Err(
+                                        "routing rule set rule domain_suffix is empty".to_owned()
+                                    );
+                                }
+                                matcher.add(DomainKind::SuffixOnly, lower_arc(rest));
+                                continue;
+                            }
+                        }
+                        let item = if has_domain_prefix(&item) {
+                            item
                         } else {
                             format!("domain:{item}")
                         };
@@ -1900,6 +1912,7 @@ impl SetRule {
 pub(crate) struct DomainMatcher {
     full: DomainSet,
     suffix: DomainSet,
+    suffix_only: DomainSet,
     substr: Vec<Arc<str>>,
     ac: Option<aho_corasick::AhoCorasick>,
     regex: Vec<regex::Regex>,
@@ -1996,6 +2009,7 @@ impl DomainMatcher {
         Self {
             full: DomainSet::default(),
             suffix: DomainSet::default(),
+            suffix_only: DomainSet::default(),
             substr: Vec::new(),
             ac: None,
             regex: Vec::new(),
@@ -2005,6 +2019,7 @@ impl DomainMatcher {
     pub(crate) fn finish(&mut self) -> Result<(), String> {
         self.full.finish();
         self.suffix.finish();
+        self.suffix_only.finish();
         if !self.substr.is_empty() {
             self.ac = Some(
                 aho_corasick::AhoCorasick::new(self.substr.iter().map(|value| value.as_bytes()))
@@ -2018,6 +2033,7 @@ impl DomainMatcher {
         match kind {
             DomainKind::Substr => self.substr.push(value),
             DomainKind::Domain => self.suffix.insert(value),
+            DomainKind::SuffixOnly => self.suffix_only.insert(value),
             DomainKind::Full => self.full.insert(value),
             DomainKind::Regex => {
                 if let Ok(regex) = regex::Regex::new(value.as_ref()) {
@@ -2035,7 +2051,10 @@ impl DomainMatcher {
         let bytes = lower.as_bytes();
         let mut hash = 0u64;
         for at in (0..bytes.len()).rev() {
-            if bytes[at] == b'.' && self.suffix.contains(hash, &lower[at + 1..]) {
+            if bytes[at] == b'.'
+                && (self.suffix.contains(hash, &lower[at + 1..])
+                    || self.suffix_only.contains(hash, &lower[at + 1..]))
+            {
                 return true;
             }
             hash = hash
@@ -2057,6 +2076,7 @@ enum DomainKind {
     Substr,
     Regex,
     Domain,
+    SuffixOnly,
     Full,
 }
 
@@ -3032,24 +3052,30 @@ pub(crate) fn resolve_ips(host: &str, port: u16) -> Vec<IpAddr> {
 }
 
 pub(crate) fn resolve_ips_ttl(host: &str, port: u16) -> (Vec<IpAddr>, u32) {
-    resolve_ips_script(host, port, false)
+    resolve_ips_script(host, port, false, true, true)
 }
 
-pub(crate) fn resolve_ips_script(host: &str, port: u16, fake: bool) -> (Vec<IpAddr>, u32) {
+pub(crate) fn resolve_ips_script(
+    host: &str,
+    port: u16,
+    fake: bool,
+    v4: bool,
+    v6: bool,
+) -> (Vec<IpAddr>, u32) {
     use std::net::ToSocketAddrs;
     if let Some(resolver) = crate::dnsapp::installed() {
-        let answer = if fake {
-            resolver.lookup_fake(host)
-        } else {
-            resolver.lookup(host)
-        };
-        if let Some(answer) = answer {
+        if let Some(answer) = resolver.lookup_families(host, v4, v6, fake) {
             return answer;
         }
     }
     let ips = (host, port)
         .to_socket_addrs()
-        .map(|addrs| addrs.map(|addr| addr.ip()).collect())
+        .map(|addrs| {
+            addrs
+                .map(|addr| addr.ip())
+                .filter(|ip| (v4 && ip.is_ipv4()) || (v6 && ip.is_ipv6()))
+                .collect()
+        })
         .unwrap_or_default();
     (ips, 0)
 }
@@ -3594,6 +3620,56 @@ mod tests {
     }
 
     #[test]
+    fn an_ip_candidate_past_the_small_table_still_matches_its_inbound() {
+        let mut rules = (0..256)
+            .map(|at| {
+                rule(
+                    "filler",
+                    vec![("domain", array(vec![text(&format!("miss{at}.test"))]))],
+                )
+            })
+            .collect::<Vec<_>>();
+        rules.push(rule(
+            "trusted",
+            vec![
+                ("inboundTag", array(vec![text("trusted")])),
+                ("ip", array(vec![text("192.0.2.0/24")])),
+            ],
+        ));
+        rules.push(rule(
+            "public",
+            vec![
+                ("inboundTag", array(vec![text("public")])),
+                ("ip", array(vec![text("192.0.2.0/24")])),
+            ],
+        ));
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                ("domainStrategy", text("IPIfNonMatch")),
+                ("rules", array(rules)),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("public.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: Some("public"),
+            protocol: None,
+        };
+        assert_eq!(
+            routing.route_with(&flow, &|_, _| { vec!["192.0.2.9".parse().expect("ip")] }),
+            Some("public")
+        );
+    }
+
+    #[test]
     fn a_candidate_is_not_re_evaluated_under_ip_if_non_match() {
         let root = object(vec![(
             "routing",
@@ -3741,6 +3817,13 @@ mod tests {
             }),
             None
         );
+        assert_eq!(
+            routing.route(&Flow {
+                domain: Some("ends.test"),
+                ..flow
+            }),
+            None
+        );
     }
 
     #[test]
@@ -3798,6 +3881,13 @@ mod tests {
             protocol: None,
         };
         assert_eq!(routing.route(&flow), Some("block"));
+        assert_eq!(
+            routing.route(&Flow {
+                domain: Some("ads.test"),
+                ..flow
+            }),
+            None
+        );
         assert_eq!(
             routing.route(&Flow {
                 domain: Some("tracker.other.test"),
