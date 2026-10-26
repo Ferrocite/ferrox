@@ -11223,6 +11223,10 @@ impl Drivable for ferrox_core::tls::ClientSession<KcpIo> {
 
 impl Drivable for ferrox_core::tls::RealityServer<Connection> {
     fn transport(&self) -> Option<Connection> {
+        // A replayed prefix is not on the socket, so a raw read would lose it.
+        if self.has_pending() {
+            return None;
+        }
         // The core accessor the inherent name would shadow: one explicit call, no recursion.
         ferrox_core::tls::RealityServer::transport(self)
             .try_clone()
