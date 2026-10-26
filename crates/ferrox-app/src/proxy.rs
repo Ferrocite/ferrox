@@ -2984,7 +2984,7 @@ fn serve_sealed_raw<S: Read + Write + Send + ferrox_core::tls::RecordAlignment +
                 SealedHalf(shared),
                 &target,
                 Vec::new(),
-                closer,
+                &closer,
             );
         }
         3 => {
@@ -16491,7 +16491,7 @@ fn serve_vless_udp(mut stream: Connection, target: &SocketAddr, carried: Vec<u8>
     if stream.write_all(&[0, 0]).is_err() {
         return;
     }
-    serve_udp_stream(read, stream, target, carried, close);
+    serve_udp_stream(read, stream, target, carried, &close);
 }
 
 fn serve_udp_stream<R, W>(
@@ -16499,7 +16499,7 @@ fn serve_udp_stream<R, W>(
     mut writer: W,
     target: &SocketAddr,
     carried: Vec<u8>,
-    close: Arc<dyn Fn() + Send + Sync>,
+    close: &Arc<dyn Fn() + Send + Sync>,
 ) where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
