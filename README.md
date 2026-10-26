@@ -88,7 +88,7 @@ printf '%s %s %s %s\n' '<doc>' '<key>' '<value>' '<checker>' >> scripts/method-c
 | KCP | [kcp](docs/function/kcp.md) | 1 sendto per segment | in place, pooled | `UNBLESSED` | not measured |
 | dokodemo-door inbound | [front-dokodemo](docs/function/front-dokodemo.md) | 1 send + 1 recv per datagram | 1 (the relay's own) | `UNBLESSED` | not measured |
 | health observatory + `leastPing`/`leastLoad` | [engine-observatory](docs/function/engine-observatory.md) | 1 dial per probe | 0 per sample put | `UNBLESSED` | not measured |
-| healthcheck inbound | [front-healthcheck](docs/function/front-healthcheck.md) | 1 answer write | 1 (the answer) | `UNBLESSED` | not measured |
+| healthcheck inbound | [front-healthcheck](docs/function/front-healthcheck.md) | 1 answer write | 0 (prebuilt) | `UNBLESSED` | not measured |
 | SOCKS5 + SOCKS4, both roles | [socks](docs/function/socks.md) | 3 writes + 4 reads per dial | 1 (the relay's own) | `UNBLESSED` | not measured |
 | Reverse tunnel (bridge + portal) | [reverse](docs/function/reverse.md) | 1 write per mux frame | 1 downlink, 0 uplink | `UNBLESSED` | not measured |
 

@@ -7253,11 +7253,7 @@ fn serve_hc_inbound(address: &str, inbound: &Json) -> bool {
             return false;
         }
     };
-    let handler = std::sync::Arc::new(HcHandler {
-        path: path.to_owned(),
-        request,
-        response: response.to_owned(),
-    });
+    let handler = std::sync::Arc::new(HcHandler::new(path, request, response));
     let address = address.to_owned();
     thread::spawn(move || {
         let target = parse_target(&address)
@@ -7277,10 +7273,28 @@ fn serve_hc_inbound(address: &str, inbound: &Json) -> bool {
 struct HcHandler {
     path: String,
     request: String,
-    response: String,
+    answer: Vec<u8>,
 }
 
 impl HcHandler {
+    fn new(path: &str, request: String, response: &str) -> Self {
+        let answer = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
+            response.len(),
+            response
+        )
+        .into_bytes();
+        Self {
+            path: path.to_owned(),
+            request,
+            answer,
+        }
+    }
+
+    fn payload(&self) -> &[u8] {
+        &self.answer
+    }
+
     fn serve(&self, mut stream: Connection) {
         let mut data = Vec::with_capacity(1024);
         let mut buf = [0u8; 8192];
@@ -7342,16 +7356,8 @@ impl HcHandler {
                 return Err(std::io::Error::other("bad body"));
             }
         }
-        stream.write_all(self.payload().as_bytes())?;
+        stream.write_all(self.payload())?;
         stream.flush()
-    }
-
-    fn payload(&self) -> String {
-        format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n{}",
-            self.response.len(),
-            self.response
-        )
     }
 }
 
@@ -42682,11 +42688,7 @@ mod hc_tests {
 
     #[test]
     fn an_hc_get_answers_the_configured_body_after_the_exact_path() {
-        let port = serve(HcHandler {
-            path: "/health".to_owned(),
-            request: String::new(),
-            response: "ok".to_owned(),
-        });
+        let port = serve(HcHandler::new("/health", String::new(), "ok"));
         assert_eq!(
             exchange(port, b"GET /health HTTP/1.1\r\nHost: probe\r\n\r\n"),
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok"
@@ -42694,24 +42696,20 @@ mod hc_tests {
     }
 
     #[test]
-    fn an_hc_answer_is_one_allocation() {
-        let handler = HcHandler {
-            path: "/health".to_owned(),
-            request: String::new(),
-            response: "ok".to_owned(),
-        };
+    fn an_hc_answer_is_prebuilt_without_allocating() {
+        let handler = HcHandler::new("/health", String::new(), "ok");
+        let base = handler.payload().as_ptr();
+        let capacity = handler.answer.capacity();
         let (payload, counts) = ferrox_core::alloc_count::measure(|| handler.payload());
         assert_eq!(payload.len(), 85);
-        assert_eq!(counts.allocs, 1);
+        assert_eq!(counts.allocs, 0);
+        assert_eq!(payload.as_ptr(), base);
+        assert_eq!(handler.answer.capacity(), capacity);
     }
 
     #[test]
     fn an_hc_post_checks_the_body_and_a_mismatch_answers_nothing() {
-        let handler = || HcHandler {
-            path: "/health".to_owned(),
-            request: "ping".to_owned(),
-            response: "pong".to_owned(),
-        };
+        let handler = || HcHandler::new("/health", "ping".to_owned(), "pong");
         let port = serve(handler());
         assert_eq!(
             exchange(

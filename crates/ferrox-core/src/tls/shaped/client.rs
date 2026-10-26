@@ -17,6 +17,8 @@ const MAX_RECORD: usize = 16384 + 256;
 const RECORD_READ: usize = 16384;
 const MAX_HANDSHAKE: usize = 1 << 20;
 const MAX_PLAINTEXT: usize = 16384;
+/// How many poll quanta a handshake record may spend waiting for the socket: at KCP's 20 ms read that is 30 s, and a retry cannot re-enter a shaped hello already on the wire.
+const HANDSHAKE_POLLS: u32 = 1_500;
 
 /// The `HelloRetryRequest` random, which names the message without a new type.
 const HRR_RANDOM: [u8; 32] = [
@@ -38,6 +40,7 @@ pub struct Session<S: Stream> {
     server_name: ServerName<'static>,
     profile: &'static Profile,
     hello: Option<Hello>,
+    handshake_polls: Option<u32>,
     client_random: [u8; 32],
     transcript: Vec<u8>,
     version: Option<Version>,
@@ -104,6 +107,7 @@ impl<S: Stream> Session<S> {
             server_name,
             profile,
             hello: Some(hello),
+            handshake_polls: None,
             client_random: [0u8; 32],
             transcript: Vec::new(),
             version: None,
@@ -147,6 +151,9 @@ impl<S: Stream> Session<S> {
     fn run(&mut self) -> Result<(), TlsError> {
         if self.done {
             return Ok(());
+        }
+        if self.handshake_polls.is_none() {
+            self.handshake_polls = Some(HANDSHAKE_POLLS);
         }
         let mut hello = self
             .hello
@@ -217,6 +224,7 @@ impl<S: Stream> Session<S> {
         }?;
         self.check_alpn(&hello, &mut sh)?;
         self.done = true;
+        self.handshake_polls = None;
         Ok(())
     }
 
@@ -507,8 +515,13 @@ impl<S: Stream> Session<S> {
 
     /// Reads one record's body into `plain`, decrypts it in place, and leaves its content pending there.
     fn read_record(&mut self) -> Result<u8, TlsError> {
+        let mut polls = self.handshake_polls.unwrap_or(0);
         let mut header = [0u8; 5];
-        exact(&mut self.io, &mut header)?;
+        let exact = exact_until(&mut self.io, &mut header, &mut polls);
+        if self.handshake_polls.is_some() {
+            self.handshake_polls = Some(polls);
+        }
+        exact?;
         let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
         if len > MAX_RECORD {
             return Err(TlsError::Other(
@@ -520,7 +533,11 @@ impl<S: Stream> Session<S> {
         if self.plain.len() < len {
             self.plain.resize(len, 0);
         }
-        exact(&mut self.io, &mut self.plain[..len])?;
+        let exact = exact_until(&mut self.io, &mut self.plain[..len], &mut polls);
+        if self.handshake_polls.is_some() {
+            self.handshake_polls = Some(polls);
+        }
+        exact?;
         let Self {
             read_key,
             server12,
@@ -1554,6 +1571,24 @@ fn exact<S: Read>(io: &mut S, mut buf: &mut [u8]) -> Result<(), TlsError> {
     Ok(())
 }
 
+/// Fills `buf` from the transport; a non-zero `polls` is a handshake's budget, so a poll-quantum expiry waits for the peer instead of failing a hello that is already on the wire.
+fn exact_until<S: Read>(io: &mut S, mut buf: &mut [u8], polls: &mut u32) -> Result<(), TlsError> {
+    while !buf.is_empty() {
+        match io.read(buf) {
+            Ok(0) => return Err(TlsError::Closed),
+            Ok(n) => buf = &mut buf[n..],
+            Err(error) if TlsError::is_timeout(&error) => {
+                if *polls == 0 {
+                    return Err(TlsError::Timeout);
+                }
+                *polls -= 1;
+            }
+            Err(error) => return Err(TlsError::from(error)),
+        }
+    }
+    Ok(())
+}
+
 fn alert(body: &[u8]) -> TlsError {
     match body.get(1) {
         Some(0) => TlsError::Closed,
@@ -1715,6 +1750,7 @@ mod tests {
             server_name: ServerName::try_from("tls.test".to_owned()).expect("name"),
             profile: profiles::profile("chrome").expect("chrome profile"),
             hello: None,
+            handshake_polls: None,
             client_random: [0; 32],
             transcript: Vec::new(),
             version: Some(version),
@@ -2274,6 +2310,32 @@ mod tests {
         );
         let n = subject.read(&mut buf).expect("the record resumes");
         assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[test]
+    fn a_handshake_record_split_by_a_timeout_is_resumed_not_lost() {
+        let mut wire = vec![HANDSHAKE, 0x03, 0x03, 0x00, 0x04];
+        wire.extend_from_slice(&[1, 2, 3, 4]);
+        let mut subject = session_on(
+            SplitRead {
+                wire,
+                at: 0,
+                stall_at: 7,
+                stalled: false,
+            },
+            Version::Tls13,
+            Suite::Aes128GcmSha256,
+            Direction::tls13(Suite::Aes128GcmSha256, &[0u8; 32]),
+            Direction::tls13(Suite::Aes128GcmSha256, &[0u8; 32]),
+        );
+        subject.read_key = None;
+        subject.done = false;
+        subject.handshake_polls = Some(HANDSHAKE_POLLS);
+        assert_eq!(
+            subject.read_record().expect("the handshake record resumes"),
+            HANDSHAKE
+        );
+        assert_eq!(subject.pending(), &[1, 2, 3, 4]);
     }
 
     struct SplitRead {
