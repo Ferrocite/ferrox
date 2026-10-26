@@ -17,6 +17,7 @@
 set -uo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SELF="$SCRIPT_DIR/$(basename "$0")"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Three homes for the binary, first hit wins: $FERROX_BIN names one outright; a
 # release package puts it next to this script; in the repository cargo writes
@@ -58,8 +59,10 @@ PID_FILE="$CONF_DIR/lane.pid"
 LOG="$CONF_DIR/lane.log"
 PROXY_PORTS="$STATE_DIR/system-proxy.ports"
 PROXY_STATE="$STATE_DIR/system-proxy.state"
+SUPERVISOR_FILE="$STATE_DIR/system-proxy.supervisor"
 
 ACTION="up"
+SUPERVISE_PID=""
 OUTBOUND=""
 INSTANCE=""
 ALL=0
@@ -1375,8 +1378,15 @@ stale_proxy_endpoint() {
 
 reconcile_stale_proxy() {
   lane_running && return 0
+  # A marker left by a lane that is not alive is a dead arm: restore it before
+  # anything else, whether or not the services still show the endpoint.
+  if [ -e "$PROXY_STATE" ] || [ -e "$PROXY_PORTS" ]; then
+    say "system proxy: no lane owns the armed endpoint; clearing it."
+    system_proxy_off
+    return
+  fi
   stale_proxy_endpoint >/dev/null || return 0
-  say "login: a stale ferrox system proxy points at a lane that is not running; clearing it."
+  say "system proxy: no lane owns the armed endpoint; clearing it."
   system_proxy_off
 }
 
@@ -1392,6 +1402,7 @@ apply_instance() {
   LOG="$CONF_DIR/lane$suffix.log"
   PROXY_PORTS="$STATE_DIR/system-proxy$suffix.ports"
   PROXY_STATE="$STATE_DIR/system-proxy$suffix.state"
+  SUPERVISOR_FILE="$STATE_DIR/system-proxy$suffix.supervisor"
   LOCATION_FILE="$CONF_DIR/foxy-location$suffix"
 }
 
@@ -1402,6 +1413,38 @@ lane_running() {
 }
 
 lane_pid() { cat "$PID_FILE" 2>/dev/null || true; }
+
+# The supervisor outlives `up`: it owns the armed proxy until the lane it watched
+# exits, and a newer lane's pid file makes it stand down instead of clearing.
+supervise_clear() {
+  local watched="$1" current
+  current="$(lane_pid)"
+  if [ -z "$current" ] || [ "$current" = "$watched" ]; then
+    system_proxy_off >/dev/null 2>&1 || true
+    if [ "$(lane_pid)" = "$watched" ]; then rm -f "$PID_FILE"; fi
+  fi
+  if [ "$(cat "$SUPERVISOR_FILE" 2>/dev/null)" = "$$" ]; then rm -f "$SUPERVISOR_FILE"; fi
+  return 0
+}
+
+supervise_terminate() {
+  local watched="$1" current
+  current="$(lane_pid)"
+  if [ -z "$current" ] || [ "$current" = "$watched" ]; then
+    kill "$watched" 2>/dev/null || true
+  fi
+  supervise_clear "$watched"
+}
+
+action_supervise() {
+  local watched="$SUPERVISE_PID"
+  [ -n "$watched" ] || exit 0
+  printf '%s\n' "$$" > "$SUPERVISOR_FILE" 2>/dev/null || true
+  trap 'supervise_terminate "$watched"; exit 0' HUP INT TERM
+  while kill -0 "$watched" 2>/dev/null; do sleep 1; done
+  supervise_clear "$watched"
+  exit 0
+}
 
 # Only a foxy lane has an allowance to report, and its own config says so without asking the plane.
 foxy_lane_configured() {
@@ -1545,6 +1588,14 @@ start_lane() {
     "$BIN" run -c "$CFG" >"$LOG" 2>&1 &
   fi
   echo "$!" > "$PID_FILE"
+}
+
+supervise_lane() {
+  local pid; pid="$(lane_pid)"
+  [ -n "$pid" ] || return 0
+  local -a sup=("${BASH:-/bin/bash}" "$SELF" __supervise "$pid")
+  [ -n "$INSTANCE" ] && sup+=(--instance "$INSTANCE")
+  "${sup[@]}" </dev/null >/dev/null 2>&1 &
 }
 
 stop_lane() {
@@ -1772,6 +1823,7 @@ verify_flow() {
 }
 
 action_up() {
+  reconcile_stale_proxy || die "the stale system proxy could not be cleared; run ferrox-cli down."
   if [ "$WANT_VPN" = 1 ] && ! system_proxy_preflight; then exit 1; fi
   choose_carrier
   start_lane
@@ -1801,10 +1853,13 @@ action_up() {
   fi
   # Route the machine only at a lane that proved it carries a flow: an armed
   # system proxy over a dead lane takes the network down with it.
-  if [ "$WANT_VPN" = 1 ] && ! system_proxy_on; then
-    stop_and_forget
-    say "the system proxy was not armed; the lane was stopped and its config removed."
-    exit 1
+  if [ "$WANT_VPN" = 1 ]; then
+    if ! system_proxy_on; then
+      stop_and_forget
+      say "the system proxy was not armed; the lane was stopped and its config removed."
+      exit 1
+    fi
+    supervise_lane
   fi
   say "log:  $LOG"
   say "stop: ferrox-cli down"
@@ -1852,6 +1907,7 @@ action_serve() {
 }
 
 action_status() {
+  reconcile_stale_proxy || true
   if ! lane_running; then
     say "lane${INSTANCE:+ '$INSTANCE'} not running."
     local stale others
@@ -1959,6 +2015,9 @@ EOF
 while [ $# -gt 0 ]; do
   case "$1" in
     up|serve|down|status|ports|tun|login|logout|version) ACTION="$1"; shift ;;
+    __supervise)
+      ACTION=__supervise; shift
+      if [ $# -gt 0 ]; then SUPERVISE_PID="$1"; shift; fi ;;
     locations)
       ACTION=locations; shift
       # Both spellings: `locations --ping US` and `locations US --ping`.
@@ -2104,6 +2163,7 @@ require_bin() {
 case "$ACTION" in
   up) action_up ;;
   serve) action_serve ;;
+  __supervise) action_supervise ;;
   login) action_login ;;
   logout) action_logout ;;
   locations) action_locations ;;
