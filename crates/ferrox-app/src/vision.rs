@@ -478,6 +478,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     /// window resolves only with a full uuid and either a mismatch (everything passes)
     /// or the framing's first frame header. A walk that blocks mid-frame parks there
     /// and reports what it handed out.
+    #[allow(clippy::too_many_lines)]
     fn pump(&mut self, mut buf: Option<&mut [u8]>, mut feed: Option<&mut Feeding>) -> usize {
         let end = self.have.len();
         let mut dot = self.dot;
@@ -501,17 +502,56 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             dot += 16;
         }
         let mut held = 0;
-        let result = loop {
+        let result = 'frames: loop {
             // the header is read whole when the window offers five bytes; the tail is byte-by-byte
             if walk.want_header == 5 && end - dot >= 5 {
                 let frame = &self.have[dot..dot + 5];
-                walk.command = frame[0];
-                walk.want_content = usize::from(u16::from_be_bytes([frame[1], frame[2]]));
-                walk.want_padding = usize::from(u16::from_be_bytes([frame[3], frame[4]]));
+                let body = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
+                let command = frame[0];
+                let content = (body >> 16) as usize;
+                let padding = (body & 0xffff) as usize;
                 self.validate();
                 dot += 5;
+                let room = match buf.as_deref() {
+                    Some(slot) => slot.len() - held,
+                    None => usize::MAX,
+                };
+                if end - dot >= content + padding && room >= content {
+                    if content > 0 {
+                        let fresh = &self.have[dot..dot + content];
+                        if self.tls.budget > 0 {
+                            if let Some(feed) = feed.as_deref_mut() {
+                                feed.run += content;
+                                feed_extent(fresh, feed);
+                            }
+                        }
+                        if let Some(slot) = buf.as_deref_mut() {
+                            slot[held..held + content].copy_from_slice(fresh);
+                        }
+                        held += content;
+                    }
+                    dot += content + padding;
+                    if command == VisionCommand::Continue.byte() {
+                        continue 'frames;
+                    }
+                    self.read.padding = false;
+                    if command == VisionCommand::Direct.byte() {
+                        if let Some(direct) = self.direct {
+                            direct(&mut self.session);
+                        }
+                    }
+                    self.read.raw = command == VisionCommand::Direct.byte() && self.raw.is_some();
+                    break 'frames held;
+                }
+                walk.command = command;
+                walk.want_content = content;
+                walk.want_padding = padding;
                 walk.want_header = 0;
-            } else if walk.want_header > 0 && dot < end {
+            } else if walk.want_header > 0 {
+                if dot == end {
+                    // parked inside an incomplete header: nothing moves without bytes
+                    break 'frames held;
+                }
                 let byte = self.have[dot];
                 match walk.want_header {
                     5 => {
@@ -525,6 +565,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 }
                 dot += 1;
                 walk.want_header -= 1;
+                continue 'frames;
             }
             if walk.want_content > 0 {
                 let room = match buf.as_deref() {
@@ -546,24 +587,20 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 walk.want_content -= take;
                 held += take;
                 if walk.want_content > 0 || held == buf.as_deref().map_or(0, <[u8]>::len) {
-                    break held;
+                    break 'frames held;
                 }
-                continue;
             }
             if walk.want_padding > 0 {
                 let take = walk.want_padding.min(end - dot);
                 dot += take;
                 walk.want_padding -= take;
                 if walk.want_padding > 0 {
-                    break held;
+                    break 'frames held;
                 }
-            } else if walk.want_header > 0 {
-                // parked inside an incomplete header: nothing moves without bytes
-                break held;
             }
             if walk.command == VisionCommand::Continue.byte() {
                 walk.want_header = 5;
-                continue;
+                continue 'frames;
             }
             // a command that is not a continue ends the framing; its tail is content
             self.read.padding = false;
@@ -573,7 +610,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 }
             }
             self.read.raw = walk.command == VisionCommand::Direct.byte() && self.raw.is_some();
-            break held;
+            break 'frames held;
         };
         self.dot = dot;
         self.walk = walk;
@@ -875,6 +912,50 @@ mod tests {
         assert_eq!(out, b"splittail");
     }
 
+    /// A header split after its first two bytes must stay header: the bytes the window
+    /// still holds are the rest of the lengths, not content the caller may see.
+    #[test]
+    fn a_split_header_is_not_read_as_content() {
+        struct Chunked<'a> {
+            left: &'a [u8],
+            step: usize,
+        }
+        impl Read for Chunked<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.left.len().min(buf.len()).min(self.step);
+                buf[..n].copy_from_slice(&self.left[..n]);
+                self.left = &self.left[n..];
+                Ok(n)
+            }
+        }
+        impl Write for Chunked<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl RecordAlignment for Chunked<'_> {}
+
+        let mut input = frame(true, 0, b"a", 0);
+        // The first read ends three bytes into the next frame's five-byte header.
+        input.extend(frame(false, 0, b"bc", 0));
+        input.extend(frame(false, 1, b"", 0));
+        let split = 16 + 5 + 1 + 3;
+        let mut link = Link::new(
+            Chunked {
+                left: &input,
+                step: split,
+            },
+            None,
+            &UUID,
+        );
+        let mut got = Vec::new();
+        link.read_to_end(&mut got).expect("reads");
+        assert_eq!(got, b"abc");
+    }
+
     #[test]
     fn a_stream_without_the_uuid_is_content_from_the_start() {
         let mut link = link(b"no framing here at all");
@@ -939,16 +1020,18 @@ mod tests {
         );
     }
 
-    /// The frame parser alone: a fixed window of empty frames, walked again and again,
-    /// with the fold outside the walk so the frame holds the parse and nothing else.
+    /// The frame parser alone: a fixed window of frames carrying content and padding,
+    /// walked again and again with the filter spent and no caller buffer, so the frame
+    /// holds the parse and neither the copy nor the scan.
     #[test]
     fn the_frame_parser_probe_costs_the_walk_and_nothing_else() {
         let mut input = Vec::new();
         for _ in 0..7 {
-            input.extend(frame(false, 0, &[], 0));
+            input.extend(frame(false, 0, b"record", 4));
         }
-        input.extend(frame(false, 1, &[], 0));
+        input.extend(frame(false, 1, b"record", 4));
         let mut link = link(&[]);
+        link.tls.budget = 0;
         let mut frames = 0usize;
         for _ in 0..64 {
             link.have.clear();
@@ -958,7 +1041,7 @@ mod tests {
             link.walk.want_header = 5;
             let mut feed = Feeding::new(&link.tls);
             let runs = link.pump(None, Some(&mut feed));
-            assert_eq!(runs, 0);
+            assert_eq!(runs, 48, "eight six-byte contents cross the walk");
             link.read.padding = true;
             link.read.raw = false;
             frames += 8;
@@ -1114,6 +1197,66 @@ mod tests {
         assert_eq!(out, b"paddedafter the switch");
         assert!(!link.read.raw);
         assert!(!link.read.padding);
+    }
+
+    /// A long run of full frames across many window and caller-buffer boundaries must
+    /// deliver exactly the concatenated content; the walk parks and resumes mid-frame
+    /// on every fill, so a stale length would surface as a missing or shifted byte.
+    #[test]
+    fn a_long_run_of_frames_survives_every_boundary() {
+        struct Drip<'a> {
+            left: &'a [u8],
+            step: usize,
+        }
+        impl Read for Drip<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.left.len().min(buf.len()).min(self.step);
+                buf[..n].copy_from_slice(&self.left[..n]);
+                self.left = &self.left[n..];
+                Ok(n)
+            }
+        }
+        impl Write for Drip<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl RecordAlignment for Drip<'_> {}
+
+        let mut want = Vec::new();
+        let mut input = frame(true, 0, b"", 1000);
+        for index in 0..400usize {
+            let content = vec![(index % 251) as u8; 8171];
+            input.extend(frame(false, 0, &content, (index * 37) % 256));
+            want.extend_from_slice(&content);
+        }
+        input.extend(frame(false, 1, b"tail", 7));
+        want.extend_from_slice(b"tail");
+        input.extend_from_slice(b"after-end");
+        want.extend_from_slice(b"after-end");
+
+        let mut link = Link::new(
+            Drip {
+                left: &input,
+                step: 1500,
+            },
+            None,
+            &UUID,
+        );
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 65_536];
+        loop {
+            let n = link.read(&mut buf).expect("reads");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got.len(), want.len());
+        assert_eq!(got, want);
     }
 
     #[test]
