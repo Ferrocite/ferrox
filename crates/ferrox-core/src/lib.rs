@@ -29,6 +29,7 @@ pub mod transport;
 pub mod trojan;
 pub mod veepn;
 pub mod vless;
+pub mod vless_encryption;
 pub mod wireguard;
 
 #[cfg(any(test, feature = "bench-reference"))]
