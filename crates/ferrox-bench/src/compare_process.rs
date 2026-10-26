@@ -1110,6 +1110,7 @@ pub fn run(
                 &request,
                 engine.config_arg,
                 engine.dialect,
+                engine.name == "xray-rust",
                 &cell,
                 workload.server_pid,
             ) {

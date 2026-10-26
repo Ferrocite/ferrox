@@ -85,7 +85,7 @@ impl Dialect {
         }
     }
 
-    fn socks_inbound(self, listen: Ipv4Addr, port: u16) -> Json {
+    fn socks_inbound(self, listen: Ipv4Addr, port: u16, allow_unauthenticated_lan: bool) -> Json {
         let mut inbound = Json::object();
         match self {
             Self::Xray => {
@@ -118,6 +118,9 @@ impl Dialect {
         settings.insert("udp", Json::Bool(false));
         match self {
             Self::Xray => {
+                if allow_unauthenticated_lan {
+                    settings.insert("allowUnauthenticatedLan", Json::Bool(true));
+                }
                 inbound.insert("settings", settings);
             }
             Self::SingBox => {
@@ -974,11 +977,18 @@ pub fn measure(
     request: &Request,
     config_arg: ConfigArg,
     dialect: Dialect,
+    allow_unauthenticated_lan: bool,
     cell: &Cell,
     server_pid: Option<u32>,
 ) -> Result<Run, Error> {
     remeasure_disturbed(REMEASURE_ATTEMPTS, cell.budget(), || {
-        measure_once(request, config_arg, dialect, server_pid)
+        measure_once(
+            request,
+            config_arg,
+            dialect,
+            allow_unauthenticated_lan,
+            server_pid,
+        )
     })
 }
 
@@ -1034,6 +1044,7 @@ fn measure_once(
     request: &Request,
     config_arg: ConfigArg,
     dialect: Dialect,
+    allow_unauthenticated_lan: bool,
     server_pid: Option<u32>,
 ) -> Result<Run, Error> {
     let ip = local_non_loopback_ipv4()?;
@@ -1050,7 +1061,13 @@ fn measure_once(
 
     let desync: Desync = Arc::new(std::sync::Mutex::new(None));
     let sink_thread = spawn_sink(sink, request, &desync)?;
-    let config_text = inject_inbound(&request.config, ip, engine_port, dialect)?;
+    let config_text = inject_inbound(
+        &request.config,
+        ip,
+        engine_port,
+        dialect,
+        allow_unauthenticated_lan,
+    )?;
     std::fs::write(&config_path, &config_text).map_err(io("writing the engine config"))?;
 
     let started = Instant::now();
@@ -2114,10 +2131,11 @@ pub fn inject_inbound(
     listen: Ipv4Addr,
     port: u16,
     dialect: Dialect,
+    allow_unauthenticated_lan: bool,
 ) -> Result<String, Error> {
     let mut root = json::parse(config)
         .map_err(|e| Error::Invalid(format!("config is not valid json: {e}")))?;
-    let inbound = dialect.socks_inbound(listen, port);
+    let inbound = dialect.socks_inbound(listen, port, allow_unauthenticated_lan);
 
     let mut list = match root.get("inbounds") {
         Some(Json::Arr(existing)) => existing.clone(),
@@ -3382,8 +3400,14 @@ mod tests {
     #[test]
     fn the_socks_inbound_is_injected_and_the_outbounds_survive() {
         let base = Dialect::Xray.base_config().to_string().expect("serialises");
-        let out = inject_inbound(&base, Ipv4Addr::new(192, 0, 2, 7), 1080, Dialect::Xray)
-            .expect("injectable");
+        let out = inject_inbound(
+            &base,
+            Ipv4Addr::new(192, 0, 2, 7),
+            1080,
+            Dialect::Xray,
+            false,
+        )
+        .expect("injectable");
         let root = json::parse(&out).expect("valid json");
         let inbounds = root
             .get("inbounds")
@@ -3414,13 +3438,45 @@ mod tests {
             Some(1),
             "the request's own outbounds must survive"
         );
+        assert!(
+            inbounds[0]
+                .get("settings")
+                .and_then(|s| s.get("allowUnauthenticatedLan"))
+                .is_none(),
+            "only an engine that refuses a non-loopback listener is asked to allow one"
+        );
+    }
+
+    #[test]
+    fn a_refusing_engine_is_told_to_allow_the_non_loopback_listener() {
+        let base = Dialect::Xray.base_config().to_string().expect("serialises");
+        let out = inject_inbound(
+            &base,
+            Ipv4Addr::new(192, 0, 2, 7),
+            1080,
+            Dialect::Xray,
+            true,
+        )
+        .expect("injectable");
+        let root = json::parse(&out).expect("valid json");
+        let inbound = &root
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0];
+        assert_eq!(
+            inbound
+                .get("settings")
+                .and_then(|s| s.get("allowUnauthenticatedLan"))
+                .and_then(Json::as_bool),
+            Some(true)
+        );
     }
 
     #[test]
     fn each_dialect_writes_the_fields_that_engine_actually_reads() {
         for dialect in [Dialect::Xray, Dialect::SingBox, Dialect::Leaf] {
             let base = dialect.base_config().to_string().expect("serialises");
-            let out = inject_inbound(&base, Ipv4Addr::new(192, 0, 2, 7), 1080, dialect)
+            let out = inject_inbound(&base, Ipv4Addr::new(192, 0, 2, 7), 1080, dialect, false)
                 .expect("injectable");
             let root = json::parse(&out).expect("valid json");
             let outbound = &root
@@ -3516,6 +3572,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             1,
             Dialect::Xray,
+            false,
         )
         .expect("injectable");
         let root = json::parse(&out).expect("valid json");
@@ -3529,9 +3586,14 @@ mod tests {
 
     #[test]
     fn an_inbound_that_is_not_an_array_is_an_error() {
-        assert!(
-            inject_inbound(r#"{"inbounds":7}"#, Ipv4Addr::LOCALHOST, 1, Dialect::Xray).is_err()
-        );
+        assert!(inject_inbound(
+            r#"{"inbounds":7}"#,
+            Ipv4Addr::LOCALHOST,
+            1,
+            Dialect::Xray,
+            false,
+        )
+        .is_err());
     }
 
     #[test]
