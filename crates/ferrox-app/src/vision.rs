@@ -11,8 +11,6 @@ const BUFFER: usize = 2048;
 const WINDOW: usize = RELAY_SMALL_BUFFER;
 const SEED: [u32; 4] = [900, 500, 900, 256];
 const FILTER_PACKETS: i32 = 8;
-pub(crate) const FLOW: &str = ferrox_core::vless::VISION_FLOW;
-
 const TLS_SERVER_HELLO: [u8; 3] = [0x16, 0x03, 0x03];
 const TLS_HANDSHAKE_START: [u8; 2] = [0x16, 0x03];
 const TLS_APPLICATION_DATA: [u8; 3] = [0x17, 0x03, 0x03];

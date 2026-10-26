@@ -21132,14 +21132,11 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
             return None;
         }
     };
-    let flow = if server.flow.is_empty() || server.flow == "none" {
-        String::new()
-    } else if ferrox_core::vless::is_vision_name(&server.flow) {
-        server.flow
-    } else {
-        eprintln!("vless: unknown flow `{}`; outbound refused", server.flow);
+    let flow = server.flow;
+    if !flow.is_empty() && flow != "none" && !ferrox_core::vless::is_vision_name(&flow) {
+        eprintln!("vless: unknown flow `{flow}`; outbound refused");
         return None;
-    };
+    }
     let security = stream_security(outbound);
     let quic_tls = outbound
         .get("streamSettings")
@@ -22221,7 +22218,7 @@ mod tests {
             quic_ech: None,
             hysteria_roots: None,
             tls: Some(Arc::new(client_config)),
-            flow: crate::vision::FLOW.to_owned(),
+            flow: ferrox_core::vless::VISION_FLOW.to_owned(),
             reality: None,
             headers: crate::config::carrier_headers(None).0,
             heartbeat: crate::config::carrier_headers(None).1,
@@ -24771,7 +24768,7 @@ mod tests {
             }
         });
         let id = uuid_bytes(REALITY_TEST_ID).expect("id");
-        let account = if flow == crate::vision::FLOW {
+        let account = if flow == ferrox_core::vless::VISION_FLOW {
             Flow::Vision
         } else {
             Flow::None
@@ -24887,7 +24884,7 @@ mod tests {
 
     #[test]
     fn reality_vision_dial_reaches_echo_through_the_relay() {
-        let pair = reality_pair(crate::vision::FLOW);
+        let pair = reality_pair(ferrox_core::vless::VISION_FLOW);
         let (mut user, dialled) = dial_pair(&pair);
         let payload: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
         assert_eq!(echo_bulk(&mut user, &payload), payload);
@@ -25002,7 +24999,7 @@ mod tests {
     fn reality_vision_direct_switch_carries_inner_tls() {
         use ferrox_core::tls::TlsProvider as _;
 
-        let pair = reality_pair(crate::vision::FLOW);
+        let pair = reality_pair(ferrox_core::vless::VISION_FLOW);
         let (server_config, client_config) = carried_tls_configs();
         let inner = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let inner_addr = inner.local_addr().expect("addr");
@@ -25087,7 +25084,7 @@ mod tests {
     fn reality_vision_inner_tls_survives_rounds_through_the_window() {
         use ferrox_core::tls::TlsProvider as _;
 
-        let pair = reality_pair(crate::vision::FLOW);
+        let pair = reality_pair(ferrox_core::vless::VISION_FLOW);
         let (server_config, client_config) = carried_tls_configs();
         let inner = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let inner_addr = inner.local_addr().expect("addr");
@@ -27912,7 +27909,7 @@ mod tests {
                 quic_ech: None,
                 hysteria_roots: None,
                 tls: Some(Arc::new(client_config)),
-                flow: crate::vision::FLOW.to_owned(),
+                flow: ferrox_core::vless::VISION_FLOW.to_owned(),
                 reality: None,
                 headers: Vec::new(),
                 heartbeat: 0,
