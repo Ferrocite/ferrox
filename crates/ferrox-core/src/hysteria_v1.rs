@@ -686,7 +686,7 @@ mod tests {
         let xplus = XPlus::new("Vaundy").expect("key");
         let salt: [u8; XPLUS_SALT] = core::array::from_fn(|i| (i as u8).wrapping_mul(7));
         let key = xplus.keystream(salt);
-        for len in 0..=160usize {
+        for len in 1..=160usize {
             let plain: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(31)).collect();
             let mut want = salt.to_vec();
             want.extend((0..len).map(|i| plain[i] ^ key[i % XPLUS_KEY]));

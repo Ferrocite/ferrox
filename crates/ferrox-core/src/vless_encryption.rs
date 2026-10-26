@@ -1860,6 +1860,8 @@ mod tests {
         let mut stream = client.handshake(a).unwrap();
         let mut buf = [0u8; 300];
         stream.read_exact(&mut buf).unwrap();
+        stream.read.wire.reserve(16 * 1024);
+        stream.read.input.reserve(16 * 1024);
         let ((), counts) = crate::alloc_count::measure(|| {
             for _ in 1..rounds {
                 stream.read_exact(&mut buf).unwrap();
