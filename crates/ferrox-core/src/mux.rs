@@ -601,7 +601,12 @@ impl<T> Sessions<T> {
                     return (None, free);
                 }
                 Slot::Live(key, _) | Slot::Closed(key) if *key == id => return (Some(at), free),
-                Slot::Live(..) | Slot::Closed(..) => {}
+                Slot::Closed(_) => {
+                    if free.is_none() {
+                        free = Some(at);
+                    }
+                }
+                Slot::Live(..) => {}
             }
             at = (at + 1) & self.mask;
         }
@@ -1412,6 +1417,22 @@ mod tests {
             assert_eq!(sessions.live(), 0, "round {round}");
         }
         assert_eq!(sessions.slot_count(), slots, "1000 rounds and no growth");
+    }
+
+    #[test]
+    fn a_tombstone_is_reused_for_a_new_id() {
+        let mut sessions = Sessions::<u32>::with_cap(2);
+        for id in 1..=4u16 {
+            assert_eq!(sessions.open(id, u32::from(id)), Some(None), "id {id}");
+            assert_eq!(sessions.close(id), Some(u32::from(id)), "id {id}");
+        }
+        assert_eq!(sessions.live(), 0);
+        assert_eq!(
+            sessions.open(5, 5),
+            Some(None),
+            "a closed slot is free for a new id"
+        );
+        assert_eq!(sessions.get(5), Some(&5));
     }
 
     #[test]
