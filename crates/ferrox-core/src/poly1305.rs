@@ -355,6 +355,12 @@ pub struct Poly1305 {
     s2: u64,
     #[cfg(target_arch = "aarch64")]
     r26: [u64; 5],
+    #[cfg(target_arch = "aarch64")]
+    h26: [u64; 5],
+    #[cfg(target_arch = "aarch64")]
+    small_blocks: usize,
+    #[cfg(target_arch = "aarch64")]
+    small: bool,
     h: [u64; 3],
     pad: [u64; 2],
     buffer: [u8; 16],
@@ -410,6 +416,12 @@ impl Poly1305 {
             s2: r2 * 20,
             #[cfg(target_arch = "aarch64")]
             r26,
+            #[cfg(target_arch = "aarch64")]
+            h26: [0; 5],
+            #[cfg(target_arch = "aarch64")]
+            small_blocks: 0,
+            #[cfg(target_arch = "aarch64")]
+            small: true,
             h: [0; 3],
             pad: [w2, w3],
             buffer: [0; 16],
@@ -458,6 +470,14 @@ impl Poly1305 {
 
     #[must_use]
     pub fn finish(mut self) -> [u8; 16] {
+        #[cfg(target_arch = "aarch64")]
+        if self.small {
+            if self.held == 0 {
+                return finish_small_26(self.h26, self.pad);
+            }
+            self.flush_small();
+        }
+
         if self.held > 0 {
             let n = self.held;
             self.buffer[n] = 1;
@@ -477,9 +497,17 @@ impl Poly1305 {
 
     fn absorb(&mut self, data: &[u8], hibit: u64) {
         #[cfg(target_arch = "aarch64")]
-        if hibit == HIBIT && data.len() <= SMALL26_MAX_BYTES {
-            self.absorb_small_26(data);
-            return;
+        {
+            let blocks = data.len() / 16;
+            if self.small
+                && hibit == HIBIT
+                && data.len() <= SMALL26_MAX_BYTES
+                && self.small_blocks + blocks <= 4
+            {
+                self.absorb_small_26(data);
+                return;
+            }
+            self.flush_small();
         }
         #[cfg(target_arch = "aarch64")]
         if hibit == HIBIT && data.len() >= NEON4_THRESHOLD_BYTES {
@@ -502,6 +530,8 @@ impl Poly1305 {
     }
 
     fn absorb_one_block_chain(&mut self, data: &[u8], hibit: u64) {
+        #[cfg(target_arch = "aarch64")]
+        self.flush_small();
         let (r0, r1, r2, s1, s2) = (self.r0, self.r1, self.r2, self.s1, self.s2);
         let (mut h0, mut h1, mut h2) = (self.h[0], self.h[1], self.h[2]);
 
@@ -544,6 +574,7 @@ impl Poly1305 {
     #[cfg(target_arch = "aarch64")]
     fn absorb_small_26(&mut self, data: &[u8]) {
         const M: u64 = 0x03ff_ffff;
+        debug_assert!(self.small, "the small path owns the accumulator");
         debug_assert!(data.len().is_multiple_of(16), "absorb takes whole blocks");
         debug_assert!(
             data.len() <= SMALL26_MAX_BYTES,
@@ -551,11 +582,7 @@ impl Poly1305 {
         );
         let r = self.r26;
         let s = [r[1] * 5, r[2] * 5, r[3] * 5, r[4] * 5];
-        let mut h = if self.h == [0; 3] {
-            [0; 5]
-        } else {
-            to_26(self.h).map(u64::from)
-        };
+        let mut h = self.h26;
 
         let mut rest = data;
         while let Some(m) = rest.first_chunk::<16>() {
@@ -592,7 +619,17 @@ impl Poly1305 {
             rest = &rest[16..];
         }
 
-        self.h = from_26(h.map(|limb| limb as u32));
+        self.h26 = h;
+        self.small_blocks += data.len() / 16;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    fn flush_small(&mut self) {
+        if self.small {
+            self.h = from_26(self.h26.map(|limb| limb as u32));
+            self.small = false;
+            self.small_blocks = 0;
+        }
     }
 
     #[inline]
@@ -621,6 +658,8 @@ impl Poly1305 {
     }
 
     fn absorb_stride2(&mut self, data: &[u8]) {
+        #[cfg(target_arch = "aarch64")]
+        self.flush_small();
         debug_assert!(data.len().is_multiple_of(16), "absorb takes whole blocks");
         let r2 = Self::fold_unfolded(Self::mul_unfolded(
             [self.r0, self.r1, self.r2],
@@ -793,6 +832,7 @@ impl Poly1305 {
         #[allow(clippy::wildcard_imports, reason = "flat lane primitives")]
         use core::arch::aarch64::*;
 
+        self.flush_small();
         debug_assert!(data.len().is_multiple_of(16), "absorb takes whole blocks");
         let n = data.len() / 16;
         let e = n % 4;
@@ -952,6 +992,8 @@ impl Poly1305 {
             reason = "flat lane primitives, as in chacha::neon"
         )]
         use core::arch::aarch64::*;
+
+        self.flush_small();
 
         let n = data.len() / 16;
         let k1 = n / 2;
@@ -1274,6 +1316,83 @@ pub fn tag_via_26_bit_horner(key: &[u8; 32], data: &[u8]) -> [u8; 16] {
     let f1 = ((h1 >> 6) | (h2 << 20)) & WORD;
     let f2 = ((h2 >> 12) | (h3 << 14)) & WORD;
     let f3 = ((h3 >> 18) | (h4 << 8)) & WORD;
+
+    let mut carry = f0 + u64::from(pad[0]);
+    let f0 = carry as u32;
+    carry = f1 + u64::from(pad[1]) + (carry >> 32);
+    let f1 = carry as u32;
+    carry = f2 + u64::from(pad[2]) + (carry >> 32);
+    let f2 = carry as u32;
+    carry = f3 + u64::from(pad[3]) + (carry >> 32);
+    let f3 = carry as u32;
+
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&f0.to_le_bytes());
+    out[4..8].copy_from_slice(&f1.to_le_bytes());
+    out[8..12].copy_from_slice(&f2.to_le_bytes());
+    out[12..16].copy_from_slice(&f3.to_le_bytes());
+    out
+}
+
+#[cfg(target_arch = "aarch64")]
+fn finish_small_26(h: [u64; 5], pad: [u64; 2]) -> [u8; 16] {
+    const M: u64 = 0x03ff_ffff;
+    const WORD: u64 = 0xffff_ffff;
+
+    let [mut h0, mut h1, mut h2, mut h3, mut h4] = h;
+    let mut c;
+    c = h1 >> 26;
+    h1 &= M;
+    h2 += c;
+    c = h2 >> 26;
+    h2 &= M;
+    h3 += c;
+    c = h3 >> 26;
+    h3 &= M;
+    h4 += c;
+    c = h4 >> 26;
+    h4 &= M;
+    h0 += c * 5;
+    c = h0 >> 26;
+    h0 &= M;
+    h1 += c;
+
+    let mut g0 = h0 + 5;
+    c = g0 >> 26;
+    g0 &= M;
+    let mut g1 = h1 + c;
+    c = g1 >> 26;
+    g1 &= M;
+    let mut g2 = h2 + c;
+    c = g2 >> 26;
+    g2 &= M;
+    let mut g3 = h3 + c;
+    c = g3 >> 26;
+    g3 &= M;
+    let g4 = h4.wrapping_add(c).wrapping_sub(1 << 26);
+    let mut mask = (g4 >> 63).wrapping_sub(1);
+    g0 &= mask;
+    g1 &= mask;
+    g2 &= mask;
+    g3 &= mask;
+    let g4 = g4 & mask;
+    mask = !mask;
+    h0 = (h0 & mask) | g0;
+    h1 = (h1 & mask) | g1;
+    h2 = (h2 & mask) | g2;
+    h3 = (h3 & mask) | g3;
+    let h4 = (h4 & mask) | g4;
+
+    let f0 = (h0 | (h1 << 26)) & WORD;
+    let f1 = ((h1 >> 6) | (h2 << 20)) & WORD;
+    let f2 = ((h2 >> 12) | (h3 << 14)) & WORD;
+    let f3 = ((h3 >> 18) | (h4 << 8)) & WORD;
+    let pad = [
+        pad[0] as u32,
+        (pad[0] >> 32) as u32,
+        pad[1] as u32,
+        (pad[1] >> 32) as u32,
+    ];
 
     let mut carry = f0 + u64::from(pad[0]);
     let f0 = carry as u32;
