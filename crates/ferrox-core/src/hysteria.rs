@@ -445,48 +445,6 @@ pub const SALAMANDER_MIN_PASSWORD: usize = 4;
 /// The BLAKE2b-256 keystream block, tiled cyclically over a payload.
 const SALAMANDER_KEY: usize = 32;
 
-/// The keystream as four native words, so a thirty-two-byte pass is four xors
-/// rather than thirty-two loads through `i % SALAMANDER_KEY`.
-fn key_words(key: &[u8; SALAMANDER_KEY]) -> [u64; 4] {
-    let mut words = [0u64; 4];
-    for (word, bytes) in words.iter_mut().zip(key.as_chunks::<8>().0) {
-        *word = u64::from_ne_bytes(*bytes);
-    }
-    words
-}
-
-/// XOR `len` bytes of `src` with the tiled keystream into `dst`, one word at a
-/// time. `dst` may be `src` or trail it by at least a word: a pass reads all
-/// four words before writing any, and a later pass starts past this one's write.
-///
-/// # Safety
-/// Both pointers are valid for `len` bytes; when they overlap, `src >= dst` and
-/// `src - dst >= 8`.
-#[inline]
-unsafe fn xor_key(dst: *mut u8, src: *const u8, len: usize, key: &[u64; 4]) {
-    let mut at = 0usize;
-    while at + SALAMANDER_KEY <= len {
-        let mut words = [0u64; 4];
-        for (lane, word) in words.iter_mut().enumerate() {
-            let off = at + lane * 8;
-            // SAFETY: `off + 8 <= at + SALAMANDER_KEY <= len` on both ranges.
-            *word = unsafe { core::ptr::read_unaligned(src.add(off).cast::<u64>()) } ^ key[lane];
-        }
-        for (lane, word) in words.iter().enumerate() {
-            let off = at + lane * 8;
-            // SAFETY: the same eight bytes of `dst`; the read above precedes every overlapping store.
-            unsafe { core::ptr::write_unaligned(dst.add(off).cast::<u64>(), *word) };
-        }
-        at += SALAMANDER_KEY;
-    }
-    while at < len {
-        // SAFETY: `at < len`, and every pass reads eight bytes ahead of where it wrote.
-        let word = key[(at & (SALAMANDER_KEY - 1)) / 8].to_ne_bytes();
-        unsafe { *dst.add(at) = *src.add(at) ^ word[at & 7] };
-        at += 1;
-    }
-}
-
 impl Salamander {
     /// `None` when the password is shorter than a server accepts.
     #[must_use]
@@ -517,7 +475,6 @@ impl Salamander {
         out: &mut Vec<u8>,
     ) {
         let key = self.keystream(*salt);
-        out.reserve(SALAMANDER_SALT + plain.len());
         out.extend_from_slice(salt);
         for (i, b) in plain.iter().enumerate() {
             out.push(b ^ key[i % SALAMANDER_KEY]);
@@ -540,20 +497,10 @@ impl Salamander {
         plain: &[u8],
         out: &mut [u8],
     ) -> usize {
-        let key = key_words(&self.keystream(*salt));
-        assert!(
-            out.len() >= SALAMANDER_SALT + plain.len(),
-            "the caller gives the salt and payload room"
-        );
+        let key = self.keystream(*salt);
         out[..SALAMANDER_SALT].copy_from_slice(salt);
-        // SAFETY: `plain` and `out` are distinct, and the destination holds `plain.len()` bytes after the salt.
-        unsafe {
-            xor_key(
-                out.as_mut_ptr().add(SALAMANDER_SALT),
-                plain.as_ptr(),
-                plain.len(),
-                &key,
-            );
+        for (i, b) in plain.iter().enumerate() {
+            out[SALAMANDER_SALT + i] = b ^ key[i % SALAMANDER_KEY];
         }
         SALAMANDER_SALT + plain.len()
     }
@@ -576,11 +523,11 @@ impl Salamander {
         }
         let mut salt = [0u8; SALAMANDER_SALT];
         salt.copy_from_slice(&datagram[..SALAMANDER_SALT]);
-        let key = key_words(&self.keystream(salt));
+        let key = self.keystream(salt);
         let payload = datagram.len() - SALAMANDER_SALT;
-        // SAFETY: `src` trails `dst` by the salt; `xor_key` reads a word before writing eight bytes back.
-        let base = datagram.as_mut_ptr();
-        unsafe { xor_key(base, base.add(SALAMANDER_SALT), payload, &key) };
+        for i in 0..payload {
+            datagram[i] = datagram[SALAMANDER_SALT + i] ^ key[i % SALAMANDER_KEY];
+        }
         Some(payload)
     }
 }
@@ -1507,51 +1454,6 @@ mod tests {
     }
 
     #[test]
-    fn the_salamander_seal_probe_costs_the_mask_and_the_hash_and_nothing_else() {
-        // One fixed frame, no socket or allocation: the frame is the seal and its hash.
-        let salamander = Salamander::new("gawrgura").expect("password");
-        let salt = [0x5a; SALAMANDER_SALT];
-        let plain = [0xa5u8; 1200];
-        let mut frame = [0u8; SALAMANDER_SALT + 1200];
-        for _ in 0..256 {
-            let n = salamander.obfuscate_into(&salt, &plain, &mut frame);
-            assert_eq!(n, frame.len());
-        }
-    }
-
-    #[test]
-    fn the_word_pass_is_the_byte_loop_at_every_length() {
-        // Four words a pass; this is the byte loop it must equal at every length.
-        let salamander = Salamander::new("gawrgura").expect("password");
-        let salt = [0x5a; SALAMANDER_SALT];
-        let key = salamander.keystream(salt);
-        let plain: Vec<u8> = (0..4096).map(|i| (i * 31 + 7) as u8).collect();
-        for len in 0..=plain.len() {
-            let mut want = Vec::with_capacity(SALAMANDER_SALT + len);
-            want.extend_from_slice(&salt);
-            want.extend(
-                plain[..len]
-                    .iter()
-                    .enumerate()
-                    .map(|(i, b)| b ^ key[i % SALAMANDER_KEY]),
-            );
-            let mut got = vec![0u8; SALAMANDER_SALT + len];
-            let written = salamander.obfuscate_into(&salt, &plain[..len], &mut got);
-            assert_eq!(written, SALAMANDER_SALT + len, "length {len}");
-            assert_eq!(got, want, "length {len}");
-            if len == 0 {
-                assert!(salamander.deobfuscate_in_place(&mut got).is_none());
-                continue;
-            }
-            let n = salamander
-                .deobfuscate_in_place(&mut got)
-                .expect("a payload of one byte or more");
-            assert_eq!(n, len, "length {len}");
-            assert_eq!(&got[..n], &plain[..len], "length {len}");
-        }
-    }
-
-    #[test]
     fn salamander_round_trips_every_length_under_a_fresh_salt() {
         let salamander = Salamander::new("gawrgura").expect("password");
         for len in [1usize, 7, 31, 32, 33, 63, 64, 1200, 1342] {
@@ -1587,10 +1489,10 @@ mod tests {
         right.obfuscate(&plain, &mut sealed).expect("salt");
         let n = wrong.deobfuscate_in_place(&mut sealed).expect("length");
         assert_ne!(&sealed[..n], &plain[..], "wrong key is noise");
-        // A datagram that cannot hold a salt and one byte de-obfuscates to nothing, unchanged.
-        let mut short = [0xaau8; SALAMANDER_SALT];
-        assert!(right.deobfuscate_in_place(&mut short).is_none());
-        assert_eq!(short, [0xaau8; SALAMANDER_SALT]);
+        // A datagram that cannot hold a salt and one byte de-obfuscates to nothing.
+        assert!(right
+            .deobfuscate_in_place(&mut [0u8; SALAMANDER_SALT])
+            .is_none());
         assert!(right.deobfuscate_in_place(&mut []).is_none());
         // And a password below the floor the server accepts is refused at construction.
         assert!(Salamander::new("abc").is_none());

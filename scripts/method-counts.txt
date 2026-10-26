@@ -474,7 +474,6 @@ carrier-hysteria udp-fragments-witnessed 200 ferrox-core-hysteria::tests::every_
 carrier-hysteria udp-fragment-list-allocations-per-datagram 0 ferrox-core-hysteria::tests::a_fragment_run_takes_no_heap
 carrier-hysteria udp-datagram-reassembly-allocations-per-whole-packet 0 ferrox-core-hysteria::tests::an_unfragmented_datagram_is_handed_over_without_a_buffer
 carrier-hysteria obfuscated-datagram-heap-copies 0 ferrox-core-hysteria::tests::a_sealed_datagram_never_touches_the_heap
-carrier-hysteria salamander-mask-lengths-witnessed 4097 ferrox-core-hysteria::tests::the_word_pass_is_the_byte_loop_at_every_length
 carrier-hysteria pinned-hysteria-client-verdicts 1 scripts/run-upstream-suite.sh
 carrier-hysteria masquerade-answers-browser-on-same-port 1 ferrox-app-proxy::tests::hysteria_serves_a_canned_masquerade_response
 carrier-hysteria masquerade-answer-allocations-per-response 1 ferrox-core-hysteria::tests::an_h3_answer_allocates_only_its_field_block
