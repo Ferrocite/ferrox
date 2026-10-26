@@ -385,10 +385,13 @@ const VISION_ADDONS: [u8; 18] = *b"\x0A\x10xtls-rprx-vision";
 /// The flow the Vision framing speaks.
 pub const VISION_FLOW: &str = "xtls-rprx-vision";
 
+/// The outbound-only alias that also permits UDP to port 443; the wire still carries [`VISION_FLOW`].
+pub const VISION_UDP443_FLOW: &str = "xtls-rprx-vision-udp443";
+
 /// The flow names the Vision framing answers to, and the one UDP variant that rides it.
 #[must_use]
 pub fn is_vision_name(flow: &str) -> bool {
-    matches!(flow.len(), 16 | 23) && (flow == VISION_FLOW || flow == "xtls-rprx-vision-udp443")
+    flow == VISION_FLOW || flow == VISION_UDP443_FLOW
 }
 
 /// The longest request header the wire can carry: the head, the add-ons, the command.
