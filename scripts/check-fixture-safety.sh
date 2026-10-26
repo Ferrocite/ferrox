@@ -21,6 +21,9 @@ def allowed(a, b, c, d):
         return True
     if a == 172 and 16 <= b <= 31:
         return True
+    if a == 169 and b == 254:
+        # Link-local, the VPN lane's bypass default; not routable.
+        return True
     if a == 192 and b == 168:
         return True
     if a == 198 and b in (18, 19):

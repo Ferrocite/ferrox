@@ -662,9 +662,8 @@ fn send_batch(sock: &Datagram, batch: &mut [std::mem::MaybeUninit<libc::mmsghdr>
     }
 }
 
-/// The datagrams one receive takes at a time, the mirror of the send side's `SEND_SLOTS`: a 16 KiB DATA frame is a dozen QUIC packets, and one `recvfrom` each paid a syscall and a timer set per packet.
-#[cfg(target_os = "linux")]
-const RECV_SLOTS: usize = 8;
+/// The datagrams one receive takes at a time, the mirror of the send side's `SEND_SLOTS`: a 16 KiB DATA frame is a dozen QUIC packets, and one `recvfrom` each paid a syscall and a timer set per packet. A lane with no batched call reads the same count one at a time.
+pub(crate) const RECV_SLOTS: usize = 8;
 
 /// A batch of datagrams read off a lane's socket: the bytes of each, the peer it came from and the length of that peer's name. The batch owns its slots, so a read costs no allocation and a caller takes each datagram by its place in the batch.
 #[cfg(target_os = "linux")]
@@ -694,7 +693,7 @@ impl Batch {
     }
 
     /// One datagram of the batch, with the peer it came from: the bytes are read out of the slot the kernel wrote, and the address out of the storage it filled.
-    fn at(&mut self, at: usize) -> Option<(&mut [u8], SocketAddr)> {
+    pub(crate) fn at(&mut self, at: usize) -> Option<(&mut [u8], SocketAddr)> {
         // SAFETY: `recv_batch` writes this slot's length, name and peer before it publishes the slot in `len`, and `at` only visits `0..len`.
         let len = usize::try_from(unsafe { *self.lens[at].assume_init_ref() }).ok()?;
         let from =
@@ -726,7 +725,7 @@ impl Batch {
     }
 
     /// One datagram of the batch: a platform with no batched call has none to give.
-    fn at(&mut self, _at: usize) -> Option<(&mut [u8], SocketAddr)> {
+    pub(crate) fn at(&mut self, _at: usize) -> Option<(&mut [u8], SocketAddr)> {
         let _ = self;
         None
     }
@@ -832,7 +831,7 @@ pub(crate) fn send_h3_opening(conn: &mut quiche::Connection, sock: &Datagram) ->
 const PUMP_BURST: usize = 64;
 
 /// How long a pump waits for a datagram once it has taken the one it came for: long enough to catch what is already in flight, far shorter than the caller's own deadline.
-const PUMP_TAIL: Duration = Duration::from_millis(1);
+pub(crate) const PUMP_TAIL: Duration = Duration::from_millis(1);
 
 pub(crate) fn pump_once(
     conn: &mut quiche::Connection,
