@@ -1199,6 +1199,66 @@ mod tests {
         assert!(!link.read.padding);
     }
 
+    /// A long run of full frames across many window and caller-buffer boundaries must
+    /// deliver exactly the concatenated content; the walk parks and resumes mid-frame
+    /// on every fill, so a stale length would surface as a missing or shifted byte.
+    #[test]
+    fn a_long_run_of_frames_survives_every_boundary() {
+        struct Drip<'a> {
+            left: &'a [u8],
+            step: usize,
+        }
+        impl Read for Drip<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.left.len().min(buf.len()).min(self.step);
+                buf[..n].copy_from_slice(&self.left[..n]);
+                self.left = &self.left[n..];
+                Ok(n)
+            }
+        }
+        impl Write for Drip<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl RecordAlignment for Drip<'_> {}
+
+        let mut want = Vec::new();
+        let mut input = frame(true, 0, b"", 1000);
+        for index in 0..400usize {
+            let content = vec![(index % 251) as u8; 8171];
+            input.extend(frame(false, 0, &content, (index * 37) % 256));
+            want.extend_from_slice(&content);
+        }
+        input.extend(frame(false, 1, b"tail", 7));
+        want.extend_from_slice(b"tail");
+        input.extend_from_slice(b"after-end");
+        want.extend_from_slice(b"after-end");
+
+        let mut link = Link::new(
+            Drip {
+                left: &input,
+                step: 1500,
+            },
+            None,
+            &UUID,
+        );
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65_536];
+        loop {
+            let n = link.read(&mut buf).expect("reads");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got.len(), want.len());
+        assert_eq!(got, want);
+    }
+
     #[test]
     fn a_truncated_frame_is_dropped_not_delivered() {
         let mut input = frame(true, 0, b"kept", 0);
