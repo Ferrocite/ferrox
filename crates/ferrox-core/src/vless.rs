@@ -186,8 +186,23 @@ impl VlessLink {
     #[must_use]
     pub fn support_opted(&self, opt_in: UnsafeOptIn) -> Support {
         if self.has_encryption() {
+            if self.transport_kind() == TransportKind::Tcp
+                && crate::vless_encryption::ClientConfig::parse(self.encryption()).is_ok()
+            {
+                let method = match self.security() {
+                    Security::None | Security::NoneToPublic => "vless-tcp-encryption",
+                    Security::Tls => "vless-tcp-tls-encryption",
+                    Security::Reality => "vless-tcp-reality-encryption",
+                    Security::Other => {
+                        return Support::Planned {
+                            reason: "vless-encryption: unsupported security",
+                        };
+                    }
+                };
+                return Support::Implemented { method };
+            }
             return Support::Planned {
-                reason: "vless-encryption: mlkem768x25519plus variants not yet implemented",
+                reason: "vless-encryption: unsupported carrier or malformed mlkem768x25519plus key",
             };
         }
         if self.is_first_method() {

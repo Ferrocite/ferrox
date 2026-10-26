@@ -96,9 +96,46 @@ pub(crate) enum FallbackNetwork {
     NotDialable,
 }
 
-/// The vless decryption a server names and the fallbacks it routes. The reading carries the
-/// dialect's verdicts: an empty `decryption` refuses, a decryption engine this tree does not
-/// carry refuses, and fallback rows refuse beside one.
+/// The decryption string an inbound names, if any.
+pub(crate) fn server_decryption_string(inbound: &Json) -> Option<&str> {
+    inbound
+        .get("settings")
+        .and_then(|settings| settings.get("decryption").and_then(Json::as_str))
+}
+
+pub(crate) fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| {
+            i64::try_from(since.as_secs()).unwrap_or(i64::MAX)
+        })
+}
+
+/// The decryption engine an inbound names, parsed the way the reference's build does.
+pub(crate) fn server_decryption(
+    inbound: &Json,
+) -> Result<Option<std::sync::Arc<ferrox_core::vless_encryption::Server>>, String> {
+    let decryption = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("decryption").and_then(Json::as_str));
+    let Some(decryption) = decryption else {
+        return Ok(None);
+    };
+    if decryption.is_empty() {
+        return Err(
+            r#"VLESS settings: please add/set "decryption":"none" to every settings"#.into(),
+        );
+    }
+    if decryption == "none" {
+        return Ok(None);
+    }
+    let config = ferrox_core::vless_encryption::ServerConfig::parse(decryption)?;
+    Ok(Some(ferrox_core::vless_encryption::Server::with_clock(
+        config,
+        std::sync::Arc::new(unix_seconds),
+    )))
+}
+/// The fallbacks an inbound routes; an empty decryption refuses beside them.
 pub(crate) fn server_fallbacks(inbound: &Json) -> Result<Option<Vec<Fallback>>, String> {
     let decryption = inbound
         .get("settings")
@@ -108,11 +145,6 @@ pub(crate) fn server_fallbacks(inbound: &Json) -> Result<Option<Vec<Fallback>>, 
             return Err(
                 r#"VLESS settings: please add/set "decryption":"none" to every settings"#.into(),
             );
-        }
-        if decryption != "none" {
-            return Err(format!(
-                r#"VLESS settings: unsupported "decryption": {decryption}"#
-            ));
         }
     }
     let rows = inbound
@@ -2761,22 +2793,22 @@ mod tests {
             r#"VLESS settings: please add/set "decryption":"none" to every settings"#
         );
         assert_eq!(
-            server_fallbacks(&vless_settings(r#"{"decryption":"always"}"#)).expect_err("engine"),
-            r#"VLESS settings: unsupported "decryption": always"#
+            server_decryption(&vless_settings(r#"{"decryption":"always"}"#)).expect_err("engine"),
+            "unsupported VLESS decryption"
         );
 
-        // Rows beside `none` serve; beside an engine they refuse on the first line.
+        // Rows beside `none` serve; an engine beside rows is the role's refusal, not this reader's.
         assert_eq!(
             fallback_rows(r#"{"dest":"127.0.0.1:8080"}"#).len(),
             1,
             "none carries the rows it names"
         );
-        assert_eq!(
+        assert!(
             server_fallbacks(&vless_settings(
                 r#"{"decryption":"always","fallbacks":[{"dest":"192.0.2.1:80"}]}"#
             ))
-            .expect_err("engine"),
-            r#"VLESS settings: unsupported "decryption": always"#
+            .is_ok(),
+            "the rows read, and the role refuses the pairing"
         );
 
         let path = r#"{"dest":"127.0.0.1:8080","path":"no"}"#;

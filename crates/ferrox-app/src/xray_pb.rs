@@ -2061,6 +2061,36 @@ fn system_stats(bytes: &[u8]) -> Result<crate::policy::SystemStats, String> {
     Ok(stats)
 }
 
+/// The pb strips the prefix, mode and seconds into separate fields; the JSON dialect reads one
+/// string, so put them back. A full string that already carries the prefix is left as it came.
+fn vless_stripped_encryption(
+    keys: &[u8],
+    xor_mode: u64,
+    seconds: &str,
+    padding: Option<&[u8]>,
+) -> Result<String, String> {
+    let keys = std::str::from_utf8(keys).map_err(|_| "not utf-8".to_owned())?;
+    if keys.starts_with("mlkem768x25519plus.") {
+        return Ok(keys.to_owned());
+    }
+    let mode = match xor_mode {
+        0 => "native",
+        1 => "xorpub",
+        2 => "random",
+        other => return Err(format!("VLESS encryption xorMode {other} is not carried")),
+    };
+    let mut full = format!("mlkem768x25519plus.{mode}.{seconds}.");
+    if let Some(padding) = padding {
+        if !padding.is_empty() {
+            let padding = std::str::from_utf8(padding).map_err(|_| "not utf-8".to_owned())?;
+            full.push_str(padding);
+            full.push('.');
+        }
+    }
+    full.push_str(keys);
+    Ok(full)
+}
+
 /// A vless account: its uuid, and the two strings that shape the dial when the config names them.
 type VlessAccount = (String, Option<String>, Option<String>, Option<String>);
 
@@ -2080,22 +2110,50 @@ fn vless_account(bytes: &[u8]) -> Result<VlessAccount, String> {
     let mut id = None;
     let mut flow = None;
     let mut encryption = None;
+    let mut xor_mode = 0u64;
+    let mut seconds = 0u64;
+    let mut padding = None;
     let mut reverse = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => id = Some(account_text(&mut reader)?),
             (2, 2) => flow = Some(account_text(&mut reader)?),
-            (3, 2) => encryption = Some(account_text(&mut reader)?),
-            (4 | 5 | 8 | 9, 0) => {
+            (3, 2) => encryption = Some(reader.bytes()?.to_owned()),
+            (4, 0) => xor_mode = reader.varint()?,
+            (5, 0) => seconds = reader.varint()?,
+            (6, 2) => padding = Some(reader.bytes()?.to_owned()),
+            (7, 2) => reverse = Some(vless_reverse(reader.bytes()?)?),
+            (8 | 9, 0) => {
                 reader.varint()?;
             }
-            (7, 2) => reverse = Some(vless_reverse(reader.bytes()?)?),
-            (6 | 9, 2) => {
+            (9, 2) => {
                 reader.bytes()?;
             }
             _ => return Err(reader.refuse(field, wire)),
         }
     }
+    let encryption = match encryption {
+        None => None,
+        Some(keys) if keys == b"none" => Some("none".to_owned()),
+        Some(keys) if keys.is_empty() => {
+            return Err(r#"VLESS users: please add/set "encryption":"none" for every user"#.into())
+        }
+        Some(keys) => {
+            let full = vless_stripped_encryption(
+                &keys,
+                xor_mode,
+                if seconds > 0 { "0rtt" } else { "1rtt" },
+                padding.as_deref(),
+            )?;
+            if ferrox_core::vless_encryption::ClientConfig::parse(&full).is_err() {
+                return Err(format!(
+                    r#"VLESS users: unsupported "encryption": {}"#,
+                    String::from_utf8_lossy(&keys)
+                ));
+            }
+            Some(full)
+        }
+    };
     Ok((
         id.ok_or("xray.proxy.vless.Account: no id".to_owned())?,
         encryption,
@@ -2151,6 +2209,10 @@ fn vless_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut clients = Vec::new();
     let mut fallbacks = Vec::new();
     let mut decryption = None;
+    let mut xor_mode = 0u64;
+    let mut seconds_from = 0u64;
+    let mut seconds_to = 0u64;
+    let mut padding = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => {
@@ -2159,35 +2221,46 @@ fn vless_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
             }
             (2, 2) => fallbacks.push(vless_fallback(reader.bytes()?)?),
             (3, 2) => decryption = Some(reader.bytes()?.to_owned()),
-            (4..=6, 0) => {
-                reader.varint()?;
-            }
-            (7, 2) => {
-                reader.bytes()?;
-            }
+            (4, 0) => xor_mode = reader.varint()?,
+            (5, 0) => seconds_from = reader.varint()?,
+            (6, 0) => seconds_to = reader.varint()?,
+            (7, 2) => padding = Some(reader.bytes()?.to_owned()),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    match decryption.as_deref() {
-        Some(b"") => {
+    let decryption = match decryption {
+        None => None,
+        Some(shape) if shape == b"none" => None,
+        Some(shape) if shape.is_empty() => {
             return Err(
                 r#"VLESS settings: please add/set "decryption":"none" to every settings"#.into(),
             )
         }
-        Some(shape) if shape != b"none" => {
-            return Err(format!(
-                r#"VLESS settings: unsupported "decryption": {}"#,
-                String::from_utf8_lossy(shape)
-            ))
+        Some(keys) => {
+            let seconds = if seconds_to > 0 {
+                format!("{seconds_from}-{seconds_to}s")
+            } else {
+                format!("{seconds_from}s")
+            };
+            let full = vless_stripped_encryption(&keys, xor_mode, &seconds, padding.as_deref())?;
+            if ferrox_core::vless_encryption::ServerConfig::parse(&full).is_err() {
+                return Err(format!(
+                    r#"VLESS settings: unsupported "decryption": {}"#,
+                    String::from_utf8_lossy(&keys)
+                ));
+            }
+            Some(full)
         }
-        _ => {}
-    }
+    };
     if clients.is_empty() {
         return Err("xray.proxy.vless.inbound.Config: no user".to_owned());
     }
     let mut pairs = vec![("clients", Json::Arr(clients))];
     if !fallbacks.is_empty() {
         pairs.push(("fallbacks", Json::Arr(fallbacks)));
+    }
+    if let Some(decryption) = decryption {
+        pairs.push(("decryption", Json::Str(decryption)));
     }
     Ok(object(pairs))
 }
@@ -3790,6 +3863,73 @@ mod tests {
             .and_then(Json::as_arr)
             .expect("clients")[0];
         assert_eq!(client.get("id").and_then(Json::as_str), Some("a"));
+    }
+
+    #[test]
+    fn a_stripped_mlkem_key_is_put_back_together_with_its_mode_and_seconds() {
+        let (client, server) =
+            ferrox_core::vless_encryption::generate_pair(false, "xorpub", "1rtt", "600");
+        let public = client.rsplit('.').next().expect("public key");
+        let private = server.rsplit('.').next().expect("private key");
+        let settings = message(&[
+            bytes_field(
+                1,
+                &vless_user(&vless_account_with(b"aaaa-aaaa", None, None, None)),
+            ),
+            bytes_field(3, private.as_bytes()),
+            varint_field(4, 1),
+            varint_field(5, 600),
+        ]);
+        let endpoint = message(&[
+            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+            varint_field(2, 443),
+            bytes_field(
+                3,
+                &vless_user(&typed(
+                    "xray.proxy.vless.Account",
+                    &message(&[
+                        bytes_field(1, b"aaaa-aaaa"),
+                        bytes_field(3, public.as_bytes()),
+                        varint_field(4, 1),
+                        varint_field(5, 1),
+                    ]),
+                )),
+            ),
+        ]);
+        let outbound = message(&[bytes_field(
+            3,
+            &typed(
+                "xray.proxy.vless.outbound.Config",
+                &bytes_field(1, &endpoint),
+            ),
+        )]);
+        let json =
+            to_json(&config(&vless_inbound(5000, &settings), &outbound)).expect("vless decodes");
+        let decryption = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .and_then(|settings| settings.get("decryption"))
+            .and_then(Json::as_str);
+        assert_eq!(decryption, Some(server.replace(".600.", ".600s.").as_str()));
+        let encryption = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0]
+            .get("settings")
+            .and_then(|settings| settings.get("vnext"))
+            .and_then(Json::as_arr)
+            .expect("vnext")[0]
+            .get("users")
+            .and_then(Json::as_arr)
+            .expect("users")[0]
+            .get("encryption")
+            .and_then(Json::as_str);
+        assert_eq!(
+            encryption,
+            Some(client.replace(".1rtt.", ".0rtt.").as_str())
+        );
     }
 
     #[test]

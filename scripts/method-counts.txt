@@ -113,7 +113,7 @@ trojan udp-framing-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_fram
 trojan udp-carriers-holding-an-association 7 ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier
 
 # --- XTLS Vision ------------------------------------------------------------
-xtls-vision ops-retired-instructions 17152 scripts/count-ops.sh
+xtls-vision ops-retired-instructions 16896 scripts/count-ops.sh
 xtls-vision padding-command-bytes 5 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
 xtls-vision first-frame-uuid-bytes 16 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
 xtls-vision largest-framed-block-bytes 8171 ferrox-app-vision::tests::a_bulk_write_frames_every_block_inside_the_bound
@@ -687,7 +687,7 @@ carrier-foxy edge-strike-lookup-allocations 0 ferrox-core-foxy::tests::an_edge_s
 carrier-foxy carrier-alpn-allocations-per-dial 0 ferrox-app-foxy::tests::a_carriers_alpn_list_is_shared_rather_than_built_per_dial
 
 # --- the DNS outbound -------------------------------------------------------
-dns-outbound ops-retired-instructions 47810992 scripts/count-ops.sh
+dns-outbound ops-retired-instructions 51892686 scripts/count-ops.sh
 dns-outbound answer-cases-replayed 21 ferrox-core-dns::tests::the_answer_is_the_bytes_the_pinned_go_writes
 dns-outbound parse-refusals-replayed 8 ferrox-core-dns::tests::the_parse_refuses_what_the_reference_refuses
 dns-outbound pointer-hop-cap 10 ferrox-core-dns::tests::the_pointer_loop_refuses_at_the_cap

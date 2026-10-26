@@ -28,7 +28,7 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 17152 | scripts/count-ops.sh |
+| ops-retired-instructions | 16896 | scripts/count-ops.sh |
 | padding-command-bytes | 5 | ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid |
 | first-frame-uuid-bytes | 16 | ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid |
 | largest-framed-block-bytes | 8171 | ferrox-app-vision::tests::a_bulk_write_frames_every_block_inside_the_bound |
@@ -54,7 +54,7 @@ graph TD
   'vision::Linkferrox_app::vision::tests::Fake::pump'
 ```
 
-`17152` retired instructions, the frame the probe walks through 512 empty frames. The row names the monomorphized frame the probe builds because `count-ops.sh` drops the angle brackets from a generic frame; the row it replaced named `unpad`, which the walk no longer has, so it read as an inlined frame rather than a measurement. The probe's own row is in `scripts/expected-ops.txt`. The count rose from 16,896 with the steady-read feed: the probe pays 256 more instructions (0.5 per empty frame) for the `Option` that lets a post-budget read skip the feed, while that read no longer builds its 320 bytes of scan state.
+`16896` retired instructions, the frame the probe walks through 512 empty frames. The row names the monomorphized frame the probe builds because `count-ops.sh` drops the angle brackets from a generic frame; the row it replaced named `unpad`, which the walk no longer has, so it read as an inlined frame rather than a measurement. The probe's own row is in `scripts/expected-ops.txt`. The count sat at 17,152 while the steady-read feed's `Option` was priced here; the vless-encryption module's layout moved the probe back to 16,896 with the frames, commands and bytes unchanged.
 
 ## Time
 
