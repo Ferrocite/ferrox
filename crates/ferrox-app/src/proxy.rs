@@ -3204,8 +3204,8 @@ fn serve_sealed_raw<S: Read + Write + Send + ferrox_core::tls::RecordAlignment +
             if flow == Flow::Vision {
                 let link = crate::vision::Link::sealed(sealed, &got);
                 relay_link(&uplink, link, &close, timeout);
-            } else {
-                relay_sealed(&uplink, sealed, &close);
+            } else if let Some((reader, writer)) = sealed.into_split() {
+                relay_split(reader, writer, &uplink, &close);
             }
         }
         _ => {}
