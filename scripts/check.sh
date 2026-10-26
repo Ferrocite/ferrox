@@ -63,10 +63,20 @@ step "prompt library"
 cargo run --locked --quiet -p ferrox-prompt -- check
 
 step "stall detector"
-./scripts/watch-test.sh --selftest
+mkdir -p target/ci
+./scripts/watch-test.sh --selftest > target/ci/selftest.log 2>&1 &
+selftest=$!
 
 step "tests"
-./scripts/watch-test.sh -- cargo test --workspace --locked
+tests=0
+./scripts/watch-test.sh -- cargo test --workspace --locked || tests=$?
+
+selftest_rc=0
+wait "$selftest" || selftest_rc=$?
+cat target/ci/selftest.log
+if [ "$tests" -ne 0 ] || [ "$selftest_rc" -ne 0 ]; then
+    exit 1
+fi
 
 # Same flags ops.yml blesses under: line tables only, nothing else, because a
 # different RUSTFLAGS is a different program and the counts in expected-ops.txt
