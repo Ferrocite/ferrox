@@ -478,6 +478,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     /// window resolves only with a full uuid and either a mismatch (everything passes)
     /// or the framing's first frame header. A walk that blocks mid-frame parks there
     /// and reports what it handed out.
+    #[allow(clippy::too_many_lines)]
     fn pump(&mut self, mut buf: Option<&mut [u8]>, mut feed: Option<&mut Feeding>) -> usize {
         let end = self.have.len();
         let mut dot = self.dot;
