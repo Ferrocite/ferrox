@@ -21148,8 +21148,7 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
     let hysteria_tls = hysteria_transport(outbound) && security == "tls";
     let transport_tls = quic_tls || hysteria_tls;
     let address = server.address.to_owned();
-    let port = server.port;
-    let id = server.id;
+    let (port, id) = (server.port, server.id);
     let mux = outbound.get("mux").and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true));
     let stored = xdrive_carried(outbound, &address);
     if security == "tls" && !transport_tls && stored.is_none() {
