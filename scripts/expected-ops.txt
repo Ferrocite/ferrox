@@ -143,4 +143,4 @@ ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_n
 # steady-read feed replaced; the frames, commands and bytes are unchanged.
 vision::Linkferrox_app::vision::tests::Fake::pump 16896 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
 
-vision::Linkferrox_app::vision::tests::Fake::pump_baseline 1 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
+vision::Linkferrox_app::vision::tests::Fake::walk_before_the_whole_frame_pass 1 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
