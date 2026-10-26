@@ -118,6 +118,12 @@ impl<S: Stream> RealityServer<S> {
         self.inner.get_ref().transport().get_ref()
     }
 
+    /// Whether bytes the client's hello read past are still waiting to be replayed, so a raw
+    /// transport read would miss them.
+    pub fn has_pending(&self) -> bool {
+        self.inner.get_ref().has_pending()
+    }
+
     /// Reads the `ClientHello`, authenticates it, and answers with the session or
     /// with the splice. A hello that does not authenticate and has no cover
     /// origin configured is an error, which is the whole of a refusal. A peer
@@ -369,6 +375,10 @@ impl<S> Replay<S> {
             at: 0,
             io,
         }
+    }
+
+    fn has_pending(&self) -> bool {
+        self.at < self.prefix.len()
     }
 
     /// The socket under the replay: past the handshake the record layer is the

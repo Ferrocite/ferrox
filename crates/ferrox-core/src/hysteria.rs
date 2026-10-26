@@ -475,9 +475,14 @@ impl Salamander {
         out: &mut Vec<u8>,
     ) {
         let key = self.keystream(*salt);
+        let body = out.len() + SALAMANDER_SALT;
+        out.reserve(SALAMANDER_SALT + plain.len());
         out.extend_from_slice(salt);
-        for (i, b) in plain.iter().enumerate() {
-            out.push(b ^ key[i % SALAMANDER_KEY]);
+        out.extend_from_slice(plain);
+        for dst in out[body..].chunks_mut(SALAMANDER_KEY) {
+            for (byte, key) in dst.iter_mut().zip(key.iter()) {
+                *byte ^= key;
+            }
         }
     }
 

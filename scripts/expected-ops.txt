@@ -132,7 +132,9 @@ append_pem 591
 # new module moved `decide` into the probe's own frame under thin LTO, so the
 # probe now carries the five calls it makes per turn (4096 turns) instead of
 # pricing them as callees; the bytes and decisions are unchanged.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51892686 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# Re-blessed 51892694 by the VLESS record-buffer reuse, which moves the same
+# frame's inlining by eight instructions; the bytes and decisions are unchanged.
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51892694 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
