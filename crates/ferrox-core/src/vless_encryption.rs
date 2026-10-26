@@ -1140,6 +1140,7 @@ struct ReadSide {
     input: Vec<u8>,
     input_pos: usize,
     wire: Vec<u8>,
+    wire_pos: usize,
     header: Option<[u8; HEADER_LEN]>,
     direct: bool,
 }
@@ -1147,8 +1148,8 @@ struct ReadSide {
 impl ReadSide {
     /// One exact wire read that survives a timeout: the bytes already taken stay in `wire`,
     /// so a retry resumes where the kernel stopped instead of reading a record header twice.
-    fn take_wire<S: Read>(&mut self, inner: &mut S, len: usize) -> io::Result<Vec<u8>> {
-        while self.wire.len() < len {
+    fn take_wire<S: Read>(&mut self, inner: &mut S, len: usize) -> io::Result<()> {
+        while self.wire.len() - self.wire_pos < len {
             let mut chunk = [0u8; 8192];
             match inner.read(&mut chunk) {
                 Ok(0) => {
@@ -1162,7 +1163,19 @@ impl ReadSide {
                 Err(error) => return Err(error),
             }
         }
-        Ok(self.wire.drain(..len).collect())
+        self.input.clear();
+        self.input
+            .extend_from_slice(&self.wire[self.wire_pos..self.wire_pos + len]);
+        self.wire_pos += len;
+        if self.wire_pos == self.wire.len() {
+            self.wire.clear();
+            self.wire_pos = 0;
+        } else if self.wire_pos >= 8192 {
+            self.wire.copy_within(self.wire_pos.., 0);
+            self.wire.truncate(self.wire.len() - self.wire_pos);
+            self.wire_pos = 0;
+        }
+        Ok(())
     }
 
     fn fill_input<S: Read>(&mut self, inner: &mut S) -> io::Result<()> {
@@ -1170,8 +1183,9 @@ impl ReadSide {
         self.input_pos = 0;
         match self.read_stage {
             ReadStage::ServerRandom => {
+                self.take_wire(inner, 16)?;
                 let random: [u8; 16] = self
-                    .take_wire(inner, 16)?
+                    .input
                     .as_slice()
                     .try_into()
                     .map_err(|_| invalid("VLESS encryption server random is short"))?;
@@ -1188,13 +1202,13 @@ impl ReadSide {
                 self.fill_input(inner)
             }
             ReadStage::ServerPadding(len) => {
-                let mut padding = self.take_wire(inner, len)?;
-                self.in_mask.apply(&mut padding, false);
+                self.take_wire(inner, len)?;
+                self.in_mask.apply(&mut self.input, false);
                 let peer = self
                     .peer_aead
                     .as_mut()
                     .ok_or_else(|| invalid("VLESS encryption is missing its peer key"))?;
-                peer.open_in_place(None, &mut padding, &[])?;
+                peer.open_in_place(None, &mut self.input, &[])?;
                 self.read_stage = ReadStage::Records;
                 self.fill_input(inner)
             }
@@ -1202,8 +1216,9 @@ impl ReadSide {
                 let header = if let Some(header) = self.header {
                     header
                 } else {
+                    self.take_wire(inner, HEADER_LEN)?;
                     let mut header: [u8; HEADER_LEN] = self
-                        .take_wire(inner, HEADER_LEN)?
+                        .input
                         .as_slice()
                         .try_into()
                         .map_err(|_| invalid("VLESS encryption record header is short"))?;
@@ -1224,21 +1239,20 @@ impl ReadSide {
                 };
                 let len = decode_header(&header)
                     .ok_or_else(|| invalid("invalid VLESS encryption record header"))?;
-                let mut body = self.take_wire(inner, len)?;
+                self.take_wire(inner, len)?;
                 self.header = None;
-                self.in_mask.apply(&mut body, false);
+                self.in_mask.apply(&mut self.input, false);
                 let peer = self
                     .peer_aead
                     .as_mut()
                     .ok_or_else(|| invalid("VLESS encryption is missing its peer key"))?;
                 let next = (peer.nonce == MAX_NONCE)
-                    .then(|| peer.derive(&body, self.united_key.as_slice()));
-                let result = peer.open_in_place(None, &mut body, &header);
+                    .then(|| peer.derive(&self.input, self.united_key.as_slice()));
+                let result = peer.open_in_place(None, &mut self.input, &header);
                 if let Some(next) = next {
                     *peer = next;
                 }
                 result?;
-                self.input = body;
                 self.input.truncate(len - TAG_LEN);
                 Ok(())
             }
@@ -1257,10 +1271,15 @@ impl ReadSide {
             return Ok(n);
         }
         if self.direct {
-            if !self.wire.is_empty() {
-                let n = self.wire.len().min(buf.len());
-                buf[..n].copy_from_slice(&self.wire[..n]);
-                self.wire.drain(..n);
+            if self.wire_pos < self.wire.len() {
+                let available = &self.wire[self.wire_pos..];
+                let n = available.len().min(buf.len());
+                buf[..n].copy_from_slice(&available[..n]);
+                self.wire_pos += n;
+                if self.wire_pos == self.wire.len() {
+                    self.wire.clear();
+                    self.wire_pos = 0;
+                }
                 self.in_mask.apply(&mut buf[..n], false);
                 return Ok(n);
             }
@@ -1282,6 +1301,7 @@ struct WriteSide {
     aead: Aead,
     out_mask: HeaderMask,
     pre_write: Vec<u8>,
+    out: Vec<u8>,
     direct: bool,
 }
 
@@ -1291,27 +1311,28 @@ impl WriteSide {
             return Ok(0);
         }
         if self.direct {
-            let mut masked = buf.to_vec();
-            self.out_mask.apply(&mut masked, true);
-            inner.write_all(&masked)?;
+            self.out.clear();
+            self.out.extend_from_slice(buf);
+            self.out_mask.apply(&mut self.out, true);
+            inner.write_all(&self.out)?;
             return Ok(buf.len());
         }
         let n = buf.len().min(MAX_RECORD_PLAINTEXT);
-        let mut out = Vec::with_capacity(self.pre_write.len() + HEADER_LEN + n + TAG_LEN);
-        out.append(&mut self.pre_write);
-        let header_at = out.len();
+        self.out.clear();
+        self.out.append(&mut self.pre_write);
+        let header_at = self.out.len();
         let len = n + TAG_LEN;
         let header = [23, 3, 3, (len >> 8) as u8, len as u8];
-        out.extend_from_slice(&header);
+        self.out.extend_from_slice(&header);
         let rekey = self.aead.nonce == MAX_NONCE;
-        self.aead.seal_into(None, &buf[..n], &header, &mut out);
+        self.aead.seal_into(None, &buf[..n], &header, &mut self.out);
         if rekey {
             self.aead = self
                 .aead
-                .derive(&out[header_at..], self.united_key.as_slice());
+                .derive(&self.out[header_at..], self.united_key.as_slice());
         }
-        self.out_mask.apply(&mut out, true);
-        inner.write_all(&out)?;
+        self.out_mask.apply(&mut self.out, true);
+        inner.write_all(&self.out)?;
         Ok(n)
     }
 }
@@ -1352,6 +1373,7 @@ impl<S> EncryptedStream<S> {
                 input: Vec::new(),
                 input_pos: 0,
                 wire: Vec::new(),
+                wire_pos: 0,
                 header: None,
                 direct: false,
             },
@@ -1360,6 +1382,7 @@ impl<S> EncryptedStream<S> {
                 aead,
                 out_mask: HeaderMask::new(None, 0),
                 pre_write: Vec::new(),
+                out: Vec::new(),
                 direct: false,
             },
         }
@@ -1813,5 +1836,78 @@ mod tests {
     #[test]
     fn random_zero_rtt_exchanges_bytes() {
         exchange("random", true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_sealed_record_allocates_nothing_on_the_steady_path() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        let (encryption, decryption) = generate_pair(false, "native", "1rtt", "600s");
+        let server = Server::new(ServerConfig::parse(&decryption).unwrap());
+        let client = Client::new(ClientConfig::parse(&encryption).unwrap());
+        let (a, b) = UnixStream::pair().unwrap();
+        let payload = [0x5au8; 300];
+        let rounds = 64usize;
+        let writer = std::thread::spawn(move || {
+            let mut stream = server.handshake(b).unwrap();
+            for _ in 0..rounds {
+                stream.write_all(&payload).unwrap();
+            }
+            stream.flush().unwrap();
+        });
+        let mut stream = client.handshake(a).unwrap();
+        let mut buf = [0u8; 300];
+        stream.read_exact(&mut buf).unwrap();
+        stream.read.wire.reserve(16 * 1024);
+        stream.read.input.reserve(16 * 1024);
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 1..rounds {
+                stream.read_exact(&mut buf).unwrap();
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "a record read reuses its buffers"
+        );
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn a_record_write_allocates_nothing_after_warmup() {
+        use std::io::Write as _;
+
+        struct Sink;
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let key = vec![7u8; 32];
+        let mut stream = EncryptedStream::new(
+            Sink,
+            key.clone(),
+            Aead::new(b"record write", &key),
+            None,
+            ReadStage::Records,
+        );
+        let buf = [0x33u8; 300];
+        stream.write_all(&buf).unwrap();
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..64 {
+                stream.write_all(&buf).unwrap();
+            }
+        });
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "a record write reuses its staging buffer"
+        );
     }
 }

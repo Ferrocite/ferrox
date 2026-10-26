@@ -441,10 +441,11 @@ impl XPlus {
     /// Prepend `salt`, then append `plain` masked by its keystream.
     pub fn obfuscate_with_salt(&self, salt: &[u8; XPLUS_SALT], plain: &[u8], out: &mut Vec<u8>) {
         let key = self.keystream(*salt);
+        let body = out.len() + XPLUS_SALT;
+        out.reserve(XPLUS_SALT + plain.len());
         out.extend_from_slice(salt);
-        for (i, b) in plain.iter().enumerate() {
-            out.push(b ^ key[i % XPLUS_KEY]);
-        }
+        out.extend_from_slice(plain);
+        xor_keystream(&mut out[body..], &key);
     }
 
     /// Obfuscate `plain` under a fresh random salt appended to `out`; `None` only when the system RNG fails.
@@ -460,8 +461,11 @@ impl XPlus {
     pub fn obfuscate_into(&self, salt: &[u8; XPLUS_SALT], plain: &[u8], out: &mut [u8]) -> usize {
         let key = self.keystream(*salt);
         out[..XPLUS_SALT].copy_from_slice(salt);
-        for (i, b) in plain.iter().enumerate() {
-            out[XPLUS_SALT + i] = b ^ key[i % XPLUS_KEY];
+        let body = &mut out[XPLUS_SALT..XPLUS_SALT + plain.len()];
+        for (dst, src) in body.chunks_mut(XPLUS_KEY).zip(plain.chunks(XPLUS_KEY)) {
+            for ((out, plain), key) in dst.iter_mut().zip(src).zip(key.iter()) {
+                *out = plain ^ key;
+            }
         }
         XPLUS_SALT + plain.len()
     }
@@ -486,10 +490,31 @@ impl XPlus {
         salt.copy_from_slice(&datagram[..XPLUS_SALT]);
         let key = self.keystream(salt);
         let payload = datagram.len() - XPLUS_SALT;
-        for i in 0..payload {
-            datagram[i] = datagram[XPLUS_SALT + i] ^ key[i % XPLUS_KEY];
+        let mut block = [0u8; XPLUS_KEY];
+        let mut at = 0usize;
+        while at < payload {
+            let len = XPLUS_KEY.min(payload - at);
+            let from = XPLUS_SALT + at;
+            block[..len].copy_from_slice(&datagram[from..from + len]);
+            for ((out, src), key) in datagram[at..at + len]
+                .iter_mut()
+                .zip(&block[..len])
+                .zip(&key[..len])
+            {
+                *out = *src ^ key;
+            }
+            at += len;
         }
         Some(payload)
+    }
+}
+
+#[inline]
+fn xor_keystream(bytes: &mut [u8], key: &[u8; XPLUS_KEY]) {
+    for dst in bytes.chunks_mut(XPLUS_KEY) {
+        for (out, key) in dst.iter_mut().zip(key.iter()) {
+            *out ^= key;
+        }
     }
 }
 
@@ -654,6 +679,26 @@ mod tests {
             decoded.payload.as_ptr(),
             base.wrapping_add(decoded.header_len())
         );
+    }
+
+    #[test]
+    fn the_xplus_mask_wraps_every_phase_identically() {
+        let xplus = XPlus::new("Vaundy").expect("key");
+        let salt: [u8; XPLUS_SALT] = core::array::from_fn(|i| (i as u8).wrapping_mul(7));
+        let key = xplus.keystream(salt);
+        for len in 1..=160usize {
+            let plain: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(31)).collect();
+            let mut want = salt.to_vec();
+            want.extend((0..len).map(|i| plain[i] ^ key[i % XPLUS_KEY]));
+            let mut out = Vec::new();
+            xplus.obfuscate_with_salt(&salt, &plain, &mut out);
+            assert_eq!(out, want, "vec form at {len}");
+            let mut stack = vec![0u8; XPLUS_SALT + len];
+            assert_eq!(xplus.obfuscate_into(&salt, &plain, &mut stack), want.len());
+            assert_eq!(stack, want, "stack form at {len}");
+            let n = xplus.deobfuscate_in_place(&mut out).expect("unmasks");
+            assert_eq!(&out[..n], &plain[..], "round trip at {len}");
+        }
     }
 
     #[test]

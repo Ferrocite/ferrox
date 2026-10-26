@@ -3126,16 +3126,121 @@ fn serve_vless_encrypted_raw(
     let close = close_sealed
         .as_ref()
         .map_or_else(|| Arc::new(|| {}), connection_closer);
-    serve_sealed_raw(sealed, peer, users, freedom, &close, close_sealed);
+    serve_sealed_raw(
+        sealed,
+        peer,
+        users,
+        freedom,
+        &close,
+        close_sealed,
+        SplitRelay,
+    );
 }
 
-fn serve_sealed_raw<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'static>(
+/// How a decoded sealed session hands its two directions to the relay: a socket can split, a TLS
+/// session cannot, and a parked read on a shared stream must not hold the write.
+trait SealedRelay<S> {
+    fn relay(
+        sealed: ferrox_core::vless_encryption::EncryptedStream<S>,
+        uplink: &Connection,
+        close: &Arc<dyn Fn() + Send + Sync>,
+    );
+}
+
+struct SplitRelay;
+
+struct SharedRelay;
+
+impl SealedRelay<Connection> for SplitRelay {
+    fn relay(
+        sealed: ferrox_core::vless_encryption::EncryptedStream<Connection>,
+        uplink: &Connection,
+        close: &Arc<dyn Fn() + Send + Sync>,
+    ) {
+        if let Some((reader, writer)) = sealed.into_split() {
+            relay_split(reader, writer, uplink, close);
+        }
+    }
+}
+
+impl<S: Read + Write + Send + 'static> SealedRelay<S> for SharedRelay {
+    fn relay(
+        sealed: ferrox_core::vless_encryption::EncryptedStream<S>,
+        uplink: &Connection,
+        close: &Arc<dyn Fn() + Send + Sync>,
+    ) {
+        relay_sealed(uplink, sealed, close);
+    }
+}
+
+impl<S, R> SealedRelay<DrivenIo<S, R>> for SplitRelay
+where
+    S: CipherOpen + Send + 'static,
+    R: Read + Send + 'static,
+{
+    fn relay(
+        sealed: ferrox_core::vless_encryption::EncryptedStream<DrivenIo<S, R>>,
+        uplink: &Connection,
+        close: &Arc<dyn Fn() + Send + Sync>,
+    ) {
+        if let Some((reader, writer)) = sealed.into_split() {
+            relay_split(reader, writer, uplink, close);
+        }
+    }
+}
+
+fn serve_sealed_session<S>(
+    session: S,
+    peer: Option<SocketAddr>,
+    users: &[VlessUser],
+    freedom: bool,
+    closer: &Arc<dyn Fn() + Send + Sync>,
+    timeout: Option<Connection>,
+    decryption: &ferrox_core::vless_encryption::Server,
+) where
+    S: ferrox_core::tls::TlsProvider
+        + Drivable
+        + ferrox_core::tls::RecordAlignment
+        + Send
+        + 'static,
+{
+    match driven_io(session, budgets::handshake()) {
+        Ok(driven) => match decryption.handshake(driven) {
+            Ok(sealed) => {
+                if let Some(raw) = &timeout {
+                    if raw.set_read_timeout(Some(RELAY_POLL)).is_err() {
+                        return;
+                    }
+                }
+                serve_sealed_raw(sealed, peer, users, freedom, closer, timeout, SplitRelay);
+            }
+            Err(error) => eprintln!("vless: encryption handshake failed: {error}"),
+        },
+        Err(session) => match decryption.handshake(session) {
+            Ok(sealed) => {
+                if let Some(raw) = &timeout {
+                    if raw.set_read_timeout(Some(RELAY_POLL)).is_err() {
+                        return;
+                    }
+                }
+                serve_sealed_raw(sealed, peer, users, freedom, closer, timeout, SharedRelay);
+            }
+            Err(error) => eprintln!("vless: encryption handshake failed: {error}"),
+        },
+    }
+}
+
+fn serve_sealed_raw<
+    S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'static,
+    R: SealedRelay<S>,
+>(
     mut sealed: ferrox_core::vless_encryption::EncryptedStream<S>,
     peer: Option<SocketAddr>,
     users: &[VlessUser],
     freedom: bool,
     closer: &Arc<dyn Fn() + Send + Sync>,
     timeout: Option<Connection>,
+    _relay: R,
 ) {
     let Some((got, flow, cmd, target)) = decode_request_bounded(&mut sealed) else {
         return;
@@ -3205,7 +3310,7 @@ fn serve_sealed_raw<S: Read + Write + Send + ferrox_core::tls::RecordAlignment +
                 let link = crate::vision::Link::sealed(sealed, &got);
                 relay_link(&uplink, link, &close, timeout);
             } else {
-                relay_sealed(&uplink, sealed, &close);
+                R::relay(sealed, &uplink, &close);
             }
         }
         _ => {}
@@ -5694,19 +5799,9 @@ fn serve_vless_tls(
                 if raw.set_read_timeout(Some(budgets::handshake())).is_err() {
                     return;
                 }
-                let sealed = match decryption.handshake(tls) {
-                    Ok(sealed) => sealed,
-                    Err(error) => {
-                        eprintln!("vless: encryption handshake failed: {error}");
-                        return;
-                    }
-                };
-                if raw.set_read_timeout(Some(RELAY_POLL)).is_err() {
-                    return;
-                }
                 let peer = raw.peer_addr().ok();
                 let close = connection_closer(&raw);
-                serve_sealed_raw(sealed, peer, users, freedom, &close, Some(raw));
+                serve_sealed_session(tls, peer, users, freedom, &close, Some(raw), decryption);
                 return;
             }
             let front = FrontNames::of(&tls);
@@ -6120,13 +6215,6 @@ fn finish_reality<S>(
                 return;
             }
         }
-        let sealed = match decryption.handshake(session) {
-            Ok(sealed) => sealed,
-            Err(error) => {
-                eprintln!("vless: encryption handshake failed: {error}");
-                return;
-            }
-        };
         if let Some(raw) = &raw {
             if raw.set_read_timeout(Some(RELAY_POLL)).is_err() {
                 return;
@@ -6135,7 +6223,7 @@ fn finish_reality<S>(
         let close = raw
             .as_ref()
             .map_or_else(|| Arc::new(|| {}), connection_closer);
-        serve_sealed_raw(sealed, peer, users, freedom, &close, raw);
+        serve_sealed_session(session, peer, users, freedom, &close, raw, decryption);
         return;
     }
     let front = FrontNames::of(&session);
@@ -11123,6 +11211,10 @@ impl Drivable for ferrox_core::tls::ClientSession<KcpIo> {
 
 impl Drivable for ferrox_core::tls::RealityServer<Connection> {
     fn transport(&self) -> Option<Connection> {
+        // A replayed prefix is not on the socket, so a raw read would lose it.
+        if self.has_pending() {
+            return None;
+        }
         // The core accessor the inherent name would shadow: one explicit call, no recursion.
         ferrox_core::tls::RealityServer::transport(self)
             .try_clone()
@@ -11224,6 +11316,79 @@ where
     ))
 }
 
+/// The same driven session as one readable and writable stream, so a sealed layer can split it.
+struct DrivenIo<S, R> {
+    reader: DrivenHalf<S, R>,
+    writer: DrivenHalf<S, R>,
+}
+
+impl<S, R> Clone for DrivenIo<S, R> {
+    fn clone(&self) -> Self {
+        Self {
+            reader: self.reader.clone(),
+            writer: self.writer.clone(),
+        }
+    }
+}
+
+impl<S, R> Read for DrivenIo<S, R>
+where
+    S: CipherOpen,
+    R: Read,
+{
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(buf)
+    }
+}
+
+impl<S, R> Write for DrivenIo<S, R>
+where
+    S: CipherOpen,
+{
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.writer.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+impl<S, R> ferrox_core::tls::RecordAlignment for DrivenIo<S, R> {}
+
+impl<S, R> ferrox_core::vless_encryption::SplitIo for DrivenIo<S, R> {
+    type Reader = Self;
+    type Writer = Self;
+
+    fn split_io(self) -> Option<(Self, Self)> {
+        Some((self.clone(), self))
+    }
+}
+
+fn driven_io<S>(session: S, grain: Duration) -> Result<DrivenIo<S, Connection>, S>
+where
+    S: Drivable + CipherOpen + ferrox_core::tls::RecordAlignment + Send + Sized + 'static,
+{
+    let Some(cipher) = session.transport() else {
+        return Err(session);
+    };
+    if cipher.set_read_timeout(Some(grain)).is_err() {
+        return Err(session);
+    }
+    let Ok(out) = cipher.try_clone() else {
+        return Err(session);
+    };
+    let mut session = session;
+    session.disarm_record_alignment();
+    let session = Arc::new(Mutex::new(session));
+    let cipher = Arc::new(Mutex::new(cipher));
+    let out = Arc::new(Mutex::new(Sealed::new(out)));
+    Ok(DrivenIo {
+        reader: DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher), Arc::clone(&out)),
+        writer: DrivenHalf::new(session, cipher, out),
+    })
+}
+
 // A session whose transport the relay reads: the ciphertext comes off the socket with no session lock held.
 struct DrivenHalf<S, R> {
     session: Arc<Mutex<S>>,
@@ -11232,6 +11397,19 @@ struct DrivenHalf<S, R> {
     scratch: Vec<u8>,
     pending_at: usize,
     pending_end: usize,
+}
+
+impl<S, R> Clone for DrivenHalf<S, R> {
+    fn clone(&self) -> Self {
+        Self {
+            session: Arc::clone(&self.session),
+            reader: Arc::clone(&self.reader),
+            out: Arc::clone(&self.out),
+            scratch: self.scratch.clone(),
+            pending_at: self.pending_at,
+            pending_end: self.pending_end,
+        }
+    }
 }
 
 impl<S, R> DrivenHalf<S, R> {
@@ -11271,6 +11449,10 @@ impl<S: CipherOpen, R: Read> Read for DrivenHalf<S, R> {
             };
             self.pending_at += taken;
             filled += plain;
+            if filled == buf.len() {
+                // The caller's window is full: what the session still holds waits for the next read rather than a transport wait it does not need.
+                return Ok(filled);
+            }
             if self.pending_at < self.pending_end {
                 if taken == 0 && plain == 0 {
                     // The session took nothing and gave nothing: the peer is gone.

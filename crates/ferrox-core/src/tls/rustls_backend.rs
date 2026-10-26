@@ -626,12 +626,16 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
             outcome => outcome?,
         };
-        if plain > 0 || ciphertext.is_empty() {
+        if plain > 0 {
             return Ok((plain, 0));
         }
-        // The layer is empty, so the ciphertext has room to be decrypted.
-        let mut cursor = std::io::Cursor::new(ciphertext);
-        let taken = self.conn.read_tls(&mut cursor).map_err(recover)?;
+        // A handshake may leave ciphertext in the layer with no new input, so the empty slice still processes it.
+        let taken = if ciphertext.is_empty() {
+            0
+        } else {
+            let mut cursor = std::io::Cursor::new(ciphertext);
+            self.conn.read_tls(&mut cursor).map_err(recover)?
+        };
         self.conn
             .process_new_packets()
             .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -1236,11 +1240,16 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
                     outcome => outcome?,
                 };
-                if plain > 0 || ciphertext.is_empty() {
+                if plain > 0 {
                     return Ok((plain, 0));
                 }
-                let mut cursor = std::io::Cursor::new(ciphertext);
-                let taken = conn.read_tls(&mut cursor).map_err(recover)?;
+                // A handshake may leave ciphertext in the layer with no new input, so the empty slice still processes it.
+                let taken = if ciphertext.is_empty() {
+                    0
+                } else {
+                    let mut cursor = std::io::Cursor::new(ciphertext);
+                    conn.read_tls(&mut cursor).map_err(recover)?
+                };
                 conn.process_new_packets()
                     .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
                 // A key update waits for the next seal rather than a transport write under this lock.
