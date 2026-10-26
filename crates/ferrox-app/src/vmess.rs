@@ -2875,6 +2875,8 @@ mod tests {
         let iv = [0x72u8; 16];
         let wire = response_prefix(&key, &iv, 0xAB).expect("prefixes");
         let mut reader = std::io::Cursor::new(wire);
+        // The trace gate reads the environment once; warming it keeps that first read out of the window.
+        let _ = crate::proxy::echo_trace_on();
         let (opened, counts) = ferrox_core::alloc_count::measure(|| {
             super::read_response(&mut reader, &key, &iv, 0xAB)
         });
