@@ -28,6 +28,7 @@ COMMANDS
     list                   roadmap progress: templates, matrix rows left, what is next
     next                   the slice to work on, its blanks filled from the matrix
     render <id>            that slice's prompt, with add-ons and gates
+    issue <number>         the P0/P1 regression-issue prompt, filled and copied
     show <id>              that slice's metadata, then its full prompt
     rows                   the matrix rows a slice can be about
     set-status <id> <status>  record progress: todo, doing, done or blocked
@@ -35,6 +36,7 @@ COMMANDS
 OPTIONS
     --library <path>       read this Markdown instead of prompts.md
     --set KEY=VALUE        fill a placeholder; repeatable, wins over a default
+    --issue <number>       fill the issue template's number, as `issue <number>` does
     --row <key|index|name> the matrix row this slice is about: A13, 13, or part of a name
     --addon <slug|all>     append an add-on; repeatable or comma-separated
     --print                print instead of copying to the clipboard
@@ -53,6 +55,7 @@ OPTIONS
 EXAMPLES
     ferrox-prompt next
     ferrox-prompt next --rotate --seed 4
+    ferrox-prompt issue 661
     ferrox-prompt render 5 --addon isa-matrix
     ferrox-prompt render 1 --row A13
     ferrox-prompt next --row quic
@@ -72,6 +75,10 @@ created with `scripts/new-worktree.sh` when there is none, used and brought onto
 greenfield plan, a high-priority row outranks its unmarked peers, and a
 `not-scheduled` row is never drawn unless `--row` names it.
 
+`issue <number>` fills the one template that asks for `{issue}` — the P0/P1
+regression template — names its worktree `bugfix-<number>`, and copies the
+completed prompt. `--issue` fills the same blank wherever `{issue}` appears.
+
 `--row` names the matrix row a slice is about, so a template and a row can be
 picked by hand: `render 1 --row A13` renders P1 for that row, and
 `next --row A13` picks the template that draws it. A row is named by its key
@@ -90,6 +97,8 @@ enum Command {
     Next,
     /// One prompt.
     Render,
+    /// The regression-issue prompt, filled from a number.
+    Issue,
     /// One prompt's metadata.
     Show,
     /// The matrix rows a slice can be about.
@@ -130,11 +139,13 @@ enum Draw {
 }
 
 /// Everything the command line said.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Args {
     command: Command,
     /// A prompt id, for `render` and `show`.
     id: Option<u32>,
+    /// The GitHub issue a regression template fixes.
+    issue: Option<u64>,
     library: Option<PathBuf>,
     output: Output,
     draw: Draw,
@@ -163,6 +174,7 @@ impl Default for Args {
         Self {
             command: Command::Help,
             id: None,
+            issue: None,
             library: None,
             output: Output::Copy,
             draw: Draw::Ranked,
@@ -236,6 +248,7 @@ fn main() -> ExitCode {
                 Command::List => run_list(&args, &library, &root),
                 Command::Next => run_next(&args, &library, &root),
                 Command::Render => run_render(&args, &library, &root),
+                Command::Issue => run_issue(&args, &library, &root),
                 Command::Show => run_show(&args, &library, &root),
                 Command::Rows => run_rows(&args, &library, &root),
                 Command::SetStatus => run_set_status(&args, &library),
@@ -263,8 +276,8 @@ fn parse(arguments: &[String]) -> Result<Args, String> {
         let borrowed = inline.as_deref();
         let text = |at: &mut usize| take_value(arguments, at, borrowed, &flag);
         match flag.as_str() {
-            verb @ ("check" | "list" | "ls" | "next" | "render" | "show" | "rows"
-            | "set-status") => {
+            verb @ ("check" | "list" | "ls" | "next" | "render" | "show" | "rows" | "issue"
+            | "bug" | "set-status") => {
                 parsed.command = verb_of(verb);
             }
             "help" | "-h" | "--help" => parsed.command = Command::Help,
@@ -277,6 +290,12 @@ fn parse(arguments: &[String]) -> Result<Args, String> {
                 parsed.id = Some(parse_id(&text(&mut index)?)?);
             }
             "--id" => parsed.forced = Some(parse_id(&text(&mut index)?)?),
+            "--issue" => {
+                if parsed.issue.is_some() {
+                    return Err("issue number given twice".to_owned());
+                }
+                parsed.issue = Some(parse_issue(&text(&mut index)?)?);
+            }
             "--row" | "-r" => parsed.row = Some(text(&mut index)?),
             "--set" => assign(&mut parsed.values, &text(&mut index)?)?,
             "--addon" => parsed.addons.push(text(&mut index)?),
@@ -313,9 +332,32 @@ fn parse(arguments: &[String]) -> Result<Args, String> {
             _ => positional.push(argument),
         }
     }
+    parse_positional(&mut parsed, positional)?;
+    Ok(parsed)
+}
+
+/// The words after the flags: one prompt id for `render`/`show`, one status for `set-status`, one number for `issue`.
+fn parse_positional(parsed: &mut Args, mut positional: Vec<String>) -> Result<(), String> {
     if parsed.command == Command::SetStatus {
-        parse_set_status(&mut parsed, &positional)?;
-        return Ok(parsed);
+        return parse_set_status(parsed, &positional);
+    }
+    if parsed.command == Command::Issue {
+        if positional.len() > 1 {
+            return Err(format!(
+                "unexpected arguments after the issue number: {}",
+                positional[1..].join(", ")
+            ));
+        }
+        if let Some(number) = positional.pop() {
+            if parsed.issue.is_some() {
+                return Err("issue number given twice".to_owned());
+            }
+            parsed.issue = Some(parse_issue(&number)?);
+        }
+        if parsed.issue.is_none() {
+            return Err("issue needs a number, as in `ferrox-prompt issue 661`".to_owned());
+        }
+        return Ok(());
     }
     if let Some(id) = positional.pop() {
         if parsed.id.is_some() {
@@ -342,7 +384,7 @@ fn parse(arguments: &[String]) -> Result<Args, String> {
             "{name} needs a prompt id, as in `ferrox-prompt {name} 2`"
         ));
     }
-    Ok(parsed)
+    Ok(())
 }
 
 /// `set-status <id> <status>`, positional in that order; split out of `parse` for the line-count lint.
@@ -371,6 +413,7 @@ fn verb_of(word: &str) -> Command {
         "list" | "ls" => Command::List,
         "next" => Command::Next,
         "render" => Command::Render,
+        "issue" | "bug" => Command::Issue,
         "show" => Command::Show,
         "rows" => Command::Rows,
         "set-status" => Command::SetStatus,
@@ -414,6 +457,21 @@ fn parse_id(text: &str) -> Result<u32, String> {
         .trim_start_matches(['P', 'p'])
         .parse()
         .map_err(|_| format!("`{text}` is not a prompt id; write it as P<n>"))
+}
+
+/// `661` or `#661`: the issue the regression template fixes.
+fn parse_issue(text: &str) -> Result<u64, String> {
+    let number: u64 = text
+        .trim()
+        .trim_start_matches('#')
+        .parse()
+        .map_err(|_| format!("`{text}` is not an issue number; write it as `issue 661`"))?;
+    if number == 0 {
+        return Err(format!(
+            "`{text}` is not an issue number; write it as `issue 661`"
+        ));
+    }
+    Ok(number)
 }
 
 /// `check`, and the CI step that runs it.
@@ -611,9 +669,18 @@ fn run_rows(args: &Args, library: &Library, root: &Path) -> ExitCode {
 /// The state-filled placeholder values a template renders with.
 type Values = BTreeMap<String, String>;
 
+/// `--set` values plus `--issue`, so both spellings fill the same blank.
+fn requested_values(args: &Args) -> Values {
+    let mut values = args.values.clone();
+    if let Some(issue) = args.issue {
+        values.insert("issue".to_owned(), issue.to_string());
+    }
+    values
+}
+
 /// The values a handout may count as supplied: `--set`, plus every matrix blank when the matrix was readable.
 fn supplied_values(args: &Args, state: &ProjectState) -> Values {
-    let mut supplied = args.values.clone();
+    let mut supplied = requested_values(args);
     if state.has_matrix() {
         for name in expand::FILLABLE {
             supplied.entry((*name).to_owned()).or_default();
@@ -695,13 +762,16 @@ fn merge_values(
     values
 }
 
-/// The worktree this slice runs in: named from the matrix row it draws, or from its title when it draws none, so one task keeps one worktree.
+/// The worktree this slice runs in: named from the matrix row it draws, from its issue when it fixes one, or from its title when it draws neither, so one task keeps one worktree.
 fn slice_worktree(
     prompt: &Prompt,
     target: Option<&(&MethodRow, Values)>,
     values: &Values,
     root: &Path,
 ) -> Worktree {
+    if let Some(issue) = values.get("issue") {
+        return Worktree::named(format!("bugfix-{issue}"), root);
+    }
     let label = values
         .get("method")
         .map(String::as_str)
@@ -819,7 +889,7 @@ fn run_next(args: &Args, library: &Library, root: &Path) -> ExitCode {
         }
     };
     // `--set` wins over the state-filled value, so an explicit row beats the first unserved candidate.
-    let values = merge_values(&args.values, target.as_ref(), &state);
+    let values = merge_values(&requested_values(args), target.as_ref(), &state);
     let worktree = slice_worktree(prompt, target.as_ref(), &values, root);
     let options = Options {
         allow_unfilled: args.allow_unfilled,
@@ -1032,7 +1102,7 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let values = merge_values(&args.values, target.as_ref(), &state);
+    let values = merge_values(&requested_values(args), target.as_ref(), &state);
     let worktree = slice_worktree(prompt, target.as_ref(), &values, root);
     let options = Options {
         allow_unfilled: args.allow_unfilled,
@@ -1096,6 +1166,47 @@ fn run_render(args: &Args, library: &Library, root: &Path) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// `issue <number>`: the one template that takes an issue number, rendered and copied like `render`.
+fn run_issue(args: &Args, library: &Library, root: &Path) -> ExitCode {
+    let prompt = match issue_prompt(library) {
+        Ok(prompt) => prompt,
+        Err(reason) => {
+            eprintln!("{reason}");
+            return ExitCode::from(2);
+        }
+    };
+    let mut render = args.clone();
+    render.command = Command::Issue;
+    render.id = Some(prompt.id);
+    run_render(&render, library, root)
+}
+
+/// The template that declares `{issue}`; more than one would make `issue <number>` a guess.
+fn issue_prompt(library: &Library) -> Result<&Prompt, String> {
+    let matching: Vec<&Prompt> = library
+        .prompts
+        .iter()
+        .filter(|prompt| {
+            prompt
+                .placeholders
+                .iter()
+                .any(|placeholder| placeholder.name == "issue")
+        })
+        .collect();
+    match matching.as_slice() {
+        [only] => Ok(only),
+        [] => Err(format!(
+            "{} has no template with an {{issue}} blank; add one, or name a template and pass --set issue=<number>",
+            library.path.display()
+        )),
+        many => Err(format!(
+            "{} has {} templates with an {{issue}} blank; `issue <number>` needs exactly one",
+            library.path.display(),
+            many.len()
+        )),
+    }
+}
+
 /// `show <id>`: metadata, then the same rendered prompt `render <id>` delivers, so one command reads a slice.
 fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
     let id = args.id.expect("parse requires an id for show");
@@ -1123,7 +1234,7 @@ fn run_show(args: &Args, library: &Library, root: &Path) -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let values = merge_values(&args.values, target.as_ref(), &state);
+    let values = merge_values(&requested_values(args), target.as_ref(), &state);
     let worktree = slice_worktree(prompt, target.as_ref(), &values, root);
     let rendered = render::render(
         library,
@@ -1726,6 +1837,7 @@ fn how_asked(args: &Args) -> String {
         Command::Next => "next".to_owned(),
         Command::Render if args.row.is_some() => "render --row".to_owned(),
         Command::Render => "render".to_owned(),
+        Command::Issue => "issue".to_owned(),
         _ => "show".to_owned(),
     }
 }
@@ -2017,6 +2129,19 @@ tune {method}
 ```text
 do the fixed thing
 ```
+
+## P4 · Fix an issue
+
+**When to use:** an open P0 or P1 regression
+**Status:** todo
+**Leverage:** 5
+**Effort:** medium
+**Targets:** none
+**Gates:** `cargo test`
+
+```text
+fix issue #{issue} at {priority=P0 or P1} priority
+```
 ";
 
     fn library() -> Library {
@@ -2069,6 +2194,26 @@ do the fixed thing
         assert_eq!(parse_args(&["show", "3"]).command, Command::Show);
         assert_eq!(parse_args(&["ls"]).command, Command::List);
         assert_eq!(parse_args(&["rows"]).command, Command::Rows);
+        assert_eq!(parse_args(&["issue", "661"]).command, Command::Issue);
+        assert_eq!(parse_args(&["issue", "#661"]).issue, Some(661));
+        assert_eq!(
+            parse_args(&["render", "P4", "--issue", "661"]).issue,
+            Some(661)
+        );
+    }
+
+    #[test]
+    fn the_issue_command_finds_its_template_and_names_the_bugfix_worktree() {
+        let library = library();
+        let prompt = issue_prompt(&library).expect("the P4 issue template");
+        assert_eq!(prompt.id, 4);
+        let values = requested_values(&parse_args(&["issue", "661"]));
+        assert_eq!(values["issue"], "661");
+        let worktree = slice_worktree(prompt, None, &values, Path::new("/tmp/ferrox"));
+        assert_eq!(worktree.name, "bugfix-661");
+        assert!(worktree
+            .brief()
+            .contains("./scripts/new-worktree.sh bugfix-661"));
     }
 
     #[test]
@@ -2164,6 +2309,7 @@ do the fixed thing
                             "list",
                             "next",
                             "render",
+                            "issue",
                             "show",
                             "rows",
                             "set-status",
@@ -2188,6 +2334,11 @@ do the fixed thing
             |words: &[&str]| -> Vec<String> { words.iter().map(|w| (*w).to_owned()).collect() };
         assert!(parse(&owned(&["render", "two"])).is_err());
         assert!(parse(&owned(&["render"])).is_err());
+        assert!(parse(&owned(&["issue"])).is_err());
+        assert!(parse(&owned(&["issue", "two"])).is_err());
+        assert!(parse(&owned(&["issue", "0"])).is_err());
+        assert!(parse(&owned(&["issue", "661", "662"])).is_err());
+        assert!(parse(&owned(&["issue", "661", "--issue", "662"])).is_err());
         assert!(parse(&owned(&["nope"])).is_err());
         assert!(parse(&owned(&["next", "--set", "nope"])).is_err());
         assert!(parse(&owned(&["list", "--status", "finished"])).is_err());
@@ -2232,6 +2383,7 @@ do the fixed thing
             "next --rotate"
         );
         assert_eq!(how_asked(&parse_args(&["render", "2"])), "render");
+        assert_eq!(how_asked(&parse_args(&["issue", "661"])), "issue");
     }
 
     #[test]

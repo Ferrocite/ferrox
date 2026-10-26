@@ -36,7 +36,13 @@ impl Worktree {
     /// The worktree for the slice `P{id}` drawing `label` now draws — named from the label so the same task keeps the same worktree, located without creating anything.
     #[must_use]
     pub fn plan(id: u32, label: &str, root: &Path) -> Self {
-        let name = name(id, label);
+        Self::named(name(id, label), root)
+    }
+
+    /// A worktree whose branch name is already decided, as `bugfix-661` is for an issue template.
+    #[must_use]
+    pub fn named(name: impl Into<String>, root: &Path) -> Self {
+        let name = name.into();
         let path = path_for(&name, root);
         Self {
             place: probe(&path, root),
@@ -180,6 +186,20 @@ mod tests {
     #[test]
     fn the_same_slice_always_gets_the_same_name() {
         assert_eq!(name(7, "VMess TCP (AEAD)"), name(7, "VMess TCP (AEAD)"));
+    }
+
+    #[test]
+    fn an_explicit_branch_name_is_not_prefixed_or_slugified() {
+        let scratch = Scratch::new("named");
+        let root = scratch.0.join("ferrox");
+        std::fs::create_dir_all(&root).expect("checkout");
+        let plan = Worktree::named("bugfix-661", &root);
+        assert_eq!(plan.name, "bugfix-661");
+        assert_eq!(plan.place, Place::Absent);
+        assert_eq!(plan.path, scratch.0.join(format!("{DIR_PREFIX}bugfix-661")));
+        assert!(plan
+            .brief()
+            .contains("./scripts/new-worktree.sh bugfix-661"));
     }
 
     #[test]

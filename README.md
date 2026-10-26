@@ -389,6 +389,7 @@ The roadmap is `crates/ferrox-prompt/prompts.md`: reusable templates, each fille
 
 ```bash
 cargo run -p ferrox-prompt -- next        # the slice, the reason, prompt → clipboard
+cargo run -p ferrox-prompt -- issue 661 # a P0/P1 regression prompt, filled and copied
 cargo run -p ferrox-prompt -- list        # roadmap progress and what is ready now
 cargo run -p ferrox-prompt -- check       # is the library still coherent?
 cargo run -p ferrox-prompt -- rows        # the matrix rows a slice can be about

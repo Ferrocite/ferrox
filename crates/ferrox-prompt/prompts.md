@@ -1,6 +1,6 @@
 # Ferrox prompt library
 
-Twenty reusable templates. `ferrox-prompt` fills each one from the live matrix in `README.md` and the pins in `upstream/pins.toml`, so `next` names the concrete row to work on rather than a hand-transcribed idea. If the tool and these files disagree, the files are right — that is why `ferrox-prompt check` is a CI step and `tests/contract.rs` locks the properties below.
+Twenty-one reusable templates. `ferrox-prompt` fills each one from the live matrix in `README.md` and the pins in `upstream/pins.toml`, so `next` names the concrete row to work on rather than a hand-transcribed idea; `issue <number>` fills the one template that takes a regression issue. If the tool and these files disagree, the files are right — that is why `ferrox-prompt check` is a CI step and `tests/contract.rs` locks the properties below.
 
 ## Grammar
 
@@ -430,4 +430,24 @@ Report the per-wait cost the census adds where it is reachable, or state that th
 {method} — matrix row {index} of table {section} — gains its user-settable parameters by carving, not by accretion: move the knob group named in its superset row into the section-owned config type that `crates/ferrox-app/src/config.rs` already shapes per plane, give the app one reader of it, and keep the defaults byte-for-byte what the constants in `budgets.rs` say today, so every blessed count holds across the move and `scripts/count-ops.sh` is the witness that the carve moved no work. A runtime-settable cadence is a count change: the page states the new worst case of a wait the peer can tune, and a knob whose default differs from the constant is refused until the matrix and pages say so.
 
 Prove the surface, not the struct: a config-named test per knob that asserts the engine acts on the value it names — a bound that stops a parked wait, a header that appears on the wire, a byte rate the gauge enforces — beside the parse round-trip. A parsed field no component reads is the defect P18 exists to own; check the knob has its actor before calling the row shipped, and record in the superset matrix the row that moved from planned to implemented only when the actor exists.
+```
+
+## P21 · Fix and land a P0/P1 regression issue
+
+**When to use:** A P0 or P1 regression issue is open and must be fixed end to end — reproduced, fixed, proven, landed on `main` and closed — before any feature slice continues.
+**Status:** todo
+**Leverage:** 5
+**Effort:** medium
+**Targets:** none
+**Gates:** `./scripts/check.sh`; `cargo test --workspace --all-features`; CI: `conformance.yml`; CI: `bench.yml`
+**Random weight:** 0
+
+```text
+Phase 1 — Fix and land issue #{issue}, a {priority=P0 or P1} regression. Read the issue and reproduce the failure before editing; work only in a worktree made by `./scripts/new-worktree.sh bugfix-{issue}`. The fix is complete when the defect cannot recur: add a test that is red on the unfixed tree and green after the fix, run it with the gate in `./scripts/check.sh`, then rebase onto `main`, land the fix there, and close the issue with the integration that proves it. Do not leave a smaller defect behind to finish the issue.
+
+Phase 2 — Study upstream. Read the relevant pinned implementations in {references} and find how each handles this path. Name which one is best, and why, with the evidence that decides it.
+
+Phase 3 — Performance passes. First, the focused pass: move the thing the issue touched towards the best upstream form without changing a wire byte: fewer retired instructions, copies, branches, locks and allocations. Re-measure the exact count with `scripts/count-ops.sh`; land only the changes that count proves, and write down the arithmetic for any regression you revert. Then the open-ended pass: make it faster, leaner and more capable than every reference in {references} together. Carry each winner as far as it goes rather than stopping after one; change the basis or the order, factor, recast and prove equivalence. Mine hot loops and algebraic structure, every SIMD width the ladder runs, cache locality and branch prediction, batched or vectored I/O and lock-free handoffs, and remove ops, copies, allocations, syscalls, atomics, zeroing and checks nothing reads. Sweep the bytes both ways after the change: the block, byte, counter and panic-threshold totals must stay put, not merely agree at one length. Where the wire shape is fixed, say so.
+
+Phase 4 — Before every push, run the shared local gate. Nothing connection-dependent is local evidence; the CI jobs are where a dial, a benchmark and Miri count.
 ```
