@@ -2022,6 +2022,10 @@ mod tests {
         let mut handler = Handler::new(Device::from_handle(a, DEFAULT_MTU), relay, no_associate());
         let mut buf = vec![0u8; DEFAULT_MTU + 64];
         let destination: SocketAddr = "203.0.113.61:80".parse().unwrap();
+        let destination_ip = match destination {
+            SocketAddr::V4(address) => address.ip().octets(),
+            SocketAddr::V6(_) => panic!("the flow names IPv4"),
+        };
         let source_port = 52000;
         let syn_seq = 3000;
         open_flow(
@@ -2052,7 +2056,7 @@ mod tests {
         // The device's own goodbye still lands after the proxy's.
         peer.write_all(&build_tcp_packet(
             (SCRIPT_CLIENT, source_port),
-            (destination.ip().octets(), destination.port()),
+            (destination_ip, destination.port()),
             syn_seq.wrapping_add(1),
             fin.seq.wrapping_add(1),
             FLAG_FIN | FLAG_ACK,
