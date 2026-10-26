@@ -5675,6 +5675,10 @@ pub(crate) mod loopback {
                 if !read_exact_poll(&mut tls, &mut rest) {
                     return;
                 }
+                // The lane resets its stream on drop while the pooled session stays open, so the reset is the edge's end.
+                if frame.kind == frames::RST_STREAM {
+                    return;
+                }
             }
         })
     }
@@ -6536,6 +6540,10 @@ pub(crate) mod loopback {
                 if frame.kind == frames::WINDOW_UPDATE && payload.len() == 4 {
                     let increment = u32::from_be_bytes(payload[..4].try_into().expect("four"));
                     let _ = updates.send((frame.stream, increment));
+                }
+                // The lane resets its stream on drop while the pooled session stays open, so the reset is the edge's end.
+                if frame.kind == frames::RST_STREAM {
+                    return;
                 }
             }
         })

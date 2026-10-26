@@ -17337,16 +17337,13 @@ pub(crate) fn pump_vmess_udp<R, W>(
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    if udp.set_read_timeout(Some(budgets::udp_idle())).is_err() {
+    if udp.set_nonblocking(true).is_err() {
         close();
         return;
     }
     let Ok(udp_send) = udp.try_clone() else {
         return;
     };
-    if udp.set_read_timeout(Some(budgets::udp_idle())).is_err() {
-        return;
-    }
     let done = Arc::new(AtomicBool::new(false));
     let done_in = Arc::clone(&done);
     let forward_user = user.clone();
@@ -17391,10 +17388,11 @@ pub(crate) fn pump_vmess_udp<R, W>(
                     break;
                 }
             }
-            Err(error) if is_timeout(&error) => {
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                 if done.load(Ordering::Relaxed) {
                     break;
                 }
+                thread::sleep(RELAY_POLL);
             }
             Err(_) => break,
         }
