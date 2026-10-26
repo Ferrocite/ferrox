@@ -901,7 +901,7 @@ proxy_bypass_join() {
 }
 
 system_proxy_preflight() {
-  local platform https="" all=""
+  local platform https="" all="" svc state
   platform="$(uname -s 2>/dev/null || true)"
   case "$platform" in
     Darwin) ;;
@@ -936,11 +936,81 @@ system_proxy_preflight() {
     say "ferrox-cli: --vpn needs scutil on PATH to verify the proxy; nothing was started." >&2
     return 1
   }
+  svc="$(networksetup -listallnetworkservices 2>/dev/null | tail -n +2 | sed '/^\*/d' | head -n 1)"
+  [ -n "$svc" ] || {
+    say "ferrox-cli: --vpn found no network service to carry the proxy; nothing was started." >&2
+    return 1
+  }
+  state="$(proxy_auto_line "$svc" | sed -n 's/^Auto Proxy Discovery: //p' | head -n 1 | tr '[:upper:]' '[:lower:]')"
+  case "$state" in
+    on|yes) state=on ;;
+    off|no) state=off ;;
+    *)
+      say "ferrox-cli: --vpn cannot read the current auto discovery state; nothing was started." >&2
+      return 1
+      ;;
+  esac
+  if ! networksetup -setproxyautodiscovery "$svc" "$state" 2>/dev/null; then
+    say "ferrox-cli: --vpn needs administrator permission to change the system proxy; nothing was started." >&2
+    say "  run it with sudo, or point the app at the fronts: ferrox-cli ports" >&2
+    return 1
+  fi
   return 0
 }
 
 proxy_readback_has() {
   printf '%s\n' "$1" | grep -Eq "^[[:space:]]*$2[[:space:]]*:[[:space:]]*$3[[:space:]]*$"
+}
+
+proxy_readback_endpoint() {
+  printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2[[:space:]]*:[[:space:]]*//p" | head -n 1
+}
+
+proxy_service_armed() {
+  local svc="$1" socks="$2" http="$3" report
+  if [ -n "$socks" ]; then
+    report="$(networksetup -getsocksfirewallproxy "$svc" 2>/dev/null)" || return 1
+    [ "$(proxy_field "$report" Enabled | tr '[:upper:]' '[:lower:]')" = yes ] || return 1
+    [ "$(proxy_field "$report" Server)" = 127.0.0.1 ] || return 1
+    [ "$(proxy_field "$report" Port)" = "$socks" ] || return 1
+  fi
+  if [ -n "$http" ]; then
+    report="$(networksetup -getwebproxy "$svc" 2>/dev/null)" || return 1
+    [ "$(proxy_field "$report" Enabled | tr '[:upper:]' '[:lower:]')" = yes ] || return 1
+    [ "$(proxy_field "$report" Server)" = 127.0.0.1 ] || return 1
+    [ "$(proxy_field "$report" Port)" = "$http" ] || return 1
+    report="$(networksetup -getsecurewebproxy "$svc" 2>/dev/null)" || return 1
+    [ "$(proxy_field "$report" Enabled | tr '[:upper:]' '[:lower:]')" = yes ] || return 1
+    [ "$(proxy_field "$report" Server)" = 127.0.0.1 ] || return 1
+    [ "$(proxy_field "$report" Port)" = "$http" ] || return 1
+  fi
+  return 0
+}
+
+proxy_system_request() {
+  local endpoint="$1" url="$2"
+  env -u ALL_PROXY -u all_proxy -u HTTP_PROXY -u http_proxy \
+    -u HTTPS_PROXY -u https_proxy -u NO_PROXY -u no_proxy \
+    ALL_PROXY="$endpoint" all_proxy="$endpoint" \
+    HTTP_PROXY="$endpoint" http_proxy="$endpoint" \
+    HTTPS_PROXY="$endpoint" https_proxy="$endpoint" NO_PROXY= no_proxy= \
+    curl -q -s --max-time "$PROBE_TIMEOUT" "$url" 2>/dev/null
+}
+
+proxy_system_probe() {
+  local readback="$1" socks="$2" http="$3" endpoint answer
+  if [ -n "$socks" ]; then
+    endpoint="socks5h://$(proxy_readback_endpoint "$readback" SOCKSProxy):$(proxy_readback_endpoint "$readback" SOCKSPort)"
+  else
+    endpoint="http://$(proxy_readback_endpoint "$readback" HTTPProxy):$(proxy_readback_endpoint "$readback" HTTPPort)"
+  fi
+  answer="$(proxy_system_request "$endpoint" https://www.cloudflare.com/cdn-cgi/trace)"
+  if printf '%s\n' "$answer" | grep -qE '^(ip|loc)='; then
+    return 0
+  fi
+  [ "$OUTBOUND" = veepn ] || return 1
+  answer="$(proxy_system_request "$endpoint" http://example.com/)"
+  printf '%s\n' "$answer" | grep -q 'Example Domain'
 }
 
 # Snapshot every field the arm can change, so down can put back exactly what was there.
@@ -1186,6 +1256,11 @@ system_proxy_on() {
         return 1
       fi
     fi
+    if ! proxy_service_armed "$svc" "$want_socks" "$want_http"; then
+      say "system proxy: read-back for '$svc' did not show the armed host and port; clearing." >&2
+      system_proxy_off
+      return 1
+    fi
     any=1
   done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
   [ "$any" = 1 ] || { system_proxy_off; say "no network service took the proxy" >&2; return 1; }
@@ -1197,13 +1272,26 @@ system_proxy_on() {
   proxy_readback_has "$readback" ProxyAutoDiscoveryEnable 0 || bad="$bad auto discovery"
   if [ -n "$want_socks" ]; then
     proxy_readback_has "$readback" SOCKSEnable 1 || bad="$bad SOCKS"
+    { [ "$(proxy_readback_endpoint "$readback" SOCKSProxy)" = 127.0.0.1 ] &&
+      [ "$(proxy_readback_endpoint "$readback" SOCKSPort)" = "$want_socks" ]; } ||
+      bad="$bad SOCKS endpoint"
   fi
   if [ -n "$want_http" ]; then
     proxy_readback_has "$readback" HTTPEnable 1 || bad="$bad HTTP"
     proxy_readback_has "$readback" HTTPSEnable 1 || bad="$bad HTTPS"
+    { [ "$(proxy_readback_endpoint "$readback" HTTPProxy)" = 127.0.0.1 ] &&
+      [ "$(proxy_readback_endpoint "$readback" HTTPPort)" = "$want_http" ] &&
+      [ "$(proxy_readback_endpoint "$readback" HTTPSProxy)" = 127.0.0.1 ] &&
+      [ "$(proxy_readback_endpoint "$readback" HTTPSPort)" = "$want_http" ]; } ||
+      bad="$bad HTTP endpoint"
   fi
   if [ -n "$bad" ]; then
     say "system proxy: the read-back did not show the armed state ($bad); clearing it." >&2
+    system_proxy_off
+    return 1
+  fi
+  if ! proxy_system_probe "$readback" "$want_socks" "$want_http"; then
+    say "system proxy: the armed proxy did not carry a trace; clearing it." >&2
     system_proxy_off
     return 1
   fi
