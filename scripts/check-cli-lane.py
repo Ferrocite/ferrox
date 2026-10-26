@@ -18,7 +18,9 @@ nothing either: the lane child, its pid file, its config and the proxy marker
 are all gone. The proxy is never armed or cleared on the machine running the
 gate: a fake `networksetup` and `scutil` record and answer the calls instead, so
 `--vpn` must turn PAC and auto discovery off, restore them on `down`, and fail
-when the read-back still shows PAC enabled.
+when the read-back still shows PAC enabled. An armed proxy is read back per
+service and through `scutil` for the exact loopback host and port, and one trace
+must pass through that endpoint before the arm is reported.
 """
 
 from __future__ import annotations
@@ -67,6 +69,14 @@ args = sys.argv[1:]
 command = args[0] if args else ""
 root = machine / "fake-net"
 root.mkdir(exist_ok=True)
+deny = os.environ.get("FERROX_FAKE_DENY_SET") == "1"
+ignore = os.environ.get("FERROX_FAKE_SET_IGNORE") == "1"
+lie = os.environ.get("FERROX_FAKE_PROXY_LIE") == "1"
+if command.startswith("-set"):
+    if deny:
+        sys.exit(1)
+    if ignore:
+        sys.exit(0)
 
 
 def service(name):
@@ -107,6 +117,8 @@ elif command in (
     }[command]
     endpoint = read(directory, f"{field}-proxy")
     server, _, port = endpoint.rpartition(":")
+    if lie and field == "socks":
+        server, port = "192.0.2.1", str(int(port or "0") + 1)
     enabled = read(directory, f"{field}-enabled", "off") in ("on", "yes")
     print(f"Enabled: {'Yes' if enabled else 'No'}")
     print(f"Server: {server}")
@@ -192,6 +204,7 @@ override = machine / "scutil.override"
 if override.exists():
     sys.stdout.write(override.read_text(encoding="utf-8"))
     sys.exit(0)
+lie = os.environ.get("FERROX_FAKE_SCUTIL_LIE") == "1"
 
 directory = machine / "fake-net" / "Wi-Fi"
 
@@ -205,12 +218,28 @@ def enabled(field):
     return 1 if read(field, "off") in ("on", "yes") else 0
 
 
+def endpoint(field):
+    server, _, port = read(f"{field}-proxy").rpartition(":")
+    return server, port
+
+
 print("<dictionary> {")
 print(f"  ProxyAutoConfigEnable : {enabled('pac-enabled')}")
 print(f"  ProxyAutoDiscoveryEnable : {enabled('autodiscovery')}")
 print(f"  HTTPEnable : {enabled('http-enabled')}")
 print(f"  HTTPSEnable : {enabled('https-enabled')}")
 print(f"  SOCKSEnable : {enabled('socks-enabled')}")
+for field, proxy, port in (
+    ("http", "HTTPProxy", "HTTPPort"),
+    ("https", "HTTPSProxy", "HTTPSPort"),
+    ("socks", "SOCKSProxy", "SOCKSPort"),
+):
+    if enabled(f"{field}-enabled"):
+        server, number = endpoint(field)
+        if lie:
+            server, number = "192.0.2.1", str(int(number or "0") + 1)
+        print(f"  {proxy} : {server}")
+        print(f"  {port} : {number}")
 print("}")
 ''',
         encoding="utf-8",
@@ -225,6 +254,18 @@ def fake_curl(state: pathlib.Path) -> pathlib.Path:
     tool = bin_dir / "curl"
     tool.write_text(
         """#!/bin/sh
+if [ -n "${FERROX_FAKE_CURL_LOG:-}" ]; then
+  {
+    printf 'args:'
+    printf ' %s' "$@"
+    printf '\\n'
+    env | grep -E '^(ALL_PROXY|all_proxy|HTTP_PROXY|http_proxy|HTTPS_PROXY|https_proxy|NO_PROXY|no_proxy)=' || true
+    printf 'end\\n'
+  } >> "$FERROX_FAKE_CURL_LOG"
+fi
+if [ "${FERROX_FAKE_SYSTEM_FAIL:-}" = 1 ]; then
+  case " $* " in *" --noproxy "*) ;; *) exit 7 ;; esac
+fi
 if [ "${FERROX_FAKE_TRACE:-}" = 1 ]; then
   printf 'ip=203.0.113.9\\nloc=US\\n'
   exit 0
@@ -1282,7 +1323,12 @@ def check_config_fronts(state: pathlib.Path) -> int:
     )
     run, recorded = config_lane(state, silent, trace=False)
     output = run.stdout + run.stderr
-    writes = [line for line in recorded.splitlines() if line.startswith("-set")]
+    writes = [
+        line
+        for line in recorded.splitlines()
+        if line.startswith("-set")
+        and not line.startswith("-setproxyautodiscovery ")
+    ]
     if (
         run.returncode == 0
         or writes
@@ -1497,6 +1543,180 @@ def check_vpn_pac(state: pathlib.Path) -> int:
     print(
         "check-cli-lane: a read-back that still shows PAC enabled fails the arm and clears it"
     )
+    return 0
+
+
+def check_vpn_proxy_readback(state: pathlib.Path) -> int:
+    port = free_port()
+    config = vpn_config(state, "vpn-readback.json", port)
+    curl_log = state / "curl.calls"
+
+    def fresh() -> None:
+        reset_fake_net(state)
+        curl_log.unlink(missing_ok=True)
+
+    def run(args: list[str], extra: dict[str, str] | None = None):
+        env = env_for(state, curl=True, darwin=True)
+        env["FERROX_BIN"] = str(vpn_lane_binary(state))
+        env["FERROX_FAKE_TRACE"] = "1"
+        env["FERROX_FAKE_CURL_LOG"] = str(curl_log)
+        if extra:
+            env.update(extra)
+        return subprocess.run(
+            [str(CLI), *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+
+    def up(extra: dict[str, str] | None = None):
+        return run(["up", "--config", str(config), "--vpn"], extra)
+
+    def live_lanes() -> list[int]:
+        pids = state / "fake-vpn-lane.pids"
+        live = []
+        for raw in pids.read_text(encoding="utf-8").split() if pids.exists() else []:
+            try:
+                os.kill(int(raw), 0)
+            except ProcessLookupError:
+                continue
+            live.append(int(raw))
+        return live
+
+    def cleared(output: str, label: str) -> bool:
+        if (state / "system-proxy.ports").exists() or (
+            state / "system-proxy.state"
+        ).exists():
+            print(
+                f"check-cli-lane: {label} left a proxy marker:\n{output}",
+                file=sys.stderr,
+            )
+            return False
+        if (state / "lane.pid").exists() or live_lanes():
+            print(
+                f"check-cli-lane: {label} left a lane behind:\n{output}",
+                file=sys.stderr,
+            )
+            return False
+        return True
+
+    fresh()
+    arm = up()
+    output = arm.stdout + arm.stderr
+    if (
+        arm.returncode != 0
+        or proxy_field(state, "socks-proxy") != f"127.0.0.1:{port}"
+        or proxy_field(state, "socks-enabled") != "on"
+        or not (state / "system-proxy.ports").exists()
+    ):
+        print(
+            f"check-cli-lane: a successful arm did not read back its endpoint:"
+            f"\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    recorded = curl_log.read_text(encoding="utf-8") if curl_log.exists() else ""
+    probe = [
+        block
+        for block in recorded.split("end\n")
+        if "args:" in block
+        and "--noproxy" not in block
+        and f"ALL_PROXY=socks5h://127.0.0.1:{port}" in block
+    ]
+    if not probe:
+        print(
+            "check-cli-lane: a successful arm never proved a trace through the"
+            f" system proxy:\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    down = run(["down"])
+    output = down.stdout + down.stderr
+    if down.returncode != 0 or not cleared(output, "down after a successful arm"):
+        return 1
+    print(
+        "check-cli-lane: an arm reads its exact endpoint back and proves a trace through it"
+    )
+
+    fresh()
+    denied = up({"FERROX_FAKE_DENY_SET": "1"})
+    output = denied.stdout + denied.stderr
+    if (
+        denied.returncode == 0
+        or "administrator" not in output
+        or "nothing was started" not in output
+        or (state / "fake-vpn-lane.pids").exists()
+        or not cleared(output, "a denied preflight")
+    ):
+        print(
+            f"check-cli-lane: a denied proxy write did not refuse before the lane:"
+            f"\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "check-cli-lane: a denied proxy write refuses before the lane starts"
+    )
+
+    fresh()
+    ignored = up({"FERROX_FAKE_SET_IGNORE": "1"})
+    output = ignored.stdout + ignored.stderr
+    if ignored.returncode == 0 or "read-back" not in output or not cleared(
+        output, "a write that persisted nothing"
+    ):
+        print(
+            f"check-cli-lane: a write that persisted nothing passed the arm:"
+            f"\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print("check-cli-lane: a write that persisted nothing fails the read-back")
+
+    fresh()
+    lied = up({"FERROX_FAKE_PROXY_LIE": "1"})
+    output = lied.stdout + lied.stderr
+    if lied.returncode == 0 or "read-back" not in output or not cleared(
+        output, "a service read-back at the wrong endpoint"
+    ):
+        print(
+            f"check-cli-lane: a service read-back at the wrong endpoint passed:"
+            f"\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print("check-cli-lane: a service read-back must show the exact host and port")
+
+    fresh()
+    scutil_lie = up({"FERROX_FAKE_SCUTIL_LIE": "1"})
+    output = scutil_lie.stdout + scutil_lie.stderr
+    if scutil_lie.returncode == 0 or "read-back" not in output or not cleared(
+        output, "a scutil read-back at the wrong endpoint"
+    ):
+        print(
+            f"check-cli-lane: a scutil read-back at the wrong endpoint passed:"
+            f"\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print("check-cli-lane: scutil's read-back must show the exact host and port")
+
+    fresh()
+    silent = up({"FERROX_FAKE_SYSTEM_FAIL": "1"})
+    output = silent.stdout + silent.stderr
+    if (
+        silent.returncode == 0
+        or "did not carry a trace" not in output
+        or not cleared(output, "a system proxy that carried no trace")
+    ):
+        print(
+            f"check-cli-lane: a system proxy that carried no trace passed:"
+            f"\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print("check-cli-lane: a trace through the system proxy must pass before the arm")
     return 0
 
 
@@ -2596,6 +2816,8 @@ def main() -> int:
     if check_config_fronts(state) != 0:
         return 1
     if check_vpn_pac(state) != 0:
+        return 1
+    if check_vpn_proxy_readback(state) != 0:
         return 1
     if check_vpn_bypass(state) != 0:
         return 1
