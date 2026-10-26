@@ -138,66 +138,27 @@ impl Hmac {
     }
 }
 
-enum Kdf {
-    Root(Box<Hmac>),
-    Link {
-        below: Box<Kdf>,
-        seal_in: [u8; 64],
-        seal_out: [u8; 64],
-    },
-}
-
-impl Kdf {
-    fn root() -> Self {
-        Self::Root(Box::new(Hmac::fresh(b"VMess AEAD KDF")))
+fn kdf_digest(root: &mut Hmac, path: &[&[u8]], level: usize) -> [u8; 32] {
+    if level == 0 {
+        return root.digest();
     }
-    fn wrap(mut self, key: &[u8]) -> Self {
-        let (seal_in, seal_out) = hmac_pads(key);
-        self.push(&seal_in);
-        Self::Link {
-            below: Box::new(self),
-            seal_in,
-            seal_out,
-        }
+    let mid = kdf_digest(root, path, level - 1);
+    root.restart();
+    for layer in &path[..level - 1] {
+        root.push(&hmac_pads(layer).0);
     }
-    fn push(&mut self, data: &[u8]) {
-        match self {
-            Self::Root(h) => h.push(data),
-            Self::Link { below, .. } => below.push(data),
-        }
-    }
-    fn restart(&mut self) {
-        match self {
-            Self::Root(h) => h.restart(),
-            Self::Link { below, seal_in, .. } => {
-                below.restart();
-                below.push(seal_in);
-            }
-        }
-    }
-    fn digest(&mut self) -> [u8; 32] {
-        match self {
-            Self::Root(h) => h.digest(),
-            Self::Link {
-                below, seal_out, ..
-            } => {
-                let mid = below.digest();
-                below.restart();
-                below.push(seal_out);
-                below.push(&mid);
-                below.digest()
-            }
-        }
-    }
+    root.push(&hmac_pads(path[level - 1]).1);
+    root.push(&mid);
+    kdf_digest(root, path, level - 1)
 }
 
 fn kdf(key: &[u8], path: &[&[u8]]) -> [u8; 32] {
-    let mut chain = Kdf::root();
+    let mut root = Hmac::fresh(b"VMess AEAD KDF");
     for layer in path {
-        chain = chain.wrap(layer);
+        root.push(&hmac_pads(layer).0);
     }
-    chain.push(key);
-    chain.digest()
+    root.push(key);
+    kdf_digest(&mut root, path, path.len())
 }
 
 fn kdf16(key: &[u8], path: &[&[u8]]) -> [u8; 16] {
@@ -391,23 +352,33 @@ fn seal_header(key: &[u8; 16], nonce: &[u8; 12], plain: &[u8], aad: &[u8]) -> Op
     Some(body)
 }
 
-fn open_header(key: &[u8; 16], nonce: &[u8; 12], sealed: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
+fn open_header_into<'a>(
+    key: &[u8; 16],
+    nonce: &[u8; 12],
+    sealed: &[u8],
+    aad: &[u8],
+    out: &'a mut [u8],
+) -> Option<&'a [u8]> {
     use aes_gcm::aead::AeadInPlace as _;
     use aes_gcm::KeyInit as _;
-    if sealed.len() < TAG_LEN {
-        return None;
-    }
+    let split = sealed.len().checked_sub(TAG_LEN)?;
+    let body = out.get_mut(..split)?;
+    body.copy_from_slice(&sealed[..split]);
     let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).ok()?;
-    let split = sealed.len() - TAG_LEN;
-    let mut body = sealed[..split].to_vec();
     cipher
         .decrypt_in_place_detached(
             aes_gcm::Nonce::from_slice(nonce),
             aad,
-            &mut body,
+            body,
             aes_gcm::Tag::from_slice(&sealed[split..]),
         )
         .ok()?;
+    Some(body)
+}
+
+fn open_header(key: &[u8; 16], nonce: &[u8; 12], sealed: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
+    let mut body = vec![0u8; sealed.len().checked_sub(TAG_LEN)?];
+    open_header_into(key, nonce, sealed, aad, &mut body)?;
     Some(body)
 }
 
@@ -1192,6 +1163,19 @@ pub(crate) fn read_response(
     response_iv: &[u8; 16],
     auth: u8,
 ) -> bool {
+    let ok = read_response_header(stream, response_key, response_iv, auth);
+    if ok && crate::proxy::echo_trace_on() {
+        crate::proxy::echo_trace("response ok");
+    }
+    ok
+}
+
+fn read_response_header(
+    stream: &mut dyn Read,
+    response_key: &[u8; 16],
+    response_iv: &[u8; 16],
+    auth: u8,
+) -> bool {
     let len_key = kdf16(response_key, &[b"AEAD Resp Header Len Key"]);
     let len_full = kdf(response_iv, &[b"AEAD Resp Header Len IV"]);
     let len_nonce: [u8; 12] = len_full[..12].try_into().unwrap();
@@ -1199,29 +1183,32 @@ pub(crate) fn read_response(
     if read_exact(stream, &mut sealed_len).is_err() {
         return false;
     }
-    let Some(clear_len) = open_header(&len_key, &len_nonce, &sealed_len, &[]) else {
+    let mut len_plain = [0u8; 2];
+    let Some(clear_len) = open_header_into(&len_key, &len_nonce, &sealed_len, &[], &mut len_plain)
+    else {
         return false;
     };
-    if clear_len.len() != 2 {
-        return false;
-    }
     let body_len = usize::from(u16::from_be_bytes([clear_len[0], clear_len[1]]));
     if body_len > 64 {
         return false;
     }
-    let mut sealed_body = crate::proxy::unfilled(body_len + TAG_LEN);
-    if read_exact(stream, &mut sealed_body).is_err() {
+    let mut sealed_body = [0u8; 64 + TAG_LEN];
+    if read_exact(stream, &mut sealed_body[..body_len + TAG_LEN]).is_err() {
         return false;
     }
     let body_key = kdf16(response_key, &[b"AEAD Resp Header Key"]);
     let body_full = kdf(response_iv, &[b"AEAD Resp Header IV"]);
     let body_nonce: [u8; 12] = body_full[..12].try_into().unwrap();
-    let Some(clear_body) = open_header(&body_key, &body_nonce, &sealed_body, &[]) else {
+    let mut body_plain = [0u8; 64];
+    let Some(clear_body) = open_header_into(
+        &body_key,
+        &body_nonce,
+        &sealed_body[..body_len + TAG_LEN],
+        &[],
+        &mut body_plain,
+    ) else {
         return false;
     };
-    if crate::proxy::echo_trace_on() {
-        crate::proxy::echo_trace("response ok");
-    }
     clear_body.len() == 4 && clear_body[0] == auth
 }
 
@@ -2890,6 +2877,19 @@ mod tests {
                 0xcd, 0x45, 0x4e, 0x47, 0x98, 0x8d, 0x4a, 0xf9, 0x11, 0xd7,
             ]
         );
+    }
+
+    #[test]
+    fn a_response_header_reads_without_allocating() {
+        let key = [0x71u8; 16];
+        let iv = [0x72u8; 16];
+        let wire = response_prefix(&key, &iv, 0xAB).expect("prefixes");
+        let mut reader = std::io::Cursor::new(wire);
+        let (opened, counts) = ferrox_core::alloc_count::measure(|| {
+            super::read_response_header(&mut reader, &key, &iv, 0xAB)
+        });
+        assert!(opened, "the sealed header opens");
+        assert_eq!(counts.allocs, 0, "the response header is read on the stack");
     }
 
     #[test]
