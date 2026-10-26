@@ -1113,25 +1113,6 @@ impl<S> std::fmt::Debug for EncryptedStream<S> {
     }
 }
 
-impl<S: crate::tls::RecordAlignment + io::Write> crate::tls::RecordAlignment
-    for EncryptedStream<S>
-{
-    fn engage_record_alignment(&mut self) {
-        self.inner.engage_record_alignment();
-    }
-
-    fn disarm_record_alignment(&mut self) {
-        self.inner.disarm_record_alignment();
-    }
-
-    fn write_all_slices(&mut self, parts: &[&[u8]]) -> io::Result<()>
-    where
-        Self: io::Write,
-    {
-        self.inner.write_all_slices(parts)
-    }
-}
-
 impl<S> Drop for EncryptedStream<S> {
     fn drop(&mut self) {
         use zeroize::Zeroize as _;

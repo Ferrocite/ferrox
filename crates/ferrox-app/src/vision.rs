@@ -267,11 +267,11 @@ impl<S: Read + Write> Write for Sealed<S> {
 
 impl<S: Read + Write + RecordAlignment> RecordAlignment for Sealed<S> {
     fn engage_record_alignment(&mut self) {
-        self.0.engage_record_alignment();
+        self.0.get_mut().engage_record_alignment();
     }
 
     fn disarm_record_alignment(&mut self) {
-        self.0.disarm_record_alignment();
+        self.0.get_mut().disarm_record_alignment();
     }
 
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
