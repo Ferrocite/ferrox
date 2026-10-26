@@ -1415,6 +1415,22 @@ mod tests {
     }
 
     #[test]
+    fn a_tombstone_is_reused_for_a_new_id() {
+        let mut sessions = Sessions::<u32>::with_cap(2);
+        for id in 1..=4 {
+            assert_eq!(sessions.open(id, id), Some(None), "id {id}");
+            assert_eq!(sessions.close(id), Some(id), "id {id}");
+        }
+        assert_eq!(sessions.live(), 0);
+        assert_eq!(
+            sessions.open(5, 5),
+            Some(None),
+            "a closed slot is free for a new id"
+        );
+        assert_eq!(sessions.get(5), Some(&5));
+    }
+
+    #[test]
     fn a_tombstone_does_not_open_past_the_cap() {
         let mut sessions = Sessions::with_cap(2);
         assert_eq!(sessions.open(1, 'a'), Some(None));
