@@ -138,8 +138,10 @@ ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_n
 # loaded the five header bytes one at a time. It now keeps the cursor and the
 # Walk in registers and writes them back once, and parses the header as one
 # slice; the bytes, commands and frames are unchanged.
-# Re-blessed 16896 by the vless-encryption module: the Vision walk is untouched.
-# The new module's layout moved the probe's frame back to the 16896 the
-# steady-read feed replaced; the frames, commands and bytes are unchanged.
-vision::Linkferrox_app::vision::tests::Fake::pump 16896 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
+# Re-blessed 30208 by the whole-frame vision walk: the probe now carries six
+# content bytes and four padding bytes per frame, with the filter spent and no
+# caller buffer, because the empty-frame probe walked no content and could not
+# see the one-pass delivery. The same probe priced the old walk at 35584 in the
+# same binary: 5376 fewer, 15.1%. The frames, commands and bytes are unchanged.
+vision::Linkferrox_app::vision::tests::Fake::pump 30208 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
 
