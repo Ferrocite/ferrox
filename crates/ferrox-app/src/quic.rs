@@ -781,7 +781,7 @@ pub(crate) fn recv_batch(sock: &Datagram, batch: &mut Batch) -> Drain {
     let got = unsafe {
         libc::recvmmsg(
             sock.sock.as_raw_fd(),
-            headers.as_mut_ptr(),
+            headers.as_mut_ptr().cast::<libc::mmsghdr>(),
             RECV_SLOTS as libc::c_uint,
             libc::MSG_WAITFORONE as _,
             std::ptr::null_mut(),
