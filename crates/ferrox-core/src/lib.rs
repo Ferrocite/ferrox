@@ -17,6 +17,7 @@ pub mod foxy;
 pub mod hysteria;
 pub mod hysteria_v1;
 pub mod kcp;
+pub(crate) mod keystream;
 pub mod mux;
 pub mod policy;
 pub mod poly1305;
