@@ -9,9 +9,9 @@
 use std::net::{IpAddr, SocketAddr, UdpSocket};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ferrox_core::wireguard::device::{Event, Tunnel};
+use ferrox_core::wireguard::device::{tai64n, Event, Tunnel};
 use ferrox_core::wireguard::handshake::{
     check_mac1, INITIATION_SIZE, TYPE_INITIATION, TYPE_RESPONSE,
 };
@@ -162,7 +162,8 @@ fn io(
     routes: Option<UdpRoutes>,
 ) {
     let _ = socket.set_read_timeout(Some(IO_TICK));
-    let mut peers = peers(&config);
+    let epoch = tai64n_now();
+    let mut peers = peers(&config, epoch);
     let started = Instant::now();
     let mut buf = vec![0u8; 65_535];
     loop {
@@ -297,7 +298,14 @@ fn flush(
     }
 }
 
-fn peers(config: &DeviceConfig) -> Vec<Peer> {
+fn tai64n_now() -> [u8; 12] {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    tai64n(now.as_secs(), now.subsec_nanos())
+}
+
+fn peers(config: &DeviceConfig, epoch: [u8; 12]) -> Vec<Peer> {
     config
         .peers
         .iter()
@@ -319,6 +327,7 @@ fn peers(config: &DeviceConfig) -> Vec<Peer> {
                 }),
                 peer.keepalive,
                 config.reserved,
+                epoch,
             ),
         })
         .collect()

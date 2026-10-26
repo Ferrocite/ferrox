@@ -19,8 +19,6 @@
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use zeroize::Zeroize as _;
 
 use super::handshake::{self, Handshake, MAC_SIZE};
@@ -46,6 +44,9 @@ pub const COOKIE_REFRESH: u64 = 120_000;
 /// stalled handshake cannot grow the process without a bound.
 const QUEUE_BYTES: usize = 256 * 1024;
 
+/// TAI64N's first second; the record adds Unix seconds to it.
+const TAI64N_EPOCH: u64 = 0x4000_0000_0000_000a;
+
 /// One outbound packet and where it goes, or one decrypted payload for the
 /// upper layer.
 #[derive(Debug)]
@@ -61,14 +62,11 @@ pub enum Event {
 /// TAI offset, then nanoseconds, both big-endian. The record is ordered
 /// lexicographically, which is how the responder refuses a replay.
 #[must_use]
-pub fn tai64n_now() -> [u8; 12] {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let seconds = 0x4000_0000_0000_000a_u64.wrapping_add(now.as_secs());
+pub fn tai64n(seconds: u64, nanos: u32) -> [u8; 12] {
+    let seconds = TAI64N_EPOCH.wrapping_add(seconds);
     let mut out = [0u8; 12];
     out[..8].copy_from_slice(&seconds.to_be_bytes());
-    out[8..].copy_from_slice(&now.subsec_nanos().to_be_bytes());
+    out[8..].copy_from_slice(&nanos.to_be_bytes());
     out
 }
 
@@ -113,6 +111,7 @@ pub struct Tunnel {
     handshake_started: u64,
     handshake_sent: u64,
     last_timestamp: Option<[u8; 12]>,
+    epoch: [u8; 12],
     session: Option<Session>,
     queue: VecDeque<Vec<u8>>,
     queued_bytes: usize,
@@ -156,6 +155,7 @@ impl Tunnel {
         endpoint: SocketAddr,
         keepalive: u16,
         reserved: [u8; 3],
+        epoch: [u8; 12],
     ) -> Self {
         let public = public_key(&private);
         Self {
@@ -172,12 +172,28 @@ impl Tunnel {
             handshake_started: 0,
             handshake_sent: 0,
             last_timestamp: None,
+            epoch,
             session: None,
             queue: VecDeque::new(),
             queued_bytes: 0,
             last_send: 0,
             last_recv: 0,
         }
+    }
+
+    /// The wall-clock base carried from startup plus the monotonic elapsed time, so a
+    /// retry is newer than the initiation it replaces without a clock read here.
+    fn timestamp_at(&self, now: u64) -> [u8; 12] {
+        let seconds = u64::from_be_bytes(self.epoch[..8].try_into().expect("eight bytes"));
+        let nanos = u64::from(u32::from_be_bytes(
+            self.epoch[8..].try_into().expect("four bytes"),
+        )) + now.saturating_mul(1_000_000);
+        tai64n(
+            seconds
+                .wrapping_sub(TAI64N_EPOCH)
+                .wrapping_add(nanos / 1_000_000_000),
+            (nanos % 1_000_000_000) as u32,
+        )
     }
 
     /// This side's static public key.
@@ -221,7 +237,7 @@ impl Tunnel {
         let Ok((index, ephemeral)) = random_index() else {
             return false;
         };
-        let timestamp = tai64n_now();
+        let timestamp = self.timestamp_at(now);
         let mut message = state.create_initiation(&self.public, ephemeral, index, &timestamp);
         handshake::set_mac1(&mut message, &self.peer);
         if let Some((cookie, at)) = self.cookie {
@@ -341,9 +357,7 @@ impl Tunnel {
             return;
         };
         self.cookie = Some((cookie, now));
-        // The next attempt carries mac2; a fresh initiation is the reference's
-        // own answer to a cookie, and its timestamp is newer than the one the
-        // reply was bound to. The attempt budget is the original one.
+        // The next initiation carries mac2, and the original attempt budget survives.
         let started = self.handshake_started;
         self.handshake = None;
         if self.initiate(now, out) {
@@ -578,6 +592,7 @@ mod tests {
                 ALICE.parse().unwrap(),
                 keepalive,
                 [0; 3],
+                [0; 12],
             ),
             Tunnel::new(
                 bob_private,
@@ -586,6 +601,7 @@ mod tests {
                 BOB.parse().unwrap(),
                 keepalive,
                 [0; 3],
+                [0; 12],
             ),
         )
     }

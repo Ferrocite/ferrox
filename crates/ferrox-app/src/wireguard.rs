@@ -359,7 +359,7 @@ mod tests {
         assert!(!prefix_matches(
             "10.0.0.0".parse().unwrap(),
             8,
-            "11.0.0.1".parse().unwrap()
+            "192.0.2.1".parse().unwrap()
         ));
         assert!(prefix_matches(
             "::".parse().unwrap(),
