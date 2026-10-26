@@ -20,9 +20,9 @@ before the build and the cell measures the transport rather than a TLS refusal.
 A wide PR's smoke cell also builds and runs sing-box, so the translated client
 is exercised before the nightly.
 
-`leaf` joins where its pin has the protocol and carrier: raw, TLS and REALITY
-VLESS over TCP or WebSocket, VMess, Trojan, and legacy Shadowsocks. It has no
-`xhttp`, KCP, gRPC, HTTPUpgrade, Hysteria, VLESS flow or encryption, or
+`leaf` joins where its pin has the protocol and carrier: VMess, Trojan, legacy
+Shadowsocks, and VLESS only with the Vision flow on raw TCP. It has no plain
+VLESS, `xhttp`, KCP, gRPC, HTTPUpgrade, Hysteria, VLESS encryption, or
 Shadowsocks 2022, and those cells name that in the bundle's skipped list.
 `scripts/xray-to-leaf.py` writes its TLS, REALITY and WebSocket layers as chain
 actors. `xray-rust` joins every standard and full cell its pin admits;

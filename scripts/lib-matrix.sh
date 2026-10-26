@@ -46,6 +46,10 @@ matrix_server_serves() {
 # skipped list, so a reader sees which side is behind instead of a zero.
 matrix_engine_skip_reason() {
   local engine="$1" id="$2"
+  if [[ "$engine" == "leaf" && "$id" == vless-* && "$id" != *-vision-* ]]; then
+    printf '%s\n' "leaf at this pin only sends VLESS with the Vision flow, which this scenario does not configure"
+    return 0
+  fi
   case "$engine:$id" in
     sing-box:*-xhttp-*|sing-box:*-kcp-*)
       printf '%s\n' "sing-box at this pin has no xhttp or KCP transport" ;;
@@ -65,8 +69,6 @@ matrix_engine_skip_reason() {
       printf '%s\n' "leaf at this pin has no gRPC transport" ;;
     leaf:*-httpupgrade-*)
       printf '%s\n' "leaf at this pin has no HTTPUpgrade transport" ;;
-    leaf:*-vision-*)
-      printf '%s\n' "leaf at this pin has no VLESS flow" ;;
     leaf:shadowsocks2022-*)
       printf '%s\n' "leaf at this pin has no Shadowsocks 2022" ;;
     *)

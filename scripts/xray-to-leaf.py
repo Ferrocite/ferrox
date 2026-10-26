@@ -85,8 +85,10 @@ def _protocol_layer(source):
     if protocol == "vless":
         server = _first(settings.get("vnext"), "`vnext`")
         user = _first(server.get("users"), "`vnext[0].users`")
-        if user.get("flow"):
-            raise ValueError("leaf at this pin has no VLESS flow")
+        if user.get("flow") != "xtls-rprx-vision":
+            raise ValueError(
+                "leaf at this pin only implements VLESS with the Vision flow"
+            )
         layer = {
             "address": server["address"],
             "port": server["port"],
