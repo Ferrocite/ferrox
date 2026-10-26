@@ -650,12 +650,6 @@ impl Client {
             if *len > 0 {
                 inner.write_all(&hello[sent..sent + len])?;
                 inner.flush()?;
-                eprintln!(
-                    "ferrox-diag: client hello piece {} {} total {}",
-                    i,
-                    *len,
-                    hello.len()
-                );
                 sent += len;
             }
             if let Some(gap) = gaps.get(i) {

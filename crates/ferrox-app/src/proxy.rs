@@ -3204,38 +3204,27 @@ fn serve_sealed_session<S>(
         + Send
         + 'static,
 {
-    eprintln!("ferrox-diag: session enter");
     match driven_io(session, budgets::handshake()) {
-        Ok(driven) => {
-            eprintln!("ferrox-diag: driven armed");
-            match decryption.handshake(driven) {
-                Ok(sealed) => {
-                    eprintln!("ferrox-diag: driven handshake done");
-                    if let Some(raw) = &timeout {
-                        if raw.set_read_timeout(Some(RELAY_POLL)).is_err() {
-                            return;
-                        }
+        Ok(driven) => match decryption.handshake(driven) {
+            Ok(sealed) => {
+                if let Some(raw) = &timeout {
+                    if raw.set_read_timeout(Some(RELAY_POLL)).is_err() {
+                        return;
                     }
-                    serve_sealed_raw(sealed, peer, users, freedom, closer, timeout, SplitRelay);
                 }
-                Err(error) => eprintln!("ferrox-diag: driven handshake failed: {error}"),
+                serve_sealed_raw(sealed, peer, users, freedom, closer, timeout, SplitRelay);
             }
-        }
-        Err(session) => {
-            eprintln!("ferrox-diag: shared fallback");
-            match decryption.handshake(session) {
-                Ok(sealed) => {
-                    eprintln!("ferrox-diag: shared handshake done");
-                    if let Some(raw) = &timeout {
-                        if raw.set_read_timeout(Some(RELAY_POLL)).is_err() {
-                            return;
-                        }
+        },
+        Err(session) => match decryption.handshake(session) {
+            Ok(sealed) => {
+                if let Some(raw) = &timeout {
+                    if raw.set_read_timeout(Some(RELAY_POLL)).is_err() {
+                        return;
                     }
-                    serve_sealed_raw(sealed, peer, users, freedom, closer, timeout, SharedRelay);
                 }
-                Err(error) => eprintln!("ferrox-diag: shared handshake failed: {error}"),
+                serve_sealed_raw(sealed, peer, users, freedom, closer, timeout, SharedRelay);
             }
-        }
+        },
     }
 }
 
@@ -3252,10 +3241,8 @@ fn serve_sealed_raw<
     _relay: R,
 ) {
     let Some((got, flow, cmd, target)) = decode_request_bounded(&mut sealed) else {
-        eprintln!("ferrox-diag: request decode failed");
         return;
     };
-    eprintln!("ferrox-diag: request decoded cmd={cmd}");
     let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
         crate::accesslog::record(peer, false, &target, None, "invalid user", "");
         return;
@@ -3317,7 +3304,6 @@ fn serve_sealed_raw<
                 return;
             }
             let close = close_with_uplink(closer, &uplink);
-            eprintln!("ferrox-diag: relay armed");
             if flow == Flow::Vision {
                 let link = crate::vision::Link::sealed(sealed, &got);
                 relay_link(&uplink, link, &close, timeout);
@@ -11350,7 +11336,6 @@ where
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let out = self.reader.read(buf);
-        eprintln!("ferrox-diag: io read {} -> {:?}", buf.len(), out);
         out
     }
 }
@@ -11361,7 +11346,6 @@ where
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let out = self.writer.write(buf);
-        eprintln!("ferrox-diag: io write {} -> {:?}", buf.len(), out);
         out
     }
 
@@ -11463,12 +11447,12 @@ impl<S: CipherOpen, R: Read> Read for DrivenHalf<S, R> {
                     .map_err(|_| std::io::Error::other("tls half poisoned"))?;
                 session.open(pending, &mut buf[filled..])?
             };
-            eprintln!(
-                "ferrox-diag: open pending={} plain={plain} taken={taken}",
-                pending.len()
-            );
             self.pending_at += taken;
             filled += plain;
+            if filled == buf.len() {
+                // The caller's window is full: what the session still holds waits for the next read rather than a transport wait it does not need.
+                return Ok(filled);
+            }
             if self.pending_at < self.pending_end {
                 if taken == 0 && plain == 0 {
                     // The session took nothing and gave nothing: the peer is gone.
@@ -11489,14 +11473,6 @@ impl<S: CipherOpen, R: Read> Read for DrivenHalf<S, R> {
                     .map_err(|_| std::io::Error::other("tls half poisoned"))?;
                 reader.read(&mut self.scratch)
             };
-            eprintln!(
-                "ferrox-diag: t={} transport read {read:?}",
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_millis()
-                    % 100000
-            );
             let read = match read {
                 Ok(0) => {
                     // The peer is gone: what was read is handed over, and the next read reports the end.
