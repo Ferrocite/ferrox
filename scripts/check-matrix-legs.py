@@ -116,6 +116,17 @@ def load_baseline(path):
     return known
 
 
+def within_baseline(leg, ratio, filed):
+    """A hole is known while it is no worse than its filed ratio by more than 0.10.
+
+    Throughput legs are fractions where lower is worse; the server cost legs are
+    multiples where higher is worse, so the same subtraction cannot read both.
+    """
+    if leg in ("server-cpu", "server-threads"):
+        return ratio <= filed + 0.10
+    return ratio >= filed - 0.10
+
+
 def check_grouped(grouped, threshold, cpu_threshold, threads_threshold):
     """Every leg gap in the matrix, before baseline reconciliation."""
     holes = []
@@ -297,6 +308,20 @@ def selftest():
         proc = run_self(cells)
         if proc.returncode == 0 or "server CPU was not sampled" not in proc.stderr:
             return f"an unsampled ferrox server passed the gate: {proc.stderr}"
+
+    for leg, ratio, filed, want in (
+        ("client", 0.50, 0.56, True),
+        ("client", 0.40, 0.56, False),
+        ("server-threads", 1.29, 1.54, True),
+        ("server-threads", 1.70, 1.54, False),
+        ("server-cpu", 0.90, 1.00, True),
+        ("server-cpu", 1.20, 1.00, False),
+    ):
+        if within_baseline(leg, ratio, filed) != want:
+            return (
+                f"{leg} at {ratio:.2f}x against a filed {filed:.2f}x was "
+                f"read as {not want}: the wrong direction is worse"
+            )
     print("check-matrix-legs selftest: passed")
     return None
 
@@ -386,7 +411,7 @@ def main():
         filed = baseline.get((hole["base"], hole["leg"]))
         if filed is None:
             new.append(hole)
-        elif hole["ratio"] >= filed[0] - 0.10:
+        elif within_baseline(hole["leg"], hole["ratio"], filed[0]):
             known.append((hole, filed[1]))
         else:
             new.append(hole)
