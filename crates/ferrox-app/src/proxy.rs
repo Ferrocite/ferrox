@@ -3297,7 +3297,7 @@ fn serve_sealed_mux<S>(
 /// A relay over two independently sealed halves, so a parked read never stops the other direction.
 fn relay_split<R, W>(
     mut sealed_read: R,
-    mut sealed_write: W,
+    sealed_write: W,
     plain: &Connection,
     close: &Arc<dyn Fn() + Send + Sync>,
 ) where
