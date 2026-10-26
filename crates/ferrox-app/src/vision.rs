@@ -502,29 +502,73 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         }
         let mut held = 0;
         let result = loop {
-            // the header is read whole when the window offers five bytes; the tail is byte-by-byte
-            if walk.want_header == 5 && end - dot >= 5 {
-                let frame = &self.have[dot..dot + 5];
-                walk.command = frame[0];
-                walk.want_content = usize::from(u16::from_be_bytes([frame[1], frame[2]]));
-                walk.want_padding = usize::from(u16::from_be_bytes([frame[3], frame[4]]));
-                self.validate();
-                dot += 5;
-                walk.want_header = 0;
-            } else if walk.want_header > 0 && dot < end {
-                let byte = self.have[dot];
-                match walk.want_header {
-                    5 => {
-                        walk.command = byte;
-                        self.validate();
+            if walk.want_header > 0 {
+                // the header is read whole when the window offers five bytes; the tail is byte-by-byte
+                if walk.want_header == 5 && end - dot >= 5 {
+                    let frame = &self.have[dot..dot + 5];
+                    let body = u32::from_be_bytes([frame[1], frame[2], frame[3], frame[4]]);
+                    let command = frame[0];
+                    let content = (body >> 16) as usize;
+                    let padding = (body & 0xffff) as usize;
+                    self.validate();
+                    dot += 5;
+                    let room = match buf.as_deref() {
+                        Some(slot) => slot.len() - held,
+                        None => usize::MAX,
+                    };
+                    if end - dot >= content + padding && room >= content {
+                        if content > 0 {
+                            let fresh = &self.have[dot..dot + content];
+                            if self.tls.budget > 0 {
+                                if let Some(feed) = feed.as_deref_mut() {
+                                    feed.run += content;
+                                    feed_extent(fresh, feed);
+                                }
+                            }
+                            if let Some(slot) = buf.as_deref_mut() {
+                                slot[held..held + content].copy_from_slice(fresh);
+                            }
+                            held += content;
+                        }
+                        dot += content + padding;
+                        if command == VisionCommand::Continue.byte() {
+                            continue;
+                        }
+                        self.read.padding = false;
+                        if command == VisionCommand::Direct.byte() {
+                            if let Some(direct) = self.direct {
+                                direct(&mut self.session);
+                            }
+                        }
+                        self.read.raw =
+                            command == VisionCommand::Direct.byte() && self.raw.is_some();
+                        break held;
                     }
-                    4 => walk.want_content = usize::from(byte) << 8,
-                    3 => walk.want_content |= usize::from(byte),
-                    2 => walk.want_padding = usize::from(byte) << 8,
-                    _ => walk.want_padding |= usize::from(byte),
+                    walk.command = command;
+                    walk.want_content = content;
+                    walk.want_padding = padding;
+                    walk.want_header = 0;
+                } else if dot < end {
+                    let byte = self.have[dot];
+                    match walk.want_header {
+                        5 => {
+                            walk.command = byte;
+                            self.validate();
+                        }
+                        4 => walk.want_content = usize::from(byte) << 8,
+                        3 => walk.want_content |= usize::from(byte),
+                        2 => walk.want_padding = usize::from(byte) << 8,
+                        _ => walk.want_padding |= usize::from(byte),
+                    }
+                    dot += 1;
+                    walk.want_header -= 1;
+                } else {
+                    // parked inside an incomplete header: nothing moves without bytes
+                    break held;
                 }
-                dot += 1;
-                walk.want_header -= 1;
+                if walk.want_header > 0 {
+                    continue;
+                }
             }
             if walk.want_content > 0 {
                 let room = match buf.as_deref() {
@@ -548,7 +592,6 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 if walk.want_content > 0 || held == buf.as_deref().map_or(0, <[u8]>::len) {
                     break held;
                 }
-                continue;
             }
             if walk.want_padding > 0 {
                 let take = walk.want_padding.min(end - dot);
@@ -557,9 +600,6 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 if walk.want_padding > 0 {
                     break held;
                 }
-            } else if walk.want_header > 0 {
-                // parked inside an incomplete header: nothing moves without bytes
-                break held;
             }
             if walk.command == VisionCommand::Continue.byte() {
                 walk.want_header = 5;
@@ -873,6 +913,50 @@ mod tests {
         let mut out = Vec::new();
         link.read_to_end(&mut out).expect("reads");
         assert_eq!(out, b"splittail");
+    }
+
+    /// A header split after its first two bytes must stay header: the bytes the window
+    /// still holds are the rest of the lengths, not content the caller may see.
+    #[test]
+    fn a_split_header_is_not_read_as_content() {
+        struct Chunked<'a> {
+            left: &'a [u8],
+            step: usize,
+        }
+        impl Read for Chunked<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.left.len().min(buf.len()).min(self.step);
+                buf[..n].copy_from_slice(&self.left[..n]);
+                self.left = &self.left[n..];
+                Ok(n)
+            }
+        }
+        impl Write for Chunked<'_> {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl RecordAlignment for Chunked<'_> {}
+
+        let mut input = frame(true, 0, b"a", 0);
+        // The first read ends three bytes into the next frame's five-byte header.
+        input.extend(frame(false, 0, b"bc", 0));
+        input.extend(frame(false, 1, b"", 0));
+        let split = 16 + 5 + 1 + 3;
+        let mut link = Link::new(
+            Chunked {
+                left: &input,
+                step: split,
+            },
+            None,
+            &UUID,
+        );
+        let mut got = Vec::new();
+        link.read_to_end(&mut got).expect("reads");
+        assert_eq!(got, b"abc");
     }
 
     #[test]
