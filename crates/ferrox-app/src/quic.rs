@@ -1700,7 +1700,9 @@ impl Gecko {
             let (start, end) = ferrox_core::hysteria::gecko_chunk_range(buf.len(), idx, total)
                 .ok_or(invalid(std::io::ErrorKind::InvalidInput))?;
             let chunk = &buf[start..end];
-            let base = SALAMANDER_SALT + ferrox_core::hysteria::GECKO_HEADER + chunk.len();
+            let base = ferrox_core::hysteria::SALAMANDER_SALT
+                + ferrox_core::hysteria::GECKO_HEADER
+                + chunk.len();
             let pad_len = usize::from(ferrox_core::hysteria::gecko_pad_len(
                 self.min,
                 self.max,
@@ -2243,7 +2245,9 @@ fn pump(
     let mut ready: Vec<(u64, Arc<Connection>)> = Vec::new();
     // One lock per 32 KiB rather than per 8: the drain is the connection's busiest shared path, and every pass pays the mutex twice.
     let mut chunk = crate::proxy::RelayBuf::with_len(PUMP_WINDOW).into_vec();
-    let mut buf = [0u8; MAX_DATAGRAM];
+    // The obfuscated fallback lands the salt in the room too, so `masked_read` unmasks in place rather than staging every plaintext through a scratch.
+    let mut room = Unfilled::<RECV_ROOM>::new();
+    let buf = room.as_mut();
     // The batch lives across the turns, so a turn does not build the slots again.
     let mut batch = Batch::new();
     loop {
@@ -2272,7 +2276,7 @@ fn pump(
                 timed_out = true;
                 None
             }
-            Drain::Unbatchable => match sock.recv_from(&mut buf) {
+            Drain::Unbatchable => match sock.recv_from(buf) {
                 Ok(found) => Some(found),
                 Err(e)
                     if matches!(
