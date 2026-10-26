@@ -617,7 +617,7 @@ impl Connection {
             if n > 0 {
                 return Ok(n);
             }
-            if matches!(self.state(), State::PeerClosed | State::PeerTerminating) {
+            if self.state() == State::PeerTerminating {
                 return Err(ConnError::Closed);
             }
             self.wait_for_data_input(snap)?;
@@ -910,12 +910,13 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_close_ends_the_read_after_the_data_it_sent() {
+    fn a_peer_close_waits_for_the_data_it_still_owes() {
         let conn = echoing_connection();
-        let mut close = CmdOnlySegment::new();
-        close.conv = 4;
-        close.option = super::SegmentOption::CLOSE;
-        conn.input(&mut vec![data(0, 0, b"last"), Segment::CmdOnly(close)]);
+        let mut last = data(0, 0, b"last");
+        if let Segment::Data(segment) = &mut last {
+            segment.option = super::SegmentOption::CLOSE;
+        }
+        conn.input(&mut vec![last]);
         let mut buf = [0u8; 8];
         assert_eq!(read_once(&conn, &mut buf), Ok(4));
         assert_eq!(
@@ -923,13 +924,19 @@ mod tests {
             b"last",
             "the close did not drop the data before it"
         );
-        conn.set_read_deadline(Instant::now() + Duration::from_secs(5));
-        let began = Instant::now();
-        assert_eq!(conn.read(&mut buf), Err(super::ConnError::Closed));
-        assert!(
-            began.elapsed() < Duration::from_millis(500),
-            "the reader waited for its deadline instead of the peer's close"
+        assert_eq!(
+            read_once(&conn, &mut buf),
+            Err(super::ConnError::IoTimeout),
+            "the peer's close ended the read before the rest of its data arrived"
         );
+        conn.input(&mut vec![data(1, 0, b"tail")]);
+        assert_eq!(read_once(&conn, &mut buf), Ok(4));
+        assert_eq!(&buf[..4], b"tail");
+        let mut terminate = CmdOnlySegment::new();
+        terminate.conv = 4;
+        terminate.cmd = Command::Terminate.to_byte();
+        conn.input(&mut vec![Segment::CmdOnly(terminate)]);
+        assert_eq!(read_once(&conn, &mut buf), Err(super::ConnError::Closed));
     }
 
     #[test]
