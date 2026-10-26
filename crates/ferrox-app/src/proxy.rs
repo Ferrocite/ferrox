@@ -3070,7 +3070,7 @@ fn serve_vless_encrypted_raw(
     let close = close_sealed
         .as_ref()
         .map_or_else(|| Arc::new(|| {}), connection_closer);
-    serve_sealed_raw(sealed, peer, users, freedom, close, close_sealed);
+    serve_sealed_raw(sealed, peer, users, freedom, &close, close_sealed);
 }
 
 fn serve_sealed_raw<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'static>(
@@ -3078,7 +3078,7 @@ fn serve_sealed_raw<S: Read + Write + Send + ferrox_core::tls::RecordAlignment +
     peer: Option<SocketAddr>,
     users: &[VlessUser],
     freedom: bool,
-    closer: Arc<dyn Fn() + Send + Sync>,
+    closer: &Arc<dyn Fn() + Send + Sync>,
     timeout: Option<Connection>,
 ) {
     let Some((got, flow, cmd, target)) = decode_request_bounded(&mut sealed) else {
@@ -3104,7 +3104,7 @@ fn serve_sealed_raw<S: Read + Write + Send + ferrox_core::tls::RecordAlignment +
                 portal,
                 SealedHalf(Arc::clone(&shared)),
                 SealedHalf(shared),
-                Arc::clone(&closer),
+                Arc::clone(closer),
             ),
             ReverseAsk::Refused | ReverseAsk::NotReverse => false,
         };
@@ -3128,14 +3128,14 @@ fn serve_sealed_raw<S: Read + Write + Send + ferrox_core::tls::RecordAlignment +
                 SealedHalf(shared),
                 &target,
                 Vec::new(),
-                &closer,
+                closer,
             );
         }
         3 => {
             if sealed.write_all(&[0, 0]).is_err() {
                 return;
             }
-            serve_sealed_mux(sealed, Arc::clone(&closer));
+            serve_sealed_mux(sealed, Arc::clone(closer));
         }
         1 => {
             let Some(uplink) = dial_or_report(&target) else {
@@ -3144,7 +3144,7 @@ fn serve_sealed_raw<S: Read + Write + Send + ferrox_core::tls::RecordAlignment +
             if sealed.write_all(&[0, 0]).is_err() {
                 return;
             }
-            let close = close_with_uplink(&closer, &uplink);
+            let close = close_with_uplink(closer, &uplink);
             if flow == Flow::Vision {
                 let link = crate::vision::Link::sealed(sealed, &got);
                 relay_link(&uplink, link, &close, timeout);
@@ -4669,7 +4669,7 @@ fn serve_mux_wire(
             match read_into_tail(&mut read, &mut buf) {
                 Ok(0) => break,
                 Ok(_) => {}
-                Err(error) if is_timeout(&error) => continue,
+                Err(error) if is_timeout(&error) => {}
                 Err(_) => break,
             }
         }
@@ -5400,6 +5400,7 @@ pub(crate) fn serve_session_xhttp_with(
     relay_sink_drained(creader, cwriter, &uplink);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_session_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(
     read: R,
     write: W,
@@ -5592,7 +5593,7 @@ fn serve_vless_tls(
                 }
                 let peer = raw.peer_addr().ok();
                 let close = connection_closer(&raw);
-                serve_sealed_raw(sealed, peer, users, freedom, close, Some(raw));
+                serve_sealed_raw(sealed, peer, users, freedom, &close, Some(raw));
                 return;
             }
             let front = FrontNames::of(&tls);
@@ -6021,7 +6022,7 @@ fn finish_reality<S>(
         let close = raw
             .as_ref()
             .map_or_else(|| Arc::new(|| {}), connection_closer);
-        serve_sealed_raw(sealed, peer, users, freedom, close, raw);
+        serve_sealed_raw(sealed, peer, users, freedom, &close, raw);
         return;
     }
     let front = FrontNames::of(&session);
@@ -6974,7 +6975,7 @@ fn dial_sealed_carried<R, W>(
     header: &[u8],
     reader: R,
     writer: W,
-    close: Arc<dyn Fn() + Send + Sync>,
+    close: &Arc<dyn Fn() + Send + Sync>,
 ) -> bool
 where
     R: Read + Send + 'static,
@@ -7004,7 +7005,7 @@ where
         close();
         return false;
     }
-    relay_split(reader, writer, client, &close);
+    relay_split(reader, writer, client, close);
     true
 }
 
@@ -7024,7 +7025,7 @@ fn dial_vless_headed(
     };
     if vless.encryption.is_some() {
         let close = connection_closer(&write);
-        return dial_sealed_carried(client, vless, header, reader, write, close);
+        return dial_sealed_carried(client, vless, header, reader, write, &close);
     }
     let (mut reader, mut write) = (reader, write);
     if write.write_all(header).is_err() {
@@ -7071,7 +7072,7 @@ fn dial_vless_rung(
             if vless.encryption.is_some() {
                 let close = writer.clone();
                 let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-                if dial_sealed_carried(client, vless, header, reader, writer, close) {
+                if dial_sealed_carried(client, vless, header, reader, writer, &close) {
                     note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
                     return true;
                 }
@@ -7106,7 +7107,7 @@ fn dial_vless_rung(
             };
             if vless.encryption.is_some() {
                 let close = connection_closer(&write);
-                if dial_sealed_carried(client, vless, header, reader, write, close) {
+                if dial_sealed_carried(client, vless, header, reader, write, &close) {
                     note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
                     return true;
                 }
@@ -7136,7 +7137,7 @@ fn dial_vless_rung(
             if vless.encryption.is_some() {
                 let close = writer.clone();
                 let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-                if dial_sealed_carried(client, vless, header, reader, writer, close) {
+                if dial_sealed_carried(client, vless, header, reader, writer, &close) {
                     note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
                     return true;
                 }
@@ -7165,7 +7166,7 @@ fn dial_vless_rung(
             if vless.encryption.is_some() {
                 let close = writer.clone();
                 let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.finish());
-                if dial_sealed_carried(client, vless, header, reader, writer, close) {
+                if dial_sealed_carried(client, vless, header, reader, writer, &close) {
                     note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
                     return true;
                 }
@@ -9912,7 +9913,7 @@ fn mux_downlink(read: &mut (impl Read + ?Sized), write: &mut dyn Write, id: u16)
             match read_into_tail(read, &mut buf) {
                 Ok(0) => return false,
                 Ok(_) => {}
-                Err(error) if is_timeout(&error) => continue,
+                Err(error) if is_timeout(&error) => {}
                 Err(_) => return false,
             }
         }
@@ -11244,6 +11245,7 @@ where
 }
 
 /// The carrier lanes a dialled session rides, shared by the `TLS` and `REALITY` client dials: split the sealed session into a carrier's reader and writer, read the answer, then run the plain relay. `Raw` is the caller's and is left untouched here.
+#[allow(clippy::too_many_lines)]
 fn ride_carrier<S: Dialed, D: Dialed>(
     server: &SocketAddr,
     session: S,
@@ -11252,13 +11254,13 @@ fn ride_carrier<S: Dialed, D: Dialed>(
     header: &[u8],
     client: &Connection,
 ) {
+    let first = if vless.encryption.is_some() {
+        &[][..]
+    } else {
+        header
+    };
     match &vless.carrier {
         Carrier::Ws { path, ed } => {
-            let first = if vless.encryption.is_some() {
-                &[][..]
-            } else {
-                header
-            };
             let Some((reader, writer)) = tls_ws(
                 server,
                 session,
@@ -11274,7 +11276,7 @@ fn ride_carrier<S: Dialed, D: Dialed>(
             if vless.encryption.is_some() {
                 let close = writer.clone();
                 let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-                if dial_sealed_carried(client, vless, header, reader, writer, close) {
+                if dial_sealed_carried(client, vless, header, reader, writer, &close) {
                     return;
                 }
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
@@ -11286,11 +11288,6 @@ fn ride_carrier<S: Dialed, D: Dialed>(
             relay_sink(reader, &writer, client, |_| {});
         }
         Carrier::HttpUpgrade { path, ed, .. } => {
-            let first = if vless.encryption.is_some() {
-                &[][..]
-            } else {
-                header
-            };
             let Some((reader, sink)) = tls_httpupgrade(
                 server,
                 session,
@@ -11305,7 +11302,7 @@ fn ride_carrier<S: Dialed, D: Dialed>(
             if vless.encryption.is_some() {
                 let close = sink.clone();
                 let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-                if dial_sealed_carried(client, vless, header, reader, sink, close) {
+                if dial_sealed_carried(client, vless, header, reader, sink, &close) {
                     return;
                 }
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
@@ -11323,7 +11320,7 @@ fn ride_carrier<S: Dialed, D: Dialed>(
             if vless.encryption.is_some() {
                 let close = writer.clone();
                 let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-                if dial_sealed_carried(client, vless, header, reader, writer, close) {
+                if dial_sealed_carried(client, vless, header, reader, writer, &close) {
                     return;
                 }
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
@@ -11345,7 +11342,7 @@ fn ride_carrier<S: Dialed, D: Dialed>(
             if vless.encryption.is_some() {
                 let close = writer.clone();
                 let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.finish());
-                if dial_sealed_carried(client, vless, header, reader, writer, close) {
+                if dial_sealed_carried(client, vless, header, reader, writer, &close) {
                     return;
                 }
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
@@ -11368,7 +11365,7 @@ fn ride_carrier<S: Dialed, D: Dialed>(
             if vless.encryption.is_some() {
                 let close = sink.clone();
                 let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.close());
-                if dial_sealed_carried(client, vless, header, reader, sink, close) {
+                if dial_sealed_carried(client, vless, header, reader, sink, &close) {
                     return;
                 }
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
