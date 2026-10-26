@@ -34,6 +34,17 @@ resolve_bin() {
   BIN="${cargo_target:-$ROOT/target}/release/ferrox-app"
 }
 CONF_DIR="${FERROX_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ferrox}"
+# The system proxy is machine-wide, so its marker and the lane registry live
+# outside the per-user config dir that FERROX_CONF_DIR can move.
+if [ -n "${FERROX_STATE_DIR:-}" ]; then
+  STATE_DIR="$FERROX_STATE_DIR"
+elif [ "$(uname -s)" = Darwin ]; then
+  STATE_DIR="$HOME/Library/Application Support/ferrox"
+else
+  STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/ferrox"
+fi
+LANES_FILE="$STATE_DIR/lanes"
+PROXY_OWNER="$STATE_DIR/system-proxy.owner"
 CREDS="${FOXY_CREDENTIALS:-$CONF_DIR/credentials}"
 CFG="$CONF_DIR/lane.json"
 # The signed-in session FxA handed back, so a launch after the first signs in
@@ -45,8 +56,8 @@ LOCATION_FILE="$CONF_DIR/foxy-location"
 LOCATIONS_FILE="$CONF_DIR/foxy-locations.jsonl"
 PID_FILE="$CONF_DIR/lane.pid"
 LOG="$CONF_DIR/lane.log"
-PROXY_PORTS="$CONF_DIR/system-proxy.ports"
-PROXY_STATE="$CONF_DIR/system-proxy.state"
+PROXY_PORTS="$STATE_DIR/system-proxy.ports"
+PROXY_STATE="$STATE_DIR/system-proxy.state"
 
 ACTION="up"
 OUTBOUND=""
@@ -238,6 +249,7 @@ EOF
 shell_quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 action_login() {
+  reconcile_stale_proxy || die "login: the stale system proxy could not be cleared; run ferrox-cli down."
   local email="$EMAIL" pass="$PASSWORD"
   if [ -z "$email" ]; then
     printf 'firefox account email: ' && read -r email
@@ -931,6 +943,7 @@ proxy_readback_has() {
 system_proxy_on() {
   command -v networksetup >/dev/null 2>&1 || { say "system proxy: no networksetup; nothing was armed." >&2; return 1; }
   command -v scutil >/dev/null 2>&1 || { say "system proxy: no scutil to read the proxy back; nothing was armed." >&2; return 1; }
+  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
   local any=0 svc want_socks="" want_http="" front pac auto pac_url pac_on auto_on bypass readback bad
   for front in ${FRONTS//,/ }; do
     case "$front" in
@@ -945,7 +958,7 @@ system_proxy_on() {
   [ -n "$want_socks$want_http" ] || { say "system proxy: --fronts names no socks, http or mixed front; nothing was armed." >&2; return 1; }
   # Keep the first snapshot: a re-arm must still restore what the user had before any lane touched it.
   if [ ! -f "$PROXY_STATE" ]; then
-    [ -f "$PROXY_PORTS" ] && system_proxy_off
+    [ -f "$PROXY_PORTS" ] && { system_proxy_off || return 1; }
     : > "$PROXY_STATE"
     while IFS= read -r svc; do
       [ -z "$svc" ] && continue
@@ -1019,6 +1032,7 @@ system_proxy_on() {
   done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
   [ "$any" = 1 ] || { system_proxy_off; say "no network service took the proxy" >&2; return 1; }
   printf '%s %s\n' "${want_socks:--}" "${want_http:--}" > "$PROXY_PORTS"
+  printf '%s\n' "$CONF_DIR" > "$PROXY_OWNER"
   readback="$(scutil --proxy 2>/dev/null)" || readback=""
   bad=""
   proxy_readback_has "$readback" ProxyAutoConfigEnable 0 || bad="PAC"
@@ -1041,53 +1055,158 @@ system_proxy_on() {
   say "apps that ignore it (and UDP) are not captured: ferrox-cli tun says why."
 }
 
-system_proxy_off() {
-  [ -f "$PROXY_PORTS" ] || [ -f "$PROXY_STATE" ] || return 0
-  local svc pac_on pac_url auto_on bypass
-  if command -v networksetup >/dev/null 2>&1; then
-    if [ -f "$PROXY_STATE" ]; then
-      while IFS=$'\t' read -r svc pac_on pac_url auto_on bypass; do
-        [ -z "$svc" ] && continue
-        case "$svc" in *\**) continue ;; esac
-        [ "$pac_url" = - ] && pac_url=""
-        if [ -n "$pac_url" ]; then
-          networksetup -setautoproxyurl "$svc" "$pac_url" 2>/dev/null || true
-        else
-          networksetup -setautoproxyurl "$svc" "" 2>/dev/null || true
-        fi
-        if [ "$pac_on" = on ]; then
-          networksetup -setautoproxystate "$svc" on 2>/dev/null || true
-        else
-          networksetup -setautoproxystate "$svc" off 2>/dev/null || true
-        fi
-        if [ "$auto_on" = on ]; then
-          networksetup -setproxyautodiscovery "$svc" on 2>/dev/null || true
-        else
-          networksetup -setproxyautodiscovery "$svc" off 2>/dev/null || true
-        fi
-        if [ "$bypass" = - ]; then
-          networksetup -setproxybypassdomains "$svc" Empty 2>/dev/null || true
-        elif [ -n "$bypass" ]; then
-          local -a prior=()
-          IFS=, read -r -a prior <<< "$bypass"
-          networksetup -setproxybypassdomains "$svc" "${prior[@]}" 2>/dev/null || true
-        fi
-        networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null || true
-        networksetup -setwebproxystate "$svc" off 2>/dev/null || true
-        networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
-      done < "$PROXY_STATE"
-    else
-      while IFS= read -r svc; do
-        [ -z "$svc" ] && continue
-        case "$svc" in *\**) continue ;; esac
-        networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null || true
-        networksetup -setwebproxystate "$svc" off 2>/dev/null || true
-        networksetup -setsecurewebproxystate "$svc" off 2>/dev/null || true
-      done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
-    fi
-    say "system proxy cleared."
+proxy_field() {
+  printf '%s\n' "$1" | sed -n "s/^$2:[[:space:]]*//p" | head -n 1
+}
+
+# The loopback ports a lane of this config dir can own: its marker, the inbounds
+# of its served config, and the three defaults a lane with neither still uses.
+proxy_owned_ports() {
+  local ports=" $SOCKS_PORT $HTTP_PORT $MIXED_PORT " first="" second="" file from_config port
+  if [ -r "$PROXY_PORTS" ]; then
+    read -r first second < "$PROXY_PORTS" || true
+    for port in "$first" "$second"; do
+      [ -n "$port" ] && [ "$port" != "-" ] && ports="$ports$port "
+    done
   fi
-  rm -f "$PROXY_PORTS" "$PROXY_STATE"
+  file="$CFG"
+  if [ -r "$file" ] && command -v python3 >/dev/null 2>&1; then
+    from_config="$(python3 - "$file" 2>/dev/null <<'PY'
+import json, sys
+try:
+    document = json.load(open(sys.argv[1], encoding="utf-8"))
+except Exception:
+    raise SystemExit(0)
+for inbound in document.get("inbounds", []):
+    if inbound.get("protocol") in ("socks", "http", "mixed"):
+        port = inbound.get("port")
+        if isinstance(port, int) and 0 < port < 65536:
+            print(port)
+PY
+)" || from_config=""
+    for port in $from_config; do ports="$ports$port "; done
+  fi
+  printf '%s' "$ports"
+}
+
+system_proxy_off() {
+  local svc kind get set line enabled server port owned failed=0 cleared=0 restored=0
+  local pac_on pac_url auto_on bypass
+  owned="$(proxy_owned_ports)"
+  if ! command -v networksetup >/dev/null 2>&1; then
+    rm -f "$PROXY_PORTS" "$PROXY_STATE" "$PROXY_OWNER"
+    return 0
+  fi
+  if [ -e "$PROXY_STATE" ] && [ ! -r "$PROXY_STATE" ]; then
+    say "system proxy: $PROXY_STATE is unreadable; probing the services." >&2
+  fi
+  if [ -r "$PROXY_STATE" ]; then
+    while IFS=$'\t' read -r svc pac_on pac_url auto_on bypass; do
+      [ -z "$svc" ] && continue
+      case "$svc" in *\**) continue ;; esac
+      [ "$pac_url" = - ] && pac_url=""
+      if [ -n "$pac_url" ]; then
+        networksetup -setautoproxyurl "$svc" "$pac_url" 2>/dev/null ||
+          { say "system proxy: could not restore the PAC URL on '$svc'." >&2; failed=1; }
+      else
+        networksetup -setautoproxyurl "$svc" "" 2>/dev/null ||
+          { say "system proxy: could not clear the PAC URL on '$svc'." >&2; failed=1; }
+      fi
+      if [ "$pac_on" = on ]; then
+        networksetup -setautoproxystate "$svc" on 2>/dev/null ||
+          { say "system proxy: could not restore the PAC state on '$svc'." >&2; failed=1; }
+      else
+        networksetup -setautoproxystate "$svc" off 2>/dev/null ||
+          { say "system proxy: could not clear the PAC state on '$svc'." >&2; failed=1; }
+      fi
+      if [ "$auto_on" = on ]; then
+        networksetup -setproxyautodiscovery "$svc" on 2>/dev/null ||
+          { say "system proxy: could not restore auto discovery on '$svc'." >&2; failed=1; }
+      else
+        networksetup -setproxyautodiscovery "$svc" off 2>/dev/null ||
+          { say "system proxy: could not clear auto discovery on '$svc'." >&2; failed=1; }
+      fi
+      if [ "$bypass" = - ]; then
+        networksetup -setproxybypassdomains "$svc" Empty 2>/dev/null ||
+          { say "system proxy: could not clear the bypass list on '$svc'." >&2; failed=1; }
+      elif [ -n "$bypass" ]; then
+        local -a prior=()
+        IFS=, read -r -a prior <<< "$bypass"
+        networksetup -setproxybypassdomains "$svc" "${prior[@]}" 2>/dev/null ||
+          { say "system proxy: could not restore the bypass list on '$svc'." >&2; failed=1; }
+      fi
+      restored=1
+    done < "$PROXY_STATE"
+  fi
+  while IFS= read -r svc; do
+    [ -z "$svc" ] && continue
+    case "$svc" in *\**) continue ;; esac
+    for kind in socks web secureweb; do
+      case "$kind" in
+        socks) get=-getsocksfirewallproxy; set=-setsocksfirewallproxystate ;;
+        web) get=-getwebproxy; set=-setwebproxystate ;;
+        secureweb) get=-getsecurewebproxy; set=-setsecurewebproxystate ;;
+      esac
+      line="$(networksetup "$get" "$svc" 2>/dev/null)" ||
+        { say "system proxy: could not read $kind on '$svc'." >&2; failed=1; continue; }
+      enabled="$(proxy_field "$line" Enabled | tr '[:upper:]' '[:lower:]')"
+      [ "$enabled" = yes ] || continue
+      server="$(proxy_field "$line" Server)"
+      port="$(proxy_field "$line" Port)"
+      case "$server" in 127.*|localhost|::1) ;; *) continue ;; esac
+      case "$owned" in *" $port "*) ;; *) continue ;; esac
+      if networksetup "$set" "$svc" off 2>/dev/null; then
+        cleared=1
+      else
+        say "system proxy: could not clear $kind on '$svc'." >&2
+        failed=1
+      fi
+    done
+  done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+  if [ "$failed" = 1 ]; then
+    say "system proxy: the clear failed; $PROXY_PORTS is kept for a retry." >&2
+    return 1
+  fi
+  if [ "$cleared" = 1 ] || [ "$restored" = 1 ]; then
+    say "system proxy cleared."
+  else
+    say "system proxy: no ferrox endpoint was armed."
+  fi
+  rm -f "$PROXY_PORTS" "$PROXY_STATE" "$PROXY_OWNER"
+}
+
+stale_proxy_endpoint() {
+  command -v networksetup >/dev/null 2>&1 || return 1
+  local svc kind get line enabled server port owned
+  owned="$(proxy_owned_ports)"
+  while IFS= read -r svc; do
+    [ -z "$svc" ] && continue
+    case "$svc" in *\**) continue ;; esac
+    for kind in socks web secureweb; do
+      case "$kind" in
+        socks) get=-getsocksfirewallproxy ;;
+        web) get=-getwebproxy ;;
+        secureweb) get=-getsecurewebproxy ;;
+      esac
+      line="$(networksetup "$get" "$svc" 2>/dev/null)" || continue
+      enabled="$(proxy_field "$line" Enabled | tr '[:upper:]' '[:lower:]')"
+      [ "$enabled" = yes ] || continue
+      server="$(proxy_field "$line" Server)"
+      port="$(proxy_field "$line" Port)"
+      case "$server" in 127.*|localhost|::1) ;; *) continue ;; esac
+      case "$owned" in *" $port "*) ;; *) continue ;; esac
+      printf '%s %s:%s\n' "$kind" "$server" "$port"
+      return 0
+    done
+  done < <(networksetup -listallnetworkservices 2>/dev/null | tail -n +2)
+  return 1
+}
+
+reconcile_stale_proxy() {
+  lane_running && return 0
+  stale_proxy_endpoint >/dev/null || return 0
+  say "login: a stale ferrox system proxy points at a lane that is not running; clearing it."
+  system_proxy_off
 }
 
 # ---------------------------------------------------------------------- lane
@@ -1100,8 +1219,8 @@ apply_instance() {
   CFG="$CONF_DIR/lane$suffix.json"
   PID_FILE="$CONF_DIR/lane$suffix.pid"
   LOG="$CONF_DIR/lane$suffix.log"
-  PROXY_PORTS="$CONF_DIR/system-proxy$suffix.ports"
-  PROXY_STATE="$CONF_DIR/system-proxy$suffix.state"
+  PROXY_PORTS="$STATE_DIR/system-proxy$suffix.ports"
+  PROXY_STATE="$STATE_DIR/system-proxy$suffix.state"
   LOCATION_FILE="$CONF_DIR/foxy-location$suffix"
 }
 
@@ -1238,6 +1357,9 @@ choose_carrier() {
 
 start_lane() {
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  mkdir -p "$STATE_DIR"; chmod 700 "$STATE_DIR" 2>/dev/null || true
+  touch "$LANES_FILE"
+  grep -Fxq "$CONF_DIR" "$LANES_FILE" || printf '%s\n' "$CONF_DIR" >> "$LANES_FILE"
   # Validate first: an invocation that cannot start must not stop a healthy lane,
   # and a bad link must not send the user to a build before saying what is wrong.
   build_config
@@ -1262,8 +1384,9 @@ stop_lane() {
     lane_running && kill -9 "$(lane_pid)" 2>/dev/null || true
   fi
   rm -f "$PID_FILE"
-  [ "$clear" = 1 ] && system_proxy_off
-  return 0
+  local rc=0
+  if [ "$clear" = 1 ]; then system_proxy_off || rc=$?; fi
+  return "$rc"
 }
 
 # The config is ours only when we generated it: a --config file belongs to its owner.
@@ -1272,20 +1395,51 @@ stop_and_forget() {
   [ "$OUTBOUND" = config ] || rm -f "$CFG"
 }
 
+forget_lane_config() {
+  case "$CFG" in
+    "$CONF_DIR"/lane*.json) rm -f "$CFG" ;;
+  esac
+}
+
 # The account is shared, so signing out ends every lane; each owns its pid and config.
+# The registry makes a lane armed under a moved FERROX_CONF_DIR visible here.
 stop_all_lanes() {
-  local pidfile base
+  local saved_conf="$CONF_DIR" saved_instance="$INSTANCE" dir pidfile base rc=0
+  if [ -r "$LANES_FILE" ]; then
+    while IFS= read -r dir; do
+      [ -n "$dir" ] || continue
+      CONF_DIR="$dir"
+      INSTANCE=""
+      apply_instance
+      for pidfile in "$CONF_DIR"/lane*.pid; do
+        [ -f "$pidfile" ] || continue
+        base="${pidfile##*/}"; base="${base#lane}"; base="${base%.pid}"
+        INSTANCE="${base#-}"
+        apply_instance
+        stop_lane 0 || rc=1
+        forget_lane_config
+      done
+    done < "$LANES_FILE"
+  fi
+  CONF_DIR="$saved_conf"
+  INSTANCE=""
+  apply_instance
   for pidfile in "$CONF_DIR"/lane*.pid; do
     [ -f "$pidfile" ] || continue
     base="${pidfile##*/}"; base="${base#lane}"; base="${base%.pid}"
     INSTANCE="${base#-}"
     apply_instance
-    stop_lane 0
-    rm -f "$CFG"
+    stop_lane 0 || rc=1
+    forget_lane_config
   done
   INSTANCE=""
   apply_instance
-  system_proxy_off
+  system_proxy_off || rc=1
+  rm -f "$LANES_FILE" "$PROXY_OWNER"
+  CONF_DIR="$saved_conf"
+  INSTANCE="$saved_instance"
+  apply_instance
+  return "$rc"
 }
 
 other_lanes() {
@@ -1529,7 +1683,11 @@ action_serve() {
 action_status() {
   if ! lane_running; then
     say "lane${INSTANCE:+ '$INSTANCE'} not running."
-    local others; others="$(other_lanes)"
+    local stale others
+    if stale="$(stale_proxy_endpoint)"; then
+      say "system proxy points at $stale but no lane owns it; run 'ferrox-cli down' to clear it."
+    fi
+    others="$(other_lanes)"
     if [ -n "$others" ]; then
       say "instances running:"
       printf '%s\n' "$others"
@@ -1780,11 +1938,20 @@ case "$ACTION" in
   locations) action_locations ;;
   location) action_location ;;
   down)
+    down_rc=0
     if [ "$ALL" = 1 ]; then
-      stop_all_lanes
+      stop_all_lanes || down_rc=$?
+    else
+      stop_lane 1 || down_rc=$?
+      forget_lane_config
+    fi
+    if [ "$down_rc" -ne 0 ]; then
+      say "lane${INSTANCE:+ '$INSTANCE'} stopped, but the system proxy was not cleared; run 'ferrox-cli down' again." >&2
+      exit "$down_rc"
+    fi
+    if [ "$ALL" = 1 ]; then
       say "every lane is stopped and its config removed. The stored foxy session is kept; 'ferrox-cli logout' forgets it."
     else
-      stop_lane 1; rm -f "$CFG"
       say "lane${INSTANCE:+ '$INSTANCE'} stopped; the lane config is removed. The stored foxy session is kept; 'ferrox-cli logout' forgets it."
     fi ;;
   status) action_status ;;

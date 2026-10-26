@@ -58,12 +58,13 @@ import pathlib
 import sys
 
 state = pathlib.Path(os.environ["FERROX_CONF_DIR"])
+machine = pathlib.Path(os.environ.get("FERROX_STATE_DIR", state))
 with open(state / "networksetup.calls", "a", encoding="utf-8") as log:
     log.write(" ".join(sys.argv[1:]) + "\\n")
 
 args = sys.argv[1:]
 command = args[0] if args else ""
-root = state / "fake-net"
+root = machine / "fake-net"
 root.mkdir(exist_ok=True)
 
 
@@ -83,7 +84,7 @@ def write(directory, field, value):
 
 
 if command == "-listallnetworkservices":
-    listing = state / "fake-services"
+    listing = machine / "fake-services"
     names = (
         listing.read_text(encoding="utf-8").splitlines()
         if listing.exists()
@@ -92,6 +93,38 @@ if command == "-listallnetworkservices":
     print("An asterisk (*) denotes that a network service is disabled.")
     for name in names:
         print(name)
+elif command in (
+    "-getsocksfirewallproxy",
+    "-getwebproxy",
+    "-getsecurewebproxy",
+):
+    directory = service(args[1])
+    field = {
+        "-getsocksfirewallproxy": "socks",
+        "-getwebproxy": "http",
+        "-getsecurewebproxy": "https",
+    }[command]
+    endpoint = read(directory, f"{field}-proxy")
+    server, _, port = endpoint.rpartition(":")
+    enabled = read(directory, f"{field}-enabled", "off") in ("on", "yes")
+    print(f"Enabled: {'Yes' if enabled else 'No'}")
+    print(f"Server: {server}")
+    print(f"Port: {port}")
+    print("Authenticated Proxy Enabled: 0")
+elif command in (
+    "-setsocksfirewallproxystate",
+    "-setwebproxystate",
+    "-setsecurewebproxystate",
+):
+    if (machine / "fail-off").exists() and args[-1] == "off":
+        sys.exit(1)
+    directory = service(args[1])
+    field = {
+        "-setsocksfirewallproxystate": "socks",
+        "-setwebproxystate": "http",
+        "-setsecurewebproxystate": "https",
+    }[command]
+    write(directory, f"{field}-enabled", args[2])
 elif command == "-getautoproxyurl":
     directory = service(args[1])
     url = read(directory, "pac-url")
@@ -134,18 +167,6 @@ elif command in ("-setsocksfirewallproxy", "-setwebproxy", "-setsecurewebproxy")
         "-setsecurewebproxy": "https",
     }[command]
     write(directory, f"{field}-proxy", f"{args[2]}:{args[3]}")
-elif command in (
-    "-setsocksfirewallproxystate",
-    "-setwebproxystate",
-    "-setsecurewebproxystate",
-):
-    directory = service(args[1])
-    field = {
-        "-setsocksfirewallproxystate": "socks",
-        "-setwebproxystate": "http",
-        "-setsecurewebproxystate": "https",
-    }[command]
-    write(directory, f"{field}-enabled", args[2])
 sys.exit(0)
 ''',
         encoding="utf-8",
@@ -160,12 +181,13 @@ import pathlib
 import sys
 
 state = pathlib.Path(os.environ["FERROX_CONF_DIR"])
-override = state / "scutil.override"
+machine = pathlib.Path(os.environ.get("FERROX_STATE_DIR", state))
+override = machine / "scutil.override"
 if override.exists():
     sys.stdout.write(override.read_text(encoding="utf-8"))
     sys.exit(0)
 
-directory = state / "fake-net" / "Wi-Fi"
+directory = machine / "fake-net" / "Wi-Fi"
 
 
 def read(field, default=""):
@@ -242,11 +264,44 @@ def proxy_bypass(state: pathlib.Path) -> list[str]:
     return proxy_field(state, "bypass").splitlines()
 
 
+def seed_service_proxy(
+    state: pathlib.Path,
+    kind: str,
+    server: str,
+    port: int,
+    *,
+    enabled: bool = True,
+) -> None:
+    directory = state / "fake-net" / "Wi-Fi"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"{kind}-proxy").write_text(f"{server}:{port}", encoding="utf-8")
+    (directory / f"{kind}-enabled").write_text(
+        "on" if enabled else "off", encoding="utf-8"
+    )
+
+
+def reset_fake_net(state: pathlib.Path) -> None:
+    shutil.rmtree(state / "fake-net", ignore_errors=True)
+    for stale in (
+        "networksetup.calls",
+        "system-proxy.ports",
+        "system-proxy.state",
+        "scutil.override",
+        "fail-off",
+        "lanes",
+        "system-proxy.owner",
+        "lane.pid",
+        "lane.json",
+    ):
+        (state / stale).unlink(missing_ok=True)
+
+
 def env_for(
     state: pathlib.Path, curl: bool = False, darwin: bool = False
 ) -> dict[str, str]:
     env = dict(os.environ)
     env["FERROX_CONF_DIR"] = str(state)
+    env["FERROX_STATE_DIR"] = str(state)
     env["FERROX_BIN"] = shutil.which("true") or "/bin/true"
     path = f"{fake_networksetup(state)}:{env.get('PATH', '')}"
     if darwin:
@@ -648,6 +703,9 @@ def check_failed_lane_is_closed(state: pathlib.Path) -> int:
     ):
         (state / stale).unlink(missing_ok=True)
     (state / "system-proxy.ports").write_text("10808 8080\n", encoding="utf-8")
+    seed_service_proxy(state, "socks", "127.0.0.1", 10808)
+    seed_service_proxy(state, "http", "127.0.0.1", 8080)
+    seed_service_proxy(state, "https", "127.0.0.1", 8080)
     port = free_port()
     env = env_for(state)
     env["FERROX_BIN"] = str(dead_lane_binary(state))
@@ -746,6 +804,9 @@ def check_interrupted_attempt_leaves_nothing(state: pathlib.Path) -> int:
     ):
         (state / stale).unlink(missing_ok=True)
     (state / "system-proxy.ports").write_text("10808 8080\n", encoding="utf-8")
+    seed_service_proxy(state, "socks", "127.0.0.1", 10808)
+    seed_service_proxy(state, "http", "127.0.0.1", 8080)
+    seed_service_proxy(state, "https", "127.0.0.1", 8080)
     port = free_port()
     env = env_for(state)
     env["FERROX_BIN"] = str(stuck_lane_binary(state))
@@ -1206,9 +1267,10 @@ def check_config_fronts(state: pathlib.Path) -> int:
     )
     run, recorded = config_lane(state, silent, trace=False)
     output = run.stdout + run.stderr
+    writes = [line for line in recorded.splitlines() if line.startswith("-set")]
     if (
         run.returncode == 0
-        or recorded
+        or writes
         or (state / "lane.pid").exists()
         or marker.exists()
     ):
@@ -1757,6 +1819,157 @@ def check_vpn_platform_refusal(state: pathlib.Path) -> int:
     return 0
 
 
+def check_proxy_cleanup(state: pathlib.Path) -> int:
+    def run(args: list[str], env: dict[str, str]) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(
+            [str(CLI), *args],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env,
+        )
+
+    reset_fake_net(state)
+    seed_service_proxy(state, "socks", "127.0.0.1", 10808)
+    seed_service_proxy(state, "http", "127.0.0.1", 3128)
+    down = run(["down"], env_for(state))
+    output = down.stdout + down.stderr
+    calls = state / "networksetup.calls"
+    recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    if (
+        down.returncode != 0
+        or "-setsocksfirewallproxystate Wi-Fi off" not in recorded
+        or "-setwebproxystate Wi-Fi off" in recorded
+        or proxy_field(state, "socks-enabled") != "off"
+        or proxy_field(state, "http-enabled") != "on"
+    ):
+        print(
+            "check-cli-lane: down without a marker did not clear the ferrox"
+            f" endpoint and leave the user's proxy alone:\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "check-cli-lane: down without a marker clears the ferrox loopback proxy"
+        " and leaves a non-ferrox proxy untouched"
+    )
+
+    reset_fake_net(state)
+    seed_service_proxy(state, "socks", "127.0.0.1", 10808)
+    (state / "system-proxy.ports").write_text("10808 -\n", encoding="utf-8")
+    (state / "fail-off").write_text("", encoding="utf-8")
+    down = run(["down"], env_for(state))
+    output = down.stdout + down.stderr
+    if (
+        down.returncode == 0
+        or "system proxy cleared." in output
+        or "failed" not in output
+        or not (state / "system-proxy.ports").exists()
+    ):
+        print(
+            "check-cli-lane: a failed proxy clear was reported as success:"
+            f"\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print("check-cli-lane: a failed proxy clear is named and down exits nonzero")
+
+    reset_fake_net(state)
+    seed_service_proxy(state, "socks", "127.0.0.1", 10808)
+    status = run(["status"], env_for(state))
+    output = status.stdout + status.stderr
+    if (
+        status.returncode == 0
+        or "system proxy" not in output
+        or "no lane" not in output
+    ):
+        print(
+            f"check-cli-lane: status hid a stale system proxy:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print("check-cli-lane: status names a stale system proxy and exits nonzero")
+
+    reset_fake_net(state)
+    seed_service_proxy(state, "socks", "127.0.0.1", 10808)
+    login = run(
+        ["login", "--email", "lane@example.com", "--password", "not-a-secret"],
+        env_for(state),
+    )
+    calls = state / "networksetup.calls"
+    recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    output = login.stdout + login.stderr
+    if (
+        login.returncode != 0
+        or "-setsocksfirewallproxystate Wi-Fi off" not in recorded
+        or proxy_field(state, "socks-enabled") != "off"
+    ):
+        print(
+            "check-cli-lane: login did not reconcile a stale ferrox proxy:"
+            f"\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print("check-cli-lane: login reconciles a stale ferrox proxy")
+
+    reset_fake_net(state)
+    state_a = state / "moved-a"
+    state_b = state / "moved-b"
+    state_a.mkdir(exist_ok=True)
+    state_b.mkdir(exist_ok=True)
+    port = free_port()
+    config = state / "moved.json"
+    config.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {"protocol": "http", "listen": "127.0.0.1", "port": port}
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    env_a = env_for(state_a, curl=True, darwin=True)
+    env_a["FERROX_STATE_DIR"] = str(state)
+    env_a["FERROX_BIN"] = str(vpn_lane_binary(state))
+    env_a["FERROX_FAKE_TRACE"] = "1"
+    up = run(["up", "--config", str(config), "--vpn"], env_a)
+    output = up.stdout + up.stderr
+    if up.returncode != 0 or not (state / "system-proxy.ports").exists():
+        print(
+            f"check-cli-lane: the moved-dir lane did not arm:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    env_b = env_for(state_b)
+    env_b["FERROX_STATE_DIR"] = str(state)
+    down = run(["down", "--all"], env_b)
+    output = down.stdout + down.stderr
+    calls = state_b / "networksetup.calls"
+    recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    if (
+        down.returncode != 0
+        or f"-setwebproxystate Wi-Fi off" not in recorded
+        or proxy_field(state, "http-enabled") == "on"
+        or (state / "system-proxy.ports").exists()
+        or (state_a / "lane.pid").exists()
+        or not config.exists()
+    ):
+        print(
+            "check-cli-lane: down --all from another config dir did not clear the"
+            f" moved lane's proxy:\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "check-cli-lane: down --all finds a lane armed under another config dir"
+        " and clears its proxy"
+    )
+    return 0
+
+
 def check_instance_ports(state: pathlib.Path) -> int:
     held = socket.socket()
     held.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1917,6 +2130,8 @@ def main() -> int:
     if check_vpn_bypass(state) != 0:
         return 1
     if check_vpn_platform_refusal(state) != 0:
+        return 1
+    if check_proxy_cleanup(state) != 0:
         return 1
     return check_instance_lifecycle(state)
 
