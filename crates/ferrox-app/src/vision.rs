@@ -450,16 +450,17 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         self.staged += n;
     }
 
-    /// One command byte validated. The count is the validator's row, and the production
-    /// arm folds away: the validator's own cost is in the match it makes.
+    /// The command bytes validated by one walk. The count is the validator's row,
+    /// and the production arm folds away: the validator's own cost is in the match
+    /// it makes.
     #[cfg(test)]
-    fn validate(&mut self) {
-        self.validated += 1;
+    fn validate(&mut self, frames: usize) {
+        self.validated += frames;
     }
 
     #[cfg(not(test))]
     #[allow(clippy::unused_self)]
-    fn validate(&mut self) {}
+    fn validate(&mut self, _frames: usize) {}
 
     #[cfg(not(test))]
     #[allow(clippy::unused_self)]
@@ -501,6 +502,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             dot += 16;
         }
         let mut held = 0;
+        let mut validated = 0usize;
         let result = loop {
             // the header is read whole when the window offers five bytes; the tail is byte-by-byte
             if walk.want_header == 5 && end - dot >= 5 {
@@ -509,7 +511,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 let command = frame[0];
                 let mut content = (body >> 16) as usize;
                 let padding = (body & 0xffff) as usize;
-                self.validate();
+                validated += 1;
                 dot += 5;
                 if content > 0 {
                     let room = match buf.as_deref() {
@@ -571,7 +573,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 match walk.want_header {
                     5 => {
                         walk.command = byte;
-                        self.validate();
+                        validated += 1;
                     }
                     4 => walk.want_content = usize::from(byte) << 8,
                     3 => walk.want_content |= usize::from(byte),
@@ -627,6 +629,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             self.read.raw = walk.command == VisionCommand::Direct.byte() && self.raw.is_some();
             break held;
         };
+        self.validate(validated);
         self.dot = dot;
         self.walk = walk;
         result
