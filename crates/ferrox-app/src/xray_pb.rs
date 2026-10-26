@@ -176,6 +176,7 @@ pub(crate) fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
         "xray.proxy.vless.inbound.Config" => ("vless", vless_inbound_settings(value)?),
         "xray.proxy.shadowsocks.ServerConfig" => ("shadowsocks", ss_inbound_settings(value)?),
         "xray.proxy.socks.ServerConfig" => ("socks", socks_inbound_settings(value)?),
+        "xray.proxy.wireguard.DeviceConfig" => ("wireguard", wireguard_settings(value)?),
         _ => return Err(format!("inbound protocol `{name}` is not carried")),
     };
     Ok(ports
@@ -239,8 +240,11 @@ pub(crate) fn outbound(bytes: &[u8]) -> Result<Json, String> {
     let (name, value) = settings.ok_or("xray.core.OutboundHandlerConfig: no proxy settings")?;
     let mut pairs = match name.as_str() {
         "xray.proxy.freedom.Config" => {
-            freedom_settings(value)?;
-            vec![("protocol", Json::Str("freedom".to_owned()))]
+            let mut pairs = vec![("protocol", Json::Str("freedom".to_owned()))];
+            if let Some(settings) = freedom_settings(value)? {
+                pairs.push(("settings", settings));
+            }
+            pairs
         }
         "xray.proxy.vmess.outbound.Config" => vec![
             ("protocol", Json::Str("vmess".to_owned())),
@@ -266,6 +270,10 @@ pub(crate) fn outbound(bytes: &[u8]) -> Result<Json, String> {
             }
             pairs
         }
+        "xray.proxy.wireguard.DeviceConfig" => vec![
+            ("protocol", Json::Str("wireguard".to_owned())),
+            ("settings", wireguard_settings(value)?),
+        ],
         _ => return Err(format!("outbound protocol `{name}` is not carried")),
     };
     if let Some(stream) = sender {
@@ -306,6 +314,162 @@ fn receiver_config(bytes: &[u8]) -> Result<ReceiverConfig, String> {
         stream,
         sniffing,
     ))
+}
+
+/// `WireGuard`'s device config: the keys stay the strings the wire carried —
+/// xray hands both hexadecimal and base64 to the same parser — and a user's
+/// account is a peer, flattened into the JSON shape the config reader expects.
+fn wireguard_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.wireguard.DeviceConfig");
+    let mut secret = None;
+    let mut endpoints = Vec::new();
+    let mut peers = Vec::new();
+    let mut users = Vec::new();
+    let mut mtu = 0i32;
+    let mut reserved = None;
+    let mut is_client = false;
+    let mut no_kernel_tun = false;
+    let mut dns = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                secret = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.proxy.wireguard.DeviceConfig: the secret key is not utf-8"
+                                .to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            (2, 2) => endpoints.push(text(&mut reader, "endpoint")?),
+            (3, 2) => peers.push(wireguard_peer(reader.bytes()?)?),
+            (4, 0) => {
+                mtu = i32::try_from(reader.varint()?).map_err(|_| {
+                    "xray.proxy.wireguard.DeviceConfig: mtu is not an int32".to_owned()
+                })?;
+            }
+            (5, 2) => users.push(wireguard_user(reader.bytes()?)?),
+            (6, 2) => reserved = Some(reader.bytes()?.to_vec()),
+            (8, 0) => is_client = reader.varint()? != 0,
+            (9, 0) => no_kernel_tun = reader.varint()? != 0,
+            (10, 2) => dns.push(text(&mut reader, "DNS")?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let secret = secret.ok_or("xray.proxy.wireguard.DeviceConfig: no secret key")?;
+    let mut pairs = vec![("secretKey", Json::Str(secret))];
+    if !endpoints.is_empty() {
+        pairs.push((
+            "endpoint",
+            Json::Arr(endpoints.into_iter().map(Json::Str).collect()),
+        ));
+    }
+    if !peers.is_empty() {
+        pairs.push(("peers", Json::Arr(peers)));
+    }
+    if !users.is_empty() {
+        pairs.push(("users", Json::Arr(users)));
+    }
+    if mtu > 0 {
+        pairs.push(("mtu", Json::Num(f64::from(mtu))));
+    }
+    if let Some(reserved) = reserved.filter(|bytes| !bytes.is_empty()) {
+        pairs.push((
+            "reserved",
+            Json::Arr(
+                reserved
+                    .into_iter()
+                    .map(|byte| Json::Num(f64::from(byte)))
+                    .collect(),
+            ),
+        ));
+    }
+    pairs.push(("isClient", Json::Bool(is_client)));
+    pairs.push(("noKernelTun", Json::Bool(no_kernel_tun)));
+    if !dns.is_empty() {
+        pairs.push((
+            "remoteDNS",
+            Json::Arr(dns.into_iter().map(Json::Str).collect()),
+        ));
+    }
+    Ok(object(pairs))
+}
+
+fn wireguard_peer(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.wireguard.PeerConfig");
+    let mut public = None;
+    let mut preshared = None;
+    let mut endpoint = None;
+    let mut keepalive = None;
+    let mut allowed = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => public = Some(text(&mut reader, "public key")?),
+            (2, 2) => preshared = Some(text(&mut reader, "pre-shared key")?),
+            (3, 2) => endpoint = Some(text(&mut reader, "endpoint")?),
+            (4, 2) => keepalive = Some(text(&mut reader, "keep alive")?),
+            (5, 2) => allowed.push(text(&mut reader, "allowed IP")?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = vec![(
+        "publicKey",
+        Json::Str(public.ok_or("xray.proxy.wireguard.PeerConfig: no public key")?),
+    )];
+    if let Some(preshared) = preshared.filter(|key| !key.is_empty()) {
+        pairs.push(("preSharedKey", Json::Str(preshared)));
+    }
+    if let Some(endpoint) = endpoint.filter(|endpoint| !endpoint.is_empty()) {
+        pairs.push(("endpoint", Json::Str(endpoint)));
+    }
+    if let Some(keepalive) = keepalive.filter(|keepalive| !keepalive.is_empty()) {
+        pairs.push(("keepAlive", Json::Str(keepalive)));
+    }
+    if !allowed.is_empty() {
+        pairs.push((
+            "allowedIPs",
+            Json::Arr(allowed.into_iter().map(Json::Str).collect()),
+        ));
+    }
+    Ok(object(pairs))
+}
+
+fn wireguard_user(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.common.protocol.User");
+    let mut level = 0u32;
+    let mut email = String::new();
+    let mut account = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => level = reader.varint()?.try_into().unwrap_or(u32::MAX),
+            (2, 2) => {
+                let value = std::str::from_utf8(reader.bytes()?)
+                    .map_err(|_| "xray.common.protocol.User: email is not utf-8".to_owned())?;
+                email.push_str(value);
+            }
+            (3, 2) => {
+                let (name, value) = typed_message(reader.bytes()?)?;
+                if name != "xray.proxy.wireguard.PeerConfig" {
+                    return Err(format!("wireguard account `{name}` is not carried"));
+                }
+                account = Some(wireguard_peer(value)?);
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let account = account.ok_or("xray.common.protocol.User: no account")?;
+    Ok(object(vec![
+        ("email", Json::Str(email)),
+        ("level", Json::Num(f64::from(level))),
+        ("account", account),
+    ]))
+}
+
+fn text(reader: &mut Reader<'_>, what: &str) -> Result<String, String> {
+    std::str::from_utf8(reader.bytes()?)
+        .map(str::to_owned)
+        .map_err(|_| format!("wireguard {what} is not utf-8"))
 }
 
 fn sniffing_settings(bytes: &[u8]) -> Result<Json, String> {
@@ -2650,12 +2814,13 @@ fn socks_account(bytes: &[u8]) -> Result<(String, String), String> {
     ))
 }
 
-fn freedom_settings(bytes: &[u8]) -> Result<(), String> {
+fn freedom_settings(bytes: &[u8]) -> Result<Option<Json>, String> {
     let mut reader = Reader::new(bytes, "xray.proxy.freedom.Config");
+    let mut redirect = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 0) => return Err(reader.uncarried("domain_strategy")),
-            (3, 2) => return Err(reader.uncarried("destination_override")),
+            (3, 2) => redirect = Some(destination_override(reader.bytes()?)?),
             (4, 0) => return Err(reader.uncarried("user_level")),
             (5, 2) => return Err(reader.uncarried("fragment (README row 124)")),
             (6, 0) => return Err(reader.uncarried("proxy_protocol (README row 121)")),
@@ -2664,7 +2829,51 @@ fn freedom_settings(bytes: &[u8]) -> Result<(), String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    Ok(())
+    Ok(redirect.map(|redirect| object(vec![("redirect", Json::Str(redirect))])))
+}
+
+/// The reference's freedom rewrite: an address, a port, or both, with the omitted half kept from
+/// the flow. This tree's `redirect` names both halves, so a port-less override is refused rather
+/// than silently dropping the address.
+fn destination_override(bytes: &[u8]) -> Result<String, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.freedom.DestinationOverride");
+    let mut server = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => server = Some(override_endpoint(reader.bytes()?)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let Some((address, port)) = server else {
+        return Err("xray.proxy.freedom.DestinationOverride: no server".to_owned());
+    };
+    match (address, port) {
+        (_, 0) => Err(
+            "xray.proxy.freedom.DestinationOverride: an address without a port is not carried"
+                .to_owned(),
+        ),
+        (address, port) if address.is_empty() => Ok(format!(":{port}")),
+        (address, port) if address.contains(':') => Ok(format!("[{address}]:{port}")),
+        (address, port) => Ok(format!("{address}:{port}")),
+    }
+}
+
+fn override_endpoint(bytes: &[u8]) -> Result<(String, u16), String> {
+    let mut reader = Reader::new(bytes, "xray.common.protocol.ServerEndpoint");
+    let (mut address, mut port): (Option<String>, Option<u16>) = (None, None);
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => address = Some(ip_or_domain(reader.bytes()?)?),
+            (2, 0) => {
+                port = Some(u16::try_from(reader.varint()?).map_err(|_| {
+                    "xray.common.protocol.ServerEndpoint: a port above 65535".to_owned()
+                })?);
+            }
+            (3, 2) => return Err(reader.uncarried("server endpoint user")),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok((address.unwrap_or_default(), port.unwrap_or(0)))
 }
 
 /// Freedom dials directly unless a final rule says otherwise; an allow rule is
@@ -3513,6 +3722,32 @@ mod tests {
         );
         let error = to_json(&bytes).expect_err("refused");
         assert!(error.contains("account map"), "{error}");
+    }
+
+    #[test]
+    fn a_freedom_destination_override_becomes_a_redirect() {
+        let address = message(&[bytes_field(1, &[127, 0, 0, 1])]);
+        let server = message(&[bytes_field(1, &address), varint_field(2, 8080)]);
+        let override_message = message(&[bytes_field(1, &server)]);
+        let settings = bytes_field(3, &override_message);
+        let outbound = message(&[bytes_field(
+            3,
+            &typed("xray.proxy.freedom.Config", &settings),
+        )]);
+        let json = to_json(&config(
+            &http_inbound(&receiver(5000, None), &[]),
+            &outbound,
+        ))
+        .expect("freedom override decodes");
+        let outbound = &json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0];
+        let redirect = outbound
+            .get("settings")
+            .and_then(|settings| settings.get("redirect"))
+            .and_then(Json::as_str);
+        assert_eq!(redirect, Some("127.0.0.1:8080"));
     }
 
     #[test]
@@ -5055,5 +5290,98 @@ mod tests {
         bytes.extend([0x0a, 0x05]);
         let error = to_json(&bytes).expect_err("refused");
         assert!(error.contains("runs past"), "{error}");
+    }
+
+    fn wg_peer() -> Vec<u8> {
+        message(&[
+            bytes_field(1, "33".repeat(32).as_bytes()),
+            bytes_field(3, b"127.0.0.1:1234"),
+            bytes_field(4, b"25"),
+            bytes_field(5, b"0.0.0.0/0"),
+            bytes_field(5, b"::/0"),
+        ])
+    }
+
+    #[test]
+    fn a_wireguard_client_becomes_the_json_device_config() {
+        let settings = message(&[
+            bytes_field(1, "11".repeat(32).as_bytes()),
+            bytes_field(2, b"10.0.0.2"),
+            bytes_field(2, b"fd00::2"),
+            bytes_field(3, &wg_peer()),
+            varint_field(4, 1420),
+            varint_field(8, 1),
+            varint_field(9, 1),
+        ]);
+        let raw = message(&[bytes_field(
+            3,
+            &typed("xray.proxy.wireguard.DeviceConfig", &settings),
+        )]);
+        let json = outbound(&raw).expect("the pinned shape decodes");
+        assert_eq!(
+            json.get("protocol").and_then(Json::as_str),
+            Some("wireguard")
+        );
+        let settings = json.get("settings").expect("settings");
+        assert_eq!(settings.get("isClient"), Some(&Json::Bool(true)));
+        let decoded = crate::wireguard::DeviceConfig::from_json(settings).expect("device config");
+        assert_eq!(decoded.peers.len(), 1);
+        assert_eq!(
+            decoded.peers[0].endpoint.map(|endpoint| endpoint.port()),
+            Some(1234)
+        );
+        assert_eq!(decoded.peers[0].keepalive, 25);
+        assert!(decoded.peers[0].routes("192.0.2.1".parse().unwrap()));
+        assert!(decoded.peers[0].routes("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn a_wireguard_server_user_is_a_peer_under_its_account() {
+        let account = typed("xray.proxy.wireguard.PeerConfig", &wg_peer());
+        let user = message(&[bytes_field(2, b"love@xray.com"), bytes_field(3, &account)]);
+        let settings = message(&[
+            bytes_field(1, "11".repeat(32).as_bytes()),
+            bytes_field(5, &user),
+            varint_field(8, 0),
+        ]);
+        let raw = message(&[
+            bytes_field(
+                2,
+                &typed(
+                    "xray.app.proxyman.ReceiverConfig",
+                    &receiver(51820, Some(&[0, 0, 0, 0])),
+                ),
+            ),
+            bytes_field(3, &typed("xray.proxy.wireguard.DeviceConfig", &settings)),
+        ]);
+        let json = inbound(&raw).expect("the pinned shape decodes");
+        assert_eq!(json.len(), 1);
+        assert_eq!(
+            json[0].get("protocol").and_then(Json::as_str),
+            Some("wireguard")
+        );
+        let decoded =
+            crate::wireguard::DeviceConfig::from_json(json[0].get("settings").expect("settings"))
+                .expect("device config");
+        assert_eq!(decoded.peers.len(), 1);
+        assert_eq!(decoded.peers[0].allowed.len(), 2);
+    }
+
+    #[test]
+    fn a_wireguard_reserved_field_round_trips_as_three_bytes() {
+        let settings = message(&[
+            bytes_field(1, "11".repeat(32).as_bytes()),
+            bytes_field(6, &[1, 2, 3]),
+            bytes_field(3, &wg_peer()),
+        ]);
+        let json = wireguard_settings(&settings).expect("device config");
+        assert_eq!(
+            json.get("reserved"),
+            Some(&Json::Arr(vec![
+                Json::Num(1.0),
+                Json::Num(2.0),
+                Json::Num(3.0)
+            ]))
+        );
     }
 }

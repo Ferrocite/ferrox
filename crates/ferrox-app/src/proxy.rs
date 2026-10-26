@@ -460,6 +460,24 @@ fn serve_inbounds_counted(
                             inbounds += 1;
                         }
                     }
+                    "wireguard" => {
+                        if let Some(shared) = route {
+                            let tag = inbound_tag(inbound);
+                            if let Some(selector) = shared.routing.source_refusal(tag.as_deref()) {
+                                exit(&format!(
+                                    "bad config {label}: wireguard inbound {} names `{selector}`, which a tunnel flow cannot answer",
+                                    tag.as_deref().unwrap_or("<untagged>")
+                                ));
+                            }
+                        }
+                        let Some(out) = routed(inbound, false) else {
+                            continue;
+                        };
+                        match crate::wg::serve_inbound(inbound, &out, address) {
+                            Ok(_) => inbounds += 1,
+                            Err(reason) => eprintln!("wireguard inbound {address}: {reason}"),
+                        }
+                    }
                     _ => eprintln!("unsupported inbound protocol `{protocol}` in {label}"),
                 }
             }
@@ -549,7 +567,7 @@ fn refuse_inbound(protocol: &str, label: &str, inbound: &Json) {
 }
 
 /// Served inbounds; the `tun` device inbound opens a native interface and relays TCP flows.
-const SERVED_INBOUNDS: [&str; 11] = [
+const SERVED_INBOUNDS: [&str; 12] = [
     "vless",
     "trojan",
     "vmess",
@@ -559,6 +577,7 @@ const SERVED_INBOUNDS: [&str; 11] = [
     "http",
     "mixed",
     "tun",
+    "wireguard",
     "dokodemo-door",
     "hc",
 ];
@@ -1256,6 +1275,9 @@ pub(crate) enum Outbound {
     /// A reverse portal, named by an inbound user's tag: its flows ride a mux session the bridge
     /// opened, and the portal answers them from its own side.
     ReversePortal(Arc<crate::reverse::Portal>),
+    /// The flow rides a `WireGuard` tunnel: the userspace stack dials the
+    /// destination the rules chose and encrypts every inner packet.
+    WireGuard(Arc<crate::wg::WireGuardOut>),
     /// The metrics app's tag: a flow routed here reaches its own HTTP handler on a loopback lane.
     Metrics {
         address: SocketAddr,
@@ -1275,6 +1297,7 @@ impl Outbound {
             Self::Hysteria(hy) => resolve_outbound(&hy.address, hy.port),
             Self::Socks(socks) => resolve_outbound(&socks.address, socks.port),
             Self::Http(http) => resolve_outbound(&http.address, http.port),
+            Self::WireGuard(wireguard) => wireguard.edge(),
             Self::Metrics { address } => Some(*address),
             Self::Foxy(_)
             | Self::Veepn(_)
@@ -1314,7 +1337,7 @@ impl Outbound {
 
 /// A routing answer: a configured outbound borrowed from the startup table, or an outbound the
 /// management API added after startup and keeps alive for as long as a flow holds it.
-enum Picked<'a> {
+pub(crate) enum Picked<'a> {
     Static(&'a Outbound),
     Dynamic(Arc<Outbound>),
 }
@@ -1326,6 +1349,16 @@ impl std::ops::Deref for Picked<'_> {
         match self {
             Self::Static(out) => out,
             Self::Dynamic(out) => out,
+        }
+    }
+}
+
+impl Picked<'_> {
+    /// The answer as an owned outbound, for a lane that outlives the plan's borrow.
+    pub(crate) fn into_owned(self) -> Outbound {
+        match self {
+            Self::Static(out) => out.clone(),
+            Self::Dynamic(out) => (*out).clone(),
         }
     }
 }
@@ -1536,7 +1569,7 @@ impl RoutePlan {
         }
     }
 
-    fn pick(
+    pub(crate) fn pick(
         &self,
         asked: &Destination,
         network: crate::router::Network,
@@ -14119,6 +14152,10 @@ pub(crate) fn serve_connect(
         crate::blackhole::serve(client, answer);
         return;
     }
+    if let Outbound::WireGuard(wireguard) = out {
+        wireguard.serve_tcp(client, asked);
+        return;
+    }
     if let Outbound::Foxy(foxy) = out {
         return serve_foxy_front(client, foxy, asked, front, prefix);
     }
@@ -14263,6 +14300,7 @@ fn dial_socks_outbound(
         | Outbound::Block(_)
         | Outbound::Dns(_)
         | Outbound::ReversePortal(_)
+        | Outbound::WireGuard(_)
         | Outbound::Metrics { .. }
         | Outbound::Api(_) => {}
     }
@@ -15340,7 +15378,7 @@ fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
 
 /// One outbound's datagram lane over a relay socket. The association is `None` when the lane is
 /// itself an inner relay of a split association, whose control socket the splitter owns.
-fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Option<&Connection>) {
+pub(crate) fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Option<&Connection>) {
     match out {
         // The reference's loopback handler is TCP-only, so a datagram keeps the named dial's lane.
         Outbound::Loopback(loopback) => serve_udp_lane(relay, &loopback.dial, associate),
@@ -15372,6 +15410,7 @@ fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Option<&Connecti
             crate::foxy::Carrier::H3 => serve_socks_udp_foxy_ip(relay, foxy, associate),
             _ => serve_socks_udp_foxy(relay, foxy, associate),
         },
+        Outbound::WireGuard(wireguard) => wireguard.serve_udp(relay),
         Outbound::Freedom(out) => serve_socks_udp_freedom(relay, out),
         Outbound::Socks(socks) => serve_socks_udp_socks(relay, socks),
         Outbound::Dns(dns) => serve_dns_udp(relay, dns),
@@ -19637,7 +19676,7 @@ impl Destination {
     }
 
     /// The address to connect to directly: only a lane that carries no destination answers the name itself.
-    fn socket(&self) -> Option<SocketAddr> {
+    pub(crate) fn socket(&self) -> Option<SocketAddr> {
         match self {
             Self::Address(address) => Some(*address),
             Self::Name(host, port) => resolve_endpoint(host, *port),
@@ -20101,7 +20140,7 @@ fn canonical_protocol(protocol: &str) -> &str {
 }
 
 /// The protocols xray registers with no handler here: a config naming one dials direct and says so at the outbound.
-const UNBUILT_OUTBOUNDS: [&str; 2] = ["wireguard", "masque"];
+const UNBUILT_OUTBOUNDS: [&str; 1] = ["masque"];
 
 /// The first outbound naming an unbuilt protocol, with its tag and that name.
 fn find_unbuilt_outbound(root: &Json) -> Option<(&str, &str)> {
@@ -20392,6 +20431,9 @@ fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
     if let Some(hysteria) = find_hysteria_outbound(root) {
         return Ok(Some(Outbound::Hysteria(Box::new(hysteria))));
     }
+    if let Some(wireguard) = find_wireguard_outbound(root)? {
+        return Ok(Some(Outbound::WireGuard(Arc::new(wireguard))));
+    }
     if let Some(freedom) = find_freedom_outbound(root)? {
         return Ok(Some(Outbound::Freedom(Arc::new(freedom))));
     }
@@ -20405,6 +20447,36 @@ fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
     if let Some((tag, protocol)) = find_unbuilt_outbound(root) {
         eprintln!("outbound `{tag}` protocol `{protocol}` is not carried; dialing direct");
         return Ok(Some(Outbound::Freedom(Arc::default())));
+    }
+    Ok(None)
+}
+
+/// The `WireGuard` outbound's device config, built once at startup so a bad key or
+/// endpoint refuses the config instead of a flow.
+fn find_wireguard_outbound(root: &Json) -> Result<Option<crate::wg::WireGuardOut>, String> {
+    let empty = Vec::new();
+    for outbound in root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty)
+    {
+        if canonical_protocol(
+            outbound
+                .get("protocol")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        ) != "wireguard"
+        {
+            continue;
+        }
+        let settings = outbound
+            .get("settings")
+            .ok_or("wireguard outbound has no settings")?;
+        let config = crate::wireguard::DeviceConfig::from_json(settings)
+            .map_err(|reason| format!("wireguard outbound: {reason}"))?;
+        return crate::wg::WireGuardOut::new(config)
+            .map(Some)
+            .map_err(|reason| format!("wireguard outbound: {reason}"));
     }
     Ok(None)
 }
@@ -41564,6 +41636,49 @@ mod tests {
         )))
     }
 
+    /// A `WireGuard` server datagram takes the tag its rules pick for UDP, follows that freedom's
+    /// redirect, and reports the reply as the original target the inner packet named.
+    #[test]
+    fn a_wireguard_server_datagram_takes_its_udp_lane_and_redirect() {
+        let echo = std::net::UdpSocket::bind("127.0.0.1:0").expect("echo");
+        let echo_port = echo.local_addr().expect("address").port();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            if let Ok((n, from)) = echo.recv_from(&mut buf) {
+                let _ = echo.send_to(&buf[..n], from);
+            }
+        });
+        let config = format!(
+            r#"{{"routing":{{"rules":[{{"network":"tcp","outboundTag":"tcp"}},{{"network":"udp","outboundTag":"udp"}}]}},"outbounds":[{{"tag":"tcp","protocol":"freedom","settings":{{"redirect":"127.0.0.1:1"}}}},{{"tag":"udp","protocol":"freedom","settings":{{"redirect":"127.0.0.1:{echo_port}"}}}}]}}"#
+        );
+        let plan = route_outbound(&config, None, false);
+        let (to_tunnel, replies) = std::sync::mpsc::channel();
+        let target: std::net::SocketAddr = "192.0.2.1:7".parse().unwrap();
+        let source: std::net::SocketAddr = "10.0.0.2:1234".parse().unwrap();
+        let uplink = crate::wg_stack::server_udp(([0x11; 32], source, target), &plan, &to_tunnel)
+            .expect("lane");
+        let mut buf = Vec::new();
+        let frame = socks_udp_frame(&mut buf, None, &target, b"hi");
+        uplink.send(frame).expect("send");
+        let packet = replies.recv_timeout(Duration::from_secs(5)).expect("reply");
+        let datagram =
+            ferrox_core::foxy::connectip::udp_from_packet(&packet).expect("inner datagram");
+        assert_eq!(datagram.payload, b"hi");
+        assert_eq!(
+            datagram.source,
+            target
+                .ip()
+                .to_string()
+                .parse::<std::net::IpAddr>()
+                .map(|ip| match ip {
+                    std::net::IpAddr::V4(ip) => ip.octets().to_vec(),
+                    std::net::IpAddr::V6(ip) => ip.octets().to_vec(),
+                })
+                .unwrap()
+        );
+        assert_eq!(datagram.source_port, target.port());
+    }
+
     /// A routing script picks the lane before the (empty) rule table, and its error closes the
     /// flow instead of falling back to the default handler.
     #[test]
@@ -41679,16 +41794,15 @@ end
     /// A handler xray registers and this tree has not built serves as the direct lane rather than refusing the config.
     #[test]
     fn an_unbuilt_outbound_dials_direct_instead_of_refusing_the_config() {
-        for protocol in ["wireguard", "masque"] {
-            let text = format!(
-                r#"{{"outbounds":[{{"tag":"named","protocol":"{protocol}","settings":{{}}}}]}}"#
-            );
-            let root = crate::json::parse(&text).expect("parses");
-            assert!(
-                matches!(find_outbound(&root), Ok(Some(Outbound::Freedom(_)))),
-                "`{protocol}` is named at its outbound and dials direct"
-            );
-        }
+        let protocol = "masque";
+        let text = format!(
+            r#"{{"outbounds":[{{"tag":"named","protocol":"{protocol}","settings":{{}}}}]}}"#
+        );
+        let root = crate::json::parse(&text).expect("parses");
+        assert!(
+            matches!(find_outbound(&root), Ok(Some(Outbound::Freedom(_)))),
+            "`{protocol}` is named at its outbound and dials direct"
+        );
     }
 
     /// The sink answers the front's client with the reference's bytes and dials
