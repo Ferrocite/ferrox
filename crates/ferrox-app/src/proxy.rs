@@ -3126,16 +3126,64 @@ fn serve_vless_encrypted_raw(
     let close = close_sealed
         .as_ref()
         .map_or_else(|| Arc::new(|| {}), connection_closer);
-    serve_sealed_raw(sealed, peer, users, freedom, &close, close_sealed);
+    serve_sealed_raw(
+        sealed,
+        peer,
+        users,
+        freedom,
+        &close,
+        close_sealed,
+        SplitRelay,
+    );
 }
 
-fn serve_sealed_raw<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'static>(
+/// How a decoded sealed session hands its two directions to the relay: a socket can split, a TLS
+/// session cannot, and a parked read on a shared stream must not hold the write.
+trait SealedRelay<S> {
+    fn relay(
+        sealed: ferrox_core::vless_encryption::EncryptedStream<S>,
+        uplink: &Connection,
+        close: &Arc<dyn Fn() + Send + Sync>,
+    );
+}
+
+struct SplitRelay;
+
+struct SharedRelay;
+
+impl SealedRelay<Connection> for SplitRelay {
+    fn relay(
+        sealed: ferrox_core::vless_encryption::EncryptedStream<Connection>,
+        uplink: &Connection,
+        close: &Arc<dyn Fn() + Send + Sync>,
+    ) {
+        if let Some((reader, writer)) = sealed.into_split() {
+            relay_split(reader, writer, uplink, close);
+        }
+    }
+}
+
+impl<S: Read + Write + Send + 'static> SealedRelay<S> for SharedRelay {
+    fn relay(
+        sealed: ferrox_core::vless_encryption::EncryptedStream<S>,
+        uplink: &Connection,
+        close: &Arc<dyn Fn() + Send + Sync>,
+    ) {
+        relay_sealed(uplink, sealed, close);
+    }
+}
+
+fn serve_sealed_raw<
+    S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'static,
+    R: SealedRelay<S>,
+>(
     mut sealed: ferrox_core::vless_encryption::EncryptedStream<S>,
     peer: Option<SocketAddr>,
     users: &[VlessUser],
     freedom: bool,
     closer: &Arc<dyn Fn() + Send + Sync>,
     timeout: Option<Connection>,
+    _relay: R,
 ) {
     let Some((got, flow, cmd, target)) = decode_request_bounded(&mut sealed) else {
         return;
@@ -3204,8 +3252,8 @@ fn serve_sealed_raw<S: Read + Write + Send + ferrox_core::tls::RecordAlignment +
             if flow == Flow::Vision {
                 let link = crate::vision::Link::sealed(sealed, &got);
                 relay_link(&uplink, link, &close, timeout);
-            } else if let Some((reader, writer)) = sealed.into_split() {
-                relay_split(reader, writer, &uplink, &close);
+            } else {
+                R::relay(sealed, &uplink, &close);
             }
         }
         _ => {}
@@ -5706,7 +5754,7 @@ fn serve_vless_tls(
                 }
                 let peer = raw.peer_addr().ok();
                 let close = connection_closer(&raw);
-                serve_sealed_raw(sealed, peer, users, freedom, &close, Some(raw));
+                serve_sealed_raw(sealed, peer, users, freedom, &close, Some(raw), SharedRelay);
                 return;
             }
             let front = FrontNames::of(&tls);
@@ -6135,7 +6183,7 @@ fn finish_reality<S>(
         let close = raw
             .as_ref()
             .map_or_else(|| Arc::new(|| {}), connection_closer);
-        serve_sealed_raw(sealed, peer, users, freedom, &close, raw);
+        serve_sealed_raw(sealed, peer, users, freedom, &close, raw, SharedRelay);
         return;
     }
     let front = FrontNames::of(&session);
