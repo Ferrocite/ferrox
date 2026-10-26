@@ -2,12 +2,12 @@
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/observatory.rs
-- symbols: probe_stream, tunnel_stream
+- symbols: probe_stream, tunnel_stream, observatory_settings, burst_observatory_settings, healthping_settings
 - scenarios: vless-raw, vmess-raw, trojan-raw, shadowsocks-raw
 <!-- scope:end -->
 Row 149's engine half: xray's `observatory` and `burstObservatory` apps probe the outbounds a balancer selects, and the balancer's strategy reads that history. This page is the probe loop and the status it publishes; [`engine-router`](engine-router.md) is the rule scan that hands a flow to a balancer.
 
-A config may name either app at the top level. `observatory` is the legacy loop: `subjectSelector` prefixes pick outbounds, `probeURL` defaults to `https://www.google.com/generate_204`, `probeInterval` defaults to 10 seconds, and `enableConcurrency` probes every selected tag at once instead of in sorted order. A probe is one HTTP `GET`; any response means alive and the time to its headers is the delay in milliseconds; a failure publishes `99999999`, the reference's sentinel. `burstObservatory.pingConfig` is required, `destination` defaults to the Chromium connectivity URL, `interval` to one minute (never below ten seconds), `sampling` to ten, `timeout` to five seconds and `httpMethod` to `HEAD`. A failed sample is stored unless `connectivity` is configured and that direct URL fails too, in which case the network is down and the sample is not put.
+A config may name either app at the top level, in the JSON dialect or as the protobuf `xray.app.observatory.Config`/`xray.app.observatory.burst.Config` messages, which the bridge decodes to the same keys. `observatory` is the legacy loop: `subjectSelector` prefixes pick outbounds, `probeURL` defaults to `https://www.google.com/generate_204`, `probeInterval` defaults to 10 seconds, and `enableConcurrency` probes every selected tag at once instead of in sorted order. A probe is one HTTP `GET`; any response means alive and the time to its headers is the delay in milliseconds; a failure publishes `99999999`, the reference's sentinel. `burstObservatory.pingConfig` is required in the JSON dialect, as the reference's build is; a protobuf app with no ping settings decodes to an empty block and takes these defaults: `destination` defaults to the Chromium connectivity URL, `interval` to one minute (never below ten seconds), `sampling` to ten, `timeout` to five seconds and `httpMethod` to `HEAD`. A failed sample is stored unless `connectivity` is configured and that direct URL fails too, in which case the network is down and the sample is not put.
 
 When both blocks are present the legacy app runs, as the reference's first-of-type observatory lookup does; both are parsed first, so a malformed burst block is still a startup refusal. The burst history is a ring of `sampling` samples with a validity of twice the sampling window; a sample expires on read, a failure counts in `fail`, and the published `average`/`deviation` are the reference's integer nanoseconds. An outbound with no reading is unknown to the balancer, not dead.
 
@@ -66,7 +66,7 @@ No duration is claimed here. Benchmarks are CI-only, and a local probe measures 
 | default-burst-samples | 10 | ferrox-app-observatory::tests::burst_settings_default_to_ten_samples_and_head |
 <!-- counts:end -->
 
-The ring's ten slots are `a_burst_ring_holds_the_sampling_window_and_puts_without_allocating`; the same test puts ten samples under `ferrox_core::alloc_count` and reads zero allocations, so a per-sample buffer fails it. The failure sentinel is `a_failed_legacy_probe_keeps_the_reference_delay`, which publishes a failed legacy status and reads `99999999` back. `burst_settings_default_to_ten_samples_and_head` pins the defaults a missing `pingConfig` field leaves, not a number a run measured.
+The ring's ten slots are `a_burst_ring_holds_the_sampling_window_and_puts_without_allocating`; the same test puts ten samples under `ferrox_core::alloc_count` and reads zero allocations, so a per-sample buffer fails it. The failure sentinel is `a_failed_legacy_probe_keeps_the_reference_delay`, which publishes a failed legacy status and reads `99999999` back. `burst_settings_default_to_ten_samples_and_head` pins the defaults an empty `pingConfig` block leaves, not a number a run measured.
 
 ## Pins
 

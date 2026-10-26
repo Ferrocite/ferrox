@@ -506,12 +506,18 @@ struct UdpFlow {
     stop: Arc<AtomicBool>,
 }
 
+#[derive(Default)]
+struct UdpLane {
+    sessions: HashSet<u32>,
+    flows: HashMap<u32, UdpFlow>,
+}
+
 struct Inbound {
     conn: Arc<Mutex<quiche::Connection>>,
     authed: bool,
     auth_buf: Vec<u8>,
     served: HashSet<u64>,
-    udp: HashMap<u32, UdpFlow>,
+    udp: Arc<Mutex<UdpLane>>,
     next_udp: u32,
     client_cid: Vec<u8>,
     initial_dcid: Vec<u8>,
@@ -649,7 +655,7 @@ fn udp_reader(
     }
 }
 
-fn serve_udp_stream(mut flow: Flow, next_udp: u32) {
+fn serve_udp_stream(mut flow: Flow, next_udp: u32, lane: &Arc<Mutex<UdpLane>>) {
     let mut response = Vec::with_capacity(8);
     wire::encode_server_response(
         &wire::ServerResponse {
@@ -659,7 +665,15 @@ fn serve_udp_stream(mut flow: Flow, next_udp: u32) {
         },
         &mut response,
     );
+    if let Ok(mut lane) = lane.lock() {
+        lane.sessions.insert(next_udp);
+    } else {
+        return;
+    }
     if flow.write_all(&response).is_err() {
+        if let Ok(mut lane) = lane.lock() {
+            lane.sessions.remove(&next_udp);
+        }
         return;
     }
     // The stream is the session's lifetime: the server holds it until the client closes it.
@@ -668,6 +682,12 @@ fn serve_udp_stream(mut flow: Flow, next_udp: u32) {
         match flow.read(&mut room) {
             Ok(0) | Err(_) => break,
             Ok(_) => {}
+        }
+    }
+    if let Ok(mut lane) = lane.lock() {
+        lane.sessions.remove(&next_udp);
+        if let Some(flow) = lane.flows.remove(&next_udp) {
+            flow.stop.store(true, Ordering::Relaxed);
         }
     }
     flow.close();
@@ -684,13 +704,20 @@ fn relay_datagrams(
         let Ok(message) = wire::decode_udp(&data) else {
             continue;
         };
-        let Some(inbound) = routes.get_mut(dcid) else {
+        let Some(inbound) = routes.get(dcid) else {
             return;
         };
         if !inbound.authed {
             continue;
         }
+        let Ok(mut lane) = inbound.udp.lock() else {
+            return;
+        };
         let session = message.session;
+        if !lane.sessions.contains(&session) {
+            let _ = conn.close(false, 0, b"");
+            return;
+        }
         let Some(peer) = (message.host, message.port)
             .to_socket_addrs()
             .ok()
@@ -698,7 +725,7 @@ fn relay_datagrams(
         else {
             continue;
         };
-        let flow = match inbound.udp.entry(session) {
+        let flow = match lane.flows.entry(session) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(vacant) => {
                 let Some(opened) = open_udp(shared, sock, session, peer) else {
@@ -719,7 +746,7 @@ fn relay_datagrams(
             Err(_) => flow.stop.store(true, Ordering::Relaxed),
         }
         if forged {
-            inbound.udp.remove(&session);
+            lane.flows.remove(&session);
         }
     }
 }
@@ -818,7 +845,7 @@ impl Router<'_> {
                 authed: false,
                 auth_buf: Vec::new(),
                 served: HashSet::new(),
-                udp: HashMap::new(),
+                udp: Arc::new(Mutex::new(UdpLane::default())),
                 next_udp: 1,
                 client_cid: client_cid.to_vec(),
                 initial_dcid: initial_dcid.to_vec(),
@@ -867,9 +894,9 @@ impl Router<'_> {
                 inbound.served.insert(id);
                 let request_udp = inbound.next_udp;
                 inbound.next_udp = inbound.next_udp.wrapping_add(1);
-                streams.push((id, request_udp));
+                streams.push((id, request_udp, Arc::clone(&inbound.udp)));
             }
-            for (id, next_udp) in streams {
+            for (id, next_udp, lane) in streams {
                 let thread_shared = Arc::clone(&shared);
                 let thread_sock = Arc::clone(sock);
                 let thread_serve = Arc::clone(serve);
@@ -882,6 +909,7 @@ impl Router<'_> {
                         id,
                         &thread_serve,
                         next_udp,
+                        &lane,
                     );
                 });
             }
@@ -900,22 +928,27 @@ impl Router<'_> {
                 return true;
             };
             if conn.is_closed() {
-                for flow in inbound.udp.values() {
-                    flow.stop.store(true, Ordering::Relaxed);
+                if let Ok(mut lane) = inbound.udp.lock() {
+                    for flow in lane.flows.values() {
+                        flow.stop.store(true, Ordering::Relaxed);
+                    }
+                    lane.flows.clear();
+                    lane.sessions.clear();
                 }
-                inbound.udp.clear();
                 return false;
             }
             conn.on_timeout();
             flush(sock, &mut conn, out.as_mut());
-            inbound.udp.retain(|_, flow| {
-                if now.duration_since(flow.last) > UDP_IDLE {
-                    flow.stop.store(true, Ordering::Relaxed);
-                    false
-                } else {
-                    true
-                }
-            });
+            if let Ok(mut lane) = inbound.udp.lock() {
+                lane.flows.retain(|_, flow| {
+                    if now.duration_since(flow.last) > UDP_IDLE {
+                        flow.stop.store(true, Ordering::Relaxed);
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
             true
         });
     }
@@ -928,6 +961,7 @@ fn serve_tcp_or_udp(
     stream: u64,
     serve: &Serve,
     next_udp: u32,
+    lane: &Arc<Mutex<UdpLane>>,
 ) {
     let mut flow = Flow::from_parts(
         Arc::clone(shared),
@@ -942,7 +976,7 @@ fn serve_tcp_or_udp(
         return;
     };
     if udp {
-        serve_udp_stream(flow, next_udp);
+        serve_udp_stream(flow, next_udp, lane);
     } else {
         serve(flow, host, port);
     }
@@ -1064,6 +1098,88 @@ mod tests {
                 .0
                 .port,
             80
+        );
+    }
+
+    #[test]
+    fn an_unknown_udp_session_never_reaches_its_destination() {
+        let canary = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        canary
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let canary_port = canary.local_addr().expect("addr").port();
+
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tag = format!("ferrox-hysteria-v1-unknown-{}-{stamp}", std::process::id());
+        let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+        let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
+        std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
+        std::fs::write(&key_path, &key_pem).expect("stages key");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
+        let cert = cert_path.to_str().expect("ascii").to_owned();
+        let key = key_path.to_str().expect("ascii").to_owned();
+        let address = format!("127.0.0.1:{port}");
+        let serve: Serve = Arc::new(|_, _, _| {});
+        std::thread::spawn(move || {
+            serve_loop(
+                &address,
+                &["v1-auth".to_owned()],
+                ferrox_core::hysteria::Congestion::Bbr,
+                &cert,
+                &key,
+                "",
+                &serve,
+            );
+        });
+
+        let dial = Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port,
+            config: ferrox_core::hysteria::Config {
+                version: 1,
+                auth: "v1-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: String::new(),
+                hop: None,
+                gecko: None,
+            },
+            roots: Some(roots.into()),
+        };
+        let session = connect(&dial).expect("connects");
+        let mut datagram = Vec::new();
+        wire::encode_udp(
+            &UdpMessage {
+                session: u32::MAX,
+                host: "127.0.0.1",
+                port: canary_port,
+                packet: 1,
+                frag: 0,
+                frags: 1,
+                payload: b"forged",
+            },
+            &mut datagram,
+        )
+        .expect("encodes");
+        {
+            let mut conn = session.shared.lock().expect("locks");
+            conn.dgram_send(&datagram).expect("sends");
+            let mut out = Unfilled::<MAX_DATAGRAM>::new();
+            flush(&session.sock, &mut conn, out.as_mut());
+        }
+        let mut buf = [0u8; 64];
+        assert!(
+            canary.recv_from(&mut buf).is_err(),
+            "unknown session reached its destination"
         );
     }
 }

@@ -100,7 +100,7 @@ impl Legacy {
                 "subjectSelector" => selectors = selectors_of(field, "observatory")?,
                 "probeURL" => {
                     if let Some(text) = field.as_str() {
-                        if !text.trim().is_empty() {
+                        if !text.is_empty() {
                             url = Some(text.to_owned());
                         }
                     }
@@ -203,10 +203,11 @@ impl BurstSettings {
         let method = method.map_or_else(
             || "HEAD".to_owned(),
             |method| {
+                let method = method.trim();
                 if method.is_empty() {
                     "HEAD".to_owned()
                 } else {
-                    method.trim().to_owned()
+                    method.to_owned()
                 }
             },
         );
@@ -830,6 +831,37 @@ mod tests {
         .expect("parses");
         assert_eq!(config.url, LEGACY_URL);
         assert_eq!(config.interval, DEFAULT_INTERVAL);
+        let spaced = Legacy::parse(&Json::Obj(vec![(
+            "probeURL".to_owned(),
+            Json::Str(" ".to_owned()),
+        )]))
+        .expect("parses");
+        assert_eq!(spaced.url, " ");
+    }
+
+    #[test]
+    fn a_burst_without_a_ping_config_is_refused_like_the_json_build() {
+        let error = Burst::parse(&Json::Obj(vec![(
+            "subjectSelector".to_owned(),
+            Json::Arr(vec![Json::Str("proxy".to_owned())]),
+        )]))
+        .expect_err("refuses");
+        assert!(error.contains("pingConfig"));
+    }
+
+    #[test]
+    fn a_whitespace_http_method_is_head_like_the_json_build() {
+        let method = |value: &str| {
+            BurstSettings::parse(&Json::Obj(vec![(
+                "httpMethod".to_owned(),
+                Json::Str(value.to_owned()),
+            )]))
+            .expect("parses")
+            .method
+        };
+        assert_eq!(method(""), "HEAD");
+        assert_eq!(method(" "), "HEAD");
+        assert_eq!(method(" get "), "get");
     }
 
     #[test]

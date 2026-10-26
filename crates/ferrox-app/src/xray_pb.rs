@@ -32,6 +32,8 @@ pub(crate) fn to_json_seeded(bytes: &[u8]) -> Result<(Json, Seed), String> {
     let mut seed = Seed::default();
     let mut routing = None;
     let mut dns = None;
+    let mut observatory = None;
+    let mut burst_observatory = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => {
@@ -73,6 +75,18 @@ pub(crate) fn to_json_seeded(bytes: &[u8]) -> Result<(Json, Seed), String> {
                         seed.policy = Some(policy_settings(value)?);
                     }
                     "xray.app.stats.Config" => seed.stats = true,
+                    "xray.app.observatory.Config" => {
+                        if observatory.is_some() {
+                            return Err("xray.core.Config: two observatory apps".to_owned());
+                        }
+                        observatory = Some(observatory_settings(value)?);
+                    }
+                    "xray.app.observatory.burst.Config" => {
+                        if burst_observatory.is_some() {
+                            return Err("xray.core.Config: two burst observatory apps".to_owned());
+                        }
+                        burst_observatory = Some(burst_observatory_settings(value)?);
+                    }
                     _ => {}
                 }
             }
@@ -95,6 +109,12 @@ pub(crate) fn to_json_seeded(bytes: &[u8]) -> Result<(Json, Seed), String> {
     }
     if seed.stats {
         pairs.push(("stats", Json::Obj(Vec::new())));
+    }
+    if let Some(observatory) = observatory {
+        pairs.push(("observatory", observatory));
+    }
+    if let Some(burst_observatory) = burst_observatory {
+        pairs.push(("burstObservatory", burst_observatory));
     }
     Ok((object(pairs), seed))
 }
@@ -2711,6 +2731,165 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// `xray.app.observatory.Config`: the legacy probe loop, in the shape this
+/// tree's own observatory reads.
+fn observatory_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.observatory.Config");
+    let mut selectors = Vec::new();
+    let mut url = None;
+    let mut interval = None;
+    let mut concurrency = false;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (2, 2) => selectors.push(
+                std::str::from_utf8(reader.bytes()?)
+                    .map_err(|_| "xray.app.observatory.Config: a selector is not utf-8".to_owned())?
+                    .to_owned(),
+            ),
+            (3, 2) => {
+                url = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.app.observatory.Config: the URL is not utf-8".to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            (4, 0) => interval = Some(reader.varint()?.cast_signed()),
+            (5, 0) => concurrency = reader.varint()? != 0,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    if !selectors.is_empty() {
+        pairs.push((
+            "subjectSelector",
+            Json::Arr(selectors.into_iter().map(Json::Str).collect()),
+        ));
+    }
+    if let Some(url) = url.filter(|url| !url.is_empty()) {
+        pairs.push(("probeURL", Json::Str(url)));
+    }
+    if let Some(interval) = interval.filter(|nanos| *nanos != 0) {
+        pairs.push(("probeInterval", Json::Str(format!("{interval}ns"))));
+    }
+    if concurrency {
+        pairs.push(("enableConcurrency", Json::Bool(true)));
+    }
+    Ok(object(pairs))
+}
+
+/// `xray.app.observatory.burst.Config`: the sampled probe loop and its
+/// required `HealthPingConfig`.
+fn burst_observatory_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.observatory.burst.Config");
+    let mut selectors = Vec::new();
+    let mut ping = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (2, 2) => selectors.push(
+                std::str::from_utf8(reader.bytes()?)
+                    .map_err(|_| {
+                        "xray.app.observatory.burst.Config: a selector is not utf-8".to_owned()
+                    })?
+                    .to_owned(),
+            ),
+            (3, 2) => ping = Some(healthping_settings(reader.bytes()?)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    if !selectors.is_empty() {
+        pairs.push((
+            "subjectSelector",
+            Json::Arr(selectors.into_iter().map(Json::Str).collect()),
+        ));
+    }
+    pairs.push(("pingConfig", ping.unwrap_or_else(|| Json::Obj(Vec::new()))));
+    Ok(object(pairs))
+}
+
+/// `xray.app.observatory.burst.HealthPingConfig`: the sampler's defaults,
+/// destination, connectivity check, interval, window and method.
+fn healthping_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.observatory.burst.HealthPingConfig");
+    let mut destination = None;
+    let mut connectivity = None;
+    let mut interval = None;
+    let mut sampling = 0;
+    let mut timeout = None;
+    let mut method = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                destination = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.app.observatory.burst.HealthPingConfig: the destination is not utf-8"
+                                .to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            (2, 2) => {
+                connectivity = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.app.observatory.burst.HealthPingConfig: the connectivity URL is not utf-8"
+                                .to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            (3, 0) => interval = Some(reader.varint()?.cast_signed()),
+            (4, 0) => {
+                sampling = i32::try_from(reader.varint()?.cast_signed()).map_err(|_| {
+                    "xray.app.observatory.burst.HealthPingConfig: sampling overflows".to_owned()
+                })?;
+            }
+            (5, 0) => timeout = Some(reader.varint()?.cast_signed()),
+            (6, 2) => {
+                method = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.app.observatory.burst.HealthPingConfig: the method is not utf-8"
+                                .to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    if let Some(destination) = destination.filter(|url| !url.is_empty()) {
+        pairs.push(("destination", Json::Str(destination)));
+    }
+    if let Some(connectivity) = connectivity.filter(|url| !url.is_empty()) {
+        pairs.push(("connectivity", Json::Str(connectivity)));
+    }
+    if let Some(interval) = interval.filter(|nanos| *nanos != 0) {
+        pairs.push(("interval", Json::Str(format!("{interval}ns"))));
+    }
+    if sampling != 0 {
+        pairs.push(("sampling", Json::Num(f64::from(sampling))));
+    }
+    if let Some(timeout) = timeout.filter(|nanos| *nanos != 0) {
+        pairs.push(("timeout", Json::Str(format!("{timeout}ns"))));
+    }
+    if let Some(raw) = method {
+        let method = raw.trim();
+        if method.is_empty() {
+            if !raw.is_empty() {
+                pairs.push(("httpMethod", Json::Str("GET".to_owned())));
+            }
+        } else {
+            pairs.push(("httpMethod", Json::Str(method.to_owned())));
+        }
+    }
+    Ok(object(pairs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4429,6 +4608,124 @@ mod tests {
         let config = message(&[bytes_field(4, &typed("xray.app.stats.Config", &[]))]);
         let json = to_json(&config).expect("stats app");
         assert!(json.get("stats").is_some());
+    }
+
+    /// A protobuf burst app with no ping settings takes the nil-config defaults.
+    #[test]
+    fn a_burst_app_without_ping_settings_decodes_to_the_defaults() {
+        let burst = message(&[bytes_field(2, b"proxy")]);
+        let config = message(&[bytes_field(
+            4,
+            &typed("xray.app.observatory.burst.Config", &burst),
+        )]);
+        let json = to_json(&config).expect("the burst app decodes");
+        let ping = json
+            .get("burstObservatory")
+            .and_then(|burst| burst.get("pingConfig"))
+            .expect("the default sampler");
+        assert!(matches!(ping, Json::Obj(pairs) if pairs.is_empty()));
+    }
+
+    /// A whitespace-only protobuf method trims to `GET`, as the reference's
+    /// `http.NewRequest` does with the trimmed empty method.
+    #[test]
+    fn a_whitespace_ping_method_decodes_to_get() {
+        let ping = message(&[bytes_field(6, b" ")]);
+        let burst = message(&[bytes_field(3, &ping)]);
+        let config = message(&[bytes_field(
+            4,
+            &typed("xray.app.observatory.burst.Config", &burst),
+        )]);
+        let json = to_json(&config).expect("the burst app decodes");
+        let method = json
+            .get("burstObservatory")
+            .and_then(|burst| burst.get("pingConfig"))
+            .and_then(|ping| ping.get("httpMethod"))
+            .and_then(Json::as_str);
+        assert_eq!(method, Some("GET"));
+    }
+
+    /// Both observatory apps decode to the keys the probe loop reads, so a
+    /// protobuf config observes the same outbounds a JSON one does.
+    #[test]
+    fn the_observatory_apps_decode_to_the_probe_loop_settings() {
+        let legacy = message(&[
+            bytes_field(2, b"proxy"),
+            bytes_field(3, b"https://example.com/generate_204"),
+            varint_field(4, 30_000_000_000),
+            varint_field(5, 1),
+        ]);
+        let ping = message(&[
+            bytes_field(1, b"https://example.com/204"),
+            bytes_field(2, b"https://example.com/direct"),
+            varint_field(3, 20_000_000_000),
+            varint_field(4, 4),
+            varint_field(5, 2_000_000_000),
+            bytes_field(6, b"GET"),
+        ]);
+        let burst = message(&[bytes_field(2, b"proxy"), bytes_field(3, &ping)]);
+        let config = message(&[
+            bytes_field(4, &typed("xray.app.observatory.Config", &legacy)),
+            bytes_field(4, &typed("xray.app.observatory.burst.Config", &burst)),
+        ]);
+        let json = to_json(&config).expect("both observatory apps decode");
+        let legacy = json.get("observatory").expect("the legacy app");
+        assert_eq!(
+            legacy
+                .get("subjectSelector")
+                .and_then(Json::as_arr)
+                .and_then(|selectors| selectors[0].as_str()),
+            Some("proxy")
+        );
+        assert_eq!(
+            legacy.get("probeURL").and_then(Json::as_str),
+            Some("https://example.com/generate_204")
+        );
+        assert_eq!(
+            legacy.get("probeInterval").and_then(Json::as_str),
+            Some("30000000000ns")
+        );
+        assert_eq!(
+            legacy.get("enableConcurrency").and_then(Json::as_bool),
+            Some(true)
+        );
+        let settings = json
+            .get("burstObservatory")
+            .and_then(|burst| burst.get("pingConfig"))
+            .expect("the burst sampler");
+        assert_eq!(
+            settings.get("destination").and_then(Json::as_str),
+            Some("https://example.com/204")
+        );
+        assert_eq!(
+            settings.get("connectivity").and_then(Json::as_str),
+            Some("https://example.com/direct")
+        );
+        assert_eq!(
+            settings.get("interval").and_then(Json::as_str),
+            Some("20000000000ns")
+        );
+        assert_eq!(settings.get("sampling").and_then(Json::as_u32), Some(4));
+        assert_eq!(
+            settings.get("timeout").and_then(Json::as_str),
+            Some("2000000000ns")
+        );
+        assert_eq!(
+            settings.get("httpMethod").and_then(Json::as_str),
+            Some("GET")
+        );
+    }
+
+    /// A negative `int32` arrives as a ten-byte varint and stays signed, so a
+    /// sampling count the reference treats as "use the default" is not refused.
+    #[test]
+    fn negative_burst_sampling_keeps_its_sign() {
+        let ping = message(&[varint_field(4, u64::MAX)]);
+        let settings = healthping_settings(&ping).expect("a negative sampler decodes");
+        assert!(matches!(
+            settings.get("sampling"),
+            Some(Json::Num(value)) if value.to_bits() == (-1.0f64).to_bits()
+        ));
     }
 
     /// An app this tree does not read is xray's own object graph and is
