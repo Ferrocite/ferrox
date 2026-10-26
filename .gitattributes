@@ -20,3 +20,7 @@ scripts/blackhole-oracle/script.txt -text
 # Same reason, for every other checked-in expectation in this tree.
 **/fixtures/** -text
 **/*.golden -text
+
+# The engine-cache key hashes this file on every runner; a converted checkout
+# would key a cache the build never wrote.
+upstream/pins.toml -text
