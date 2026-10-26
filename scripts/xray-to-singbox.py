@@ -134,6 +134,8 @@ def convert(document):
     tls = _tls(stream)
     if tls is not None:
         outbound["tls"] = tls
+        if protocol == "vmess" and outbound.get("security") == "auto":
+            outbound["security"] = "aes-128-gcm"
     if protocol != "hysteria":
         transport = _transport(stream)
         if transport is not None:

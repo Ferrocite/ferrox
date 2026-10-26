@@ -41,6 +41,7 @@ pub struct Workload {
     pub warmup: bool,
     pub outbound_config: String,
     pub outbound_configs: Vec<(String, String)>,
+    pub skip_engines: Vec<(String, String)>,
     pub scenario: String,
     /// The server running beside this cell, sampled on the same clock as the client.
     pub server_pid: Option<u32>,
@@ -997,6 +998,14 @@ fn participant_names(
     let names = engines
         .iter()
         .filter(|e| {
+            if let Some((_, reason)) = workload
+                .skip_engines
+                .iter()
+                .find(|(label, _)| label == e.name)
+            {
+                skipped.push((e.name.to_owned(), reason.clone()));
+                return false;
+            }
             let translated = workload
                 .outbound_configs
                 .iter()
@@ -1717,6 +1726,7 @@ mod tests {
             warmup: false,
             outbound_config: String::new(),
             outbound_configs: Vec::new(),
+            skip_engines: Vec::new(),
             scenario: String::new(),
             server_pid: None,
         }
@@ -1899,6 +1909,23 @@ mod tests {
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].0, "sing-box");
         assert!(skipped[0].1.contains("hysteria is not a carrier"));
+    }
+
+    #[test]
+    fn an_explicit_engine_skip_carries_the_matrix_reason_verbatim() {
+        let engines = vec![
+            dialect_engine("xray-core", parity::Dialect::Xray),
+            dialect_engine("sing-box", parity::Dialect::SingBox),
+        ];
+        let mut workload = scenario_workload("vless-grpc-down-8");
+        workload.outbound_configs = vec![("sing-box".into(), r#"{"outbounds":[]}"#.into())];
+        workload.skip_engines = vec![("sing-box".into(), "the server carries one stream".into())];
+        let (names, skipped) = participant_names(&engines, &workload);
+        assert_eq!(names, vec!["xray-core"]);
+        assert_eq!(
+            skipped,
+            vec![("sing-box".into(), "the server carries one stream".into())]
+        );
     }
 
     fn protocol_limited_engine() -> Engine {

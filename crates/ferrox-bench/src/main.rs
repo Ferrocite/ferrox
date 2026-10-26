@@ -71,6 +71,7 @@ struct Args {
     traffic: String,
     outbound_config: String,
     outbound_configs: Vec<(String, String)>,
+    skip_engines: Vec<(String, String)>,
     output_dir: String,
     json_report: Option<String>,
     scenario: String,
@@ -144,6 +145,7 @@ fn parse_args() -> Args {
     let mut traffic = String::from("download");
     let mut outbound_config = String::new();
     let mut outbound_configs: Vec<(String, String)> = Vec::new();
+    let mut skip_engines: Vec<(String, String)> = Vec::new();
     let mut output_dir = String::from("target/parity");
     let mut json_report: Option<String> = None;
     let mut scenario = String::from("gate5");
@@ -200,6 +202,18 @@ fn parse_args() -> Args {
                 &flag_value(&mut args, "--outbound-config-for"),
                 |document| json::parse(document).map(|_| ()),
             ),
+            "--skip-engine-for" => {
+                let spec = flag_value(&mut args, "--skip-engine-for");
+                let Some((label, reason)) = spec.split_once('=') else {
+                    eprintln!("--skip-engine-for needs <label>=<reason>, got `{spec}`");
+                    std::process::exit(2);
+                };
+                if label.is_empty() || reason.is_empty() {
+                    eprintln!("--skip-engine-for needs a non-empty label and reason");
+                    std::process::exit(2);
+                }
+                skip_engines.push((label.to_owned(), reason.to_owned()));
+            }
             "--outbound-config" | "--output-dir" | "--json-report" | "--scenario" => {
                 parse_matrix_arg(
                     &mut outbound_config,
@@ -241,6 +255,7 @@ fn parse_args() -> Args {
         traffic,
         outbound_config,
         outbound_configs,
+        skip_engines,
         output_dir,
         json_report,
         scenario,
@@ -761,6 +776,7 @@ fn gate5_section(args: &Args) -> Result<Gate5, String> {
         warmup: false,
         outbound_config: args.outbound_config.clone(),
         outbound_configs: args.outbound_configs.clone(),
+        skip_engines: args.skip_engines.clone(),
         scenario: args.scenario.clone(),
         server_pid: args.server_pid,
     };

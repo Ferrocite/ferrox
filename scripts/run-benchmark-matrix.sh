@@ -410,7 +410,11 @@ while read -r id traffic connections iterations payload; do
         status=1
         continue
       }
-      client_args+=(--outbound-config-for "sing-box=$(cat "$celldir/client-sing-box.json")")
+      if skip_reason="$(matrix_engine_skip_reason sing-box "$id" "$server")"; then
+        client_args+=(--skip-engine-for "sing-box=$skip_reason")
+      else
+        client_args+=(--outbound-config-for "sing-box=$(cat "$celldir/client-sing-box.json")")
+      fi
     fi
     if ((probe_only)); then
       cells_run=$((cells_run + 1))

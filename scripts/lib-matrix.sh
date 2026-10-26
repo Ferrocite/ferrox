@@ -51,6 +51,13 @@ matrix_server_serves() {
   return 0
 }
 
+# A pair can carry a scenario's transport and still not interoperate at its pins. Name that
+# here rather than letting the cell fail as a workload fault: the reason reaches the bundle's
+# skipped list, so a reader sees which side is behind instead of a zero.
+matrix_engine_skip_reason() {
+  return 1
+}
+
 server_config() {
   local port="$3" cover="${4:-}"
   local extra=""
