@@ -2112,6 +2112,16 @@ pub(crate) struct VlessOut {
     encryption: Option<Arc<ferrox_core::vless_encryption::Client>>,
 }
 
+impl VlessOut {
+    fn is_vision(&self) -> bool {
+        ferrox_core::vless::is_vision_name(&self.flow)
+    }
+
+    fn allows_udp443(&self) -> bool {
+        self.flow == ferrox_core::vless::VISION_UDP443_FLOW
+    }
+}
+
 /// The freedom lane's own settings: where it redirects, how it resolves a name, whether it
 /// prefixes the dial with a PROXY header, and the fragment stage its carrier writes through.
 #[derive(Debug, Clone, Default)]
@@ -6492,9 +6502,7 @@ pub(crate) fn vless_reverse_header(id: &[u8; 16]) -> Vec<u8> {
 fn vless_request_header(vless: &VlessOut, target: Option<&Destination>) -> Vec<u8> {
     match target {
         None => vless_reverse_header(&vless.id),
-        Some(target) if vless.flow == crate::vision::FLOW => {
-            vless_vision_header(&vless.id, 1, target)
-        }
+        Some(target) if vless.is_vision() => vless_vision_header(&vless.id, 1, target),
         Some(target) => vless_header(&vless.id, 1, target),
     }
 }
@@ -6639,7 +6647,7 @@ fn dial_vless_encrypted_raw(
         client.try_clone().ok(),
         timeout.as_ref().and_then(|raw| raw.try_clone().ok()),
     );
-    if vless.flow == crate::vision::FLOW {
+    if vless.is_vision() {
         let link = crate::vision::Link::sealed(sealed, &vless.id);
         relay_link(client, link, &close, timeout);
     } else {
@@ -8529,6 +8537,9 @@ fn dial_udp_uplink(
     relay: &UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
 ) -> Option<UdpUplink> {
+    if !vless_udp_target_allowed(vless, dest) {
+        return None;
+    }
     if !matches!(vless.carrier, Carrier::Raw(_)) {
         return None;
     }
@@ -10908,7 +10919,7 @@ fn dial_vless_tls(
                     );
                 }
                 let close = shutdown_pair(client.try_clone().ok(), raw.try_clone().ok());
-                if vless.flow == crate::vision::FLOW {
+                if vless.is_vision() {
                     let link = crate::vision::Link::sealed(sealed, &vless.id);
                     relay_link(client, link, &close, Some(raw));
                 } else {
@@ -10916,7 +10927,7 @@ fn dial_vless_tls(
                 }
                 return;
             }
-            if vless.flow != crate::vision::FLOW {
+            if !vless.is_vision() {
                 if session.write_all(&header).is_err() {
                     return note_dial_failure(
                         server,
@@ -11175,7 +11186,7 @@ fn dial_vless_reality(
                     );
                 }
                 let close = shutdown_pair(client.try_clone().ok(), raw.try_clone().ok());
-                if vless.flow == crate::vision::FLOW {
+                if vless.is_vision() {
                     let link = crate::vision::Link::sealed(sealed, &vless.id);
                     relay_link(client, link, &close, Some(raw));
                 } else {
@@ -11219,7 +11230,7 @@ fn dial_vless_reality(
                 return;
             }
             let close = shutdown_pair(downstream.try_clone().ok(), raw.try_clone().ok());
-            if vless.flow == crate::vision::FLOW {
+            if vless.is_vision() {
                 // The Link reads its own transport, so the split is not its shape: the quiet grain stops at the tick instead, and a park never outlasts a writer.
                 let link = crate::vision::Link::new(session, Some(raw), &vless.id);
                 let half = Half::shared_armed_capped(
@@ -15851,6 +15862,19 @@ fn serve_socks_udp_vmess(relay: &UdpSocket, vmess: &VmessOut) {
     }
 }
 
+fn vless_udp_target_allowed(vless: &VlessOut, dest: &SocketAddr) -> bool {
+    let allowed = !vless.is_vision() || vless.allows_udp443() || dest.port() != 443;
+    if !allowed {
+        static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if SAID.set(()).is_ok() {
+            eprintln!(
+                "vless: xtls-rprx-vision refuses UDP/443; use flow=xtls-rprx-vision-udp443 to allow it"
+            );
+        }
+    }
+    allowed
+}
+
 fn serve_socks_udp_vless(relay: &UdpSocket, vless: &VlessOut) {
     if vless.mux {
         return serve_socks_udp_vless_xudp(relay, vless);
@@ -15862,7 +15886,7 @@ fn serve_socks_udp_vless(relay: &UdpSocket, vless: &VlessOut) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
         };
-        if payload.is_empty() {
+        if payload.is_empty() || !vless_udp_target_allowed(vless, &dest) {
             continue;
         }
         if let Ok(mut slot) = source.lock() {
@@ -16003,7 +16027,7 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
         };
-        if payload.is_empty() {
+        if payload.is_empty() || !vless_udp_target_allowed(vless, &dest) {
             continue;
         }
         // The reply reader only needs the slot once: an association that keeps its socket writes it once.
@@ -21108,6 +21132,14 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
             return None;
         }
     };
+    let flow = if server.flow.is_empty() || server.flow == "none" {
+        String::new()
+    } else if ferrox_core::vless::is_vision_name(&server.flow) {
+        server.flow
+    } else {
+        eprintln!("vless: unknown flow `{}`; outbound refused", server.flow);
+        return None;
+    };
     let security = stream_security(outbound);
     let quic_tls = outbound
         .get("streamSettings")
@@ -21124,7 +21156,7 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
     let mux = outbound.get("mux").and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true));
     let stored = xdrive_carried(outbound, &address);
     if security == "tls" && !transport_tls && stored.is_none() {
-        let out = tls_carried_vless(outbound, address, port, id, &server.flow, mux, encryption)?;
+        let out = tls_carried_vless(outbound, address, port, id, &flow, mux, encryption)?;
         return Some(out);
     }
     // REALITY dials raw TCP and every carried carrier the client reaches; the rest stay refused.
@@ -21142,9 +21174,6 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
             return None;
         }
         let reality = outbound_reality(outbound, &address)?;
-        if !matches!(server.flow.as_str(), "" | "none" | crate::vision::FLOW) {
-            return None;
-        }
         return Some(VlessOut {
             address,
             port,
@@ -21156,7 +21185,7 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
             quic_ech: None,
             hysteria_roots: None,
             tls: None,
-            flow: server.flow,
+            flow,
             reality: Some(reality),
             headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
             heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
@@ -21196,7 +21225,7 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
         quic_ech,
         hysteria_roots,
         tls: None,
-        flow: server.flow,
+        flow,
         reality: None,
         headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
         heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
@@ -21210,15 +21239,15 @@ fn find_bridges(root: &Json) -> Vec<(String, VlessOut)> {
     vless_outbounds(root)
         .filter_map(|(outbound, server)| {
             let tag = server.reverse.filter(|tag| !tag.is_empty())?;
-            if server.flow != crate::vision::FLOW && !server.flow.is_empty() && server.flow != "none"
-            {
+            let vision = ferrox_core::vless::is_vision_name(&server.flow);
+            if !vision && !server.flow.is_empty() && server.flow != "none" {
                 eprintln!(
                     "vless: reverse bridge `{tag}` names an unknown flow `{}`; not started",
                     server.flow
                 );
                 return None;
             }
-            if server.flow == crate::vision::FLOW {
+            if vision {
                 eprintln!(
                     "vless: reverse bridge `{tag}` names the vision flow; a reverse session carries the unframed stream only"
                 );
@@ -24571,6 +24600,38 @@ mod tests {
         .expect("parses");
         let out = find_vless_outbound(&root).expect("dials raw REALITY");
         assert_eq!(out.flow, "xtls-rprx-vision");
+        assert!(out.is_vision());
+        assert!(!out.allows_udp443());
+        let target = SocketAddr::from(([192, 0, 2, 1], 443));
+        assert!(
+            !vless_udp_target_allowed(&out, &target),
+            "the bare vision flow refuses UDP/443"
+        );
+        assert!(vless_udp_target_allowed(
+            &out,
+            &SocketAddr::from(([192, 0, 2, 1], 8443))
+        ));
+        let alias_flow = crate::json::parse(&reality_client_json(
+            443,
+            &b64url(&public),
+            ferrox_core::vless::VISION_UDP443_FLOW,
+        ))
+        .expect("parses");
+        let alias = find_vless_outbound(&alias_flow).expect("dials the alias");
+        assert_eq!(alias.flow, ferrox_core::vless::VISION_UDP443_FLOW);
+        assert!(alias.is_vision());
+        assert!(alias.allows_udp443());
+        assert!(vless_udp_target_allowed(&alias, &target));
+        let core = ferrox_core::vless::VlessLink::parse(&format!(
+            "vless://{REALITY_TEST_ID}@192.0.2.1:443?security=reality&encryption=none&type=tcp&flow={}#x",
+            ferrox_core::vless::VISION_UDP443_FLOW
+        ))
+        .expect("parses");
+        assert_eq!(
+            vless_request_header(&alias, Some(&Destination::from(target))),
+            core.encode_request_header("192.0.2.1", 443),
+            "the alias writes the same bytes as the core link"
+        );
         let reality = out.reality.expect("carries its identity");
         assert_eq!(reality.server_name, REALITY_TEST_SNI);
         assert_eq!(reality.public_key, public);
@@ -24582,7 +24643,7 @@ mod tests {
         let bad_flow = crate::json::parse(&reality_client_json(
             443,
             &b64url(&public),
-            "xtls-rprx-vision-udp443",
+            "xtls-rprx-vision-udp4430",
         ))
         .expect("parses");
         assert!(
