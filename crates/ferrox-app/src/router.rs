@@ -5,6 +5,7 @@
 //! so a config that names a code this host cannot find fails at start with the file and code named.
 
 use crate::json::Json;
+use crate::router_script::ScriptRouter;
 use crate::xray_pb::Reader;
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -60,14 +61,6 @@ pub(crate) enum RouteTarget<'a> {
     Balancer(&'a str),
 }
 
-impl<'a> RouteTarget<'a> {
-    pub(crate) fn tag(self) -> &'a str {
-        match self {
-            Self::Outbound(tag) | Self::Balancer(tag) => tag,
-        }
-    }
-}
-
 fn rule_target(rule: &Rule) -> RouteTarget<'_> {
     if rule.balancer {
         RouteTarget::Balancer(&rule.target)
@@ -81,6 +74,7 @@ pub(crate) struct Routing {
     strategy: DomainStrategy,
     rules: Vec<Rule>,
     balancers: Vec<Balancer>,
+    script: Option<ScriptRouter>,
     has_domains: bool,
 }
 
@@ -616,6 +610,42 @@ struct Rule {
     source_ips: Option<IpMatcher>,
     local_ips: Option<IpMatcher>,
     protocols: Option<Vec<String>>,
+    sets: Option<Vec<Arc<RuleSet>>>,
+}
+
+/// One `ruleSet`/`rule_set` entry. A flow matches when any of its headless rules does; each rule is
+/// an AND of the selectors it names, and an `invert` flips that rule alone.
+#[derive(Debug)]
+struct RuleSet {
+    tag: String,
+    rules: Vec<SetRule>,
+}
+
+/// A headless rule, or a logical group of them. `Unknown` is the IP verdict before an address is
+/// known: it decides whether `IPIfNonMatch` has to resolve for this rule at all.
+#[derive(Debug)]
+enum Verdict {
+    Yes,
+    No,
+    Unknown,
+}
+
+#[derive(Debug)]
+struct SetRule {
+    invert: bool,
+    logical: Option<SetLogical>,
+    networks: Option<Vec<Network>>,
+    domains: Option<DomainMatcher>,
+    ports: Option<PortSet>,
+    source_ports: Option<PortSet>,
+    ips: Option<IpMatcher>,
+    source_ips: Option<IpMatcher>,
+}
+
+#[derive(Debug)]
+struct SetLogical {
+    all: bool,
+    rules: Vec<SetRule>,
 }
 
 impl Routing {
@@ -625,6 +655,7 @@ impl Routing {
         Self::parse_in(root, asset_dirs())
     }
 
+    #[allow(clippy::too_many_lines)]
     pub(crate) fn parse_in(root: &Json, dirs: Vec<PathBuf>) -> Result<Option<Self>, String> {
         let Some(block) = root.get("routing") else {
             return Ok(None);
@@ -634,15 +665,19 @@ impl Routing {
         }
         let pairs = object(block, "routing")?;
         let mut strategy = DomainStrategy::AsIs;
+        let mut strategy_seen = false;
         let mut raw_rules = None;
         let mut raw_balancers = None;
-        let mut assets = Assets::new(dirs);
+        let mut raw_sets = None;
+        let mut raw_script = None;
+        let mut assets = Assets::new(dirs.clone());
         for (key, value) in pairs {
             match key.as_str() {
                 "domainStrategy" => {
                     if matches!(value, Json::Null) {
                         continue;
                     }
+                    strategy_seen = true;
                     let named = value
                         .as_str()
                         .ok_or_else(|| "routing domainStrategy is not a string".to_owned())?;
@@ -663,14 +698,47 @@ impl Routing {
                 "balancers" => {
                     raw_balancers = Some(value);
                 }
-                "script" => {
-                    if value.as_str().is_some_and(|script| !script.is_empty()) {
-                        return Err("routing script is not carried".into());
-                    }
-                }
+                "script" => raw_script = Some(value),
+                "ruleSet" | "ruleSets" | "rule_set" | "rule_sets" => raw_sets = Some(value),
                 other => return Err(format!("routing field `{other}` is not carried")),
             }
         }
+        let mut rule_sets = Vec::new();
+        if let Some(value) = raw_sets {
+            if !matches!(value, Json::Null) {
+                let items = value
+                    .as_arr()
+                    .ok_or_else(|| "routing rule set is not an array".to_owned())?;
+                let mut tags = HashSet::new();
+                for item in items {
+                    let set = RuleSet::parse(item, &mut assets, &dirs)?;
+                    if !tags.insert(set.tag.clone()) {
+                        return Err(format!("duplicate rule set tag `{}`", set.tag));
+                    }
+                    rule_sets.push(Arc::new(set));
+                }
+            }
+        }
+        let script = match raw_script {
+            Some(value) if !matches!(value, Json::Null) => {
+                let path = value
+                    .as_str()
+                    .ok_or_else(|| "routing script is not a string".to_owned())?;
+                if path.is_empty() {
+                    return Err("routing script is empty".into());
+                }
+                let rules_present = raw_rules.as_ref().is_some_and(|rules| match rules {
+                    Json::Null => false,
+                    Json::Arr(items) => !items.is_empty(),
+                    _ => true,
+                });
+                if strategy_seen || rules_present {
+                    return Err("routing script cannot be used with domainStrategy or rules".into());
+                }
+                Some(ScriptRouter::parse_in(path, dirs)?)
+            }
+            _ => None,
+        };
         let mut balancers = Vec::new();
         if let Some(value) = raw_balancers {
             if !matches!(value, Json::Null) {
@@ -695,7 +763,7 @@ impl Routing {
                     .ok_or_else(|| "routing rules is not an array".to_owned())?;
                 let mut tags = HashSet::new();
                 for item in items {
-                    let Some(rule) = Rule::parse(item, &mut assets)? else {
+                    let Some(rule) = Rule::parse(item, &mut assets, &rule_sets)? else {
                         continue;
                     };
                     if let Some(tag) = &rule.tag {
@@ -712,11 +780,18 @@ impl Routing {
                 return Err(format!("balancer `{}` not found", rule.target));
             }
         }
-        let has_domains = rules.iter().any(|rule| rule.domains.is_some());
+        let has_domains = rules.iter().any(|rule| {
+            rule.domains.is_some()
+                || rule
+                    .sets
+                    .as_ref()
+                    .is_some_and(|sets| sets.iter().any(|set| set.has_domains()))
+        });
         Ok(Some(Self {
             strategy,
             rules,
             balancers,
+            script,
             has_domains,
         }))
     }
@@ -741,10 +816,16 @@ impl Routing {
         self.balancers.iter().find(|balancer| balancer.tag == tag)
     }
 
+    pub(crate) fn script(&self) -> Option<&ScriptRouter> {
+        self.script.as_ref()
+    }
+
     /// The first matching rule's target; `None` leaves the caller's default in place.
     #[cfg(test)]
     pub(crate) fn route(&self, flow: &Flow) -> Option<&str> {
-        self.route_target(flow).map(RouteTarget::tag)
+        self.route_target(flow).map(|target| match target {
+            RouteTarget::Outbound(tag) | RouteTarget::Balancer(tag) => tag,
+        })
     }
 
     pub(crate) fn route_target(&self, flow: &Flow) -> Option<RouteTarget<'_>> {
@@ -753,7 +834,10 @@ impl Routing {
 
     #[cfg(test)]
     fn route_with(&self, flow: &Flow, resolve: &dyn Fn(&str, u16) -> Vec<IpAddr>) -> Option<&str> {
-        self.route_target_with(flow, resolve).map(RouteTarget::tag)
+        self.route_target_with(flow, resolve)
+            .map(|target| match target {
+                RouteTarget::Outbound(tag) | RouteTarget::Balancer(tag) => tag,
+            })
     }
 
     fn route_target_with(
@@ -805,15 +889,23 @@ impl Routing {
         let mut pending = [0u64; 4];
         let mut spilled = false;
         for (at, rule) in self.rules.iter().enumerate() {
-            if !rule.matches_without_ip(flow, names) {
+            if !rule.base_matches(flow, names) {
+                continue;
+            }
+            let verdict = rule.set_verdict(flow, names, None);
+            let needs_ip = rule.ips.is_some() || matches!(verdict, Verdict::Unknown);
+            if !needs_ip {
+                if matches!(verdict, Verdict::Yes) {
+                    return Some(rule);
+                }
                 continue;
             }
             if let Some(ip) = flow.ip {
-                if rule.ip_matches_addr(ip) {
+                if matches!(rule.set_verdict(flow, names, Some(&[ip])), Verdict::Yes)
+                    && rule.ip_matches_any(&[ip])
+                {
                     return Some(rule);
                 }
-            } else if rule.ips.is_none() {
-                return Some(rule);
             } else if at < pending.len() * 64 {
                 pending[at / 64] |= 1 << (at % 64);
             } else {
@@ -828,16 +920,16 @@ impl Routing {
             return None;
         }
         for at in 0..self.rules.len().min(pending.len() * 64) {
-            if pending[at / 64] & (1 << (at % 64)) != 0 && self.rules[at].ip_matches_any(&addrs) {
+            if pending[at / 64] & (1 << (at % 64)) != 0
+                && self.rules[at].matches_tail(flow, names, &addrs)
+            {
                 return Some(&self.rules[at]);
             }
         }
         if spilled {
-            return self.rules[pending.len() * 64..].iter().find(|rule| {
-                rule.ips.is_some()
-                    && rule.matches_without_ip(flow, names)
-                    && rule.ip_matches_any(&addrs)
-            });
+            return self.rules[pending.len() * 64..]
+                .iter()
+                .find(|rule| rule.needs_ip(flow, names) && rule.matches_tail(flow, names, &addrs));
         }
         None
     }
@@ -850,6 +942,9 @@ impl Routing {
         inbound: Option<&str>,
         default: Option<&'a str>,
     ) -> Result<Option<&'a str>, ()> {
+        if self.script.is_some() {
+            return Err(());
+        }
         let mut decided: Option<&str> = None;
         for rule in &self.rules {
             if !rule.reachable(inbound, Network::Udp) || !rule.local_os_matches() {
@@ -880,6 +975,12 @@ impl Routing {
         default_direct: bool,
         direct: impl Fn(&str, bool) -> bool,
     ) -> Result<(), String> {
+        if self.script.is_some() {
+            return Err(format!(
+                "inbound {} names a routing script, which the server inbound cannot evaluate",
+                inbound.unwrap_or("<untagged>")
+            ));
+        }
         for rule in &self.rules {
             if !rule.reachable(inbound, Network::Tcp) || !rule.local_os_matches() {
                 continue;
@@ -907,9 +1008,19 @@ impl Routing {
 
     /// The first selector a `tun` flow cannot answer, if a rule that could reach it names one.
     pub(crate) fn source_refusal(&self, inbound: Option<&str>) -> Option<&'static str> {
+        if self.script.is_some() {
+            return Some("script");
+        }
         for rule in &self.rules {
             if !rule.reachable(inbound, Network::Tcp) || !rule.local_os_matches() {
                 continue;
+            }
+            if rule
+                .sets
+                .as_ref()
+                .is_some_and(|sets| sets.iter().any(|set| set.needs_source()))
+            {
+                return Some("ruleSet");
             }
             for (present, name) in [
                 (rule.source_ips.is_some(), "source"),
@@ -985,7 +1096,12 @@ fn rule_field_target(field: &Json, name: &str) -> Result<Option<String>, String>
 }
 
 impl Rule {
-    fn parse(value: &Json, assets: &mut Assets) -> Result<Option<Self>, String> {
+    #[allow(clippy::too_many_lines)]
+    fn parse(
+        value: &Json,
+        assets: &mut Assets,
+        sets: &[Arc<RuleSet>],
+    ) -> Result<Option<Self>, String> {
         let pairs = object(value, "routing rule")?;
         let mut target = None;
         let mut balancing_target = None;
@@ -1005,6 +1121,7 @@ impl Rule {
         let mut source_ip_value = None;
         let mut local_ips = None;
         let mut protocols = None;
+        let mut rule_sets = None;
         let mut unread = None;
         for (key, field) in pairs {
             match key.as_str() {
@@ -1037,6 +1154,12 @@ impl Rule {
                 "inboundTag" => inbound_tags = string_list(field, "inboundTag")?,
                 "localOS" => local_os = string_list(field, "localOS")?,
                 "protocol" => protocols = string_list(field, "protocol")?,
+                "ruleSet" | "rule_set" => {
+                    rule_sets = Some(
+                        string_list(field, "ruleSet")?
+                            .ok_or_else(|| "routing ruleSet is empty".to_owned())?,
+                    );
+                }
                 "attrs" | "user" | "vlessRoute" | "process" | "webhook" => {
                     unread = Some(key);
                 }
@@ -1051,6 +1174,19 @@ impl Rule {
             eprintln!("routing rule selector `{selector}` is not carried; the rule is skipped");
             return Ok(None);
         }
+        let rule_sets = match rule_sets {
+            Some(tags) => Some(
+                tags.iter()
+                    .map(|tag| {
+                        sets.iter()
+                            .find(|set| &set.tag == tag)
+                            .cloned()
+                            .ok_or_else(|| format!("rule set `{tag}` not found"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            None => None,
+        };
         let domain_json = domains_list.or(domain_value);
         if let Some(field) = domain_json {
             domains = Some(domain_matcher(field, assets)?);
@@ -1074,6 +1210,7 @@ impl Rule {
             source_ips,
             local_ips,
             protocols,
+            sets: rule_sets,
         }))
     }
 
@@ -1087,6 +1224,7 @@ impl Rule {
             && self.source_ips.is_none()
             && self.local_ips.is_none()
             && self.protocols.is_none()
+            && self.sets.is_none()
     }
 
     fn server_always(&self) -> bool {
@@ -1119,12 +1257,24 @@ impl Rule {
     }
 
     fn matches(&self, flow: &Flow, names: Option<Names<'_>>, ips: &mut Ips<'_>) -> bool {
-        self.matches_without_ip(flow, names) && self.ip_matches(flow, ips)
+        if !self.base_matches(flow, names) {
+            return false;
+        }
+        let verdict = if let Some(ip) = flow.ip {
+            self.set_verdict(flow, names, Some(&[ip]))
+        } else {
+            let verdict = self.set_verdict(flow, names, None);
+            if matches!(verdict, Verdict::Unknown) {
+                let addrs = ips.get(flow);
+                self.set_verdict(flow, names, Some(addrs))
+            } else {
+                verdict
+            }
+        };
+        matches!(verdict, Verdict::Yes) && self.ip_matches(flow, ips)
     }
 
-    /// Every selector but the destination address, in the order a decision reads them. The address
-    /// is last so a selector that already failed does not spend a resolver call under `IPOnDemand`.
-    fn matches_without_ip(&self, flow: &Flow, names: Option<Names<'_>>) -> bool {
+    fn base_matches(&self, flow: &Flow, names: Option<Names<'_>>) -> bool {
         if let Some(networks) = &self.networks {
             if !networks.contains(&flow.network) {
                 return false;
@@ -1191,6 +1341,35 @@ impl Rule {
         true
     }
 
+    fn set_verdict(
+        &self,
+        flow: &Flow,
+        names: Option<Names<'_>>,
+        addrs: Option<&[IpAddr]>,
+    ) -> Verdict {
+        let Some(sets) = &self.sets else {
+            return Verdict::Yes;
+        };
+        let mut verdict = Verdict::No;
+        for set in sets {
+            match set.verdict(flow, names, addrs) {
+                Verdict::Yes => return Verdict::Yes,
+                Verdict::Unknown => verdict = Verdict::Unknown,
+                Verdict::No => {}
+            }
+        }
+        verdict
+    }
+
+    fn needs_ip(&self, flow: &Flow, names: Option<Names<'_>>) -> bool {
+        self.ips.is_some() || matches!(self.set_verdict(flow, names, None), Verdict::Unknown)
+    }
+
+    fn matches_tail(&self, flow: &Flow, names: Option<Names<'_>>, addrs: &[IpAddr]) -> bool {
+        matches!(self.set_verdict(flow, names, Some(addrs)), Verdict::Yes)
+            && self.ip_matches_any(addrs)
+    }
+
     fn ip_matches(&self, flow: &Flow, ips: &mut Ips<'_>) -> bool {
         let Some(matcher) = &self.ips else {
             return true;
@@ -1201,14 +1380,506 @@ impl Rule {
         }
     }
 
-    fn ip_matches_addr(&self, ip: IpAddr) -> bool {
-        self.ips.as_ref().is_none_or(|matcher| matcher.matches(ip))
-    }
-
     fn ip_matches_any(&self, addrs: &[IpAddr]) -> bool {
         self.ips
             .as_ref()
             .is_none_or(|matcher| addrs.iter().any(|ip| matcher.matches(*ip)))
+    }
+}
+
+impl RuleSet {
+    #[allow(clippy::too_many_lines)]
+    fn parse(value: &Json, assets: &mut Assets, dirs: &[PathBuf]) -> Result<Self, String> {
+        let pairs = object(value, "routing rule set")?;
+        let mut tag = None;
+        let mut kind = None;
+        let mut format = None;
+        let mut path = None;
+        let mut url = None;
+        let mut rules = None;
+        for (key, value) in pairs {
+            match key.as_str() {
+                "tag" => {
+                    tag = Some(
+                        value
+                            .as_str()
+                            .filter(|tag| !tag.is_empty())
+                            .ok_or_else(|| "routing rule set tag is not a string".to_owned())?
+                            .to_owned(),
+                    );
+                }
+                "type" => kind = value.as_str().map(str::to_owned),
+                "format" => format = value.as_str().map(str::to_owned),
+                "path" => path = value.as_str().map(str::to_owned),
+                "url" => url = value.as_str().map(str::to_owned),
+                "rules" => rules = Some(value),
+                other => return Err(format!("routing rule set field `{other}` is not carried")),
+            }
+        }
+        let tag = tag.ok_or_else(|| "routing rule set has no tag".to_owned())?;
+        let format = format.unwrap_or_else(|| "source".to_owned());
+        if matches!(format.as_str(), "binary" | "srs") {
+            return Err(format!(
+                "routing rule set `{tag}` is a binary rule set, which is not carried"
+            ));
+        }
+        if format != "source" && format != "json" {
+            return Err(format!(
+                "routing rule set `{tag}` format `{format}` is not carried"
+            ));
+        }
+        let kind = kind.unwrap_or_else(|| {
+            if rules.is_some() {
+                "inline".to_owned()
+            } else if url.is_some() {
+                "remote".to_owned()
+            } else {
+                "local".to_owned()
+            }
+        });
+        let body = match kind.as_str() {
+            "inline" => rules
+                .ok_or_else(|| format!("routing rule set `{tag}` has no rules"))?
+                .clone(),
+            "local" | "file" => {
+                let path = path.ok_or_else(|| format!("routing rule set `{tag}` has no path"))?;
+                let file = resolve_asset_path(&path, dirs)
+                    .ok_or_else(|| format!("routing rule set `{tag}` path `{path}` not found"))?;
+                let bytes = std::fs::read(&file)
+                    .map_err(|error| format!("routing rule set `{tag}` cannot be read: {error}"))?;
+                if bytes.starts_with(b"SRS") {
+                    return Err(format!(
+                        "routing rule set `{tag}` is a binary rule set, which is not carried"
+                    ));
+                }
+                let text = String::from_utf8(bytes)
+                    .map_err(|_| format!("routing rule set `{tag}` is not UTF-8 JSON"))?;
+                crate::json::parse(text.trim())
+                    .map_err(|error| format!("routing rule set `{tag}` is not JSON: {error}"))?
+            }
+            "remote" => {
+                let url = url.or(path).unwrap_or_default();
+                return Err(format!(
+                    "routing rule set `{tag}` is remote (`{url}`), which is not carried"
+                ));
+            }
+            other => {
+                return Err(format!(
+                    "routing rule set `{tag}` type `{other}` is not carried"
+                ));
+            }
+        };
+        if let Json::Obj(pairs) = &body {
+            if let Some((_, version)) = pairs.iter().find(|(key, _)| key == "version") {
+                let version = version
+                    .as_u32()
+                    .ok_or_else(|| format!("routing rule set `{tag}` version is not a number"))?;
+                if !(1..=5).contains(&version) {
+                    return Err(format!(
+                        "routing rule set `{tag}` version {version} is not carried"
+                    ));
+                }
+            }
+        }
+        let rules = match &body {
+            Json::Arr(items) => items
+                .iter()
+                .map(|item| SetRule::parse(item, assets))
+                .collect::<Result<Vec<_>, _>>()?,
+            Json::Obj(pairs) => {
+                if let Some((_, rules)) = pairs.iter().find(|(key, _)| key == "rules") {
+                    for (key, _) in pairs {
+                        if key != "rules" && key != "version" {
+                            return Err(format!(
+                                "routing rule set `{tag}` field `{key}` is not carried"
+                            ));
+                        }
+                    }
+                    if let Some(items) = rules.as_arr() {
+                        items
+                            .iter()
+                            .map(|item| SetRule::parse(item, assets))
+                            .collect::<Result<Vec<_>, _>>()?
+                    } else {
+                        return Err(format!("routing rule set `{tag}` rules is not an array"));
+                    }
+                } else {
+                    let mut out = Vec::new();
+                    for (key, value) in pairs {
+                        match key.as_str() {
+                            "version" => {
+                                let version = value.as_u32().ok_or_else(|| {
+                                    format!("routing rule set `{tag}` version is not a number")
+                                })?;
+                                if !(1..=5).contains(&version) {
+                                    return Err(format!(
+                                        "routing rule set `{tag}` version {version} is not carried"
+                                    ));
+                                }
+                            }
+                            "domain" => out.push(SetRule::domains(value, assets)?),
+                            "ip" => out.push(SetRule::addresses(value, assets)?),
+                            other => {
+                                return Err(format!(
+                                    "routing rule set `{tag}` field `{other}` is not carried"
+                                ));
+                            }
+                        }
+                    }
+                    if out.is_empty() {
+                        return Err(format!(
+                            "routing rule set `{tag}` names neither rules nor domain and ip"
+                        ));
+                    }
+                    out
+                }
+            }
+            _ => {
+                return Err(format!(
+                    "routing rule set `{tag}` is not a rule list or rule set object"
+                ));
+            }
+        };
+        Ok(Self { tag, rules })
+    }
+
+    fn verdict(&self, flow: &Flow, names: Option<Names<'_>>, addrs: Option<&[IpAddr]>) -> Verdict {
+        let mut verdict = Verdict::No;
+        for rule in &self.rules {
+            match rule.verdict(flow, names, addrs) {
+                Verdict::Yes => return Verdict::Yes,
+                Verdict::Unknown => verdict = Verdict::Unknown,
+                Verdict::No => {}
+            }
+        }
+        verdict
+    }
+
+    fn needs_source(&self) -> bool {
+        self.rules.iter().any(SetRule::needs_source)
+    }
+
+    fn has_domains(&self) -> bool {
+        self.rules.iter().any(SetRule::has_domains)
+    }
+}
+
+impl SetRule {
+    #[allow(clippy::too_many_lines)]
+    fn parse(value: &Json, assets: &mut Assets) -> Result<Self, String> {
+        let pairs = object(value, "routing rule set rule")?;
+        let mut kind = None;
+        let mut mode = None;
+        let mut invert = false;
+        let mut nested = None;
+        let mut networks = None;
+        let mut domains = None;
+        let mut ports = None;
+        let mut port_ranges = None;
+        let mut source_ports = None;
+        let mut source_port_ranges = None;
+        let mut ips = None;
+        let mut source_ips = None;
+        for (key, value) in pairs {
+            match key.as_str() {
+                "type" => kind = value.as_str().map(str::to_owned),
+                "mode" => mode = value.as_str().map(str::to_owned),
+                "invert" => invert = value.as_bool().unwrap_or(false),
+                "rules" => nested = Some(value),
+                "network" => networks = network_list(value)?,
+                "domain" => {
+                    let matcher = domains.get_or_insert_with(DomainMatcher::new);
+                    for item in string_list(value, "domain")?.unwrap_or_default() {
+                        let item = item.trim_start_matches('.');
+                        let item = if has_domain_prefix(item) {
+                            item.to_owned()
+                        } else {
+                            format!("full:{item}")
+                        };
+                        add_domain(matcher, &item, assets)?;
+                    }
+                }
+                "domain_suffix" => {
+                    let matcher = domains.get_or_insert_with(DomainMatcher::new);
+                    for item in string_list(value, "domain_suffix")?.unwrap_or_default() {
+                        let item = item.trim_start_matches('.');
+                        let item = if has_domain_prefix(item) {
+                            item.to_owned()
+                        } else {
+                            format!("domain:{item}")
+                        };
+                        add_domain(matcher, &item, assets)?;
+                    }
+                }
+                "domain_keyword" | "domainKeyword" => {
+                    let matcher = domains.get_or_insert_with(DomainMatcher::new);
+                    for item in string_list(value, "domain_keyword")?.unwrap_or_default() {
+                        add_domain(matcher, &format!("keyword:{item}"), assets)?;
+                    }
+                }
+                "domain_regex" | "domainRegex" => {
+                    let matcher = domains.get_or_insert_with(DomainMatcher::new);
+                    for item in string_list(value, "domain_regex")?.unwrap_or_default() {
+                        add_domain(matcher, &format!("regexp:{item}"), assets)?;
+                    }
+                }
+                "ip_cidr" | "ipCIDR" | "ip" => {
+                    if !matches!(value, Json::Null) {
+                        ips = Some(ip_matcher(value, &mut *assets, "ip_cidr")?);
+                    }
+                }
+                "source_ip_cidr" | "sourceIP" => {
+                    if !matches!(value, Json::Null) {
+                        source_ips = Some(ip_matcher(value, &mut *assets, "source_ip_cidr")?);
+                    }
+                }
+                "port" => ports = port_set(value, "port")?,
+                "port_range" | "portRange" => port_ranges = port_range_set(value, "port_range")?,
+                "source_port" => source_ports = port_set(value, "source_port")?,
+                "source_port_range" | "sourcePortRange" => {
+                    source_port_ranges = port_range_set(value, "source_port_range")?;
+                }
+                other => {
+                    return Err(format!(
+                        "routing rule set rule field `{other}` is not carried"
+                    ))
+                }
+            }
+        }
+        let kind = kind.unwrap_or_else(|| {
+            if nested.is_some() {
+                "logical".to_owned()
+            } else {
+                "default".to_owned()
+            }
+        });
+        if kind == "logical" {
+            if networks.is_some()
+                || domains.is_some()
+                || ports.is_some()
+                || source_ports.is_some()
+                || ips.is_some()
+                || source_ips.is_some()
+            {
+                return Err("routing logical rule mixes nested rules with selectors".to_owned());
+            }
+            let mode = mode.ok_or_else(|| "routing logical rule has no mode".to_owned())?;
+            let all = match mode.as_str() {
+                "and" => true,
+                "or" => false,
+                other => {
+                    return Err(format!(
+                        "routing logical rule mode `{other}` is not carried"
+                    ))
+                }
+            };
+            let items = nested
+                .and_then(Json::as_arr)
+                .ok_or_else(|| "routing logical rule has no rules".to_owned())?;
+            let rules = items
+                .iter()
+                .map(|item| SetRule::parse(item, assets))
+                .collect::<Result<Vec<_>, _>>()?;
+            if rules.is_empty() {
+                return Err("routing logical rule has no rules".to_owned());
+            }
+            return Ok(Self {
+                invert,
+                logical: Some(SetLogical { all, rules }),
+                networks: None,
+                domains: None,
+                ports: None,
+                source_ports: None,
+                ips: None,
+                source_ips: None,
+            });
+        }
+        if kind != "default" {
+            return Err(format!(
+                "routing rule set rule type `{kind}` is not carried"
+            ));
+        }
+        if mode.is_some() || nested.is_some() {
+            return Err("routing rule set rule mode or rules without type logical".to_owned());
+        }
+        if let Some(range) = port_ranges {
+            ports
+                .get_or_insert_with(PortSet::default)
+                .ranges
+                .extend(range.ranges);
+        }
+        if let Some(range) = source_port_ranges {
+            source_ports
+                .get_or_insert_with(PortSet::default)
+                .ranges
+                .extend(range.ranges);
+        }
+        if let Some(ports) = ports.as_mut() {
+            ports.finish();
+        }
+        if let Some(ports) = source_ports.as_mut() {
+            ports.finish();
+        }
+        if let Some(matcher) = domains.as_mut() {
+            matcher.finish()?;
+        }
+        if networks.is_none()
+            && domains.is_none()
+            && ports.is_none()
+            && source_ports.is_none()
+            && ips.is_none()
+            && source_ips.is_none()
+        {
+            return Err("routing rule set rule names no condition".to_owned());
+        }
+        Ok(Self {
+            invert,
+            logical: None,
+            networks,
+            domains,
+            ports,
+            source_ports,
+            ips,
+            source_ips,
+        })
+    }
+
+    fn domains(value: &Json, assets: &mut Assets) -> Result<Self, String> {
+        let mut matcher = DomainMatcher::new();
+        for item in string_list(value, "domain")?.unwrap_or_default() {
+            let item = item.trim_start_matches('.');
+            let item = if has_domain_prefix(item) {
+                item.to_owned()
+            } else {
+                format!("domain:{item}")
+            };
+            add_domain(&mut matcher, &item, assets)?;
+        }
+        matcher.finish()?;
+        Ok(Self {
+            invert: false,
+            logical: None,
+            networks: None,
+            domains: Some(matcher),
+            ports: None,
+            source_ports: None,
+            ips: None,
+            source_ips: None,
+        })
+    }
+
+    fn addresses(value: &Json, assets: &mut Assets) -> Result<Self, String> {
+        Ok(Self {
+            invert: false,
+            logical: None,
+            networks: None,
+            domains: None,
+            ports: None,
+            source_ports: None,
+            ips: Some(ip_matcher(value, assets, "ip")?),
+            source_ips: None,
+        })
+    }
+
+    fn verdict(&self, flow: &Flow, names: Option<Names<'_>>, addrs: Option<&[IpAddr]>) -> Verdict {
+        let verdict = self.evaluate(flow, names, addrs);
+        if self.invert {
+            match verdict {
+                Verdict::Yes => Verdict::No,
+                Verdict::No => Verdict::Yes,
+                Verdict::Unknown => Verdict::Unknown,
+            }
+        } else {
+            verdict
+        }
+    }
+
+    fn evaluate(&self, flow: &Flow, names: Option<Names<'_>>, addrs: Option<&[IpAddr]>) -> Verdict {
+        if let Some(logical) = &self.logical {
+            let mut verdict = if logical.all {
+                Verdict::Yes
+            } else {
+                Verdict::No
+            };
+            for rule in &logical.rules {
+                match rule.verdict(flow, names, addrs) {
+                    Verdict::No if logical.all => return Verdict::No,
+                    Verdict::Yes if !logical.all => return Verdict::Yes,
+                    Verdict::Unknown => verdict = Verdict::Unknown,
+                    _ => {}
+                }
+            }
+            return verdict;
+        }
+        if let Some(networks) = &self.networks {
+            if !networks.contains(&flow.network) {
+                return Verdict::No;
+            }
+        }
+        if let Some(ports) = &self.ports {
+            if !flow.port.is_some_and(|port| ports.contains(port)) {
+                return Verdict::No;
+            }
+        }
+        if let Some(ports) = &self.source_ports {
+            if !flow
+                .source
+                .is_some_and(|source| ports.contains(source.port()))
+            {
+                return Verdict::No;
+            }
+        }
+        if let Some(matcher) = &self.domains {
+            let Some(names) = names else {
+                return Verdict::No;
+            };
+            if !matcher.matches(names.raw, names.lower()) {
+                return Verdict::No;
+            }
+        }
+        if let Some(matcher) = &self.source_ips {
+            if !flow
+                .source
+                .is_some_and(|source| matcher.matches(source.ip()))
+            {
+                return Verdict::No;
+            }
+        }
+        let Some(matcher) = &self.ips else {
+            return Verdict::Yes;
+        };
+        if let Some(ip) = flow.ip {
+            return if matcher.matches(ip) {
+                Verdict::Yes
+            } else {
+                Verdict::No
+            };
+        }
+        let Some(addrs) = addrs else {
+            return Verdict::Unknown;
+        };
+        if addrs.iter().any(|ip| matcher.matches(*ip)) {
+            Verdict::Yes
+        } else {
+            Verdict::No
+        }
+    }
+
+    fn needs_source(&self) -> bool {
+        self.source_ports.is_some()
+            || self.source_ips.is_some()
+            || self
+                .logical
+                .as_ref()
+                .is_some_and(|logical| logical.rules.iter().any(SetRule::needs_source))
+    }
+
+    fn has_domains(&self) -> bool {
+        self.domains.is_some()
+            || self
+                .logical
+                .as_ref()
+                .is_some_and(|logical| logical.rules.iter().any(SetRule::has_domains))
     }
 }
 
@@ -1387,6 +2058,18 @@ impl IpMatcher {
             .iter()
             .any(|(set, reverse)| set.matches(ip, *reverse))
     }
+
+    pub(crate) fn set_reverse(&mut self, reverse: bool) {
+        for (_, current) in &mut self.sets {
+            *current = reverse;
+        }
+    }
+
+    pub(crate) fn toggle_reverse(&mut self) {
+        for (_, current) in &mut self.sets {
+            *current = !*current;
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1552,28 +2235,91 @@ fn port_set(value: &Json, field: &str) -> Result<Option<PortSet>, String> {
         let port =
             u16::try_from(number).map_err(|_| format!("routing {field} {number} exceeds 65535"))?;
         set.ranges.push((port, port));
+    } else if let Some(items) = value.as_arr() {
+        for item in items {
+            if let Some(number) = item.as_u32() {
+                let port = u16::try_from(number)
+                    .map_err(|_| format!("routing {field} {number} exceeds 65535"))?;
+                set.ranges.push((port, port));
+            } else if let Some(text) = item.as_str() {
+                add_port_pieces(&mut set, text, field)?;
+            } else {
+                return Err(format!("routing {field} has a value that is not a port"));
+            }
+        }
     } else if let Some(text) = value.as_str() {
-        for piece in text.split(',') {
-            let piece = piece.trim();
-            if piece.is_empty() {
-                continue;
-            }
-            if piece.starts_with("env:") {
-                return Err(format!("routing {field} `env:` is not carried"));
-            }
-            let (from, to) = match piece.split_once('-') {
-                Some((from, to)) => (from, to),
-                None => (piece, piece),
-            };
-            let from = parse_port(from, field)?;
-            let to = parse_port(to, field)?;
-            if from > to {
-                return Err(format!("routing {field} range `{piece}` counts down"));
-            }
-            set.ranges.push((from, to));
+        add_port_pieces(&mut set, text, field)?;
+    } else {
+        return Err(format!("routing {field} is not a number, string or array"));
+    }
+    set.finish();
+    Ok(Some(set))
+}
+
+fn add_port_pieces(set: &mut PortSet, text: &str, field: &str) -> Result<(), String> {
+    for piece in text.split(',') {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        if piece.starts_with("env:") {
+            return Err(format!("routing {field} `env:` is not carried"));
+        }
+        let (from, to) = match piece.split_once('-') {
+            Some((from, to)) => (from, to),
+            None => (piece, piece),
+        };
+        let from = parse_port(from, field)?;
+        let to = parse_port(to, field)?;
+        if from > to {
+            return Err(format!("routing {field} range `{piece}` counts down"));
+        }
+        set.ranges.push((from, to));
+    }
+    Ok(())
+}
+
+fn port_range_set(value: &Json, field: &str) -> Result<Option<PortSet>, String> {
+    if matches!(value, Json::Null) {
+        return Ok(None);
+    }
+    let mut set = PortSet::default();
+    let mut pieces = Vec::new();
+    if let Some(text) = value.as_str() {
+        pieces.extend(text.split(',').map(str::to_owned));
+    } else if let Some(items) = value.as_arr() {
+        for item in items {
+            pieces.push(
+                item.as_str()
+                    .ok_or_else(|| format!("routing {field} has a value that is not a string"))?
+                    .to_owned(),
+            );
         }
     } else {
-        return Err(format!("routing {field} is not a number or string"));
+        return Err(format!("routing {field} is not a string or array"));
+    }
+    for piece in pieces {
+        let piece = piece.trim();
+        if piece.is_empty() {
+            continue;
+        }
+        let (from, to) = piece
+            .split_once(':')
+            .ok_or_else(|| format!("routing {field} range `{piece}` has no colon"))?;
+        let from = if from.is_empty() {
+            0
+        } else {
+            parse_port(from, field)?
+        };
+        let to = if to.is_empty() {
+            u16::MAX
+        } else {
+            parse_port(to, field)?
+        };
+        if from > to {
+            return Err(format!("routing {field} range `{piece}` counts down"));
+        }
+        set.ranges.push((from, to));
     }
     set.finish();
     Ok(Some(set))
@@ -1586,7 +2332,7 @@ fn parse_port(text: &str, field: &str) -> Result<u16, String> {
     u16::try_from(number).map_err(|_| format!("routing {field} {number} exceeds 65535"))
 }
 
-fn local_os() -> &'static str {
+pub(crate) fn local_os() -> &'static str {
     match std::env::consts::OS {
         "macos" => "darwin",
         other => other,
@@ -1612,6 +2358,32 @@ fn lower_arc(text: &str) -> Arc<str> {
     } else {
         Arc::from(text)
     }
+}
+
+fn has_domain_prefix(value: &str) -> bool {
+    [
+        "domain:",
+        "full:",
+        "keyword:",
+        "regexp:",
+        "dotless:",
+        "geosite:",
+        "ext:",
+        "ext-domain:",
+        "ext-site:",
+    ]
+    .iter()
+    .any(|prefix| value.starts_with(prefix))
+}
+
+fn resolve_asset_path(path: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+    let direct = PathBuf::from(path);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    dirs.iter()
+        .map(|dir| dir.join(path))
+        .find(|path| path.is_file())
 }
 
 pub(crate) fn add_domain(
@@ -2242,7 +3014,7 @@ fn geoip_cidr(bytes: &[u8]) -> Result<Option<(IpAddr, u32)>, String> {
     }
 }
 
-fn resolve_ips(host: &str, port: u16) -> Vec<IpAddr> {
+pub(crate) fn resolve_ips(host: &str, port: u16) -> Vec<IpAddr> {
     use std::net::ToSocketAddrs;
     if let Some(resolver) = crate::dnsapp::installed() {
         if let Some((ips, _)) = resolver.lookup(host) {
@@ -2884,13 +3656,408 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_set_domain_is_exact_and_a_suffix_is_not() {
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                (
+                    "ruleSets",
+                    array(vec![object(vec![
+                        ("tag", text("names")),
+                        ("type", text("inline")),
+                        (
+                            "rules",
+                            array(vec![
+                                object(vec![("domain", array(vec![text("exact.test")]))]),
+                                object(vec![("domain_suffix", array(vec![text(".ends.test")]))]),
+                            ]),
+                        ),
+                    ])]),
+                ),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "block",
+                        vec![("ruleSet", array(vec![text("names")]))],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("exact.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+            protocol: None,
+        };
+        assert_eq!(routing.route(&flow), Some("block"));
+        for name in ["exact.test", "name.ends.test"] {
+            assert_eq!(
+                routing.route(&Flow {
+                    domain: Some(name),
+                    ..flow
+                }),
+                Some("block"),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            routing.route(&Flow {
+                domain: Some("name.exact.test"),
+                ..flow
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_rule_set_matches_its_domains_and_logical_rules() {
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                (
+                    "ruleSets",
+                    array(vec![object(vec![
+                        ("tag", text("blocked")),
+                        ("type", text("inline")),
+                        (
+                            "rules",
+                            array(vec![
+                                object(vec![("domain_suffix", array(vec![text(".ads.test")]))]),
+                                object(vec![
+                                    ("type", text("logical")),
+                                    ("mode", text("and")),
+                                    (
+                                        "rules",
+                                        array(vec![
+                                            object(vec![(
+                                                "domain_keyword",
+                                                array(vec![text("track")]),
+                                            )]),
+                                            object(vec![("port", array(vec![number(443)]))]),
+                                        ]),
+                                    ),
+                                ]),
+                            ]),
+                        ),
+                    ])]),
+                ),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "block",
+                        vec![("ruleSet", array(vec![text("blocked")]))],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("x.Ads.Test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+            protocol: None,
+        };
+        assert_eq!(routing.route(&flow), Some("block"));
+        assert_eq!(
+            routing.route(&Flow {
+                domain: Some("tracker.other.test"),
+                ..flow
+            }),
+            Some("block")
+        );
+        assert_eq!(
+            routing.route(&Flow {
+                domain: Some("tracker.other.test"),
+                port: Some(80),
+                ..flow
+            }),
+            None
+        );
+        assert_eq!(
+            routing.route(&Flow {
+                domain: Some("ads.test"),
+                ..flow
+            }),
+            Some("block")
+        );
+    }
+
+    #[test]
+    fn a_rule_set_address_waits_for_ip_if_non_match() {
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                ("domainStrategy", text("IPIfNonMatch")),
+                (
+                    "ruleSets",
+                    array(vec![object(vec![
+                        ("tag", text("net")),
+                        (
+                            "rules",
+                            array(vec![object(vec![(
+                                "ip_cidr",
+                                array(vec![text("10.0.0.0/8")]),
+                            )])]),
+                        ),
+                    ])]),
+                ),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "direct",
+                        vec![("ruleSet", array(vec![text("net")]))],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("once.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+            protocol: None,
+        };
+        assert_eq!(
+            routing.route_with(&flow, &|_, _| vec!["10.1.2.3".parse().expect("ip")]),
+            Some("direct")
+        );
+        assert_eq!(
+            routing.route_with(&flow, &|_, _| vec!["192.0.2.1".parse().expect("ip")]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_logical_rule_set_inverts_without_hiding_the_address() {
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                (
+                    "ruleSets",
+                    array(vec![object(vec![
+                        ("tag", text("plain")),
+                        (
+                            "rules",
+                            array(vec![object(vec![
+                                ("domain_suffix", array(vec![text("ok.test")])),
+                                ("invert", Json::Bool(true)),
+                            ])]),
+                        ),
+                    ])]),
+                ),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "direct",
+                        vec![("ruleSet", array(vec![text("plain")]))],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("other.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+            protocol: None,
+        };
+        assert_eq!(routing.route(&flow), Some("direct"));
+        assert_eq!(
+            routing.route(&Flow {
+                domain: Some("x.ok.test"),
+                ..flow
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn a_native_rule_set_file_matches_domain_and_address() {
+        let dir = dir();
+        std::fs::write(
+            dir.join("native.json"),
+            r#"{"domain":["native.test"],"ip":["192.0.2.0/24"]}"#,
+        )
+        .expect("write");
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                (
+                    "ruleSets",
+                    array(vec![object(vec![
+                        ("tag", text("native")),
+                        ("type", text("local")),
+                        ("path", text("native.json")),
+                    ])]),
+                ),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "direct",
+                        vec![("ruleSet", array(vec![text("native")]))],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir])
+            .expect("parses")
+            .expect("routing");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("native.test"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+            protocol: None,
+        };
+        assert_eq!(routing.route(&flow), Some("direct"));
+        assert_eq!(
+            routing.route(&Flow {
+                domain: None,
+                ip: Some("192.0.2.7".parse().expect("ip")),
+                ..flow
+            }),
+            Some("direct")
+        );
+        assert_eq!(
+            routing.route(&Flow {
+                domain: None,
+                ip: Some("198.51.100.7".parse().expect("ip")),
+                ..flow
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn binary_remote_and_missing_rule_sets_are_refused_by_name() {
+        let dir = dir();
+        std::fs::write(dir.join("rules.srs"), b"SRS\x00\x00").expect("write");
+        for (entry, wanted) in [
+            (
+                object(vec![
+                    ("tag", text("srs")),
+                    ("type", text("local")),
+                    ("format", text("binary")),
+                    ("path", text("rules.srs")),
+                ]),
+                "binary",
+            ),
+            (
+                object(vec![
+                    ("tag", text("srs")),
+                    ("type", text("local")),
+                    ("path", text("rules.srs")),
+                ]),
+                "binary",
+            ),
+            (
+                object(vec![
+                    ("tag", text("remote")),
+                    ("type", text("remote")),
+                    ("url", text("https://example.test/rules.srs")),
+                ]),
+                "remote",
+            ),
+        ] {
+            let root = object(vec![(
+                "routing",
+                object(vec![("ruleSets", array(vec![entry]))]),
+            )]);
+            let error = Routing::parse_in(&root, vec![dir.clone()]).expect_err("refused");
+            assert!(error.contains(wanted), "{error}");
+        }
+        let root = object(vec![(
+            "routing",
+            object(vec![(
+                "rules",
+                array(vec![rule(
+                    "direct",
+                    vec![("ruleSet", array(vec![text("none")]))],
+                )]),
+            )]),
+        )]);
+        let error = Routing::parse_in(&root, vec![dir.clone()]).expect_err("refused");
+        assert!(error.contains("none"), "{error}");
+        std::fs::write(
+            dir.join("late.json"),
+            r#"{"version":9,"rules":[{"domain":["a.test"]}]}"#,
+        )
+        .expect("write");
+        let root = object(vec![(
+            "routing",
+            object(vec![(
+                "ruleSets",
+                array(vec![object(vec![
+                    ("tag", text("late")),
+                    ("type", text("local")),
+                    ("path", text("late.json")),
+                ])]),
+            )]),
+        )]);
+        let error = Routing::parse_in(&root, vec![dir]).expect_err("refused");
+        assert!(error.contains("version 9"), "{error}");
+    }
+
+    #[test]
+    fn a_routing_script_refuses_rules_and_a_strategy() {
+        let dir = dir();
+        std::fs::write(
+            dir.join("route.lua"),
+            "function HandleRoute() return nil end",
+        )
+        .expect("write");
+        for extra in [
+            (
+                "rules",
+                array(vec![rule("direct", vec![("network", text("tcp"))])]),
+            ),
+            ("domainStrategy", text("AsIs")),
+        ] {
+            let root = object(vec![(
+                "routing",
+                object(vec![("script", text("route.lua")), extra]),
+            )]);
+            let error = Routing::parse_in(&root, vec![dir.clone()]).expect_err("refused");
+            assert!(error.contains("script"), "{error}");
+        }
+    }
+
+    #[test]
     fn unknown_routing_fields_are_refused_by_name() {
         let root = object(vec![(
             "routing",
-            object(vec![("script", text("x")), ("rules", array(Vec::new()))]),
+            object(vec![("notAField", text("x")), ("rules", array(Vec::new()))]),
         )]);
         let error = Routing::parse_in(&root, vec![dir()]).expect_err("refused");
-        assert!(error.contains("script"), "{error}");
+        assert!(error.contains("notAField"), "{error}");
         let root = object(vec![(
             "routing",
             routing(vec![rule("direct", vec![("notAField", text("x"))])]),

@@ -1280,7 +1280,7 @@ impl Outbound {
         asked: &Destination,
         network: crate::router::Network,
         client: Option<&Connection>,
-    ) -> (Picked<'_>, Option<&str>) {
+    ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         self.resolved_lane_with_protocol(asked, network, client, None)
     }
 
@@ -1290,7 +1290,7 @@ impl Outbound {
         network: crate::router::Network,
         client: Option<&Connection>,
         protocol: Option<&str>,
-    ) -> (Picked<'_>, Option<&str>) {
+    ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         match self {
             Self::Route(plan) => plan.lane_with_protocol(asked, network, client, protocol),
             other => (Picked::Static(other), None),
@@ -1329,11 +1329,12 @@ struct Dynamic {
 /// configured outbound as the fallback the reference calls its default handler.
 #[derive(Debug)]
 struct RouteShared {
-    routing: crate::router::Routing,
+    routing: Arc<crate::router::Routing>,
     tagged: HashMap<String, Outbound>,
     /// Each balancer's candidate tags, ordered by tag. Built once so a flow picks from a slice.
-    balancers: HashMap<String, Vec<String>>,
+    balancers: Arc<HashMap<String, Vec<String>>>,
     observatory: Option<Arc<crate::observatory::Observatory>>,
+    script: Option<crate::router_script::ScriptCallbacks>,
     default: Outbound,
     default_tag: Option<String>,
     dynamic: RwLock<Dynamic>,
@@ -1514,9 +1515,9 @@ impl RoutePlan {
 
     /// The fallback lane, resolved through the same dynamic table so removing the default tag
     /// blocks it instead of serving a handler the operator dropped.
-    fn default_lane(&self) -> (Picked<'_>, Option<&str>) {
+    fn default_lane(&self) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         match self.shared.default_tag.as_deref() {
-            Some(tag) => (self.target(tag), Some(tag)),
+            Some(tag) => (self.target(tag), Some(std::borrow::Cow::Borrowed(tag))),
             None => (Picked::Static(&self.shared.default), None),
         }
     }
@@ -1548,7 +1549,7 @@ impl RoutePlan {
         asked: &Destination,
         network: crate::router::Network,
         client: Option<&Connection>,
-    ) -> (Picked<'_>, Option<&str>) {
+    ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         self.lane_with_protocol(asked, network, client, None)
     }
 
@@ -1558,7 +1559,7 @@ impl RoutePlan {
         network: crate::router::Network,
         client: Option<&Connection>,
         protocol: Option<&str>,
-    ) -> (Picked<'_>, Option<&str>) {
+    ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         let (domain, ip) = match asked {
             Destination::Name(host, _) => (Some(host.as_str()), None),
             Destination::Address(address) => (None, Some(address.ip())),
@@ -1577,12 +1578,28 @@ impl RoutePlan {
             inbound_tag: self.inbound_tag.as_deref(),
             protocol,
         };
+        if let Some(script) = self.shared.routing.script() {
+            let Some(callbacks) = self.shared.script.as_ref() else {
+                return self.default_lane();
+            };
+            return match script.route(&flow, callbacks) {
+                Ok(Some(tag)) => {
+                    let out = self.target(&tag);
+                    (out, Some(std::borrow::Cow::Owned(tag)))
+                }
+                Ok(None) => self.default_lane(),
+                Err(error) => {
+                    eprintln!("routing script: {error}");
+                    (Picked::Static(&self.shared.closed), None)
+                }
+            };
+        }
         let Some(target) = self.shared.routing.route_target(&flow) else {
             return self.default_lane();
         };
         let tag = match target {
             crate::router::RouteTarget::Outbound(tag) => {
-                return (self.target(tag), Some(tag));
+                return (self.target(tag), Some(std::borrow::Cow::Borrowed(tag)));
             }
             crate::router::RouteTarget::Balancer(tag) => tag,
         };
@@ -1600,10 +1617,16 @@ impl RoutePlan {
             .as_deref()
             .map(crate::observatory::Observatory::snapshot);
         if let Some(picked) = balancer.pick(candidates, observed.as_deref()) {
-            return (self.target(picked), Some(picked));
+            return (
+                self.target(picked),
+                Some(std::borrow::Cow::Borrowed(picked)),
+            );
         }
         if let Some(fallback) = balancer.fallback() {
-            return (self.target(fallback), Some(fallback));
+            return (
+                self.target(fallback),
+                Some(std::borrow::Cow::Borrowed(fallback)),
+            );
         }
         self.default_lane()
     }
@@ -1761,11 +1784,18 @@ fn route_shared_with_api(
         }
     }
     let mut tagged = HashMap::new();
-    for target in routing.targets() {
-        if matches!(target, crate::router::RouteTarget::Balancer(_)) {
-            continue;
-        }
-        let target = target.tag();
+    let targets: Vec<&str> = if routing.script().is_some() {
+        configs.keys().copied().collect()
+    } else {
+        routing
+            .targets()
+            .filter_map(|target| match target {
+                crate::router::RouteTarget::Outbound(tag) => Some(tag),
+                crate::router::RouteTarget::Balancer(_) => None,
+            })
+            .collect()
+    };
+    for target in targets {
         if tagged.contains_key(target) {
             continue;
         }
@@ -1834,17 +1864,61 @@ fn route_shared_with_api(
         }
         balancers.insert(balancer.tag().to_owned(), candidates);
     }
+    let routing = Arc::new(routing);
+    let balancers = Arc::new(balancers);
+    let script = if routing.script().is_some() {
+        let routing = Arc::clone(&routing);
+        let balancers = Arc::clone(&balancers);
+        let tags: Arc<HashSet<String>> = Arc::new(tagged.keys().cloned().collect());
+        let observatory = observatory.clone();
+        Some(crate::router_script::ScriptCallbacks {
+            resolve: Arc::new(crate::router::resolve_ips),
+            pick: Arc::new(move |tag| {
+                pick_script_outbound(&routing, &balancers, &tags, observatory.as_deref(), tag)
+            }),
+        })
+    } else {
+        None
+    };
     Ok(Arc::new(RouteShared {
         routing,
         tagged,
         balancers,
         observatory,
+        script,
         default,
         default_tag,
         dynamic: RwLock::new(Dynamic::default()),
         changed: AtomicBool::new(false),
         closed: Outbound::Block(ferrox_core::blackhole::Response::None),
     }))
+}
+
+/// `xray.router.PickOutbound`: a balancer tag picks one candidate (its fallback when a strategy
+/// names none), any other tag has to be an outbound this table built.
+fn pick_script_outbound(
+    routing: &crate::router::Routing,
+    balancers: &HashMap<String, Vec<String>>,
+    tags: &HashSet<String>,
+    observatory: Option<&crate::observatory::Observatory>,
+    tag: &str,
+) -> Result<String, String> {
+    if let Some(balancer) = routing.balancer(tag) {
+        let candidates = balancers.get(tag).map_or(&[][..], Vec::as_slice);
+        let observed = observatory.map(crate::observatory::Observatory::snapshot);
+        if let Some(picked) = balancer.pick(candidates, observed.as_deref()) {
+            return Ok(picked.to_owned());
+        }
+        if let Some(fallback) = balancer.fallback() {
+            return Ok(fallback.to_owned());
+        }
+        return Err(format!("balancer `{tag}` has no outbound"));
+    }
+    if tags.contains(tag) {
+        Ok(tag.to_owned())
+    } else {
+        Err(format!("outbound `{tag}` not found"))
+    }
 }
 
 /// A server inbound dials direct, so every rule that can reach it must name a freedom outbound and
@@ -12901,7 +12975,7 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
     }
     let (dial, out, tag) = sniff_lane(out, &handshake.asked, &client);
     let asked = dial.as_ref().unwrap_or(&handshake.asked);
-    serve_connect(client, &out, asked, Front::Socks, &[], tag);
+    serve_connect(client, &out, asked, Front::Socks, &[], tag.as_deref());
 }
 
 /// The device front's relay: the front layer's own dial, with the destination the
@@ -12913,7 +12987,7 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
 pub(crate) fn serve_device_flow(client: Connection, out: &Outbound, dest: &Destination) {
     let (dial, lane, tag) = sniff_lane(out, dest, &client);
     let dest = dial.as_ref().unwrap_or(dest);
-    serve_connect(client, &lane, dest, Front::Socks, &[], tag);
+    serve_connect(client, &lane, dest, Front::Socks, &[], tag.as_deref());
 }
 
 /// One mux `New` target for a flow the portal carries.
@@ -13077,7 +13151,11 @@ fn sniff_lane<'a>(
     out: &'a Outbound,
     asked: &Destination,
     client: &Connection,
-) -> (Option<Destination>, Picked<'a>, Option<&'a str>) {
+) -> (
+    Option<Destination>,
+    Picked<'a>,
+    Option<std::borrow::Cow<'a, str>>,
+) {
     let Some(sniffing) = crate::sniff::current() else {
         let (lane, tag) = out.resolved_lane(asked, crate::router::Network::Tcp, Some(client));
         return (None, lane, tag);
@@ -14115,7 +14193,7 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
             }
             let (dial, out, tag) = sniff_lane(out, &asked, &client);
             let asked = dial.as_ref().unwrap_or(&asked);
-            serve_connect(client, &out, asked, Front::Http, &[], tag);
+            serve_connect(client, &out, asked, Front::Http, &[], tag.as_deref());
         }
         ProxyRequest::Forward(asked, origin) => {
             let destination = asked.authority();
@@ -14126,7 +14204,7 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                 Some(&client),
                 Some("http/1.1"),
             );
-            serve_connect(client, &out, &asked, Front::Http, &origin, tag);
+            serve_connect(client, &out, &asked, Front::Http, &origin, tag.as_deref());
         }
     }
 }
@@ -14527,7 +14605,7 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan) {
         client_addr = Some(src);
         let (out, key) =
             plan.lane_with_protocol(&route, crate::router::Network::Udp, Some(&client), protocol);
-        let key = key.map(str::to_owned);
+        let key = key.map(std::borrow::Cow::into_owned);
         if matches!(&*out, Outbound::Block(_)) {
             continue;
         }
@@ -39992,6 +40070,50 @@ mod tests {
         )))
     }
 
+    /// A routing script picks the lane before the (empty) rule table, and its error closes the
+    /// flow instead of falling back to the default handler.
+    #[test]
+    fn a_routing_script_picks_the_lane_and_closes_on_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-proxy-script-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let script = dir.join("route.lua");
+        std::fs::write(
+            &script,
+            r#"
+function HandleRoute(ctx, inbound, sourcePort, targetPort, localPort, targetDomain, network, protocol)
+  if targetDomain == "blocked.test" then return "block" end
+  if targetDomain == "broken.test" then error("script failed") end
+  return nil
+end
+"#,
+        )
+        .expect("write");
+        let config = format!(
+            r#"{{"routing":{{"script":{:?}}},"outbounds":[{{"tag":"direct","protocol":"freedom"}},{{"tag":"block","protocol":"blackhole"}}]}}"#,
+            script.display().to_string()
+        );
+        let plan = route_outbound(&config, Some("in"), false);
+        let Outbound::Route(plan) = plan else {
+            panic!("the config is routed");
+        };
+        let blocked = Destination::Name("blocked.test".to_owned(), 80);
+        let (picked, tag) = plan.lane(&blocked, crate::router::Network::Tcp, None);
+        assert_eq!(tag.as_deref(), Some("block"));
+        assert!(matches!(&*picked, Outbound::Block(_)));
+        let other = Destination::Name("other.test".to_owned(), 80);
+        let (_, tag) = plan.lane(&other, crate::router::Network::Tcp, None);
+        assert_eq!(tag.as_deref(), Some("direct"));
+        let broken = Destination::Name("broken.test".to_owned(), 80);
+        let (picked, tag) = plan.lane(&broken, crate::router::Network::Tcp, None);
+        assert_eq!(tag, None);
+        assert!(matches!(&*picked, Outbound::Block(_)));
+    }
+
     /// One SOCKS CONNECT by name, granted; the caller writes the payload or reads the close.
     fn socks_name_client(front_port: u16, name: &str, port: u16) -> Connection {
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
@@ -40307,7 +40429,11 @@ mod tests {
         };
         let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None);
         assert!(matches!(&*picked, Outbound::Freedom(_)));
-        assert_eq!(tag, Some("direct"), "an observatory-less pick falls back");
+        assert_eq!(
+            tag.as_deref(),
+            Some("direct"),
+            "an observatory-less pick falls back"
+        );
     }
 
     /// A balancer tag and an outbound tag may be the same name; an `outboundTag` rule still takes
@@ -40327,7 +40453,7 @@ mod tests {
         let asked = Destination::Name("echo.test".to_owned(), 443);
         let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None);
         assert!(matches!(&*picked, Outbound::Freedom(_)));
-        assert_eq!(tag, Some("pool"));
+        assert_eq!(tag.as_deref(), Some("pool"));
     }
 
     /// A tag a rule names but no outbound carries, a tag named twice, and a blackhole mode this tree
@@ -43360,7 +43486,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             let dest = port_map.get(&port).unwrap_or(&dest);
             let (dial, target, tag) = sniff_lane(&out, dest, &stream);
             let dest = dial.as_ref().unwrap_or(dest);
-            serve_connect(stream, &target, dest, Front::Socks, &[], tag);
+            serve_connect(stream, &target, dest, Front::Socks, &[], tag.as_deref());
         }
         Role::Proxied(inner) => dispatch(stream, *inner, None),
     }
@@ -43639,7 +43765,7 @@ mod accept_proxy_protocol_tests {
             .with_peer("192.0.2.1:1234".parse().expect("source"));
         let asked = Destination::Address("192.0.2.9:80".parse().expect("target"));
         let (_, tag) = plan.lane(&asked, crate::router::Network::Tcp, Some(&client));
-        assert_eq!(tag, Some("pinned"));
+        assert_eq!(tag.as_deref(), Some("pinned"));
     }
 
     #[test]
