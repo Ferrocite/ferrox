@@ -1417,9 +1417,9 @@ mod tests {
     #[test]
     fn a_tombstone_is_reused_for_a_new_id() {
         let mut sessions = Sessions::<u32>::with_cap(2);
-        for id in 1..=4 {
-            assert_eq!(sessions.open(id, id), Some(None), "id {id}");
-            assert_eq!(sessions.close(id), Some(id), "id {id}");
+        for id in 1..=4u16 {
+            assert_eq!(sessions.open(id, u32::from(id)), Some(None), "id {id}");
+            assert_eq!(sessions.close(id), Some(u32::from(id)), "id {id}");
         }
         assert_eq!(sessions.live(), 0);
         assert_eq!(
