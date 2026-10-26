@@ -43,12 +43,13 @@ graph TD
 
 ## The exchange
 
-The reader keeps one growing head buffer and one 8192-byte read buffer. It stops at the first `\r\n\r\n`, keeps whatever bytes followed as the body's prefix, and reads the rest of the declared `Content-Length`. The length is read case-insensitively from any header line; a POST with no length, a zero length, or a length over 8192 closes without reading a body, exactly as the reference leaves the body empty in those cases. The successful answer is one `format!` allocation and one write; the body is the configured string, not a value built from the request.
+The reader keeps one growing head buffer and one 8192-byte read buffer. It stops at the first `\r\n\r\n`, keeps whatever bytes followed as the body's prefix, and reads the rest of the declared `Content-Length`. The length is read case-insensitively from any header line; a POST with no length, a zero length, or a length over 8192 closes without reading a body, exactly as the reference leaves the body empty in those cases. The successful answer is one prebuilt byte string and one write; the body is the configured string, not a value built from the request.
 
 ## What was removed
 
+- **The per-request answer allocation.** The reference formats the response on every successful probe; this tree formats it once when the inbound is built and writes that same buffer, so an answer allocates nothing.
 - **A body buffer beyond the configured signature.** The reference allocates a fresh `Vec` in each remaining-body read; this tree reuses one 8192-byte stack read buffer and appends into the body it already has, so a POST body costs the body vector and no per-read allocation. The head grows only as far as the request sends it; a 64 KiB cap ends a peer that never sends the terminator.
-- **A per-connection copy of the configured strings.** The path/request/response strings are built once into an `HcHandler`, and each accepted stream takes one `Arc` reference to it instead of cloning three `String`s and reparsing the settings block.
+- **A per-connection copy of the configured strings.** The path, request and prebuilt answer are built once into an `HcHandler`, and each accepted stream takes one `Arc` reference to it instead of cloning three `String`s and reparsing the settings block.
 - **The reference's failure delay.** Named under "what was not removed" instead: the random delay before a refused close is not carried. It changes no successful response and no refusal byte, but it does change how long a refused socket lives.
 
 What was not removed: the inbound still accepts one connection per probe and closes it after one answer; it does not keep a connection pool. A malformed request is still read up to 64 KiB before the close, as the reference's `read_until_eoh` is.
@@ -63,11 +64,11 @@ No duration is claimed. The answer is one write of a fixed string; benchmarks ar
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
-| answer-allocations | 1 | ferrox-app-proxy::hc_tests::an_hc_answer_is_one_allocation |
-| answer-bytes | 85 | ferrox-app-proxy::hc_tests::an_hc_answer_is_one_allocation |
+| answer-allocations | 0 | ferrox-app-proxy::hc_tests::an_hc_answer_is_prebuilt_without_allocating |
+| answer-bytes | 85 | ferrox-app-proxy::hc_tests::an_hc_answer_is_prebuilt_without_allocating |
 <!-- counts:end -->
 
-`an_hc_answer_is_one_allocation` builds the answer for the empty-body `"ok"` case under `ferrox_core::alloc_count`: one allocation, 85 bytes including the response head and the body. A second buffer added to the answer path fails the allocation count; a changed header or body fails the byte count. The GET and POST round trips are gated by `an_hc_get_answers_the_configured_body_after_the_exact_path` and `an_hc_post_checks_the_body_and_a_mismatch_answers_nothing`, which assert the exact bytes and the empty refusal.
+`an_hc_answer_is_prebuilt_without_allocating` reads the answer for the empty-body `"ok"` case under `ferrox_core::alloc_count`: zero allocations, 85 bytes including the response head and the body. The returned slice starts at the handler's own buffer, that pointer and the buffer's capacity do not change across reads, so a copy or a reallocation fails the identity assertions; a changed header or body fails the byte count. The GET and POST round trips are gated by `an_hc_get_answers_the_configured_body_after_the_exact_path` and `an_hc_post_checks_the_body_and_a_mismatch_answers_nothing`, which assert the exact bytes and the empty refusal.
 
 ## Pins
 

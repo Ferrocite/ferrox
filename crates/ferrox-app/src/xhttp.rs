@@ -2129,6 +2129,7 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
                 + path.len()
                 + BEFORE_PADDING.len()
                 + PADDING_MAX
+                + 2
                 + headers_len
                 + TAIL.len(),
         );
