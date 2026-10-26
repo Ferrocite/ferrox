@@ -704,6 +704,15 @@ impl<S: Stream> Session<S> {
         }
     }
 
+    /// Keeps the ciphertext a poll split already consumed, so the next read resumes the record.
+    fn stage(&mut self, head: &[u8], body: &[u8], error: TlsError) -> Result<usize, TlsError> {
+        if error == TlsError::Timeout {
+            self.inbuf.extend_from_slice(head);
+            self.inbuf.extend_from_slice(body);
+        }
+        Err(error)
+    }
+
     /// Reads one record into the window that will hold it: a TLS 1.3 application body is decrypted
     /// where the transport wrote it, so the plaintext the caller gets costs no second buffer.
     fn read_direct(&mut self, buf: &mut [u8]) -> Result<usize, TlsError> {
@@ -722,13 +731,14 @@ impl<S: Stream> Session<S> {
         };
         let mut got = n.saturating_sub(5);
         if n < 5 {
-            match exact(&mut self.io, &mut header[n..]) {
+            let (filled, result) = exact_before(&mut self.io, &mut header[n..]);
+            match result {
                 Ok(()) => {}
                 Err(TlsError::Closed) => {
                     self.eof = true;
                     return Ok(0);
                 }
-                Err(error) => return Err(error),
+                Err(error) => return self.stage(&header[..n + filled], &[], error),
             }
             got = 0;
         }
@@ -758,9 +768,10 @@ impl<S: Stream> Session<S> {
                     self.inbuf.extend_from_slice(&buf[body_at..got]);
                     return Ok(filled);
                 }
-                if let Err(error) = exact(&mut self.io, &mut buf[got..len]) {
+                let (body, result) = exact_before(&mut self.io, &mut buf[got..len]);
+                if let Err(error) = result {
                     if error != TlsError::Closed {
-                        return Err(error);
+                        return self.stage(&header, &buf[..got + body], error);
                     }
                     self.eof = true;
                     return Ok(filled);
@@ -1557,18 +1568,21 @@ fn decrypt(
     record::open13(keys, header, body).map(|(kind, bytes)| (kind, 0, bytes))
 }
 
-/// Fills `buf` from the transport, but a poll-quantum expiry is the caller's timeout and
-/// not an answer: a handshake the socket does not feed must fail the dial, not spin on it.
-fn exact<S: Read>(io: &mut S, mut buf: &mut [u8]) -> Result<(), TlsError> {
-    while !buf.is_empty() {
-        match io.read(buf) {
-            Ok(0) => return Err(TlsError::Closed),
-            Ok(n) => buf = &mut buf[n..],
-            Err(error) if TlsError::is_timeout(&error) => return Err(TlsError::Timeout),
-            Err(error) => return Err(TlsError::from(error)),
+/// Fills `buf` from the transport, reporting the bytes it filled before a poll expiry: the
+/// caller stages them, so the record resumes instead of decoding its own tail as a header.
+fn exact_before<S: Read>(io: &mut S, buf: &mut [u8]) -> (usize, Result<(), TlsError>) {
+    let mut filled = 0;
+    while filled < buf.len() {
+        match io.read(&mut buf[filled..]) {
+            Ok(0) => return (filled, Err(TlsError::Closed)),
+            Ok(n) => filled += n,
+            Err(error) if TlsError::is_timeout(&error) => {
+                return (filled, Err(TlsError::Timeout));
+            }
+            Err(error) => return (filled, Err(TlsError::from(error))),
         }
     }
-    Ok(())
+    (filled, Ok(()))
 }
 
 /// Fills `buf` from the transport; a non-zero `polls` is a handshake's budget, so a poll-quantum expiry waits for the peer instead of failing a hello that is already on the wire.
@@ -2310,6 +2324,42 @@ mod tests {
         );
         let n = subject.read(&mut buf).expect("the record resumes");
         assert_eq!(&buf[..n], b"hello");
+    }
+
+    /// The roomy path lands the record in the caller's window; a poll that splits its header or
+    /// body leaves the bytes already consumed behind it, so the next read resumes rather than
+    /// decoding a body as a header.
+    #[test]
+    fn a_landed_record_split_by_a_timeout_is_resumed_not_lost() {
+        let suite = Suite::Aes128GcmSha256;
+        let secret = [7u8; 32];
+        let mut sender = Direction::tls13(suite, &secret);
+        let mut wire = Vec::new();
+        record::seal13(&mut sender, APPLICATION, b"hello", &mut wire).expect("seals");
+        for stall_at in [3usize, 5, 7, 12] {
+            let mut subject = session_on(
+                SplitRead {
+                    wire: wire.clone(),
+                    at: 0,
+                    stall_at,
+                    stalled: false,
+                },
+                Version::Tls13,
+                suite,
+                Direction::tls13(suite, &secret),
+                Direction::tls13(suite, &secret),
+            );
+            let mut buf = vec![0u8; RECORD_READ];
+            let first = subject
+                .read(&mut buf)
+                .expect_err("the split record times out");
+            assert!(
+                TlsError::is_timeout(&first),
+                "stall {stall_at}: the first read is the timeout"
+            );
+            let n = subject.read(&mut buf).expect("the record resumes");
+            assert_eq!(&buf[..n], b"hello", "stall {stall_at}");
+        }
     }
 
     #[test]

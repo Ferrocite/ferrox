@@ -2655,6 +2655,102 @@ mod tests {
         server.join().expect("joins");
     }
 
+    /// A poll that splits an application record must resume it: the client stages the ciphertext
+    /// it already read, so the next read decodes the record instead of a body as a header.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_client_record_split_by_a_poll_timeout_is_resumed_not_lost() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct StallOnce {
+            io: TcpStream,
+            arm: Arc<AtomicUsize>,
+            seen: usize,
+        }
+
+        impl Read for StallOnce {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let left = self.arm.load(Ordering::SeqCst);
+                if left != 0 {
+                    self.seen += 1;
+                    if self.seen == left {
+                        self.arm.store(0, Ordering::SeqCst);
+                        return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                    }
+                }
+                self.io.read(buf)
+            }
+        }
+
+        impl Write for StallOnce {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.io.write(buf)
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                self.io.flush()
+            }
+        }
+
+        let payload = vec![0x5au8; 8_192];
+        let expected = payload.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("timeout");
+            let accepted =
+                RealityServer::accept(&settings(), 0, stream, Edges::default()).expect("accepts");
+            let mut session = match accepted {
+                RealityAccept::Session(session) => session,
+                RealityAccept::Proxied(_) => panic!("the client authenticates"),
+            };
+            session.handshake().expect("handshakes");
+            let mut request = [0u8; 16];
+            session.read_exact(&mut request).expect("reads");
+            session.write_all(&payload).expect("writes");
+            session.write_all(b"tail").expect("writes");
+            session.flush().expect("flushes");
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        let arm = Arc::new(AtomicUsize::new(0));
+        let limiter = RecordLimiter::new(StallOnce {
+            io: stream,
+            arm: Arc::clone(&arm),
+            seen: 0,
+        });
+        let mut client =
+            RealityClientSession::connect(&client_config(server_public()), 1_700_000_000, limiter)
+                .expect("dials");
+        client.write_all(&[0u8; 16]).expect("writes");
+        client.flush().expect("flushes");
+        arm.store(2, Ordering::SeqCst);
+        let mut back = Vec::new();
+        let mut buf = vec![0u8; 16_384];
+        loop {
+            match client.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => back.extend_from_slice(&buf[..n]),
+                Err(error) if TlsError::is_timeout(&error) => {}
+                Err(error) => panic!("reads the record: {error}"),
+            }
+        }
+        assert_eq!(back.len(), expected.len() + b"tail".len());
+        assert_eq!(&back[..expected.len()], &expected[..]);
+        assert_eq!(&back[expected.len()..], b"tail");
+        drop(client);
+        server.join().expect("joins");
+    }
+
     #[cfg_attr(
         miri,
         ignore = "needs a loopback socket, and ring's assembly behind it"
