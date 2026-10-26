@@ -76,6 +76,7 @@ struct Args {
     scenario: String,
     no_ceiling: bool,
     keep_going: bool,
+    server_pid: Option<u32>,
 }
 
 const DEFAULT_REPEATS: usize = 3;
@@ -148,6 +149,7 @@ fn parse_args() -> Args {
     let mut scenario = String::from("gate5");
     let mut no_ceiling = false;
     let mut keep_going = false;
+    let mut server_pid = None;
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--reference" => declared = flag_value(&mut args, "--reference"),
@@ -210,6 +212,16 @@ fn parse_args() -> Args {
             }
             "--no-harness-ceiling" => no_ceiling = true,
             "--keep-going" => keep_going = true,
+            "--server-pid" => {
+                server_pid = Some(
+                    flag_value(&mut args, "--server-pid")
+                        .parse()
+                        .unwrap_or_else(|e| {
+                            eprintln!("--server-pid needs a process id: {e}");
+                            std::process::exit(2);
+                        }),
+                );
+            }
             other => {
                 eprintln!("unknown argument: {other}");
                 std::process::exit(2);
@@ -234,6 +246,7 @@ fn parse_args() -> Args {
         scenario,
         no_ceiling,
         keep_going,
+        server_pid,
     }
 }
 
@@ -749,6 +762,7 @@ fn gate5_section(args: &Args) -> Result<Gate5, String> {
         outbound_config: args.outbound_config.clone(),
         outbound_configs: args.outbound_configs.clone(),
         scenario: args.scenario.clone(),
+        server_pid: args.server_pid,
     };
     let comparison = compare_process::run(
         &engines,
