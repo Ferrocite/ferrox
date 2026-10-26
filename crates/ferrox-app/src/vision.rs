@@ -635,6 +635,111 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         result
     }
 
+    /// The walk as it stood before the whole-frame pass, kept in the test build so the
+    /// content-bearing probe prices both paths in one binary.
+    #[cfg(test)]
+    fn pump_baseline(
+        &mut self,
+        mut buf: Option<&mut [u8]>,
+        mut feed: Option<&mut Feeding>,
+    ) -> usize {
+        let end = self.have.len();
+        let mut dot = self.dot;
+        let mut walk = self.walk;
+        if !walk.framed {
+            if end - dot < SHORTEST_FRAME {
+                return 0;
+            }
+            if self.have[dot..dot + 16] != self.uuid {
+                self.read.padding = false;
+                return 0;
+            }
+            walk = Walk {
+                framed: true,
+                want_header: 5,
+                want_content: 0,
+                want_padding: 0,
+                command: 0,
+            };
+            dot += 16;
+        }
+        let mut held = 0;
+        let result = loop {
+            if walk.want_header == 5 && end - dot >= 5 {
+                let frame = &self.have[dot..dot + 5];
+                walk.command = frame[0];
+                walk.want_content = usize::from(u16::from_be_bytes([frame[1], frame[2]]));
+                walk.want_padding = usize::from(u16::from_be_bytes([frame[3], frame[4]]));
+                self.validate();
+                dot += 5;
+                walk.want_header = 0;
+            } else if walk.want_header > 0 && dot < end {
+                let byte = self.have[dot];
+                match walk.want_header {
+                    5 => {
+                        walk.command = byte;
+                        self.validate();
+                    }
+                    4 => walk.want_content = usize::from(byte) << 8,
+                    3 => walk.want_content |= usize::from(byte),
+                    2 => walk.want_padding = usize::from(byte) << 8,
+                    _ => walk.want_padding |= usize::from(byte),
+                }
+                dot += 1;
+                walk.want_header -= 1;
+            }
+            if walk.want_content > 0 {
+                let room = match buf.as_deref() {
+                    Some(slot) => slot.len() - held,
+                    None => usize::MAX,
+                };
+                let take = walk.want_content.min(end - dot).min(room);
+                let fresh = &self.have[dot..dot + take];
+                if self.tls.budget > 0 {
+                    if let Some(feed) = feed.as_deref_mut() {
+                        feed.run += take;
+                        feed_extent(fresh, feed);
+                    }
+                }
+                if let Some(slot) = buf.as_deref_mut() {
+                    slot[held..held + take].copy_from_slice(fresh);
+                }
+                dot += take;
+                walk.want_content -= take;
+                held += take;
+                if walk.want_content > 0 || held == buf.as_deref().map_or(0, <[u8]>::len) {
+                    break held;
+                }
+                continue;
+            }
+            if walk.want_padding > 0 {
+                let take = walk.want_padding.min(end - dot);
+                dot += take;
+                walk.want_padding -= take;
+                if walk.want_padding > 0 {
+                    break held;
+                }
+            } else if walk.want_header > 0 {
+                break held;
+            }
+            if walk.command == VisionCommand::Continue.byte() {
+                walk.want_header = 5;
+                continue;
+            }
+            self.read.padding = false;
+            if walk.command == VisionCommand::Direct.byte() {
+                if let Some(direct) = self.direct {
+                    direct(&mut self.session);
+                }
+            }
+            self.read.raw = walk.command == VisionCommand::Direct.byte() && self.raw.is_some();
+            break held;
+        };
+        self.dot = dot;
+        self.walk = walk;
+        result
+    }
+
     /// Reached only while the framing is live: the read lands in spare capacity held
     /// steady at the window, and the cursor is parked where the walk stands — no
     /// staging buffer, no second pass over the frames on the read path.
@@ -1038,16 +1143,18 @@ mod tests {
         );
     }
 
-    /// The frame parser alone: a fixed window of empty frames, walked again and again,
-    /// with the fold outside the walk so the frame holds the parse and nothing else.
+    /// The frame parser alone: a fixed window of frames carrying content and padding,
+    /// walked again and again with the filter spent and no caller buffer, so the frame
+    /// holds the parse and neither the copy nor the scan.
     #[test]
     fn the_frame_parser_probe_costs_the_walk_and_nothing_else() {
         let mut input = Vec::new();
         for _ in 0..7 {
-            input.extend(frame(false, 0, &[], 0));
+            input.extend(frame(false, 0, b"record", 4));
         }
-        input.extend(frame(false, 1, &[], 0));
+        input.extend(frame(false, 1, b"record", 4));
         let mut link = link(&[]);
+        link.tls.budget = 0;
         let mut frames = 0usize;
         for _ in 0..64 {
             link.have.clear();
@@ -1057,12 +1164,31 @@ mod tests {
             link.walk.want_header = 5;
             let mut feed = Feeding::new(&link.tls);
             let runs = link.pump(None, Some(&mut feed));
-            assert_eq!(runs, 0);
+            assert_eq!(runs, 48, "eight six-byte contents cross the walk");
             link.read.padding = true;
             link.read.raw = false;
             frames += 8;
         }
         assert_eq!(frames, 512, "the walk saw every frame");
+
+        let mut baseline_frames = 0usize;
+        for _ in 0..64 {
+            link.have.clear();
+            link.have.extend_from_slice(&input);
+            link.dot = 0;
+            link.walk.framed = true;
+            link.walk.want_header = 5;
+            let mut feed = Feeding::new(&link.tls);
+            let runs = link.pump_baseline(None, Some(&mut feed));
+            assert_eq!(runs, 48, "the baseline walks the same contents");
+            link.read.padding = true;
+            link.read.raw = false;
+            baseline_frames += 8;
+        }
+        assert_eq!(
+            baseline_frames, 512,
+            "the baseline walk saw every frame too"
+        );
     }
 
     /// The scan budget is spent after the handshake; a steady read must not build the
