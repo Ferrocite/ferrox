@@ -1163,6 +1163,19 @@ pub(crate) fn read_response(
     response_iv: &[u8; 16],
     auth: u8,
 ) -> bool {
+    let ok = read_response_header(stream, response_key, response_iv, auth);
+    if ok && crate::proxy::echo_trace_on() {
+        crate::proxy::echo_trace("response ok");
+    }
+    ok
+}
+
+fn read_response_header(
+    stream: &mut dyn Read,
+    response_key: &[u8; 16],
+    response_iv: &[u8; 16],
+    auth: u8,
+) -> bool {
     let len_key = kdf16(response_key, &[b"AEAD Resp Header Len Key"]);
     let len_full = kdf(response_iv, &[b"AEAD Resp Header Len IV"]);
     let len_nonce: [u8; 12] = len_full[..12].try_into().unwrap();
@@ -1196,9 +1209,6 @@ pub(crate) fn read_response(
     ) else {
         return false;
     };
-    if crate::proxy::echo_trace_on() {
-        crate::proxy::echo_trace("response ok");
-    }
     clear_body.len() == 4 && clear_body[0] == auth
 }
 
@@ -2875,10 +2885,8 @@ mod tests {
         let iv = [0x72u8; 16];
         let wire = response_prefix(&key, &iv, 0xAB).expect("prefixes");
         let mut reader = std::io::Cursor::new(wire);
-        // The trace gate reads the environment once; warming it keeps that first read out of the window.
-        let _ = crate::proxy::echo_trace_on();
         let (opened, counts) = ferrox_core::alloc_count::measure(|| {
-            super::read_response(&mut reader, &key, &iv, 0xAB)
+            super::read_response_header(&mut reader, &key, &iv, 0xAB)
         });
         assert!(opened, "the sealed header opens");
         assert_eq!(counts.allocs, 0, "the response header is read on the stack");
