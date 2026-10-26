@@ -353,6 +353,8 @@ pub struct Poly1305 {
     r2: u64,
     s1: u64,
     s2: u64,
+    #[cfg(target_arch = "aarch64")]
+    r26: [u64; 5],
     h: [u64; 3],
     pad: [u64; 2],
     buffer: [u8; 16],
@@ -388,12 +390,26 @@ impl Poly1305 {
         let r0 = lo & LIMB_MASK;
         let r1 = ((lo >> 44) | (hi << 20)) & LIMB_MASK;
         let r2 = hi >> 24;
+        #[cfg(target_arch = "aarch64")]
+        let r26 = {
+            let word =
+                |at: usize| u32::from_le_bytes([key[at], key[at + 1], key[at + 2], key[at + 3]]);
+            [
+                u64::from(word(0) & 0x03ff_ffff),
+                u64::from((word(3) >> 2) & 0x03ff_ff03),
+                u64::from((word(6) >> 4) & 0x03ff_c0ff),
+                u64::from((word(9) >> 6) & 0x03f0_3fff),
+                u64::from((word(12) >> 8) & 0x000f_ffff),
+            ]
+        };
         Self {
             r0,
             r1,
             r2,
             s1: r1 * 20,
             s2: r2 * 20,
+            #[cfg(target_arch = "aarch64")]
+            r26,
             h: [0; 3],
             pad: [w2, w3],
             buffer: [0; 16],
@@ -533,9 +549,13 @@ impl Poly1305 {
             data.len() <= SMALL26_MAX_BYTES,
             "the small path covers at most four blocks"
         );
-        let r = to_26([self.r0, self.r1, self.r2]).map(u64::from);
+        let r = self.r26;
         let s = [r[1] * 5, r[2] * 5, r[3] * 5, r[4] * 5];
-        let mut h = to_26(self.h).map(u64::from);
+        let mut h = if self.h == [0; 3] {
+            [0; 5]
+        } else {
+            to_26(self.h).map(u64::from)
+        };
 
         let mut rest = data;
         while let Some(m) = rest.first_chunk::<16>() {
