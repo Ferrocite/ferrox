@@ -9,7 +9,7 @@ use ferrox_core::foxy::frames;
 use ferrox_core::hysteria::{self, Defrag, Masquerade, UdpMessage};
 
 use crate::conn::Connection;
-use crate::quic::{Unfilled, MAX_DATAGRAM};
+use crate::quic::{Unfilled, MAX_DATAGRAM, RECV_ROOM};
 
 const AUTH_STREAM: u64 = 0;
 
@@ -211,7 +211,7 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
     if !session.sock.refresh_read_timeout(timeout) {
         return false;
     }
-    let mut room = Unfilled::<MAX_DATAGRAM>::new();
+    let mut room = Unfilled::<RECV_ROOM>::new();
     let incoming = match session.sock.recv_from(room.as_mut()) {
         Ok(found) => Some(found),
         Err(e)
@@ -274,7 +274,7 @@ fn take_queued(conn: &mut quiche::Connection, session: &Session) {
             crate::quic::Drain::Unbatchable => {}
         }
     }
-    let mut room = Unfilled::<MAX_DATAGRAM>::new();
+    let mut room = Unfilled::<RECV_ROOM>::new();
     for _ in 0..crate::quic::RECV_SLOTS {
         let Ok((n, from)) = session.sock.recv_from(room.as_mut()) else {
             return;
@@ -1996,7 +1996,7 @@ pub(crate) fn serve_loop(
         masq: Arc::from(masq.clone()),
         routes: HashMap::new(),
     };
-    let mut buf = Unfilled::<MAX_DATAGRAM>::new();
+    let mut buf = Unfilled::<RECV_ROOM>::new();
     if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
         return;
     }

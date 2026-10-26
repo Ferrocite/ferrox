@@ -843,7 +843,7 @@ pub(crate) fn pump_once(
     if !sock.refresh_read_timeout(timer.max(Duration::from_millis(1))) {
         return false;
     }
-    let mut room = Unfilled::<MAX_DATAGRAM>::new();
+    let mut room = Unfilled::<RECV_ROOM>::new();
     let buf = room.as_mut();
     // One armed wait, then the queue already full behind it: a 16 KiB DATA frame is a dozen datagrams, and absorbing one per visit paid a timer set and an egress sweep for each.
     let mut taken = 0usize;
@@ -1374,6 +1374,34 @@ const RELAY_HEADER: usize = 22;
 /// One obfuscated datagram is a salt ahead of the QUIC packet it masks, so the wire frame is the widest salt wider than the largest plain datagram.
 const SALAMANDER_SALT: usize = ferrox_core::hysteria_v1::XPLUS_SALT;
 
+/// The widest frame a masked lane reads: the largest datagram plus the salt in front of it. A receive room this wide unmasks where the wire bytes landed; a narrower one reads into a scratch a salt wider and copies the plaintext back.
+pub(crate) const RECV_ROOM: usize = MAX_DATAGRAM + SALAMANDER_SALT;
+
+/// Read one datagram and unmask it where it landed when the caller's room holds the salt too, so no second buffer carries the plaintext.
+fn masked_read(
+    read: impl FnOnce(&mut [u8]) -> std::io::Result<(usize, SocketAddr)>,
+    buf: &mut [u8],
+    obfs: &Mask,
+) -> std::io::Result<(usize, SocketAddr)> {
+    if let Some(room) = buf.get_mut(..RECV_ROOM) {
+        let (found, from) = read(room)?;
+        return obfs
+            .deobfuscate_in_place(&mut room[..found])
+            .map(|plain| (plain, from))
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData));
+    }
+    let mut room = Unfilled::<RECV_ROOM>::new();
+    let (found, from) = read(room.as_mut())?;
+    let plain = obfs
+        .deobfuscate_in_place(&mut room.as_mut()[..found])
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+    let out = buf
+        .get_mut(..plain)
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    out.copy_from_slice(&room.as_mut()[..plain]);
+    Ok((plain, from))
+}
+
 /// How long a socket the schedule just left stays readable, so a reply still in
 /// flight on the old flow is not lost the instant the port moves. The reference
 /// lingers the same ten seconds; a datagram that misses both windows is a real loss.
@@ -1559,7 +1587,7 @@ impl Hopper {
     }
 
     /// Read one datagram off `sock`, unmasking it into the caller's buffer when the
-    /// lane is obfuscated — the salt is a payload byte the caller was not sized for.
+    /// lane is obfuscated.
     fn read_into(
         sock: &UdpSocket,
         buf: &mut [u8],
@@ -1568,16 +1596,7 @@ impl Hopper {
         let Some(obfs) = obfs else {
             return sock.recv_from(buf);
         };
-        let mut room = Unfilled::<{ MAX_DATAGRAM + SALAMANDER_SALT }>::new();
-        let (found, from) = sock.recv_from(room.as_mut())?;
-        let Some(plain) = obfs.deobfuscate_in_place(&mut room.as_mut()[..found]) else {
-            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
-        };
-        let Some(out) = buf.get_mut(..plain) else {
-            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
-        };
-        out.copy_from_slice(&room.as_mut()[..plain]);
-        Ok((plain, from))
+        masked_read(|room| sock.recv_from(room), buf, obfs)
     }
 
     /// The current flow's address, read without moving the schedule.
@@ -1967,17 +1986,7 @@ impl Datagram {
         let Some(obfs) = self.obfs.as_ref() else {
             return self.raw_recv_from(buf);
         };
-        // The salt on the wire is a payload byte the caller's buffer was not sized for, so an obfuscated read lands in a scratch a salt wider and unmasks in place before copying back.
-        let mut room = Unfilled::<{ MAX_DATAGRAM + SALAMANDER_SALT }>::new();
-        let (found, from) = self.raw_recv_from(room.as_mut())?;
-        let Some(plain) = obfs.deobfuscate_in_place(&mut room.as_mut()[..found]) else {
-            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
-        };
-        let Some(out) = buf.get_mut(..plain) else {
-            return Err(std::io::Error::from(std::io::ErrorKind::InvalidInput));
-        };
-        out.copy_from_slice(&room.as_mut()[..plain]);
-        Ok((plain, from))
+        masked_read(|room| self.raw_recv_from(room), buf, obfs)
     }
 
     /// A read with no obfuscation on it: plain bytes straight from the socket, or the relay hop stripped.
@@ -3330,6 +3339,38 @@ mod tests {
             &got[..n],
             &want[..],
             "reserved, fragment, family, address, port, payload"
+        );
+    }
+
+    #[test]
+    fn an_obfuscated_read_unmasks_where_the_wire_bytes_landed() {
+        let key = "hy2!";
+        let server = Datagram::obfuscated(
+            bind_datagram("127.0.0.1:0").expect("binds"),
+            ferrox_core::hysteria::Salamander::new(key).expect("four-byte key"),
+        );
+        let peer = server.local_addr().expect("addr");
+        server
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("times out");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let salt = [7u8; ferrox_core::hysteria::SALAMANDER_SALT];
+        let plain = [0x33u8; 200];
+        let mut wire = Vec::new();
+        ferrox_core::hysteria::Salamander::new(key)
+            .expect("four-byte key")
+            .obfuscate_with_salt(&salt, &plain, &mut wire);
+        sender.send_to(&wire, peer).expect("sends");
+        let mut got = [0x5au8; RECV_ROOM];
+        let (n, _) = server.recv_from(&mut got).expect("reads a salted frame");
+        assert_eq!(n, plain.len(), "the salt never reaches the caller");
+        assert_eq!(&got[..n], &plain[..], "unmasked to the bytes that went in");
+        // The unmask shifted the payload to the front of this buffer, so the salt-wide tail it never reaches still holds the frame's masked end; a copy out of a scratch would have left the caller's own bytes there.
+        let tail = ferrox_core::hysteria::SALAMANDER_SALT;
+        assert_eq!(
+            &got[n..n + tail],
+            &wire[n..n + tail],
+            "the read did not unmask in the caller's own buffer"
         );
     }
 
