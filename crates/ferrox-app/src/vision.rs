@@ -239,15 +239,60 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     }
 }
 
-impl<S: Read + Write + RecordAlignment> Link<ferrox_core::vless_encryption::EncryptedStream<S>> {
+/// A sealed session as the framer sees it: one frame is one sealed record, so the parts the
+/// walk hands over are joined before the record layer takes them.
+pub(crate) struct Sealed<S>(ferrox_core::vless_encryption::EncryptedStream<S>);
+
+impl<S: Read + Write + RecordAlignment> Sealed<S> {
+    fn enter_direct_mode(&mut self) {
+        self.0.enter_direct_mode();
+    }
+}
+
+impl<S: Read + Write> Read for Sealed<S> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl<S: Read + Write> Write for Sealed<S> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> RecordAlignment for Sealed<S> {
+    fn engage_record_alignment(&mut self) {
+        self.0.engage_record_alignment();
+    }
+
+    fn disarm_record_alignment(&mut self) {
+        self.0.disarm_record_alignment();
+    }
+
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        let len = parts.iter().map(|part| part.len()).sum();
+        let mut joined = Vec::with_capacity(len);
+        for part in parts {
+            joined.extend_from_slice(part);
+        }
+        self.0.write_all(&joined)
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> Link<Sealed<S>> {
     /// The direct command peels the record layer, not the transport: the sealed stream keeps the
     /// XOR header mask the reference's `XorConn` carries across the switch.
     pub(crate) fn sealed(
         session: ferrox_core::vless_encryption::EncryptedStream<S>,
         uuid: &[u8; 16],
     ) -> Self {
-        let mut link = Self::new(session, None, uuid);
-        link.direct = Some(ferrox_core::vless_encryption::EncryptedStream::<S>::enter_direct_mode);
+        let mut link = Self::new(Sealed(session), None, uuid);
+        link.direct = Some(Sealed::<S>::enter_direct_mode);
         link
     }
 }

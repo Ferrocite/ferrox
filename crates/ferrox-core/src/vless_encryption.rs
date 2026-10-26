@@ -1128,18 +1128,7 @@ impl<S: crate::tls::RecordAlignment + io::Write> crate::tls::RecordAlignment
     where
         Self: io::Write,
     {
-        if self.direct {
-            for part in parts {
-                self.write_all(part)?;
-            }
-            return Ok(());
-        }
-        let len = parts.iter().map(|part| part.len()).sum();
-        let mut joined = Vec::with_capacity(len);
-        for part in parts {
-            joined.extend_from_slice(part);
-        }
-        self.write(&joined).map(|_| ())
+        self.inner.write_all_slices(parts)
     }
 }
 

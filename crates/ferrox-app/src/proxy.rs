@@ -3061,7 +3061,7 @@ fn relay_sealed<S: Read + Write + Send + 'static>(
 
 fn relay_link<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'static>(
     plain: &Connection,
-    link: crate::vision::Link<ferrox_core::vless_encryption::EncryptedStream<S>>,
+    link: crate::vision::Link<crate::vision::Sealed<S>>,
     close: &Arc<dyn Fn() + Send + Sync>,
     timeout: Option<Connection>,
 ) {
