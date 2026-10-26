@@ -125,7 +125,17 @@ graph TD
 
 ## Time
 
-**Not measured yet.** Every duration in this repository comes from a named runner, and a number produced off a machine behind a VPN measures the tunnel. No CI artefact has been read.
+The matrix's `vless-hysteria` cells on `ubuntu-latest`, base `62c54e90` against the server-receive-turn branch (runs `40258853413` and `40258675970`), five repeats. The change touches the `srv-ferrox` cell only; the ratio is ferrox's median against xray-core's in that cell:
+
+| cell | throughput | cpu per GiB |
+| --- | --- | --- |
+| `vless-hysteria-down-8--srv-ferrox` | 2.02× → 2.16× | 1.77× → 1.76× |
+| `vless-hysteria-duplex-8--srv-ferrox` | 1.06× → 1.30× | 1.36× → 1.38× |
+| `vless-hysteria-up-1--srv-ferrox` | 0.09× → 0.11× | 1.37× → 1.38× |
+
+The cross-cell server leg — the same xray-core client on the ferrox server against the xray-core server — is still under the 0.85 bound: down `0.36× → 0.36×`, duplex `0.43× → 0.40×`, up `0.26× → 0.35×`. Those are the known holes filed in `scripts/leg-gaps.txt`; the matrix gate is red on the base too, so this page does not call the server leg closed.
+
+`hysteria::serve_loop` retires 2 749 401 → 2 684 380 instructions on the loopback echo (`ops.yml` base `3e00131c` against branch run `40258675941`); `drive_once` reads 169 974 → 172 708. The loop is a published measurement, not a blessed gate.
 
 ## What we removed
 
