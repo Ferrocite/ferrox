@@ -612,6 +612,7 @@ impl Handler {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn accept_flow(&mut self, ip: &Ipv4Head, tcp: &TcpHead, key: FlowKey) -> io::Result<()> {
         let local_ip = ip.destination;
         let remote_ip = ip.source;

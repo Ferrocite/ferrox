@@ -13687,7 +13687,7 @@ pub(crate) fn serve_device_flow(
 ) -> std::io::Result<()> {
     let (dial, lane, tag) = sniff_lane(out, dest, &client);
     let dest = dial.as_ref().unwrap_or(dest);
-    let (_, dial_report) = observe_dial(|| {
+    let ((), dial_report) = observe_dial(|| {
         serve_connect(client, &lane, dest, Front::Socks, &[], tag.as_deref());
     });
     match dial_report {
