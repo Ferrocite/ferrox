@@ -302,6 +302,9 @@ def reset_fake_net(state: pathlib.Path) -> None:
         "fake-services",
         "lanes",
         "system-proxy.owner",
+        "system-proxy.supervisor",
+        "fake-vpn-lane.pids",
+        "fake-exiting-lane.pids",
         "lane.pid",
         "lane.json",
     ):
@@ -2272,6 +2275,304 @@ def check_instance_lifecycle(state: pathlib.Path) -> int:
     return 0
 
 
+def exiting_lane_binary(state: pathlib.Path) -> pathlib.Path:
+    binary = state / "fake-exiting-lane"
+    binary.write_text(
+        """#!/usr/bin/env python3
+import json, os, socket, sys, time
+config = sys.argv[sys.argv.index("-c") + 1]
+with open(config, encoding="utf-8") as handle:
+    document = json.load(handle)
+state = os.environ["FERROX_CONF_DIR"]
+with open(os.path.join(state, "fake-exiting-lane.pids"), "a", encoding="utf-8") as handle:
+    handle.write(f"{os.getpid()}\\n")
+bound = []
+for inbound in document.get("inbounds", []):
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", inbound["port"]))
+    server.listen(16)
+    bound.append(server)
+time.sleep(1.5)
+""",
+        encoding="utf-8",
+    )
+    binary.chmod(0o755)
+    return binary
+
+
+def wait_for_proxy_clear(state: pathlib.Path) -> bool:
+    deadline = time.monotonic() + WATCH
+    while time.monotonic() < deadline:
+        if (
+            not (state / "system-proxy.ports").exists()
+            and not (state / "system-proxy.state").exists()
+            and not (state / "lane.pid").exists()
+        ):
+            return True
+        time.sleep(0.1)
+    return False
+
+
+def vpn_config(state: pathlib.Path, name: str, port: int) -> pathlib.Path:
+    path = state / name
+    path.write_text(
+        json.dumps(
+            {
+                "inbounds": [
+                    {"protocol": "socks", "listen": "127.0.0.1", "port": port}
+                ],
+                "outbounds": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def check_vpn_lane_exit_clears_proxy(state: pathlib.Path) -> int:
+    reset_fake_net(state)
+    seed_service_proxy(state, "http", "proxy.corp", 3128)
+    (state / "fake-services").write_text("Wi-Fi\nEthernet\n", encoding="utf-8")
+    port = free_port()
+    env = env_for(state, curl=True, darwin=True)
+    env["FERROX_BIN"] = str(exiting_lane_binary(state))
+    env["FERROX_FAKE_TRACE"] = "1"
+    config = vpn_config(state, "vpn-exit.json", port)
+    run = subprocess.run(
+        [str(CLI), "up", "--config", str(config), "--vpn"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env,
+    )
+    output = run.stdout + run.stderr
+    if run.returncode != 0:
+        print(
+            f"check-cli-lane: a --vpn lane exited {run.returncode}:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if not (state / "system-proxy.ports").exists():
+        print(f"check-cli-lane: --vpn did not arm the proxy:\n{output}", file=sys.stderr)
+        return 1
+    if not wait_for_proxy_clear(state):
+        print(
+            "check-cli-lane: the system proxy outlived its lane; the marker is still"
+            f" armed:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    calls = state / "networksetup.calls"
+    recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    for service in ("Wi-Fi", "Ethernet"):
+        if f"-setsocksfirewallproxystate {service} off" not in recorded:
+            print(
+                f"check-cli-lane: the lane exit did not clear {service}:\n{recorded}\n"
+                f"{output}",
+                file=sys.stderr,
+            )
+            return 1
+    if (
+        "-setwebproxy Wi-Fi proxy.corp 3128" not in recorded
+        or proxy_field(state, "http-proxy") != "proxy.corp:3128"
+        or proxy_field(state, "http-enabled") != "on"
+        or proxy_field(state, "socks-enabled") != "off"
+    ):
+        print(
+            "check-cli-lane: the lane exit did not restore the prior proxy:"
+            f"\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if (state / "system-proxy.owner").exists():
+        print(
+            f"check-cli-lane: the lane exit left the proxy owner behind:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "check-cli-lane: a lane that exits after up clears the system proxy it armed"
+        " and restores the prior settings"
+    )
+    return 0
+
+
+def check_vpn_hangup_clears_proxy(state: pathlib.Path) -> int:
+    reset_fake_net(state)
+    seed_service_proxy(state, "http", "proxy.corp", 3128)
+    port = free_port()
+    env = env_for(state, curl=True, darwin=True)
+    env["FERROX_BIN"] = str(vpn_lane_binary(state))
+    env["FERROX_FAKE_TRACE"] = "1"
+    run = subprocess.Popen(
+        [str(CLI), "up", "--config", str(vpn_config(state, "vpn-hup.json", port)), "--vpn"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        env=env,
+        start_new_session=True,
+    )
+    try:
+        output, _ = run.communicate(timeout=WATCH)
+    except subprocess.TimeoutExpired:
+        run.kill()
+        output, _ = run.communicate()
+        print(f"check-cli-lane: a --vpn lane kept running:\n{output}", file=sys.stderr)
+        return 1
+    if run.returncode != 0:
+        print(
+            f"check-cli-lane: a --vpn lane exited {run.returncode}:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    supervisor = state / "system-proxy.supervisor"
+    deadline = time.monotonic() + WATCH
+    while not supervisor.exists() and time.monotonic() < deadline:
+        time.sleep(0.1)
+    if not supervisor.exists():
+        print(
+            f"check-cli-lane: --vpn left no supervisor to clear a dead lane:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    try:
+        os.killpg(run.pid, signal.SIGHUP)
+    except ProcessLookupError:
+        print(
+            f"check-cli-lane: the --vpn process group was gone before the hangup:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if not wait_for_proxy_clear(state):
+        print(
+            "check-cli-lane: a terminal hangup left the system proxy armed:"
+            f"\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    calls = state / "networksetup.calls"
+    recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    if (
+        "-setsocksfirewallproxystate Wi-Fi off" not in recorded
+        or "-setwebproxy Wi-Fi proxy.corp 3128" not in recorded
+        or proxy_field(state, "http-proxy") != "proxy.corp:3128"
+        or proxy_field(state, "socks-enabled") != "off"
+    ):
+        print(
+            "check-cli-lane: a terminal hangup did not restore the prior proxy:"
+            f"\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    pids = state / "fake-vpn-lane.pids"
+    started = pids.read_text(encoding="utf-8").split() if pids.exists() else []
+    deadline = time.monotonic() + WATCH
+    while time.monotonic() < deadline:
+        if all(not _alive(int(pid)) for pid in started):
+            break
+        time.sleep(0.1)
+    for pid in started:
+        if _alive(int(pid)):
+            print(
+                f"check-cli-lane: a terminal hangup left lane process {pid} running:"
+                f"\n{output}",
+                file=sys.stderr,
+            )
+            return 1
+    print(
+        "check-cli-lane: a terminal hangup stops the lane and clears the system proxy"
+        " it armed"
+    )
+    return 0
+
+
+def _alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def check_stale_proxy_reconciled(state: pathlib.Path) -> int:
+    def fabricate() -> None:
+        reset_fake_net(state)
+        seed_service_proxy(state, "socks", "127.0.0.1", 10808)
+        (state / "system-proxy.ports").write_text("10808 -\n", encoding="utf-8")
+        (state / "lane.pid").write_text("999999\n", encoding="utf-8")
+
+    fabricate()
+    status = subprocess.run(
+        [str(CLI), "status"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env_for(state, darwin=True),
+    )
+    output = status.stdout + status.stderr
+    calls = state / "networksetup.calls"
+    recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    if (
+        status.returncode == 0
+        or "-setsocksfirewallproxystate Wi-Fi off" not in recorded
+        or proxy_field(state, "socks-enabled") != "off"
+        or (state / "system-proxy.ports").exists()
+    ):
+        print(
+            f"check-cli-lane: status did not clear a stale armed proxy:\n{recorded}\n"
+            f"{output}",
+            file=sys.stderr,
+        )
+        return 1
+
+    fabricate()
+    port = free_port()
+    env = env_for(state, curl=True, darwin=True)
+    env["FERROX_BIN"] = str(vpn_lane_binary(state))
+    env["FERROX_FAKE_TRACE"] = "1"
+    up = subprocess.run(
+        [str(CLI), "up", "--config", str(vpn_config(state, "vpn-stale.json", port)), "--vpn"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env,
+    )
+    output = up.stdout + up.stderr
+    recorded = calls.read_text(encoding="utf-8") if calls.exists() else ""
+    cleared = recorded.find("-setsocksfirewallproxystate Wi-Fi off")
+    armed = recorded.find(f"-setsocksfirewallproxy Wi-Fi 127.0.0.1 {port}")
+    subprocess.run(
+        [str(CLI), "down"],
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        env=env_for(state, darwin=True),
+    )
+    if up.returncode != 0:
+        print(
+            f"check-cli-lane: up over a stale proxy exited {up.returncode}:\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    if cleared == -1 or armed == -1 or cleared > armed:
+        print(
+            "check-cli-lane: up armed the new proxy before clearing the stale one:"
+            f"\n{recorded}\n{output}",
+            file=sys.stderr,
+        )
+        return 1
+    print(
+        "check-cli-lane: status and up clear a stale armed proxy before anything else"
+    )
+    return 0
+
+
 def main() -> int:
     state = pathlib.Path(tempfile.mkdtemp(prefix="ferrox-cli-lane-"))
     if check_picker(state) != 0:
@@ -2303,6 +2604,12 @@ def main() -> int:
     if check_proxy_transaction(state) != 0:
         return 1
     if check_proxy_cleanup(state) != 0:
+        return 1
+    if check_vpn_lane_exit_clears_proxy(state) != 0:
+        return 1
+    if check_vpn_hangup_clears_proxy(state) != 0:
+        return 1
+    if check_stale_proxy_reconciled(state) != 0:
         return 1
     return check_instance_lifecycle(state)
 
