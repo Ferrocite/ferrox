@@ -5,6 +5,7 @@ PASSWORD="matrix-secret"
 SS_PASSWORD="matrix-shadowsocks-password"
 SS2022_PASSWORD="MDEyMzQ1Njc4OUFCQ0RFRg=="
 HYSTERIA_AUTH="matrix-hysteria-auth"
+HYSTERIA_V1_OBFS="matrix-hysteria-v1-xplus"
 VLESS_ENC_CLIENT="mlkem768x25519plus.native.1rtt.2KpP3KYKjxF9Rew2c-oAq0YdFawg9Lhc6yzMrSWfZcAzN8O2MrVQEHCAKfOVdCyDAvIEI-gcswjOvDCsZcTPiFITitJt1SGrYsjF4pc_7cua3CNgZ5qUBrZEKRGvcQkdpYswh2ozDxApJParJXa8s-h9YeEWRKG8aGhwQhBq5RVIepsFaAa2SDQA7YUn2rBWKFmJc9gngJQfDftticxhWPC0h9BMgBxx5tiU46tNu1ifyjaWOcVoIwtxfFCSv-p2btNHJJeBOAdQ61dC46qdO2CzujO4clRz0TrB2tliQBi0BKVG8mgYtxZFOGoDtre3sTYO6CS5xExmcOp9zUrHBeoFo5quBZFr5nZ84pQ0NrYBigwemDFE0htQM1YHCFESm1eY_sWSfRGkCLC2KqVXh0cClKjIF2Fazgaoy6qACttDccd0YVtVzFgyNAi1tKXKjNMhgZIyx5e_QmhjJcdDCOS0tzE-ecJRggZ31XzLlPVCeeiuliwJ_UzOWXHOJ0wYiwwtiZhQYIwF7GqHBmF6hrqbSLm0Pau5wLKSUdc3OgjGxWMs34okmnoIvTWoA1Am-IKxCISsCdy-iqFghasCdruLb7luKgMT7soJ95NY0LQOn4FSonEZPKIP_rBvmKJJWyOtl6qThFNzfYBQD2pTM4aXZKrOrYB7kbI_CPqM9dE740IM-suSyoEBCSi8NCB6feoMw5PNdTRDhnyuFPjKL3o_61gMjJwsW8Vq3CKMVByMJXq8QqCmQlyRXxhFVTcNdAYOeePA_JczfWIOGzCIc5wuuAHFxzfAfpWMtlEe3BMxYySXEBTG8meB7nYULth9XorFvYyM7giO4_h7YGqZEfe5hDxnAUpN00nLEwaWNfhaq9x4p7KkCEG6xIFzBhN__7OJUTgARjCagHAxBgSWDCY8qqHI4ZYpzxTI8qkPvTRZBylJZkOhGKdI_XCb9ulTy0cpeeAIF2Fw_UF7RKQ7IrnF1Ycza7MFQzd1i6wPE8fDgBFE1Jgfi_Fg8UsZtSS_q_xnV-pqOPAkDcK9MDt7obIejfHPaKTBZfa-_kp-67l_TRaudHCWoDQ4mtaZcTRo8kNX4BZ1ibUqytYU-IucCfnG32iOlVxCSzA_2CiQqvgiApu3KfiqekBM2YoaIoDEFzmwJVlsSvMDufCf3mo43YhkQFdEHxFLkpgS4WcGPCK59PuM8lNzlDXCvkeNY2lwN8yv7sI06YCz31Q38gqNjsmrBPRYTOQ550Ag8UoTE5dZUOUfhMMaomIYOnA2zUpU_tWy-Vq-F8AL8vVyjEtJRunGY-Q1D9qIaCI1YHmiKQLACiOwR6RDu-Ok0SmtCKeI9iNfqYgbnYyXP2VVIGcpw7uIwVeW_bVMnYqZIgzL4_kMQqGwmGImusoHKvNhRVc6wrkzCdhbXpmAK0nIhtSde4Q9JYqrTVmQBGRLLEc9tAK8-4ydcvJJ3PWCablnEASktKvInUh3g0xQ2teRoqC_fXCi--E0VySRQ7CGWmA8RxNJmvA2WakGplG5QhoK8hSNiIgXmXph_MQO6M34HQtfqyHVqeItfyOmgns747xGrPs"
 VLESS_ENC_SERVER="mlkem768x25519plus.native.600.7SIPAtLwXE0BAcgnUkP8ERcxxHc0NMa-7GE0fcqjc4b8ckDaZ2WEGg7FvAbJs_0ovWXWLWz4CYwjGoqT9TaiMw"
 
@@ -26,7 +27,7 @@ s.close()'
 
 matrix_udp_carrier() {
   case "$1" in
-    *-kcp-*|*-hysteria-*) return 0 ;;
+    *-kcp-*|*-hysteria-*|hysteria-*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -35,11 +36,26 @@ matrix_engine_serves() {
   case "$1" in
     sing-box)
       case "$2" in
+        hysteria-v1-*) return 0 ;;
         *-xhttp-*|*-kcp-*|*-hysteria-*|*-encryption-*) return 1 ;;
       esac
       ;;
   esac
   return 0
+}
+
+matrix_server_serves() {
+  case "$1:$2" in
+    xray-core:hysteria-v1-*) return 1 ;;
+  esac
+  return 0
+}
+
+# A pair can carry a scenario's transport and still not interoperate at its pins. Name that
+# here rather than letting the cell fail as a workload fault: the reason reaches the bundle's
+# skipped list, so a reader sees which side is behind instead of a zero.
+matrix_engine_skip_reason() {
+  return 1
 }
 
 server_config() {
@@ -201,6 +217,18 @@ hysteria_client_settings() {
   echo "\"streamSettings\": {\"network\": \"hysteria\", \"hysteriaSettings\": {\"version\": 2, \"auth\": \"$HYSTERIA_AUTH\"}, \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
 }
 
+hysteria_v1_server_settings() {
+  local dir
+  dir="$(matrix_tls_dir)"
+  echo "\"protocol\": \"hysteria\", \"settings\": {\"version\": 1, \"users\": [{\"auth\": \"$HYSTERIA_AUTH\"}]}, \"streamSettings\": {\"network\": \"hysteria\", \"security\": \"tls\", \"tlsSettings\": {\"alpn\": [\"hysteria\"], \"obfs\": \"$HYSTERIA_V1_OBFS\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\"}]}}"
+}
+
+hysteria_v1_client_settings() {
+  local dir port="$1"
+  dir="$(matrix_tls_dir)"
+  echo "\"tag\": \"proxy\", \"protocol\": \"hysteria\", \"settings\": {\"version\": 1, \"address\": \"127.0.0.1\", \"port\": $port, \"auth\": \"$HYSTERIA_AUTH\"}, \"streamSettings\": {\"network\": \"hysteria\", \"security\": \"tls\", \"hysteriaSettings\": {\"version\": 1, \"auth\": \"$HYSTERIA_AUTH\"}, \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"hysteria\"], \"caCertFile\": \"$dir/cert.pem\", \"obfs\": \"$HYSTERIA_V1_OBFS\"}}"
+}
+
 vless_server_vision() {
   echo "\"protocol\": \"vless\", \"settings\": {\"clients\": [{\"id\": \"$UUID\", \"flow\": \"xtls-rprx-vision\"}], \"decryption\": \"none\"}$1"
 }
@@ -246,6 +274,7 @@ scenario_config() {
     vless-vision-reality-raw-*) server_config "$(vless_server_vision ", $(reality_server_settings tcp "")")" "$(vless_client_vision ", $(reality_client_settings tcp "")" "$port")" "$port" "$cover_json" ;;
     vless-kcp-*) server_config "$(vless_server ", $(kcp_settings)")" "$(vless_client ", $(kcp_settings)" "$port")" "$port" ;;
     vless-hysteria-*) server_config "$(vless_server ", $(hysteria_server_settings)")" "$(vless_client ", $(hysteria_client_settings)" "$port")" "$port" ;;
+    hysteria-v1-*) server_config "$(hysteria_v1_server_settings)" "$(hysteria_v1_client_settings "$port")" "$port" ;;
     vmess-tls-ws-*) server_config "\"protocol\": \"vmess\", \"settings\": {\"clients\": [{\"id\": \"$UUID\"}]}, $(tls_ws_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"vmess\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"users\": [{\"id\": \"$UUID\", \"security\": \"auto\"}]}]}, $(tls_ws_client_settings)" "$port" ;;
     trojan-tls-ws-*) server_config "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}, $(tls_ws_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"password\": \"$PASSWORD\"}]}, $(tls_ws_client_settings)" "$port" ;;
     *) echo "::error::unknown scenario $1" >&2; return 1 ;;
@@ -285,6 +314,7 @@ standard_scenarios() {
   echo "vless-vision-reality-raw-down-8 download 8 256 65536"
   echo "vless-kcp-down-8 download 8 256 65536"
   echo "vless-hysteria-down-8 download 8 256 65536"
+  echo "hysteria-v1-down-8 download 8 256 65536"
   echo "shadowsocks2022-raw-down-8 download 8 256 65536"
   echo "vmess-tls-ws-down-8 download 8 256 65536"
   echo "trojan-tls-ws-down-8 download 8 256 65536"
@@ -318,6 +348,8 @@ scenarios() {
       echo "vless-kcp-duplex-8 full-duplex 8 128 65536"
       echo "vless-hysteria-up-1 upload 1 2048 65536"
       echo "vless-hysteria-duplex-8 full-duplex 8 128 65536"
+      echo "hysteria-v1-up-1 upload 1 2048 65536"
+      echo "hysteria-v1-duplex-8 full-duplex 8 128 65536"
       echo "vless-reality-raw-up-1 upload 1 2048 65536"
       echo "vless-reality-raw-duplex-8 full-duplex 8 128 65536"
       echo "vless-vision-tls-raw-up-1 upload 1 2048 65536"

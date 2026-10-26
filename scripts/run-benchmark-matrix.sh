@@ -43,7 +43,7 @@ mkdir -p "$out" "$engine_dir" "$out/cells"
 
 if [[ -z "$engines_list" ]]; then
   if [[ "$tier" == "smoke" ]]; then
-    engines_list="ferrox,xray-core,xray-core-rust"
+    engines_list="ferrox,xray-core,xray-core-rust,sing-box"
   else
     engines_list="ferrox,xray-core,xray-core-rust,zeronet,sing-box,leaf"
   fi
@@ -116,15 +116,18 @@ for have in ${built[@]+"${built[@]}"}; do
   [[ "$seen" == "0" ]] && ordered+=("$have")
 done
 engines=(${ordered[@]+"${ordered[@]}"})
-engine_args=()
-for have in "${engines[@]}"; do
-  label="${have%%=*}"
-  engine_args+=(--engine "$have")
-  shape="$(config_arg_for "$label")"
-  [[ "$shape" == "long" ]] || engine_args+=(--config-arg "$label=$shape")
-  dialect="$(dialect_for "$label")"
-  [[ "$dialect" == "xray" ]] || engine_args+=(--dialect "$label=$dialect")
-done
+build_engine_args() {
+  engine_args=()
+  local have label shape dialect
+  for have in "$@"; do
+    label="${have%%=*}"
+    engine_args+=(--engine "$have")
+    shape="$(config_arg_for "$label")"
+    [[ "$shape" == "long" ]] || engine_args+=(--config-arg "$label=$shape")
+    dialect="$(dialect_for "$label")"
+    [[ "$dialect" == "xray" ]] || engine_args+=(--dialect "$label=$dialect")
+  done
+}
 [[ "${engines[0]%%=*}" == "xray-core" ]] || fail "no xray-core reference: a comparison without one is not a comparison"
 ferrox_present=0
 for have in "${engines[@]}"; do [[ "${have%%=*}" == "ferrox" ]] && ferrox_present=1; done
@@ -340,6 +343,11 @@ while read -r id traffic connections iterations payload; do
     continue
   fi
   note "cell $id ($traffic $connections flows)"
+  if [[ "$id" == hysteria-v1-* ]] && ! engine_path sing-box >/dev/null; then
+    note "skipping $id: Hysteria v1 needs sing-box as its reference"
+    echo "# $id: skipped, Hysteria v1 needs sing-box as its reference" >>"$out/commands.sh"
+    continue
+  fi
   if matrix_udp_carrier "$id"; then
     srvport="$(matrix_udp_srvport)"
   else
@@ -370,7 +378,13 @@ while read -r id traffic connections iterations payload; do
     status=1
     continue
   }
+  cell_engines=(${engines[@]+"${engines[@]}"})
+  if [[ "$id" == hysteria-v1-* ]]; then
+    cell_engines=("sing-box=$(engine_path sing-box)" "ferrox=$(engine_path ferrox)")
+  fi
+  build_engine_args "${cell_engines[@]}"
   for server in "${servers[@]}"; do
+    matrix_server_serves "$server" "$id" || continue
     cell="$id--srv-$server"
     celldir="$out/cells/$cell"
     rm -rf "$celldir"
@@ -396,7 +410,11 @@ while read -r id traffic connections iterations payload; do
         status=1
         continue
       }
-      client_args+=(--outbound-config-for "sing-box=$(cat "$celldir/client-sing-box.json")")
+      if skip_reason="$(matrix_engine_skip_reason sing-box "$id" "$server")"; then
+        client_args+=(--skip-engine-for "sing-box=$skip_reason")
+      else
+        client_args+=(--outbound-config-for "sing-box=$(cat "$celldir/client-sing-box.json")")
+      fi
     fi
     if ((probe_only)); then
       cells_run=$((cells_run + 1))

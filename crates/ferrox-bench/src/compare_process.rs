@@ -41,6 +41,7 @@ pub struct Workload {
     pub warmup: bool,
     pub outbound_config: String,
     pub outbound_configs: Vec<(String, String)>,
+    pub skip_engines: Vec<(String, String)>,
     pub scenario: String,
     /// The server running beside this cell, sampled on the same clock as the client.
     pub server_pid: Option<u32>,
@@ -959,6 +960,7 @@ const SCENARIO_PROTOCOLS: &[&str] = &[
     "trojan",
     "shadowsocks",
     "shadowsocks2022",
+    "hysteria",
     "socks",
     "http",
     "tun",
@@ -970,9 +972,10 @@ fn protocol_of(scenario: &str) -> Option<&str> {
 }
 
 fn carrier_of(scenario: &str) -> Option<&'static str> {
-    ["kcp", "hysteria", "xhttp"]
-        .into_iter()
-        .find(|carrier| scenario.split('-').any(|rung| rung == *carrier))
+    let protocol = protocol_of(scenario);
+    ["kcp", "hysteria", "xhttp"].into_iter().find(|carrier| {
+        Some(*carrier) != protocol && scenario.split('-').any(|rung| rung == *carrier)
+    })
 }
 
 fn carries(engine: &str, carrier: &str) -> bool {
@@ -995,11 +998,24 @@ fn participant_names(
     let names = engines
         .iter()
         .filter(|e| {
-            if custom && e.dialect != parity::Dialect::Xray {
+            if let Some((_, reason)) = workload
+                .skip_engines
+                .iter()
+                .find(|(label, _)| label == e.name)
+            {
+                skipped.push((e.name.to_owned(), reason.clone()));
+                return false;
+            }
+            let translated = workload
+                .outbound_configs
+                .iter()
+                .any(|(label, _)| label == e.name);
+            if custom && !translated && e.dialect != parity::Dialect::Xray {
                 skipped.push((
                     e.name.to_owned(),
                     format!(
-                        "custom scenario configs are Xray-dialect documents; {} reads {:?}",
+                        "custom scenario configs are Xray-dialect documents; {} reads {:?} \
+                         and the matrix supplied no translation",
                         e.name, e.dialect
                     ),
                 ));
@@ -1710,6 +1726,7 @@ mod tests {
             warmup: false,
             outbound_config: String::new(),
             outbound_configs: Vec::new(),
+            skip_engines: Vec::new(),
             scenario: String::new(),
             server_pid: None,
         }
@@ -1831,27 +1848,84 @@ mod tests {
     }
 
     #[test]
-    fn custom_configs_sit_out_non_xray_engines_with_a_reason() {
+    fn custom_configs_sit_out_untranslated_non_xray_engines_with_a_reason() {
         let engines = vec![
             dialect_engine("xray-core", parity::Dialect::Xray),
             dialect_engine("sing-box", parity::Dialect::SingBox),
+            dialect_engine("leaf", parity::Dialect::Leaf),
         ];
-        let custom = Workload {
+        let mut custom = Workload {
             outbound_config: r#"{"outbounds":[]}"#.into(),
             ..workload()
         };
         let (names, skipped) = participant_names(&engines, &custom);
         assert_eq!(names, vec!["xray-core"]);
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped.iter().all(|(engine, _)| engine != "xray-core"));
+        assert!(
+            skipped
+                .iter()
+                .all(|(_, reason)| reason.contains("Xray-dialect")),
+            "every reason names the mismatch: {skipped:?}"
+        );
+
+        custom.outbound_configs = vec![("sing-box".into(), r#"{"outbounds":[]}"#.into())];
+        let (names, skipped) = participant_names(&engines, &custom);
+        assert_eq!(
+            names,
+            vec!["xray-core", "sing-box"],
+            "a translated non-Xray dialect joins a custom scenario"
+        );
+        assert_eq!(skipped.len(), 1);
+        assert_eq!(skipped[0].0, "leaf");
+
+        let (names, skipped) = participant_names(&engines, &workload());
+        assert_eq!(names, vec!["xray-core", "sing-box", "leaf"]);
+        assert_eq!(skipped, Vec::new());
+    }
+
+    #[test]
+    fn a_hysteria_protocol_scenario_is_not_a_hysteria_carrier() {
+        let engines = vec![
+            dialect_engine("sing-box", parity::Dialect::SingBox),
+            dialect_engine("ferrox", parity::Dialect::Xray),
+        ];
+        let mut standalone = Workload {
+            outbound_config: r#"{"outbounds":[]}"#.into(),
+            outbound_configs: vec![("sing-box".into(), r#"{"outbounds":[]}"#.into())],
+            ..scenario_workload("hysteria-v1-down-8")
+        };
+        let (names, skipped) = participant_names(&engines, &standalone);
+        assert_eq!(
+            names,
+            vec!["sing-box", "ferrox"],
+            "a v1 scenario names its protocol, not its carrier"
+        );
+        assert!(skipped.is_empty(), "{skipped:?}");
+
+        standalone.scenario = "vless-hysteria-down-8".into();
+        let (names, skipped) = participant_names(&engines, &standalone);
+        assert_eq!(names, vec!["ferrox"]);
         assert_eq!(skipped.len(), 1);
         assert_eq!(skipped[0].0, "sing-box");
-        assert!(
-            skipped[0].1.contains("Xray-dialect"),
-            "the reason names the mismatch: {}",
-            skipped[0].1
+        assert!(skipped[0].1.contains("hysteria is not a carrier"));
+    }
+
+    #[test]
+    fn an_explicit_engine_skip_carries_the_matrix_reason_verbatim() {
+        let engines = vec![
+            dialect_engine("xray-core", parity::Dialect::Xray),
+            dialect_engine("sing-box", parity::Dialect::SingBox),
+        ];
+        let mut workload = scenario_workload("vless-grpc-down-8");
+        workload.outbound_configs = vec![("sing-box".into(), r#"{"outbounds":[]}"#.into())];
+        workload.skip_engines = vec![("sing-box".into(), "the server carries one stream".into())];
+        let (names, skipped) = participant_names(&engines, &workload);
+        assert_eq!(names, vec!["xray-core"]);
+        assert_eq!(
+            skipped,
+            vec![("sing-box".into(), "the server carries one stream".into())]
         );
-        let (names, skipped) = participant_names(&engines, &workload());
-        assert_eq!(names, vec!["xray-core", "sing-box"]);
-        assert_eq!(skipped, Vec::new());
     }
 
     fn protocol_limited_engine() -> Engine {

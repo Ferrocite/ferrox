@@ -113,15 +113,33 @@ def convert(document):
         outbound["server_port"] = server["port"]
         outbound["method"] = server["method"]
         outbound["password"] = server["password"]
+    elif protocol == "hysteria":
+        if settings.get("version") != 1:
+            raise ValueError("sing-box at this pin carries only Hysteria v1 here")
+        server = settings
+        if settings.get("servers"):
+            server = _first(settings["servers"], "`servers`")
+        outbound["type"] = "hysteria"
+        outbound["server"] = server["address"]
+        outbound["server_port"] = server["port"]
+        outbound["auth_str"] = server.get("auth", settings.get("auth", ""))
+        outbound["up_mbps"] = 100
+        outbound["down_mbps"] = 100
+        obfs = (stream.get("tlsSettings") or {}).get("obfs")
+        if obfs:
+            outbound["obfs"] = obfs
     else:
         raise ValueError(f"sing-box at this pin has no `{protocol}` client here")
 
     tls = _tls(stream)
     if tls is not None:
         outbound["tls"] = tls
-    transport = _transport(stream)
-    if transport is not None:
-        outbound["transport"] = transport
+        if protocol == "vmess" and outbound.get("security") == "auto":
+            outbound["security"] = "aes-128-gcm"
+    if protocol != "hysteria":
+        transport = _transport(stream)
+        if transport is not None:
+            outbound["transport"] = transport
     return {"outbounds": [outbound], "route": {"final": outbound["tag"]}}
 
 
