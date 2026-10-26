@@ -11489,7 +11489,14 @@ impl<S: CipherOpen, R: Read> Read for DrivenHalf<S, R> {
                     .map_err(|_| std::io::Error::other("tls half poisoned"))?;
                 reader.read(&mut self.scratch)
             };
-            eprintln!("ferrox-diag: transport read {read:?}");
+            eprintln!(
+                "ferrox-diag: t={} transport read {read:?}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis()
+                    % 100000
+            );
             let read = match read {
                 Ok(0) => {
                     // The peer is gone: what was read is handed over, and the next read reports the end.
