@@ -11349,7 +11349,9 @@ where
     R: Read,
 {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        self.reader.read(buf)
+        let out = self.reader.read(buf);
+        eprintln!("ferrox-diag: io read {} -> {:?}", buf.len(), out);
+        out
     }
 }
 
@@ -11358,7 +11360,9 @@ where
     S: CipherOpen,
 {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.writer.write(buf)
+        let out = self.writer.write(buf);
+        eprintln!("ferrox-diag: io write {} -> {:?}", buf.len(), out);
+        out
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
