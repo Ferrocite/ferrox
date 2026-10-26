@@ -471,6 +471,7 @@ impl Flow {
 
     /// Consumes the reply before the stream's payload: a server that buffers `[0, 0]` until its first downlink byte cannot hold an upload-only flow open, so the opening write returns before the reply and the first read pays it.
     fn drain_reply(&mut self) -> std::io::Result<()> {
+        let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
         while self.reply > 0 {
             let before = self.wake.as_ref().map_or(0, |wake| wake.seen());
             let mut room = Unfilled::<2>::new();
@@ -498,6 +499,9 @@ impl Flow {
                 }
                 self.reply -= n;
                 continue;
+            }
+            if Instant::now() >= deadline {
+                return Err(broken());
             }
             if self.drive {
                 let _ = drive_once(&self.session, STREAM_POLL);
