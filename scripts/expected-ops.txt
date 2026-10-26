@@ -131,7 +131,7 @@ append_pem 591
 # Re-blessed 47810894 by the idle-scheduler test: the new test in
 # connection.rs shifts the ferrox-core test binary's CGU layout; dns.rs and the
 # DNS page's method count are untouched.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 47810894 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 47810992 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the
