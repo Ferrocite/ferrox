@@ -181,6 +181,15 @@ impl<const N: usize> Unfilled<N> {
         // SAFETY: every byte read out of here was written by the call this slice was handed to.
         unsafe { std::slice::from_raw_parts_mut(self.0.as_mut_ptr().cast::<u8>(), N) }
     }
+
+    /// The first `len` bytes, which the call this buffer was handed wrote before it published `len`.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub(crate) fn written(&self, len: usize) -> &[u8] {
+        let len = len.min(N);
+        // SAFETY: the read that filled this buffer wrote every byte below `len`, and only that far is read here.
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr().cast::<u8>(), len) }
+    }
 }
 
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -703,6 +712,16 @@ impl Batch {
             })?;
         let bytes = self.slots[at].as_mut().get_mut(..len)?;
         Some((bytes, from))
+    }
+
+    /// The routing key of one slot, borrowed from the bytes the kernel wrote there: a run of datagrams for one lane is compared and looked up without copying a key out of the batch.
+    pub(crate) fn key(&self, at: usize) -> Option<&[u8]> {
+        if at >= self.len {
+            return None;
+        }
+        // SAFETY: `recv_batch` writes this slot's length before it publishes the slot in `len`, and `at` is below `len`.
+        let len = usize::try_from(unsafe { *self.lens.get(at)?.assume_init_ref() }).ok()?;
+        packet_key(self.slots.get(at)?.written(len))
     }
 }
 
@@ -2940,24 +2959,18 @@ pub(crate) fn serve_loop(
         if !sock.refresh_read_timeout(wait) {
             return;
         }
-        // A serving lane takes the queue in a batch where the platform has one: a burst of a dozen packets is one read and one reap, not one visit each.
+        // A serving lane takes the queue in a batch where the platform has one: a burst of a dozen packets is one read, one lock per lane and one reap, not one of each per packet.
         #[cfg(target_os = "linux")]
         match recv_batch(&sock, &mut batch) {
             Drain::Read => {
-                for at in 0..batch.len() {
-                    let Some((bytes, from)) = batch.at(at) else {
-                        continue;
-                    };
-                    route(
-                        &sock,
-                        local,
-                        config,
-                        &mut conns,
-                        bytes,
-                        &mut scratch.out,
-                        from,
-                    );
-                }
+                route_batch(
+                    &sock,
+                    local,
+                    config,
+                    &mut conns,
+                    &mut batch,
+                    &mut scratch.out,
+                );
                 reap(serve, &sock, &mut conns, &mut scratch);
                 continue;
             }
@@ -3013,6 +3026,19 @@ fn learn_ids(
     }
 }
 
+/// The routing key a packet carries, read without building a header: a short-header DCID is the fixed-width server id at a known offset, and that is every packet on an established lane, so the lookup copies nothing and allocates nothing. A long header names its DCID length at byte five.
+fn packet_key(buf: &[u8]) -> Option<&[u8]> {
+    let first = *buf.first()?;
+    if first & 0x80 == 0 {
+        return buf.get(1..1 + quiche::MAX_CONN_ID_LEN);
+    }
+    let dcid_len = usize::from(*buf.get(5)?);
+    if dcid_len > quiche::MAX_CONN_ID_LEN {
+        return None;
+    }
+    buf.get(6..6 + dcid_len)
+}
+
 /// One packet to its connection, or to a new connection when it knocks with an Initial.
 fn route(
     sock: &Datagram,
@@ -3023,10 +3049,10 @@ fn route(
     out: &mut [u8],
     from: SocketAddr,
 ) {
-    let Ok(header) = quiche::Header::from_slice(buf, quiche::MAX_CONN_ID_LEN) else {
+    let Some(key) = packet_key(buf) else {
         return;
     };
-    if let Some(state) = conns.get(header.dcid.as_ref()).cloned() {
+    if let Some(state) = conns.get(key).cloned() {
         let Ok(mut conn) = state.conn.lock() else {
             return;
         };
@@ -3036,6 +3062,13 @@ fn route(
         learn_ids(conns, &state, &conn);
         return;
     }
+    // A short header names an established lane or nothing: only a long header can open one.
+    if buf.first().is_none_or(|first| first & 0x80 == 0) {
+        return;
+    }
+    let Ok(header) = quiche::Header::from_slice(buf, quiche::MAX_CONN_ID_LEN) else {
+        return;
+    };
     if header.ty != quiche::Type::Initial {
         return;
     }
@@ -3071,6 +3104,55 @@ fn route(
     conns.insert(header.dcid.as_ref().to_vec(), state);
 }
 
+/// A whole receive batch, one lock per run of datagrams for the same lane. A burst for one lane is what a data frame is, so the common batch pays one lock, one `learn_ids` pass per packet and one egress sweep for the run, not one of each per packet. A lane's run keeps the kernel's order; a run for another lane starts its own.
+#[cfg(target_os = "linux")]
+fn route_batch(
+    sock: &Datagram,
+    local: SocketAddr,
+    config: &Arc<Mutex<quiche::Config>>,
+    conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
+    batch: &mut Batch,
+    out: &mut [u8],
+) {
+    let mut at = 0;
+    while at < batch.len() {
+        let Some(key) = batch.key(at) else {
+            at += 1;
+            continue;
+        };
+        let Some(state) = conns.get(key).cloned() else {
+            // A lane the table does not hold: one datagram through the path that may accept or negotiate.
+            let Some((bytes, from)) = batch.at(at) else {
+                at += 1;
+                continue;
+            };
+            route(sock, local, config, conns, bytes, out, from);
+            at += 1;
+            continue;
+        };
+        let mut end = at + 1;
+        while end < batch.len() {
+            if batch.key(end) != Some(key) {
+                break;
+            }
+            end += 1;
+        }
+        if let Ok(mut conn) = state.conn.lock() {
+            for index in at..end {
+                let Some((bytes, from)) = batch.at(index) else {
+                    continue;
+                };
+                let info = quiche::RecvInfo { from, to: local };
+                let _ = conn.recv(bytes, info);
+                // Per packet, not per run: a source id the edge starts using mid-connection has to route on the next datagram, and that datagram can be in this same batch.
+                learn_ids(conns, &state, &conn);
+            }
+            flush_egress(&mut conn, sock);
+        }
+        at = end;
+    }
+}
+
 /// New peer streams to sessions, finished ones out of the table, dead connections dropped. One lock per connection covers the closed, timer, source-id and readable questions, and the tables live across calls so a busy connection does not pay for them again on every visit.
 fn reap(
     serve: &Serve,
@@ -3090,7 +3172,7 @@ fn reap(
         if scratch.seen.contains(&ptr) {
             // A closed connection still owes every key it routes: they leave together.
             if scratch.gone.contains(&ptr) {
-                scratch.closed.push(key.to_vec());
+                scratch.closed.push(key.clone());
             }
             continue;
         }
@@ -3100,7 +3182,7 @@ fn reap(
         };
         if conn.is_closed() {
             scratch.gone.push(ptr);
-            scratch.closed.push(key.to_vec());
+            scratch.closed.push(key.clone());
             continue;
         }
         if let Some(at) = conn.timeout_instant() {
@@ -4248,6 +4330,57 @@ mod tests {
         assert!(
             waited >= Duration::from_millis(100),
             "the read waited {waited:?}, not the arm it asked for"
+        );
+    }
+
+    /// The routing key is a window into the packet the kernel wrote: its base is the DCID inside the caller's buffer, so the lookup costs no copy of its own.
+    #[test]
+    fn a_route_key_is_a_window_into_the_packet() {
+        let mut short = [0u8; 64];
+        short[0] = 0x40;
+        short[1..=quiche::MAX_CONN_ID_LEN].fill(7);
+        let key = packet_key(&short).expect("a short header names its DCID");
+        assert_eq!(key, &short[1..=quiche::MAX_CONN_ID_LEN]);
+        assert_eq!(
+            key.as_ptr(),
+            short[1..].as_ptr(),
+            "the key was copied out of the packet"
+        );
+
+        let mut long = [0u8; 64];
+        long[0] = 0xc0;
+        long[1..5].copy_from_slice(&1u32.to_be_bytes());
+        long[5] = 8;
+        long[6..14].fill(9);
+        let key = packet_key(&long).expect("a long header names its DCID length");
+        assert_eq!(key, &long[6..14]);
+        assert_eq!(
+            key.as_ptr(),
+            long[6..].as_ptr(),
+            "the key was copied out of the packet"
+        );
+    }
+
+    /// The header the route used to build allocated its DCID out of the packet on every datagram; the key borrows it, so the established lane's lookup allocates nothing. The two halves are measured side by side, so the removed allocation is the witness rather than a reading of the code.
+    #[test]
+    fn the_route_key_replaces_the_allocating_header_parse() {
+        let mut packet = [0u8; 64];
+        packet[0] = 0x40;
+        packet[1..=quiche::MAX_CONN_ID_LEN].fill(7);
+        let (header, parsed) = ferrox_core::alloc_count::measure(|| {
+            let mut copy = packet;
+            quiche::Header::from_slice(&mut copy, quiche::MAX_CONN_ID_LEN).ok()
+        });
+        assert!(header.is_some(), "the header parses");
+        assert!(
+            parsed.allocs > 0,
+            "the parse this replaces copied the DCID out of the packet"
+        );
+        let (key, routed) = ferrox_core::alloc_count::measure(|| packet_key(&packet));
+        assert!(key.is_some(), "the key reads");
+        assert_eq!(
+            routed.allocs, 0,
+            "the routing key copied the DCID out of the packet"
         );
     }
 }

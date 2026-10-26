@@ -383,6 +383,8 @@ carrier-quic quic-bytes-parked-per-unread-connection 2097152 ferrox-app-proxy::t
 carrier-quic stream-window-ceiling-bytes 8000000 ferrox-app-quic::tests::the_window_ceiling_leaves_the_autotuner_room
 carrier-quic connection-window-ceiling-bytes 32000000 ferrox-app-quic::tests::the_window_ceiling_leaves_the_autotuner_room
 carrier-quic send-datagram-bytes 1350 ferrox-app-quic::tests::the_lane_sends_the_datagram_its_buffer_holds
+carrier-quic route-key-copies-per-packet 0 ferrox-app-quic::tests::a_route_key_is_a_window_into_the_packet
+carrier-quic route-key-allocations 0 ferrox-app-quic::tests::the_route_key_replaces_the_allocating_header_parse
 carrier-quic quic-config-builds-per-warm-dial 0 ferrox-app-quic::tests::one_trust_bundle_shares_its_built_config
 carrier-quic quic-config-lookup-allocations 0 ferrox-app-quic::tests::a_warm_config_lookup_allocates_nothing
 
