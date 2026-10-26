@@ -12,7 +12,7 @@ use ferrox_core::hysteria_v1::{Defrag, UdpMessage, XPlus};
 
 use crate::conn::Connection;
 use crate::hysteria::{Dial, Flow, Session};
-use crate::quic::{Mask, Unfilled, MAX_DATAGRAM};
+use crate::quic::{Mask, Unfilled, MAX_DATAGRAM, RECV_ROOM};
 
 const FIRST_FLOW_STREAM: u64 = 4;
 
@@ -1014,7 +1014,7 @@ pub(crate) fn serve_loop(
         serve,
         routes: HashMap::new(),
     };
-    let mut buf = Unfilled::<MAX_DATAGRAM>::new();
+    let mut buf = Unfilled::<RECV_ROOM>::new();
     if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
         return;
     }
