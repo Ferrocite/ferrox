@@ -1130,7 +1130,7 @@ impl<S: crate::tls::RecordAlignment + io::Write> crate::tls::RecordAlignment
     {
         if self.direct {
             for part in parts {
-                self.write(part)?;
+                self.write_all(part)?;
             }
             return Ok(());
         }
