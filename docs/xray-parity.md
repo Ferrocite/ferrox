@@ -34,7 +34,7 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | TUN inbound (`proxy/tun`) | done (row 29) |
 | uTLS fingerprints per connection | planned (row 38) |
 | ECH | client done, `echSockopt` applied to the DNS query socket; TLS server done; QUIC both roles, a dial offers the same list and a serving lane accepts it, while one that omits it still falls back; a rejected offer is redialled once with the BoringSSL retry list it returns where Go's `SendAsRetry=false` sends none, while an accepted offer is unchanged (row 39) |
-| VLESS stream encryption (`encryption` field, XOR/MLKEM) | partial (row 34): both roles raw/TLS/REALITY, non-Vision |
+| VLESS stream encryption (`encryption` field, XOR/MLKEM) | partial (row 34): both roles raw/TLS/REALITY, Vision; server UDP/mux/reverse compose, client UDP/mux and carried transports open |
 | XTLS Vision UDP-over-443 flow | planned (row 35) |
 | REALITY ML-DSA-65 binding (`mldsa65Seed` / `mldsa65Verify`) | planned (row 122; the ZeroNet oracle row `reality_with_the_mldsa65_binding_matches_the_oracle` is waiting on it) |
 
