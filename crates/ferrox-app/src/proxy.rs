@@ -19547,7 +19547,12 @@ fn forward_flush(
     while *sent < *pending {
         match uplink.push(&buffer.prefix(*pending)[*sent..]) {
             Push::Took(n) if n > 0 => *sent += n,
-            Push::Took(_) | Push::Parked => return Some(Next::Idle),
+            Push::Took(_) => return Some(Next::Idle),
+            Push::Parked => {
+                // A parked window has no read to wait in, so the lane must sleep here or its next turn spins against the same full queue.
+                std::thread::sleep(crate::budgets::RELAY_POLL);
+                return Some(Next::Idle);
+            }
             Push::Lost => {
                 echo_trace("relay fwd send failed");
                 return Some(Next::Done);
@@ -26235,6 +26240,7 @@ mod tests {
         struct ParkingSink {
             state: Arc<Mutex<(usize, Vec<u8>)>>,
             parks: Arc<std::sync::atomic::AtomicUsize>,
+            parked_at: Arc<Mutex<Vec<std::time::Instant>>>,
         }
 
         impl CarrierSink for ParkingSink {
@@ -26246,6 +26252,10 @@ mod tests {
                 if state.0 > 0 {
                     state.0 -= 1;
                     self.parks.fetch_add(1, Ordering::SeqCst);
+                    self.parked_at
+                        .lock()
+                        .expect("parked at")
+                        .push(std::time::Instant::now());
                     return Push::Parked;
                 }
                 state.1.extend_from_slice(bytes);
@@ -26268,6 +26278,7 @@ mod tests {
         let sink = ParkingSink {
             state: Arc::new(Mutex::new((2, Vec::new()))),
             parks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            parked_at: Arc::new(Mutex::new(Vec::new())),
         };
         let carrier = {
             let sink = sink.clone();
@@ -26299,6 +26310,12 @@ mod tests {
             sink.parks.load(std::sync::atomic::Ordering::SeqCst),
             2,
             "both refusals parked and the third attempt took the window"
+        );
+        let parked_at = sink.parked_at.lock().expect("parked at");
+        assert_eq!(parked_at.len(), 2, "both refusals were timed");
+        assert!(
+            parked_at[1].duration_since(parked_at[0]) >= crate::budgets::RELAY_POLL,
+            "a parked window waited a relay quantum before its next turn"
         );
     }
 
