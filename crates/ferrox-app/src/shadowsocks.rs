@@ -2476,6 +2476,15 @@ mod tests {
                 .expect("reads the task table")
                 .count()
         }
+        fn lane_workers() -> usize {
+            std::fs::read_dir("/proc/self/task")
+                .expect("reads the task table")
+                .filter_map(|task| {
+                    let name = std::fs::read_to_string(task.ok()?.path().join("comm")).ok()?;
+                    (name.trim() == "ferrox-relay-lane").then_some(())
+                })
+                .count()
+        }
         fn pair() -> (Connection, Connection) {
             let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let port = listener.local_addr().expect("addr").port();
@@ -2505,6 +2514,7 @@ mod tests {
             (peer, client)
         };
         let before = threads();
+        let lanes_before = lane_workers();
         let mut held = Vec::new();
         for _ in 0..8 {
             let (plain, peer) = pair();
@@ -2525,10 +2535,15 @@ mod tests {
             held.push((peer, client));
         }
         let after = threads();
+        assert_eq!(
+            lane_workers(),
+            lanes_before,
+            "eight live sessions added no worker to the lane pool"
+        );
         assert!(
-            after - before < 8,
+            after < before + 8,
             "eight live sessions added {} threads",
-            after - before
+            after.saturating_sub(before)
         );
         drop(held);
         drop(held_first);
