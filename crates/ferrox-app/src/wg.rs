@@ -7,13 +7,14 @@
 //! flow ever locks a session or races a counter.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use ferrox_core::dns::{build_query, parse_answer};
+use ferrox_core::dns::{build_query, parse_answer, Answer};
 use ferrox_core::foxy::connectip::{
     udp_datagram, udp_from_packet, UdpDatagram, IPV4_HEADER, IPV6_HEADER, UDP_HEADER,
 };
@@ -55,6 +56,25 @@ const DNS_CACHE: usize = 256;
 struct Resolved {
     addrs: Vec<IpAddr>,
     until: Instant,
+}
+
+/// The addresses of `qtype` an answer carries, with the smallest record TTL.
+fn addresses(answer: &Answer, qtype: u16) -> Option<(Vec<IpAddr>, u32)> {
+    let mut addrs = Vec::new();
+    let mut ttl = 300u32;
+    for record in &answer.records {
+        if record.kind != qtype {
+            continue;
+        }
+        let address = match record.rdata.len() {
+            4 => IpAddr::from(<[u8; 4]>::try_from(record.rdata.as_slice()).ok()?),
+            16 => IpAddr::from(<[u8; 16]>::try_from(record.rdata.as_slice()).ok()?),
+            _ => continue,
+        };
+        addrs.push(address);
+        ttl = ttl.min(record.ttl.max(1));
+    }
+    (!addrs.is_empty()).then_some((addrs, ttl))
 }
 
 /// A client outbound: the flow channel, the inner-packet queue the stack and
@@ -331,27 +351,62 @@ impl WireGuardOut {
             let Some(answer) = parse_answer(datagram.payload) else {
                 continue;
             };
-            if answer.id != id || answer.rcode != 0 || answer.truncated {
+            if answer.id != id || answer.rcode != 0 {
                 continue;
             }
-            let mut addrs = Vec::new();
-            let mut ttl = 300u32;
-            for record in answer.records {
-                if record.kind != qtype {
-                    continue;
-                }
-                let address = match record.rdata.len() {
-                    4 => IpAddr::from(<[u8; 4]>::try_from(record.rdata.as_slice()).ok()?),
-                    16 => IpAddr::from(<[u8; 16]>::try_from(record.rdata.as_slice()).ok()?),
-                    _ => continue,
-                };
-                addrs.push(address);
-                ttl = ttl.min(record.ttl.max(1));
+            if answer.truncated {
+                break self.exchange_tcp(server, &query, id, qtype);
             }
-            break (!addrs.is_empty()).then_some((addrs, ttl));
+            break addresses(&answer, qtype);
         };
         self.remove_dns_route(port);
         result
+    }
+
+    /// Ask again over a TCP flow through the same tunnel when a UDP answer is
+    /// truncated, as the reference does: a local loopback pair hands the stream
+    /// to the client stack, and the query travels length-prefixed.
+    fn exchange_tcp(
+        &self,
+        server: IpAddr,
+        query: &[u8],
+        id: u16,
+        qtype: u16,
+    ) -> Option<(Vec<IpAddr>, u32)> {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).ok()?;
+        let mut app = TcpStream::connect(listener.local_addr().ok()?).ok()?;
+        let (tunnel, _) = listener.accept().ok()?;
+        app.set_read_timeout(Some(DNS_TIMEOUT)).ok()?;
+        app.set_write_timeout(Some(DNS_TIMEOUT)).ok()?;
+        if self
+            .flows
+            .send(ClientFlow {
+                client: Connection::from(tunnel),
+                destination: SocketAddr::new(server, self.dns_port),
+                prefix: Vec::new(),
+            })
+            .is_err()
+        {
+            return None;
+        }
+        let len = u16::try_from(query.len()).ok()?;
+        let mut framed = Vec::with_capacity(2 + query.len());
+        framed.extend_from_slice(&len.to_be_bytes());
+        framed.extend_from_slice(query);
+        app.write_all(&framed).ok()?;
+        let mut prefix = [0u8; 2];
+        app.read_exact(&mut prefix).ok()?;
+        let len = usize::from(u16::from_be_bytes(prefix));
+        if len == 0 {
+            return None;
+        }
+        let mut response = vec![0u8; len];
+        app.read_exact(&mut response).ok()?;
+        let answer = parse_answer(&response)?;
+        if answer.id != id || answer.rcode != 0 || answer.truncated {
+            return None;
+        }
+        addresses(&answer, qtype)
     }
 
     fn reserve_dns_route(&self) -> Option<(u16, Receiver<Vec<u8>>)> {
@@ -674,7 +729,6 @@ fn bind_socket(config: &DeviceConfig) -> Result<UdpSocket, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
 
     #[test]
@@ -882,5 +936,83 @@ mod tests {
         let mut received = [0u8; 9];
         app.read_exact(&mut received).expect("read");
         assert_eq!(&received, b"headhello");
+    }
+
+    #[test]
+    fn a_truncated_answer_is_asked_again_over_tcp() {
+        let tcp = TcpListener::bind("127.0.0.1:0").expect("dns tcp");
+        let dns_address = tcp.local_addr().expect("dns address");
+        let udp = UdpSocket::bind(dns_address).expect("dns udp");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let Ok((n, from)) = udp.recv_from(&mut buf) else {
+                return;
+            };
+            let Some(question) = ferrox_core::dns::parse_query(&buf[..n]) else {
+                return;
+            };
+            let Some(mut reply) =
+                ferrox_core::dns::ip_answer(&question, 0, 60, &[vec![192, 0, 2, 9]])
+            else {
+                return;
+            };
+            reply[2] |= 0x02;
+            let _ = udp.send_to(&reply, from);
+        });
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = tcp.accept() else {
+                return;
+            };
+            let mut prefix = [0u8; 2];
+            if stream.read_exact(&mut prefix).is_err() {
+                return;
+            }
+            let mut query = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+            if stream.read_exact(&mut query).is_err() {
+                return;
+            }
+            let Some(question) = ferrox_core::dns::parse_query(&query) else {
+                return;
+            };
+            let Some(reply) = ferrox_core::dns::ip_answer(&question, 0, 60, &[vec![127, 0, 0, 1]])
+            else {
+                return;
+            };
+            let len = u16::try_from(reply.len()).expect("fits");
+            let mut framed = Vec::with_capacity(2 + reply.len());
+            framed.extend_from_slice(&len.to_be_bytes());
+            framed.extend_from_slice(&reply);
+            let _ = stream.write_all(&framed);
+        });
+
+        let client_private = [0x11; 32];
+        let server_private = [0x22; 32];
+        let client_public = ferrox_core::wireguard::device::public_key(&client_private);
+        let server_public = ferrox_core::wireguard::device::public_key(&server_private);
+        let hex = ferrox_core::foxy::account::hex_encode;
+        let server_settings = format!(
+            r#"{{"secretKey":"{}","endpoint":["10.0.0.1"],"users":[{{"account":{{"publicKey":"{}","allowedIPs":["10.0.0.2/32"]}}}}]}}"#,
+            hex(&server_private),
+            hex(&client_public)
+        );
+        let inbound =
+            crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
+        let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
+        let port = serve_inbound(&inbound, &out, "127.0.0.1:0").expect("serve");
+
+        let client = DeviceConfig::from_json(
+            &crate::json::parse(&format!(
+                r#"{{"secretKey":"{}","address":["10.0.0.2"],"remoteDNS":["127.0.0.1"],"peers":[{{"publicKey":"{}","endpoint":"127.0.0.1:{port}"}}]}}"#,
+                hex(&client_private),
+                hex(&server_public)
+            ))
+            .expect("client config"),
+        )
+        .expect("device");
+        let wireguard = WireGuardOut::with_dns_port(client, dns_address.port()).expect("outbound");
+        assert_eq!(
+            wireguard.resolve("example.test", 7),
+            vec!["127.0.0.1:7".parse().expect("address")]
+        );
     }
 }
