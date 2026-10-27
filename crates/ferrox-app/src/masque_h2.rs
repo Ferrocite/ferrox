@@ -5,15 +5,16 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::sync::mpsc::{self, Receiver};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::{connectip, frames};
-use ferrox_core::tls::{TlsProvider as _, TlsServerConfig};
+use ferrox_core::tls::{TlsConfig, TlsProvider as _, TlsServerConfig};
 
 use crate::h2::{self, Decoder};
-use crate::masque::{self, Granted, ServerSpec, Shared, AUTH_REALM};
+use crate::masque::{self, deliver, withdrawn, Granted, ServerSpec, Shared, AUTH_REALM};
+use crate::wg_stack::{Packet, UdpRoutes};
 
 const HANDSHAKE: Duration = Duration::from_secs(10);
 const READ_WAIT: Duration = Duration::from_millis(10);
@@ -80,7 +81,7 @@ fn connection(
 }
 
 struct Wire {
-    stream: Box<dyn ReadWrite>,
+    stream: Box<dyn ReadWrite + Send>,
     pending: Vec<u8>,
     closed: bool,
 }
@@ -113,14 +114,7 @@ impl Wire {
                 self.pending.extend_from_slice(&room[..n]);
                 true
             }
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                true
-            }
+            Err(error) if ferrox_core::tls::TlsError::is_timeout(&error) => true,
             Err(_) => {
                 self.closed = true;
                 false
@@ -162,6 +156,345 @@ impl Wire {
             return false;
         }
         true
+    }
+}
+
+/// The dialer's half of the same wire: the request rides stream one, capsules
+/// go out as DATA, and the peer's assignment names the addresses the stack may
+/// source. Windows are tracked per stream and per connection, as the reference
+/// transport does, so a peer that grants only one cannot be overrun.
+pub(crate) struct Client {
+    wire: Wire,
+    decoder: Decoder,
+    stream: u32,
+    status: Option<u16>,
+    continuation: Option<(u32, Vec<u8>)>,
+    send_window: i64,
+    connection_window: i64,
+    queued: VecDeque<Vec<u8>>,
+    capsules: Vec<u8>,
+    capsule_at: usize,
+    pub(crate) addresses: Vec<IpAddr>,
+    pub(crate) mtu: usize,
+    pub(crate) packets: Vec<Vec<u8>>,
+    end: bool,
+}
+
+impl Client {
+    pub(crate) fn dial(
+        tls_config: &TlsConfig,
+        edge: SocketAddr,
+        authority: &str,
+        path: &str,
+        headers: &[(String, String)],
+    ) -> Result<Self, String> {
+        let tcp = TcpStream::connect_timeout(&edge, HANDSHAKE)
+            .map_err(|error| format!("cannot reach {edge}: {error}"))?;
+        let _ = tcp.set_nodelay(true);
+        let _ = tcp.set_read_timeout(Some(HANDSHAKE));
+        let _ = tcp.set_write_timeout(Some(HANDSHAKE));
+        let mut tls =
+            ferrox_core::tls::connect(tls_config, tcp).map_err(|error| format!("tls: {error}"))?;
+        tls.handshake()
+            .map_err(|error| format!("tls handshake: {error}"))?;
+        if tls.alpn() != Some(b"h2".as_slice()) {
+            return Err("the edge did not negotiate h2".to_owned());
+        }
+        let _ = tls.get_ref().set_read_timeout(Some(READ_WAIT));
+        tls.write_all(h2::MAGIC)
+            .map_err(|error| format!("preface: {error}"))?;
+        let mut client = Self {
+            wire: Wire {
+                stream: Box::new(tls),
+                pending: Vec::new(),
+                closed: false,
+            },
+            decoder: Decoder::default(),
+            stream: 1,
+            status: None,
+            continuation: None,
+            send_window: DEFAULT_WINDOW,
+            connection_window: DEFAULT_WINDOW,
+            queued: VecDeque::new(),
+            capsules: Vec::new(),
+            capsule_at: 0,
+            addresses: Vec::new(),
+            mtu: masque::DEFAULT_MTU,
+            packets: Vec::new(),
+            end: false,
+        };
+        let mut settings = Vec::with_capacity(12);
+        settings.extend_from_slice(&SETTINGS_ENABLE_CONNECT.to_be_bytes());
+        settings.extend_from_slice(&1u32.to_be_bytes());
+        settings.extend_from_slice(&SETTINGS_INITIAL_WINDOW.to_be_bytes());
+        settings.extend_from_slice(&h2::WINDOW.to_be_bytes());
+        let raised = h2::WINDOW - u32::try_from(DEFAULT_WINDOW).expect("a positive window");
+        if !client.wire.send(h2::T_SETTINGS, 0, 0, &settings)
+            || !client.wire.send(h2::T_WINDOW, 0, 0, &raised.to_be_bytes())
+        {
+            return Err("the edge closed while settings were written".to_owned());
+        }
+        let mut fields: Vec<(&str, &str)> = Vec::with_capacity(6 + headers.len());
+        fields.push((":method", "CONNECT"));
+        fields.push((":protocol", "connect-ip"));
+        fields.push((":scheme", "https"));
+        fields.push((":path", path));
+        fields.push((":authority", authority));
+        fields.push(("capsule-protocol", "?1"));
+        for (name, value) in headers {
+            fields.push((name, value));
+        }
+        let block = h2::block_encode(&fields);
+        if !client
+            .wire
+            .send(h2::T_HEADERS, h2::F_END_HEADERS, client.stream, &block)
+        {
+            return Err("the edge closed while the request was written".to_owned());
+        }
+        let deadline = Instant::now() + HANDSHAKE;
+        while client.status.is_none() {
+            if Instant::now() > deadline {
+                return Err("the edge sent no response head".to_owned());
+            }
+            client.pump();
+            if client.wire.closed || client.end {
+                return Err("the edge closed before the response head".to_owned());
+            }
+            client.wire.fill();
+        }
+        let status = client.status.unwrap_or(0);
+        if !(200..300).contains(&status) {
+            return Err(format!("the edge answered {status}"));
+        }
+        let v4 = [0u8; 4];
+        let v6 = [0u8; 16];
+        let mut requests = Vec::with_capacity(40);
+        connectip::address_requests(&[(1, 4, &v4), (2, 6, &v6)], &mut requests);
+        client.capsule(&requests);
+        let deadline = Instant::now() + HANDSHAKE;
+        while client.addresses.is_empty() {
+            if Instant::now() > deadline {
+                return Err("no address assigned".to_owned());
+            }
+            client.flush();
+            client.pump();
+            if client.wire.closed || client.end {
+                return Err("the edge closed before assigning an address".to_owned());
+            }
+            client.wire.fill();
+        }
+        Ok(client)
+    }
+
+    pub(crate) fn run(
+        &mut self,
+        from_tunnel: &Receiver<Vec<u8>>,
+        to_stack: &Sender<Packet>,
+        routes: &UdpRoutes,
+    ) {
+        while !self.wire.closed && !self.end {
+            self.pump();
+            for packet in self.packets.drain(..) {
+                deliver(to_stack, routes, &packet);
+            }
+            if self.wire.closed || self.end {
+                break;
+            }
+            while let Ok(packet) = from_tunnel.try_recv() {
+                let mut capsule = Vec::with_capacity(packet.len() + 8);
+                datagram(&packet, &mut capsule);
+                self.capsule(&capsule);
+            }
+            self.flush();
+            if self.wire.closed || self.end {
+                break;
+            }
+            if !self.wire.fill() {
+                break;
+            }
+        }
+    }
+
+    fn pump(&mut self) {
+        while let Some((kind, flags, id, body)) = self.wire.frame() {
+            self.on(kind, flags, id, &body);
+            if self.end || self.wire.closed {
+                return;
+            }
+        }
+    }
+
+    fn on(&mut self, kind: u8, flags: u8, id: u32, body: &[u8]) {
+        match kind {
+            h2::T_SETTINGS if flags & h2::F_ACK == 0 => {
+                let mut at = 0;
+                while at + 6 <= body.len() {
+                    let setting = u16::from_be_bytes([body[at], body[at + 1]]);
+                    let value = u32::from_be_bytes([
+                        body[at + 2],
+                        body[at + 3],
+                        body[at + 4],
+                        body[at + 5],
+                    ]);
+                    if setting == SETTINGS_INITIAL_WINDOW {
+                        self.send_window = i64::from(value);
+                    }
+                    at += 6;
+                }
+                self.wire.send(h2::T_SETTINGS, h2::F_ACK, 0, &[]);
+            }
+            h2::T_WINDOW if body.len() == 4 => {
+                let increment =
+                    u32::from_be_bytes(body.try_into().expect("four bytes")) & 0x7fff_ffff;
+                if id == 0 {
+                    self.connection_window += i64::from(increment);
+                } else if id == self.stream {
+                    self.send_window += i64::from(increment);
+                }
+            }
+            h2::T_PING if flags & h2::F_ACK == 0 => {
+                self.wire.send(h2::T_PING, h2::F_ACK, 0, body);
+            }
+            h2::T_HEADERS if id == self.stream => {
+                let block = strip_padding(flags, body);
+                if flags & h2::F_END_HEADERS != 0 {
+                    self.head(block);
+                } else {
+                    self.continuation = Some((id, block.to_vec()));
+                }
+                if flags & h2::F_END != 0 {
+                    self.end = true;
+                }
+            }
+            h2::T_CONT => {
+                if let Some((stream, mut block)) = self.continuation.take() {
+                    if stream != id {
+                        self.end = true;
+                        return;
+                    }
+                    block.extend_from_slice(strip_padding(flags, body));
+                    if flags & h2::F_END_HEADERS != 0 {
+                        self.head(&block);
+                    } else {
+                        self.continuation = Some((id, block));
+                    }
+                }
+            }
+            h2::T_DATA if id == self.stream => {
+                let length = body.len();
+                let data = strip_padding(flags, body);
+                self.window(length);
+                self.capsules(data);
+                if flags & h2::F_END != 0 {
+                    self.end = true;
+                }
+            }
+            h2::T_RST if id == self.stream => self.end = true,
+            h2::T_GOAWAY => self.end = true,
+            _ => {}
+        }
+    }
+
+    fn head(&mut self, block: &[u8]) {
+        if self.status.is_some() {
+            return;
+        }
+        let mut status = None;
+        let decoded = self
+            .decoder
+            .decode(block, &mut |name, value| {
+                if name == b":status" {
+                    status = std::str::from_utf8(value)
+                        .ok()
+                        .and_then(|value| value.parse().ok());
+                }
+            })
+            .is_some();
+        if decoded {
+            self.status = status;
+        } else {
+            self.end = true;
+        }
+    }
+
+    fn window(&mut self, length: usize) {
+        let length = u32::try_from(length).unwrap_or(u32::MAX).to_be_bytes();
+        self.wire.send(h2::T_WINDOW, 0, 0, &length);
+        self.wire.send(h2::T_WINDOW, 0, self.stream, &length);
+    }
+
+    fn capsules(&mut self, bytes: &[u8]) {
+        self.capsules.extend_from_slice(bytes);
+        let mut answers = Vec::new();
+        while let Some((used, capsule)) =
+            connectip::capsule_split(&self.capsules[self.capsule_at..])
+        {
+            self.capsule_at += used;
+            match capsule {
+                connectip::Capsule::AddressAssign(body) => {
+                    if self.addresses.is_empty() {
+                        let mut assigned = Vec::new();
+                        if connectip::address_assign(body, &mut assigned).is_some() {
+                            self.addresses.extend(assigned.iter().filter_map(|grant| {
+                                (!grant.refused())
+                                    .then(|| masque::address_of(grant))
+                                    .flatten()
+                            }));
+                        }
+                    } else if let Some(address) = withdrawn(body, &self.addresses) {
+                        eprintln!("masque: the proxy withdrew {address}");
+                        self.end = true;
+                    }
+                }
+                connectip::Capsule::Datagram(packet) => self.packets.push(packet.to_vec()),
+                connectip::Capsule::AddressRequest(body) => {
+                    let granted = masque::respond(body, &self.addresses);
+                    if !granted.is_empty() {
+                        let mut out = Vec::new();
+                        connectip::address_assign_encode(&granted, &mut out);
+                        answers.push(out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        if self.capsule_at > 0 {
+            self.capsules.drain(..self.capsule_at);
+            self.capsule_at = 0;
+        }
+        for answer in answers {
+            self.capsule(&answer);
+        }
+    }
+
+    fn capsule(&mut self, capsule: &[u8]) {
+        let length = i64::try_from(capsule.len()).unwrap_or(i64::MAX);
+        if length <= self.send_window.min(self.connection_window) {
+            if self.wire.send(h2::T_DATA, 0, self.stream, capsule) {
+                self.send_window -= length;
+                self.connection_window -= length;
+            }
+        } else {
+            self.queued.push_back(capsule.to_vec());
+        }
+    }
+
+    fn flush(&mut self) {
+        while let Some(answer) = self.queued.front() {
+            let length = i64::try_from(answer.len()).unwrap_or(i64::MAX);
+            if length > self.send_window.min(self.connection_window) {
+                return;
+            }
+            let Some(answer) = self.queued.pop_front() else {
+                return;
+            };
+            if self.wire.send(h2::T_DATA, 0, self.stream, &answer) {
+                self.send_window -= length;
+                self.connection_window -= length;
+            } else {
+                return;
+            }
+        }
     }
 }
 

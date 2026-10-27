@@ -759,3 +759,5 @@ carrier-masque icmp-too-big-edges 5 ferrox-core-connectip::tests::a_packet_too_b
 carrier-masque icmp-mtu-narrows 2 ferrox-app-wg-stack::tests::a_packet_too_big_narrows_the_device_mtu
 carrier-masque icmp-too-big-responses 1 ferrox-app-masque::tests::a_packet_wider_than_one_datagram_is_answered_with_icmp
 carrier-masque h2-datagram-round-trips 1 ferrox-app-masque-h2::tests::an_h2_tunnel_assigns_and_carries_a_datagram
+carrier-masque h2-dialer-round-trips 1 ferrox-app-masque::tests::a_datagram_flow_crosses_the_h2_tunnel_to_a_freedom_dial
+carrier-masque carrier-alpn-choices-witnessed 5 ferrox-app-masque::tests::the_carrier_follows_the_alpn_list
