@@ -18824,6 +18824,7 @@ pub(crate) mod lane_pool {
 pub(crate) struct RelayFinish {
     left: AtomicU32,
     ended: AtomicBool,
+    ended_at: Mutex<Option<std::time::Instant>>,
     closed: AtomicBool,
     close_first: bool,
     close: Arc<dyn Fn() + Send + Sync>,
@@ -18843,6 +18844,7 @@ impl RelayFinish {
         Arc::new(Self {
             left: AtomicU32::new(2),
             ended: AtomicBool::new(false),
+            ended_at: Mutex::new(None),
             closed: AtomicBool::new(false),
             close_first,
             close,
@@ -18859,7 +18861,21 @@ impl RelayFinish {
     }
 
     pub(crate) fn mark_ended(&self) {
+        *self
+            .ended_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
         self.ended.store(true, Ordering::Relaxed);
+    }
+
+    /// True once the sibling ended and the last-reply grace has run: a timeout may only end the leg after that, or a reply that follows the FIN is dropped.
+    pub(crate) fn ended_and_drained(&self) -> bool {
+        self.ended_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .map_or(false, |at| {
+                at.elapsed() >= crate::budgets::RELAY_DRAIN_GRACE
+            })
     }
 
     fn close_once(&self) {
@@ -19512,7 +19528,7 @@ fn forward_finished(
     first: &mut bool,
     pending: &mut usize,
     sent: &mut usize,
-    ended: impl FnOnce() -> bool,
+    ended_and_drained: impl FnOnce() -> bool,
 ) -> Next {
     match read {
         Ok(n) if n > 0 => {
@@ -19526,7 +19542,7 @@ fn forward_finished(
             forward_flush(buffer, uplink, first, pending, sent).unwrap_or(Next::More)
         }
         Err(error) if is_timeout(&error) => {
-            if ended() {
+            if ended_and_drained() {
                 Next::Done
             } else {
                 Next::Idle
@@ -19655,7 +19671,7 @@ where
                 &mut first,
                 &mut pending,
                 &mut sent,
-                || forward_flow.ended(),
+                || forward_flow.ended_and_drained(),
             );
             if next != Next::Done {
                 return next;
