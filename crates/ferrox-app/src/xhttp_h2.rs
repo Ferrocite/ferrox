@@ -2217,14 +2217,18 @@ mod tests {
             thread::yield_now();
         }
         drop(held);
-        *conn
-            .send_conn
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) += 4;
-        *state
-            .send_window
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) += 4;
+        {
+            let mut conn_window = conn
+                .send_conn
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let mut stream_window = state
+                .send_window
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            *conn_window += 4;
+            *stream_window += 4;
+        }
         conn.wake.notify_all();
         assert!(
             running.join().expect("sender thread"),
