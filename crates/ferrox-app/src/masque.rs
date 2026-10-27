@@ -137,6 +137,7 @@ impl MasqueOut {
                     &inner.to_tunnel,
                     &inner.routes,
                     associate,
+                    &crate::proxy::resolve_endpoint,
                 );
             }
             Err(reason) => eprintln!("masque: {reason}"),
