@@ -254,10 +254,11 @@ masque_server_settings() {
 }
 
 masque_client_settings() {
-  local port="$1" dir pin
+  local port="$1" dir pin auth
   dir="$(matrix_tls_dir)"
   pin="$(matrix_tls_pin "$dir/cert.pem")"
-  echo "\"tag\": \"proxy\", \"protocol\": \"masque\", \"settings\": {\"address\": \"127.0.0.1\", \"port\": $port}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
+  auth="$(printf '%s' "matrix@carrier.test:$PASSWORD" | base64)"
+  echo "\"tag\": \"proxy\", \"protocol\": \"masque\", \"settings\": {\"address\": \"127.0.0.1\", \"port\": $port}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"masqueSettings\": {\"headers\": {\"Authorization\": \"Basic $auth\"}}, \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
 }
 
 httpupgrade_settings() {

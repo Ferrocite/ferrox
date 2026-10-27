@@ -251,6 +251,9 @@ carrier-xhttp user-space-copies-per-byte-written 1 ferrox-app-xhttp::tests::exch
 carrier-xhttp requests-served-per-connection 2 ferrox-app-xhttp::tests::one_connection_carries_the_packet_up_uplink
 carrier-xhttp requests-served-before-a-close 1 ferrox-app-xhttp::tests::a_request_that_says_close_takes_the_connection_with_it
 carrier-xhttp writes-per-credit 1 ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write
+carrier-xhttp data-window-writes 1 ferrox-app-xhttp_h2::tests::a_data_window_leaves_as_one_write
+carrier-xhttp packet-up-windows-per-post 2 ferrox-app-xhttp::tests::a_packet_up_upload_batches_what_queues_behind_an_answer
+carrier-xhttp packet-up-bytes-reordered 0 ferrox-app-xhttp::tests::a_packet_up_upload_posts_every_byte_in_order
 carrier-xhttp window-update-frames-per-credit 2 ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write
 carrier-xhttp head-buffer-reallocations-per-request-head 0 ferrox-app-xhttp_h2::tests::the_synthesized_head_is_sized_for_its_bytes
 carrier-xhttp head-tail-read-syscalls 0 ferrox-app-xhttp::tests::a_chunk_that_rode_in_with_the_head_costs_no_syscall
@@ -743,6 +746,8 @@ wireguard default-mtu 1420 ferrox-app-wireguard::tests::the_defaults_are_the_ref
 wireguard tcp-bytes-echoed 9 ferrox-app-wg::tests::a_tcp_flow_crosses_the_tunnel_to_a_freedom_dial
 wireguard client-datagram-bytes-echoed 6 ferrox-app-wg-stack::tests::a_client_datagram_lane_frames_and_unframes
 wireguard server-datagram-bytes-echoed 2 ferrox-app-wg-stack::tests::a_server_datagram_lane_echoes_through_freedom
+wireguard echo-answers-on-the-client 2 ferrox-app-wg-stack::tests::an_echo_to_the_devices_own_address_is_answered_on_the_tunnel
+wireguard echo-answers-on-the-server 1 ferrox-app-wg-stack::tests::a_server_answers_an_echo_to_its_own_address
 carrier-masque ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-masque tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_tunnel_to_a_freedom_dial
 carrier-masque ipv6-tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_tunnel_over_ipv6
@@ -760,6 +765,11 @@ carrier-masque icmp-too-big-shapes 2 ferrox-core-connectip::tests::a_packet_too_
 carrier-masque icmp-too-big-edges 5 ferrox-core-connectip::tests::a_packet_too_big_copies_options_and_refuses_a_narrow_mtu
 carrier-masque icmp-mtu-narrows 2 ferrox-app-wg-stack::tests::a_packet_too_big_narrows_the_device_mtu
 carrier-masque icmp-too-big-responses 1 ferrox-app-masque::tests::a_packet_wider_than_one_datagram_is_answered_with_icmp
+carrier-masque echo-replies 2 ferrox-core-connectip::tests::an_echo_request_is_answered_at_both_families
+carrier-masque echo-refusals 3 ferrox-core-connectip::tests::a_message_that_is_not_an_echo_request_leaves_the_buffer_alone
+carrier-masque echo-answers-on-the-client 2 ferrox-app-wg-stack::tests::an_echo_to_the_devices_own_address_is_answered_on_the_tunnel
+carrier-masque echo-answers-on-the-server 1 ferrox-app-wg-stack::tests::a_server_answers_an_echo_to_its_own_address
 carrier-masque h2-datagram-round-trips 1 ferrox-app-masque-h2::tests::an_h2_tunnel_assigns_and_carries_a_datagram
 carrier-masque h2-dialer-round-trips 1 ferrox-app-masque::tests::a_datagram_flow_crosses_the_h2_tunnel_to_a_freedom_dial
+carrier-masque h2-tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_h2_tunnel_to_a_freedom_dial
 carrier-masque carrier-alpn-choices-witnessed 5 ferrox-app-masque::tests::the_carrier_follows_the_alpn_list
