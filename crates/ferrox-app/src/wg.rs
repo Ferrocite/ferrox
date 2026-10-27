@@ -6,12 +6,17 @@
 //! packet to the lane that asked. Writers only enqueue inner packets, so no
 //! flow ever locks a session or races a counter.
 
-use std::net::{IpAddr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ferrox_core::dns::{build_query, parse_answer};
+use ferrox_core::foxy::connectip::{
+    udp_datagram, udp_from_packet, UdpDatagram, IPV4_HEADER, IPV6_HEADER, UDP_HEADER,
+};
 use ferrox_core::wireguard::device::{tai64n, Event, Tunnel};
 use ferrox_core::wireguard::handshake::{
     check_mac1, INITIATION_SIZE, TYPE_INITIATION, TYPE_RESPONSE,
@@ -21,12 +26,36 @@ use ferrox_core::wireguard::transport::clear_reserved;
 use crate::conn::Connection;
 use crate::json::Json;
 use crate::proxy::{Destination, Outbound};
-use crate::wg_stack::{self, ClientFlow, Packet, UdpRoutes};
+use crate::wg_stack::{self, ip_bytes, ClientFlow, Packet, UdpRoutes};
 use crate::wireguard::{DeviceConfig, PeerConfig};
 
 /// The reader's wait for a datagram: it also bounds how long a queued inner
 /// packet waits before the tunnel encrypts it.
 const IO_TICK: Duration = Duration::from_millis(10);
+/// The reference's DNS servers when the config names none.
+const DEFAULT_DNS: [IpAddr; 4] = [
+    IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
+    IpAddr::V4(Ipv4Addr::new(1, 0, 0, 1)),
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1111)),
+    IpAddr::V6(Ipv6Addr::new(0x2606, 0x4700, 0x4700, 0, 0, 0, 0, 0x1001)),
+];
+/// The wire DNS port; the config names addresses, not ports.
+const DNS_PORT: u16 = 53;
+/// How long one remote-DNS exchange waits for its answer.
+const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+/// The source-port range reserved for remote-DNS queries, below the ephemeral
+/// range the datagram lanes bind.
+const DNS_PORT_FIRST: u16 = 1024;
+const DNS_PORT_LAST: u16 = 49_152;
+/// The most names one outbound caches.
+const DNS_CACHE: usize = 256;
+
+/// A cached remote-DNS answer and the instant it stops being usable.
+#[derive(Debug)]
+struct Resolved {
+    addrs: Vec<IpAddr>,
+    until: Instant,
+}
 
 /// A client outbound: the flow channel, the inner-packet queue the stack and
 /// the datagram lanes write, and the lane table the reader routes replies by.
@@ -37,10 +66,19 @@ pub(crate) struct WireGuardOut {
     to_tunnel: Sender<Vec<u8>>,
     routes: UdpRoutes,
     stop: Arc<AtomicBool>,
+    dns_servers: Vec<IpAddr>,
+    dns_port: u16,
+    dns_port_next: AtomicU16,
+    dns_id: AtomicU16,
+    resolved: Mutex<HashMap<String, Resolved>>,
 }
 
 impl WireGuardOut {
     pub(crate) fn new(config: DeviceConfig) -> Result<Self, String> {
+        Self::with_dns_port(config, DNS_PORT)
+    }
+
+    fn with_dns_port(config: DeviceConfig, dns_port: u16) -> Result<Self, String> {
         if config.is_client == Some(false) {
             return Err("a wireguard outbound must set `isClient: true`".to_owned());
         }
@@ -49,9 +87,11 @@ impl WireGuardOut {
                 "wireguard: `noKernelTun` is false, so the reference opens a kernel TUN; this tree opens none and serves the userspace stack"
             );
         }
-        if !config.dns.is_empty() {
-            eprintln!("wireguard: `remoteDNS` is not carried; names resolve on the host");
-        }
+        let dns_servers = if config.dns.is_empty() {
+            DEFAULT_DNS.to_vec()
+        } else {
+            config.dns.clone()
+        };
         let socket = bind_socket(&config)?;
         let (packets_tx, packets_rx) = mpsc::channel();
         let (to_tunnel, from_tunnel) = mpsc::channel();
@@ -83,6 +123,11 @@ impl WireGuardOut {
             to_tunnel,
             routes,
             stop,
+            dns_servers,
+            dns_port,
+            dns_port_next: AtomicU16::new(0),
+            dns_id: AtomicU16::new(0),
+            resolved: Mutex::new(HashMap::new()),
         })
     }
 
@@ -91,7 +136,7 @@ impl WireGuardOut {
     }
 
     pub(crate) fn serve_tcp(&self, client: Connection, asked: &Destination, prefix: &[u8]) {
-        let Some(destination) = asked.socket() else {
+        let Some(destination) = self.destination(asked) else {
             eprintln!("wireguard: destination `{asked:?}` does not resolve");
             return;
         };
@@ -124,7 +169,210 @@ impl WireGuardOut {
             &self.to_tunnel,
             &self.routes,
             associate,
+            &|host, port| {
+                self.resolve(host, port).into_iter().find(|address| {
+                    self.config
+                        .peers
+                        .iter()
+                        .any(|peer| peer.routes(address.ip()))
+                })
+            },
         );
+    }
+
+    /// The address to dial: a literal stands, a name is asked through the tunnel
+    /// against the configured servers and the first answer a peer routes wins.
+    fn destination(&self, asked: &Destination) -> Option<SocketAddr> {
+        match asked {
+            Destination::Address(address) => Some(*address),
+            Destination::Name(host, port) => {
+                self.resolve(host, *port).into_iter().find(|address| {
+                    self.config
+                        .peers
+                        .iter()
+                        .any(|peer| peer.routes(address.ip()))
+                })
+            }
+        }
+    }
+
+    fn resolve(&self, host: &str, port: u16) -> Vec<SocketAddr> {
+        if let Ok(address) = host.parse::<IpAddr>() {
+            return vec![SocketAddr::new(address, port)];
+        }
+        self.lookup(host)
+            .into_iter()
+            .map(|address| SocketAddr::new(address, port))
+            .collect()
+    }
+
+    fn lookup(&self, host: &str) -> Vec<IpAddr> {
+        let key = host.trim_end_matches('.').to_ascii_lowercase();
+        if let Ok(cache) = self.resolved.lock() {
+            if let Some(entry) = cache.get(&key) {
+                if entry.until > Instant::now() {
+                    return entry.addrs.clone();
+                }
+            }
+        }
+        let Some((addrs, ttl)) = self.query(host) else {
+            return Vec::new();
+        };
+        if let Ok(mut cache) = self.resolved.lock() {
+            if cache.len() >= DNS_CACHE {
+                cache.clear();
+            }
+            cache.insert(
+                key,
+                Resolved {
+                    addrs: addrs.clone(),
+                    until: Instant::now() + Duration::from_secs(u64::from(ttl)),
+                },
+            );
+        }
+        addrs
+    }
+
+    fn query(&self, host: &str) -> Option<(Vec<IpAddr>, u32)> {
+        let name = if host.ends_with('.') {
+            host.to_owned()
+        } else {
+            format!("{host}.")
+        };
+        let has_v4 = self.config.addresses.iter().any(IpAddr::is_ipv4);
+        let has_v6 = self.config.addresses.iter().any(IpAddr::is_ipv6);
+        let mut answers = Vec::new();
+        let mut ttl = 300u32;
+        for server in &self.dns_servers {
+            if !self.config.peers.iter().any(|peer| peer.routes(*server)) {
+                continue;
+            }
+            let Some(source) = self
+                .config
+                .addresses
+                .iter()
+                .find(|address| address.is_ipv4() == server.is_ipv4())
+                .copied()
+            else {
+                continue;
+            };
+            let (v4, v6) = std::thread::scope(|scope| {
+                let v4 = has_v4.then(|| scope.spawn(|| self.exchange(source, *server, &name, 1)));
+                let v6 = has_v6.then(|| scope.spawn(|| self.exchange(source, *server, &name, 28)));
+                (
+                    v4.and_then(|handle| handle.join().ok().flatten()),
+                    v6.and_then(|handle| handle.join().ok().flatten()),
+                )
+            });
+            for (mut records, answer_ttl) in [v4, v6].into_iter().flatten() {
+                answers.append(&mut records);
+                ttl = ttl.min(answer_ttl.max(1));
+            }
+            if !answers.is_empty() {
+                break;
+            }
+        }
+        (!answers.is_empty()).then_some((answers, ttl))
+    }
+
+    fn exchange(
+        &self,
+        source: IpAddr,
+        server: IpAddr,
+        name: &str,
+        qtype: u16,
+    ) -> Option<(Vec<IpAddr>, u32)> {
+        let id = self.dns_id.fetch_add(1, Ordering::Relaxed);
+        let query = build_query(id, name.as_bytes(), qtype, None)?;
+        let (port, replies) = self.reserve_dns_route()?;
+        let source_bytes = ip_bytes(source);
+        let destination_bytes = ip_bytes(server);
+        let header = if source.is_ipv4() {
+            IPV4_HEADER
+        } else {
+            IPV6_HEADER
+        };
+        let mut packet = Vec::with_capacity(header + UDP_HEADER + query.len());
+        if !udp_datagram(
+            &UdpDatagram {
+                source: &source_bytes,
+                destination: &destination_bytes,
+                source_port: port,
+                destination_port: self.dns_port,
+                payload: &query,
+            },
+            &mut packet,
+        ) {
+            self.remove_dns_route(port);
+            return None;
+        }
+        if self.to_tunnel.send(packet).is_err() {
+            self.remove_dns_route(port);
+            return None;
+        }
+        let deadline = Instant::now() + DNS_TIMEOUT;
+        let result = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break None;
+            }
+            let Ok(inner) = replies.recv_timeout(remaining) else {
+                break None;
+            };
+            let Some(datagram) = udp_from_packet(&inner) else {
+                continue;
+            };
+            if datagram.source != destination_bytes.as_slice()
+                || datagram.source_port != self.dns_port
+                || datagram.destination_port != port
+            {
+                continue;
+            }
+            let Some(answer) = parse_answer(datagram.payload) else {
+                continue;
+            };
+            if answer.id != id || answer.rcode != 0 || answer.truncated {
+                continue;
+            }
+            let mut addrs = Vec::new();
+            let mut ttl = 300u32;
+            for record in answer.records {
+                if record.kind != qtype {
+                    continue;
+                }
+                let address = match record.rdata.len() {
+                    4 => IpAddr::from(<[u8; 4]>::try_from(record.rdata.as_slice()).ok()?),
+                    16 => IpAddr::from(<[u8; 16]>::try_from(record.rdata.as_slice()).ok()?),
+                    _ => continue,
+                };
+                addrs.push(address);
+                ttl = ttl.min(record.ttl.max(1));
+            }
+            break (!addrs.is_empty()).then_some((addrs, ttl));
+        };
+        self.remove_dns_route(port);
+        result
+    }
+
+    fn reserve_dns_route(&self) -> Option<(u16, Receiver<Vec<u8>>)> {
+        let mut routes = self.routes.lock().ok()?;
+        let span = u32::from(DNS_PORT_LAST - DNS_PORT_FIRST);
+        for _ in 0..span {
+            let offset = u32::from(self.dns_port_next.fetch_add(1, Ordering::Relaxed)) % span;
+            let port = DNS_PORT_FIRST + offset as u16;
+            if let std::collections::hash_map::Entry::Vacant(entry) = routes.entry(port) {
+                let (sender, receiver) = mpsc::channel();
+                entry.insert(sender);
+                return Some((port, receiver));
+            }
+        }
+        None
+    }
+
+    fn remove_dns_route(&self, port: u16) {
+        if let Ok(mut routes) = self.routes.lock() {
+            routes.remove(&port);
+        }
     }
 }
 
@@ -540,5 +788,99 @@ mod tests {
         assert_eq!(&answer, b"headhello");
         let mut eof = [0u8; 1];
         assert_eq!(app.read(&mut eof).expect("eof"), 0);
+    }
+
+    #[test]
+    fn a_name_resolves_through_the_tunnel_before_the_flow() {
+        let dns = UdpSocket::bind("127.0.0.1:0").expect("dns");
+        let dns_address = dns.local_addr().expect("dns address");
+        let (answered, answer) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let Ok((n, from)) = dns.recv_from(&mut buf) else {
+                return;
+            };
+            let Some(question) = ferrox_core::dns::parse_query(&buf[..n]) else {
+                return;
+            };
+            let Some(reply) = ferrox_core::dns::ip_answer(&question, 0, 60, &[vec![127, 0, 0, 1]])
+            else {
+                return;
+            };
+            if dns.send_to(&reply, from).is_ok() {
+                let _ = answered.send(());
+            }
+        });
+
+        let echo = TcpListener::bind("127.0.0.1:0").expect("echo");
+        let echo_address = echo.local_addr().expect("echo address");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = echo.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            let mut seen = 0;
+            loop {
+                let Ok(n) = stream.read(&mut buf) else {
+                    return;
+                };
+                if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+                seen += n;
+                if seen >= 9 {
+                    return;
+                }
+            }
+        });
+
+        let client_private = [0x11; 32];
+        let server_private = [0x22; 32];
+        let client_public = ferrox_core::wireguard::device::public_key(&client_private);
+        let server_public = ferrox_core::wireguard::device::public_key(&server_private);
+        let hex = ferrox_core::foxy::account::hex_encode;
+        let server_settings = format!(
+            r#"{{"secretKey":"{}","endpoint":["10.0.0.1"],"users":[{{"account":{{"publicKey":"{}","allowedIPs":["10.0.0.2/32"]}}}}]}}"#,
+            hex(&server_private),
+            hex(&client_public)
+        );
+        let inbound =
+            crate::json::parse(&format!(r#"{{"settings":{server_settings}}}"#)).expect("inbound");
+        let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
+        let port = serve_inbound(&inbound, &out, "127.0.0.1:0").expect("serve");
+
+        let client = DeviceConfig::from_json(
+            &crate::json::parse(&format!(
+                r#"{{"secretKey":"{}","address":["10.0.0.2"],"remoteDNS":["127.0.0.1"],"peers":[{{"publicKey":"{}","endpoint":"127.0.0.1:{port}"}}]}}"#,
+                hex(&client_private),
+                hex(&server_public)
+            ))
+            .expect("client config"),
+        )
+        .expect("device");
+        let wireguard = WireGuardOut::with_dns_port(client, dns_address.port()).expect("outbound");
+        assert_eq!(
+            wireguard.resolve("example.test", 7),
+            vec!["127.0.0.1:7".parse().expect("address")]
+        );
+        answer
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the resolver asked the tunnel's DNS server");
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("pair");
+        let tun = std::net::TcpStream::connect(listener.local_addr().expect("pair address"))
+            .expect("connect");
+        let (mut app, _) = listener.accept().expect("accept");
+        app.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        wireguard.serve_tcp(
+            Connection::from(tun),
+            &Destination::Name("example.test".to_owned(), echo_address.port()),
+            b"head",
+        );
+        app.write_all(b"hello").expect("write");
+        let mut received = [0u8; 9];
+        app.read_exact(&mut received).expect("read");
+        assert_eq!(&received, b"headhello");
     }
 }

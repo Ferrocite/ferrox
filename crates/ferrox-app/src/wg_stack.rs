@@ -799,6 +799,7 @@ pub(crate) fn client_udp(
     to_tunnel: &ToTunnel,
     routes: &UdpRoutes,
     associate: Option<&Connection>,
+    resolve: &dyn Fn(&str, u16) -> Option<SocketAddr>,
 ) {
     let Ok(local) = relay.local_addr() else {
         return;
@@ -837,13 +838,23 @@ pub(crate) fn client_udp(
         match relay.recv_from(&mut buf) {
             Ok((n, sender)) => {
                 quiet = StdInstant::now();
-                let Some((target, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
+                let Some((destination, payload)) = crate::proxy::parse_socks_udp_dest(&buf[..n])
+                else {
                     continue;
                 };
                 if app.is_some_and(|bound| bound != sender) {
                     continue;
                 }
                 app = Some(sender);
+                let target = match destination {
+                    Destination::Address(address) => address,
+                    Destination::Name(host, port) => {
+                        let Some(address) = resolve(&host, port) else {
+                            continue;
+                        };
+                        address
+                    }
+                };
                 let Some(inner_source) = config
                     .addresses
                     .iter()
@@ -978,7 +989,7 @@ fn socket_addr(bytes: &[u8], port: u16) -> Option<SocketAddr> {
     }
 }
 
-fn ip_bytes(address: IpAddr) -> Vec<u8> {
+pub(crate) fn ip_bytes(address: IpAddr) -> Vec<u8> {
     match address {
         IpAddr::V4(address) => address.octets().to_vec(),
         IpAddr::V6(address) => address.octets().to_vec(),
@@ -1150,6 +1161,7 @@ mod client_tests {
                 &to_tunnel,
                 &thread_routes,
                 Some(&Connection::from(associate)),
+                &crate::proxy::resolve_endpoint,
             );
             let _ = done_tx.send(());
         });
@@ -1181,6 +1193,7 @@ mod client_tests {
                 &to_tunnel,
                 &thread_routes,
                 None,
+                &crate::proxy::resolve_endpoint,
             );
             let _ = done_tx.send(());
         });
@@ -1209,6 +1222,7 @@ mod client_tests {
                 &to_tunnel,
                 &thread_routes,
                 None,
+                &crate::proxy::resolve_endpoint,
             );
         });
         let port = relay_address.port();
@@ -1253,5 +1267,54 @@ mod client_tests {
         let (remote, payload) = crate::proxy::parse_socks_udp(&received[..n]).expect("frame");
         assert_eq!(remote, target);
         assert_eq!(payload, b"answer");
+    }
+
+    #[test]
+    fn a_client_datagram_name_uses_the_supplied_resolver() {
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
+        let relay_address = relay.local_addr().expect("address");
+        let app = UdpSocket::bind("127.0.0.1:0").expect("app");
+        app.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let (to_tunnel, packets) = std::sync::mpsc::channel();
+        let routes: UdpRoutes = Arc::default();
+        let thread_relay = relay.try_clone().expect("clone");
+        let thread_config = config();
+        let thread_routes = Arc::clone(&routes);
+        let target: SocketAddr = "192.0.2.7:53".parse().unwrap();
+        std::thread::spawn(move || {
+            client_udp(
+                &thread_relay,
+                &thread_config,
+                &to_tunnel,
+                &thread_routes,
+                None,
+                &|host, port| {
+                    assert_eq!(host, "example.test");
+                    assert_eq!(port, 53);
+                    Some(target)
+                },
+            );
+        });
+        let port = relay_address.port();
+        for _ in 0..100 {
+            if routes.lock().expect("routes").contains_key(&port) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(routes.lock().expect("routes").contains_key(&port));
+
+        let name = b"example.test";
+        let mut frame = vec![0, 0, 0, 3, name.len() as u8];
+        frame.extend_from_slice(name);
+        frame.extend_from_slice(&53u16.to_be_bytes());
+        frame.extend_from_slice(b"query");
+        app.send_to(&frame, relay_address).expect("send");
+        let inner = packets.recv_timeout(Duration::from_secs(5)).expect("inner");
+        let datagram = udp_from_packet(&inner).expect("packet");
+        assert_eq!(datagram.destination, ip_bytes(target.ip()).as_slice());
+        assert_eq!(datagram.destination_port, 53);
+        assert_eq!(datagram.payload, b"query");
     }
 }
