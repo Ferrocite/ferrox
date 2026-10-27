@@ -1937,6 +1937,54 @@ mod tests {
         assert!(!pool.holds("10.15.0.1".parse().expect("an address")));
     }
 
+    fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> Vec<u8> {
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&20u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&source);
+        packet[16..20].copy_from_slice(&destination);
+        packet
+    }
+
+    #[test]
+    fn a_packet_from_outside_the_tunnel_is_not_forwarded() {
+        let (packets, _packets_rx) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            pool: Mutex::new(AddressPool::default()),
+            tunnels: Mutex::new(HashMap::new()),
+            packets,
+            local: Vec::new(),
+        });
+        let spec = ServerSpec {
+            users: Vec::new(),
+            path: DEFAULT_PATH.to_owned(),
+            pool: AddressPool::default(),
+            mtu: DEFAULT_MTU,
+        };
+        let victim: IpAddr = "10.14.0.3".parse().expect("an address");
+        let (to_victim, forwarded) = mpsc::sync_channel(4);
+        shared
+            .tunnels
+            .lock()
+            .expect("tunnels")
+            .insert(victim, to_victim);
+        let owner: IpAddr = "10.14.0.2".parse().expect("an address");
+        let forged = ipv4_packet([10, 14, 0, 99], [10, 14, 0, 3]);
+        forward(&shared, &spec, &[owner], &forged);
+        assert!(
+            forwarded.try_recv().is_err(),
+            "a packet with a source outside the tunnel reached the destination"
+        );
+        let allowed = ipv4_packet([10, 14, 0, 2], [10, 14, 0, 3]);
+        forward(&shared, &spec, &[owner], &allowed);
+        assert!(
+            forwarded.try_recv().is_ok(),
+            "the tunnel's own source is forwarded"
+        );
+    }
+
     #[test]
     fn a_subnet_grant_names_its_first_host() {
         let grant = Assigned {
