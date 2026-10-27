@@ -2951,6 +2951,14 @@ impl Write for QuicStream {
     }
 }
 
+impl crate::proxy::HalfShut for QuicStream {
+    /// A finished direction is a FIN on the stream, not a reset: the bytes already queued must
+    /// reach the peer before the stream ends, or the last window of the transfer is lost.
+    fn spill(&self) {
+        let _ = self.fin();
+    }
+}
+
 impl crate::proxy::Duplicate for QuicStream {
     /// Two handles of one stream: the clone shares the connection and the id and costs no
     /// syscall, and neither half holds a lock across the wait the other direction wants.
@@ -2977,15 +2985,36 @@ impl QuicStream {
         }
     }
 
-    /// Half-close our direction: the peer reads everything sent, then EOF.
+    /// Half-close our direction: the peer reads everything sent, then EOF. A stream the peer already
+    /// reset is finished, not a send to wait ten seconds for; and the wait itself takes the lock one
+    /// poll at a time, so a lane finishing never parks every other stream behind it.
     pub(crate) fn fin(&self) -> bool {
-        let Ok(mut conn) = self.conn.lock() else {
-            return false;
-        };
         let deadline = Instant::now() + SEND_WAIT;
-        let done = stream_send_all(&mut conn, &self.sock, self.id, &[], true, deadline);
-        flush_egress(&mut conn, &self.sock);
-        done
+        loop {
+            let outcome = {
+                let Ok(mut conn) = self.conn.lock() else {
+                    return false;
+                };
+                if conn.is_closed() || conn.stream_finished(self.id) {
+                    Some(true)
+                } else {
+                    match conn.stream_send(self.id, &[], true) {
+                        Ok(_) => {
+                            flush_egress(&mut conn, &self.sock);
+                            Some(true)
+                        }
+                        Err(quiche::Error::Done) if conn.stream_finished(self.id) => Some(true),
+                        Err(quiche::Error::Done) => None,
+                        Err(_) => Some(false),
+                    }
+                }
+            };
+            match outcome {
+                Some(done) => return done,
+                None if Instant::now() >= deadline => return false,
+                None => std::thread::sleep(STREAM_POLL),
+            }
+        }
     }
 
     /// Stop the stream in both directions; the connection itself is untouched.

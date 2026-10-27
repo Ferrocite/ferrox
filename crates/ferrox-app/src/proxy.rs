@@ -5561,12 +5561,10 @@ fn serve_vless_quic_tcp(mut stream: crate::quic::QuicStream, target: &SocketAddr
         stream.close();
         return;
     };
-    let peer = stream.clone();
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         let _ = stop.shutdown(Shutdown::Both);
-        peer.close();
     });
-    relay_stream(Half::socket(stream), Half::socket(uplink), &close);
+    relay_lanes(Half::socket(stream), Half::socket(uplink), &close);
     let _ = fin.fin();
 }
 
