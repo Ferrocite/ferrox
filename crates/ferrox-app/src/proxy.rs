@@ -9483,7 +9483,7 @@ fn dial_vless_quic_sealed(client: &Connection, vless: &VlessOut, target: &Destin
     };
     let close_stream = pooled.stream_handle();
     let pooled = Mutex::new(Some(pooled));
-    let close = Arc::new(move || {
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         close_stream.close();
         drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
     });
