@@ -41656,9 +41656,15 @@ mod tests {
         let (to_tunnel, replies) = std::sync::mpsc::channel();
         let target: std::net::SocketAddr = "192.0.2.1:7".parse().unwrap();
         let source: std::net::SocketAddr = "10.0.0.2:1234".parse().unwrap();
-        let (uplink, _) =
-            crate::wg_stack::server_udp(([0x11; 32], source, target), &plan, &to_tunnel)
-                .expect("lane");
+        let last_used = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (uplink, _) = crate::wg_stack::server_udp(
+            ([0x11; 32], source, target),
+            std::time::Instant::now(),
+            &last_used,
+            &plan,
+            &to_tunnel,
+        )
+        .expect("lane");
         let mut buf = Vec::new();
         let frame = socks_udp_frame(&mut buf, None, &target, b"hi");
         uplink.send(frame).expect("send");

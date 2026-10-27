@@ -300,7 +300,7 @@ impl Tunnel {
         if packet.len() < 4 {
             return;
         }
-        let kind = u32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]);
+        let kind = u32::from(packet[0]);
         match kind {
             handshake::TYPE_RESPONSE => {
                 let reserved = [packet[1], packet[2], packet[3]];

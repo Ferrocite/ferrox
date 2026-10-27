@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, Shutdown, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
@@ -365,7 +365,11 @@ struct Listener {
 struct UdpLane {
     uplink: UdpSocket,
     stop: Arc<AtomicBool>,
-    last_used: StdInstant,
+    last_used: Arc<AtomicU64>,
+}
+
+fn elapsed_ms(started: StdInstant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 struct ServerStack {
@@ -427,7 +431,10 @@ impl ServerStack {
             if self.udp.len() >= UDP_FLOWS {
                 return;
             }
-            let Some((uplink, stop)) = server_udp(key, &self.out, &self.to_tunnel) else {
+            let last_used = Arc::new(AtomicU64::new(elapsed_ms(self.started)));
+            let Some((uplink, stop)) =
+                server_udp(key, self.started, &last_used, &self.out, &self.to_tunnel)
+            else {
                 return;
             };
             self.udp.insert(
@@ -435,14 +442,15 @@ impl ServerStack {
                 UdpLane {
                     uplink,
                     stop,
-                    last_used: StdInstant::now(),
+                    last_used,
                 },
             );
         }
         let Some(lane) = self.udp.get_mut(&key) else {
             return;
         };
-        lane.last_used = StdInstant::now();
+        lane.last_used
+            .store(elapsed_ms(self.started), Ordering::Relaxed);
         let mut frame = Vec::with_capacity(32 + datagram.payload.len());
         let out = crate::proxy::socks_udp_frame(&mut frame, None, &target, datagram.payload);
         let _ = lane.uplink.send(out);
@@ -498,11 +506,12 @@ impl ServerStack {
                 }
             }
         }
-        let idle = crate::budgets::udp_idle();
+        let idle = u64::try_from(crate::budgets::udp_idle().as_millis()).unwrap_or(u64::MAX);
+        let now = elapsed_ms(self.started);
         let stale: Vec<_> = self
             .udp
             .iter()
-            .filter(|(_, lane)| lane.last_used.elapsed() >= idle)
+            .filter(|(_, lane)| now.saturating_sub(lane.last_used.load(Ordering::Relaxed)) >= idle)
             .map(|(key, _)| *key)
             .collect();
         for key in stale {
@@ -885,6 +894,8 @@ pub(crate) fn client_udp(
 /// expects back.
 pub(crate) fn server_udp(
     flow: ([u8; 32], SocketAddr, SocketAddr),
+    started: StdInstant,
+    last_used: &Arc<AtomicU64>,
     out: &Outbound,
     to_tunnel: &ToTunnel,
 ) -> Option<(UdpSocket, Arc<AtomicBool>)> {
@@ -909,6 +920,7 @@ pub(crate) fn server_udp(
 
     let stop = Arc::new(AtomicBool::new(false));
     let reader_stop = Arc::clone(&stop);
+    let reader_activity = Arc::clone(last_used);
     let tunnel = to_tunnel.clone();
     std::thread::spawn(move || {
         let mut buf = crate::proxy::udp_buffer();
@@ -935,6 +947,7 @@ pub(crate) fn server_udp(
                     if !udp_datagram(&datagram, &mut packet) {
                         continue;
                     }
+                    reader_activity.store(elapsed_ms(started), Ordering::Relaxed);
                     if tunnel.send(packet).is_err() {
                         break;
                     }
@@ -1022,11 +1035,26 @@ mod tests {
         let (to_tunnel, replies) = std::sync::mpsc::channel();
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
         let source: SocketAddr = "10.0.0.2:1234".parse().unwrap();
-        let (uplink, _) = server_udp(([0x11; 32], source, target), &out, &to_tunnel).expect("lane");
+        let started = StdInstant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("instant");
+        let last_used = Arc::new(AtomicU64::new(0));
+        let (uplink, _) = server_udp(
+            ([0x11; 32], source, target),
+            started,
+            &last_used,
+            &out,
+            &to_tunnel,
+        )
+        .expect("lane");
         let mut buf = Vec::new();
         let frame = crate::proxy::socks_udp_frame(&mut buf, None, &target, b"hi");
         uplink.send(frame).expect("send");
         let packet = replies.recv_timeout(Duration::from_secs(5)).expect("reply");
+        assert!(
+            last_used.load(Ordering::Relaxed) > 0,
+            "a reply refreshes the lane's activity"
+        );
         let datagram = udp_from_packet(&packet).expect("inner datagram");
         assert_eq!(datagram.payload, b"hi");
         assert_eq!(datagram.source, ip_bytes(target.ip()));
@@ -1058,15 +1086,18 @@ mod tests {
         let source: SocketAddr = "10.0.0.2:1234".parse().unwrap();
         let target: SocketAddr = "192.0.2.1:7".parse().unwrap();
         let key = ([0x11; 32], source, target);
-        let (uplink, stop) = server_udp(key, &out, &to_tunnel).expect("lane");
+        let started = StdInstant::now()
+            .checked_sub(Duration::from_secs(1))
+            .expect("instant");
+        stack.started = started;
+        let last_used = Arc::new(AtomicU64::new(0));
+        let (uplink, stop) = server_udp(key, started, &last_used, &out, &to_tunnel).expect("lane");
         stack.udp.insert(
             key,
             UdpLane {
                 uplink,
                 stop: Arc::clone(&stop),
-                last_used: StdInstant::now()
-                    .checked_sub(Duration::from_millis(100))
-                    .expect("instant"),
+                last_used,
             },
         );
         let mut buf = [0u8; 1024];

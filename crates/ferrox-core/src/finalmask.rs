@@ -250,6 +250,9 @@ impl Fragment {
     /// The `packets` modes that are not `tlshello`: the whole goes out as pieces of the drawn
     /// widths, each advance measured by what the socket actually took.
     fn write_pieces<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
+        if p.is_empty() {
+            return Ok(0);
+        }
         let Some(bound) = self.max_split.pick_from(&mut self.ent) else {
             return write_progress(raw, p);
         };
@@ -259,9 +262,15 @@ impl Fragment {
             let Some(to) = self.cut(segment, from, p.len(), bound) else {
                 return write_progress(raw, &p[from..]).map(|written| from + written);
             };
+            if from == to {
+                self.park(self.delay_at(segment));
+                segment += 1;
+                continue;
+            }
             let written = match raw.write(&p[from..to]) {
                 Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
                 Ok(written) => written,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error)
                     if from > 0
                         && matches!(
@@ -295,6 +304,7 @@ fn write_progress<W: Write>(raw: &mut W, mut p: &[u8]) -> io::Result<usize> {
                 written += taken;
                 p = &p[taken..];
             }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error)
                 if written > 0
                     && matches!(
@@ -486,6 +496,54 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    struct InterruptedOnce {
+        bytes: Vec<u8>,
+        interrupted: bool,
+    }
+
+    impl Write for InterruptedOnce {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if !self.interrupted {
+                self.interrupted = true;
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            self.bytes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_interrupted_write_is_retried_without_losing_progress() {
+        let mut sink = InterruptedOnce {
+            bytes: Vec::new(),
+            interrupted: false,
+        };
+        assert_eq!(write_progress(&mut sink, b"abc").expect("retries"), 3);
+        assert_eq!(sink.bytes, b"abc");
+    }
+
+    #[test]
+    fn zero_width_pieces_are_skipped_and_empty_input_writes_nothing() {
+        let mut mask = Fragment::new(
+            0,
+            0,
+            vec![range(0, 0), range(4, 4)],
+            vec![range(0, 0)],
+            range(24, 24),
+        )
+        .expect("valid");
+        let whole: Vec<u8> = (0..10).collect();
+        let mut wire = Wire::default();
+        assert_eq!(mask.write(&mut wire, &whole).expect("writes"), whole.len());
+        assert_eq!(wire.bytes, whole);
+        assert_eq!(mask.write(&mut wire, b"").expect("empty"), 0);
+        assert_eq!(wire.bytes.len(), whole.len(), "empty input writes nothing");
     }
 
     #[test]
