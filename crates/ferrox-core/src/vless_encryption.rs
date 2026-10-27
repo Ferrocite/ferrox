@@ -1,4 +1,5 @@
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 
@@ -617,10 +618,14 @@ impl Client {
                 united_key.extend_from_slice(&nfs_key);
                 let aead = Aead::new(&ticket_context, &united_key);
                 let out_ctr = (config.xor_mode == 2).then(|| new_ctr(&united_key, &iv));
+                let in_ctr = (config.xor_mode == 2).then(|| new_ctr(&united_key, &iv));
                 let skip = hello.len();
                 let mut stream =
                     EncryptedStream::new(inner, united_key, aead, None, ReadStage::ServerRandom);
                 stream.set_out_mask(HeaderMask::new(out_ctr, skip));
+                if let Some(in_ctr) = in_ctr {
+                    stream.set_in_mask(HeaderMask::new(Some(in_ctr), 0));
+                }
                 stream.set_zero_rtt(Arc::clone(self), pfs_key);
                 stream.set_pre_write(hello);
                 return Ok(stream);
@@ -726,28 +731,18 @@ struct Session {
 
 #[derive(Default)]
 struct Tickets {
-    lasts: HashMap<i64, [u8; 16]>,
-    order: VecDeque<[u8; 16]>,
+    expires: BinaryHeap<Reverse<(i64, [u8; 16])>>,
     sessions: HashMap<[u8; 16], Session>,
-    swept_minute: i64,
 }
 
 impl Tickets {
     fn sweep(&mut self, now: i64) {
-        let minute = now / 60;
-        if minute == self.swept_minute {
-            return;
-        }
-        self.swept_minute = minute;
-        let last = self.lasts.remove(&minute);
-        self.lasts.remove(&(minute - 1));
-        if let Some(last) = last {
-            while let Some(ticket) = self.order.pop_front() {
-                self.sessions.remove(&ticket);
-                if ticket == last {
-                    break;
-                }
+        while let Some(Reverse((expires, ticket))) = self.expires.peek().copied() {
+            if expires > now {
+                break;
             }
+            self.expires.pop();
+            self.sessions.remove(&ticket);
         }
     }
 }
@@ -902,16 +897,12 @@ impl Server {
         ticket[..2].copy_from_slice(&encode_length(seconds as usize));
         if seconds > 0 {
             let now = (self.clock)();
+            let expires = now.saturating_add(seconds);
             let mut tickets = self
                 .tickets
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             tickets.sweep(now);
-            tickets.lasts.insert(
-                (now + config.seconds_from.max(config.seconds_to)) / 60 + 2,
-                ticket,
-            );
-            tickets.order.push_back(ticket);
             tickets.sessions.insert(
                 ticket,
                 Session {
@@ -919,6 +910,7 @@ impl Server {
                     seen: HashSet::new(),
                 },
             );
+            tickets.expires.push(Reverse((expires, ticket)));
         }
 
         let mut server_hello = Vec::new();

@@ -120,7 +120,7 @@ An encrypted `http-header` row never falls back to the raw rung: a failed sealed
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
 
 <!-- scope:begin -->
-- paths: crates/ferrox-core/src/vless.rs, crates/ferrox-core/src/vless_encryption.rs
+- paths: crates/ferrox-core/src/vless.rs, crates/ferrox-core/src/vless_encryption.rs, crates/ferrox-core/tests/vless_zero_rtt.rs
 - symbols: vless
 - scenarios: vless-raw, vless-tls-raw, vless-encryption-raw, vless-encryption-tls-raw, vless-encryption-reality-raw
 - oracle: vless
