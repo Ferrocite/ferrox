@@ -2955,6 +2955,56 @@ impl std::io::Read for HandshakeDeadline<'_> {
     }
 }
 
+/// An owned carried reader under the handshake clock: the frame reader sleeps through poll timeouts, so this claims the poll and ends the read at the deadline instead.
+struct HandshakeRead<R> {
+    inner: R,
+    until: Option<Instant>,
+    step: Option<RelayStep>,
+}
+
+impl<R: Read> HandshakeRead<R> {
+    fn new(inner: R, budget: Duration) -> Self {
+        Self {
+            inner,
+            until: Some(Instant::now() + budget),
+            step: Some(RelayStep::enter()),
+        }
+    }
+
+    fn rearm(&mut self, budget: Duration) {
+        self.until = Some(Instant::now() + budget);
+    }
+
+    fn disarm(&mut self) {
+        self.until = None;
+        self.step = None;
+    }
+}
+
+impl<R: Read> Read for HandshakeRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let Some(until) = self.until else {
+                return self.inner.read(buf);
+            };
+            if Instant::now() >= until {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            match self.inner.read(buf) {
+                Ok(n) => return Ok(n),
+                Err(error) if is_timeout(&error) => {
+                    let left = until.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                    }
+                    thread::sleep(left.min(RELAY_POLL));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
 /// A QUIC stream under the encryption handshake's clock: its reads poll in a quantum, so a sealed hello that waits past the last packet is a timeout rather than a spin.
 struct SealHandshake {
     stream: crate::quic::QuicStream,
@@ -5798,7 +5848,18 @@ fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static>(
     if let Some(decryption) = decryption {
         let close = cwriter.clone();
         let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.finish());
-        return serve_sealed_carried(creader, cwriter, users, freedom, decryption, close);
+        let reader = HandshakeRead::new(creader, budgets::handshake());
+        return serve_sealed_carried_with(
+            reader,
+            cwriter,
+            users,
+            freedom,
+            decryption,
+            close,
+            |_| {},
+            |reader| reader.rearm(budgets::handshake()),
+            HandshakeRead::disarm,
+        );
     }
     serve_session_xhttp_with(creader, &cwriter, users, freedom);
 }
@@ -28208,6 +28269,53 @@ mod tests {
         assert!(
             verdict.is_ok(),
             "a silent xhttp peer pinned its thread past the handshake budget"
+        );
+        serving.join().expect("joins");
+    }
+
+    /// An encrypted xHTTP peer that opens the session and never sends the hello must release its thread at the handshake budget; the chunk body reader retries timeouts forever.
+    #[test]
+    fn an_encrypted_silent_xhttp_peer_releases_its_thread() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let (_, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let carrier = Carrier::Xhttp {
+            settings: xhttp_settings("/up/"),
+        };
+        let (done, waited) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_vless(
+                stream,
+                &one_vless_user(&[0xaau8; 16]),
+                &carrier,
+                true,
+                None,
+                Some(&decryption),
+            );
+            let _ = done.send(());
+        });
+        let mut peer = Connection::connect(addr).expect("connects");
+        xhttp_post_head(&mut peer, "/up/", true);
+        let verdict = waited.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        drop(peer);
+        crate::budgets::clear();
+        assert!(
+            verdict.is_ok(),
+            "an encrypted silent xhttp peer pinned its thread past the handshake budget"
         );
         serving.join().expect("joins");
     }
