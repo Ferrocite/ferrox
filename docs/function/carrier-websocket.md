@@ -39,6 +39,10 @@ The handshake read used to `peek` for `\r\n\r\n`, prove the head there, then re-
 
 What is *not* removed: `proxy::read_http_head` still answers the `http` front, whose prefix has one buffer and nowhere else to go, and the Shadowsocks rung, which waits inside a `peek` for the first byte of a request packet and must not take it.
 
+## The poll it hands back
+
+A relay lane owns the socket's poll quantum, so a read that comes back empty-handed is the lane's turn to move another flow, not an invitation to wait again. `WsReader` keeps a half-parsed frame in `assembling`/`whole`/`filled` and returns the timeout: `frame` does not move the cursor until the whole frame is in `have`, so the next step resumes on the same frame, and nothing compacts the buffer under an assembly. A handshake still in flight waits to its own deadline, and a spent clock is a hard end rather than a timeout `read_exact` would retry forever. The syscall count per frame is unchanged; what moves is one return, earlier. Witnessed by `proxy::tests::production_tls_first_ws_matches_the_seam`, and the frame-atomic parse is the one `ws::tests::frames_round_trip_masked_and_plain` drives.
+
 ## Measured
 
 <!-- counts:begin -->

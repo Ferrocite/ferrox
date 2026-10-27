@@ -34,6 +34,10 @@ graph TD
     J --> K["1 copy into the caller's buffer"]
 ```
 
+## The poll it hands back
+
+A gRPC frame is parsed in place and resumed: `pending`, `frame_head` and `frame_have` hold a half-read length prefix or message across a poll timeout, `pump` saves the bytes it filled back into `pending` before it propagates an error, and `begin_data`/`finish_data` keep the DATA frame's buffer. A lane's expired quantum returns to the lane; a spent handshake clock ends the read hard, so `read_exact` stops retrying. Syscalls per frame are unchanged. Witnessed by the silent-peer set, `proxy::tests::a_silent_peer_cannot_pin_a_grpc_request_head` and its siblings across the four protocols.
+
 ## Measured
 
 <!-- counts:begin -->
