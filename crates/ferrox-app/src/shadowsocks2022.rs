@@ -531,7 +531,7 @@ pub(crate) fn serve_session<R, W>(
     freedom: bool,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let Some((uplink, response, recv)) =
@@ -551,7 +551,7 @@ pub(crate) fn serve_kcp<R, W>(
     freedom: bool,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let Some((uplink, response, recv)) =
@@ -707,7 +707,7 @@ pub(crate) fn pump_relay_carried<R, W>(
     send: Cipher,
     recv: Recv,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     pump_relay_carried_inner(plain, reader, writer, close, Outbound::Client(send), recv);
@@ -721,7 +721,7 @@ fn pump_relay_carried_with_response<R, W>(
     response: Response,
     recv: Recv,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     pump_relay_carried_inner(
@@ -737,12 +737,12 @@ fn pump_relay_carried_with_response<R, W>(
 fn pump_relay_carried_inner<R, W>(
     plain: &Connection,
     reader: R,
-    mut writer: W,
+    writer: W,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
-    mut outbound: Outbound,
+    outbound: Outbound,
     recv: Recv,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let Ok(plain_read) = plain.try_clone() else {
@@ -753,100 +753,421 @@ fn pump_relay_carried_inner<R, W>(
     };
     let mut plain_read = plain_read;
     let mut plain_write = plain_write;
-    let thread_close = std::sync::Arc::clone(close);
-    let done = thread::spawn(move || {
-        let mut buf = crate::proxy::RelayBuf::with_len(SEAL_HEAD + READ_CHUNK + TAG_LEN);
-        while let Ok(read) = plain_read.read(&mut buf.as_mut()[SEAL_HEAD..SEAL_HEAD + READ_CHUNK]) {
-            if read == 0 {
-                if let Outbound::Server(response) = &mut outbound {
-                    if response.first_owed {
-                        let _ = response.seal_first(buf.as_mut(), 0, &mut writer);
-                    }
+    let _ = plain_read.set_read_timeout(Some(RELAY_POLL));
+    let flow = crate::proxy::RelayFinish::new(true, std::sync::Arc::clone(close), None);
+    let mut outbound = outbound;
+    let mut writer = writer;
+    let mut buf = crate::proxy::RelayBuf::with_len(SEAL_HEAD + READ_CHUNK + TAG_LEN);
+    let up_flow = std::sync::Arc::clone(&flow);
+    crate::proxy::lane_pool::submit(
+        Box::new(move || {
+            uplink_step(
+                &mut plain_read,
+                buf.as_mut(),
+                &mut outbound,
+                &mut writer,
+                &up_flow,
+            )
+        }),
+        Box::new(crate::proxy::stream_lane_done(&flow)),
+    );
+    let mut reader = reader;
+    reader.arm_relay_poll();
+    let mut link = Downlink::new(reader, recv);
+    let down_flow = std::sync::Arc::clone(&flow);
+    crate::proxy::lane_pool::submit(
+        Box::new(move || link.step(&mut plain_write, Some(&down_flow))),
+        Box::new(crate::proxy::stream_lane_done(&flow)),
+    );
+}
+
+/// One step of the sealing leg: read what the client sent, seal it into the carrier, and hand the
+/// lane back when the socket has nothing yet rather than waiting inside the read.
+fn uplink_step(
+    plain_read: &mut Connection,
+    buf: &mut [u8],
+    outbound: &mut Outbound,
+    writer: &mut dyn Write,
+    flow: &crate::proxy::RelayFinish,
+) -> crate::proxy::lane_pool::Next {
+    let read = plain_read.read(&mut buf[SEAL_HEAD..SEAL_HEAD + READ_CHUNK]);
+    let sealed = match read {
+        Ok(0) => {
+            if let Outbound::Server(response) = outbound {
+                if response.first_owed {
+                    let _ = response.seal_first(buf, 0, writer);
                 }
-                break;
             }
-            let sealed = match &mut outbound {
-                Outbound::Client(send) => seal_all(send, buf.as_mut(), read, &mut writer),
-                Outbound::Server(response) => {
-                    if response.first_owed {
-                        response.seal_first(buf.as_mut(), read, &mut writer)
-                    } else {
-                        seal_all(&mut response.send, buf.as_mut(), read, &mut writer)
-                    }
-                }
-            };
-            if sealed.is_err() {
-                break;
-            }
+            return crate::proxy::lane_pool::Next::Done;
         }
-        thread_close();
-        let _ = plain_read.shutdown(std::net::Shutdown::Both);
-    });
-    if !relay_downlink(reader, recv, &mut plain_write) {
-        return;
+        Ok(n) => match outbound {
+            Outbound::Client(send) => seal_all(send, buf, n, writer),
+            Outbound::Server(response) => {
+                if response.first_owed {
+                    response.seal_first(buf, n, writer)
+                } else {
+                    seal_all(&mut response.send, buf, n, writer)
+                }
+            }
+        },
+        Err(error) if crate::proxy::is_timeout(&error) && !flow.ended() => {
+            return crate::proxy::lane_pool::Next::Idle;
+        }
+        Err(_) => return crate::proxy::lane_pool::Next::Done,
+    };
+    if sealed.is_ok() {
+        crate::proxy::lane_pool::Next::More
+    } else {
+        crate::proxy::lane_pool::Next::Done
     }
-    close();
-    let _ = plain_write.shutdown(std::net::Shutdown::Both);
-    let _ = done.join();
 }
 
 /// The downlink the dials build: the carrier's octets opened into the codec's own window, so the
 /// widest ask the carrier ever hears is a window, a sealed length never costs its own ask, and a
-/// payload byte crosses user space once. `false` is the handshake never opening, which is the pump's
-/// own early exit: the carrier is not finished and the uplink is not joined, because the dial
-/// dropping the sockets is what ends it.
-fn relay_downlink<R: Read>(mut reader: R, recv: Recv, out: &mut dyn Write) -> bool {
-    let mut recv = match recv {
-        Recv::Ready(cipher) => cipher,
-        Recv::Waiting(method, psk, client_salt) => {
-            let key_len = method.key_len();
-            let mut server_salt = vec![0u8; key_len];
-            if read_exact(&mut reader, &mut server_salt).is_err() {
-                return false;
+/// payload byte crosses user space once. `false` is the handshake never opening, which is the
+/// blocking dial's own early exit: the carrier is not finished and the uplink is not joined.
+#[cfg(test)]
+fn relay_downlink<R: Read>(reader: R, recv: Recv, out: &mut dyn Write) -> bool {
+    let mut link = Downlink::new(reader, recv);
+    loop {
+        let handshaking = !matches!(link, Downlink::Aead { .. });
+        match link.step(out, None) {
+            crate::proxy::lane_pool::Next::Done => return !handshaking,
+            crate::proxy::lane_pool::Next::Idle | crate::proxy::lane_pool::Next::More => {}
+        }
+    }
+}
+
+/// The carrier's direction of a sealed relay as lane steps: the server's salt, the fixed header a
+/// 2022 server answers with, its first payload, then the codec's own window. A step that finds
+/// nothing yet hands the lane back instead of waiting on the socket.
+enum Downlink<R> {
+    Salt {
+        read: R,
+        method: Method,
+        psk: Vec<u8>,
+        client_salt: Vec<u8>,
+        server_salt: Vec<u8>,
+        at: usize,
+    },
+    Fixed {
+        read: R,
+        cipher: Cipher,
+        fixed: Vec<u8>,
+        client_salt: Vec<u8>,
+        at: usize,
+    },
+    First {
+        read: R,
+        cipher: Cipher,
+        chunk: Vec<u8>,
+        at: usize,
+    },
+    Aead {
+        window: ChunkReader<R>,
+        cipher: Cipher,
+    },
+    /// Holds the value a step swaps out while it runs; never observed or stepped twice.
+    Running,
+}
+
+impl<R: Read> Downlink<R> {
+    fn new(read: R, recv: Recv) -> Self {
+        match recv {
+            Recv::Ready(cipher) => Self::Aead {
+                window: ChunkReader::new(read),
+                cipher,
+            },
+            Recv::Waiting(method, psk, client_salt) => {
+                let key_len = method.key_len();
+                Self::Salt {
+                    read,
+                    method,
+                    psk,
+                    client_salt,
+                    server_salt: vec![0u8; key_len],
+                    at: 0,
+                }
             }
-            let Some(mut cipher) = Cipher::from_psk(method, &psk, &server_salt) else {
-                return false;
+        }
+    }
+
+    fn step(
+        &mut self,
+        out: &mut dyn Write,
+        flow: Option<&crate::proxy::RelayFinish>,
+    ) -> crate::proxy::lane_pool::Next {
+        let next = std::mem::replace(self, Self::Running);
+        let (next, state) = next.advance(out, flow);
+        *self = state;
+        next
+    }
+
+    fn advance(
+        self,
+        out: &mut dyn Write,
+        flow: Option<&crate::proxy::RelayFinish>,
+    ) -> (crate::proxy::lane_pool::Next, Self) {
+        match self {
+            Self::Salt {
+                read,
+                method,
+                psk,
+                client_salt,
+                server_salt,
+                at,
+            } => salt_step(read, method, psk, client_salt, server_salt, at, flow),
+            Self::Fixed {
+                read,
+                cipher,
+                fixed,
+                client_salt,
+                at,
+            } => fixed_step(read, cipher, fixed, client_salt, at, flow),
+            Self::First {
+                read,
+                cipher,
+                chunk,
+                at,
+            } => first_step(read, cipher, chunk, at, out, flow),
+            Self::Aead { window, cipher } => aead_step(window, cipher, out, flow),
+            Self::Running => unreachable!("a step that is running is never stepped again"),
+        }
+    }
+}
+
+/// The server's salt, one read at a time: the key that opens everything behind it derives from it.
+#[allow(clippy::too_many_arguments)]
+fn salt_step<R: Read>(
+    mut read: R,
+    method: Method,
+    psk: Vec<u8>,
+    client_salt: Vec<u8>,
+    mut server_salt: Vec<u8>,
+    mut at: usize,
+    flow: Option<&crate::proxy::RelayFinish>,
+) -> (crate::proxy::lane_pool::Next, Downlink<R>) {
+    let key_len = method.key_len();
+    match read.read(&mut server_salt[at..key_len]) {
+        Ok(0) => (crate::proxy::lane_pool::Next::Done, Downlink::Running),
+        Ok(n) => {
+            at += n;
+            if at < key_len {
+                return (
+                    crate::proxy::lane_pool::Next::More,
+                    Downlink::Salt {
+                        read,
+                        method,
+                        psk,
+                        client_salt,
+                        server_salt,
+                        at,
+                    },
+                );
+            }
+            let Some(cipher) = Cipher::from_psk(method, &psk, &server_salt) else {
+                return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
             };
             let fixed_len = 1 + 8 + key_len + 2 + TAG_LEN;
-            let mut fixed = vec![0u8; fixed_len];
-            if read_exact(&mut reader, &mut fixed).is_err() {
-                return false;
+            (
+                crate::proxy::lane_pool::Next::More,
+                Downlink::Fixed {
+                    read,
+                    cipher,
+                    fixed: vec![0u8; fixed_len],
+                    client_salt,
+                    at: 0,
+                },
+            )
+        }
+        Err(error) if crate::proxy::is_timeout(&error) => (
+            waited(flow),
+            Downlink::Salt {
+                read,
+                method,
+                psk,
+                client_salt,
+                server_salt,
+                at,
+            },
+        ),
+        Err(_) => (crate::proxy::lane_pool::Next::Done, Downlink::Running),
+    }
+}
+
+/// The fixed header a 2022 server answers with, then the first payload chunk its length names.
+fn fixed_step<R: Read>(
+    mut read: R,
+    mut cipher: Cipher,
+    mut fixed: Vec<u8>,
+    client_salt: Vec<u8>,
+    mut at: usize,
+    flow: Option<&crate::proxy::RelayFinish>,
+) -> (crate::proxy::lane_pool::Next, Downlink<R>) {
+    match read.read(&mut fixed[at..]) {
+        Ok(0) => (crate::proxy::lane_pool::Next::Done, Downlink::Running),
+        Ok(n) => {
+            at += n;
+            if at < fixed.len() {
+                return (
+                    crate::proxy::lane_pool::Next::More,
+                    Downlink::Fixed {
+                        read,
+                        cipher,
+                        fixed,
+                        client_salt,
+                        at,
+                    },
+                );
             }
+            let key_len = client_salt.len();
             let Some(len) = cipher.open_in_place(&mut fixed) else {
-                return false;
+                return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
             };
             if len != 1 + 8 + key_len + 2 || fixed[0] != 1 {
-                return false;
+                return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
             }
             let stamp = u64::from_be_bytes(fixed[1..9].try_into().unwrap_or([0u8; 8]));
-            if now_secs().abs_diff(stamp) > SKEW {
-                return false;
-            }
-            if fixed[9..9 + key_len] != client_salt[..] {
-                return false;
+            if now_secs().abs_diff(stamp) > SKEW || fixed[9..9 + key_len] != client_salt[..] {
+                return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
             }
             let first = usize::from(u16::from_be_bytes([
                 fixed[9 + key_len],
                 fixed[10 + key_len],
             ]));
-            if first > 0 {
-                let mut chunk = vec![0u8; first + TAG_LEN];
-                if read_exact(&mut reader, &mut chunk).is_err() {
-                    return false;
-                }
-                let Some(got) = cipher.open_in_place(&mut chunk) else {
-                    return false;
-                };
-                if out.write_all(&chunk[..got]).is_err() {
-                    return false;
-                }
+            if first == 0 {
+                (
+                    crate::proxy::lane_pool::Next::More,
+                    Downlink::Aead {
+                        window: ChunkReader::new(read),
+                        cipher,
+                    },
+                )
+            } else {
+                (
+                    crate::proxy::lane_pool::Next::More,
+                    Downlink::First {
+                        read,
+                        cipher,
+                        chunk: vec![0u8; first + TAG_LEN],
+                        at: 0,
+                    },
+                )
             }
-            cipher
+        }
+        Err(error) if crate::proxy::is_timeout(&error) => (
+            waited(flow),
+            Downlink::Fixed {
+                read,
+                cipher,
+                fixed,
+                client_salt,
+                at,
+            },
+        ),
+        Err(_) => (crate::proxy::lane_pool::Next::Done, Downlink::Running),
+    }
+}
+
+/// The chunk the fixed header named, opened where the carrier put it and handed straight on.
+fn first_step<R: Read>(
+    mut read: R,
+    mut cipher: Cipher,
+    mut chunk: Vec<u8>,
+    mut at: usize,
+    out: &mut dyn Write,
+    flow: Option<&crate::proxy::RelayFinish>,
+) -> (crate::proxy::lane_pool::Next, Downlink<R>) {
+    match read.read(&mut chunk[at..]) {
+        Ok(0) => (crate::proxy::lane_pool::Next::Done, Downlink::Running),
+        Ok(n) => {
+            at += n;
+            if at < chunk.len() {
+                return (
+                    crate::proxy::lane_pool::Next::More,
+                    Downlink::First {
+                        read,
+                        cipher,
+                        chunk,
+                        at,
+                    },
+                );
+            }
+            let Some(got) = cipher.open_in_place(&mut chunk) else {
+                return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
+            };
+            if out.write_all(&chunk[..got]).is_err() {
+                return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
+            }
+            (
+                crate::proxy::lane_pool::Next::More,
+                Downlink::Aead {
+                    window: ChunkReader::new(read),
+                    cipher,
+                },
+            )
+        }
+        Err(error) if crate::proxy::is_timeout(&error) => (
+            waited(flow),
+            Downlink::First {
+                read,
+                cipher,
+                chunk,
+                at,
+            },
+        ),
+        Err(_) => (crate::proxy::lane_pool::Next::Done, Downlink::Running),
+    }
+}
+
+/// The window's step: hand the target every chunk that has arrived, and ask once for more when none
+/// has — a batch that has not finished arriving is a wait, not a chunk to hold the worker for.
+fn aead_step<R: Read>(
+    mut window: ChunkReader<R>,
+    mut cipher: Cipher,
+    out: &mut dyn Write,
+    flow: Option<&crate::proxy::RelayFinish>,
+) -> (crate::proxy::lane_pool::Next, Downlink<R>) {
+    let mut batch = [(0usize, 0usize); CHUNKS_PER_BATCH];
+    let opened = window.open_ready(&mut cipher, &mut batch);
+    let next = if opened > 0 {
+        if write_all_runs::<CHUNKS_PER_BATCH>(out, &window.buf, &batch[..opened]).is_err() {
+            return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
+        }
+        crate::proxy::lane_pool::Next::More
+    } else {
+        match window.try_fill() {
+            Fill::Ready => crate::proxy::lane_pool::Next::More,
+            Fill::Idle => waited(flow),
+            Fill::End => {
+                return (
+                    crate::proxy::lane_pool::Next::Done,
+                    Downlink::Aead { window, cipher },
+                );
+            }
         }
     };
-    let mut window = ChunkReader::new(reader);
-    let _ = drain_window(&mut window, &mut recv, out);
-    true
+    (next, Downlink::Aead { window, cipher })
+}
+
+/// A quiet socket is a wait for the lane unless the sibling has ended: then there is nothing left
+/// to read on either side.
+fn waited(flow: Option<&crate::proxy::RelayFinish>) -> crate::proxy::lane_pool::Next {
+    if flow.is_some_and(crate::proxy::RelayFinish::ended) {
+        crate::proxy::lane_pool::Next::Done
+    } else {
+        crate::proxy::lane_pool::Next::Idle
+    }
+}
+
+#[cfg(test)]
+impl<R: Read> Downlink<R> {
+    fn window(&mut self) -> Option<&mut ChunkReader<R>> {
+        match self {
+            Self::Aead { window, .. } => Some(window),
+            _ => None,
+        }
+    }
 }
 
 /// Chunks one window batch opens and hands to the target at once.
@@ -879,42 +1200,35 @@ impl<R: Read> ChunkReader<R> {
         }
     }
 
-    /// Fill until `need` bytes wait at `at`, compacting only when the buffer is full so leftovers
-    /// move once: one `read` per fill on a live socket, and short reads and quiet sockets loop
-    /// exactly like `read_exact`.
-    fn fill(&mut self, need: usize) -> Option<()> {
-        loop {
-            if self.end - self.at >= need {
-                return Some(());
+    /// One read's worth of filling for a lane: the window compacts only when it is full, so
+    /// leftovers move once, and a quiet socket hands the worker back instead of parking it.
+    fn try_fill(&mut self) -> Fill {
+        if self.end == self.buf.len() {
+            self.buf.copy_within(self.at..self.end, 0);
+            self.end -= self.at;
+            self.at = 0;
+        }
+        match self.read.read(&mut self.buf[self.end..]) {
+            Ok(0) => Fill::End,
+            Ok(n) => {
+                self.end += n;
+                Fill::Ready
             }
-            if self.end == self.buf.len() {
-                self.buf.copy_within(self.at..self.end, 0);
-                self.end -= self.at;
-                self.at = 0;
-            }
-            match self.read.read(&mut self.buf[self.end..]) {
-                Ok(0) => return None,
-                Ok(n) => self.end += n,
-                Err(error) if crate::proxy::is_timeout(&error) => {}
-                Err(_) => return None,
-            }
+            Err(error) if crate::proxy::is_timeout(&error) => Fill::Idle,
+            Err(_) => Fill::End,
         }
     }
 
-    /// Open one chunk where it lies and say where its plaintext ended up. `None` with `wait` is the
-    /// stream ending or a tag that will not open, and nothing after either is trustworthy; without
-    /// `wait` it also means this chunk has not finished arriving, which is why its length is drawn
-    /// once and held rather than drawn again against the next chunk's nonce.
-    fn open_chunk(&mut self, recv: &mut Cipher, wait: bool) -> Option<(usize, usize)> {
+    /// Open one chunk where it lies and say where its plaintext ended up. `None` is the stream
+    /// ending, a tag that will not open, or a chunk that has not finished arriving — which is why
+    /// its length is drawn once and held rather than drawn again against the next chunk's nonce.
+    fn open_chunk(&mut self, recv: &mut Cipher) -> Option<(usize, usize)> {
         let head = LENGTH_LEN + TAG_LEN;
         let size = if let Some(size) = self.held {
             size
         } else {
             if self.end - self.at < head {
-                if !wait {
-                    return None;
-                }
-                self.fill(head)?;
+                return None;
             }
             let length = &mut self.buf[self.at..self.at + head];
             let size = open_length(recv, length)?;
@@ -923,10 +1237,7 @@ impl<R: Read> ChunkReader<R> {
         };
         let body = size + TAG_LEN;
         if self.end - self.at < head + body {
-            if !wait {
-                return None;
-            }
-            self.fill(head + body)?;
+            return None;
         }
         self.held = None;
         let start = self.at + head;
@@ -935,41 +1246,26 @@ impl<R: Read> ChunkReader<R> {
         Some((start, plain))
     }
 
-    /// Open the chunks this window already holds, waiting only for the first: a peer that stops to
-    /// hear back from its own target must never find the chunk it is waiting on held for a batch
-    /// that has not arrived. Returns how many opened, or `0` once the stream is over or damaged.
-    fn open_batch(&mut self, recv: &mut Cipher, out: &mut [(usize, usize)]) -> usize {
+    /// Open every chunk the window already holds: a peer that stops to hear back from its own
+    /// target must never find the chunk it is waiting on held for a batch that has not arrived.
+    fn open_ready(&mut self, recv: &mut Cipher, out: &mut [(usize, usize)]) -> usize {
         let mut opened = 0usize;
-        let mut wait = true;
         while opened < out.len() {
-            let Some(chunk) = self.open_chunk(recv, wait) else {
+            let Some(chunk) = self.open_chunk(recv) else {
                 break;
             };
             out[opened] = chunk;
             opened += 1;
-            // Only the first chunk of a batch may be waited for.
-            wait = false;
         }
         opened
     }
 }
 
-/// Hand the whole batch the window already holds to the target, and keep doing so until the stream
-/// ends or the target refuses: one `write_vectored` per batch where the socket has `writev`, one
-/// write per chunk where it has not, and no wait for a chunk that has not arrived.
-fn drain_window<R: Read>(
-    window: &mut ChunkReader<R>,
-    recv: &mut Cipher,
-    out: &mut dyn Write,
-) -> std::io::Result<()> {
-    let mut batch = [(0usize, 0usize); CHUNKS_PER_BATCH];
-    loop {
-        let opened = window.open_batch(recv, &mut batch);
-        if opened == 0 {
-            return Ok(());
-        }
-        write_all_runs::<CHUNKS_PER_BATCH>(out, &window.buf, &batch[..opened])?;
-    }
+/// What one lane step's filling found: bytes arrived, the socket has none yet, or the stream ended.
+enum Fill {
+    Ready,
+    Idle,
+    End,
 }
 
 /// Open an 18 B sealed length in place: the payload size it names, or `None` on a forged tag or a
@@ -2850,11 +3146,14 @@ mod tests {
             plain.extend_from_slice(&piece);
             wire.extend_from_slice(&seal_one(&mut send, &piece));
         }
-        let mut recv = Cipher::from_psk(method, &psk, &salt).expect("derives");
-        let mut window = ChunkReader::new(CountingReads {
-            read: std::io::Cursor::new(wire),
-            reads: 0,
-        });
+        let recv = Cipher::from_psk(method, &psk, &salt).expect("derives");
+        let mut link = Downlink::new(
+            CountingReads {
+                read: std::io::Cursor::new(wire),
+                reads: 0,
+            },
+            Recv::Ready(recv),
+        );
         let mut got = Vec::new();
         let (writes, bases) = {
             let mut out = Vectored {
@@ -2862,9 +3161,13 @@ mod tests {
                 writes: 0,
                 bases: Vec::new(),
             };
-            drain_window(&mut window, &mut recv, &mut out).expect("drains");
+            while !matches!(
+                link.step(&mut out, None),
+                crate::proxy::lane_pool::Next::Done
+            ) {}
             (out.writes, out.bases)
         };
+        let window = link.window().expect("an opened batch keeps its window");
         assert_eq!(
             window.read.reads, 2,
             "one bulk read serves the whole batch, the next one finds the end"
@@ -2912,15 +3215,17 @@ mod tests {
         let mut recv = Cipher::from_psk(method, &psk, &salt).expect("derives");
         let mut window = ChunkReader::new(&mut staged);
         let mut batch = [(0usize, 0usize); CHUNKS_PER_BATCH];
+        assert!(matches!(window.try_fill(), Fill::Ready));
         assert_eq!(
-            window.open_batch(&mut recv, &mut batch),
+            window.open_ready(&mut recv, &mut batch),
             1,
             "the second chunk is still arriving"
         );
         assert_eq!(window.read.reads, 1, "no read is spent waiting for it");
         assert_eq!(&window.buf[batch[0].0..batch[0].0 + batch[0].1], &first[..]);
+        assert!(matches!(window.try_fill(), Fill::Ready));
         assert_eq!(
-            window.open_batch(&mut recv, &mut batch),
+            window.open_ready(&mut recv, &mut batch),
             1,
             "the held length opens against its own nonce once the payload lands"
         );
@@ -2928,5 +3233,80 @@ mod tests {
             &window.buf[batch[0].0..batch[0].0 + batch[0].1],
             &second[..]
         );
+    }
+    /// Eight sessions that never send a byte add no thread: both directions are lane steps, and a
+    /// step with nothing to read hands its worker back instead of parking on the socket.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_session_costs_no_thread() {
+        fn threads() -> usize {
+            std::fs::read_dir("/proc/self/task")
+                .expect("reads the task table")
+                .count()
+        }
+        fn lane_workers() -> usize {
+            std::fs::read_dir("/proc/self/task")
+                .expect("reads the task table")
+                .filter_map(|task| {
+                    let name = std::fs::read_to_string(task.ok()?.path().join("comm")).ok()?;
+                    (name.trim() == "ferrox-relay-lane").then_some(())
+                })
+                .count()
+        }
+        fn pair() -> (Connection, Connection) {
+            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = listener.local_addr().expect("addr").port();
+            let dialled = Connection::connect(("127.0.0.1", port)).expect("connects");
+            let (accepted, _) = listener.accept().expect("accepts");
+            (dialled, accepted)
+        }
+        let method = Method::Aes256Gcm;
+        let psk = vec![7u8; 32];
+        let salt = vec![7u8; 32];
+        let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(|| {});
+        let held_first = {
+            let (plain, peer) = pair();
+            let (sealed, client) = pair();
+            let writer = sealed.try_clone().expect("clones the carrier");
+            pump_relay_carried(
+                &plain,
+                sealed,
+                writer,
+                &close,
+                Cipher::from_psk(method, &psk, &salt).expect("derives"),
+                Recv::Ready(Cipher::from_psk(method, &psk, &salt).expect("derives")),
+            );
+            (peer, client)
+        };
+        let before = threads();
+        let lanes_before = lane_workers();
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            let (plain, peer) = pair();
+            let (sealed, client) = pair();
+            let writer = sealed.try_clone().expect("clones the carrier");
+            pump_relay_carried(
+                &plain,
+                sealed,
+                writer,
+                &close,
+                Cipher::from_psk(method, &psk, &salt).expect("derives"),
+                Recv::Ready(Cipher::from_psk(method, &psk, &salt).expect("derives")),
+            );
+            held.push((peer, client));
+        }
+        let after = threads();
+        assert_eq!(
+            lane_workers(),
+            lanes_before,
+            "eight live sessions added no worker to the lane pool"
+        );
+        assert!(
+            after < before + 8,
+            "eight live sessions added {} threads",
+            after.saturating_sub(before)
+        );
+        drop(held);
+        drop(held_first);
     }
 }

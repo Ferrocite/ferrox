@@ -645,11 +645,13 @@ fn check_request<'a>(head: &'a [u8], path: &str) -> Option<Upgrade<'a>> {
     if crate::proxy::request_path_in(text)? != path {
         return None;
     }
-    let key = crate::proxy::header_value_in(text, "sec-websocket-key")?;
+    let [key, offered] =
+        crate::proxy::header_values_in(text, ["sec-websocket-key", "sec-websocket-protocol"]);
+    let key = key?;
     if key.is_empty() {
         return None;
     }
-    let offered = crate::proxy::header_value_in(text, "sec-websocket-protocol").unwrap_or_default();
+    let offered = offered.unwrap_or_default();
     let early = early_decode(offered)
         .filter(|bytes| !bytes.is_empty())
         .unwrap_or_default();
@@ -1720,6 +1722,55 @@ mod tests {
             check_request(&[0xff, 0xfe, b'\r', b'\n'], "/tunnel").is_none(),
             "a head that is not text upgrades nothing"
         );
+    }
+
+    /// The two-field walk exactly as the two lookups stood, kept as the oracle the one-pass form must answer with.
+    fn header_value_staged<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+        let mut lines = text.split("\r\n");
+        lines.next()?;
+        for line in lines {
+            let (key, value) = line.split_once(':')?;
+            if key.trim().eq_ignore_ascii_case(name) {
+                return Some(value.trim());
+            }
+        }
+        None
+    }
+
+    /// Every head shape the two lookups accept or refuse: the one walk must return what two scans returned.
+    #[test]
+    fn the_two_field_walk_is_two_lookups_at_every_head() {
+        for head in [
+            "GET / HTTP/1.1\r\nSec-WebSocket-Key: abc\r\nSec-WebSocket-Protocol: x\r\n\r\n",
+            "GET / HTTP/1.1\r\nSEC-WEBSOCKET-KEY: abc\r\nsec-websocket-protocol: x\r\n",
+            "GET / HTTP/1.1\r\nSec-WebSocket-Protocol: x\r\nSec-WebSocket-Key: abc\r\n",
+            "GET / HTTP/1.1\r\nSec-WebSocket-Key: first\r\nSec-WebSocket-Key: second\r\n",
+            "GET / HTTP/1.1\r\nSec-WebSocket-Key: abc\r\nHost: h\r\n",
+            "GET / HTTP/1.1\r\nbroken\r\nSec-WebSocket-Key: abc\r\n",
+            "GET / HTTP/1.1\r\nSec-WebSocket-Key: abc\r\nbroken\r\n",
+            "GET / HTTP/1.1\r\nSec-WebSocket-Key: abc\r\nSec-WebSocket-Protocol: x\r\nbroken\r\n",
+            "GET / HTTP/1.1\r\n\r\n",
+            "GET / HTTP/1.1",
+            "",
+            "\r\n",
+            "GET / HTTP/1.1\r\n Sec-WebSocket-Key : abc \r\n Sec-WebSocket-Protocol : x \r\n",
+            "GET / HTTP/1.1\r\nSec-WebSocket-Key:\r\nSec-WebSocket-Protocol:\r\n",
+        ] {
+            let [key, offered] = crate::proxy::header_values_in(
+                head,
+                ["sec-websocket-key", "sec-websocket-protocol"],
+            );
+            assert_eq!(
+                key,
+                header_value_staged(head, "sec-websocket-key"),
+                "{head:?}: key"
+            );
+            assert_eq!(
+                offered,
+                header_value_staged(head, "sec-websocket-protocol"),
+                "{head:?}: protocol"
+            );
+        }
     }
 
     /// The bytes behind the head are the reader's own buffer, base and all: nothing copies them into the early data, so they arrive where they already were.
