@@ -181,6 +181,15 @@ impl<const N: usize> Unfilled<N> {
         // SAFETY: every byte read out of here was written by the call this slice was handed to.
         unsafe { std::slice::from_raw_parts_mut(self.0.as_mut_ptr().cast::<u8>(), N) }
     }
+
+    /// The first `len` bytes, which the call this buffer was handed wrote before it published `len`.
+    #[cfg(target_os = "linux")]
+    #[must_use]
+    pub(crate) fn written(&self, len: usize) -> &[u8] {
+        let len = len.min(N);
+        // SAFETY: the read that filled this buffer wrote every byte below `len`, and only that far is read here.
+        unsafe { std::slice::from_raw_parts(self.0.as_ptr().cast::<u8>(), len) }
+    }
 }
 
 pub(crate) const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -704,6 +713,16 @@ impl Batch {
         let bytes = self.slots[at].as_mut().get_mut(..len)?;
         Some((bytes, from))
     }
+
+    /// The routing key of one slot, borrowed from the bytes the kernel wrote there: a run of datagrams for one lane is compared and looked up without copying a key out of the batch.
+    pub(crate) fn key(&self, at: usize) -> Option<&[u8]> {
+        if at >= self.len {
+            return None;
+        }
+        // SAFETY: `recv_batch` writes this slot's length before it publishes the slot in `len`, and `at` is below `len`.
+        let len = usize::try_from(unsafe { *self.lens.get(at)?.assume_init_ref() }).ok()?;
+        packet_key(self.slots.get(at)?.written(len))
+    }
 }
 
 /// A platform with no batched call has no batch to own, and the lane says so before it reads.
@@ -755,15 +774,23 @@ pub(crate) fn recv_batch(sock: &Datagram, batch: &mut Batch) -> Drain {
         iov_base: std::ptr::null_mut(),
         iov_len: MAX_DATAGRAM,
     });
-    let mut headers: [libc::mmsghdr; RECV_SLOTS] =
-        std::array::from_fn(|_| unsafe { std::mem::zeroed() });
+    let mut headers: [std::mem::MaybeUninit<libc::mmsghdr>; RECV_SLOTS] =
+        std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
     let room = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     for at in 0..RECV_SLOTS {
         parts[at].iov_base = batch.slots[at].as_mut().as_mut_ptr().cast();
-        headers[at].msg_hdr.msg_name = batch.peers[at].as_mut_ptr().cast();
-        headers[at].msg_hdr.msg_namelen = room;
-        headers[at].msg_hdr.msg_iov = (&raw mut parts[at]).cast();
-        headers[at].msg_hdr.msg_iovlen = 1;
+        headers[at].write(libc::mmsghdr {
+            msg_hdr: libc::msghdr {
+                msg_name: batch.peers[at].as_mut_ptr().cast(),
+                msg_namelen: room,
+                msg_iov: (&raw mut parts[at]).cast(),
+                msg_iovlen: 1,
+                msg_control: std::ptr::null_mut(),
+                msg_controllen: 0,
+                msg_flags: 0,
+            },
+            msg_len: 0,
+        });
     }
     // `MSG_WAITFORONE` returns on the first datagram that is there rather than waiting for the whole batch: the caller's deadline is the socket's own arm, and a batch that waited for eight would turn one slow packet into eight slow packets.
     //
@@ -773,7 +800,7 @@ pub(crate) fn recv_batch(sock: &Datagram, batch: &mut Batch) -> Drain {
     let got = unsafe {
         libc::recvmmsg(
             sock.sock.as_raw_fd(),
-            headers.as_mut_ptr(),
+            headers.as_mut_ptr().cast::<libc::mmsghdr>(),
             RECV_SLOTS as libc::c_uint,
             libc::MSG_WAITFORONE as _,
             std::ptr::null_mut(),
@@ -796,6 +823,8 @@ pub(crate) fn recv_batch(sock: &Datagram, batch: &mut Batch) -> Drain {
     // A read that ran dry after some datagrams is the count, not the error: the kernel answers with what it took.
     let got = usize::try_from(got).unwrap_or(0).min(RECV_SLOTS);
     for (at, header) in headers.iter().enumerate().take(got) {
+        // SAFETY: `recvmmsg` wrote `msg_len` for every message it reported, and the name length is the one the kernel filled beside it.
+        let header = unsafe { header.assume_init_ref() };
         batch.lens[at].write(header.msg_len);
         batch.names[at].write(header.msg_hdr.msg_namelen);
     }
@@ -2879,10 +2908,17 @@ struct ServerConn {
 /// The per-stream entry point a VLESS inbound serves: one stream, one session, no shared state.
 pub(crate) type Serve = Arc<dyn Fn(QuicStream) + Send + Sync>;
 
-/// The driver's two datagram scratch buffers, passed as one so routing stays within the argument budget.
+/// The driver's two datagram scratch buffers and the tables one reap fills, passed as one so routing stays within the argument budget and a batch reuses its slots instead of allocating.
 struct Scratch {
     buf: [u8; MAX_DATAGRAM],
     out: [u8; MAX_DATAGRAM],
+    fresh: Vec<(Arc<Mutex<quiche::Connection>>, u64)>,
+    learned: Vec<(Vec<u8>, Arc<ServerConn>)>,
+    closed: Vec<Vec<u8>>,
+    seen: Vec<*const ServerConn>,
+    gone: Vec<*const ServerConn>,
+    /// The earliest timer a live connection wants, carried from the reap that read it to the wait it gates.
+    deadline: Option<Instant>,
 }
 
 /// The driver: one UDP socket is read by this loop alone, so no packet is fed to the wrong connection.
@@ -2900,44 +2936,80 @@ pub(crate) fn serve_loop(
     let mut scratch = Scratch {
         buf: [0u8; MAX_DATAGRAM],
         out: [0u8; MAX_DATAGRAM],
+        fresh: Vec::new(),
+        learned: Vec::new(),
+        closed: Vec::new(),
+        seen: Vec::new(),
+        gone: Vec::new(),
+        deadline: None,
     };
+    #[cfg(target_os = "linux")]
+    let mut batch = Batch::new();
     while !stop.load(Ordering::Relaxed) {
         let start = Instant::now();
-        let mut wait = Duration::from_millis(100);
-        for state in conns.values() {
-            let Ok(conn) = state.conn.lock() else {
-                continue;
-            };
-            if let Some(left) = conn.timeout() {
-                wait = wait.min(left);
-            }
-        }
-        wait = wait.max(Duration::from_millis(1));
+        // The deadline the last reap read: the same lock pass that answers the readable streams answers when the connection next needs a timer, so no visit pays a second walk of the table.
+        let wait = scratch
+            .deadline
+            .map_or(Duration::from_millis(100), |deadline| {
+                deadline
+                    .saturating_duration_since(start)
+                    .min(Duration::from_millis(100))
+            })
+            .max(Duration::from_millis(1));
         if !sock.refresh_read_timeout(wait) {
             return;
         }
+        // A serving lane takes the queue in a batch where the platform has one: a burst of a dozen packets is one read, one lock per lane and one reap, not one of each per packet.
+        #[cfg(target_os = "linux")]
+        match recv_batch(&sock, &mut batch) {
+            Drain::Read => {
+                route_batch(
+                    &sock,
+                    local,
+                    config,
+                    &mut conns,
+                    &mut batch,
+                    &mut scratch.out,
+                );
+                reap(serve, &sock, &mut conns, &mut scratch);
+                continue;
+            }
+            Drain::Empty => {
+                run_timers(&mut conns, &sock, start.elapsed());
+                reap(serve, &sock, &mut conns, &mut scratch);
+                continue;
+            }
+            Drain::Unbatchable => {}
+        }
         match sock.recv_from(&mut scratch.buf) {
-            Ok((n, from)) => route(&sock, local, config, &mut conns, &mut scratch, n, from),
+            Ok((n, from)) => {
+                let Scratch { buf, out, .. } = &mut scratch;
+                route(&sock, local, config, &mut conns, &mut buf[..n], out, from);
+            }
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                let elapsed = start.elapsed();
-                for state in conns.values() {
-                    let Ok(mut conn) = state.conn.lock() else {
-                        continue;
-                    };
-                    if conn.timeout().is_none_or(|left| left <= elapsed) {
-                        conn.on_timeout();
-                        flush_egress(&mut conn, &sock);
-                    }
-                }
+                run_timers(&mut conns, &sock, start.elapsed());
             }
             Err(_) => return,
         }
-        reap(serve, &sock, &mut conns);
+        reap(serve, &sock, &mut conns, &mut scratch);
+    }
+}
+
+/// Run the timers whose deadline this wait passed, answering what they queued.
+fn run_timers(conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>, sock: &Datagram, elapsed: Duration) {
+    for state in conns.values() {
+        let Ok(mut conn) = state.conn.lock() else {
+            continue;
+        };
+        if conn.timeout().is_none_or(|left| left <= elapsed) {
+            conn.on_timeout();
+            flush_egress(&mut conn, sock);
+        }
     }
 }
 
@@ -2954,30 +3026,49 @@ fn learn_ids(
     }
 }
 
+/// The routing key a packet carries, read without building a header: a short-header DCID is the fixed-width server id at a known offset, and that is every packet on an established lane, so the lookup copies nothing and allocates nothing. A long header names its DCID length at byte five.
+fn packet_key(buf: &[u8]) -> Option<&[u8]> {
+    let first = *buf.first()?;
+    if first & 0x80 == 0 {
+        return buf.get(1..1 + quiche::MAX_CONN_ID_LEN);
+    }
+    let dcid_len = usize::from(*buf.get(5)?);
+    if dcid_len > quiche::MAX_CONN_ID_LEN {
+        return None;
+    }
+    buf.get(6..6 + dcid_len)
+}
+
 /// One packet to its connection, or to a new connection when it knocks with an Initial.
 fn route(
     sock: &Datagram,
     local: SocketAddr,
     config: &Arc<Mutex<quiche::Config>>,
     conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
-    scratch: &mut Scratch,
-    n: usize,
+    buf: &mut [u8],
+    out: &mut [u8],
     from: SocketAddr,
 ) {
-    let Scratch { buf, out } = scratch;
-    let Ok(header) = quiche::Header::from_slice(&mut buf[..n], quiche::MAX_CONN_ID_LEN) else {
+    let Some(key) = packet_key(buf) else {
         return;
     };
-    if let Some(state) = conns.get(header.dcid.as_ref()).cloned() {
+    if let Some(state) = conns.get(key).cloned() {
         let Ok(mut conn) = state.conn.lock() else {
             return;
         };
         let info = quiche::RecvInfo { from, to: local };
-        let _ = conn.recv(&mut buf[..n], info);
+        let _ = conn.recv(buf, info);
         flush_egress(&mut conn, sock);
         learn_ids(conns, &state, &conn);
         return;
     }
+    // A short header names an established lane or nothing: only a long header can open one.
+    if buf.first().is_none_or(|first| first & 0x80 == 0) {
+        return;
+    }
+    let Ok(header) = quiche::Header::from_slice(buf, quiche::MAX_CONN_ID_LEN) else {
+        return;
+    };
     if header.ty != quiche::Type::Initial {
         return;
     }
@@ -3001,7 +3092,7 @@ fn route(
     };
     drop(guard);
     let info = quiche::RecvInfo { from, to: local };
-    if conn.recv(&mut buf[..n], info).is_err() {
+    if conn.recv(buf, info).is_err() {
         return;
     }
     flush_egress(&mut conn, sock);
@@ -3013,35 +3104,122 @@ fn route(
     conns.insert(header.dcid.as_ref().to_vec(), state);
 }
 
-/// New peer streams to sessions, finished ones out of the table, dead connections dropped.
-fn reap(serve: &Serve, sock: &Arc<Datagram>, conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>) {
-    // Closed connections drop every key they hold, so no routing entry outlives its connection.
-    conns.retain(|_, state| state.conn.lock().is_ok_and(|conn| !conn.is_closed()));
-    // New source IDs first: a packet carrying one must route on the next datagram.
-    for state in conns.values().cloned().collect::<Vec<_>>() {
-        let Ok(conn) = state.conn.lock() else {
+/// A whole receive batch, one lock per run of datagrams for the same lane. A burst for one lane is what a data frame is, so the common batch pays one lock, one `learn_ids` pass per packet and one egress sweep for the run, not one of each per packet. A lane's run keeps the kernel's order; a run for another lane starts its own.
+#[cfg(target_os = "linux")]
+fn route_batch(
+    sock: &Datagram,
+    local: SocketAddr,
+    config: &Arc<Mutex<quiche::Config>>,
+    conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
+    batch: &mut Batch,
+    out: &mut [u8],
+) {
+    let mut at = 0;
+    while at < batch.len() {
+        let Some(key) = batch.key(at) else {
+            at += 1;
             continue;
         };
-        learn_ids(conns, &state, &conn);
+        let Some(state) = conns.get(key).cloned() else {
+            // A lane the table does not hold: one datagram through the path that may accept or negotiate.
+            let Some((bytes, from)) = batch.at(at) else {
+                at += 1;
+                continue;
+            };
+            route(sock, local, config, conns, bytes, out, from);
+            at += 1;
+            continue;
+        };
+        let mut end = at + 1;
+        while end < batch.len() {
+            if batch.key(end) != Some(key) {
+                break;
+            }
+            end += 1;
+        }
+        if let Ok(mut conn) = state.conn.lock() {
+            for index in at..end {
+                let Some((bytes, from)) = batch.at(index) else {
+                    continue;
+                };
+                let info = quiche::RecvInfo { from, to: local };
+                let _ = conn.recv(bytes, info);
+                // Per packet, not per run: a source id the edge starts using mid-connection has to route on the next datagram, and that datagram can be in this same batch.
+                learn_ids(conns, &state, &conn);
+            }
+            flush_egress(&mut conn, sock);
+        }
+        at = end;
     }
-    let mut fresh: Vec<(Arc<Mutex<quiche::Connection>>, u64)> = Vec::new();
-    for state in conns.values() {
+}
+
+/// New peer streams to sessions, finished ones out of the table, dead connections dropped. One lock per connection covers the closed, timer, source-id and readable questions, and the tables live across calls so a busy connection does not pay for them again on every visit.
+fn reap(
+    serve: &Serve,
+    sock: &Arc<Datagram>,
+    conns: &mut HashMap<Vec<u8>, Arc<ServerConn>>,
+    scratch: &mut Scratch,
+) {
+    scratch.fresh.clear();
+    scratch.learned.clear();
+    scratch.closed.clear();
+    scratch.seen.clear();
+    scratch.gone.clear();
+    let mut deadline = None;
+    // A state is keyed once per connection id, so the pointer is what keeps one connection's questions asked once.
+    for (key, state) in conns.iter() {
+        let ptr = Arc::as_ptr(state);
+        if scratch.seen.contains(&ptr) {
+            // A closed connection still owes every key it routes: they leave together.
+            if scratch.gone.contains(&ptr) {
+                scratch.closed.push(key.clone());
+            }
+            continue;
+        }
+        scratch.seen.push(ptr);
         let Ok(conn) = state.conn.lock() else {
             continue;
         };
-        let readable: Vec<u64> = conn.readable().collect();
+        if conn.is_closed() {
+            scratch.gone.push(ptr);
+            scratch.closed.push(key.clone());
+            continue;
+        }
+        if let Some(at) = conn.timeout_instant() {
+            deadline = Some(deadline.map_or(at, |soonest: Instant| soonest.min(at)));
+        }
+        // New source IDs first: a packet carrying one must route on the next datagram.
+        for id in conn.source_ids() {
+            if !conns.contains_key(id.as_ref()) {
+                scratch
+                    .learned
+                    .push((id.as_ref().to_vec(), Arc::clone(state)));
+            }
+        }
         if let Ok(mut seen) = state.seen.lock() {
-            for stream in readable {
+            let mut spawned = false;
+            for stream in conn.readable() {
                 // Client bidirectional streams only: the H3 opening rides unidirectional ones.
                 if stream % 4 != 0 || !seen.insert(stream) {
                     continue;
                 }
-                fresh.push((Arc::clone(&state.conn), stream));
+                scratch.fresh.push((Arc::clone(&state.conn), stream));
+                spawned = true;
             }
-            seen.retain(|stream| !conn.stream_finished(*stream));
+            // Only a pass that added a stream can leave a finished one behind: an idle connection's set has nothing to sweep.
+            if spawned {
+                seen.retain(|stream| !conn.stream_finished(*stream));
+            }
         }
     }
-    for (conn, stream) in fresh {
+    scratch.deadline = deadline;
+    for (key, state) in scratch.learned.drain(..) {
+        conns.entry(key).or_insert(state);
+    }
+    for key in scratch.closed.drain(..) {
+        conns.remove(&key);
+    }
+    for (conn, stream) in scratch.fresh.drain(..) {
         let session = QuicStream {
             conn,
             sock: Arc::clone(sock),
@@ -4152,6 +4330,57 @@ mod tests {
         assert!(
             waited >= Duration::from_millis(100),
             "the read waited {waited:?}, not the arm it asked for"
+        );
+    }
+
+    /// The routing key is a window into the packet the kernel wrote: its base is the DCID inside the caller's buffer, so the lookup costs no copy of its own.
+    #[test]
+    fn a_route_key_is_a_window_into_the_packet() {
+        let mut short = [0u8; 64];
+        short[0] = 0x40;
+        short[1..=quiche::MAX_CONN_ID_LEN].fill(7);
+        let key = packet_key(&short).expect("a short header names its DCID");
+        assert_eq!(key, &short[1..=quiche::MAX_CONN_ID_LEN]);
+        assert_eq!(
+            key.as_ptr(),
+            short[1..].as_ptr(),
+            "the key was copied out of the packet"
+        );
+
+        let mut long = [0u8; 64];
+        long[0] = 0xc0;
+        long[1..5].copy_from_slice(&1u32.to_be_bytes());
+        long[5] = 8;
+        long[6..14].fill(9);
+        let key = packet_key(&long).expect("a long header names its DCID length");
+        assert_eq!(key, &long[6..14]);
+        assert_eq!(
+            key.as_ptr(),
+            long[6..].as_ptr(),
+            "the key was copied out of the packet"
+        );
+    }
+
+    /// The header the route used to build allocated its DCID out of the packet on every datagram; the key borrows it, so the established lane's lookup allocates nothing. The two halves are measured side by side, so the removed allocation is the witness rather than a reading of the code.
+    #[test]
+    fn the_route_key_replaces_the_allocating_header_parse() {
+        let mut packet = [0u8; 64];
+        packet[0] = 0x40;
+        packet[1..=quiche::MAX_CONN_ID_LEN].fill(7);
+        let (header, parsed) = ferrox_core::alloc_count::measure(|| {
+            let mut copy = packet;
+            quiche::Header::from_slice(&mut copy, quiche::MAX_CONN_ID_LEN).ok()
+        });
+        assert!(header.is_some(), "the header parses");
+        assert!(
+            parsed.allocs > 0,
+            "the parse this replaces copied the DCID out of the packet"
+        );
+        let (key, routed) = ferrox_core::alloc_count::measure(|| packet_key(&packet));
+        assert!(key.is_some(), "the key reads");
+        assert_eq!(
+            routed.allocs, 0,
+            "the routing key copied the DCID out of the packet"
         );
     }
 }

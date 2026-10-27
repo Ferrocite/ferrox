@@ -70,6 +70,8 @@ def _transport(stream):
             if source in settings:
                 transport[target] = settings[source]
         return transport
+    if network == "quic":
+        return {"type": "quic"}
     raise ValueError(f"sing-box at this pin has no `{network}` transport")
 
 
@@ -150,6 +152,21 @@ def _certificate(settings):
     return certificate["certificateFile"], certificate["keyFile"]
 
 
+def _server_tls(stream):
+    if stream.get("security") != "tls":
+        return None
+    settings = stream.get("tlsSettings") or {}
+    certificate, key = _certificate(settings)
+    tls = {
+        "enabled": True,
+        "certificate_path": certificate,
+        "key_path": key,
+    }
+    if "alpn" in settings:
+        tls["alpn"] = settings["alpn"]
+    return tls
+
+
 def _server_inbound(inbound):
     protocol = inbound.get("protocol")
     if protocol == "socks":
@@ -159,6 +176,33 @@ def _server_inbound(inbound):
             "listen": inbound.get("listen", "127.0.0.1"),
             "listen_port": inbound["port"],
         }
+    if protocol == "vless":
+        settings = inbound.get("settings") or {}
+        stream = inbound.get("streamSettings") or {}
+        users = settings.get("clients")
+        if not isinstance(users, list) or not users:
+            raise ValueError("the VLESS server needs at least one client")
+        converted = {
+            "type": "vless",
+            "tag": inbound.get("tag", "vless-in"),
+            "listen": inbound.get("listen", "127.0.0.1"),
+            "listen_port": inbound["port"],
+            "users": [
+                {
+                    "name": user.get("name", f"user-{index}"),
+                    "uuid": user["id"],
+                    "flow": user.get("flow", ""),
+                }
+                for index, user in enumerate(users)
+            ],
+        }
+        tls = _server_tls(stream)
+        if tls is not None:
+            converted["tls"] = tls
+        transport = _transport(stream)
+        if transport is not None:
+            converted["transport"] = transport
+        return converted
     if protocol != "hysteria":
         raise ValueError(f"sing-box at this pin has no `{protocol}` server here")
     settings = inbound.get("settings") or {}
