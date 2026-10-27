@@ -31,6 +31,7 @@ fn order_cipher_suites(provider: &mut rustls::crypto::CryptoProvider, order: &[u
 pub struct RustlsProvider<S: Stream> {
     conn: rustls::ClientConnection,
     io: S,
+    eof: bool,
 }
 
 impl<S: Stream> std::fmt::Debug for RustlsProvider<S> {
@@ -529,13 +530,21 @@ impl<S: Stream> RustlsProvider<S> {
             .map_err(|e| TlsError::Other(format!("rustls server name: {e}")))?;
         let conn =
             rustls::ClientConnection::new(client_config(cfg)?, name).map_err(|e| map_error(&e))?;
-        Ok(Self { conn, io })
+        Ok(Self {
+            conn,
+            io,
+            eof: false,
+        })
     }
 
     /// A connection whose hello was fixed before the handshake: REALITY seals
     /// its tag into the session id, so the stock random hello cannot go out.
     pub fn from_connection(conn: rustls::ClientConnection, io: S) -> Self {
-        Self { conn, io }
+        Self {
+            conn,
+            io,
+            eof: false,
+        }
     }
 
     #[cfg(test)]
@@ -566,6 +575,11 @@ impl<S: Stream> RustlsProvider<S> {
     /// plaintext still sits in the layer, which a read takes without touching the socket.
     pub fn wants_read(&self) -> bool {
         self.conn.wants_read()
+    }
+
+    /// Whether the peer's close has already been read.
+    pub fn closed(&self) -> bool {
+        self.eof
     }
 
     /// Writes two slices as one TLS record: the fragmenter sees `head` and `tail`
@@ -656,6 +670,12 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
         // The plaintext the layer holds comes out first: its room is finite, and the ciphertext that follows waits for it.
         let plain = match self.conn.reader().read(buf) {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Ok(0) => {
+                if !buf.is_empty() {
+                    self.eof = true;
+                }
+                0
+            }
             outcome => outcome?,
         };
         if plain > 0 {
@@ -674,9 +694,19 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
         // A peer's key update is answered into the queue here and leaves with the next seal: a read never writes the transport.
         let plain = match self.conn.reader().read(buf) {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Ok(0) => {
+                if !buf.is_empty() {
+                    self.eof = true;
+                }
+                0
+            }
             outcome => outcome?,
         };
         Ok((plain, taken))
+    }
+
+    fn closed(&self) -> bool {
+        self.eof
     }
 }
 
@@ -695,6 +725,12 @@ impl<S: Stream> Read for RustlsProvider<S> {
                         }
                         return Err(recover(io_error).into());
                     }
+                }
+                Ok(0) => {
+                    if !buf.is_empty() {
+                        self.eof = true;
+                    }
+                    return Ok(0);
                 }
                 outcome => return outcome,
             }
@@ -765,6 +801,7 @@ enum ServerInner<S: Stream> {
 
 pub struct RustlsServerProvider<S: Stream> {
     inner: ServerInner<S>,
+    eof: bool,
 }
 
 impl<S: Stream> std::fmt::Debug for RustlsServerProvider<S> {
@@ -803,6 +840,7 @@ impl<S: Stream> RustlsServerProvider<S> {
                     stream: None,
                     failure: None,
                 },
+                eof: false,
             });
         }
         let conn = Box::new(
@@ -810,6 +848,7 @@ impl<S: Stream> RustlsServerProvider<S> {
         );
         Ok(Self {
             inner: ServerInner::Rustls { conn, io },
+            eof: false,
         })
     }
 
@@ -821,6 +860,7 @@ impl<S: Stream> RustlsServerProvider<S> {
         );
         Ok(Self {
             inner: ServerInner::Rustls { conn, io },
+            eof: false,
         })
     }
 
@@ -1270,6 +1310,12 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
             ServerInner::Rustls { conn, .. } => {
                 let plain = match conn.reader().read(buf) {
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+                    Ok(0) => {
+                        if !buf.is_empty() {
+                            self.eof = true;
+                        }
+                        0
+                    }
                     outcome => outcome?,
                 };
                 if plain > 0 {
@@ -1287,6 +1333,12 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
                 // A key update waits for the next seal rather than a transport write under this lock.
                 let plain = match conn.reader().read(buf) {
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+                    Ok(0) => {
+                        if !buf.is_empty() {
+                            self.eof = true;
+                        }
+                        0
+                    }
                     outcome => outcome?,
                 };
                 Ok((plain, taken))
@@ -1295,6 +1347,10 @@ impl<S: Stream> TlsProvider for RustlsServerProvider<S> {
                 Err(std::io::Error::other("ech session reads its own transport"))
             }
         }
+    }
+
+    fn closed(&self) -> bool {
+        self.eof
     }
 }
 
@@ -1321,7 +1377,13 @@ impl<S: Stream> Read for RustlsServerProvider<S> {
             ServerInner::Ech {
                 stream: Some(stream),
                 ..
-            } => stream.read(buf),
+            } => match stream.read(buf) {
+                Ok(0) => {
+                    self.eof = true;
+                    Ok(0)
+                }
+                outcome => outcome,
+            },
             ServerInner::Ech { .. } => Err(std::io::Error::other("ech handshake is not complete")),
         }
     }
@@ -3141,6 +3203,62 @@ mod tests {
                 "the write read the transport {after} times where it had read {before}"
             );
         });
+    }
+
+    /// A served session stops on the peer's close the same way a dialled one does: the
+    /// `close_notify` carries no plaintext, so the EOF has to be the session's own state.
+    #[test]
+    fn a_server_session_reports_the_peers_close_notify() {
+        use crate::tls::TlsProvider as _;
+
+        let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
+        let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
+        let identity = crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (done, waited) = std::sync::mpsc::channel();
+        let (ready, dialled) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+                .expect("timeout");
+            let mut server = RustlsServerProvider::accept(identity, stream).expect("accepts");
+            server.handshake().expect("handshakes");
+            ready.send(()).expect("signals the handshake");
+            let mut header = [0u8; 5];
+            server
+                .get_ref()
+                .read_exact(&mut header)
+                .expect("reads the alert head");
+            let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+            let mut wire = vec![0u8; 5 + len];
+            wire[..5].copy_from_slice(&header);
+            server
+                .get_ref()
+                .read_exact(&mut wire[5..])
+                .expect("reads the alert");
+            let mut plain = [0u8; 8];
+            let (read, taken) = server.open(&wire, &mut plain).expect("opens");
+            assert_eq!(read, 0, "`close_notify` carries no plaintext");
+            assert_eq!(taken, wire.len(), "the whole alert was consumed");
+            assert!(server.closed(), "the peer's close is reported");
+            done.send(()).expect("signals the dial");
+        });
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut client = crate::tls::connect(&client("tls.test", &[]), stream).expect("dials");
+        client.handshake().expect("handshakes");
+        dialled.recv().expect("the server handshook");
+        let crate::tls::ClientSession::Stock(provider) = &mut client else {
+            panic!("the test dials the stock session");
+        };
+        provider.conn.send_close_notify();
+        let mut wire = Vec::new();
+        provider.drain_into(&mut wire).expect("drains");
+        provider.io.write_all(&wire).expect("sends");
+        provider.io.flush().expect("flushes");
+        waited.recv().expect("the server read the close");
+        server.join().expect("joins");
     }
 
     /// The answer's half of the write rule: a server session's write pushes the records it

@@ -114,7 +114,7 @@ trojan udp-framing-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_fram
 trojan udp-carriers-holding-an-association 7 ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier
 
 # --- XTLS Vision ------------------------------------------------------------
-xtls-vision ops-retired-instructions 30208 scripts/count-ops.sh
+xtls-vision ops-retired-instructions 29568 scripts/count-ops.sh
 xtls-vision padding-command-bytes 5 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
 xtls-vision first-frame-uuid-bytes 16 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
 xtls-vision largest-framed-block-bytes 8171 ferrox-app-vision::tests::a_bulk_write_frames_every_block_inside_the_bound
@@ -130,6 +130,7 @@ xtls-vision command-bytes-validated-per-frame 1 ferrox-app-vision::tests::a_fram
 xtls-vision commands-the-validator-accepts 3 ferrox-core-vless::tests::the_command_validator_accepts_three_commands
 xtls-vision seal-open-staging-allocations 0 ferrox-bench-gate-2
 xtls-vision coalesce-segment-allocations 0 ferrox-core-tls::rustls_backend::tests::the_framer_path_coalesces_without_a_heap_buffer
+xtls-vision vision-read-waits-outside-the-lock 0 ferrox-app-proxy::tests::a_vision_read_waits_outside_the_lock
 
 # --- Mux.Cool ---------------------------------------------------------------
 mux-cool ops-retired-instructions UNBLESSED scripts/count-ops.sh
