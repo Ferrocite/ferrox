@@ -2108,7 +2108,7 @@ mod tests {
         const CELL_JOB_STEPS: Duration = Duration::from_secs(60);
         const SERVER_PASSES: u32 = 2;
         let workflow = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../.github/workflows/benchmark-matrix.yml");
+            .join("../../.github/workflows/benchmark-matrix-os.yml");
         let text = std::fs::read_to_string(&workflow)
             .unwrap_or_else(|e| panic!("reading {}: {e}", workflow.display()));
         let cells = text
@@ -2134,6 +2134,54 @@ mod tests {
              the harness, but the matrix declares only {declared} minutes: the cell would be cut \
              off mid-run and report nothing"
         );
+    }
+
+    /// #705: every cell used to need the whole multi-OS build matrix, so the first ubuntu cell waited for the macos and arm builds. Each OS now runs its own build -> cells -> collect chain in one reusable workflow.
+    #[test]
+    fn every_cells_leg_waits_only_on_its_own_build() {
+        let workflows =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
+        let job = |text: &str, name: &str, path: &std::path::Path| -> String {
+            text.split_once(&format!("\n  {name}:"))
+                .unwrap_or_else(|| panic!("{} has no `{name}:` job", path.display()))
+                .1
+                .to_owned()
+        };
+        let main = workflows.join("benchmark-matrix.yml");
+        let text = std::fs::read_to_string(&main)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", main.display()));
+        assert!(
+            !text.contains("\n  cells:"),
+            "{} still has a top-level `cells` job, so its `needs` can only mean the whole \
+             build matrix: every cell waits for the slowest OS",
+            main.display()
+        );
+        let call = job(&text, "run-os", &main);
+        assert!(
+            call.contains("uses: ./.github/workflows/benchmark-matrix-os.yml"),
+            "`run-os` does not call the per-OS workflow, so the split never happens"
+        );
+        assert!(
+            call.contains("os: ${{ fromJSON(needs.setup.outputs.oses) }}"),
+            "`run-os` must fan out over setup's oses, one leg per runner"
+        );
+        let per_os = workflows.join("benchmark-matrix-os.yml");
+        let text = std::fs::read_to_string(&per_os)
+            .unwrap_or_else(|e| panic!("reading {}: {e}", per_os.display()));
+        for (name, need) in [("cells", "build"), ("collect", "cells")] {
+            let body = job(&text, name, &per_os);
+            let needs = body
+                .lines()
+                .find_map(|line| line.trim().strip_prefix("needs:"))
+                .unwrap_or_else(|| panic!("`{name}` declares no needs"));
+            assert!(
+                needs
+                    .trim_matches(|c: char| c == '[' || c == ']' || c == ' ' || c == ',')
+                    .split(',')
+                    .any(|part| part.trim() == need),
+                "`{name}` does not need `{need}`: {needs}"
+            );
+        }
     }
 
     /// A reference that landed no run is no baseline, so the cell is `no-reference` and fails: zero reference runs is missing data, and missing data must never read as parity (#358). The old line called it `unmeasured by the runner` and passed.

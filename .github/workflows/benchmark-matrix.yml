@@ -20,6 +20,7 @@ on:
       - "docs/function/**/*.md"
       - "docs/benchmarks/matrix.md"
       - ".github/workflows/benchmark-matrix.yml"
+      - ".github/workflows/benchmark-matrix-os.yml"
   schedule:
     - cron: "41 3 * * *"
     - cron: "17 4 * * 0"
@@ -212,187 +213,24 @@ jobs:
           include-hidden-files: true
           if-no-files-found: error
 
-  build:
-    name: build the engines (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+  run-os:
+    name: build and measure (${{ matrix.os }})
     needs: [setup, fetch]
-    timeout-minutes: 60
+    if: needs.setup.outputs.matrix == 'true'
     strategy:
       fail-fast: false
       matrix:
         os: ${{ fromJSON(needs.setup.outputs.oses) }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-go@v5
-        with:
-          go-version: stable
-          cache-dependency-path: upstream/pins.toml
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: benchmark-matrix
-      - name: install the QUIC build tool
-        if: runner.os == 'Windows'
-        run: choco install nasm -y --no-progress || echo "nasm already installed"
-      - name: install protoc for xray-core-rust
-        shell: bash
-        run: |
-          case "$RUNNER_OS" in
-            Linux) sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler ;;
-            macOS) brew install protobuf ;;
-            Windows) choco install protoc -y --no-progress || echo "protoc already installed" ;;
-          esac
-      - uses: actions/download-artifact@v4
-        with:
-          name: upstream-trees
-          path: upstream
-      - uses: actions/cache@v4
-        with:
-          path: target/parity-engines
-          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh', 'scripts/patch-sing-box.py') }}
-      - name: build every engine without moving traffic
-        shell: bash
-        env:
-          FERROX_UPSTREAM_HANDOFF: "1"
-        run: >
-          ./scripts/run-benchmark-matrix.sh
-          --tier "${{ needs.setup.outputs.tier }}"
-          --out target/benchmark-matrix
-          --probe-only
-          ${{ needs.setup.outputs.flags }}
-      - uses: actions/upload-artifact@v4
-        with:
-          name: matrix-ferrox-${{ matrix.os }}
-          path: |
-            target/release/ferrox-bench*
-            target/release/ferrox-app*
-          retention-days: 1
-          if-no-files-found: error
-
-  cells:
-    name: measure ${{ matrix.cell }} (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    needs: [setup, build]
-    timeout-minutes: 90
-    strategy:
-      fail-fast: false
-      matrix:
-        os: ${{ fromJSON(needs.setup.outputs.oses) }}
-        cell: ${{ fromJSON(needs.setup.outputs.cells) }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      # No pip cache here: this job installs nothing, so setup-python's post
-      # step has no cache to save and fails on the empty folder.
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - uses: actions/download-artifact@v4
-        with:
-          name: matrix-ferrox-${{ matrix.os }}
-          path: target/release
-      - uses: actions/cache@v4
-        with:
-          path: target/parity-engines
-          key: matrix-engines-${{ matrix.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh', 'scripts/patch-sing-box.py') }}
-      - name: run one cell with handed-over binaries
-        shell: bash
-        env:
-          FERROX_UPSTREAM_HANDOFF: "1"
-        run: >
-          ./scripts/run-benchmark-matrix.sh
-          --tier "${{ needs.setup.outputs.tier }}"
-          --out target/benchmark-matrix
-          --only "${{ matrix.cell }}"
-          --no-build
-          ${{ needs.setup.outputs.flags }}
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: matrix-cell-${{ matrix.os }}-${{ matrix.cell }}
-          path: target/benchmark-matrix/
-          retention-days: 1
-          if-no-files-found: error
-
-  collect:
-    name: render the bundle (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
-    needs: [setup, cells]
-    # `!cancelled()` alone would run this after a skipped matrix: the plan decided
-    # no cell of it is in scope, and a render over an empty bundle is a red job.
-    if: ${{ !cancelled() && needs.setup.outputs.matrix == 'true' }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        os: ${{ fromJSON(needs.setup.outputs.oses) }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-          cache: pip
-          cache-dependency-path: scripts/requirements-benchmark.txt
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: matrix-cell-${{ matrix.os }}-*
-          path: cell-bundles/
-      - name: install the chart dependency
-        shell: bash
-        run: pip install -r scripts/requirements-benchmark.txt
-      - name: merge the cells and render once
-        shell: bash
-        run: |
-          rm -rf target/benchmark-matrix
-          mkdir -p target/benchmark-matrix/cells
-          first=""
-          for bundle in cell-bundles/matrix-cell-${{ matrix.os }}-*/; do
-            [[ -z "$first" ]] && first="$bundle"
-            cp -r "$bundle"/cells/* target/benchmark-matrix/cells/
-            cat "$bundle/commands.sh" >> target/benchmark-matrix/commands.sh
-          done
-          [[ -n "$first" ]] || { echo "::error::no cell bundle for ${{ matrix.os }}" >&2; exit 1; }
-          cp "$first/manifest.txt" target/benchmark-matrix/manifest.txt
-          runner="$(grep -m1 '^runner: ' target/benchmark-matrix/manifest.txt | cut -d' ' -f2)"
-          baseline=""
-          if [[ -d docs/benchmarks/results ]]; then
-            baseline="$(find docs/benchmarks/results -mindepth 2 -maxdepth 2 \
-              -type d -name "$runner" | sort | tail -1)"
-          fi
-          previous=()
-          [[ -n "$baseline" ]] && previous=(--previous "$baseline/matrix-results.json")
-          python3 scripts/render-benchmark-charts.py \
-            --input target/benchmark-matrix \
-            --charts target/benchmark-matrix/charts \
-            --results target/benchmark-matrix/matrix-results.json \
-            "${previous[@]}"
-          python3 scripts/validate-benchmark-matrix.py \
-            --cells target/benchmark-matrix/cells \
-            --results target/benchmark-matrix/matrix-results.json \
-            --charts target/benchmark-matrix/charts \
-            --bundle-readme target/benchmark-matrix/README.md
-          python3 scripts/check-matrix-legs.py --cells target/benchmark-matrix/cells --baseline scripts/leg-gaps.txt
-      - name: refuse a bundle that measured nothing
-        shell: bash
-        run: |
-          cells="$(find target/benchmark-matrix/cells -name cell.json | wc -l)"
-          echo "cells with a report: $cells"
-          if [[ "$cells" == "0" ]]; then
-            echo "::error::no matrix cell produced a report on ${{ matrix.os }}; \
-              the run above exited 0 without measuring anything"
-            exit 1
-          fi
-      - uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: benchmark-matrix-${{ needs.setup.outputs.tier }}-${{ matrix.os }}
-          path: target/benchmark-matrix/
-          retention-days: 30
-          if-no-files-found: error
+    uses: ./.github/workflows/benchmark-matrix-os.yml
+    with:
+      os: ${{ matrix.os }}
+      tier: ${{ needs.setup.outputs.tier }}
+      cells: ${{ needs.setup.outputs.cells }}
+      flags: ${{ needs.setup.outputs.flags }}
 
   refresh:
     name: publish the dated bundles
-    needs: collect
+    needs: run-os
     if: github.event_name == 'schedule' && github.event.schedule == '41 3 * * *'
     runs-on: ubuntu-latest
     timeout-minutes: 20
