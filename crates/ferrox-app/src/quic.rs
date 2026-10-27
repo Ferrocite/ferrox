@@ -682,7 +682,7 @@ fn send_batch(sock: &Datagram, batch: &mut [std::mem::MaybeUninit<libc::mmsghdr>
 }
 
 /// The datagrams one receive takes at a time, the mirror of the send side's `SEND_SLOTS`: a 16 KiB DATA frame is a dozen QUIC packets, and one `recvfrom` each paid a syscall and a timer set per packet. A lane with no batched call reads the same count one at a time.
-pub(crate) const RECV_SLOTS: usize = 8;
+pub(crate) const RECV_SLOTS: usize = 64;
 
 /// A batch of datagrams read off a lane's socket: the bytes of each, the peer it came from and the length of that peer's name. The batch owns its slots, so a read costs no allocation and a caller takes each datagram by its place in the batch.
 #[cfg(target_os = "linux")]
