@@ -36,6 +36,7 @@ mod httpupgrade;
 mod hysteria;
 mod hysteria_v1;
 mod json;
+mod masque;
 mod metrics;
 mod observatory;
 mod policy;

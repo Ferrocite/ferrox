@@ -177,6 +177,7 @@ pub(crate) fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
         "xray.proxy.shadowsocks.ServerConfig" => ("shadowsocks", ss_inbound_settings(value)?),
         "xray.proxy.socks.ServerConfig" => ("socks", socks_inbound_settings(value)?),
         "xray.proxy.wireguard.DeviceConfig" => ("wireguard", wireguard_settings(value)?),
+        "xray.proxy.masque.ServerConfig" => ("masque", masque_server_settings(value)?),
         _ => return Err(format!("inbound protocol `{name}` is not carried")),
     };
     Ok(ports
@@ -273,6 +274,10 @@ pub(crate) fn outbound(bytes: &[u8]) -> Result<Json, String> {
         "xray.proxy.wireguard.DeviceConfig" => vec![
             ("protocol", Json::Str("wireguard".to_owned())),
             ("settings", wireguard_settings(value)?),
+        ],
+        "xray.proxy.masque.ClientConfig" => vec![
+            ("protocol", Json::Str("masque".to_owned())),
+            ("settings", masque_client_settings(value)?),
         ],
         _ => return Err(format!("outbound protocol `{name}` is not carried")),
     };
@@ -394,6 +399,136 @@ fn wireguard_settings(bytes: &[u8]) -> Result<Json, String> {
         ));
     }
     Ok(object(pairs))
+}
+
+/// The MASQUE client's endpoint and the addresses it wants resolved on the far side.
+fn masque_client_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.masque.ClientConfig");
+    let mut server = None;
+    let mut remote_dns = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => server = Some(masque_endpoint(reader.bytes()?)?),
+            (2, 2) => remote_dns.push(account_text(&mut reader)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let (address, port, password) = server.ok_or("xray.proxy.masque.ClientConfig: no server")?;
+    let mut pairs = vec![(
+        "server",
+        object(vec![
+            ("address", Json::Str(address)),
+            ("port", Json::Num(f64::from(port))),
+        ]),
+    )];
+    if let Some(password) = password {
+        pairs.push(("password", Json::Str(password)));
+    }
+    if !remote_dns.is_empty() {
+        pairs.push((
+            "remoteDNS",
+            Json::Arr(remote_dns.into_iter().map(Json::Str).collect()),
+        ));
+    }
+    Ok(object(pairs))
+}
+
+fn masque_endpoint(bytes: &[u8]) -> Result<(String, u16, Option<String>), String> {
+    let mut reader = Reader::new(bytes, "xray.common.protocol.ServerEndpoint");
+    let mut address = None;
+    let mut port = None;
+    let mut password = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => address = Some(ip_or_domain(reader.bytes()?)?),
+            (2, 0) => {
+                let value = reader.varint()?;
+                port = Some(u16::try_from(value).map_err(|_| {
+                    format!("xray.proxy.masque.ClientConfig: port {value} is above 65535")
+                })?);
+            }
+            (3, 2) => password = masque_user_fields(reader.bytes()?)?.2,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok((
+        address.ok_or("xray.proxy.masque.ClientConfig: the server has no address")?,
+        port.ok_or("xray.proxy.masque.ClientConfig: the server has no port")?,
+        password,
+    ))
+}
+
+fn masque_password(bytes: &[u8]) -> Result<String, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.masque.Account");
+    let mut password = String::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => password = account_text(&mut reader)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(password)
+}
+
+/// The MASQUE server's accounts and the pools it assigns from.
+fn masque_server_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.masque.ServerConfig");
+    let mut users = Vec::new();
+    let mut address = Vec::new();
+    let mut mtu = 0u32;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => users.push(masque_user(reader.bytes()?)?),
+            (2, 2) => address.push(account_text(&mut reader)?),
+            (3, 0) => mtu = reader.varint()?.try_into().unwrap_or(u32::MAX),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = vec![
+        ("users", Json::Arr(users)),
+        (
+            "address",
+            Json::Arr(address.into_iter().map(Json::Str).collect()),
+        ),
+    ];
+    if mtu > 0 {
+        pairs.push(("mtu", Json::Num(f64::from(mtu))));
+    }
+    Ok(object(pairs))
+}
+
+fn masque_user_fields(bytes: &[u8]) -> Result<(u32, String, Option<String>), String> {
+    let mut reader = Reader::new(bytes, "xray.common.protocol.User");
+    let mut level = 0u32;
+    let mut email = String::new();
+    let mut password = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => level = reader.varint()?.try_into().unwrap_or(u32::MAX),
+            (2, 2) => email = account_text(&mut reader)?,
+            (3, 2) => {
+                let (name, value) = typed_message(reader.bytes()?)?;
+                if name != "xray.proxy.masque.Account" {
+                    return Err(format!("masque account `{name}` is not carried"));
+                }
+                password = Some(masque_password(value)?);
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok((level, email, password))
+}
+
+fn masque_user(bytes: &[u8]) -> Result<Json, String> {
+    let (level, email, password) = masque_user_fields(bytes)?;
+    Ok(object(vec![
+        ("email", Json::Str(email)),
+        ("level", Json::Num(f64::from(level))),
+        (
+            "password",
+            Json::Str(password.ok_or("xray.proxy.masque.ServerConfig: a user has no account")?),
+        ),
+    ]))
 }
 
 fn wireguard_peer(bytes: &[u8]) -> Result<Json, String> {
@@ -554,15 +689,15 @@ fn socket_settings(bytes: &[u8]) -> Result<(), String> {
 fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.transport.internet.StreamConfig");
     let mut network = String::new();
-    let mut tcp_settings: Option<Json> = None;
+    let mut transport_settings: Option<Json> = None;
     let mut security_type = String::new();
     let mut security: Option<(&'static str, Json)> = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (2, 2) => {
-                let settings = transport_settings(reader.bytes()?)?;
-                if let Some((json, name)) = settings {
-                    tcp_settings = Some(json);
+                let (json, name) = transport_config(reader.bytes()?)?;
+                transport_settings = json;
+                if !name.is_empty() {
                     network = name;
                 }
             }
@@ -587,12 +722,17 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
     } else {
         network
     };
-    if network != "tcp" {
+    if network != "tcp" && network != "masque" {
         return Err(format!("network `{network}` is not carried"));
     }
-    let mut pairs = vec![("network", Json::Str(network))];
-    if let Some(settings) = tcp_settings {
-        pairs.push(("tcpSettings", settings));
+    let mut pairs = vec![("network", Json::Str(network.clone()))];
+    if let Some(settings) = transport_settings {
+        let key = if network == "masque" {
+            "masqueSettings"
+        } else {
+            "tcpSettings"
+        };
+        pairs.push((key, settings));
     }
     if let Some((kind, settings)) = security {
         pairs.push(("security", Json::Str(kind.to_owned())));
@@ -630,32 +770,47 @@ fn security_settings_exists(name: &str) -> Result<(), String> {
 
 /// One transport's settings: the tree's raw tcp carrier reads none, so a named tcp config is
 /// the `tcpSettings` key the dialect answers empty and a camouflaged header or a proxy
-/// protocol verdict is a refusal by name.
-fn transport_settings(bytes: &[u8]) -> Result<Option<(Json, String)>, String> {
+/// protocol verdict is a refusal by name. A masque config carries the host, path and headers
+/// its request names.
+fn transport_config(bytes: &[u8]) -> Result<(Option<Json>, String), String> {
     let mut reader = Reader::new(bytes, "xray.transport.internet.TransportConfig");
     let mut name = "tcp".to_owned();
+    let mut settings = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (2, 2) => settings = Some(typed_message(reader.bytes()?)?),
+            (3, 2) => name = account_text(&mut reader)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    match settings {
+        None => Ok((None, name)),
+        Some((message, value)) if message == "xray.transport.internet.tcp.Config" => {
+            tcp_transport(value).map(|()| (None, name))
+        }
+        Some((message, value)) if message == "xray.transport.internet.masque.Config" => {
+            let name = if name.is_empty() || name == "tcp" {
+                "masque".to_owned()
+            } else {
+                name
+            };
+            masque_transport(value).map(|json| (Some(json), name))
+        }
+        Some((message, _)) => Err(format!("transport settings `{message}` is not carried")),
+    }
+}
+
+fn tcp_transport(bytes: &[u8]) -> Result<(), String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.tcp.Config");
     let mut header = false;
     let mut proxy_protocol = false;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (2, 2) => {
-                let (message, value) = typed_message(reader.bytes()?)?;
-                if message != "xray.transport.internet.tcp.Config" {
-                    return Err(format!("transport settings `{message}` is not carried"));
-                }
-                let mut config = Reader::new(value, "xray.transport.internet.tcp.Config");
-                while let Some((field, wire)) = config.field()? {
-                    match (field, wire) {
-                        (2, 2) => {
-                            header = true;
-                            config.bytes()?;
-                        }
-                        (3, 0) => proxy_protocol = config.varint()? != 0,
-                        _ => return Err(config.refuse(field, wire)),
-                    }
-                }
+                header = true;
+                reader.bytes()?;
             }
-            (3, 2) => name = account_text(&mut reader)?,
+            (3, 0) => proxy_protocol = reader.varint()? != 0,
             _ => return Err(reader.refuse(field, wire)),
         }
     }
@@ -669,10 +824,85 @@ fn transport_settings(bytes: &[u8]) -> Result<Option<(Json, String)>, String> {
             "xray.transport.internet.tcp.Config: accept_proxy_protocol is not carried".to_owned(),
         );
     }
-    if name != "tcp" {
-        return Err(format!("transport `{name}` is not carried"));
+    Ok(())
+}
+
+fn masque_transport(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.masque.Config");
+    let mut host = String::new();
+    let mut path = String::new();
+    let mut headers = Vec::new();
+    let mut warp = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => host = account_text(&mut reader)?,
+            (2, 2) => path = account_text(&mut reader)?,
+            (3, 2) => headers.push(masque_header(reader.bytes()?)?),
+            (4, 2) => warp = Some(masque_warp(reader.bytes()?)?),
+            (5, 2) => {
+                // One connection carries every flow here; the mux policy names how the reference splits it, not a wire byte.
+                reader.bytes()?;
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
     }
-    Ok(None)
+    let mut pairs = Vec::new();
+    if !host.is_empty() {
+        pairs.push(("host", Json::Str(host)));
+    }
+    if !path.is_empty() {
+        pairs.push(("path", Json::Str(path)));
+    }
+    if !headers.is_empty() {
+        pairs.push(("headers", Json::Arr(headers)));
+    }
+    if let Some(warp) = warp {
+        pairs.push(("warp", warp));
+    }
+    Ok(object(pairs))
+}
+
+fn masque_warp(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.masque.Warp");
+    let mut private_key = String::new();
+    let mut public_key = String::new();
+    let mut address = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => private_key = hex(reader.bytes()?),
+            (2, 2) => public_key = hex(reader.bytes()?),
+            (3, 2) => address.push(Json::Str(account_text(&mut reader)?)),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    if !private_key.is_empty() {
+        pairs.push(("privateKey", Json::Str(private_key)));
+    }
+    if !public_key.is_empty() {
+        pairs.push(("publicKey", Json::Str(public_key)));
+    }
+    if !address.is_empty() {
+        pairs.push(("address", Json::Arr(address)));
+    }
+    Ok(object(pairs))
+}
+
+fn masque_header(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.masque.Config.HeadersEntry");
+    let mut name = String::new();
+    let mut value = String::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => name = account_text(&mut reader)?,
+            (2, 2) => value = account_text(&mut reader)?,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(object(vec![
+        ("name", Json::Str(name)),
+        ("value", Json::Str(value)),
+    ]))
 }
 
 /// The security settings a stream names, keyed the dialect's spelling of the dial that reads it.
@@ -5323,6 +5553,127 @@ mod tests {
             bytes_field(5, b"0.0.0.0/0"),
             bytes_field(5, b"::/0"),
         ])
+    }
+
+    #[test]
+    fn a_masque_client_carries_its_endpoint_and_remote_dns() {
+        let address = message(&[bytes_field(2, b"example.com")]);
+        let user = message(&[
+            bytes_field(2, b"u@example.com"),
+            bytes_field(
+                3,
+                &typed(
+                    "xray.proxy.masque.Account",
+                    &message(&[bytes_field(1, b"p")]),
+                ),
+            ),
+        ]);
+        let endpoint = message(&[
+            bytes_field(1, &address),
+            varint_field(2, 443),
+            bytes_field(3, &user),
+        ]);
+        let settings = message(&[
+            bytes_field(1, &endpoint),
+            bytes_field(2, b"192.0.2.1"),
+            bytes_field(2, b"192.0.2.2"),
+        ]);
+        let raw = message(&[bytes_field(
+            3,
+            &typed("xray.proxy.masque.ClientConfig", &settings),
+        )]);
+        let json = outbound(&raw).expect("the pinned shape decodes");
+        assert_eq!(json.get("protocol").and_then(Json::as_str), Some("masque"));
+        let settings = json.get("settings").expect("settings");
+        let server = settings.get("server").expect("server");
+        assert_eq!(
+            server.get("address").and_then(Json::as_str),
+            Some("example.com")
+        );
+        assert_eq!(server.get("port").and_then(Json::as_port), Some(443));
+        assert_eq!(settings.get("password").and_then(Json::as_str), Some("p"));
+        assert_eq!(
+            settings.get("remoteDNS"),
+            Some(&Json::Arr(vec![
+                Json::Str("192.0.2.1".to_owned()),
+                Json::Str("192.0.2.2".to_owned()),
+            ]))
+        );
+    }
+
+    #[test]
+    fn a_masque_server_user_is_its_account_password() {
+        let account = typed(
+            "xray.proxy.masque.Account",
+            &message(&[bytes_field(1, b"p")]),
+        );
+        let user = message(&[bytes_field(2, b"u@example.com"), bytes_field(3, &account)]);
+        let settings = message(&[
+            bytes_field(1, &user),
+            bytes_field(2, b"10.14.0.1/24"),
+            bytes_field(2, b"fd14::1/64"),
+            varint_field(3, 1280),
+        ]);
+        let raw = message(&[
+            bytes_field(
+                2,
+                &typed(
+                    "xray.app.proxyman.ReceiverConfig",
+                    &receiver(443, Some(&[0, 0, 0, 0])),
+                ),
+            ),
+            bytes_field(3, &typed("xray.proxy.masque.ServerConfig", &settings)),
+        ]);
+        let json = inbound(&raw).expect("the pinned shape decodes");
+        assert_eq!(json.len(), 1);
+        assert_eq!(
+            json[0].get("protocol").and_then(Json::as_str),
+            Some("masque")
+        );
+        let settings = json[0].get("settings").expect("settings");
+        assert_eq!(settings.get("mtu").and_then(Json::as_u32), Some(1280));
+        let user = settings
+            .get("users")
+            .and_then(Json::as_arr)
+            .and_then(|users| users.first())
+            .expect("a user");
+        assert_eq!(
+            user.get("email").and_then(Json::as_str),
+            Some("u@example.com")
+        );
+        assert_eq!(user.get("password").and_then(Json::as_str), Some("p"));
+    }
+
+    #[test]
+    fn a_masque_transport_carries_its_host_path_and_headers() {
+        let header = message(&[bytes_field(1, b"Authorization"), bytes_field(2, b"Basic x")]);
+        let settings = message(&[
+            bytes_field(1, b"example.com"),
+            bytes_field(2, b"/.well-known/masque/ip/*/*/"),
+            bytes_field(3, &header),
+        ]);
+        let raw = message(&[
+            bytes_field(
+                2,
+                &typed("xray.transport.internet.masque.Config", &settings),
+            ),
+            bytes_field(3, b"masque"),
+        ]);
+        let (json, name) = transport_config(&raw).expect("the transport decodes");
+        assert_eq!(name, "masque");
+        let json = json.expect("masque settings");
+        assert_eq!(json.get("host").and_then(Json::as_str), Some("example.com"));
+        assert_eq!(
+            json.get("path").and_then(Json::as_str),
+            Some("/.well-known/masque/ip/*/*/")
+        );
+        assert_eq!(
+            json.get("headers"),
+            Some(&Json::Arr(vec![object(vec![
+                ("name", Json::Str("Authorization".to_owned())),
+                ("value", Json::Str("Basic x".to_owned())),
+            ])]))
+        );
     }
 
     #[test]
