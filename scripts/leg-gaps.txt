@@ -42,5 +42,3 @@ vless-xhttp-duplex-8|client|0.84|472
 vless-xhttp-duplex-8|rust|0.59|472
 vless-xhttp-duplex-8|server-threads|1.20|696
 vless-xhttp-up-1|server-threads|1.20|696
-vmess-raw-down-8|server-threads|1.46|696
-vmess-tls-ws-down-8|server-threads|1.31|696
