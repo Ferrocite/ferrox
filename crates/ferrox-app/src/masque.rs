@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -54,6 +54,7 @@ struct Inner {
     flows: Sender<ClientFlow>,
     to_tunnel: Sender<Vec<u8>>,
     routes: UdpRoutes,
+    alive: Arc<AtomicBool>,
 }
 
 impl MasqueOut {
@@ -95,7 +96,10 @@ impl MasqueOut {
             .inner
             .lock()
             .map_err(|_| "masque: the lane lock is poisoned".to_owned())?;
-        if let Some(inner) = slot.as_ref() {
+        if let Some(inner) = slot
+            .as_ref()
+            .filter(|inner| inner.alive.load(Ordering::Relaxed))
+        {
             return Ok(Arc::clone(inner));
         }
         let inner = Arc::new(open(&self.spec)?);
@@ -170,39 +174,32 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
         wg_stack::client((*stack_config).clone(), stack_tunnel, packets_rx, flow_rx);
     });
     let io_routes = Arc::clone(&routes);
-    let stream = lane.stream;
-    let mut conn = lane.conn.take().ok_or("the masque lane closed")?;
+    let alive = Arc::clone(&lane.alive);
     let mut initial = std::mem::take(&mut lane.packets);
     std::thread::spawn(move || {
         for packet in initial.drain(..) {
             deliver(&packets_tx, &io_routes, &packet);
         }
-        io(
-            &mut conn,
-            &sock,
-            local,
-            stream,
-            from_tunnel,
-            packets_tx,
-            io_routes,
-        );
+        io(lane, &sock, local, from_tunnel, packets_tx, io_routes);
     });
     Ok(Inner {
         config,
         flows,
         to_tunnel,
         routes,
+        alive,
     })
 }
 
 /// One lane that finished its handshake and its first address assignment: the
 /// connection and request stream the caller now owns, and what it may source.
 struct Lane {
-    conn: Option<quiche::Connection>,
+    conn: quiche::Connection,
     stream: u64,
     addresses: Vec<IpAddr>,
     mtu: usize,
     packets: Vec<Vec<u8>>,
+    alive: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone)]
@@ -391,11 +388,12 @@ fn attempt(
         return Err("masque: no address assigned".to_owned());
     }
     Ok(Lane {
-        conn: Some(conn),
+        conn,
         stream: stream.id,
         addresses,
         mtu: DEFAULT_MTU,
         packets: stream.packets,
+        alive: Arc::new(AtomicBool::new(true)),
     })
 }
 
@@ -555,6 +553,48 @@ fn address_of(grant: &Assigned) -> Option<IpAddr> {
     }
 }
 
+/// The first address a fresh `ADDRESS_ASSIGN` no longer grants: the capsule
+/// replaces the set, so an omitted or refused entry is a withdrawal.
+fn withdrawn(body: &[u8], current: &[IpAddr]) -> Option<IpAddr> {
+    let mut grants = Vec::new();
+    connectip::address_assign(body, &mut grants)?;
+    current.iter().copied().find(|address| {
+        !grants
+            .iter()
+            .any(|grant| !grant.refused() && grant_contains(grant, *address))
+    })
+}
+
+fn grant_contains(grant: &Assigned, address: IpAddr) -> bool {
+    match (grant.version, address) {
+        (4, IpAddr::V4(address)) => {
+            let prefix = grant.prefix.min(32);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u32::MAX << (32 - prefix)
+            };
+            let granted = u32::from_be_bytes([
+                grant.address[0],
+                grant.address[1],
+                grant.address[2],
+                grant.address[3],
+            ]);
+            u32::from(address) & mask == granted & mask
+        }
+        (6, IpAddr::V6(address)) => {
+            let prefix = grant.prefix.min(128);
+            let mask = if prefix == 0 {
+                0
+            } else {
+                u128::MAX << (128 - prefix)
+            };
+            u128::from(address) & mask == u128::from_be_bytes(grant.address) & mask
+        }
+        _ => false,
+    }
+}
+
 /// A capsule this lane owns: the parser borrows the stream buffer, and a
 /// capsule can arrive while the caller is elsewhere.
 enum Owned {
@@ -612,6 +652,19 @@ impl Stream {
         if conn.is_closed() {
             return Err("masque: the edge closed the connection".to_owned());
         }
+        self.read_stream(conn)?;
+        let mut room = vec![0u8; 65535];
+        while let Ok(n) = conn.dgram_recv(&mut room) {
+            if let Some((stream, packet)) = connectip::datagram_split(&room[..n]) {
+                if stream == self.id {
+                    self.packets.push(packet.to_vec());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn read_stream(&mut self, conn: &mut quiche::Connection) -> Result<(), String> {
         let mut room = [0u8; 4096];
         loop {
             match conn.stream_recv(self.id, &mut room) {
@@ -630,14 +683,6 @@ impl Stream {
             }
         }
         self.parse();
-        let mut room = vec![0u8; 65535];
-        while let Ok(n) = conn.dgram_recv(&mut room) {
-            if let Some((stream, packet)) = connectip::datagram_split(&room[..n]) {
-                if stream == self.id {
-                    self.packets.push(packet.to_vec());
-                }
-            }
-        }
         Ok(())
     }
 
@@ -686,21 +731,47 @@ impl Stream {
 /// packet to the stack, a UDP packet to the loopback lane waiting on its port.
 #[allow(clippy::needless_pass_by_value)]
 fn io(
-    conn: &mut quiche::Connection,
+    lane: Lane,
     sock: &Datagram,
     local: SocketAddr,
-    stream: u64,
     from_tunnel: Receiver<Vec<u8>>,
     to_stack: Sender<Packet>,
     routes: UdpRoutes,
 ) {
+    let Lane {
+        mut conn,
+        stream,
+        addresses,
+        alive,
+        ..
+    } = lane;
+    let mut control = Stream {
+        id: stream,
+        ..Stream::default()
+    };
     let mut room = vec![0u8; 65535];
     loop {
         while let Ok(packet) = from_tunnel.try_recv() {
-            send_datagram(conn, stream, &packet);
+            send_datagram(&mut conn, stream, &packet);
         }
-        if !quic::pump_once(conn, sock, local, TICK) || conn.is_closed() {
-            return;
+        if !quic::pump_once(&mut conn, sock, local, TICK) || conn.is_closed() {
+            break;
+        }
+        if let Err(reason) = control.read_stream(&mut conn) {
+            eprintln!("masque: {reason}");
+            break;
+        }
+        let mut withdrew = false;
+        for capsule in control.take_capsules() {
+            if let Owned::AddressAssign(body) = capsule {
+                if let Some(address) = withdrawn(&body, &addresses) {
+                    eprintln!("masque: the proxy withdrew {address}");
+                    withdrew = true;
+                }
+            }
+        }
+        if withdrew || control.done {
+            break;
         }
         while let Ok(n) = conn.dgram_recv(&mut room) {
             let Some((id, packet)) = connectip::datagram_split(&room[..n]) else {
@@ -711,8 +782,9 @@ fn io(
             }
             deliver(&to_stack, &routes, packet);
         }
-        quic::flush_egress(conn, sock);
+        quic::flush_egress(&mut conn, sock);
     }
+    alive.store(false, Ordering::Relaxed);
 }
 
 fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u8]) {
@@ -1726,6 +1798,52 @@ mod tests {
             address_of(&grant),
             Some("2001:db8::1".parse().expect("an address"))
         );
+    }
+
+    #[test]
+    fn an_address_capsule_withdraws_what_it_no_longer_grants() {
+        fn grant(version: u8, address: &str, prefix: u8) -> Assigned {
+            let address = match address.parse::<IpAddr>().expect("an address") {
+                IpAddr::V4(ip) => {
+                    let mut bytes = [0u8; 16];
+                    bytes[..4].copy_from_slice(&ip.octets());
+                    bytes
+                }
+                IpAddr::V6(ip) => ip.octets(),
+            };
+            Assigned {
+                request_id: 1,
+                version,
+                address,
+                prefix,
+            }
+        }
+        let v4: IpAddr = "10.13.0.2".parse().expect("an address");
+        let v6: IpAddr = "fd13::2".parse().expect("an address");
+        let current = vec![v4, v6];
+        let withdrawn_from = |entries: &[Assigned]| {
+            let mut capsule = Vec::new();
+            connectip::address_assign_encode(entries, &mut capsule);
+            let (_, kind) = connectip::capsule_split(&capsule).expect("a whole capsule");
+            let connectip::Capsule::AddressAssign(body) = kind else {
+                panic!("an assignment capsule")
+            };
+            withdrawn(body, &current)
+        };
+        assert_eq!(
+            withdrawn_from(&[grant(4, "10.13.0.2", 32), grant(6, "fd13::2", 128)]),
+            None
+        );
+        assert_eq!(withdrawn_from(&[grant(6, "fd13::2", 128)]), Some(v4));
+        assert_eq!(
+            withdrawn_from(&[grant(4, "10.14.0.0", 24), grant(6, "fd13::2", 128)]),
+            Some(v4)
+        );
+        assert_eq!(
+            withdrawn_from(&[grant(4, "0.0.0.0", 32), grant(6, "fd13::2", 128)]),
+            Some(v4)
+        );
+        assert_eq!(withdrawn_from(&[]), Some(v4));
     }
 
     fn pem_lines(pem: &str) -> String {

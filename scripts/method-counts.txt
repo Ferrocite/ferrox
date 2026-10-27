@@ -750,3 +750,4 @@ carrier-masque pool-contained-addresses-witnessed 2 ferrox-app-masque::tests::a_
 carrier-masque pool-outside-addresses-witnessed 1 ferrox-app-masque::tests::a_pool_holds_every_address_its_prefix_covers
 carrier-masque subnet-grants-witnessed 2 ferrox-app-masque::tests::a_subnet_grant_names_its_first_host
 carrier-masque datagram-prefix-round-trips 1 ferrox-app-masque::tests::the_datagram_prefix_round_trips
+carrier-masque assignment-outcomes-witnessed 5 ferrox-app-masque::tests::an_address_capsule_withdraws_what_it_no_longer_grants

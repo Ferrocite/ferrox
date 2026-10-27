@@ -47,11 +47,12 @@ graph TD
 | pool-outside-addresses-witnessed | 1 | ferrox-app-masque::tests::a_pool_holds_every_address_its_prefix_covers |
 | subnet-grants-witnessed | 2 | ferrox-app-masque::tests::a_subnet_grant_names_its_first_host |
 | datagram-prefix-round-trips | 1 | ferrox-app-masque::tests::the_datagram_prefix_round_trips |
+| assignment-outcomes-witnessed | 5 | ferrox-app-masque::tests::an_address_capsule_withdraws_what_it_no_longer_grants |
 <!-- counts:end -->
 
 ## Time
 
-No duration is quoted here. The matrix's `vless-masque` cell and the `TestMasque` / `TestMasqueServer` conformance run are CI-only (`parity.yml`, `conformance.yml`); a local number would measure this machine's tunnel, not the code, so the page carries `UNBLESSED` for the retired-instruction count until the `ops.yml` artefact is read and the gate moves only with that measurement. What the counts above witness is shape, not speed: one TCP echo per family through the full tunnel, one UDP datagram, the 401 on a wrong password, and the pool's containment rule.
+No duration is quoted here. The matrix's `vless-masque` cell and the `TestMasque` / `TestMasqueServer` conformance run are CI-only (`parity.yml`, `conformance.yml`); a local number would measure this machine's tunnel, not the code, so the page carries `UNBLESSED` for the retired-instruction count until the `ops.yml` artefact is read and the gate moves only with that measurement. What the counts above witness is shape, not speed: one TCP echo per family through the full tunnel, one UDP datagram, the 401 on a wrong password, and the pool's containment rule, and five post-establish assignment outcomes.
 
 ## What we removed
 
@@ -59,7 +60,7 @@ No duration is quoted here. The matrix's `vless-masque` cell and the `TestMasque
 - **A copy of the flow source.** The client's stack resolves the source from the local CIDR once per flow and the datagram prefix borrows the packet it was handed; no byte of the IP packet is copied to add the prefix.
 - **The reference's per-request address manager.** The pool is one masked prefix per family, assigned and released under the same lock, with no goroutines or retry timers; a request whose family is exhausted is answered 503 rather than queued.
 - **The h2 leg and the client-to-client test.** Row 48 is h3, so the `TestMasqueServerClientToClient` case that dials h2 is left to row 49; the h3 client and server it does exercise are gated here.
-- **What was not removed, named.** The IP packet still crosses one `Vec` from the tunnel receiver into quiche's datagram queue, the reply takes one more into the stack, and each capsule body is staged in a control buffer before its DATA frame; ICMP is dropped rather than forwarded, and the dialer ignores post-establish address updates because the reference closes the tunnel on a withdrawal.
+- **What was not removed, named.** The IP packet still crosses one `Vec` from the tunnel receiver into quiche's datagram queue, the reply takes one more into the stack, and each capsule body is staged in a control buffer before its DATA frame; ICMP is dropped rather than forwarded. A post-establish `ADDRESS_ASSIGN` that omits or refuses an address closes the lane, as the reference closes its tunnel; the next flow opens a new lane, and a newly granted family is only used then.
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/masque.rs
