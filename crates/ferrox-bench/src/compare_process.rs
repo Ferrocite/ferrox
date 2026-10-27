@@ -2030,8 +2030,8 @@ mod tests {
         assert!(skipped.iter().all(|(_, reason)| reason.contains("kcp")));
         let (names, skipped) =
             participant_names(&engines, &scenario_workload("vless-hysteria-down-8"));
-        assert_eq!(names, vec!["xray-rust", "xray-core"]);
-        assert_eq!(skipped.len(), 3);
+        assert_eq!(names, vec!["xray-core"]);
+        assert_eq!(skipped.len(), 4);
         assert!(skipped
             .iter()
             .all(|(_, reason)| reason.contains("hysteria")));
