@@ -195,16 +195,10 @@ fn escaped(text: &str) -> std::io::Result<()> {
 pub fn api_domain(url: &str) -> Option<(&str, u16)> {
     let url = url.trim().trim_end_matches('/');
     let host = url.strip_prefix("https://")?;
-    if host.is_empty() || host.contains('/') || host.bytes().any(|byte| byte <= b' ') {
-        return None;
-    }
     let (host, port) = match host.rsplit_once(':') {
         Some((host, digits)) => (host, parse_port(digits)?),
         None => (host, 443),
     };
-    if host.is_empty() {
-        return None;
-    }
     labels(host).then_some((host, port))
 }
 
@@ -221,29 +215,36 @@ fn parse_port(digits: &str) -> Option<u16> {
     (1..65_536).contains(&value).then_some(value as u16)
 }
 
-/// `label.` once or more, then a final label: every label non-empty, alphanumeric-bounded, and filled by alphanumerics and hyphens.
+/// `label.` once or more, then a final label: every label non-empty, alphanumeric-bounded, and filled by alphanumerics and hyphens. The dot and the byte it follows are one walk, not a split and a second scan per label.
 #[must_use]
 fn labels(host: &str) -> bool {
-    let host = host.as_bytes();
-    let mut parts = host.split(|byte| *byte == b'.').peekable();
-    let mut dotted = false;
-    while let Some(label) = parts.next() {
-        if label.is_empty()
-            || !label[0].is_ascii_alphanumeric()
-            || !label[label.len() - 1].is_ascii_alphanumeric()
-            || label
-                .iter()
-                .any(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-')
-        {
+    let mut labels = 0usize;
+    let mut at_start = true;
+    let mut last = 0u8;
+    for &byte in host.as_bytes() {
+        if byte == b'.' {
+            if at_start || !last.is_ascii_alphanumeric() {
+                return false;
+            }
+            labels += 1;
+            at_start = true;
+            last = 0;
+            continue;
+        }
+        if !byte.is_ascii_alphanumeric() && byte != b'-' {
             return false;
         }
-        if parts.peek().is_some() {
-            dotted = true;
-        } else if !dotted {
+        if at_start && !byte.is_ascii_alphanumeric() {
             return false;
         }
+        at_start = false;
+        last = byte;
     }
-    true
+    if at_start || !last.is_ascii_alphanumeric() {
+        return false;
+    }
+    labels += 1;
+    labels >= 2
 }
 
 #[cfg(test)]
@@ -452,6 +453,55 @@ mod tests {
             rotated, 0,
             "the same rotation, a plane that answered nothing"
         );
+    }
+
+    /// The split-and-scan walk exactly as it stood, kept as the oracle the one-pass form must answer with the same verdict on every host.
+    fn labels_staged(host: &str) -> bool {
+        let host = host.as_bytes();
+        let mut parts = host.split(|byte| *byte == b'.').peekable();
+        let mut dotted = false;
+        while let Some(label) = parts.next() {
+            if label.is_empty()
+                || !label[0].is_ascii_alphanumeric()
+                || !label[label.len() - 1].is_ascii_alphanumeric()
+                || label
+                    .iter()
+                    .any(|byte| !byte.is_ascii_alphanumeric() && *byte != b'-')
+            {
+                return false;
+            }
+            if parts.peek().is_some() {
+                dotted = true;
+            } else if !dotted {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Every curated shape, then 20 000 seeded byte strings: the one-pass walk and the split oracle must agree on the verdict, not just on the shipped origins.
+    #[test]
+    fn the_one_pass_label_walk_is_the_split_walk_at_every_host() {
+        for host in [
+            "", ".", "a", "a.", ".a", "a.b", "a..b", "a.b.", "a-b.c", "-a.b", "a-.b", "a_b.c",
+            "a/b.c", "a b.c", "a:b.c", "a.b:443", "A.B", "a.1", "1.2", "é.b", "a.b-c", "a-.b",
+            "a.-b", "a.b.", "a..", "..a", "a.-", "a.b..c",
+        ] {
+            assert_eq!(labels(host), labels_staged(host), "{host:?}");
+        }
+        let alphabet = b"abzAZ09-._:/ \t\n\r\x7f\x80";
+        let mut word = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..20_000 {
+            let len = (word as usize >> 7) % 33;
+            let mut host = String::with_capacity(len);
+            for _ in 0..len {
+                word ^= word << 13;
+                word ^= word >> 7;
+                word ^= word << 17;
+                host.push(alphabet[(word as usize >> 11) % alphabet.len()] as char);
+            }
+            assert_eq!(labels(&host), labels_staged(&host), "{host:?}");
+        }
     }
 
     /// The origin walk, and nothing else: the seven domains this crate ships, walked 64 times over with the answer folded after each, so the frame is the walk and no socket, buffer or fixture rides in it. Read as the difference between two runs of this row, never as the cost of the method alone.
