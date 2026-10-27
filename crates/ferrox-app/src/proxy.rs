@@ -7469,6 +7469,10 @@ fn dial_vless(
     let start = ladder_start(&vless.carrier);
     let (rungs, count) = Rung::climb_from(start);
     for rung in &rungs[..count] {
+        // The raw rung writes the header in clear; a sealed row must not fall back to it.
+        if *rung == Rung::Raw && vless.encryption.is_some() {
+            continue;
+        }
         let attempt = if *rung == Rung::Raw {
             RungAttempt {
                 rung: *rung,
@@ -28553,6 +28557,95 @@ mod tests {
             "oracle.example",
             "/camouflage",
         );
+    }
+
+    /// A failed encryption handshake on an HTTP-header carrier must not climb to the raw rung: that rung would put the user id and destination on the wire in clear.
+    #[test]
+    fn a_failed_encrypted_httpheader_handshake_never_writes_the_plain_header() {
+        let (client_string, _server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let id = [0x7au8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr = listener.local_addr().expect("addr");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let seen = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_seen = Arc::clone(&seen);
+        let server_stop = Arc::clone(&stop);
+        let server = thread::spawn(move || {
+            while !server_stop.load(Ordering::SeqCst) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: keep-alive\r\n\r\n",
+                        );
+                        stream
+                            .set_read_timeout(Some(Duration::from_millis(100)))
+                            .expect("timeout");
+                        let mut got = Vec::new();
+                        let mut buf = [0u8; 256];
+                        while got.len() < buf.len() {
+                            match stream.read(&mut buf) {
+                                Ok(0) | Err(_) => break,
+                                Ok(n) => got.extend_from_slice(&buf[..n]),
+                            }
+                        }
+                        server_seen.lock().expect("seen").push(got);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: server_addr.port(),
+            id,
+            carrier: Carrier::HttpHeader {
+                path: "/p".to_owned(),
+            },
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: Some(Arc::clone(&client)),
+        };
+        let target: SocketAddr = "192.0.2.1:80".parse().expect("addr");
+        let relaying = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+                &Ladder::new(),
+            );
+        });
+        let mut peer = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        peer.write_all(b"ping").expect("writes");
+        relaying.join().expect("joins");
+        stop.store(true, Ordering::SeqCst);
+        server.join().expect("joins");
+        let seen = seen.lock().expect("seen");
+        for payload in seen.iter() {
+            assert!(
+                !payload.windows(id.len()).any(|window| window == id),
+                "the user id reached the edge in clear"
+            );
+        }
     }
 
     const CARRIER_CERT: &[u8] = &[
