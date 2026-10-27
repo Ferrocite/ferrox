@@ -1085,6 +1085,95 @@ fn send_credit_wait(conn: &mut quiche::Connection, sock: &Datagram, deadline: In
     pump_once(conn, sock, local, left)
 }
 
+/// A send on a lane whose pump owns the socket: the caller never reads it, so a blocked send waits for the pump's ACK instead of stealing its datagram.
+fn stream_send_all_parked(
+    shared: &Mutex<quiche::Connection>,
+    sock: &Datagram,
+    stream: u64,
+    mut buf: &[u8],
+    fin: bool,
+    deadline: Instant,
+) -> bool {
+    while !buf.is_empty() || fin {
+        let outcome = {
+            let Ok(mut conn) = shared.lock() else {
+                return false;
+            };
+            if conn.is_closed() {
+                return false;
+            }
+            match conn.stream_send(stream, buf, fin && buf.is_empty()) {
+                Ok(written) => {
+                    flush_egress(&mut conn, sock);
+                    Some(written)
+                }
+                Err(quiche::Error::Done) => None,
+                Err(_) => return false,
+            }
+        };
+        match outcome {
+            Some(written) => {
+                buf = &buf[written..];
+                if buf.is_empty() {
+                    return true;
+                }
+                if written > 0 {
+                    continue;
+                }
+            }
+            None if buf.is_empty() && !fin => return true,
+            None => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(STREAM_POLL);
+    }
+    true
+}
+
+/// The receive half of `stream_send_all_parked`: the pump feeds the connection, so the waiter polls it without reading the socket.
+fn stream_recv_exact_parked(
+    shared: &Mutex<quiche::Connection>,
+    stream: u64,
+    want: usize,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(want);
+    let mut chunk = [0u8; 8192];
+    while out.len() < want {
+        let end = (want - out.len()).min(chunk.len());
+        let found = {
+            let Ok(mut conn) = shared.lock() else {
+                return None;
+            };
+            if conn.is_closed() {
+                return None;
+            }
+            match conn.stream_recv(stream, &mut chunk[..end]) {
+                Ok((0, _)) | Err(quiche::Error::Done) => None,
+                Ok(found) => Some(found),
+                Err(_) => return None,
+            }
+        };
+        match found {
+            Some((n, fin)) => {
+                out.extend_from_slice(&chunk[..n]);
+                if fin {
+                    break;
+                }
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                std::thread::sleep(STREAM_POLL);
+            }
+        }
+    }
+    (out.len() == want).then_some(out)
+}
+
 pub(crate) fn stream_recv_exact(
     conn: &mut quiche::Connection,
     sock: &Datagram,
@@ -2292,12 +2381,14 @@ fn pump(
     loop {
         // The lock covers quiche calls only: a stalled peer must not stall the sessions sharing the connection.
         let timeout = {
-            let Ok(conn) = shared.lock() else {
+            let Ok(mut conn) = shared.lock() else {
                 return;
             };
             if conn.is_closed() {
                 return;
             }
+            // The previous pass read streams after its flush, so the window updates and ACKs that reading produced are still queued: send them before waiting, or the peer stalls on a closed window.
+            flush_egress(&mut conn, sock);
             conn.timeout()
                 .map_or(PUMP_POLL, |left| left.min(PUMP_POLL))
                 .max(Duration::from_millis(1))
@@ -2621,21 +2712,10 @@ pub(crate) fn dial_pooled(
         leave_session(&pooled.table, id);
         return;
     };
-    let Ok(local) = pooled.sock.local_addr() else {
-        leave_session(&pooled.table, id);
-        return;
-    };
     let header = crate::proxy::vless_header(&dial.id, 1, target);
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    let opened = {
-        let Ok(mut conn) = pooled.conn.lock() else {
-            leave_session(&pooled.table, id);
-            return;
-        };
-        stream_send_all(&mut conn, &flush_sock, id, &header, false, deadline)
-            && stream_recv_exact(&mut conn, &flush_sock, local, id, 2, deadline).as_deref()
-                == Some(&[0, 0])
-    };
+    let opened = stream_send_all_parked(&pooled.conn, &flush_sock, id, &header, false, deadline)
+        && stream_recv_exact_parked(&pooled.conn, id, 2, deadline).as_deref() == Some(&[0, 0]);
     #[cfg(test)]
     qstage(format!("{} t={} header {id} {opened}", dial.port, qms()));
     if !opened {
@@ -2824,6 +2904,7 @@ impl Read for QuicStream {
                         }
                     };
                     if n > 0 {
+                        flush_egress(&mut conn, &self.sock);
                         return Ok(n);
                     }
                     if fin {
