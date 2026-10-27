@@ -6726,7 +6726,7 @@ fn unix_millis() -> u64 {
 /// writes. A socket's two directions never touch each other, so its side is two handles
 /// and no lock stands between them — a read parked in the kernel never makes the write
 /// wait for it. A session's read and its write are one object, so its side is one handle
-/// behind one lock, and the lock is held for the length of the wait.
+/// behind one lock; a shared half that knows its transport polls it outside that lock.
 #[derive(Debug)]
 enum Half<T> {
     /// Two handles of one socket, each behind its own lock: the two directions of a
@@ -6943,7 +6943,13 @@ impl<T: Write + HalfShut> Half<T> {
 impl<T: Read> Half<T> {
     fn read_once(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         census!("tunnel-leg-read", crate::census::NO_FD, None);
-        let result = match self {
+        let result = self.read_locked(buf);
+        self.hand_off();
+        result
+    }
+
+    fn read_locked(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
             Self::Split { read, .. } => match read.lock() {
                 Ok(mut guard) => guard.read(buf),
                 Err(_) => Err(std::io::Error::other("relay half poisoned")),
@@ -6952,27 +6958,25 @@ impl<T: Read> Half<T> {
                 inner,
                 wanted,
                 grain,
-            } => match inner.lock() {
-                Ok(mut guard) => {
-                    if let Some(grain) = grain {
-                        grain.before_read(&guard, wanted.load(Ordering::Relaxed));
-                    }
-                    let result = guard.read(buf);
-                    if let Some(grain) = grain {
-                        match &result {
-                            Ok(0) => {}
-                            Ok(_) => grain.moved(),
-                            Err(error) if is_timeout(error) => grain.empty(),
-                            Err(_) => {}
-                        }
-                    }
-                    result
+            } => {
+                let Ok(mut guard) = inner.lock() else {
+                    return Err(std::io::Error::other("relay half poisoned"));
+                };
+                if let Some(grain) = grain {
+                    grain.before_read(&guard, wanted.load(Ordering::Relaxed));
                 }
-                Err(_) => Err(std::io::Error::other("relay half poisoned")),
-            },
-        };
-        self.hand_off();
-        result
+                let result = guard.read(buf);
+                if let Some(grain) = grain {
+                    match &result {
+                        Ok(0) => {}
+                        Ok(_) => grain.moved(),
+                        Err(error) if is_timeout(error) => grain.empty(),
+                        Err(_) => {}
+                    }
+                }
+                result
+            }
+        }
     }
 }
 
@@ -11515,6 +11519,26 @@ fn seal_out<S: CipherOpen>(
     Ok(wrote)
 }
 
+fn seal_slices_out<S: CipherOpen>(
+    session: &Arc<Mutex<S>>,
+    out: &Arc<Mutex<Sealed>>,
+    parts: &[&[u8]],
+) -> std::io::Result<()> {
+    let mut out = out
+        .lock()
+        .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+    {
+        let mut session = session
+            .lock()
+            .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+        if let Err(error) = session.seal_slices_into(parts, &mut out.bytes) {
+            out.bytes.clear();
+            return Err(error);
+        }
+    }
+    out.send()
+}
+
 // A reader that drives the transport parks outside the session lock; one that cannot stays behind it.
 struct TlsHalf<S> {
     session: Arc<Mutex<S>>,
@@ -11671,6 +11695,16 @@ impl ferrox_core::tls::RecordAlignment for KcpIo {}
 trait CipherOpen {
     fn open(&mut self, ciphertext: &[u8], buf: &mut [u8]) -> std::io::Result<(usize, usize)>;
     fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize>;
+    fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
+        for part in parts {
+            self.seal_into(part, out)?;
+        }
+        Ok(())
+    }
+
+    fn closed(&self) -> bool {
+        false
+    }
 }
 
 impl<S: ferrox_core::tls::TlsProvider> CipherOpen for S {
@@ -11680,6 +11714,14 @@ impl<S: ferrox_core::tls::TlsProvider> CipherOpen for S {
 
     fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
         ferrox_core::tls::TlsProvider::seal_into(self, plaintext, out)
+    }
+
+    fn seal_slices_into(&mut self, parts: &[&[u8]], out: &mut Vec<u8>) -> std::io::Result<()> {
+        ferrox_core::tls::TlsProvider::seal_slices_into(self, parts, out)
+    }
+
+    fn closed(&self) -> bool {
+        ferrox_core::tls::TlsProvider::closed(self)
     }
 }
 
@@ -11691,6 +11733,14 @@ impl CipherOpen for Connection {
     fn seal_into(&mut self, _plaintext: &[u8], _out: &mut Vec<u8>) -> std::io::Result<usize> {
         Err(std::io::Error::other("this transport has no record layer"))
     }
+
+    fn seal_slices_into(&mut self, _parts: &[&[u8]], _out: &mut Vec<u8>) -> std::io::Result<()> {
+        Err(std::io::Error::other("this transport has no record layer"))
+    }
+
+    fn closed(&self) -> bool {
+        false
+    }
 }
 
 impl CipherOpen for KcpIo {
@@ -11700,6 +11750,14 @@ impl CipherOpen for KcpIo {
 
     fn seal_into(&mut self, _plaintext: &[u8], _out: &mut Vec<u8>) -> std::io::Result<usize> {
         Err(std::io::Error::other("this transport has no record layer"))
+    }
+
+    fn seal_slices_into(&mut self, _parts: &[&[u8]], _out: &mut Vec<u8>) -> std::io::Result<()> {
+        Err(std::io::Error::other("this transport has no record layer"))
+    }
+
+    fn closed(&self) -> bool {
+        false
     }
 }
 
@@ -11727,6 +11785,68 @@ where
         DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher), Arc::clone(&out)),
         DrivenHalf::new(session, cipher, out),
     ))
+}
+
+/// The ciphertext side a Vision link reads: a plain outer TLS stops at the byte after the
+/// record it decrypted, while a REALITY link that will hand the raw socket to the inner TLS
+/// must stop at the outer record boundary or the unwrap loses bytes the record layer read.
+enum CipherReader<R> {
+    Plain(R),
+    Record(ferrox_core::tls::reality::RecordLimiter<R>),
+}
+
+impl<R: Read> Read for CipherReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(io) => io.read(buf),
+            Self::Record(io) => io.read(buf),
+        }
+    }
+}
+
+type DrivenLink<S> = Half<crate::vision::Link<DrivenHalf<S, CipherReader<Connection>>>>;
+
+/// A Vision link over a driven session: the reader takes ciphertext off the transport with no
+/// session lock held, the writer seals under it, and the link's framing state is the only state
+/// the two directions share.
+fn driven_link<S>(
+    session: S,
+    raw: Option<&Connection>,
+    uuid: &[u8; 16],
+    grain: Duration,
+) -> Result<DrivenLink<S>, S>
+where
+    S: Drivable + CipherOpen + ferrox_core::tls::RecordAlignment + Send + 'static,
+{
+    let Some(cipher) = session.transport() else {
+        return Err(session);
+    };
+    if cipher.set_read_timeout(Some(grain)).is_err() {
+        return Err(session);
+    }
+    let Ok(out) = cipher.try_clone() else {
+        return Err(session);
+    };
+    let (raw_read, raw_write) = match raw {
+        Some(raw) => match (raw.try_clone(), raw.try_clone()) {
+            (Ok(read), Ok(write)) => (Some(read), Some(write)),
+            _ => return Err(session),
+        },
+        None => (None, None),
+    };
+    let mut session = session;
+    session.disarm_record_alignment();
+    let session = Arc::new(Mutex::new(session));
+    let cipher = match raw {
+        Some(_) => CipherReader::Record(ferrox_core::tls::reality::RecordLimiter::new(cipher)),
+        None => CipherReader::Plain(cipher),
+    };
+    let cipher = Arc::new(Mutex::new(cipher));
+    let out = Arc::new(Mutex::new(Sealed::new(out)));
+    let read = DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher), Arc::clone(&out));
+    let write = DrivenHalf::new(session, cipher, out);
+    let (read, write) = crate::vision::Link::split(read, write, raw_read, raw_write, uuid);
+    Ok(Half::split(read, write))
 }
 
 /// The same driven session as one readable and writable stream, so a sealed layer can split it.
@@ -11853,12 +11973,13 @@ impl<S: CipherOpen, R: Read> Read for DrivenHalf<S, R> {
             }
             // The session's own plaintext comes out first, and the ciphertext it has not taken yet is fed after it.
             let pending = &self.scratch[self.pending_at..self.pending_end];
-            let (plain, taken) = {
+            let (plain, taken, closed) = {
                 let mut session = self
                     .session
                     .lock()
                     .map_err(|_| std::io::Error::other("tls half poisoned"))?;
-                session.open(pending, &mut buf[filled..])?
+                let (plain, taken) = session.open(pending, &mut buf[filled..])?;
+                (plain, taken, session.closed())
             };
             self.pending_at += taken;
             filled += plain;
@@ -11874,8 +11995,8 @@ impl<S: CipherOpen, R: Read> Read for DrivenHalf<S, R> {
                 // The session has more ciphertext to take.
                 continue;
             }
-            if filled > 0 {
-                // Plaintext is ready: the transport waits for the next read, not behind this one.
+            if filled > 0 || closed {
+                // Plaintext is ready, or the peer's close was already read: the transport waits for the next read, not behind this one.
                 return Ok(filled);
             }
             // The transport's wait happens here, with no session lock held.
@@ -11916,6 +12037,26 @@ impl<S: CipherOpen, R> Write for DrivenHalf<S, R> {
     }
 }
 
+impl<S: CipherOpen + ferrox_core::tls::RecordAlignment, R> ferrox_core::tls::RecordAlignment
+    for DrivenHalf<S, R>
+{
+    fn engage_record_alignment(&mut self) {
+        if let Ok(mut session) = self.session.lock() {
+            session.engage_record_alignment();
+        }
+    }
+
+    fn disarm_record_alignment(&mut self) {
+        if let Ok(mut session) = self.session.lock() {
+            session.disarm_record_alignment();
+        }
+    }
+
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        seal_slices_out(&self.session, &self.out, parts)
+    }
+}
+
 impl<S: ferrox_core::tls::TlsProvider> Write for TlsHalf<S> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         seal_out(&self.session, &self.out, buf)
@@ -11923,17 +12064,6 @@ impl<S: ferrox_core::tls::TlsProvider> Write for TlsHalf<S> {
 
     fn flush(&mut self) -> std::io::Result<()> {
         seal_out(&self.session, &self.out, &[]).map(|_| ())
-    }
-}
-
-impl TlsHalf<ferrox_core::tls::ClientSession<Connection>> {
-    /// Arms the transport the shared session reads, for a relay that hands this half to a framer.
-    fn arm_session_timeout(&self, grain: Duration) -> std::io::Result<()> {
-        self.session
-            .lock()
-            .map_err(|_| std::io::Error::other("tls half poisoned"))?
-            .get_ref()
-            .set_read_timeout(Some(grain))
     }
 }
 
@@ -12234,7 +12364,7 @@ fn dial_vless_tls(
             if session.write_all(&header).is_err() {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            let Some(link) = pump_vision_answer(client, session, &vless.id) else {
+            let Some(half) = pump_vision_answer(client, session, &vless.id) else {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             };
             let Ok(downstream) = client.try_clone() else {
@@ -12244,12 +12374,6 @@ fn dial_vless_tls(
                 return;
             }
             let close = shutdown_pair(downstream.try_clone().ok(), None);
-            // The Link frames its writes over this session, so the quiet grain arms on the transport it reads.
-            let half = Half::shared_armed_capped(
-                link,
-                |link, grain| link.session().arm_session_timeout(grain),
-                SESSION_POLL,
-            );
             relay_stream(Half::socket(downstream), half, &close);
         }
         _ => ride_carrier(
@@ -12299,22 +12423,38 @@ fn pump_tls_answer(
         .and_then(Result::ok)
 }
 
-/// The Vision answer wait, framed: the pump writes through the same `Link` the relay keeps, so the first upload is a Vision frame rather than raw TLS content, and the link's UUID and filter state survive the handoff.
+/// The Vision answer wait, framed: the pump writes through the writer `Link` the relay keeps, so the first upload is a Vision frame rather than raw TLS content, and the link's UUID and filter state survive the handoff. The pair is split from the start so the relay's read and write never share a lock across the transport wait.
 fn pump_vision_answer(
     client: &Connection,
     session: ferrox_core::tls::ClientSession<Connection>,
     id: &[u8; 16],
-) -> Option<crate::vision::Link<TlsHalf<ferrox_core::tls::ClientSession<Connection>>>> {
+) -> Option<Half<crate::vision::Link<TlsHalf<ferrox_core::tls::ClientSession<Connection>>>>> {
     let Ok(out) = session.get_ref().try_clone() else {
         return None;
     };
+    let Ok(cipher) = session.get_ref().try_clone() else {
+        return None;
+    };
+    if cipher.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return None;
+    }
     let shared = Arc::new(Mutex::new(session));
     let out = Arc::new(Mutex::new(Sealed::new(out)));
-    let mut reader = TlsHalf {
+    let mut answer = TlsHalf {
         session: Arc::clone(&shared),
         out: Arc::clone(&out),
         driven: None,
         sleep_on_timeout: true,
+    };
+    let reader = TlsHalf {
+        session: Arc::clone(&shared),
+        out: Arc::clone(&out),
+        driven: Some(DrivenHalf::new(
+            Arc::clone(&shared),
+            Arc::new(Mutex::new(cipher)),
+            Arc::clone(&out),
+        )),
+        sleep_on_timeout: false,
     };
     let writer = TlsHalf {
         session: Arc::clone(&shared),
@@ -12322,7 +12462,8 @@ fn pump_vision_answer(
         driven: None,
         sleep_on_timeout: false,
     };
-    let link = Arc::new(Mutex::new(crate::vision::Link::new(writer, None, id)));
+    let (reader, writer) = crate::vision::Link::split(reader, writer, None, None, id);
+    let link = Arc::new(Mutex::new(writer));
     let pump = Pump::over_now(client, {
         let link = Arc::clone(&link);
         move |bytes| {
@@ -12332,13 +12473,14 @@ fn pump_vision_answer(
             link.write_all(bytes).is_ok()
         }
     });
-    let answered = read_vless_response(&mut reader).is_some();
+    let answered = read_vless_response(&mut answer).is_some();
     let _ = pump.end();
     if !answered {
         return None;
     }
-    drop(reader);
-    Arc::into_inner(link).and_then(|link| link.into_inner().ok())
+    drop(answer);
+    let writer = Arc::into_inner(link).and_then(|link| link.into_inner().ok())?;
+    Some(Half::split(reader, writer))
 }
 
 fn tls_lane(
@@ -12533,14 +12675,18 @@ fn dial_vless_reality(
             }
             let close = shutdown_pair(downstream.try_clone().ok(), raw.try_clone().ok());
             if vless.is_vision() {
-                // The Link reads its own transport, so the split is not its shape: the quiet grain stops at the tick instead, and a park never outlasts a writer.
-                let link = crate::vision::Link::new(session, Some(raw), &vless.id);
-                let half = Half::shared_armed_capped(
-                    link,
-                    crate::vision::Link::arm_read_timeout,
-                    SESSION_POLL,
-                );
-                relay_stream(Half::socket(downstream), half, &close);
+                match driven_link(session, Some(&raw), &vless.id, RELAY_POLL) {
+                    Ok(half) => relay_stream(Half::socket(downstream), half, &close),
+                    Err(session) => relay_stream(
+                        Half::socket(downstream),
+                        Half::shared_armed_capped(
+                            crate::vision::Link::new(session, Some(raw), &vless.id),
+                            crate::vision::Link::arm_read_timeout,
+                            SESSION_POLL,
+                        ),
+                        &close,
+                    ),
+                }
             } else {
                 // The limiter stops bounding, the transport's wait leaves the lock, and only the decryption stays under it.
                 match driven_halves(session, RELAY_POLL) {
@@ -23298,6 +23444,100 @@ mod tests {
             *lock.lock().expect("locks") = true;
             cvar.notify_all();
         }
+        let _ = leg.join().expect("joins");
+    }
+
+    /// A Vision link over a driven session: the reader parks in the transport read with no
+    /// session lock held, and the writer seals through the same session while it waits.
+    #[test]
+    fn a_vision_read_waits_outside_the_lock() {
+        use std::sync::mpsc;
+
+        struct FakeSession {
+            written: mpsc::Sender<()>,
+        }
+
+        impl CipherOpen for FakeSession {
+            fn open(
+                &mut self,
+                _ciphertext: &[u8],
+                _buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                Ok((0, 0))
+            }
+
+            fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+                if !plaintext.is_empty() {
+                    let _ = self.written.send(());
+                }
+                out.extend_from_slice(plaintext);
+                Ok(plaintext.len())
+            }
+
+            fn seal_slices_into(
+                &mut self,
+                parts: &[&[u8]],
+                out: &mut Vec<u8>,
+            ) -> std::io::Result<()> {
+                if parts.iter().any(|part| !part.is_empty()) {
+                    let _ = self.written.send(());
+                }
+                for part in parts {
+                    out.extend_from_slice(part);
+                }
+                Ok(())
+            }
+
+            fn closed(&self) -> bool {
+                false
+            }
+        }
+
+        impl ferrox_core::tls::RecordAlignment for FakeSession {}
+
+        struct ParkedReader {
+            entered: mpsc::Sender<()>,
+            released: mpsc::Receiver<()>,
+        }
+
+        impl Read for ParkedReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                let _ = self.entered.send(());
+                let _ = self.released.recv();
+                Ok(0)
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (written_tx, written_rx) = mpsc::channel();
+        let (released_tx, released_rx) = mpsc::channel();
+        let session = Arc::new(Mutex::new(FakeSession {
+            written: written_tx,
+        }));
+        let reader = Arc::new(Mutex::new(ParkedReader {
+            entered: entered_tx,
+            released: released_rx,
+        }));
+        let out = Arc::new(Mutex::new(Sealed::new(std::io::sink())));
+        let read = DrivenHalf::new(Arc::clone(&session), Arc::clone(&reader), Arc::clone(&out));
+        let write = DrivenHalf::new(session, reader, out);
+        let (read, write) = crate::vision::Link::split(read, write, None, None, &[0u8; 16]);
+        let half = Arc::new(Half::split(read, write));
+
+        let parked = Arc::clone(&half);
+        let leg = std::thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            parked.read_once(&mut buf)
+        });
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("the reader is parked in its transport, outside the session lock");
+        half.write_once(b"ping").expect("writes");
+        assert!(
+            written_rx.try_recv().is_ok(),
+            "the write sealed while the read was parked outside the lock"
+        );
+        let _ = released_tx.send(());
         let _ = leg.join().expect("joins");
     }
 

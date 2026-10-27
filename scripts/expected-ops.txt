@@ -145,5 +145,8 @@ ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_n
 # caller buffer, because the empty-frame probe walked no content and could not
 # see the one-pass delivery. The same probe priced the old walk at 35584 in the
 # same binary: 5376 fewer, 15.1%. The frames, commands and bytes are unchanged.
-vision::Linkferrox_app::vision::tests::Fake::pump 30208 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
+# Re-blessed 29568 by the split's walk: the pump reads the read's active flag
+# instead of taking the shared filter lock twice per frame. The frames, commands
+# and bytes are unchanged.
+vision::Linkferrox_app::vision::tests::Fake::pump 29568 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
 

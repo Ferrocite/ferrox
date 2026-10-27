@@ -56,6 +56,12 @@ pub trait TlsProvider: std::io::Read + std::io::Write {
 
     fn alpn(&self) -> Option<&[u8]>;
 
+    /// Whether the peer's close has already been read: a read now reports the end without
+    /// touching the transport, even when the peer keeps TCP open after TLS shutdown.
+    fn closed(&self) -> bool {
+        false
+    }
+
     /// The server name the front's hello named, once the handshake has read
     /// it: a fallback row that names its fronts is routed by it. A provider
     /// that heard no name, or one on the client side, answers `None`.
@@ -438,6 +444,13 @@ impl<S: Stream> TlsProvider for ClientSession<S> {
         match self {
             Self::Stock(session) => session.alpn(),
             Self::Shaped(session) => session.alpn(),
+        }
+    }
+
+    fn closed(&self) -> bool {
+        match self {
+            Self::Stock(session) => session.closed(),
+            Self::Shaped(session) => session.closed(),
         }
     }
 
