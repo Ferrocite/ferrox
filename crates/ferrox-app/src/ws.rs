@@ -285,8 +285,9 @@ impl<R: Read> WsReader<R> {
         self.handshake = until;
     }
 
-    /// One syscall; the buffer grows only past the window and frames unmask in place. `False` means done.
-    fn pull(&mut self, len: usize) -> bool {
+    /// One syscall; the buffer grows only past the window and frames unmask in place. `False` means
+    /// done, and a relay's poll timeout is handed back to the lane with the frame where it broke.
+    fn pull(&mut self, len: usize) -> std::io::Result<bool> {
         if self.at > 0 && !self.assembling {
             self.have.copy_within(self.at.., 0);
             self.have.truncate(self.have.len() - self.at);
@@ -309,16 +310,22 @@ impl<R: Read> WsReader<R> {
                     break 0;
                 }
                 Ok(n) => break n,
-                Err(error) if crate::proxy::is_timeout(&error) => {
-                    if self
-                        .handshake
-                        .is_some_and(|until| std::time::Instant::now() >= until)
-                    {
+                Err(error) if crate::proxy::is_timeout(&error) => match self.handshake {
+                    // The opening decode is the one wait a budget owns, and a silence past it is the end.
+                    Some(until) if std::time::Instant::now() < until => {}
+                    Some(_) => {
                         self.have.truncate(base);
                         self.eof = true;
                         break 0;
                     }
-                }
+                    // A lane's poll: the frame resumes from the bytes already in hand.
+                    None if crate::proxy::relay_step_owns_poll() => {
+                        self.have.truncate(base);
+                        return Err(error);
+                    }
+                    // A split's poll with no lane above it: sleep a grain and keep the wait blocking.
+                    None => std::thread::sleep(crate::budgets::RELAY_POLL),
+                },
                 Err(_) => {
                     self.have.truncate(base);
                     self.eof = true;
@@ -328,17 +335,17 @@ impl<R: Read> WsReader<R> {
         };
         self.reads += 1;
         self.have.truncate(base + taken);
-        taken > 0
+        Ok(taken > 0)
     }
 
     /// One complete frame parsed out of the window, or `None` when the bytes are not there.
-    fn frame(&mut self, fill: bool) -> Option<Frame> {
+    fn frame(&mut self, fill: bool) -> std::io::Result<Option<Frame>> {
         loop {
             let at = self.at;
             let avail = self.have.len() - at;
             if avail < 2 {
-                if !fill || self.eof || !self.pull(2) {
-                    return None;
+                if !fill || self.eof || !self.pull(2)? {
+                    return Ok(None);
                 }
                 continue;
             }
@@ -356,8 +363,8 @@ impl<R: Read> WsReader<R> {
             };
             let head_len = 2 + ext_len + usize::from(masked) * 4;
             if avail < head_len {
-                if !fill || self.eof || !self.pull(head_len) {
-                    return None;
+                if !fill || self.eof || !self.pull(head_len)? {
+                    return Ok(None);
                 }
                 continue;
             }
@@ -368,16 +375,16 @@ impl<R: Read> WsReader<R> {
                 let mut raw = [0u8; 8];
                 raw.copy_from_slice(&self.have[at + 2..at + 10]);
                 let Ok(wide) = usize::try_from(u64::from_be_bytes(raw)) else {
-                    return None;
+                    return Ok(None);
                 };
                 len = wide;
             }
             if len > FRAME_LIMIT || (opcode & 0x08 != 0 && (len > 125 || !fin)) {
-                return None;
+                return Ok(None);
             }
             if avail < head_len + len {
-                if !fill || self.eof || !self.pull(head_len + len) {
-                    return None;
+                if !fill || self.eof || !self.pull(head_len + len)? {
+                    return Ok(None);
                 }
                 continue;
             }
@@ -392,25 +399,25 @@ impl<R: Read> WsReader<R> {
             } else {
                 None
             };
-            return Some(Frame {
+            return Ok(Some(Frame {
                 fin,
                 opcode,
                 mask,
                 payload: at + head_len..at + head_len + len,
-            });
+            }));
         }
     }
 
     /// Parse frames until a message ends: control frames answered on the spot, data unmasked where they lie.
-    fn message(&mut self, fill: bool) -> bool {
+    fn message(&mut self, fill: bool) -> std::io::Result<bool> {
         if !self.assembling {
             self.whole = 0;
             self.filled = 0;
         }
         let mut open = self.assembling;
         loop {
-            let Some(frame) = self.frame(fill) else {
-                return false;
+            let Some(frame) = self.frame(fill)? else {
+                return Ok(false);
             };
             let start = frame.payload.start;
             let len = frame.payload.len();
@@ -420,7 +427,7 @@ impl<R: Read> WsReader<R> {
                     self.reply(OP_CLOSE, &self.have[frame.payload]);
                     self.at = end;
                     self.eof = true;
-                    return false;
+                    return Ok(false);
                 }
                 OP_PING => {
                     self.reply(OP_PONG, &self.have[frame.payload]);
@@ -432,7 +439,7 @@ impl<R: Read> WsReader<R> {
                 // RFC 6455 has two data opcodes; the tunnel reads both and writes binary, the order the reference keeps.
                 OP_TEXT | OP_DATA | OP_CONT => {
                     if (frame.opcode == OP_CONT) != open {
-                        return false;
+                        return Ok(false);
                     }
                     if let Some(mask) = frame.mask {
                         apply_mask(&mut self.have[frame.payload.clone()], mask);
@@ -454,13 +461,13 @@ impl<R: Read> WsReader<R> {
                         self.msg_end = self.filled + len;
                         self.at = self.whole;
                         self.assembling = false;
-                        return true;
+                        return Ok(true);
                     }
                     self.assembling = true;
                     self.filled += len;
                     open = true;
                 }
-                _ => return false,
+                _ => return Ok(false),
             }
         }
     }
@@ -511,7 +518,7 @@ impl<R: Read> Read for WsReader<R> {
             self.eat = 0;
             // The first message may wait in the transport; a message already buffered behind it may not.
             let fill = filled == 0;
-            if !self.message(fill) {
+            if !self.message(fill)? {
                 if fill {
                     self.eof = true;
                 }
