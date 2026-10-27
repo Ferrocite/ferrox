@@ -2653,7 +2653,7 @@ fn serve_ss_tls_session<R, W>(
     close: &Arc<dyn Fn() + Send + Sync>,
     is_2022: bool,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     if is_2022 {
@@ -13408,7 +13408,7 @@ fn ss_client_relay<R, W>(
     target: &Destination,
 ) -> bool
 where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
