@@ -2226,9 +2226,8 @@ mod tests {
             .lock()
             .unwrap_or_else(PoisonError::into_inner) += 4;
         conn.wake.notify_all();
-        assert_eq!(
+        assert!(
             running.join().expect("sender thread"),
-            true,
             "the ended request's response is still sent"
         );
         crate::budgets::clear();
