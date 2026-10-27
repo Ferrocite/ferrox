@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, Shutdown, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
@@ -219,11 +220,7 @@ pub(crate) fn client(
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                if stack.flows.is_empty() {
-                    return;
-                }
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
         stack.poll(&mut buf);
         if progress {
@@ -287,7 +284,12 @@ impl ClientStack {
                 format!("destination {} is not a TCP endpoint", flow.destination),
             ));
         }
-        let local_port = self.free_port();
+        let Some(local_port) = self.free_port() else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AddrNotAvailable,
+                "wireguard has no free local ephemeral port",
+            ));
+        };
         let mut socket = TcpSocket::new(
             SocketBuffer::new(vec![0u8; TCP_BUFFER]),
             SocketBuffer::new(vec![0u8; TCP_BUFFER]),
@@ -314,14 +316,16 @@ impl ClientStack {
         Ok(())
     }
 
-    fn free_port(&mut self) -> u16 {
-        loop {
+    fn free_port(&mut self) -> Option<u16> {
+        let span = usize::from(u16::MAX) - 49_152 + 1;
+        for _ in 0..span {
             let port = self.next_port.max(49_152);
             self.next_port = if port == u16::MAX { 49_152 } else { port + 1 };
-            if self.ports.insert(port) {
-                return port;
+            if !self.ports.contains(&port) {
+                return Some(port);
             }
         }
+        None
     }
 
     fn poll(&mut self, buf: &mut [u8]) {
@@ -358,13 +362,19 @@ struct Listener {
     since: StdInstant,
 }
 
+struct UdpLane {
+    uplink: UdpSocket,
+    stop: Arc<AtomicBool>,
+    last_used: StdInstant,
+}
+
 struct ServerStack {
     device: QueueDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
     flows: Vec<Flow>,
     listeners: HashMap<u16, Vec<Listener>>,
-    udp: HashMap<([u8; 32], SocketAddr, SocketAddr), UdpSocket>,
+    udp: HashMap<([u8; 32], SocketAddr, SocketAddr), UdpLane>,
     to_tunnel: ToTunnel,
     out: Outbound,
     started: StdInstant,
@@ -417,17 +427,25 @@ impl ServerStack {
             if self.udp.len() >= UDP_FLOWS {
                 return;
             }
-            let Some(uplink) = server_udp(key, &self.out, &self.to_tunnel) else {
+            let Some((uplink, stop)) = server_udp(key, &self.out, &self.to_tunnel) else {
                 return;
             };
-            self.udp.insert(key, uplink);
+            self.udp.insert(
+                key,
+                UdpLane {
+                    uplink,
+                    stop,
+                    last_used: StdInstant::now(),
+                },
+            );
         }
-        let Some(uplink) = self.udp.get(&key) else {
+        let Some(lane) = self.udp.get_mut(&key) else {
             return;
         };
+        lane.last_used = StdInstant::now();
         let mut frame = Vec::with_capacity(32 + datagram.payload.len());
         let out = crate::proxy::socks_udp_frame(&mut frame, None, &target, datagram.payload);
-        let _ = uplink.send(out);
+        let _ = lane.uplink.send(out);
     }
 
     fn poll(&mut self, buf: &mut [u8]) {
@@ -478,6 +496,18 @@ impl ServerStack {
                 if listeners.is_empty() {
                     self.listeners.remove(&port);
                 }
+            }
+        }
+        let idle = crate::budgets::udp_idle();
+        let stale: Vec<_> = self
+            .udp
+            .iter()
+            .filter(|(_, lane)| lane.last_used.elapsed() >= idle)
+            .map(|(key, _)| *key)
+            .collect();
+        for key in stale {
+            if let Some(lane) = self.udp.remove(&key) {
+                lane.stop.store(true, Ordering::Relaxed);
             }
         }
     }
@@ -583,6 +613,7 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8]) {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(_) => {
                 flow.done = true;
+                socket.abort();
                 break;
             }
         }
@@ -607,6 +638,7 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8]) {
                         }
                         Err(_) => {
                             flow.done = true;
+                            socket.abort();
                             at = n;
                         }
                     }
@@ -624,7 +656,10 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8]) {
             Ok(0) => flow.up_eof = true,
             Ok(n) => flow.pending_up.extend_from_slice(&buf[..n]),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(_) => flow.done = true,
+            Err(_) => {
+                flow.done = true;
+                socket.abort();
+            }
         }
     }
     if !flow.pending_up.is_empty() && socket.can_send() {
@@ -633,7 +668,10 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8]) {
             Ok(n) => {
                 flow.pending_up.drain(..n);
             }
-            Err(SendError::InvalidState) => flow.done = true,
+            Err(SendError::InvalidState) => {
+                flow.done = true;
+                socket.abort();
+            }
         }
     }
     if flow.up_eof && flow.pending_up.is_empty() && socket.is_open() && !flow.sent_fin {
@@ -790,10 +828,13 @@ pub(crate) fn client_udp(
         match relay.recv_from(&mut buf) {
             Ok((n, sender)) => {
                 quiet = StdInstant::now();
-                app = Some(sender);
                 let Some((target, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
                     continue;
                 };
+                if app.is_some_and(|bound| bound != sender) {
+                    continue;
+                }
+                app = Some(sender);
                 let Some(inner_source) = config
                     .addresses
                     .iter()
@@ -846,11 +887,12 @@ pub(crate) fn server_udp(
     flow: ([u8; 32], SocketAddr, SocketAddr),
     out: &Outbound,
     to_tunnel: &ToTunnel,
-) -> Option<UdpSocket> {
+) -> Option<(UdpSocket, Arc<AtomicBool>)> {
     let relay = UdpSocket::bind("127.0.0.1:0").ok()?;
     let relay_address = relay.local_addr().ok()?;
     let uplink = UdpSocket::bind("127.0.0.1:0").ok()?;
     uplink.connect(relay_address).ok()?;
+    let reader = uplink.try_clone().ok()?;
     let (_, source, target) = flow;
     let outbound = match out {
         Outbound::Route(plan) => plan
@@ -862,14 +904,19 @@ pub(crate) fn server_udp(
             .into_owned(),
         other => other.clone(),
     };
+    let _ = relay.set_read_timeout(Some(crate::budgets::udp_idle()));
     std::thread::spawn(move || serve_udp_lane(&relay, &outbound, None));
 
-    let reader = uplink.try_clone().ok()?;
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader_stop = Arc::clone(&stop);
     let tunnel = to_tunnel.clone();
     std::thread::spawn(move || {
         let mut buf = crate::proxy::udp_buffer();
         let _ = reader.set_read_timeout(Some(TICK));
         loop {
+            if reader_stop.load(Ordering::Relaxed) {
+                break;
+            }
             match reader.recv(&mut buf) {
                 Ok(n) => {
                     let Some((_, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
@@ -901,7 +948,7 @@ pub(crate) fn server_udp(
             }
         }
     });
-    Some(uplink)
+    Some((uplink, stop))
 }
 
 fn socket_addr(bytes: &[u8], port: u16) -> Option<SocketAddr> {
@@ -975,7 +1022,7 @@ mod tests {
         let (to_tunnel, replies) = std::sync::mpsc::channel();
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
         let source: SocketAddr = "10.0.0.2:1234".parse().unwrap();
-        let uplink = server_udp(([0x11; 32], source, target), &out, &to_tunnel).expect("lane");
+        let (uplink, _) = server_udp(([0x11; 32], source, target), &out, &to_tunnel).expect("lane");
         let mut buf = Vec::new();
         let frame = crate::proxy::socks_udp_frame(&mut buf, None, &target, b"hi");
         uplink.send(frame).expect("send");
@@ -986,6 +1033,47 @@ mod tests {
         assert_eq!(datagram.source_port, target.port());
         assert_eq!(datagram.destination, ip_bytes(source.ip()));
         assert_eq!(datagram.destination_port, source.port());
+    }
+
+    #[test]
+    fn a_server_datagram_lane_is_reclaimed_when_idle() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            udp_idle: Some(Duration::from_millis(100)),
+            ..Default::default()
+        });
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.1".parse().unwrap()],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(false),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
+        let (to_tunnel, _) = std::sync::mpsc::channel();
+        let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
+        let mut stack = ServerStack::new(&config, to_tunnel.clone(), out.clone());
+        let source: SocketAddr = "10.0.0.2:1234".parse().unwrap();
+        let target: SocketAddr = "192.0.2.1:7".parse().unwrap();
+        let key = ([0x11; 32], source, target);
+        let (uplink, stop) = server_udp(key, &out, &to_tunnel).expect("lane");
+        stack.udp.insert(
+            key,
+            UdpLane {
+                uplink,
+                stop: Arc::clone(&stop),
+                last_used: StdInstant::now()
+                    .checked_sub(Duration::from_millis(100))
+                    .expect("instant"),
+            },
+        );
+        let mut buf = [0u8; 1024];
+        stack.poll(&mut buf);
+        assert!(stack.udp.is_empty(), "an idle lane leaves the table");
+        assert!(stop.load(Ordering::Relaxed), "its reader is told to stop");
+        crate::budgets::clear();
     }
 }
 

@@ -114,6 +114,7 @@ pub struct Tunnel {
     epoch: [u8; 12],
     session: Option<Session>,
     previous: Option<Session>,
+    next: Option<Session>,
     queue: VecDeque<Vec<u8>>,
     queued_bytes: usize,
     last_send: u64,
@@ -176,6 +177,7 @@ impl Tunnel {
             epoch,
             session: None,
             previous: None,
+            next: None,
             queue: VecDeque::new(),
             queued_bytes: 0,
             last_send: 0,
@@ -298,10 +300,14 @@ impl Tunnel {
         if packet.len() < 4 {
             return;
         }
-        transport::clear_reserved(packet);
         let kind = u32::from_le_bytes([packet[0], packet[1], packet[2], packet[3]]);
         match kind {
-            handshake::TYPE_RESPONSE => self.response(now, src, packet, out),
+            handshake::TYPE_RESPONSE => {
+                let reserved = [packet[1], packet[2], packet[3]];
+                transport::clear_reserved(packet);
+                self.response(now, src, packet, out);
+                packet[1..4].copy_from_slice(&reserved);
+            }
             transport::TYPE_COOKIE_REPLY => self.cookie_reply(now, packet, out),
             transport::TYPE_TRANSPORT => self.transport(now, src, packet, out),
             _ => {}
@@ -344,7 +350,11 @@ impl Tunnel {
         self.endpoint = src;
         self.last_recv = now;
         self.last_send = now;
+        let pending = !self.queue.is_empty();
         self.flush(now, out);
+        if !pending {
+            self.seal(now, &[], out);
+        }
     }
 
     fn cookie_reply(&mut self, now: u64, packet: &mut [u8], out: &mut Vec<Event>) {
@@ -389,21 +399,34 @@ impl Tunnel {
         {
             self.previous = None;
         }
+        if self
+            .next
+            .as_ref()
+            .is_some_and(|session| now.saturating_sub(session.created) >= REJECT_AFTER)
+        {
+            self.next = None;
+        }
         let receiver = u32::from_le_bytes(packet[4..8].try_into().unwrap_or([0; 4]));
-        let session = if self
+        let (session, promote) = if self
             .session
             .as_ref()
             .is_some_and(|session| session.local_index == receiver)
         {
-            self.session.as_mut()
+            (self.session.as_mut(), false)
         } else if self
             .previous
             .as_ref()
             .is_some_and(|session| session.local_index == receiver)
         {
-            self.previous.as_mut()
+            (self.previous.as_mut(), false)
+        } else if self
+            .next
+            .as_ref()
+            .is_some_and(|session| session.local_index == receiver)
+        {
+            (self.next.as_mut(), true)
         } else {
-            None
+            (None, false)
         };
         let Some(session) = session else {
             return;
@@ -417,6 +440,13 @@ impl Tunnel {
             return;
         };
         session.replay.commit(counter, action);
+        if promote {
+            self.previous = self
+                .session
+                .take()
+                .filter(|session| now.saturating_sub(session.created) < REJECT_AFTER);
+            self.session = self.next.take();
+        }
         self.endpoint = src;
         self.last_recv = now;
         if len > 0 {
@@ -445,6 +475,10 @@ impl Tunnel {
                 .is_some_and(|session| session.local_index == index)
             || self
                 .previous
+                .as_ref()
+                .is_some_and(|session| session.local_index == index)
+            || self
+                .next
                 .as_ref()
                 .is_some_and(|session| session.local_index == index)
     }
@@ -481,11 +515,7 @@ impl Tunnel {
             return false;
         };
         self.last_timestamp = Some(timestamp);
-        self.previous = self
-            .session
-            .take()
-            .filter(|session| now.saturating_sub(session.created) < REJECT_AFTER);
-        self.session = Some(Session {
+        self.next = Some(Session {
             send,
             recv,
             counter: Counter::new(),
@@ -524,6 +554,20 @@ impl Tunnel {
             }
             return;
         }
+        if self
+            .next
+            .as_ref()
+            .is_some_and(|session| now.saturating_sub(session.created) >= REJECT_AFTER)
+        {
+            self.next = None;
+        }
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|session| now.saturating_sub(session.created) >= REJECT_AFTER)
+        {
+            self.previous = None;
+        }
         let Some(session) = self.session.as_ref() else {
             return;
         };
@@ -549,6 +593,7 @@ impl Tunnel {
     pub fn reset(&mut self) {
         self.session = None;
         self.previous = None;
+        self.next = None;
         self.handshake = None;
         self.pending_mac1 = None;
     }
@@ -687,12 +732,18 @@ mod tests {
         let initiation = packet(&out);
         let response = answer(&mut bob, &initiation, NOW + 1);
         let mut response = packet(&response);
-        alice.receive(
-            NOW + 2,
-            BOB.parse().unwrap(),
-            &mut response,
-            &mut Vec::new(),
-        );
+        let mut flushed = Vec::new();
+        alice.receive(NOW + 2, BOB.parse().unwrap(), &mut response, &mut flushed);
+        for event in flushed {
+            if let Event::Send { mut packet, .. } = event {
+                bob.receive(
+                    NOW + 2,
+                    ALICE.parse().unwrap(),
+                    &mut packet,
+                    &mut Vec::new(),
+                );
+            }
+        }
         assert!(alice.established(NOW + 2));
         assert!(bob.established(NOW + 1));
         (alice, bob)
@@ -775,25 +826,78 @@ mod tests {
         alice.send(NOW + 3, b"before", &mut old);
         let mut record = packet(&old);
         let old_index = alice.session.as_ref().expect("session").local_index;
+        let bob_old = bob.session.as_ref().expect("session").local_index;
         let mut out = Vec::new();
         alice.send(NOW + 2 + REKEY_AFTER, b"after", &mut out);
         assert!(alice.owns(old_index), "the old session stays reachable");
         let initiation = packet(&out);
-        let _response = answer(&mut bob, &initiation, NOW + 3 + REKEY_AFTER);
+        let response = answer(&mut bob, &initiation, NOW + 3 + REKEY_AFTER);
+        assert_eq!(
+            bob.session.as_ref().expect("session").local_index,
+            bob_old,
+            "the old session stays live until the new one authenticates"
+        );
+        assert!(bob.next.is_some(), "the answered keypair waits beside it");
+        let mut response = packet(&response);
+        let mut alice_out = Vec::new();
+        alice.receive(
+            NOW + 4 + REKEY_AFTER,
+            BOB.parse().unwrap(),
+            &mut response,
+            &mut alice_out,
+        );
+        for event in alice_out {
+            if let Event::Send { mut packet, .. } = event {
+                bob.receive(
+                    NOW + 4 + REKEY_AFTER,
+                    ALICE.parse().unwrap(),
+                    &mut packet,
+                    &mut Vec::new(),
+                );
+            }
+        }
+        assert_eq!(
+            bob.previous
+                .as_ref()
+                .expect("the previous session")
+                .local_index,
+            bob_old
+        );
+        assert_ne!(
+            bob.session.as_ref().expect("session").local_index,
+            bob_old,
+            "the first authenticated transport record promotes the new keypair"
+        );
         let mut received = Vec::new();
         bob.receive(
-            NOW + 4 + REKEY_AFTER,
+            NOW + 5 + REKEY_AFTER,
             ALICE.parse().unwrap(),
             &mut record,
             &mut received,
         );
         assert!(matches!(&received[0], Event::Data(payload) if payload == b"before"));
-        assert!(bob.owns(
-            bob.previous
-                .as_ref()
-                .expect("the previous session")
-                .local_index
-        ));
+        let mut after = Vec::new();
+        alice.send(NOW + 6 + REKEY_AFTER, b"after", &mut after);
+        let mut record = packet(&after);
+        let mut made = Vec::new();
+        bob.receive(
+            NOW + 7 + REKEY_AFTER,
+            ALICE.parse().unwrap(),
+            &mut record,
+            &mut made,
+        );
+        assert!(matches!(&made.first(), Some(Event::Data(payload)) if payload == b"after"));
+        let mut replay = Vec::new();
+        bob.receive(
+            NOW + 8 + REKEY_AFTER,
+            ALICE.parse().unwrap(),
+            &mut record,
+            &mut replay,
+        );
+        assert!(
+            replay.is_empty(),
+            "the new session's counter is still checked"
+        );
     }
 
     #[test]

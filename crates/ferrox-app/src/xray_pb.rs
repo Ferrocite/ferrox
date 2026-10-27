@@ -2820,7 +2820,7 @@ fn freedom_settings(bytes: &[u8]) -> Result<Option<Json>, String> {
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 0) => return Err(reader.uncarried("domain_strategy")),
-            (3, 2) => redirect = Some(destination_override(reader.bytes()?)?),
+            (3, 2) => redirect = destination_override(reader.bytes()?)?,
             (4, 0) => return Err(reader.uncarried("user_level")),
             (5, 2) => return Err(reader.uncarried("fragment (README row 124)")),
             (6, 0) => return Err(reader.uncarried("proxy_protocol (README row 121)")),
@@ -2833,9 +2833,8 @@ fn freedom_settings(bytes: &[u8]) -> Result<Option<Json>, String> {
 }
 
 /// The reference's freedom rewrite: an address, a port, or both, with the omitted half kept from
-/// the flow. This tree's `redirect` names both halves, so a port-less override is refused rather
-/// than silently dropping the address.
-fn destination_override(bytes: &[u8]) -> Result<String, String> {
+/// the flow. An empty address and a zero port are both unset, so they leave the request as it is.
+fn destination_override(bytes: &[u8]) -> Result<Option<String>, String> {
     let mut reader = Reader::new(bytes, "xray.proxy.freedom.DestinationOverride");
     let mut server = None;
     while let Some((field, wire)) = reader.field()? {
@@ -2848,13 +2847,12 @@ fn destination_override(bytes: &[u8]) -> Result<String, String> {
         return Err("xray.proxy.freedom.DestinationOverride: no server".to_owned());
     };
     match (address, port) {
-        (_, 0) => Err(
-            "xray.proxy.freedom.DestinationOverride: an address without a port is not carried"
-                .to_owned(),
-        ),
-        (address, port) if address.is_empty() => Ok(format!(":{port}")),
-        (address, port) if address.contains(':') => Ok(format!("[{address}]:{port}")),
-        (address, port) => Ok(format!("{address}:{port}")),
+        (address, 0) if address.is_empty() => Ok(None),
+        (address, 0) if address.contains(':') => Ok(Some(format!("[{address}]:0"))),
+        (address, 0) => Ok(Some(format!("{address}:0"))),
+        (address, port) if address.is_empty() => Ok(Some(format!(":{port}"))),
+        (address, port) if address.contains(':') => Ok(Some(format!("[{address}]:{port}"))),
+        (address, port) => Ok(Some(format!("{address}:{port}"))),
     }
 }
 
@@ -3748,6 +3746,31 @@ mod tests {
             .and_then(|settings| settings.get("redirect"))
             .and_then(Json::as_str);
         assert_eq!(redirect, Some("127.0.0.1:8080"));
+    }
+
+    #[test]
+    fn a_freedom_address_only_override_keeps_the_requested_port() {
+        let address = message(&[bytes_field(1, &[127, 0, 0, 1])]);
+        let server = message(&[bytes_field(1, &address)]);
+        let override_message = message(&[bytes_field(1, &server)]);
+        let settings = bytes_field(3, &override_message);
+        let outbound = message(&[bytes_field(
+            3,
+            &typed("xray.proxy.freedom.Config", &settings),
+        )]);
+        let json = to_json(&config(
+            &http_inbound(&receiver(5000, None), &[]),
+            &outbound,
+        ))
+        .expect("freedom override decodes");
+        let redirect = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .and_then(|outbounds| outbounds.first())
+            .and_then(|outbound| outbound.get("settings"))
+            .and_then(|settings| settings.get("redirect"))
+            .and_then(Json::as_str);
+        assert_eq!(redirect, Some("127.0.0.1:0"));
     }
 
     #[test]

@@ -737,6 +737,6 @@ wireguard transport-header-bytes 16 ferrox-core-wireguard::tests::the_reference_
 wireguard initiation-bytes 148 ferrox-core-wireguard::tests::the_reference_message_sizes
 wireguard response-bytes 92 ferrox-core-wireguard::tests::the_reference_message_sizes
 wireguard default-mtu 1420 ferrox-app-wireguard::tests::the_defaults_are_the_reference_ones
-wireguard tcp-bytes-echoed 5 ferrox-app-wg::tests::a_tcp_flow_crosses_the_tunnel_to_a_freedom_dial
+wireguard tcp-bytes-echoed 9 ferrox-app-wg::tests::a_tcp_flow_crosses_the_tunnel_to_a_freedom_dial
 wireguard client-datagram-bytes-echoed 6 ferrox-app-wg-stack::tests::a_client_datagram_lane_frames_and_unframes
 wireguard server-datagram-bytes-echoed 2 ferrox-app-wg-stack::tests::a_server_datagram_lane_echoes_through_freedom

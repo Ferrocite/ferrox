@@ -7,6 +7,7 @@
 //! flow ever locks a session or races a counter.
 
 use std::net::{IpAddr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -35,6 +36,7 @@ pub(crate) struct WireGuardOut {
     flows: Sender<ClientFlow>,
     to_tunnel: Sender<Vec<u8>>,
     routes: UdpRoutes,
+    stop: Arc<AtomicBool>,
 }
 
 impl WireGuardOut {
@@ -55,11 +57,20 @@ impl WireGuardOut {
         let (to_tunnel, from_tunnel) = mpsc::channel();
         let (flows, flow_rx) = mpsc::channel();
         let routes: UdpRoutes = Arc::default();
+        let stop = Arc::new(AtomicBool::new(false));
         let io_config = config.clone();
         let io_packets = packets_tx.clone();
         let io_routes = Arc::clone(&routes);
+        let io_stop = Arc::clone(&stop);
         std::thread::spawn(move || {
-            io(io_config, socket, from_tunnel, io_packets, Some(io_routes));
+            io(
+                io_config,
+                socket,
+                from_tunnel,
+                io_packets,
+                Some(io_routes),
+                Some(io_stop),
+            );
         });
         let stack_config = config.clone();
         let stack_tunnel = to_tunnel.clone();
@@ -71,6 +82,7 @@ impl WireGuardOut {
             flows,
             to_tunnel,
             routes,
+            stop,
         })
     }
 
@@ -116,6 +128,12 @@ impl WireGuardOut {
     }
 }
 
+impl Drop for WireGuardOut {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+    }
+}
+
 /// Open the server's UDP socket and spawn its reader and stack. Returns the
 /// port the OS bound, or a refusal the startup names.
 pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Result<u16, String> {
@@ -142,7 +160,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     let (to_tunnel, from_tunnel) = mpsc::channel();
     let io_config = config.clone();
     let io_packets = packets_tx.clone();
-    std::thread::spawn(move || io(io_config, socket, from_tunnel, io_packets, None));
+    std::thread::spawn(move || io(io_config, socket, from_tunnel, io_packets, None, None));
     let stack_config = config;
     let stack_tunnel = to_tunnel;
     let stack_out = out.clone();
@@ -167,6 +185,7 @@ fn io(
     from_tunnel: Receiver<Vec<u8>>,
     to_stack: Sender<Packet>,
     routes: Option<UdpRoutes>,
+    stop: Option<Arc<AtomicBool>>,
 ) {
     let _ = socket.set_read_timeout(Some(IO_TICK));
     let epoch = tai64n_now();
@@ -174,6 +193,12 @@ fn io(
     let started = Instant::now();
     let mut buf = vec![0u8; 65_535];
     loop {
+        if stop
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Relaxed))
+        {
+            return;
+        }
         let now = started.elapsed().as_millis() as u64;
         let mut events = Vec::new();
         loop {
@@ -212,10 +237,11 @@ fn io(
 
         match socket.recv_from(&mut buf) {
             Ok((n, source)) if n >= 4 => {
-                clear_reserved(&mut buf[..n]);
                 let kind = u32::from_le_bytes(buf[..4].try_into().unwrap_or([0; 4]));
                 if kind == TYPE_INITIATION && n == INITIATION_SIZE {
-                    handle_initiation(&mut peers, now, source, &buf[..n], &socket, &to_stack);
+                    let mut packet = buf[..n].to_vec();
+                    clear_reserved(&mut packet);
+                    handle_initiation(&mut peers, now, source, &packet, &socket, &to_stack);
                 } else {
                     let at = if kind == TYPE_RESPONSE { 8 } else { 4 };
                     let receiver = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap_or([0; 4]));
@@ -241,7 +267,11 @@ fn io(
             Err(error)
                 if matches!(
                     error.kind(),
-                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                        | std::io::ErrorKind::Interrupted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::ConnectionRefused
                 ) => {}
             Err(_) => return,
         }

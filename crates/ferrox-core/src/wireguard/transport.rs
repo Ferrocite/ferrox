@@ -91,10 +91,10 @@ pub fn clear_reserved(buf: &mut [u8]) {
 
 /// Parse and decrypt a `total`-byte record from `buf`, returning `(receiver,
 /// counter, plaintext length)` with the plaintext at `buf[HEADER_SIZE..]`. The
-/// three reserved bytes are cleared first, as the reference's bind does, so a
-/// peer that fills them parses like one that leaves them zero. The tag is checked
-/// before any keystream exists, so a forged or undersized record leaves `buf`
-/// exactly as it was handed over.
+/// three reserved bytes are cleared, as the reference's bind does, so a peer
+/// that fills them parses like one that leaves them zero. The tag is checked
+/// before any keystream exists, and a refused record has its reserved bytes put
+/// back, so a forged or undersized record leaves `buf` exactly as handed over.
 pub fn open(key: &[u8; 32], buf: &mut [u8], total: usize) -> Option<(u32, u64, usize)> {
     if total < MIN_SIZE || buf.len() < total {
         return None;
@@ -102,14 +102,21 @@ pub fn open(key: &[u8; 32], buf: &mut [u8], total: usize) -> Option<(u32, u64, u
     if buf[0] != TYPE_TRANSPORT as u8 {
         return None;
     }
+    let reserved = [buf[1], buf[2], buf[3]];
     clear_reserved(buf);
-    let receiver = u32::from_le_bytes(buf[4..8].try_into().ok()?);
-    let counter = u64::from_le_bytes(buf[8..16].try_into().ok()?);
-    let len = total - HEADER_SIZE - TAG_SIZE;
-    let (body, tag) = buf[HEADER_SIZE..total].split_at_mut(len);
-    let tag: &[u8; TAG_SIZE] = (&*tag).try_into().ok()?;
-    chacha20_poly1305_decrypt_in_place(key, &nonce(counter), b"", body, tag)?;
-    Some((receiver, counter, len))
+    let opened = (|| {
+        let receiver = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        let counter = u64::from_le_bytes(buf[8..16].try_into().ok()?);
+        let len = total - HEADER_SIZE - TAG_SIZE;
+        let (body, tag) = buf[HEADER_SIZE..total].split_at_mut(len);
+        let tag: &[u8; TAG_SIZE] = (&*tag).try_into().ok()?;
+        chacha20_poly1305_decrypt_in_place(key, &nonce(counter), b"", body, tag)?;
+        Some((receiver, counter, len))
+    })();
+    if opened.is_none() {
+        buf[1..4].copy_from_slice(&reserved);
+    }
+    opened
 }
 
 /// The sender's counter. It hands out each nonce exactly once and refuses once
@@ -397,9 +404,15 @@ mod tests {
         let mut buf = vec![0u8; HEADER_SIZE + plain.len() + TAG_SIZE];
         buf[HEADER_SIZE..HEADER_SIZE + plain.len()].copy_from_slice(&plain);
         let total = seal(KEY, 5, 9, plain.len(), &mut buf);
+        set_reserved(&mut buf, [9, 8, 7]);
         let sealed = buf.clone();
         buf[total - 1] ^= 1;
         assert!(open(KEY, &mut buf, total).is_none(), "a flipped tag fails");
+        assert_eq!(
+            &buf[1..4],
+            &[9, 8, 7],
+            "a refused record keeps the reserved bytes it arrived with"
+        );
         assert_eq!(
             &buf[HEADER_SIZE..HEADER_SIZE + plain.len()],
             &sealed[HEADER_SIZE..HEADER_SIZE + plain.len()],

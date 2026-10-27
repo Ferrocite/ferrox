@@ -20454,31 +20454,30 @@ fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
 /// The `WireGuard` outbound's device config, built once at startup so a bad key or
 /// endpoint refuses the config instead of a flow.
 fn find_wireguard_outbound(root: &Json) -> Result<Option<crate::wg::WireGuardOut>, String> {
-    let empty = Vec::new();
-    for outbound in root
+    let Some(outbound) = root
         .get("outbounds")
         .and_then(Json::as_arr)
-        .unwrap_or(&empty)
+        .and_then(|outbounds| outbounds.first())
+    else {
+        return Ok(None);
+    };
+    if canonical_protocol(
+        outbound
+            .get("protocol")
+            .and_then(Json::as_str)
+            .unwrap_or(""),
+    ) != "wireguard"
     {
-        if canonical_protocol(
-            outbound
-                .get("protocol")
-                .and_then(Json::as_str)
-                .unwrap_or(""),
-        ) != "wireguard"
-        {
-            continue;
-        }
-        let settings = outbound
-            .get("settings")
-            .ok_or("wireguard outbound has no settings")?;
-        let config = crate::wireguard::DeviceConfig::from_json(settings)
-            .map_err(|reason| format!("wireguard outbound: {reason}"))?;
-        return crate::wg::WireGuardOut::new(config)
-            .map(Some)
-            .map_err(|reason| format!("wireguard outbound: {reason}"));
+        return Ok(None);
     }
-    Ok(None)
+    let settings = outbound
+        .get("settings")
+        .ok_or("wireguard outbound has no settings")?;
+    let config = crate::wireguard::DeviceConfig::from_json(settings)
+        .map_err(|reason| format!("wireguard outbound: {reason}"))?;
+    crate::wg::WireGuardOut::new(config)
+        .map(Some)
+        .map_err(|reason| format!("wireguard outbound: {reason}"))
 }
 
 /// The freedom outbound's settings, read the way the reference reads them. A value the
@@ -22384,6 +22383,23 @@ mod tests {
 
     fn freedom() -> Outbound {
         Outbound::Freedom(Arc::default())
+    }
+
+    #[test]
+    fn the_first_configured_outbound_is_the_default() {
+        let private = [0x11u8; 32];
+        let peer = ferrox_core::wireguard::device::public_key(&[0x22; 32]);
+        let json = format!(
+            r#"{{"outbounds":[{{"protocol":"freedom","settings":{{}}}},{{"protocol":"wireguard","settings":{{"secretKey":"{}","address":["10.0.0.2"],"peers":[{{"publicKey":"{}","endpoint":"127.0.0.1:1"}}]}}}}]}}"#,
+            ferrox_core::foxy::account::hex_encode(&private),
+            ferrox_core::foxy::account::hex_encode(&peer)
+        );
+        let root = crate::json::parse(&json).expect("config");
+        let outbound = find_outbound(&root).expect("outbound").expect("some");
+        assert!(
+            matches!(outbound, Outbound::Freedom(_)),
+            "freedom before wireguard stays the default"
+        );
     }
 
     /// A relay half that is read by one thread and written by another: the reader parks
@@ -41655,8 +41671,9 @@ mod tests {
         let (to_tunnel, replies) = std::sync::mpsc::channel();
         let target: std::net::SocketAddr = "192.0.2.1:7".parse().unwrap();
         let source: std::net::SocketAddr = "10.0.0.2:1234".parse().unwrap();
-        let uplink = crate::wg_stack::server_udp(([0x11; 32], source, target), &plan, &to_tunnel)
-            .expect("lane");
+        let (uplink, _) =
+            crate::wg_stack::server_udp(([0x11; 32], source, target), &plan, &to_tunnel)
+                .expect("lane");
         let mut buf = Vec::new();
         let frame = socks_udp_frame(&mut buf, None, &target, b"hi");
         uplink.send(frame).expect("send");
