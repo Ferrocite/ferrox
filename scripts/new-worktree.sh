@@ -38,6 +38,7 @@ fi
 git -C "$top" worktree add "$dest" -b "$name" "$base"
 
 ferrox_write_cargo_config "$dest" "$shared"
+ferrox_write_cargo_config "$top" "$shared"
 ferrox_claim_target "$dest" "$shared"
 linked="$(ferrox_link_upstream "$dest" "$top")"
 

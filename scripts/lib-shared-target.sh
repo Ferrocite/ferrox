@@ -101,14 +101,32 @@ ferrox_clone_dir() {
 
 # The seed is itself whatever the main worktree last built; a clone carries only
 # the profiles locals use, and drops incremental state (its sessions name the
-# seed's source paths, so they can never hit here). `aside/` and the scripts'
-# output dirs stay behind: they are not build artefacts.
+# seed's source paths, so they can never hit here). A worktree tests in debug;
+# release and doc are a click away in Cargo and would otherwise be a gigabyte of
+# copy-on-write blocks every branch pays for. `FERROX_TARGET_PROFILES` widens it
+# for a branch that really does measure release locally.
+ferrox_target_profiles() {
+  local part
+  local -a parts
+  read -ra parts <<< "${FERROX_TARGET_PROFILES:-debug}"
+  for part in "${parts[@]}"; do
+    case "$part" in
+      debug|release|doc) printf '%s\n' "$part" ;;
+      *) echo "::error::FERROX_TARGET_PROFILES: unknown profile '$part'" >&2; return 1 ;;
+    esac
+  done
+}
+
 ferrox_clone_target() {
   local dest="$1" shared="$2" part
   local staging="$dest/target.claim"
+  local profiles
+  local -a parts
+  profiles="$(ferrox_target_profiles)" || return 1
+  read -ra parts <<< "$profiles"
   rm -rf "$staging"
   mkdir -p "$staging"
-  for part in debug release doc; do
+  for part in "${parts[@]}"; do
     [[ -d "$shared/$part" ]] || continue
     ferrox_clone_dir "$shared/$part" "$staging/$part"
   done

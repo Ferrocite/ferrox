@@ -400,12 +400,14 @@ cargo run -p ferrox-prompt -- rows        # the matrix rows a slice can be about
 ## Contributing
 
 ```bash
-./scripts/new-worktree.sh <name>      # worktree with its own copy-on-write warm target
+./scripts/new-worktree.sh <name>      # worktree with a debug-only copy-on-write warm target
 ./scripts/claim-target.sh             # claim/re-clone this worktree's target from the seed
 ./scripts/link-shared-target.sh       # repair config/upstream links (--all claims every worktree)
+./scripts/gc-target.sh --lean --apply # drop release/doc/incremental from worktrees
 ./scripts/gc-target.sh --apply        # reclaim dead incremental sessions and stranded target dirs
 ./scripts/fetch-upstream.sh           # only what the links missed
 cargo run -p ferrox-prompt -- next    # the slice
+./scripts/check.sh --fast             # fmt, clippy and tests while iterating
 ./scripts/check.sh                    # everything ci.yml runs, before the push
 
 cargo run -p ferrox-bench -- --config 'vless://...'   # the comparison table for a link

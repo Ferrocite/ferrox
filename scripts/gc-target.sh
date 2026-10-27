@@ -6,6 +6,7 @@
 #
 #   ./scripts/gc-target.sh                          show what would go
 #   ./scripts/gc-target.sh --apply                  reclaim it
+#   ./scripts/gc-target.sh --lean --apply           drop release/doc/incremental from worktrees
 #   ./scripts/gc-target.sh --older-than 12 --apply
 #   ./scripts/gc-target.sh --reset-idle 14 --apply  drop clones idle 14 days
 #   ./scripts/gc-target.sh --ensure-free 25         reclaim until 25 GiB is free
@@ -23,20 +24,26 @@ reset_days=0
 reset_minutes=0
 ensure_free=0
 keep=""
+lean=0
+lean_age=60
+lean_age_set=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --apply) apply=1; shift ;;
     --dry-run) apply=0; shift ;;
+    --lean) lean=1; shift ;;
+    --lean-age) lean_age="${2:?--lean-age wants minutes}"; lean_age_set=1; shift 2 ;;
     --older-than) hours="${2:?--older-than wants hours}"; hours_set=1; shift 2 ;;
     --reset-idle) reset_days="${2:?--reset-idle wants days}"; shift 2 ;;
     --ensure-free) ensure_free="${2:?--ensure-free wants GiB}"; shift 2 ;;
     --keep) keep="${2:?--keep wants a path}"; shift 2 ;;
-    *) echo "usage: scripts/gc-target.sh [--dry-run|--apply] [--older-than HOURS] [--reset-idle DAYS] [--ensure-free GIB] [--keep PATH]" >&2; exit 2 ;;
+    *) echo "usage: scripts/gc-target.sh [--dry-run|--apply] [--lean] [--lean-age MINUTES] [--older-than HOURS] [--reset-idle DAYS] [--ensure-free GIB] [--keep PATH]" >&2; exit 2 ;;
   esac
 done
 [[ "$hours" =~ ^[0-9]+$ ]] || { echo "--older-than wants whole hours" >&2; exit 2; }
 [[ "$reset_days" =~ ^[0-9]+$ ]] || { echo "--reset-idle wants whole days" >&2; exit 2; }
 [[ "$ensure_free" =~ ^[0-9]+$ ]] || { echo "--ensure-free wants whole GiB" >&2; exit 2; }
+[[ "$lean_age" =~ ^[0-9]+$ ]] || { echo "--lean-age wants whole minutes" >&2; exit 2; }
 minutes=$((hours * 60))
 idle_minutes=$((reset_days * 1440))
 reset_minutes=$idle_minutes
@@ -64,6 +71,10 @@ if [[ $ensure_free -gt 0 ]]; then
   if [[ $reset_minutes -eq 0 ]]; then
     reset_minutes=30
   fi
+  if [[ $lean_age_set -eq 0 ]]; then
+    lean_age=10
+  fi
+  lean=1
   if (( $(free_kib "$top") >= ensure_free * 1048576 )); then
     printf 'free: %s GiB (target %s GiB)\n' "$(free_gib "$top")" "$ensure_free"
     exit 0
@@ -147,6 +158,27 @@ reset_idle_targets() {
   done <<< "$worktrees"
 }
 
+# A local gate tests in debug. Release, doc and incremental sessions are the
+# three dirs it never reads, so an idle one is the cheapest space to take back
+# before a whole clone is dropped.
+lean_worktrees() {
+  local age="$1" path part recent
+  while IFS= read -r path; do
+    [[ -d "$path" ]] || continue
+    [[ -n "$keep" && "$path" == "$keep" ]] && continue
+    ferrox_target_is_own "$path" || continue
+    for part in release doc debug/incremental; do
+      [[ -d "$path/target/$part" ]] || continue
+      recent="$(find "$path/target/$part" -type f -mmin "-$age" -print -quit 2>/dev/null)"
+      [[ -n "$recent" ]] && continue
+      reclaim "$path/target/$part"
+      if [[ $ensure_free -gt 0 ]] && (( $(free_kib "$top") >= ensure_free * 1048576 )); then
+        return 0
+      fi
+    done
+  done <<< "$worktrees"
+}
+
 reclaim_temp_forges() {
   local age="${1:-}" dir
   if [[ ! -d "$tmp" ]]; then
@@ -170,6 +202,10 @@ reclaim_temp_forges() {
 }
 
 prune_all_sessions "$minutes"
+
+if [[ $lean == 1 ]]; then
+  lean_worktrees "$lean_age"
+fi
 
 while IFS= read -r path; do
   if [[ ! -d "$path" ]]; then

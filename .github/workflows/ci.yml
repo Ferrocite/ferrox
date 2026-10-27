@@ -8,13 +8,15 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
-      - "crates/**/*.rs"
-      - "crates/**/*.toml"
+      - "crates/ferrox-core/**"
+      - "crates/ferrox-app/**"
+      - "crates/ferrox-prompt/**"
+      - "crates/ferrox-bench/**"
       - "scripts/**"
       - "docs/**"
       - "README.md"
       - "AGENTS.md"
-      - ".github/workflows/**"
+      - ".github/workflows/ci.yml"
   workflow_dispatch:
 
 concurrency:
@@ -26,7 +28,9 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  CARGO_INCREMENTAL: "1"
+  # The cache restores the whole target tree; incremental state only bloats it
+  # and names paths the next runner does not have.
+  CARGO_INCREMENTAL: "0"
   RUSTFLAGS: -D warnings --cfg aes_armv8 --cfg polyval_armv8
 
 jobs:
@@ -54,29 +58,12 @@ jobs:
             python3 scripts/ci-scope.py scope --wide
           fi
 
-  lint:
-    name: lint, docs and gates
+  gates:
+    name: gates that need no toolchain
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
-        with:
-          shared-key: ci
-      - run: cargo fmt --all -- --check
-      - name: lint the workspace
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::perf -W clippy::suspicious
-      - run: cargo doc --workspace --locked --no-deps
-        env:
-          RUSTDOCFLAGS: -D warnings
-      - name: prove the stall detector names the hang
-        shell: bash
-        # watch-test.sh is what cuts a hung suite at the quiet limit and points at the
-        # one test that never returns; nothing else runs its selftest, so gate it here.
-        run: ./scripts/watch-test.sh --selftest
       - name: the CLI's own gates
         run: |
           python3 scripts/check-cli-args.py
@@ -99,6 +86,39 @@ jobs:
             fi
           done
           exit "$status"
+      - name: the benchmark and matrix self-checks
+        run: |
+          python3 scripts/benchmark-delta.py --selftest
+          python3 scripts/check-matrix-legs.py --selftest
+
+  lint:
+    name: lint, docs and stall detector
+    needs: plan
+    # A prose, workflow or script change moves no Rust, so three compilers and a
+    # clippy run are not owed; the plan already knows the difference.
+    if: needs.plan.outputs.rust == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: ci
+          cache-on-failure: true
+      - run: cargo fmt --all -- --check
+      - name: lint the workspace
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings -W clippy::perf -W clippy::suspicious
+      - run: cargo doc --workspace --locked --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+      - name: prove the stall detector names the hang
+        shell: bash
+        # watch-test.sh is what cuts a hung suite at the quiet limit and points at the
+        # one test that never returns; nothing else runs its selftest, so gate it here.
+        run: ./scripts/watch-test.sh --selftest
 
   test:
     name: test (${{ matrix.name }})
@@ -125,6 +145,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           shared-key: ci
+          cache-on-failure: true
       - name: install the QUIC build tool
         if: runner.os == 'Windows'
         shell: bash

@@ -4,7 +4,10 @@ name: interop-baseline
 on:
   pull_request:
     paths:
-      - "crates/**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/ferrox-core/**"
+      - "crates/ferrox-app/**"
       - "upstream/pins.toml"
       - "scripts/run-interop-baseline.sh"
       - ".github/workflows/interop-baseline.yml"

@@ -3,13 +3,16 @@ name: ops
 on:
   pull_request:
     paths:
-      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'crates/ferrox-core/**'
+      - 'crates/ferrox-app/**'
       - 'scripts/count-ops.sh'
       - 'scripts/expected-ops.txt'
       - 'scripts/method-ops.txt'
       - 'scripts/method-counts.txt'
       - 'scripts/ci-scope.py'
-      - 'docs/**'
+      - 'docs/function/**'
       - '.github/workflows/ops.yml'
   workflow_dispatch:
 
