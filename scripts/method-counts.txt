@@ -765,6 +765,7 @@ carrier-masque icmp-too-big-shapes 2 ferrox-core-connectip::tests::a_packet_too_
 carrier-masque icmp-too-big-edges 5 ferrox-core-connectip::tests::a_packet_too_big_copies_options_and_refuses_a_narrow_mtu
 carrier-masque icmp-mtu-narrows 2 ferrox-app-wg-stack::tests::a_packet_too_big_narrows_the_device_mtu
 carrier-masque icmp-too-big-responses 1 ferrox-app-masque::tests::a_packet_wider_than_one_datagram_is_answered_with_icmp
+carrier-masque datagram-send-queue-depth 32 ferrox-app-masque::tests::a_full_datagram_queue_refuses_the_next_packet
 carrier-masque echo-replies 2 ferrox-core-connectip::tests::an_echo_request_is_answered_at_both_families
 carrier-masque echo-refusals 3 ferrox-core-connectip::tests::a_message_that_is_not_an_echo_request_leaves_the_buffer_alone
 carrier-masque echo-answers-on-the-client 2 ferrox-app-wg-stack::tests::an_echo_to_the_devices_own_address_is_answered_on_the_tunnel

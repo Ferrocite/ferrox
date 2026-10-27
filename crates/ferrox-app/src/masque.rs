@@ -27,11 +27,17 @@ use crate::wg_stack::{self, ClientFlow, Packet, UdpRoutes};
 use crate::wireguard::DeviceConfig;
 
 const TICK: Duration = Duration::from_millis(10);
+const RETRY: Duration = Duration::from_millis(1);
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
 pub(crate) const DEFAULT_MTU: usize = 1280;
 pub(crate) const QUEUE: usize = 512;
+/// Frames the connection may hold before `dgram_send` refuses more: the
+/// reference queues 32, and a peer that drains slower drops what the wire
+/// delivers above its own receive queue, which the inner TCP then backs off
+/// from for seconds.
+const DGRAM_INFLIGHT: usize = 32;
 /// The server's own connection ID: a short header carries no length, so the demultiplexer reads exactly this many bytes.
 const CID_LEN: usize = 16;
 pub(crate) const AUTH_REALM: &str = "Basic realm=\"masque\", charset=\"UTF-8\"";
@@ -418,7 +424,7 @@ fn client_config(spec: &ClientSpec) -> Result<quiche::Config, String> {
         quic::quiche_config(&spec.tls.roots, None)
             .ok_or("masque: no certificate authorities for the edge")?
     };
-    config.enable_dgram(true, quic::MAX_DATAGRAM, quic::MAX_DATAGRAM);
+    config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
     Ok(config)
 }
 
@@ -833,13 +839,21 @@ fn io(
         ..Stream::default()
     };
     let mut room = vec![0u8; 65535];
+    let mut unsent: Option<Vec<u8>> = None;
     loop {
-        while let Ok(packet) = from_tunnel.try_recv() {
-            if let Some(icmp) = send_datagram(&mut conn, stream, &packet) {
-                let _ = to_stack.send(Packet {
-                    peer: [0u8; 32],
-                    bytes: icmp,
-                });
+        while let Some(packet) = unsent.take().or_else(|| from_tunnel.try_recv().ok()) {
+            match send_datagram(&mut conn, stream, &packet) {
+                Emission::Queued => {}
+                Emission::Full => {
+                    unsent = Some(packet);
+                    break;
+                }
+                Emission::TooLarge(icmp) => {
+                    let _ = to_stack.send(Packet {
+                        peer: [0u8; 32],
+                        bytes: icmp,
+                    });
+                }
             }
         }
         if !quic::pump_once(&mut conn, sock, local, TICK) || conn.is_closed() {
@@ -894,18 +908,35 @@ pub(crate) fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u
     }
 }
 
+enum Emission {
+    Queued,
+    Full,
+    TooLarge(Vec<u8>),
+}
+
 /// One inner packet on its stream, or the ICMP Packet Too Big it needs instead when the lane cannot carry it: the MTU the answer names is what the inner stack has left after the stream prefix.
-fn send_datagram(conn: &mut quiche::Connection, stream: u64, packet: &[u8]) -> Option<Vec<u8>> {
+fn send_datagram(conn: &mut quiche::Connection, stream: u64, packet: &[u8]) -> Emission {
     let mut datagram = Vec::with_capacity(3 + packet.len());
     connectip::datagram_prefix(stream, &mut datagram);
     datagram.extend_from_slice(packet);
-    let max = conn.dgram_max_writable_len()?;
+    let Some(max) = conn.dgram_max_writable_len() else {
+        return Emission::Full;
+    };
     if datagram.len() > max {
         let overhead = frames::quic_varint_len(stream / 4) + 1;
-        return connectip::icmp_too_large(packet, max.checked_sub(overhead)?);
+        let Some(icmp) = max
+            .checked_sub(overhead)
+            .and_then(|mtu| connectip::icmp_too_large(packet, mtu))
+        else {
+            return Emission::Queued;
+        };
+        return Emission::TooLarge(icmp);
     }
-    let _ = conn.dgram_send(&datagram);
-    None
+    // Only a full queue asks for the packet back; any other failure is the connection ending, which the loop's own close check ends.
+    match conn.dgram_send(&datagram) {
+        Err(quiche::Error::Done) => Emission::Full,
+        _ => Emission::Queued,
+    }
 }
 
 /// Open a server inbound's socket and spawn its demultiplexer, stack and forwarder.
@@ -916,7 +947,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     let Some(mut config) = quic::serve_config(&identity) else {
         return Err("unreadable masque tls identity".to_owned());
     };
-    config.enable_dgram(true, quic::MAX_DATAGRAM, quic::MAX_DATAGRAM);
+    config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
     let sock = UdpSocket::bind(address)
         .map_err(|error| format!("cannot bind masque `{address}`: {error}"))?;
     let local = sock
@@ -1252,10 +1283,13 @@ fn dispatch(shared: &Shared, from_stack: Receiver<Vec<u8>>) {
         let Some(destination) = packet_destination(&packet) else {
             continue;
         };
-        if let Ok(tunnels) = shared.tunnels.lock() {
-            if let Some(tunnel) = tunnels.get(&destination) {
-                let _ = tunnel.try_send(packet);
-            }
+        let sender = shared
+            .tunnels
+            .lock()
+            .ok()
+            .and_then(|tunnels| tunnels.get(&destination).cloned());
+        if let Some(tunnel) = sender {
+            let _ = tunnel.send(packet);
         }
     }
 }
@@ -1351,6 +1385,7 @@ struct Tunnel {
     rejected: bool,
     settings_sent: bool,
     pending: Option<Vec<u8>>,
+    unsent: Option<Vec<u8>>,
     outgoing: Receiver<Vec<u8>>,
     sender: SyncSender<Vec<u8>>,
     addrs: Vec<IpAddr>,
@@ -1381,6 +1416,7 @@ fn worker(
         rejected: false,
         settings_sent: false,
         pending: None,
+        unsent: None,
         outgoing,
         sender,
         addrs: Vec::new(),
@@ -1390,7 +1426,11 @@ fn worker(
         if conn.is_closed() {
             return;
         }
-        let wait = conn.timeout().unwrap_or(TICK).min(TICK);
+        let wait = if tunnel.unsent.is_some() {
+            RETRY
+        } else {
+            conn.timeout().unwrap_or(TICK).min(TICK)
+        };
         match rx.recv_timeout(wait) {
             Ok((mut bytes, from)) => {
                 let info = quiche::RecvInfo { from, to: local };
@@ -1406,9 +1446,21 @@ fn worker(
             }
             service(&mut conn, &shared, &spec, &mut tunnel);
         }
-        while let Ok(packet) = tunnel.outgoing.try_recv() {
-            if let Some(stream) = tunnel.stream {
-                if let Some(icmp) = send_datagram(&mut conn, stream, &packet) {
+        while let Some(packet) = tunnel
+            .unsent
+            .take()
+            .or_else(|| tunnel.outgoing.try_recv().ok())
+        {
+            let Some(stream) = tunnel.stream else {
+                continue;
+            };
+            match send_datagram(&mut conn, stream, &packet) {
+                Emission::Queued => {}
+                Emission::Full => {
+                    tunnel.unsent = Some(packet);
+                    break;
+                }
+                Emission::TooLarge(icmp) => {
                     let _ = shared.packets.send(Packet {
                         peer: [0u8; 32],
                         bytes: icmp,
@@ -2240,7 +2292,9 @@ mod tests {
         packet[20..22].copy_from_slice(&1234u16.to_be_bytes());
         packet[22..24].copy_from_slice(&4321u16.to_be_bytes());
         packet[24..26].copy_from_slice(&1380u16.to_be_bytes());
-        let icmp = send_datagram(&mut lane.conn, lane.stream, &packet).expect("too big");
+        let Emission::TooLarge(icmp) = send_datagram(&mut lane.conn, lane.stream, &packet) else {
+            panic!("too big for one datagram");
+        };
         assert_eq!(icmp[9], 1, "ICMP");
         assert_eq!((icmp[20], icmp[21]), (3, 4), "fragmentation needed");
         assert_eq!(
@@ -2260,8 +2314,54 @@ mod tests {
             max - overhead
         );
         assert!(
-            send_datagram(&mut lane.conn, lane.stream, &icmp).is_none(),
+            matches!(
+                send_datagram(&mut lane.conn, lane.stream, &icmp),
+                Emission::Queued
+            ),
             "it fits"
+        );
+    }
+
+    #[test]
+    fn a_full_datagram_queue_refuses_the_next_packet() {
+        let (_inbound, port) = serve("127.0.0.1:1");
+        let spec = ClientSpec::from(&outbound(port)).expect("spec");
+        let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port).expect("resolve");
+        let sock = Datagram::plain(sock);
+        let mut lane = establish(&spec, &sock, peer, local).expect("lane");
+        let mut packet = vec![0u8; 64];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&64u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[10, 14, 0, 2]);
+        packet[16..20].copy_from_slice(&[192, 0, 2, 1]);
+        packet[20..22].copy_from_slice(&1234u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&4321u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&44u16.to_be_bytes());
+        for _ in 0..DGRAM_INFLIGHT {
+            assert!(
+                matches!(
+                    send_datagram(&mut lane.conn, lane.stream, &packet),
+                    Emission::Queued
+                ),
+                "the queue is not full yet"
+            );
+        }
+        assert!(
+            matches!(
+                send_datagram(&mut lane.conn, lane.stream, &packet),
+                Emission::Full
+            ),
+            "a full queue refuses the packet instead of dropping it"
+        );
+        quic::flush_egress(&mut lane.conn, &sock);
+        assert!(
+            matches!(
+                send_datagram(&mut lane.conn, lane.stream, &packet),
+                Emission::Queued
+            ),
+            "a drained queue takes the packet that was held"
         );
     }
 
