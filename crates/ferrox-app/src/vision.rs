@@ -366,11 +366,6 @@ impl<S: Read + Write + RecordAlignment> RecordAlignment for Link<S> {
 }
 
 impl<S: Read + Write + RecordAlignment> Link<S> {
-    /// The session this link frames, so a caller that shares it can arm the transport it reads.
-    pub(crate) fn session(&self) -> &S {
-        &self.session
-    }
-
     /// The direct switch reads the raw clone, so the grain a shared read needs is armed on the handle it reads.
     pub(crate) fn arm_read_timeout(&self, grain: std::time::Duration) -> std::io::Result<()> {
         match &self.raw {

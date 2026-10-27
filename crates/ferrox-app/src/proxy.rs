@@ -12067,17 +12067,6 @@ impl<S: ferrox_core::tls::TlsProvider> Write for TlsHalf<S> {
     }
 }
 
-impl TlsHalf<ferrox_core::tls::ClientSession<Connection>> {
-    /// Arms the transport the shared session reads, for a relay that hands this half to a framer.
-    fn arm_session_timeout(&self, grain: Duration) -> std::io::Result<()> {
-        self.session
-            .lock()
-            .map_err(|_| std::io::Error::other("tls half poisoned"))?
-            .get_ref()
-            .set_read_timeout(Some(grain))
-    }
-}
-
 impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send>
     ferrox_core::tls::RecordAlignment for TlsHalf<S>
 {
@@ -12375,7 +12364,7 @@ fn dial_vless_tls(
             if session.write_all(&header).is_err() {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            let Some(link) = pump_vision_answer(client, session, &vless.id) else {
+            let Some(half) = pump_vision_answer(client, session, &vless.id) else {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             };
             let Ok(downstream) = client.try_clone() else {
@@ -12385,12 +12374,6 @@ fn dial_vless_tls(
                 return;
             }
             let close = shutdown_pair(downstream.try_clone().ok(), None);
-            // The Link frames its writes over this session, so the quiet grain arms on the transport it reads.
-            let half = Half::shared_armed_capped(
-                link,
-                |link, grain| link.session().arm_session_timeout(grain),
-                SESSION_POLL,
-            );
             relay_stream(Half::socket(downstream), half, &close);
         }
         _ => ride_carrier(
@@ -12440,27 +12423,30 @@ fn pump_tls_answer(
         .and_then(Result::ok)
 }
 
-/// The Vision answer wait, framed: the pump writes through the same `Link` the relay keeps, so the first upload is a Vision frame rather than raw TLS content, and the link's UUID and filter state survive the handoff.
+/// The Vision answer wait, framed: the pump writes through the writer `Link` the relay keeps, so the first upload is a Vision frame rather than raw TLS content, and the link's UUID and filter state survive the handoff. The pair is split from the start so the relay's read and write never share a lock across the transport wait.
 fn pump_vision_answer(
     client: &Connection,
     session: ferrox_core::tls::ClientSession<Connection>,
     id: &[u8; 16],
-) -> Option<crate::vision::Link<TlsHalf<ferrox_core::tls::ClientSession<Connection>>>> {
+) -> Option<Half<crate::vision::Link<TlsHalf<ferrox_core::tls::ClientSession<Connection>>>>> {
     let Ok(out) = session.get_ref().try_clone() else {
         return None;
     };
     let Ok(cipher) = session.get_ref().try_clone() else {
         return None;
     };
+    if cipher.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return None;
+    }
     let shared = Arc::new(Mutex::new(session));
     let out = Arc::new(Mutex::new(Sealed::new(out)));
-    let mut reader = TlsHalf {
+    let mut answer = TlsHalf {
         session: Arc::clone(&shared),
         out: Arc::clone(&out),
         driven: None,
         sleep_on_timeout: true,
     };
-    let writer = TlsHalf {
+    let reader = TlsHalf {
         session: Arc::clone(&shared),
         out: Arc::clone(&out),
         driven: Some(DrivenHalf::new(
@@ -12470,11 +12456,14 @@ fn pump_vision_answer(
         )),
         sleep_on_timeout: false,
     };
-    let link = Arc::new(Mutex::new(crate::vision::Link::new(
-        writer.clone(),
-        None,
-        id,
-    )));
+    let writer = TlsHalf {
+        session: Arc::clone(&shared),
+        out: Arc::clone(&out),
+        driven: None,
+        sleep_on_timeout: false,
+    };
+    let (reader, writer) = crate::vision::Link::split(reader, writer, None, None, id);
+    let link = Arc::new(Mutex::new(writer));
     let pump = Pump::over_now(client, {
         let link = Arc::clone(&link);
         move |bytes| {
@@ -12484,13 +12473,14 @@ fn pump_vision_answer(
             link.write_all(bytes).is_ok()
         }
     });
-    let answered = read_vless_response(&mut reader).is_some();
+    let answered = read_vless_response(&mut answer).is_some();
     let _ = pump.end();
     if !answered {
         return None;
     }
-    drop(reader);
-    Arc::into_inner(link).and_then(|link| link.into_inner().ok())
+    drop(answer);
+    let writer = Arc::into_inner(link).and_then(|link| link.into_inner().ok())?;
+    Some(Half::split(reader, writer))
 }
 
 fn tls_lane(
