@@ -190,8 +190,7 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>) -> 
     crate::accesslog::install(root)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     install_default_outbound_tag(root);
-    let freedom =
-        has_protocol(root, "outbounds", "freedom") || find_unbuilt_outbound(root).is_some();
+    let freedom = has_protocol(root, "outbounds", "freedom");
     let outbound =
         find_outbound(root).unwrap_or_else(|reason| exit(&format!("bad config {label}: {reason}")));
     // A loopback outbound names its inbound by tag, so it resolves only when no concrete dial won.
@@ -478,6 +477,15 @@ fn serve_inbounds_counted(
                             Err(reason) => eprintln!("wireguard inbound {address}: {reason}"),
                         }
                     }
+                    "masque" => {
+                        let Some(out) = routed(inbound, false) else {
+                            continue;
+                        };
+                        match crate::masque::serve_inbound(inbound, &out, address) {
+                            Ok(_) => inbounds += 1,
+                            Err(reason) => eprintln!("masque inbound {address}: {reason}"),
+                        }
+                    }
                     _ => eprintln!("unsupported inbound protocol `{protocol}` in {label}"),
                 }
             }
@@ -567,7 +575,7 @@ fn refuse_inbound(protocol: &str, label: &str, inbound: &Json) {
 }
 
 /// Served inbounds; the `tun` device inbound opens a native interface and relays TCP flows.
-const SERVED_INBOUNDS: [&str; 12] = [
+const SERVED_INBOUNDS: [&str; 13] = [
     "vless",
     "trojan",
     "vmess",
@@ -578,6 +586,7 @@ const SERVED_INBOUNDS: [&str; 12] = [
     "mixed",
     "tun",
     "wireguard",
+    "masque",
     "dokodemo-door",
     "hc",
 ];
@@ -1278,6 +1287,9 @@ pub(crate) enum Outbound {
     /// The flow rides a `WireGuard` tunnel: the userspace stack dials the
     /// destination the rules chose and encrypts every inner packet.
     WireGuard(Arc<crate::wg::WireGuardOut>),
+    /// The flow rides a MASQUE CONNECT-IP tunnel: one HTTP/3 conversation carries
+    /// every destination as inner IP packets over QUIC datagrams.
+    Masque(Arc<crate::masque::MasqueOut>),
     /// The metrics app's tag: a flow routed here reaches its own HTTP handler on a loopback lane.
     Metrics {
         address: SocketAddr,
@@ -1298,6 +1310,7 @@ impl Outbound {
             Self::Socks(socks) => resolve_outbound(&socks.address, socks.port),
             Self::Http(http) => resolve_outbound(&http.address, http.port),
             Self::WireGuard(wireguard) => wireguard.edge(),
+            Self::Masque(masque) => masque.edge(),
             Self::Metrics { address } => Some(*address),
             Self::Foxy(_)
             | Self::Veepn(_)
@@ -1811,8 +1824,7 @@ fn route_shared_with_api(
     let Some(first) = list.first() else {
         return Err("routing has no outbound to fall back to".into());
     };
-    let freedom =
-        has_protocol(root, "outbounds", "freedom") || find_unbuilt_outbound(root).is_some();
+    let freedom = has_protocol(root, "outbounds", "freedom");
     let build = |config: &Json, tag: &str| routed_outbound(root, config, tag, freedom);
     let default_tag = first
         .get("tag")
@@ -5294,7 +5306,9 @@ fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
 }
 
 /// The QUIC identity an inbound serves: QUIC mandates TLS, so anything without a certificate serves nothing.
-fn quic_inbound_identity(inbound: &Json) -> Option<Arc<ferrox_core::tls::TlsServerConfig>> {
+pub(crate) fn quic_inbound_identity(
+    inbound: &Json,
+) -> Option<Arc<ferrox_core::tls::TlsServerConfig>> {
     let settings = inbound.get("streamSettings")?;
     if settings.get("security").and_then(Json::as_str) != Some("tls") {
         return None;
@@ -14136,6 +14150,10 @@ pub(crate) fn serve_connect(
         wireguard.serve_tcp(client, asked, prefix);
         return;
     }
+    if let Outbound::Masque(masque) = out {
+        masque.serve_tcp(client, asked, prefix);
+        return;
+    }
     if let Outbound::Foxy(foxy) = out {
         return serve_foxy_front(client, foxy, asked, front, prefix);
     }
@@ -14281,6 +14299,7 @@ fn dial_socks_outbound(
         | Outbound::Dns(_)
         | Outbound::ReversePortal(_)
         | Outbound::WireGuard(_)
+        | Outbound::Masque(_)
         | Outbound::Metrics { .. }
         | Outbound::Api(_) => {}
     }
@@ -15391,6 +15410,7 @@ pub(crate) fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Optio
             _ => serve_socks_udp_foxy(relay, foxy, associate),
         },
         Outbound::WireGuard(wireguard) => wireguard.serve_udp(relay, associate),
+        Outbound::Masque(masque) => masque.serve_udp(relay, associate),
         Outbound::Freedom(out) => serve_socks_udp_freedom(relay, out),
         Outbound::Socks(socks) => serve_socks_udp_socks(relay, socks),
         Outbound::Dns(dns) => serve_dns_udp(relay, dns),
@@ -20119,25 +20139,6 @@ fn canonical_protocol(protocol: &str) -> &str {
     }
 }
 
-/// The protocols xray registers with no handler here: a config naming one dials direct and says so at the outbound.
-const UNBUILT_OUTBOUNDS: [&str; 1] = ["masque"];
-
-/// The first outbound naming an unbuilt protocol, with its tag and that name.
-fn find_unbuilt_outbound(root: &Json) -> Option<(&str, &str)> {
-    let outbounds = root.get("outbounds").and_then(Json::as_arr)?;
-    outbounds.iter().find_map(|outbound| {
-        let protocol = canonical_protocol(outbound.get("protocol").and_then(Json::as_str)?);
-        if !UNBUILT_OUTBOUNDS.contains(&protocol) {
-            return None;
-        }
-        let tag = outbound
-            .get("tag")
-            .and_then(Json::as_str)
-            .unwrap_or("<untagged>");
-        Some((tag, protocol))
-    })
-}
-
 fn has_protocol(root: &Json, array: &str, protocol: &str) -> bool {
     root.get(array).and_then(Json::as_arr).is_some_and(|items| {
         items.iter().any(|item| {
@@ -20324,10 +20325,10 @@ fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
             None
         }
         // The chain's own refusals carry their one line already.
-        "foxy" | "veepn" => None,
+        "foxy" | "veepn" | "masque" => None,
         // A lane without an outbound this binary builds: the name is xray's, not a typo to diagnose.
         "hysteria" => hysteria_outbound_refusal(outbound),
-        "dokodemo-door" | "masque" => Some(format!("the `{protocol}` outbound is not carried")),
+        "dokodemo-door" => Some("the `dokodemo-door` outbound is not carried".to_owned()),
         _ => Some(format!("unknown outbound protocol: {protocol}")),
     }
 }
@@ -20414,6 +20415,9 @@ fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
     if let Some(wireguard) = find_wireguard_outbound(root)? {
         return Ok(Some(Outbound::WireGuard(Arc::new(wireguard))));
     }
+    if let Some(masque) = find_masque_outbound(root)? {
+        return Ok(Some(Outbound::Masque(Arc::new(masque))));
+    }
     if let Some(freedom) = find_freedom_outbound(root)? {
         return Ok(Some(Outbound::Freedom(Arc::new(freedom))));
     }
@@ -20423,10 +20427,6 @@ fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
     }
     if let Some(dns) = find_dns_outbound(root)? {
         return Ok(Some(Outbound::Dns(dns)));
-    }
-    if let Some((tag, protocol)) = find_unbuilt_outbound(root) {
-        eprintln!("outbound `{tag}` protocol `{protocol}` is not carried; dialing direct");
-        return Ok(Some(Outbound::Freedom(Arc::default())));
     }
     Ok(None)
 }
@@ -20460,10 +20460,35 @@ fn find_wireguard_outbound(root: &Json) -> Result<Option<crate::wg::WireGuardOut
         .map_err(|reason| format!("wireguard outbound: {reason}"))
 }
 
+/// The MASQUE outbound's transport and account, built once at startup so a bad
+/// server or a missing TLS identity refuses the config instead of a flow.
+fn find_masque_outbound(root: &Json) -> Result<Option<crate::masque::MasqueOut>, String> {
+    let empty = Vec::new();
+    for outbound in root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&empty)
+    {
+        if canonical_protocol(
+            outbound
+                .get("protocol")
+                .and_then(Json::as_str)
+                .unwrap_or(""),
+        ) != "masque"
+        {
+            continue;
+        }
+        return crate::masque::MasqueOut::new(outbound)
+            .map(Some)
+            .map_err(|reason| format!("masque outbound: {reason}"));
+    }
+    Ok(None)
+}
+
 /// The freedom outbound's settings, read the way the reference reads them. A value the
 /// reference refuses is a startup refusal here too; a field this tree has no lane for is
 /// named once and left out rather than silently changing the dial.
-fn find_freedom_outbound(root: &Json) -> Result<Option<FreedomOut>, String> {
+pub(crate) fn find_freedom_outbound(root: &Json) -> Result<Option<FreedomOut>, String> {
     let empty = Vec::new();
     let outbounds = root
         .get("outbounds")
@@ -41791,20 +41816,6 @@ end
         let mut answer = Vec::new();
         blocked.read_to_end(&mut answer).expect("closes");
         assert_eq!(answer, ferrox_core::blackhole::HTTP_403);
-    }
-
-    /// A handler xray registers and this tree has not built serves as the direct lane rather than refusing the config.
-    #[test]
-    fn an_unbuilt_outbound_dials_direct_instead_of_refusing_the_config() {
-        let protocol = "masque";
-        let text = format!(
-            r#"{{"outbounds":[{{"tag":"named","protocol":"{protocol}","settings":{{}}}}]}}"#
-        );
-        let root = crate::json::parse(&text).expect("parses");
-        assert!(
-            matches!(find_outbound(&root), Ok(Some(Outbound::Freedom(_)))),
-            "`{protocol}` is named at its outbound and dials direct"
-        );
     }
 
     /// The sink answers the front's client with the reference's bytes and dials

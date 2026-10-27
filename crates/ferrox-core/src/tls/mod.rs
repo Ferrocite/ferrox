@@ -382,7 +382,7 @@ pub fn decode_ech_keys(text: &str) -> Result<Vec<u8>, String> {
 }
 
 mod rustls_backend;
-pub use rustls_backend::{RustlsProvider, RustlsServerProvider};
+pub use rustls_backend::{verify_cert_pinned, RustlsProvider, RustlsServerProvider};
 
 pub mod shaped;
 pub use shaped::Fingerprint;
