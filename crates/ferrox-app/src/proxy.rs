@@ -5313,6 +5313,17 @@ fn serve_vless_quic_inbound(
         eprintln!("quic inbound in {path} needs security tls with a certificate: serves nothing");
         return false;
     };
+    match crate::config::server_decryption(inbound) {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            eprintln!("vless: encryption over quic is not served yet; inbound refused");
+            return false;
+        }
+        Err(error) => {
+            eprintln!("{error} in {path}: inbound refused");
+            return false;
+        }
+    }
     let Some(config) = crate::quic::serve_config(&identity) else {
         eprintln!("unreadable quic tls identity in {path}: serves nothing");
         return false;
@@ -16975,8 +16986,11 @@ fn spawn_xudp_reader(
             }
             if !progressed {
                 match read_into_tail(&mut read, &mut buf) {
-                    Ok(0) | Err(_) => return,
+                    Ok(0) => return,
                     Ok(_) => {}
+                    // A quiet gap is not an end: the stream's own poll times out before the peer speaks again.
+                    Err(error) if is_timeout(&error) => {}
+                    Err(_) => return,
                 }
             }
         }
@@ -17602,12 +17616,15 @@ fn serve_udp_stream<R, W>(
         "0.0.0.0:0"
     };
     let Ok(udp) = UdpSocket::bind(bind) else {
+        close();
         return;
     };
     if udp.connect(target).is_err() || udp.set_read_timeout(Some(budgets::udp_idle())).is_err() {
+        close();
         return;
     }
     let Ok(udp_send) = udp.try_clone() else {
+        close();
         return;
     };
     let done = Arc::new(AtomicBool::new(false));
@@ -22196,6 +22213,10 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
         return None;
     }
     let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
+    if matches!(&carrier, Carrier::Quic) && encryption.is_some() {
+        eprintln!("vless: encryption over quic is not carried yet; outbound refused");
+        return None;
+    }
     let (quic_roots, quic_ech, hysteria_roots) = match &carrier {
         Carrier::Quic => {
             let ech = if security == "tls" {
@@ -37034,6 +37055,89 @@ mod tests {
     }
 
     #[test]
+    fn socks_associate_reaches_udp_echo_via_quic_mux_after_a_gap() {
+        let _serial = quic_serial();
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            loop {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (addr, roots, stop, driver) = quic_serve_loopback(id);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            id,
+            carrier: Carrier::Quic,
+            host: "localhost".to_owned(),
+            mux: true,
+            quic_roots: Some(roots.into()),
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        });
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, relay).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = udp.recv_from(&mut back).expect("echoes");
+        assert_eq!(parse_socks_udp(&back[..n]).expect("splits").1, b"ping");
+        // The reader's own poll is shorter than this gap: a quiet mux stream is not an ended one.
+        thread::sleep(Duration::from_millis(300));
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"pong");
+        udp.send_to(&datagram, relay).expect("sends after the gap");
+        let (n, _) = udp.recv_from(&mut back).expect("echoes after the gap");
+        assert_eq!(parse_socks_udp(&back[..n]).expect("splits").1, b"pong");
+        drop(client);
+        stop.store(true, Ordering::Relaxed);
+        driver.join().expect("joins");
+    }
+
+    #[test]
     fn socks_dials_vless_quic_mux_to_echo() {
         let _serial = quic_serial();
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -37194,6 +37298,24 @@ mod tests {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         }
+    }
+
+    #[test]
+    fn a_quic_outbound_with_encryption_is_refused() {
+        let (client_string, _) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "vless",
+                "settings": {{"vnext": [{{"address": "127.0.0.1", "port": 443,
+                    "users": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "encryption": "{client_string}"}}]}}]}},
+                "streamSettings": {{"network": "quic", "security": "tls"}}}}]}}"#
+        ))
+        .expect("parses");
+        assert!(
+            find_vless_outbound(&root).is_none(),
+            "a carrier that cannot seal yet refuses instead of sending plaintext"
+        );
     }
 
     #[test]
