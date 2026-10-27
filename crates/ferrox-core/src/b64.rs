@@ -234,15 +234,14 @@ pub fn decode(text: &[u8]) -> Option<Vec<u8>> {
     let mut at = 0usize;
     let (pairs, _) = text.as_chunks::<8>();
     for pair in pairs {
-        let group = u64::from_le_bytes(*pair);
-        let t0 = u32::from(DIGITS[(group & 0xff) as usize]);
-        let t1 = u32::from(DIGITS[((group >> 8) & 0xff) as usize]);
-        let t2 = u32::from(DIGITS[((group >> 16) & 0xff) as usize]);
-        let t3 = u32::from(DIGITS[((group >> 24) & 0xff) as usize]);
-        let t4 = u32::from(DIGITS[((group >> 32) & 0xff) as usize]);
-        let t5 = u32::from(DIGITS[((group >> 40) & 0xff) as usize]);
-        let t6 = u32::from(DIGITS[((group >> 48) & 0xff) as usize]);
-        let t7 = u32::from(DIGITS[(group >> 56) as usize]);
+        let t0 = u32::from(DIGITS[usize::from(pair[0])]);
+        let t1 = u32::from(DIGITS[usize::from(pair[1])]);
+        let t2 = u32::from(DIGITS[usize::from(pair[2])]);
+        let t3 = u32::from(DIGITS[usize::from(pair[3])]);
+        let t4 = u32::from(DIGITS[usize::from(pair[4])]);
+        let t5 = u32::from(DIGITS[usize::from(pair[5])]);
+        let t6 = u32::from(DIGITS[usize::from(pair[6])]);
+        let t7 = u32::from(DIGITS[usize::from(pair[7])]);
         if (t0 | t1 | t2 | t3 | t4 | t5 | t6 | t7) & 0xc0 != 0 {
             break;
         }
