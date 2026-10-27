@@ -28,7 +28,7 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 30208 | scripts/count-ops.sh |
+| ops-retired-instructions | 29568 | scripts/count-ops.sh |
 | padding-command-bytes | 5 | ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid |
 | first-frame-uuid-bytes | 16 | ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid |
 | largest-framed-block-bytes | 8171 | ferrox-app-vision::tests::a_bulk_write_frames_every_block_inside_the_bound |
@@ -55,7 +55,7 @@ graph TD
   'vision::Linkferrox_app::vision::tests::Fake::pump'
 ```
 
-`30208` retired instructions, the frame the probe walks through 512 frames carrying six content bytes and four padding bytes each, with the filter spent and no caller buffer, so the walk parses, delivers, pads over and dispatches each frame without pricing the copy or the scan. The same probe prices the walk before the whole-frame pass at `35584` in the same binary: 5,376 fewer, 15.1%. The row names the monomorphized frame the probe builds because `count-ops.sh` drops the angle brackets from a generic frame; the row it replaced named `unpad`, which the walk no longer has, so it read as an inlined frame rather than a measurement. The probe's own row is in `scripts/expected-ops.txt`. The earlier empty-frame probe sat at 17,152 while the steady-read feed's `Option` was priced here and at 16,896 after the vless-encryption layout moved it; it walked no content, so it could not see the one-pass delivery, and the probe now carries the frame shape the wire does.
+`29568` retired instructions, the frame the probe walks through 512 frames carrying six content bytes and four padding bytes each, with the filter spent and no caller buffer, so the walk parses, delivers, pads over and dispatches each frame without pricing the copy or the scan. The same probe prices the walk before the whole-frame pass at `35584` in the same binary: 6,016 fewer, 16.9%. The row names the monomorphized frame the probe builds because `count-ops.sh` drops the angle brackets from a generic frame; the row it replaced named `unpad`, which the walk no longer has, so it read as an inlined frame rather than a measurement. The probe's own row is in `scripts/expected-ops.txt`. The earlier empty-frame probe sat at 17,152 while the steady-read feed's `Option` was priced here and at 16,896 after the vless-encryption layout moved it; it walked no content, so it could not see the one-pass delivery, and the probe now carries the frame shape the wire does.
 
 ## Time
 
