@@ -30,7 +30,7 @@ const TICK: Duration = Duration::from_millis(10);
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
-const DEFAULT_MTU: usize = 1280;
+pub(crate) const DEFAULT_MTU: usize = 1280;
 pub(crate) const QUEUE: usize = 512;
 /// The server's own connection ID: a short header carries no length, so the demultiplexer reads exactly this many bytes.
 const CID_LEN: usize = 16;
@@ -150,15 +150,87 @@ impl MasqueOut {
 }
 
 fn open(spec: &ClientSpec) -> Result<Inner, String> {
+    if uses_h2(&spec.tls) {
+        return open_h2(spec);
+    }
     let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port)
         .ok_or_else(|| format!("cannot resolve masque `{}:{}`", spec.address, spec.port))?;
     let sock = Datagram::plain(sock);
     let mut lane = establish(spec, &sock, peer, local)?;
+    let addresses = lane.addresses.clone();
+    let mtu = lane.mtu;
+    let initial = std::mem::take(&mut lane.packets);
+    let alive = Arc::clone(&lane.alive);
+    Ok(assemble(
+        addresses,
+        mtu,
+        initial,
+        alive,
+        move |from_tunnel, to_stack, routes| {
+            io(lane, &sock, local, from_tunnel, to_stack, routes);
+        },
+    ))
+}
+
+/// The reference picks HTTP/2 only when the configured ALPN names it and does
+/// not name HTTP/3; anything else takes the QUIC carrier.
+fn uses_h2(tls: &TlsConfig) -> bool {
+    tls.alpn.iter().any(|protocol| protocol.as_slice() == b"h2")
+        && !tls.alpn.iter().any(|protocol| protocol.as_slice() == b"h3")
+}
+
+fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
+    let edge = format!("{}:{}", spec.address, spec.port)
+        .to_socket_addrs()
+        .map_err(|error| {
+            format!(
+                "masque: cannot resolve `{}:{}`: {error}",
+                spec.address, spec.port
+            )
+        })?
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "masque: `{}:{}` resolves to nothing",
+                spec.address, spec.port
+            )
+        })?;
+    let mut client = crate::masque_h2::Client::dial(
+        &spec.tls,
+        edge,
+        &authority(spec),
+        &spec.path,
+        &spec.headers,
+    )
+    .map_err(|reason| format!("masque: {reason}"))?;
+    let addresses = client.addresses.clone();
+    let mtu = client.mtu;
+    let initial = std::mem::take(&mut client.packets);
+    Ok(assemble(
+        addresses,
+        mtu,
+        initial,
+        Arc::new(AtomicBool::new(true)),
+        move |from_tunnel, to_stack, routes| {
+            client.run(&from_tunnel, &to_stack, &routes);
+        },
+    ))
+}
+
+/// The stack every carrier feeds, and the thread that hands the handshake's
+/// early packets to it before the carrier loop takes over.
+fn assemble(
+    addresses: Vec<IpAddr>,
+    mtu: usize,
+    initial: Vec<Vec<u8>>,
+    alive: Arc<AtomicBool>,
+    run: impl FnOnce(Receiver<Vec<u8>>, Sender<Packet>, UdpRoutes) + Send + 'static,
+) -> Inner {
     let config = Arc::new(DeviceConfig {
         secret: [0u8; 32],
-        addresses: lane.addresses.clone(),
+        addresses,
         peers: Vec::new(),
-        mtu: lane.mtu,
+        mtu,
         reserved: [0u8; 3],
         is_client: Some(true),
         no_kernel_tun: true,
@@ -174,21 +246,21 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
         wg_stack::client((*stack_config).clone(), stack_tunnel, packets_rx, flow_rx);
     });
     let io_routes = Arc::clone(&routes);
-    let alive = Arc::clone(&lane.alive);
-    let mut initial = std::mem::take(&mut lane.packets);
+    let watch = Arc::clone(&alive);
     std::thread::spawn(move || {
-        for packet in initial.drain(..) {
+        for packet in initial {
             deliver(&packets_tx, &io_routes, &packet);
         }
-        io(lane, &sock, local, from_tunnel, packets_tx, io_routes);
+        run(from_tunnel, packets_tx, io_routes);
+        watch.store(false, Ordering::Relaxed);
     });
-    Ok(Inner {
+    Inner {
         config,
         flows,
         to_tunnel,
         routes,
         alive,
-    })
+    }
 }
 
 /// One lane that finished its handshake and its first address assignment: the
@@ -512,7 +584,7 @@ fn authority(spec: &ClientSpec) -> String {
 }
 
 /// xray takes a subnet grant's first usable address rather than the raw bytes, so a proxy that assigns a range still names one host.
-fn address_of(grant: &Assigned) -> Option<IpAddr> {
+pub(crate) fn address_of(grant: &Assigned) -> Option<IpAddr> {
     match grant.version {
         4 => {
             let address = u32::from_be_bytes([
@@ -555,7 +627,7 @@ fn address_of(grant: &Assigned) -> Option<IpAddr> {
 
 /// The first address a fresh `ADDRESS_ASSIGN` no longer grants: the capsule
 /// replaces the set, so an omitted or refused entry is a withdrawal.
-fn withdrawn(body: &[u8], current: &[IpAddr]) -> Option<IpAddr> {
+pub(crate) fn withdrawn(body: &[u8], current: &[IpAddr]) -> Option<IpAddr> {
     let mut grants = Vec::new();
     connectip::address_assign(body, &mut grants)?;
     current.iter().copied().find(|address| {
@@ -742,7 +814,6 @@ fn io(
         mut conn,
         stream,
         addresses,
-        alive,
         ..
     } = lane;
     let mut control = Stream {
@@ -789,10 +860,9 @@ fn io(
         }
         quic::flush_egress(&mut conn, sock);
     }
-    alive.store(false, Ordering::Relaxed);
 }
 
-fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u8]) {
+pub(crate) fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u8]) {
     if let Some(datagram) = connectip::udp_from_packet(packet) {
         if !datagram.verified {
             return;
@@ -1901,6 +1971,32 @@ mod tests {
         .expect("a masque outbound")
     }
 
+    fn outbound_h2(port: u16) -> Json {
+        crate::json::parse(&format!(
+            r#"{{"settings":{{"server":{{"address":"127.0.0.1","port":{port}}}}},"streamSettings":{{"security":"tls","tlsSettings":{{"serverName":"localhost","allowInsecure":true,"alpn":["h2"]}},"masqueSettings":{{"headers":[{{"name":"Authorization","value":"Basic dUBleGFtcGxlLmNvbTpw"}}]}}}}}}"#
+        ))
+        .expect("a masque outbound")
+    }
+
+    fn inbound_h2(settings: &str) -> Json {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        crate::json::parse(&format!(
+            r#"{{"settings":{settings},"streamSettings":{{"security":"tls","tlsSettings":{{"alpn":["h3","h2"],"certificates":[{{"certificate":[{}],"key":[{}]}}]}}}}}}"#,
+            pem_lines(&minted.cert.pem()),
+            pem_lines(&minted.signing_key.serialize_pem())
+        ))
+        .expect("a masque inbound")
+    }
+
+    fn serve_h2(redirect: &str) -> (Json, u16) {
+        let inbound = inbound_h2(
+            r#"{"users":[{"email":"u@example.com","password":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
+        );
+        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
+        (inbound, port)
+    }
+
     fn freedom(redirect: &str) -> Outbound {
         let root = crate::json::parse(&format!(
             r#"{{"outbounds":[{{"protocol":"freedom","settings":{{"redirect":"{redirect}"}}}}]}}"#
@@ -2028,6 +2124,52 @@ mod tests {
         let (remote, payload) = crate::proxy::parse_socks_udp(&received[..n]).expect("frame");
         assert_eq!(remote, target);
         assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn a_datagram_flow_crosses_the_h2_tunnel_to_a_freedom_dial() {
+        let echo = std::net::UdpSocket::bind("127.0.0.1:0").expect("echo");
+        let echo_address = echo.local_addr().expect("address");
+        let target: SocketAddr = format!("192.0.2.1:{}", echo_address.port())
+            .parse()
+            .expect("a target");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            if let Ok((n, from)) = echo.recv_from(&mut buf) {
+                let _ = echo.send_to(&buf[..n], from);
+            }
+        });
+        let (_inbound, port) = serve_h2(&echo_address.to_string());
+        let masque = MasqueOut::new(&outbound_h2(port)).expect("outbound");
+        let relay = std::net::UdpSocket::bind("127.0.0.1:0").expect("relay");
+        let relay_address = relay.local_addr().expect("relay address");
+        let thread_relay = relay.try_clone().expect("clone");
+        std::thread::spawn(move || masque.serve_udp(&thread_relay, None));
+        std::thread::sleep(Duration::from_secs(1));
+        let app = std::net::UdpSocket::bind("127.0.0.1:0").expect("app");
+        app.set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        let mut frame = Vec::new();
+        crate::proxy::socks_udp_frame(&mut frame, None, &target, b"hello");
+        app.send_to(&frame, relay_address).expect("send");
+        let mut received = [0u8; 2048];
+        let (n, _) = app.recv_from(&mut received).expect("framed reply");
+        let (remote, payload) = crate::proxy::parse_socks_udp(&received[..n]).expect("frame");
+        assert_eq!(remote, target);
+        assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn the_carrier_follows_the_alpn_list() {
+        let alpn = |protocols: &[&[u8]]| TlsConfig {
+            alpn: protocols.iter().map(|protocol| protocol.to_vec()).collect(),
+            ..TlsConfig::default()
+        };
+        assert!(uses_h2(&alpn(&[b"h2"])));
+        assert!(!uses_h2(&alpn(&[b"h3"])));
+        assert!(!uses_h2(&alpn(&[b"h3", b"h2"])));
+        assert!(!uses_h2(&alpn(&[b"h2", b"h3"])));
+        assert!(!uses_h2(&alpn(&[])));
     }
 
     #[test]
