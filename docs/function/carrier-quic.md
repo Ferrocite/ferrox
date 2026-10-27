@@ -1,6 +1,6 @@
 # The QUIC carrier
 
-QUIC carried VLESS only as a client row; the **server role now exists** and serves a `vless` inbound on `security: tls` with a certificate (`serve_vless_quic`, `proxy.rs:5307`). Each bidirectional stream is one VLESS session, all three of the reference's kinds: TCP, UDP (`[0,0]` then the length-framed datagrams of `serve_udp_stream`) or mux (`serve_sealed_mux_split`). The UUID and flow check happens before the accept, and a stranger, a Vision flow or a reverse account closes the stream before anything is relayed. The client dials the same three: `dial_quic_udp_uplink` and `open_vless_mux_quic` take a `pumped_stream_within` lease, and the lane's pump drives the connection while the lease reads its own stream. The ALPN is the default lane one (`h3`).
+QUIC carried VLESS only as a client row; the **server role now exists** and serves a `vless` inbound on `security: tls` with a certificate (`serve_vless_quic`, `proxy.rs:5307`) when the config has a `freedom` outbound or an unbuilt one; a config without either closes every stream. Each bidirectional stream is one VLESS session, all three of the reference's kinds: TCP, UDP (`[0,0]` then the length-framed datagrams of `serve_udp_stream`) or mux (`serve_sealed_mux_split`). The UUID and flow check happens before the accept, and a stranger, a Vision flow or a reverse account closes the stream before anything is relayed. The client dials the same three: `dial_quic_udp_uplink` and `open_vless_mux_quic` take a `pumped_stream_within` lease, and the lane's pump drives the connection while the lease reads its own stream. The ALPN is the default lane one (`h3`).
 
 quiche is the default QUIC stack for this rung, and that is a rule rather than a preference: whenever a rung needs QUIC and quiche is feasible, quiche. The pin `upstream/quiche` at `3fc9bc1c` exists for reading.
 
@@ -40,7 +40,7 @@ graph TD
     D --> N{"roots missing?"}
     N -- yes --> X["return None, send nothing"]
     D -. "one built config per trust bundle,<br/>not one per connection" .-> CF["quiche::Config, shared"]
-    H(["server role"]) --> R["refused by name"]
+    H(["server role"]) --> R["served when the config has freedom"]
 ```
 
 ## Measured
@@ -52,7 +52,7 @@ graph TD
 | zero-filled-bytes-per-relayed-frame | 3 | ferrox-app-quic::tests::a_relayed_datagram_frames_its_target_ahead_of_its_payload |
 | handshakes-per-server | 1 | ferrox-app-proxy::tests::quic_pool_shares_one_connection_between_two_streams |
 | streams-left-open-per-flow | 0 | ferrox-app-proxy::tests::quic_pool_shares_one_connection_between_two_streams |
-| server-roles | 0 | ferrox-app-proxy::tests::quic_serve_closes_without_handshake |
+| server-roles | 1 | ferrox-app-proxy::tests::quic_serves_vless_echo_over_loopback |
 | dialled-without-ca-cert-file | 0 | ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file |
 | lanes-held-after-the-last-lease | 1 | ferrox-app-foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it |
 | pump-threads-owned-by-an-idle-lane | 0 | ferrox-app-proxy::tests::quic_dials_loopback_echo |

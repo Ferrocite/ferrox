@@ -9290,10 +9290,19 @@ fn dial_quic_udp_uplink(
     let pooled = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())?;
     let mut stream = pooled.stream_handle();
     let header = vless_header(&vless.id, 2, &Destination::from(*dest));
-    stream.write_all(&header).ok()?;
-    read_vless_response(&mut stream)?;
+    if stream.write_all(&header).is_err()
+        || read_vless_response(&mut HandshakeDeadline {
+            inner: &mut stream,
+            until: Instant::now() + budgets::dial(),
+        })
+        .is_none()
+    {
+        pooled.cancel();
+        return None;
+    }
     let read = pooled.stream_handle();
     let Ok(udp_send) = relay.try_clone() else {
+        pooled.cancel();
         return None;
     };
     let done = spawn_udp_uplink_reader(Box::new(read), udp_send, source, *dest);
@@ -10326,8 +10335,16 @@ fn open_vless_mux(vless: &VlessOut) -> Option<MuxUplink> {
 fn open_vless_mux_quic(vless: &VlessOut) -> Option<MuxUplink> {
     let pooled = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())?;
     let mut stream = pooled.stream_handle();
-    stream.write_all(&vless_mux_header(&vless.id)).ok()?;
-    read_vless_response(&mut stream)?;
+    if stream.write_all(&vless_mux_header(&vless.id)).is_err()
+        || read_vless_response(&mut HandshakeDeadline {
+            inner: &mut stream,
+            until: Instant::now() + budgets::dial(),
+        })
+        .is_none()
+    {
+        pooled.cancel();
+        return None;
+    }
     let read = pooled.stream_handle();
     let close_stream = pooled.stream_handle();
     let pooled = Mutex::new(Some(pooled));
@@ -35538,9 +35555,9 @@ mod tests {
         }
     }
 
-    /// The production QUIC inbound on loopback: real identity, real driver, real VLESS sessions.
-    fn quic_serve_loopback(
-        id: [u8; 16],
+    /// A QUIC inbound on loopback: real identity, real driver, the caller's session handler.
+    fn quic_serve_with(
+        serve: crate::quic::Serve,
     ) -> (
         SocketAddr,
         Vec<Vec<u8>>,
@@ -35562,14 +35579,25 @@ mod tests {
         let addr = sock.local_addr().expect("addr");
         let stop = Arc::new(AtomicBool::new(false));
         let task_stop = Arc::clone(&stop);
-        let serve: crate::quic::Serve = Arc::new(move |stream| {
-            serve_vless_quic(stream, &one_vless_user(&id), true);
-        });
         let driver = thread::spawn(move || {
             let config = Arc::new(Mutex::new(config));
             crate::quic::serve_loop(sock, &config, &serve, &task_stop);
         });
         (addr, roots, stop, driver)
+    }
+
+    /// The production QUIC inbound on loopback.
+    fn quic_serve_loopback(
+        id: [u8; 16],
+    ) -> (
+        SocketAddr,
+        Vec<Vec<u8>>,
+        Arc<AtomicBool>,
+        thread::JoinHandle<()>,
+    ) {
+        quic_serve_with(Arc::new(move |stream| {
+            serve_vless_quic(stream, &one_vless_user(&id), true);
+        }))
     }
 
     /// One VLESS round trip over a direct QUIC stream: the same header and response bytes as TCP.
@@ -35698,6 +35726,64 @@ mod tests {
         assert_eq!(&back[2..], payload);
         let _ = conn.close(false, 0, b"done");
         crate::quic::flush_egress(&mut conn, &sock);
+        stop.store(true, Ordering::Relaxed);
+        driver.join().expect("joins");
+    }
+
+    #[test]
+    fn a_silent_quic_udp_peer_cannot_pin_the_dial() {
+        let _serial = quic_serial();
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            dial: Some(Duration::from_secs(2)),
+            ..Default::default()
+        });
+        let saw = Arc::new(AtomicBool::new(false));
+        let task_saw = Arc::clone(&saw);
+        let (addr, roots, stop, driver) = quic_serve_with(Arc::new(move |mut stream| {
+            let mut buf = [0u8; 64];
+            if stream.read(&mut buf).is_ok() {
+                task_saw.store(true, Ordering::Relaxed);
+            }
+            thread::sleep(Duration::from_secs(5));
+        }));
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let out = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            id,
+            carrier: Carrier::Quic,
+            host: "localhost".to_owned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            mux: false,
+            quic_roots: Some(roots.into()),
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            encryption: None,
+        };
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let source = Arc::new(Mutex::new(Some(relay.local_addr().expect("addr"))));
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let started = Instant::now();
+        let uplink = dial_quic_udp_uplink(&out, &target, &relay, source);
+        let elapsed = started.elapsed();
+        budgets::clear();
+        assert!(
+            uplink.is_none(),
+            "a peer that never answers is not an uplink"
+        );
+        assert!(
+            saw.load(Ordering::Relaxed),
+            "the header reached the silent peer"
+        );
+        assert!(
+            elapsed < Duration::from_secs(4),
+            "the dial ends at its budget"
+        );
         stop.store(true, Ordering::Relaxed);
         driver.join().expect("joins");
     }
