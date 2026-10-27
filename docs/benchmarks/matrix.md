@@ -3,7 +3,8 @@
 Every cell measures one client engine against a fixed server engine on loopback.
 The grid runs `ferrox` and `xray-core` as servers for every scenario they admit,
 and `sing-box` as a third server in the standalone Hysteria v1 cell, where
-`xray-core` reads v2 only. Every client the scenario's protocol and carrier
+`xray-core` reads v2 only, and in the VLESS-over-QUIC cell, where `xray-core`
+removed the transport at its pin. Every client the scenario's protocol and carrier
 admit is measured: `ferrox`, `xray-core`, `xray-core-rust`, `zeronet`,
 `sing-box`, and in the standard and full tiers `xray-rust` and `leaf`.
 `xray-core` is the reference wherever it participates; the standalone Hysteria
@@ -34,8 +35,9 @@ Each scenario that has both servers also runs the reference client against both,
 so `scripts/check-matrix-legs.py` can say which leg lost: a ferrox client below
 the xray-core client on the xray-core server is a client hole, and a ferrox
 server below the xray-core server under the xray-core client is a server hole.
-The standalone Hysteria v1 cell has no xray-core server control, so that check
-leaves it to its ratio row. The workload moves 128 MiB per flow, scaled down
+The standalone Hysteria v1 and VLESS-over-QUIC cells have no xray-core server
+control — xray-core reads only v2 Hysteria and removed QUIC — so that check
+leaves them to their ratio rows. The workload moves 128 MiB per flow, scaled down
 from the bytes a profile needs so a
 standard run finishes in minutes rather than hours; throughput, CPU and syscall
 ratios are unchanged by the size.
@@ -85,7 +87,7 @@ transport and no VLESS `encryption` field.
 
 ## Every standard configuration
 
-The standard tier measures these 64 configurations: one row per scenario and server, except the standalone Hysteria v1 row, which runs the ferrox and sing-box servers. The full tier adds the 16-flow cells (`vless-raw-down-16`, `vless-raw-duplex-16`, `vless-tls-raw-duplex-16`, `vless-ws-down-16`), the missing up/duplex lanes for every method that had only a down lane, plus `vmess-tls-raw`, and the v1 up and duplex lanes: 146 in all. The full tier runs weekly on `ubuntu-latest`, `ubuntu-24.04-arm` and `macos-15`; `windows-latest` is available by `workflow_dispatch`, because 73 scenarios across four runners is more than one matrix job may hold. The nightly standard tier runs on `ubuntu-latest` only, because a ratio is read inside one cell and four runners were measuring the same ratio four times.
+The standard tier measures these 66 configurations: one row per scenario and server, except the standalone Hysteria v1 and VLESS-over-QUIC rows, which run the ferrox and sing-box servers. The full tier adds the 16-flow cells (`vless-raw-down-16`, `vless-raw-duplex-16`, `vless-tls-raw-duplex-16`, `vless-ws-down-16`), the missing up/duplex lanes for every method that had only a down lane, plus `vmess-tls-raw`, and the v1 up and duplex lanes: 152 in all. The full tier runs weekly on `ubuntu-latest`, `ubuntu-24.04-arm` and `macos-15`; `windows-latest` is available by `workflow_dispatch`, because 76 scenarios across four runners is more than one matrix job may hold. The nightly standard tier runs on `ubuntu-latest` only, because a ratio is read inside one cell and four runners were measuring the same ratio four times.
 
 | scenario | server | measured |
 | --- | --- | --- |
@@ -143,6 +145,8 @@ The standard tier measures these 64 configurations: one row per scenario and ser
 | `vless-vision-reality-raw-down-8` | xray-core | yes |
 | `vless-kcp-down-8` | ferrox | yes |
 | `vless-kcp-down-8` | xray-core | yes |
+| `vless-quic-down-8` | ferrox | yes |
+| `vless-quic-down-8` | sing-box | yes |
 | `vless-hysteria-down-8` | ferrox | yes |
 | `vless-hysteria-down-8` | xray-core | yes |
 | `hysteria-v1-down-8` | ferrox | yes |
@@ -162,8 +166,6 @@ lane, not a claim that the method works.
 
 | method | carrier or security | direction | status |
 | --- | --- | --- | --- |
-| vless | quic | down, up, duplex | no scenario; the config path exists, the harness does not |
-| vless | tls over quic | down | no scenario |
 | vless | raw with mux | down, up | no scenario; mux is read, not measured |
 | vless | tls raw with mux | down, up | no scenario |
 | vless | ws 16 flows | down | full tier only |
