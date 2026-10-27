@@ -232,29 +232,39 @@ pub fn decode(text: &[u8]) -> Option<Vec<u8>> {
     let ptr: *mut u8 = out.as_mut_ptr();
     let mut out_at = 0usize;
     let mut at = 0usize;
-    while at + 4 <= text.len() {
-        let group = u32::from_le_bytes([text[at], text[at + 1], text[at + 2], text[at + 3]]);
+    let (pairs, _) = text.as_chunks::<8>();
+    for pair in pairs {
+        let group = u64::from_le_bytes(*pair);
         let t0 = u32::from(DIGITS[(group & 0xff) as usize]);
         let t1 = u32::from(DIGITS[((group >> 8) & 0xff) as usize]);
         let t2 = u32::from(DIGITS[((group >> 16) & 0xff) as usize]);
-        let t3 = u32::from(DIGITS[(group >> 24) as usize]);
-        if (t0 | t1 | t2 | t3) & 0xc0 != 0 {
+        let t3 = u32::from(DIGITS[((group >> 24) & 0xff) as usize]);
+        let t4 = u32::from(DIGITS[((group >> 32) & 0xff) as usize]);
+        let t5 = u32::from(DIGITS[((group >> 40) & 0xff) as usize]);
+        let t6 = u32::from(DIGITS[((group >> 48) & 0xff) as usize]);
+        let t7 = u32::from(DIGITS[(group >> 56) as usize]);
+        if (t0 | t1 | t2 | t3 | t4 | t5 | t6 | t7) & 0xc0 != 0 {
             break;
         }
-        let word = (t0 << 18) | (t1 << 12) | (t2 << 6) | t3;
-        // SAFETY: every whole group writes four bytes at a three-byte stride, and the buffer's `+3` slack covers the one byte past the logical length; the last group's own store lands inside it.
+        let first = (t0 << 18) | (t1 << 12) | (t2 << 6) | t3;
+        let second = (t4 << 18) | (t5 << 12) | (t6 << 6) | t7;
+        // SAFETY: a pair writes eight bytes at a six-byte stride, and the buffer's `+3` slack covers the two bytes past the logical length; the last pair's own store lands inside it.
         unsafe {
             ptr.add(out_at)
-                .cast::<u32>()
-                .write_unaligned(u32::from_ne_bytes([
-                    (word >> 16) as u8,
-                    (word >> 8) as u8,
-                    word as u8,
+                .cast::<u64>()
+                .write_unaligned(u64::from_ne_bytes([
+                    (first >> 16) as u8,
+                    (first >> 8) as u8,
+                    first as u8,
+                    (second >> 16) as u8,
+                    (second >> 8) as u8,
+                    second as u8,
+                    0,
                     0,
                 ]));
         }
-        out_at += 3;
-        at += 4;
+        out_at += 6;
+        at += 8;
     }
     // SAFETY: `out_at` counts the bytes the loop wrote, and every one of them was written above.
     unsafe { out.set_len(out_at) };
