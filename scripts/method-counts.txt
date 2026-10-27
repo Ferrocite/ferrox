@@ -370,7 +370,7 @@ carrier-quic ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-quic zero-filled-bytes-per-relayed-frame 3 ferrox-app-quic::tests::a_relayed_datagram_frames_its_target_ahead_of_its_payload
 carrier-quic handshakes-per-server 1 ferrox-app-proxy::tests::quic_pool_shares_one_connection_between_two_streams
 carrier-quic streams-left-open-per-flow 0 ferrox-app-proxy::tests::quic_pool_shares_one_connection_between_two_streams
-carrier-quic server-roles 0 ferrox-app-proxy::tests::quic_serve_closes_without_handshake
+carrier-quic server-roles 1 ferrox-app-proxy::tests::quic_serves_vless_echo_over_loopback
 carrier-quic dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file
 carrier-quic lanes-held-after-the-last-lease 1 ferrox-app-foxy::loopback::a_lane_outlives_its_leases_and_the_next_flow_rides_it
 carrier-quic pump-threads-owned-by-an-idle-lane 0 ferrox-app-proxy::tests::quic_dials_loopback_echo
