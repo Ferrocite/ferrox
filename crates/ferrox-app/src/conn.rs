@@ -588,7 +588,6 @@ impl Connection {
 
     /// Switch the socket's blocking mode, the readiness seam's one socket-shape change: a
     /// duplicate shares the descriptor's status flags, so the relay restores it when the flow ends.
-    #[cfg(not(target_os = "linux"))]
     pub(crate) fn set_nonblocking(&self, nonblocking: bool) -> io::Result<()> {
         match self {
             Connection::Tcp(stream) => stream.set_nonblocking(nonblocking),
