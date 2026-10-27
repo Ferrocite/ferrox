@@ -37,6 +37,7 @@ mod hysteria;
 mod hysteria_v1;
 mod json;
 mod masque;
+mod masque_h2;
 mod metrics;
 mod observatory;
 mod policy;
