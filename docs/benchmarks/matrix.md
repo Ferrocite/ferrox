@@ -57,23 +57,23 @@ README block and the bundle's `README.md` are generated from the same
 last published run and leaves the committed markdown and charts alone when no
 cell moved by more than 10%, the top of the shared runner's noise band.
 
-## Known holes (2026-10-25, standard / ubuntu-latest)
+## Known holes (2026-10-25, rechecked 2026-10-27, standard / ubuntu-latest)
 
 These are the gaps this tree still measures. `scripts/check-matrix-legs.py`
 reads the same list from `scripts/leg-gaps.txt`: a filed gap warns with its issue,
 while a new leg or one worse than its filed ratio by more than 0.10 fails the
-matrix. Remove a line when its issue closes, so the fix is a visible gate rather
-than a quiet baseline. The numbers come from the
-`benchmark-matrix-standard-ubuntu-latest` bundle of run
-[40032539826](https://github.com/FerroxCo/ferrox/actions/runs/40032539826).
+matrix. Remove a line only when a run proves the leg fixed, so the fix is a
+visible gate rather than a quiet baseline; a closed issue can still cover an
+open regression. The 2026-10-27 recheck of the vmess, hysteria and gRPC rows
+is runs [40523513428](https://github.com/FerroxCo/ferrox/actions/runs/40523513428)
+and [40527294332](https://github.com/FerroxCo/ferrox/actions/runs/40527294332).
 
 | leg | cell | measurement | issue |
 | --- | ---- | ----------- | ----- |
-| both | `vless-hysteria-down-8` | ferrox server 4.9 vs 110.9 MiB/s (0.04x); ferrox client reads 0 against xray-core | [#466](https://github.com/FerroxCo/ferrox/issues/466) |
-| server | `vless-tls-grpc-down-8` | 0.79x (118 vs 149 MiB/s) | [#467](https://github.com/FerroxCo/ferrox/issues/467) |
+| both | `vless-hysteria-down-8`, `vless-hysteria-up-1`, `vless-hysteria-duplex-8` | down server 32.8 vs 109.6 MiB/s and 1.82x CPU; upload/duplex below the gate | [#670](https://github.com/FerroxCo/ferrox/issues/670) |
+| server | `vless-tls-grpc-down-8` | one run moved 450.8 vs 167.0 MiB/s, another stopped at 64 MiB; [#702](https://github.com/FerroxCo/ferrox/issues/702) covers the dropped clients | [#669](https://github.com/FerroxCo/ferrox/issues/669) |
 | server | `vless-reality-grpc-down-8` | 0.78x (121 vs 156 MiB/s) | [#468](https://github.com/FerroxCo/ferrox/issues/468) |
-| server | `vmess-raw-down-8` | xray-core reads 0 after a 64 KiB write (broken pipe); ferrox, xray-core-rust and zeronet pass | [#470](https://github.com/FerroxCo/ferrox/issues/470) |
-| both | `vless-reality-xhttp-down-8` | all engines 0 B on the ferrox server; ferrox client 0 B on xray-core | [#472](https://github.com/FerroxCo/ferrox/issues/472) |
+| both | `vless-reality-xhttp-down-8` | all engines 0 B on the ferrox server; ferrox client 0 B on xray-core | [#668](https://github.com/FerroxCo/ferrox/issues/668) |
 
 The coverage holes with no number — a client that cannot use a ferrox server at all — are tracked in [#480](https://github.com/FerroxCo/ferrox/issues/480):
 `shadowsocks2022-raw-down-8--srv-ferrox` drops xray-core-rust and zeronet, and
