@@ -175,12 +175,20 @@ pub(crate) struct Ctx {
 }
 
 const WRITE_ATTEMPTS: u32 = 5;
-const WRITE_RETRY_MS: u64 = 100;
+
+/// A send that failed because the socket was momentarily unavailable is worth another write; a
+/// refused or unreachable one is the peer's answer, and retrying it only holds the flush.
+fn transient(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+    )
+}
 
 impl Ctx {
     fn emit(&self, mut enc: impl FnMut(&mut Vec<u8>)) -> io::Result<()> {
         let mut last = None;
-        for attempt in 0..WRITE_ATTEMPTS {
+        for _ in 0..WRITE_ATTEMPTS {
             let outcome = {
                 let mut sink = self.output.lock().unwrap();
                 let OutputSink { buf, write } = &mut *sink;
@@ -190,10 +198,8 @@ impl Ctx {
             };
             match outcome {
                 Ok(()) => return Ok(()),
-                Err(e) => last = Some(e),
-            }
-            if attempt + 1 < WRITE_ATTEMPTS {
-                thread::sleep(Duration::from_millis(WRITE_RETRY_MS));
+                Err(e) if transient(&e) => last = Some(e),
+                Err(e) => return Err(e),
             }
         }
         Err(last.unwrap_or_else(|| io::Error::other("segment write")))
@@ -202,17 +208,15 @@ impl Ctx {
     /// Sender path: the segment is already contiguous in the sending window's arena (an 18-byte header gap and the payload), so the writer gets those bytes directly and the payload never enters a staging buffer.
     pub(crate) fn emit_slice(&self, data: &[u8]) -> io::Result<()> {
         let mut last = None;
-        for attempt in 0..WRITE_ATTEMPTS {
+        for _ in 0..WRITE_ATTEMPTS {
             let outcome = {
                 let mut sink = self.output.lock().unwrap();
                 (sink.write)(data)
             };
             match outcome {
                 Ok(()) => return Ok(()),
-                Err(e) => last = Some(e),
-            }
-            if attempt + 1 < WRITE_ATTEMPTS {
-                thread::sleep(Duration::from_millis(WRITE_RETRY_MS));
+                Err(e) if transient(&e) => last = Some(e),
+                Err(e) => return Err(e),
             }
         }
         Err(last.unwrap_or_else(|| io::Error::other("segment write")))
@@ -763,7 +767,7 @@ mod tests {
             let n = self.attempts.fetch_add(1, Ordering::SeqCst);
             self.seen.lock().unwrap().push(data.to_vec());
             if n < self.fail_times {
-                Err(io::Error::other("transient"))
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
             } else {
                 Ok(())
             }
@@ -802,8 +806,14 @@ mod tests {
     #[test]
     fn a_write_that_never_succeeds_stops_at_the_attempt_limit() {
         let (recorder, conn) = recording_connection(u32::MAX);
+        let started = Instant::now();
         conn.ping(1, Command::Ping);
         assert_eq!(recorder.attempts.load(Ordering::SeqCst), WRITE_ATTEMPTS);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "a dead sink held the flush for {:?}; the scheduler drives every connection",
+            started.elapsed()
+        );
     }
 
     /// An idle connection must park the scheduler for a tick rather than return an instant that already passed.
