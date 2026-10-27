@@ -289,22 +289,34 @@ impl ClientSpec {
         let settings = outbound
             .get("settings")
             .ok_or("masque outbound has no settings")?;
-        let server = settings
-            .get("server")
-            .ok_or("masque outbound has no `server`")?;
-        let (address, port) = if let Json::Str(text) = server {
-            split_host_port(text).ok_or_else(|| format!("masque server `{text}` has no port"))?
-        } else {
-            let address = server
-                .get("address")
-                .and_then(Json::as_str)
-                .ok_or("masque server has no `address`")?;
-            let port = server
-                .get("port")
-                .and_then(Json::as_port)
-                .ok_or("masque server has no `port`")?;
-            (address.to_owned(), port)
-        };
+        let (address, port) =
+            if let (Some(address), Some(port)) = (settings.get("address"), settings.get("port")) {
+                (
+                    address
+                        .as_str()
+                        .ok_or("masque `address` is not a string")?
+                        .to_owned(),
+                    port.as_port().ok_or("masque `port` is not a port")?,
+                )
+            } else {
+                let server = settings
+                    .get("server")
+                    .ok_or("masque outbound has no `address`/`port` or `server`")?;
+                if let Json::Str(text) = server {
+                    split_host_port(text)
+                        .ok_or_else(|| format!("masque server `{text}` has no port"))?
+                } else {
+                    let address = server
+                        .get("address")
+                        .and_then(Json::as_str)
+                        .ok_or("masque server has no `address`")?;
+                    let port = server
+                        .get("port")
+                        .and_then(Json::as_port)
+                        .ok_or("masque server has no `port`")?;
+                    (address.to_owned(), port)
+                }
+            };
         let tls = crate::config::outbound_tls(outbound, &address)?;
         let transport = outbound
             .get("streamSettings")
@@ -966,14 +978,16 @@ impl ServerSpec {
             .ok_or("masque inbound has no settings")?;
         let users: Vec<(String, String)> = settings
             .get("users")
+            .or_else(|| settings.get("clients"))
             .and_then(Json::as_arr)
-            .ok_or("masque inbound has no `users`")?
+            .ok_or("masque inbound has no `users` or `clients`")?
             .iter()
             .filter_map(|user| {
                 let email = user.get("email").and_then(Json::as_str)?.to_owned();
                 let password = user
-                    .get("password")
+                    .get("pass")
                     .and_then(Json::as_str)
+                    .or_else(|| user.get("password").and_then(Json::as_str))
                     .or_else(|| user.get("account")?.get("password")?.as_str())?
                     .to_owned();
                 Some((email, password))
@@ -1953,7 +1967,7 @@ mod tests {
         let minted =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
         crate::json::parse(&format!(
-            r#"{{"settings":{settings},"streamSettings":{{"security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{}],"key":[{}]}}]}}}}}}"#,
+            r#"{{"settings":{settings},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"certificates":[{{"certificate":[{}],"key":[{}]}}]}}}}}}"#,
             pem_lines(&minted.cert.pem()),
             pem_lines(&minted.signing_key.serialize_pem())
         ))
@@ -1966,14 +1980,14 @@ mod tests {
 
     fn outbound_with(port: u16, authorization: &str) -> Json {
         crate::json::parse(&format!(
-            r#"{{"settings":{{"server":{{"address":"127.0.0.1","port":{port}}}}},"streamSettings":{{"security":"tls","tlsSettings":{{"serverName":"localhost","allowInsecure":true}},"masqueSettings":{{"headers":[{{"name":"Authorization","value":"{authorization}"}}]}}}}}}"#
+            r#"{{"settings":{{"address":"127.0.0.1","port":{port}}},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"serverName":"localhost","allowInsecure":true}},"masqueSettings":{{"headers":{{"Authorization":"{authorization}"}}}}}}}}"#
         ))
         .expect("a masque outbound")
     }
 
     fn outbound_h2(port: u16) -> Json {
         crate::json::parse(&format!(
-            r#"{{"settings":{{"server":{{"address":"127.0.0.1","port":{port}}}}},"streamSettings":{{"security":"tls","tlsSettings":{{"serverName":"localhost","allowInsecure":true,"alpn":["h2"]}},"masqueSettings":{{"headers":[{{"name":"Authorization","value":"Basic dUBleGFtcGxlLmNvbTpw"}}]}}}}}}"#
+            r#"{{"settings":{{"address":"127.0.0.1","port":{port}}},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"serverName":"localhost","allowInsecure":true,"alpn":["h2"]}},"masqueSettings":{{"headers":{{"Authorization":"Basic dUBleGFtcGxlLmNvbTpw"}}}}}}}}"#
         ))
         .expect("a masque outbound")
     }
@@ -1982,7 +1996,7 @@ mod tests {
         let minted =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
         crate::json::parse(&format!(
-            r#"{{"settings":{settings},"streamSettings":{{"security":"tls","tlsSettings":{{"alpn":["h3","h2"],"certificates":[{{"certificate":[{}],"key":[{}]}}]}}}}}}"#,
+            r#"{{"settings":{settings},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"alpn":["h3","h2"],"certificates":[{{"certificate":[{}],"key":[{}]}}]}}}}}}"#,
             pem_lines(&minted.cert.pem()),
             pem_lines(&minted.signing_key.serialize_pem())
         ))
@@ -1991,7 +2005,7 @@ mod tests {
 
     fn serve_h2(redirect: &str) -> (Json, u16) {
         let inbound = inbound_h2(
-            r#"{"users":[{"email":"u@example.com","password":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
+            r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
         );
         let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
         (inbound, port)
@@ -2011,7 +2025,7 @@ mod tests {
 
     fn serve(redirect: &str) -> (Json, u16) {
         let inbound = inbound(
-            r#"{"users":[{"email":"u@example.com","password":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
+            r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
         );
         let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
         (inbound, port)
@@ -2231,6 +2245,38 @@ mod tests {
         .expect("an outbound");
         let spec = ClientSpec::from(&outbound).expect("spec");
         assert_eq!(authority(&spec), "edge.example:443");
+    }
+
+    #[test]
+    fn the_reference_settings_spellings_read_the_same_edge() {
+        let flat = crate::json::parse(
+            r#"{"settings":{"address":"127.0.0.1","port":8443},"streamSettings":{"network":"masque","security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true}}}"#,
+        )
+        .expect("the reference outbound");
+        let nested = crate::json::parse(
+            r#"{"settings":{"server":{"address":"127.0.0.1","port":8443}},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true}}}"#,
+        )
+        .expect("the nested outbound");
+        let flat = ClientSpec::from(&flat).expect("the reference spec");
+        let nested = ClientSpec::from(&nested).expect("the nested spec");
+        assert_eq!(
+            (flat.address.as_str(), flat.port),
+            (nested.address.as_str(), nested.port)
+        );
+    }
+
+    #[test]
+    fn the_reference_user_spellings_serve_the_same_table() {
+        let header = Some(&b"Basic dUBleGFtcGxlLmNvbTpw"[..]);
+        for settings in [
+            r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]}"#,
+            r#"{"clients":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24"]}"#,
+            r#"{"users":[{"email":"u@example.com","password":"p"}],"address":["10.14.0.1/24"]}"#,
+            r#"{"users":[{"email":"u@example.com","account":{"password":"p"}}],"address":["10.14.0.1/24"]}"#,
+        ] {
+            let spec = ServerSpec::from(&inbound(settings)).expect("a spec");
+            assert!(spec.authenticates(header), "{settings}");
+        }
     }
 
     #[test]
