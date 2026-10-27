@@ -468,7 +468,13 @@ impl Flow {
             crate::quic::flush_egress(&mut conn, &self.session.sock);
         }
     }
+}
 
+fn broken() -> std::io::Error {
+    std::io::Error::from(std::io::ErrorKind::BrokenPipe)
+}
+
+impl Flow {
     /// Consumes the reply before the stream's payload: a server that buffers `[0, 0]` until its first downlink byte cannot hold an upload-only flow open, so the opening write returns before the reply and the first read pays it.
     fn drain_reply(&mut self) -> std::io::Result<()> {
         let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
@@ -528,67 +534,74 @@ impl Flow {
         }
         Ok(())
     }
-}
 
-fn broken() -> std::io::Error {
-    std::io::Error::from(std::io::ErrorKind::BrokenPipe)
-}
-
-impl Read for Flow {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    /// One turn of the read loop: bytes when the stream has them, `None` when this turn waited
+    /// and found nothing. The relay's fixed lane re-queues on `None`, so a quiet flow hands its
+    /// worker back instead of parking it for the life of the stream; `Read` loops over the same
+    /// step, which is what a caller that asked for a blocking read still gets.
+    fn read_step(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
         if buf.is_empty() {
-            return Ok(0);
+            return Ok(Some(0));
         }
         self.drain_reply()?;
         if self.at < self.backlog.len() {
             let n = (self.backlog.len() - self.at).min(buf.len());
             buf[..n].copy_from_slice(&self.backlog[self.at..self.at + n]);
             self.at += n;
-            return Ok(n);
+            return Ok(Some(n));
         }
-        loop {
-            let before = self.wake.as_ref().map_or(0, |wake| wake.seen());
-            let read = {
-                let Ok(mut conn) = self.session.shared.lock() else {
-                    return Err(broken());
-                };
-                if conn.is_closed() {
-                    return Ok(0);
-                }
-                match conn.stream_recv(self.stream, buf) {
-                    Ok((n, _)) => {
-                        crate::quic::flush_egress(&mut conn, &self.session.sock);
-                        Some(n)
-                    }
-                    Err(quiche::Error::Done) => None,
-                    Err(_) => return Err(broken()),
-                }
+        let before = self.wake.as_ref().map_or(0, |wake| wake.seen());
+        let read = {
+            let Ok(mut conn) = self.session.shared.lock() else {
+                return Err(broken());
             };
-            if let Some(n) = read {
+            if conn.is_closed() {
+                return Ok(Some(0));
+            }
+            match conn.stream_recv(self.stream, buf) {
+                Ok((n, _)) => {
+                    crate::quic::flush_egress(&mut conn, &self.session.sock);
+                    Some(n)
+                }
+                Err(quiche::Error::Done) => None,
+                Err(_) => return Err(broken()),
+            }
+        };
+        if let Some(n) = read {
+            return Ok(Some(n));
+        }
+        if self.drive {
+            let _ = drive_once(&self.session, STREAM_POLL);
+            return Ok(None);
+        }
+        let pumped = self
+            .session
+            .driver
+            .as_ref()
+            .is_some_and(|driver| driver.running());
+        if let Some(wake) = self.wake.as_ref().filter(|_| pumped) {
+            wake.wait(before, STREAM_POLL);
+            return Ok(None);
+        }
+        {
+            let Ok(conn) = self.session.shared.lock() else {
+                return Err(broken());
+            };
+            if conn.is_closed() {
+                return Ok(Some(0));
+            }
+        }
+        std::thread::sleep(STREAM_POLL);
+        Ok(None)
+    }
+}
+
+impl Read for Flow {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if let Some(n) = self.read_step(buf)? {
                 return Ok(n);
             }
-            if self.drive {
-                let _ = drive_once(&self.session, STREAM_POLL);
-                continue;
-            }
-            let pumped = self
-                .session
-                .driver
-                .as_ref()
-                .is_some_and(|driver| driver.running());
-            if let Some(wake) = self.wake.as_ref().filter(|_| pumped) {
-                wake.wait(before, STREAM_POLL);
-                continue;
-            }
-            {
-                let Ok(conn) = self.session.shared.lock() else {
-                    return Err(broken());
-                };
-                if conn.is_closed() {
-                    return Ok(0);
-                }
-            }
-            std::thread::sleep(STREAM_POLL);
         }
     }
 }
@@ -822,44 +835,73 @@ pub(crate) fn dial_vless(
 }
 
 pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
-    let Ok(tcp_read) = tcp.try_clone() else {
+    let Ok(mut tcp_read) = tcp.try_clone() else {
         return;
     };
     let Ok(mut tcp_write) = tcp.try_clone() else {
         return;
     };
-    let up = flow.clone();
-    let done = std::thread::spawn(move || {
-        let mut tcp_read = tcp_read;
-        let mut up = up;
-        let mut buf = crate::proxy::RelayBuf::new();
-        loop {
-            match tcp_read.read(buf.as_mut()) {
-                Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if up.write_all(&buf.as_mut()[..n]).is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-        up.close();
-    });
-    let mut back = flow.clone();
-    let mut buf = crate::proxy::RelayBuf::new();
-    loop {
-        match back.read(buf.as_mut()) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if tcp_write.write_all(&buf.as_mut()[..n]).is_err() {
-                    break;
-                }
-            }
-        }
+    // A read nobody bounded cannot hand its lane back: an unarmed caller takes the poll grain.
+    if tcp_read.read_timeout().ok().flatten().is_none() {
+        let _ = tcp_read.set_read_timeout(Some(crate::budgets::RELAY_POLL));
     }
-    let _ = tcp_write.shutdown(Shutdown::Write);
-    let _ = done.join();
-    flow.close();
+    let done = crate::proxy::RelayFinish::new(
+        false,
+        Arc::new(|| {}),
+        Some(Box::new({
+            let flow = flow.clone();
+            move || flow.close()
+        })),
+    );
+
+    let mut up = flow.clone();
+    let forward = Arc::clone(&done);
+    let mut buffer = crate::proxy::RelayBuf::new();
+    crate::proxy::lane_pool::submit(
+        Box::new(move || {
+            let more = match tcp_read.read(buffer.as_mut()) {
+                Ok(0) => false,
+                Ok(n) => up.write_all(buffer.filled(n)).is_ok(),
+                Err(error) if crate::proxy::is_timeout(&error) => !forward.ended(),
+                Err(_) => false,
+            };
+            if !more {
+                up.close();
+            }
+            more
+        }),
+        Box::new({
+            let done = Arc::clone(&done);
+            move || {
+                done.mark_ended();
+                done.lane_done();
+            }
+        }),
+    );
+
+    let mut back = flow.clone();
+    let backward = Arc::clone(&done);
+    let mut buffer = crate::proxy::RelayBuf::new();
+    crate::proxy::lane_pool::submit(
+        Box::new(move || {
+            let more = match back.read_step(buffer.as_mut()) {
+                Ok(Some(0)) | Err(_) => false,
+                Ok(Some(n)) => tcp_write.write_all(buffer.filled(n)).is_ok(),
+                Ok(None) => !backward.ended(),
+            };
+            if !more {
+                let _ = tcp_write.shutdown(Shutdown::Write);
+            }
+            more
+        }),
+        Box::new({
+            let done = Arc::clone(&done);
+            move || {
+                done.mark_ended();
+                done.lane_done();
+            }
+        }),
+    );
 }
 
 pub(crate) fn server_config(
