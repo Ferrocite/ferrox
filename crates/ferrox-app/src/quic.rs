@@ -592,9 +592,9 @@ fn debug_staged(staged: Option<Instant>) {
     );
 }
 
-/// The datagrams one egress sweep hands the socket in one call: a 32 KiB write queues about ten behind each other, so a batch of eight sends most of a frame where the loop paid one syscall per packet.
+/// The datagrams one egress sweep hands the socket in one call: a 64 KiB relay read queues about fifty behind each other, so a batch of sixty-four sends a whole frame where the loop paid one syscall per packet.
 #[cfg(target_os = "linux")]
-const SEND_SLOTS: usize = 8;
+const SEND_SLOTS: usize = 64;
 
 pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &Datagram) {
     #[cfg(target_os = "linux")]
