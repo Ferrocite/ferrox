@@ -5,6 +5,7 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use crate::conn::Connection;
+use crate::proxy::lane_pool::Next;
 use crate::proxy::{read_exact, under_handshake};
 
 const AUTH_LEN: usize = 16;
@@ -944,6 +945,13 @@ enum Frame {
     Last,
 }
 
+/// What [`Wire::step`] handed back: plaintext by position, a wait the lane returns to, or the end.
+enum Opened {
+    Batch { at: usize, len: usize },
+    Idle,
+    End,
+}
+
 /// The receive half of a relay. Sealed bytes and the plaintext gathered from them share one
 /// buffer, so the pump can tell without asking the carrier that a batch of frames is already
 /// here and leave the whole batch in one write — which a `BufReader` hides, and one frame per
@@ -987,11 +995,12 @@ impl<R: Read> Wire<R> {
         self.marker
     }
 
-    /// Open up to `FRAMES_PER_WRITE` frames, waiting only for the first, and hand back their
-    /// plaintext as one slice. `None` ends the pump.
-    fn batch(&mut self, recv: &mut Flow) -> Option<&[u8]> {
+    /// One step of the relay: open up to `FRAMES_PER_WRITE` frames, waiting only for the first,
+    /// and hand back their plaintext as one slice. A wait with nothing yet gathered is `Idle` so
+    /// the lane can come back to it.
+    fn step(&mut self, recv: &mut Flow) -> Opened {
         if self.last {
-            return None;
+            return Opened::End;
         }
         self.compact();
         self.front = 0;
@@ -1021,7 +1030,33 @@ impl<R: Read> Wire<R> {
                 }
             }
         }
-        Some(&self.held[self.front..self.front + self.plain])
+        if decoded > 0 {
+            return Opened::Batch {
+                at: self.front,
+                len: self.plain,
+            };
+        }
+        if self.last {
+            Opened::End
+        } else {
+            Opened::Idle
+        }
+    }
+
+    /// The blocking shape: wait out an idle step, so a caller outside a lane never sees one.
+    fn batch(&mut self, recv: &mut Flow) -> Option<&[u8]> {
+        loop {
+            match self.step(recv) {
+                Opened::Idle => {}
+                Opened::End => return None,
+                Opened::Batch { at, len } => return Some(&self.held[at..at + len]),
+            }
+        }
+    }
+
+    /// The carrier before the first frame opens, where a response header waits for its bytes.
+    fn carrier(&mut self) -> &mut R {
+        &mut self.carrier
     }
 
     fn buffered(&self) -> usize {
@@ -1060,8 +1095,12 @@ impl<R: Read> Wire<R> {
                     return false;
                 }
                 Ok(read) => self.end += read,
-                // A shared-session carrier sleeps the poll grain then returns a timeout; the wait is paid, so ask again.
-                Err(ref error) if crate::proxy::is_timeout(error) => {}
+                // A lane's read polls the carrier, and hands the wait back rather than spinning on it.
+                Err(ref error) if crate::proxy::is_timeout(error) => {
+                    if crate::proxy::relay_step_owns_poll() {
+                        return false;
+                    }
+                }
                 Err(_) => {
                     self.last = true;
                     return false;
@@ -1176,40 +1215,124 @@ fn read_response_header(
     response_iv: &[u8; 16],
     auth: u8,
 ) -> bool {
-    let len_key = kdf16(response_key, &[b"AEAD Resp Header Len Key"]);
-    let len_full = kdf(response_iv, &[b"AEAD Resp Header Len IV"]);
-    let len_nonce: [u8; 12] = len_full[..12].try_into().unwrap();
     let mut sealed_len = [0u8; 2 + TAG_LEN];
     if read_exact(stream, &mut sealed_len).is_err() {
         return false;
     }
-    let mut len_plain = [0u8; 2];
-    let Some(clear_len) = open_header_into(&len_key, &len_nonce, &sealed_len, &[], &mut len_plain)
-    else {
+    let Some(body_len) = response_len(response_key, response_iv, &sealed_len) else {
         return false;
     };
-    let body_len = usize::from(u16::from_be_bytes([clear_len[0], clear_len[1]]));
-    if body_len > 64 {
-        return false;
-    }
     let mut sealed_body = [0u8; 64 + TAG_LEN];
     if read_exact(stream, &mut sealed_body[..body_len + TAG_LEN]).is_err() {
         return false;
     }
+    response_body(
+        response_key,
+        response_iv,
+        &sealed_body[..body_len + TAG_LEN],
+        auth,
+    )
+}
+
+fn response_len(
+    response_key: &[u8; 16],
+    response_iv: &[u8; 16],
+    sealed: &[u8; 2 + TAG_LEN],
+) -> Option<usize> {
+    let len_key = kdf16(response_key, &[b"AEAD Resp Header Len Key"]);
+    let len_full = kdf(response_iv, &[b"AEAD Resp Header Len IV"]);
+    let len_nonce: [u8; 12] = len_full[..12].try_into().unwrap();
+    let mut len_plain = [0u8; 2];
+    open_header_into(&len_key, &len_nonce, sealed, &[], &mut len_plain)?;
+    let body_len = usize::from(u16::from_be_bytes([len_plain[0], len_plain[1]]));
+    (body_len <= 64).then_some(body_len)
+}
+
+fn response_body(response_key: &[u8; 16], response_iv: &[u8; 16], sealed: &[u8], auth: u8) -> bool {
     let body_key = kdf16(response_key, &[b"AEAD Resp Header Key"]);
     let body_full = kdf(response_iv, &[b"AEAD Resp Header IV"]);
     let body_nonce: [u8; 12] = body_full[..12].try_into().unwrap();
     let mut body_plain = [0u8; 64];
-    let Some(clear_body) = open_header_into(
-        &body_key,
-        &body_nonce,
-        &sealed_body[..body_len + TAG_LEN],
-        &[],
-        &mut body_plain,
-    ) else {
+    let Some(clear_body) = open_header_into(&body_key, &body_nonce, sealed, &[], &mut body_plain)
+    else {
         return false;
     };
     clear_body.len() == 4 && clear_body[0] == auth
+}
+
+/// What one step of [`Answer`] did: the header is open, it needs another step, or it will not open.
+enum AnswerStep {
+    Done,
+    Idle,
+    Failed,
+}
+
+/// The lazy server's response header, resumed across steps: a lane hands back the wait with the
+/// bytes it already has rather than spinning inside `read_exact` for the rest.
+struct Answer {
+    key: [u8; 16],
+    iv: [u8; 16],
+    auth: u8,
+    sealed: [u8; 64 + TAG_LEN],
+    got: usize,
+    need: usize,
+    body: bool,
+}
+
+impl Answer {
+    fn new((key, iv, auth): PendingResponse) -> Self {
+        Self {
+            key,
+            iv,
+            auth,
+            sealed: [0u8; 64 + TAG_LEN],
+            got: 0,
+            need: 2 + TAG_LEN,
+            body: false,
+        }
+    }
+
+    fn step(&mut self, stream: &mut dyn Read) -> AnswerStep {
+        loop {
+            if self.got == self.need {
+                if self.body {
+                    return if response_body(
+                        &self.key,
+                        &self.iv,
+                        &self.sealed[..self.need],
+                        self.auth,
+                    ) {
+                        AnswerStep::Done
+                    } else {
+                        AnswerStep::Failed
+                    };
+                }
+                let Some(body_len) = response_len(
+                    &self.key,
+                    &self.iv,
+                    self.sealed[..self.need].try_into().unwrap(),
+                ) else {
+                    return AnswerStep::Failed;
+                };
+                self.body = true;
+                self.got = 0;
+                self.need = body_len + TAG_LEN;
+                continue;
+            }
+            match stream.read(&mut self.sealed[self.got..self.need]) {
+                Ok(0) => return AnswerStep::Failed,
+                Ok(read) => self.got += read,
+                Err(ref error) if crate::proxy::is_timeout(error) => {
+                    return if crate::proxy::relay_step_owns_poll() {
+                        AnswerStep::Idle
+                    } else {
+                        continue;
+                    };
+                }
+                Err(_) => return AnswerStep::Failed,
+            }
+        }
+    }
 }
 
 fn read_open_header(
@@ -1391,36 +1514,95 @@ pub(crate) fn pump_relay_carried<R, W>(
     send: Flow,
     recv: Flow,
     pending: Option<PendingResponse>,
-) where
-    R: Read + Send + 'static,
+) -> Option<std::sync::Arc<crate::proxy::RelayFinish>>
+where
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    let Ok(plain_read) = plain.try_clone() else {
-        return;
-    };
-    let Ok(plain_write) = plain.try_clone() else {
-        return;
-    };
-    let mut plain_read = plain_read;
-    let mut plain_write = plain_write;
+    let mut plain_read = plain.try_clone().ok()?;
+    let mut plain_write = plain.try_clone().ok()?;
+    // Both legs poll the plain socket, so a lane hands the wait back instead of parking on it.
+    let _ = plain_read.set_read_timeout(Some(crate::budgets::RELAY_POLL));
+    let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::clone(close), None);
     let mut writer = writer;
-
     let mut send = send;
-    let thread_close = std::sync::Arc::clone(close);
+    let mut pad = PadSource::fresh();
+    let mut staging = Vec::with_capacity(FRAMES_PER_WRITE * (MAX_WIRE + HEADER_LEN));
     let mut buf = relay_window();
-    let done = thread::spawn(move || {
-        let mut staging = Vec::with_capacity(FRAMES_PER_WRITE * (MAX_WIRE + HEADER_LEN));
-        let Some(mut pad) = PadSource::fresh() else {
-            return;
-        };
-        let mut first = true;
-        let mut ended = false;
-        while let Ok(read) = plain_read.read(&mut buf) {
-            if read == 0 {
-                ended = write_frame(&mut writer, &mut send, &[], &mut staging, &mut pad);
-                break;
+    let forward_flow = std::sync::Arc::clone(&flow);
+    let forward_close = std::sync::Arc::clone(close);
+    crate::proxy::lane_pool::submit(
+        Box::new(move || {
+            let Some(pad) = pad.as_mut() else {
+                return Next::Done;
+            };
+            let next = forward_step(
+                &mut plain_read,
+                &mut buf,
+                &mut writer,
+                &mut send,
+                &mut staging,
+                pad,
+                &forward_close,
+                &forward_flow,
+            );
+            if next == Next::Done {
+                let _ = plain_read.shutdown(Shutdown::Both);
             }
-            let traced = crate::proxy::echo_trace_on() && first;
+            next
+        }),
+        Box::new(crate::proxy::stream_lane_done(&flow)),
+    );
+    let mut recv = recv;
+    // The carrier polls too: a download step with nothing yet must hand the lane back, or every worker parks inside a carrier read.
+    let mut reader = reader;
+    reader.arm_relay_poll();
+    let mut reader = Wire::new(reader);
+    // A lazy server sends the prefix with its first data, so the forward lane runs beside this wait.
+    let mut answer = pending.map(Answer::new);
+    let mut first = true;
+    let backward_flow = std::sync::Arc::clone(&flow);
+    let backward_close = std::sync::Arc::clone(close);
+    crate::proxy::lane_pool::submit(
+        Box::new(move || {
+            backward_step(
+                &mut reader,
+                &mut answer,
+                &mut recv,
+                &mut plain_write,
+                &backward_close,
+                &backward_flow,
+                &mut first,
+            )
+        }),
+        Box::new(crate::proxy::stream_lane_done(&flow)),
+    );
+    Some(flow)
+}
+
+/// One step of the plain leg: read what the target sent, stage it into frames, and hand the lane
+/// back a wait when the socket has nothing yet.
+#[allow(clippy::too_many_arguments)]
+fn forward_step(
+    plain_read: &mut Connection,
+    buf: &mut [u8],
+    writer: &mut dyn Write,
+    send: &mut Flow,
+    staging: &mut Vec<u8>,
+    pad: &mut PadSource,
+    close: &Close,
+    flow: &crate::proxy::RelayFinish,
+) -> Next {
+    match plain_read.read(buf) {
+        Ok(0) => {
+            // A clean end tells the peer this direction is done; the other direction keeps relaying.
+            if !write_frame(writer, send, &[], staging, pad) {
+                close();
+            }
+            Next::Done
+        }
+        Ok(read) => {
+            let traced = crate::proxy::echo_trace_on();
             if traced {
                 crate::proxy::echo_trace("relay fwd first read");
             }
@@ -1428,13 +1610,7 @@ pub(crate) fn pump_relay_carried<R, W>(
             let mut ok = true;
             while at < read {
                 let end = (at + READ_PLAIN).min(read);
-                if !stage_frames(
-                    &mut writer,
-                    &mut send,
-                    &buf[at..end],
-                    &mut staging,
-                    &mut pad,
-                ) {
+                if !stage_frames(writer, send, &buf[at..end], staging, pad) {
                     ok = false;
                     break;
                 }
@@ -1446,51 +1622,82 @@ pub(crate) fn pump_relay_carried<R, W>(
                 } else {
                     "relay fwd first send failed"
                 });
-                first = false;
             }
-            if !ok {
-                break;
+            if ok {
+                Next::More
+            } else {
+                close();
+                Next::Done
             }
         }
-        // A clean end tells the peer this direction is done; the other direction keeps relaying.
-        if !ended {
-            thread_close();
+        Err(ref error) if crate::proxy::is_timeout(error) => {
+            if flow.ended_and_drained() {
+                Next::Done
+            } else {
+                Next::Idle
+            }
         }
-    });
-
-    let mut recv = recv;
-    let mut reader = Wire::new(reader);
-    // A lazy server sends the prefix with its first data, so the forward thread is already running here.
-    if let Some((response_key, response_iv, auth)) = pending {
-        if !read_response(&mut reader, &response_key, &response_iv, auth) {
+        Err(_) => {
             close();
-            let _ = plain_write.shutdown(Shutdown::Both);
-            let _ = done.join();
-            return;
+            Next::Done
         }
     }
-    let mut first = true;
-    while let Some(chunk) = reader.batch(&mut recv) {
-        if crate::proxy::echo_trace_on() && first {
-            crate::proxy::echo_trace("relay bwd first read");
-            first = false;
-        }
-        if plain_write.write_all(chunk).is_err() {
-            break;
+}
+
+/// One step of the carrier leg: open the lazy server's response header first, then write what the
+/// frames it opens carry, and half-close on the peer's marker rather than on an EOF.
+fn backward_step<R: Read>(
+    reader: &mut Wire<R>,
+    answer: &mut Option<Answer>,
+    recv: &mut Flow,
+    out: &mut Connection,
+    close: &Close,
+    flow: &crate::proxy::RelayFinish,
+    first: &mut bool,
+) -> Next {
+    if let Some(waiting) = answer.as_mut() {
+        match waiting.step(reader.carrier()) {
+            AnswerStep::Done => *answer = None,
+            AnswerStep::Idle => return Next::Idle,
+            AnswerStep::Failed => {
+                close();
+                let _ = out.shutdown(Shutdown::Both);
+                return Next::Done;
+            }
         }
     }
-    if reader.ended_by_marker() {
-        // The marker ends this direction only: half-close its peer and keep the other direction.
-        let _ = plain_write.shutdown(Shutdown::Write);
-        let _ = done.join();
-    } else {
-        close();
-        let _ = plain_write.shutdown(Shutdown::Both);
-        let _ = done.join();
-        return;
+    match reader.step(recv) {
+        Opened::Idle => {
+            if flow.ended() {
+                Next::Done
+            } else {
+                Next::Idle
+            }
+        }
+        Opened::End => {
+            // The marker ends this direction only: half-close its peer and keep the other direction.
+            if reader.ended_by_marker() {
+                let _ = out.shutdown(Shutdown::Write);
+            } else {
+                close();
+                let _ = out.shutdown(Shutdown::Both);
+            }
+            Next::Done
+        }
+        Opened::Batch { at, len } => {
+            if crate::proxy::echo_trace_on() && *first {
+                crate::proxy::echo_trace("relay bwd first read");
+                *first = false;
+            }
+            if out.write_all(&reader.held[at..at + len]).is_ok() {
+                Next::More
+            } else {
+                close();
+                let _ = out.shutdown(Shutdown::Both);
+                Next::Done
+            }
+        }
     }
-    close();
-    let _ = plain_write.shutdown(Shutdown::Both);
 }
 
 pub(crate) struct Accepted {
@@ -1518,7 +1725,7 @@ fn serve_decoded<R, W>(
     decoded: Option<Accepted>,
     freedom: bool,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let Some(Accepted {
@@ -1571,7 +1778,7 @@ fn serve_udp_carried<R, W>(
     recv: Flow,
     user: &crate::stats::Meter,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let bind = if target.is_ipv6() {
@@ -1612,7 +1819,7 @@ pub(crate) fn serve_ws_split<R, W>(
     freedom: bool,
     close: &Close,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: crate::proxy::FrameWrite + Send + 'static,
 {
     let Some((mut reader, writer)) = crate::ws::accept_split(reader, writer, path) else {
@@ -1661,7 +1868,7 @@ pub(crate) fn serve_grpc_split<R, W>(
     freedom: bool,
     close: &Close,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: crate::proxy::FrameWrite + Send + 'static,
 {
     let Some((mut reader, writer)) = crate::grpc::accept_split_with(reader, writer, settings)
@@ -1696,7 +1903,7 @@ pub(crate) fn serve_xhttp_split<R, W>(
     freedom: bool,
     close: &Close,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: crate::proxy::FrameWrite + Send + 'static,
 {
     let Some((mut reader, writer)) =
@@ -1736,7 +1943,7 @@ pub(crate) fn serve_httpheader_split<R, W>(
     freedom: bool,
     close: &Close,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let Some((mut reader, writer)) = crate::httpheader::accept_split(reader, writer, path) else {
@@ -1775,7 +1982,7 @@ pub(crate) fn serve_httpupgrade_split<R, W>(
     freedom: bool,
     close: &Close,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let Some((mut reader, writer)) = crate::httpupgrade::accept_split(reader, writer, path, host)
@@ -1793,7 +2000,7 @@ pub(crate) fn serve_raw_split<R, W>(
     freedom: bool,
     close: &Close,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let decoded = accept_request_bounded(&mut reader, users);
@@ -1807,7 +2014,7 @@ pub(crate) fn serve_kcp<R, W>(
     freedom: bool,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let decoded = accept_request_bounded(&mut reader, users);
@@ -1854,7 +2061,16 @@ pub(crate) fn serve(mut stream: Connection, users: &Users, freedom: bool) {
     if stream.write_all(&prefix).is_err() {
         return;
     }
-    pump_relay(&uplink, &stream, send, recv, None);
+    let Ok(reader) = stream.try_clone() else {
+        return;
+    };
+    let Ok(closer) = stream.try_clone() else {
+        return;
+    };
+    let close: Close = std::sync::Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    pump_relay_carried(&uplink, reader, stream, &close, send, recv, None);
 }
 
 pub(crate) fn serve_vmess_udp(
@@ -3591,6 +3807,11 @@ mod tests {
         reads: usize,
     }
 
+    impl crate::proxy::RelayPoll for Sealed {
+        /// Memory never waits, so there is no poll to arm.
+        fn arm_relay_poll(&mut self) {}
+    }
+
     impl Read for Sealed {
         fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
             self.reads += 1;
@@ -3903,7 +4124,9 @@ mod tests {
             send,
             recv,
             None,
-        );
+        )
+        .expect("clones the plain socket")
+        .wait();
         target.join().expect("joins");
 
         let mut answer = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("answers");
@@ -3916,6 +4139,52 @@ mod tests {
             got, b"pong",
             "the download survives the upload's marker and arrives after it"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_live_vmess_session_costs_no_thread() {
+        fn threads() -> usize {
+            std::fs::read_dir("/proc/self/task")
+                .expect("reads the task table")
+                .count()
+        }
+        let key = [0x91u8; 16];
+        let iv = [0x92u8; 16];
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(|| {});
+        // Warm the lane pool: a session that finds it built adds no worker of its own.
+        {
+            let (plain, peer) = socket_pair();
+            let (sealed, client) = socket_pair();
+            let writer = sealed.try_clone().expect("clones the carrier");
+            let send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+            let recv = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
+            let flow = pump_relay_carried(&plain, sealed, writer, &close, send, recv, None)
+                .expect("clones the plain socket");
+            drop(peer);
+            drop(client);
+            flow.wait();
+        }
+        let before = threads();
+        let mut held = Vec::new();
+        for _ in 0..8 {
+            let (plain, peer) = socket_pair();
+            let (sealed, client) = socket_pair();
+            let writer = sealed.try_clone().expect("clones the carrier");
+            let send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+            let recv = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
+            let flow = pump_relay_carried(&plain, sealed, writer, &close, send, recv, None)
+                .expect("clones the plain socket");
+            held.push((flow, peer, client));
+        }
+        let after = threads();
+        assert!(
+            after - before < 8,
+            "eight live sessions added {} threads",
+            after - before
+        );
+        drop(held);
     }
 
     fn socket_pair() -> (Connection, Connection) {
