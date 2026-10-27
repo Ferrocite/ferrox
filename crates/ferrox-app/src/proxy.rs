@@ -30938,6 +30938,7 @@ mod tests {
         inbound: &Json,
         port: u16,
         client: Option<&Arc<ferrox_core::tls::TlsConfig>>,
+        udp: &UdpSocket,
     ) {
         let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
@@ -30963,7 +30964,6 @@ mod tests {
         let relay_addr = relay.local_addr().expect("addr");
         let served = Arc::clone(&relay);
         thread::spawn(move || serve_socks_udp_trojan(&served, &trojan));
-        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
         udp.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
@@ -31008,6 +31008,7 @@ mod tests {
             ),
             ("kcp", r#""network": "kcp""#),
         ];
+        let mut held = Vec::new();
         for (index, (tag, stream)) in carriers.into_iter().enumerate() {
             for (tls_index, tls) in [false, true].into_iter().enumerate() {
                 let security = if tls {
@@ -31038,7 +31039,10 @@ mod tests {
                         thread::sleep(Duration::from_millis(5));
                     }
                 }
-                assert_trojan_udp_echo(tag, &inbound, port, tls.then_some(&client));
+                let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+                assert_trojan_udp_echo(tag, &inbound, port, tls.then_some(&client), &udp);
+                // Held for the test: a leaked association still addresses the port it last saw, and a freed one can become a later call's relay.
+                held.push(udp);
             }
         }
     }
