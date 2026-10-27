@@ -18658,6 +18658,12 @@ impl RelayBuf {
         &self.bytes[..n]
     }
 
+    /// The bytes an earlier read left in the window, for a send that parked and is retried on a later lane step.
+    #[must_use]
+    pub fn prefix(&self, n: usize) -> &[u8] {
+        &self.bytes[..n]
+    }
+
     #[cfg(test)]
     #[must_use]
     pub fn capacity(&self) -> usize {
@@ -18836,6 +18842,7 @@ pub(crate) mod lane_pool {
 pub(crate) struct RelayFinish {
     left: AtomicU32,
     ended: AtomicBool,
+    ended_at: Mutex<Option<std::time::Instant>>,
     closed: AtomicBool,
     close_first: bool,
     close: Arc<dyn Fn() + Send + Sync>,
@@ -18855,6 +18862,7 @@ impl RelayFinish {
         Arc::new(Self {
             left: AtomicU32::new(2),
             ended: AtomicBool::new(false),
+            ended_at: Mutex::new(None),
             closed: AtomicBool::new(false),
             close_first,
             close,
@@ -18871,7 +18879,19 @@ impl RelayFinish {
     }
 
     pub(crate) fn mark_ended(&self) {
+        *self
+            .ended_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
         self.ended.store(true, Ordering::Relaxed);
+    }
+
+    /// True once the sibling ended and the last-reply grace has run: a timeout may only end the leg after that, or a reply that follows the FIN is dropped.
+    pub(crate) fn ended_and_drained(&self) -> bool {
+        self.ended_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_some_and(|at| at.elapsed() >= crate::budgets::RELAY_DRAIN_GRACE)
     }
 
     fn close_once(&self) {
@@ -19375,8 +19395,23 @@ pub(crate) fn read_exact_head(
     kept_head_rounds(stream, limit, budget)
 }
 
+/// What a carrier did with a relay window: took a prefix, had no room and asked for the same bytes again, or ended the flow.
+pub(crate) enum Push {
+    Took(usize),
+    Parked,
+    Lost,
+}
+
 pub(crate) trait CarrierSink: Clone + Send + 'static {
     fn send(&self, bytes: &[u8]) -> bool;
+    /// A lane step must not wait for room a paced carrier frees later: a full queue parks the window instead of holding the worker the other flows need.
+    fn push(&self, bytes: &[u8]) -> Push {
+        if self.send(bytes) {
+            Push::Took(bytes.len())
+        } else {
+            Push::Lost
+        }
+    }
     fn close(&self);
     /// Ends the request body when the app half-closes, before the carrier's own download ends; only a carrier whose response is gated on that body (xhttp) answers here.
     fn upload_done(&self) {}
@@ -19470,14 +19505,46 @@ const CLOSE_BEFORE_JOIN: bool = true;
 
 const CLOSE_AFTER_JOIN: bool = false;
 
-/// Classifies one forward wait: a send the carrier refused ends the leg, and a timeout only ends
-/// it when the sibling already did.
+/// Offers the bytes a parked window still owes; `Some` ends or parks the lane, `None` means the window is clear and the leg may read again.
+fn forward_flush(
+    buffer: &RelayBuf,
+    uplink: &impl CarrierSink,
+    first: &mut bool,
+    pending: &mut usize,
+    sent: &mut usize,
+) -> Option<Next> {
+    while *sent < *pending {
+        match uplink.push(&buffer.prefix(*pending)[*sent..]) {
+            Push::Took(n) if n > 0 => *sent += n,
+            Push::Took(_) | Push::Parked => return Some(Next::Idle),
+            Push::Lost => {
+                echo_trace("relay fwd send failed");
+                return Some(Next::Done);
+            }
+        }
+    }
+    if *pending > 0 {
+        if *first {
+            echo_trace("relay fwd sent");
+            echo_trace("relay fwd first send ok");
+            *first = false;
+        }
+        *pending = 0;
+        *sent = 0;
+    }
+    None
+}
+
+/// Classifies one forward wait: a send the carrier refused ends the leg, a full queue keeps the
+/// window for the next lane turn, and a timeout only ends it when the sibling already did.
 fn forward_finished(
     read: std::io::Result<usize>,
     buffer: &mut RelayBuf,
     uplink: &impl CarrierSink,
     first: &mut bool,
-    ended: impl FnOnce() -> bool,
+    pending: &mut usize,
+    sent: &mut usize,
+    ended_and_drained: impl FnOnce() -> bool,
 ) -> Next {
     match read {
         Ok(n) if n > 0 => {
@@ -19485,27 +19552,13 @@ fn forward_finished(
                 echo_trace("relay fwd first read");
                 echo_trace("relay fwd sending");
             }
-            let sent = uplink.send(buffer.filled(n));
-            if *first {
-                echo_trace("relay fwd sent");
-                echo_trace(if sent {
-                    "relay fwd first send ok"
-                } else {
-                    "relay fwd first send failed"
-                });
-                *first = false;
-            }
-            if !sent {
-                echo_trace("relay fwd send failed");
-            }
-            if sent {
-                Next::More
-            } else {
-                Next::Done
-            }
+            *pending = n;
+            *sent = 0;
+            let _ = buffer.filled(n);
+            forward_flush(buffer, uplink, first, pending, sent).unwrap_or(Next::More)
         }
         Err(error) if is_timeout(&error) => {
-            if ended() {
+            if ended_and_drained() {
                 Next::Done
             } else {
                 Next::Idle
@@ -19615,15 +19668,27 @@ where
     let mut peer_read = peer_read;
     let mut buffer = RelayBuf::new();
     let mut first = true;
+    let mut pending = 0usize;
+    let mut sent = 0usize;
     lane_pool::submit(
         Box::new(move || {
+            if let Some(next) = forward_flush(&buffer, &uplink, &mut first, &mut pending, &mut sent)
+            {
+                return next;
+            }
             let read = {
                 census!("carrier-read", crate::census::handle(&peer_read), read_arm);
                 peer_read.read(buffer.as_mut())
             };
-            let next = forward_finished(read, &mut buffer, &uplink, &mut first, || {
-                forward_flow.ended()
-            });
+            let next = forward_finished(
+                read,
+                &mut buffer,
+                &uplink,
+                &mut first,
+                &mut pending,
+                &mut sent,
+                || forward_flow.ended_and_drained(),
+            );
             if next != Next::Done {
                 return next;
             }
@@ -26102,6 +26167,7 @@ mod tests {
             let mut writer = stream.try_clone().expect("clones");
             writer.write_all(b"request").expect("writes");
             writer.shutdown(Shutdown::Write).expect("half closes");
+            drop(stream);
         });
         let sink = carrier.join().expect("joins");
         client.join().expect("joins");
@@ -26128,6 +26194,80 @@ mod tests {
         assert!(
             closed_empty || accepted.is_empty(),
             "a sink that closed before the reply must not accept it"
+        );
+    }
+
+    /// A carrier that answers `Parked` keeps the window for the next lane turn: the relay must retry those bytes, not end the flow or move on to the next read.
+    #[test]
+    fn a_parked_window_is_retried_instead_of_ending_the_flow() {
+        #[derive(Clone, Default)]
+        struct ParkingSink {
+            state: Arc<Mutex<(usize, Vec<u8>)>>,
+            parks: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl CarrierSink for ParkingSink {
+            fn send(&self, _: &[u8]) -> bool {
+                false
+            }
+            fn push(&self, bytes: &[u8]) -> Push {
+                let mut state = self.state.lock().expect("state");
+                if state.0 > 0 {
+                    state.0 -= 1;
+                    self.parks.fetch_add(1, Ordering::SeqCst);
+                    return Push::Parked;
+                }
+                state.1.extend_from_slice(bytes);
+                Push::Took(bytes.len())
+            }
+            fn close(&self) {}
+        }
+
+        let peer = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let peer_port = peer.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = peer.accept().expect("accepts");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("reads the request");
+            assert_eq!(request, b"request");
+            stream.write_all(b"reply").expect("writes the reply");
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let sink = ParkingSink {
+            state: Arc::new(Mutex::new((2, Vec::new()))),
+            parks: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+        };
+        let carrier = {
+            let sink = sink.clone();
+            thread::spawn(move || {
+                let (stream, _) = front.accept().expect("accepts");
+                let uplink = Connection::connect(("127.0.0.1", peer_port)).expect("dials");
+                if let Some(flow) = relay_sink_drained(stream, &sink, &uplink) {
+                    flow.wait();
+                }
+                sink
+            })
+        };
+        let client = thread::spawn(move || {
+            let stream = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+            let mut writer = stream.try_clone().expect("clones");
+            writer.write_all(b"request").expect("writes");
+            writer.shutdown(Shutdown::Write).expect("half closes");
+            drop(stream);
+        });
+        let sink = carrier.join().expect("joins");
+        client.join().expect("joins");
+        server.join().expect("joins");
+        assert_eq!(
+            sink.state.lock().expect("state").1,
+            b"reply",
+            "the parked window reached the sink whole"
+        );
+        assert_eq!(
+            sink.parks.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "both refusals parked and the third attempt took the window"
         );
     }
 
