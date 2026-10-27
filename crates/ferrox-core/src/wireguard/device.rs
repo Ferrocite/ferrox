@@ -113,6 +113,7 @@ pub struct Tunnel {
     last_timestamp: Option<[u8; 12]>,
     epoch: [u8; 12],
     session: Option<Session>,
+    previous: Option<Session>,
     queue: VecDeque<Vec<u8>>,
     queued_bytes: usize,
     last_send: u64,
@@ -174,6 +175,7 @@ impl Tunnel {
             last_timestamp: None,
             epoch,
             session: None,
+            previous: None,
             queue: VecDeque::new(),
             queued_bytes: 0,
             last_send: 0,
@@ -326,6 +328,10 @@ impl Tunnel {
         };
         self.handshake = None;
         self.pending_mac1 = None;
+        self.previous = self
+            .session
+            .take()
+            .filter(|session| now.saturating_sub(session.created) < REJECT_AFTER);
         self.session = Some(Session {
             send,
             recv,
@@ -366,24 +372,42 @@ impl Tunnel {
     }
 
     fn transport(&mut self, now: u64, src: SocketAddr, packet: &mut [u8], out: &mut Vec<Event>) {
-        if self
-            .session
-            .as_ref()
-            .is_none_or(|session| now.saturating_sub(session.created) >= REJECT_AFTER)
-        {
-            self.session = None;
-            return;
-        }
-        let Some(session) = self.session.as_mut() else {
-            return;
-        };
         if packet.len() < transport::MIN_SIZE {
             return;
         }
-        let receiver = u32::from_le_bytes(packet[4..8].try_into().unwrap_or([0; 4]));
-        if receiver != session.local_index {
-            return;
+        if self
+            .session
+            .as_ref()
+            .is_some_and(|session| now.saturating_sub(session.created) >= REJECT_AFTER)
+        {
+            self.session = None;
         }
+        if self
+            .previous
+            .as_ref()
+            .is_some_and(|session| now.saturating_sub(session.created) >= REJECT_AFTER)
+        {
+            self.previous = None;
+        }
+        let receiver = u32::from_le_bytes(packet[4..8].try_into().unwrap_or([0; 4]));
+        let session = if self
+            .session
+            .as_ref()
+            .is_some_and(|session| session.local_index == receiver)
+        {
+            self.session.as_mut()
+        } else if self
+            .previous
+            .as_ref()
+            .is_some_and(|session| session.local_index == receiver)
+        {
+            self.previous.as_mut()
+        } else {
+            None
+        };
+        let Some(session) = session else {
+            return;
+        };
         let counter = u64::from_le_bytes(packet[8..16].try_into().unwrap_or([0; 8]));
         let action = session.replay.check(counter);
         if action == Action::Reject {
@@ -412,7 +436,17 @@ impl Tunnel {
     /// every session's key material.
     #[must_use]
     pub fn owns(&self, index: u32) -> bool {
-        self.local_index() == index
+        self.handshake
+            .as_ref()
+            .is_some_and(|state| state.indexes().0 == index)
+            || self
+                .session
+                .as_ref()
+                .is_some_and(|session| session.local_index == index)
+            || self
+                .previous
+                .as_ref()
+                .is_some_and(|session| session.local_index == index)
     }
 
     /// Answer a consumed initiation. The caller has already checked `mac1` and
@@ -447,6 +481,10 @@ impl Tunnel {
             return false;
         };
         self.last_timestamp = Some(timestamp);
+        self.previous = self
+            .session
+            .take()
+            .filter(|session| now.saturating_sub(session.created) < REJECT_AFTER);
         self.session = Some(Session {
             send,
             recv,
@@ -491,7 +529,13 @@ impl Tunnel {
         };
         if now.saturating_sub(session.created) >= REJECT_AFTER {
             self.session = None;
+            if self.keepalive > 0 {
+                self.initiate(now, out);
+            }
             return;
+        }
+        if self.keepalive > 0 && now.saturating_sub(session.created) >= REKEY_AFTER {
+            self.initiate(now, out);
         }
         if self.keepalive > 0
             && now.saturating_sub(self.last_send) >= u64::from(self.keepalive) * 1000
@@ -504,6 +548,7 @@ impl Tunnel {
     /// configuration. The next send starts a fresh handshake.
     pub fn reset(&mut self) {
         self.session = None;
+        self.previous = None;
         self.handshake = None;
         self.pending_mac1 = None;
     }
@@ -721,6 +766,46 @@ mod tests {
         assert!(out.is_empty());
         alice.send(NOW + 2 + REJECT_AFTER, b"x", &mut out);
         assert!(matches!(&out[0], Event::Send { .. }), "a fresh initiation");
+    }
+
+    #[test]
+    fn a_rekey_keeps_the_previous_index_receivable() {
+        let (mut alice, mut bob) = establish(0);
+        let mut old = Vec::new();
+        alice.send(NOW + 3, b"before", &mut old);
+        let mut record = packet(&old);
+        let old_index = alice.session.as_ref().expect("session").local_index;
+        let mut out = Vec::new();
+        alice.send(NOW + 2 + REKEY_AFTER, b"after", &mut out);
+        assert!(alice.owns(old_index), "the old session stays reachable");
+        let initiation = packet(&out);
+        let _response = answer(&mut bob, &initiation, NOW + 3 + REKEY_AFTER);
+        let mut received = Vec::new();
+        bob.receive(
+            NOW + 4 + REKEY_AFTER,
+            ALICE.parse().unwrap(),
+            &mut record,
+            &mut received,
+        );
+        assert!(matches!(&received[0], Event::Data(payload) if payload == b"before"));
+        assert!(bob.owns(
+            bob.previous
+                .as_ref()
+                .expect("the previous session")
+                .local_index
+        ));
+    }
+
+    #[test]
+    fn a_persistent_keepalive_rehandshakes_after_the_reject_threshold() {
+        let (mut alice, _bob) = establish(10);
+        let mut out = Vec::new();
+        let at = NOW + 2 + REJECT_AFTER;
+        alice.poll(at, &mut out);
+        assert!(!alice.established(at));
+        let initiation = packet(&out);
+        assert_eq!(&initiation[0..4], &handshake::TYPE_INITIATION.to_le_bytes());
+        assert!(alice.handshake.is_some());
     }
 
     #[test]

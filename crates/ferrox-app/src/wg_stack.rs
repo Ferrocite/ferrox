@@ -28,15 +28,22 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndp
 
 use crate::conn::Connection;
 use crate::proxy::{serve_device_flow, serve_udp_lane, Destination, Outbound};
-use crate::wireguard::{DeviceConfig, PeerConfig};
+use crate::wireguard::DeviceConfig;
 
 /// The bytes one direction of a TCP flow may buffer inside `smoltcp`: a 1 MiB
 /// transfer needs no window larger than this, and five concurrent flows stay
 /// under a few megabytes.
 const TCP_BUFFER: usize = 256 * 1024;
-/// The most listeners one destination port may hold at once. A retransmitted
-/// SYN raises another, so the bound keeps a probe from growing the set.
-const LISTENERS_PER_PORT: usize = 32;
+/// The most listeners one inbound may hold across every destination port. Each
+/// listener owns both TCP buffers, so a spoofed SYN stream must not grow the
+/// set past a fixed share of memory.
+const LISTENERS: usize = 64;
+/// The most listeners one destination port may hold, so concurrent SYNs to one
+/// service do not wait for a retransmit while the total stays bounded.
+const LISTENERS_PER_PORT: usize = 8;
+/// How long a listener may wait for a handshake before it is reclaimed, so a
+/// spoofed SYN cannot hold a slot for the life of the inbound.
+const LISTENER_TTL: Duration = Duration::from_secs(60);
 /// The stack's poll interval when no packet arrived: retransmit timers are
 /// seconds, so ten milliseconds is latency without a spin.
 const TICK: Duration = Duration::from_millis(10);
@@ -56,6 +63,7 @@ pub(crate) struct Packet {
 pub(crate) struct ClientFlow {
     pub(crate) client: Connection,
     pub(crate) destination: SocketAddr,
+    pub(crate) prefix: Vec<u8>,
 }
 
 /// The route table of live client datagram lanes, keyed by the loopback relay
@@ -300,7 +308,9 @@ impl ClientStack {
         flow.client.set_nonblocking(true)?;
         let handle = self.sockets.add(socket);
         self.ports.insert(local_port);
-        self.flows.push(Flow::new(handle, flow.client, local_port));
+        let mut routed = Flow::new(handle, flow.client, local_port);
+        routed.pending_up = flow.prefix;
+        self.flows.push(routed);
         Ok(())
     }
 
@@ -343,12 +353,17 @@ impl ClientStack {
     }
 }
 
+struct Listener {
+    handle: SocketHandle,
+    since: StdInstant,
+}
+
 struct ServerStack {
     device: QueueDevice,
     iface: Interface,
     sockets: SocketSet<'static>,
     flows: Vec<Flow>,
-    listeners: HashMap<u16, Vec<SocketHandle>>,
+    listeners: HashMap<u16, Vec<Listener>>,
     udp: HashMap<([u8; 32], SocketAddr, SocketAddr), UdpSocket>,
     to_tunnel: ToTunnel,
     out: Outbound,
@@ -444,20 +459,36 @@ impl ServerStack {
                 true
             }
         });
-        self.listeners.retain(|_, handles| {
-            handles.retain(|handle| {
-                matches!(
-                    self.sockets.get::<TcpSocket>(*handle).state(),
-                    State::Listen | State::SynReceived
-                )
-            });
-            !handles.is_empty()
-        });
+        let dead: Vec<(u16, SocketHandle)> = self
+            .listeners
+            .iter()
+            .flat_map(|(port, listeners)| {
+                listeners.iter().filter_map(|listener| {
+                    let state = self.sockets.get::<TcpSocket>(listener.handle).state();
+                    let live = matches!(state, State::Listen | State::SynReceived)
+                        && listener.since.elapsed() < LISTENER_TTL;
+                    (!live).then_some((*port, listener.handle))
+                })
+            })
+            .collect();
+        for (port, handle) in dead {
+            self.sockets.remove(handle);
+            if let Some(listeners) = self.listeners.get_mut(&port) {
+                listeners.retain(|listener| listener.handle != handle);
+                if listeners.is_empty() {
+                    self.listeners.remove(&port);
+                }
+            }
+        }
     }
 
     fn listen(&mut self, port: u16) {
-        let handles = self.listeners.entry(port).or_default();
-        if handles.len() >= LISTENERS_PER_PORT {
+        let total = self.listeners.values().map(Vec::len).sum::<usize>();
+        if total >= LISTENERS {
+            return;
+        }
+        let listeners = self.listeners.entry(port).or_default();
+        if listeners.len() >= LISTENERS_PER_PORT {
             return;
         }
         let mut socket = TcpSocket::new(
@@ -467,32 +498,39 @@ impl ServerStack {
         socket.set_nagle_enabled(false);
         if socket.listen(IpListenEndpoint { addr: None, port }).is_ok() {
             let handle = self.sockets.add(socket);
-            handles.push(handle);
+            listeners.push(Listener {
+                handle,
+                since: StdInstant::now(),
+            });
         }
     }
 
     fn handoff(&mut self) {
         let mut ready = Vec::new();
-        for (port, handles) in &mut self.listeners {
-            handles.retain(|handle| {
-                let socket = self.sockets.get::<TcpSocket>(*handle);
+        for (port, listeners) in &self.listeners {
+            for listener in listeners {
+                let socket = self.sockets.get::<TcpSocket>(listener.handle);
                 if socket.state() == State::Established {
                     if let Some(local) = socket.local_endpoint() {
-                        ready.push((*handle, *port, local));
+                        ready.push((*port, listener.handle, local));
                     }
-                    false
-                } else {
-                    matches!(socket.state(), State::Listen | State::SynReceived)
                 }
-            });
+            }
         }
-        for (handle, port, local) in ready {
+        for (port, handle, local) in ready {
+            if let Some(listeners) = self.listeners.get_mut(&port) {
+                listeners.retain(|listener| listener.handle != handle);
+                if listeners.is_empty() {
+                    self.listeners.remove(&port);
+                }
+            }
             let destination = match local.addr {
                 IpAddress::Ipv4(address) => SocketAddr::new(IpAddr::V4(address), local.port),
                 IpAddress::Ipv6(address) => SocketAddr::new(IpAddr::V6(address), local.port),
             };
             let Ok((tun, proxy)) = loopback() else {
                 self.sockets.remove(handle);
+                self.listen(port);
                 continue;
             };
             let out = self.out.clone();
@@ -505,6 +543,7 @@ impl ServerStack {
             });
             if tun.set_nonblocking(true).is_err() {
                 self.sockets.remove(handle);
+                self.listen(port);
                 continue;
             }
             self.flows.push(Flow::new(handle, Connection::from(tun), 0));
@@ -550,7 +589,7 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8]) {
     }
     flow.pending_down = pending;
 
-    while flow.pending_down.is_empty() && socket.can_recv() {
+    while flow.pending_down.is_empty() {
         match socket.recv_slice(buf) {
             Ok(0) | Err(RecvError::InvalidState) => break,
             Ok(n) => {
@@ -588,7 +627,7 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8]) {
             Err(_) => flow.done = true,
         }
     }
-    if !flow.pending_up.is_empty() {
+    if !flow.pending_up.is_empty() && socket.can_send() {
         match socket.send_slice(&flow.pending_up) {
             Ok(0) => {}
             Ok(n) => {
@@ -604,6 +643,10 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8]) {
     if flow.down_eof && !flow.down_shutdown && flow.pending_down.is_empty() {
         let _ = flow.local.shutdown(Shutdown::Write);
         flow.down_shutdown = true;
+    }
+    if socket.state() == State::Closed && flow.established && flow.pending_down.is_empty() {
+        flow.down_eof = true;
+        flow.done = true;
     }
     if flow.sent_fin && flow.down_eof && socket.state() == State::Closed {
         flow.done = true;
@@ -708,6 +751,7 @@ pub(crate) fn client_udp(
     config: &DeviceConfig,
     to_tunnel: &ToTunnel,
     routes: &UdpRoutes,
+    associate: Option<&Connection>,
 ) {
     let Ok(local) = relay.local_addr() else {
         return;
@@ -718,8 +762,12 @@ pub(crate) fn client_udp(
         table.insert(port, reply_tx);
     }
     let _ = relay.set_read_timeout(Some(TICK));
+    if let Some(associate) = associate {
+        let _ = associate.set_read_timeout(Some(crate::budgets::SESSION_POLL));
+    }
     let mut buf = crate::proxy::udp_buffer();
     let mut app: Option<SocketAddr> = None;
+    let mut quiet = StdInstant::now();
     loop {
         while let Ok(inner) = reply_rx.try_recv() {
             let Some(datagram) = udp_from_packet(&inner) else {
@@ -737,9 +785,11 @@ pub(crate) fn client_udp(
             let mut frame = Vec::with_capacity(32 + datagram.payload.len());
             let out = crate::proxy::socks_udp_frame(&mut frame, None, &remote, datagram.payload);
             let _ = relay.send_to(out, app);
+            quiet = StdInstant::now();
         }
         match relay.recv_from(&mut buf) {
             Ok((n, sender)) => {
+                quiet = StdInstant::now();
                 app = Some(sender);
                 let Some((target, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
                     continue;
@@ -772,7 +822,14 @@ pub(crate) fn client_udp(
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) => {}
+                ) =>
+            {
+                if associate.is_some_and(crate::proxy::peer_left)
+                    || quiet.elapsed() >= crate::budgets::udp_idle()
+                {
+                    break;
+                }
+            }
             Err(_) => break,
         }
     }
@@ -868,18 +925,42 @@ fn ip_bytes(address: IpAddr) -> Vec<u8> {
     }
 }
 
-/// Whether a peer's allowed IPs cover an inner packet's source, so a server
-/// never forwards a packet the peer is not allowed to originate.
-pub(crate) fn source_allowed(peer: &PeerConfig, packet: &[u8]) -> bool {
-    inner_addresses(packet).is_some_and(|(source, _)| peer.routes(source))
-}
-
 /// The IP protocol number a TCP segment carries.
 pub(crate) const PROTOCOL_TCP: u8 = 6;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn listeners_share_one_total_budget_and_expire() {
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.1".parse().unwrap()],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(false),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
+        let (to_tunnel, _) = std::sync::mpsc::channel();
+        let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
+        let mut stack = ServerStack::new(&config, to_tunnel, out);
+        for port in 0..(LISTENERS as u16 + 10) {
+            stack.listen(10_000 + port);
+        }
+        assert_eq!(stack.listeners.len(), LISTENERS);
+        let expired = 10_000;
+        stack.listeners.get_mut(&expired).expect("listener")[0].since = StdInstant::now()
+            .checked_sub(LISTENER_TTL)
+            .expect("instant");
+        let mut buf = [0u8; 1024];
+        stack.poll(&mut buf);
+        assert!(!stack.listeners.contains_key(&expired));
+        stack.listen(10_000 + LISTENERS as u16 + 20);
+        assert_eq!(stack.listeners.len(), LISTENERS);
+    }
 
     #[test]
     fn a_server_datagram_lane_echoes_through_freedom() {
@@ -927,6 +1008,70 @@ mod client_tests {
     }
 
     #[test]
+    fn a_client_datagram_lane_returns_when_its_client_leaves() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            udp_idle: Some(Duration::from_secs(30)),
+            ..Default::default()
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
+        let port = relay.local_addr().expect("address").port();
+        let (associate, remote) = loopback().expect("pair");
+        drop(remote);
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread_relay = relay.try_clone().expect("clone");
+        let thread_config = config();
+        let routes: UdpRoutes = Arc::default();
+        let thread_routes = Arc::clone(&routes);
+        std::thread::spawn(move || {
+            let (to_tunnel, _) = std::sync::mpsc::channel();
+            client_udp(
+                &thread_relay,
+                &thread_config,
+                &to_tunnel,
+                &thread_routes,
+                Some(&Connection::from(associate)),
+            );
+            let _ = done_tx.send(());
+        });
+        let returned = done_rx.recv_timeout(Duration::from_secs(5));
+        crate::budgets::clear();
+        returned.expect("a closed control socket ends the lane");
+        assert!(!routes.lock().expect("routes").contains_key(&port));
+    }
+
+    #[test]
+    fn a_quiet_client_datagram_lane_returns_on_the_idle_budget() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            udp_idle: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
+        let port = relay.local_addr().expect("address").port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let thread_relay = relay.try_clone().expect("clone");
+        let thread_config = config();
+        let routes: UdpRoutes = Arc::default();
+        let thread_routes = Arc::clone(&routes);
+        std::thread::spawn(move || {
+            let (to_tunnel, _) = std::sync::mpsc::channel();
+            client_udp(
+                &thread_relay,
+                &thread_config,
+                &to_tunnel,
+                &thread_routes,
+                None,
+            );
+            let _ = done_tx.send(());
+        });
+        let returned = done_rx.recv_timeout(Duration::from_secs(5));
+        crate::budgets::clear();
+        returned.expect("a quiet lane ends on its idle budget");
+        assert!(!routes.lock().expect("routes").contains_key(&port));
+    }
+
+    #[test]
     fn a_client_datagram_lane_frames_and_unframes() {
         let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
         let relay_address = relay.local_addr().expect("address");
@@ -939,7 +1084,13 @@ mod client_tests {
         let thread_config = config();
         let thread_routes = Arc::clone(&routes);
         std::thread::spawn(move || {
-            client_udp(&thread_relay, &thread_config, &to_tunnel, &thread_routes);
+            client_udp(
+                &thread_relay,
+                &thread_config,
+                &to_tunnel,
+                &thread_routes,
+                None,
+            );
         });
         let port = relay_address.port();
         for _ in 0..100 {

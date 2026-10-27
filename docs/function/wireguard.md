@@ -45,7 +45,7 @@ graph TD
 | server-datagram-bytes-echoed | 2 | ferrox-app-wg-stack::tests::a_server_datagram_lane_echoes_through_freedom |
 <!-- counts:end -->
 
-The size rows are the constants the record and handshake write, asserted against the reference's numbers. The echo rows are bytes, not durations: a TCP flow crosses both tunnel directions, the smoltcp handoff, the freedom dial and a loopback echo with its five bytes unchanged; a client datagram lane frames a six-byte answer and unframes it; a server datagram lane frames a two-byte answer through `serve_udp_lane` and wraps the reply. The scenario gate is `TestWireguard` in `upstream/pins.toml`; it is CI's to report, not a local claim.
+The size rows are the constants the record and handshake write, asserted against the reference's numbers. The echo rows are bytes, not durations: a TCP flow crosses both tunnel directions, the smoltcp handoff, the freedom dial and a loopback echo with its five bytes unchanged; a client datagram lane frames a six-byte answer and unframes it; a server datagram lane frames a two-byte answer through `serve_udp_lane` and wraps the reply. The scenario gate is `TestWireguard` in `upstream/pins.toml`; it is green in `conformance.yml` at this pin.
 
 ## Ops
 
@@ -57,7 +57,7 @@ The size rows are the constants the record and handshake write, asserted against
 
 ## Time
 
-**Not measured.** `scripts/lib-matrix.sh` carries no benchmark cell for this row and no scenario id names wireguard, so `bench.yml` and `parity.yml` gate nothing here. What is argued is the shape: one userspace stack per device, one thread per tunnel direction, a 10 ms reader tick that bounds both the timer check and a queued packet's wait, 256 KiB per TCP direction, one listener per destination port capped at 32, and one lane per server datagram tuple capped at 4096. A duration would come from a CI runner, and no CI artefact has been read for this row.
+**Not measured.** `scripts/lib-matrix.sh` carries no benchmark cell for this row and no scenario id names wireguard, so `bench.yml` and `parity.yml` gate nothing here. What is argued is the shape: one userspace stack per device, one thread per tunnel direction, a 10 ms reader tick that bounds both the timer check and a queued packet's wait, 256 KiB per TCP direction, up to eight listeners per destination port and 64 per inbound with a 60 s reap, and one lane per server datagram tuple capped at 4096. A duration would come from a CI runner, and no CI artefact has been read for this row.
 
 ## What we removed
 

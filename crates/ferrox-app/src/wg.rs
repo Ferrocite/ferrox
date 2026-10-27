@@ -78,7 +78,7 @@ impl WireGuardOut {
         self.config.peers.first().and_then(|peer| peer.endpoint)
     }
 
-    pub(crate) fn serve_tcp(&self, client: Connection, asked: &Destination) {
+    pub(crate) fn serve_tcp(&self, client: Connection, asked: &Destination, prefix: &[u8]) {
         let Some(destination) = asked.socket() else {
             eprintln!("wireguard: destination `{asked:?}` does not resolve");
             return;
@@ -97,6 +97,7 @@ impl WireGuardOut {
             .send(ClientFlow {
                 client,
                 destination,
+                prefix: prefix.to_vec(),
             })
             .is_err()
         {
@@ -104,8 +105,14 @@ impl WireGuardOut {
         }
     }
 
-    pub(crate) fn serve_udp(&self, relay: &UdpSocket) {
-        wg_stack::client_udp(relay, &self.config, &self.to_tunnel, &self.routes);
+    pub(crate) fn serve_udp(&self, relay: &UdpSocket, associate: Option<&Connection>) {
+        wg_stack::client_udp(
+            relay,
+            &self.config,
+            &self.to_tunnel,
+            &self.routes,
+            associate,
+        );
     }
 }
 
@@ -187,13 +194,21 @@ fn io(
                 &socket,
                 &to_stack,
                 routes.as_ref(),
-                Some(&peers[index]),
+                &peers,
+                Some(index),
             );
         }
         for peer in &mut peers {
             peer.tunnel.poll(now, &mut events);
         }
-        flush(&mut events, &socket, &to_stack, routes.as_ref(), None);
+        flush(
+            &mut events,
+            &socket,
+            &to_stack,
+            routes.as_ref(),
+            &peers,
+            None,
+        );
 
         match socket.recv_from(&mut buf) {
             Ok((n, source)) if n >= 4 => {
@@ -217,7 +232,8 @@ fn io(
                         &socket,
                         &to_stack,
                         routes.as_ref(),
-                        Some(&peers[index]),
+                        &peers,
+                        Some(index),
                     );
                 }
             }
@@ -255,17 +271,19 @@ fn handle_initiation(
     };
     let mut events = Vec::new();
     peers[index].tunnel.answer(now, source, state, &mut events);
-    flush(&mut events, socket, to_stack, None, Some(&peers[index]));
+    flush(&mut events, socket, to_stack, None, peers, Some(index));
 }
 
-/// Send every event, and for each decrypted payload validate the source the
-/// peer is allowed to originate before the upper layer sees it.
+/// Send every event, and for each decrypted payload require the authenticating
+/// peer to own the source by longest allowed prefix before the upper layer sees
+/// it.
 fn flush(
     events: &mut Vec<Event>,
     socket: &UdpSocket,
     to_stack: &Sender<Packet>,
     routes: Option<&UdpRoutes>,
-    peer: Option<&Peer>,
+    peers: &[Peer],
+    peer: Option<usize>,
 ) {
     for event in events.drain(..) {
         match event {
@@ -273,10 +291,13 @@ fn flush(
                 let _ = socket.send_to(&packet, endpoint);
             }
             Event::Data(inner) => {
-                let Some(peer) = peer else {
+                let Some(index) = peer else {
                     continue;
                 };
-                if !wg_stack::source_allowed(&peer.config, &inner) {
+                let Some((source, _)) = wg_stack::inner_addresses(&inner) else {
+                    continue;
+                };
+                if peer_for(peers, source) != Some(index) {
                     continue;
                 }
                 if let Some(routes) = routes {
@@ -290,7 +311,7 @@ fn flush(
                     }
                 }
                 let _ = to_stack.send(Packet {
-                    peer: peer.config.public,
+                    peer: peers[index].config.public,
                     bytes: inner,
                 });
             }
@@ -379,6 +400,50 @@ mod tests {
     use std::net::TcpListener;
 
     #[test]
+    fn a_peer_may_not_originate_another_peers_source() {
+        let config = DeviceConfig {
+            secret: [0x11; 32],
+            addresses: vec!["10.0.0.1".parse().unwrap()],
+            peers: vec![
+                PeerConfig {
+                    public: [0x22; 32],
+                    preshared: [0; 32],
+                    endpoint: None,
+                    keepalive: 0,
+                    allowed: vec![("10.0.0.2".parse().unwrap(), 32)],
+                },
+                PeerConfig {
+                    public: [0x33; 32],
+                    preshared: [0; 32],
+                    endpoint: None,
+                    keepalive: 0,
+                    allowed: vec![("10.0.0.0".parse().unwrap(), 8)],
+                },
+            ],
+            mtu: 1420,
+            reserved: [0; 3],
+            is_client: Some(false),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
+        let peers = peers(&config, [0; 12]);
+        let socket = UdpSocket::bind("127.0.0.1:0").expect("socket");
+        let (to_stack, packets) = mpsc::channel();
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        let mut events = vec![Event::Data(packet)];
+        flush(&mut events, &socket, &to_stack, None, &peers, Some(1));
+        assert!(packets.try_recv().is_err(), "the owner is peer zero");
+        let mut packet = vec![0u8; 20];
+        packet[0] = 0x45;
+        packet[12..16].copy_from_slice(&[10, 1, 2, 3]);
+        let mut events = vec![Event::Data(packet)];
+        flush(&mut events, &socket, &to_stack, None, &peers, Some(1));
+        assert!(packets.try_recv().is_ok(), "the peer owns its own source");
+    }
+
+    #[test]
     fn a_tcp_flow_crosses_the_tunnel_to_a_freedom_dial() {
         let echo = TcpListener::bind("127.0.0.1:0").expect("echo");
         let echo_address = echo.local_addr().expect("address");
@@ -387,11 +452,16 @@ mod tests {
                 return;
             };
             let mut buf = [0u8; 1024];
+            let mut seen = 0;
             loop {
                 let Ok(n) = stream.read(&mut buf) else {
                     return;
                 };
                 if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+                seen += n;
+                if seen >= 9 {
                     return;
                 }
             }
@@ -429,10 +499,16 @@ mod tests {
         let (mut app, _) = listener.accept().expect("accept");
         app.set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
-        wireguard.serve_tcp(Connection::from(tun), &Destination::Address(echo_address));
+        wireguard.serve_tcp(
+            Connection::from(tun),
+            &Destination::Address(echo_address),
+            b"head",
+        );
         app.write_all(b"hello").expect("write");
-        let mut answer = [0u8; 5];
+        let mut answer = [0u8; 9];
         app.read_exact(&mut answer).expect("read");
-        assert_eq!(&answer, b"hello");
+        assert_eq!(&answer, b"headhello");
+        let mut eof = [0u8; 1];
+        assert_eq!(app.read(&mut eof).expect("eof"), 0);
     }
 }

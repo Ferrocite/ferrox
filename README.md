@@ -167,7 +167,7 @@ Rows 1–22 are the share-link world; rows 23–39 are the xray-core config surf
 
 | # | method | state | supported today by |
 | --- | --- | --- | --- |
-| 46 | WireGuard (UDP) | partial — both roles; local gates green, conformance pending ([wireguard](docs/function/wireguard.md)) | Xray `proxy/wireguard`, sing-box `protocol/wireguard`, Aether, PattNG, mlmvpn; ZeroNet ships both ends. Client outbound and server inbound over one `smoltcp` 0.14 userspace stack: Noise_IKpsk2 both directions, the reference's timers, cryptokey routing by longest allowed prefix, IPv4/IPv6 TCP and UDP, WARP reserved bytes, JSON and protobuf config with the reference's defaults, no kernel TUN. `TestWireguard` is the CI gate; no benchmark cell names the row. |
+| 46 | WireGuard (UDP) | implemented ([wireguard](docs/function/wireguard.md)) | Xray `proxy/wireguard`, sing-box `protocol/wireguard`, Aether, PattNG, mlmvpn; ZeroNet ships both ends. Client outbound and server inbound over one `smoltcp` 0.14 userspace stack: Noise_IKpsk2 both directions, the reference's timers, cryptokey routing by longest allowed prefix, IPv4/IPv6 TCP and UDP, WARP reserved bytes, JSON and protobuf config with the reference's defaults, no kernel TUN. `TestWireguard` is green in CI; no benchmark cell names the row. |
 | 47 | AmneziaWG | planned | amneziawg-go, amnezia-client, mlmvpn |
 | 48 | MASQUE CONNECT-IP over QUIC | planned, quiche default | mqvpn, Aether, sing-box, Xray-core, PattNG |
 | 49 | MASQUE over HTTP/3 vs HTTP/2 | planned | Aether, mqvpn |

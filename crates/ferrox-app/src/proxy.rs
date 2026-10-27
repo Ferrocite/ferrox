@@ -14153,7 +14153,7 @@ pub(crate) fn serve_connect(
         return;
     }
     if let Outbound::WireGuard(wireguard) = out {
-        wireguard.serve_tcp(client, asked);
+        wireguard.serve_tcp(client, asked, prefix);
         return;
     }
     if let Outbound::Foxy(foxy) = out {
@@ -15410,7 +15410,7 @@ pub(crate) fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Optio
             crate::foxy::Carrier::H3 => serve_socks_udp_foxy_ip(relay, foxy, associate),
             _ => serve_socks_udp_foxy(relay, foxy, associate),
         },
-        Outbound::WireGuard(wireguard) => wireguard.serve_udp(relay),
+        Outbound::WireGuard(wireguard) => wireguard.serve_udp(relay, associate),
         Outbound::Freedom(out) => serve_socks_udp_freedom(relay, out),
         Outbound::Socks(socks) => serve_socks_udp_socks(relay, socks),
         Outbound::Dns(dns) => serve_dns_udp(relay, dns),
@@ -15728,7 +15728,7 @@ fn serve_socks_udp_freedom(relay: &UdpSocket, freedom: &FreedomOut) {
 }
 
 /// The association's control socket answers a peek with zero (or an error) once the app is gone; a timeout is the answer that says it is still there.
-fn peer_left(associate: &Connection) -> bool {
+pub(crate) fn peer_left(associate: &Connection) -> bool {
     let mut byte = [0u8; 1];
     match associate.peek(&mut byte) {
         Err(error) => !is_timeout(&error),
