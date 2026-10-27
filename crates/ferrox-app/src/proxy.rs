@@ -18873,9 +18873,7 @@ impl RelayFinish {
         self.ended_at
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .map_or(false, |at| {
-                at.elapsed() >= crate::budgets::RELAY_DRAIN_GRACE
-            })
+            .is_some_and(|at| at.elapsed() >= crate::budgets::RELAY_DRAIN_GRACE)
     }
 
     fn close_once(&self) {
