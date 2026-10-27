@@ -383,12 +383,13 @@ impl<S: Read + Write + RecordAlignment> Read for Link<S> {
     /// feeding spread through the run, and the machine spends at the unit's end.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let tls = *self.lock_tls();
-        let mut feed = (tls.budget > 0).then(|| Feeding::new(&tls));
+        let active = tls.budget > 0;
+        let mut feed = active.then(|| Feeding::new(&tls));
         #[cfg(test)]
         if feed.is_some() {
             self.feeds += 1;
         }
-        let n = self.drive_read(buf, feed.as_mut())?;
+        let n = self.drive_read(buf, feed.as_mut(), active)?;
         if let Some(feed) = feed {
             if feed.run > 0 && self.lock_tls().budget > 0 {
                 self.spend(&feed);
@@ -417,12 +418,13 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         &mut self,
         buf: &mut [u8],
         mut feed: Option<&mut Feeding>,
+        active: bool,
     ) -> std::io::Result<usize> {
         loop {
             if self.read.padding {
                 if self.dot < self.have.len() {
                     let was = self.dot;
-                    match self.pump(Some(buf), feed.as_deref_mut()) {
+                    match self.pump(Some(buf), feed.as_deref_mut(), active) {
                         0 => {}
                         n => return Ok(n),
                     }
@@ -551,7 +553,12 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     /// or the framing's first frame header. A walk that blocks mid-frame parks there
     /// and reports what it handed out.
     #[allow(clippy::too_many_lines)]
-    fn pump(&mut self, mut buf: Option<&mut [u8]>, mut feed: Option<&mut Feeding>) -> usize {
+    fn pump(
+        &mut self,
+        mut buf: Option<&mut [u8]>,
+        mut feed: Option<&mut Feeding>,
+        active: bool,
+    ) -> usize {
         let end = self.have.len();
         let mut dot = self.dot;
         let mut walk = self.walk;
@@ -591,7 +598,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 if end - dot >= content + padding && room >= content {
                     if content > 0 {
                         let fresh = &self.have[dot..dot + content];
-                        if self.lock_tls().budget > 0 {
+                        if active {
                             if let Some(feed) = feed.as_deref_mut() {
                                 feed.run += content;
                                 feed_extent(fresh, feed);
@@ -646,7 +653,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 };
                 let take = walk.want_content.min(end - dot).min(room);
                 let fresh = &self.have[dot..dot + take];
-                if self.lock_tls().budget > 0 {
+                if active {
                     if let Some(feed) = feed.as_deref_mut() {
                         feed.run += take;
                         feed_extent(fresh, feed);
@@ -1112,7 +1119,7 @@ mod tests {
             link.walk.want_header = 5;
             let tls = *link.lock_tls();
             let mut feed = Feeding::new(&tls);
-            let runs = link.pump(None, Some(&mut feed));
+            let runs = link.pump(None, Some(&mut feed), false);
             assert_eq!(runs, 48, "eight six-byte contents cross the walk");
             link.read.padding = true;
             link.read.raw = false;
