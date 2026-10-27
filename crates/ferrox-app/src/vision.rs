@@ -302,19 +302,17 @@ impl<S: Read + Write + RecordAlignment> RecordAlignment for Link<S> {
 }
 
 impl<S: Read + Write + RecordAlignment> Link<S> {
+    /// The session this link frames, so a caller that shares it can arm the transport it reads.
+    pub(crate) fn session(&self) -> &S {
+        &self.session
+    }
+
     /// The direct switch reads the raw clone, so the grain a shared read needs is armed on the handle it reads.
     pub(crate) fn arm_read_timeout(&self, grain: std::time::Duration) -> std::io::Result<()> {
         match &self.raw {
             Some(raw) => raw.set_read_timeout(Some(grain)),
             None => Ok(()),
         }
-    }
-}
-
-impl Link<ferrox_core::tls::ClientSession<Connection>> {
-    /// A raw-less link parks its reads in the session it frames, so the shared half's grain arms on that transport rather than on a handle the link does not keep.
-    pub(crate) fn arm_session_timeout(&self, grain: std::time::Duration) -> std::io::Result<()> {
-        self.session.get_ref().set_read_timeout(Some(grain))
     }
 }
 
