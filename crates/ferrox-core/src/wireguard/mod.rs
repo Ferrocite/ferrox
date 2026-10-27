@@ -8,12 +8,13 @@
 //! and `mac1` is keyed BLAKE2s-128 — which is why [`crate::blake2s`] is its
 //! only new primitive; X25519 and the AEAD were already here.
 //!
-//! Current scope: [`kdf`], [`handshake`] and [`transport`] — the key
-//! derivation, the initiation/response exchange, and the record layer with its
-//! replay window and `mac2` cookie. The message timers (reserve,
-//! handshake-attempt, cookie-refresh) and the config binding stay out until the
-//! method slice, `P70`.
+//! [`kdf`], [`handshake`] and [`transport`] are the key derivation, the
+//! initiation/response exchange, and the record layer with its replay window
+//! and `mac2` cookie. [`device`] is one peer's tunnel: the session, the queue,
+//! the reserved bytes, and the reference's five message timers. The config
+//! binding lives in `ferrox-app` (`wireguard`, `wg_stack`, `wg`).
 
+pub mod device;
 pub mod handshake;
 pub mod kdf;
 pub mod transport;

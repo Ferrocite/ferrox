@@ -251,15 +251,28 @@ impl Fragment {
     /// widths, each advance measured by what the socket actually took.
     fn write_pieces<W: Write>(&mut self, raw: &mut W, p: &[u8]) -> io::Result<usize> {
         let Some(bound) = self.max_split.pick_from(&mut self.ent) else {
-            return raw.write_all(p).map(|()| p.len());
+            return write_progress(raw, p);
         };
         let mut from = 0usize;
         let mut segment = 0usize;
         loop {
             let Some(to) = self.cut(segment, from, p.len(), bound) else {
-                return raw.write_all(&p[from..]).map(|()| p.len());
+                return write_progress(raw, &p[from..]).map(|written| from + written);
             };
-            let written = raw.write(&p[from..to])?;
+            let written = match raw.write(&p[from..to]) {
+                Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+                Ok(written) => written,
+                Err(error)
+                    if from > 0
+                        && matches!(
+                            error.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                {
+                    return Ok(from);
+                }
+                Err(error) => return Err(error),
+            };
             from += written;
             let delay = self.delay_at(segment);
             self.park(delay);
@@ -269,6 +282,32 @@ impl Fragment {
             }
         }
     }
+}
+
+/// Write as much of `p` as a nonblocking sink will take in one call, answering the progress made
+/// before it blocked so the caller drains exactly those octets rather than sending them twice.
+fn write_progress<W: Write>(raw: &mut W, mut p: &[u8]) -> io::Result<usize> {
+    let mut written = 0usize;
+    while !p.is_empty() {
+        match raw.write(p) {
+            Ok(0) => return Err(io::ErrorKind::WriteZero.into()),
+            Ok(taken) => {
+                written += taken;
+                p = &p[taken..];
+            }
+            Err(error)
+                if written > 0
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+            {
+                return Ok(written);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(written)
 }
 
 /// A record's header and its body go out as one gathered write, so the body never lands in a buffer
@@ -427,6 +466,43 @@ mod tests {
             at += HEADER + len;
         }
         (widths, message)
+    }
+
+    struct Stalling {
+        bytes: Vec<u8>,
+        limit: usize,
+    }
+
+    impl Write for Stalling {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.bytes.len() >= self.limit {
+                return Err(io::ErrorKind::WouldBlock.into());
+            }
+            let take = buf.len().min(self.limit - self.bytes.len());
+            self.bytes.extend_from_slice(&buf[..take]);
+            Ok(take)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_blocked_piece_returns_the_octets_it_already_wrote() {
+        let mut mask = Fragment::new(0, 0, vec![range(4, 4)], vec![range(0, 0)], range(24, 24))
+            .expect("valid");
+        let whole: Vec<u8> = (0..20).collect();
+        let mut sink = Stalling {
+            bytes: Vec::new(),
+            limit: 6,
+        };
+        let written = mask.write(&mut sink, &whole).expect("progress");
+        assert_eq!(
+            written, 6,
+            "the caller learns exactly what reached the sink"
+        );
+        assert_eq!(sink.bytes, whole[..6], "and only those octets were sent");
     }
 
     #[test]

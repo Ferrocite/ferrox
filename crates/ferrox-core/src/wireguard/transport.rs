@@ -5,32 +5,35 @@
 //!
 //! The frame is the one both reference engines put on the wire
 //! (`xray-core/proxy/wireguard` and `sing-box/protocol/wireguard` both embed the
-//! vanilla device): an eight-byte header — receiver index then counter, each a
-//! little-endian word — then the ciphertext with its 16-byte tag behind it. The
-//! AEAD nonce is twelve bytes: four zero bytes then the counter widened to eight.
-//! A record whose plaintext is empty is a keepalive, so `MIN_SIZE` bytes is the
-//! whole of the smallest thing on the wire.
+//! vanilla device): a sixteen-byte header — the transport type word, then the
+//! receiver index, then the sixty-four-bit counter, each little-endian — the
+//! ciphertext, and its 16-byte tag. The AEAD nonce is twelve bytes: four zero
+//! bytes then the counter. A record whose plaintext is empty is a keepalive, so
+//! `MIN_SIZE` bytes is the whole of the smallest thing on the wire.
 //!
-//! Against the pinned `amneziawg-go` the handshake, the KDF and the cookie are
-//! carried exactly; the data header is not — that variant widens it to sixteen
-//! bytes, prepends an obfuscated type field and keeps a 64-bit counter, which
-//! changes every byte a vanilla peer would parse. This carries the vanilla
-//! framing, and names the divergence rather than silently shipping a different
-//! wire. What is deliberately out of scope: the message timers (reserve,
-//! handshake-attempt, cookie-refresh) and the config binding, which belong to
-//! the method slice, not here.
+//! The three bytes between the type and the receiver are the reserved field
+//! `WARP` uses; a receiver clears them before reading the type, and a sender
+//! writes them after sealing. They are outside the AEAD, like the rest of the
+//! header, so neither side authenticates them.
+//!
+//! Against the pinned `amneziawg-go` this is the vanilla framing, including the
+//! sixteen-byte header and the sixty-four-bit counter. What is deliberately out
+//! of scope: the message timers (reserve, handshake-attempt, cookie-refresh)
+//! and the config binding, which belong to the method slice, not here.
 
 use super::handshake::MAC_SIZE;
 use crate::aead::{chacha20_poly1305_decrypt_in_place, chacha20_poly1305_seal_in_place};
 use crate::blake2s::Blake2s;
 
-/// The receiver index and counter ahead of the ciphertext.
-pub const HEADER_SIZE: usize = 8;
+/// The type word, receiver index and counter ahead of the ciphertext.
+pub const HEADER_SIZE: usize = 16;
 /// The `ChaCha20Poly1305` tag behind the ciphertext.
 pub const TAG_SIZE: usize = 16;
 /// The smallest record: an empty payload, which is a keepalive.
 pub const MIN_SIZE: usize = HEADER_SIZE + TAG_SIZE;
 
+/// The transport frame's message type, in the first little-endian word.
+pub const TYPE_TRANSPORT: u32 = 4;
 /// The cookie reply's message type, in the first little-endian word.
 pub const TYPE_COOKIE_REPLY: u32 = 3;
 /// A cookie reply: type, receiver, a 24-byte `XChaCha` nonce, then the sealed
@@ -45,55 +48,83 @@ pub const LABEL_COOKIE: &[u8] = b"cookie--";
 /// The reorder span the receive window tracks. `WireGuard`'s own window is
 /// larger, but this width is receiver-local policy and touches no byte on the
 /// wire; 128 is ample for the reordering a single UDP path does.
-const WINDOW_BITS: u32 = 128;
+const WINDOW_BITS: u64 = 128;
 
 /// The AEAD nonce for a counter: four zero bytes, then the counter as eight
-/// little-endian bytes. A session rekeys well before `2^32`, so the high four of
-/// those eight are always zero — widened here rather than masked so the layout
-/// is the reference's byte for byte.
-fn nonce(counter: u32) -> [u8; 12] {
+/// little-endian bytes.
+fn nonce(counter: u64) -> [u8; 12] {
     let mut n = [0u8; 12];
-    n[4..].copy_from_slice(&(counter as u64).to_le_bytes());
+    n[4..].copy_from_slice(&counter.to_le_bytes());
     n
 }
 
 /// Seal the record in place: the plaintext sits at `buf[HEADER_SIZE..]` for `len`
-/// bytes, the buffer is `HEADER_SIZE + len + TAG_SIZE` long, and the receiver
+/// bytes, the buffer is `HEADER_SIZE + len + TAG_SIZE` long, and the type, receiver
 /// index and counter are written ahead. Returns the total record length. The
 /// encryption is the already-proved `aead` seal, so the ciphertext is what a
 /// vanilla peer decrypts — this adds only the header and the counter nonce.
-pub fn seal(key: &[u8; 32], receiver: u32, counter: u32, len: usize, buf: &mut [u8]) -> usize {
-    buf[0..4].copy_from_slice(&receiver.to_le_bytes());
-    buf[4..8].copy_from_slice(&counter.to_le_bytes());
+pub fn seal(key: &[u8; 32], receiver: u32, counter: u64, len: usize, buf: &mut [u8]) -> usize {
+    buf[0..4].copy_from_slice(&TYPE_TRANSPORT.to_le_bytes());
+    buf[4..8].copy_from_slice(&receiver.to_le_bytes());
+    buf[8..16].copy_from_slice(&counter.to_le_bytes());
     let body = &mut buf[HEADER_SIZE..HEADER_SIZE + len];
     let tag = chacha20_poly1305_seal_in_place(key, &nonce(counter), b"", body);
     buf[HEADER_SIZE + len..HEADER_SIZE + len + TAG_SIZE].copy_from_slice(&tag);
     HEADER_SIZE + len + TAG_SIZE
 }
 
+/// Write the three reserved bytes a `WARP` endpoint names, leaving the type word's
+/// low byte alone. A record shorter than the header is left untouched.
+pub fn set_reserved(buf: &mut [u8], reserved: [u8; 3]) {
+    if buf.len() >= 4 {
+        buf[1..4].copy_from_slice(&reserved);
+    }
+}
+
+/// Clear the three reserved bytes before parsing a message whose `mac1` was
+/// computed over them as zero. A message shorter than four bytes is untouched.
+pub fn clear_reserved(buf: &mut [u8]) {
+    if buf.len() >= 4 {
+        buf[1..4].fill(0);
+    }
+}
+
 /// Parse and decrypt a `total`-byte record from `buf`, returning `(receiver,
 /// counter, plaintext length)` with the plaintext at `buf[HEADER_SIZE..]`. The
-/// tag is checked before any keystream exists, so a forged or undersized record
-/// leaves `buf` exactly as it was handed over.
-pub fn open(key: &[u8; 32], buf: &mut [u8], total: usize) -> Option<(u32, u32, usize)> {
+/// three reserved bytes are cleared, as the reference's bind does, so a peer
+/// that fills them parses like one that leaves them zero. The tag is checked
+/// before any keystream exists, and a refused record has its reserved bytes put
+/// back, so a forged or undersized record leaves `buf` exactly as handed over.
+pub fn open(key: &[u8; 32], buf: &mut [u8], total: usize) -> Option<(u32, u64, usize)> {
     if total < MIN_SIZE || buf.len() < total {
         return None;
     }
-    let receiver = u32::from_le_bytes(buf[0..4].try_into().ok()?);
-    let counter = u32::from_le_bytes(buf[4..8].try_into().ok()?);
-    let len = total - HEADER_SIZE - TAG_SIZE;
-    let (body, tag) = buf[HEADER_SIZE..total].split_at_mut(len);
-    let tag: &[u8; TAG_SIZE] = (&*tag).try_into().ok()?;
-    chacha20_poly1305_decrypt_in_place(key, &nonce(counter), b"", body, tag)?;
-    Some((receiver, counter, len))
+    if buf[0] != TYPE_TRANSPORT as u8 {
+        return None;
+    }
+    let reserved = [buf[1], buf[2], buf[3]];
+    clear_reserved(buf);
+    let opened = (|| {
+        let receiver = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        let counter = u64::from_le_bytes(buf[8..16].try_into().ok()?);
+        let len = total - HEADER_SIZE - TAG_SIZE;
+        let (body, tag) = buf[HEADER_SIZE..total].split_at_mut(len);
+        let tag: &[u8; TAG_SIZE] = (&*tag).try_into().ok()?;
+        chacha20_poly1305_decrypt_in_place(key, &nonce(counter), b"", body, tag)?;
+        Some((receiver, counter, len))
+    })();
+    if opened.is_none() {
+        buf[1..4].copy_from_slice(&reserved);
+    }
+    opened
 }
 
-/// The sender's counter. It hands out each nonce exactly once and refuses at
-/// `2^32`, the point the reference rekeys: past it a `(key, nonce)` would repeat,
-/// which is the one thing the AEAD cannot survive.
+/// The sender's counter. It hands out each nonce exactly once and refuses once
+/// the next value would wrap, the point a `(key, nonce)` would repeat — the one
+/// thing the AEAD cannot survive.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Counter {
-    next: u32,
+    next: u64,
 }
 
 impl Counter {
@@ -105,7 +136,7 @@ impl Counter {
 
     /// The counter to use now, advancing past it; `None` once the key must be
     /// rekeyed because the next value would repeat a nonce.
-    pub fn advance(&mut self) -> Option<u32> {
+    pub fn advance(&mut self) -> Option<u64> {
         let current = self.next;
         self.next = self.next.checked_add(1)?;
         Some(current)
@@ -121,9 +152,9 @@ pub enum Action {
     /// Far in the future (or the first ever): the window resets to this counter.
     Roll,
     /// Inside the window's future edge by `delta`: shift the mask up and accept.
-    Advance(u32),
+    Advance(u64),
     /// Inside the window, not yet seen: mark the bit at `offset` and accept.
-    Mark(u32),
+    Mark(u64),
     /// A replay, or older than the window reaches.
     Reject,
 }
@@ -135,7 +166,7 @@ pub enum Action {
 /// callback.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ReplayWindow {
-    top: u32,
+    top: u64,
     seen: u128,
     started: bool,
 }
@@ -149,7 +180,7 @@ impl ReplayWindow {
 
     /// Decide about `counter` without touching the window.
     #[must_use]
-    pub fn check(&self, counter: u32) -> Action {
+    pub fn check(&self, counter: u64) -> Action {
         if !self.started {
             return Action::Roll;
         }
@@ -172,7 +203,7 @@ impl ReplayWindow {
 
     /// Apply an accepting [`Action`] for `counter`, marking it seen. A `Reject`
     /// is a no-op, so a caller that commits unconditionally is still correct.
-    pub fn commit(&mut self, counter: u32, action: Action) {
+    pub fn commit(&mut self, counter: u64, action: Action) {
         match action {
             Action::Roll => {
                 self.top = counter;
@@ -317,16 +348,24 @@ mod tests {
 
     #[test]
     fn a_record_round_trips_and_is_byte_identical_to_the_aead_crate() {
-        for (counter, len) in [(0u32, 0usize), (1, 1), (7, 15), (255, 64), (1 << 20, 300)] {
+        for (counter, len) in [
+            (0u64, 0usize),
+            (1, 1),
+            (7, 15),
+            (255, 64),
+            (1 << 20, 300),
+            (u64::from(u32::MAX) + 7, 1),
+        ] {
             let plain: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(11)).collect();
             let mut buf = vec![0u8; HEADER_SIZE + len + TAG_SIZE];
             buf[HEADER_SIZE..HEADER_SIZE + len].copy_from_slice(&plain);
             let total = seal(KEY, 0xBEEF, counter, len, &mut buf);
             assert_eq!(total, buf.len(), "the record fills the buffer");
 
-            // Header is receiver then counter, both little-endian.
-            assert_eq!(&buf[0..4], &0xBEEFu32.to_le_bytes());
-            assert_eq!(&buf[4..8], &counter.to_le_bytes());
+            // Header is the transport type, the receiver and the counter, all little-endian.
+            assert_eq!(&buf[0..4], &TYPE_TRANSPORT.to_le_bytes());
+            assert_eq!(&buf[4..8], &0xBEEFu32.to_le_bytes());
+            assert_eq!(&buf[8..16], &counter.to_le_bytes());
 
             // The body and tag are what the pinned AEAD crate produces for the same key, counter-derived nonce and empty AD: an independent witness that the frame on the wire is the vanilla one.
             let reference = ChaCha20Poly1305::new_from_slice(KEY).expect("key");
@@ -365,14 +404,32 @@ mod tests {
         let mut buf = vec![0u8; HEADER_SIZE + plain.len() + TAG_SIZE];
         buf[HEADER_SIZE..HEADER_SIZE + plain.len()].copy_from_slice(&plain);
         let total = seal(KEY, 5, 9, plain.len(), &mut buf);
+        set_reserved(&mut buf, [9, 8, 7]);
         let sealed = buf.clone();
         buf[total - 1] ^= 1;
         assert!(open(KEY, &mut buf, total).is_none(), "a flipped tag fails");
+        assert_eq!(
+            &buf[1..4],
+            &[9, 8, 7],
+            "a refused record keeps the reserved bytes it arrived with"
+        );
         assert_eq!(
             &buf[HEADER_SIZE..HEADER_SIZE + plain.len()],
             &sealed[HEADER_SIZE..HEADER_SIZE + plain.len()],
             "a refused tag decrypts nothing"
         );
+    }
+
+    #[test]
+    fn the_reserved_bytes_are_cleared_and_the_type_is_the_only_one_accepted() {
+        let mut buf = [0u8; MIN_SIZE];
+        seal(KEY, 7, 3, 0, &mut buf);
+        set_reserved(&mut buf, [1, 2, 3]);
+        assert_eq!(&buf[1..4], &[1, 2, 3]);
+        assert_eq!(open(KEY, &mut buf, MIN_SIZE), Some((7, 3, 0)));
+        assert_eq!(&buf[1..4], &[0, 0, 0], "the receiver clears the field");
+        buf[0] = 1;
+        assert!(open(KEY, &mut buf, MIN_SIZE).is_none(), "another type");
     }
 
     #[test]
@@ -404,10 +461,10 @@ mod tests {
         assert_eq!(counter.advance(), Some(0));
         assert_eq!(counter.advance(), Some(1));
         // At the rekey boundary the counter cannot advance without wrapping onto a spent nonce: the all-ones counter is never transmitted, and that message is refused so a (key, nonce) pair cannot repeat.
-        let mut at_edge = Counter { next: u32::MAX - 1 };
+        let mut at_edge = Counter { next: u64::MAX - 1 };
         assert_eq!(
             at_edge.advance(),
-            Some(u32::MAX - 1),
+            Some(u64::MAX - 1),
             "the top transmitted nonce"
         );
         assert_eq!(at_edge.advance(), None, "refused before the counter wraps");
