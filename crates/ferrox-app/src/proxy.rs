@@ -15647,9 +15647,29 @@ fn serve_socks_udp_socks(relay: &UdpSocket, socks: &SocksOut) {
 /// Freedom UDP: the machine's own socket per destination, since a datagram here has no carrier to ride.
 fn serve_socks_udp_freedom(relay: &UdpSocket, freedom: &FreedomOut) {
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let replies = Arc::new(AtomicU64::new(0));
     let mut uplinks: HashMap<SocketAddr, (UdpSocket, thread::JoinHandle<()>)> = HashMap::new();
     let mut buf = udp_buffer();
-    while let Ok((n, src)) = relay.recv_from(&mut buf) {
+    let mut seen = 0u64;
+    loop {
+        let (n, src) = match relay.recv_from(&mut buf) {
+            Ok(read) => read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                let now = replies.load(Ordering::Relaxed);
+                if now == seen {
+                    break;
+                }
+                seen = now;
+                continue;
+            }
+            Err(_) => break,
+        };
+        seen = replies.load(Ordering::Relaxed);
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
         };
@@ -15679,6 +15699,7 @@ fn serve_socks_udp_freedom(relay: &UdpSocket, freedom: &FreedomOut) {
             continue;
         };
         let peer = source.clone();
+        let answered = Arc::clone(&replies);
         let Ok(relay_write) = relay.try_clone() else {
             continue;
         };
@@ -15695,6 +15716,7 @@ fn serve_socks_udp_freedom(relay: &UdpSocket, freedom: &FreedomOut) {
                 if relay_write.send_to(out, source).is_err() {
                     break;
                 }
+                answered.fetch_add(1, Ordering::Relaxed);
             }
         });
         uplinks.insert(dest, (writer, done));
@@ -41685,6 +41707,77 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(datagram.source_port, target.port());
+    }
+
+    /// Replies are activity too: a lane whose requests paused but whose target keeps answering
+    /// must not lose the reader that turns those answers back into packets.
+    #[test]
+    fn a_wireguard_reply_stream_keeps_the_inner_lane_reading() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            udp_idle: Some(Duration::from_millis(300)),
+            ..Default::default()
+        });
+        let target = std::net::UdpSocket::bind("127.0.0.1:0").expect("target");
+        let target_addr = target.local_addr().expect("address");
+        target
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let Ok((n, client)) = target.recv_from(&mut buf) else {
+                return;
+            };
+            let _ = target.send_to(&buf[..n], client);
+            for _ in 0..7 {
+                std::thread::sleep(Duration::from_millis(50));
+                let _ = target.send_to(b"tick", client);
+            }
+            if let Ok((n, client)) = target.recv_from(&mut buf) {
+                let _ = target.send_to(&buf[..n], client);
+            }
+        });
+        let config = format!(
+            r#"{{"routing":{{"rules":[{{"network":"udp","outboundTag":"udp"}}]}},"outbounds":[{{"tag":"udp","protocol":"freedom","settings":{{"redirect":"127.0.0.1:{}"}}}}]}}"#,
+            target_addr.port()
+        );
+        let plan = route_outbound(&config, None, false);
+        let (to_tunnel, replies) = std::sync::mpsc::channel();
+        let target: std::net::SocketAddr = "192.0.2.1:7".parse().unwrap();
+        let source: std::net::SocketAddr = "10.0.0.2:1234".parse().unwrap();
+        let last_used = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let (uplink, stop) = crate::wg_stack::server_udp(
+            ([0x11; 32], source, target),
+            std::time::Instant::now(),
+            &last_used,
+            &plan,
+            &to_tunnel,
+        )
+        .expect("lane");
+        let mut buf = Vec::new();
+        let frame = socks_udp_frame(&mut buf, None, &target, b"one");
+        uplink.send(frame).expect("send");
+        let mut payloads = Vec::new();
+        for _ in 0..8 {
+            let packet = replies.recv_timeout(Duration::from_secs(5)).expect("reply");
+            let datagram =
+                ferrox_core::foxy::connectip::udp_from_packet(&packet).expect("inner datagram");
+            payloads.push(datagram.payload.to_vec());
+        }
+        assert_eq!(payloads[0].as_slice(), b"one");
+        assert!(
+            payloads[1..]
+                .iter()
+                .all(|payload| payload.as_slice() == b"tick"),
+            "the replies cross the lane while requests are paused"
+        );
+        let frame = socks_udp_frame(&mut buf, None, &target, b"two");
+        uplink.send(frame).expect("send");
+        let packet = replies.recv_timeout(Duration::from_secs(5)).expect("reply");
+        let datagram = ferrox_core::foxy::connectip::udp_from_packet(&packet).expect("datagram");
+        assert_eq!(datagram.payload, b"two");
+        stop.store(true, Ordering::Relaxed);
+        budgets::clear();
     }
 
     /// A routing script picks the lane before the (empty) rule table, and its error closes the

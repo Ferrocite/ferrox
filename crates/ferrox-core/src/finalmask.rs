@@ -328,7 +328,11 @@ fn write_record<W: Write>(raw: &mut W, head: &[u8], body: &[u8]) -> io::Result<(
     let mut at = 0usize;
     while at < parts.len() {
         let iovecs = [io::IoSlice::new(parts[0]), io::IoSlice::new(parts[1])];
-        let taken = raw.write_vectored(&iovecs[at..])?;
+        let taken = match raw.write_vectored(&iovecs[at..]) {
+            Ok(taken) => taken,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
         if taken == 0 {
             return Err(io::Error::from(io::ErrorKind::WriteZero));
         }
@@ -516,6 +520,48 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    struct InterruptsBody {
+        bytes: Vec<u8>,
+        calls: usize,
+    }
+
+    impl Write for InterruptsBody {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.write_vectored(&[io::IoSlice::new(buf)])
+        }
+
+        fn write_vectored(&mut self, bufs: &[io::IoSlice<'_>]) -> io::Result<usize> {
+            self.calls += 1;
+            if self.calls == 2 {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let part = bufs
+                .iter()
+                .find(|part| !part.is_empty())
+                .ok_or_else(|| io::Error::from(io::ErrorKind::WriteZero))?;
+            self.bytes.extend_from_slice(part);
+            Ok(part.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_interrupted_record_body_is_retried_without_replaying_the_header() {
+        let mut sink = InterruptsBody {
+            bytes: Vec::new(),
+            calls: 0,
+        };
+        write_record(&mut sink, &[HANDSHAKE, 3, 1, 0, 3], b"abc").expect("retries the body");
+        assert_eq!(
+            sink.bytes,
+            [HANDSHAKE, 3, 1, 0, 3, b'a', b'b', b'c'],
+            "the header is written once and the body follows it"
+        );
     }
 
     #[test]
