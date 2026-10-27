@@ -428,6 +428,16 @@ impl<R: Read> WsReader<R> {
             let start = frame.payload.start;
             let len = frame.payload.len();
             let end = frame.payload.end;
+            // Ready data returns first: a reply can block on the shared write lock or a peer that stopped reading.
+            if !fill && matches!(frame.opcode, OP_CLOSE | OP_PING | OP_PONG) {
+                return Ok(false);
+            }
+            // A close or pong echoes the control payload as sent, not as the client masked it.
+            if matches!(frame.opcode, OP_CLOSE | OP_PING) {
+                if let Some(mask) = frame.mask {
+                    apply_mask(&mut self.have[frame.payload.clone()], mask);
+                }
+            }
             match frame.opcode {
                 OP_CLOSE => {
                     self.reply(OP_CLOSE, &self.have[frame.payload]);
@@ -1179,6 +1189,100 @@ mod tests {
         );
         assert_eq!(&buf[..n], &[0x33u8; 300]);
         assert_eq!(reader.reads(), 1);
+    }
+
+    /// Ready data must leave before a buffered control reply, and a fragmented message must keep its offsets and answer its ping once across reads.
+    #[test]
+    fn ready_data_leaves_before_a_buffered_ping_reply() {
+        struct Recorder(Arc<Mutex<Vec<u8>>>);
+
+        impl Write for Recorder {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().expect("records").extend_from_slice(data);
+                Ok(data.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl crate::proxy::FrameWrite for Recorder {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                parts.iter().all(|part| self.write_all(part).is_ok())
+            }
+        }
+
+        let frame = |fin: bool, opcode: u8, mask: [u8; 4], payload: &[u8]| {
+            let mut wire = vec![u8::from(fin) * 0x80 + opcode, 0x80 | payload.len() as u8];
+            wire.extend_from_slice(&mask);
+            wire.extend(
+                payload
+                    .iter()
+                    .enumerate()
+                    .map(|(i, byte)| byte ^ mask[i & 3]),
+            );
+            wire
+        };
+        let mut wire = frame(true, OP_DATA, [1, 2, 3, 4], b"READY");
+        wire.extend(frame(false, OP_TEXT, [5, 6, 7, 8], b"AAAA"));
+        wire.extend(frame(true, OP_PING, [9, 10, 11, 12], b"PING"));
+        wire.extend(frame(true, OP_CONT, [13, 14, 15, 16], b"BBBB"));
+        let kept = Arc::new(Mutex::new(Vec::new()));
+        let mut reader = WsReader {
+            read: std::io::Cursor::new(wire),
+            shared: Arc::new(Shared {
+                stream: Mutex::new(Box::new(Recorder(Arc::clone(&kept)))),
+                closed: AtomicBool::new(false),
+                masked: false,
+            }),
+            have: Vec::new(),
+            at: 0,
+            msg_end: 0,
+            early: Vec::new(),
+            eat: 0,
+            eof: false,
+            assembling: false,
+            whole: 0,
+            filled: 0,
+            handshake: None,
+            reads: 0,
+        };
+        let mut buf = [0u8; 4096];
+        let n = reader.read(&mut buf).expect("reads");
+        assert_eq!(&buf[..n], b"READY", "the ready message leaves first");
+        assert!(
+            kept.lock().expect("kept").is_empty(),
+            "no control reply holds the ready data"
+        );
+        let n = reader.read(&mut buf).expect("reads");
+        assert_eq!(
+            &buf[..n],
+            b"AAAABBBB",
+            "the resumed fragments reassemble exactly"
+        );
+        let replies = kept.lock().expect("kept");
+        let (mut at, mut pongs) = (0, 0);
+        while at + 2 <= replies.len() {
+            let opcode = replies[at] & 0x0F;
+            let mask = replies[at + 1] & 0x80 != 0;
+            let len = usize::from(replies[at + 1] & 0x7F);
+            let head = 2 + usize::from(mask) * 4;
+            assert!(at + head + len <= replies.len(), "a whole reply frame");
+            if opcode == OP_PONG {
+                pongs += 1;
+                let mut payload = replies[at + head..at + head + len].to_vec();
+                if mask {
+                    let key = &replies[at + 2..at + head];
+                    for (i, byte) in payload.iter_mut().enumerate() {
+                        *byte ^= key[i & 3];
+                    }
+                }
+                assert_eq!(payload, b"PING");
+            }
+            at += head + len;
+        }
+        assert_eq!(pongs, 1, "the ping is answered once");
     }
 
     #[test]
