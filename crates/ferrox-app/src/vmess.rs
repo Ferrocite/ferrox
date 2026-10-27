@@ -1631,7 +1631,7 @@ fn forward_step(
             }
         }
         Err(ref error) if crate::proxy::is_timeout(error) => {
-            if flow.ended() {
+            if flow.ended_and_drained() {
                 Next::Done
             } else {
                 Next::Idle
