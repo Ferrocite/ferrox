@@ -144,6 +144,38 @@ fn anchored(
         .build()
         .map_err(|e| rustls::Error::General(format!("pinned anchor: {e}")))
 }
+/// Verifies a chain a backend read itself, for a pin set that backend could not hand to a verifier: a leaf digest accepts on the pin alone, an intermediate's anchors the chain with the server name still checked. Used by the QUIC lanes, whose library exposes no verifier hook.
+#[must_use]
+pub fn verify_cert_pinned(
+    chain: &[Vec<u8>],
+    cert_pins: &Arc<[[u8; 32]]>,
+    server_name: &str,
+) -> bool {
+    let Some((leaf, rest)) = chain.split_first() else {
+        return false;
+    };
+    let Ok(name) = rustls::pki_types::ServerName::try_from(server_name.to_owned()) else {
+        return false;
+    };
+    let leaf = rustls::pki_types::CertificateDer::from(leaf.as_slice());
+    let intermediates: Vec<_> = rest
+        .iter()
+        .map(|cert| rustls::pki_types::CertificateDer::from(cert.as_slice()))
+        .collect();
+    let verifier = CertPinned {
+        cert_pins: cert_pins.clone(),
+    };
+    rustls::client::danger::ServerCertVerifier::verify_server_cert(
+        &verifier,
+        &leaf,
+        &intermediates,
+        &name,
+        &[],
+        rustls::pki_types::UnixTime::now(),
+    )
+    .is_ok()
+}
+
 impl rustls::client::danger::ServerCertVerifier for Pinned {
     fn verify_server_cert(
         &self,

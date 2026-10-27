@@ -203,14 +203,62 @@ pub fn connect_ip_qpack(
     qpack_field(out, b"capsule-protocol", b"?1");
 }
 
+/// The same request as a QPACK block with the path, authority and headers a config named, which is how MASQUE's transport writes it: the path is a literal rather than the RFC 9484 template, and every header rides in the order the config gave.
+pub fn connect_ip_qpack_named(
+    authority: &str,
+    path: &str,
+    headers: &[(String, String)],
+    out: &mut Vec<u8>,
+) {
+    out.extend_from_slice(&[0x00, 0x00]);
+    qpack_field(out, b":method", b"CONNECT");
+    qpack_field(out, b":protocol", b"connect-ip");
+    qpack_field(out, b":scheme", b"https");
+    qpack_field(out, b":authority", authority.as_bytes());
+    qpack_field(out, b":path", path.as_bytes());
+    for (name, value) in headers {
+        qpack_field(out, name.as_bytes(), value.as_bytes());
+    }
+    qpack_field(out, b"capsule-protocol", b"?1");
+}
+
+/// The prefix one IP packet carries inside a QUIC DATAGRAM on a CONNECT-IP stream (RFC 9484 §5): the stream id divided by four as a varint, then context zero. The datagram's length comes from the QUIC frame, so none is written here.
+pub fn datagram_prefix(stream: u64, out: &mut Vec<u8>) {
+    quic_varint(out, stream / 4);
+    out.push(0);
+}
+
+/// Splits one QUIC DATAGRAM on a CONNECT-IP stream into its stream id and packet, refusing a context this lane does not read; the inverse of [`datagram_prefix`].
+#[must_use]
+pub fn datagram_split(datagram: &[u8]) -> Option<(u64, &[u8])> {
+    let mut at = 0usize;
+    let quarter = quic_read(datagram, &mut at)?;
+    let context = quic_read(datagram, &mut at)?;
+    if context != 0 {
+        return None;
+    }
+    Some((quarter.checked_mul(4)?, &datagram[at..]))
+}
+
 /// One `ADDRESS_REQUEST` capsule (RFC 9484 §4.1): a request id that must not be zero, then the address wanted; a client with no preference asks for `0.0.0.0` or `::` and the proxy answers with what it picks.
 pub fn address_request(id: u64, version: u8, address: &[u8], out: &mut Vec<u8>) {
+    address_requests(&[(id, version, address)], out);
+}
+
+/// One `ADDRESS_REQUEST` capsule naming every address a client wants, which is how the reference asks for both families at once: a proxy replaces the peer's allowed sources with each answer, so a second request would leave the first family unroutable.
+pub fn address_requests(entries: &[(u64, u8, &[u8])], out: &mut Vec<u8>) {
+    let length: usize = entries
+        .iter()
+        .map(|(id, _, address)| quic_varint_len(*id) + 1 + address.len() + 1)
+        .sum();
     quic_varint(out, ADDRESS_REQUEST);
-    quic_varint(out, (quic_varint_len(id) + 1 + address.len() + 1) as u64);
-    quic_varint(out, id);
-    out.push(version);
-    out.extend_from_slice(address);
-    out.push((address.len() as u8) * 8);
+    quic_varint(out, length as u64);
+    for (id, version, address) in entries {
+        quic_varint(out, *id);
+        out.push(*version);
+        out.extend_from_slice(address);
+        out.push((address.len() as u8) * 8);
+    }
 }
 
 /// Bytes one DATAGRAM capsule takes for an IP packet of this length, so a caller frames it before building it: HTTP/3 writes its frame length ahead, and the capsule's own varint sits inside it.
@@ -741,6 +789,20 @@ mod tests {
 
     const V4: [u8; 4] = [0, 0, 0, 0];
     const V6: [u8; 16] = [0; 16];
+
+    /// A client asks for both families in one capsule: a proxy replaces the peer's allowed sources with each answer, so two capsules would leave the first family's replies refused.
+    #[test]
+    fn one_request_capsule_names_every_family_a_client_wants() {
+        let mut out = Vec::new();
+        address_requests(&[(1, 4, &V4), (2, 6, &V6)], &mut out);
+        let (end, capsule) = capsule_split(&out).expect("a capsule");
+        assert_eq!(end, out.len(), "both families are in one capsule");
+        let Capsule::AddressRequest(body) = capsule else {
+            panic!("a request");
+        };
+        assert_eq!(body.len(), 7 + 19);
+        assert_eq!(request(1, 4, &V4).len(), 9, "one family keeps its bytes");
+    }
 
     /// The all-zeros prefix at full length is how a proxy refuses, and the reader has to say so rather than hand the lane a tunnel address of zero.
     #[test]
