@@ -4469,6 +4469,22 @@ mod tests {
         );
     }
 
+    /// A waiter beside a pump must leave the pump's datagram on the socket: the queue is the witness, since a waiter that read it would empty the queue before the pump saw it.
+    #[test]
+    fn a_parked_receive_leaves_the_socket_to_its_pump() {
+        let (sock, local, conn) = deaf_lane();
+        sock.send_to(&[0xc0, 0x00, 0x00, 0x01, 7], local)
+            .expect("queues");
+        let shared = Mutex::new(conn);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert!(stream_recv_exact_parked(&shared, 0, 2, deadline).is_none());
+        let mut buf = [0u8; 64];
+        assert!(
+            sock.recv_from(&mut buf).is_ok(),
+            "the parked waiter read the pump's datagram"
+        );
+    }
+
     /// One visit to the socket absorbs the whole burst waiting on it, and the witness is the queue itself: one armed wait and a fourth read that must find nothing says whether three datagrams were taken in one visit or one at a time.
     #[test]
     fn one_pump_absorbs_the_whole_datagram_burst_on_the_socket() {
