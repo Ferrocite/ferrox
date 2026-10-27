@@ -19888,17 +19888,36 @@ pub(crate) fn header_value<'a>(head: &'a [u8], name: &str) -> Option<&'a str> {
     header_value_in(std::str::from_utf8(head).ok()?, name)
 }
 
-/// The lookup over a head somebody already paid one `from_utf8` for, so a head read for three names is validated once.
+/// The lookup over a head somebody already paid one `from_utf8` for.
 pub(crate) fn header_value_in<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    header_values_in(text, [name])[0]
+}
+
+/// Every named field in one walk of the head: a caller that needs two of them pays one line split, not one per name.
+pub(crate) fn header_values_in<'a, const N: usize>(
+    text: &'a str,
+    names: [&str; N],
+) -> [Option<&'a str>; N] {
+    let mut found = [None; N];
+    let mut left = N;
     let mut lines = text.split("\r\n");
-    lines.next()?;
+    lines.next();
     for line in lines {
-        let (key, value) = line.split_once(':')?;
-        if key.trim().eq_ignore_ascii_case(name) {
-            return Some(value.trim());
+        let Some((key, value)) = line.split_once(':') else {
+            break;
+        };
+        let key = key.trim();
+        for (slot, name) in found.iter_mut().zip(names) {
+            if slot.is_none() && key.eq_ignore_ascii_case(name) {
+                *slot = Some(value.trim());
+                left -= 1;
+                if left == 0 {
+                    return found;
+                }
+            }
         }
     }
-    None
+    found
 }
 
 pub(crate) fn request_path(head: &[u8]) -> Option<&str> {
