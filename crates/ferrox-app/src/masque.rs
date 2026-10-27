@@ -2108,6 +2108,43 @@ mod tests {
     }
 
     #[test]
+    fn a_tcp_flow_crosses_the_h2_tunnel_to_a_freedom_dial() {
+        use std::io::{Read as _, Write as _};
+        let echo = std::net::TcpListener::bind("127.0.0.1:0").expect("echo");
+        let echo_address = echo.local_addr().expect("address");
+        let target: SocketAddr = format!("192.0.2.1:{}", echo_address.port())
+            .parse()
+            .expect("a target");
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = echo.accept() else {
+                return;
+            };
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok(n) = stream.read(&mut buf) else {
+                    return;
+                };
+                if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+        });
+        let (_inbound, port) = serve_h2(&echo_address.to_string());
+        let masque = MasqueOut::new(&outbound_h2(port)).expect("outbound");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("pair");
+        let tun = std::net::TcpStream::connect(listener.local_addr().expect("pair address"))
+            .expect("connect");
+        let (mut app, _) = listener.accept().expect("accept");
+        app.set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        masque.serve_tcp(Connection::from(tun), &Destination::Address(target), &[]);
+        app.write_all(b"hello").expect("write");
+        let mut answer = [0u8; 5];
+        app.read_exact(&mut answer).expect("read");
+        assert_eq!(&answer, b"hello");
+    }
+
+    #[test]
     fn a_datagram_flow_crosses_the_tunnel_to_a_freedom_dial() {
         let echo = std::net::UdpSocket::bind("127.0.0.1:0").expect("echo");
         let echo_address = echo.local_addr().expect("address");

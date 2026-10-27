@@ -768,4 +768,5 @@ carrier-masque echo-answers-on-the-client 2 ferrox-app-wg-stack::tests::an_echo_
 carrier-masque echo-answers-on-the-server 1 ferrox-app-wg-stack::tests::a_server_answers_an_echo_to_its_own_address
 carrier-masque h2-datagram-round-trips 1 ferrox-app-masque-h2::tests::an_h2_tunnel_assigns_and_carries_a_datagram
 carrier-masque h2-dialer-round-trips 1 ferrox-app-masque::tests::a_datagram_flow_crosses_the_h2_tunnel_to_a_freedom_dial
+carrier-masque h2-tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_h2_tunnel_to_a_freedom_dial
 carrier-masque carrier-alpn-choices-witnessed 5 ferrox-app-masque::tests::the_carrier_follows_the_alpn_list
