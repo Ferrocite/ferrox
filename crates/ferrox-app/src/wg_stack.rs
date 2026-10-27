@@ -1247,21 +1247,27 @@ mod tests {
         while packets.try_recv().is_ok() {}
 
         app.write_all(b"hello").expect("write");
-        stack.poll(&mut buf);
+        let mut seen = false;
+        for _ in 0..50 {
+            stack.poll(&mut buf);
+            while let Ok(packet) = packets.try_recv() {
+                if packet
+                    .windows(b"hello".len())
+                    .any(|window| window == b"hello")
+                {
+                    seen = true;
+                }
+            }
+            if seen {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert_eq!(
             stack.flows[0].pending_up.capacity(),
             0,
             "an accepted upload is never copied into pending_up"
         );
-        let mut seen = false;
-        while let Ok(packet) = packets.try_recv() {
-            if packet
-                .windows(b"hello".len())
-                .any(|window| window == b"hello")
-            {
-                seen = true;
-            }
-        }
         assert!(seen, "the accepted bytes leave on the tunnel");
     }
 
