@@ -31,6 +31,7 @@ fn order_cipher_suites(provider: &mut rustls::crypto::CryptoProvider, order: &[u
 pub struct RustlsProvider<S: Stream> {
     conn: rustls::ClientConnection,
     io: S,
+    eof: bool,
 }
 
 impl<S: Stream> std::fmt::Debug for RustlsProvider<S> {
@@ -529,13 +530,21 @@ impl<S: Stream> RustlsProvider<S> {
             .map_err(|e| TlsError::Other(format!("rustls server name: {e}")))?;
         let conn =
             rustls::ClientConnection::new(client_config(cfg)?, name).map_err(|e| map_error(&e))?;
-        Ok(Self { conn, io })
+        Ok(Self {
+            conn,
+            io,
+            eof: false,
+        })
     }
 
     /// A connection whose hello was fixed before the handshake: REALITY seals
     /// its tag into the session id, so the stock random hello cannot go out.
     pub fn from_connection(conn: rustls::ClientConnection, io: S) -> Self {
-        Self { conn, io }
+        Self {
+            conn,
+            io,
+            eof: false,
+        }
     }
 
     #[cfg(test)]
@@ -566,6 +575,11 @@ impl<S: Stream> RustlsProvider<S> {
     /// plaintext still sits in the layer, which a read takes without touching the socket.
     pub fn wants_read(&self) -> bool {
         self.conn.wants_read()
+    }
+
+    /// Whether the peer's close has already been read.
+    pub fn closed(&self) -> bool {
+        self.eof
     }
 
     /// Writes two slices as one TLS record: the fragmenter sees `head` and `tail`
@@ -656,6 +670,12 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
         // The plaintext the layer holds comes out first: its room is finite, and the ciphertext that follows waits for it.
         let plain = match self.conn.reader().read(buf) {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Ok(0) => {
+                if !buf.is_empty() {
+                    self.eof = true;
+                }
+                0
+            }
             outcome => outcome?,
         };
         if plain > 0 {
@@ -674,9 +694,19 @@ impl<S: Stream> TlsProvider for RustlsProvider<S> {
         // A peer's key update is answered into the queue here and leaves with the next seal: a read never writes the transport.
         let plain = match self.conn.reader().read(buf) {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => 0,
+            Ok(0) => {
+                if !buf.is_empty() {
+                    self.eof = true;
+                }
+                0
+            }
             outcome => outcome?,
         };
         Ok((plain, taken))
+    }
+
+    fn closed(&self) -> bool {
+        self.eof
     }
 }
 
@@ -695,6 +725,12 @@ impl<S: Stream> Read for RustlsProvider<S> {
                         }
                         return Err(recover(io_error).into());
                     }
+                }
+                Ok(0) => {
+                    if !buf.is_empty() {
+                        self.eof = true;
+                    }
+                    return Ok(0);
                 }
                 outcome => return outcome,
             }

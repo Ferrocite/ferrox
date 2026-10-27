@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 
 use crate::conn::Connection;
 use crate::proxy::RELAY_SMALL_BUFFER;
@@ -44,7 +45,7 @@ pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     feeds: usize,
     read: Reading,
     write: Writing,
-    tls: Tls,
+    tls: Arc<Mutex<Tls>>,
 }
 
 /// The filter's feed, one caller buffer deep: the content the walk hands the caller
@@ -185,6 +186,7 @@ struct Writing {
     raw: bool,
 }
 
+#[derive(Clone, Copy)]
 struct Tls {
     present: bool,
     twelve_or_above: bool,
@@ -225,14 +227,74 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 sent_uuid: false,
                 raw: false,
             },
-            tls: Tls {
-                present: false,
-                twelve_or_above: false,
-                enable_xtls: false,
-                budget: FILTER_PACKETS,
-                server_hello_left: 0,
-                cipher: 0,
+            tls: Arc::new(Mutex::new(Tls::new())),
+        }
+    }
+
+    /// Two halves of one link: the reader frames the plaintext a driven session hands it, the
+    /// writer seals frames through the same session, and only the filter state is shared.
+    pub(crate) fn split(
+        read: S,
+        write: S,
+        raw_read: Option<Connection>,
+        raw_write: Option<Connection>,
+        uuid: &[u8; 16],
+    ) -> (Self, Self) {
+        let tls = Arc::new(Mutex::new(Tls::new()));
+        let reader = Self::with_tls(read, raw_read, uuid, Arc::clone(&tls));
+        let writer = Self::with_tls(write, raw_write, uuid, tls);
+        (reader, writer)
+    }
+
+    fn with_tls(
+        session: S,
+        raw: Option<Connection>,
+        uuid: &[u8; 16],
+        tls: Arc<Mutex<Tls>>,
+    ) -> Self {
+        Self {
+            session,
+            raw,
+            direct: None,
+            uuid: *uuid,
+            have: Vec::with_capacity(WINDOW),
+            dot: 0,
+            walk: Walk {
+                framed: false,
+                want_header: 0,
+                want_content: 0,
+                want_padding: 0,
+                command: 0,
             },
+            #[cfg(test)]
+            staged: 0,
+            #[cfg(test)]
+            validated: 0,
+            #[cfg(test)]
+            feeds: 0,
+            read: Reading {
+                padding: true,
+                raw: false,
+            },
+            write: Writing {
+                padding: true,
+                sent_uuid: false,
+                raw: false,
+            },
+            tls,
+        }
+    }
+}
+
+impl Tls {
+    fn new() -> Self {
+        Self {
+            present: false,
+            twelve_or_above: false,
+            enable_xtls: false,
+            budget: FILTER_PACKETS,
+            server_hello_left: 0,
+            cipher: 0,
         }
     }
 }
@@ -320,18 +382,27 @@ impl<S: Read + Write + RecordAlignment> Read for Link<S> {
     /// The content the walk hands this caller buffer is one filter unit: it joins the
     /// feeding spread through the run, and the machine spends at the unit's end.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut feed = (self.tls.budget > 0).then(|| Feeding::new(&self.tls));
+        let tls = *self.lock_tls();
+        let mut feed = (tls.budget > 0).then(|| Feeding::new(&tls));
         #[cfg(test)]
         if feed.is_some() {
             self.feeds += 1;
         }
         let n = self.drive_read(buf, feed.as_mut())?;
         if let Some(feed) = feed {
-            if feed.run > 0 && self.tls.budget > 0 {
+            if feed.run > 0 && self.lock_tls().budget > 0 {
                 self.spend(&feed);
             }
         }
         Ok(n)
+    }
+}
+
+impl<S: Read + Write + RecordAlignment> Link<S> {
+    fn lock_tls(&self) -> std::sync::MutexGuard<'_, Tls> {
+        self.tls
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -387,29 +458,32 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     /// hands its confirmed switch or its exhausted window over, and the idle switch
     /// arms the alignment only when its verdict earned it.
     fn spend(&mut self, feed: &Feeding) {
-        self.tls.budget -= 1;
-        self.tls.server_hello_left = feed.left.saturating_sub(feed.scanned);
-        if feed.shaped != Shaped::Nothing {
-            self.tls.present = true;
-        }
-        if feed.shaped == Shaped::Server {
-            self.tls.twelve_or_above = true;
-        }
-        if feed.sampled {
-            self.tls.cipher = feed.cipher;
-        }
-        if feed.found {
-            self.tls.enable_xtls = self.tls.cipher != TLS_AES_128_CCM_8_SHA256;
-            self.tls.budget = 0;
-        } else if feed.left > 0 && feed.scanned >= feed.left {
-            self.tls.budget = 0;
+        {
+            let mut tls = self.lock_tls();
+            tls.budget -= 1;
+            tls.server_hello_left = feed.left.saturating_sub(feed.scanned);
+            if feed.shaped != Shaped::Nothing {
+                tls.present = true;
+            }
+            if feed.shaped == Shaped::Server {
+                tls.twelve_or_above = true;
+            }
+            if feed.sampled {
+                tls.cipher = feed.cipher;
+            }
+            if feed.found {
+                tls.enable_xtls = tls.cipher != TLS_AES_128_CCM_8_SHA256;
+                tls.budget = 0;
+            } else if feed.left > 0 && feed.scanned >= feed.left {
+                tls.budget = 0;
+            }
         }
         self.engage();
     }
 
     fn drain_tail(&mut self, buf: &mut [u8], feed: Option<&mut Feeding>) -> usize {
         let n = (self.have.len() - self.dot).min(buf.len());
-        if n > 0 && self.tls.budget > 0 {
+        if n > 0 && self.lock_tls().budget > 0 {
             if let Some(feed) = feed {
                 feed_extent(&self.have[self.dot..self.dot + n], feed);
             }
@@ -430,15 +504,15 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             Some(handle) if raw => handle.read(buf)?,
             _ => self.session.read(buf)?,
         };
-        if n > 0 && !raw && self.tls.budget > 0 {
-            self.tls.observe(&buf[..n]);
+        if n > 0 && !raw && self.lock_tls().budget > 0 {
+            self.lock_tls().observe(&buf[..n]);
             self.engage();
         }
         Ok(n)
     }
 
     fn engage(&mut self) {
-        if self.tls.enable_xtls {
+        if self.lock_tls().enable_xtls {
             self.session.engage_record_alignment();
         }
     }
@@ -517,7 +591,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 if end - dot >= content + padding && room >= content {
                     if content > 0 {
                         let fresh = &self.have[dot..dot + content];
-                        if self.tls.budget > 0 {
+                        if self.lock_tls().budget > 0 {
                             if let Some(feed) = feed.as_deref_mut() {
                                 feed.run += content;
                                 feed_extent(fresh, feed);
@@ -572,7 +646,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 };
                 let take = walk.want_content.min(end - dot).min(room);
                 let fresh = &self.have[dot..dot + take];
-                if self.tls.budget > 0 {
+                if self.lock_tls().budget > 0 {
                     if let Some(feed) = feed.as_deref_mut() {
                         feed.run += take;
                         feed_extent(fresh, feed);
@@ -697,23 +771,22 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
             self.write_out(buf)?;
             return Ok(buf.len());
         }
-        if self.tls.budget > 0 {
-            self.tls.observe(buf);
+        if self.lock_tls().budget > 0 {
+            self.lock_tls().observe(buf);
             self.engage();
         }
+        let tls = *self.lock_tls();
         // The relay hands one buffer of up to 256 KiB: it frames as blocks of one Xray buffer, and the filter budget and the switch are counted per caller buffer as the reference counts them per `MultiBuffer`.
-        let complete = self.tls.present
-            && buf.len() >= 6
-            && buf[..3] == TLS_APPLICATION_DATA
-            && is_record_run(buf);
-        let ends_early = !self.tls.twelve_or_above && self.tls.budget <= 1;
+        let complete =
+            tls.present && buf.len() >= 6 && buf[..3] == TLS_APPLICATION_DATA && is_record_run(buf);
+        let ends_early = !tls.twelve_or_above && tls.budget <= 1;
         let mut at = 0;
         while at < buf.len() {
             let content = (buf.len() - at).min(MAX_FRAME_CONTENT);
             let last = at + content == buf.len();
-            let padding = padding_len(content, self.tls.present);
+            let padding = padding_len(content, tls.present);
             let switches = last && complete;
-            let command = match (switches && self.tls.enable_xtls, ends_early || switches) {
+            let command = match (switches && tls.enable_xtls, ends_early || switches) {
                 (true, _) => VisionCommand::Direct.byte(),
                 (_, true) => 1,
                 _ => 0,
@@ -738,7 +811,7 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
                     }
                 }
                 self.write.raw = self.raw.is_some()
-                    && self.tls.enable_xtls
+                    && tls.enable_xtls
                     && command == VisionCommand::Direct.byte();
                 self.write_out(&buf[at..])?;
                 return Ok(buf.len());
@@ -1029,7 +1102,7 @@ mod tests {
         }
         input.extend(frame(false, 1, b"record", 4));
         let mut link = link(&[]);
-        link.tls.budget = 0;
+        link.lock_tls().budget = 0;
         let mut frames = 0usize;
         for _ in 0..64 {
             link.have.clear();
@@ -1037,7 +1110,8 @@ mod tests {
             link.dot = 0;
             link.walk.framed = true;
             link.walk.want_header = 5;
-            let mut feed = Feeding::new(&link.tls);
+            let tls = *link.lock_tls();
+            let mut feed = Feeding::new(&tls);
             let runs = link.pump(None, Some(&mut feed));
             assert_eq!(runs, 48, "eight six-byte contents cross the walk");
             link.read.padding = true;
@@ -1053,7 +1127,7 @@ mod tests {
     fn a_steady_read_builds_no_feed() {
         let input = frame(true, 0, b"body", 0);
         let mut link = link(&input);
-        link.tls.budget = 0;
+        link.lock_tls().budget = 0;
         let mut out = [0u8; 16];
         let n = link.read(&mut out).expect("reads");
         assert_eq!(&out[..n], b"body");
@@ -1510,7 +1584,11 @@ mod tests {
         }
         assert_eq!(commands, vec![0, 0, 0, 0, 0, 0, 1]);
         assert!(!link.write.padding);
-        assert_eq!(link.tls.budget, 1, "the last buffer of the window is spent");
+        assert_eq!(
+            link.lock_tls().budget,
+            1,
+            "the last buffer of the window is spent"
+        );
         link.write_all(b"y").expect("writes");
         assert!(link.session.written.ends_with(b"y"), "unframed from here");
     }
@@ -1520,7 +1598,7 @@ mod tests {
         let mut link = link(&[]);
         link.write_all(&server_hello()).expect("writes");
         assert!(
-            link.tls.enable_xtls,
+            link.lock_tls().enable_xtls,
             "a 1.3 ServerHello is worth switching for"
         );
         assert!(link.write.padding, "the handshake is still padded");
@@ -1585,13 +1663,13 @@ mod tests {
         let mut link = link(&[]);
         link.write_all(&[0x16, 0x03, 0x01, 0x00, 0x05, 0x01])
             .expect("writes");
-        assert_eq!(link.tls.budget, FILTER_PACKETS - 1);
+        assert_eq!(link.lock_tls().budget, FILTER_PACKETS - 1);
         assert!(
-            link.tls.present,
+            link.lock_tls().present,
             "a ClientHello record makes the stream TLS"
         );
         assert!(
-            !link.tls.twelve_or_above,
+            !link.lock_tls().twelve_or_above,
             "a ClientHello says nothing about a version"
         );
     }

@@ -136,6 +136,10 @@ impl<S: Stream> Session<S> {
         &self.io
     }
 
+    pub(crate) fn closed(&self) -> bool {
+        self.eof
+    }
+
     /// The plaintext buffer, which a carrier record with room in the caller's window never stages into.
     #[cfg(test)]
     pub(crate) fn plain_buffer(&self) -> &[u8] {
@@ -1108,6 +1112,10 @@ impl<S: Stream> TlsProvider for Session<S> {
         self.alpn.as_deref()
     }
 
+    fn closed(&self) -> bool {
+        self.eof
+    }
+
     fn peer_leaf(&self) -> Option<&[u8]> {
         self.leaf.as_deref()
     }
@@ -1787,6 +1795,22 @@ mod tests {
             reply: Vec::new(),
             out: Vec::new(),
         }
+    }
+
+    /// A close already read with the data is reported as the end, not hidden behind a
+    /// socket the peer kept open for more.
+    #[test]
+    fn a_received_close_is_reported() {
+        let suite = Suite::Aes128GcmSha256;
+        let secret = [9u8; 32];
+        let mut session = session(
+            Version::Tls13,
+            suite,
+            Direction::tls13(suite, &secret),
+            Direction::tls13(suite, &secret),
+        );
+        session.eof = true;
+        assert!(session.closed());
     }
 
     #[test]
