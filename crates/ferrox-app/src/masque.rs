@@ -31,10 +31,10 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
 const DEFAULT_MTU: usize = 1280;
-const QUEUE: usize = 512;
+pub(crate) const QUEUE: usize = 512;
 /// The server's own connection ID: a short header carries no length, so the demultiplexer reads exactly this many bytes.
 const CID_LEN: usize = 16;
-const AUTH_REALM: &str = "Basic realm=\"masque\", charset=\"UTF-8\"";
+pub(crate) const AUTH_REALM: &str = "Basic realm=\"masque\", charset=\"UTF-8\"";
 const H3_SETTINGS: u64 = 0x04;
 const SETTINGS_H3_DATAGRAM: u64 = 0x33;
 const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x8;
@@ -851,6 +851,14 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     let (to_tunnel, from_stack) = mpsc::channel();
     let dispatcher = Arc::clone(&shared);
     std::thread::spawn(move || dispatch(&dispatcher, from_stack));
+    if identity.alpn.iter().any(|alpn| alpn == b"h2") {
+        crate::masque_h2::serve(
+            Arc::clone(&identity),
+            Arc::clone(&shared),
+            Arc::clone(&spec),
+            local,
+        );
+    }
     let device = DeviceConfig {
         secret: [0u8; 32],
         addresses: spec.pool.server.clone(),
@@ -874,9 +882,9 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
 }
 
 #[derive(Debug, Clone)]
-struct ServerSpec {
+pub(crate) struct ServerSpec {
     users: Vec<(String, String)>,
-    path: String,
+    pub(crate) path: String,
     pool: AddressPool,
     mtu: usize,
 }
@@ -937,7 +945,7 @@ impl ServerSpec {
         })
     }
 
-    fn authenticates(&self, header: Option<&[u8]>) -> bool {
+    pub(crate) fn authenticates(&self, header: Option<&[u8]>) -> bool {
         let Some(text) = header.and_then(|value| std::str::from_utf8(value).ok()) else {
             return false;
         };
@@ -962,9 +970,9 @@ impl ServerSpec {
     }
 }
 
-struct Shared {
+pub(crate) struct Shared {
     pool: Mutex<AddressPool>,
-    tunnels: Mutex<HashMap<IpAddr, SyncSender<Vec<u8>>>>,
+    pub(crate) tunnels: Mutex<HashMap<IpAddr, SyncSender<Vec<u8>>>>,
     packets: Sender<Packet>,
     local: Vec<IpAddr>,
 }
@@ -1134,7 +1142,7 @@ impl Family {
 }
 
 /// A tunnel's addresses go back to the pool when its worker ends, whatever ended it.
-struct Granted {
+pub(crate) struct Granted {
     shared: Arc<Shared>,
     addrs: Vec<IpAddr>,
 }
@@ -1443,7 +1451,7 @@ fn path_query(bytes: &[u8]) -> (&[u8], &[u8]) {
 }
 
 /// xray parses the request URI before comparing, so an escaped star names the same path the literal does.
-fn path_matches(got: &[u8], want: &str) -> bool {
+pub(crate) fn path_matches(got: &[u8], want: &str) -> bool {
     fn decode(bytes: &[u8]) -> Option<Vec<u8>> {
         let mut out = Vec::with_capacity(bytes.len());
         let mut at = 0;
@@ -1474,47 +1482,16 @@ fn accept(
     let Some(stream) = tunnel.stream else {
         return;
     };
-    let addrs = {
-        let Ok(mut pool) = shared.pool.lock() else {
-            reject(tunnel, 503);
-            return;
-        };
-        pool.assign()
-    };
-    if addrs.is_empty() {
-        reject(tunnel, 503);
-        return;
-    }
-    let Some(granted) = register(shared, tunnel, &addrs) else {
-        if let Ok(mut pool) = shared.pool.lock() {
-            for address in &addrs {
-                pool.release(*address);
-            }
-        }
+    let Some(addrs) = assign(shared) else {
         reject(tunnel, 503);
         return;
     };
-    let assignments: Vec<Assigned> = addrs
-        .iter()
-        .map(|address| match address {
-            IpAddr::V4(ip) => Assigned {
-                request_id: 0,
-                version: 4,
-                address: {
-                    let mut bytes = [0u8; 16];
-                    bytes[..4].copy_from_slice(&ip.octets());
-                    bytes
-                },
-                prefix: 32,
-            },
-            IpAddr::V6(ip) => Assigned {
-                request_id: 0,
-                version: 6,
-                address: ip.octets(),
-                prefix: 128,
-            },
-        })
-        .collect();
+    let Some(granted) = register(shared, &addrs, &tunnel.sender) else {
+        release(shared, &addrs);
+        reject(tunnel, 503);
+        return;
+    };
+    let assignments = grants(&addrs, 0);
     tunnel.addrs = addrs;
     tunnel.granted = Some(granted);
     tunnel.opened = true;
@@ -1532,8 +1509,54 @@ fn accept(
     connectip::address_assign_encode(&assignments, &mut control);
     send_data(conn, stream, &control).ok();
     control.clear();
+    connectip::route_advert_encode(&routes(&tunnel.addrs), &mut control);
+    send_data(conn, stream, &control).ok();
+}
+
+/// One address per family from the pool, or `None` when it has none left.
+pub(crate) fn assign(shared: &Arc<Shared>) -> Option<Vec<IpAddr>> {
+    let addresses = shared.pool.lock().ok()?.assign();
+    (!addresses.is_empty()).then_some(addresses)
+}
+
+/// The addresses an assignment was refused go back to the pool.
+pub(crate) fn release(shared: &Arc<Shared>, addrs: &[IpAddr]) {
+    if let Ok(mut pool) = shared.pool.lock() {
+        for address in addrs {
+            pool.release(*address);
+        }
+    }
+}
+
+/// The `ADDRESS_ASSIGN` body an answer carries: each address at its full prefix, naming the request it answers.
+pub(crate) fn grants(addrs: &[IpAddr], request_id: u64) -> Vec<Assigned> {
+    addrs
+        .iter()
+        .map(|address| match address {
+            IpAddr::V4(ip) => Assigned {
+                request_id,
+                version: 4,
+                address: {
+                    let mut bytes = [0u8; 16];
+                    bytes[..4].copy_from_slice(&ip.octets());
+                    bytes
+                },
+                prefix: 32,
+            },
+            IpAddr::V6(ip) => Assigned {
+                request_id,
+                version: 6,
+                address: ip.octets(),
+                prefix: 128,
+            },
+        })
+        .collect()
+}
+
+/// The `ROUTE_ADVERTISEMENT` body a tunnel's families are carried for.
+pub(crate) fn routes(addrs: &[IpAddr]) -> Vec<Route> {
     let mut routes = Vec::new();
-    if tunnel.addrs.iter().any(IpAddr::is_ipv4) {
+    if addrs.iter().any(IpAddr::is_ipv4) {
         routes.push(Route {
             first: [0u8; 16],
             last: {
@@ -1545,7 +1568,7 @@ fn accept(
             protocol: 0,
         });
     }
-    if tunnel.addrs.iter().any(IpAddr::is_ipv6) {
+    if addrs.iter().any(IpAddr::is_ipv6) {
         routes.push(Route {
             first: [0u8; 16],
             last: [0xff; 16],
@@ -1553,11 +1576,33 @@ fn accept(
             protocol: 0,
         });
     }
-    connectip::route_advert_encode(&routes, &mut control);
-    send_data(conn, stream, &control).ok();
+    routes
 }
 
-fn register(shared: &Arc<Shared>, tunnel: &Tunnel, addrs: &[IpAddr]) -> Option<Granted> {
+/// The `ADDRESS_ASSIGN` body answering the requests a peer named, one grant per request the tunnel's own families can hold.
+pub(crate) fn respond(body: &[u8], addrs: &[IpAddr]) -> Vec<Assigned> {
+    let mut requested = Vec::new();
+    if connectip::address_assign(body, &mut requested).is_none() {
+        return Vec::new();
+    }
+    let mut assignments = Vec::new();
+    for request in &requested {
+        let wanted = addrs.iter().find(|address| {
+            (request.version == 4 && address.is_ipv4())
+                || (request.version == 6 && address.is_ipv6())
+        });
+        if let Some(address) = wanted {
+            assignments.extend(grants(std::slice::from_ref(address), request.request_id));
+        }
+    }
+    assignments
+}
+
+pub(crate) fn register(
+    shared: &Arc<Shared>,
+    addrs: &[IpAddr],
+    sender: &SyncSender<Vec<u8>>,
+) -> Option<Granted> {
     let mut tunnels = shared.tunnels.lock().ok()?;
     let mut inserted = Vec::with_capacity(addrs.len());
     for address in addrs {
@@ -1567,7 +1612,7 @@ fn register(shared: &Arc<Shared>, tunnel: &Tunnel, addrs: &[IpAddr]) -> Option<G
             }
             return None;
         }
-        tunnels.insert(*address, tunnel.sender.clone());
+        tunnels.insert(*address, sender.clone());
         inserted.push(*address);
     }
     Some(Granted {
@@ -1597,39 +1642,7 @@ fn parse_capsules(conn: &mut quiche::Connection, tunnel: &mut Tunnel) {
         let connectip::Capsule::AddressRequest(body) = capsule else {
             continue;
         };
-        let mut requested = Vec::new();
-        if connectip::address_assign(body, &mut requested).is_none() {
-            continue;
-        }
-        let mut assignments = Vec::new();
-        for request in &requested {
-            let wanted = tunnel.addrs.iter().find(|address| {
-                (request.version == 4 && address.is_ipv4())
-                    || (request.version == 6 && address.is_ipv6())
-            });
-            let Some(address) = wanted else {
-                continue;
-            };
-            let grant = match address {
-                IpAddr::V4(ip) => Assigned {
-                    request_id: request.request_id,
-                    version: 4,
-                    address: {
-                        let mut bytes = [0u8; 16];
-                        bytes[..4].copy_from_slice(&ip.octets());
-                        bytes
-                    },
-                    prefix: 32,
-                },
-                IpAddr::V6(ip) => Assigned {
-                    request_id: request.request_id,
-                    version: 6,
-                    address: ip.octets(),
-                    prefix: 128,
-                },
-            };
-            assignments.push(grant);
-        }
+        let assignments = respond(body, &tunnel.addrs);
         if !assignments.is_empty() {
             let mut body = Vec::new();
             connectip::address_assign_encode(&assignments, &mut body);
@@ -1658,11 +1671,11 @@ fn read_datagrams(
         if tunnel.stream != Some(stream) {
             continue;
         }
-        forward(shared, spec, tunnel, packet);
+        forward(shared, spec, &tunnel.addrs, packet);
     }
 }
 
-fn forward(shared: &Arc<Shared>, spec: &ServerSpec, tunnel: &Tunnel, packet: &[u8]) {
+pub(crate) fn forward(shared: &Arc<Shared>, spec: &ServerSpec, addrs: &[IpAddr], packet: &[u8]) {
     let Some(destination) = packet_destination(packet) else {
         return;
     };
@@ -1671,7 +1684,7 @@ fn forward(shared: &Arc<Shared>, spec: &ServerSpec, tunnel: &Tunnel, packet: &[u
     }
     if let Ok(tunnels) = shared.tunnels.lock() {
         if let Some(other) = tunnels.get(&destination) {
-            if !tunnel.addrs.contains(&destination) {
+            if !addrs.contains(&destination) {
                 let _ = other.try_send(packet.to_vec());
             }
             return;
@@ -1681,7 +1694,7 @@ fn forward(shared: &Arc<Shared>, spec: &ServerSpec, tunnel: &Tunnel, packet: &[u
         return;
     }
     let _ = shared.packets.send(Packet {
-        peer: peer_key(&tunnel.addrs),
+        peer: peer_key(addrs),
         bytes: packet.to_vec(),
     });
 }
