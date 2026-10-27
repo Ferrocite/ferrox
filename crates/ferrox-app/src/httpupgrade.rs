@@ -23,6 +23,12 @@ impl UpReader<Connection> {
     }
 }
 
+impl<R: Read + crate::proxy::RelayPoll> crate::proxy::RelayPoll for UpReader<R> {
+    fn arm_relay_poll(&mut self) {
+        self.read.arm_relay_poll();
+    }
+}
+
 impl<R: Read> Read for UpReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         // Once the riding bytes are spent every read is one branch and a delegate to the stream.

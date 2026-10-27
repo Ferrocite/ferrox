@@ -17,6 +17,12 @@ impl HeadReader<Connection> {
     }
 }
 
+impl<R: Read + crate::proxy::RelayPoll> crate::proxy::RelayPoll for HeadReader<R> {
+    fn arm_relay_poll(&mut self) {
+        self.read.arm_relay_poll();
+    }
+}
+
 impl<R: Read> HeadReader<R> {
     // A head that ended at the delimiter leaves no tail to deliver, so its buffer is dead at birth.
     fn new(read: R, prefix: Vec<u8>, at: usize) -> Self {

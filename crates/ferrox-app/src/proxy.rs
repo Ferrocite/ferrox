@@ -3054,6 +3054,37 @@ impl Carried for crate::ws::WsReader {
     }
 }
 
+/// A carrier a relay lane reads: its socket holds the relay quantum, so a step that finds nothing hands the wait back instead of pinning the worker.
+pub(crate) trait RelayPoll {
+    fn arm_relay_poll(&mut self);
+}
+
+impl RelayPoll for Connection {
+    fn arm_relay_poll(&mut self) {
+        let _ = self.set_read_timeout(Some(RELAY_POLL));
+    }
+}
+
+impl RelayPoll for Box<dyn Read + Send> {
+    /// Every boxed carrier here is a `TlsHalf` chain whose cipher `session_halves` armed before the split.
+    fn arm_relay_poll(&mut self) {}
+}
+
+impl<S> RelayPoll for TlsHalf<S> {
+    /// `session_halves` armed the cipher before splitting, so a step already hands back its wait.
+    fn arm_relay_poll(&mut self) {}
+}
+
+impl RelayPoll for KcpIo {
+    /// The read arms its own deadline per call.
+    fn arm_relay_poll(&mut self) {}
+}
+
+impl RelayPoll for crate::xdrive::Conn {
+    /// The mailbox read takes the relay quantum itself.
+    fn arm_relay_poll(&mut self) {}
+}
+
 /// One decode run between the arms, both put away on the way out: a carrier answers its own head and then clears its clock, so the protocol that reads through it would otherwise wait unbounded.
 pub(crate) fn under_handshake<T, R: Read + Carried>(
     reader: &mut R,
@@ -36669,6 +36700,99 @@ mod tests {
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
+    }
+
+    /// One pool serves both directions of every session: an idle leg that waits inside the carrier
+    /// instead of handing its lane back leaves the other direction with nowhere to run.
+    #[test]
+    fn eight_live_carried_sessions_share_one_pool() {
+        const SESSIONS: usize = 8;
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for stream in echo.incoming().take(SESSIONS) {
+                let Ok(mut stream) = stream else { continue };
+                thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let Ok(read) = stream.read(&mut buf) else {
+                            return;
+                        };
+                        if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let users = crate::vmess::Users::single(id);
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for stream in tunnel.incoming().take(SESSIONS) {
+                let Ok(stream) = stream else { continue };
+                crate::vmess::serve_ws(stream, "/tunnel", &users, true);
+            }
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = Outbound::Vmess(VmessOut {
+            address: "127.0.0.1".to_owned(),
+            port: tunnel_port,
+            id,
+            cipher: crate::vmess::Cipher::Chacha,
+            carrier: Carrier::Ws {
+                path: "/tunnel".to_owned(),
+                ed: 0,
+            },
+            host: "127.0.0.1".to_owned(),
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+        });
+        thread::spawn(move || {
+            for stream in front.incoming().take(SESSIONS) {
+                let Ok(stream) = stream else { continue };
+                let out = out.clone();
+                thread::spawn(move || serve_socks(stream, &out, &no_accounts()));
+            }
+        });
+        // Each session holds a leg before any carries a byte, so a parked idle wait leaves no lane for the reply.
+        let opened = std::sync::Arc::new(std::sync::Barrier::new(SESSIONS + 1));
+        let carry = std::sync::Arc::new(std::sync::Barrier::new(SESSIONS + 1));
+        let mut clients = Vec::with_capacity(SESSIONS);
+        for n in 0..SESSIONS {
+            let opened = std::sync::Arc::clone(&opened);
+            let carry = std::sync::Arc::clone(&carry);
+            clients.push(thread::spawn(move || {
+                let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+                client
+                    .set_read_timeout(Some(Duration::from_secs(30)))
+                    .expect("timeout");
+                client.write_all(&[5, 1, 0]).expect("greets");
+                let mut method = [0u8; 2];
+                client.read_exact(&mut method).expect("selects");
+                let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+                request.extend_from_slice(&echo_port.to_be_bytes());
+                client.write_all(&request).expect("connects");
+                let mut reply = [0u8; 10];
+                client.read_exact(&mut reply).expect("replies");
+                opened.wait();
+                carry.wait();
+                let body = [n as u8; 5];
+                client.write_all(&body).expect("writes");
+                let mut back = [0u8; 5];
+                client.read_exact(&mut back).expect("echoes");
+                assert_eq!(back, body, "session {n} reads back its own bytes");
+            }));
+        }
+        opened.wait();
+        thread::sleep(Duration::from_millis(250));
+        carry.wait();
+        for client in clients {
+            client.join().expect("every session crosses the pool");
+        }
     }
 
     #[test]

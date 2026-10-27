@@ -217,6 +217,12 @@ impl GrpcReader<Connection> {
     }
 }
 
+impl<R: Read + crate::proxy::RelayPoll> crate::proxy::RelayPoll for GrpcReader<R> {
+    fn arm_relay_poll(&mut self) {
+        self.read.arm_relay_poll();
+    }
+}
+
 impl<R: Read> GrpcReader<R> {
     /// Arm or clear the clock the opening head is decoded under; only that head runs armed, a relay waits blocking again, as the `ws` reader's budget does.
     pub(crate) fn set_handshake_budget(&mut self, until: Option<std::time::Instant>) {
