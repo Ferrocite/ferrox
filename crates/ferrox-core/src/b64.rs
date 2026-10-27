@@ -229,7 +229,7 @@ fn group_tail(rest: &[u8]) -> Option<[u8; 3]> {
 #[must_use]
 pub fn decode(text: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() / 4 * 3 + 3);
-    let ptr = out.as_mut_ptr();
+    let ptr: *mut u8 = out.as_mut_ptr();
     let mut out_at = 0usize;
     let mut at = 0usize;
     while at + 4 <= text.len() {
