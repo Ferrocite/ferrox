@@ -4,7 +4,10 @@ name: xray-baseline
 on:
   pull_request:
     paths:
-      - "crates/**/*.rs"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/ferrox-core/**"
+      - "crates/ferrox-app/**"
       - "upstream/pins.toml"
       - "scripts/run-xray-baseline.sh"
       - ".github/workflows/xray-baseline.yml"

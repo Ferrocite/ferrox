@@ -4,8 +4,10 @@ name: benchmark-matrix
 on:
   pull_request:
     paths:
-      - "crates/**/*.rs"
-      - "crates/**/*.toml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "crates/ferrox-core/**"
+      - "crates/ferrox-app/**"
       - "scripts/run-benchmark-matrix.sh"
       - "scripts/lib-matrix.sh"
       - "scripts/lib-engines.sh"

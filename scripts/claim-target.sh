@@ -16,6 +16,22 @@ source scripts/lib-shared-target.sh
 shared="$(ferrox_shared_target)"
 
 if [[ "$(git rev-parse --git-dir)" == "$(git rev-parse --git-common-dir)" ]]; then
+  # `cargo clean` removes the symlink, not the tree it names, and the next build
+  # then writes a real target. Adopt that tree as the seed instead of leaving
+  # the main checkout with a private one every clone has to bypass.
+  if [[ -d "$PWD/target" && ! -L "$PWD/target" ]]; then
+    echo "claim: adopting the main checkout's target as the seed" >&2
+    chmod -R u+w "$shared" 2>/dev/null || true
+    rm -rf "$shared"
+    mv "$PWD/target" "$shared"
+    ln -s "$shared" "$PWD/target"
+  fi
+  # The main checkout keeps the seed; repair its config here so a changed
+  # generator does not make `check-worktree-artifacts` red before the first
+  # worktree is created. CI has no seed and needs no link.
+  if [[ -d "$shared" ]]; then
+    ferrox_write_cargo_config "$PWD" "$shared"
+  fi
   exit 0
 fi
 if ferrox_target_is_own "$PWD"; then

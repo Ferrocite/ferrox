@@ -47,8 +47,8 @@ WIDE_GO = ["./..."]
 OWNED_NOWHERE = "-"
 
 # Under crates/, the trees that ship no method code: a change here owes the
-# workspace build and its tests, not the comparisons against the references. The
-# bench harness measures, the prompt library plans; neither is a thing measured.
+# comparisons against the references and ci.yml's test matrix nothing. The bench
+# harness measures, the prompt library plans; tools.yml owns their build.
 TOOL = ("crates/ferrox-prompt/", "crates/ferrox-bench/")
 
 SCOPE_BLOCK = re.compile(r"<!--\s*scope:begin\s*-->(.*?)<!--\s*scope:end\s*-->", re.S)
@@ -350,13 +350,11 @@ def classify(changed: list[str], scopes: dict[str, dict[str, list[str]]],
     methods: set[str] = set()
     unclaimed: set[str] = set()
     attributed: list[str] = []
-    tool = False
     rust = False
     # A plan with nothing to look at has no evidence to narrow on, so it runs wide.
     shared = "" if changed else "no changed-path list to plan against"
     for path in changed:
         if path.startswith(TOOL):
-            tool = True
             continue
         if path.endswith((".rs", ".toml")) and path.startswith("crates/"):
             rust = True
@@ -401,7 +399,7 @@ def classify(changed: list[str], scopes: dict[str, dict[str, list[str]]],
     reason = shared or ("" if methods else "nothing a method page owns")
     return {"wide": wide, "reason": reason, "methods": sorted(methods),
             "unclaimed": sorted(unclaimed), "attributed": attributed,
-            "planned": bool(changed), "rust": rust or tool}
+            "planned": bool(changed), "rust": rust}
 
 
 def is_shared_source(path: str) -> bool:
@@ -886,6 +884,14 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         failed += 0 if ok else 1
         print(f"selftest: {'ok  ' if ok else 'FAIL'} {label} -> "
               f"wide={plan['wide']} methods={plan['methods']}")
+    for label, changed in [
+        ("the prompt tool owes no compiler", ["crates/ferrox-prompt/src/check.rs"]),
+        ("the bench harness owes no compiler", ["crates/ferrox-bench/src/methods.rs"]),
+    ]:
+        plan = classify(changed, scopes)
+        ok = plan["rust"] is False and plan["wide"] is False
+        failed += 0 if ok else 1
+        print(f"selftest: {'ok  ' if ok else 'FAIL'} {label} -> rust={plan['rust']}")
     for label, changed, names, want_wide, want_methods in ATTRIBUTED:
         plan = classify(changed, scopes, names)
         ok = plan["wide"] == want_wide and (want_methods is None

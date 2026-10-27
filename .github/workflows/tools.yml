@@ -1,0 +1,51 @@
+name: tools
+
+# `ferrox-prompt` and `ferrox-bench` are tools, not methods: neither ships in the
+# app and neither is measured against a reference. They get one Linux runner
+# instead of ci.yml's three compilers, and an edit to either no longer starts a
+# test matrix it cannot move. `prompts.md` lives under `crates/ferrox-prompt/`,
+# so the roadmap edit is covered here too.
+
+on:
+  pull_request:
+    paths:
+      - "crates/ferrox-prompt/**"
+      - "crates/ferrox-bench/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/tools.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: tools-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: -D warnings --cfg aes_armv8 --cfg polyval_armv8
+
+jobs:
+  check:
+    name: tools build, test and the prompt library
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          shared-key: tools
+          cache-on-failure: true
+      - run: cargo fmt --all -- --check
+      - name: lint the tools
+        run: cargo clippy -p ferrox-prompt -p ferrox-bench --all-targets --locked -- -D warnings -W clippy::perf -W clippy::suspicious
+      - name: test the tools
+        run: cargo test -p ferrox-prompt -p ferrox-bench --locked
+      - name: the prompt library is well formed
+        run: cargo run --locked --quiet -p ferrox-prompt -- check
