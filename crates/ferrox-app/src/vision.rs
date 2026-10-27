@@ -64,6 +64,7 @@ struct Feeding {
     head: [u8; 310],
     head_len: usize,
     run: usize,
+    start: usize,
     left: usize,
     scanned: usize,
     /// the shape the run's head resolved to; its arm carries the presence and
@@ -84,6 +85,7 @@ impl Feeding {
             head: [0u8; 310],
             head_len: 0,
             run: 0,
+            start: tls.server_hello_left,
             left: tls.server_hello_left,
             scanned: 0,
             shaped: Shaped::Nothing,
@@ -463,7 +465,10 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         {
             let mut tls = self.lock_tls();
             tls.budget -= 1;
-            tls.server_hello_left = feed.left.saturating_sub(feed.scanned);
+            // A split writer can observe a hello after this snapshot; its progress outranks ours.
+            if tls.server_hello_left == feed.start {
+                tls.server_hello_left = feed.left.saturating_sub(feed.scanned);
+            }
             if feed.shaped != Shaped::Nothing {
                 tls.present = true;
             }
@@ -1126,6 +1131,31 @@ mod tests {
             frames += 8;
         }
         assert_eq!(frames, 512, "the walk saw every frame");
+    }
+
+    /// A split writer can see the server hello while the reader is parked; the reader's
+    /// older snapshot must not erase the scan the write already started.
+    #[test]
+    fn a_split_read_keeps_the_server_hello_scan_a_write_observed() {
+        let mut link = link(&[]);
+        let tls = *link.lock_tls();
+        let feed = Feeding::new(&tls);
+        let mut head = vec![0x16, 0x03, 0x03, 0x00, 0x30, 0x02];
+        head.extend_from_slice(&[0u8; 6]);
+        link.lock_tls().observe(&head);
+        let left = link.lock_tls().server_hello_left;
+        assert!(left > 0, "the write observed a fragmented server hello");
+        link.spend(&feed);
+        assert_eq!(
+            link.lock_tls().server_hello_left,
+            left,
+            "the read snapshot undid the write's progress"
+        );
+        link.lock_tls().observe(&TLS13_VERSIONS);
+        assert!(
+            link.lock_tls().enable_xtls,
+            "the later fragment still selects Direct"
+        );
     }
 
     /// The scan budget is spent after the handshake; a steady read must not build the
