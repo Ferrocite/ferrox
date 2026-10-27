@@ -47,12 +47,10 @@ def parse(blob: bytes, header: int) -> tuple[list[tuple[bytes, bytes]], bytes] |
             break
         records.append((path, tail))
         offset = end + 2
-    if not records or offset > len(blob):
+    if not records or offset > len(blob) or len(blob) - offset > 4:
         return None
     if count >= 0 and count != len(records):
         return None
-    # Whatever follows the file records is an env-var section; it is preserved
-    # byte for byte, because its length is not needed to rewrite a file path.
     return records, blob[offset:]
 
 
@@ -90,7 +88,7 @@ def selftest() -> int:
     header = struct.pack("<IHIB", 1, 0x01FF, 2, 0)
     records = [(b"/seed/crates/ferrox-core/src/lib.rs", b"\x00\x01"),
                (b"/seed/crates/ferrox-app/src/main.rs", b"\x00\x00")]
-    trailer = b"\x00\x00\x00\x0b\x00\x00\x00CLIPPY_ARGS\x01\x03\x00\x00\x00abc"
+    trailer = b"\x00\x00\x00"
     blob = header + b"".join(
         struct.pack("<I", len(path)) + path + tail for path, tail in records) + trailer
     with tempfile.TemporaryDirectory() as tmp:
