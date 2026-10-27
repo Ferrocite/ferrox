@@ -225,7 +225,7 @@ fn group_tail(rest: &[u8]) -> Option<[u8; 3]> {
     Some([bytes[1], bytes[2], bytes[3]])
 }
 
-/// One pass over the text and one output buffer: whole groups are four table loads and three stores, whitespace is skipped where it lies, padding ends the text, and a 2..=3 digit tail keeps the bytes its padded group would have held.
+/// One pass over the text and one output buffer: a pair of whole groups is eight table loads and one eight-byte store, whitespace is skipped where it lies, padding ends the text, and a 2..=3 digit tail keeps the bytes its padded group would have held.
 #[must_use]
 pub fn decode(text: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() / 4 * 3 + 3);
