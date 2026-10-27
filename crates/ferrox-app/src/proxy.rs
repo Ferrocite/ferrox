@@ -2949,6 +2949,66 @@ impl std::io::Read for HandshakeDeadline<'_> {
     }
 }
 
+/// A QUIC stream under the encryption handshake's clock: its reads poll in a quantum, so a sealed hello that waits past the last packet is a timeout rather than a spin.
+struct SealHandshake {
+    stream: crate::quic::QuicStream,
+    until: Instant,
+}
+
+impl SealHandshake {
+    fn new(stream: crate::quic::QuicStream, budget: Duration) -> Self {
+        Self {
+            stream,
+            until: Instant::now() + budget,
+        }
+    }
+
+    fn rearm(&mut self, budget: Duration) {
+        self.until = Instant::now() + budget;
+    }
+}
+
+impl Read for SealHandshake {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if Instant::now() >= self.until {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            match self.stream.read(buf) {
+                Ok(n) => return Ok(n),
+                Err(error) if is_timeout(&error) => {
+                    let left = self.until.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                    }
+                    thread::sleep(left.min(RELAY_POLL));
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+}
+
+impl Write for SealHandshake {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.stream.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.stream.flush()
+    }
+}
+
+impl ferrox_core::vless_encryption::SplitIo for SealHandshake {
+    type Reader = crate::quic::QuicStream;
+    type Writer = crate::quic::QuicStream;
+
+    fn split_io(self) -> Option<(Self::Reader, Self::Writer)> {
+        let writer = self.stream.clone();
+        Some((self.stream, writer))
+    }
+}
+
 /// The opening request decoded under a wall-clock budget: a peer that upgrades, connects or handshakes and then stays silent costs a thread briefly, not forever.
 fn decode_request_bounded(stream: &mut dyn Read) -> Option<([u8; 16], Flow, u8, SocketAddr)> {
     let mut bounded = HandshakeDeadline {
@@ -5327,17 +5387,13 @@ fn serve_vless_quic_inbound(
         eprintln!("quic inbound in {path} needs security tls with a certificate: serves nothing");
         return false;
     };
-    match crate::config::server_decryption(inbound) {
-        Ok(None) => {}
-        Ok(Some(_)) => {
-            eprintln!("vless: encryption over quic is not served yet; inbound refused");
-            return false;
-        }
+    let decryption = match crate::config::server_decryption(inbound) {
+        Ok(decryption) => decryption,
         Err(error) => {
             eprintln!("{error} in {path}: inbound refused");
             return false;
         }
-    }
+    };
     let Some(config) = crate::quic::serve_config(&identity) else {
         eprintln!("unreadable quic tls identity in {path}: serves nothing");
         return false;
@@ -5348,7 +5404,7 @@ fn serve_vless_quic_inbound(
     };
     let users = Arc::clone(users);
     let serve: crate::quic::Serve = Arc::new(move |stream| {
-        serve_vless_quic(stream, &users, freedom);
+        serve_vless_quic(stream, &users, freedom, decryption.as_deref());
     });
     thread::spawn(move || {
         crate::quic::serve_loop(
@@ -5362,7 +5418,26 @@ fn serve_vless_quic_inbound(
 }
 
 /// One QUIC stream, one VLESS session: the header, the accept, then TCP, UDP or mux on the same stream.
-fn serve_vless_quic(mut stream: crate::quic::QuicStream, users: &[VlessUser], freedom: bool) {
+fn serve_vless_quic(
+    stream: crate::quic::QuicStream,
+    users: &[VlessUser],
+    freedom: bool,
+    decryption: Option<&ferrox_core::vless_encryption::Server>,
+) {
+    if let Some(decryption) = decryption {
+        let sealed =
+            match decryption.handshake(SealHandshake::new(stream.clone(), budgets::handshake())) {
+                Ok(sealed) => sealed,
+                Err(error) => {
+                    eprintln!("vless: encryption handshake failed: {error}");
+                    stream.close();
+                    return;
+                }
+            };
+        serve_vless_quic_sealed(sealed, users, freedom, stream);
+        return;
+    }
+    let mut stream = stream;
     let decoded = decode_request_bounded(&mut stream);
     let Some((got, flow, cmd, target)) = decoded else {
         stream.close();
@@ -5396,6 +5471,74 @@ fn serve_vless_quic(mut stream: crate::quic::QuicStream, users: &[VlessUser], fr
             serve_sealed_mux_split(stream.clone(), stream, close);
         }
         _ => stream.close(),
+    }
+}
+
+fn serve_vless_quic_sealed(
+    mut sealed: ferrox_core::vless_encryption::EncryptedStream<SealHandshake>,
+    users: &[VlessUser],
+    freedom: bool,
+    stop: crate::quic::QuicStream,
+) {
+    let decoded = decode_request_bounded(&mut sealed);
+    let Some((got, flow, cmd, target)) = decoded else {
+        stop.close();
+        return;
+    };
+    let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
+        stop.close();
+        return;
+    };
+    if !freedom || user.reverse.is_some() || !vless_flow_ok(user, flow, cmd, false) {
+        stop.close();
+        return;
+    }
+    let fin = stop.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || stop.close());
+    match cmd {
+        1 => {
+            let Some(uplink) = dial_or_report(&target) else {
+                close();
+                return;
+            };
+            if uplink.set_read_timeout(Some(RELAY_POLL)).is_err() {
+                close();
+                return;
+            }
+            if sealed.write_all(&[0, 0]).is_err() {
+                close();
+                return;
+            }
+            let Some((reader, writer)) = sealed.into_split() else {
+                close();
+                return;
+            };
+            relay_split(reader, writer, &uplink, &close);
+            let _ = fin.fin();
+        }
+        2 => {
+            if sealed.write_all(&[0, 0]).is_err() {
+                close();
+                return;
+            }
+            let Some((reader, writer)) = sealed.into_split() else {
+                close();
+                return;
+            };
+            serve_udp_stream(reader, writer, &target, Vec::new(), &close);
+        }
+        3 => {
+            if sealed.write_all(&[0, 0]).is_err() {
+                close();
+                return;
+            }
+            let Some((reader, writer)) = sealed.into_split() else {
+                close();
+                return;
+            };
+            serve_sealed_mux_split(reader, writer, close);
+        }
+        _ => close(),
     }
 }
 
@@ -9302,6 +9445,51 @@ fn vless_quic_dial(vless: &VlessOut) -> crate::quic::QuicDial {
     }
 }
 
+fn dial_vless_quic_sealed(client: &Connection, vless: &VlessOut, target: &Destination) {
+    let Some(encryption) = &vless.encryption else {
+        return;
+    };
+    let Some(pooled) = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())
+    else {
+        return;
+    };
+    let mut sealed = match encryption.handshake(SealHandshake::new(
+        pooled.stream_handle(),
+        budgets::handshake(),
+    )) {
+        Ok(sealed) => sealed,
+        Err(error) => {
+            eprintln!("vless: encryption handshake failed: {error}");
+            pooled.cancel();
+            return;
+        }
+    };
+    sealed.get_mut().rearm(budgets::dial());
+    if sealed
+        .write_all(&vless_header(&vless.id, 1, target))
+        .is_err()
+        || read_vless_response(&mut HandshakeDeadline {
+            inner: &mut sealed,
+            until: Instant::now() + budgets::dial(),
+        })
+        .is_none()
+    {
+        pooled.cancel();
+        return;
+    }
+    let Some((reader, writer)) = sealed.into_split() else {
+        pooled.cancel();
+        return;
+    };
+    let close_stream = pooled.stream_handle();
+    let pooled = Mutex::new(Some(pooled));
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        close_stream.close();
+        drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
+    });
+    relay_split(reader, writer, client, &close);
+}
+
 /// A datagram association on its own QUIC stream: the lease is the flow's, so the stream and the pool entry live until the association closes.
 fn dial_quic_udp_uplink(
     vless: &VlessOut,
@@ -9310,24 +9498,55 @@ fn dial_quic_udp_uplink(
     source: Arc<Mutex<Option<SocketAddr>>>,
 ) -> Option<UdpUplink> {
     let pooled = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())?;
-    let mut stream = pooled.stream_handle();
     let header = vless_header(&vless.id, 2, &Destination::from(*dest));
-    if stream.write_all(&header).is_err()
-        || read_vless_response(&mut HandshakeDeadline {
-            inner: &mut stream,
-            until: Instant::now() + budgets::dial(),
-        })
-        .is_none()
-    {
-        pooled.cancel();
-        return None;
-    }
-    let read = pooled.stream_handle();
+    let (read, write): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+        if let Some(encryption) = &vless.encryption {
+            let mut sealed = match encryption.handshake(SealHandshake::new(
+                pooled.stream_handle(),
+                budgets::handshake(),
+            )) {
+                Ok(sealed) => sealed,
+                Err(error) => {
+                    eprintln!("vless: encryption handshake failed: {error}");
+                    pooled.cancel();
+                    return None;
+                }
+            };
+            sealed.get_mut().rearm(budgets::dial());
+            if sealed.write_all(&header).is_err()
+                || read_vless_response(&mut HandshakeDeadline {
+                    inner: &mut sealed,
+                    until: Instant::now() + budgets::dial(),
+                })
+                .is_none()
+            {
+                pooled.cancel();
+                return None;
+            }
+            let Some((reader, writer)) = sealed.into_split() else {
+                pooled.cancel();
+                return None;
+            };
+            (Box::new(reader), Box::new(writer))
+        } else {
+            let mut stream = pooled.stream_handle();
+            if stream.write_all(&header).is_err()
+                || read_vless_response(&mut HandshakeDeadline {
+                    inner: &mut stream,
+                    until: Instant::now() + budgets::dial(),
+                })
+                .is_none()
+            {
+                pooled.cancel();
+                return None;
+            }
+            (Box::new(pooled.stream_handle()), Box::new(stream))
+        };
     let Ok(udp_send) = relay.try_clone() else {
         pooled.cancel();
         return None;
     };
-    let done = spawn_udp_uplink_reader(Box::new(read), udp_send, source, *dest);
+    let done = spawn_udp_uplink_reader(read, udp_send, source, *dest);
     let close_stream = pooled.stream_handle();
     let pooled = Mutex::new(Some(pooled));
     let close = Arc::new(move || {
@@ -9335,7 +9554,7 @@ fn dial_quic_udp_uplink(
         drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
     });
     Some(UdpUplink {
-        write: Box::new(stream),
+        write,
         close,
         target: *dest,
         done,
@@ -10356,29 +10575,57 @@ fn open_vless_mux(vless: &VlessOut) -> Option<MuxUplink> {
 
 fn open_vless_mux_quic(vless: &VlessOut) -> Option<MuxUplink> {
     let pooled = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())?;
-    let mut stream = pooled.stream_handle();
-    if stream.write_all(&vless_mux_header(&vless.id)).is_err()
-        || read_vless_response(&mut HandshakeDeadline {
-            inner: &mut stream,
-            until: Instant::now() + budgets::dial(),
-        })
-        .is_none()
-    {
-        pooled.cancel();
-        return None;
-    }
-    let read = pooled.stream_handle();
+    let header = vless_mux_header(&vless.id);
+    let (read, write): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+        if let Some(encryption) = &vless.encryption {
+            let mut sealed = match encryption.handshake(SealHandshake::new(
+                pooled.stream_handle(),
+                budgets::handshake(),
+            )) {
+                Ok(sealed) => sealed,
+                Err(error) => {
+                    eprintln!("vless: encryption handshake failed: {error}");
+                    pooled.cancel();
+                    return None;
+                }
+            };
+            sealed.get_mut().rearm(budgets::dial());
+            if sealed.write_all(&header).is_err()
+                || read_vless_response(&mut HandshakeDeadline {
+                    inner: &mut sealed,
+                    until: Instant::now() + budgets::dial(),
+                })
+                .is_none()
+            {
+                pooled.cancel();
+                return None;
+            }
+            let Some((reader, writer)) = sealed.into_split() else {
+                pooled.cancel();
+                return None;
+            };
+            (Box::new(reader), Box::new(writer))
+        } else {
+            let mut stream = pooled.stream_handle();
+            if stream.write_all(&header).is_err()
+                || read_vless_response(&mut HandshakeDeadline {
+                    inner: &mut stream,
+                    until: Instant::now() + budgets::dial(),
+                })
+                .is_none()
+            {
+                pooled.cancel();
+                return None;
+            }
+            (Box::new(pooled.stream_handle()), Box::new(stream))
+        };
     let close_stream = pooled.stream_handle();
     let pooled = Mutex::new(Some(pooled));
     let close = Arc::new(move || {
         close_stream.close();
         drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
     });
-    Some(MuxUplink {
-        read: Box::new(read),
-        write: Box::new(stream),
-        close,
-    })
+    Some(MuxUplink { read, write, close })
 }
 
 fn dial_vless_mux(client: &Connection, vless: &VlessOut, target: &Destination) {
@@ -14388,6 +14635,8 @@ pub(crate) fn serve_connect(
         if matches!(vless.carrier, Carrier::Quic) {
             if vless.mux {
                 dial_vless_mux(&client, vless, asked);
+            } else if vless.encryption.is_some() {
+                dial_vless_quic_sealed(&client, vless, asked);
             } else {
                 crate::quic::dial_pooled(&client, &vless_quic_dial(vless), asked);
             }
@@ -22354,10 +22603,6 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
         return None;
     }
     let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
-    if matches!(&carrier, Carrier::Quic) && encryption.is_some() {
-        eprintln!("vless: encryption over quic is not carried yet; outbound refused");
-        return None;
-    }
     let (quic_roots, quic_ech, hysteria_roots) = match &carrier {
         Carrier::Quic => {
             let ech = if security == "tls" {
@@ -35899,7 +36144,45 @@ mod tests {
         thread::JoinHandle<()>,
     ) {
         quic_serve_with(Arc::new(move |stream| {
-            serve_vless_quic(stream, &one_vless_user(&id), true);
+            serve_vless_quic(stream, &one_vless_user(&id), true, None);
+        }))
+    }
+
+    fn quic_encryption_pair() -> (
+        Arc<ferrox_core::vless_encryption::Client>,
+        Arc<ferrox_core::vless_encryption::Server>,
+    ) {
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let client = vless_client_encryption(Some(&client_string))
+            .expect("client")
+            .expect("engine");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+        (client, decryption)
+    }
+
+    fn quic_serve_encrypted(
+        id: [u8; 16],
+        decryption: Arc<ferrox_core::vless_encryption::Server>,
+    ) -> (
+        SocketAddr,
+        Vec<Vec<u8>>,
+        Arc<AtomicBool>,
+        thread::JoinHandle<()>,
+    ) {
+        quic_serve_with(Arc::new(move |stream| {
+            serve_vless_quic(
+                stream,
+                &one_vless_user(&id),
+                true,
+                Some(decryption.as_ref()),
+            );
         }))
     }
 
@@ -37593,6 +37876,216 @@ mod tests {
     }
 
     #[test]
+    fn socks_dials_encrypted_vless_quic_to_echo() {
+        let _serial = quic_serial();
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (engine, decryption) = quic_encryption_pair();
+        let (addr, roots, stop, driver) = quic_serve_encrypted(id, decryption);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            id,
+            carrier: Carrier::Quic,
+            host: "localhost".to_owned(),
+            mux: false,
+            quic_roots: Some(roots.into()),
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: Some(engine),
+        });
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        client.write_all(&request).expect("connects");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        stop.store(true, Ordering::Relaxed);
+        driver.join().expect("joins");
+    }
+
+    #[test]
+    fn socks_associate_reaches_udp_echo_via_encrypted_quic_vless() {
+        let _serial = quic_serial();
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            loop {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (engine, decryption) = quic_encryption_pair();
+        let (addr, roots, stop, driver) = quic_serve_encrypted(id, decryption);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            id,
+            carrier: Carrier::Quic,
+            host: "localhost".to_owned(),
+            mux: false,
+            quic_roots: Some(roots.into()),
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: Some(engine),
+        });
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        let mut datagram = vec![0u8, 0, 0];
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, relay).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = udp.recv_from(&mut back).expect("echoes");
+        let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"ping");
+        drop(client);
+        stop.store(true, Ordering::Relaxed);
+        driver.join().expect("joins");
+    }
+
+    #[test]
+    fn socks_dials_encrypted_vless_quic_mux_to_echo() {
+        let _serial = quic_serial();
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (engine, decryption) = quic_encryption_pair();
+        let (addr, roots, stop, driver) = quic_serve_encrypted(id, decryption);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            id,
+            carrier: Carrier::Quic,
+            host: "localhost".to_owned(),
+            mux: true,
+            quic_roots: Some(roots.into()),
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: Some(engine),
+        });
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        client.write_all(&request).expect("connects");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        stop.store(true, Ordering::Relaxed);
+        driver.join().expect("joins");
+    }
+
+    #[test]
     fn a_quic_carrier_with_mux_never_dials_the_server_tcp_port() {
         let _serial = quic_serial();
         let id = uuid_bytes("bbbbbbbb-cccc-dddd-eeee-ffffffffffff").expect("id");
@@ -37691,7 +38184,7 @@ mod tests {
     }
 
     #[test]
-    fn a_quic_outbound_with_encryption_is_refused() {
+    fn a_quic_outbound_carries_encryption() {
         let (client_string, _) =
             ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
         let root = crate::json::parse(&format!(
@@ -37702,9 +38195,10 @@ mod tests {
                 "streamSettings": {{"network": "quic", "security": "tls"}}}}]}}"#
         ))
         .expect("parses");
+        let out = find_vless_outbound(&root).expect("finds the sealed quic outbound");
         assert!(
-            find_vless_outbound(&root).is_none(),
-            "a carrier that cannot seal yet refuses instead of sending plaintext"
+            out.encryption.is_some(),
+            "the engine the config names rides the quic stream"
         );
     }
 
