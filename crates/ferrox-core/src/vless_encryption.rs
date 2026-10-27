@@ -1796,13 +1796,10 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn exchange(mode: &str, zero_rtt: bool) {
+    fn round_trip(server: &Arc<Server>, client: &Arc<Client>) {
         use std::os::unix::net::UnixStream;
-        let (encryption, decryption) =
-            generate_pair(false, mode, if zero_rtt { "0rtt" } else { "1rtt" }, "600s");
-        let server = Server::new(ServerConfig::parse(&decryption).unwrap());
-        let client = Client::new(ClientConfig::parse(&encryption).unwrap());
         let (a, b) = UnixStream::pair().unwrap();
+        let server = Arc::clone(server);
         let server_thread = std::thread::spawn(move || {
             let mut stream = server.handshake(b).unwrap();
             let mut buf = [0u8; 5];
@@ -1821,6 +1818,15 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn exchange(mode: &str, zero_rtt: bool) {
+        let (encryption, decryption) =
+            generate_pair(false, mode, if zero_rtt { "0rtt" } else { "1rtt" }, "600s");
+        let server = Server::new(ServerConfig::parse(&decryption).unwrap());
+        let client = Client::new(ClientConfig::parse(&encryption).unwrap());
+        round_trip(&server, &client);
+    }
+
+    #[cfg(unix)]
     #[test]
     fn native_one_rtt_exchanges_bytes() {
         exchange("native", false);
@@ -1836,6 +1842,51 @@ mod tests {
     #[test]
     fn random_zero_rtt_exchanges_bytes() {
         exchange("random", true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn random_zero_rtt_resumes_with_a_masked_reply() {
+        let (encryption, decryption) = generate_pair(false, "random", "0rtt", "600s");
+        let server = Server::new(ServerConfig::parse(&decryption).unwrap());
+        let client = Client::new(ClientConfig::parse(&encryption).unwrap());
+        round_trip(&server, &client);
+        round_trip(&server, &client);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_expired_zero_rtt_ticket_is_not_resumed() {
+        use std::os::unix::net::UnixStream;
+        use std::sync::atomic::{AtomicI64, Ordering};
+
+        let (encryption, decryption) = generate_pair(false, "native", "0rtt", "300-300s");
+        let server_now = Arc::new(AtomicI64::new(0));
+        let client_now = Arc::new(AtomicI64::new(0));
+        let server_clock: Clock = {
+            let now = Arc::clone(&server_now);
+            Arc::new(move || now.load(Ordering::Relaxed))
+        };
+        let client_clock: Clock = {
+            let now = Arc::clone(&client_now);
+            Arc::new(move || now.load(Ordering::Relaxed))
+        };
+        let server = Server::with_clock(ServerConfig::parse(&decryption).unwrap(), server_clock);
+        let client = Client::with_clock(ClientConfig::parse(&encryption).unwrap(), client_clock);
+        round_trip(&server, &client);
+
+        server_now.store(1000, Ordering::Relaxed);
+        let (a, b) = UnixStream::pair().unwrap();
+        let server_thread = std::thread::spawn(move || server.handshake(b).map(|_| ()));
+        let client_stream = client.handshake(a);
+        if let Ok(mut stream) = client_stream {
+            let _ = stream.write_all(b"hello");
+            let _ = stream.flush();
+        }
+        assert!(
+            server_thread.join().unwrap().is_err(),
+            "an expired 0-RTT ticket must not resume"
+        );
     }
 
     #[cfg(unix)]
