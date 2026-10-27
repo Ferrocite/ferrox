@@ -27,7 +27,7 @@ s.close()'
 
 matrix_udp_carrier() {
   case "$1" in
-    *-kcp-*|*-hysteria-*|hysteria-*) return 0 ;;
+    *-kcp-*|*-hysteria-*|*-quic-*|hysteria-*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -36,6 +36,8 @@ matrix_server_serves() {
   case "$1:$2" in
     xray-core:hysteria-v1-*) return 1 ;;
     sing-box:hysteria-v1-*) return 0 ;;
+    xray-core:*-quic-*) return 1 ;;
+    sing-box:*-quic-*) return 0 ;;
     sing-box:*) return 1 ;;
   esac
   return 0
@@ -57,6 +59,12 @@ matrix_engine_skip_reason() {
       printf '%s\n' "sing-box at this pin has no VLESS over Hysteria transport" ;;
     sing-box:*-encryption-*)
       printf '%s\n' "sing-box at this pin has no VLESS encryption field" ;;
+    xray-core:*-quic-*)
+      printf '%s\n' "xray-core at this pin removed the QUIC transport; xhttp stream-one h3 replaces it" ;;
+    xray-rust:*-quic-*)
+      printf '%s\n' "xray-rust at this pin removed the QUIC transport" ;;
+    zeronet:*-quic-*)
+      printf '%s\n' "zeronet at this pin has no VLESS over QUIC transport" ;;
     leaf:*-xhttp-*)
       printf '%s\n' "leaf at this pin has no xhttp transport" ;;
     leaf:*-kcp-*)
@@ -221,6 +229,21 @@ kcp_settings() {
   echo '"streamSettings": {"network": "kcp", "kcpSettings": {"mtu": 1350, "tti": 50, "uplinkCapacity": 5, "downlinkCapacity": 20, "congestion": false, "readBufferSize": 2, "writeBufferSize": 2, "header": {"type": "none"}, "seed": "matrix"}}'
 }
 
+# QUIC is TLS by definition, and the ALPN is the one every pin reads: h3. xray-core-rust
+# otherwise defaults its TLS to h2/http1.1, which a h3-only lane refuses.
+quic_server_settings() {
+  local dir
+  dir="$(matrix_tls_dir)"
+  echo "\"streamSettings\": {\"network\": \"quic\", \"security\": \"tls\", \"tlsSettings\": {\"alpn\": [\"h3\"], \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\"}]}, \"quicSettings\": {}}"
+}
+
+quic_client_settings() {
+  local dir pin
+  dir="$(matrix_tls_dir)"
+  pin="$(matrix_tls_pin "$dir/cert.pem")"
+  echo "\"streamSettings\": {\"network\": \"quic\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}, \"quicSettings\": {}}"
+}
+
 httpupgrade_settings() {
   echo '"streamSettings": {"network": "httpupgrade", "httpupgradeSettings": {"path": "/tunnel", "host": "carrier.test"}}'
 }
@@ -293,6 +316,7 @@ scenario_config() {
     vless-reality-xhttp-*) server_config "$(vless_server ", $(reality_server_settings xhttp ', "xhttpSettings": {"path": "/share"}')")" "$(vless_client ", $(reality_client_settings xhttp ', "xhttpSettings": {"path": "/share"}')" "$port")" "$port" "$cover_json" ;;
     vless-vision-tls-raw-*) server_config "$(vless_server_vision ", $(tls_server_settings)")" "$(vless_client_vision ", $(tls_client_settings)" "$port")" "$port" ;;
     vless-vision-reality-raw-*) server_config "$(vless_server_vision ", $(reality_server_settings tcp "")")" "$(vless_client_vision ", $(reality_client_settings tcp "")" "$port")" "$port" "$cover_json" ;;
+    vless-quic-*) server_config "$(vless_server ", $(quic_server_settings)")" "$(vless_client ", $(quic_client_settings)" "$port")" "$port" ;;
     vless-kcp-*) server_config "$(vless_server ", $(kcp_settings)")" "$(vless_client ", $(kcp_settings)" "$port")" "$port" ;;
     vless-hysteria-*) server_config "$(vless_server ", $(hysteria_server_settings)")" "$(vless_client ", $(hysteria_client_settings)" "$port")" "$port" ;;
     hysteria-v1-*) server_config "$(hysteria_v1_server_settings)" "$(hysteria_v1_client_settings "$port")" "$port" ;;
@@ -334,6 +358,7 @@ standard_scenarios() {
   echo "vless-vision-tls-raw-down-8 download 8 256 65536"
   echo "vless-vision-reality-raw-down-8 download 8 256 65536"
   echo "vless-kcp-down-8 download 8 256 65536"
+  echo "vless-quic-down-8 download 8 256 65536"
   echo "vless-hysteria-down-8 download 8 256 65536"
   echo "hysteria-v1-down-8 download 8 256 65536"
   echo "shadowsocks2022-raw-down-8 download 8 256 65536"
@@ -367,6 +392,8 @@ scenarios() {
       echo "vless-xhttp-duplex-8 full-duplex 8 128 65536"
       echo "vless-kcp-up-1 upload 1 2048 65536"
       echo "vless-kcp-duplex-8 full-duplex 8 128 65536"
+      echo "vless-quic-up-1 upload 1 2048 65536"
+      echo "vless-quic-duplex-8 full-duplex 8 128 65536"
       echo "vless-hysteria-up-1 upload 1 2048 65536"
       echo "vless-hysteria-duplex-8 full-duplex 8 128 65536"
       echo "hysteria-v1-up-1 upload 1 2048 65536"

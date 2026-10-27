@@ -973,9 +973,11 @@ fn protocol_of(scenario: &str) -> Option<&str> {
 
 fn carrier_of(scenario: &str) -> Option<&'static str> {
     let protocol = protocol_of(scenario);
-    ["kcp", "hysteria", "xhttp"].into_iter().find(|carrier| {
-        Some(*carrier) != protocol && scenario.split('-').any(|rung| rung == *carrier)
-    })
+    ["kcp", "hysteria", "xhttp", "quic"]
+        .into_iter()
+        .find(|carrier| {
+            Some(*carrier) != protocol && scenario.split('-').any(|rung| rung == *carrier)
+        })
 }
 
 fn carries(engine: &str, carrier: &str) -> bool {
@@ -983,6 +985,7 @@ fn carries(engine: &str, carrier: &str) -> bool {
         (engine, carrier),
         ("xray-rust" | "zeronet", "kcp" | "hysteria")
             | ("sing-box" | "leaf", "kcp" | "hysteria" | "xhttp")
+            | ("xray-core" | "xray-rust" | "zeronet" | "leaf", "quic")
     )
 }
 
@@ -2042,6 +2045,10 @@ mod tests {
         assert!(skipped.iter().any(|(engine, _)| engine == "sing-box"));
         assert!(skipped.iter().any(|(engine, _)| engine == "leaf"));
         assert!(skipped.iter().all(|(_, reason)| reason.contains("xhttp")));
+        let (names, skipped) = participant_names(&engines, &scenario_workload("vless-quic-down-8"));
+        assert_eq!(names, vec!["sing-box"]);
+        assert_eq!(skipped.len(), 4);
+        assert!(skipped.iter().all(|(_, reason)| reason.contains("quic")));
     }
 
     #[test]
