@@ -34,7 +34,7 @@ const TCP_PROTO: u8 = 6;
 const ICMP_PROTO: u8 = 1;
 /// An ICMP echo request is type 8; its answer flips that to type 0 and carries the message back.
 const ICMP_ECHO_REQUEST: u8 = 8;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 const ICMP_ECHO_REPLY: u8 = 0;
 const FLAG_FIN: u8 = 0x01;
 const FLAG_SYN: u8 = 0x02;
@@ -837,6 +837,7 @@ pub(crate) fn refusal_reason(spec: &Spec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use ferrox_core::foxy::connectip::checksum;
 
     #[test]
