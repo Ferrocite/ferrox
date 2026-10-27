@@ -237,7 +237,7 @@ fn io(
 
         match socket.recv_from(&mut buf) {
             Ok((n, source)) if n >= 4 => {
-                let kind = u32::from_le_bytes(buf[..4].try_into().unwrap_or([0; 4]));
+                let kind = u32::from(buf[0]);
                 if kind == TYPE_INITIATION && n == INITIATION_SIZE {
                     let mut packet = buf[..n].to_vec();
                     clear_reserved(&mut packet);
@@ -503,7 +503,7 @@ mod tests {
         let server_public = ferrox_core::wireguard::device::public_key(&server_private);
         let hex = ferrox_core::foxy::account::hex_encode;
         let server_settings = format!(
-            r#"{{"secretKey":"{}","endpoint":["10.0.0.1"],"users":[{{"account":{{"publicKey":"{}","allowedIPs":["10.0.0.2/32"]}}}}]}}"#,
+            r#"{{"secretKey":"{}","endpoint":["10.0.0.1"],"reserved":[4,5,6],"users":[{{"account":{{"publicKey":"{}","allowedIPs":["10.0.0.2/32"]}}}}]}}"#,
             hex(&server_private),
             hex(&client_public)
         );
@@ -515,7 +515,7 @@ mod tests {
 
         let client = DeviceConfig::from_json(
             &crate::json::parse(&format!(
-                r#"{{"secretKey":"{}","address":["10.0.0.2"],"peers":[{{"publicKey":"{}","endpoint":"127.0.0.1:{port}"}}]}}"#,
+                r#"{{"secretKey":"{}","address":["10.0.0.2"],"reserved":[1,2,3],"peers":[{{"publicKey":"{}","endpoint":"127.0.0.1:{port}"}}]}}"#,
                 hex(&client_private),
                 hex(&server_public)
             ))
