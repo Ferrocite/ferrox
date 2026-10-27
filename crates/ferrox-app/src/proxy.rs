@@ -22145,6 +22145,7 @@ fn find_vless_outbound(root: &Json) -> Option<VlessOut> {
     vless_outbounds(root).find_map(|(outbound, server)| vless_outbound(outbound, server))
 }
 
+#[allow(clippy::too_many_lines)]
 fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> {
     let encryption = match vless_client_encryption(server.encryption) {
         Ok(encryption) => encryption,
