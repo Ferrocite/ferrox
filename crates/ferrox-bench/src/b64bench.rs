@@ -6,7 +6,7 @@ use crate::framing::{timed_row, Row};
 
 const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
-fn digit_table() -> [u8; 256] {
+const fn digit_table() -> [u8; 256] {
     let mut table = [255u8; 256];
     let mut byte = b'A';
     while byte <= b'Z' {
