@@ -17,6 +17,7 @@ use crate::masque::{self, deliver, withdrawn, Granted, ServerSpec, Shared, AUTH_
 use crate::wg_stack::{Packet, UdpRoutes};
 
 const HANDSHAKE: Duration = Duration::from_secs(10);
+const EDGE_RETRY: Duration = Duration::from_secs(1);
 const READ_WAIT: Duration = Duration::from_millis(10);
 const READ_ROOM: usize = 16 * 1024;
 const PREFACE: usize = 24;
@@ -180,6 +181,23 @@ pub(crate) struct Client {
     end: bool,
 }
 
+/// An edge still binding refuses the first dial the way a QUIC handshake loses it, so the dial is retried for as long as the handshake would have.
+fn connect_edge(edge: SocketAddr) -> Result<TcpStream, String> {
+    let deadline = Instant::now() + EDGE_RETRY;
+    loop {
+        match TcpStream::connect_timeout(&edge, HANDSHAKE) {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionRefused
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("cannot reach {edge}: {error}")),
+        }
+    }
+}
+
 impl Client {
     pub(crate) fn dial(
         tls_config: &TlsConfig,
@@ -188,8 +206,7 @@ impl Client {
         path: &str,
         headers: &[(String, String)],
     ) -> Result<Self, String> {
-        let tcp = TcpStream::connect_timeout(&edge, HANDSHAKE)
-            .map_err(|error| format!("cannot reach {edge}: {error}"))?;
+        let tcp = connect_edge(edge)?;
         let _ = tcp.set_nodelay(true);
         let _ = tcp.set_read_timeout(Some(HANDSHAKE));
         let _ = tcp.set_write_timeout(Some(HANDSHAKE));
@@ -812,6 +829,21 @@ mod tests {
 
     use super::*;
     use crate::json::Json;
+
+    #[test]
+    fn an_edge_that_binds_after_the_first_dial_is_reached() {
+        let probe = TcpListener::bind("127.0.0.1:0").expect("probe");
+        let edge = probe.local_addr().expect("addr");
+        drop(probe);
+        let late = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            let listener = TcpListener::bind(edge).expect("late bind");
+            std::thread::sleep(Duration::from_millis(200));
+            drop(listener);
+        });
+        assert!(connect_edge(edge).is_ok());
+        late.join().expect("binder");
+    }
 
     fn pem_lines(pem: &str) -> String {
         pem.trim_end()
