@@ -740,3 +740,13 @@ wireguard default-mtu 1420 ferrox-app-wireguard::tests::the_defaults_are_the_ref
 wireguard tcp-bytes-echoed 9 ferrox-app-wg::tests::a_tcp_flow_crosses_the_tunnel_to_a_freedom_dial
 wireguard client-datagram-bytes-echoed 6 ferrox-app-wg-stack::tests::a_client_datagram_lane_frames_and_unframes
 wireguard server-datagram-bytes-echoed 2 ferrox-app-wg-stack::tests::a_server_datagram_lane_echoes_through_freedom
+carrier-masque ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-masque tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_tunnel_to_a_freedom_dial
+carrier-masque ipv6-tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_tunnel_over_ipv6
+carrier-masque udp-echo-round-trips 1 ferrox-app-masque::tests::a_datagram_flow_crosses_the_tunnel_to_a_freedom_dial
+carrier-masque wrong-password-status 401 ferrox-app-masque::tests::a_wrong_password_is_refused_with_401
+carrier-masque path-forms-witnessed 5 ferrox-app-masque::tests::a_request_path_reads_the_way_xray_parses_it
+carrier-masque pool-contained-addresses-witnessed 2 ferrox-app-masque::tests::a_pool_holds_every_address_its_prefix_covers
+carrier-masque pool-outside-addresses-witnessed 1 ferrox-app-masque::tests::a_pool_holds_every_address_its_prefix_covers
+carrier-masque subnet-grants-witnessed 2 ferrox-app-masque::tests::a_subnet_grant_names_its_first_host
+carrier-masque datagram-prefix-round-trips 1 ferrox-app-masque::tests::the_datagram_prefix_round_trips
