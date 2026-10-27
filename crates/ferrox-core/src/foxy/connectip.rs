@@ -2,6 +2,7 @@
 
 use super::frames::{quic_read, quic_varint, quic_varint_len};
 use super::hpack::{integer, integer_into};
+use std::net::IpAddr;
 
 /// The default URI template, RFC 9484 §3.2, up to the host the tunnel reaches.
 const PREFIX: &[u8] = b"/.well-known/masque/ip/";
@@ -702,6 +703,88 @@ pub fn icmp_too_large(packet: &[u8], mtu: usize) -> Option<Vec<u8>> {
         _ => return None,
     }
     Some(answer)
+}
+
+const ICMP_ECHO_REQUEST: u8 = 8;
+const ICMP_ECHO_REPLY: u8 = 0;
+const ICMPV6_ECHO_REQUEST: u8 = 128;
+const ICMPV6_ECHO_REPLY: u8 = 129;
+
+/// Answer an ICMP echo request that reached a device's own address: its message with the
+/// type flipped and the checksum recomputed, wrapped in an IP header whose addresses are
+/// the request's swapped, rendered into the caller's reused `out` so a ping storm allocates
+/// nothing per reply. A message that is not a well-formed echo request is refused and `out`
+/// is left untouched.
+pub fn icmp_echo_reply(
+    source: IpAddr,
+    destination: IpAddr,
+    message: &[u8],
+    out: &mut Vec<u8>,
+) -> bool {
+    if message.len() < 8 || message[1] != 0 {
+        return false;
+    }
+    let echo = match (source, destination) {
+        (IpAddr::V4(_), IpAddr::V4(_)) => message[0] == ICMP_ECHO_REQUEST,
+        (IpAddr::V6(_), IpAddr::V6(_)) => message[0] == ICMPV6_ECHO_REQUEST,
+        _ => false,
+    };
+    if !echo {
+        return false;
+    }
+    match (source, destination) {
+        (IpAddr::V4(source), IpAddr::V4(destination)) => {
+            let Ok(total) = u16::try_from(IPV4_HEADER + message.len()) else {
+                return false;
+            };
+            out.clear();
+            out.reserve(usize::from(total));
+            let mut head = [0u8; IPV4_HEADER];
+            head[0] = 0x45;
+            head[2..4].copy_from_slice(&total.to_be_bytes());
+            head[6] = 0x40;
+            head[8] = HOP_LIMIT;
+            head[9] = ICMP_PROTOCOL;
+            head[12..16].copy_from_slice(&destination.octets());
+            head[16..20].copy_from_slice(&source.octets());
+            let sum = ipv4_checksum(&head);
+            head[10..12].copy_from_slice(&sum.to_be_bytes());
+            out.extend_from_slice(&head);
+            out.extend_from_slice(message);
+            out[IPV4_HEADER] = ICMP_ECHO_REPLY;
+            out[IPV4_HEADER + 2..IPV4_HEADER + 4].fill(0);
+            let sum = checksum(&out[IPV4_HEADER..]);
+            out[IPV4_HEADER + 2..IPV4_HEADER + 4].copy_from_slice(&sum.to_be_bytes());
+            true
+        }
+        (IpAddr::V6(source), IpAddr::V6(destination)) => {
+            let Ok(payload) = u16::try_from(message.len()) else {
+                return false;
+            };
+            out.clear();
+            out.reserve(IPV6_HEADER + message.len());
+            let mut head = [0u8; IPV6_HEADER];
+            head[0] = 0x60;
+            head[4..6].copy_from_slice(&payload.to_be_bytes());
+            head[6] = ICMPV6_PROTOCOL;
+            head[7] = HOP_LIMIT;
+            head[8..24].copy_from_slice(&destination.octets());
+            head[24..40].copy_from_slice(&source.octets());
+            out.extend_from_slice(&head);
+            out.extend_from_slice(message);
+            out[IPV6_HEADER] = ICMPV6_ECHO_REPLY;
+            out[IPV6_HEADER + 2..IPV6_HEADER + 4].fill(0);
+            let sum = pseudo_checksum(
+                &destination.octets(),
+                &source.octets(),
+                ICMPV6_PROTOCOL,
+                &out[IPV6_HEADER..],
+            );
+            out[IPV6_HEADER + 2..IPV6_HEADER + 4].copy_from_slice(&sum.to_be_bytes());
+            true
+        }
+        _ => false,
+    }
 }
 
 /// A checksum over a pseudo-header plus a payload, summed without writing the pseudo-header down.
@@ -1668,5 +1751,105 @@ mod tests {
             icmp_too_large(&[0x55; 40], 1280).is_none(),
             "not an IP version"
         );
+    }
+
+    #[test]
+    fn an_echo_request_is_answered_at_both_families() {
+        let request = [
+            ICMP_ECHO_REQUEST,
+            0,
+            0,
+            0,
+            0x12,
+            0x34,
+            0,
+            7,
+            b'p',
+            b'i',
+            b'n',
+            b'g',
+        ];
+        let mut answer = Vec::new();
+        assert!(icmp_echo_reply(
+            "10.13.0.2".parse().expect("a v4 source"),
+            "10.13.0.1".parse().expect("a v4 destination"),
+            &request,
+            &mut answer
+        ));
+        assert_eq!(answer.len(), IPV4_HEADER + request.len());
+        assert_eq!(answer[0], 0x45);
+        assert_eq!(answer[8], HOP_LIMIT);
+        assert_eq!(answer[9], ICMP_PROTOCOL);
+        assert_eq!(&answer[12..16], &[10, 13, 0, 1], "source is the old target");
+        assert_eq!(&answer[16..20], &[10, 13, 0, 2], "target is the old source");
+        assert_eq!(&answer[IPV4_HEADER..IPV4_HEADER + 2], &[ICMP_ECHO_REPLY, 0]);
+        assert_eq!(&answer[IPV4_HEADER + 4..], &request[4..]);
+        assert_eq!(fold(word_sum(&answer[..IPV4_HEADER])), 0xffff, "v4 header");
+        assert_eq!(fold(word_sum(&answer[IPV4_HEADER..])), 0xffff, "v4 ICMP");
+
+        let source6 = [0xfd, 0x13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let destination6 = [0xfd, 0x13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+        let mut request = vec![ICMPV6_ECHO_REQUEST, 0, 0, 0, 0x12, 0x34, 0, 7];
+        request.extend_from_slice(b"ping");
+        let mut answer = Vec::new();
+        assert!(icmp_echo_reply(
+            source6.into(),
+            destination6.into(),
+            &request,
+            &mut answer
+        ));
+        assert_eq!(answer.len(), IPV6_HEADER + request.len());
+        assert_eq!(answer[0], 0x60);
+        assert_eq!(answer[6], ICMPV6_PROTOCOL);
+        assert_eq!(answer[7], HOP_LIMIT);
+        assert_eq!(&answer[8..24], &destination6, "source is the old target");
+        assert_eq!(&answer[24..40], &source6, "target is the old source");
+        assert_eq!(
+            &answer[IPV6_HEADER..IPV6_HEADER + 2],
+            &[ICMPV6_ECHO_REPLY, 0]
+        );
+        assert_eq!(&answer[IPV6_HEADER + 4..], &request[4..]);
+        let sum = word_sum(&answer[8..24])
+            + word_sum(&answer[24..40])
+            + request.len() as u32
+            + u32::from(ICMPV6_PROTOCOL);
+        let sum = (sum & 0xffff) + (sum >> 16);
+        assert_eq!(
+            fold(sum + word_sum(&answer[IPV6_HEADER..])),
+            0xffff,
+            "v6 ICMP covers the pseudo-header"
+        );
+    }
+
+    #[test]
+    fn a_message_that_is_not_an_echo_request_leaves_the_buffer_alone() {
+        let mut answer = b"kept".to_vec();
+        let base = answer.as_ptr();
+        let refused: [(&[u8], &str); 3] = [
+            (&[ICMP_ECHO_REPLY, 0, 0, 0, 0, 0, 0, 0], "10.13.0.1"),
+            (&[ICMP_ECHO_REQUEST, 3, 0, 0, 0, 0, 0, 0], "10.13.0.1"),
+            (&[ICMP_ECHO_REQUEST, 0, 0, 0], "10.13.0.1"),
+        ];
+        for (message, destination) in refused {
+            assert!(!icmp_echo_reply(
+                "10.13.0.2".parse().expect("a v4 source"),
+                destination.parse().expect("a v4 destination"),
+                message,
+                &mut answer
+            ));
+            assert_eq!(answer, b"kept", "a refusal writes nothing");
+            assert_eq!(answer.as_ptr(), base, "and moves no buffer");
+        }
+        let v6 = [ICMPV6_ECHO_REQUEST, 0, 0, 0, 0, 0, 0, 0];
+        assert!(
+            !icmp_echo_reply(
+                "10.13.0.2".parse().expect("a v4 source"),
+                "fd13::1".parse().expect("a v6 destination"),
+                &v6,
+                &mut answer
+            ),
+            "a family the request does not share"
+        );
+        assert_eq!(answer, b"kept");
     }
 }

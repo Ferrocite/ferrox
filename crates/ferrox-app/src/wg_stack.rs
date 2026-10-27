@@ -19,7 +19,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
 use ferrox_core::foxy::connectip::{
-    udp_datagram, udp_from_packet, UdpDatagram, IPV4_HEADER, IPV6_HEADER, PROTOCOL_UDP,
+    icmp_echo_reply, udp_datagram, udp_from_packet, UdpDatagram, IPV4_HEADER, IPV6_HEADER,
+    PROTOCOL_UDP,
 };
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -229,7 +230,7 @@ pub(crate) fn client(
                 if inner_protocol(&packet.bytes) == Some(PROTOCOL_TCP) {
                     stack.device.push(packet.bytes);
                     progress = true;
-                } else if stack.device.absorb(&packet.bytes) {
+                } else if stack.answer_echo(&packet.bytes) || stack.device.absorb(&packet.bytes) {
                     progress = true;
                 }
             }
@@ -266,6 +267,7 @@ struct ClientStack {
     ports: HashSet<u16>,
     next_port: u16,
     to_tunnel: ToTunnel,
+    addresses: Vec<IpAddr>,
     started: StdInstant,
 }
 
@@ -287,8 +289,13 @@ impl ClientStack {
             ports: HashSet::new(),
             next_port: 49_152,
             to_tunnel,
+            addresses: config.addresses.clone(),
             started: StdInstant::now(),
         }
+    }
+
+    fn answer_echo(&self, packet: &[u8]) -> bool {
+        answer_echo(packet, &self.addresses, &self.to_tunnel)
     }
 
     fn connect(&mut self, flow: ClientFlow) -> std::io::Result<()> {
@@ -395,6 +402,7 @@ struct ServerStack {
     udp: HashMap<([u8; 32], SocketAddr, SocketAddr), UdpLane>,
     to_tunnel: ToTunnel,
     out: Outbound,
+    addresses: Vec<IpAddr>,
     started: StdInstant,
 }
 
@@ -418,6 +426,7 @@ impl ServerStack {
             udp: HashMap::new(),
             to_tunnel,
             out,
+            addresses: config.addresses.clone(),
             started: StdInstant::now(),
         }
     }
@@ -427,9 +436,15 @@ impl ServerStack {
             Some(PROTOCOL_TCP) => self.device.push(packet.bytes),
             Some(PROTOCOL_UDP) => self.datagram(packet.peer, &packet.bytes),
             _ => {
-                self.device.absorb(&packet.bytes);
+                if !self.answer_echo(&packet.bytes) {
+                    self.device.absorb(&packet.bytes);
+                }
             }
         }
+    }
+
+    fn answer_echo(&self, packet: &[u8]) -> bool {
+        answer_echo(packet, &self.addresses, &self.to_tunnel)
     }
 
     fn datagram(&mut self, peer: [u8; 32], bytes: &[u8]) {
@@ -1017,6 +1032,48 @@ pub(crate) const PROTOCOL_TCP: u8 = 6;
 const PROTOCOL_ICMP: u8 = 1;
 const PROTOCOL_ICMPV6: u8 = 58;
 
+/// Answer an echo request the tunnel sent to one of this device's own addresses; the reply
+/// rides the same tunnel back, so a ping to the tunnel address returns instead of vanishing.
+fn answer_echo(packet: &[u8], addresses: &[IpAddr], to_tunnel: &ToTunnel) -> bool {
+    let Some((source, destination)) = inner_addresses(packet) else {
+        return false;
+    };
+    if !addresses.contains(&destination) {
+        return false;
+    }
+    let Some(message) = icmp_message(packet) else {
+        return false;
+    };
+    let mut reply = Vec::with_capacity(packet.len());
+    if !icmp_echo_reply(source, destination, message, &mut reply) {
+        return false;
+    }
+    to_tunnel.send(reply).is_ok()
+}
+
+/// The ICMP message an inner packet carries, cut at its IP header's length so trailing
+/// padding is not read as part of the message.
+fn icmp_message(packet: &[u8]) -> Option<&[u8]> {
+    match packet.first()? >> 4 {
+        4 => {
+            let header = usize::from(*packet.first()? & 0x0f) * 4;
+            let total = usize::from(u16::from_be_bytes([*packet.get(2)?, *packet.get(3)?]));
+            (packet.get(9) == Some(&PROTOCOL_ICMP)
+                && header >= IPV4_HEADER
+                && header + 8 <= total
+                && total <= packet.len())
+            .then(|| &packet[header..total])
+        }
+        6 => {
+            let payload = usize::from(u16::from_be_bytes([*packet.get(4)?, *packet.get(5)?]));
+            let total = IPV6_HEADER + payload;
+            (packet.get(6) == Some(&PROTOCOL_ICMPV6) && total <= packet.len())
+                .then(|| &packet[IPV6_HEADER..total])
+        }
+        _ => None,
+    }
+}
+
 /// The MTU an ICMP Packet Too Big names, when the packet is one at all: a v4 destination-unreachable with code 4, or a v6 packet-too-big, both at or above their family's floor.
 fn icmp_mtu(packet: &[u8]) -> Option<usize> {
     match packet.first()? >> 4 {
@@ -1161,6 +1218,102 @@ mod tests {
         assert!(stack.udp.is_empty(), "an idle lane leaves the table");
         assert!(stop.load(Ordering::Relaxed), "its reader is told to stop");
         crate::budgets::clear();
+    }
+
+    fn echo_v4(source: [u8; 4], destination: [u8; 4], payload: &[u8]) -> Vec<u8> {
+        let length = IPV4_HEADER + 8 + payload.len();
+        let mut packet = vec![0u8; length];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&(length as u16).to_be_bytes());
+        packet[8] = 64;
+        packet[9] = PROTOCOL_ICMP;
+        packet[12..16].copy_from_slice(&source);
+        packet[16..20].copy_from_slice(&destination);
+        packet[IPV4_HEADER] = 8;
+        packet[IPV4_HEADER + 8..].copy_from_slice(payload);
+        packet
+    }
+
+    fn echo_v6(source: [u8; 16], destination: [u8; 16], payload: &[u8]) -> Vec<u8> {
+        let length = 8 + payload.len();
+        let mut packet = vec![0u8; IPV6_HEADER + length];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&(length as u16).to_be_bytes());
+        packet[6] = PROTOCOL_ICMPV6;
+        packet[7] = 64;
+        packet[8..24].copy_from_slice(&source);
+        packet[24..40].copy_from_slice(&destination);
+        packet[IPV6_HEADER] = 128;
+        packet[IPV6_HEADER + 8..].copy_from_slice(payload);
+        packet
+    }
+
+    fn device(addresses: &[&str], is_client: bool) -> DeviceConfig {
+        DeviceConfig {
+            secret: [0u8; 32],
+            addresses: addresses
+                .iter()
+                .map(|address| address.parse().unwrap())
+                .collect(),
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(is_client),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn an_echo_to_the_devices_own_address_is_answered_on_the_tunnel() {
+        let (to_tunnel, replies) = std::sync::mpsc::channel();
+        let stack = ClientStack::new(&device(&["10.0.0.2", "fd00::2"], true), to_tunnel);
+
+        assert!(stack.answer_echo(&echo_v4([10, 0, 0, 1], [10, 0, 0, 2], b"ping")));
+        let reply = replies.try_recv().expect("a v4 reply");
+        assert_eq!(reply[0], 0x45);
+        assert_eq!(&reply[12..16], &[10, 0, 0, 2], "source is this device");
+        assert_eq!(&reply[16..20], &[10, 0, 0, 1], "target is the pinger");
+        assert_eq!(reply[IPV4_HEADER], 0, "an echo reply");
+        assert_eq!(&reply[IPV4_HEADER + 8..], b"ping");
+
+        assert!(stack.answer_echo(&echo_v6(
+            [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2],
+            b"ping",
+        )));
+        let reply = replies.try_recv().expect("a v6 reply");
+        assert_eq!(reply[0], 0x60);
+        assert_eq!(reply[IPV6_HEADER], 129, "an echo reply");
+        assert_eq!(&reply[IPV6_HEADER + 8..], b"ping", "the message comes back");
+
+        assert!(
+            !stack.answer_echo(&echo_v4([10, 0, 0, 1], [10, 0, 0, 9], b"ping")),
+            "not this device's address"
+        );
+        assert!(replies.try_recv().is_err(), "and no reply was sent");
+    }
+
+    #[test]
+    fn a_server_answers_an_echo_to_its_own_address() {
+        let (to_tunnel, replies) = std::sync::mpsc::channel();
+        let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
+        let mut stack = ServerStack::new(&device(&["10.13.0.1"], false), to_tunnel, out);
+
+        stack.receive(Packet {
+            peer: [0u8; 32],
+            bytes: echo_v4([10, 13, 0, 2], [10, 13, 0, 1], b"ping"),
+        });
+        let reply = replies.try_recv().expect("a reply");
+        assert_eq!(&reply[12..16], &[10, 13, 0, 1], "source is this server");
+        assert_eq!(&reply[16..20], &[10, 13, 0, 2], "target is the pinger");
+        assert_eq!(reply[IPV4_HEADER], 0);
+
+        stack.receive(Packet {
+            peer: [0u8; 32],
+            bytes: echo_v4([10, 13, 0, 2], [10, 13, 0, 9], b"ping"),
+        });
+        assert!(replies.try_recv().is_err(), "an address it does not own");
     }
 }
 
