@@ -41678,7 +41678,7 @@ mod tests {
         let (to_tunnel, replies) = std::sync::mpsc::channel();
         let target: std::net::SocketAddr = "192.0.2.1:7".parse().unwrap();
         let source: std::net::SocketAddr = "10.0.0.2:1234".parse().unwrap();
-        let last_used = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let last_used = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(u64::MAX));
         let (uplink, _) = crate::wg_stack::server_udp(
             ([0x11; 32], source, target),
             std::time::Instant::now(),
@@ -41707,8 +41707,9 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(datagram.source_port, target.port());
-        assert!(
-            last_used.load(Ordering::Relaxed) > 0,
+        assert_ne!(
+            last_used.load(Ordering::Relaxed),
+            u64::MAX,
             "the reply refreshes the lane's activity"
         );
     }
