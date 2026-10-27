@@ -682,7 +682,7 @@ fn send_batch(sock: &Datagram, batch: &mut [std::mem::MaybeUninit<libc::mmsghdr>
 }
 
 /// The datagrams one receive takes at a time, the mirror of the send side's `SEND_SLOTS`: a 16 KiB DATA frame is a dozen QUIC packets, and one `recvfrom` each paid a syscall and a timer set per packet. A lane with no batched call reads the same count one at a time.
-pub(crate) const RECV_SLOTS: usize = 8;
+pub(crate) const RECV_SLOTS: usize = 64;
 
 /// A batch of datagrams read off a lane's socket: the bytes of each, the peer it came from and the length of that peer's name. The batch owns its slots, so a read costs no allocation and a caller takes each datagram by its place in the batch.
 #[cfg(target_os = "linux")]
@@ -1083,6 +1083,91 @@ fn send_credit_wait(conn: &mut quiche::Connection, sock: &Datagram, deadline: In
     };
     let left = deadline.saturating_duration_since(Instant::now());
     pump_once(conn, sock, local, left)
+}
+
+/// A send on a lane whose pump owns the socket: the caller never reads it, so a blocked send waits for the pump's ACK instead of stealing its datagram.
+fn stream_send_all_parked(
+    shared: &Mutex<quiche::Connection>,
+    sock: &Datagram,
+    stream: u64,
+    mut buf: &[u8],
+    fin: bool,
+    deadline: Instant,
+) -> bool {
+    while !buf.is_empty() || fin {
+        let outcome = {
+            let Ok(mut conn) = shared.lock() else {
+                return false;
+            };
+            if conn.is_closed() {
+                return false;
+            }
+            match conn.stream_send(stream, buf, fin && buf.is_empty()) {
+                Ok(written) => {
+                    flush_egress(&mut conn, sock);
+                    Some(written)
+                }
+                Err(quiche::Error::Done) => None,
+                Err(_) => return false,
+            }
+        };
+        match outcome {
+            Some(written) => {
+                buf = &buf[written..];
+                if buf.is_empty() {
+                    return true;
+                }
+                if written > 0 {
+                    continue;
+                }
+            }
+            None if buf.is_empty() && !fin => return true,
+            None => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(STREAM_POLL);
+    }
+    true
+}
+
+/// The receive half of `stream_send_all_parked`: the pump feeds the connection, so the waiter polls it without reading the socket.
+fn stream_recv_exact_parked(
+    shared: &Mutex<quiche::Connection>,
+    stream: u64,
+    want: usize,
+    deadline: Instant,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(want);
+    let mut chunk = [0u8; 8192];
+    while out.len() < want {
+        let end = (want - out.len()).min(chunk.len());
+        let found = {
+            let Ok(mut conn) = shared.lock() else {
+                return None;
+            };
+            if conn.is_closed() {
+                return None;
+            }
+            match conn.stream_recv(stream, &mut chunk[..end]) {
+                Ok((0, _)) | Err(quiche::Error::Done) => None,
+                Ok(found) => Some(found),
+                Err(_) => return None,
+            }
+        };
+        if let Some((n, fin)) = found {
+            out.extend_from_slice(&chunk[..n]);
+            if fin {
+                break;
+            }
+        } else if Instant::now() >= deadline {
+            return None;
+        } else {
+            std::thread::sleep(STREAM_POLL);
+        }
+    }
+    (out.len() == want).then_some(out)
 }
 
 pub(crate) fn stream_recv_exact(
@@ -2292,12 +2377,14 @@ fn pump(
     loop {
         // The lock covers quiche calls only: a stalled peer must not stall the sessions sharing the connection.
         let timeout = {
-            let Ok(conn) = shared.lock() else {
+            let Ok(mut conn) = shared.lock() else {
                 return;
             };
             if conn.is_closed() {
                 return;
             }
+            // The previous pass read streams after its flush, so the window updates and ACKs that reading produced are still queued: send them before waiting, or the peer stalls on a closed window.
+            flush_egress(&mut conn, sock);
             conn.timeout()
                 .map_or(PUMP_POLL, |left| left.min(PUMP_POLL))
                 .max(Duration::from_millis(1))
@@ -2621,21 +2708,10 @@ pub(crate) fn dial_pooled(
         leave_session(&pooled.table, id);
         return;
     };
-    let Ok(local) = pooled.sock.local_addr() else {
-        leave_session(&pooled.table, id);
-        return;
-    };
     let header = crate::proxy::vless_header(&dial.id, 1, target);
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    let opened = {
-        let Ok(mut conn) = pooled.conn.lock() else {
-            leave_session(&pooled.table, id);
-            return;
-        };
-        stream_send_all(&mut conn, &flush_sock, id, &header, false, deadline)
-            && stream_recv_exact(&mut conn, &flush_sock, local, id, 2, deadline).as_deref()
-                == Some(&[0, 0])
-    };
+    let opened = stream_send_all_parked(&pooled.conn, &flush_sock, id, &header, false, deadline)
+        && stream_recv_exact_parked(&pooled.conn, id, 2, deadline).as_deref() == Some(&[0, 0]);
     #[cfg(test)]
     qstage(format!("{} t={} header {id} {opened}", dial.port, qms()));
     if !opened {
@@ -2824,6 +2900,7 @@ impl Read for QuicStream {
                         }
                     };
                     if n > 0 {
+                        flush_egress(&mut conn, &self.sock);
                         return Ok(n);
                     }
                     if fin {
@@ -2900,15 +2977,36 @@ impl QuicStream {
         }
     }
 
-    /// Half-close our direction: the peer reads everything sent, then EOF.
+    /// Half-close our direction: the peer reads everything sent, then EOF. A stream the peer already
+    /// reset is finished, not a send to wait ten seconds for; and the wait itself takes the lock one
+    /// poll at a time, so a lane finishing never parks every other stream behind it.
     pub(crate) fn fin(&self) -> bool {
-        let Ok(mut conn) = self.conn.lock() else {
-            return false;
-        };
         let deadline = Instant::now() + SEND_WAIT;
-        let done = stream_send_all(&mut conn, &self.sock, self.id, &[], true, deadline);
-        flush_egress(&mut conn, &self.sock);
-        done
+        loop {
+            let outcome = {
+                let Ok(mut conn) = self.conn.lock() else {
+                    return false;
+                };
+                if conn.is_closed() || conn.stream_finished(self.id) {
+                    Some(true)
+                } else {
+                    match conn.stream_send(self.id, &[], true) {
+                        Ok(_) => {
+                            flush_egress(&mut conn, &self.sock);
+                            Some(true)
+                        }
+                        Err(quiche::Error::Done) if conn.stream_finished(self.id) => Some(true),
+                        Err(quiche::Error::Done) => None,
+                        Err(_) => Some(false),
+                    }
+                }
+            };
+            match outcome {
+                Some(done) => return done,
+                None if Instant::now() >= deadline => return false,
+                None => std::thread::sleep(STREAM_POLL),
+            }
+        }
     }
 
     /// Stop the stream in both directions; the connection itself is untouched.
@@ -3122,7 +3220,7 @@ fn route(
     conns.insert(header.dcid.as_ref().to_vec(), state);
 }
 
-/// A whole receive batch, one lock per run of datagrams for the same lane. A burst for one lane is what a data frame is, so the common batch pays one lock, one `learn_ids` pass per packet and one egress sweep for the run, not one of each per packet. A lane's run keeps the kernel's order; a run for another lane starts its own.
+/// A whole receive batch, one lock per run of datagrams for the same lane. A burst for one lane is what a data frame is, so the common batch pays one lock, one `learn_ids` pass per run and one egress sweep for the run, not one of each per packet. A lane's run keeps the kernel's order; a run for another lane starts its own.
 #[cfg(target_os = "linux")]
 fn route_batch(
     sock: &Datagram,
@@ -3162,7 +3260,6 @@ fn route_batch(
                 };
                 let info = quiche::RecvInfo { from, to: local };
                 let _ = conn.recv(bytes, info);
-                // Per packet, not per run: a source id the edge starts using mid-connection has to route on the next datagram, and that datagram can be in this same batch.
                 learn_ids(conns, &state, &conn);
             }
             flush_egress(&mut conn, sock);
@@ -4117,7 +4214,9 @@ mod tests {
         offer: Option<&[u8]>,
     ) -> (Lane, Lane) {
         let mut server_config = serve_config(identity).expect("serves");
+        server_config.set_active_connection_id_limit(4);
         let mut client_config = quiche_config(&identity.cert_chain, None).expect("trusts");
+        client_config.set_active_connection_id_limit(4);
         let server_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
         let server_addr = server_sock.local_addr().expect("addr");
         let client_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
@@ -4212,6 +4311,107 @@ mod tests {
         );
     }
 
+    /// A peer that rebinds its address keeps the lane: quiche validates the new path and the
+    /// stream id is still the one both ends opened before the move.
+    #[test]
+    fn a_peer_rebind_keeps_the_quic_lane() {
+        let (mut client, mut server) = lane_pair();
+        let id = 0;
+        let sent = client
+            .conn
+            .stream_send(id, b"before", false)
+            .expect("opens");
+        assert_eq!(sent, b"before".len());
+        let mut buf = [0u8; 32];
+        let mut got = 0;
+        for _ in 0..64 {
+            pass(
+                &mut client.conn,
+                &client.sock,
+                &mut server.conn,
+                &server.sock,
+                server.addr,
+            );
+            match server.conn.stream_recv(id, &mut buf) {
+                Ok((n, _)) => {
+                    got = n;
+                    break;
+                }
+                Err(quiche::Error::Done) => {}
+                Err(error) => panic!("reads before the move: {error:?}"),
+            }
+        }
+        assert_eq!(&buf[..got], b"before");
+
+        for _ in 0..2 {
+            let mut scid = [0u8; 16];
+            getrandom::fill(&mut scid).expect("random");
+            client
+                .conn
+                .new_scid(&quiche::ConnectionId::from_ref(&scid), 0, true)
+                .expect("adds a client source id");
+            getrandom::fill(&mut scid).expect("random");
+            server
+                .conn
+                .new_scid(&quiche::ConnectionId::from_ref(&scid), 0, true)
+                .expect("adds a server source id");
+        }
+        for _ in 0..4 {
+            pass(
+                &mut client.conn,
+                &client.sock,
+                &mut server.conn,
+                &server.sock,
+                server.addr,
+            );
+            pass(
+                &mut server.conn,
+                &server.sock,
+                &mut client.conn,
+                &client.sock,
+                client.addr,
+            );
+        }
+
+        let moved = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
+        let moved_addr = moved.local_addr().expect("addr");
+        client
+            .conn
+            .migrate(moved_addr, server.addr)
+            .expect("migrates");
+        client.sock = moved;
+        client.addr = moved_addr;
+        client.conn.stream_send(id, b"after", false).expect("sends");
+
+        let mut after = [0u8; 32];
+        let mut got = 0;
+        for _ in 0..64 {
+            pass(
+                &mut client.conn,
+                &client.sock,
+                &mut server.conn,
+                &server.sock,
+                server.addr,
+            );
+            pass(
+                &mut server.conn,
+                &server.sock,
+                &mut client.conn,
+                &client.sock,
+                client.addr,
+            );
+            match server.conn.stream_recv(id, &mut after) {
+                Ok((n, _)) => {
+                    got = n;
+                    break;
+                }
+                Err(quiche::Error::Done) => {}
+                Err(error) => panic!("reads after the move: {error:?}"),
+            }
+        }
+        assert_eq!(&after[..got], b"after");
+    }
+
     /// The production dial hands the offer to the connection before its first packet, not only the
     /// test helper: a config that names ECH is what makes both ends report acceptance.
     #[test]
@@ -4287,6 +4487,22 @@ mod tests {
             buf[..read],
             pattern[..read],
             "the batch delivered the frame in order, whole"
+        );
+    }
+
+    /// A waiter beside a pump must leave the pump's datagram on the socket: the queue is the witness, since a waiter that read it would empty the queue before the pump saw it.
+    #[test]
+    fn a_parked_receive_leaves_the_socket_to_its_pump() {
+        let (sock, local, conn) = deaf_lane();
+        sock.send_to(&[0xc0, 0x00, 0x00, 0x01, 7], local)
+            .expect("queues");
+        let shared = Mutex::new(conn);
+        let deadline = Instant::now() + Duration::from_millis(20);
+        assert!(stream_recv_exact_parked(&shared, 0, 2, deadline).is_none());
+        let mut buf = [0u8; 64];
+        assert!(
+            sock.recv_from(&mut buf).is_ok(),
+            "the parked waiter read the pump's datagram"
         );
     }
 
