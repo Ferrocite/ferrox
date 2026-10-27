@@ -118,6 +118,7 @@ xtls-vision ops-retired-instructions 29568 scripts/count-ops.sh
 xtls-vision padding-command-bytes 5 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
 xtls-vision first-frame-uuid-bytes 16 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
 xtls-vision largest-framed-block-bytes 8171 ferrox-app-vision::tests::a_bulk_write_frames_every_block_inside_the_bound
+xtls-vision framed-write-calls-per-64KiB-window 1 ferrox-app-vision::tests::a_bulk_write_frames_every_block_inside_the_bound
 xtls-vision tls-buffers-inspected-before-the-switch 8 ferrox-app-vision::tests::both_directions_spend_the_same_filter_budget
 xtls-vision feed-bytes-zeroed-per-steady-read 0 ferrox-app-vision::tests::a_steady_read_builds_no_feed
 xtls-vision user-space-copies-per-byte-while-framed 1 ferrox-app-vision::tests::the_framing_switch_ends_the_staging

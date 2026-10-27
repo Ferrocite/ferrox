@@ -22,6 +22,10 @@ const SHORTEST_FRAME: usize = 21;
 const MAX_FRAME_CONTENT: usize = 8192 - SHORTEST_FRAME;
 /// Padding never exceeds `BUFFER - SHORTEST_FRAME`, so one static zero run covers every trailer the framer writes.
 const ZERO: [u8; BUFFER] = [0u8; BUFFER];
+/// One relay window frames in at most this many blocks; a wider caller flushes between batches.
+const BATCH_FRAMES: usize = crate::proxy::RELAY_BUFFER.div_ceil(MAX_FRAME_CONTENT);
+/// The first frame carries the uuid as its own part, every later frame three parts.
+const BATCH_PARTS: usize = 4 + 3 * (BATCH_FRAMES - 1);
 
 pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     session: S,
@@ -801,28 +805,54 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
         let ends_early = !tls.twelve_or_above && tls.budget <= 1;
         let mut at = 0;
         while at < buf.len() {
-            let content = (buf.len() - at).min(MAX_FRAME_CONTENT);
-            let last = at + content == buf.len();
-            let padding = padding_len(content, tls.present);
-            let switches = last && complete;
-            let command = match (switches && tls.enable_xtls, ends_early || switches) {
-                (true, _) => VisionCommand::Direct.byte(),
-                (_, true) => 1,
-                _ => 0,
-            };
-            let head = Self::frame_head(command, content, padding);
-            let payload = &buf[at..at + content];
-            // Uuid on the first frame, then head, caller's buffer, zero trailer: one `write_all_slices`, one record, no copies.
+            let mut heads = [[0u8; 5]; BATCH_FRAMES];
+            let mut offsets = [0usize; BATCH_FRAMES];
+            let mut lengths = [0usize; BATCH_FRAMES];
+            let mut paddings = [0usize; BATCH_FRAMES];
+            let mut frames = 0usize;
+            let mut switch_at = None;
+            while at < buf.len() && frames < BATCH_FRAMES {
+                let content = (buf.len() - at).min(MAX_FRAME_CONTENT);
+                let last = at + content == buf.len();
+                let padding = padding_len(content, tls.present);
+                let switches = last && complete;
+                let command = match (switches && tls.enable_xtls, ends_early || switches) {
+                    (true, _) => VisionCommand::Direct.byte(),
+                    (_, true) => 1,
+                    _ => 0,
+                };
+                heads[frames] = Self::frame_head(command, content, padding);
+                offsets[frames] = at;
+                lengths[frames] = content;
+                paddings[frames] = padding;
+                at += content;
+                frames += 1;
+                if command != 0 {
+                    switch_at = Some((at, command));
+                    break;
+                }
+            }
             let first = !self.write.sent_uuid;
             self.write.sent_uuid = true;
-            let parts: &[&[u8]] = if first {
-                &[&self.uuid[..], &head, payload, &ZERO[..padding]]
-            } else {
-                &[&head, payload, &ZERO[..padding]]
-            };
-            self.session.write_all_slices(parts)?;
-            at += content;
-            if command != 0 {
+            let mut parts: [&[u8]; BATCH_PARTS] = [&[]; BATCH_PARTS];
+            let mut used = 0usize;
+            for frame in 0..frames {
+                if first && frame == 0 {
+                    parts[used] = &self.uuid[..];
+                    used += 1;
+                }
+                parts[used] = &heads[frame];
+                used += 1;
+                let content = &buf[offsets[frame]..offsets[frame] + lengths[frame]];
+                parts[used] = content;
+                used += 1;
+                if paddings[frame] > 0 {
+                    parts[used] = &ZERO[..paddings[frame]];
+                    used += 1;
+                }
+            }
+            self.session.write_all_slices(&parts[..used])?;
+            if let Some((at, command)) = switch_at {
                 self.write.padding = false;
                 if command == VisionCommand::Direct.byte() {
                     if let Some(direct) = self.direct {
@@ -1432,8 +1462,8 @@ mod tests {
     /// A sink that records the slices it was handed, so the pointer can witness the removed copy.
     struct Peeker {
         written: Vec<u8>,
-        /// `(payload_ptr, payload_len)` for each `write_all_slices` call.
-        calls: Vec<(*const u8, usize)>,
+        /// Every part `(ptr, len)` of each `write_all_slices` call.
+        calls: Vec<Vec<(*const u8, usize)>>,
         /// uuid pointer for the calls where the framer prepended it (the first frame).
         uuids: Vec<*const u8>,
     }
@@ -1457,16 +1487,18 @@ mod tests {
 
     impl RecordAlignment for Peeker {
         fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
-            // First frame: uuid | head | caller's payload | zero trailer. Later: head | caller's payload | zero trailer.
-            let (uuid_at, payload_at) = match parts.len() {
-                3 => (None, 1),
-                4 => (Some(0), 2),
-                n => panic!("unexpected {n} parts"),
-            };
-            self.calls
-                .push((parts[payload_at].as_ptr(), parts[payload_at].len()));
-            if let Some(i) = uuid_at {
-                self.uuids.push(parts[i].as_ptr());
+            self.calls.push(
+                parts
+                    .iter()
+                    .map(|part| (part.as_ptr(), part.len()))
+                    .collect(),
+            );
+            if self.uuids.is_empty() {
+                if let Some(first) = parts.first() {
+                    if first.len() == 16 {
+                        self.uuids.push(first.as_ptr());
+                    }
+                }
             }
             for part in parts {
                 self.written.extend_from_slice(part);
@@ -1492,7 +1524,7 @@ mod tests {
         let want_len = payload.len();
         link.write_all(&payload).expect("writes");
         assert_eq!(link.session.calls.len(), 1);
-        let (got_ptr, got_len) = link.session.calls[0];
+        let (got_ptr, got_len) = link.session.calls[0][2];
         assert_eq!(
             got_ptr, want_ptr,
             "the caller's payload reached the session uncopied"
@@ -1504,7 +1536,7 @@ mod tests {
         link.write_all(&payload).expect("writes");
         assert_eq!(link.session.calls.len(), 2);
         assert_eq!(
-            link.session.calls[1].0, second_ptr,
+            link.session.calls[1][1].0, second_ptr,
             "still by pointer, after a realloc"
         );
     }
@@ -1546,12 +1578,11 @@ mod tests {
                 content + padding <= MAX_FRAME_CONTENT,
                 "block {blocks} frames {content}+{padding} past the bound"
             );
-            assert_eq!(
-                link.session.calls[blocks].0,
-                base.wrapping_add(framed),
+            let part = (base.wrapping_add(framed), content);
+            assert!(
+                link.session.calls[0].contains(&part),
                 "block {blocks} reaches the session from the caller's buffer"
             );
-            assert_eq!(link.session.calls[blocks].1, content);
             assert_eq!(
                 &out[at + 5..at + 5 + content],
                 &body[framed..framed + content]
@@ -1570,7 +1601,11 @@ mod tests {
         assert_eq!(at, out.len(), "every framed byte was walked");
         assert_eq!(framed, body.len(), "the payload arrived whole");
         assert_eq!(blocks, body.len().div_ceil(MAX_FRAME_CONTENT));
-        assert_eq!(link.session.calls.len(), blocks);
+        assert_eq!(
+            link.session.calls.len(),
+            1,
+            "the 64 KiB window leaves in one session call"
+        );
     }
 
     /// The uuid reaches the session as a slice of the link's own field; a stack-header build would have copied it there.

@@ -997,15 +997,7 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsServer
 /// caller text, so they are laid out on the stack like [`RustlsProvider::write_parts`] does
 /// its two, rather than spending one heap `Vec<IoSlice>` on every framed write.
 fn coalesce<W: Write + ?Sized>(writer: &mut W, parts: &[&[u8]]) -> std::io::Result<()> {
-    let mut stack = [
-        std::io::IoSlice::new(&[]),
-        std::io::IoSlice::new(&[]),
-        std::io::IoSlice::new(&[]),
-        std::io::IoSlice::new(&[]),
-        std::io::IoSlice::new(&[]),
-        std::io::IoSlice::new(&[]),
-        std::io::IoSlice::new(&[]),
-    ];
+    let mut stack: [std::io::IoSlice<'_>; 32] = std::array::from_fn(|_| std::io::IoSlice::new(&[]));
     if parts.len() <= stack.len() {
         let mut kept = 0;
         for part in parts.iter().copied().filter(|part| !part.is_empty()) {
@@ -3339,6 +3331,7 @@ mod tests {
 
     /// The four segments the Vision framer hands go out in one record off the stack: no heap
     /// buffer per framed write, which is the allocation the old `collect::<Vec<_>>` paid for.
+    /// The nine-frame batch is 28 parts and rides the same stack.
     #[test]
     fn the_framer_path_coalesces_without_a_heap_buffer() {
         let uuid = [0xabu8; 16];
@@ -3356,6 +3349,18 @@ mod tests {
         );
         assert_eq!(recorder.calls, 1, "one `write_vectored`, so one record");
         assert_eq!(recorder.bytes, 16 + 5 + 1400 + 200);
+
+        let part: &[u8] = &[0u8];
+        let batch = [part; 28];
+        let mut recorder = SegmentRecorder { calls: 0, bytes: 0 };
+        let (result, counts) = crate::alloc_count::measure(|| coalesce(&mut recorder, &batch));
+        result.expect("coalesces");
+        assert_eq!(
+            counts.allocs, 0,
+            "the 28-part batch rides the stack, counted {counts:?}"
+        );
+        assert_eq!(recorder.calls, 1, "one `write_vectored` for the batch");
+        assert_eq!(recorder.bytes, 28);
     }
 
     /// The camouflage head gather is one piece wider than the framer — `GET `, the path, the
