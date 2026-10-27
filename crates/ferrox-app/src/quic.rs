@@ -92,6 +92,15 @@ impl PooledStream {
     pub(crate) fn cancel(&self) {
         stop_stream(&self.conn, &self.sock, self.id);
     }
+
+    /// A byte-stream handle on this lease: the same connection and id, without a second lease, so the caller keeps this one alive until both directions end.
+    pub(crate) fn stream_handle(&self) -> QuicStream {
+        QuicStream {
+            conn: Arc::clone(&self.conn),
+            sock: Arc::clone(&self.sock),
+            id: self.id,
+        }
+    }
 }
 
 /// Stops one stream in both directions: the connection itself is untouched and keeps carrying other flows.
@@ -2400,13 +2409,13 @@ fn lane_is_live(entry: &PooledConn) -> bool {
 }
 
 /// Take a stream on the lane, and put a pump behind a parked one that this lease can use in the same table lock: a thread leaving an empty lane and a lease landing on it cannot both win the flag, so no flow waits on a thread that already ended.
-fn lend(pooled: &PooledConn, up: Option<Connection>) -> Option<u64> {
+fn lend(pooled: &PooledConn, up: Option<Connection>, drive: bool) -> Option<u64> {
     let mut table = pooled.table.lock().ok()?;
     if table.sessions.len() + table.opening.len() >= MAX_STREAMS as usize {
         return None;
     }
-    // Only a lease the pump can serve starts one: `hand_off` skips an id still opening, so for a lease that reads itself the thread is a second reader of one file description — it takes datagrams as they land and re-arms the read wait the flow just set, so the flow wakes on the pump's poll instead of its own.
-    if up.is_some() && table.parked.take().is_some() {
+    // A lease that hands its stream to a client and one that reads the stream itself both need the lane's datagrams taken; the second kind gets the driver because no client thread will read for it, and `hand_off` skips an id still opening.
+    if drive && table.parked.take().is_some() {
         let (Ok(pump_sock), Ok(local)) = (pooled.sock.try_clone(), pooled.sock.local_addr()) else {
             table.parked = Some(Instant::now());
             return None;
@@ -2601,7 +2610,7 @@ pub(crate) fn dial_pooled(
         qstage(format!("{} t={} build-none", dial.port, qms()));
         return;
     };
-    let Some(id) = lend(&pooled, client.try_clone().ok()) else {
+    let Some(id) = lend(&pooled, client.try_clone().ok(), true) else {
         #[cfg(test)]
         qstage(format!("{} t={} open-none", dial.port, qms()));
         return;
@@ -2643,6 +2652,15 @@ pub(crate) fn dial_pooled(
 
 /// A stream on the pooled connection under the named budget; a connection the budget missed is never pooled.
 pub(crate) fn pooled_stream_within(dial: &QuicDial, budget: Duration) -> Option<PooledStream> {
+    lease_within(dial, budget, false)
+}
+
+/// A lease that reads its own stream: the lane's pump drives the connection while the lease is alive, since no client thread reads the socket for it.
+pub(crate) fn pumped_stream_within(dial: &QuicDial, budget: Duration) -> Option<PooledStream> {
+    lease_within(dial, budget, true)
+}
+
+fn lease_within(dial: &QuicDial, budget: Duration, drive: bool) -> Option<PooledStream> {
     let pooled = pool().stream(dial).or_else(|| {
         let fresh = build_pooled_within(dial, budget)?;
         let Ok(mut pool) = pool().inner.lock() else {
@@ -2656,7 +2674,7 @@ pub(crate) fn pooled_stream_within(dial: &QuicDial, budget: Duration) -> Option<
     })?;
     // The address is read before the id is taken: a lease that cannot say where it is has no id to give back yet.
     let local = pooled.sock.local_addr().ok()?;
-    let id = lend(&pooled, None)?;
+    let id = lend(&pooled, None, drive)?;
     Some(PooledStream {
         conn: Arc::clone(&pooled.conn),
         sock: Arc::clone(&pooled.sock),

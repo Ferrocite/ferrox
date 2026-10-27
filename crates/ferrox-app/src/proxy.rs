@@ -5336,20 +5336,47 @@ fn serve_vless_quic_inbound(
     true
 }
 
-/// One QUIC stream, one VLESS session: the header, the accept, then the relay with a FIN at its end.
+/// One QUIC stream, one VLESS session: the header, the accept, then TCP, UDP or mux on the same stream.
 fn serve_vless_quic(mut stream: crate::quic::QuicStream, users: &[VlessUser], freedom: bool) {
-    let fin = stream.clone();
     let decoded = decode_request_bounded(&mut stream);
     let Some((got, flow, cmd, target)) = decoded else {
         stream.close();
         return;
     };
-    // Streams carry TCP sessions only, never Vision framing, UDP or mux: a foreign shape closes here.
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    // Vision framing and reverse accounts ride their own carriers: a QUIC stream carries the reference's three session kinds.
+    let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
+        stream.close();
+        return;
+    };
+    if !freedom || user.reverse.is_some() || !vless_flow_ok(user, flow, cmd, false) {
         stream.close();
         return;
     }
-    let Some(uplink) = dial_or_report(&target) else {
+    let stop = stream.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || stop.close());
+    match cmd {
+        1 => serve_vless_quic_tcp(stream, &target),
+        2 => {
+            if stream.write_all(&[0, 0]).is_err() {
+                stream.close();
+                return;
+            }
+            serve_udp_stream(stream.clone(), stream, &target, Vec::new(), &close);
+        }
+        3 => {
+            if stream.write_all(&[0, 0]).is_err() {
+                stream.close();
+                return;
+            }
+            serve_sealed_mux_split(stream.clone(), stream, close);
+        }
+        _ => stream.close(),
+    }
+}
+
+fn serve_vless_quic_tcp(mut stream: crate::quic::QuicStream, target: &SocketAddr) {
+    let fin = stream.clone();
+    let Some(uplink) = dial_or_report(target) else {
         stream.close();
         return;
     };
@@ -9184,6 +9211,9 @@ fn dial_udp_uplink(
     if !vless_udp_target_allowed(vless, dest) {
         return None;
     }
+    if matches!(vless.carrier, Carrier::Quic) {
+        return dial_quic_udp_uplink(vless, dest, relay, source);
+    }
     if !matches!(vless.carrier, Carrier::Raw(_)) {
         return None;
     }
@@ -9221,6 +9251,49 @@ fn dial_udp_uplink(
     let done = spawn_udp_uplink_reader(read, udp_send, source, *dest);
     Some(UdpUplink {
         write,
+        close,
+        target: *dest,
+        done,
+    })
+}
+
+fn vless_quic_dial(vless: &VlessOut) -> crate::quic::QuicDial {
+    crate::quic::QuicDial {
+        id: vless.id,
+        host: std::sync::Arc::from(vless.host.as_str()),
+        address: std::sync::Arc::from(vless.address.as_str()),
+        port: vless.port,
+        upstream: None,
+        roots: vless.quic_roots.clone(),
+        ech_config_list: vless.quic_ech.clone(),
+    }
+}
+
+/// A datagram association on its own QUIC stream: the lease is the flow's, so the stream and the pool entry live until the association closes.
+fn dial_quic_udp_uplink(
+    vless: &VlessOut,
+    dest: &SocketAddr,
+    relay: &UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+) -> Option<UdpUplink> {
+    let pooled = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())?;
+    let mut stream = pooled.stream_handle();
+    let header = vless_header(&vless.id, 2, &Destination::from(*dest));
+    stream.write_all(&header).ok()?;
+    read_vless_response(&mut stream)?;
+    let read = pooled.stream_handle();
+    let Ok(udp_send) = relay.try_clone() else {
+        return None;
+    };
+    let done = spawn_udp_uplink_reader(Box::new(read), udp_send, source, *dest);
+    let close_stream = pooled.stream_handle();
+    let pooled = Mutex::new(Some(pooled));
+    let close = Arc::new(move || {
+        close_stream.close();
+        drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
+    });
+    Some(UdpUplink {
+        write: Box::new(stream),
         close,
         target: *dest,
         done,
@@ -10203,6 +10276,9 @@ struct MuxUplink {
 }
 
 fn open_vless_mux(vless: &VlessOut) -> Option<MuxUplink> {
+    if matches!(vless.carrier, Carrier::Quic) {
+        return open_vless_mux_quic(vless);
+    }
     let server = resolve_outbound(&vless.address, vless.port)?;
     let uplink = dial_or_report(&server)?.with_mask(vless.carrier.tcp_mask());
     let header = vless_mux_header(&vless.id);
@@ -10232,6 +10308,25 @@ fn open_vless_mux(vless: &VlessOut) -> Option<MuxUplink> {
     Some(MuxUplink {
         read: Box::new(read),
         write: Box::new(uplink),
+        close,
+    })
+}
+
+fn open_vless_mux_quic(vless: &VlessOut) -> Option<MuxUplink> {
+    let pooled = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())?;
+    let mut stream = pooled.stream_handle();
+    stream.write_all(&vless_mux_header(&vless.id)).ok()?;
+    read_vless_response(&mut stream)?;
+    let read = pooled.stream_handle();
+    let close_stream = pooled.stream_handle();
+    let pooled = Mutex::new(Some(pooled));
+    let close = Arc::new(move || {
+        close_stream.close();
+        drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
+    });
+    Some(MuxUplink {
+        read: Box::new(read),
+        write: Box::new(stream),
         close,
     })
 }
@@ -14169,20 +14264,10 @@ pub(crate) fn serve_connect(
     }
     if let Outbound::Vless(vless) = out {
         if matches!(vless.carrier, Carrier::Quic) {
-            if !vless.mux {
-                crate::quic::dial_pooled(
-                    &client,
-                    &crate::quic::QuicDial {
-                        id: vless.id,
-                        host: std::sync::Arc::from(vless.host.as_str()),
-                        address: std::sync::Arc::from(vless.address.as_str()),
-                        port: vless.port,
-                        upstream: None,
-                        roots: vless.quic_roots.clone(),
-                        ech_config_list: vless.quic_ech.clone(),
-                    },
-                    asked,
-                );
+            if vless.mux {
+                dial_vless_mux(&client, vless, asked);
+            } else {
+                crate::quic::dial_pooled(&client, &vless_quic_dial(vless), asked);
             }
             return;
         }
@@ -15362,6 +15447,9 @@ pub(crate) fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Optio
     match out {
         // The reference's loopback handler is TCP-only, so a datagram keeps the named dial's lane.
         Outbound::Loopback(loopback) => serve_udp_lane(relay, &loopback.dial, associate),
+        Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Quic) => {
+            serve_socks_udp_vless(relay, vless);
+        }
         Outbound::Vless(vless)
             if matches!(vless.carrier, Carrier::Raw(_)) && vless.tls.is_none() =>
         {
@@ -35530,6 +35618,69 @@ mod tests {
     }
 
     #[test]
+    fn quic_serves_vless_udp_over_loopback() {
+        let _serial = quic_serial();
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            loop {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (addr, roots, stop, driver) = quic_serve_loopback(id);
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
+            .expect("a socket the server can be addressed from");
+        let sock = crate::quic::Datagram::plain(sock);
+        let mut conn = crate::quic::handshake_within(
+            &sock,
+            peer,
+            local,
+            "localhost",
+            &roots,
+            None,
+            QUIC_TEST_TIMEOUT,
+        )
+        .expect("handshakes");
+        assert!(crate::quic::send_h3_opening(&mut conn, &sock));
+        let deadline = Instant::now() + QUIC_TEST_TIMEOUT;
+        assert!(crate::quic::stream_send_all(
+            &mut conn,
+            &sock,
+            0,
+            &vless_header(&id, 2, &Destination::from(target)),
+            false,
+            deadline
+        ));
+        let accept = crate::quic::stream_recv_exact(&mut conn, &sock, local, 0, 2, deadline)
+            .expect("accepts");
+        assert_eq!(accept, vec![0, 0]);
+        let payload = b"ping";
+        let mut frame = Vec::with_capacity(2 + payload.len());
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        frame.extend_from_slice(payload);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 0, &frame, false, deadline
+        ));
+        let back =
+            crate::quic::stream_recv_exact(&mut conn, &sock, local, 0, frame.len(), deadline)
+                .expect("echoes");
+        assert_eq!(&back[..2], &frame[..2]);
+        assert_eq!(&back[2..], payload);
+        let _ = conn.close(false, 0, b"done");
+        crate::quic::flush_egress(&mut conn, &sock);
+        stop.store(true, Ordering::Relaxed);
+        driver.join().expect("joins");
+    }
+
+    #[test]
     fn quic_serves_two_streams_on_one_connection() {
         let _serial = quic_serial();
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -36803,6 +36954,148 @@ mod tests {
         assert_eq!(&back, b"ping");
         drop(client);
         server.join().expect("joins");
+    }
+
+    #[test]
+    fn socks_associate_reaches_udp_echo_via_quic_vless() {
+        let _serial = quic_serial();
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            loop {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (addr, roots, stop, driver) = quic_serve_loopback(id);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            id,
+            carrier: Carrier::Quic,
+            host: "localhost".to_owned(),
+            mux: false,
+            quic_roots: Some(roots.into()),
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        });
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        let mut datagram = vec![0u8, 0, 0];
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, relay).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = udp.recv_from(&mut back).expect("echoes");
+        let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"ping");
+        drop(client);
+        stop.store(true, Ordering::Relaxed);
+        driver.join().expect("joins");
+    }
+
+    #[test]
+    fn socks_dials_vless_quic_mux_to_echo() {
+        let _serial = quic_serial();
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                let Ok(read) = stream.read(&mut buf) else {
+                    return;
+                };
+                if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                    return;
+                }
+            }
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (addr, roots, stop, driver) = quic_serve_loopback(id);
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = Outbound::Vless(VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port: addr.port(),
+            id,
+            carrier: Carrier::Quic,
+            host: "localhost".to_owned(),
+            mux: true,
+            quic_roots: Some(roots.into()),
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        });
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        let mut request = vec![5, 1, 0, 1, 127, 0, 0, 1];
+        request.extend_from_slice(&echo_port.to_be_bytes());
+        client.write_all(&request).expect("connects");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(reply[1], 0);
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        drop(client);
+        stop.store(true, Ordering::Relaxed);
+        driver.join().expect("joins");
     }
 
     #[test]
