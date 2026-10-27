@@ -2061,7 +2061,16 @@ pub(crate) fn serve(mut stream: Connection, users: &Users, freedom: bool) {
     if stream.write_all(&prefix).is_err() {
         return;
     }
-    pump_relay(&uplink, &stream, send, recv, None);
+    let Ok(reader) = stream.try_clone() else {
+        return;
+    };
+    let Ok(closer) = stream.try_clone() else {
+        return;
+    };
+    let close: Close = std::sync::Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    pump_relay_carried(&uplink, reader, stream, &close, send, recv, None);
 }
 
 pub(crate) fn serve_vmess_udp(
