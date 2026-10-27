@@ -9,6 +9,7 @@ use ferrox_core::foxy::frames;
 use ferrox_core::hysteria::{self, Defrag, Masquerade, UdpMessage};
 
 use crate::conn::Connection;
+use crate::proxy::lane_pool::Next;
 use crate::quic::{Unfilled, MAX_DATAGRAM, RECV_ROOM};
 
 const AUTH_STREAM: u64 = 0;
@@ -859,16 +860,28 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
     let mut buffer = crate::proxy::RelayBuf::new();
     crate::proxy::lane_pool::submit(
         Box::new(move || {
-            let more = match tcp_read.read(buffer.as_mut()) {
-                Ok(0) => false,
-                Ok(n) => up.write_all(buffer.filled(n)).is_ok(),
-                Err(error) if crate::proxy::is_timeout(&error) => !forward.ended(),
-                Err(_) => false,
+            let next = match tcp_read.read(buffer.as_mut()) {
+                Ok(0) => Next::Done,
+                Ok(n) => {
+                    if up.write_all(buffer.filled(n)).is_ok() {
+                        Next::More
+                    } else {
+                        Next::Done
+                    }
+                }
+                Err(error) if crate::proxy::is_timeout(&error) => {
+                    if forward.ended() {
+                        Next::Done
+                    } else {
+                        Next::Idle
+                    }
+                }
+                Err(_) => Next::Done,
             };
-            if !more {
+            if next == Next::Done {
                 up.close();
             }
-            more
+            next
         }),
         Box::new({
             let done = Arc::clone(&done);
@@ -884,15 +897,27 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
     let mut buffer = crate::proxy::RelayBuf::new();
     crate::proxy::lane_pool::submit(
         Box::new(move || {
-            let more = match back.read_step(buffer.as_mut()) {
-                Ok(Some(0)) | Err(_) => false,
-                Ok(Some(n)) => tcp_write.write_all(buffer.filled(n)).is_ok(),
-                Ok(None) => !backward.ended(),
+            let next = match back.read_step(buffer.as_mut()) {
+                Ok(Some(0)) | Err(_) => Next::Done,
+                Ok(Some(n)) => {
+                    if tcp_write.write_all(buffer.filled(n)).is_ok() {
+                        Next::More
+                    } else {
+                        Next::Done
+                    }
+                }
+                Ok(None) => {
+                    if backward.ended() {
+                        Next::Done
+                    } else {
+                        Next::Idle
+                    }
+                }
             };
-            if !more {
+            if next == Next::Done {
                 let _ = tcp_write.shutdown(Shutdown::Write);
             }
-            more
+            next
         }),
         Box::new({
             let done = Arc::clone(&done);

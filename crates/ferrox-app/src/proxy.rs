@@ -9,6 +9,8 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use lane_pool::Next;
+
 use crate::budgets::{
     self, ACCOUNT_ATTEMPTS, CARRIER_DEAD_SECS, RELAY_HANDOFF_SPINS, RELAY_IDLE, RELAY_LOCK_TRIES,
     RELAY_MOVING_READS, RELAY_POLL, SESSION_POLL,
@@ -2762,6 +2764,7 @@ fn serve_vless_ws(
     if !writer.send(&[0, 0]) {
         return;
     }
+    reader.set_poll(Some(RELAY_POLL));
     crate::proxy::relay_sink(reader, &writer, &uplink, |_| {});
 }
 
@@ -2812,6 +2815,7 @@ fn serve_vless_httpupgrade(
     if write.write_all(&[0, 0]).is_err() {
         return;
     }
+    reader.set_poll(Some(RELAY_POLL));
     crate::proxy::relay_carried(reader, &write, &uplink);
 }
 
@@ -2863,6 +2867,7 @@ fn serve_vless_grpc(
     if !writer.send(&[0, 0]) {
         return;
     }
+    reader.set_poll(Some(RELAY_POLL));
     crate::proxy::relay_sink(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
 }
 
@@ -2912,6 +2917,7 @@ fn serve_vless_httpheader(
     if write.write_all(&[0, 0]).is_err() {
         return;
     }
+    reader.set_poll(Some(RELAY_POLL));
     crate::proxy::relay_carried(reader, &write, &uplink);
 }
 
@@ -3018,7 +3024,7 @@ fn decode_request_bounded(stream: &mut dyn Read) -> Option<([u8; 16], Flow, u8, 
     decode_request(&mut bounded)
 }
 
-/// The two arms a carried reader holds for the length of one decode: the `ws` and `grpc` readers both retry a timeout forever, so a head needs the socket's poll quantum and a wall-clock end.
+/// The two arms a carried reader holds for the length of one decode: outside a lane the `ws` and `grpc` readers wait out a timeout, so a head needs the socket's poll quantum and a wall-clock end.
 pub(crate) trait Carried {
     fn arm(&mut self, every: std::time::Duration, until: Instant);
     fn disarm(&mut self);
@@ -7157,7 +7163,7 @@ fn spill_lane_step<R, W>(
     to: &Half<W>,
     buffer: &mut RelayBuf,
     ended: &RelayFinish,
-) -> bool
+) -> Next
 where
     R: Read,
     W: Write + HalfShut,
@@ -7165,11 +7171,17 @@ where
     match from.read_once(buffer.as_mut()) {
         Ok(0) => {
             to.spill_write();
-            false
+            Next::Done
         }
-        Ok(n) => to.write_once(buffer.filled(n)).is_ok(),
-        Err(error) if is_timeout(&error) => !ended.ended(),
-        Err(_) => false,
+        Ok(n) if to.write_once(buffer.filled(n)).is_ok() => Next::More,
+        Err(error) if is_timeout(&error) => {
+            if ended.ended() {
+                Next::Done
+            } else {
+                Next::Idle
+            }
+        }
+        Ok(_) | Err(_) => Next::Done,
     }
 }
 
@@ -7267,6 +7279,30 @@ pub(crate) fn read_into_tail(
 
 pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
     ferrox_core::tls::TlsError::is_timeout(error)
+}
+
+thread_local! {
+    /// Set while a lane step runs: a framed reader that times out hands the lane back instead of sleeping in it.
+    static RELAY_STEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(crate) fn relay_step_owns_poll() -> bool {
+    RELAY_STEP.with(std::cell::Cell::get)
+}
+
+/// Scoped claim, so a step that returns or panics leaves the thread as it found it.
+pub(crate) struct RelayStep(bool);
+
+impl RelayStep {
+    pub(crate) fn enter() -> Self {
+        Self(RELAY_STEP.with(|flag| flag.replace(true)))
+    }
+}
+
+impl Drop for RelayStep {
+    fn drop(&mut self) {
+        RELAY_STEP.with(|flag| flag.set(self.0));
+    }
 }
 
 pub(crate) fn vless_header(id: &[u8; 16], cmd: u8, target: &Destination) -> Vec<u8> {
@@ -7540,6 +7576,7 @@ fn dial_vless_headed(
     if !answered {
         return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
     }
+    reader.set_poll(Some(RELAY_POLL));
     crate::proxy::relay_carried(reader, &write, client);
     true
 }
@@ -7589,6 +7626,7 @@ fn dial_vless_rung(
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
+            reader.set_poll(Some(RELAY_POLL));
             crate::proxy::relay_sink(reader, &writer, client, |_| {});
             true
         }
@@ -7628,6 +7666,7 @@ fn dial_vless_rung(
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
+            reader.set_poll(Some(RELAY_POLL));
             crate::proxy::relay_carried(reader, &write, client);
             true
         }
@@ -7661,6 +7700,7 @@ fn dial_vless_rung(
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
+            reader.set_poll(Some(RELAY_POLL));
             crate::proxy::relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
             true
         }
@@ -7690,6 +7730,7 @@ fn dial_vless_rung(
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
+            reader.set_poll(Some(RELAY_POLL));
             crate::proxy::relay_sink_drained(reader, &writer, client);
             true
         }
@@ -7735,7 +7776,7 @@ thread_local! {
 struct KcpHandshakeRead(bool);
 
 impl KcpHandshakeRead {
-    fn enter() -> Self {
+    pub(crate) fn enter() -> Self {
         Self(KCP_HANDSHAKE_READ.with(|read| read.replace(true)))
     }
 }
@@ -7810,16 +7851,28 @@ fn kcp_relay(tcp: &Connection, conn: &Arc<ferrox_core::kcp::Connection>) {
     let mut buffer = RelayBuf::new();
     lane_pool::submit(
         Box::new(move || {
-            let more = match tcp_read.read(buffer.as_mut()) {
-                Ok(0) => false,
-                Ok(n) => up.write(buffer.filled(n)).is_ok(),
-                Err(error) if is_timeout(&error) => !forward.ended(),
-                Err(_) => false,
+            let next = match tcp_read.read(buffer.as_mut()) {
+                Ok(0) => Next::Done,
+                Ok(n) => {
+                    if up.write(buffer.filled(n)).is_ok() {
+                        Next::More
+                    } else {
+                        Next::Done
+                    }
+                }
+                Err(error) if is_timeout(&error) => {
+                    if forward.ended() {
+                        Next::Done
+                    } else {
+                        Next::Idle
+                    }
+                }
+                Err(_) => Next::Done,
             };
-            if !more {
+            if next == Next::Done {
                 up.close();
             }
-            more
+            next
         }),
         Box::new({
             let finish = Arc::clone(&finish);
@@ -7837,16 +7890,28 @@ fn kcp_relay(tcp: &Connection, conn: &Arc<ferrox_core::kcp::Connection>) {
     let mut buffer = RelayBuf::new();
     lane_pool::submit(
         Box::new(move || {
-            let more = match download.read(buffer.as_mut()) {
-                Ok(0) => false,
-                Ok(n) => tcp_write.write_all(buffer.filled(n)).is_ok(),
-                Err(error) if is_timeout(&error) => !backward.ended(),
-                Err(_) => false,
+            let next = match download.read(buffer.as_mut()) {
+                Ok(0) => Next::Done,
+                Ok(n) => {
+                    if tcp_write.write_all(buffer.filled(n)).is_ok() {
+                        Next::More
+                    } else {
+                        Next::Done
+                    }
+                }
+                Err(error) if is_timeout(&error) => {
+                    if backward.ended() {
+                        Next::Done
+                    } else {
+                        Next::Idle
+                    }
+                }
+                Err(_) => Next::Done,
             };
-            if !more {
+            if next == Next::Done {
                 let _ = tcp_write.shutdown(Shutdown::Write);
             }
-            more
+            next
         }),
         Box::new({
             let finish = Arc::clone(&finish);
@@ -11200,7 +11265,7 @@ fn dial_trojan_headed(
     let Carrier::HttpHeader { path } = &trojan.carrier else {
         return true;
     };
-    let Some((reader, mut write)) =
+    let Some((mut reader, mut write)) =
         crate::httpheader::connect(uplink, &trojan.host, path, &trojan.headers)
     else {
         return !Failure::new(Stage::SocketConnected, Kind::Unreachable).worth_retrying();
@@ -11208,6 +11273,7 @@ fn dial_trojan_headed(
     if write.write_all(header).is_err() {
         return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
     }
+    reader.set_poll(Some(RELAY_POLL));
     crate::proxy::relay_carried(reader, &write, client);
     true
 }
@@ -11224,7 +11290,7 @@ fn dial_trojan_rung(
     let rung = attempt.rung;
     match rung {
         Rung::Ws => {
-            let Some((reader, writer)) = crate::ws::connect(
+            let Some((mut reader, writer)) = crate::ws::connect(
                 uplink,
                 &trojan.host,
                 attempt.path,
@@ -11236,6 +11302,7 @@ fn dial_trojan_rung(
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
             note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+            reader.set_poll(Some(RELAY_POLL));
             crate::proxy::relay_sink(reader, &writer, client, |_| {});
             true
         }
@@ -11252,7 +11319,7 @@ fn dial_trojan_rung(
             true
         }
         Rung::HttpUpgrade => {
-            let Some((reader, write)) = crate::httpupgrade::connect(
+            let Some((mut reader, write)) = crate::httpupgrade::connect(
                 uplink,
                 &trojan.host,
                 attempt.path,
@@ -11263,6 +11330,7 @@ fn dial_trojan_rung(
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
             note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+            reader.set_poll(Some(RELAY_POLL));
             crate::proxy::relay_carried(reader, &write, client);
             true
         }
@@ -11272,7 +11340,8 @@ fn dial_trojan_rung(
                 .grpc_settings()
                 .cloned()
                 .unwrap_or_else(|| crate::config::GrpcSettings::path(attempt.path));
-            let Some((reader, writer)) = crate::grpc::connect_with(uplink, &trojan.host, &settings)
+            let Some((mut reader, writer)) =
+                crate::grpc::connect_with(uplink, &trojan.host, &settings)
             else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
@@ -11280,11 +11349,12 @@ fn dial_trojan_rung(
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+            reader.set_poll(Some(RELAY_POLL));
             crate::proxy::relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
             true
         }
         Rung::Xhttp => {
-            let Some((reader, writer)) =
+            let Some((mut reader, writer)) =
                 xhttp_rung(uplink, &trojan.host, &trojan.carrier, attempt.path)
             else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
@@ -11293,6 +11363,7 @@ fn dial_trojan_rung(
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
+            reader.set_poll(Some(RELAY_POLL));
             crate::proxy::relay_sink_drained(reader, &writer, client);
             true
         }
@@ -13874,6 +13945,7 @@ fn serve_trojan_ws(stream: Connection, key: &[u8; 56], path: &str, freedom: bool
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
+    reader.set_poll(Some(RELAY_POLL));
     crate::proxy::relay_sink(reader, &writer, &uplink, |_| {});
 }
 
@@ -13908,6 +13980,7 @@ fn serve_trojan_httpupgrade(
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
+    reader.set_poll(Some(RELAY_POLL));
     crate::proxy::relay_carried(reader, &write, &uplink);
 }
 
@@ -13938,6 +14011,7 @@ fn serve_trojan_grpc(
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
+    reader.set_poll(Some(RELAY_POLL));
     crate::proxy::relay_sink(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
 }
 
@@ -13962,6 +14036,7 @@ fn serve_trojan_xhttp(stream: Connection, key: &[u8; 56], path: &str, freedom: b
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
+    reader.set_poll(Some(RELAY_POLL));
     crate::proxy::relay_sink_drained(reader, &writer, &uplink);
 }
 
@@ -13990,6 +14065,7 @@ fn serve_trojan_httpheader(stream: Connection, key: &[u8; 56], path: &str, freed
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
+    reader.set_poll(Some(RELAY_POLL));
     crate::proxy::relay_carried(reader, &write, &uplink);
 }
 
@@ -18593,7 +18669,15 @@ pub(crate) mod lane_pool {
     use std::sync::{Condvar, Mutex, OnceLock, PoisonError};
     use std::thread;
 
-    pub(crate) type Step = Box<dyn FnMut() -> bool + Send + 'static>;
+    /// What one step did: moved bytes keep the lane at the head, a parked read yields to the queue, and a finished lane hands its worker on.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum Next {
+        Done,
+        Idle,
+        More,
+    }
+
+    pub(crate) type Step = Box<dyn FnMut() -> Next + Send + 'static>;
 
     pub(crate) type Complete = Box<dyn FnOnce() + Send + 'static>;
 
@@ -18603,7 +18687,7 @@ pub(crate) mod lane_pool {
     }
 
     impl Lane {
-        fn run(&mut self) -> bool {
+        fn run(&mut self) -> Next {
             (self.step)()
         }
 
@@ -18665,16 +18749,27 @@ pub(crate) mod lane_pool {
                         .unwrap_or_else(PoisonError::into_inner);
                 }
             };
-            let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.run()));
-            if matches!(stepped.as_ref(), Ok(&true)) {
-                let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
-                ready.push_back(lane);
-                drop(ready);
-                pool.notify.notify_one();
-                continue;
-            }
-            if stepped.is_err() {
-                eprintln!("ferrox-app: a relay lane panicked");
+            let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _step = crate::proxy::RelayStep::enter();
+                lane.run()
+            }));
+            match stepped {
+                Ok(Next::More) => {
+                    let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                    ready.push_front(lane);
+                    drop(ready);
+                    pool.notify.notify_one();
+                    continue;
+                }
+                Ok(Next::Idle) => {
+                    let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                    ready.push_back(lane);
+                    drop(ready);
+                    pool.notify.notify_one();
+                    continue;
+                }
+                Ok(Next::Done) => {}
+                Err(_) => eprintln!("ferrox-app: a relay lane panicked"),
             }
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.finish()));
         }
@@ -18682,12 +18777,18 @@ pub(crate) mod lane_pool {
 
     fn run_to_end(mut lane: Lane) {
         loop {
-            let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.run()));
-            if matches!(stepped.as_ref(), Ok(&true)) {
-                continue;
+            let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _step = crate::proxy::RelayStep::enter();
+                lane.run()
+            }));
+            match stepped {
+                Ok(Next::Idle | Next::More) => {}
+                Ok(Next::Done) | Err(_) => {
+                    let _ =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.finish()));
+                    return;
+                }
             }
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.finish()));
-            return;
         }
     }
 
@@ -18827,16 +18928,22 @@ fn stream_lane_step<R, W>(
     to: &Half<W>,
     buffer: &mut RelayBuf,
     ended: &RelayFinish,
-) -> bool
+) -> Next
 where
     R: Read,
     W: Write,
 {
     match from.read_once(buffer.as_mut()) {
-        Ok(0) => false,
-        Ok(n) => to.write_once(buffer.filled(n)).is_ok(),
-        Err(error) if is_timeout(&error) => !ended.ended(),
-        Err(_) => false,
+        Ok(0) => Next::Done,
+        Ok(n) if to.write_once(buffer.filled(n)).is_ok() => Next::More,
+        Err(error) if is_timeout(&error) => {
+            if ended.ended() {
+                Next::Done
+            } else {
+                Next::Idle
+            }
+        }
+        Ok(_) | Err(_) => Next::Done,
     }
 }
 
@@ -19355,7 +19462,7 @@ fn forward_finished(
     uplink: &impl CarrierSink,
     first: &mut bool,
     ended: impl FnOnce() -> bool,
-) -> bool {
+) -> Next {
     match read {
         Ok(n) if n > 0 => {
             if *first {
@@ -19375,16 +19482,26 @@ fn forward_finished(
             if !sent {
                 echo_trace("relay fwd send failed");
             }
-            !sent
+            if sent {
+                Next::More
+            } else {
+                Next::Done
+            }
         }
-        Err(error) if is_timeout(&error) => ended(),
+        Err(error) if is_timeout(&error) => {
+            if ended() {
+                Next::Done
+            } else {
+                Next::Idle
+            }
+        }
         Err(error) => {
             echo_trace(&format!("relay fwd read err {error:?}"));
-            true
+            Next::Done
         }
         Ok(_) => {
             echo_trace("relay fwd eof");
-            true
+            Next::Done
         }
     }
 }
@@ -19398,7 +19515,7 @@ fn upload_finished(
     stall: Duration,
     first: &mut bool,
     ended: impl FnOnce() -> bool,
-) -> bool {
+) -> Next {
     let _ = stall;
     match read {
         Ok(n) if n > 0 => {
@@ -19413,23 +19530,28 @@ fn upload_finished(
             );
             if peer_write.write_all(buffer.filled(n)).is_err() {
                 echo_trace("relay bwd peer write failed");
-                true
+                return Next::Done;
+            }
+            if *first {
+                echo_trace("relay bwd forwarded");
+                *first = false;
+            }
+            Next::More
+        }
+        Err(error) if is_timeout(&error) => {
+            if ended() {
+                Next::Done
             } else {
-                if *first {
-                    echo_trace("relay bwd forwarded");
-                    *first = false;
-                }
-                false
+                Next::Idle
             }
         }
-        Err(error) if is_timeout(&error) => ended(),
         Err(error) => {
             echo_trace(&format!("relay bwd read err {error:?}"));
-            true
+            Next::Done
         }
         Ok(_) => {
             echo_trace("relay bwd eof");
-            true
+            Next::Done
         }
     }
 }
@@ -19483,11 +19605,11 @@ where
                 census!("carrier-read", crate::census::handle(&peer_read), read_arm);
                 peer_read.read(buffer.as_mut())
             };
-            let finished = forward_finished(read, &mut buffer, &uplink, &mut first, || {
+            let next = forward_finished(read, &mut buffer, &uplink, &mut first, || {
                 forward_flow.ended()
             });
-            if !finished {
-                return true;
+            if next != Next::Done {
+                return next;
             }
             // The app's upload ended: a carrier whose answer is gated on that body ends it now, before the download leg does.
             uplink.upload_done();
@@ -19495,7 +19617,7 @@ where
                 uplink.close();
                 let _ = peer_read.shutdown(Shutdown::Both);
             }
-            false
+            Next::Done
         }),
         Box::new(stream_lane_done(&flow)),
     );
@@ -19512,7 +19634,7 @@ where
     lane_pool::submit(
         Box::new(move || {
             let read = reader.read(buffer.as_mut());
-            let finished = upload_finished(
+            let next = upload_finished(
                 read,
                 &mut buffer,
                 &mut peer_write,
@@ -19520,8 +19642,8 @@ where
                 &mut first,
                 || upload_flow.ended(),
             );
-            if !finished {
-                return true;
+            if next != Next::Done {
+                return next;
             }
             if CLOSE_FIRST {
                 upload_writer.close();
@@ -19534,7 +19656,7 @@ where
             } else {
                 let _ = peer_write.shutdown(Shutdown::Write);
             }
-            false
+            Next::Done
         }),
         Box::new(stream_lane_done(&flow)),
     );
@@ -19574,15 +19696,27 @@ pub(crate) fn relay_carried<R: Read + Send + 'static>(
                 census!("carrier-read", crate::census::handle(&peer_read), read_arm);
                 peer_read.read(buffer.as_mut())
             };
-            let more = match read {
-                Ok(n) if n > 0 => uplink.write_all(buffer.filled(n)).is_ok(),
-                Err(error) if is_timeout(&error) => !forward_flow.ended(),
-                _ => false,
+            let next = match read {
+                Ok(n) if n > 0 => {
+                    if uplink.write_all(buffer.filled(n)).is_ok() {
+                        Next::More
+                    } else {
+                        Next::Done
+                    }
+                }
+                Err(error) if is_timeout(&error) => {
+                    if forward_flow.ended() {
+                        Next::Done
+                    } else {
+                        Next::Idle
+                    }
+                }
+                _ => Next::Done,
             };
-            if !more {
+            if next == Next::Done {
                 let _ = uplink.shutdown(Shutdown::Write);
             }
-            more
+            next
         }),
         Box::new(stream_lane_done(&flow)),
     );
@@ -19591,23 +19725,33 @@ pub(crate) fn relay_carried<R: Read + Send + 'static>(
     lane_pool::submit(
         Box::new(move || {
             let read = reader.read(buffer.as_mut());
-            let more = match read {
+            let next = match read {
                 Ok(n) if n > 0 => {
                     census!(
                         "carrier-write",
                         crate::census::handle(&peer_write),
                         Some(stall)
                     );
-                    peer_write.write_all(buffer.filled(n)).is_ok()
+                    if peer_write.write_all(buffer.filled(n)).is_ok() {
+                        Next::More
+                    } else {
+                        Next::Done
+                    }
                 }
-                Err(error) if is_timeout(&error) => !upload_flow.ended(),
-                _ => false,
+                Err(error) if is_timeout(&error) => {
+                    if upload_flow.ended() {
+                        Next::Done
+                    } else {
+                        Next::Idle
+                    }
+                }
+                _ => Next::Done,
             };
-            if !more {
+            if next == Next::Done {
                 // Half-close this direction's write only: `Both` would abort the sibling clone's still-open read and drop a pending download.
                 let _ = peer_write.shutdown(Shutdown::Write);
             }
-            more
+            next
         }),
         Box::new(stream_lane_done(&flow)),
     );
