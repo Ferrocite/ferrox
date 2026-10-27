@@ -31807,8 +31807,6 @@ mod tests {
     /// KCP is the transport and the security rides it, as it does upstream: the dial's header goes out inside the session, not before it.
     #[test]
     fn a_trojan_kcp_dial_under_tls_wraps_the_header_in_the_session() {
-        use ferrox_core::tls::TlsProvider as _;
-
         let (server_config, client_config) = carried_tls_configs();
         let key = trojan_key("secret");
         let echo_port = echo_loop();
@@ -31827,12 +31825,14 @@ mod tests {
                 },
             )
             .expect("accepts");
-            tls.handshake().expect("handshakes");
+            assert!(shake_tls(&mut tls), "handshakes");
             let (cmd, _asked) = decode_trojan_request(&mut tls, &key).expect("reads the header");
             assert_eq!(cmd, 1);
             let mut back = [0u8; 4];
             ferrox_core::tls::read_exact(&mut tls, &mut back).expect("reads ping");
             tls.write_all(&back).expect("echoes");
+            let mut seen = [0u8; 1];
+            ferrox_core::tls::read_exact(&mut tls, &mut seen).expect("sees the echo land");
         });
         let trojan = TrojanOut {
             address: "127.0.0.1".to_owned(),
@@ -31870,6 +31870,7 @@ mod tests {
             b"ping",
             "the header rides the session"
         );
+        sock.write_all(b"!").expect("confirms the echo");
         drop(sock);
         server.join().expect("joins");
     }
