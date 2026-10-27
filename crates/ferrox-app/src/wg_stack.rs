@@ -95,6 +95,18 @@ impl QueueDevice {
         }
         self.rx.push_back(packet);
     }
+
+    /// A path MTU an ICMP Packet Too Big names narrows every later segment; a packet that names no usable MTU leaves it alone.
+    fn absorb(&mut self, packet: &[u8]) -> bool {
+        let Some(mtu) = icmp_mtu(packet) else {
+            return false;
+        };
+        if mtu >= self.mtu {
+            return false;
+        }
+        self.mtu = mtu;
+        true
+    }
 }
 
 struct QueueRx {
@@ -216,6 +228,8 @@ pub(crate) fn client(
             Ok(packet) => {
                 if inner_protocol(&packet.bytes) == Some(PROTOCOL_TCP) {
                     stack.device.push(packet.bytes);
+                    progress = true;
+                } else if stack.device.absorb(&packet.bytes) {
                     progress = true;
                 }
             }
@@ -412,7 +426,9 @@ impl ServerStack {
         match inner_protocol(&packet.bytes) {
             Some(PROTOCOL_TCP) => self.device.push(packet.bytes),
             Some(PROTOCOL_UDP) => self.datagram(packet.peer, &packet.bytes),
-            _ => {}
+            _ => {
+                self.device.absorb(&packet.bytes);
+            }
         }
     }
 
@@ -998,6 +1014,35 @@ pub(crate) fn ip_bytes(address: IpAddr) -> Vec<u8> {
 
 /// The IP protocol number a TCP segment carries.
 pub(crate) const PROTOCOL_TCP: u8 = 6;
+const PROTOCOL_ICMP: u8 = 1;
+const PROTOCOL_ICMPV6: u8 = 58;
+
+/// The MTU an ICMP Packet Too Big names, when the packet is one at all: a v4 destination-unreachable with code 4, or a v6 packet-too-big, both at or above their family's floor.
+fn icmp_mtu(packet: &[u8]) -> Option<usize> {
+    match packet.first()? >> 4 {
+        4 if packet.len() >= 28
+            && packet[9] == PROTOCOL_ICMP
+            && packet[20] == 3
+            && packet[21] == 4 =>
+        {
+            let mtu = usize::from(u16::from_be_bytes([packet[26], packet[27]]));
+            (mtu >= 68).then_some(mtu)
+        }
+        6 if packet.len() >= 48
+            && packet[6] == PROTOCOL_ICMPV6
+            && packet[40] == 2
+            && packet[41] == 0 =>
+        {
+            let mtu = u32::from_be_bytes([packet[44], packet[45], packet[46], packet[47]]);
+            if mtu >= 1280 {
+                usize::try_from(mtu).ok()
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1316,5 +1361,39 @@ mod client_tests {
         assert_eq!(datagram.destination, ip_bytes(target.ip()).as_slice());
         assert_eq!(datagram.destination_port, 53);
         assert_eq!(datagram.payload, b"query");
+    }
+
+    #[test]
+    fn a_packet_too_big_narrows_the_device_mtu() {
+        let mut inner = vec![0u8; 28];
+        inner[0] = 0x45;
+        inner[2..4].copy_from_slice(&28u16.to_be_bytes());
+        inner[8] = 64;
+        inner[9] = PROTOCOL_UDP;
+        inner[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        inner[16..20].copy_from_slice(&[198, 51, 100, 7]);
+        let too_big =
+            ferrox_core::foxy::connectip::icmp_too_large(&inner, 1170).expect("a v4 answer");
+        let mut device = QueueDevice::new(1420);
+        assert!(device.absorb(&too_big));
+        assert_eq!(device.capabilities().max_transmission_unit, 1170);
+        assert!(!device.absorb(&too_big), "never wider again");
+
+        let mut inner = vec![0u8; 48];
+        inner[0] = 0x60;
+        inner[4..6].copy_from_slice(&8u16.to_be_bytes());
+        inner[6] = PROTOCOL_UDP;
+        inner[7] = 64;
+        inner[24..40]
+            .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7]);
+        let too_big =
+            ferrox_core::foxy::connectip::icmp_too_large(&inner, 1280).expect("a v6 answer");
+        let mut device = QueueDevice::new(1420);
+        assert!(device.absorb(&too_big));
+        assert_eq!(device.capabilities().max_transmission_unit, 1280);
+
+        let mut forged = too_big;
+        forged[40] = 3;
+        assert!(!device.absorb(&forged), "not a packet too big");
     }
 }
