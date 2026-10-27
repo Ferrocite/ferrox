@@ -102,6 +102,8 @@ An upload *throughput* row is only evidence about the engines once the benchmark
 
 `security=reality` outbounds dial raw TCP and every carried carrier (`vless_outbound_with_reality_dials_raw_and_every_carrier`): the dial seals the session id into a stock hello, verifies the bound leaf, and relays with or without Vision. A carried REALITY row rides the same `ws`, `httpupgrade`, `grpc`, `xhttp` and `http-header` framings a plain-`TLS` row does, over the one seal the raw dial pays; only the UDP-carrier set stays a server row, so those shapes are still skipped rather than dialled. The dial writes the same header bytes the core encoder writes (`vision_header_matches_the_core_encoder`).
 
+An encrypted `http-header` row never falls back to the raw rung: a failed sealed handshake skips it and climbs to the carried rungs, because raw would put the user id and destination on the wire. `a_failed_encrypted_httpheader_handshake_never_writes_the_plain_header` watches every byte the edge receives for the id.
+
 ## Pins
 
 | what | where |
