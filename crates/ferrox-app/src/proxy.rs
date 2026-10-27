@@ -24933,7 +24933,7 @@ mod tests {
     #[test]
     fn wrapped_flows_share_a_fixed_set_of_lanes() {
         fn live_threads() -> usize {
-            std::fs::read_dir("/proc/self/task").map_or(0, |tasks| tasks.count())
+            std::fs::read_dir("/proc/self/task").map_or(0, std::iter::Iterator::count)
         }
 
         let before = live_threads();
@@ -24964,8 +24964,7 @@ mod tests {
         );
         assert!(
             grown <= lanes + 8,
-            "{flows} wrapped flows grew the process by {grown} threads, past {} lanes plus slack",
-            lanes
+            "{flows} wrapped flows grew the process by {grown} threads, past {lanes} lanes plus slack"
         );
         assert!(
             grown < flows,
