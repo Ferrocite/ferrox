@@ -28193,6 +28193,53 @@ mod tests {
         serving.join().expect("joins");
     }
 
+    /// An encrypted xHTTP peer that opens the session and never sends the hello must release its thread at the handshake budget; the chunk body reader retries timeouts forever.
+    #[test]
+    fn an_encrypted_silent_xhttp_peer_releases_its_thread() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let (_, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let carrier = Carrier::Xhttp {
+            settings: xhttp_settings("/up/"),
+        };
+        let (done, waited) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_vless(
+                stream,
+                &one_vless_user(&[0xaau8; 16]),
+                &carrier,
+                true,
+                None,
+                Some(&decryption),
+            );
+            let _ = done.send(());
+        });
+        let mut peer = Connection::connect(addr).expect("connects");
+        xhttp_post_head(&mut peer, "/up/", true);
+        let verdict = waited.recv_timeout(budgets::handshake() + Duration::from_secs(5));
+        drop(peer);
+        crate::budgets::clear();
+        assert!(
+            verdict.is_ok(),
+            "an encrypted silent xhttp peer pinned its thread past the handshake budget"
+        );
+        serving.join().expect("joins");
+    }
+
     /// An HTTP/2 xhttp client sends its preface once; the carrier's probe must hand those bytes to the h2 loop rather than consume them and read the next frame as a second preface.
     #[test]
     fn an_h2_xhttp_client_is_served_after_the_preface() {
