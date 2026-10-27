@@ -1812,6 +1812,12 @@ fn read_datagrams(
 }
 
 pub(crate) fn forward(shared: &Arc<Shared>, spec: &ServerSpec, addrs: &[IpAddr], packet: &[u8]) {
+    let Some(source) = packet_source(packet) else {
+        return;
+    };
+    if !addrs.contains(&source) {
+        return;
+    }
     let Some(destination) = packet_destination(packet) else {
         return;
     };
@@ -1862,6 +1868,20 @@ fn reject_auth(tunnel: &mut Tunnel) {
     tunnel.buf.clear();
     tunnel.at = 0;
     tunnel.pending = Some(head);
+}
+
+fn packet_source(packet: &[u8]) -> Option<IpAddr> {
+    match packet.first()? >> 4 {
+        4 if packet.len() >= 20 => Some(IpAddr::V4(Ipv4Addr::new(
+            packet[12], packet[13], packet[14], packet[15],
+        ))),
+        6 if packet.len() >= 40 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&packet[8..24]);
+            Some(IpAddr::V6(Ipv6Addr::from(octets)))
+        }
+        _ => None,
+    }
 }
 
 fn packet_destination(packet: &[u8]) -> Option<IpAddr> {
