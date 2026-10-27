@@ -28,7 +28,7 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | DNS proxy + fakeDNS + hosts + DoH/DoQ/local nameservers (`app/dns`) | `proxy/dns` outbound done (row 26); the resolver app planned (row 82) |
 | Blackhole outbound | partial (row 25): the three answers, the 403's bytes the reference's own (an oracle drives the pinned handler and the comparison is octet for octet), the flow ending when the peer is done; the datagram lane refuses the association with `0x07` ([blackhole](function/blackhole.md)) |
 | Loopback | done (row 27) |
-| WireGuard proxy (`proxy/wireguard`, lightweight `netstack.go`) | planned (row 46) |
+| WireGuard proxy (`proxy/wireguard`, lightweight `netstack.go`) | partial (row 46): client outbound and server inbound over `smoltcp`, IPv4/IPv6 TCP and UDP, JSON and protobuf config, no kernel TUN; `TestWireguard` is the CI gate ([wireguard](function/wireguard.md)) |
 | Hysteria v1 proxy (`proxy/hysteria`) | planned (only v2 as carrier today) |
 | MASQUE proxy (`proxy/masque`) | planned; CONNECT-IP client dials on the Foxy `h3` lane (row 20) |
 | TUN inbound (`proxy/tun`) | done (row 29) |
