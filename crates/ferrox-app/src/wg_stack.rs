@@ -628,6 +628,7 @@ impl ServerStack {
 
 /// Move bytes between one flow's local stream and its TCP socket. Every read and
 /// write is nonblocking, so a slow local peer parks only its own buffers.
+#[allow(clippy::too_many_lines)]
 fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8]) {
     let socket = sockets.get_mut::<TcpSocket>(flow.handle);
     if matches!(socket.state(), State::Established | State::CloseWait) {
@@ -1235,6 +1236,14 @@ mod tests {
         assert_eq!(syn[9], 6, "the inner packet is TCP");
         stack.device.push(syn_ack(&syn));
         stack.poll(&mut buf);
+        assert_eq!(
+            stack
+                .sockets
+                .get::<TcpSocket>(stack.flows[0].handle)
+                .state(),
+            State::Established,
+            "the SYN-ACK establishes the flow"
+        );
         while packets.try_recv().is_ok() {}
 
         app.write_all(b"hello").expect("write");
@@ -1258,7 +1267,7 @@ mod tests {
 
     #[test]
     fn a_datagram_address_is_written_in_stack_room_and_the_bytes_are_the_allocated_ones() {
-        let source: IpAddr = "10.0.0.2".parse().unwrap();
+        let source: IpAddr = "2001:db8::2".parse().unwrap();
         let destination: IpAddr = "2001:db8::7".parse().unwrap();
         let payload = b"addresses";
         let mut packet = Vec::with_capacity(IPV6_HEADER + 8 + payload.len());

@@ -898,6 +898,7 @@ fn gate_ten(report: &mut String) -> Vec<framing::Row> {
     rows
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     if let Some(code) = side_exit() {
         std::process::exit(code);
