@@ -45,7 +45,33 @@ pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     feeds: usize,
     read: Reading,
     write: Writing,
-    tls: Arc<Mutex<Tls>>,
+    tls: TlsCell,
+}
+
+/// One link owns its filter state; the two halves of a split link share it.
+enum TlsCell {
+    Owned(Tls),
+    Shared(Arc<Mutex<Tls>>),
+}
+
+impl TlsCell {
+    fn snapshot(&self) -> Tls {
+        match self {
+            Self::Owned(tls) => *tls,
+            Self::Shared(tls) => *tls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        }
+    }
+
+    fn update<R>(&mut self, f: impl FnOnce(&mut Tls) -> R) -> R {
+        match self {
+            Self::Owned(tls) => f(tls),
+            Self::Shared(tls) => f(&mut tls
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)),
+        }
+    }
 }
 
 /// The filter's feed, one caller buffer deep: the content the walk hands the caller
@@ -229,7 +255,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 sent_uuid: false,
                 raw: false,
             },
-            tls: Arc::new(Mutex::new(Tls::new())),
+            tls: TlsCell::Owned(Tls::new()),
         }
     }
 
@@ -243,17 +269,12 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
         uuid: &[u8; 16],
     ) -> (Self, Self) {
         let tls = Arc::new(Mutex::new(Tls::new()));
-        let reader = Self::with_tls(read, raw_read, uuid, Arc::clone(&tls));
-        let writer = Self::with_tls(write, raw_write, uuid, tls);
+        let reader = Self::with_tls(read, raw_read, uuid, TlsCell::Shared(Arc::clone(&tls)));
+        let writer = Self::with_tls(write, raw_write, uuid, TlsCell::Shared(tls));
         (reader, writer)
     }
 
-    fn with_tls(
-        session: S,
-        raw: Option<Connection>,
-        uuid: &[u8; 16],
-        tls: Arc<Mutex<Tls>>,
-    ) -> Self {
+    fn with_tls(session: S, raw: Option<Connection>, uuid: &[u8; 16], tls: TlsCell) -> Self {
         Self {
             session,
             raw,
@@ -379,7 +400,7 @@ impl<S: Read + Write + RecordAlignment> Read for Link<S> {
     /// The content the walk hands this caller buffer is one filter unit: it joins the
     /// feeding spread through the run, and the machine spends at the unit's end.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let tls = *self.lock_tls();
+        let tls = self.tls.snapshot();
         let active = tls.budget > 0;
         let mut feed = active.then(|| Feeding::new(&tls));
         #[cfg(test)]
@@ -388,19 +409,11 @@ impl<S: Read + Write + RecordAlignment> Read for Link<S> {
         }
         let n = self.drive_read(buf, feed.as_mut(), active)?;
         if let Some(feed) = feed {
-            if feed.run > 0 && self.lock_tls().budget > 0 {
+            if feed.run > 0 && self.tls.snapshot().budget > 0 {
                 self.spend(&feed);
             }
         }
         Ok(n)
-    }
-}
-
-impl<S: Read + Write + RecordAlignment> Link<S> {
-    fn lock_tls(&self) -> std::sync::MutexGuard<'_, Tls> {
-        self.tls
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 }
 
@@ -457,8 +470,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     /// hands its confirmed switch or its exhausted window over, and the idle switch
     /// arms the alignment only when its verdict earned it.
     fn spend(&mut self, feed: &Feeding) {
-        {
-            let mut tls = self.lock_tls();
+        self.tls.update(|tls| {
             tls.budget -= 1;
             // A split writer can observe a hello after this snapshot; its progress outranks ours.
             if tls.server_hello_left == feed.start {
@@ -479,13 +491,13 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             } else if feed.left > 0 && feed.scanned >= feed.left {
                 tls.budget = 0;
             }
-        }
+        });
         self.engage();
     }
 
     fn drain_tail(&mut self, buf: &mut [u8], feed: Option<&mut Feeding>) -> usize {
         let n = (self.have.len() - self.dot).min(buf.len());
-        if n > 0 && self.lock_tls().budget > 0 {
+        if n > 0 && self.tls.snapshot().budget > 0 {
             if let Some(feed) = feed {
                 feed_extent(&self.have[self.dot..self.dot + n], feed);
             }
@@ -506,15 +518,15 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             Some(handle) if raw => handle.read(buf)?,
             _ => self.session.read(buf)?,
         };
-        if n > 0 && !raw && self.lock_tls().budget > 0 {
-            self.lock_tls().observe(&buf[..n]);
+        if n > 0 && !raw && self.tls.snapshot().budget > 0 {
+            self.tls.update(|tls| tls.observe(&buf[..n]));
             self.engage();
         }
         Ok(n)
     }
 
     fn engage(&mut self) {
-        if self.lock_tls().enable_xtls {
+        if self.tls.snapshot().enable_xtls {
             self.session.engage_record_alignment();
         }
     }
@@ -778,11 +790,11 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
             self.write_out(buf)?;
             return Ok(buf.len());
         }
-        if self.lock_tls().budget > 0 {
-            self.lock_tls().observe(buf);
+        if self.tls.snapshot().budget > 0 {
+            self.tls.update(|tls| tls.observe(buf));
             self.engage();
         }
-        let tls = *self.lock_tls();
+        let tls = self.tls.snapshot();
         // The relay hands one buffer of up to 256 KiB: it frames as blocks of one Xray buffer, and the filter budget and the switch are counted per caller buffer as the reference counts them per `MultiBuffer`.
         let complete =
             tls.present && buf.len() >= 6 && buf[..3] == TLS_APPLICATION_DATA && is_record_run(buf);
@@ -1109,7 +1121,7 @@ mod tests {
         }
         input.extend(frame(false, 1, b"record", 4));
         let mut link = link(&[]);
-        link.lock_tls().budget = 0;
+        link.tls.update(|tls| tls.budget = 0);
         let mut frames = 0usize;
         for _ in 0..64 {
             link.have.clear();
@@ -1117,7 +1129,7 @@ mod tests {
             link.dot = 0;
             link.walk.framed = true;
             link.walk.want_header = 5;
-            let tls = *link.lock_tls();
+            let tls = link.tls.snapshot();
             let mut feed = Feeding::new(&tls);
             let runs = link.pump(None, Some(&mut feed), false);
             assert_eq!(runs, 48, "eight six-byte contents cross the walk");
@@ -1133,22 +1145,22 @@ mod tests {
     #[test]
     fn a_split_read_keeps_the_server_hello_scan_a_write_observed() {
         let mut link = link(&[]);
-        let tls = *link.lock_tls();
+        let tls = link.tls.snapshot();
         let feed = Feeding::new(&tls);
         let mut head = vec![0x16, 0x03, 0x03, 0x00, 0x30, 0x02];
         head.extend_from_slice(&[0u8; 6]);
-        link.lock_tls().observe(&head);
-        let left = link.lock_tls().server_hello_left;
+        link.tls.update(|tls| tls.observe(&head));
+        let left = link.tls.snapshot().server_hello_left;
         assert!(left > 0, "the write observed a fragmented server hello");
         link.spend(&feed);
         assert_eq!(
-            link.lock_tls().server_hello_left,
+            link.tls.snapshot().server_hello_left,
             left,
             "the read snapshot undid the write's progress"
         );
-        link.lock_tls().observe(&TLS13_VERSIONS);
+        link.tls.update(|tls| tls.observe(&TLS13_VERSIONS));
         assert!(
-            link.lock_tls().enable_xtls,
+            link.tls.snapshot().enable_xtls,
             "the later fragment still selects Direct"
         );
     }
@@ -1159,7 +1171,7 @@ mod tests {
     fn a_steady_read_builds_no_feed() {
         let input = frame(true, 0, b"body", 0);
         let mut link = link(&input);
-        link.lock_tls().budget = 0;
+        link.tls.update(|tls| tls.budget = 0);
         let mut out = [0u8; 16];
         let n = link.read(&mut out).expect("reads");
         assert_eq!(&out[..n], b"body");
@@ -1617,7 +1629,7 @@ mod tests {
         assert_eq!(commands, vec![0, 0, 0, 0, 0, 0, 1]);
         assert!(!link.write.padding);
         assert_eq!(
-            link.lock_tls().budget,
+            link.tls.snapshot().budget,
             1,
             "the last buffer of the window is spent"
         );
@@ -1630,7 +1642,7 @@ mod tests {
         let mut link = link(&[]);
         link.write_all(&server_hello()).expect("writes");
         assert!(
-            link.lock_tls().enable_xtls,
+            link.tls.snapshot().enable_xtls,
             "a 1.3 ServerHello is worth switching for"
         );
         assert!(link.write.padding, "the handshake is still padded");
@@ -1695,13 +1707,13 @@ mod tests {
         let mut link = link(&[]);
         link.write_all(&[0x16, 0x03, 0x01, 0x00, 0x05, 0x01])
             .expect("writes");
-        assert_eq!(link.lock_tls().budget, FILTER_PACKETS - 1);
+        assert_eq!(link.tls.snapshot().budget, FILTER_PACKETS - 1);
         assert!(
-            link.lock_tls().present,
+            link.tls.snapshot().present,
             "a ClientHello record makes the stream TLS"
         );
         assert!(
-            !link.lock_tls().twelve_or_above,
+            !link.tls.snapshot().twelve_or_above,
             "a ClientHello says nothing about a version"
         );
     }
