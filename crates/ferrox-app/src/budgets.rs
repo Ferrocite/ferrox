@@ -8,7 +8,7 @@ pub(crate) const DIAL_TIMEOUT: Duration = Duration::from_secs(8);
 // Bound the raw opening request read: a peer that connects and stays silent must not pin its per-connection thread forever.
 pub(crate) const HANDSHAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub(crate) const RELAY_POLL: Duration = Duration::from_millis(20);
+pub(crate) const RELAY_POLL: Duration = Duration::from_millis(1);
 
 /// How long a connection we refused stays open after its GOAWAY: closing with the peer's bytes still unread makes the stack abort with RST, and that can swallow the refusal itself.
 pub(crate) const GOAWAY_GRACE: Duration = Duration::from_millis(100);
