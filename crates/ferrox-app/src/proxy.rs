@@ -41707,17 +41707,16 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(datagram.source_port, target.port());
+        assert!(
+            last_used.load(Ordering::Relaxed) > 0,
+            "the reply refreshes the lane's activity"
+        );
     }
 
     /// Replies are activity too: a lane whose requests paused but whose target keeps answering
     /// must not lose the reader that turns those answers back into packets.
     #[test]
-    fn a_wireguard_reply_stream_keeps_the_inner_lane_reading() {
-        let _guard = budgets::lock();
-        budgets::apply(&crate::config::Budgets {
-            udp_idle: Some(Duration::from_millis(300)),
-            ..Default::default()
-        });
+    fn a_reply_stream_keeps_the_freedom_lane_reading() {
         let target = std::net::UdpSocket::bind("127.0.0.1:0").expect("target");
         let target_addr = target.local_addr().expect("address");
         target
@@ -41737,32 +41736,26 @@ mod tests {
                 let _ = target.send_to(&buf[..n], client);
             }
         });
-        let config = format!(
-            r#"{{"routing":{{"rules":[{{"network":"udp","outboundTag":"udp"}}]}},"outbounds":[{{"tag":"udp","protocol":"freedom","settings":{{"redirect":"127.0.0.1:{}"}}}}]}}"#,
-            target_addr.port()
-        );
-        let plan = route_outbound(&config, None, false);
-        let (to_tunnel, replies) = std::sync::mpsc::channel();
-        let target: std::net::SocketAddr = "192.0.2.1:7".parse().unwrap();
-        let source: std::net::SocketAddr = "10.0.0.2:1234".parse().unwrap();
-        let last_used = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let (uplink, stop) = crate::wg_stack::server_udp(
-            ([0x11; 32], source, target),
-            std::time::Instant::now(),
-            &last_used,
-            &plan,
-            &to_tunnel,
-        )
-        .expect("lane");
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
+        let relay_addr = relay.local_addr().expect("address");
+        relay
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("timeout");
+        let _serving =
+            std::thread::spawn(move || serve_socks_udp_freedom(&relay, &FreedomOut::default()));
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
         let mut buf = Vec::new();
-        let frame = socks_udp_frame(&mut buf, None, &target, b"one");
-        uplink.send(frame).expect("send");
+        let mut back = vec![0u8; UDP_BUF];
+        let frame = socks_udp_frame(&mut buf, None, &target_addr, b"one");
+        client.send_to(frame, relay_addr).expect("send");
         let mut payloads = Vec::new();
         for _ in 0..8 {
-            let packet = replies.recv_timeout(Duration::from_secs(5)).expect("reply");
-            let datagram =
-                ferrox_core::foxy::connectip::udp_from_packet(&packet).expect("inner datagram");
-            payloads.push(datagram.payload.to_vec());
+            let (n, _) = client.recv_from(&mut back).expect("reply");
+            let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
+            payloads.push(payload.to_vec());
         }
         assert_eq!(payloads[0].as_slice(), b"one");
         assert!(
@@ -41771,13 +41764,11 @@ mod tests {
                 .all(|payload| payload.as_slice() == b"tick"),
             "the replies cross the lane while requests are paused"
         );
-        let frame = socks_udp_frame(&mut buf, None, &target, b"two");
-        uplink.send(frame).expect("send");
-        let packet = replies.recv_timeout(Duration::from_secs(5)).expect("reply");
-        let datagram = ferrox_core::foxy::connectip::udp_from_packet(&packet).expect("datagram");
-        assert_eq!(datagram.payload, b"two");
-        stop.store(true, Ordering::Relaxed);
-        budgets::clear();
+        let frame = socks_udp_frame(&mut buf, None, &target_addr, b"two");
+        client.send_to(frame, relay_addr).expect("send");
+        let (n, _) = client.recv_from(&mut back).expect("reply");
+        let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
+        assert_eq!(payload, b"two");
     }
 
     /// A routing script picks the lane before the (empty) rule table, and its error closes the
