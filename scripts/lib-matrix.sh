@@ -27,7 +27,7 @@ s.close()'
 
 matrix_udp_carrier() {
   case "$1" in
-    *-kcp-*|*-hysteria-*|*-quic-*|hysteria-*) return 0 ;;
+    *-kcp-*|*-hysteria-*|*-quic-*|hysteria-*|masque-*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -81,6 +81,8 @@ matrix_engine_skip_reason() {
       printf '%s\n' "leaf at this pin has no Shadowsocks 2022" ;;
     xray-rust:*-hysteria-*)
       printf '%s\n' "xray-rust at this pin has no VLESS over Hysteria; its Hysteria outbound is the native proxy protocol" ;;
+    xray-core-rust:masque-*|zeronet:masque-*|sing-box:masque-*|xray-rust:masque-*|leaf:masque-*)
+      printf '%s\n' "$engine at this pin has no MASQUE CONNECT-IP outbound" ;;
     *)
       return 1 ;;
   esac
@@ -244,6 +246,20 @@ quic_client_settings() {
   echo "\"streamSettings\": {\"network\": \"quic\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}, \"quicSettings\": {}}"
 }
 
+# MASQUE CONNECT-IP is TLS by definition; the h3 ALPN names the carrier this cell measures.
+masque_server_settings() {
+  local dir
+  dir="$(matrix_tls_dir)"
+  echo "\"protocol\": \"masque\", \"settings\": {\"users\": [{\"email\": \"matrix@carrier.test\", \"pass\": \"$PASSWORD\"}], \"address\": [\"10.13.0.1/24\", \"fd13::1/64\"]}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"tlsSettings\": {\"alpn\": [\"h3\"], \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\"}]}}"
+}
+
+masque_client_settings() {
+  local port="$1" dir pin
+  dir="$(matrix_tls_dir)"
+  pin="$(matrix_tls_pin "$dir/cert.pem")"
+  echo "\"tag\": \"proxy\", \"protocol\": \"masque\", \"settings\": {\"address\": \"127.0.0.1\", \"port\": $port}, \"streamSettings\": {\"network\": \"masque\", \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"h3\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
+}
+
 httpupgrade_settings() {
   echo '"streamSettings": {"network": "httpupgrade", "httpupgradeSettings": {"path": "/tunnel", "host": "carrier.test"}}'
 }
@@ -322,6 +338,7 @@ scenario_config() {
     hysteria-v1-*) server_config "$(hysteria_v1_server_settings)" "$(hysteria_v1_client_settings "$port")" "$port" ;;
     vmess-tls-ws-*) server_config "\"protocol\": \"vmess\", \"settings\": {\"clients\": [{\"id\": \"$UUID\"}]}, $(tls_ws_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"vmess\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"users\": [{\"id\": \"$UUID\", \"security\": \"auto\"}]}]}, $(tls_ws_client_settings)" "$port" ;;
     trojan-tls-ws-*) server_config "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}, $(tls_ws_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"password\": \"$PASSWORD\"}]}, $(tls_ws_client_settings)" "$port" ;;
+    masque-*) server_config "$(masque_server_settings)" "$(masque_client_settings "$port")" "$port" ;;
     *) echo "::error::unknown scenario $1" >&2; return 1 ;;
   esac
 }
@@ -364,6 +381,7 @@ standard_scenarios() {
   echo "shadowsocks2022-raw-down-8 download 8 256 65536"
   echo "vmess-tls-ws-down-8 download 8 256 65536"
   echo "trojan-tls-ws-down-8 download 8 256 65536"
+  echo "masque-down-8 download 8 256 65536"
 }
 
 scenarios() {

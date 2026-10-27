@@ -964,6 +964,7 @@ const SCENARIO_PROTOCOLS: &[&str] = &[
     "socks",
     "http",
     "tun",
+    "masque",
 ];
 
 fn protocol_of(scenario: &str) -> Option<&str> {

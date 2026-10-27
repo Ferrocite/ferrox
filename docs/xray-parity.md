@@ -30,7 +30,7 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | Loopback | done (row 27) |
 | WireGuard proxy (`proxy/wireguard`, lightweight `netstack.go`) | partial (row 46): client outbound and server inbound over `smoltcp`, IPv4/IPv6 TCP and UDP, JSON and protobuf config, no kernel TUN; `TestWireguard` is the CI gate ([wireguard](function/wireguard.md)) |
 | Hysteria v1 proxy (`proxy/hysteria`) | planned (only v2 as carrier today) |
-| MASQUE proxy (`proxy/masque`) | done over h3, both roles (row 48): `protocol: masque` inbound with an address pool, and the `masque` transport dial (row 20); the h2 listener and the h2 dialer serve the same inbound and outbound (row 49), chosen by the configured ALPN |
+| MASQUE proxy (`proxy/masque`) | done over h3, both roles (row 48): `protocol: masque` inbound with an address pool, and the `masque` transport dial (row 20); the h2 listener and the h2 dialer serve the same inbound and outbound (row 49), chosen by the configured ALPN; the reference's flat `address`/`port` outbound and `users`/`clients` with `pass` read the same edge and table |
 | TUN inbound (`proxy/tun`) | done (row 29) |
 | uTLS fingerprints per connection | planned (row 38) |
 | ECH | client done, `echSockopt` applied to the DNS query socket; TLS server done; QUIC both roles, a dial offers the same list and a serving lane accepts it, while one that omits it still falls back; a rejected offer is redialled once with the BoringSSL retry list it returns where Go's `SendAsRetry=false` sends none, while an accepted offer is unchanged (row 39) |
@@ -49,7 +49,7 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | xHTTP / SplitHTTP modes (packet-up, stream-up, stream-one, padding/placement) | all three modes both roles: the dial resolves an unstated `mode` and mints the session the hub validates, packets split at `uplinkChunkSize` into body or `X-Data-{i}`/cookie parts, posts paced by `scMinPostsIntervalMs`, and a relay half-close ends the request body ([carrier-xhttp](function/carrier-xhttp.md)) |
 | KCP/mKCP + FinalMask (aes128gcm, header, original) | core done; finalmask `fragment` done (row 31), other mask types planned |
 | Hysteria v2 transport (network `hysteria`, masquerade surface) | done as `vless-hysteria` / `protocol: hysteria` over quiche, both roles (row 19); datagrams, salamander obfs, masquerade site |
-| MASQUE transport | CONNECT-IP client and terminating server over h3 (row 48); h2 server is row 49 |
+| MASQUE transport | CONNECT-IP client and terminating server over h3 (row 48) and, on the same port, h2 (row 49), chosen by the configured ALPN |
 | XDrive (remote-storage carrier) | planned (row 32) |
 | Browser dialer | not scheduled |
 | Tagged connections / observatory webhooks | planned (rows 81, 144) |
