@@ -1085,9 +1085,35 @@ impl ServerSpec {
     }
 }
 
+/// What a worker waits for: a datagram the demultiplexer routed to it, or a
+/// packet the stack just queued, so a flow is not clocked by the tick alone.
+pub(crate) enum Arrival {
+    Datagram(Vec<u8>, SocketAddr),
+    Ready,
+}
+
+/// One tunnel's inbox and the handle that wakes its worker. `pending` keeps at
+/// most one `Ready` in flight, so a burst queues packets, not wake-ups.
+#[derive(Clone)]
+pub(crate) struct TunnelQueue {
+    sender: SyncSender<Vec<u8>>,
+    wake: Option<Sender<Arrival>>,
+    pending: Arc<AtomicBool>,
+}
+
+impl TunnelQueue {
+    pub(crate) fn new(sender: SyncSender<Vec<u8>>, wake: Option<Sender<Arrival>>) -> Self {
+        Self {
+            sender,
+            wake,
+            pending: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
 pub(crate) struct Shared {
     pool: Mutex<AddressPool>,
-    pub(crate) tunnels: Mutex<HashMap<IpAddr, SyncSender<Vec<u8>>>>,
+    pub(crate) tunnels: Mutex<HashMap<IpAddr, TunnelQueue>>,
     packets: Sender<Packet>,
     local: Vec<IpAddr>,
 }
@@ -1283,18 +1309,23 @@ fn dispatch(shared: &Shared, from_stack: Receiver<Vec<u8>>) {
         let Some(destination) = packet_destination(&packet) else {
             continue;
         };
-        let sender = shared
+        let tunnel = shared
             .tunnels
             .lock()
             .ok()
             .and_then(|tunnels| tunnels.get(&destination).cloned());
-        if let Some(tunnel) = sender {
-            let _ = tunnel.send(packet);
+        if let Some(tunnel) = tunnel {
+            if let Some(wake) = &tunnel.wake {
+                if !tunnel.pending.swap(true, Ordering::Relaxed) {
+                    let _ = wake.send(Arrival::Ready);
+                }
+            }
+            let _ = tunnel.sender.send(packet);
         }
     }
 }
 
-type Routes = Arc<Mutex<HashMap<Vec<u8>, (u64, Sender<(Vec<u8>, SocketAddr)>)>>>;
+type Routes = Arc<Mutex<HashMap<Vec<u8>, (u64, Sender<Arrival>)>>>;
 
 static WORKERS: AtomicU64 = AtomicU64::new(0);
 
@@ -1323,7 +1354,7 @@ fn demux(
             .ok()
             .and_then(|table| table.get(&dcid).map(|(_, tx)| tx.clone()));
         if let Some(tx) = queued {
-            let _ = tx.send((buf[..n].to_vec(), from));
+            let _ = tx.send(Arrival::Datagram(buf[..n].to_vec(), from));
             continue;
         }
         if kind != quiche::Type::Initial {
@@ -1348,7 +1379,7 @@ fn demux(
             table.insert(dcid.clone(), (worker_id, tx.clone()));
             table.insert(server_scid.clone(), (worker_id, tx.clone()));
         }
-        let _ = tx.send((buf[..n].to_vec(), from));
+        let _ = tx.send(Arrival::Datagram(buf[..n].to_vec(), from));
         let sock = Arc::clone(&sock);
         let shared = Arc::clone(&shared);
         let spec = Arc::clone(&spec);
@@ -1387,7 +1418,7 @@ struct Tunnel {
     pending: Option<Vec<u8>>,
     unsent: Option<Vec<u8>>,
     outgoing: Receiver<Vec<u8>>,
-    sender: SyncSender<Vec<u8>>,
+    queue: TunnelQueue,
     addrs: Vec<IpAddr>,
     granted: Option<Granted>,
 }
@@ -1397,8 +1428,8 @@ fn worker(
     mut conn: quiche::Connection,
     sock: Arc<Datagram>,
     local: SocketAddr,
-    rx: Receiver<(Vec<u8>, SocketAddr)>,
-    tx: Sender<(Vec<u8>, SocketAddr)>,
+    rx: Receiver<Arrival>,
+    tx: Sender<Arrival>,
     shared: Arc<Shared>,
     spec: Arc<ServerSpec>,
     routes: Routes,
@@ -1418,7 +1449,7 @@ fn worker(
         pending: None,
         unsent: None,
         outgoing,
-        sender,
+        queue: TunnelQueue::new(sender, Some(tx.clone())),
         addrs: Vec::new(),
         granted: None,
     };
@@ -1432,10 +1463,11 @@ fn worker(
             conn.timeout().unwrap_or(TICK).min(TICK)
         };
         match rx.recv_timeout(wait) {
-            Ok((mut bytes, from)) => {
+            Ok(Arrival::Datagram(mut bytes, from)) => {
                 let info = quiche::RecvInfo { from, to: local };
                 let _ = conn.recv(&mut bytes, info);
             }
+            Ok(Arrival::Ready) => tunnel.queue.pending.store(false, Ordering::Relaxed),
             Err(mpsc::RecvTimeoutError::Timeout) => conn.on_timeout(),
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
@@ -1622,7 +1654,7 @@ fn accept(
         reject(tunnel, 503);
         return;
     };
-    let Some(granted) = register(shared, &addrs, &tunnel.sender) else {
+    let Some(granted) = register(shared, &addrs, &tunnel.queue) else {
         release(shared, &addrs);
         reject(tunnel, 503);
         return;
@@ -1737,7 +1769,7 @@ pub(crate) fn respond(body: &[u8], addrs: &[IpAddr]) -> Vec<Assigned> {
 pub(crate) fn register(
     shared: &Arc<Shared>,
     addrs: &[IpAddr],
-    sender: &SyncSender<Vec<u8>>,
+    queue: &TunnelQueue,
 ) -> Option<Granted> {
     let mut tunnels = shared.tunnels.lock().ok()?;
     let mut inserted = Vec::with_capacity(addrs.len());
@@ -1748,7 +1780,7 @@ pub(crate) fn register(
             }
             return None;
         }
-        tunnels.insert(*address, sender.clone());
+        tunnels.insert(*address, queue.clone());
         inserted.push(*address);
     }
     Some(Granted {
@@ -1821,7 +1853,7 @@ pub(crate) fn forward(shared: &Arc<Shared>, spec: &ServerSpec, addrs: &[IpAddr],
     if let Ok(tunnels) = shared.tunnels.lock() {
         if let Some(other) = tunnels.get(&destination) {
             if !addrs.contains(&destination) {
-                let _ = other.try_send(packet.to_vec());
+                let _ = other.sender.try_send(packet.to_vec());
             }
             return;
         }
