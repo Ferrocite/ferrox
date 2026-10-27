@@ -304,9 +304,18 @@ enum Body {
     Packets(Box<Packets>),
 }
 
-/// The packet-up upload: one POST per slice, each with its own seq and the answer read before the next.
+/// The packet-up upload: one POST per queued batch, each with its own seq, the answer drained before the next.
 struct Packets {
+    up: Arc<Packer>,
+    poster: Mutex<Option<std::thread::JoinHandle<()>>>,
+}
+
+struct Packer {
     stream: Mutex<Box<dyn FrameStream + Send>>,
+    queue: Mutex<Vec<u8>>,
+    cv: Condvar,
+    closed: AtomicBool,
+    failed: AtomicBool,
     host: String,
     settings: XhttpSettings,
     session: String,
@@ -316,41 +325,115 @@ struct Packets {
 
 impl Packets {
     fn send(&self, data: &[u8]) -> bool {
-        let Ok(mut stream) = self.stream.lock() else {
+        self.up.enqueue(data)
+    }
+
+    fn finish(&self) -> bool {
+        self.up.closed.store(true, Ordering::SeqCst);
+        self.up.cv.notify_all();
+        let poster = self.poster.lock().ok().and_then(|mut poster| poster.take());
+        if let Some(poster) = poster {
+            let _ = poster.join();
+        }
+        !self.up.failed.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for Packets {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+impl Packer {
+    fn max(&self) -> usize {
+        self.settings.sc_max_each_post.max(1)
+    }
+
+    /// The reference's pipe batches every write that lands while a POST is in flight (`dialer.go:489`), so a full pipe becomes one POST instead of one POST per relay window.
+    fn enqueue(&self, data: &[u8]) -> bool {
+        if self.closed.load(Ordering::SeqCst) {
+            return false;
+        }
+        let max = self.max();
+        let Ok(mut queue) = self.queue.lock() else {
             return false;
         };
-        let max = self.settings.sc_max_each_post.max(1);
+        let mut at = 0;
+        while at < data.len() {
+            while queue.len() >= max && !self.failed.load(Ordering::SeqCst) {
+                queue = self
+                    .cv
+                    .wait(queue)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            if self.failed.load(Ordering::SeqCst) {
+                return false;
+            }
+            let take = (max - queue.len()).min(data.len() - at);
+            queue.extend_from_slice(&data[at..at + take]);
+            at += take;
+            self.cv.notify_all();
+        }
+        !self.failed.load(Ordering::SeqCst)
+    }
+
+    fn pump(&self) {
+        loop {
+            let Ok(mut queue) = self.queue.lock() else {
+                self.failed.store(true, Ordering::SeqCst);
+                return;
+            };
+            while queue.is_empty() && !self.closed.load(Ordering::SeqCst) {
+                queue = self
+                    .cv
+                    .wait(queue)
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+            }
+            if queue.is_empty() {
+                return;
+            }
+            let take = queue.len().min(self.max());
+            let rest = queue.split_off(take);
+            let piece = std::mem::replace(&mut *queue, rest);
+            self.cv.notify_all();
+            drop(queue);
+            let Ok(mut stream) = self.stream.lock() else {
+                self.failed.store(true, Ordering::SeqCst);
+                return;
+            };
+            if !self.post(&mut **stream, &piece) {
+                self.failed.store(true, Ordering::SeqCst);
+                self.cv.notify_all();
+                return;
+            }
+        }
+    }
+
+    fn post(&self, stream: &mut dyn FrameStream, piece: &[u8]) -> bool {
         let Ok(mut last) = self.last.lock() else {
             return false;
         };
-        for piece in data.chunks(max) {
-            if piece.is_empty() {
-                continue;
-            }
-            // The reference paces the posts from the second one (`dialer.go:520`), gated on the range's `from`.
-            if let Some(since) = *last {
-                let (from, to) = self.settings.sc_min_posts_interval_ms;
-                if from > 0 {
-                    let want = std::time::Duration::from_millis(
-                        u64::try_from(random_between(from as usize, to as usize)).unwrap_or(0),
-                    );
-                    if let Some(pause) = want.checked_sub(since.elapsed()) {
-                        std::thread::sleep(pause);
-                    }
+        // The reference paces the posts from the second one (`dialer.go:520`), gated on the range's `from`.
+        if let Some(since) = *last {
+            let (from, to) = self.settings.sc_min_posts_interval_ms;
+            if from > 0 {
+                let want = std::time::Duration::from_millis(
+                    u64::try_from(random_between(from as usize, to as usize)).unwrap_or(0),
+                );
+                if let Some(pause) = want.checked_sub(since.elapsed()) {
+                    std::thread::sleep(pause);
                 }
             }
-            *last = Some(std::time::Instant::now());
-            let seq = self.seq.fetch_add(1, Ordering::SeqCst);
-            let (head, body) = packet_head(&self.host, &self.settings, &self.session, seq, piece);
-            let wrote = match body {
-                Some(body) => stream.write_slices(&[head.as_bytes(), body]),
-                None => stream.write_all(head.as_bytes()).is_ok(),
-            };
-            if !wrote || !drain_answer(&mut **stream as &mut dyn Read) {
-                return false;
-            }
         }
-        true
+        *last = Some(std::time::Instant::now());
+        let seq = self.seq.fetch_add(1, Ordering::SeqCst);
+        let (head, body) = packet_head(&self.host, &self.settings, &self.session, seq, piece);
+        let wrote = match body {
+            Some(body) => stream.write_slices(&[head.as_bytes(), body]),
+            None => stream.write_all(head.as_bytes()).is_ok(),
+        };
+        wrote && drain_answer(stream)
     }
 }
 
@@ -480,15 +563,30 @@ impl XhttpWriter {
         settings: &XhttpSettings,
         session: String,
     ) -> Self {
+        let up = Arc::new(Packer {
+            stream: Mutex::new(Box::new(w) as Box<dyn FrameStream + Send>),
+            queue: Mutex::new(Vec::new()),
+            cv: Condvar::new(),
+            closed: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            host: host.to_owned(),
+            settings: settings.clone(),
+            session,
+            seq: AtomicU64::new(0),
+            last: Mutex::new(None),
+        });
+        let poster = {
+            let up = Arc::clone(&up);
+            std::thread::Builder::new()
+                .name("xhttp-packet-up".to_owned())
+                .spawn(move || up.pump())
+                .ok()
+        };
         Self {
             shared: Arc::new(Shared {
                 body: Body::Packets(Box::new(Packets {
-                    stream: Mutex::new(Box::new(w) as Box<dyn FrameStream + Send>),
-                    host: host.to_owned(),
-                    settings: settings.clone(),
-                    session,
-                    seq: AtomicU64::new(0),
-                    last: Mutex::new(None),
+                    up,
+                    poster: Mutex::new(poster),
                 })),
                 finished: AtomicBool::new(false),
             }),
@@ -529,14 +627,17 @@ impl XhttpWriter {
             h2.end();
             return;
         }
-        let Body::Stream(stream) = &self.shared.body else {
-            // A packet-up upload has no end frame: the downlink's close ends the session.
-            return;
-        };
-        let Ok(mut stream) = stream.lock() else {
-            return;
-        };
-        let _ = stream.write_all(b"0\r\n\r\n");
+        match &self.shared.body {
+            Body::Stream(stream) => {
+                let Ok(mut stream) = stream.lock() else {
+                    return;
+                };
+                let _ = stream.write_all(b"0\r\n\r\n");
+            }
+            Body::Packets(packets) => {
+                let _ = packets.finish();
+            }
+        }
     }
 }
 
@@ -3551,6 +3652,144 @@ mod tests {
         assert_eq!(posts[1].0, format!("/share/{session}/1"));
         assert_eq!(posts[0].1, b"ab");
         assert_eq!(posts[1].1, b"cd");
+    }
+
+    /// A packet-up POST whose answer is still in flight lets the relay queue the next window, and the poster posts that queue as one body.
+    type Posts = Arc<Mutex<Vec<(String, Vec<u8>)>>>;
+
+    struct HeldUp {
+        posts: Posts,
+        wrote_first: std::sync::mpsc::SyncSender<()>,
+        answer: Mutex<std::sync::mpsc::Receiver<()>>,
+        answered: AtomicBool,
+        reply_at: usize,
+    }
+
+    impl Write for HeldUp {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for HeldUp {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            let head = parts.first().copied().unwrap_or_default();
+            let body = parts.get(1).copied().unwrap_or_default();
+            let text = String::from_utf8_lossy(head);
+            let target = text.split(' ').nth(1).unwrap_or_default().to_owned();
+            self.posts
+                .lock()
+                .expect("posts")
+                .push((target, body.to_vec()));
+            let _ = self.wrote_first.try_send(());
+            true
+        }
+    }
+
+    impl Read for HeldUp {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.answered.swap(true, Ordering::SeqCst) {
+                let _ = self.answer.lock().expect("answer").recv();
+            }
+            let reply = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+            if self.reply_at == reply.len() {
+                self.reply_at = 0;
+            }
+            let n = (reply.len() - self.reply_at).min(buf.len());
+            buf[..n].copy_from_slice(&reply[self.reply_at..self.reply_at + n]);
+            self.reply_at += n;
+            Ok(n)
+        }
+    }
+
+    struct HeldUpDial {
+        writer: XhttpWriter,
+        posts: Posts,
+        release: std::sync::mpsc::Sender<()>,
+        first_written: std::sync::mpsc::Receiver<()>,
+    }
+
+    fn held_up(settings: &XhttpSettings) -> HeldUpDial {
+        let posts = Arc::new(Mutex::new(Vec::new()));
+        let (wrote_first, first_written) = std::sync::mpsc::sync_channel(1);
+        let (release, answer) = std::sync::mpsc::channel();
+        let up = HeldUp {
+            posts: Arc::clone(&posts),
+            wrote_first,
+            answer: Mutex::new(answer),
+            answered: AtomicBool::new(false),
+            reply_at: 0,
+        };
+        let writer = XhttpWriter::packets(up, "h", settings, "session".to_owned());
+        HeldUpDial {
+            writer,
+            posts,
+            release,
+            first_written,
+        }
+    }
+
+    #[test]
+    fn a_packet_up_upload_batches_what_queues_behind_an_answer() {
+        let mut settings = packet_settings(XhttpMode::PacketUp);
+        settings.sc_max_each_post = 64;
+        settings.sc_min_posts_interval_ms = (0, 0);
+        let HeldUpDial {
+            writer,
+            posts,
+            release,
+            first_written,
+        } = held_up(&settings);
+        assert!(writer.send(&[0u8; 32]));
+        first_written
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first post left");
+        assert!(writer.send(&[1u8; 32]));
+        assert!(writer.send(&[2u8; 32]));
+        release.send(()).expect("releases the answer");
+        writer.finish();
+        let posts = posts.lock().expect("posts");
+        assert_eq!(posts.len(), 2, "the queued windows share one post");
+        assert_eq!(posts[0].1, [0u8; 32]);
+        let mut batched = vec![1u8; 32];
+        batched.extend_from_slice(&[2u8; 32]);
+        assert_eq!(posts[1].1, batched, "the batched post carries both windows");
+        assert!(posts[0].0.ends_with("/session/0"));
+        assert!(posts[1].0.ends_with("/session/1"));
+    }
+
+    /// Any tail the relay hands over rides the post it queued behind, and the posts put the upload back byte for byte.
+    #[test]
+    fn a_packet_up_upload_posts_every_byte_in_order() {
+        let mut settings = packet_settings(XhttpMode::PacketUp);
+        settings.sc_max_each_post = 7;
+        settings.sc_min_posts_interval_ms = (0, 0);
+        let HeldUpDial {
+            writer,
+            posts,
+            release,
+            first_written: _,
+        } = held_up(&settings);
+        release.send(()).expect("answers without holding");
+        let pieces: [&[u8]; 5] = [b"ab", &[0u8; 7], &[1u8; 8], &[2u8; 3], b""];
+        let mut want = Vec::new();
+        for piece in pieces {
+            assert!(writer.send(piece));
+            want.extend_from_slice(piece);
+        }
+        writer.finish();
+        let posts = posts.lock().expect("posts");
+        let got: Vec<u8> = posts
+            .iter()
+            .flat_map(|(_, body)| body.iter().copied())
+            .collect();
+        assert_eq!(got, want);
+        assert!(posts
+            .iter()
+            .all(|(_, body)| !body.is_empty() && body.len() <= 7));
     }
 
     /// A stream-up dial uploads the whole payload before the downlink carries a byte: the two halves are independent, and the upload's `0` terminator ends the session the downlink reads from.
