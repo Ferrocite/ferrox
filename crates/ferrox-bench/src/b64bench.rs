@@ -198,8 +198,8 @@ pub(crate) fn report(rows: &[Row]) -> String {
          the same process, and asserts the two produce the same text and the same decode before\n\
          either is timed. The reference is the four-shift, four-store group walk; the shipped\n\
          form reads one twelve-bit group as two table probes and two stores, and decodes a\n\
-         group with one load and one four-byte store. The gate below requires every row to be\n\
-         no slower than its own reference.\n"
+         pair of groups with eight table probes and one eight-byte store. The gate below\n\
+         requires every row to be no slower than its own reference.\n"
     );
     let _ = writeln!(
         out,
