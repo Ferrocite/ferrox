@@ -5,15 +5,22 @@ const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz012
 /// [`encode_parts_into`] is the other route to these bytes and the one that writes where the caller already has a window; `the_window_coder_matches_the_alphabet_at_every_length` holds the two byte-identical, which is why this shape survives instead of delegating and paying a fill plus a UTF-8 walk per call.
 #[must_use]
 pub fn encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(encoded_len(bytes.len()));
-    // A whole group is three adjacent bytes, so the word is read as one and no per-byte walk or variable shift is paid for it.
+    let len = encoded_len(bytes.len());
+    let mut out = Vec::<u8>::with_capacity(len);
+    // The buffer is opened to the exact coded length and every byte of it is written below, so the four alphabet octets of a group are four stores and one cursor add rather than four capacity checks and a length reload each.
+    let ptr = out.as_mut_ptr();
     let (whole, rest) = bytes.as_chunks::<3>();
+    let mut at = 0usize;
     for [a, b, c] in whole {
         let word = u32::from_be_bytes([0, *a, *b, *c]);
-        out.push(STD[(word >> 18 & 63) as usize] as char);
-        out.push(STD[(word >> 12 & 63) as usize] as char);
-        out.push(STD[(word >> 6 & 63) as usize] as char);
-        out.push(STD[(word & 63) as usize] as char);
+        // SAFETY: `at + 4 <= len` for every whole group, and the four bytes written are alphabet octets, so the `String` below is valid UTF-8.
+        unsafe {
+            ptr.add(at).write(STD[(word >> 18 & 63) as usize]);
+            ptr.add(at + 1).write(STD[(word >> 12 & 63) as usize]);
+            ptr.add(at + 2).write(STD[(word >> 6 & 63) as usize]);
+            ptr.add(at + 3).write(STD[(word & 63) as usize]);
+        }
+        at += 4;
     }
     // The one or two bytes a whole group does not cover are the padded group they always were, with its last octets zero.
     if !rest.is_empty() {
@@ -22,16 +29,25 @@ pub fn encode(bytes: &[u8]) -> String {
             word = (word << 8) | u32::from(*byte);
         }
         word <<= 8 * (3 - rest.len());
-        out.push(STD[(word >> 18 & 63) as usize] as char);
-        out.push(STD[(word >> 12 & 63) as usize] as char);
-        out.push(if rest.len() > 1 {
-            STD[(word >> 6 & 63) as usize] as char
-        } else {
-            '='
-        });
-        out.push('=');
+        // SAFETY: the padded group is the final four bytes of the exact coded length.
+        unsafe {
+            ptr.add(at).write(STD[(word >> 18 & 63) as usize]);
+            ptr.add(at + 1).write(STD[(word >> 12 & 63) as usize]);
+            ptr.add(at + 2).write(if rest.len() > 1 {
+                STD[(word >> 6 & 63) as usize]
+            } else {
+                b'='
+            });
+            ptr.add(at + 3).write(b'=');
+        }
+        at += 4;
     }
-    out
+    debug_assert_eq!(at, len, "the alphabet fills the capacity it reserved");
+    // SAFETY: the whole buffer was initialized above with alphabet octets or padding.
+    unsafe {
+        out.set_len(len);
+        String::from_utf8_unchecked(out)
+    }
 }
 
 #[must_use]
@@ -132,41 +148,111 @@ impl Gather<'_> {
     }
 }
 
+/// One table for both alphabets: a valid digit is below 64, so the invalid sentinel is the only value with bit 6 set.
+const fn digit_table() -> [u8; 256] {
+    let mut table = [255u8; 256];
+    let mut byte = b'A';
+    while byte <= b'Z' {
+        table[byte as usize] = byte - b'A';
+        byte += 1;
+    }
+    byte = b'a';
+    while byte <= b'z' {
+        table[byte as usize] = byte - b'a' + 26;
+        byte += 1;
+    }
+    byte = b'0';
+    while byte <= b'9' {
+        table[byte as usize] = byte - b'0' + 52;
+        byte += 1;
+    }
+    table[b'+' as usize] = 62;
+    table[b'-' as usize] = 62;
+    table[b'/' as usize] = 63;
+    table[b'_' as usize] = 63;
+    table
+}
+
+const DIGITS: [u8; 256] = digit_table();
+
 pub fn value(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' | b'-' => Some(62),
-        b'/' | b'_' => Some(63),
-        _ => None,
+    match DIGITS[usize::from(byte)] {
+        255 => None,
+        digit => Some(digit),
     }
 }
 
-#[must_use]
-pub fn decode(text: &[u8]) -> Option<Vec<u8>> {
-    let mut clean: Vec<u8> = text
-        .iter()
-        .copied()
-        .filter(|byte| !byte.is_ascii_whitespace())
-        .take_while(|byte| *byte != b'=')
-        .collect();
-    if clean.is_empty() || clean.len() % 4 == 1 {
+/// The three bytes four digits stand for, or `None` for a byte outside the alphabet, padding or whitespace.
+fn group_word(group: [u8; 4]) -> Option<[u8; 3]> {
+    let t0 = u32::from(DIGITS[usize::from(group[0])]);
+    let t1 = u32::from(DIGITS[usize::from(group[1])]);
+    let t2 = u32::from(DIGITS[usize::from(group[2])]);
+    let t3 = u32::from(DIGITS[usize::from(group[3])]);
+    if (t0 | t1 | t2 | t3) & 0xc0 != 0 {
         return None;
     }
-    let drop = (4 - clean.len() % 4) % 4;
-    clean.resize(clean.len() + drop, b'A');
-    let mut out = Vec::with_capacity(clean.len() / 4 * 3);
-    for group in clean.as_chunks::<4>().0 {
-        let mut word = 0u32;
-        for byte in group {
-            word = (word << 6) | u32::from(value(*byte)?);
+    let word = (t0 << 18) | (t1 << 12) | (t2 << 6) | t3;
+    let bytes = word.to_be_bytes();
+    Some([bytes[1], bytes[2], bytes[3]])
+}
+
+/// The bytes a partial group stands for, its digits left-aligned in the window.
+fn group_tail(rest: &[u8]) -> Option<[u8; 3]> {
+    let mut word = 0u32;
+    for &byte in rest {
+        let digit = DIGITS[usize::from(byte)];
+        if digit == 255 {
+            return None;
         }
-        out.push((word >> 16) as u8);
-        out.push((word >> 8) as u8);
-        out.push(word as u8);
+        word = (word << 6) | u32::from(digit);
     }
-    out.truncate(out.len() - drop);
+    word <<= 6 * (4 - rest.len());
+    let bytes = word.to_be_bytes();
+    Some([bytes[1], bytes[2], bytes[3]])
+}
+
+/// One pass over the text and one output buffer: whole groups are four table loads and three stores, whitespace is skipped where it lies, padding ends the text, and a 2..=3 digit tail keeps the bytes its padded group would have held.
+#[must_use]
+pub fn decode(text: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(text.len() / 4 * 3 + 3);
+    let mut at = 0usize;
+    while at + 4 <= text.len() {
+        let Some(bytes) = group_word([text[at], text[at + 1], text[at + 2], text[at + 3]]) else {
+            break;
+        };
+        out.extend_from_slice(&bytes);
+        at += 4;
+    }
+    if at == text.len() {
+        return (!out.is_empty()).then_some(out);
+    }
+    let mut group = [0u8; 4];
+    let mut held = 0usize;
+    let mut saw = false;
+    for &byte in &text[at..] {
+        if byte == b'=' {
+            break;
+        }
+        if byte.is_ascii_whitespace() {
+            continue;
+        }
+        group[held] = byte;
+        held += 1;
+        saw = true;
+        if held == 4 {
+            out.extend_from_slice(&group_word(group)?);
+            held = 0;
+        }
+    }
+    if held == 1 {
+        return None;
+    }
+    if held != 0 {
+        out.extend_from_slice(&group_tail(&group[..held])?[..held - 1]);
+    }
+    if out.is_empty() && !saw {
+        return None;
+    }
     Some(out)
 }
 
@@ -290,6 +376,95 @@ mod tests {
         }
         assert_eq!(
             fold, 0x4291_eb80,
+            "64 passes over a whole coding and a padded one, folded after each"
+        );
+    }
+
+    /// The staged decoder exactly as it stood, kept as the oracle the one-pass form must answer with the same verdict and the same bytes on every input.
+    fn decode_staged(text: &[u8]) -> Option<Vec<u8>> {
+        let mut clean: Vec<u8> = text
+            .iter()
+            .copied()
+            .filter(|byte| !byte.is_ascii_whitespace())
+            .take_while(|byte| *byte != b'=')
+            .collect();
+        if clean.is_empty() || clean.len() % 4 == 1 {
+            return None;
+        }
+        let drop = (4 - clean.len() % 4) % 4;
+        clean.resize(clean.len() + drop, b'A');
+        let mut out = Vec::with_capacity(clean.len() / 4 * 3);
+        for group in clean.as_chunks::<4>().0 {
+            let mut word = 0u32;
+            for byte in group {
+                word = (word << 6) | u32::from(value(*byte)?);
+            }
+            out.push((word >> 16) as u8);
+            out.push((word >> 8) as u8);
+            out.push(word as u8);
+        }
+        out.truncate(out.len() - drop);
+        Some(out)
+    }
+
+    /// Every prefix of every coded length, then arbitrary bytes over both alphabets, padding, whitespace and the invalid range: the one-pass decoder and the staged one must agree on the bytes **and** the verdict.
+    #[test]
+    fn the_one_pass_decoder_is_the_staged_decoder_at_every_input() {
+        for len in 0..=96usize {
+            let raw: Vec<u8> = (0..len).map(|i| (i * 7 + 11) as u8).collect();
+            let coded = encode(&raw).replace('+', "-").replace('/', "_");
+            for cut in 0..=coded.len() {
+                let head = &coded.as_bytes()[..cut];
+                assert_eq!(decode(head), decode_staged(head), "prefix {cut} of {len}");
+            }
+        }
+        let alphabet =
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/-_= \t\n\r!";
+        let mut word = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..20_000 {
+            let len = (word as usize >> 7) % 41;
+            let mut input = Vec::with_capacity(len);
+            for _ in 0..len {
+                word ^= word << 13;
+                word ^= word >> 7;
+                word ^= word << 17;
+                input.push(alphabet[(word as usize >> 11) % alphabet.len()]);
+            }
+            assert_eq!(decode(&input), decode_staged(&input), "{input:?}");
+        }
+    }
+
+    /// The one buffer the decoder hands back is the only one it takes: the staged form allocated the filtered text as well, so the counting allocator is what says the pass is gone.
+    #[test]
+    fn the_decoder_takes_one_buffer_and_the_staged_form_took_two() {
+        let coded = encode(&(0..96).map(|i| (i * 7 + 11) as u8).collect::<Vec<_>>());
+        let (decoded, counts) = crate::alloc_count::measure(|| decode(coded.as_bytes()));
+        assert_eq!(decoded.expect("decodes").len(), 96);
+        assert_eq!(counts.allocs, 1, "only the output buffer: {counts:?}");
+        assert_eq!(counts.zeroed, 0, "the output is written as it is decoded");
+        let (_, staged) = crate::alloc_count::measure(|| decode_staged(coded.as_bytes()));
+        assert!(
+            staged.allocs > counts.allocs,
+            "the staged form paid more: {staged:?}"
+        );
+    }
+
+    /// The decoder, and nothing else: 64 passes over a 96-byte coding and a 95-byte padded one, the decoded bytes folded into a pinned `u32` so the loop cannot be folded away.
+    #[test]
+    fn the_alphabet_decoder_costs_the_groups_and_nothing_else() {
+        let bytes: Vec<u8> = (0..96).map(|i| (i * 7 + 11) as u8).collect();
+        let whole = encode(&bytes);
+        let padded = encode(&bytes[..95]);
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            for coded in [&whole, &padded] {
+                for byte in decode(coded.as_bytes()).expect("decodes") {
+                    fold = fold.wrapping_mul(31).wrapping_add(u32::from(byte));
+                }
+            }
+        }
+        assert_eq!(
+            fold, 0x69b9_f000,
             "64 passes over a whole coding and a padded one, folded after each"
         );
     }
