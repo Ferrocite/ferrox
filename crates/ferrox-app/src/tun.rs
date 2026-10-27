@@ -13,7 +13,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering::Relaxed};
 use std::sync::{mpsc, Arc};
 
@@ -23,7 +23,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use crate::budgets;
 use crate::conn::Connection;
 use ferrox_core::foxy::connectip::{
-    checksum, ipv4_checksum, ipv4_head, tcp_checksum, udp_datagram, udp_head, Ipv4Head,
+    icmp_echo_reply, ipv4_checksum, ipv4_head, tcp_checksum, udp_datagram, udp_head, Ipv4Head,
     UdpDatagram, IPV4_HEADER, PROTOCOL_UDP, UDP_HEADER,
 };
 
@@ -34,6 +34,7 @@ const TCP_PROTO: u8 = 6;
 const ICMP_PROTO: u8 = 1;
 /// An ICMP echo request is type 8; its answer flips that to type 0 and carries the message back.
 const ICMP_ECHO_REQUEST: u8 = 8;
+#[cfg(all(test, unix))]
 const ICMP_ECHO_REPLY: u8 = 0;
 const FLAG_FIN: u8 = 0x01;
 const FLAG_SYN: u8 = 0x02;
@@ -342,29 +343,12 @@ fn render_tcp_packet(
     out[IPV4_HEADER + 16..IPV4_HEADER + 18].copy_from_slice(&tc.to_be_bytes());
 }
 
-/// An ICMP echo request answered as the device's own destination would: the request's own message with the type flipped to an echo reply, the code and checksum zeroed and the checksum recomputed, wrapped in an IPv4 header whose source and destination are the request's swapped — rendered into the caller's reused `out`, so a ping storm allocates nothing per reply.
+/// An ICMP echo request answered as the device's own destination would: the shared renderer
+/// flips the type, swaps the addresses and recomputes both checksums into the caller's reused
+/// `out`, so a ping storm allocates nothing per reply. `src` and `dst` are the reply's, the
+/// request's the other way round.
 fn render_icmp_reply(src: [u8; 4], dst: [u8; 4], request: &[u8], out: &mut Vec<u8>) {
-    let ip_len = IPV4_HEADER + request.len();
-    out.clear();
-    out.reserve(ip_len);
-    let mut ip = [0u8; IPV4_HEADER];
-    ip[0] = 0x45;
-    ip[2..4].copy_from_slice(&(ip_len as u16).to_be_bytes());
-    ip[6] = 0x40;
-    ip[8] = 64;
-    ip[9] = ICMP_PROTO;
-    ip[12..16].copy_from_slice(&src);
-    ip[16..20].copy_from_slice(&dst);
-    let c = ipv4_checksum(&ip);
-    ip[10..12].copy_from_slice(&c.to_be_bytes());
-    out.extend_from_slice(&ip);
-    out.extend_from_slice(request);
-    let m = &mut out[IPV4_HEADER..];
-    m[0] = ICMP_ECHO_REPLY;
-    m[1] = 0;
-    m[2..4].copy_from_slice(&[0, 0]);
-    let ic = checksum(m);
-    m[2..4].copy_from_slice(&ic.to_be_bytes());
+    let _ = icmp_echo_reply(IpAddr::from(dst), IpAddr::from(src), request, out);
 }
 
 /// Test-only: the render pair behind a fresh vector, so a caller that only wants to inspect one packet need not thread a buffer. Production emits reach the device through `render_*_packet` into a reused buffer.
@@ -853,6 +837,8 @@ pub(crate) fn refusal_reason(spec: &Spec) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use ferrox_core::foxy::connectip::checksum;
 
     #[test]
     fn device_protocols_recognized() {
