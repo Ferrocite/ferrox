@@ -5858,7 +5858,7 @@ fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static>(
             close,
             |_| {},
             |reader| reader.rearm(budgets::handshake()),
-            |reader| reader.disarm(),
+            HandshakeRead::disarm,
         );
     }
     serve_session_xhttp_with(creader, &cwriter, users, freedom);
