@@ -29259,13 +29259,19 @@ mod tests {
             assert_eq!(got, id);
             assert_eq!(flow, Flow::Vision);
             assert_eq!(cmd, 1);
-            tls.get_ref()
-                .get_ref()
-                .set_read_timeout(Some(Duration::from_millis(200)))
-                .expect("timeout");
-            let mut uuid = [0u8; 16];
-            let framed = tls.read_exact(&mut uuid).is_ok() && uuid == id;
-            let _ = seen.send(framed);
+            tls.write_all(&[0, 0]).expect("answers");
+            let mut link = crate::vision::Link::new(tls, None, &id);
+            let mut first = [0u8; 4];
+            link.read_exact(&mut first)
+                .expect("reads the pumped upload");
+            assert_eq!(&first, b"ping");
+            link.write_all(&first).expect("echoes the pumped upload");
+            let mut second = [0u8; 4];
+            link.read_exact(&mut second)
+                .expect("reads the relayed upload");
+            assert_eq!(&second, b"pong");
+            link.write_all(&second).expect("echoes the relayed upload");
+            let _ = seen.send(true);
         });
         let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let dport = downstream.local_addr().expect("addr").port();
@@ -29301,9 +29307,12 @@ mod tests {
         sock.set_read_timeout(Some(Duration::from_secs(2)))
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping");
+        sock.write_all(b"pong").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"pong");
         let framed = framed
             .recv_timeout(Duration::from_secs(2))
-            .expect("the server sees the first write");
+            .expect("the server sees both writes");
         budgets::clear();
         drop(sock);
         relay.join().expect("joins");
