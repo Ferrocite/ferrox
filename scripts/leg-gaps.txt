@@ -40,8 +40,9 @@ vless-vision-tls-raw-up-1|server|0.79|486
 vless-vision-tls-raw-up-1|server-cpu|1.12|486
 vless-ws-down-8|server-threads|1.36|696
 vless-xhttp-down-8|server-threads|1.73|696
-vless-xhttp-down-8|client|0.36|472
-vless-xhttp-duplex-8|client|0.59|472
+vless-xhttp-down-8|rust|0.36|472
+vless-xhttp-duplex-8|client|0.84|472
+vless-xhttp-duplex-8|rust|0.59|472
 vless-xhttp-duplex-8|server-threads|1.20|696
 vless-xhttp-up-1|server-threads|1.20|696
 vmess-raw-down-8|server-threads|1.46|696
