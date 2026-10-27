@@ -250,10 +250,20 @@ pub(crate) struct WsReader<R: Read = Connection> {
     eof: bool,
     /// A fragmented message is mid-assembly: the buffer must not compact under its offsets.
     assembling: bool,
+    /// Start of the message being assembled, and the offset its fragments are packed to.
+    whole: usize,
+    filled: usize,
     /// Wall-clock end of the opening handshake: past it an idle socket is death, not a round to retry.
     handshake: Option<std::time::Instant>,
     #[cfg_attr(not(test), allow(dead_code, reason = "read by the syscall gate"))]
     reads: usize,
+}
+
+struct Frame {
+    fin: bool,
+    opcode: u8,
+    mask: Option<[u8; 4]>,
+    payload: std::ops::Range<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -275,18 +285,9 @@ impl<R: Read> WsReader<R> {
         self.handshake = until;
     }
 
-    /// At least `len` unparsed bytes, or false once the socket is done.
-    fn need(&mut self, len: usize) -> bool {
-        while self.have.len() - self.at < len {
-            if self.eof || !self.pull(len) {
-                return false;
-            }
-        }
-        true
-    }
-
-    /// One syscall; the buffer grows only past the window and frames unmask in place. `False` means done.
-    fn pull(&mut self, len: usize) -> bool {
+    /// One syscall; the buffer grows only past the window and frames unmask in place. `False` means
+    /// done, and a relay's poll timeout is handed back to the lane with the frame where it broke.
+    fn pull(&mut self, len: usize) -> std::io::Result<bool> {
         if self.at > 0 && !self.assembling {
             self.have.copy_within(self.at.., 0);
             self.have.truncate(self.have.len() - self.at);
@@ -309,16 +310,22 @@ impl<R: Read> WsReader<R> {
                     break 0;
                 }
                 Ok(n) => break n,
-                Err(error) if crate::proxy::is_timeout(&error) => {
-                    if self
-                        .handshake
-                        .is_some_and(|until| std::time::Instant::now() >= until)
-                    {
+                Err(error) if crate::proxy::is_timeout(&error) => match self.handshake {
+                    // The opening decode is the one wait a budget owns, and a silence past it is the end.
+                    Some(until) if std::time::Instant::now() < until => {}
+                    Some(_) => {
                         self.have.truncate(base);
                         self.eof = true;
                         break 0;
                     }
-                }
+                    // A lane's poll: the frame resumes from the bytes already in hand.
+                    None if crate::proxy::relay_step_owns_poll() => {
+                        self.have.truncate(base);
+                        return Err(error);
+                    }
+                    // A split's poll with no lane above it: sleep a grain and keep the wait blocking.
+                    None => std::thread::sleep(crate::budgets::RELAY_POLL),
+                },
                 Err(_) => {
                     self.have.truncate(base);
                     self.eof = true;
@@ -328,22 +335,21 @@ impl<R: Read> WsReader<R> {
         };
         self.reads += 1;
         self.have.truncate(base + taken);
-        taken > 0
+        Ok(taken > 0)
     }
 
-    /// Parse frames until a message ends: control frames answered on the spot, data unmasked where they lie.
-    fn message(&mut self) -> bool {
-        self.assembling = false;
-        let mut open = false;
-        // Assembly coordinates: every fragment's bytes land at `filled`, so the span delivered is the message's.
-        let mut whole = 0usize;
-        let mut filled = 0usize;
+    /// One complete frame parsed out of the window, or `None` when the bytes are not there.
+    fn frame(&mut self, fill: bool) -> std::io::Result<Option<Frame>> {
         loop {
-            if !self.need(2) {
-                return false;
+            let at = self.at;
+            let avail = self.have.len() - at;
+            if avail < 2 {
+                if !fill || self.eof || !self.pull(2)? {
+                    return Ok(None);
+                }
+                continue;
             }
-            let head = [self.have[self.at], self.have[self.at + 1]];
-            self.at += 2;
+            let head = [self.have[at], self.have[at + 1]];
             let fin = head[0] & 0x80 != 0;
             let opcode = head[0] & 0x0F;
             let masked = head[1] & 0x80 != 0;
@@ -355,81 +361,113 @@ impl<R: Read> WsReader<R> {
             } else {
                 0
             };
-            let rest = ext_len + usize::from(masked) * 4;
-            if !self.need(rest) {
-                return false;
+            let head_len = 2 + ext_len + usize::from(masked) * 4;
+            if avail < head_len {
+                if !fill || self.eof || !self.pull(head_len)? {
+                    return Ok(None);
+                }
+                continue;
             }
             let mut len = marker;
             if marker == 126 {
-                let at = self.at;
-                len = usize::from(u16::from_be_bytes([self.have[at], self.have[at + 1]]));
+                len = usize::from(u16::from_be_bytes([self.have[at + 2], self.have[at + 3]]));
             } else if marker == 127 {
                 let mut raw = [0u8; 8];
-                raw.copy_from_slice(&self.have[self.at..self.at + 8]);
+                raw.copy_from_slice(&self.have[at + 2..at + 10]);
                 let Ok(wide) = usize::try_from(u64::from_be_bytes(raw)) else {
-                    return false;
+                    return Ok(None);
                 };
                 len = wide;
             }
             if len > FRAME_LIMIT || (opcode & 0x08 != 0 && (len > 125 || !fin)) {
-                return false;
+                return Ok(None);
+            }
+            if avail < head_len + len {
+                if !fill || self.eof || !self.pull(head_len + len)? {
+                    return Ok(None);
+                }
+                continue;
             }
             let mask = if masked {
-                let at = self.at + ext_len;
-                let mask = [
+                let at = at + head_len - 4;
+                Some([
                     self.have[at],
                     self.have[at + 1],
                     self.have[at + 2],
                     self.have[at + 3],
-                ];
-                Some(mask)
+                ])
             } else {
                 None
             };
-            self.at += rest;
-            if !self.need(len) {
-                return false;
-            }
-            let start = self.at;
-            let payload = start..start + len;
-            self.at += len;
-            match opcode {
+            return Ok(Some(Frame {
+                fin,
+                opcode,
+                mask,
+                payload: at + head_len..at + head_len + len,
+            }));
+        }
+    }
+
+    /// Parse frames until a message ends: control frames answered on the spot, data unmasked where they lie.
+    fn message(&mut self, fill: bool) -> std::io::Result<bool> {
+        if !self.assembling {
+            self.whole = 0;
+            self.filled = 0;
+        }
+        let mut open = self.assembling;
+        loop {
+            let Some(frame) = self.frame(fill)? else {
+                return Ok(false);
+            };
+            let start = frame.payload.start;
+            let len = frame.payload.len();
+            let end = frame.payload.end;
+            match frame.opcode {
                 OP_CLOSE => {
-                    self.reply(OP_CLOSE, &self.have[payload]);
-                    return false;
+                    self.reply(OP_CLOSE, &self.have[frame.payload]);
+                    self.at = end;
+                    self.eof = true;
+                    return Ok(false);
                 }
-                OP_PING => self.reply(OP_PONG, &self.have[payload]),
-                OP_PONG => {}
+                OP_PING => {
+                    self.reply(OP_PONG, &self.have[frame.payload]);
+                    self.at = end;
+                }
+                OP_PONG => {
+                    self.at = end;
+                }
                 // RFC 6455 has two data opcodes; the tunnel reads both and writes binary, the order the reference keeps.
                 OP_TEXT | OP_DATA | OP_CONT => {
-                    if (opcode == OP_CONT) != open {
-                        return false;
+                    if (frame.opcode == OP_CONT) != open {
+                        return Ok(false);
                     }
-                    if let Some(mask) = mask {
-                        apply_mask(&mut self.have[payload], mask);
+                    if let Some(mask) = frame.mask {
+                        apply_mask(&mut self.have[frame.payload.clone()], mask);
                     }
                     if !open {
-                        whole = start;
-                        filled = start;
-                    } else if filled != start {
-                        self.have.copy_within(start..start + len, filled);
+                        self.whole = start;
+                        self.filled = start;
+                    } else if self.filled != start {
+                        self.have.copy_within(frame.payload.clone(), self.filled);
                     }
-                    if fin {
-                        let gap = start.saturating_sub(filled);
+                    self.at = end;
+                    if frame.fin {
+                        let gap = start.saturating_sub(self.filled);
                         if gap > 0 {
-                            let tail = start + len;
-                            self.have.copy_within(tail.., filled + len);
+                            let tail = end;
+                            self.have.copy_within(tail.., self.filled + len);
                             self.have.truncate(self.have.len() - gap);
                         }
-                        self.msg_end = filled + len;
-                        self.at = whole;
-                        return true;
+                        self.msg_end = self.filled + len;
+                        self.at = self.whole;
+                        self.assembling = false;
+                        return Ok(true);
                     }
                     self.assembling = true;
-                    filled += len;
+                    self.filled += len;
                     open = true;
                 }
-                _ => return false,
+                _ => return Ok(false),
             }
         }
     }
@@ -462,21 +500,29 @@ impl<R: Read> Read for WsReader<R> {
             self.eat += n;
             return Ok(n);
         }
+        let mut filled = 0;
         loop {
             if self.at < self.msg_end {
-                let n = (self.msg_end - self.at).min(buf.len());
-                buf[..n].copy_from_slice(&self.have[self.at..self.at + n]);
+                let n = (self.msg_end - self.at).min(buf.len() - filled);
+                buf[filled..filled + n].copy_from_slice(&self.have[self.at..self.at + n]);
                 self.at += n;
-                return Ok(n);
+                filled += n;
+                if filled == buf.len() {
+                    return Ok(filled);
+                }
             }
             if self.eof {
-                return Ok(0);
+                return Ok(filled);
             }
             self.early.clear();
             self.eat = 0;
-            if !self.message() {
-                self.eof = true;
-                return Ok(0);
+            // The first message may wait in the transport; a message already buffered behind it may not.
+            let fill = filled == 0;
+            if !self.message(fill)? {
+                if fill {
+                    self.eof = true;
+                }
+                return Ok(filled);
             }
         }
     }
@@ -805,6 +851,8 @@ pub(crate) fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
         eat: 0,
         eof: false,
         assembling: false,
+        whole: 0,
+        filled: 0,
         handshake: None,
         reads: 0,
     };
@@ -1033,6 +1081,8 @@ mod tests {
                     eat: 0,
                     eof: false,
                     assembling: false,
+                    whole: 0,
+                    filled: 0,
                     handshake: None,
                     reads: 0,
                 };
@@ -1051,6 +1101,81 @@ mod tests {
 
     /// RFC 6455 has two data opcodes, and the tunnel reads both: a text frame answers like a binary one, a text message reassembles over a continuation, and a binary one reaches the reader unchanged.
     #[test]
+    fn two_buffered_frames_leave_in_one_read() {
+        let frame = |payload: &[u8]| {
+            let mut wire = vec![0x80 | OP_DATA, 126];
+            wire.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            wire.extend_from_slice(payload);
+            wire
+        };
+        let first = [0x11u8; 300];
+        let second = [0x22u8; 300];
+        let mut wire = frame(&first);
+        wire.extend(frame(&second));
+        let mut reader = WsReader {
+            read: std::io::Cursor::new(wire),
+            shared: Arc::new(Shared {
+                stream: Mutex::new(Box::new(Sink::default())),
+                closed: AtomicBool::new(false),
+                masked: false,
+            }),
+            have: Vec::new(),
+            at: 0,
+            msg_end: 0,
+            early: Vec::new(),
+            eat: 0,
+            eof: false,
+            assembling: false,
+            whole: 0,
+            filled: 0,
+            handshake: None,
+            reads: 0,
+        };
+        let mut buf = [0u8; 600];
+        let n = reader.read(&mut buf).expect("reads");
+        assert_eq!(n, 600, "both buffered frames leave in one read");
+        assert_eq!(
+            &buf[..n],
+            &[first.as_slice(), second.as_slice()].concat()[..]
+        );
+        assert_eq!(reader.reads(), 1);
+    }
+
+    #[test]
+    fn a_partial_next_frame_does_not_hold_the_ready_message() {
+        let mut wire = vec![0x80 | OP_DATA, 126, 0x01, 0x2C];
+        wire.extend_from_slice(&[0x33u8; 300]);
+        wire.push(0x80 | OP_DATA);
+        let mut reader = WsReader {
+            read: std::io::Cursor::new(wire),
+            shared: Arc::new(Shared {
+                stream: Mutex::new(Box::new(Sink::default())),
+                closed: AtomicBool::new(false),
+                masked: false,
+            }),
+            have: Vec::new(),
+            at: 0,
+            msg_end: 0,
+            early: Vec::new(),
+            eat: 0,
+            eof: false,
+            assembling: false,
+            whole: 0,
+            filled: 0,
+            handshake: None,
+            reads: 0,
+        };
+        let mut buf = [0u8; 600];
+        let n = reader.read(&mut buf).expect("reads");
+        assert_eq!(
+            n, 300,
+            "the ready message leaves without waiting for the next head"
+        );
+        assert_eq!(&buf[..n], &[0x33u8; 300]);
+        assert_eq!(reader.reads(), 1);
+    }
+
+    #[test]
     fn a_text_frame_carries_a_message_like_a_binary_one() {
         let payload: Vec<u8> = (0..300u16).map(|i| (i % 251) as u8).collect();
         let reader_for = |frames: Vec<u8>| WsReader {
@@ -1067,6 +1192,8 @@ mod tests {
             eat: 0,
             eof: false,
             assembling: false,
+            whole: 0,
+            filled: 0,
             handshake: None,
             reads: 0,
         };
@@ -1165,6 +1292,8 @@ mod tests {
             eat: 0,
             eof: false,
             assembling: false,
+            whole: 0,
+            filled: 0,
             handshake: None,
             reads: 0,
         };
@@ -1210,6 +1339,8 @@ mod tests {
             eat: 0,
             eof: false,
             assembling: false,
+            whole: 0,
+            filled: 0,
             handshake: None,
             reads: 0,
         };
@@ -1262,6 +1393,8 @@ mod tests {
             eat: 0,
             eof: false,
             assembling: false,
+            whole: 0,
+            filled: 0,
             handshake: None,
             reads: 0,
         };

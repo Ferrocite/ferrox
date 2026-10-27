@@ -2951,14 +2951,6 @@ impl Write for QuicStream {
     }
 }
 
-impl crate::proxy::HalfShut for QuicStream {
-    /// A finished direction is a FIN on the stream, not a reset: the bytes already queued must
-    /// reach the peer before the stream ends, or the last window of the transfer is lost.
-    fn spill(&self) {
-        let _ = self.fin();
-    }
-}
-
 impl crate::proxy::Duplicate for QuicStream {
     /// Two handles of one stream: the clone shares the connection and the id and costs no
     /// syscall, and neither half holds a lock across the wait the other direction wants.

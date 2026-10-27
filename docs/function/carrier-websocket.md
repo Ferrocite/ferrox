@@ -39,6 +39,10 @@ The handshake read used to `peek` for `\r\n\r\n`, prove the head there, then re-
 
 What is *not* removed: `proxy::read_http_head` still answers the `http` front, whose prefix has one buffer and nowhere else to go, and the Shadowsocks rung, which waits inside a `peek` for the first byte of a request packet and must not take it.
 
+## The poll it hands back
+
+A relay lane owns the socket's poll quantum, so a read that comes back empty-handed is the lane's turn to move another flow, not an invitation to wait again. `WsReader` keeps a half-parsed frame in `assembling`/`whole`/`filled` and returns the timeout: `frame` does not move the cursor until the whole frame is in `have`, so the next step resumes on the same frame, and nothing compacts the buffer under an assembly. A handshake still in flight waits to its own deadline, and a spent clock is a hard end rather than a timeout `read_exact` would retry forever. The syscall count per frame is unchanged; what moves is one return, earlier. Witnessed by `proxy::tests::production_tls_first_ws_matches_the_seam`, and the frame-atomic parse is the one `ws::tests::frames_round_trip_masked_and_plain` drives.
+
 ## Measured
 
 <!-- counts:begin -->
@@ -51,6 +55,8 @@ What is *not* removed: `proxy::read_http_head` still answers the `http` front, w
 | user-space-copies-per-byte-unmasked-write | 0 | ferrox-app-ws::tests::frames_round_trip_masked_and_plain |
 | user-space-copies-per-byte-masked-write | 1 | ferrox-app-ws::tests::frames_round_trip_masked_and_plain |
 | user-space-copies-per-byte-read | 1 | ferrox-app-ws::tests::a_read_covers_a_window_not_one_frame_header |
+| read-calls-per-two-buffered-frames | 1 | ferrox-app-ws::tests::two_buffered_frames_leave_in_one_read |
+| transport-reads-after-a-ready-message | 0 | ferrox-app-ws::tests::a_partial_next_frame_does_not_hold_the_ready_message |
 | request-buffer-reallocations-per-dial | 0 | ferrox-app-ws::tests::the_request_is_sized_for_its_bytes |
 | response-buffer-reallocations-per-accept | 0 | ferrox-app-ws::tests::the_101_is_the_key_and_the_echoed_subprotocol |
 | early-data-copies-of-the-pipelined-bytes | 0 | ferrox-app-ws::tests::the_pipelined_prefix_is_the_readers_own_buffer |
@@ -115,6 +121,8 @@ What the release assembly says on its own, checked by `cargo rustc -p ferrox-cor
 - **A string the path parse built and threw away.** `EarlyData::split` opened `out` and copied the base and every kept query pair *before* it knew whether an `ed` was there, so `/tunnel`, `/p?ed=` and `/p?ed=&ed=4` — the shapes the rewrite does not fire on, and the common one among them — paid two allocations and two full copies of the path. The first `ed=` now decides and the string is built once, only when the rewrite fires, on the same `Go Atoi` arithmetic the 24 oracle vectors pin. **No checker in this tree counts that allocation**: the differential in `early_data_split_matches_go_arithmetic` and the 192-case sweep in `crates/ferrox-core/tests/parsers.rs` see the bytes and not the allocation, so the count of two-to-one is not a row here.
 
 ### The frame path
+
+- **A read call per frame, and the relay write behind it.** `Read::read` returned as soon as one message ended, so a window holding four 4 KiB frames handed the relay one 4 KiB `read` and one 4 KiB write four times. It now keeps parsing complete messages already in `have` until the caller's buffer is full; a partial next frame is left for the next call, so the ready message never waits for the socket. The copy count is unchanged — the payload still crosses into the caller once — and the socket-read count is unchanged; what falls is the `Read::read` returns and the relay writes behind them. The first message still waits in the transport, and only messages already buffered are coalesced. `two_buffered_frames_leave_in_one_read` hands two complete frames to one read and `a_partial_next_frame_does_not_hold_the_ready_message` proves the second rule: a one-byte next head costs no further transport read and does not delay the first frame.
 
 - **An unbounded `realloc` chain in the read-ahead buffer.** `WsReader::pull` asks for `reserve_exact(READ_AHEAD)`, which requests exactly the leftover plus 32 KiB — one byte more than the previous capacity whenever the leftover grew, so a stream that lands mid-frame reallocates and memcpys once per read. `reserve` amortises that. In the good case, where a read lands on a frame boundary, the branch was already false and this changes nothing.
 - **Widening the mask loop's stride the naive way is a regression; unrolling the loop over four 16-byte lanes ships.** `apply_mask` XORs 16 bytes per iteration, so about a quarter of its work on a long masked frame is loop counter and bounds check rather than XOR. Striding 64 bytes was tried — same vector op count, same bytes at the same offsets, since 64 is a multiple of the 4-byte mask — and it is a **regression**, and the arithmetic says so without a benchmark: the remainder is taken scalar, so `as_chunks_mut::<64>()` makes the scalar tail up to 63 bytes where `as_chunks_mut::<16>()` kept it under 16. At 63 bytes it is 63 scalar XORs against 3 vector ops plus 15. Every length that is not a multiple of 64 is worse, and the lengths that are multiples of 64 are unchanged, so the change only ever helped frames that were already vector-aligned. Reverted. What ships instead keeps the 16-byte op and strides the *loop* 64: four `xor_block` lanes per iteration, the sub-64 remainder through the old 16-loop, scalar tail still under 16 — same vector ops, a quarter of the loop overhead, identical tail by construction since 64, 16 and the tail start are all multiples of the 4-byte mask. `mask_chunks_match_the_byte_loop` pins it against the byte loop at every 16- and 64-boundary ±1.

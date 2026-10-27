@@ -30,11 +30,11 @@ const TICK: Duration = Duration::from_millis(10);
 const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
-const DEFAULT_MTU: usize = 1280;
-const QUEUE: usize = 512;
+pub(crate) const DEFAULT_MTU: usize = 1280;
+pub(crate) const QUEUE: usize = 512;
 /// The server's own connection ID: a short header carries no length, so the demultiplexer reads exactly this many bytes.
 const CID_LEN: usize = 16;
-const AUTH_REALM: &str = "Basic realm=\"masque\", charset=\"UTF-8\"";
+pub(crate) const AUTH_REALM: &str = "Basic realm=\"masque\", charset=\"UTF-8\"";
 const H3_SETTINGS: u64 = 0x04;
 const SETTINGS_H3_DATAGRAM: u64 = 0x33;
 const SETTINGS_ENABLE_CONNECT_PROTOCOL: u64 = 0x8;
@@ -150,15 +150,87 @@ impl MasqueOut {
 }
 
 fn open(spec: &ClientSpec) -> Result<Inner, String> {
+    if uses_h2(&spec.tls) {
+        return open_h2(spec);
+    }
     let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port)
         .ok_or_else(|| format!("cannot resolve masque `{}:{}`", spec.address, spec.port))?;
     let sock = Datagram::plain(sock);
     let mut lane = establish(spec, &sock, peer, local)?;
+    let addresses = lane.addresses.clone();
+    let mtu = lane.mtu;
+    let initial = std::mem::take(&mut lane.packets);
+    let alive = Arc::clone(&lane.alive);
+    Ok(assemble(
+        addresses,
+        mtu,
+        initial,
+        alive,
+        move |from_tunnel, to_stack, routes| {
+            io(lane, &sock, local, from_tunnel, to_stack, routes);
+        },
+    ))
+}
+
+/// The reference picks HTTP/2 only when the configured ALPN names it and does
+/// not name HTTP/3; anything else takes the QUIC carrier.
+fn uses_h2(tls: &TlsConfig) -> bool {
+    tls.alpn.iter().any(|protocol| protocol.as_slice() == b"h2")
+        && !tls.alpn.iter().any(|protocol| protocol.as_slice() == b"h3")
+}
+
+fn open_h2(spec: &ClientSpec) -> Result<Inner, String> {
+    let edge = format!("{}:{}", spec.address, spec.port)
+        .to_socket_addrs()
+        .map_err(|error| {
+            format!(
+                "masque: cannot resolve `{}:{}`: {error}",
+                spec.address, spec.port
+            )
+        })?
+        .next()
+        .ok_or_else(|| {
+            format!(
+                "masque: `{}:{}` resolves to nothing",
+                spec.address, spec.port
+            )
+        })?;
+    let mut client = crate::masque_h2::Client::dial(
+        &spec.tls,
+        edge,
+        &authority(spec),
+        &spec.path,
+        &spec.headers,
+    )
+    .map_err(|reason| format!("masque: {reason}"))?;
+    let addresses = client.addresses.clone();
+    let mtu = client.mtu;
+    let initial = std::mem::take(&mut client.packets);
+    Ok(assemble(
+        addresses,
+        mtu,
+        initial,
+        Arc::new(AtomicBool::new(true)),
+        move |from_tunnel, to_stack, routes| {
+            client.run(&from_tunnel, &to_stack, &routes);
+        },
+    ))
+}
+
+/// The stack every carrier feeds, and the thread that hands the handshake's
+/// early packets to it before the carrier loop takes over.
+fn assemble(
+    addresses: Vec<IpAddr>,
+    mtu: usize,
+    initial: Vec<Vec<u8>>,
+    alive: Arc<AtomicBool>,
+    run: impl FnOnce(Receiver<Vec<u8>>, Sender<Packet>, UdpRoutes) + Send + 'static,
+) -> Inner {
     let config = Arc::new(DeviceConfig {
         secret: [0u8; 32],
-        addresses: lane.addresses.clone(),
+        addresses,
         peers: Vec::new(),
-        mtu: lane.mtu,
+        mtu,
         reserved: [0u8; 3],
         is_client: Some(true),
         no_kernel_tun: true,
@@ -174,21 +246,21 @@ fn open(spec: &ClientSpec) -> Result<Inner, String> {
         wg_stack::client((*stack_config).clone(), stack_tunnel, packets_rx, flow_rx);
     });
     let io_routes = Arc::clone(&routes);
-    let alive = Arc::clone(&lane.alive);
-    let mut initial = std::mem::take(&mut lane.packets);
+    let watch = Arc::clone(&alive);
     std::thread::spawn(move || {
-        for packet in initial.drain(..) {
+        for packet in initial {
             deliver(&packets_tx, &io_routes, &packet);
         }
-        io(lane, &sock, local, from_tunnel, packets_tx, io_routes);
+        run(from_tunnel, packets_tx, io_routes);
+        watch.store(false, Ordering::Relaxed);
     });
-    Ok(Inner {
+    Inner {
         config,
         flows,
         to_tunnel,
         routes,
         alive,
-    })
+    }
 }
 
 /// One lane that finished its handshake and its first address assignment: the
@@ -512,7 +584,7 @@ fn authority(spec: &ClientSpec) -> String {
 }
 
 /// xray takes a subnet grant's first usable address rather than the raw bytes, so a proxy that assigns a range still names one host.
-fn address_of(grant: &Assigned) -> Option<IpAddr> {
+pub(crate) fn address_of(grant: &Assigned) -> Option<IpAddr> {
     match grant.version {
         4 => {
             let address = u32::from_be_bytes([
@@ -555,7 +627,7 @@ fn address_of(grant: &Assigned) -> Option<IpAddr> {
 
 /// The first address a fresh `ADDRESS_ASSIGN` no longer grants: the capsule
 /// replaces the set, so an omitted or refused entry is a withdrawal.
-fn withdrawn(body: &[u8], current: &[IpAddr]) -> Option<IpAddr> {
+pub(crate) fn withdrawn(body: &[u8], current: &[IpAddr]) -> Option<IpAddr> {
     let mut grants = Vec::new();
     connectip::address_assign(body, &mut grants)?;
     current.iter().copied().find(|address| {
@@ -742,7 +814,6 @@ fn io(
         mut conn,
         stream,
         addresses,
-        alive,
         ..
     } = lane;
     let mut control = Stream {
@@ -752,7 +823,12 @@ fn io(
     let mut room = vec![0u8; 65535];
     loop {
         while let Ok(packet) = from_tunnel.try_recv() {
-            send_datagram(&mut conn, stream, &packet);
+            if let Some(icmp) = send_datagram(&mut conn, stream, &packet) {
+                let _ = to_stack.send(Packet {
+                    peer: [0u8; 32],
+                    bytes: icmp,
+                });
+            }
         }
         if !quic::pump_once(&mut conn, sock, local, TICK) || conn.is_closed() {
             break;
@@ -784,10 +860,9 @@ fn io(
         }
         quic::flush_egress(&mut conn, sock);
     }
-    alive.store(false, Ordering::Relaxed);
 }
 
-fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u8]) {
+pub(crate) fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u8]) {
     if let Some(datagram) = connectip::udp_from_packet(packet) {
         if !datagram.verified {
             return;
@@ -807,16 +882,18 @@ fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u8]) {
     }
 }
 
-fn send_datagram(conn: &mut quiche::Connection, stream: u64, packet: &[u8]) {
+/// One inner packet on its stream, or the ICMP Packet Too Big it needs instead when the lane cannot carry it: the MTU the answer names is what the inner stack has left after the stream prefix.
+fn send_datagram(conn: &mut quiche::Connection, stream: u64, packet: &[u8]) -> Option<Vec<u8>> {
     let mut datagram = Vec::with_capacity(3 + packet.len());
     connectip::datagram_prefix(stream, &mut datagram);
     datagram.extend_from_slice(packet);
-    if conn
-        .dgram_max_writable_len()
-        .is_some_and(|max| max >= datagram.len())
-    {
-        let _ = conn.dgram_send(&datagram);
+    let max = conn.dgram_max_writable_len()?;
+    if datagram.len() > max {
+        let overhead = frames::quic_varint_len(stream / 4) + 1;
+        return connectip::icmp_too_large(packet, max.checked_sub(overhead)?);
     }
+    let _ = conn.dgram_send(&datagram);
+    None
 }
 
 /// Open a server inbound's socket and spawn its demultiplexer, stack and forwarder.
@@ -844,6 +921,14 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     let (to_tunnel, from_stack) = mpsc::channel();
     let dispatcher = Arc::clone(&shared);
     std::thread::spawn(move || dispatch(&dispatcher, from_stack));
+    if identity.alpn.iter().any(|alpn| alpn == b"h2") {
+        crate::masque_h2::serve(
+            Arc::clone(&identity),
+            Arc::clone(&shared),
+            Arc::clone(&spec),
+            local,
+        );
+    }
     let device = DeviceConfig {
         secret: [0u8; 32],
         addresses: spec.pool.server.clone(),
@@ -867,9 +952,9 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
 }
 
 #[derive(Debug, Clone)]
-struct ServerSpec {
+pub(crate) struct ServerSpec {
     users: Vec<(String, String)>,
-    path: String,
+    pub(crate) path: String,
     pool: AddressPool,
     mtu: usize,
 }
@@ -930,7 +1015,7 @@ impl ServerSpec {
         })
     }
 
-    fn authenticates(&self, header: Option<&[u8]>) -> bool {
+    pub(crate) fn authenticates(&self, header: Option<&[u8]>) -> bool {
         let Some(text) = header.and_then(|value| std::str::from_utf8(value).ok()) else {
             return false;
         };
@@ -955,9 +1040,9 @@ impl ServerSpec {
     }
 }
 
-struct Shared {
+pub(crate) struct Shared {
     pool: Mutex<AddressPool>,
-    tunnels: Mutex<HashMap<IpAddr, SyncSender<Vec<u8>>>>,
+    pub(crate) tunnels: Mutex<HashMap<IpAddr, SyncSender<Vec<u8>>>>,
     packets: Sender<Packet>,
     local: Vec<IpAddr>,
 }
@@ -1127,7 +1212,7 @@ impl Family {
 }
 
 /// A tunnel's addresses go back to the pool when its worker ends, whatever ended it.
-struct Granted {
+pub(crate) struct Granted {
     shared: Arc<Shared>,
     addrs: Vec<IpAddr>,
 }
@@ -1309,7 +1394,12 @@ fn worker(
         }
         while let Ok(packet) = tunnel.outgoing.try_recv() {
             if let Some(stream) = tunnel.stream {
-                send_datagram(&mut conn, stream, &packet);
+                if let Some(icmp) = send_datagram(&mut conn, stream, &packet) {
+                    let _ = shared.packets.send(Packet {
+                        peer: [0u8; 32],
+                        bytes: icmp,
+                    });
+                }
             }
         }
         if let Ok(mut table) = routes.lock() {
@@ -1431,7 +1521,7 @@ fn path_query(bytes: &[u8]) -> (&[u8], &[u8]) {
 }
 
 /// xray parses the request URI before comparing, so an escaped star names the same path the literal does.
-fn path_matches(got: &[u8], want: &str) -> bool {
+pub(crate) fn path_matches(got: &[u8], want: &str) -> bool {
     fn decode(bytes: &[u8]) -> Option<Vec<u8>> {
         let mut out = Vec::with_capacity(bytes.len());
         let mut at = 0;
@@ -1462,47 +1552,16 @@ fn accept(
     let Some(stream) = tunnel.stream else {
         return;
     };
-    let addrs = {
-        let Ok(mut pool) = shared.pool.lock() else {
-            reject(tunnel, 503);
-            return;
-        };
-        pool.assign()
-    };
-    if addrs.is_empty() {
-        reject(tunnel, 503);
-        return;
-    }
-    let Some(granted) = register(shared, tunnel, &addrs) else {
-        if let Ok(mut pool) = shared.pool.lock() {
-            for address in &addrs {
-                pool.release(*address);
-            }
-        }
+    let Some(addrs) = assign(shared) else {
         reject(tunnel, 503);
         return;
     };
-    let assignments: Vec<Assigned> = addrs
-        .iter()
-        .map(|address| match address {
-            IpAddr::V4(ip) => Assigned {
-                request_id: 0,
-                version: 4,
-                address: {
-                    let mut bytes = [0u8; 16];
-                    bytes[..4].copy_from_slice(&ip.octets());
-                    bytes
-                },
-                prefix: 32,
-            },
-            IpAddr::V6(ip) => Assigned {
-                request_id: 0,
-                version: 6,
-                address: ip.octets(),
-                prefix: 128,
-            },
-        })
-        .collect();
+    let Some(granted) = register(shared, &addrs, &tunnel.sender) else {
+        release(shared, &addrs);
+        reject(tunnel, 503);
+        return;
+    };
+    let assignments = grants(&addrs, 0);
     tunnel.addrs = addrs;
     tunnel.granted = Some(granted);
     tunnel.opened = true;
@@ -1520,8 +1579,54 @@ fn accept(
     connectip::address_assign_encode(&assignments, &mut control);
     send_data(conn, stream, &control).ok();
     control.clear();
+    connectip::route_advert_encode(&routes(&tunnel.addrs), &mut control);
+    send_data(conn, stream, &control).ok();
+}
+
+/// One address per family from the pool, or `None` when it has none left.
+pub(crate) fn assign(shared: &Arc<Shared>) -> Option<Vec<IpAddr>> {
+    let addresses = shared.pool.lock().ok()?.assign();
+    (!addresses.is_empty()).then_some(addresses)
+}
+
+/// The addresses an assignment was refused go back to the pool.
+pub(crate) fn release(shared: &Arc<Shared>, addrs: &[IpAddr]) {
+    if let Ok(mut pool) = shared.pool.lock() {
+        for address in addrs {
+            pool.release(*address);
+        }
+    }
+}
+
+/// The `ADDRESS_ASSIGN` body an answer carries: each address at its full prefix, naming the request it answers.
+pub(crate) fn grants(addrs: &[IpAddr], request_id: u64) -> Vec<Assigned> {
+    addrs
+        .iter()
+        .map(|address| match address {
+            IpAddr::V4(ip) => Assigned {
+                request_id,
+                version: 4,
+                address: {
+                    let mut bytes = [0u8; 16];
+                    bytes[..4].copy_from_slice(&ip.octets());
+                    bytes
+                },
+                prefix: 32,
+            },
+            IpAddr::V6(ip) => Assigned {
+                request_id,
+                version: 6,
+                address: ip.octets(),
+                prefix: 128,
+            },
+        })
+        .collect()
+}
+
+/// The `ROUTE_ADVERTISEMENT` body a tunnel's families are carried for.
+pub(crate) fn routes(addrs: &[IpAddr]) -> Vec<Route> {
     let mut routes = Vec::new();
-    if tunnel.addrs.iter().any(IpAddr::is_ipv4) {
+    if addrs.iter().any(IpAddr::is_ipv4) {
         routes.push(Route {
             first: [0u8; 16],
             last: {
@@ -1533,7 +1638,7 @@ fn accept(
             protocol: 0,
         });
     }
-    if tunnel.addrs.iter().any(IpAddr::is_ipv6) {
+    if addrs.iter().any(IpAddr::is_ipv6) {
         routes.push(Route {
             first: [0u8; 16],
             last: [0xff; 16],
@@ -1541,11 +1646,33 @@ fn accept(
             protocol: 0,
         });
     }
-    connectip::route_advert_encode(&routes, &mut control);
-    send_data(conn, stream, &control).ok();
+    routes
 }
 
-fn register(shared: &Arc<Shared>, tunnel: &Tunnel, addrs: &[IpAddr]) -> Option<Granted> {
+/// The `ADDRESS_ASSIGN` body answering the requests a peer named, one grant per request the tunnel's own families can hold.
+pub(crate) fn respond(body: &[u8], addrs: &[IpAddr]) -> Vec<Assigned> {
+    let mut requested = Vec::new();
+    if connectip::address_assign(body, &mut requested).is_none() {
+        return Vec::new();
+    }
+    let mut assignments = Vec::new();
+    for request in &requested {
+        let wanted = addrs.iter().find(|address| {
+            (request.version == 4 && address.is_ipv4())
+                || (request.version == 6 && address.is_ipv6())
+        });
+        if let Some(address) = wanted {
+            assignments.extend(grants(std::slice::from_ref(address), request.request_id));
+        }
+    }
+    assignments
+}
+
+pub(crate) fn register(
+    shared: &Arc<Shared>,
+    addrs: &[IpAddr],
+    sender: &SyncSender<Vec<u8>>,
+) -> Option<Granted> {
     let mut tunnels = shared.tunnels.lock().ok()?;
     let mut inserted = Vec::with_capacity(addrs.len());
     for address in addrs {
@@ -1555,7 +1682,7 @@ fn register(shared: &Arc<Shared>, tunnel: &Tunnel, addrs: &[IpAddr]) -> Option<G
             }
             return None;
         }
-        tunnels.insert(*address, tunnel.sender.clone());
+        tunnels.insert(*address, sender.clone());
         inserted.push(*address);
     }
     Some(Granted {
@@ -1585,39 +1712,7 @@ fn parse_capsules(conn: &mut quiche::Connection, tunnel: &mut Tunnel) {
         let connectip::Capsule::AddressRequest(body) = capsule else {
             continue;
         };
-        let mut requested = Vec::new();
-        if connectip::address_assign(body, &mut requested).is_none() {
-            continue;
-        }
-        let mut assignments = Vec::new();
-        for request in &requested {
-            let wanted = tunnel.addrs.iter().find(|address| {
-                (request.version == 4 && address.is_ipv4())
-                    || (request.version == 6 && address.is_ipv6())
-            });
-            let Some(address) = wanted else {
-                continue;
-            };
-            let grant = match address {
-                IpAddr::V4(ip) => Assigned {
-                    request_id: request.request_id,
-                    version: 4,
-                    address: {
-                        let mut bytes = [0u8; 16];
-                        bytes[..4].copy_from_slice(&ip.octets());
-                        bytes
-                    },
-                    prefix: 32,
-                },
-                IpAddr::V6(ip) => Assigned {
-                    request_id: request.request_id,
-                    version: 6,
-                    address: ip.octets(),
-                    prefix: 128,
-                },
-            };
-            assignments.push(grant);
-        }
+        let assignments = respond(body, &tunnel.addrs);
         if !assignments.is_empty() {
             let mut body = Vec::new();
             connectip::address_assign_encode(&assignments, &mut body);
@@ -1646,11 +1741,11 @@ fn read_datagrams(
         if tunnel.stream != Some(stream) {
             continue;
         }
-        forward(shared, spec, tunnel, packet);
+        forward(shared, spec, &tunnel.addrs, packet);
     }
 }
 
-fn forward(shared: &Arc<Shared>, spec: &ServerSpec, tunnel: &Tunnel, packet: &[u8]) {
+pub(crate) fn forward(shared: &Arc<Shared>, spec: &ServerSpec, addrs: &[IpAddr], packet: &[u8]) {
     let Some(destination) = packet_destination(packet) else {
         return;
     };
@@ -1659,7 +1754,7 @@ fn forward(shared: &Arc<Shared>, spec: &ServerSpec, tunnel: &Tunnel, packet: &[u
     }
     if let Ok(tunnels) = shared.tunnels.lock() {
         if let Some(other) = tunnels.get(&destination) {
-            if !tunnel.addrs.contains(&destination) {
+            if !addrs.contains(&destination) {
                 let _ = other.try_send(packet.to_vec());
             }
             return;
@@ -1669,7 +1764,7 @@ fn forward(shared: &Arc<Shared>, spec: &ServerSpec, tunnel: &Tunnel, packet: &[u
         return;
     }
     let _ = shared.packets.send(Packet {
-        peer: peer_key(&tunnel.addrs),
+        peer: peer_key(addrs),
         bytes: packet.to_vec(),
     });
 }
@@ -1876,6 +1971,32 @@ mod tests {
         .expect("a masque outbound")
     }
 
+    fn outbound_h2(port: u16) -> Json {
+        crate::json::parse(&format!(
+            r#"{{"settings":{{"server":{{"address":"127.0.0.1","port":{port}}}}},"streamSettings":{{"security":"tls","tlsSettings":{{"serverName":"localhost","allowInsecure":true,"alpn":["h2"]}},"masqueSettings":{{"headers":[{{"name":"Authorization","value":"Basic dUBleGFtcGxlLmNvbTpw"}}]}}}}}}"#
+        ))
+        .expect("a masque outbound")
+    }
+
+    fn inbound_h2(settings: &str) -> Json {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        crate::json::parse(&format!(
+            r#"{{"settings":{settings},"streamSettings":{{"security":"tls","tlsSettings":{{"alpn":["h3","h2"],"certificates":[{{"certificate":[{}],"key":[{}]}}]}}}}}}"#,
+            pem_lines(&minted.cert.pem()),
+            pem_lines(&minted.signing_key.serialize_pem())
+        ))
+        .expect("a masque inbound")
+    }
+
+    fn serve_h2(redirect: &str) -> (Json, u16) {
+        let inbound = inbound_h2(
+            r#"{"users":[{"email":"u@example.com","password":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
+        );
+        let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
+        (inbound, port)
+    }
+
     fn freedom(redirect: &str) -> Outbound {
         let root = crate::json::parse(&format!(
             r#"{{"outbounds":[{{"protocol":"freedom","settings":{{"redirect":"{redirect}"}}}}]}}"#
@@ -2003,6 +2124,94 @@ mod tests {
         let (remote, payload) = crate::proxy::parse_socks_udp(&received[..n]).expect("frame");
         assert_eq!(remote, target);
         assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn a_datagram_flow_crosses_the_h2_tunnel_to_a_freedom_dial() {
+        let echo = std::net::UdpSocket::bind("127.0.0.1:0").expect("echo");
+        let echo_address = echo.local_addr().expect("address");
+        let target: SocketAddr = format!("192.0.2.1:{}", echo_address.port())
+            .parse()
+            .expect("a target");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            if let Ok((n, from)) = echo.recv_from(&mut buf) {
+                let _ = echo.send_to(&buf[..n], from);
+            }
+        });
+        let (_inbound, port) = serve_h2(&echo_address.to_string());
+        let masque = MasqueOut::new(&outbound_h2(port)).expect("outbound");
+        let relay = std::net::UdpSocket::bind("127.0.0.1:0").expect("relay");
+        let relay_address = relay.local_addr().expect("relay address");
+        let thread_relay = relay.try_clone().expect("clone");
+        std::thread::spawn(move || masque.serve_udp(&thread_relay, None));
+        std::thread::sleep(Duration::from_secs(1));
+        let app = std::net::UdpSocket::bind("127.0.0.1:0").expect("app");
+        app.set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        let mut frame = Vec::new();
+        crate::proxy::socks_udp_frame(&mut frame, None, &target, b"hello");
+        app.send_to(&frame, relay_address).expect("send");
+        let mut received = [0u8; 2048];
+        let (n, _) = app.recv_from(&mut received).expect("framed reply");
+        let (remote, payload) = crate::proxy::parse_socks_udp(&received[..n]).expect("frame");
+        assert_eq!(remote, target);
+        assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn the_carrier_follows_the_alpn_list() {
+        let alpn = |protocols: &[&[u8]]| TlsConfig {
+            alpn: protocols.iter().map(|protocol| protocol.to_vec()).collect(),
+            ..TlsConfig::default()
+        };
+        assert!(uses_h2(&alpn(&[b"h2"])));
+        assert!(!uses_h2(&alpn(&[b"h3"])));
+        assert!(!uses_h2(&alpn(&[b"h3", b"h2"])));
+        assert!(!uses_h2(&alpn(&[b"h2", b"h3"])));
+        assert!(!uses_h2(&alpn(&[])));
+    }
+
+    #[test]
+    fn a_packet_wider_than_one_datagram_is_answered_with_icmp() {
+        let (_inbound, port) = serve("127.0.0.1:1");
+        let spec = ClientSpec::from(&outbound(port)).expect("spec");
+        let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port).expect("resolve");
+        let sock = Datagram::plain(sock);
+        let mut lane = establish(&spec, &sock, peer, local).expect("lane");
+        let mut packet = vec![0u8; 1400];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&1400u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[10, 14, 0, 2]);
+        packet[16..20].copy_from_slice(&[192, 0, 2, 1]);
+        packet[20..22].copy_from_slice(&1234u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&4321u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&1380u16.to_be_bytes());
+        let icmp = send_datagram(&mut lane.conn, lane.stream, &packet).expect("too big");
+        assert_eq!(icmp[9], 1, "ICMP");
+        assert_eq!((icmp[20], icmp[21]), (3, 4), "fragmentation needed");
+        assert_eq!(
+            icmp[12..16],
+            [192, 0, 2, 1],
+            "the source is what was addressed"
+        );
+        assert_eq!(
+            icmp[16..20],
+            [10, 14, 0, 2],
+            "the destination is the sender"
+        );
+        let max = lane.conn.dgram_max_writable_len().expect("datagrams");
+        let overhead = frames::quic_varint_len(lane.stream / 4) + 1;
+        assert_eq!(
+            u16::from_be_bytes([icmp[26], icmp[27]]) as usize,
+            max - overhead
+        );
+        assert!(
+            send_datagram(&mut lane.conn, lane.stream, &icmp).is_none(),
+            "it fits"
+        );
     }
 
     #[test]

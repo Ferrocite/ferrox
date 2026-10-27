@@ -53,7 +53,7 @@ A workflow's first job is a five-line `plan` job that runs `scope` with the pull
 | --- | --- | --- |
 | `ci.yml`'s `test` (three runners) | `rust` | a `.rs`, `Cargo.*` or tool-crate change: the compiler's own inputs moved. A wide plan that names none of them — a workflow file, a script — still skips it, because nothing a test reads changed; a schedule with no diff to read keeps the tests |
 | `ops.yml`'s `counts` | `ops`, then `rust` for the exact-count step | the row list is the touched methods'; the blessed-count check only rebuilds when Rust moved |
-| `benchmark-matrix.yml`'s `fetch…collect` | `matrix` | a method the matrix does not measure has no cell to run, and on a narrow plan `engines` says which comparators it fetches, builds and probes |
+| `benchmark-matrix.yml`'s `fetch…run-os` | `matrix` | a method the matrix does not measure has no cell to run, and on a narrow plan `engines` says which comparators it fetches, builds and probes |
 | `conformance.yml`'s `suites`, `interop-baseline.yml`'s `baseline` | `suites` | a pin whose suite holds no test in scope is skipped, and says so; conformance then narrows the suite it keeps to those names, while the baseline runs a suite that stays whole |
 | `xray-baseline.yml`'s `baseline` | `go` | only the reference packages that test the touched methods |
 | `foxy-relay.yml`'s live lane | `wide`, or `methods` naming foxy or quic | the lane dials those carriers; a method it never dials does not owe three runners and real quota |

@@ -192,6 +192,10 @@ impl<S: Stream> TlsProvider for RealityServer<S> {
         self.inner.alpn()
     }
 
+    fn closed(&self) -> bool {
+        self.inner.closed()
+    }
+
     /// The name the client's hello replayed into the session, so the inner
     /// handshake's own answer is the matched one.
     fn sni(&self) -> Option<&[u8]> {
@@ -1131,6 +1135,10 @@ impl<S: Stream> TlsProvider for RealityClientSession<S> {
 
     fn suites(&self) -> Vec<String> {
         self.inner.suites()
+    }
+
+    fn closed(&self) -> bool {
+        self.inner.closed()
     }
 
     fn handshake(&mut self) -> Result<(), TlsError> {

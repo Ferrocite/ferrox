@@ -114,7 +114,7 @@ trojan udp-framing-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_fram
 trojan udp-carriers-holding-an-association 7 ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier
 
 # --- XTLS Vision ------------------------------------------------------------
-xtls-vision ops-retired-instructions 30208 scripts/count-ops.sh
+xtls-vision ops-retired-instructions 29568 scripts/count-ops.sh
 xtls-vision padding-command-bytes 5 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
 xtls-vision first-frame-uuid-bytes 16 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
 xtls-vision largest-framed-block-bytes 8171 ferrox-app-vision::tests::a_bulk_write_frames_every_block_inside_the_bound
@@ -130,6 +130,7 @@ xtls-vision command-bytes-validated-per-frame 1 ferrox-app-vision::tests::a_fram
 xtls-vision commands-the-validator-accepts 3 ferrox-core-vless::tests::the_command_validator_accepts_three_commands
 xtls-vision seal-open-staging-allocations 0 ferrox-bench-gate-2
 xtls-vision coalesce-segment-allocations 0 ferrox-core-tls::rustls_backend::tests::the_framer_path_coalesces_without_a_heap_buffer
+xtls-vision vision-read-waits-outside-the-lock 0 ferrox-app-proxy::tests::a_vision_read_waits_outside_the_lock
 
 # --- Mux.Cool ---------------------------------------------------------------
 mux-cool ops-retired-instructions UNBLESSED scripts/count-ops.sh
@@ -151,6 +152,8 @@ carrier-websocket write-syscalls-per-frame 1 ferrox-app-ws::tests::frames_round_
 carrier-websocket user-space-copies-per-byte-unmasked-write 0 ferrox-app-ws::tests::frames_round_trip_masked_and_plain
 carrier-websocket user-space-copies-per-byte-masked-write 1 ferrox-app-ws::tests::frames_round_trip_masked_and_plain
 carrier-websocket user-space-copies-per-byte-read 1 ferrox-app-ws::tests::a_read_covers_a_window_not_one_frame_header
+carrier-websocket read-calls-per-two-buffered-frames 1 ferrox-app-ws::tests::two_buffered_frames_leave_in_one_read
+carrier-websocket transport-reads-after-a-ready-message 0 ferrox-app-ws::tests::a_partial_next_frame_does_not_hold_the_ready_message
 carrier-websocket request-buffer-reallocations-per-dial 0 ferrox-app-ws::tests::the_request_is_sized_for_its_bytes
 carrier-websocket response-buffer-reallocations-per-accept 0 ferrox-app-ws::tests::the_101_is_the_key_and_the_echoed_subprotocol
 carrier-websocket early-data-copies-of-the-pipelined-bytes 0 ferrox-app-ws::tests::the_pipelined_prefix_is_the_readers_own_buffer
@@ -751,3 +754,10 @@ carrier-masque pool-outside-addresses-witnessed 1 ferrox-app-masque::tests::a_po
 carrier-masque subnet-grants-witnessed 2 ferrox-app-masque::tests::a_subnet_grant_names_its_first_host
 carrier-masque datagram-prefix-round-trips 1 ferrox-app-masque::tests::the_datagram_prefix_round_trips
 carrier-masque assignment-outcomes-witnessed 5 ferrox-app-masque::tests::an_address_capsule_withdraws_what_it_no_longer_grants
+carrier-masque icmp-too-big-shapes 2 ferrox-core-connectip::tests::a_packet_too_big_swaps_the_addresses_and_verifies_at_both_versions
+carrier-masque icmp-too-big-edges 5 ferrox-core-connectip::tests::a_packet_too_big_copies_options_and_refuses_a_narrow_mtu
+carrier-masque icmp-mtu-narrows 2 ferrox-app-wg-stack::tests::a_packet_too_big_narrows_the_device_mtu
+carrier-masque icmp-too-big-responses 1 ferrox-app-masque::tests::a_packet_wider_than_one_datagram_is_answered_with_icmp
+carrier-masque h2-datagram-round-trips 1 ferrox-app-masque-h2::tests::an_h2_tunnel_assigns_and_carries_a_datagram
+carrier-masque h2-dialer-round-trips 1 ferrox-app-masque::tests::a_datagram_flow_crosses_the_h2_tunnel_to_a_freedom_dial
+carrier-masque carrier-alpn-choices-witnessed 5 ferrox-app-masque::tests::the_carrier_follows_the_alpn_list
