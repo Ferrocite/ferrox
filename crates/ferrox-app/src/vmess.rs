@@ -1516,7 +1516,7 @@ pub(crate) fn pump_relay_carried<R, W>(
     pending: Option<PendingResponse>,
 ) -> Option<std::sync::Arc<crate::proxy::RelayFinish>>
 where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let mut plain_read = plain.try_clone().ok()?;
@@ -1554,6 +1554,9 @@ where
         Box::new(crate::proxy::stream_lane_done(&flow)),
     );
     let mut recv = recv;
+    // The carrier polls too: a download step with nothing yet must hand the lane back, or every worker parks inside a carrier read.
+    let mut reader = reader;
+    reader.arm_relay_poll();
     let mut reader = Wire::new(reader);
     // A lazy server sends the prefix with its first data, so the forward lane runs beside this wait.
     let mut answer = pending.map(Answer::new);
@@ -1722,7 +1725,7 @@ fn serve_decoded<R, W>(
     decoded: Option<Accepted>,
     freedom: bool,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let Some(Accepted {
@@ -1775,7 +1778,7 @@ fn serve_udp_carried<R, W>(
     recv: Flow,
     user: &crate::stats::Meter,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let bind = if target.is_ipv6() {
@@ -1816,7 +1819,7 @@ pub(crate) fn serve_ws_split<R, W>(
     freedom: bool,
     close: &Close,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: crate::proxy::FrameWrite + Send + 'static,
 {
     let Some((mut reader, writer)) = crate::ws::accept_split(reader, writer, path) else {
@@ -1865,7 +1868,7 @@ pub(crate) fn serve_grpc_split<R, W>(
     freedom: bool,
     close: &Close,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: crate::proxy::FrameWrite + Send + 'static,
 {
     let Some((mut reader, writer)) = crate::grpc::accept_split_with(reader, writer, settings)
@@ -1900,7 +1903,7 @@ pub(crate) fn serve_xhttp_split<R, W>(
     freedom: bool,
     close: &Close,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: crate::proxy::FrameWrite + Send + 'static,
 {
     let Some((mut reader, writer)) =
@@ -1940,7 +1943,7 @@ pub(crate) fn serve_httpheader_split<R, W>(
     freedom: bool,
     close: &Close,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let Some((mut reader, writer)) = crate::httpheader::accept_split(reader, writer, path) else {
@@ -1979,7 +1982,7 @@ pub(crate) fn serve_httpupgrade_split<R, W>(
     freedom: bool,
     close: &Close,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let Some((mut reader, writer)) = crate::httpupgrade::accept_split(reader, writer, path, host)
@@ -1997,7 +2000,7 @@ pub(crate) fn serve_raw_split<R, W>(
     freedom: bool,
     close: &Close,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let decoded = accept_request_bounded(&mut reader, users);
@@ -2011,7 +2014,7 @@ pub(crate) fn serve_kcp<R, W>(
     freedom: bool,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
     let decoded = accept_request_bounded(&mut reader, users);
@@ -3793,6 +3796,11 @@ mod tests {
         at: usize,
         grain: usize,
         reads: usize,
+    }
+
+    impl crate::proxy::RelayPoll for Sealed {
+        /// Memory never waits, so there is no poll to arm.
+        fn arm_relay_poll(&mut self) {}
     }
 
     impl Read for Sealed {

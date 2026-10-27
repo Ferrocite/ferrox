@@ -229,6 +229,12 @@ impl Reader<Connection> {
     }
 }
 
+impl<R: Read + crate::proxy::RelayPoll> crate::proxy::RelayPoll for Reader<R> {
+    fn arm_relay_poll(&mut self) {
+        self.read.arm_relay_poll();
+    }
+}
+
 impl<R: Read> Reader<R> {
     /// Every read that reaches the stream, counted where it happens. A relay's poll timeout comes
     /// back to the lane instead of being retried here: the chunk stays where it broke.

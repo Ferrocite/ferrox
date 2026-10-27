@@ -279,6 +279,12 @@ impl WsReader<Connection> {
     }
 }
 
+impl<R: Read + crate::proxy::RelayPoll> crate::proxy::RelayPoll for WsReader<R> {
+    fn arm_relay_poll(&mut self) {
+        self.read.arm_relay_poll();
+    }
+}
+
 impl<R: Read> WsReader<R> {
     /// Arm or clear the handshake budget; only the opening decode runs armed, relays wait blocking again.
     pub(crate) fn set_handshake_budget(&mut self, until: Option<std::time::Instant>) {
