@@ -19826,7 +19826,7 @@ pub(crate) fn relay_carried<R: Read + Send + 'static>(
                     }
                 }
                 Err(error) if is_timeout(&error) => {
-                    if forward_flow.ended() {
+                    if forward_flow.ended_and_drained() {
                         Next::Done
                     } else {
                         Next::Idle
