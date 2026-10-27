@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use crate::h2::{
-    block_encode, read_head, write_frame, Decoder, E_FRAME_SIZE, E_PROTOCOL, E_REFUSED, F_ACK,
-    F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_FRAME, S_WINDOW, T_CONT,
-    T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW,
+    block_encode, frame_head, read_head, write_frame, Decoder, E_FRAME_SIZE, E_PROTOCOL, E_REFUSED,
+    F_ACK, F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_FRAME, S_WINDOW,
+    T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW,
 };
 use crate::proxy::{VlessUser, VlessUsers};
 use crate::xhttp::XhttpSettings;
@@ -27,6 +27,61 @@ const CREDIT_TEMPLATE: [u8; 26] = {
     out[16] = T_WINDOW;
     out
 };
+
+/// The DATA frames one downlink write carries: a promoted relay window is `64 KiB`, four frames of the default `SETTINGS_MAX_FRAME_SIZE`, so one window reaches the peer as one vectored write.
+const DATA_FRAMES_PER_WRITE: usize = 8;
+
+const NO_PART: &[u8] = &[];
+
+/// A window's DATA frames held apart rather than staged together: each nine-byte head in its own
+/// slot and every payload still the caller's own slice, so one flush is one write whose bytes are
+/// the same frames written one at a time.
+struct DataBatch<'a> {
+    heads: [[u8; 9]; DATA_FRAMES_PER_WRITE],
+    bodies: [&'a [u8]; DATA_FRAMES_PER_WRITE],
+    used: usize,
+}
+
+impl<'a> DataBatch<'a> {
+    fn new() -> Self {
+        Self {
+            heads: [[0u8; 9]; DATA_FRAMES_PER_WRITE],
+            bodies: [NO_PART; DATA_FRAMES_PER_WRITE],
+            used: 0,
+        }
+    }
+
+    fn full(&self) -> bool {
+        self.used == DATA_FRAMES_PER_WRITE
+    }
+
+    fn add(&mut self, stream: u32, payload: &'a [u8]) {
+        self.heads[self.used] = frame_head(payload.len(), T_DATA, 0, stream);
+        self.bodies[self.used] = payload;
+        self.used += 1;
+    }
+
+    fn flush(&mut self, conn: &H2Conn) -> bool {
+        if self.used == 0 {
+            return true;
+        }
+        let mut parts: [&[u8]; 2 * DATA_FRAMES_PER_WRITE] = [NO_PART; 2 * DATA_FRAMES_PER_WRITE];
+        let mut pieces = 0;
+        for (head, body) in self.heads[..self.used]
+            .iter()
+            .zip(self.bodies[..self.used].iter().copied())
+        {
+            parts[pieces] = head;
+            pieces += 1;
+            if !body.is_empty() {
+                parts[pieces] = body;
+                pieces += 1;
+            }
+        }
+        self.used = 0;
+        conn.write_batch(&parts[..pieces])
+    }
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct H2StreamOut {
@@ -64,6 +119,17 @@ struct StreamState {
     body: VecDeque<Vec<u8>>,
     ended: bool,
     dead: bool,
+}
+
+impl H2Stream {
+    /// The stream is gone from the connection, not merely done reading: a sender waiting for
+    /// credit on it has nothing left to write, while an ended request still has a response to send.
+    fn gone(&self) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .dead
+    }
 }
 
 struct H2Conn {
@@ -277,6 +343,17 @@ impl H2Conn {
         true
     }
 
+    fn write_batch(&self, parts: &[&[u8]]) -> bool {
+        let Ok(mut write) = self.write.lock() else {
+            return false;
+        };
+        if !write.write_slices(parts) {
+            self.dead.store(true, Ordering::SeqCst);
+            return false;
+        }
+        true
+    }
+
     /// Refuse the connection: the GOAWAY goes out now, and `refused` remembers that the peer still has to be given the window to read it.
     fn refuse(&self, code: u32) {
         self.refused.store(true, Ordering::SeqCst);
@@ -286,59 +363,84 @@ impl H2Conn {
     }
 
     fn send_data(&self, stream: u32, mut payload: &[u8]) -> bool {
+        if payload.is_empty() {
+            return true;
+        }
+        let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .cloned()
+        else {
+            return false;
+        };
+        let max = *self
+            .max_frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut batch = DataBatch::new();
         while !payload.is_empty() {
-            let max = *self
-                .max_frame
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let chunk = {
-                let mut conn = self
-                    .send_conn
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                loop {
-                    if self.dead.load(Ordering::SeqCst) {
-                        return false;
-                    }
-                    let window = self
-                        .streams
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .get(&stream)
-                        .map(|s| *s.send_window.lock().unwrap_or_else(PoisonError::into_inner));
-                    let Some(window) = window else {
-                        return false;
-                    };
-                    let take = (payload.len().min(max) as u64).min(*conn).min(window);
-                    if take > 0 {
-                        *conn -= take;
-                        drop(conn);
-                        let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
-                        if let Some(state) = streams.get(&stream) {
-                            let mut w = state
-                                .send_window
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner);
-                            *w -= take;
-                        }
-                        break take as usize;
-                    }
-                    let (guard, waited) = self
-                        .wake
-                        .wait_timeout(conn, crate::budgets::relay_stall())
-                        .unwrap_or_else(PoisonError::into_inner);
-                    conn = guard;
-                    if waited.timed_out() {
-                        return false;
-                    }
-                }
+            let fit = payload.len().min(max);
+            let Some(chunk) = self.credit(&state, fit as u64, &mut batch) else {
+                return false;
             };
-            if !self.frame(T_DATA, 0, stream, &payload[..chunk]) {
+            if batch.full() && !batch.flush(self) {
                 return false;
             }
+            batch.add(stream, &payload[..chunk]);
             payload = &payload[chunk..];
         }
-        true
+        batch.flush(self)
+    }
+
+    /// Take what the two windows allow, waiting only after the frames already reserved have reached the peer.
+    fn credit(&self, state: &H2Stream, need: u64, batch: &mut DataBatch<'_>) -> Option<usize> {
+        if let Some(take) = self.take_send_window(state, need, false) {
+            return Some(take);
+        }
+        if !batch.flush(self) {
+            return None;
+        }
+        self.take_send_window(state, need, true)
+    }
+
+    fn take_send_window(&self, stream: &H2Stream, need: u64, blocking: bool) -> Option<usize> {
+        let mut conn = self
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if self.dead.load(Ordering::SeqCst) {
+                return None;
+            }
+            let take = {
+                let mut window = stream
+                    .send_window
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                let take = need.min(*conn).min(*window);
+                if take > 0 {
+                    *conn -= take;
+                    *window -= take;
+                }
+                take
+            };
+            if take > 0 {
+                return Some(take as usize);
+            }
+            if !blocking || stream.gone() {
+                return None;
+            }
+            let (guard, waited) = self
+                .wake
+                .wait_timeout(conn, crate::budgets::relay_stall())
+                .unwrap_or_else(PoisonError::into_inner);
+            conn = guard;
+            if waited.timed_out() || stream.gone() {
+                return None;
+            }
+        }
     }
 
     fn replenish(&self, stream: u32, n: usize) {
@@ -472,6 +574,7 @@ impl H2Conn {
             if let Some(state) = state {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
                 st.ended = true;
+                st.dead = true;
                 state.cv.notify_all();
             }
         }
@@ -1950,6 +2053,91 @@ mod tests {
         }
     }
 
+    /// A connection with one stream and all the credit it needs: the frame writer is the only
+    /// observer of how many calls a downlink window costs.
+    fn streaming_conn(total: usize) -> (Arc<H2Conn>, Arc<Mutex<Vec<u8>>>, Arc<AtomicUsize>) {
+        let (conn, written, slices) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(total as u64),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+        *conn
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = total as u64;
+        (conn, written, slices)
+    }
+
+    /// The frames the pre-batch loop sent one call at a time, kept as the oracle.
+    fn one_call_per_frame(
+        payload: &[u8],
+        max: usize,
+        mut conn: usize,
+        mut stream: usize,
+    ) -> Vec<u8> {
+        let mut wire = Vec::new();
+        let mut left = payload;
+        while !left.is_empty() {
+            let take = left.len().min(max).min(conn).min(stream);
+            let (head, body) = (&left[..take], &left[..take]);
+            wire.extend_from_slice(&frame_head(body.len(), T_DATA, 0, 1));
+            wire.extend_from_slice(head);
+            conn -= take;
+            stream -= take;
+            left = &left[take..];
+        }
+        wire
+    }
+
+    /// A promoted relay window is four DATA frames of the default frame size and one write, where
+    /// the per-frame shape paid four; both shapes put the same bytes in the same order.
+    #[test]
+    fn a_data_window_leaves_as_one_write() {
+        let payload: Vec<u8> = (0..4 * 16_384u32).map(|i| (i % 251) as u8).collect();
+        let (conn, written, slices) = streaming_conn(payload.len());
+        assert!(conn.send_data(1, &payload), "the whole window is sent");
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            1,
+            "one window, one write, whatever the four frames cost the old shape"
+        );
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            *bytes,
+            one_call_per_frame(&payload, 16_384, payload.len(), payload.len()),
+            "the batch is the frames the per-frame loop wrote, byte for byte"
+        );
+    }
+
+    /// A frame the window cuts short is still its own frame: batching only the writes never
+    /// widens a frame past the credit that admitted it.
+    #[test]
+    fn a_data_batch_writes_the_frames_the_old_loop_did() {
+        for len in [1, 16_383, 16_384, 16_385, 20_000, 65_535, 65_536] {
+            let payload: Vec<u8> = (0..len as u32).map(|i| (i % 251) as u8).collect();
+            let (conn, written, slices) = streaming_conn(len);
+            assert!(conn.send_data(1, &payload), "the window is sent");
+            let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+            assert_eq!(
+                *bytes,
+                one_call_per_frame(&payload, 16_384, len, len),
+                "the frames of a {len}-byte window are the old loop's frames"
+            );
+            let frames = len.div_ceil(16_384);
+            assert!(slices.load(Ordering::SeqCst) <= frames);
+        }
+    }
+
     /// A sender the peer never credits gives up at the relay stall, so a downlink cannot park its thread on a window that never arrives.
     #[test]
     fn a_sender_with_no_credit_gives_up_at_the_stall() {
@@ -1990,6 +2178,62 @@ mod tests {
         assert_eq!(verdict, Ok(false), "a sender with no credit returned");
     }
 
+    /// A request that ended its own body still has a response to send: waiting for credit must not
+    /// read the inbound `END_STREAM` as a dead stream and drop the downlink.
+    #[test]
+    fn an_ended_request_still_sends_its_response() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_secs(30)),
+            ..Default::default()
+        });
+        let (conn, _written, _slices) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: true,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(0),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+        let held = state
+            .send_window
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let sender = Arc::clone(&conn);
+        let running = thread::spawn(move || sender.send_data(1, b"ping"));
+        let until = std::time::Instant::now() + Duration::from_secs(2);
+        while conn.send_conn.try_lock().is_ok() {
+            assert!(
+                std::time::Instant::now() < until,
+                "the sender never took the connection window"
+            );
+            thread::yield_now();
+        }
+        drop(held);
+        *conn
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 4;
+        *state
+            .send_window
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) += 4;
+        conn.wake.notify_all();
+        assert_eq!(
+            running.join().expect("sender thread"),
+            true,
+            "the ended request's response is still sent"
+        );
+        crate::budgets::clear();
+    }
+
     /// A reset stream has no window left to grant, so its writer must be woken by the reset, not
     /// left to discover the stream is gone when the relay stall expires.
     #[test]
@@ -2013,12 +2257,15 @@ mod tests {
         conn.streams
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .insert(1, state);
+            .insert(1, Arc::clone(&state));
         *conn
             .send_conn
             .lock()
             .unwrap_or_else(PoisonError::into_inner) = 0;
-        let held = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        let held = state
+            .send_window
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let (sent, got) = std::sync::mpsc::channel();
         let sender = Arc::clone(&conn);
         let running = thread::spawn(move || {
