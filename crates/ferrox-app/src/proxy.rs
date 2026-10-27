@@ -6891,6 +6891,8 @@ fn copy_lane<R: Read, W: HalfShut + Write>(from: &Half<R>, to: &Half<W>, ended: 
                 if ended.load(Ordering::Relaxed) {
                     break;
                 }
+                // Sleep after the read lock is gone, so an idle leg does not hold the session's writer behind it.
+                thread::sleep(RELAY_POLL);
                 continue;
             }
             Err(_) => break,
@@ -6922,6 +6924,8 @@ fn copy_stream<R: Read, W: Write>(
                 if ended.load(Ordering::Relaxed) {
                     break;
                 }
+                // Sleep after the read lock is gone, so an idle leg does not hold the session's writer behind it.
+                thread::sleep(RELAY_POLL);
                 continue;
             }
             Err(_) => break,
@@ -7348,10 +7352,14 @@ fn dial_vless_rung(
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             let mut reader = reader;
-            let pump = Pump::to_stream(client, &write);
+            let pump = Pump::to_stream_now(client, &write);
             let answered = read_vless_response(&mut reader).is_some();
-            pump.end();
+            let sent = pump.end();
             if !answered {
+                // The pump may have handed the edge bytes before it refused; another rung could only carry the rest of the stream.
+                if sent {
+                    return true;
+                }
                 return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
@@ -10900,6 +10908,7 @@ where
                 Arc::clone(&out),
             )
         }),
+        sleep_on_timeout: true,
     };
     (
         reader,
@@ -10907,6 +10916,7 @@ where
             session: shared,
             out,
             driven: None,
+            sleep_on_timeout: true,
         },
     )
 }
@@ -11126,6 +11136,8 @@ struct TlsHalf<S> {
     session: Arc<Mutex<S>>,
     out: Arc<Mutex<Sealed>>,
     driven: Option<DrivenHalf<S, Connection>>,
+    /// A framed half parks under the relay's lock, so it leaves the sleep to the relay's reader.
+    sleep_on_timeout: bool,
 }
 
 impl<S> Clone for TlsHalf<S> {
@@ -11135,6 +11147,7 @@ impl<S> Clone for TlsHalf<S> {
             session: Arc::clone(&self.session),
             out: Arc::clone(&self.out),
             driven: None,
+            sleep_on_timeout: self.sleep_on_timeout,
         }
     }
 }
@@ -11146,7 +11159,7 @@ impl<S: ferrox_core::tls::TlsProvider> Read for TlsHalf<S> {
             return driven.read(buf);
         }
         let out = self.locked_read(buf);
-        if out.as_ref().is_err_and(is_timeout) {
+        if self.sleep_on_timeout && out.as_ref().is_err_and(is_timeout) {
             // Idle polls sleep a grain unlocked so a spinning read cannot starve the write pump.
             thread::sleep(RELAY_POLL);
         }
@@ -11529,6 +11542,41 @@ impl<S: ferrox_core::tls::TlsProvider> Write for TlsHalf<S> {
     }
 }
 
+impl TlsHalf<ferrox_core::tls::ClientSession<Connection>> {
+    /// Arms the transport the shared session reads, for a relay that hands this half to a framer.
+    fn arm_session_timeout(&self, grain: Duration) -> std::io::Result<()> {
+        self.session
+            .lock()
+            .map_err(|_| std::io::Error::other("tls half poisoned"))?
+            .get_ref()
+            .set_read_timeout(Some(grain))
+    }
+}
+
+impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send>
+    ferrox_core::tls::RecordAlignment for TlsHalf<S>
+{
+    fn engage_record_alignment(&mut self) {
+        if let Ok(mut session) = self.session.lock() {
+            session.engage_record_alignment();
+        }
+    }
+
+    fn disarm_record_alignment(&mut self) {
+        if let Ok(mut session) = self.session.lock() {
+            session.disarm_record_alignment();
+        }
+    }
+
+    fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        if <Self as FrameWrite>::write_slices(self, parts) {
+            Ok(())
+        } else {
+            Err(std::io::Error::other("tls half write failed"))
+        }
+    }
+}
+
 // The server write end for header-only carriers: bytes through the shared session, teardown through the raw socket.
 #[derive(Debug, Clone)]
 struct SessionSink<H> {
@@ -11802,32 +11850,8 @@ fn dial_vless_tls(
             if session.write_all(&header).is_err() {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            let Ok(out) = session.get_ref().try_clone() else {
-                return;
-            };
-            let shared = Arc::new(Mutex::new(session));
-            let out = Arc::new(Mutex::new(Sealed::new(out)));
-            let mut reader = TlsHalf {
-                session: Arc::clone(&shared),
-                out: Arc::clone(&out),
-                driven: None,
-            };
-            let pump = Pump::over(client, {
-                let mut writer = TlsHalf {
-                    session: Arc::clone(&shared),
-                    out: Arc::clone(&out),
-                    driven: None,
-                };
-                move |bytes| writer.write_all(bytes).is_ok()
-            });
-            let answered = read_vless_response(&mut reader).is_some();
-            pump.end();
-            if !answered {
+            let Some(link) = pump_vision_answer(client, session, &vless.id) else {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            drop(reader);
-            let Some(Ok(session)) = Arc::into_inner(shared).map(Mutex::into_inner) else {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Local));
             };
             let Ok(downstream) = client.try_clone() else {
                 return;
@@ -11838,8 +11862,8 @@ fn dial_vless_tls(
             let close = shutdown_pair(downstream.try_clone().ok(), None);
             // The Link frames its writes over this session, so the quiet grain arms on the transport it reads.
             let half = Half::shared_armed_capped(
-                crate::vision::Link::new(session, None, &vless.id),
-                crate::vision::Link::arm_session_timeout,
+                link,
+                |link, grain| link.session().arm_session_timeout(grain),
                 SESSION_POLL,
             );
             relay_stream(Half::socket(downstream), half, &close);
@@ -11869,12 +11893,14 @@ fn pump_tls_answer(
         session: Arc::clone(&shared),
         out: Arc::clone(&out),
         driven: None,
+        sleep_on_timeout: true,
     };
     let pump = Pump::over_now(client, {
         let mut writer = TlsHalf {
             session: Arc::clone(&shared),
             out: Arc::clone(&out),
             driven: None,
+            sleep_on_timeout: true,
         };
         move |bytes| writer.write_all(bytes).is_ok()
     });
@@ -11887,6 +11913,48 @@ fn pump_tls_answer(
     Arc::into_inner(shared)
         .map(Mutex::into_inner)
         .and_then(Result::ok)
+}
+
+/// The Vision answer wait, framed: the pump writes through the same `Link` the relay keeps, so the first upload is a Vision frame rather than raw TLS content, and the link's UUID and filter state survive the handoff.
+fn pump_vision_answer(
+    client: &Connection,
+    session: ferrox_core::tls::ClientSession<Connection>,
+    id: &[u8; 16],
+) -> Option<crate::vision::Link<TlsHalf<ferrox_core::tls::ClientSession<Connection>>>> {
+    let Ok(out) = session.get_ref().try_clone() else {
+        return None;
+    };
+    let shared = Arc::new(Mutex::new(session));
+    let out = Arc::new(Mutex::new(Sealed::new(out)));
+    let mut reader = TlsHalf {
+        session: Arc::clone(&shared),
+        out: Arc::clone(&out),
+        driven: None,
+        sleep_on_timeout: true,
+    };
+    let writer = TlsHalf {
+        session: Arc::clone(&shared),
+        out: Arc::clone(&out),
+        driven: None,
+        sleep_on_timeout: false,
+    };
+    let link = Arc::new(Mutex::new(crate::vision::Link::new(writer, None, id)));
+    let pump = Pump::over_now(client, {
+        let link = Arc::clone(&link);
+        move |bytes| {
+            let Ok(mut link) = link.lock() else {
+                return false;
+            };
+            link.write_all(bytes).is_ok()
+        }
+    });
+    let answered = read_vless_response(&mut reader).is_some();
+    let _ = pump.end();
+    if !answered {
+        return None;
+    }
+    drop(reader);
+    Arc::into_inner(link).and_then(|link| link.into_inner().ok())
 }
 
 fn tls_lane(
@@ -12049,15 +12117,21 @@ fn dial_vless_reality(
                 session: Arc::clone(&shared),
                 out: Arc::clone(&out),
                 driven: None,
+                sleep_on_timeout: true,
             };
-            let pump = Pump::over(client, {
-                let mut writer = TlsHalf {
-                    session: Arc::clone(&shared),
-                    out: Arc::clone(&out),
-                    driven: None,
-                };
-                move |bytes| writer.write_all(bytes).is_ok()
-            });
+            let pump = Pump::start(
+                client,
+                {
+                    let mut writer = TlsHalf {
+                        session: Arc::clone(&shared),
+                        out: Arc::clone(&out),
+                        driven: None,
+                        sleep_on_timeout: true,
+                    };
+                    move |bytes| writer.write_all(bytes).is_ok()
+                },
+                vless.is_vision(),
+            );
             let answered = read_vless_response(&mut reader).is_some();
             pump.end();
             if !answered {
@@ -12254,12 +12328,14 @@ fn vmess_tls_raw(
             Arc::new(Mutex::new(cipher)),
             Arc::clone(&out),
         )),
+        sleep_on_timeout: true,
     };
     let writer = SessionSink {
         half: TlsHalf {
             session: shared,
             out,
             driven: None,
+            sleep_on_timeout: true,
         },
         raw: Arc::new(raw),
     };
@@ -28254,22 +28330,105 @@ mod tests {
         });
         let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         client
-            .set_read_timeout(Some(Duration::from_secs(5)))
+            .set_read_timeout(Some(Duration::from_secs(2)))
             .expect("timeout");
         client.write_all(b"ping").expect("writes");
         let mut back = [0u8; 4];
-        client
-            .read_exact(&mut back)
-            .expect("echoes through a withheld answer");
-        assert_eq!(&back, b"ping");
+        let echoed = client.read_exact(&mut back).is_ok();
+        budgets::clear();
         drop(client);
         server.join().expect("joins");
         relaying.join().expect("joins");
+        assert!(echoed, "the first write did not wait out the payload grace");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// `HTTPUpgrade` is a carrier too, and its server may hold the `[0, 0]` until the first payload arrives: the pump must start before the payload grace, not after it.
+    #[test]
+    fn vless_httpupgrade_client_pumps_the_upload_before_the_payload_grace_expires() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            payload_grace: Some(Duration::from_millis(500)),
+            ..Default::default()
+        });
+        let id = [0x29u8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let (mut reader, mut writer) =
+                crate::httpupgrade::accept(stream, "/p", "").expect("accepts the upgrade");
+            reader.set_poll(Some(Duration::from_millis(200)));
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut reader) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            let mut payload = [0u8; 4];
+            reader
+                .read_exact(&mut payload)
+                .expect("reads payload before answering");
+            writer.write_all(&[0, 0]).expect("answers");
+            writer.write_all(&payload).expect("echoes");
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::HttpUpgrade {
+                path: "/p".to_owned(),
+                host: "127.0.0.1".to_owned(),
+                ed: 0,
+            },
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let relaying = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_vless(
+                &stream,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        let echoed = client.read_exact(&mut back).is_ok();
+        budgets::clear();
+        drop(client);
+        server.join().expect("joins");
+        relaying.join().expect("joins");
+        assert!(echoed, "the first write did not wait out the payload grace");
+        assert_eq!(&back, b"ping");
     }
 
     /// The pump belongs to the carrier, and REALITY is a carrier: a REALITY server that holds its `[0, 0]` until the first payload record arrives must not deadlock the client either.
     #[test]
     fn vless_reality_client_pumps_the_upload_before_reading_the_response() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            payload_grace: Some(Duration::from_millis(500)),
+            ..Default::default()
+        });
         let id = uuid_bytes(REALITY_TEST_ID).expect("id");
         let server_config = reality_server_config();
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -28293,8 +28452,14 @@ mod tests {
             };
             assert_eq!(got, id);
             assert_eq!(cmd, 1);
+            session
+                .transport()
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("timeout");
             let mut payload = [0u8; 4];
-            read_exact(&mut session, &mut payload).expect("reads payload before answering");
+            session
+                .read_exact(&mut payload)
+                .expect("reads payload before answering");
             session.write_all(&[0, 0]).expect("answers");
             session.write_all(&payload).expect("echoes");
         });
@@ -29067,6 +29232,86 @@ mod tests {
         relay.join().expect("joins");
         server.join().expect("joins");
         filler.join().expect("joins");
+    }
+
+    /// Vision's first upload is a framed record, not raw TLS content: the pump must start before the payload grace and write through the same Link the relay keeps.
+    #[test]
+    fn vless_vision_pumps_the_upload_before_the_payload_grace_expires() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            payload_grace: Some(Duration::from_millis(500)),
+            ..Default::default()
+        });
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x4Du8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (seen, framed) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let Some((got, flow, cmd, _target)) = decode_request(&mut tls) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(flow, Flow::Vision);
+            assert_eq!(cmd, 1);
+            tls.get_ref()
+                .get_ref()
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .expect("timeout");
+            let mut uuid = [0u8; 16];
+            let framed = tls.read_exact(&mut uuid).is_ok() && uuid == id;
+            let _ = seen.send(framed);
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let relay = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: false,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(client_config)),
+                flow: ferrox_core::vless::VISION_FLOW.to_owned(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+            dial_vless_tls(
+                &client,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+            );
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        let framed = framed
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the server sees the first write");
+        budgets::clear();
+        drop(sock);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+        assert!(
+            framed,
+            "the first write did not reach the server as a Vision frame"
+        );
     }
 
     #[test]
@@ -30791,11 +31036,13 @@ mod tests {
                     session: Arc::clone(&shared),
                     out: Arc::clone(&out),
                     driven: None,
+                    sleep_on_timeout: true,
                 },
                 TlsHalf {
                     session: shared,
                     out,
                     driven: None,
+                    sleep_on_timeout: true,
                 },
             )
             .expect("accepts carrier");
