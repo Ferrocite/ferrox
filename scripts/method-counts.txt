@@ -152,6 +152,8 @@ carrier-websocket write-syscalls-per-frame 1 ferrox-app-ws::tests::frames_round_
 carrier-websocket user-space-copies-per-byte-unmasked-write 0 ferrox-app-ws::tests::frames_round_trip_masked_and_plain
 carrier-websocket user-space-copies-per-byte-masked-write 1 ferrox-app-ws::tests::frames_round_trip_masked_and_plain
 carrier-websocket user-space-copies-per-byte-read 1 ferrox-app-ws::tests::a_read_covers_a_window_not_one_frame_header
+carrier-websocket read-calls-per-two-buffered-frames 1 ferrox-app-ws::tests::two_buffered_frames_leave_in_one_read
+carrier-websocket transport-reads-after-a-ready-message 0 ferrox-app-ws::tests::a_partial_next_frame_does_not_hold_the_ready_message
 carrier-websocket request-buffer-reallocations-per-dial 0 ferrox-app-ws::tests::the_request_is_sized_for_its_bytes
 carrier-websocket response-buffer-reallocations-per-accept 0 ferrox-app-ws::tests::the_101_is_the_key_and_the_echoed_subprotocol
 carrier-websocket early-data-copies-of-the-pipelined-bytes 0 ferrox-app-ws::tests::the_pipelined_prefix_is_the_readers_own_buffer
