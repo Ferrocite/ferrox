@@ -749,6 +749,8 @@ carrier-masque ipv6-tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_
 carrier-masque udp-echo-round-trips 1 ferrox-app-masque::tests::a_datagram_flow_crosses_the_tunnel_to_a_freedom_dial
 carrier-masque wrong-password-status 401 ferrox-app-masque::tests::a_wrong_password_is_refused_with_401
 carrier-masque path-forms-witnessed 5 ferrox-app-masque::tests::a_request_path_reads_the_way_xray_parses_it
+carrier-masque reference-edge-spellings 2 ferrox-app-masque::tests::the_reference_settings_spellings_read_the_same_edge
+carrier-masque reference-user-spellings 4 ferrox-app-masque::tests::the_reference_user_spellings_serve_the_same_table
 carrier-masque pool-contained-addresses-witnessed 2 ferrox-app-masque::tests::a_pool_holds_every_address_its_prefix_covers
 carrier-masque pool-outside-addresses-witnessed 1 ferrox-app-masque::tests::a_pool_holds_every_address_its_prefix_covers
 carrier-masque subnet-grants-witnessed 2 ferrox-app-masque::tests::a_subnet_grant_names_its_first_host
