@@ -495,6 +495,8 @@ fn io(
     let mut peers = peers(&config, epoch);
     let started = Instant::now();
     let mut buf = vec![0u8; 65_535];
+    let mut events = Vec::new();
+    let mut incoming = Vec::new();
     loop {
         if stop
             .as_ref()
@@ -503,7 +505,6 @@ fn io(
             return;
         }
         let now = started.elapsed().as_millis() as u64;
-        let mut events = Vec::new();
         loop {
             let packet = match from_tunnel.try_recv() {
                 Ok(packet) => packet,
@@ -552,7 +553,6 @@ fn io(
                     else {
                         continue;
                     };
-                    let mut incoming = Vec::new();
                     peers[index]
                         .tunnel
                         .receive(now, source, &mut buf[..n], &mut incoming);
