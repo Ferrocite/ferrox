@@ -1156,19 +1156,15 @@ fn stream_recv_exact_parked(
                 Err(_) => return None,
             }
         };
-        match found {
-            Some((n, fin)) => {
-                out.extend_from_slice(&chunk[..n]);
-                if fin {
-                    break;
-                }
+        if let Some((n, fin)) = found {
+            out.extend_from_slice(&chunk[..n]);
+            if fin {
+                break;
             }
-            None => {
-                if Instant::now() >= deadline {
-                    return None;
-                }
-                std::thread::sleep(STREAM_POLL);
-            }
+        } else if Instant::now() >= deadline {
+            return None;
+        } else {
+            std::thread::sleep(STREAM_POLL);
         }
     }
     (out.len() == want).then_some(out)
