@@ -325,7 +325,33 @@ struct Packer {
 
 impl Packets {
     fn send(&self, data: &[u8]) -> bool {
-        self.up.enqueue(data)
+        let mut at = 0;
+        while at < data.len() {
+            match self.up.push(&data[at..]) {
+                crate::proxy::Push::Took(n) => at += n,
+                crate::proxy::Push::Parked => {
+                    let Ok(mut queue) = self.up.queue.lock() else {
+                        return false;
+                    };
+                    while queue.len() >= self.up.max()
+                        && !self.up.failed.load(Ordering::SeqCst)
+                        && !self.up.closed.load(Ordering::SeqCst)
+                    {
+                        queue = self
+                            .up
+                            .cv
+                            .wait(queue)
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    }
+                }
+                crate::proxy::Push::Lost => return false,
+            }
+        }
+        !self.up.failed.load(Ordering::SeqCst)
+    }
+
+    fn push(&self, data: &[u8]) -> crate::proxy::Push {
+        self.up.push(data)
     }
 
     fn finish(&self) -> bool {
@@ -351,31 +377,29 @@ impl Packer {
     }
 
     /// The reference's pipe batches every write that lands while a POST is in flight (`dialer.go:489`), so a full pipe becomes one POST instead of one POST per relay window.
-    fn enqueue(&self, data: &[u8]) -> bool {
+    /// A full queue parks the caller instead of waiting in it, so a paced upload cannot pin the lane other flows need.
+    fn push(&self, data: &[u8]) -> crate::proxy::Push {
+        if data.is_empty() {
+            return crate::proxy::Push::Took(0);
+        }
         if self.closed.load(Ordering::SeqCst) {
-            return false;
+            return crate::proxy::Push::Lost;
         }
         let max = self.max();
         let Ok(mut queue) = self.queue.lock() else {
-            return false;
+            return crate::proxy::Push::Lost;
         };
-        let mut at = 0;
-        while at < data.len() {
-            while queue.len() >= max && !self.failed.load(Ordering::SeqCst) {
-                queue = self
-                    .cv
-                    .wait(queue)
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-            }
-            if self.failed.load(Ordering::SeqCst) {
-                return false;
-            }
-            let take = (max - queue.len()).min(data.len() - at);
-            queue.extend_from_slice(&data[at..at + take]);
-            at += take;
-            self.cv.notify_all();
+        if self.failed.load(Ordering::SeqCst) {
+            return crate::proxy::Push::Lost;
         }
-        !self.failed.load(Ordering::SeqCst)
+        let room = max.saturating_sub(queue.len());
+        if room == 0 {
+            return crate::proxy::Push::Parked;
+        }
+        let take = room.min(data.len());
+        queue.extend_from_slice(&data[..take]);
+        self.cv.notify_all();
+        crate::proxy::Push::Took(take)
     }
 
     fn pump(&self) {
@@ -2583,6 +2607,26 @@ impl crate::proxy::CarrierSink for XhttpWriter {
         self.send(bytes)
     }
     #[inline]
+    fn push(&self, bytes: &[u8]) -> crate::proxy::Push {
+        if let Some(h2) = self.h2.get() {
+            return if h2.data(bytes) {
+                crate::proxy::Push::Took(bytes.len())
+            } else {
+                crate::proxy::Push::Lost
+            };
+        }
+        match &self.shared.body {
+            Body::Stream(_) => {
+                if self.send(bytes) {
+                    crate::proxy::Push::Took(bytes.len())
+                } else {
+                    crate::proxy::Push::Lost
+                }
+            }
+            Body::Packets(packets) => packets.push(bytes),
+        }
+    }
+    #[inline]
     fn close(&self) {
         self.finish();
     }
@@ -3759,6 +3803,37 @@ mod tests {
         assert_eq!(posts[1].1, batched, "the batched post carries both windows");
         assert!(posts[0].0.ends_with("/session/0"));
         assert!(posts[1].0.ends_with("/session/1"));
+    }
+
+    /// A full queue answers at once instead of waiting inside the lane the other flows share.
+    #[test]
+    fn a_full_packet_up_queue_parks_instead_of_waiting() {
+        let mut settings = packet_settings(XhttpMode::PacketUp);
+        settings.sc_max_each_post = 4;
+        settings.sc_min_posts_interval_ms = (0, 0);
+        let HeldUpDial {
+            writer,
+            posts,
+            release,
+            first_written,
+        } = held_up(&settings);
+        assert!(writer.send(b"abcd"));
+        first_written
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first post left");
+        assert!(matches!(
+            crate::proxy::CarrierSink::push(&writer, b"efgh"),
+            crate::proxy::Push::Took(4)
+        ));
+        assert!(matches!(
+            crate::proxy::CarrierSink::push(&writer, b"ij"),
+            crate::proxy::Push::Parked
+        ));
+        release.send(()).expect("releases the answer");
+        writer.finish();
+        let posts = posts.lock().expect("posts");
+        assert_eq!(posts.len(), 2);
+        assert_eq!(posts[1].1, b"efgh");
     }
 
     /// Any tail the relay hands over rides the post it queued behind, and the posts put the upload back byte for byte.
