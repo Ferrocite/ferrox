@@ -11706,15 +11706,15 @@ fn seal_slices_out<S: CipherOpen>(
 }
 
 // A reader that drives the transport parks outside the session lock; one that cannot stays behind it.
-struct TlsHalf<S> {
+struct TlsHalf<S, R = Connection> {
     session: Arc<Mutex<S>>,
     out: Arc<Mutex<Sealed>>,
-    driven: Option<DrivenHalf<S, Connection>>,
+    driven: Option<DrivenHalf<S, R>>,
     /// A framed half parks under the relay's lock, so it leaves the sleep to the relay's reader.
     sleep_on_timeout: bool,
 }
 
-impl<S> Clone for TlsHalf<S> {
+impl<S, R> Clone for TlsHalf<S, R> {
     fn clone(&self) -> Self {
         // Only write halves are cloned, and a writer does not drive the read.
         Self {
@@ -11726,7 +11726,7 @@ impl<S> Clone for TlsHalf<S> {
     }
 }
 
-impl<S: ferrox_core::tls::TlsProvider> Read for TlsHalf<S> {
+impl<S: ferrox_core::tls::TlsProvider, R: Read> Read for TlsHalf<S, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if let Some(driven) = self.driven.as_mut() {
             // The transport's wait holds no session lock; the grain it polls is the one the split armed.
@@ -11741,7 +11741,7 @@ impl<S: ferrox_core::tls::TlsProvider> Read for TlsHalf<S> {
     }
 }
 
-impl<S> TlsHalf<S> {
+impl<S, R> TlsHalf<S, R> {
     fn locked_read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>
     where
         S: ferrox_core::tls::TlsProvider,
@@ -12223,7 +12223,7 @@ impl<S: CipherOpen + ferrox_core::tls::RecordAlignment, R> ferrox_core::tls::Rec
     }
 }
 
-impl<S: ferrox_core::tls::TlsProvider> Write for TlsHalf<S> {
+impl<S: ferrox_core::tls::TlsProvider, R> Write for TlsHalf<S, R> {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         seal_out(&self.session, &self.out, buf)
     }
@@ -12233,8 +12233,8 @@ impl<S: ferrox_core::tls::TlsProvider> Write for TlsHalf<S> {
     }
 }
 
-impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send>
-    ferrox_core::tls::RecordAlignment for TlsHalf<S>
+impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send, R: Send>
+    ferrox_core::tls::RecordAlignment for TlsHalf<S, R>
 {
     fn engage_record_alignment(&mut self) {
         if let Ok(mut session) = self.session.lock() {
@@ -12563,14 +12563,14 @@ fn pump_tls_answer(
     };
     let shared = Arc::new(Mutex::new(session));
     let out = Arc::new(Mutex::new(Sealed::new(out)));
-    let mut reader = TlsHalf {
+    let mut reader: TlsHalf<_, Connection> = TlsHalf {
         session: Arc::clone(&shared),
         out: Arc::clone(&out),
         driven: None,
         sleep_on_timeout: true,
     };
     let pump = Pump::over_now(client, {
-        let mut writer = TlsHalf {
+        let mut writer: TlsHalf<_, Connection> = TlsHalf {
             session: Arc::clone(&shared),
             out: Arc::clone(&out),
             driven: None,
@@ -12589,12 +12589,18 @@ fn pump_tls_answer(
         .and_then(Result::ok)
 }
 
+type VisionTlsLink = Half<
+    crate::vision::Link<
+        TlsHalf<ferrox_core::tls::ClientSession<Connection>, CipherReader<Connection>>,
+    >,
+>;
+
 /// The Vision answer wait, framed: the pump writes through the writer `Link` the relay keeps, so the first upload is a Vision frame rather than raw TLS content, and the link's UUID and filter state survive the handoff. The pair is split from the start so the relay's read and write never share a lock across the transport wait.
 fn pump_vision_answer(
     client: &Connection,
     session: ferrox_core::tls::ClientSession<Connection>,
     id: &[u8; 16],
-) -> Option<Half<crate::vision::Link<TlsHalf<ferrox_core::tls::ClientSession<Connection>>>>> {
+) -> Option<VisionTlsLink> {
     let Ok(out) = session.get_ref().try_clone() else {
         return None;
     };
@@ -12604,9 +12610,18 @@ fn pump_vision_answer(
     if cipher.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return None;
     }
+    let Ok(raw_read) = session.get_ref().try_clone() else {
+        return None;
+    };
+    if raw_read.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return None;
+    }
+    let Ok(raw_write) = session.get_ref().try_clone() else {
+        return None;
+    };
     let shared = Arc::new(Mutex::new(session));
     let out = Arc::new(Mutex::new(Sealed::new(out)));
-    let mut answer = TlsHalf {
+    let mut answer: TlsHalf<_, Connection> = TlsHalf {
         session: Arc::clone(&shared),
         out: Arc::clone(&out),
         driven: None,
@@ -12617,7 +12632,9 @@ fn pump_vision_answer(
         out: Arc::clone(&out),
         driven: Some(DrivenHalf::new(
             Arc::clone(&shared),
-            Arc::new(Mutex::new(cipher)),
+            Arc::new(Mutex::new(CipherReader::Record(
+                ferrox_core::tls::reality::RecordLimiter::new(cipher),
+            ))),
             Arc::clone(&out),
         )),
         sleep_on_timeout: false,
@@ -12628,7 +12645,8 @@ fn pump_vision_answer(
         driven: None,
         sleep_on_timeout: false,
     };
-    let (reader, writer) = crate::vision::Link::split(reader, writer, None, None, id);
+    let (reader, writer) =
+        crate::vision::Link::split(reader, writer, Some(raw_read), Some(raw_write), id);
     let link = Arc::new(Mutex::new(writer));
     let pump = Pump::over_now(client, {
         let link = Arc::clone(&link);
@@ -12805,7 +12823,7 @@ fn dial_vless_reality(
             let Ok(out) = raw.try_clone() else { return };
             let shared = Arc::new(Mutex::new(session));
             let out = Arc::new(Mutex::new(Sealed::new(out)));
-            let mut reader = TlsHalf {
+            let mut reader: TlsHalf<_, Connection> = TlsHalf {
                 session: Arc::clone(&shared),
                 out: Arc::clone(&out),
                 driven: None,
@@ -12814,7 +12832,7 @@ fn dial_vless_reality(
             let pump = Pump::start(
                 client,
                 {
-                    let mut writer = TlsHalf {
+                    let mut writer: TlsHalf<_, Connection> = TlsHalf {
                         session: Arc::clone(&shared),
                         out: Arc::clone(&out),
                         driven: None,
@@ -13027,7 +13045,7 @@ fn vmess_tls_raw(
         sleep_on_timeout: true,
     };
     let writer = SessionSink {
-        half: TlsHalf {
+        half: TlsHalf::<_, Connection> {
             session: shared,
             out,
             driven: None,
@@ -19410,8 +19428,8 @@ where
     kept == 0 || write(&window[..kept])
 }
 
-impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send> FrameWrite
-    for TlsHalf<S>
+impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send, R: Send>
+    FrameWrite for TlsHalf<S, R>
 {
     // One seal per window, and the batch sent after the session's lock drops: every part of a window reaches the session as segments of one payload, so it seals one record where a write per part sealed one each, and a frame larger than a record is cut rather than handed over as a payload the session cannot hold. The records of a batch then leave in one send, so a 64 KiB relay window costs one write where a send per record cost it four.
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
@@ -30515,6 +30533,101 @@ mod tests {
         relay.join().expect("joins");
         server.join().expect("joins");
         filler.join().expect("joins");
+    }
+
+    /// The plain-TLS dial hands the raw socket to the same Link the answer pump framed, so an inner TLS record reaches the server unframed after the direct command.
+    #[test]
+    fn vless_over_tls_vision_direct_switch_carries_inner_tls() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let echo_config = Arc::clone(&server_config);
+        let relay_config = client_config.clone();
+        let id = [0x4Eu8; 16];
+        let inner = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let inner_addr = inner.local_addr().expect("addr");
+        let echo = thread::spawn(move || {
+            let (stream, _) = inner.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&echo_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let mut buf = [0u8; 4096];
+            loop {
+                match tls.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        tls.write_all(&buf[..n]).expect("echoes");
+                        tls.flush().expect("flushes");
+                    }
+                }
+            }
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &[VlessUser {
+                    id,
+                    flow: Flow::Vision,
+                    email: String::new(),
+                    level: 0,
+                    reverse: None,
+                }],
+                true,
+                &Carrier::Raw(Chain::default()),
+                &server_config,
+                None,
+                None,
+            );
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: false,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(relay_config)),
+                flow: ferrox_core::vless::VISION_FLOW.to_owned(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            dial_vless(
+                &client,
+                &server,
+                &vless,
+                Some(&Destination::from(inner_addr)),
+                Ladder::global(),
+            );
+        });
+        let user = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        user.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut inner = ferrox_core::tls::connect(&client_config, user).expect("inner configures");
+        inner.handshake().expect("inner handshakes");
+        for round in 0..4 {
+            let payload = format!("plain vision inner tls round {round}");
+            inner.write_all(payload.as_bytes()).expect("writes");
+            inner.flush().expect("flushes");
+            let mut echoed = vec![0; payload.len()];
+            inner.read_exact(&mut echoed).expect("echoes");
+            assert_eq!(echoed, payload.as_bytes());
+        }
+        drop(inner);
+        relay.join().expect("joins");
+        server.join().expect("joins");
+        echo.join().expect("joins");
     }
 
     /// Vision's first upload is a framed record, not raw TLS content: the pump must start before the payload grace and write through the same Link the relay keeps.
