@@ -3122,7 +3122,7 @@ fn route(
     conns.insert(header.dcid.as_ref().to_vec(), state);
 }
 
-/// A whole receive batch, one lock per run of datagrams for the same lane. A burst for one lane is what a data frame is, so the common batch pays one lock, one `learn_ids` pass per packet and one egress sweep for the run, not one of each per packet. A lane's run keeps the kernel's order; a run for another lane starts its own.
+/// A whole receive batch, one lock per run of datagrams for the same lane. A burst for one lane is what a data frame is, so the common batch pays one lock, one `learn_ids` pass per run and one egress sweep for the run, not one of each per packet. A lane's run keeps the kernel's order; a run for another lane starts its own.
 #[cfg(target_os = "linux")]
 fn route_batch(
     sock: &Datagram,
@@ -3162,7 +3162,6 @@ fn route_batch(
                 };
                 let info = quiche::RecvInfo { from, to: local };
                 let _ = conn.recv(bytes, info);
-                // Per packet, not per run: a source id the edge starts using mid-connection has to route on the next datagram, and that datagram can be in this same batch.
                 learn_ids(conns, &state, &conn);
             }
             flush_egress(&mut conn, sock);
@@ -4117,7 +4116,9 @@ mod tests {
         offer: Option<&[u8]>,
     ) -> (Lane, Lane) {
         let mut server_config = serve_config(identity).expect("serves");
+        server_config.set_active_connection_id_limit(4);
         let mut client_config = quiche_config(&identity.cert_chain, None).expect("trusts");
+        client_config.set_active_connection_id_limit(4);
         let server_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
         let server_addr = server_sock.local_addr().expect("addr");
         let client_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
@@ -4210,6 +4211,107 @@ mod tests {
             server.conn.as_mut().ech_accepted(),
             "the server opened the inner hello"
         );
+    }
+
+    /// A peer that rebinds its address keeps the lane: quiche validates the new path and the
+    /// stream id is still the one both ends opened before the move.
+    #[test]
+    fn a_peer_rebind_keeps_the_quic_lane() {
+        let (mut client, mut server) = lane_pair();
+        let id = 0;
+        let sent = client
+            .conn
+            .stream_send(id, b"before", false)
+            .expect("opens");
+        assert_eq!(sent, b"before".len());
+        let mut buf = [0u8; 32];
+        let mut got = 0;
+        for _ in 0..64 {
+            pass(
+                &mut client.conn,
+                &client.sock,
+                &mut server.conn,
+                &server.sock,
+                server.addr,
+            );
+            match server.conn.stream_recv(id, &mut buf) {
+                Ok((n, _)) => {
+                    got = n;
+                    break;
+                }
+                Err(quiche::Error::Done) => {}
+                Err(error) => panic!("reads before the move: {error:?}"),
+            }
+        }
+        assert_eq!(&buf[..got], b"before");
+
+        for _ in 0..2 {
+            let mut scid = [0u8; 16];
+            getrandom::fill(&mut scid).expect("random");
+            client
+                .conn
+                .new_scid(&quiche::ConnectionId::from_ref(&scid), 0, true)
+                .expect("adds a client source id");
+            getrandom::fill(&mut scid).expect("random");
+            server
+                .conn
+                .new_scid(&quiche::ConnectionId::from_ref(&scid), 0, true)
+                .expect("adds a server source id");
+        }
+        for _ in 0..4 {
+            pass(
+                &mut client.conn,
+                &client.sock,
+                &mut server.conn,
+                &server.sock,
+                server.addr,
+            );
+            pass(
+                &mut server.conn,
+                &server.sock,
+                &mut client.conn,
+                &client.sock,
+                client.addr,
+            );
+        }
+
+        let moved = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
+        let moved_addr = moved.local_addr().expect("addr");
+        client
+            .conn
+            .migrate(moved_addr, server.addr)
+            .expect("migrates");
+        client.sock = moved;
+        client.addr = moved_addr;
+        client.conn.stream_send(id, b"after", false).expect("sends");
+
+        let mut after = [0u8; 32];
+        let mut got = 0;
+        for _ in 0..64 {
+            pass(
+                &mut client.conn,
+                &client.sock,
+                &mut server.conn,
+                &server.sock,
+                server.addr,
+            );
+            pass(
+                &mut server.conn,
+                &server.sock,
+                &mut client.conn,
+                &client.sock,
+                client.addr,
+            );
+            match server.conn.stream_recv(id, &mut after) {
+                Ok((n, _)) => {
+                    got = n;
+                    break;
+                }
+                Err(quiche::Error::Done) => {}
+                Err(error) => panic!("reads after the move: {error:?}"),
+            }
+        }
+        assert_eq!(&after[..got], b"after");
     }
 
     /// The production dial hands the offer to the connection before its first packet, not only the
