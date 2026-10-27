@@ -630,6 +630,87 @@ pub fn udp_checksum(
     }
 }
 
+/// The smallest MTU each family may name, RFC 791 and RFC 8200 §5.
+const IPV4_MIN_MTU: usize = 68;
+const IPV6_MIN_MTU: usize = 1280;
+const ICMP_PROTOCOL: u8 = 1;
+const ICMPV6_PROTOCOL: u8 = 58;
+const ICMP_DESTINATION_UNREACHABLE: u8 = 3;
+const ICMP_FRAGMENTATION_NEEDED: u8 = 4;
+const ICMPV6_PACKET_TOO_BIG: u8 = 2;
+
+/// The ICMP Packet Too Big a narrow tunnel answers a packet too wide to carry: the version's error, this tunnel's MTU, and the start of the packet that did not fit, addressed back from where it came. `None` when the packet is not a whole IP header or the MTU is below the family's floor, which is a tunnel the reference refuses too.
+#[must_use]
+pub fn icmp_too_large(packet: &[u8], mtu: usize) -> Option<Vec<u8>> {
+    let mut answer = Vec::new();
+    match packet.first()? >> 4 {
+        4 => {
+            if packet.len() < IPV4_HEADER || mtu < IPV4_MIN_MTU {
+                return None;
+            }
+            let header = usize::from(packet[0] & 0x0f) * 4;
+            let data = &packet[..packet.len().min(header.max(IPV4_HEADER) + 8)];
+            let mtu = u16::try_from(mtu).ok()?;
+            let mut message = vec![
+                ICMP_DESTINATION_UNREACHABLE,
+                ICMP_FRAGMENTATION_NEEDED,
+                0,
+                0,
+                0,
+                0,
+                (mtu >> 8) as u8,
+                mtu as u8,
+            ];
+            message.extend_from_slice(data);
+            let sum = checksum(&message);
+            message[2..4].copy_from_slice(&sum.to_be_bytes());
+            let mut head = [0u8; IPV4_HEADER];
+            head[0] = 0x45;
+            let total = u16::try_from(IPV4_HEADER + message.len()).ok()?;
+            head[2..4].copy_from_slice(&total.to_be_bytes());
+            head[8] = HOP_LIMIT;
+            head[9] = ICMP_PROTOCOL;
+            head[12..16].copy_from_slice(&packet[16..20]);
+            head[16..20].copy_from_slice(&packet[12..16]);
+            let sum = ipv4_checksum(&head);
+            head[10..12].copy_from_slice(&sum.to_be_bytes());
+            answer.extend_from_slice(&head);
+            answer.extend_from_slice(&message);
+        }
+        6 => {
+            if packet.len() < IPV6_HEADER || mtu < IPV6_MIN_MTU {
+                return None;
+            }
+            let data = &packet[..packet.len().min(1232)];
+            let mtu = u32::try_from(mtu).ok()?;
+            let mut message = vec![ICMPV6_PACKET_TOO_BIG, 0, 0, 0];
+            message.extend_from_slice(&mtu.to_be_bytes());
+            message.extend_from_slice(data);
+            let sum = pseudo_checksum(&packet[24..40], &packet[8..24], ICMPV6_PROTOCOL, &message);
+            message[2..4].copy_from_slice(&sum.to_be_bytes());
+            let mut head = [0u8; IPV6_HEADER];
+            head[0] = 0x60;
+            let payload = u16::try_from(message.len()).ok()?;
+            head[4..6].copy_from_slice(&payload.to_be_bytes());
+            head[6] = ICMPV6_PROTOCOL;
+            head[7] = HOP_LIMIT;
+            head[8..24].copy_from_slice(&packet[24..40]);
+            head[24..40].copy_from_slice(&packet[8..24]);
+            answer.extend_from_slice(&head);
+            answer.extend_from_slice(&message);
+        }
+        _ => return None,
+    }
+    Some(answer)
+}
+
+/// A checksum over a pseudo-header plus a payload, summed without writing the pseudo-header down.
+fn pseudo_checksum(source: &[u8], destination: &[u8], protocol: u8, payload: &[u8]) -> u16 {
+    let sum = word_sum(source) + word_sum(destination) + payload.len() as u32 + u32::from(protocol);
+    let sum = (sum & 0xffff) + (sum >> 16);
+    !fold(sum + word_sum(payload))
+}
+
 /// Whether an incoming datagram's checksum verifies: pseudo-header, the whole UDP header including its checksum field, and payload must sum to all ones; over IPv4 a zero field means "not computed" and is accepted, over IPv6 the field is mandatory and a zero is refused.
 fn checksum_holds(
     source: &[u8],
@@ -1479,6 +1560,113 @@ mod tests {
             super::super::hpack::qpack_status(&q3),
             None,
             "a request carries no status"
+        );
+    }
+
+    /// A v4 packet whose payload is eight bytes, so a too-big answer copies the header and the eight bytes the reference copies.
+    fn v4_packet(source: [u8; 4], destination: [u8; 4], options: bool) -> Vec<u8> {
+        let header = if options { 24 } else { 20 };
+        let mut packet = vec![0u8; header + 8];
+        packet[0] = 0x40 | ((header / 4) as u8);
+        let total = u16::try_from(packet.len()).expect("a short packet");
+        packet[2..4].copy_from_slice(&total.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = PROTOCOL_UDP;
+        packet[12..16].copy_from_slice(&source);
+        packet[16..20].copy_from_slice(&destination);
+        packet
+    }
+
+    fn v6_packet(source: [u8; 16], destination: [u8; 16]) -> Vec<u8> {
+        let mut packet = vec![0u8; IPV6_HEADER + 8];
+        packet[0] = 0x60;
+        packet[4..6].copy_from_slice(&8u16.to_be_bytes());
+        packet[6] = PROTOCOL_UDP;
+        packet[7] = 64;
+        packet[8..24].copy_from_slice(&source);
+        packet[24..40].copy_from_slice(&destination);
+        packet
+    }
+
+    #[test]
+    fn a_packet_too_big_swaps_the_addresses_and_verifies_at_both_versions() {
+        let source = [10, 13, 0, 2];
+        let destination = [198, 51, 100, 7];
+        let packet = v4_packet(source, destination, false);
+        let answer = icmp_too_large(&packet, 1170).expect("a v4 answer");
+        assert_eq!(answer.len(), 20 + 8 + 28, "v4 header, ICMP, copied packet");
+        assert_eq!(answer[0], 0x45);
+        assert_eq!(answer[8], HOP_LIMIT);
+        assert_eq!(answer[9], ICMP_PROTOCOL);
+        assert_eq!(&answer[12..16], &destination, "source is the old target");
+        assert_eq!(&answer[16..20], &source, "target is the old source");
+        assert_eq!(
+            u16::from_be_bytes([answer[2], answer[3]]) as usize,
+            answer.len()
+        );
+        assert_eq!(
+            &answer[20..22],
+            &[ICMP_DESTINATION_UNREACHABLE, ICMP_FRAGMENTATION_NEEDED]
+        );
+        assert_eq!(u16::from_be_bytes([answer[26], answer[27]]), 1170);
+        assert_eq!(
+            &answer[28..],
+            &packet[..28],
+            "the header and eight bytes follow"
+        );
+        assert_eq!(fold(word_sum(&answer[..20])), 0xffff, "v4 header checksum");
+        assert_eq!(fold(word_sum(&answer[20..])), 0xffff, "v4 ICMP checksum");
+
+        let source6 = [0xfd, 0x13, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+        let destination6 = [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7];
+        let packet = v6_packet(source6, destination6);
+        let answer = icmp_too_large(&packet, IPV6_MIN_MTU).expect("a v6 answer");
+        assert_eq!(answer.len(), IPV6_HEADER + 8 + 48);
+        assert_eq!(answer[0], 0x60);
+        assert_eq!(answer[6], ICMPV6_PROTOCOL);
+        assert_eq!(answer[7], HOP_LIMIT);
+        assert_eq!(&answer[8..24], &destination6, "source is the old target");
+        assert_eq!(&answer[24..40], &source6, "target is the old source");
+        assert_eq!(
+            u16::from_be_bytes([answer[4], answer[5]]) as usize,
+            answer.len() - IPV6_HEADER
+        );
+        assert_eq!(&answer[40..42], &[ICMPV6_PACKET_TOO_BIG, 0]);
+        assert_eq!(
+            u32::from_be_bytes([answer[44], answer[45], answer[46], answer[47]]),
+            u32::try_from(IPV6_MIN_MTU).expect("an mtu")
+        );
+        assert_eq!(&answer[48..], &packet[..48]);
+        let sum = word_sum(&answer[8..24])
+            + word_sum(&answer[24..40])
+            + (answer.len() - IPV6_HEADER) as u32
+            + u32::from(ICMPV6_PROTOCOL);
+        let sum = (sum & 0xffff) + (sum >> 16);
+        assert_eq!(
+            fold(sum + word_sum(&answer[IPV6_HEADER..])),
+            0xffff,
+            "v6 ICMP checksum covers the pseudo-header"
+        );
+    }
+
+    #[test]
+    fn a_packet_too_big_copies_options_and_refuses_a_narrow_mtu() {
+        let packet = v4_packet([10, 13, 0, 2], [198, 51, 100, 7], true);
+        let answer = icmp_too_large(&packet, 1170).expect("a v4 answer");
+        assert_eq!(answer.len(), 20 + 8 + 32, "24-byte header and eight bytes");
+        assert_eq!(&answer[28..], &packet[..32]);
+        assert!(icmp_too_large(&packet, 67).is_none(), "below the v4 floor");
+        assert!(
+            icmp_too_large(&v6_packet([0; 16], [0; 16]), 1279).is_none(),
+            "below the v6 floor"
+        );
+        assert!(
+            icmp_too_large(&[0x45, 0, 0], 1280).is_none(),
+            "not a header"
+        );
+        assert!(
+            icmp_too_large(&[0x55; 40], 1280).is_none(),
+            "not an IP version"
         );
     }
 }

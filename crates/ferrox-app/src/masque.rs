@@ -752,7 +752,12 @@ fn io(
     let mut room = vec![0u8; 65535];
     loop {
         while let Ok(packet) = from_tunnel.try_recv() {
-            send_datagram(&mut conn, stream, &packet);
+            if let Some(icmp) = send_datagram(&mut conn, stream, &packet) {
+                let _ = to_stack.send(Packet {
+                    peer: [0u8; 32],
+                    bytes: icmp,
+                });
+            }
         }
         if !quic::pump_once(&mut conn, sock, local, TICK) || conn.is_closed() {
             break;
@@ -807,16 +812,18 @@ fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u8]) {
     }
 }
 
-fn send_datagram(conn: &mut quiche::Connection, stream: u64, packet: &[u8]) {
+/// One inner packet on its stream, or the ICMP Packet Too Big it needs instead when the lane cannot carry it: the MTU the answer names is what the inner stack has left after the stream prefix.
+fn send_datagram(conn: &mut quiche::Connection, stream: u64, packet: &[u8]) -> Option<Vec<u8>> {
     let mut datagram = Vec::with_capacity(3 + packet.len());
     connectip::datagram_prefix(stream, &mut datagram);
     datagram.extend_from_slice(packet);
-    if conn
-        .dgram_max_writable_len()
-        .is_some_and(|max| max >= datagram.len())
-    {
-        let _ = conn.dgram_send(&datagram);
+    let max = conn.dgram_max_writable_len()?;
+    if datagram.len() > max {
+        let overhead = frames::quic_varint_len(stream / 4) + 1;
+        return connectip::icmp_too_large(packet, max.checked_sub(overhead)?);
     }
+    let _ = conn.dgram_send(&datagram);
+    None
 }
 
 /// Open a server inbound's socket and spawn its demultiplexer, stack and forwarder.
@@ -1309,7 +1316,12 @@ fn worker(
         }
         while let Ok(packet) = tunnel.outgoing.try_recv() {
             if let Some(stream) = tunnel.stream {
-                send_datagram(&mut conn, stream, &packet);
+                if let Some(icmp) = send_datagram(&mut conn, stream, &packet) {
+                    let _ = shared.packets.send(Packet {
+                        peer: [0u8; 32],
+                        bytes: icmp,
+                    });
+                }
             }
         }
         if let Ok(mut table) = routes.lock() {
@@ -2003,6 +2015,48 @@ mod tests {
         let (remote, payload) = crate::proxy::parse_socks_udp(&received[..n]).expect("frame");
         assert_eq!(remote, target);
         assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn a_packet_wider_than_one_datagram_is_answered_with_icmp() {
+        let (_inbound, port) = serve("127.0.0.1:1");
+        let spec = ClientSpec::from(&outbound(port)).expect("spec");
+        let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port).expect("resolve");
+        let sock = Datagram::plain(sock);
+        let mut lane = establish(&spec, &sock, peer, local).expect("lane");
+        let mut packet = vec![0u8; 1400];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&1400u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[10, 14, 0, 2]);
+        packet[16..20].copy_from_slice(&[192, 0, 2, 1]);
+        packet[20..22].copy_from_slice(&1234u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&4321u16.to_be_bytes());
+        packet[24..26].copy_from_slice(&1380u16.to_be_bytes());
+        let icmp = send_datagram(&mut lane.conn, lane.stream, &packet).expect("too big");
+        assert_eq!(icmp[9], 1, "ICMP");
+        assert_eq!((icmp[20], icmp[21]), (3, 4), "fragmentation needed");
+        assert_eq!(
+            icmp[12..16],
+            [192, 0, 2, 1],
+            "the source is what was addressed"
+        );
+        assert_eq!(
+            icmp[16..20],
+            [10, 14, 0, 2],
+            "the destination is the sender"
+        );
+        let max = lane.conn.dgram_max_writable_len().expect("datagrams");
+        let overhead = frames::quic_varint_len(lane.stream / 4) + 1;
+        assert_eq!(
+            u16::from_be_bytes([icmp[26], icmp[27]]) as usize,
+            max - overhead
+        );
+        assert!(
+            send_datagram(&mut lane.conn, lane.stream, &icmp).is_none(),
+            "it fits"
+        );
     }
 
     #[test]
