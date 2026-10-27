@@ -17,6 +17,7 @@ use crate::masque::{self, deliver, withdrawn, Granted, ServerSpec, Shared, AUTH_
 use crate::wg_stack::{Packet, UdpRoutes};
 
 const HANDSHAKE: Duration = Duration::from_secs(10);
+const EDGE_RETRY: Duration = Duration::from_secs(1);
 const READ_WAIT: Duration = Duration::from_millis(10);
 const READ_ROOM: usize = 16 * 1024;
 const PREFACE: usize = 24;
@@ -180,6 +181,30 @@ pub(crate) struct Client {
     end: bool,
 }
 
+/// An edge still binding refuses the first dial the way a QUIC handshake loses it, so a refused dial is retried for a second.
+fn dial_until_bound(
+    edge: SocketAddr,
+    mut dial: impl FnMut(SocketAddr) -> std::io::Result<TcpStream>,
+) -> Result<TcpStream, String> {
+    let deadline = Instant::now() + EDGE_RETRY;
+    loop {
+        match dial(edge) {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::ConnectionRefused
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => return Err(format!("cannot reach {edge}: {error}")),
+        }
+    }
+}
+
+fn connect_edge(edge: SocketAddr) -> Result<TcpStream, String> {
+    dial_until_bound(edge, |edge| TcpStream::connect_timeout(&edge, HANDSHAKE))
+}
+
 impl Client {
     pub(crate) fn dial(
         tls_config: &TlsConfig,
@@ -188,8 +213,7 @@ impl Client {
         path: &str,
         headers: &[(String, String)],
     ) -> Result<Self, String> {
-        let tcp = TcpStream::connect_timeout(&edge, HANDSHAKE)
-            .map_err(|error| format!("cannot reach {edge}: {error}"))?;
+        let tcp = connect_edge(edge)?;
         let _ = tcp.set_nodelay(true);
         let _ = tcp.set_read_timeout(Some(HANDSHAKE));
         let _ = tcp.set_write_timeout(Some(HANDSHAKE));
@@ -812,6 +836,24 @@ mod tests {
 
     use super::*;
     use crate::json::Json;
+
+    #[test]
+    fn a_dial_refused_until_the_edge_binds_is_retried() {
+        let edge = TcpListener::bind("127.0.0.1:0").expect("edge");
+        let address = edge.local_addr().expect("addr");
+        let mut dials = 0;
+        let stream = dial_until_bound(address, |address| {
+            dials += 1;
+            if dials < 3 {
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionRefused));
+            }
+            TcpStream::connect_timeout(&address, Duration::from_secs(1))
+        })
+        .expect("reached the edge");
+        drop(stream);
+        assert_eq!(dials, 3);
+        drop(edge);
+    }
 
     fn pem_lines(pem: &str) -> String {
         pem.trim_end()

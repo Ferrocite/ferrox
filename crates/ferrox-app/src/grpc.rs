@@ -6,7 +6,7 @@ use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use crate::h2::{
-    block_encode, frame_head, read_head, write_frame, Decoder, E_REFUSED, FRAME_CAP, F_ACK, F_END,
+    block_encode, frame_head, write_frame, Decoder, E_REFUSED, FRAME_CAP, F_ACK, F_END,
     F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_CONCURRENT, S_MAX_FRAME, S_WINDOW,
     T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW, WINDOW_MAX,
 };
@@ -180,12 +180,28 @@ pub(crate) struct GrpcReader<R: Read = Connection> {
     reclaims: usize,
     /// Scratch for the frames that are not a body: headers, settings, ping.
     frame: Vec<u8>,
+    /// The nine bytes that open the next frame, and how many are in hand: a poll timeout hands the
+    /// lane back with the partial head kept, so the next read resumes on the same bytes.
+    frame_head: [u8; 9],
+    frame_have: usize,
+    /// The frame whose body has not landed whole: what arrived is kept and the next read continues it.
+    pending: Option<Pending>,
     /// Bodies read since the last credit, and the stream they belong to: a credit pays for a window's worth of frames, not for one.
     owed: u32,
     owed_id: u32,
     /// The clock this head must be decoded by, armed only while the preface, the request headers and the opening request arrive: past it a silence is an error rather than a wait, so a peer that stops speaking releases the thread.
     handshake: Option<std::time::Instant>,
     eof: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Pending {
+    len: usize,
+    kind: u8,
+    flags: u8,
+    id: u32,
+    from: usize,
+    filled: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -360,8 +376,8 @@ impl<R: Read> GrpcReader<R> {
         Some(())
     }
 
-    /// A DATA body lands at the end of the buffer the decoder reads and the caller takes from, so a payload moves twice at most: out of the socket, and into the caller; `staged` counts every other move.
-    fn data(&mut self, id: u32, flags: u8, len: usize) -> Option<()> {
+    /// Where this DATA body lands: the reclaim a drained buffer gets before a frame is read onto its end.
+    fn begin_data(&mut self) -> usize {
         // A fully drained buffer has nothing live to keep, so the reclaim is a clear, not a move of an empty run.
         if self.msg_at == self.msg.len() {
             self.msg.clear();
@@ -379,8 +395,11 @@ impl<R: Read> GrpcReader<R> {
             self.msg_end = self.msg_end.saturating_sub(at);
             self.pay_end = self.pay_end.saturating_sub(at);
         }
-        let from = self.msg.len();
-        self.append(len)?;
+        self.msg.len()
+    }
+
+    /// A DATA body lands at the end of the buffer the decoder reads and the caller takes from, so a payload moves twice at most: out of the socket, and into the caller; `staged` counts every other move.
+    fn finish_data(&mut self, id: u32, flags: u8, from: usize, len: usize) -> Option<()> {
         if id != self.stream || !self.answered {
             self.msg.truncate(from);
             return Some(());
@@ -425,21 +444,92 @@ impl<R: Read> GrpcReader<R> {
         out
     }
 
-    /// Reads `len` bytes onto the end of the message buffer without parking them somewhere else on the way.
-    #[allow(
-        clippy::uninit_vec,
-        reason = "the tail is handed straight to `read_exact`, and the error path truncates it"
-    )]
-    fn append(&mut self, len: usize) -> Option<()> {
-        let from = self.msg.len();
-        self.msg.reserve(len);
-        // SAFETY: `read_exact` initialises every byte it reports, and the path that does not fill them truncates them away, so no uninitialised byte is ever readable through `msg`.
-        unsafe { self.msg.set_len(from + len) };
-        if fill(&mut self.read, &mut self.msg[from..], self.handshake).is_err() {
-            self.msg.truncate(from);
-            return None;
+    /// The body read, resumed where the last one stopped: a poll timeout leaves what arrived on the
+    /// buffer and hands the lane back, and the next call fills the rest.
+    fn fill_msg(&mut self, from: usize, len: usize, filled: &mut usize) -> std::io::Result<bool> {
+        let end = from + len;
+        crate::proxy::grow_scratch(&mut self.msg, end);
+        while *filled < len {
+            match self.read.read(&mut self.msg[from + *filled..end]) {
+                Ok(0) => {
+                    self.msg.truncate(from + *filled);
+                    return Ok(false);
+                }
+                Ok(n) => *filled += n,
+                Err(error) if crate::proxy::is_timeout(&error) => {
+                    self.msg.truncate(from + *filled);
+                    match self.handshake {
+                        Some(until) if std::time::Instant::now() < until => {
+                            crate::proxy::grow_scratch(&mut self.msg, end);
+                        }
+                        // The head's clock is spent: a hard end, so `read_exact` stops retrying.
+                        Some(_) => return Ok(false),
+                        // A lane's poll resumes from the bytes in hand; a plain wait keeps waiting.
+                        None if crate::proxy::relay_step_owns_poll() => return Err(error),
+                        None => {
+                            std::thread::sleep(crate::budgets::RELAY_POLL);
+                            crate::proxy::grow_scratch(&mut self.msg, end);
+                        }
+                    }
+                }
+                Err(_) => {
+                    self.msg.truncate(from + *filled);
+                    return Ok(false);
+                }
+            }
         }
-        Some(())
+        Ok(true)
+    }
+
+    /// The same resume for the frames that are not a body: the scratch holds what arrived.
+    fn fill_frame(&mut self, len: usize, filled: &mut usize) -> std::io::Result<bool> {
+        crate::proxy::grow_scratch(&mut self.frame, len);
+        while *filled < len {
+            match self.read.read(&mut self.frame[*filled..len]) {
+                Ok(0) => {
+                    self.frame.truncate(*filled);
+                    return Ok(false);
+                }
+                Ok(n) => *filled += n,
+                Err(error) if crate::proxy::is_timeout(&error) => match self.handshake {
+                    Some(until) if std::time::Instant::now() < until => {}
+                    Some(_) => {
+                        self.frame.truncate(*filled);
+                        return Ok(false);
+                    }
+                    None if crate::proxy::relay_step_owns_poll() => {
+                        self.frame.truncate(*filled);
+                        return Err(error);
+                    }
+                    None => std::thread::sleep(crate::budgets::RELAY_POLL),
+                },
+                Err(_) => {
+                    self.frame.truncate(*filled);
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
+    }
+
+    /// The nine bytes that open a frame, resumed on a poll timeout: nothing of a partial head is lost.
+    fn read_frame_head(&mut self) -> std::io::Result<bool> {
+        while self.frame_have < 9 {
+            match self.read.read(&mut self.frame_head[self.frame_have..]) {
+                Ok(0) => return Ok(false),
+                Ok(n) => self.frame_have += n,
+                Err(error) if crate::proxy::is_timeout(&error) => match self.handshake {
+                    Some(until) if std::time::Instant::now() < until => {}
+                    // The head's clock is spent: a hard end, so `read_exact` stops retrying.
+                    Some(_) => return Ok(false),
+                    // A lane's poll: the partial head stays in hand for the next read.
+                    None if crate::proxy::relay_step_owns_poll() => return Err(error),
+                    None => std::thread::sleep(crate::budgets::RELAY_POLL),
+                },
+                Err(_) => return Ok(false),
+            }
+        }
+        Ok(true)
     }
 
     /// True when every byte past the last decoded message belongs to a whole message: `END_STREAM` over a partial head or a short body is a refusal, not a delivery of a truncated payload.
@@ -535,24 +625,64 @@ impl<R: Read> GrpcReader<R> {
         }
     }
 
-    fn pump(&mut self) -> Option<()> {
-        let head = match self.handshake {
-            Some(until) => read_head(&mut crate::proxy::HandshakeDeadline {
-                inner: &mut self.read,
-                until,
-            }),
-            None => read_head(&mut self.read),
+    fn pump(&mut self) -> std::io::Result<Option<()>> {
+        let (len, kind, flags, id, from) = if let Some(pending) = self.pending {
+            (
+                pending.len,
+                pending.kind,
+                pending.flags,
+                pending.id,
+                pending.from,
+            )
+        } else {
+            if !self.read_frame_head()? {
+                return Ok(None);
+            }
+            let head = self.frame_head;
+            self.frame_have = 0;
+            let len = usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
+            if len > FRAME_CAP {
+                return Ok(None);
+            }
+            let kind = head[3];
+            let flags = head[4];
+            let id = u32::from_be_bytes(head[5..9].try_into().unwrap()) & 0x7FFF_FFFF;
+            let from = if kind == T_DATA { self.begin_data() } else { 0 };
+            self.pending = Some(Pending {
+                len,
+                kind,
+                flags,
+                id,
+                from,
+                filled: 0,
+            });
+            (len, kind, flags, id, from)
         };
-        let (len, kind, flags, id) = head?;
-        if kind == T_DATA {
-            return self.data(id, flags, len);
+        let mut filled = self.pending.map_or(0, |pending| pending.filled);
+        let outcome = if kind == T_DATA {
+            self.fill_msg(from, len, &mut filled)
+        } else {
+            self.fill_frame(len, &mut filled)
+        };
+        // A lane's poll hands back what arrived, so the resume starts where this read stopped.
+        if let Some(pending) = self.pending.as_mut() {
+            pending.filled = filled;
         }
+        if !outcome? {
+            return Ok(None);
+        }
+        self.pending = None;
+        Ok(if kind == T_DATA {
+            self.finish_data(id, flags, from, len)
+        } else {
+            self.dispatch(kind, flags, id, len)
+        })
+    }
+
+    /// One complete frame that is not a body: the scratch holds its bytes and the match is the same one `pump` ran inline.
+    fn dispatch(&mut self, kind: u8, flags: u8, id: u32, len: usize) -> Option<()> {
         let mut frame = std::mem::take(&mut self.frame);
-        crate::proxy::resize_scratch(&mut frame, len);
-        if len > 0 && fill(&mut self.read, &mut frame, self.handshake).is_err() {
-            self.frame = frame;
-            return None;
-        }
+        frame.truncate(len);
         let out = match kind {
             T_HEADERS => self.head_block(id, flags, &frame),
             T_CONT => self.continue_block(id, flags, &frame),
@@ -575,7 +705,7 @@ impl<R: Read> GrpcReader<R> {
                 Some(())
             }
             T_WINDOW => {
-                self.window(id, &frame);
+                self.window(id, frame.get(..4).unwrap_or(&[]));
                 Some(())
             }
             // A GOAWAY still carries this stream's body; END_STREAM ends it.
@@ -671,8 +801,9 @@ impl<R: Read> Read for GrpcReader<R> {
             if self.eof {
                 return Ok(0);
             }
-            if self.pump().is_none() {
+            if self.pump()?.is_none() {
                 self.eof = true;
+                return Ok(0);
             }
         }
     }
@@ -989,21 +1120,6 @@ fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
     })
 }
 
-/// `read_exact` under the clock a head is decoded under, which the site passes while a head arrives: past the deadline a silence is an error, so `read_exact`'s timeout-retry cannot spin a peer that never finishes speaking, and an unarmed reader waits exactly as it did.
-fn fill(
-    read: &mut dyn Read,
-    buf: &mut [u8],
-    until: Option<std::time::Instant>,
-) -> std::io::Result<()> {
-    match until {
-        Some(until) => crate::proxy::read_exact(
-            &mut crate::proxy::HandshakeDeadline { inner: read, until },
-            buf,
-        ),
-        None => crate::proxy::read_exact(read, buf),
-    }
-}
-
 fn new_reader<R: Read>(
     read: R,
     shared: Arc<Shared>,
@@ -1031,6 +1147,9 @@ fn new_reader<R: Read>(
         staged: 0,
         reclaims: 0,
         frame: Vec::new(),
+        frame_head: [0; 9],
+        frame_have: 0,
+        pending: None,
         owed: 0,
         owed_id: 0,
         handshake: None,
@@ -1055,7 +1174,14 @@ pub(crate) fn accept_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
 ) -> Option<(GrpcReader<R>, GrpcWriter)> {
     let until = std::time::Instant::now() + crate::budgets::handshake();
     let mut magic = [0u8; 24];
-    fill(&mut read, &mut magic, Some(until)).ok()?;
+    crate::proxy::read_exact(
+        &mut crate::proxy::HandshakeDeadline {
+            inner: &mut read,
+            until,
+        },
+        &mut magic,
+    )
+    .ok()?;
     if magic != *MAGIC {
         return None;
     }
@@ -1082,7 +1208,7 @@ pub(crate) fn accept_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
     // The clock the preface was read under covers the request headers too, and ends where the head ends: past it the pump is a give-up rather than a wait, and a reader handed to a caller is unarmed again.
     reader.set_handshake_budget(Some(until));
     while !reader.answered && !reader.eof {
-        if reader.pump().is_none() {
+        if !matches!(reader.pump(), Ok(Some(()))) {
             reader.eof = true;
         }
     }

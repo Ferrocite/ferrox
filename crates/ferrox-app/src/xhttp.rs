@@ -77,7 +77,10 @@ fn size_line(n: usize, out: &mut [u8; 7]) -> usize {
     }
 }
 
-fn read_line_into(reader: &mut Reader<impl Read>, out: &mut [u8; 130]) -> Option<usize> {
+fn read_line_into(
+    reader: &mut Reader<impl Read>,
+    out: &mut [u8; 130],
+) -> std::io::Result<Option<usize>> {
     loop {
         let start = reader.at;
         let end = reader.prefix.len().min(start + 130);
@@ -92,14 +95,14 @@ fn read_line_into(reader: &mut Reader<impl Read>, out: &mut [u8; 130]) -> Option
         }
         if let Some(end_pos) = found {
             if end_pos > 127 {
-                return None;
+                return Ok(None);
             }
             out[..end_pos].copy_from_slice(&reader.prefix[reader.at..reader.at + end_pos]);
             reader.at = reader.at + end_pos + 2;
-            return Some(end_pos);
+            return Ok(Some(end_pos));
         }
         if reader.prefix.len() - reader.at >= 129 {
-            return None;
+            return Ok(None);
         }
         if reader.at >= reader.prefix.len() {
             reader.prefix.clear();
@@ -111,7 +114,8 @@ fn read_line_into(reader: &mut Reader<impl Read>, out: &mut [u8; 130]) -> Option
         let mut tmp = [0u8; 128];
         match reader.take(&mut tmp) {
             Ok(n) if n > 0 => reader.prefix.extend_from_slice(&tmp[..n]),
-            _ => return None,
+            Err(error) if crate::proxy::is_timeout(&error) => return Err(error),
+            _ => return Ok(None),
         }
     }
 }
@@ -171,6 +175,15 @@ pub(crate) struct Reader<R> {
     ended: bool,
     reads: usize,
     pending_head: bool,
+    /// Where the chunked framing stands: a body's bytes are being delivered, its closing CRLF is still unread, or the zero-size chunk ran and only trailer lines are left until an empty one ends the body.
+    chunk: Chunk,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Chunk {
+    Body,
+    Crlf,
+    Trailers,
 }
 
 pub(crate) type XhttpReader = Reader<Connection>;
@@ -217,13 +230,19 @@ impl Reader<Connection> {
 }
 
 impl<R: Read> Reader<R> {
-    /// Every read that reaches the stream, counted where it happens; quiet sockets retry.
+    /// Every read that reaches the stream, counted where it happens. A relay's poll timeout comes
+    /// back to the lane instead of being retried here: the chunk stays where it broke.
     fn take(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
             self.reads += 1;
             match self.read.read(buf) {
-                Err(error) if crate::proxy::is_timeout(&error) => {}
-                outcome => return outcome,
+                Err(error)
+                    if crate::proxy::is_timeout(&error)
+                        && !crate::proxy::relay_step_owns_poll() =>
+                {
+                    std::thread::sleep(crate::budgets::RELAY_POLL);
+                }
+                other => return other,
             }
         }
     }
@@ -258,17 +277,14 @@ impl<R: Read> Reader<R> {
         Ok(())
     }
 
-    fn body(&mut self, buf: &mut [u8]) -> Option<usize> {
+    fn body(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.at < self.prefix.len() {
             let n = (self.prefix.len() - self.at).min(buf.len());
             buf[..n].copy_from_slice(&self.prefix[self.at..self.at + n]);
             self.at += n;
-            return Some(n);
+            return Ok(n);
         }
-        match self.take(buf) {
-            Ok(n) if n > 0 => Some(n),
-            _ => None,
-        }
+        self.take(buf)
     }
 }
 
@@ -388,56 +404,55 @@ impl<R: Read> Read for Reader<R> {
             }
             if self.left > 0 {
                 let n = self.left.min(buf.len());
-                let got = self
-                    .body(&mut buf[..n])
-                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+                let got = self.body(&mut buf[..n])?;
+                if got == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
                 self.left -= got;
                 if self.left == 0 {
-                    let mut crlf = [0u8; 2];
-                    let mut taken = 0usize;
-                    while taken < 2 {
-                        if self.at >= self.prefix.len() {
-                            self.prefix.clear();
-                            self.at = 0;
-                        }
-                        if self.at < self.prefix.len() {
-                            crlf[taken] = self.prefix[self.at];
-                            self.at += 1;
-                            taken += 1;
-                        } else {
-                            // One window instead of a two-byte read: the bytes past the CRLF are the next size line, found without asking the socket, and a peer segmenting the CRLF across reads still gets through.
-                            let mut tmp = [0u8; 128];
-                            let n = self.take(&mut tmp).map_err(|_| {
-                                std::io::Error::from(std::io::ErrorKind::InvalidData)
-                            })?;
-                            if n == 0 {
-                                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
-                            }
-                            self.prefix.extend_from_slice(&tmp[..n]);
-                        }
-                    }
-                    if crlf != *b"\r\n" {
-                        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
-                    }
+                    // The pair is taken on the next call, so a poll timeout after these bytes cannot lose them.
+                    self.chunk = Chunk::Crlf;
                 }
                 return Ok(got);
             }
+            if self.chunk == Chunk::Crlf {
+                // Both bytes or neither: a poll timeout inside the CRLF leaves the pair unread, so the next read resumes on the same two bytes.
+                while self.prefix.len() - self.at < 2 {
+                    self.prefix.drain(..self.at);
+                    self.at = 0;
+                    let mut tmp = [0u8; 128];
+                    // One window instead of a two-byte read: the bytes past the CRLF are the next size line, found without asking the socket, and a peer segmenting the CRLF across reads still gets through.
+                    let n = self.take(&mut tmp)?;
+                    if n == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                    }
+                    self.prefix.extend_from_slice(&tmp[..n]);
+                }
+                if &self.prefix[self.at..self.at + 2] != b"\r\n" {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                }
+                self.at += 2;
+                self.chunk = Chunk::Body;
+            }
+            if self.chunk == Chunk::Trailers {
+                let mut trailer = [0u8; 130];
+                let len = read_line_into(self, &mut trailer)?
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+                if len == 0 {
+                    self.chunk = Chunk::Body;
+                    self.ended = true;
+                    return Ok(0);
+                }
+                continue;
+            }
             let mut line = [0u8; 130];
-            let len = read_line_into(self, &mut line)
+            let len = read_line_into(self, &mut line)?
                 .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
             let size = chunk_size(&line[..len])
                 .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
             if size == 0 {
-                loop {
-                    let mut trailer = [0u8; 130];
-                    let len = read_line_into(self, &mut trailer)
-                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
-                    if len == 0 {
-                        break;
-                    }
-                }
-                self.ended = true;
-                return Ok(0);
+                self.chunk = Chunk::Trailers;
+                continue;
             }
             if size > 64 * 1024 * 1024 {
                 return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
@@ -561,6 +576,7 @@ fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
         ended: false,
         reads: 0,
         pending_head: false,
+        chunk: Chunk::Body,
     };
     let writer = XhttpWriter {
         shared: Arc::new(Shared {
@@ -1956,6 +1972,7 @@ pub(crate) fn accept_core<
                         ended: false,
                         reads: 0,
                         pending_head: false,
+                        chunk: Chunk::Body,
                     })
                 };
                 let writer = writer_for(write, h2);
@@ -2000,6 +2017,7 @@ pub(crate) fn accept_core<
                     ended: false,
                     reads: 0,
                     pending_head: false,
+                    chunk: Chunk::Body,
                 }));
             }
             plain_ok(&mut write, settings, &padded);
@@ -2047,6 +2065,7 @@ pub(crate) fn accept_core<
                         ended: false,
                         reads: 0,
                         pending_head: false,
+                        chunk: Chunk::Body,
                     };
                     drain_body(&mut framed, settings.sc_max_each_post)
                 };
@@ -2424,6 +2443,7 @@ pub(crate) fn connect_dual_split<
         ended: false,
         reads: 0,
         pending_head: true,
+        chunk: Chunk::Body,
     };
     Some((reader, writer))
 }
@@ -2800,6 +2820,7 @@ mod tests {
                 ended: false,
                 reads: 0,
                 pending_head: false,
+                chunk: Chunk::Body,
             };
             let mut got = Vec::new();
             let mut buf = vec![0u8; CHUNK];
@@ -2908,6 +2929,7 @@ mod tests {
             ended: false,
             reads: 0,
             pending_head: false,
+            chunk: Chunk::Body,
         };
         let mut got = Vec::new();
         reader.read_to_end(&mut got).expect("drains");
@@ -2946,6 +2968,7 @@ mod tests {
             ended: false,
             reads: 0,
             pending_head: false,
+            chunk: Chunk::Body,
         };
         let mut got = Vec::new();
         reader.read_to_end(&mut got).expect("drains");
