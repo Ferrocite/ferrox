@@ -10835,26 +10835,6 @@ fn dial_tls_session(
     Some(session)
 }
 
-// Splits one established session into halves the carrier cores accept, plus the raw socket their teardown needs.
-fn tls_halves(
-    session: ferrox_core::tls::ClientSession<Connection>,
-) -> Option<(ClientHalf, ClientHalf, Arc<Connection>)> {
-    let raw = Arc::new(session.get_ref().try_clone().ok()?);
-    let out = Arc::new(Mutex::new(Sealed::new(session.get_ref().try_clone().ok()?)));
-    let shared = Arc::new(Mutex::new(session));
-    let reader = TlsHalf {
-        session: Arc::clone(&shared),
-        out: Arc::clone(&out),
-        driven: None,
-    };
-    let writer = TlsHalf {
-        session: shared,
-        out,
-        driven: None,
-    };
-    Some((reader, writer, raw))
-}
-
 // One session, two owners: the reader drives the transport when the session exposes one, so its parked read holds no session lock.
 fn session_halves<S, W>(session: S, transport: W) -> (TlsHalf<S>, TlsHalf<S>)
 where
@@ -10909,7 +10889,9 @@ trait Dialed:
 
 impl Dialed for ferrox_core::tls::ClientSession<Connection> {
     fn into_halves(self) -> Option<(TlsHalf<Self>, TlsHalf<Self>, Arc<Connection>)> {
-        tls_halves(self)
+        let raw = Arc::new(self.get_ref().try_clone().ok()?);
+        let (reader, writer) = session_halves(self, raw.try_clone().ok()?);
+        Some((reader, writer, raw))
     }
 }
 
@@ -11123,8 +11105,6 @@ impl<S> Clone for TlsHalf<S> {
         }
     }
 }
-
-type ClientHalf = TlsHalf<ferrox_core::tls::ClientSession<Connection>>;
 
 impl<S: ferrox_core::tls::TlsProvider> Read for TlsHalf<S> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -27211,9 +27191,10 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// Two pumps share one session: a read waiting under the lock strangles the writer for the peer's silence.
+    /// A dialled carrier's reader drives the transport: the wait a read parks on is not the lock
+    /// the writer seals under, so a silent peer costs the other direction nothing.
     #[test]
-    fn a_shared_tls_session_yields_the_lock_between_polls() {
+    fn a_dialled_carrier_read_is_driven_and_leaves_the_lock_to_the_writer() {
         use ferrox_core::tls::TlsProvider as _;
         use std::io::Read as _;
         use std::io::Write as _;
@@ -27232,7 +27213,11 @@ mod tests {
         });
 
         let session = dial_tls_session(&server, &client_config, None).expect("dialled");
-        let (reader, writer, raw) = tls_halves(session).expect("halves");
+        let (reader, writer, raw) = session.into_halves().expect("halves");
+        assert!(
+            reader.driven.is_some(),
+            "the carrier's reader drives the transport, so a parked read holds no session lock"
+        );
         let polling = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let pump_polling = Arc::clone(&polling);
         let reading = thread::spawn(move || {
