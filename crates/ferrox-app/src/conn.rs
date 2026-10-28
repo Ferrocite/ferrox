@@ -1690,6 +1690,15 @@ mod tests {
     /// hang this test, not fail it.
     #[test]
     fn a_unix_read_timeout_arms_the_way_the_tcp_one_does() {
+        let tcp_listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a TCP listener");
+        let tcp = TcpStream::connect(tcp_listener.local_addr().expect("the TCP address"))
+            .expect("a native TCP reference");
+        tcp.set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("arms the native TCP timeout");
+        let bound = tcp
+            .read_timeout()
+            .expect("reads the native TCP bound")
+            .expect("TCP has a timeout");
         let (_client, listener) = unix_pair();
         let server = listener.incoming().next().unwrap().unwrap();
         server
@@ -1697,8 +1706,8 @@ mod tests {
             .expect("arms a read timeout on a unix stream");
         assert_eq!(
             server.read_timeout().expect("reads the bound back"),
-            Some(Duration::from_millis(50)),
-            "a unix stream reports the bound it was given"
+            Some(bound),
+            "a unix stream reports the same kernel bound as TCP"
         );
         #[cfg(unix)]
         match server {

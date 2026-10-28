@@ -25846,6 +25846,25 @@ mod tests {
         let raw = session.try_clone().expect("shares the fd");
         #[cfg(unix)]
         let probe = session.try_clone().expect("probes the fd");
+        #[cfg(unix)]
+        let (relay_poll, session_poll) = {
+            let Connection::Tcp(tcp) = &edge else {
+                unreachable!("the loopback edge is TCP")
+            };
+            tcp.set_read_timeout(Some(RELAY_POLL))
+                .expect("native idle grain");
+            let idle = tcp
+                .read_timeout()
+                .expect("reads the idle grain")
+                .expect("armed idle");
+            tcp.set_read_timeout(Some(SESSION_POLL))
+                .expect("native moving grain");
+            let moving = tcp
+                .read_timeout()
+                .expect("reads the moving grain")
+                .expect("armed moving");
+            (idle, moving)
+        };
         drop(lane);
 
         let id = [0x5Au8; 16];
@@ -25872,7 +25891,7 @@ mod tests {
         #[cfg(unix)]
         {
             let idle = Instant::now() + Duration::from_secs(5);
-            while probe.read_timeout().ok().flatten() != Some(RELAY_POLL) {
+            while probe.read_timeout().ok().flatten() != Some(relay_poll) {
                 assert!(
                     Instant::now() < idle,
                     "an idle shared read must arm the relay grain"
@@ -25881,7 +25900,7 @@ mod tests {
             }
             edge.write_all(b"x").expect("moves the flow");
             let moving = Instant::now() + Duration::from_secs(5);
-            while probe.read_timeout().ok().flatten() != Some(SESSION_POLL) {
+            while probe.read_timeout().ok().flatten() != Some(session_poll) {
                 assert!(
                     Instant::now() < moving,
                     "a write must return the shared read to one tick"
@@ -42377,6 +42396,26 @@ mod tests {
             }
         }
         count
+    }
+
+    #[cfg(target_os = "linux")]
+    fn isolated_thread_count() -> bool {
+        if std::env::var_os("FERROX_THREAD_COUNT_CHILD").is_some() {
+            return false;
+        }
+        let name = thread::current().name().expect("a named test").to_owned();
+        let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+            .args(["--exact", &name, "--nocapture"])
+            .env("FERROX_THREAD_COUNT_CHILD", "1")
+            .output()
+            .expect("runs the thread-count test alone");
+        assert!(
+            output.status.success(),
+            "{name}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        true
     }
 
     #[cfg(target_os = "linux")]
