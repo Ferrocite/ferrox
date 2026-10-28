@@ -18829,40 +18829,59 @@ pub(crate) mod lane_pool {
         ready: Mutex<VecDeque<Lane>>,
         notify: Condvar,
         workers: std::sync::atomic::AtomicUsize,
+        idle: std::sync::atomic::AtomicUsize,
     }
 
     static POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
 
-    /// One lane per flow of the widest standard cell (eight connections), less the one the
+    /// The widest standard cell (eight connections) needs one lane per flow, less the one the
     /// serving process's accept threads already keep warm: a blocking read is the concurrency,
-    /// and the client fell behind xray-core-rust on every eight-flow cell with four.
+    /// and the client fell behind xray-core-rust on every eight-flow cell with four. This is the
+    /// ceiling, not the shape: a worker starts when a lane is queued and no worker is idle, so a
+    /// one-flow cell holds two lanes where it used to hold all seven.
     const RELAY_LANES: usize = 7;
-
-    fn worker_count() -> usize {
-        RELAY_LANES
-    }
 
     fn pool() -> std::sync::Arc<Pool> {
         std::sync::Arc::clone(POOL.get_or_init(spawn_pool))
     }
 
     fn spawn_pool() -> std::sync::Arc<Pool> {
-        let pool = std::sync::Arc::new(Pool {
+        std::sync::Arc::new(Pool {
             ready: Mutex::new(VecDeque::new()),
             notify: Condvar::new(),
             workers: std::sync::atomic::AtomicUsize::new(0),
-        });
-        for _ in 0..worker_count() {
-            let worker = std::sync::Arc::clone(&pool);
-            let spawned = thread::Builder::new()
-                .name("ferrox-relay-lane".into())
-                .spawn(move || worker_loop(&worker));
-            if spawned.is_ok() {
-                pool.workers
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            idle: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// One more worker, reserved before the spawn so concurrent submits stop at the ceiling. False
+    /// means the pool is already at its cap, or the thread could not start and the slot was returned.
+    fn grow(pool: &std::sync::Arc<Pool>) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut workers = pool.workers.load(Relaxed);
+        loop {
+            if workers >= RELAY_LANES {
+                return false;
+            }
+            match pool.workers.compare_exchange_weak(
+                workers,
+                workers + 1,
+                std::sync::atomic::Ordering::AcqRel,
+                Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(seen) => workers = seen,
             }
         }
-        pool
+        let worker = std::sync::Arc::clone(pool);
+        let spawned = thread::Builder::new()
+            .name("ferrox-relay-lane".into())
+            .spawn(move || worker_loop(&worker));
+        if spawned.is_err() {
+            pool.workers.fetch_sub(1, Relaxed);
+            return false;
+        }
+        true
     }
 
     fn worker_loop(pool: &Pool) {
@@ -18873,10 +18892,12 @@ pub(crate) mod lane_pool {
                     if let Some(lane) = ready.pop_front() {
                         break lane;
                     }
+                    pool.idle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     ready = pool
                         .notify
                         .wait(ready)
                         .unwrap_or_else(PoisonError::into_inner);
+                    pool.idle.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
             };
             loop {
@@ -18933,19 +18954,29 @@ pub(crate) mod lane_pool {
         submit_to(&pool(), step, complete);
     }
 
-    fn submit_to(pool: &Pool, step: Step, complete: Complete) {
+    fn submit_to(pool: &std::sync::Arc<Pool>, step: Step, complete: Complete) {
+        use std::sync::atomic::Ordering::Relaxed;
         let lane = Lane {
             step,
             complete: Some(complete),
         };
-        if pool.workers.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        let (queued, idle) = {
+            let ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+            (ready.len(), pool.idle.load(Relaxed))
+        };
+        if queued >= idle {
+            // Nobody is parked to take it: start a lane, or leave it to the cap's workers.
+            let _ = grow(pool);
+        }
+        if pool.workers.load(Relaxed) == 0 {
             // A thread the process could not start still does the lane's work on the caller.
             run_to_end(lane);
             return;
         }
-        let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
-        ready.push_back(lane);
-        drop(ready);
+        pool.ready
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push_back(lane);
         pool.notify.notify_one();
     }
 
@@ -19010,7 +19041,7 @@ pub(crate) mod lane_pool {
         fn every_lane_of_a_full_cell_has_a_worker() {
             let pool = spawn_pool();
             // The widest cell's eight flows are blocking reads; one is the accept thread's.
-            let lanes = worker_count();
+            let lanes = RELAY_LANES;
             assert!(
                 lanes >= 7,
                 "the pool carries {lanes} lanes, below the widest cell's flows"
@@ -19045,6 +19076,49 @@ pub(crate) mod lane_pool {
                 "{waiting} of {lanes} lanes reached their read: the pool cannot carry the cell"
             );
             assert_eq!(finished.load(Ordering::Relaxed), lanes);
+        }
+
+        /// A cell is as wide as the lanes it queues: two blocked reads start two workers, so a
+        /// one-flow server does not hold a full cell's threads for a session that never needs them.
+        #[test]
+        fn a_narrow_cell_starts_only_the_lanes_it_queues() {
+            let pool = spawn_pool();
+            let gate = Arc::new(Gate {
+                state: Mutex::new((0, false)),
+                wake: Condvar::new(),
+            });
+            let finished = Arc::new(AtomicUsize::new(0));
+            for _ in 0..2 {
+                let gate = Arc::clone(&gate);
+                let finished = Arc::clone(&finished);
+                submit_to(
+                    &pool,
+                    Box::new(move || {
+                        gate.arrive_and_wait();
+                        Next::Done
+                    }),
+                    Box::new(move || {
+                        finished.fetch_add(1, Ordering::Relaxed);
+                    }),
+                );
+            }
+            let waiting = gate.wait_for(2, Duration::from_secs(5));
+            assert_eq!(
+                waiting, 2,
+                "both lanes of the narrow cell reached their read"
+            );
+            assert_eq!(
+                pool.workers.load(Ordering::Relaxed),
+                2,
+                "the pool started {} workers for the two lanes a one-flow cell queues",
+                pool.workers.load(Ordering::Relaxed)
+            );
+            gate.release();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while finished.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(finished.load(Ordering::Relaxed), 2);
         }
     }
 }
