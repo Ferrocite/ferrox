@@ -357,6 +357,7 @@ mod neon {
         65, 71, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 237, 240, 0, 0,
     ];
 
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     fn mulhi_u16(a: uint16x8_t, b: uint16x8_t) -> uint16x8_t {
         unsafe {
@@ -416,6 +417,7 @@ mod neon {
         }
     }
 
+    #[allow(clippy::inline_always)]
     #[inline(always)]
     fn encode_block(
         raw: uint8x16_t,
