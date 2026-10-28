@@ -1424,8 +1424,18 @@ mod tests {
     #[test]
     fn a_direct_upload_never_builds_the_staging_buffer() {
         let (mut app, proxy) = loopback().expect("pair");
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.2".parse().unwrap()],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
         let (to_tunnel, packets) = std::sync::mpsc::channel();
-        let mut stack = ClientStack::new(&device(&["10.0.0.2"], true), to_tunnel);
+        let mut stack = ClientStack::new(&config, to_tunnel);
         stack
             .connect(ClientFlow {
                 client: Connection::from(proxy),
@@ -2045,6 +2055,72 @@ mod client_tests {
         forged[40] = 3;
         assert!(!device.absorb(&forged), "not a packet too big");
     }
+    #[test]
+    fn a_learned_mtu_reaches_the_client_segment_size() {
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.2".parse().unwrap()],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
+        let (to_tunnel, packets) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&config, to_tunnel);
+        let mut inner = vec![0u8; 28];
+        inner[0] = 0x45;
+        inner[2..4].copy_from_slice(&28u16.to_be_bytes());
+        inner[8] = 64;
+        inner[9] = PROTOCOL_UDP;
+        inner[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        inner[16..20].copy_from_slice(&[198, 51, 100, 7]);
+        let too_big =
+            ferrox_core::foxy::connectip::icmp_too_large(&inner, 600).expect("a v4 answer");
+        receive_client(
+            &mut stack,
+            Packet {
+                peer: [0u8; 32],
+                bytes: too_big,
+            },
+        );
+
+        let (app, proxy) = loopback().expect("pair");
+        stack
+            .connect(ClientFlow {
+                client: Connection::from(proxy),
+                destinations: vec!["192.0.2.1:80".parse().expect("destination")],
+                prefix: Vec::new(),
+            })
+            .expect("connect");
+        let mut buf = [0u8; 2048];
+        stack.poll(&mut buf);
+        let syn = packets.recv_timeout(Duration::from_secs(5)).expect("SYN");
+        let header = usize::from(syn[0] & 0x0f) * 4;
+        let options = header + 20..header + usize::from(syn[header + 12] >> 4) * 4;
+        let mut at = options.start;
+        let mut mss = None;
+        while at < options.end {
+            match syn[at] {
+                0 => break,
+                1 => at += 1,
+                kind => {
+                    let len = usize::from(syn[at + 1]);
+                    if kind == 2 && len == 4 {
+                        mss = Some(u16::from_be_bytes([syn[at + 2], syn[at + 3]]));
+                    }
+                    at += len;
+                }
+            }
+        }
+        assert!(
+            usize::from(mss.expect("a SYN advertises MSS")) <= 600 - 20 - 20,
+            "the SYN advertises the learned MTU's segment size"
+        );
+        drop(app);
+    }
+
 }
 
 #[cfg(all(test, unix))]
