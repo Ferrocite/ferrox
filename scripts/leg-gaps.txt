@@ -13,7 +13,7 @@ vless-reality-xhttp-down-8|client|0.00|668
 vless-reality-xhttp-down-8|server|0.00|668
 shadowsocks-raw-duplex-8|client|0.84|696
 shadowsocks2022-raw-up-1|server|0.72|696
-trojan-tls-raw-down-8|server-threads|1.15|696
+trojan-tls-raw-down-8|server-threads|1.27|696
 trojan-tls-ws-down-8|server-threads|1.46|696
 vless-encryption-raw-down-8|server-threads|1.73|696
 vless-encryption-reality-raw-down-8|server-threads|1.82|696
