@@ -293,6 +293,34 @@ impl Tunnel {
         self.initiate(now, out);
     }
 
+    /// Send a payload the caller already owns, reusing its buffer for the record
+    /// when a session is ready instead of allocating a second one.
+    pub fn send_owned(&mut self, now: u64, payload: Vec<u8>, out: &mut Vec<Event>) {
+        if self.established(now) {
+            if self
+                .session
+                .as_ref()
+                .is_some_and(|session| now.saturating_sub(session.created) >= REKEY_AFTER)
+            {
+                self.initiate(now, out);
+            }
+            self.seal_owned(now, payload, out);
+            return;
+        }
+        if payload.len() > QUEUE_BYTES {
+            return;
+        }
+        while self.queued_bytes + payload.len() > QUEUE_BYTES {
+            let Some(old) = self.queue.pop_front() else {
+                break;
+            };
+            self.queued_bytes -= old.len();
+        }
+        self.queued_bytes += payload.len();
+        self.queue.push_back(payload);
+        self.initiate(now, out);
+    }
+
     /// Feed one datagram from `src`. Handshake responses, cookie replies and
     /// transport records are accepted; anything else is ignored. A transport
     /// record's payload becomes [`Event::Data`].
@@ -615,18 +643,54 @@ impl Tunnel {
             self.initiate(now, out);
             return;
         };
-        let Some(session) = self.session.as_mut() else {
+        let Some(session) = self.session.as_ref() else {
             return;
         };
-        let mut packet = vec![0u8; HEADER_SIZE + payload.len() + TAG_SIZE];
-        packet[HEADER_SIZE..HEADER_SIZE + payload.len()].copy_from_slice(payload);
-        let total = transport::seal(
-            &session.send,
-            session.remote_index,
-            counter,
-            payload.len(),
-            &mut packet,
-        );
+        let len = payload.len();
+        let key = session.send;
+        let receiver = session.remote_index;
+        let total = HEADER_SIZE + len + TAG_SIZE;
+        let mut packet = Vec::with_capacity(total);
+        packet.extend_from_slice(&[0u8; HEADER_SIZE]);
+        packet.extend_from_slice(payload);
+        packet.resize(total, 0);
+        self.seal_packet(now, counter, key, receiver, len, packet, out);
+    }
+
+    fn seal_owned(&mut self, now: u64, mut payload: Vec<u8>, out: &mut Vec<Event>) {
+        let Some(counter) = self
+            .session
+            .as_mut()
+            .and_then(|session| session.counter.advance())
+        else {
+            self.session = None;
+            self.initiate(now, out);
+            return;
+        };
+        let Some(session) = self.session.as_ref() else {
+            return;
+        };
+        let len = payload.len();
+        let key = session.send;
+        let receiver = session.remote_index;
+        payload.reserve(HEADER_SIZE + TAG_SIZE);
+        payload.resize(len + HEADER_SIZE + TAG_SIZE, 0);
+        payload.copy_within(0..len, HEADER_SIZE);
+        self.seal_packet(now, counter, key, receiver, len, payload, out);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seal_packet(
+        &mut self,
+        now: u64,
+        counter: u64,
+        key: [u8; 32],
+        receiver: u32,
+        len: usize,
+        mut packet: Vec<u8>,
+        out: &mut Vec<Event>,
+    ) {
+        let total = transport::seal(&key, receiver, counter, len, &mut packet);
         packet.truncate(total);
         let packet = self.apply_reserved(packet);
         self.last_send = now;
@@ -639,7 +703,7 @@ impl Tunnel {
     fn flush(&mut self, now: u64, out: &mut Vec<Event>) {
         while let Some(payload) = self.queue.pop_front() {
             self.queued_bytes -= payload.len();
-            self.seal(now, &payload, out);
+            self.seal_owned(now, payload, out);
         }
     }
 
@@ -923,6 +987,55 @@ mod tests {
         let mut again = Vec::new();
         alice.poll(NOW + 2 + KEEPALIVE_TIMEOUT, &mut again);
         assert!(again.is_empty(), "one keepalive per idle interval");
+    }
+
+    #[test]
+    fn a_sealed_record_does_not_zero_the_payload_before_writing_it() {
+        let (mut alice, mut bob) = establish(0);
+        let mut out = Vec::with_capacity(4);
+        let ((), counts) = crate::alloc_count::measure(|| {
+            alice.send(NOW + 2, b"payload", &mut out);
+        });
+        assert_eq!(
+            counts.zeroed, 0,
+            "the record is written, not zeroed: {counts:?}"
+        );
+        assert_eq!(counts.allocs, 1, "the record is one allocation: {counts:?}");
+        let Event::Send { mut packet, .. } = out.remove(0) else {
+            panic!("a data event");
+        };
+        let mut received = Vec::new();
+        bob.receive(NOW + 2, ALICE.parse().unwrap(), &mut packet, &mut received);
+        assert!(matches!(&received[0], Event::Data(payload) if payload == b"payload"));
+    }
+
+    #[test]
+    fn a_send_owned_reuses_the_packet_buffer() {
+        let (mut alice, mut bob) = establish(0);
+        let mut out = Vec::with_capacity(4);
+        let mut payload = Vec::with_capacity(7 + HEADER_SIZE + TAG_SIZE);
+        payload.extend_from_slice(b"payload");
+        let base = payload.as_ptr();
+        let ((), counts) = crate::alloc_count::measure(|| {
+            alice.send_owned(NOW + 2, payload, &mut out);
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "the caller's packet is the record: {counts:?}"
+        );
+        assert_eq!(counts.zeroed, 0, "the payload is not zeroed: {counts:?}");
+        let Event::Send { mut packet, .. } = out.remove(0) else {
+            panic!("a data event");
+        };
+        assert_eq!(packet.as_ptr(), base, "the record is the caller's buffer");
+        assert_eq!(
+            packet.capacity(),
+            7 + HEADER_SIZE + TAG_SIZE,
+            "the buffer does not grow"
+        );
+        let mut received = Vec::new();
+        bob.receive(NOW + 2, ALICE.parse().unwrap(), &mut packet, &mut received);
+        assert!(matches!(&received[0], Event::Data(payload) if payload == b"payload"));
     }
 
     #[test]

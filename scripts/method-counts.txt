@@ -748,6 +748,8 @@ wireguard client-datagram-bytes-echoed 6 ferrox-app-wg-stack::tests::a_client_da
 wireguard server-datagram-bytes-echoed 2 ferrox-app-wg-stack::tests::a_server_datagram_lane_echoes_through_freedom
 wireguard echo-answers-on-the-client 2 ferrox-app-wg-stack::tests::an_echo_to_the_devices_own_address_is_answered_on_the_tunnel
 wireguard echo-answers-on-the-server 1 ferrox-app-wg-stack::tests::a_server_answers_an_echo_to_its_own_address
+wireguard kernel-rule-priority 32765 ferrox-app-wg-kernel::tests::the_rule_marks_the_table
+wireguard kernel-iif-priority 32764 ferrox-app-wg-kernel::tests::the_iif_rule_keeps_the_reverse_path_inside_the_tunnel
 carrier-masque ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-masque tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_tunnel_to_a_freedom_dial
 carrier-masque ipv6-tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_tunnel_over_ipv6

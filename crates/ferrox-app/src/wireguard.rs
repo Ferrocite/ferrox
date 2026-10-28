@@ -115,6 +115,14 @@ impl DeviceConfig {
             .iter()
             .map(|address| parse_address(address))
             .collect::<Result<Vec<_>, _>>()?;
+        // `kernelMode` is the client switch; `noKernelTun` is its inverse, and the newer name wins when both are present.
+        let no_kernel_tun = match settings.get("kernelMode").and_then(Json::as_bool) {
+            Some(kernel) => !kernel,
+            None => settings
+                .get("noKernelTun")
+                .and_then(Json::as_bool)
+                .unwrap_or(false),
+        };
         Ok(Self {
             secret,
             addresses,
@@ -122,10 +130,7 @@ impl DeviceConfig {
             mtu,
             reserved,
             is_client: settings.get("isClient").and_then(Json::as_bool),
-            no_kernel_tun: settings
-                .get("noKernelTun")
-                .and_then(Json::as_bool)
-                .unwrap_or(false),
+            no_kernel_tun,
             dns,
         })
     }
@@ -428,6 +433,25 @@ mod tests {
         );
         assert!(config.peers[0].routes("192.0.2.1".parse().unwrap()));
         assert!(config.peers[0].routes("2001:db8::1".parse().unwrap()));
+    }
+
+    #[test]
+    fn kernel_mode_is_the_newer_name_for_no_kernel_tun() {
+        let base = r#""secretKey":"0000000000000000000000000000000000000000000000000000000000000001",
+                "peers":[{"publicKey":"0000000000000000000000000000000000000000000000000000000000000002"}]"#;
+        let absent = DeviceConfig::from_json(&json(&format!("{{{base}}}"))).expect("absent");
+        assert!(!absent.no_kernel_tun);
+        let old = DeviceConfig::from_json(&json(&format!("{{{base},\"noKernelTun\":true}}")))
+            .expect("old");
+        assert!(old.no_kernel_tun);
+        let new = DeviceConfig::from_json(&json(&format!("{{{base},\"kernelMode\":false}}")))
+            .expect("new");
+        assert!(new.no_kernel_tun);
+        let both = DeviceConfig::from_json(&json(&format!(
+            "{{{base},\"noKernelTun\":true,\"kernelMode\":true}}"
+        )))
+        .expect("both");
+        assert!(!both.no_kernel_tun);
     }
 
     #[test]

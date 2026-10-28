@@ -57,7 +57,12 @@ pub fn encode(bytes: &[u8]) -> String {
     #[cfg(target_arch = "aarch64")]
     let mut at;
     #[cfg(target_arch = "x86_64")]
-    let group = if bytes.len() >= 16 && std::is_x86_feature_detected!("ssse3") {
+    let group = if bytes.len() >= 28 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: the feature is present, the wide loop loads two sixteen-byte lanes while twenty-eight bytes remain, and the tail loads exactly twelve.
+        let (done, written) = unsafe { x86::encode_prefix_avx2(bytes, ptr) };
+        at = written;
+        done / 3
+    } else if bytes.len() >= 16 && std::is_x86_feature_detected!("ssse3") {
         // SAFETY: the feature is present, the wide loop loads only while 16 bytes remain, and the tail loads exactly 12.
         let (done, written) = unsafe { x86::encode_prefix(bytes, ptr) };
         at = written;
@@ -304,6 +309,59 @@ mod x86 {
         }
     }
 
+    /// Decodes the whole 32-byte blocks of `text` into `out`, returning how much of
+    /// each was consumed. The caller checks `avx2` and has four bytes of output slop.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn decode_prefix_avx2(text: &[u8], out: *mut u8) -> (usize, usize) {
+        unsafe {
+            let offsets = _mm256_broadcastsi128_si256(_mm_loadu_si128(OFFSETS.as_ptr().cast()));
+            let low_lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(LO.as_ptr().cast()));
+            let high_lut = _mm256_broadcastsi128_si256(_mm_loadu_si128(HI.as_ptr().cast()));
+            let pack = _mm256_broadcastsi128_si256(_mm_loadu_si128(PACK.as_ptr().cast()));
+            let first = _mm256_set1_epi32(0x0140_0140);
+            let second = _mm256_set1_epi32(0x0001_1000);
+            let low_mask = _mm256_set1_epi8(0x0f);
+            let mut at = 0usize;
+            let mut out_at = 0usize;
+            while at + 32 <= text.len() {
+                let raw = _mm256_loadu_si256(text.as_ptr().add(at).cast());
+                let dash = _mm256_cmpeq_epi8(raw, _mm256_set1_epi8(45));
+                let under = _mm256_cmpeq_epi8(raw, _mm256_set1_epi8(95));
+                let raw = _mm256_or_si256(
+                    _mm256_and_si256(dash, _mm256_set1_epi8(43)),
+                    _mm256_andnot_si256(dash, raw),
+                );
+                let raw = _mm256_or_si256(
+                    _mm256_and_si256(under, _mm256_set1_epi8(47)),
+                    _mm256_andnot_si256(under, raw),
+                );
+                let high = _mm256_and_si256(_mm256_srli_epi16::<4>(raw), low_mask);
+                let slash = _mm256_cmpeq_epi8(raw, _mm256_set1_epi8(47));
+                let hash = _mm256_add_epi8(high, slash);
+                let sextets = _mm256_add_epi8(raw, _mm256_shuffle_epi8(offsets, hash));
+                let low_bits = _mm256_shuffle_epi8(low_lut, _mm256_and_si256(raw, low_mask));
+                let high_bits = _mm256_shuffle_epi8(high_lut, high);
+                let valid = _mm256_cmpeq_epi8(
+                    _mm256_and_si256(low_bits, high_bits),
+                    _mm256_setzero_si256(),
+                );
+                if _mm256_movemask_epi8(valid) != -1 {
+                    break;
+                }
+                let packed = _mm256_madd_epi16(_mm256_maddubs_epi16(sextets, first), second);
+                let packed = _mm256_shuffle_epi8(packed, pack);
+                _mm_storeu_si128(out.add(out_at).cast(), _mm256_castsi256_si128(packed));
+                _mm_storeu_si128(
+                    out.add(out_at + 12).cast(),
+                    _mm256_extracti128_si256::<1>(packed),
+                );
+                at += 32;
+                out_at += 24;
+            }
+            (at, out_at)
+        }
+    }
+
     #[inline]
     #[target_feature(enable = "ssse3")]
     unsafe fn encode_block(
@@ -348,6 +406,68 @@ mod x86 {
                 let high = _mm_loadu_si32(bytes.as_ptr().add(at + 8).cast());
                 let raw = _mm_unpacklo_epi64(low, high);
                 let ascii = encode_block(raw, shuffle, offsets, fifty_one, twenty_five);
+                _mm_storeu_si128(out.add(out_at).cast(), ascii);
+                at += 12;
+                out_at += 16;
+            }
+            (at, out_at)
+        }
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn encode_block_avx2(
+        raw: __m256i,
+        shuffle: __m256i,
+        offsets: __m256i,
+        fifty_one: __m256i,
+        twenty_five: __m256i,
+    ) -> __m256i {
+        let raw = _mm256_shuffle_epi8(raw, shuffle);
+        let t0 = _mm256_and_si256(raw, _mm256_set1_epi32(0x0fc0_fc00));
+        let t1 = _mm256_mulhi_epu16(t0, _mm256_set1_epi32(0x0400_0040));
+        let t2 = _mm256_and_si256(raw, _mm256_set1_epi32(0x003f_03f0));
+        let t3 = _mm256_mullo_epi16(t2, _mm256_set1_epi32(0x0100_0010));
+        let sextets = _mm256_or_si256(t1, t3);
+        let reduced = _mm256_subs_epu8(sextets, fifty_one);
+        let mask = _mm256_cmpgt_epi8(sextets, twenty_five);
+        let reduced = _mm256_sub_epi8(reduced, mask);
+        _mm256_add_epi8(sextets, _mm256_shuffle_epi8(offsets, reduced))
+    }
+
+    /// Encodes the whole 24-byte pairs of groups of `bytes` into `out`, returning how much of
+    /// each was consumed. The caller checks `avx2`.
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn encode_prefix_avx2(bytes: &[u8], out: *mut u8) -> (usize, usize) {
+        unsafe {
+            let shuffle =
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(ENCODE_SHUFFLE.as_ptr().cast()));
+            let offsets =
+                _mm256_broadcastsi128_si256(_mm_loadu_si128(ENCODE_OFFSETS.as_ptr().cast()));
+            let fifty_one = _mm256_set1_epi8(51);
+            let twenty_five = _mm256_set1_epi8(25);
+            let mut at = 0usize;
+            let mut out_at = 0usize;
+            while at + 28 <= bytes.len() {
+                let low = _mm_loadu_si128(bytes.as_ptr().add(at).cast());
+                let high = _mm_loadu_si128(bytes.as_ptr().add(at + 12).cast());
+                let raw = _mm256_set_m128i(high, low);
+                let ascii = encode_block_avx2(raw, shuffle, offsets, fifty_one, twenty_five);
+                _mm256_storeu_si256(out.add(out_at).cast(), ascii);
+                at += 24;
+                out_at += 32;
+            }
+            if at + 12 <= bytes.len() {
+                let low = _mm_loadl_epi64(bytes.as_ptr().add(at).cast());
+                let high = _mm_loadu_si32(bytes.as_ptr().add(at + 8).cast());
+                let raw = _mm_unpacklo_epi64(low, high);
+                let ascii = encode_block(
+                    raw,
+                    _mm256_castsi256_si128(shuffle),
+                    _mm256_castsi256_si128(offsets),
+                    _mm256_castsi256_si128(fifty_one),
+                    _mm256_castsi256_si128(twenty_five),
+                );
                 _mm_storeu_si128(out.add(out_at).cast(), ascii);
                 at += 12;
                 out_at += 16;
@@ -542,7 +662,12 @@ pub fn decode(text: &[u8]) -> Option<Vec<u8>> {
     #[cfg(target_arch = "aarch64")]
     let mut at;
     #[cfg(target_arch = "x86_64")]
-    if text.len() >= 16 && std::is_x86_feature_detected!("ssse3") {
+    if text.len() >= 32 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: the feature is present, and the buffer reserves four bytes past the exact decoded length, so the wide stores stay inside it.
+        let (done, written) = unsafe { x86::decode_prefix_avx2(text, ptr) };
+        at = done;
+        out_at = written;
+    } else if text.len() >= 16 && std::is_x86_feature_detected!("ssse3") {
         // SAFETY: the feature is present, and the buffer reserves four bytes past the exact decoded length, so the wide store stays inside it.
         let (done, written) = unsafe { x86::decode_prefix(text, ptr) };
         at = done;

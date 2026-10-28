@@ -24,6 +24,7 @@ use ferrox_core::foxy::connectip::{
     icmp_echo_reply, udp_datagram, udp_from_packet, UdpDatagram, IPV4_HEADER, IPV6_HEADER,
     PROTOCOL_UDP,
 };
+use ferrox_core::wireguard::transport::{HEADER_SIZE as WG_HEADER_SIZE, TAG_SIZE as WG_TAG_SIZE};
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{
@@ -40,9 +41,8 @@ use crate::wireguard::{DeviceConfig, PeerConfig};
 /// window update, which is the reference's order of magnitude.
 const TCP_RECV_BUFFER: usize = 512 * 1024;
 /// The send side of one flow: a stream moves this queue per round trip, and a
-/// tunnel's round trip is milliseconds, so the smaller queue capped a fast
-/// link well below the interface.
-const TCP_SEND_BUFFER: usize = 1024 * 1024;
+/// tunnel's round trip is milliseconds, so the queue bounds a fast link.
+const TCP_SEND_BUFFER: usize = 2 * 1024 * 1024;
 /// The most answers a client races for one target.
 const RACES: usize = 8;
 /// A pinned lane re-races its answers after this long without a reply.
@@ -79,9 +79,9 @@ const RX_PACKETS: usize = 4096;
 /// cannot hold, and a TCP retransmit costs more than the poll saves.
 const RX_BURST: usize = 256;
 /// The most datagrams one stack turn emits: a peer's default UDP socket holds
-/// about 212 KiB, so a 64 KiB chunk per flow would overflow it and lose tail
-/// segments, whose retransmit costs a whole RTO.
-const TX_BURST: usize = 64;
+/// about 212 KiB, so a 128-datagram chunk per flow stays under it and does not
+/// lose tail segments, whose retransmit costs a whole RTO.
+const TX_BURST: usize = 128;
 /// The most server datagram lanes one inbound may hold.
 const UDP_FLOWS: usize = 4096;
 
@@ -162,7 +162,8 @@ impl TxToken for QueueTx<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = vec![0u8; len];
+        let mut buffer = Vec::with_capacity(len + WG_HEADER_SIZE + WG_TAG_SIZE);
+        buffer.resize(len, 0);
         let answer = f(&mut buffer);
         self.tx.push_back(buffer);
         answer
@@ -929,7 +930,6 @@ impl ServerStack {
             };
             let Ok((tun, proxy)) = loopback() else {
                 self.sockets.remove(handle);
-                self.listen(port);
                 continue;
             };
             let out = self.out.clone();
@@ -942,11 +942,9 @@ impl ServerStack {
             });
             if tun.set_nonblocking(true).is_err() {
                 self.sockets.remove(handle);
-                self.listen(port);
                 continue;
             }
             self.flows.push(Flow::new(handle, Connection::from(tun), 0));
-            self.listen(port);
         }
     }
 
@@ -1202,7 +1200,8 @@ fn lane_send(
     let mut destination_room = [0u8; 16];
     let source = ip_bytes_into(*inner_source, &mut source_room);
     let destination = ip_bytes_into(target.ip(), &mut destination_room);
-    let mut packet = Vec::with_capacity(IPV4_HEADER + 8 + payload.len());
+    let mut packet =
+        Vec::with_capacity(IPV4_HEADER + 8 + payload.len() + WG_HEADER_SIZE + WG_TAG_SIZE);
     let datagram = UdpDatagram {
         source,
         destination,
@@ -1446,7 +1445,9 @@ pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
                     let mut destination_bytes = [0u8; 16];
                     let source_bytes = ip_bytes_into(target.ip(), &mut source_bytes);
                     let destination_bytes = ip_bytes_into(source.ip(), &mut destination_bytes);
-                    let mut packet = Vec::with_capacity(IPV4_HEADER + 8 + payload.len());
+                    let mut packet = Vec::with_capacity(
+                        IPV4_HEADER + 8 + payload.len() + WG_HEADER_SIZE + WG_TAG_SIZE,
+                    );
                     let datagram = UdpDatagram {
                         source: source_bytes,
                         destination: destination_bytes,
@@ -1526,7 +1527,7 @@ fn answer_echo(packet: &[u8], addresses: &[IpAddr], to_tunnel: &ToTunnel) -> boo
     let Some(message) = icmp_message(packet) else {
         return false;
     };
-    let mut reply = Vec::with_capacity(packet.len());
+    let mut reply = Vec::with_capacity(packet.len() + WG_HEADER_SIZE + WG_TAG_SIZE);
     if !icmp_echo_reply(source, destination, message, &mut reply) {
         return false;
     }
