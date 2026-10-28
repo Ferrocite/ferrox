@@ -2048,7 +2048,7 @@ mod tests {
             .tunnels
             .lock()
             .expect("tunnels")
-            .insert(victim, to_victim);
+            .insert(victim, TunnelQueue::new(to_victim, None));
         let owner: IpAddr = "10.14.0.2".parse().expect("an address");
         let forged = ipv4_packet([10, 14, 0, 99], [10, 14, 0, 3]);
         forward(&shared, &spec, &[owner], &forged);
