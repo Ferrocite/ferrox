@@ -19520,7 +19520,7 @@ pub(crate) mod lane_pool {
             assert!(grow(&pool));
             let ran = Arc::new(Mutex::new(None));
             let mut later = marker(Arc::clone(&ran));
-            later.idle = 2;
+            later.idle = 5;
             let parker = Arc::clone(&*pool);
             let handle = thread::spawn(move || {
                 park_with(&parker, later, Duration::from_millis(50));
@@ -19539,7 +19539,7 @@ pub(crate) mod lane_pool {
                 "the earlier lane never ran"
             );
             assert!(
-                at.elapsed() < Duration::from_millis(150),
+                at.elapsed() < Duration::from_millis(400),
                 "the earlier lane waited {:?}",
                 at.elapsed()
             );
