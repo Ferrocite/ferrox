@@ -34,7 +34,7 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndp
 
 use crate::conn::Connection;
 use crate::proxy::{serve_device_flow, serve_udp_lane, Destination, Outbound};
-use crate::wireguard::DeviceConfig;
+use crate::wireguard::{DeviceConfig, PeerConfig};
 
 /// The receive side of one flow: a peer may have this much in flight before a
 /// window update, which is the reference's order of magnitude.
@@ -369,7 +369,7 @@ fn receive_client(stack: &mut ClientStack, packet: Packet) {
     if inner_protocol(&packet.bytes) == Some(PROTOCOL_TCP) {
         stack.device.push(packet.bytes);
     } else if !stack.answer_echo(&packet.bytes) {
-        stack.device.absorb(&packet.bytes);
+        stack.absorb(&packet);
     }
 }
 
@@ -439,6 +439,7 @@ struct ClientStack {
     next_port: u16,
     to_tunnel: ToTunnel,
     addresses: Vec<IpAddr>,
+    peers: Vec<PeerConfig>,
     started: StdInstant,
 }
 
@@ -462,12 +463,40 @@ impl ClientStack {
             next_port: 49_152,
             to_tunnel,
             addresses: config.addresses.clone(),
+            peers: config.peers.clone(),
             started: StdInstant::now(),
         }
     }
 
     fn answer_echo(&self, packet: &[u8]) -> bool {
         answer_echo(packet, &self.addresses, &self.to_tunnel)
+    }
+
+    /// A Packet Too Big narrows the shared MTU only when it quotes a flow this
+    /// peer routes and this client sent.
+    fn absorb(&mut self, packet: &Packet) {
+        let Some((source, destination)) = icmp_quoted(&packet.bytes) else {
+            return;
+        };
+        if !self.addresses.contains(&source)
+            || !self
+                .peers
+                .iter()
+                .any(|peer| peer.public == packet.peer && peer.routes(destination))
+        {
+            return;
+        }
+        if self.device.absorb(&packet.bytes) {
+            self.reset_iface();
+        }
+    }
+
+    /// Rebuild the interface so smoltcp's cached capabilities carry the learned MTU.
+    fn reset_iface(&mut self) {
+        let now = self.now();
+        self.iface = Interface::new(iface_config(0x5eed_1234), &mut self.device, now);
+        add_addresses(&mut self.iface, &self.addresses);
+        add_default_routes(&mut self.iface, &self.addresses);
     }
 
     fn connect(&mut self, flow: ClientFlow) -> std::io::Result<()> {
@@ -1305,6 +1334,38 @@ fn icmp_message(packet: &[u8]) -> Option<&[u8]> {
     }
 }
 
+/// The source and destination the ICMP error quotes, when the quoted header is
+/// long enough to carry them.
+fn icmp_quoted(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
+    if packet.len() >= 48
+        && packet[0] >> 4 == 4
+        && packet[9] == PROTOCOL_ICMP
+        && packet[20] == 3
+        && packet[21] == 4
+    {
+        let quoted = 28;
+        if packet.len() >= quoted + 20 && packet[quoted] >> 4 == 4 {
+            let source = <[u8; 4]>::try_from(&packet[quoted + 12..quoted + 16]).ok()?;
+            let destination = <[u8; 4]>::try_from(&packet[quoted + 16..quoted + 20]).ok()?;
+            return Some((IpAddr::from(source), IpAddr::from(destination)));
+        }
+    }
+    if packet.len() >= 88
+        && packet[0] >> 4 == 6
+        && packet[6] == PROTOCOL_ICMPV6
+        && packet[40] == 2
+        && packet[41] == 0
+    {
+        let quoted = 48;
+        if packet[quoted] >> 4 == 6 {
+            let source = <[u8; 16]>::try_from(&packet[quoted + 8..quoted + 24]).ok()?;
+            let destination = <[u8; 16]>::try_from(&packet[quoted + 24..quoted + 40]).ok()?;
+            return Some((IpAddr::from(source), IpAddr::from(destination)));
+        }
+    }
+    None
+}
+
 /// The MTU an ICMP Packet Too Big names, when the packet is one at all: a v4 destination-unreachable with code 4, or a v6 packet-too-big, both at or above their family's floor.
 fn icmp_mtu(packet: &[u8]) -> Option<usize> {
     match packet.first()? >> 4 {
@@ -1424,8 +1485,18 @@ mod tests {
     #[test]
     fn a_direct_upload_never_builds_the_staging_buffer() {
         let (mut app, proxy) = loopback().expect("pair");
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.2".parse().unwrap()],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
         let (to_tunnel, packets) = std::sync::mpsc::channel();
-        let mut stack = ClientStack::new(&device(&["10.0.0.2"], true), to_tunnel);
+        let mut stack = ClientStack::new(&config, to_tunnel);
         stack
             .connect(ClientFlow {
                 client: Connection::from(proxy),
@@ -2044,6 +2115,129 @@ mod client_tests {
         let mut forged = too_big;
         forged[40] = 3;
         assert!(!device.absorb(&forged), "not a packet too big");
+    }
+    #[test]
+    fn a_learned_mtu_reaches_the_client_segment_size() {
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.2".parse().unwrap()],
+            peers: vec![crate::wireguard::PeerConfig {
+                public: [0u8; 32],
+                preshared: [0; 32],
+                endpoint: None,
+                keepalive: 0,
+                allowed: vec![("0.0.0.0".parse().unwrap(), 0)],
+            }],
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
+        let (to_tunnel, packets) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&config, to_tunnel);
+        let mut inner = vec![0u8; 28];
+        inner[0] = 0x45;
+        inner[2..4].copy_from_slice(&28u16.to_be_bytes());
+        inner[8] = 64;
+        inner[9] = PROTOCOL_UDP;
+        inner[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        inner[16..20].copy_from_slice(&[198, 51, 100, 7]);
+        let too_big =
+            ferrox_core::foxy::connectip::icmp_too_large(&inner, 600).expect("a v4 answer");
+        receive_client(
+            &mut stack,
+            Packet {
+                peer: [0u8; 32],
+                bytes: too_big,
+            },
+        );
+
+        let (app, proxy) = loopback().expect("pair");
+        stack
+            .connect(ClientFlow {
+                client: Connection::from(proxy),
+                destinations: vec!["192.0.2.1:80".parse().expect("destination")],
+                prefix: Vec::new(),
+            })
+            .expect("connect");
+        let mut buf = [0u8; 2048];
+        stack.poll(&mut buf);
+        let syn = packets.recv_timeout(Duration::from_secs(5)).expect("SYN");
+        let header = usize::from(syn[0] & 0x0f) * 4;
+        let options = header + 20..header + usize::from(syn[header + 12] >> 4) * 4;
+        let mut at = options.start;
+        let mut mss = None;
+        while at < options.end {
+            match syn[at] {
+                0 => break,
+                1 => at += 1,
+                kind => {
+                    let len = usize::from(syn[at + 1]);
+                    if kind == 2 && len == 4 {
+                        mss = Some(u16::from_be_bytes([syn[at + 2], syn[at + 3]]));
+                    }
+                    at += len;
+                }
+            }
+        }
+        assert!(
+            usize::from(mss.expect("a SYN advertises MSS")) <= 600 - 20 - 20,
+            "the SYN advertises the learned MTU's segment size"
+        );
+        drop(app);
+    }
+
+    #[test]
+    fn a_peer_cannot_narrow_another_peers_path() {
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.2".parse().unwrap()],
+            peers: vec![
+                crate::wireguard::PeerConfig {
+                    public: [0x11; 32],
+                    preshared: [0; 32],
+                    endpoint: None,
+                    keepalive: 0,
+                    allowed: vec![("198.51.100.0".parse().unwrap(), 24)],
+                },
+                crate::wireguard::PeerConfig {
+                    public: [0x22; 32],
+                    preshared: [0; 32],
+                    endpoint: None,
+                    keepalive: 0,
+                    allowed: vec![("203.0.113.0".parse().unwrap(), 24)],
+                },
+            ],
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
+        let (to_tunnel, _) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&config, to_tunnel);
+        let mut inner = vec![0u8; 28];
+        inner[0] = 0x45;
+        inner[2..4].copy_from_slice(&28u16.to_be_bytes());
+        inner[8] = 64;
+        inner[9] = PROTOCOL_UDP;
+        inner[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        inner[16..20].copy_from_slice(&[203, 0, 113, 7]);
+        let too_big =
+            ferrox_core::foxy::connectip::icmp_too_large(&inner, 1000).expect("a v4 answer");
+        receive_client(
+            &mut stack,
+            Packet {
+                peer: [0x11; 32],
+                bytes: too_big,
+            },
+        );
+        assert_eq!(
+            stack.device.capabilities().max_transmission_unit,
+            1420,
+            "one peer narrowed another peer's path"
+        );
     }
 }
 
