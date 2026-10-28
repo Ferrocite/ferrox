@@ -137,8 +137,16 @@ impl Wire {
     }
 }
 
+struct Frame {
+    kind: u8,
+    flags: u8,
+    id: u32,
+    start: usize,
+    end: usize,
+}
+
 /// One whole frame in a pending buffer, as its body's range: the caller reads the body where it landed instead of copying it out. `Err` is a frame past the cap, which closes the wire.
-fn frame_at(pending: &[u8], at: usize) -> Result<Option<(u8, u8, u32, usize, usize)>, ()> {
+fn frame_at(pending: &[u8], at: usize) -> Result<Option<Frame>, ()> {
     let Some(head) = pending.get(at..at.saturating_add(9)) else {
         return Ok(None);
     };
@@ -151,7 +159,13 @@ fn frame_at(pending: &[u8], at: usize) -> Result<Option<(u8, u8, u32, usize, usi
         return Ok(None);
     }
     let id = u32::from_be_bytes(head[5..9].try_into().expect("four bytes")) & 0x7fff_ffff;
-    Ok(Some((head[3], head[4], id, at.saturating_add(9), end)))
+    Ok(Some(Frame {
+        kind: head[3],
+        flags: head[4],
+        id,
+        start: at.saturating_add(9),
+        end,
+    }))
 }
 
 /// The dialer's half of the same wire: the request rides stream one, capsules
@@ -345,9 +359,14 @@ impl Client {
         let mut at = 0;
         loop {
             match frame_at(&pending, at) {
-                Ok(Some((kind, flags, id, start, end))) => {
-                    self.on(kind, flags, id, &pending[start..end]);
-                    at = end;
+                Ok(Some(frame)) => {
+                    self.on(
+                        frame.kind,
+                        frame.flags,
+                        frame.id,
+                        &pending[frame.start..frame.end],
+                    );
+                    at = frame.end;
                     if self.end || self.wire.closed {
                         break;
                     }
@@ -615,9 +634,15 @@ impl Session {
             let mut at = 0;
             loop {
                 match frame_at(&pending, at) {
-                    Ok(Some((kind, flags, id, start, end))) => {
-                        self.on(wire, kind, flags, id, &pending[start..end]);
-                        at = end;
+                    Ok(Some(frame)) => {
+                        self.on(
+                            wire,
+                            frame.kind,
+                            frame.flags,
+                            frame.id,
+                            &pending[frame.start..frame.end],
+                        );
+                        at = frame.end;
                         if self.end || wire.closed {
                             break;
                         }
@@ -948,11 +973,11 @@ mod tests {
         pending.extend_from_slice(&h2::frame_head(body.len(), h2::T_DATA, 0, 1));
         pending.extend_from_slice(&body);
         let ((), counts) = ferrox_core::alloc_count::measure(|| {
-            let (kind, flags, id, start, end) = frame_at(&pending, 0)
+            let frame = frame_at(&pending, 0)
                 .expect("a frame")
                 .expect("a whole frame");
-            assert_eq!((kind, flags, id), (h2::T_DATA, 0, 1));
-            assert_eq!(&pending[start..end], &body);
+            assert_eq!((frame.kind, frame.flags, frame.id), (h2::T_DATA, 0, 1));
+            assert_eq!(&pending[frame.start..frame.end], &body);
         });
         assert_eq!(
             counts.allocs, 0,
@@ -968,13 +993,17 @@ mod tests {
         let (lane, received) = std::sync::mpsc::channel();
         let mut table = std::collections::HashMap::new();
         table.insert(53, lane);
+        let routes = Arc::new(std::sync::Mutex::new(table));
+        let (to_stack, _stack_rx) = std::sync::mpsc::channel();
         let mut client = bare_client();
-        client.routes = Some(Arc::new(std::sync::Mutex::new(table)));
-        client.to_stack = Some(std::sync::mpsc::channel().0);
+        client.routes = Some(Arc::clone(&routes));
+        client.to_stack = Some(to_stack.clone());
+        let ((), direct) =
+            ferrox_core::alloc_count::measure(|| masque::deliver(&to_stack, &routes, &packet));
         let ((), counts) = ferrox_core::alloc_count::measure(|| client.capsules(&capsule));
         assert_eq!(
-            counts.allocs, 1,
-            "only the packet handed to the lane is allocated: {counts:?}"
+            counts.allocs, direct.allocs,
+            "the whole capsule adds no allocation to a direct delivery: {counts:?} vs {direct:?}"
         );
         assert_eq!(
             client.capsules.capacity(),
