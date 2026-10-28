@@ -598,6 +598,9 @@ const SEND_SLOTS: usize = 64;
 
 pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &Datagram) {
     sock.retry_held();
+    if sock.held.holding.load(Ordering::Relaxed) {
+        return;
+    }
     #[cfg(target_os = "linux")]
     if sock.batchable() {
         flush_burst(conn, sock);
@@ -606,7 +609,9 @@ pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &Datagram) {
     let mut room = Unfilled::<MAX_DATAGRAM>::new();
     let out = room.as_mut();
     while let Ok((written, info)) = conn.send(out) {
-        sock.send_or_hold(&out[..written], info.to);
+        if !sock.send_or_hold(&out[..written], info.to) {
+            break;
+        }
     }
 }
 
@@ -2133,12 +2138,14 @@ impl Datagram {
     /// Send one datagram, or hold it when the kernel refused it for a reason that
     /// clears. A QUIC DATAGRAM frame is never retransmitted, so a held datagram is
     /// the difference between a pacing blip and a hole the inner TCP must time out.
-    fn send_or_hold(&self, buf: &[u8], to: SocketAddr) {
+    fn send_or_hold(&self, buf: &[u8], to: SocketAddr) -> bool {
         if let Err(error) = self.send_to(buf, to) {
             if refused(&error) {
                 self.hold(buf, to);
+                return false;
             }
         }
+        true
     }
 
     /// Park a refused datagram behind the ones already waiting, in quiche's order.
@@ -3613,6 +3620,53 @@ mod tests {
         assert_eq!(
             got, held,
             "every held datagram arrives once, in the order it was held"
+        );
+    }
+
+    /// A retry that cannot drain must stop the sweep before new datagrams overtake it.
+    #[test]
+    fn a_blocked_retry_stops_the_sweep() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("bind the peer");
+        peer.set_nonblocking(true).expect("nonblocking");
+        let to = peer.local_addr().expect("the peer's address");
+        let socket = bind_datagram("127.0.0.1:0").expect("bind the sender");
+        let local = socket.local_addr().expect("the sender's address");
+        let sock = Datagram::plain(socket);
+
+        sock.hold(b"older", to);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = sock.held.queue.lock().expect("lock the queue");
+            panic!("poison the held queue");
+        }));
+        assert!(poisoned.is_err(), "the queue is left holding");
+        assert!(sock.held.holding.load(Ordering::Relaxed));
+
+        let mut scid = [0u8; SCID_LEN];
+        getrandom::fill(&mut scid).expect("random");
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
+        config.set_application_protos(&[ALPN]).expect("alpn");
+        let mut conn =
+            quiche::connect(Some("held.test"), &cid, local, to, &mut config).expect("connects");
+
+        flush_egress(&mut conn, &sock);
+        let mut buf = [0u8; 2048];
+        let mut received = false;
+        for _ in 0..50 {
+            match peer.recv_from(&mut buf) {
+                Ok(_) => {
+                    received = true;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            !received,
+            "a blocked retry must stop the sweep before new datagrams"
         );
     }
 
