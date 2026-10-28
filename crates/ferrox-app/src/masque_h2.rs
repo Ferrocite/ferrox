@@ -123,29 +123,6 @@ impl Wire {
         }
     }
 
-    fn frame(&mut self) -> Option<(u8, u8, u32, Vec<u8>)> {
-        if self.pending.len() < 9 {
-            return None;
-        }
-        let len = usize::from(self.pending[0]) << 16
-            | usize::from(self.pending[1]) << 8
-            | usize::from(self.pending[2]);
-        if len > FRAME_CAP {
-            self.closed = true;
-            return None;
-        }
-        if self.pending.len() < 9 + len {
-            return None;
-        }
-        let kind = self.pending[3];
-        let flags = self.pending[4];
-        let id =
-            u32::from_be_bytes(self.pending[5..9].try_into().expect("four bytes")) & 0x7fff_ffff;
-        let body = self.pending[9..9 + len].to_vec();
-        self.pending.drain(..9 + len);
-        Some((kind, flags, id, body))
-    }
-
     fn send(&mut self, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
         let head = h2::frame_head(body.len(), kind, flags, id);
         let sent = self
@@ -158,6 +135,23 @@ impl Wire {
         }
         true
     }
+}
+
+/// One whole frame in a pending buffer, as its body's range: the caller reads the body where it landed instead of copying it out. `Err` is a frame past the cap, which closes the wire.
+fn frame_at(pending: &[u8], at: usize) -> Result<Option<(u8, u8, u32, usize, usize)>, ()> {
+    let Some(head) = pending.get(at..at.saturating_add(9)) else {
+        return Ok(None);
+    };
+    let len = usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
+    if len > FRAME_CAP {
+        return Err(());
+    }
+    let end = at.saturating_add(9).saturating_add(len);
+    if pending.len() < end {
+        return Ok(None);
+    }
+    let id = u32::from_be_bytes(head[5..9].try_into().expect("four bytes")) & 0x7fff_ffff;
+    Ok(Some((head[3], head[4], id, at.saturating_add(9), end)))
 }
 
 /// The dialer's half of the same wire: the request rides stream one, capsules
@@ -178,6 +172,8 @@ pub(crate) struct Client {
     pub(crate) addresses: Vec<IpAddr>,
     pub(crate) mtu: usize,
     pub(crate) packets: Vec<Vec<u8>>,
+    to_stack: Option<Sender<Packet>>,
+    routes: Option<UdpRoutes>,
     end: bool,
 }
 
@@ -245,6 +241,8 @@ impl Client {
             addresses: Vec::new(),
             mtu: masque::DEFAULT_MTU,
             packets: Vec::new(),
+            to_stack: None,
+            routes: None,
             end: false,
         };
         let mut settings = Vec::with_capacity(12);
@@ -316,16 +314,19 @@ impl Client {
         to_stack: &Sender<Packet>,
         routes: &UdpRoutes,
     ) {
+        self.to_stack = Some(to_stack.clone());
+        self.routes = Some(routes.clone());
+        for packet in self.packets.drain(..) {
+            deliver(to_stack, routes, &packet);
+        }
+        let mut capsule = Vec::new();
         while !self.wire.closed && !self.end {
             self.pump();
-            for packet in self.packets.drain(..) {
-                deliver(to_stack, routes, &packet);
-            }
             if self.wire.closed || self.end {
                 break;
             }
             while let Ok(packet) = from_tunnel.try_recv() {
-                let mut capsule = Vec::with_capacity(packet.len() + 8);
+                capsule.clear();
                 datagram(&packet, &mut capsule);
                 self.capsule(&capsule);
             }
@@ -340,12 +341,28 @@ impl Client {
     }
 
     fn pump(&mut self) {
-        while let Some((kind, flags, id, body)) = self.wire.frame() {
-            self.on(kind, flags, id, &body);
-            if self.end || self.wire.closed {
-                return;
+        let mut pending = std::mem::take(&mut self.wire.pending);
+        let mut at = 0;
+        loop {
+            match frame_at(&pending, at) {
+                Ok(Some((kind, flags, id, start, end))) => {
+                    self.on(kind, flags, id, &pending[start..end]);
+                    at = end;
+                    if self.end || self.wire.closed {
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(()) => {
+                    self.wire.closed = true;
+                    break;
+                }
             }
         }
+        if at > 0 {
+            pending.drain(..at);
+        }
+        self.wire.pending = pending;
     }
 
     fn on(&mut self, kind: u8, flags: u8, id: u32, body: &[u8]) {
@@ -448,46 +465,77 @@ impl Client {
     }
 
     fn capsules(&mut self, bytes: &[u8]) {
-        self.capsules.extend_from_slice(bytes);
+        let mut capsules = std::mem::take(&mut self.capsules);
+        let mut at = 0;
         let mut answers = Vec::new();
-        while let Some((used, capsule)) =
-            connectip::capsule_split(&self.capsules[self.capsule_at..])
-        {
-            self.capsule_at += used;
-            match capsule {
-                connectip::Capsule::AddressAssign(body) => {
-                    if self.addresses.is_empty() {
-                        let mut assigned = Vec::new();
-                        if connectip::address_assign(body, &mut assigned).is_some() {
-                            self.addresses.extend(assigned.iter().filter_map(|grant| {
-                                (!grant.refused())
-                                    .then(|| masque::address_of(grant))
-                                    .flatten()
-                            }));
-                        }
-                    } else if let Some(address) = withdrawn(body, &self.addresses) {
-                        eprintln!("masque: the proxy withdrew {address}");
-                        self.end = true;
-                    }
+        if capsules.is_empty() {
+            let mut used = 0;
+            while let Some((n, capsule)) = connectip::capsule_split(&bytes[used..]) {
+                used += n;
+                if let Some(answer) = self.handle(capsule) {
+                    answers.push(answer);
                 }
-                connectip::Capsule::Datagram(packet) => self.packets.push(packet.to_vec()),
-                connectip::Capsule::AddressRequest(body) => {
-                    let granted = masque::respond(body, &self.addresses);
-                    if !granted.is_empty() {
-                        let mut out = Vec::new();
-                        connectip::address_assign_encode(&granted, &mut out);
-                        answers.push(out);
-                    }
+            }
+            if used < bytes.len() {
+                capsules.extend_from_slice(&bytes[used..]);
+            }
+        } else {
+            at = self.capsule_at;
+            capsules.extend_from_slice(bytes);
+            while let Some((n, capsule)) = connectip::capsule_split(&capsules[at..]) {
+                at += n;
+                if let Some(answer) = self.handle(capsule) {
+                    answers.push(answer);
                 }
-                _ => {}
+            }
+            if at > 0 {
+                capsules.drain(..at);
+                at = 0;
             }
         }
-        if self.capsule_at > 0 {
-            self.capsules.drain(..self.capsule_at);
-            self.capsule_at = 0;
-        }
+        self.capsules = capsules;
+        self.capsule_at = at;
         for answer in answers {
             self.capsule(&answer);
+        }
+    }
+
+    fn handle(&mut self, capsule: connectip::Capsule<'_>) -> Option<Vec<u8>> {
+        match capsule {
+            connectip::Capsule::AddressAssign(body) => {
+                if self.addresses.is_empty() {
+                    let mut assigned = Vec::new();
+                    if connectip::address_assign(body, &mut assigned).is_some() {
+                        self.addresses.extend(assigned.iter().filter_map(|grant| {
+                            (!grant.refused())
+                                .then(|| masque::address_of(grant))
+                                .flatten()
+                        }));
+                    }
+                } else if let Some(address) = withdrawn(body, &self.addresses) {
+                    eprintln!("masque: the proxy withdrew {address}");
+                    self.end = true;
+                }
+                None
+            }
+            connectip::Capsule::Datagram(packet) => {
+                if let (Some(to_stack), Some(routes)) = (&self.to_stack, &self.routes) {
+                    deliver(to_stack, routes, packet);
+                } else {
+                    self.packets.push(packet.to_vec());
+                }
+                None
+            }
+            connectip::Capsule::AddressRequest(body) => {
+                let granted = masque::respond(body, &self.addresses);
+                if granted.is_empty() {
+                    return None;
+                }
+                let mut out = Vec::new();
+                connectip::address_assign_encode(&granted, &mut out);
+                Some(out)
+            }
+            _ => None,
         }
     }
 
@@ -563,12 +611,28 @@ impl Session {
         settings.extend_from_slice(&1u32.to_be_bytes());
         wire.send(h2::T_SETTINGS, 0, 0, &settings);
         while !wire.closed && !self.end {
-            while let Some((kind, flags, id, body)) = wire.frame() {
-                self.on(wire, kind, flags, id, &body);
-                if self.end {
-                    break;
+            let mut pending = std::mem::take(&mut wire.pending);
+            let mut at = 0;
+            loop {
+                match frame_at(&pending, at) {
+                    Ok(Some((kind, flags, id, start, end))) => {
+                        self.on(wire, kind, flags, id, &pending[start..end]);
+                        at = end;
+                        if self.end || wire.closed {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(()) => {
+                        wire.closed = true;
+                        break;
+                    }
                 }
             }
+            if at > 0 {
+                pending.drain(..at);
+            }
+            wire.pending = pending;
             self.flush(wire);
             if !wire.fill() {
                 break;
@@ -837,6 +901,92 @@ mod tests {
 
     use super::*;
     use crate::json::Json;
+
+    fn bare_client() -> Client {
+        Client {
+            wire: Wire {
+                stream: Box::new(std::io::Cursor::new(Vec::new())),
+                pending: Vec::new(),
+                closed: false,
+            },
+            decoder: Decoder::default(),
+            stream: 1,
+            status: None,
+            continuation: None,
+            send_window: DEFAULT_WINDOW,
+            connection_window: DEFAULT_WINDOW,
+            queued: std::collections::VecDeque::new(),
+            capsules: Vec::new(),
+            capsule_at: 0,
+            addresses: Vec::new(),
+            mtu: masque::DEFAULT_MTU,
+            packets: Vec::new(),
+            to_stack: None,
+            routes: None,
+            end: false,
+        }
+    }
+
+    fn udp_packet(destination_port: u16) -> Vec<u8> {
+        let mut packet = vec![0u8; 28];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&28u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 17;
+        packet[12..16].copy_from_slice(&[10, 14, 0, 2]);
+        packet[16..20].copy_from_slice(&[192, 0, 2, 1]);
+        packet[20..22].copy_from_slice(&1234u16.to_be_bytes());
+        packet[22..24].copy_from_slice(&destination_port.to_be_bytes());
+        packet[24..26].copy_from_slice(&8u16.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn a_frame_body_is_read_where_it_landed() {
+        let body = [0x00, 0x02, 0x00, 0xde, 0xad];
+        let mut pending = Vec::new();
+        pending.extend_from_slice(&h2::frame_head(body.len(), h2::T_DATA, 0, 1));
+        pending.extend_from_slice(&body);
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            let (kind, flags, id, start, end) = frame_at(&pending, 0)
+                .expect("a frame")
+                .expect("a whole frame");
+            assert_eq!((kind, flags, id), (h2::T_DATA, 0, 1));
+            assert_eq!(&pending[start..end], &body);
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "the frame body is read where it landed: {counts:?}"
+        );
+    }
+
+    #[test]
+    fn a_whole_capsule_is_read_where_it_landed() {
+        let packet = udp_packet(53);
+        let mut capsule = Vec::new();
+        datagram(&packet, &mut capsule);
+        let (lane, received) = std::sync::mpsc::channel();
+        let mut table = std::collections::HashMap::new();
+        table.insert(53, lane);
+        let mut client = bare_client();
+        client.routes = Some(Arc::new(std::sync::Mutex::new(table)));
+        client.to_stack = Some(std::sync::mpsc::channel().0);
+        let ((), counts) = ferrox_core::alloc_count::measure(|| client.capsules(&capsule));
+        assert_eq!(
+            counts.allocs, 1,
+            "only the packet handed to the lane is allocated: {counts:?}"
+        );
+        assert_eq!(
+            client.capsules.capacity(),
+            0,
+            "a whole capsule is never staged"
+        );
+        assert!(
+            client.packets.is_empty(),
+            "the packet went straight to its lane"
+        );
+        assert_eq!(received.recv().expect("delivered"), packet);
+    }
 
     #[test]
     fn a_dial_refused_until_the_edge_binds_is_retried() {
