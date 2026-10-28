@@ -75,7 +75,8 @@ impl DeadlineStream {
         }
     }
 
-    fn set_read_timeout(&self, wait: Duration) {
+    fn set_read_timeout(&self, wait: Option<Duration>) {
+        let wait = wait.unwrap_or(HANDSHAKE);
         self.read_wait.set(wait);
         if !self.read_tight.get() {
             let _ = self.io.set_read_timeout(Some(wait));
