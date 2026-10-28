@@ -352,6 +352,26 @@ fn connect_edge(edge: SocketAddr) -> Result<TcpStream, String> {
     dial_until_bound(edge, |edge| TcpStream::connect_timeout(&edge, HANDSHAKE))
 }
 
+fn request_fields<'a>(
+    authority: &'a str,
+    path: &'a str,
+    headers: &'a [(String, String)],
+) -> Vec<(&'a str, &'a str)> {
+    let mut fields = Vec::with_capacity(6 + headers.len());
+    fields.push((":method", "CONNECT"));
+    fields.push((":protocol", "connect-ip"));
+    fields.push((":scheme", "https"));
+    fields.push((":path", path));
+    fields.push((":authority", authority));
+    fields.push(("capsule-protocol", "?1"));
+    fields.extend(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    );
+    fields
+}
+
 impl Client {
     pub(crate) fn dial(
         tls_config: &TlsConfig,
@@ -410,17 +430,7 @@ impl Client {
         {
             return Err("the edge closed while settings were written".to_owned());
         }
-        let mut fields: Vec<(&str, &str)> = Vec::with_capacity(6 + headers.len());
-        fields.push((":method", "CONNECT"));
-        fields.push((":protocol", "connect-ip"));
-        fields.push((":scheme", "https"));
-        fields.push((":path", path));
-        fields.push((":authority", authority));
-        fields.push(("capsule-protocol", "?1"));
-        for (name, value) in headers {
-            fields.push((name, value));
-        }
-        let block = h2::block_encode(&fields);
+        let block = h2::block_encode(&request_fields(authority, path, headers));
         if !client
             .wire
             .send(h2::T_HEADERS, h2::F_END_HEADERS, client.stream, &block)
