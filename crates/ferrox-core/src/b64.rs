@@ -26,7 +26,7 @@ pub fn encode(bytes: &[u8]) -> String {
     let mut at = 0usize;
     #[cfg(target_arch = "x86_64")]
     let group = if std::is_x86_feature_detected!("ssse3") {
-        // SAFETY: the feature is present, and every 12-byte group has 16 bytes to load, so the wide load stays inside `bytes`.
+        // SAFETY: the feature is present, the wide loop loads only while 16 bytes remain, and the tail loads exactly 12.
         let (done, written) = unsafe { x86::encode_prefix(bytes, ptr) };
         at = written;
         done / 3
@@ -270,8 +270,31 @@ mod x86 {
         }
     }
 
+    #[inline]
+    #[target_feature(enable = "ssse3")]
+    unsafe fn encode_block(
+        raw: __m128i,
+        shuffle: __m128i,
+        offsets: __m128i,
+        fifty_one: __m128i,
+        twenty_five: __m128i,
+    ) -> __m128i {
+        unsafe {
+            let raw = _mm_shuffle_epi8(raw, shuffle);
+            let t0 = _mm_and_si128(raw, _mm_set1_epi32(0x0fc0_fc00));
+            let t1 = _mm_mulhi_epu16(t0, _mm_set1_epi32(0x0400_0040));
+            let t2 = _mm_and_si128(raw, _mm_set1_epi32(0x003f_03f0));
+            let t3 = _mm_mullo_epi16(t2, _mm_set1_epi32(0x0100_0010));
+            let sextets = _mm_or_si128(t1, t3);
+            let reduced = _mm_subs_epu8(sextets, fifty_one);
+            let mask = _mm_cmpgt_epi8(sextets, twenty_five);
+            let reduced = _mm_sub_epi8(reduced, mask);
+            _mm_add_epi8(sextets, _mm_shuffle_epi8(offsets, reduced))
+        }
+    }
+
     /// Encodes the whole 12-byte groups of `bytes` into `out`, returning how much of
-    /// each was consumed. The caller checks `ssse3` and has a 16-byte load to spare.
+    /// each was consumed. The caller checks `ssse3`.
     #[target_feature(enable = "ssse3")]
     pub(super) unsafe fn encode_prefix(bytes: &[u8], out: *mut u8) -> (usize, usize) {
         unsafe {
@@ -282,16 +305,17 @@ mod x86 {
             let mut at = 0usize;
             let mut out_at = 0usize;
             while at + 16 <= bytes.len() {
-                let raw = _mm_shuffle_epi8(_mm_loadu_si128(bytes.as_ptr().add(at).cast()), shuffle);
-                let t0 = _mm_and_si128(raw, _mm_set1_epi32(0x0fc0_fc00));
-                let t1 = _mm_mulhi_epu16(t0, _mm_set1_epi32(0x0400_0040));
-                let t2 = _mm_and_si128(raw, _mm_set1_epi32(0x003f_03f0));
-                let t3 = _mm_mullo_epi16(t2, _mm_set1_epi32(0x0100_0010));
-                let sextets = _mm_or_si128(t1, t3);
-                let reduced = _mm_subs_epu8(sextets, fifty_one);
-                let mask = _mm_cmpgt_epi8(sextets, twenty_five);
-                let reduced = _mm_sub_epi8(reduced, mask);
-                let ascii = _mm_add_epi8(sextets, _mm_shuffle_epi8(offsets, reduced));
+                let raw = _mm_loadu_si128(bytes.as_ptr().add(at).cast());
+                let ascii = encode_block(raw, shuffle, offsets, fifty_one, twenty_five);
+                _mm_storeu_si128(out.add(out_at).cast(), ascii);
+                at += 12;
+                out_at += 16;
+            }
+            if at + 12 <= bytes.len() {
+                let low = _mm_loadl_epi64(bytes.as_ptr().add(at).cast());
+                let high = _mm_loadu_si32(bytes.as_ptr().add(at + 8).cast());
+                let raw = _mm_unpacklo_epi64(low, high);
+                let ascii = encode_block(raw, shuffle, offsets, fifty_one, twenty_five);
                 _mm_storeu_si128(out.add(out_at).cast(), ascii);
                 at += 12;
                 out_at += 16;
