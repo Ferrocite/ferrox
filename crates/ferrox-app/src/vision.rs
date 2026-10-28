@@ -443,8 +443,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                         continue;
                     }
                     if self.dot > was {
-                        // the walk ate nothing this pass; its state moved, so it resumes
-                        continue;
+                        // A pass that moves without content yields the session lock to the writer.
+                        return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
                     }
                 }
                 if !self.fill()? {
@@ -624,6 +624,9 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                     }
                     dot += content + padding;
                     if command == VisionCommand::Continue.byte() {
+                        if held == 0 {
+                            break 'frames held;
+                        }
                         continue 'frames;
                     }
                     self.session.disarm_record_alignment();
@@ -693,6 +696,9 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             }
             if walk.command == VisionCommand::Continue.byte() {
                 walk.want_header = 5;
+                if held == 0 {
+                    break 'frames held;
+                }
                 continue 'frames;
             }
             // a command that is not a continue ends the framing; its tail is content
@@ -1003,6 +1009,18 @@ mod tests {
             link.session.disarmed, 1,
             "the end of the framing stops the limiter"
         );
+    }
+
+    #[test]
+    fn a_content_free_frame_hands_the_session_lock_back() {
+        let mut input = frame(true, 0, b"", 0);
+        input.extend(frame(false, 1, b"tail", 0));
+        let mut link = link(&input);
+        let mut out = [0u8; 8];
+        let error = link.read(&mut out).expect_err("a frame boundary yields");
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        let n = link.read(&mut out).expect("reads");
+        assert_eq!(&out[..n], b"tail");
     }
 
     #[test]
@@ -1378,7 +1396,11 @@ mod tests {
         let mut got = Vec::new();
         let mut buf = vec![0u8; 65_536];
         loop {
-            let n = link.read(&mut buf).expect("reads");
+            let n = match link.read(&mut buf) {
+                Ok(n) => n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => panic!("reads: {error}"),
+            };
             if n == 0 {
                 break;
             }
