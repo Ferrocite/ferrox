@@ -1006,6 +1006,18 @@ mod tests {
     }
 
     #[test]
+    fn a_content_free_frame_hands_the_session_lock_back() {
+        let mut input = frame(true, 0, b"", 0);
+        input.extend(frame(false, 1, b"tail", 0));
+        let mut link = link(&input);
+        let mut out = [0u8; 8];
+        let error = link.read(&mut out).expect_err("a frame boundary yields");
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
+        let n = link.read(&mut out).expect("reads");
+        assert_eq!(&out[..n], b"tail");
+    }
+
+    #[test]
     fn a_frame_split_across_reads_is_reassembled() {
         let mut input = frame(true, 0, b"split", 30);
         input.extend(frame(false, 1, b"tail", 4));
