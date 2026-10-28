@@ -18791,8 +18791,11 @@ pub(crate) mod lane_pool {
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Next {
         Done,
+        /// Nothing to read yet: the lane waits off the workers for a poll quantum.
         Idle,
         More,
+        /// Ready as soon as the queue gives it a turn: the step already spent its own wait.
+        Retry,
     }
 
     pub(crate) type Step = Box<dyn FnMut() -> Next + Send + 'static>;
@@ -18894,7 +18897,7 @@ pub(crate) mod lane_pool {
                 match stepped {
                     // A burst of reads saves the wakeups a per-read requeue would pay.
                     Ok(Next::More) if burst < RELAY_BURST => burst += 1,
-                    Ok(Next::More) => {
+                    Ok(Next::More | Next::Retry) => {
                         let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
                         ready.push_back(lane);
                         drop(ready);
@@ -18961,7 +18964,7 @@ pub(crate) mod lane_pool {
                 lane.run()
             }));
             match stepped {
-                Ok(Next::Idle | Next::More) => {}
+                Ok(Next::Idle | Next::More | Next::Retry) => {}
                 Ok(Next::Done) | Err(_) => {
                     let _ =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.finish()));
@@ -19809,11 +19812,11 @@ fn forward_flush(
     while *sent < *pending {
         match uplink.push(&buffer.prefix(*pending)[*sent..]) {
             Push::Took(n) if n > 0 => *sent += n,
-            Push::Took(_) => return Some(Next::Idle),
+            Push::Took(_) => return Some(Next::Retry),
             Push::Parked => {
-                // A parked window has no read to wait in, so the lane must sleep here or its next turn spins against the same full queue.
+                // A parked window has no read to wait in, so the lane sleeps here and comes back next turn, not a quantum later.
                 std::thread::sleep(crate::budgets::RELAY_POLL);
-                return Some(Next::Idle);
+                return Some(Next::Retry);
             }
             Push::Lost => {
                 echo_trace("relay fwd send failed");
