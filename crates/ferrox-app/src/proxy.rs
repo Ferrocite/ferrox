@@ -480,6 +480,15 @@ fn serve_inbounds_counted(
                         }
                     }
                     "masque" => {
+                        if let Some(shared) = route {
+                            let tag = inbound_tag(inbound);
+                            if let Some(selector) = shared.routing.source_refusal(tag.as_deref()) {
+                                exit(&format!(
+                                    "bad config {label}: masque inbound {} names `{selector}`, which a MASQUE flow cannot answer",
+                                    tag.as_deref().unwrap_or("<untagged>")
+                                ));
+                            }
+                        }
                         let Some(out) = routed(inbound, false) else {
                             continue;
                         };
