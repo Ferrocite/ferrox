@@ -61,6 +61,8 @@ const DNS_PORT_FIRST: u16 = 1024;
 const DNS_PORT_LAST: u16 = 49_152;
 /// The most names one outbound caches.
 const DNS_CACHE: usize = 256;
+/// Seconds a failed lookup is remembered, so a dead name does not stall a lane per datagram.
+const DNS_NEGATIVE_TTL: u32 = 5;
 /// The reference's cookie lifetime and its one-second under-load tail.
 const COOKIE_REFRESH: u64 = 120_000;
 const UNDER_LOAD: u64 = 1_000;
@@ -313,9 +315,9 @@ impl WireGuardOut {
                 }
             }
         }
-        let Some((addrs, ttl)) = self.query(host) else {
-            return Vec::new();
-        };
+        let (addrs, ttl) = self
+            .query(host)
+            .unwrap_or_else(|| (Vec::new(), DNS_NEGATIVE_TTL));
         if let Ok(mut cache) = self.resolved.lock() {
             if cache.len() >= DNS_CACHE {
                 cache.clear();
@@ -1262,10 +1264,10 @@ mod tests {
             dns: vec!["127.0.0.1".parse().unwrap()],
         };
         let wireguard = WireGuardOut::new(config).expect("outbound");
-        assert!(wireguard.lookup("missing.example").is_empty());
+        assert_eq!(wireguard.lookup("missing.example"), Vec::<IpAddr>::new());
         let cache = wireguard.resolved.lock().expect("cache");
         let entry = cache.get("missing.example").expect("negative entry");
-        assert!(entry.addrs.is_empty());
+        assert_eq!(entry.addrs, Vec::<IpAddr>::new());
         assert!(entry.until > Instant::now());
     }
 
