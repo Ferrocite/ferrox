@@ -19578,6 +19578,7 @@ pub(crate) mod lane_pool {
                 );
             }
             let waiting = gate.wait_for(2, Duration::from_secs(5));
+            gate.release();
             assert_eq!(
                 waiting, 2,
                 "both lanes of the narrow cell reached their read"
@@ -19588,7 +19589,6 @@ pub(crate) mod lane_pool {
                 "the pool started {} workers for the two lanes a one-flow cell queues",
                 pool.workers.load(Ordering::Relaxed)
             );
-            gate.release();
             let deadline = Instant::now() + Duration::from_secs(5);
             while finished.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(1));
