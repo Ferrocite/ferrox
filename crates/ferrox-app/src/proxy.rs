@@ -2884,8 +2884,7 @@ fn serve_vless_grpc(
     if !writer.send(&[0, 0]) {
         return;
     }
-    // The frame that grants this lane's window arrives on this read, so it waits out the stall rather than a quantum: a read that hands back its worker every millisecond parses the credit a millisecond late, and the writer waits on it. A peer silent for a whole stall still parks the lane.
-    reader.set_poll(Some(budgets::relay_stall()));
+    reader.set_poll(Some(RELAY_POLL));
     crate::proxy::relay_sink(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
 }
 
@@ -20089,11 +20088,12 @@ fn upload_finished(
             }
             Next::More
         }
+        // A carrier read that times out is not an idle socket to park: the frame that grants the sibling's window arrives on this read, so the lane takes another turn at once rather than a quantum later.
         Err(error) if is_timeout(&error) => {
             if ended() {
                 Next::Done
             } else {
-                Next::Idle
+                Next::More
             }
         }
         Err(error) => {
