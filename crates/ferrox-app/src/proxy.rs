@@ -8673,15 +8673,27 @@ fn xdrive_relay(app: &Connection, mut down: crate::xdrive::Conn) {
         }
         let _ = up.end_write();
     });
+    let linger = down.linger();
+    let mut ended = false;
+    let mut quiet = Instant::now();
     let mut buf = RelayBuf::new().into_vec();
     loop {
         match down.read(&mut buf) {
             Ok(n) if n > 0 => {
+                quiet = Instant::now();
                 if app_write.write_all(&buf[..n]).is_err() {
                     break;
                 }
             }
-            Err(error) if is_timeout(&error) => {}
+            Err(error) if is_timeout(&error) => {
+                if !ended && done.try_recv().is_ok() {
+                    ended = true;
+                    quiet = Instant::now();
+                }
+                if ended && quiet.elapsed() >= linger {
+                    break;
+                }
+            }
             _ => break,
         }
     }
@@ -32387,7 +32399,43 @@ mod tests {
         sock.write_all(b"ping").expect("writes");
         assert_eq!(&read_echo(&mut sock), b"ping", "the store's session relays");
         drop(sock);
-        relay.join().expect("joins");
+        join_thread_within(relay, Duration::from_secs(30), "the store's session");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A store peer that goes quiet without publishing an end cannot pin the relay: once our own source is done the report stops after the store's own round trip of silence.
+    #[test]
+    fn an_xdrive_relay_leaves_a_peer_that_never_ends() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-xdrive-linger-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let folder = dir.to_str().expect("utf-8 folder").replace('\\', "\\\\");
+        let settings = crate::json::parse(&format!(
+            r#"{{"network": "xdrive", "security": "tls",
+                "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
+                    "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
+                "tlsSettings": {{"allowInsecure": true}}}}"#
+        ))
+        .expect("parses");
+        let settings = crate::xdrive::Settings::from_json(Some(&settings)).expect("settings");
+        let session = settings.dial(Some(("127.0.0.1", 9))).expect("dials");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let peer = thread::spawn(move || {
+            let (socket, _) = listener.accept().expect("accepts");
+            drop(socket);
+        });
+        let app = Connection::connect(("127.0.0.1", port)).expect("connects");
+        let relay = thread::spawn(move || xdrive_relay(&app, session));
+        join_thread_within(relay, Duration::from_secs(5), "a peer that never ends");
+        peer.join().expect("the peer closes");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
