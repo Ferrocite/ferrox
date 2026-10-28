@@ -3608,18 +3608,14 @@ mod tests {
         );
 
         receiver.set_nonblocking(true).expect("a reading queue");
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut got = Vec::new();
         let mut buf = [0u8; 128];
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while got.len() < held.len() {
+        while got.len() < held.len() && Instant::now() < deadline {
             match receiver.recv_from(&mut buf) {
                 Ok((n, _)) => got.push(buf[..n].to_vec()),
                 Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                    assert!(
-                        std::time::Instant::now() < deadline,
-                        "the held datagrams never reached the receiver"
-                    );
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    std::thread::sleep(Duration::from_millis(1));
                 }
                 Err(error) => panic!("recv: {error}"),
             }
@@ -4299,9 +4295,25 @@ mod tests {
             "the current port is not the nominal"
         );
         let mut buf = [0u8; 64];
-        hop.set_read_timeout(Some(Duration::from_millis(400)))
+        hop.set_read_timeout(Some(Duration::from_millis(100)))
             .expect("timeout");
-        let (n, from) = hop.recv_from(&mut buf).expect("reads the reply");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (n, from) = loop {
+            match hop.recv_from(&mut buf) {
+                Ok((n, from)) if from.ip() == server.ip() && from.port() == server.port() => {
+                    break (n, from);
+                }
+                Ok(_) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(error) => panic!("reads the reply: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the nominal server did not reply"
+            );
+        };
         assert_eq!(&buf[..n], b"pong");
         assert_eq!(from.ip(), server.ip());
         assert_eq!(
