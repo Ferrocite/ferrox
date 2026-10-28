@@ -3,6 +3,7 @@
     reason = "counters become floats only to be printed; no gate reads the rounded value"
 )]
 mod aesgcm;
+mod b64bench;
 mod ciphers;
 mod compare;
 mod compare_process;
@@ -897,6 +898,7 @@ fn gate_ten(report: &mut String) -> Vec<framing::Row> {
     rows
 }
 
+#[allow(clippy::too_many_lines)]
 fn main() {
     if let Some(code) = side_exit() {
         std::process::exit(code);
@@ -928,6 +930,12 @@ fn main() {
     let early = gate_eight(&mut report);
     gate_nine(&mut report);
     let aes_gcm_rows = gate_ten(&mut report);
+    let b64_rows = b64bench::gate_b64();
+    println!(
+        "gate 11 passed: {} base64 rows, each the shipped coder against the loop it replaced",
+        b64_rows.len()
+    );
+    report.push_str(&b64bench::report(&b64_rows));
 
     report.push_str(&config_section(args.config.as_deref()));
 
@@ -957,6 +965,22 @@ fn main() {
         .chain(aes_gcm_rows.iter())
         .filter(|r| r.ratio() < BAR)
         .collect();
+    let slow_b64: Vec<&framing::Row> = b64_rows.iter().filter(|r| r.ratio() < 1.0).collect();
+    assert!(
+        slow_b64.is_empty(),
+        "BASE64 REGRESSION: the shipped coder is slower than the loop it replaced at {} row(s), \
+         worst {:.3}x: {}",
+        slow_b64.len(),
+        slow_b64
+            .iter()
+            .map(|r| r.ratio())
+            .fold(f64::INFINITY, f64::min),
+        slow_b64
+            .iter()
+            .map(|r| format!("{}={:.3}x", r.name, r.ratio()))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
     assert!(
         slow_frames.is_empty(),
         "FRAMING REGRESSION: a framing slower than its reference at {} row(s), worst {:.3}x: {}",
