@@ -340,7 +340,10 @@ impl Client {
             if self.wire.closed || self.end {
                 break;
             }
-            while !self.end {
+            for _ in 0..QUEUED_CAP {
+                if self.end {
+                    break;
+                }
                 let Ok(packet) = from_tunnel.try_recv() else {
                     break;
                 };
@@ -668,6 +671,9 @@ impl Session {
             }
             wire.pending = pending;
             self.flush(wire);
+            if wire.closed || self.end {
+                break;
+            }
             if !wire.fill() {
                 break;
             }
@@ -895,7 +901,10 @@ impl Session {
                 return;
             }
         }
-        while !self.end {
+        for _ in 0..QUEUED_CAP {
+            if wire.closed || self.end {
+                break;
+            }
             let Some(packet) = self
                 .outgoing
                 .as_ref()
