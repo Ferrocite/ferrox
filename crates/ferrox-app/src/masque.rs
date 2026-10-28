@@ -8,7 +8,7 @@
 //! the stack when no tunnel does.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
@@ -999,11 +999,41 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         return Err("unreadable masque tls identity".to_owned());
     };
     config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
-    let sock = UdpSocket::bind(address)
-        .map_err(|error| format!("cannot bind masque `{address}`: {error}"))?;
-    let local = sock
-        .local_addr()
-        .map_err(|error| format!("masque `{address}` has no local address: {error}"))?;
+    let h2 = identity.alpn.iter().any(|alpn| alpn == b"h2");
+    let (sock, local, h2_listener) = if h2 && address.ends_with(":0") {
+        let mut tries = 0;
+        loop {
+            let listener = TcpListener::bind(address)
+                .map_err(|error| format!("cannot bind masque `{address}`: {error}"))?;
+            let local = listener
+                .local_addr()
+                .map_err(|error| format!("masque `{address}` has no local address: {error}"))?;
+            match UdpSocket::bind(local) {
+                Ok(sock) => break (sock, local, Some(listener)),
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && tries < 8 => {
+                    tries += 1;
+                }
+                Err(error) => return Err(format!("cannot bind masque `{local}`: {error}")),
+            }
+        }
+    } else {
+        let sock = UdpSocket::bind(address)
+            .map_err(|error| format!("cannot bind masque `{address}`: {error}"))?;
+        let local = sock
+            .local_addr()
+            .map_err(|error| format!("masque `{address}` has no local address: {error}"))?;
+        let h2_listener = if h2 {
+            if let Ok(listener) = TcpListener::bind(local) {
+                Some(listener)
+            } else {
+                eprintln!("masque: no HTTP/2 listener on {local}; h3 still serves");
+                None
+            }
+        } else {
+            None
+        };
+        (sock, local, h2_listener)
+    };
     let sock = Arc::new(Datagram::plain(sock));
     let (packets, packets_rx) = mpsc::channel();
     let shared = Arc::new(Shared {
@@ -1015,12 +1045,12 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     let (to_tunnel, from_stack) = mpsc::sync_channel(QUEUE);
     let dispatcher = Arc::clone(&shared);
     std::thread::spawn(move || dispatch(&dispatcher, from_stack));
-    if identity.alpn.iter().any(|alpn| alpn == b"h2") {
+    if let Some(listener) = h2_listener {
         crate::masque_h2::serve(
             Arc::clone(&identity),
             Arc::clone(&shared),
             Arc::clone(&spec),
-            local,
+            listener,
         );
     }
     let device = DeviceConfig {
