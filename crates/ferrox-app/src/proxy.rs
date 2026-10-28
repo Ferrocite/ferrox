@@ -296,6 +296,32 @@ fn inbound_sniffing(inbound: &Json, label: &str) -> Option<Arc<crate::sniff::Sni
     })
 }
 
+fn refuse_source(
+    route: Option<&Arc<RouteShared>>,
+    inbound: &Json,
+    label: &str,
+    kind: &str,
+    prove: bool,
+) -> bool {
+    let Some(shared) = route else {
+        return false;
+    };
+    let tag = inbound_tag(inbound);
+    let Some(selector) = shared.routing.source_refusal(tag.as_deref()) else {
+        return false;
+    };
+    let message = format!(
+        "bad config {label}: {} inbound {} names `{selector}`, which a {kind} flow cannot answer",
+        canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or("")),
+        tag.as_deref().unwrap_or("<untagged>")
+    );
+    if prove {
+        exit(&message);
+    }
+    eprintln!("{message}");
+    true
+}
+
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 fn serve_inbounds_counted(
     label: &str,
@@ -445,14 +471,8 @@ fn serve_inbounds_counted(
                     }
                     "tun" => {
                         // A tun flow has no source or local address, so a reaching rule that names one is refused here.
-                        if let Some(shared) = route {
-                            let tag = inbound_tag(inbound);
-                            if let Some(selector) = shared.routing.source_refusal(tag.as_deref()) {
-                                exit(&format!(
-                                    "bad config {label}: tun inbound {} names `{selector}`, which a tun flow cannot answer",
-                                    tag.as_deref().unwrap_or("<untagged>")
-                                ));
-                            }
+                        if refuse_source(route, inbound, label, "tun", prove) {
+                            continue;
                         }
                         let Some(out) = routed(inbound, false) else {
                             continue;
@@ -462,14 +482,8 @@ fn serve_inbounds_counted(
                         }
                     }
                     "wireguard" => {
-                        if let Some(shared) = route {
-                            let tag = inbound_tag(inbound);
-                            if let Some(selector) = shared.routing.source_refusal(tag.as_deref()) {
-                                exit(&format!(
-                                    "bad config {label}: wireguard inbound {} names `{selector}`, which a tunnel flow cannot answer",
-                                    tag.as_deref().unwrap_or("<untagged>")
-                                ));
-                            }
+                        if refuse_source(route, inbound, label, "tunnel", prove) {
+                            continue;
                         }
                         let Some(out) = routed(inbound, false) else {
                             continue;
@@ -480,14 +494,8 @@ fn serve_inbounds_counted(
                         }
                     }
                     "masque" => {
-                        if let Some(shared) = route {
-                            let tag = inbound_tag(inbound);
-                            if let Some(selector) = shared.routing.source_refusal(tag.as_deref()) {
-                                exit(&format!(
-                                    "bad config {label}: masque inbound {} names `{selector}`, which a MASQUE flow cannot answer",
-                                    tag.as_deref().unwrap_or("<untagged>")
-                                ));
-                            }
+                        if refuse_source(route, inbound, label, "MASQUE", prove) {
+                            continue;
                         }
                         let Some(out) = routed(inbound, false) else {
                             continue;
@@ -24260,6 +24268,38 @@ mod tests {
             "gone"
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_dynamic_inbound_naming_a_source_selector_is_not_served() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"}],"routing":{"rules":[{"type":"field","outboundTag":"direct","inboundTag":["dyn"],"source":["192.0.2.0/24"]}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = Arc::new(crate::reverse::Portals::default());
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let (cert, key, _) = tls_cert_json();
+        let dynamic = crate::json::parse(&format!(
+            r#"{{"inbounds":[{{"tag":"dyn","protocol":"masque","listen":"127.0.0.1","port":443,"settings":{{"users":[{{"email":"u@example.com","pass":"p"}}],"address":["10.14.0.1/24"]}},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"certificates":[{{"certificate":{cert},"key":{key}}}]}}}}}}]}}"#
+        ))
+        .expect("parses");
+        let inbound = dynamic
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .and_then(|list| list.first())
+            .expect("an inbound");
+        assert!(
+            refuse_source(Some(&shared), inbound, "commander", "MASQUE", false),
+            "the source rule is refused"
+        );
+        let runtime = Runtime::new(None, Some(Arc::clone(&shared)), false, Arc::clone(&portals));
+        let api = crate::commander::Api::new(crate::commander::ApiConfig::default());
+        let seed = crate::xray_pb::Seed::default();
+        let (served, _) = serve_dynamic_inbounds(&runtime, &dynamic, &seed, &api);
+        assert_eq!(served, 0, "the dynamic inbound is refused, not served");
     }
 
     #[test]
