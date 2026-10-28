@@ -488,7 +488,7 @@ fn attempt(
 }
 
 fn verify_edge(spec: &ClientSpec, conn: &quiche::Connection) -> Result<(), String> {
-    if spec.tls.insecure || spec.tls.cert_pins.is_empty() {
+    if spec.tls.cert_pins.is_empty() {
         return Ok(());
     }
     let chain: Vec<Vec<u8>> = match conn.peer_cert_chain() {
