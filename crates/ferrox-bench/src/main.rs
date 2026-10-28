@@ -965,7 +965,10 @@ fn main() {
         .chain(aes_gcm_rows.iter())
         .filter(|r| r.ratio() < BAR)
         .collect();
-    let slow_b64: Vec<&framing::Row> = b64_rows.iter().filter(|r| r.ratio() < 1.0).collect();
+    let slow_b64: Vec<&framing::Row> = b64_rows
+        .iter()
+        .filter(|r| r.ratio() < b64bench::PARITY)
+        .collect();
     assert!(
         slow_b64.is_empty(),
         "BASE64 REGRESSION: the shipped coder is slower than the loop it replaced at {} row(s), \
