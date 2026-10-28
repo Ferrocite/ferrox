@@ -3213,7 +3213,7 @@ mod tests {
     )]
     #[test]
     fn a_relay_sized_write_crosses_the_tls_buffer() {
-        use crate::tls::TlsProvider as _;
+        use crate::tls::{RecordAlignment as _, TlsProvider as _};
 
         let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
         let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
