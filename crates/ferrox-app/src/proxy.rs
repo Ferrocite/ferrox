@@ -480,6 +480,11 @@ fn serve_inbounds_counted(
                         }
                     }
                     "masque" => {
+                        if let Some(shared) = route {
+                            if let Some(reason) = masque_source_refusal(shared, inbound) {
+                                exit(&format!("bad config {label}: {reason}"));
+                            }
+                        }
                         let Some(out) = routed(inbound, false) else {
                             continue;
                         };

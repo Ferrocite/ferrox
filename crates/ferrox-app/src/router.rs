@@ -1010,25 +1010,27 @@ impl Routing {
 
     /// The first selector a `tun` flow cannot answer, if a rule that could reach it names one.
     pub(crate) fn source_refusal(&self, inbound: Option<&str>) -> Option<&'static str> {
-        for rule in &self.rules {
-            if !rule.reachable(inbound, Network::Tcp) || !rule.local_os_matches() {
-                continue;
-            }
-            if rule
-                .sets
-                .as_ref()
-                .is_some_and(|sets| sets.iter().any(|set| set.needs_source()))
-            {
-                return Some("ruleSet");
-            }
-            for (present, name) in [
-                (rule.source_ips.is_some(), "source"),
-                (rule.source_ports.is_some(), "sourcePort"),
-                (rule.local_ips.is_some(), "localIP"),
-                (rule.local_ports.is_some(), "localPort"),
-            ] {
-                if present {
-                    return Some(name);
+        for network in [Network::Tcp, Network::Udp] {
+            for rule in &self.rules {
+                if !rule.reachable(inbound, network) || !rule.local_os_matches() {
+                    continue;
+                }
+                if rule
+                    .sets
+                    .as_ref()
+                    .is_some_and(|sets| sets.iter().any(|set| set.needs_source()))
+                {
+                    return Some("ruleSet");
+                }
+                for (present, name) in [
+                    (rule.source_ips.is_some(), "source"),
+                    (rule.source_ports.is_some(), "sourcePort"),
+                    (rule.local_ips.is_some(), "localIP"),
+                    (rule.local_ports.is_some(), "localPort"),
+                ] {
+                    if present {
+                        return Some(name);
+                    }
                 }
             }
         }
