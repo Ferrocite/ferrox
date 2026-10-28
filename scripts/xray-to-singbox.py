@@ -34,6 +34,15 @@ def _prefix(value):
         raise ValueError(f"`{value}` is not an IP address or prefix") from error
 
 
+def _interface(value):
+    if not isinstance(value, str):
+        raise ValueError(f"`{value}` is not an IP address or prefix")
+    try:
+        return str(ipaddress.ip_interface(value))
+    except ValueError as error:
+        raise ValueError(f"`{value}` is not an IP address or prefix") from error
+
+
 def _wireguard_key(value, what):
     if not isinstance(value, str) or not value:
         raise ValueError(f"the WireGuard {what} is missing")
@@ -61,7 +70,7 @@ def _wireguard_addresses(settings):
         raw = list(DEFAULT_WIREGUARD_ADDRESSES)
     if not isinstance(raw, list):
         raise ValueError("`address` must be an array")
-    return [_prefix(value) for value in raw]
+    return [_interface(value) for value in raw]
 
 
 def _wireguard_mtu(settings):
