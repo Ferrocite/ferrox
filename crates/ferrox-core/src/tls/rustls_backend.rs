@@ -3250,10 +3250,6 @@ mod tests {
                 let (stream, _) = listener.accept().expect("accepts");
                 let mut server = crate::tls::accept(&identity, stream).expect("accepts");
                 server.handshake().expect("handshakes");
-                server
-                    .get_ref()
-                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-                    .expect("arms a timeout");
                 let mut buf = [0u8; 64 * 1024];
                 let mut got = 0usize;
                 while got < want {
