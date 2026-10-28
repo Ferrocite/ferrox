@@ -3103,7 +3103,15 @@ pub(crate) fn resolve_ips(host: &str, port: u16) -> Vec<IpAddr> {
 }
 
 pub(crate) fn resolve_ips_ttl(host: &str, port: u16) -> (Vec<IpAddr>, u32) {
-    if let Some(resolver) = crate::dnsapp::installed() {
+    resolve_ips_ttl_with(crate::dnsapp::installed().as_ref(), host, port)
+}
+
+fn resolve_ips_ttl_with(
+    resolver: Option<&Arc<crate::dnsapp::Resolver>>,
+    host: &str,
+    port: u16,
+) -> (Vec<IpAddr>, u32) {
+    if let Some(resolver) = resolver {
         match resolver.lookup_result(host) {
             crate::dnsapp::Lookup::Records(ips, ttl) => return (ips, ttl),
             crate::dnsapp::Lookup::Empty | crate::dnsapp::Lookup::Rcode(_) => {
@@ -5163,18 +5171,16 @@ mod tests {
         assert_eq!(targets, ["a", "b"]);
     }
 
-    struct ClearResolver;
-
-    impl Drop for ClearResolver {
-        fn drop(&mut self) {
-            let _ = crate::dnsapp::install(&object(vec![]));
-        }
+    fn resolver(root: &Json) -> Arc<crate::dnsapp::Resolver> {
+        Arc::new(
+            crate::dnsapp::Resolver::from_root(root)
+                .expect("resolver")
+                .expect("configured"),
+        )
     }
 
     #[test]
     fn a_routed_lookup_uses_the_configured_family_strategy() {
-        let _guard = crate::stats::test_lock();
-        let _clear = ClearResolver;
         let root = object(vec![(
             "dns",
             object(vec![
@@ -5192,11 +5198,11 @@ mod tests {
                 ),
             ]),
         )]);
-        crate::dnsapp::install(&root).expect("install");
-        let (ips, ttl) = resolve_ips_ttl("dual.test", 0);
+        let resolver = resolver(&root);
+        let (ips, ttl) = resolve_ips_ttl_with(Some(&resolver), "dual.test", 0);
         assert_eq!(ttl, 10);
         assert_eq!(ips, vec!["10.0.0.1".parse::<IpAddr>().expect("ipv4")]);
-        let (ips, _) = resolve_ips_ttl("localhost", 0);
+        let (ips, _) = resolve_ips_ttl_with(Some(&resolver), "localhost", 0);
         assert!(
             ips.is_empty(),
             "an authoritative empty answer is not retried through the system"
@@ -5205,14 +5211,12 @@ mod tests {
 
     #[test]
     fn a_skipped_fake_server_falls_back_to_the_system() {
-        let _guard = crate::stats::test_lock();
-        let _clear = ClearResolver;
         let root = crate::json::parse(
             r#"{"dns":{"servers":["fakedns"],"queryStrategy":"UseIP"},"fakeDns":{"ipPool":"198.18.0.0/15","poolSize":32768}}"#,
         )
         .expect("parses");
-        crate::dnsapp::install(&root).expect("install");
-        let (ips, _) = resolve_ips_ttl("localhost", 0);
+        let resolver = resolver(&root);
+        let (ips, _) = resolve_ips_ttl_with(Some(&resolver), "localhost", 0);
         assert!(
             !ips.is_empty(),
             "a skipped fake server falls back to the system"
