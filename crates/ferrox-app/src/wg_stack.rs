@@ -34,7 +34,7 @@ use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndp
 
 use crate::conn::Connection;
 use crate::proxy::{serve_device_flow, serve_udp_lane, Destination, Outbound};
-use crate::wireguard::DeviceConfig;
+use crate::wireguard::{DeviceConfig, PeerConfig};
 
 /// The receive side of one flow: a peer may have this much in flight before a
 /// window update, which is the reference's order of magnitude.
@@ -368,8 +368,8 @@ type Packets = Receiver<Packet>;
 fn receive_client(stack: &mut ClientStack, packet: Packet) {
     if inner_protocol(&packet.bytes) == Some(PROTOCOL_TCP) {
         stack.device.push(packet.bytes);
-    } else if !stack.answer_echo(&packet.bytes) && stack.device.absorb(&packet.bytes) {
-        stack.reset_iface();
+    } else if !stack.answer_echo(&packet.bytes) {
+        stack.absorb(&packet);
     }
 }
 
@@ -439,6 +439,7 @@ struct ClientStack {
     next_port: u16,
     to_tunnel: ToTunnel,
     addresses: Vec<IpAddr>,
+    peers: Vec<PeerConfig>,
     started: StdInstant,
 }
 
@@ -462,12 +463,32 @@ impl ClientStack {
             next_port: 49_152,
             to_tunnel,
             addresses: config.addresses.clone(),
+            peers: config.peers.clone(),
             started: StdInstant::now(),
         }
     }
 
     fn answer_echo(&self, packet: &[u8]) -> bool {
         answer_echo(packet, &self.addresses, &self.to_tunnel)
+    }
+
+    /// A Packet Too Big narrows the shared MTU only when it quotes a flow this
+    /// peer routes and this client sent.
+    fn absorb(&mut self, packet: &Packet) {
+        let Some((source, destination)) = icmp_quoted(&packet.bytes) else {
+            return;
+        };
+        if !self.addresses.contains(&source)
+            || !self
+                .peers
+                .iter()
+                .any(|peer| peer.public == packet.peer && peer.routes(destination))
+        {
+            return;
+        }
+        if self.device.absorb(&packet.bytes) {
+            self.reset_iface();
+        }
     }
 
     /// Rebuild the interface so smoltcp's cached capabilities carry the learned MTU.
@@ -1311,6 +1332,38 @@ fn icmp_message(packet: &[u8]) -> Option<&[u8]> {
         }
         _ => None,
     }
+}
+
+/// The source and destination the ICMP error quotes, when the quoted header is
+/// long enough to carry them.
+fn icmp_quoted(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
+    if packet.len() >= 48
+        && packet[0] >> 4 == 4
+        && packet[9] == PROTOCOL_ICMP
+        && packet[20] == 3
+        && packet[21] == 4
+    {
+        let quoted = 28;
+        if packet.len() >= quoted + 20 && packet[quoted] >> 4 == 4 {
+            let source = <[u8; 4]>::try_from(&packet[quoted + 12..quoted + 16]).ok()?;
+            let destination = <[u8; 4]>::try_from(&packet[quoted + 16..quoted + 20]).ok()?;
+            return Some((IpAddr::from(source), IpAddr::from(destination)));
+        }
+    }
+    if packet.len() >= 88
+        && packet[0] >> 4 == 6
+        && packet[6] == PROTOCOL_ICMPV6
+        && packet[40] == 2
+        && packet[41] == 0
+    {
+        let quoted = 48;
+        if packet[quoted] >> 4 == 6 {
+            let source = <[u8; 16]>::try_from(&packet[quoted + 8..quoted + 24]).ok()?;
+            let destination = <[u8; 16]>::try_from(&packet[quoted + 24..quoted + 40]).ok()?;
+            return Some((IpAddr::from(source), IpAddr::from(destination)));
+        }
+    }
+    None
 }
 
 /// The MTU an ICMP Packet Too Big names, when the packet is one at all: a v4 destination-unreachable with code 4, or a v6 packet-too-big, both at or above their family's floor.
