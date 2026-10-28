@@ -934,17 +934,13 @@ impl ServerStack {
             };
             let out = self.out.clone();
             std::thread::spawn(move || {
-                let _ = serve_device_flow(
-                    Connection::from(proxy),
-                    &out,
-                    &Destination::Address(destination),
-                );
+                let _ = serve_device_flow(proxy, &out, &Destination::Address(destination));
             });
             if tun.set_nonblocking(true).is_err() {
                 self.sockets.remove(handle);
                 continue;
             }
-            self.flows.push(Flow::new(handle, Connection::from(tun), 0));
+            self.flows.push(Flow::new(handle, tun, 0));
         }
     }
 
@@ -1066,12 +1062,19 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
     }
 }
 
-fn loopback() -> std::io::Result<(std::net::TcpStream, std::net::TcpStream)> {
+#[cfg(unix)]
+fn loopback() -> std::io::Result<(Connection, Connection)> {
+    let (tun, proxy) = std::os::unix::net::UnixStream::pair()?;
+    Ok((Connection::from(tun), Connection::from(proxy)))
+}
+
+#[cfg(not(unix))]
+fn loopback() -> std::io::Result<(Connection, Connection)> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     let address = listener.local_addr()?;
     let tun = std::net::TcpStream::connect(address)?;
     let (proxy, _) = listener.accept()?;
-    Ok((tun, proxy))
+    Ok((Connection::from(tun), Connection::from(proxy)))
 }
 
 fn iface_config(seed: u64) -> IfaceConfig {
@@ -1722,7 +1725,7 @@ mod tests {
         let mut stack = ClientStack::new(&config, to_tunnel);
         stack
             .connect(ClientFlow {
-                client: Connection::from(proxy),
+                client: proxy,
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
             })
@@ -2068,7 +2071,7 @@ mod client_tests {
                 &thread_config,
                 &to_tunnel,
                 &thread_routes,
-                Some(&Connection::from(associate)),
+                Some(&associate),
                 &resolve_one,
             );
             let _ = done_tx.send(());
@@ -2488,7 +2491,7 @@ mod client_tests {
         let (app, proxy) = loopback().expect("pair");
         stack
             .connect(ClientFlow {
-                client: Connection::from(proxy),
+                client: proxy,
                 destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
             })
