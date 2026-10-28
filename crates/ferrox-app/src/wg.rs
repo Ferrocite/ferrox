@@ -930,15 +930,20 @@ fn send_packet(
 ) {
     let initiation = packet.len() == INITIATION_SIZE
         && u32::from_le_bytes(packet[..4].try_into().unwrap_or([0; 4])) == TYPE_INITIATION;
-    let targets = match candidates {
-        Some(candidates) if initiation && !candidates.is_empty() => candidates,
-        _ => std::slice::from_ref(&endpoint),
-    };
-    for target in targets {
-        if !ipv6 && target.is_ipv6() {
-            continue;
+    if initiation {
+        if ipv6 || endpoint.is_ipv4() {
+            let _ = socket.send_to(packet, send_endpoint(endpoint, ipv6));
         }
-        let _ = socket.send_to(packet, send_endpoint(*target, ipv6));
+        for target in candidates.unwrap_or_default() {
+            if *target == endpoint || (!ipv6 && target.is_ipv6()) {
+                continue;
+            }
+            let _ = socket.send_to(packet, send_endpoint(*target, ipv6));
+        }
+        return;
+    }
+    if ipv6 || endpoint.is_ipv4() {
+        let _ = socket.send_to(packet, send_endpoint(endpoint, ipv6));
     }
 }
 
@@ -1419,6 +1424,62 @@ mod tests {
         assert!(
             v6.recv_from(&mut buf).is_err(),
             "a v4-only socket skips the v6 candidate"
+        );
+    }
+
+    #[test]
+    fn a_roamed_endpoint_still_receives_a_rekey() {
+        let Ok(v4) = UdpSocket::bind("127.0.0.1:0") else {
+            return;
+        };
+        let Ok(v6) = UdpSocket::bind("[::1]:0") else {
+            return;
+        };
+        let Ok(roamed) = UdpSocket::bind("127.0.0.1:0") else {
+            return;
+        };
+        let Ok(sender) = bind_dual_stack() else {
+            return;
+        };
+        let candidates = vec![
+            v4.local_addr().expect("v4 address"),
+            v6.local_addr().expect("v6 address"),
+        ];
+        let roamed_address = roamed.local_addr().expect("roamed address");
+        for socket in [&v4, &v6, &roamed] {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("timeout");
+        }
+        let mut initiation = vec![0u8; INITIATION_SIZE];
+        initiation[..4].copy_from_slice(&TYPE_INITIATION.to_le_bytes());
+        send_packet(
+            &sender,
+            true,
+            roamed_address,
+            &initiation,
+            Some(&candidates),
+        );
+        let mut buf = [0u8; 256];
+        assert_eq!(
+            v4.recv_from(&mut buf).expect("v4 initiation").0,
+            INITIATION_SIZE
+        );
+        assert_eq!(
+            v6.recv_from(&mut buf).expect("v6 initiation").0,
+            INITIATION_SIZE
+        );
+        assert_eq!(
+            roamed.recv_from(&mut buf).expect("roamed initiation").0,
+            INITIATION_SIZE
+        );
+        let mut transport = vec![0u8; 32];
+        transport[..4]
+            .copy_from_slice(&ferrox_core::wireguard::transport::TYPE_TRANSPORT.to_le_bytes());
+        send_packet(&sender, true, roamed_address, &transport, Some(&candidates));
+        assert_eq!(
+            roamed.recv_from(&mut buf).expect("roamed data").0,
+            transport.len()
         );
     }
 
