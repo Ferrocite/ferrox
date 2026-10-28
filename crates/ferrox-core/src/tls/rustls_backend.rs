@@ -618,11 +618,33 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsProvid
     }
 
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        const CHUNK: usize = 32 * 1024;
         self.drive()?;
-        let mut writer = self.conn.writer();
-        coalesce(&mut writer, parts)?;
-        self.send_pending()?;
-        Ok(())
+        if parts.iter().map(|part| part.len()).sum::<usize>() <= CHUNK {
+            coalesce(&mut self.conn.writer(), parts)?;
+            return self.send_pending();
+        }
+        let mut batch: Vec<&[u8]> = Vec::with_capacity(parts.len() + 1);
+        let mut room = CHUNK;
+        for part in parts {
+            let mut rest = *part;
+            while !rest.is_empty() {
+                let take = rest.len().min(room);
+                batch.push(&rest[..take]);
+                rest = &rest[take..];
+                room -= take;
+                if room == 0 {
+                    coalesce(&mut self.conn.writer(), &batch)?;
+                    self.send_pending()?;
+                    batch.clear();
+                    room = CHUNK;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            coalesce(&mut self.conn.writer(), &batch)?;
+        }
+        self.send_pending()
     }
 }
 
@@ -3201,6 +3223,44 @@ mod tests {
                 after - before,
                 0,
                 "the write read the transport {after} times where it had read {before}"
+            );
+        });
+    }
+
+    /// A relay-sized write is larger than rustls's 64 KiB output buffer; the writer must
+    /// drain between partial writes instead of returning `WriteZero` on the next retry.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_relay_sized_write_crosses_the_tls_buffer() {
+        use crate::tls::{RecordAlignment as _, TlsProvider as _};
+
+        let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
+        let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
+        let identity = crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let payload = vec![0x5a; 80 * 1024];
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut server = crate::tls::accept(&identity, stream).expect("accepts");
+                server.handshake().expect("handshakes");
+                thread::sleep(std::time::Duration::from_millis(100));
+            });
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut client =
+                RustlsProvider::connect(&client("tls.test", &[]), stream).expect("configures");
+            client.handshake().expect("handshakes");
+            client
+                .write_all_slices(&[&payload])
+                .expect("a relay-sized write");
+            client.flush().expect("flushes");
+            assert!(
+                !client.conn.wants_write(),
+                "the write left TLS records queued"
             );
         });
     }
