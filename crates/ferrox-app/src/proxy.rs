@@ -42366,6 +42366,7 @@ mod tests {
         port
     }
 
+    /// Runs the current census in a fresh process so unrelated suite threads cannot change its delta.
     #[cfg(target_os = "linux")]
     fn isolated_thread_count() -> bool {
         if std::env::var_os("FERROX_THREAD_COUNT_CHILD").is_some() {
@@ -42386,6 +42387,7 @@ mod tests {
         true
     }
 
+    /// Sixteen simultaneous KCP dials share a feed worker within the original thread-growth bound.
     #[cfg(target_os = "linux")]
     #[test]
     fn sixteen_kcp_dials_share_one_feed_thread() {
@@ -42424,6 +42426,7 @@ mod tests {
         listener.close();
     }
 
+    /// Sixteen live KCP connections share flush workers within the original thread-growth bound.
     #[cfg(target_os = "linux")]
     #[test]
     fn sixteen_kcp_connections_share_one_flush_thread() {
