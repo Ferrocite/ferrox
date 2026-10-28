@@ -129,7 +129,7 @@ impl MasqueOut {
             .flows
             .send(ClientFlow {
                 client,
-                destination,
+                destinations: vec![destination],
                 prefix: prefix.to_vec(),
             })
             .is_err()
@@ -147,7 +147,11 @@ impl MasqueOut {
                     &inner.to_tunnel,
                     &inner.routes,
                     associate,
-                    &crate::proxy::resolve_endpoint,
+                    &|host, port| {
+                        crate::proxy::resolve_endpoint(host, port)
+                            .into_iter()
+                            .collect()
+                    },
                 );
             }
             Err(reason) => eprintln!("masque: {reason}"),

@@ -22,7 +22,9 @@ use ferrox_core::wireguard::device::{tai64n, Event, Tunnel};
 use ferrox_core::wireguard::handshake::{
     check_mac1, INITIATION_SIZE, TYPE_INITIATION, TYPE_RESPONSE,
 };
-use ferrox_core::wireguard::transport::clear_reserved;
+use ferrox_core::wireguard::transport::{
+    check_mac2, clear_reserved, cookie_encryption_key, create_reply, COOKIE_NONCE_SIZE,
+};
 
 use crate::conn::Connection;
 use crate::json::Json;
@@ -31,8 +33,13 @@ use crate::wg_stack::{self, ip_bytes, ClientFlow, Packet, UdpRoutes};
 use crate::wireguard::{DeviceConfig, PeerConfig};
 
 /// The reader's wait for a datagram: it also bounds how long a queued inner
-/// packet waits before the tunnel encrypts it.
-const IO_TICK: Duration = Duration::from_millis(10);
+/// packet waits before the tunnel encrypts it, because a packet queued while
+/// the read waits has no datagram to interrupt it.
+const IO_TICK: Duration = Duration::from_millis(1);
+/// The kernel queue one socket keeps for a fast link, as the reference's bind
+/// asks for: a default queue holds a few milliseconds of a gigabit stream and
+/// a single scheduling gap drops the datagrams a TCP flow then retransmits.
+const SOCKET_BUFFER: usize = 7 << 20;
 /// The reference's DNS servers when the config names none.
 const DEFAULT_DNS: [IpAddr; 4] = [
     IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)),
@@ -50,6 +57,86 @@ const DNS_PORT_FIRST: u16 = 1024;
 const DNS_PORT_LAST: u16 = 49_152;
 /// The most names one outbound caches.
 const DNS_CACHE: usize = 256;
+/// The reference's cookie lifetime and its one-second under-load tail.
+const COOKIE_REFRESH: u64 = 120_000;
+const UNDER_LOAD: u64 = 1_000;
+/// The reference queues 1024 handshakes and treats an eighth of that as load.
+const COOKIE_AFTER: u32 = 128;
+/// The responder's rotating cookie secret and handshake-load window. `now` is
+/// the reader's monotonic milliseconds, not wall time.
+#[derive(Default)]
+struct CookieGuard {
+    secret: [u8; 32],
+    secret_set: Option<u64>,
+    window: u64,
+    initiations: u32,
+    under_load_until: u64,
+}
+
+impl CookieGuard {
+    fn observe(&mut self, now: u64) -> bool {
+        if now.saturating_sub(self.window) >= UNDER_LOAD {
+            self.window = now;
+            self.initiations = 0;
+        }
+        self.initiations = self.initiations.saturating_add(1);
+        if self.initiations >= COOKIE_AFTER && now >= self.under_load_until {
+            self.under_load_until = now.saturating_add(UNDER_LOAD);
+        }
+        now < self.under_load_until
+    }
+
+    fn check(&self, now: u64, packet: &[u8], source: &[u8]) -> bool {
+        self.secret_set
+            .is_some_and(|set| now.saturating_sub(set) <= COOKIE_REFRESH)
+            && check_mac2(packet, &self.secret, source)
+    }
+
+    fn reply(
+        &mut self,
+        now: u64,
+        packet: &[u8],
+        source: &[u8],
+        encryption_key: &[u8; 32],
+    ) -> Option<[u8; 64]> {
+        if self
+            .secret_set
+            .is_none_or(|set| now.saturating_sub(set) > COOKIE_REFRESH)
+        {
+            getrandom::fill(&mut self.secret).ok()?;
+            self.secret_set = Some(now);
+        }
+        let mut nonce = [0u8; COOKIE_NONCE_SIZE];
+        getrandom::fill(&mut nonce).ok()?;
+        let receiver = u32::from_le_bytes(packet.get(4..8)?.try_into().ok()?);
+        create_reply(
+            packet,
+            receiver,
+            &self.secret,
+            source,
+            encryption_key,
+            &nonce,
+        )
+    }
+}
+
+/// The source address bytes the reference hashes: family bytes then the port in
+/// big-endian, as `netip.AddrPort.MarshalBinary` writes them.
+fn endpoint_bytes(source: SocketAddr) -> ([u8; 18], usize) {
+    let mut bytes = [0u8; 18];
+    let width = match source.ip() {
+        IpAddr::V4(address) => {
+            bytes[..4].copy_from_slice(&address.octets());
+            4
+        }
+        IpAddr::V6(address) => {
+            bytes[..16].copy_from_slice(&address.octets());
+            16
+        }
+    };
+    bytes[width..width + 2].copy_from_slice(&source.port().to_be_bytes());
+    (bytes, width + 2)
+}
 
 /// A cached remote-DNS answer and the instant it stops being usable.
 #[derive(Debug)]
@@ -156,24 +243,16 @@ impl WireGuardOut {
     }
 
     pub(crate) fn serve_tcp(&self, client: Connection, asked: &Destination, prefix: &[u8]) {
-        let Some(destination) = self.destination(asked) else {
-            eprintln!("wireguard: destination `{asked:?}` does not resolve");
-            return;
-        };
-        if !self
-            .config
-            .peers
-            .iter()
-            .any(|peer| peer.routes(destination.ip()))
-        {
-            eprintln!("wireguard: no peer allows `{destination}`");
+        let destinations = self.destinations(asked);
+        if destinations.is_empty() {
+            eprintln!("wireguard: no peer allows `{asked:?}`");
             return;
         }
         if self
             .flows
             .send(ClientFlow {
                 client,
-                destination,
+                destinations,
                 prefix: prefix.to_vec(),
             })
             .is_err()
@@ -189,31 +268,26 @@ impl WireGuardOut {
             &self.to_tunnel,
             &self.routes,
             associate,
-            &|host, port| {
-                self.resolve(host, port).into_iter().find(|address| {
-                    self.config
-                        .peers
-                        .iter()
-                        .any(|peer| peer.routes(address.ip()))
-                })
-            },
+            &|host, port| self.destinations(&Destination::Name(host.to_owned(), port)),
         );
     }
 
-    /// The address to dial: a literal stands, a name is asked through the tunnel
-    /// against the configured servers and the first answer a peer routes wins.
-    fn destination(&self, asked: &Destination) -> Option<SocketAddr> {
-        match asked {
-            Destination::Address(address) => Some(*address),
-            Destination::Name(host, port) => {
-                self.resolve(host, *port).into_iter().find(|address| {
-                    self.config
-                        .peers
-                        .iter()
-                        .any(|peer| peer.routes(address.ip()))
-                })
-            }
-        }
+    /// The addresses to race: a literal stands, and a name becomes every answer
+    /// a peer routes. The stack caps how many it dials at once.
+    fn destinations(&self, asked: &Destination) -> Vec<SocketAddr> {
+        let addresses = match asked {
+            Destination::Address(address) => vec![*address],
+            Destination::Name(host, port) => self.resolve(host, *port),
+        };
+        addresses
+            .into_iter()
+            .filter(|address| {
+                self.config
+                    .peers
+                    .iter()
+                    .any(|peer| peer.routes(address.ip()))
+            })
+            .collect()
     }
 
     fn resolve(&self, host: &str, port: u16) -> Vec<SocketAddr> {
@@ -382,7 +456,7 @@ impl WireGuardOut {
             .flows
             .send(ClientFlow {
                 client: Connection::from(tunnel),
-                destination: SocketAddr::new(server, self.dns_port),
+                destinations: vec![SocketAddr::new(server, self.dns_port)],
                 prefix: Vec::new(),
             })
             .is_err()
@@ -482,6 +556,7 @@ struct Peer {
 /// The tunnel reader and writer: inner packets leave, datagrams arrive, and the
 /// timers run on the same clock.
 #[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::too_many_lines)]
 fn io(
     config: DeviceConfig,
     socket: UdpSocket,
@@ -491,11 +566,13 @@ fn io(
     stop: Option<Arc<AtomicBool>>,
 ) {
     let _ = socket.set_read_timeout(Some(IO_TICK));
+    widen(&socket);
+    let ipv6_socket = socket.local_addr().is_ok_and(|address| address.is_ipv6());
     let epoch = tai64n_now();
     let mut peers = peers(&config, epoch);
+    let mut cookies = CookieGuard::default();
     let started = Instant::now();
     let mut buf = vec![0u8; 65_535];
-    let mut events = Vec::new();
     let mut incoming = Vec::new();
     loop {
         if stop
@@ -505,7 +582,8 @@ fn io(
             return;
         }
         let now = started.elapsed().as_millis() as u64;
-        loop {
+        let mut events = Vec::new();
+        for _ in 0..TX_DRAIN {
             let packet = match from_tunnel.try_recv() {
                 Ok(packet) => packet,
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
@@ -525,6 +603,7 @@ fn io(
                 routes.as_ref(),
                 &peers,
                 Some(index),
+                ipv6_socket,
             );
         }
         for peer in &mut peers {
@@ -537,15 +616,27 @@ fn io(
             routes.as_ref(),
             &peers,
             None,
+            ipv6_socket,
         );
 
         match socket.recv_from(&mut buf) {
             Ok((n, source)) if n >= 4 => {
+                let source = recv_endpoint(source, ipv6_socket);
                 let kind = u32::from(buf[0]);
                 if kind == TYPE_INITIATION && n == INITIATION_SIZE {
+                    let under_load = cookies.observe(now);
                     let mut packet = buf[..n].to_vec();
                     clear_reserved(&mut packet);
-                    handle_initiation(&mut peers, now, source, &packet, &socket, &to_stack);
+                    handle_initiation(
+                        &mut peers,
+                        now,
+                        source,
+                        &packet,
+                        &socket,
+                        &to_stack,
+                        &mut cookies,
+                        under_load,
+                    );
                 } else {
                     let at = if kind == TYPE_RESPONSE { 8 } else { 4 };
                     let receiver = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap_or([0; 4]));
@@ -563,6 +654,7 @@ fn io(
                         routes.as_ref(),
                         &peers,
                         Some(index),
+                        ipv6_socket,
                     );
                 }
             }
@@ -581,6 +673,12 @@ fn io(
     }
 }
 
+/// The most tunnel packets one socket turn forwards before it reads again, so
+/// a backlog on the stack's channel cannot leave a burst wider than a peer's
+/// receive queue.
+const TX_DRAIN: usize = 64;
+
+#[allow(clippy::too_many_arguments)]
 fn handle_initiation(
     peers: &mut [Peer],
     now: u64,
@@ -588,12 +686,33 @@ fn handle_initiation(
     packet: &[u8],
     socket: &UdpSocket,
     to_stack: &Sender<Packet>,
+    cookies: &mut CookieGuard,
+    under_load: bool,
 ) {
+    let Some(peer) = peers.first() else {
+        return;
+    };
+    if !check_mac1(packet, &peer.tunnel.public()) {
+        return;
+    }
+    if under_load {
+        let (source_bytes, source_width) = endpoint_bytes(source);
+        let source_bytes = &source_bytes[..source_width];
+        if !cookies.check(now, packet, source_bytes) {
+            if let Some(reply) = cookies.reply(
+                now,
+                packet,
+                source_bytes,
+                &cookie_encryption_key(&peer.tunnel.public()),
+            ) {
+                let ipv6 = socket.local_addr().is_ok_and(|address| address.is_ipv6());
+                let _ = socket.send_to(&reply, send_endpoint(source, ipv6));
+            }
+            return;
+        }
+    }
     let Some(state) = peers.first().and_then(|peer| {
         let message: &[u8; INITIATION_SIZE] = packet.try_into().ok()?;
-        if !check_mac1(packet, &peer.tunnel.public()) {
-            return None;
-        }
         peer.tunnel.consume(message)
     }) else {
         return;
@@ -604,7 +723,16 @@ fn handle_initiation(
     };
     let mut events = Vec::new();
     peers[index].tunnel.answer(now, source, state, &mut events);
-    flush(&mut events, socket, to_stack, None, peers, Some(index));
+    let ipv6 = socket.local_addr().is_ok_and(|address| address.is_ipv6());
+    flush(
+        &mut events,
+        socket,
+        to_stack,
+        None,
+        peers,
+        Some(index),
+        ipv6,
+    );
 }
 
 /// Send every event, and for each decrypted payload require the authenticating
@@ -617,11 +745,12 @@ fn flush(
     routes: Option<&UdpRoutes>,
     peers: &[Peer],
     peer: Option<usize>,
+    ipv6_socket: bool,
 ) {
     for event in events.drain(..) {
         match event {
             Event::Send { endpoint, packet } => {
-                let _ = socket.send_to(&packet, endpoint);
+                let _ = socket.send_to(&packet, send_endpoint(endpoint, ipv6_socket));
             }
             Event::Data(inner) => {
                 let Some(index) = peer else {
@@ -701,35 +830,89 @@ fn peer_for(peers: &[Peer], destination: IpAddr) -> Option<usize> {
 }
 
 fn bind_socket(config: &DeviceConfig) -> Result<UdpSocket, String> {
-    let endpoint = config
-        .peers
-        .iter()
-        .find_map(|peer| peer.endpoint)
-        .ok_or("wireguard client: no peer has an `endpoint`")?;
-    let unspecified = if endpoint.is_ipv4() {
-        SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
-    } else {
-        SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
-    };
-    if config
-        .peers
-        .iter()
-        .filter_map(|peer| peer.endpoint)
-        .any(|candidate| candidate.is_ipv4() != endpoint.is_ipv4())
-    {
-        return Err(
-            "wireguard client: peers on both address families need two sockets, not carried"
-                .to_owned(),
-        );
+    let mut v4 = false;
+    let mut v6 = false;
+    let mut any = false;
+    for endpoint in config.peers.iter().filter_map(|peer| peer.endpoint) {
+        any = true;
+        if endpoint.is_ipv4() {
+            v4 = true;
+        } else {
+            v6 = true;
+        }
     }
+    if !any {
+        return Err("wireguard client: no peer has an `endpoint`".to_owned());
+    }
+    if v4 && v6 {
+        return bind_dual_stack();
+    }
+    let unspecified = if v4 {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    };
     UdpSocket::bind(unspecified)
         .map_err(|error| format!("cannot bind wireguard's UDP socket: {error}"))
+}
+
+fn bind_dual_stack() -> Result<UdpSocket, String> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let socket = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))
+        .map_err(|error| format!("cannot create wireguard's dual-stack socket: {error}"))?;
+    socket
+        .set_only_v6(false)
+        .map_err(|error| format!("cannot enable wireguard's dual-stack socket: {error}"))?;
+    let address = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+    socket
+        .bind(&address.into())
+        .map_err(|error| format!("cannot bind wireguard's dual-stack socket: {error}"))?;
+    Ok(socket.into())
+}
+
+/// Ask the kernel for the queue the reference gives its `WireGuard` socket. It
+/// may cap the request at `net.core.*mem_max`; the default is the smaller
+/// number, and a larger ask never costs the flow anything.
+fn widen(socket: &UdpSocket) {
+    let sock = socket2::SockRef::from(socket);
+    let _ = sock.set_recv_buffer_size(SOCKET_BUFFER);
+    let _ = sock.set_send_buffer_size(SOCKET_BUFFER);
+}
+
+fn send_endpoint(endpoint: SocketAddr, ipv6: bool) -> SocketAddr {
+    match endpoint {
+        SocketAddr::V4(address) if ipv6 => SocketAddr::new(
+            IpAddr::V6(Ipv4Addr::to_ipv6_mapped(address.ip())),
+            address.port(),
+        ),
+        _ => endpoint,
+    }
+}
+
+fn recv_endpoint(socket: SocketAddr, ipv6: bool) -> SocketAddr {
+    match socket {
+        SocketAddr::V6(address) if ipv6 => match address.ip().to_ipv4_mapped() {
+            Some(ip) => SocketAddr::new(IpAddr::V4(ip), address.port()),
+            None => SocketAddr::V6(address),
+        },
+        _ => socket,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::net::TcpListener;
+
+    fn sent(events: &[Event]) -> Vec<u8> {
+        events
+            .iter()
+            .find_map(|event| match event {
+                Event::Send { packet, .. } => Some(packet.clone()),
+                Event::Data(_) => None,
+            })
+            .expect("an outbound packet")
+    }
 
     #[test]
     fn a_peer_may_not_originate_another_peers_source() {
@@ -765,13 +948,29 @@ mod tests {
         packet[0] = 0x45;
         packet[12..16].copy_from_slice(&[10, 0, 0, 2]);
         let mut events = vec![Event::Data(packet)];
-        flush(&mut events, &socket, &to_stack, None, &peers, Some(1));
+        flush(
+            &mut events,
+            &socket,
+            &to_stack,
+            None,
+            &peers,
+            Some(1),
+            false,
+        );
         assert!(packets.try_recv().is_err(), "the owner is peer zero");
         let mut packet = vec![0u8; 20];
         packet[0] = 0x45;
         packet[12..16].copy_from_slice(&[10, 1, 2, 3]);
         let mut events = vec![Event::Data(packet)];
-        flush(&mut events, &socket, &to_stack, None, &peers, Some(1));
+        flush(
+            &mut events,
+            &socket,
+            &to_stack,
+            None,
+            &peers,
+            Some(1),
+            false,
+        );
         assert!(packets.try_recv().is_ok(), "the peer owns its own source");
     }
 
@@ -805,7 +1004,7 @@ mod tests {
         let server_public = ferrox_core::wireguard::device::public_key(&server_private);
         let hex = ferrox_core::foxy::account::hex_encode;
         let server_settings = format!(
-            r#"{{"secretKey":"{}","endpoint":["10.0.0.1"],"reserved":[4,5,6],"users":[{{"account":{{"publicKey":"{}","allowedIPs":["10.0.0.2/32"]}}}}]}}"#,
+            r#"{{"secretKey":"{}","endpoint":["10.0.0.1"],"users":[{{"account":{{"publicKey":"{}","allowedIPs":["10.0.0.2/32"]}}}}]}}"#,
             hex(&server_private),
             hex(&client_public)
         );
@@ -845,7 +1044,8 @@ mod tests {
     }
 
     #[test]
-    fn a_name_resolves_through_the_tunnel_before_the_flow() {
+    #[allow(clippy::too_many_lines)]
+    fn a_name_races_every_routed_answer_before_the_flow() {
         let dns = UdpSocket::bind("127.0.0.1:0").expect("dns");
         let dns_address = dns.local_addr().expect("dns address");
         let (answered, answer) = mpsc::channel();
@@ -857,8 +1057,12 @@ mod tests {
             let Some(question) = ferrox_core::dns::parse_query(&buf[..n]) else {
                 return;
             };
-            let Some(reply) = ferrox_core::dns::ip_answer(&question, 0, 60, &[vec![127, 0, 0, 1]])
-            else {
+            let Some(reply) = ferrox_core::dns::ip_answer(
+                &question,
+                0,
+                60,
+                &[vec![192, 0, 2, 1], vec![127, 0, 0, 1]],
+            ) else {
                 return;
             };
             if dns.send_to(&reply, from).is_ok() {
@@ -903,19 +1107,39 @@ mod tests {
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
         let port = serve_inbound(&inbound, &out, "127.0.0.1:0").expect("serve");
 
-        let client = DeviceConfig::from_json(
-            &crate::json::parse(&format!(
-                r#"{{"secretKey":"{}","address":["10.0.0.2"],"remoteDNS":["127.0.0.1"],"peers":[{{"publicKey":"{}","endpoint":"127.0.0.1:{port}"}}]}}"#,
-                hex(&client_private),
-                hex(&server_public)
-            ))
-            .expect("client config"),
-        )
-        .expect("device");
+        let dead = UdpSocket::bind("127.0.0.1:0").expect("dead endpoint");
+        let client = DeviceConfig {
+            secret: client_private,
+            addresses: vec!["10.0.0.2".parse().unwrap()],
+            peers: vec![
+                PeerConfig {
+                    public: server_public,
+                    preshared: [0; 32],
+                    endpoint: Some(dead.local_addr().expect("dead address")),
+                    keepalive: 0,
+                    allowed: vec![("192.0.2.1".parse().unwrap(), 32)],
+                },
+                PeerConfig {
+                    public: server_public,
+                    preshared: [0; 32],
+                    endpoint: Some(format!("127.0.0.1:{port}").parse().unwrap()),
+                    keepalive: 0,
+                    allowed: vec![("127.0.0.1".parse().unwrap(), 32)],
+                },
+            ],
+            mtu: 1420,
+            reserved: [0; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            dns: vec!["127.0.0.1".parse().unwrap()],
+        };
         let wireguard = WireGuardOut::with_dns_port(client, dns_address.port()).expect("outbound");
         assert_eq!(
             wireguard.resolve("example.test", 7),
-            vec!["127.0.0.1:7".parse().expect("address")]
+            vec![
+                "192.0.2.1:7".parse().expect("address"),
+                "127.0.0.1:7".parse().expect("address"),
+            ]
         );
         answer
             .recv_timeout(Duration::from_secs(5))
@@ -1014,5 +1238,153 @@ mod tests {
             wireguard.resolve("example.test", 7),
             vec!["127.0.0.1:7".parse().expect("address")]
         );
+    }
+
+    #[test]
+    fn a_client_with_peers_in_both_families_binds_a_dual_stack_socket() {
+        let config = DeviceConfig {
+            secret: [0x11; 32],
+            addresses: vec!["10.0.0.2".parse().unwrap()],
+            peers: vec![
+                PeerConfig {
+                    public: [0x22; 32],
+                    preshared: [0; 32],
+                    endpoint: Some("127.0.0.1:9".parse().unwrap()),
+                    keepalive: 0,
+                    allowed: vec![("0.0.0.0".parse().unwrap(), 0)],
+                },
+                PeerConfig {
+                    public: [0x33; 32],
+                    preshared: [0; 32],
+                    endpoint: Some("[::1]:9".parse().unwrap()),
+                    keepalive: 0,
+                    allowed: vec![("::".parse().unwrap(), 0)],
+                },
+            ],
+            mtu: 1420,
+            reserved: [0; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
+        let socket = bind_socket(&config).expect("dual-stack socket");
+        assert!(socket.local_addr().expect("address").is_ipv6());
+        let v4: SocketAddr = "127.0.0.1:7".parse().unwrap();
+        let mapped = send_endpoint(v4, true);
+        assert_eq!(mapped, "[::ffff:127.0.0.1]:7".parse().unwrap());
+        assert_eq!(recv_endpoint(mapped, true), v4);
+    }
+
+    #[test]
+    fn the_handshake_window_requires_cookies_after_an_eighth_of_the_queue() {
+        let mut guard = CookieGuard::default();
+        for _ in 0..(COOKIE_AFTER - 1) {
+            assert!(!guard.observe(0));
+        }
+        assert!(guard.observe(0), "the 128th initiation is under load");
+        assert!(guard.observe(500), "the load tail outlives the burst");
+        assert!(!guard.observe(1_001), "a quiet second clears the window");
+    }
+
+    #[test]
+    fn cookie_source_bytes_are_the_reference_address_port_form() {
+        let (v4, width) = endpoint_bytes("127.0.0.1:51820".parse().unwrap());
+        assert_eq!(&v4[..width], &[127, 0, 0, 1, 0xca, 0x6c]);
+        let (v6, width) = endpoint_bytes("[::1]:53".parse().unwrap());
+        let mut expected = [0u8; 18];
+        expected[15] = 1;
+        expected[16..].copy_from_slice(&53u16.to_be_bytes());
+        assert_eq!(&v6[..width], &expected);
+    }
+
+    #[test]
+    fn a_loaded_responder_issues_a_cookie_and_accepts_the_retry() {
+        let client_private = [0x11; 32];
+        let server_private = [0x22; 32];
+        let client_public = ferrox_core::wireguard::device::public_key(&client_private);
+        let server_public = ferrox_core::wireguard::device::public_key(&server_private);
+        let config = DeviceConfig {
+            secret: server_private,
+            addresses: vec!["10.0.0.1".parse().unwrap()],
+            peers: vec![PeerConfig {
+                public: client_public,
+                preshared: [0; 32],
+                endpoint: None,
+                keepalive: 0,
+                allowed: vec![("10.0.0.2".parse().unwrap(), 32)],
+            }],
+            mtu: 1420,
+            reserved: [0; 3],
+            is_client: Some(false),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
+        let server = UdpSocket::bind("127.0.0.1:0").expect("server");
+        let server_address = server.local_addr().expect("server address");
+        server
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client");
+        let client_address = client.local_addr().expect("client address");
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+
+        let mut peer = peers(&config, [0; 12]);
+        let (to_stack, _) = mpsc::channel();
+        let mut guard = CookieGuard::default();
+        let mut initiator = Tunnel::new(
+            client_private,
+            server_public,
+            [0; 32],
+            server_address,
+            0,
+            [0; 3],
+            [0; 12],
+        );
+        let mut events = Vec::new();
+        assert!(initiator.initiate(0, &mut events));
+        let first = sent(&events);
+        handle_initiation(
+            &mut peer,
+            0,
+            client_address,
+            &first,
+            &server,
+            &to_stack,
+            &mut guard,
+            true,
+        );
+
+        let mut cookie = [0u8; 64];
+        let (n, _) = client.recv_from(&mut cookie).expect("cookie reply");
+        assert_eq!(n, cookie.len());
+        assert_eq!(
+            u32::from(cookie[0]),
+            ferrox_core::wireguard::transport::TYPE_COOKIE_REPLY
+        );
+
+        let mut incoming = Vec::new();
+        initiator.receive(0, server_address, &mut cookie, &mut incoming);
+        let retry = sent(&incoming);
+        assert!(
+            retry[INITIATION_SIZE - 16..].iter().any(|byte| *byte != 0),
+            "mac2 is set"
+        );
+        handle_initiation(
+            &mut peer,
+            1,
+            client_address,
+            &retry,
+            &server,
+            &to_stack,
+            &mut guard,
+            true,
+        );
+
+        let mut answer = [0u8; 128];
+        let (n, _) = client.recv_from(&mut answer).expect("handshake response");
+        assert_eq!(u32::from(answer[0]), TYPE_RESPONSE);
+        assert_eq!(n, 92);
     }
 }

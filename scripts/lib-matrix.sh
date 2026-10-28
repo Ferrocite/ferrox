@@ -27,7 +27,7 @@ s.close()'
 
 matrix_udp_carrier() {
   case "$1" in
-    *-kcp-*|*-hysteria-*|*-quic-*|hysteria-*|masque-*) return 0 ;;
+    *-kcp-*|*-hysteria-*|*-quic-*|hysteria-*|masque-*|wireguard-*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -36,6 +36,7 @@ matrix_server_serves() {
   case "$1:$2" in
     xray-core:hysteria-v1-*) return 1 ;;
     sing-box:hysteria-v1-*) return 0 ;;
+    sing-box:wireguard-*) return 0 ;;
     xray-core:*-quic-*) return 1 ;;
     sing-box:*-quic-*) return 0 ;;
     sing-box:*) return 1 ;;
@@ -79,6 +80,8 @@ matrix_engine_skip_reason() {
       printf '%s\n' "leaf at this pin has no HTTPUpgrade transport" ;;
     leaf:shadowsocks2022-*)
       printf '%s\n' "leaf at this pin has no Shadowsocks 2022" ;;
+    xray-core-rust:wireguard-*|zeronet:wireguard-*|xray-rust:wireguard-*|leaf:wireguard-*)
+      printf '%s\n' "$engine at this pin has no WireGuard handler" ;;
     xray-rust:*-hysteria-*)
       printf '%s\n' "xray-rust at this pin has no VLESS over Hysteria; its Hysteria outbound is the native proxy protocol" ;;
     xray-core-rust:masque-*|zeronet:masque-*|sing-box:masque-*|xray-rust:masque-*|leaf:masque-*)
@@ -172,6 +175,37 @@ matrix_reality_private() {
 
 matrix_reality_public() {
   sed -n 's/^Password (PublicKey): //p' "$(matrix_reality_dir)/keys.txt"
+}
+
+matrix_wireguard_dir() {
+  local dir="target/matrix-wireguard" root
+  case "${OS:-}" in
+    Windows_NT) root="$(pwd -W 2>/dev/null || pwd)" ;;
+    *) root="$(pwd)" ;;
+  esac
+  dir="$root/$dir"
+  mkdir -p "$dir"
+  if [[ ! -s "$dir/server.txt" || ! -s "$dir/client.txt" ]]; then
+    "${ferrox_bin:?no ferrox binary to mint the WireGuard keypairs}" x25519 >"$dir/server.txt" || return 1
+    "${ferrox_bin:?no ferrox binary to mint the WireGuard keypairs}" x25519 >"$dir/client.txt" || return 1
+  fi
+  echo "$dir"
+}
+
+matrix_wireguard_server_private() {
+  sed -n 's/^PrivateKey: //p' "$(matrix_wireguard_dir)/server.txt"
+}
+
+matrix_wireguard_server_public() {
+  sed -n 's/^Password (PublicKey): //p' "$(matrix_wireguard_dir)/server.txt"
+}
+
+matrix_wireguard_client_private() {
+  sed -n 's/^PrivateKey: //p' "$(matrix_wireguard_dir)/client.txt"
+}
+
+matrix_wireguard_client_public() {
+  sed -n 's/^Password (PublicKey): //p' "$(matrix_wireguard_dir)/client.txt"
 }
 
 # The server's TLS: the identity the client is asked to trust.
@@ -290,6 +324,15 @@ hysteria_v1_client_settings() {
   echo "\"tag\": \"proxy\", \"protocol\": \"hysteria\", \"settings\": {\"version\": 1, \"address\": \"127.0.0.1\", \"port\": $port, \"auth\": \"$HYSTERIA_AUTH\"}, \"streamSettings\": {\"network\": \"hysteria\", \"security\": \"tls\", \"hysteriaSettings\": {\"version\": 1, \"auth\": \"$HYSTERIA_AUTH\"}, \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"hysteria\"], \"caCertFile\": \"$dir/cert.pem\", \"obfs\": \"$HYSTERIA_V1_OBFS\"}}"
 }
 
+wireguard_server() {
+  echo "\"protocol\": \"wireguard\", \"settings\": {\"secretKey\": \"$(matrix_wireguard_server_private)\", \"address\": [\"10.0.0.1/32\", \"fd00::1/128\"], \"mtu\": 1420, \"peers\": [{\"publicKey\": \"$(matrix_wireguard_client_public)\", \"allowedIPs\": [\"10.0.0.2/32\", \"fd00::2/128\"]}]}"
+}
+
+wireguard_client() {
+  local port="$1"
+  echo "\"tag\": \"proxy\", \"protocol\": \"wireguard\", \"settings\": {\"isClient\": true, \"noKernelTun\": true, \"secretKey\": \"$(matrix_wireguard_client_private)\", \"address\": [\"10.0.0.2/32\", \"fd00::2/128\"], \"mtu\": 1420, \"peers\": [{\"publicKey\": \"$(matrix_wireguard_server_public)\", \"endpoint\": \"127.0.0.1:$port\", \"allowedIPs\": [\"0.0.0.0/0\", \"::/0\"]}]}"
+}
+
 vless_server_vision() {
   echo "\"protocol\": \"vless\", \"settings\": {\"clients\": [{\"id\": \"$UUID\", \"flow\": \"xtls-rprx-vision\"}], \"decryption\": \"none\"}$1"
 }
@@ -337,6 +380,7 @@ scenario_config() {
     vless-kcp-*) server_config "$(vless_server ", $(kcp_settings)")" "$(vless_client ", $(kcp_settings)" "$port")" "$port" ;;
     vless-hysteria-*) server_config "$(vless_server ", $(hysteria_server_settings)")" "$(vless_client ", $(hysteria_client_settings)" "$port")" "$port" ;;
     hysteria-v1-*) server_config "$(hysteria_v1_server_settings)" "$(hysteria_v1_client_settings "$port")" "$port" ;;
+    wireguard-raw-*) server_config "$(wireguard_server)" "$(wireguard_client "$port")" "$port" ;;
     vmess-tls-ws-*) server_config "\"protocol\": \"vmess\", \"settings\": {\"clients\": [{\"id\": \"$UUID\"}]}, $(tls_ws_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"vmess\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"users\": [{\"id\": \"$UUID\", \"security\": \"auto\"}]}]}, $(tls_ws_client_settings)" "$port" ;;
     trojan-tls-ws-*) server_config "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}, $(tls_ws_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"password\": \"$PASSWORD\"}]}, $(tls_ws_client_settings)" "$port" ;;
     masque-*) server_config "$(masque_server_settings)" "$(masque_client_settings "$port")" "$port" ;;
@@ -379,6 +423,7 @@ standard_scenarios() {
   echo "vless-quic-down-8 download 8 256 65536"
   echo "vless-hysteria-down-8 download 8 256 65536"
   echo "hysteria-v1-down-8 download 8 256 65536"
+  echo "wireguard-raw-down-8 download 8 256 65536"
   echo "shadowsocks2022-raw-down-8 download 8 256 65536"
   echo "vmess-tls-ws-down-8 download 8 256 65536"
   echo "trojan-tls-ws-down-8 download 8 256 65536"
@@ -417,6 +462,8 @@ scenarios() {
       echo "vless-hysteria-duplex-8 full-duplex 8 128 65536"
       echo "hysteria-v1-up-1 upload 1 2048 65536"
       echo "hysteria-v1-duplex-8 full-duplex 8 128 65536"
+      echo "wireguard-raw-up-1 upload 1 2048 65536"
+      echo "wireguard-raw-duplex-8 full-duplex 8 128 65536"
       echo "vless-reality-raw-up-1 upload 1 2048 65536"
       echo "vless-reality-raw-duplex-8 full-duplex 8 128 65536"
       echo "vless-vision-tls-raw-up-1 upload 1 2048 65536"

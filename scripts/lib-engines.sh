@@ -93,7 +93,7 @@ build() {
       note "building the pinned sing-box at $rev"
       (cd "upstream/$name" && python3 "$OLDPWD/scripts/patch-sing-box.py" . &&
         GOENV=off GOWORK=off CGO_ENABLED=0 \
-        go build -tags "with_utls,with_quic" -o "$OLDPWD/$binary" ./cmd/sing-box) || return 1
+        go build -tags "with_utls,with_quic,with_wireguard" -o "$OLDPWD/$binary" ./cmd/sing-box) || return 1
       ;;
     zeronet)
       note "building the pinned ZeroNet (zray) at $rev"
