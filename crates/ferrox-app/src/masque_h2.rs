@@ -446,6 +446,10 @@ impl Client {
                         return;
                     }
                     block.extend_from_slice(strip_padding(flags, body));
+                    if block.len() > FRAME_CAP {
+                        self.end = true;
+                        return;
+                    }
                     if flags & h2::F_END_HEADERS != 0 {
                         self.head(&block);
                     } else {
@@ -656,7 +660,7 @@ impl Session {
         self.run_until(wire, Instant::now() + HANDSHAKE);
     }
 
-    fn run_until(&mut self, wire: &mut Wire, _deadline: Instant) {
+    fn run_until(&mut self, wire: &mut Wire, deadline: Instant) {
         let mut settings = Vec::new();
         settings.extend_from_slice(&SETTINGS_ENABLE_CONNECT.to_be_bytes());
         settings.extend_from_slice(&1u32.to_be_bytes());
@@ -690,6 +694,10 @@ impl Session {
                 pending.drain(..at);
             }
             wire.pending = pending;
+            if self.request.is_none() && Instant::now() >= deadline {
+                self.end = true;
+                break;
+            }
             self.flush(wire);
             if wire.closed || self.end {
                 break;
@@ -747,6 +755,10 @@ impl Session {
                         return;
                     }
                     block.extend_from_slice(strip_padding(flags, body));
+                    if block.len() > FRAME_CAP {
+                        self.end = true;
+                        return;
+                    }
                     if flags & h2::F_END_HEADERS != 0 {
                         self.request(wire, id, &block);
                     } else {
