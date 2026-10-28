@@ -1339,10 +1339,12 @@ impl Drop for WorkerSlot {
     }
 }
 
-#[allow(clippy::unnecessary_wraps)]
-fn admit_worker(live: &Arc<AtomicUsize>, _cap: usize) -> Option<WorkerSlot> {
-    live.fetch_add(1, Ordering::AcqRel);
-    Some(WorkerSlot(Arc::clone(live)))
+fn admit_worker(live: &Arc<AtomicUsize>, cap: usize) -> Option<WorkerSlot> {
+    live.try_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+        (current < cap).then_some(current + 1)
+    })
+    .ok()
+    .map(|_| WorkerSlot(Arc::clone(live)))
 }
 
 #[allow(clippy::needless_pass_by_value)]
