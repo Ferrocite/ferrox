@@ -18,12 +18,14 @@ use crate::vmess;
 /// What the `api` app names: the tag routing reaches in outbound mode, and the address a listener
 /// answers on in listen mode. xray treats the two as independent: a config may name either or both.
 #[derive(Clone, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct ApiConfig {
     pub(crate) tag: String,
     pub(crate) listen: Option<String>,
     pub(crate) handler: bool,
     pub(crate) stats: bool,
     pub(crate) logger: bool,
+    pub(crate) observatory: bool,
 }
 
 impl ApiConfig {
@@ -64,6 +66,7 @@ impl ApiConfig {
             "xray.app.proxyman.command.Config" => self.handler = true,
             "xray.app.stats.command.Config" => self.stats = true,
             "xray.app.log.command.Config" => self.logger = true,
+            "xray.app.observatory.command.Config" => self.observatory = true,
             "xray.app.commander.ReflectionConfig" => {}
             other => eprintln!("commander: service `{other}` is not carried; skipped"),
         }
@@ -87,6 +90,7 @@ impl ApiConfig {
             handler: false,
             stats: false,
             logger: false,
+            observatory: false,
         };
         if let Some(services) = api.get("services").and_then(Json::as_arr) {
             for service in services.iter().filter_map(Json::as_str) {
@@ -96,6 +100,8 @@ impl ApiConfig {
                     config.stats = true;
                 } else if service.eq_ignore_ascii_case("LoggerService") {
                     config.logger = true;
+                } else if service.eq_ignore_ascii_case("ObservatoryService") {
+                    config.observatory = true;
                 } else if service.eq_ignore_ascii_case("ReflectionService") {
                 } else {
                     eprintln!("commander: service `{service}` is not carried; skipped");
@@ -136,6 +142,7 @@ pub(crate) struct Api {
     mutation: Mutex<()>,
     start: std::time::Instant,
     runtime: std::sync::OnceLock<Arc<crate::proxy::Runtime>>,
+    observatory: std::sync::OnceLock<Option<Arc<crate::observatory::Observatory>>>,
 }
 
 impl std::fmt::Debug for Api {
@@ -149,6 +156,7 @@ impl std::fmt::Debug for Api {
             .field("mutation", &self.mutation.try_lock().is_ok())
             .field("start", &self.start)
             .field("runtime", &self.runtime.get().is_some())
+            .field("observatory", &self.observatory.get().is_some())
             .finish()
     }
 }
@@ -161,6 +169,7 @@ impl Api {
             mutation: Mutex::new(()),
             start: std::time::Instant::now(),
             runtime: std::sync::OnceLock::new(),
+            observatory: std::sync::OnceLock::new(),
         })
     }
 
@@ -176,6 +185,13 @@ impl Api {
     /// The startup context a later `AddInbound` needs; set once the routes are built.
     pub(crate) fn set_runtime(&self, runtime: Arc<crate::proxy::Runtime>) {
         let _ = self.runtime.set(runtime);
+    }
+
+    pub(crate) fn set_observatory(
+        &self,
+        observatory: Option<Arc<crate::observatory::Observatory>>,
+    ) {
+        let _ = self.observatory.set(observatory);
     }
 
     fn runtime(&self) -> Result<&Arc<crate::proxy::Runtime>, (u32, String)> {
@@ -403,6 +419,12 @@ impl Api {
             }
             return Err((12, format!("{path} is not a method this server carries")));
         }
+        if service == "/xray.core.app.observatory.command.ObservatoryService" {
+            if method == "GetOutboundStatus" && self.config.observatory {
+                return Ok(self.get_outbound_status());
+            }
+            return Err((12, format!("{path} is not a method this server carries")));
+        }
         let handler = service == "/xray.app.proxyman.command.HandlerService";
         let stats = service == "/xray.app.stats.command.StatsService";
         match (method, handler, stats) {
@@ -428,6 +450,18 @@ impl Api {
             ("GetAllOnlineUsers" | "GetUsersStats", _, true) if self.config.stats => Ok(Vec::new()),
             _ => Err((12, format!("{path} is not a method this server carries"))),
         }
+    }
+
+    fn get_outbound_status(&self) -> Vec<u8> {
+        let mut status = Vec::new();
+        if let Some(Some(observatory)) = self.observatory.get() {
+            for observed in observatory.snapshot().iter() {
+                field_bytes(&mut status, 1, &outbound_status(observed));
+            }
+        }
+        let mut out = Vec::new();
+        field_bytes(&mut out, 1, &status);
+        out
     }
 
     fn get_stats(request: &[u8]) -> Result<Vec<u8>, (u32, String)> {
@@ -814,6 +848,44 @@ fn inbound_config(tag: &str, _only_tags: bool) -> Vec<u8> {
     out
 }
 
+/// One `xray.core.app.observatory.OutboundStatus`: the reading a balancer already picked from.
+fn outbound_status(observed: &crate::router::Observed) -> Vec<u8> {
+    let mut out = Vec::new();
+    if observed.alive {
+        field_varint(&mut out, 1, 1);
+    }
+    if observed.delay_ms != 0 {
+        field_varint(&mut out, 2, observed.delay_ms as u64);
+    }
+    if !observed.last_error.is_empty() {
+        field_str(&mut out, 3, &observed.last_error);
+    }
+    if !observed.tag.is_empty() {
+        field_str(&mut out, 4, &observed.tag);
+    }
+    if observed.last_seen != 0 {
+        field_varint(&mut out, 5, observed.last_seen as u64);
+    }
+    if observed.last_try != 0 {
+        field_varint(&mut out, 6, observed.last_try as u64);
+    }
+    if let Some(health) = observed.health {
+        let mut ping = Vec::new();
+        for (field, value) in [
+            (1, health.all),
+            (2, health.fail),
+            (3, health.deviation),
+            (4, health.average),
+        ] {
+            if value != 0 {
+                field_varint(&mut ping, field, value as u64);
+            }
+        }
+        field_bytes(&mut out, 7, &ping);
+    }
+    out
+}
+
 /// One `xray.app.stats.command.Stat`: the name the counter registered and its total.
 fn stat(name: &str, value: i64) -> Vec<u8> {
     let mut out = Vec::new();
@@ -1061,6 +1133,7 @@ mod tests {
             handler: true,
             stats: false,
             logger: false,
+            observatory: false,
         });
         let inbound = vec![0x0a, 0x01, b'd'];
         api.register_inbound(
@@ -1102,6 +1175,7 @@ mod tests {
             handler: true,
             stats: false,
             logger: false,
+            observatory: false,
         });
         let first = [0x11u8; 16];
         let second = [0x22u8; 16];
@@ -1274,6 +1348,7 @@ mod tests {
             handler: true,
             stats: false,
             logger: false,
+            observatory: false,
         });
         api.set_runtime(std::sync::Arc::new(crate::proxy::test_runtime(&root)));
         let raw = freedom_outbound("new");
@@ -1309,6 +1384,7 @@ mod tests {
             handler: true,
             stats: false,
             logger: false,
+            observatory: false,
         });
         api.set_runtime(std::sync::Arc::new(crate::proxy::test_runtime(&root)));
         let first = free_port();
@@ -1373,6 +1449,7 @@ mod tests {
             handler: false,
             stats: false,
             logger: false,
+            observatory: false,
         });
         assert_eq!(
             unselected
@@ -1386,6 +1463,7 @@ mod tests {
             handler: false,
             stats: false,
             logger: true,
+            observatory: false,
         });
         assert_eq!(
             selected.dispatch(path, &[]).expect("answers the call"),
@@ -1400,6 +1478,93 @@ mod tests {
                 "/xray.app.log.command.LoggerService/Unknown is not a method this server carries"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn the_observatory_service_serializes_the_live_snapshot() {
+        let root = crate::json::parse(r#"{"api":{"tag":"api","services":["observatoryService"]}}"#)
+            .expect("parses");
+        assert!(
+            ApiConfig::from_json(&root).expect("api block").observatory,
+            "the service name is case-insensitive"
+        );
+        let path = "/xray.core.app.observatory.command.ObservatoryService/GetOutboundStatus";
+        let unselected = Api::new(ApiConfig {
+            tag: "api".to_owned(),
+            listen: None,
+            handler: false,
+            stats: false,
+            logger: false,
+            observatory: false,
+        });
+        assert_eq!(
+            unselected
+                .dispatch(path, &[])
+                .expect_err("service is not selected"),
+            (12, format!("{path} is not a method this server carries"))
+        );
+        let selected = Api::new(ApiConfig {
+            tag: "api".to_owned(),
+            listen: None,
+            handler: false,
+            stats: false,
+            logger: false,
+            observatory: true,
+        });
+        let observed = crate::router::Observed {
+            tag: "edge".to_owned(),
+            alive: true,
+            delay_ms: 12,
+            health: Some(crate::router::HealthPing {
+                all: 5,
+                fail: 1,
+                deviation: 2,
+                average: 12,
+            }),
+            last_error: "an earlier timeout".to_owned(),
+            last_seen: 100,
+            last_try: 101,
+        };
+        selected.set_observatory(Some(crate::observatory::Observatory::seeded(&[observed])));
+        let answer = selected.dispatch(path, &[]).expect("answers the call");
+        let status = request_bytes(&answer, 1).expect("status");
+        let entry = request_bytes(status, 1).expect("one outbound");
+        assert_eq!(request_varint(entry, 1), Some(1), "alive");
+        assert_eq!(request_varint(entry, 2), Some(12), "delay in ms");
+        assert_eq!(
+            request_str(entry, 3).as_deref(),
+            Some("an earlier timeout"),
+            "the last error"
+        );
+        assert_eq!(request_str(entry, 4).as_deref(), Some("edge"), "tag");
+        assert_eq!(request_varint(entry, 5), Some(100), "last seen");
+        assert_eq!(request_varint(entry, 6), Some(101), "last try");
+        let health = request_bytes(entry, 7).expect("health ping");
+        assert_eq!(request_varint(health, 1), Some(5), "all");
+        assert_eq!(request_varint(health, 2), Some(1), "fail");
+        assert_eq!(request_varint(health, 3), Some(2), "deviation");
+        assert_eq!(request_varint(health, 4), Some(12), "average");
+    }
+
+    #[test]
+    fn a_selected_service_without_an_observatory_answers_an_empty_result() {
+        let selected = Api::new(ApiConfig {
+            tag: "api".to_owned(),
+            listen: None,
+            handler: false,
+            stats: false,
+            logger: false,
+            observatory: true,
+        });
+        assert_eq!(
+            selected
+                .dispatch(
+                    "/xray.core.app.observatory.command.ObservatoryService/GetOutboundStatus",
+                    &[]
+                )
+                .expect("an empty result is still an answer"),
+            vec![0x0a, 0x00]
         );
     }
 
