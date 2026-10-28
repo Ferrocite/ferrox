@@ -3243,15 +3243,20 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let payload = vec![0x5a; 256 * 1024];
+        let want = payload.len();
         let (sent, received) = std::sync::mpsc::channel();
         thread::scope(|scope| {
             scope.spawn(move || {
                 let (stream, _) = listener.accept().expect("accepts");
                 let mut server = crate::tls::accept(&identity, stream).expect("accepts");
                 server.handshake().expect("handshakes");
+                server
+                    .get_ref()
+                    .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                    .expect("arms a timeout");
                 let mut buf = [0u8; 64 * 1024];
                 let mut got = 0usize;
-                loop {
+                while got < want {
                     match server.read(&mut buf) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => got += n,
@@ -3267,6 +3272,10 @@ mod tests {
                 .write_all_slices(&[&payload])
                 .expect("a relay-sized write");
             client.flush().expect("flushes");
+            assert!(
+                !client.conn.wants_write(),
+                "the write left TLS records queued"
+            );
         });
         assert_eq!(
             received.recv().expect("the server finished"),
