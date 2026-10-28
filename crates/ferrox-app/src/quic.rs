@@ -3610,10 +3610,17 @@ mod tests {
         receiver.set_nonblocking(true).expect("a reading queue");
         let mut got = Vec::new();
         let mut buf = [0u8; 128];
-        loop {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while got.len() < held.len() {
             match receiver.recv_from(&mut buf) {
                 Ok((n, _)) => got.push(buf[..n].to_vec()),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the held datagrams never reached the receiver"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
                 Err(error) => panic!("recv: {error}"),
             }
         }
