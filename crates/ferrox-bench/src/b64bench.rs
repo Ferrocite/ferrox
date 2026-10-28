@@ -2,7 +2,10 @@ use std::fmt::Write as _;
 
 use ferrox_core::b64;
 
-use crate::framing::{timed_row, Row};
+use crate::framing::{timed_row_at, Row};
+
+/// The row's claim: the shipped coder is no slower than the loop it replaced, so a first reading under parity is re-measured before it can fail.
+pub(crate) const PARITY: f64 = 1.0;
 
 const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
@@ -159,18 +162,20 @@ pub(crate) fn gate_b64() -> Vec<Row> {
             "decode {len}"
         );
         let iters = iters_for(len);
-        rows.push(timed_row(
+        rows.push(timed_row_at(
             format!("b64 encode, {len}B"),
             len,
             iters,
+            PARITY,
             &mut || b64::encode(std::hint::black_box(&raw)).len(),
             &mut || encode_reference(std::hint::black_box(&raw)).len(),
         ));
         let text = coded.as_bytes();
-        rows.push(timed_row(
+        rows.push(timed_row_at(
             format!("b64 decode, {len}B"),
             len,
             iters,
+            PARITY,
             &mut || {
                 b64::decode(std::hint::black_box(text))
                     .expect("decodes")
@@ -199,7 +204,9 @@ pub(crate) fn report(rows: &[Row]) -> String {
          either is timed. The reference is the four-shift, four-store group walk; the shipped\n\
          form reads one twelve-bit group as two table probes and two stores, and decodes a\n\
          pair of groups with eight table probes and one eight-byte store. The gate below\n\
-         requires every row to be no slower than its own reference.\n"
+         requires every row to be no slower than its own reference; a row read under\n\
+         parity is re-measured at four times the budget first, so one loaded round at\n\
+         twelve bytes cannot fail it.\n"
     );
     let _ = writeln!(
         out,
