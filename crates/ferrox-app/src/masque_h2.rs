@@ -1206,7 +1206,10 @@ mod tests {
             pending: Vec::new(),
             closed: false,
         };
-        session.run_until(&mut wire, Instant::now() - Duration::from_millis(1));
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("a past deadline");
+        session.run_until(&mut wire, deadline);
         assert!(session.end, "a silent peer is ended at the deadline");
     }
 
