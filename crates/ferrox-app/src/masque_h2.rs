@@ -250,7 +250,14 @@ impl Wire {
                 self.pending.extend_from_slice(&room[..n]);
                 true
             }
-            Err(error) if ferrox_core::tls::TlsError::is_timeout(&error) => true,
+            Err(error) if ferrox_core::tls::TlsError::is_timeout(&error) => {
+                if self.deadline.remaining().is_some_and(|left| left.is_zero()) {
+                    self.closed = true;
+                    false
+                } else {
+                    true
+                }
+            }
             Err(_) => {
                 self.closed = true;
                 false
@@ -1495,6 +1502,20 @@ mod tests {
             error.is_some_and(|reason| reason.kind() == std::io::ErrorKind::TimedOut),
             "the read outlived its absolute deadline"
         );
+    }
+
+    #[test]
+    fn a_timeout_after_the_deadline_closes_the_wire() {
+        let deadline = Deadline::default();
+        deadline.arm(Instant::now());
+        let mut wire = Wire {
+            stream: Box::new(Quiet { reads: 1_000 }),
+            pending: Vec::new(),
+            closed: false,
+            deadline,
+        };
+        assert!(!wire.fill(), "an expired deadline ends the read");
+        assert!(wire.closed, "the wire is closed, not retried as idle");
     }
 
     #[test]
