@@ -541,7 +541,7 @@ pub fn decode(text: &[u8]) -> Option<Vec<u8>> {
     #[cfg(target_arch = "aarch64")]
     let mut at;
     #[cfg(target_arch = "x86_64")]
-    if std::is_x86_feature_detected!("ssse3") {
+    if text.len() >= 16 && std::is_x86_feature_detected!("ssse3") {
         // SAFETY: the feature is present, and the buffer reserves four bytes past the exact decoded length, so the wide store stays inside it.
         let (done, written) = unsafe { x86::decode_prefix(text, ptr) };
         at = done;
