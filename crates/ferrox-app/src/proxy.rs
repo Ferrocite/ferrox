@@ -19424,10 +19424,15 @@ impl RelayFinish {
 
     /// True once the sibling ended and the last-reply grace has run: a timeout may only end the leg after that, or a reply that follows the FIN is dropped.
     pub(crate) fn ended_and_drained(&self) -> bool {
+        self.ended_and_idle(crate::budgets::RELAY_DRAIN_GRACE)
+    }
+
+    /// True once the sibling ended and `idle` has run since: the answer lane waits a target's own budget, not the upload lane's short grace.
+    pub(crate) fn ended_and_idle(&self, idle: Duration) -> bool {
         self.ended_at
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .is_some_and(|at| at.elapsed() >= crate::budgets::RELAY_DRAIN_GRACE)
+            .is_some_and(|at| at.elapsed() >= idle)
     }
 
     fn close_once(&self) {
@@ -20275,7 +20280,7 @@ where
                 &mut peer_write,
                 stall,
                 &mut first,
-                || upload_flow.ended_and_drained(),
+                || upload_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE),
             );
             if next != Next::Done {
                 return next;
@@ -31405,7 +31410,7 @@ mod tests {
         }
     }
 
-    /// A client that has sent its last byte may half-close and still receive the answer, so the ws close frame waits for the response lane.
+    /// A client that has sent its last byte may half-close and still receive an answer the target sends afterwards, so the response lane outlives the upload's EOF by its own budget.
     #[test]
     fn vless_tls_ws_answers_after_the_client_half_closes() {
         vless_tls_carried_upload_before_response(
@@ -31459,17 +31464,13 @@ mod tests {
                     .expect("the upload arrives before the response header");
                 total += want;
             }
-            if half_close {
-                writer.write_all(&[0, 0]).expect("response header");
-                writer.write_all(b"pong").expect("echoes after the header");
-                writer.flush().expect("flushes");
-            }
             uploaded_tx.send(()).expect("signals");
-            if !half_close {
-                writer.write_all(&[0, 0]).expect("response header");
-                writer.write_all(b"pong").expect("echoes after the header");
-                writer.flush().expect("flushes");
+            if half_close {
+                thread::sleep(Duration::from_millis(200));
             }
+            writer.write_all(&[0, 0]).expect("response header");
+            writer.write_all(b"pong").expect("echoes after the header");
+            writer.flush().expect("flushes");
         });
         let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let downstream_port = downstream.local_addr().expect("addr").port();
