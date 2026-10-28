@@ -51,6 +51,10 @@ const DEFAULT_DNS: [IpAddr; 4] = [
 const DNS_PORT: u16 = 53;
 /// How long one remote-DNS exchange waits for its answer.
 const DNS_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long one remote-DNS query waits before it is sent again: the tunnel may
+/// still be handshaking when the first datagram is offered, and a lost query
+/// is cheaper to repeat than to fail.
+const DNS_RETRY: Duration = Duration::from_secs(1);
 /// The source-port range reserved for remote-DNS queries, below the ephemeral
 /// range the datagram lanes bind.
 const DNS_PORT_FIRST: u16 = 1024;
@@ -400,18 +404,31 @@ impl WireGuardOut {
             self.remove_dns_route(port);
             return None;
         }
-        if self.to_tunnel.send(packet).is_err() {
+        if self.to_tunnel.send(packet.clone()).is_err() {
             self.remove_dns_route(port);
             return None;
         }
         let deadline = Instant::now() + DNS_TIMEOUT;
+        let mut resend_at = Instant::now() + DNS_RETRY;
         let result = loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            let now = Instant::now();
+            if now >= deadline {
                 break None;
             }
-            let Ok(inner) = replies.recv_timeout(remaining) else {
+            if now >= resend_at {
+                if self.to_tunnel.send(packet.clone()).is_err() {
+                    break None;
+                }
+                resend_at = now + DNS_RETRY;
+            }
+            let until = resend_at.min(deadline);
+            if until <= now {
                 break None;
+            }
+            let inner = match replies.recv_timeout(until - now) {
+                Ok(inner) => inner,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
             };
             let Some(datagram) = udp_from_packet(&inner) else {
                 continue;
@@ -1051,22 +1068,30 @@ mod tests {
         let (answered, answer) = mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
-            let Ok((n, from)) = dns.recv_from(&mut buf) else {
-                return;
-            };
-            let Some(question) = ferrox_core::dns::parse_query(&buf[..n]) else {
-                return;
-            };
-            let Some(reply) = ferrox_core::dns::ip_answer(
-                &question,
-                0,
-                60,
-                &[vec![192, 0, 2, 1], vec![127, 0, 0, 1]],
-            ) else {
-                return;
-            };
-            if dns.send_to(&reply, from).is_ok() {
-                let _ = answered.send(());
+            let mut seen = 0;
+            loop {
+                let Ok((n, from)) = dns.recv_from(&mut buf) else {
+                    return;
+                };
+                seen += 1;
+                // A tunnel still handshaking drops the first query; the resolver's retry carries it.
+                if seen == 1 {
+                    continue;
+                }
+                let Some(question) = ferrox_core::dns::parse_query(&buf[..n]) else {
+                    continue;
+                };
+                let Some(reply) = ferrox_core::dns::ip_answer(
+                    &question,
+                    0,
+                    60,
+                    &[vec![192, 0, 2, 1], vec![127, 0, 0, 1]],
+                ) else {
+                    continue;
+                };
+                if dns.send_to(&reply, from).is_ok() {
+                    let _ = answered.send(());
+                }
             }
         });
 
