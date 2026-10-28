@@ -23,7 +23,7 @@ use crate::conn::Connection;
 use crate::json::Json;
 use crate::proxy::{Destination, Outbound};
 use crate::quic::{self, Datagram};
-use crate::wg_stack::{self, ClientFlow, Packet, UdpRoutes};
+use crate::wg_stack::{self, ClientFlow, Packet, ToTunnel, UdpRoutes};
 use crate::wireguard::DeviceConfig;
 
 const TICK: Duration = Duration::from_millis(10);
@@ -58,7 +58,7 @@ pub(crate) struct MasqueOut {
 struct Inner {
     config: Arc<DeviceConfig>,
     flows: Sender<ClientFlow>,
-    to_tunnel: Sender<Vec<u8>>,
+    to_tunnel: ToTunnel,
     routes: UdpRoutes,
     alive: Arc<AtomicBool>,
 }
@@ -247,7 +247,7 @@ fn assemble(
         dns: Vec::new(),
     });
     let (packets_tx, packets_rx) = mpsc::channel();
-    let (to_tunnel, from_tunnel) = mpsc::channel();
+    let (to_tunnel, from_tunnel) = mpsc::sync_channel(QUEUE);
     let (flows, flow_rx) = mpsc::channel();
     let routes: UdpRoutes = Arc::default();
     let stack_config = Arc::clone(&config);
@@ -267,7 +267,7 @@ fn assemble(
     Inner {
         config,
         flows,
-        to_tunnel,
+        to_tunnel: to_tunnel.into(),
         routes,
         alive,
     }
@@ -1005,7 +1005,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         packets,
         local: spec.pool.server.clone(),
     });
-    let (to_tunnel, from_stack) = mpsc::channel();
+    let (to_tunnel, from_stack) = mpsc::sync_channel(QUEUE);
     let dispatcher = Arc::clone(&shared);
     std::thread::spawn(move || dispatch(&dispatcher, from_stack));
     if identity.alpn.iter().any(|alpn| alpn == b"h2") {
