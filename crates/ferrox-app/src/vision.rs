@@ -443,8 +443,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                         continue;
                     }
                     if self.dot > was {
-                        // the walk ate nothing this pass; its state moved, so it resumes
-                        continue;
+                        // A frame with no content yields the session lock to the writer.
+                        return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
                     }
                 }
                 if !self.fill()? {

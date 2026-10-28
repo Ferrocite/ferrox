@@ -7386,7 +7386,8 @@ pub(crate) fn read_into_tail(
 }
 
 pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
-    ferrox_core::tls::TlsError::is_timeout(error)
+    error.kind() == std::io::ErrorKind::Interrupted
+        || ferrox_core::tls::TlsError::is_timeout(error)
 }
 
 thread_local! {
