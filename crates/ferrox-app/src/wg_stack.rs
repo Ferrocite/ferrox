@@ -368,8 +368,8 @@ type Packets = Receiver<Packet>;
 fn receive_client(stack: &mut ClientStack, packet: Packet) {
     if inner_protocol(&packet.bytes) == Some(PROTOCOL_TCP) {
         stack.device.push(packet.bytes);
-    } else if !stack.answer_echo(&packet.bytes) {
-        stack.device.absorb(&packet.bytes);
+    } else if !stack.answer_echo(&packet.bytes) && stack.device.absorb(&packet.bytes) {
+        stack.reset_iface();
     }
 }
 
@@ -468,6 +468,14 @@ impl ClientStack {
 
     fn answer_echo(&self, packet: &[u8]) -> bool {
         answer_echo(packet, &self.addresses, &self.to_tunnel)
+    }
+
+    /// Rebuild the interface so smoltcp's cached capabilities carry the learned MTU.
+    fn reset_iface(&mut self) {
+        let now = self.now();
+        self.iface = Interface::new(iface_config(0x5eed_1234), &mut self.device, now);
+        add_addresses(&mut self.iface, &self.addresses);
+        add_default_routes(&mut self.iface, &self.addresses);
     }
 
     fn connect(&mut self, flow: ClientFlow) -> std::io::Result<()> {
