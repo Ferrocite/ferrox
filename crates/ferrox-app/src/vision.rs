@@ -941,6 +941,7 @@ mod tests {
         read: Cursor<Vec<u8>>,
         written: Vec<u8>,
         disarmed: usize,
+        engaged: usize,
     }
 
     impl Fake {
@@ -949,6 +950,7 @@ mod tests {
                 read: Cursor::new(input.to_vec()),
                 written: Vec::new(),
                 disarmed: 0,
+                engaged: 0,
             }
         }
     }
@@ -971,6 +973,10 @@ mod tests {
     }
 
     impl RecordAlignment for Fake {
+        fn engage_record_alignment(&mut self) {
+            self.engaged += 1;
+        }
+
         fn disarm_record_alignment(&mut self) {
             self.disarmed += 1;
         }
@@ -1009,6 +1015,22 @@ mod tests {
             link.session.disarmed, 1,
             "the end of the framing stops the limiter"
         );
+    }
+
+    /// The end of the framing disarms the limiter; a later spend must not arm it again.
+    #[test]
+    fn a_spend_after_framing_ends_does_not_rearm_the_limiter() {
+        let mut input = frame(true, VisionCommand::Direct.byte(), b"tail", 0);
+        input.extend_from_slice(b"raw");
+        let mut link = link(&input);
+        link.tls.update(|tls| {
+            tls.enable_xtls = true;
+            tls.budget = 1;
+        });
+        let mut out = [0u8; 4];
+        assert_eq!(link.read(&mut out).expect("reads the framed content"), 4);
+        assert_eq!(&out, b"tail");
+        assert_eq!(link.session.engaged, 0, "the framing end stays disarmed");
     }
 
     #[test]
