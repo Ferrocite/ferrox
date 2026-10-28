@@ -2573,6 +2573,60 @@ mod client_tests {
             "one peer narrowed another peer's path"
         );
     }
+
+    #[test]
+    fn a_peer_cannot_narrow_the_mtu_another_peer_uses() {
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.2".parse().unwrap()],
+            peers: vec![
+                crate::wireguard::PeerConfig {
+                    public: [0x11; 32],
+                    preshared: [0; 32],
+                    endpoint: None,
+                    endpoints: Vec::new(),
+                    keepalive: 0,
+                    allowed: vec![("0.0.0.0".parse().unwrap(), 0)],
+                },
+                crate::wireguard::PeerConfig {
+                    public: [0x22; 32],
+                    preshared: [0; 32],
+                    endpoint: None,
+                    endpoints: Vec::new(),
+                    keepalive: 0,
+                    allowed: vec![("0.0.0.0".parse().unwrap(), 0)],
+                },
+            ],
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
+        let (to_tunnel, _) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&config, to_tunnel);
+        let mut inner = vec![0u8; 28];
+        inner[0] = 0x45;
+        inner[2..4].copy_from_slice(&28u16.to_be_bytes());
+        inner[8] = 64;
+        inner[9] = PROTOCOL_UDP;
+        inner[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        inner[16..20].copy_from_slice(&[198, 51, 100, 7]);
+        let too_big =
+            ferrox_core::foxy::connectip::icmp_too_large(&inner, 600).expect("a v4 answer");
+        receive_client(
+            &mut stack,
+            Packet {
+                peer: [0x11; 32],
+                bytes: too_big,
+            },
+        );
+        assert_eq!(
+            stack.device.capabilities().max_transmission_unit,
+            1420,
+            "one peer narrowed the MTU every peer shares"
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
