@@ -2,7 +2,7 @@
 
 <!-- scope:begin -->
 - paths: -
-- symbols: find_dns_outbound, build_dns_outbound, decode_dns_rules, decode_dns_rule, decode_dns_legacy, decode_dns_network, serve_dns_tcp, serve_dns_udp, dns_lookup, dial_dns, read_dns_source, answer_handle, write_dns_frame, send_dns_query, dns_lane_tests
+- symbols: find_dns_outbound, build_dns_outbound, decode_dns_rules, decode_dns_rule, decode_dns_legacy, decode_dns_network, serve_dns_tcp, serve_dns_udp, dns_lookup, dial_dns, read_dns_source, answer_handle, write_dns_frame, send_dns_query, dns_lane_tests, the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 - go: ./proxy/dns/..., ./features/dns/...
 <!-- scope:end -->
 Row 26: a `dns` outbound answers DNS questions the way the reference's `proxy/dns` does. One flow opens a SOCKS CONNECT or a SOCKS association with the `dns` tag, and the lane behind it reads framed questions, decides each one against the rules, and answers from the resolver or relays the question out.
