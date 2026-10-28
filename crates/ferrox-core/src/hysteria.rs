@@ -34,6 +34,7 @@ pub enum BbrProfile {
 /// The `finalmask.quicParams` a hysteria transport names. A zero field keeps the
 /// carrier's own default; the reference fills the QUIC defaults only when the
 /// block is present, so `Config::quic == None` is the byte-identical old path.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct QuicParams {
     pub congestion: Congestion,
