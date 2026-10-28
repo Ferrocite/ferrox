@@ -45006,6 +45006,19 @@ end
         assert_eq!(answer.bytes(), ferrox_core::blackhole::HTTP_403);
     }
 
+    /// The default is the first configured outbound, not the first protocol the finders happen to support.
+    #[test]
+    fn the_first_outbound_is_the_default_when_a_later_one_is_buildable() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom","settings":{}},{"tag":"edge","protocol":"masque","settings":{"address":"127.0.0.1","port":443},"streamSettings":{"network":"masque","security":"tls","tlsSettings":{"serverName":"edge.example","allowInsecure":true}}}]}"#,
+        )
+        .expect("parses");
+        assert!(
+            matches!(find_outbound(&root), Ok(Some(Outbound::Freedom(_)))),
+            "a later masque outbound became the default"
+        );
+    }
+
     /// xray's `direct` outbound is the handler `freedom` names: a config with only that outbound serves the direct lane.
     #[test]
     fn the_direct_outbound_is_the_freedom_lane() {
