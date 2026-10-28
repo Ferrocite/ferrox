@@ -196,6 +196,7 @@ impl Driver {
 
 pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
     let deadline = Instant::now() + crate::quic::SEND_WAIT;
+    let mut paced = false;
     loop {
         let before = session.send_wake.as_ref().map_or(0, |wake| wake.seen());
         let last = buf.is_empty();
@@ -213,20 +214,25 @@ pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool
                     return true;
                 }
                 if written > 0 {
+                    paced = false;
                     continue;
                 }
-                if Instant::now() >= deadline {
-                    return false;
-                }
             }
-            Err(quiche::Error::Done) => {
-                if Instant::now() >= deadline {
-                    return false;
-                }
-            }
+            Err(quiche::Error::Done) => {}
             Err(_) => return false,
         }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if !paced {
+            // A pacer holding the next packet is released by the wheel's timer, not by another `send`.
+            conn.on_timeout();
+            crate::quic::flush_egress(&mut conn, &session.sock);
+            paced = true;
+            continue;
+        }
         drop(conn);
+        paced = false;
         if let Some(wake) = session.send_wake.as_ref() {
             wake.wait(before, STREAM_POLL);
         } else {
