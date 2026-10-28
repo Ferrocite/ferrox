@@ -24,6 +24,7 @@ const PREFACE: usize = 24;
 const SETTINGS_INITIAL_WINDOW: u16 = 0x4;
 const SETTINGS_ENABLE_CONNECT: u16 = 0x8;
 const FRAME_CAP: usize = 1 << 20;
+const QUEUED_CAP: usize = 64;
 const DEFAULT_WINDOW: i64 = 65_535;
 
 trait ReadWrite: Read + Write {}
@@ -1008,6 +1009,24 @@ mod tests {
             "a whole capsule is never staged"
         );
         assert_eq!(client.packets.len(), 0);
+    }
+
+    #[test]
+    fn a_stalled_send_window_bounds_the_queued_capsules() {
+        let mut client = bare_client();
+        client.send_window = 0;
+        client.connection_window = 0;
+        let mut capsule = Vec::new();
+        datagram(&udp_packet(53), &mut capsule);
+        for _ in 0..=QUEUED_CAP {
+            client.capsule(&capsule);
+        }
+        assert_eq!(
+            client.queued.len(),
+            QUEUED_CAP,
+            "a stalled window keeps at most {QUEUED_CAP} capsules"
+        );
+        assert!(client.end, "the capsule past the cap ends the session");
     }
 
     #[test]
