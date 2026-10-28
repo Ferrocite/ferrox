@@ -5222,4 +5222,41 @@ mod tests {
             "a skipped fake server falls back to the system"
         );
     }
+
+    #[test]
+    fn a_failed_family_still_falls_back_to_the_system() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("timeout");
+        let port = socket.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            for _ in 0..2 {
+                let Ok((len, peer)) = socket.recv_from(&mut buf) else {
+                    return;
+                };
+                let Some(question) = ferrox_core::dns::parse_query(&buf[..len]) else {
+                    continue;
+                };
+                let reply = if question.qtype == 28 {
+                    b"not a dns answer".to_vec()
+                } else {
+                    ferrox_core::dns::ip_answer(&question, 0, 60, &[]).expect("answer")
+                };
+                socket.send_to(&reply, peer).expect("reply");
+            }
+        });
+        let root = crate::json::parse(&format!(
+            r#"{{"dns":{{"servers":["udp://127.0.0.1:{port}"],"queryStrategy":"UseIP"}}}}"#
+        ))
+        .expect("parses");
+        let resolver = resolver(&root);
+        let (ips, _) = resolve_ips_ttl_with(Some(&resolver), "192.0.2.7", 0);
+        assert_eq!(
+            ips,
+            vec!["192.0.2.7".parse::<IpAddr>().expect("ipv4")],
+            "a failed family is not an authoritative empty answer"
+        );
+    }
 }
