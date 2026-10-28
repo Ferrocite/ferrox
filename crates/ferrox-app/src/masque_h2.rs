@@ -993,6 +993,63 @@ mod tests {
     use super::*;
     use crate::json::Json;
 
+    struct Silent;
+
+    impl Read for Silent {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            std::thread::sleep(READ_WAIT);
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+    }
+
+    impl Write for Silent {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_continued_header_block_cannot_pass_the_frame_cap() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut wire = Wire {
+            stream: Box::new(std::io::Cursor::new(Vec::new())),
+            pending: Vec::new(),
+            closed: false,
+        };
+        session.on(&mut wire, h2::T_HEADERS, 0, 1, &vec![0u8; FRAME_CAP]);
+        assert!(session.continuation.is_some(), "the block is continued");
+        session.on(&mut wire, h2::T_CONT, 0, 1, &[0u8; 2]);
+        assert!(
+            session.end,
+            "a continued header block past {FRAME_CAP} ends the session"
+        );
+    }
+
+    #[test]
+    fn a_quiet_peer_does_not_hold_the_session_thread() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut wire = Wire {
+            stream: Box::new(Silent),
+            pending: Vec::new(),
+            closed: false,
+        };
+        let (done, finished) = mpsc::channel();
+        std::thread::spawn(move || {
+            session.run(&mut wire);
+            let _ = done.send(());
+        });
+        assert!(
+            finished
+                .recv_timeout(HANDSHAKE + Duration::from_secs(1))
+                .is_ok(),
+            "a quiet peer must not hold the session thread past the handshake window"
+        );
+    }
+
     fn bare_client() -> Client {
         Client {
             wire: Wire {
