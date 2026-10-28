@@ -1,16 +1,24 @@
 const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 /// Two alphabet octets for one twelve-bit group, in native byte order: a three-byte input is two table probes and two stores instead of four shifts, four probes and four stores.
-const ENC12: [[u8; 2]; 4096] = encoded_pairs();
+const ENC12: [u16; 4096] = encoded_pairs();
 
-const fn encoded_pairs() -> [[u8; 2]; 4096] {
-    let mut table = [[0u8; 2]; 4096];
+const fn encoded_pairs() -> [u16; 4096] {
+    let mut table = [0u16; 4096];
     let mut word = 0usize;
     while word < 4096 {
-        table[word] = [STD[word >> 6], STD[word & 63]];
+        table[word] = u16::from_ne_bytes([STD[word >> 6], STD[word & 63]]);
         word += 1;
     }
     table
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn encode_group(word: u32) -> u32 {
+    let first = ENC12[((word >> 12) & 0xfff) as usize];
+    let second = ENC12[(word & 0xfff) as usize];
+    u32::from(first) | (u32::from(second) << 16)
 }
 
 /// The `String`-returning coder, one read a group with no intermediate buffer to zero and no validation pass afterwards.
@@ -18,6 +26,27 @@ const fn encoded_pairs() -> [[u8; 2]; 4096] {
 /// [`encode_parts_into`] is the other route to these bytes and the one that writes where the caller already has a window; `the_window_coder_matches_the_alphabet_at_every_length` holds the two byte-identical, which is why this shape survives instead of delegating and paying a fill plus a UTF-8 walk per call.
 #[must_use]
 pub fn encode(bytes: &[u8]) -> String {
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() == 12 {
+        let mut out = Vec::<u8>::with_capacity(16);
+        let ptr = out.as_mut_ptr();
+        // SAFETY: the two loads stay inside twelve bytes, the two stores fill the sixteen reserved bytes with alphabet octets, and the early return skips the generic walk.
+        unsafe {
+            let low = bytes.as_ptr().cast::<u64>().read_unaligned();
+            let high = bytes.as_ptr().add(8).cast::<u32>().read_unaligned();
+            let g0 = ((low & 0x00ff_ffff) as u32).swap_bytes() >> 8;
+            let g1 = (((low >> 24) & 0x00ff_ffff) as u32).swap_bytes() >> 8;
+            let g2 = (((low >> 48) as u32) | ((high & 0xff) << 16)).swap_bytes() >> 8;
+            let g3 = ((high >> 8) & 0x00ff_ffff).swap_bytes() >> 8;
+            ptr.cast::<u64>()
+                .write_unaligned(u64::from(encode_group(g0)) | (u64::from(encode_group(g1)) << 32));
+            ptr.add(8)
+                .cast::<u64>()
+                .write_unaligned(u64::from(encode_group(g2)) | (u64::from(encode_group(g3)) << 32));
+            out.set_len(16);
+            return String::from_utf8_unchecked(out);
+        }
+    }
     let len = encoded_len(bytes.len());
     let mut out = Vec::<u8>::with_capacity(len);
     // The buffer is opened to the exact coded length and every byte of it is written below, so the four alphabet octets of a group are four stores and one cursor add rather than four capacity checks and a length reload each.
@@ -50,12 +79,8 @@ pub fn encode(bytes: &[u8]) -> String {
         let second = ENC12[(word & 0xfff) as usize];
         // SAFETY: `at + 4 <= len` for every whole group, and the four bytes written are alphabet octets, so the `String` below is valid UTF-8.
         unsafe {
-            ptr.add(at)
-                .cast::<u16>()
-                .write_unaligned(u16::from_ne_bytes(first));
-            ptr.add(at + 2)
-                .cast::<u16>()
-                .write_unaligned(u16::from_ne_bytes(second));
+            ptr.add(at).cast::<u16>().write_unaligned(first);
+            ptr.add(at + 2).cast::<u16>().write_unaligned(second);
         }
         at += 4;
     }
@@ -111,8 +136,8 @@ pub fn encode_parts_into(parts: &[&[u8]], out: &mut [u8]) -> std::io::Result<usi
     for group in 0..groups {
         let word = source.triple();
         let at = group * 4;
-        let first = ENC12[((word >> 12) & 0xfff) as usize];
-        let second = ENC12[(word & 0xfff) as usize];
+        let first = ENC12[((word >> 12) & 0xfff) as usize].to_ne_bytes();
+        let second = ENC12[(word & 0xfff) as usize].to_ne_bytes();
         out[at..at + 4].copy_from_slice(&[first[0], first[1], second[0], second[1]]);
     }
     // The 1..=2 bytes that did not fill a group take the padding their empty lanes would have coded.
@@ -804,6 +829,38 @@ mod tests {
             let written = encode_parts_into(&[&bytes], &mut window).expect("exact length");
             assert_eq!(written, window.len(), "coded length for {len}");
             assert_eq!(encode(&bytes).as_bytes(), window.as_slice(), "{len} bytes");
+        }
+    }
+
+    /// The twelve-byte lane is the generic walk at every byte in every position, then over random fills, so its two loads and two stores are not a new spelling of the bytes.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_twelve_byte_lane_is_the_generic_walk_at_every_byte() {
+        let base = *b"0123456789ab";
+        let mut want = vec![0u8; encoded_len(12)];
+        for at in 0..12 {
+            for byte in 0..=255u8 {
+                let mut bytes = base;
+                bytes[at] = byte;
+                encode_parts_into(&[&bytes], &mut want).expect("exact length");
+                assert_eq!(
+                    encode(&bytes).as_bytes(),
+                    want.as_slice(),
+                    "byte {byte} at {at}"
+                );
+            }
+        }
+        let mut word = 0x9e37_79b9_7f4a_7c15_u64;
+        for _ in 0..4096 {
+            let mut bytes = [0u8; 12];
+            for byte in &mut bytes {
+                word ^= word << 13;
+                word ^= word >> 7;
+                word ^= word << 17;
+                *byte = word as u8;
+            }
+            encode_parts_into(&[&bytes], &mut want).expect("exact length");
+            assert_eq!(encode(&bytes).as_bytes(), want.as_slice(), "{bytes:?}");
         }
     }
 
