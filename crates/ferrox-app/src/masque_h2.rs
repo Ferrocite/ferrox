@@ -50,13 +50,18 @@ pub(crate) fn serve(
                 continue;
             };
             let _ = stream.set_nodelay(true);
-            let _ = stream.set_read_timeout(Some(HANDSHAKE));
+            handshake_timeouts(&stream);
             let shared = Arc::clone(&shared);
             let spec = Arc::clone(&spec);
             let identity = Arc::clone(&identity);
             std::thread::spawn(move || connection(stream, &identity, shared, spec));
         }
     });
+}
+
+fn handshake_timeouts(stream: &TcpStream) {
+    let _ = stream.set_read_timeout(Some(HANDSHAKE));
+    let _ = stream.set_write_timeout(Some(HANDSHAKE));
 }
 
 fn connection(
@@ -1026,6 +1031,23 @@ mod tests {
             routes: None,
             end: false,
         }
+    }
+
+    #[test]
+    fn an_accepted_stream_bounds_both_handshake_directions() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a listener");
+        let address = listener.local_addr().expect("an address");
+        let _client = TcpStream::connect(address).expect("a client");
+        let (server, _) = listener.accept().expect("an accepted stream");
+        handshake_timeouts(&server);
+        assert_eq!(
+            server.read_timeout().expect("a read timeout"),
+            Some(HANDSHAKE)
+        );
+        assert_eq!(
+            server.write_timeout().expect("a write timeout"),
+            Some(HANDSHAKE)
+        );
     }
 
     fn udp_packet(destination_port: u16) -> Vec<u8> {
