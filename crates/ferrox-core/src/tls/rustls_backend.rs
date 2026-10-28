@@ -618,11 +618,33 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RustlsProvid
     }
 
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        const CHUNK: usize = 32 * 1024;
         self.drive()?;
-        let mut writer = self.conn.writer();
-        coalesce(&mut writer, parts)?;
-        self.send_pending()?;
-        Ok(())
+        if parts.iter().map(|part| part.len()).sum::<usize>() <= CHUNK {
+            coalesce(&mut self.conn.writer(), parts)?;
+            return self.send_pending();
+        }
+        let mut batch: Vec<&[u8]> = Vec::with_capacity(parts.len() + 1);
+        let mut room = CHUNK;
+        for part in parts {
+            let mut rest = *part;
+            while !rest.is_empty() {
+                let take = rest.len().min(room);
+                batch.push(&rest[..take]);
+                rest = &rest[take..];
+                room -= take;
+                if room == 0 {
+                    coalesce(&mut self.conn.writer(), &batch)?;
+                    self.send_pending()?;
+                    batch.clear();
+                    room = CHUNK;
+                }
+            }
+        }
+        if !batch.is_empty() {
+            coalesce(&mut self.conn.writer(), &batch)?;
+        }
+        self.send_pending()
     }
 }
 
