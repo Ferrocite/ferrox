@@ -24,9 +24,6 @@ const STREAM_POLL: Duration = Duration::from_millis(5);
 
 const SCID_LEN: usize = 16;
 
-/// How long a QUIC datagram lane may sit without traffic before its association is reaped, matching the reference's `udp_idle_timeout`.
-const UDP_IDLE: Duration = Duration::from_secs(60);
-
 /// The reader's socket poll, matching the reference's one-second cleanup tick: it bounds how long a reaped association's thread lives, since a UDP socket has no shutdown to wake a blocked read.
 const UDP_POLL: Duration = Duration::from_secs(1);
 
@@ -400,6 +397,9 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     getrandom::fill(&mut scid).ok()?;
     let cid = quiche::ConnectionId::from_ref(&scid);
     let mut config = crate::quic::quiche_config(roots, Some(dial.config.cc.quiche_name()))?;
+    if let Some(params) = &dial.config.quic {
+        apply_quic_shape(&mut config, params);
+    }
     // The client enables the datagram lane exactly as the served connection does: advertising it changes no stream byte of a TCP-only flow, and it is what lets `dgram_max_writable_len` answer for a UDP dial on this connection.
     config.enable_dgram(true, 1024, 1024);
     let Ok(mut conn) = quiche::connect(Some(&dial.host), &cid, local, peer, &mut config) else {
@@ -757,6 +757,7 @@ struct Server {
     /// A hop plan is its own connection: a hopped dial never reuses a plain one to the
     /// same address, nor the reverse, since the two move the server port differently.
     hop: Option<hysteria::Hop>,
+    quic: Option<hysteria::QuicParams>,
     roots: Option<ferrox_core::tls::Anchors>,
 }
 
@@ -777,6 +778,7 @@ fn server_of(dial: &Dial) -> Server {
         cc: dial.config.cc.quiche_name(),
         auth: dial.config.auth.clone(),
         hop: dial.config.hop.clone(),
+        quic: dial.config.quic,
         roots: dial.roots.clone(),
     }
 }
@@ -996,23 +998,81 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
 pub(crate) fn server_config(
     cert_path: &str,
     key_path: &str,
-    cc: hysteria::Congestion,
+    config: &hysteria::Config,
 ) -> Option<quiche::Config> {
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
-    config.set_application_protos(&[crate::quic::ALPN]).ok()?;
-    config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
+    let mut quic = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
+    quic.set_application_protos(&[crate::quic::ALPN]).ok()?;
+    quic.set_cc_algorithm_name(config.cc.quiche_name()).ok()?;
     // A served connection always carries an auth validator, and the reference enables the datagram lane exactly when one is present, so the lane is on unconditionally here; the depths are the peer's unsent-datagram queue, matching `udpMessageChanSize`.
-    config.enable_dgram(true, 1024, 1024);
-    config.set_max_idle_timeout(crate::quic::IDLE_TIMEOUT_MS);
-    config.set_initial_max_data(crate::quic::MAX_DATA);
-    config.set_initial_max_stream_data_bidi_local(crate::quic::MAX_STREAM_DATA);
-    config.set_initial_max_stream_data_bidi_remote(crate::quic::MAX_STREAM_DATA);
-    config.set_initial_max_stream_data_uni(crate::quic::MAX_STREAM_DATA);
-    config.set_initial_max_streams_bidi(crate::quic::MAX_STREAMS);
-    config.set_initial_max_streams_uni(crate::quic::MAX_STREAMS);
-    config.load_cert_chain_from_pem_file(cert_path).ok()?;
-    config.load_priv_key_from_pem_file(key_path).ok()?;
-    Some(config)
+    quic.enable_dgram(true, 1024, 1024);
+    quic.set_max_idle_timeout(crate::quic::IDLE_TIMEOUT_MS);
+    quic.set_initial_max_data(crate::quic::MAX_DATA);
+    quic.set_initial_max_stream_data_bidi_local(crate::quic::MAX_STREAM_DATA);
+    quic.set_initial_max_stream_data_bidi_remote(crate::quic::MAX_STREAM_DATA);
+    quic.set_initial_max_stream_data_uni(crate::quic::MAX_STREAM_DATA);
+    quic.set_initial_max_streams_bidi(crate::quic::MAX_STREAMS);
+    quic.set_initial_max_streams_uni(crate::quic::MAX_STREAMS);
+    if let Some(params) = &config.quic {
+        apply_quic_shape(&mut quic, params);
+        if !params.disable_stateless_reset {
+            let mut token = [0u8; 16];
+            if getrandom::fill(&mut token).is_ok() {
+                quic.set_stateless_reset_token(Some(u128::from_le_bytes(token)));
+            }
+        }
+    }
+    quic.load_cert_chain_from_pem_file(cert_path).ok()?;
+    quic.load_priv_key_from_pem_file(key_path).ok()?;
+    Some(quic)
+}
+
+/// Apply the reference's `quicParams` shape over the carrier's defaults. A zero field takes the reference's own QUIC default, which is why the block's presence, not `Config::quic`'s zeros, is what moves the lane.
+fn apply_quic_shape(config: &mut quiche::Config, params: &hysteria::QuicParams) {
+    const STREAM_WINDOW: u64 = 8 * 1024 * 1024;
+    const CONNECTION_WINDOW: u64 = STREAM_WINDOW * 5 / 2;
+    const IDLE: Duration = Duration::from_secs(30);
+    const STREAMS: u64 = 1024;
+    let stream = if params.init_stream_receive_window == 0 {
+        STREAM_WINDOW
+    } else {
+        params.init_stream_receive_window
+    };
+    let connection = if params.init_connection_receive_window == 0 {
+        CONNECTION_WINDOW
+    } else {
+        params.init_connection_receive_window
+    };
+    let stream_max = if params.max_stream_receive_window == 0 {
+        STREAM_WINDOW
+    } else {
+        params.max_stream_receive_window
+    };
+    let connection_max = if params.max_connection_receive_window == 0 {
+        CONNECTION_WINDOW
+    } else {
+        params.max_connection_receive_window
+    };
+    let idle = if params.max_idle_timeout.is_zero() {
+        IDLE
+    } else {
+        params.max_idle_timeout
+    };
+    let streams = if params.max_incoming_streams == 0 {
+        STREAMS
+    } else {
+        params.max_incoming_streams
+    };
+    let _ = config.set_cc_algorithm_name(params.congestion.quiche_name());
+    config.set_max_idle_timeout(idle.as_millis() as u64);
+    config.set_initial_max_data(connection);
+    config.set_initial_max_stream_data_bidi_local(stream);
+    config.set_initial_max_stream_data_bidi_remote(stream);
+    config.set_initial_max_stream_data_uni(stream);
+    config.set_initial_max_streams_bidi(streams);
+    config.set_initial_max_streams_uni(streams);
+    config.set_max_connection_window(connection_max);
+    config.set_max_stream_window(stream_max);
+    config.discover_pmtu(!params.disable_path_mtu_discovery);
 }
 
 pub(crate) type Serve = Arc<dyn Fn(Flow) + Send + Sync>;
@@ -1890,6 +1950,7 @@ struct Router<'a> {
     serve: &'a Serve,
     masq: Arc<Masquerade>,
     routes: HashMap<Vec<u8>, Inbound>,
+    udp_idle: Duration,
 }
 
 fn flush(sock: &crate::quic::Datagram, conn: &mut quiche::Connection, out: &mut [u8]) {
@@ -2104,6 +2165,7 @@ impl Router<'_> {
     }
 
     fn idle(&mut self) {
+        let udp_idle = self.udp_idle;
         let Self {
             routes, sock, out, ..
         } = self;
@@ -2123,7 +2185,7 @@ impl Router<'_> {
             conn.on_timeout();
             flush(sock, &mut conn, out.as_mut());
             inbound.udp.retain(|_, flow| {
-                if now.duration_since(flow.last) > UDP_IDLE {
+                if now.duration_since(flow.last) > udp_idle {
                     flow.stop.store(true, Ordering::Relaxed);
                     false
                 } else {
@@ -2185,7 +2247,7 @@ fn route_packet(
 pub(crate) fn serve_loop(
     address: &str,
     auths: &[String],
-    cc: hysteria::Congestion,
+    config: &hysteria::Config,
     cert_path: &str,
     key_path: &str,
     obfs_password: &str,
@@ -2199,7 +2261,7 @@ pub(crate) fn serve_loop(
         return;
     };
     let local = sock.local_addr().unwrap_or(bound);
-    let Some(mut template) = server_config(cert_path, key_path, cc) else {
+    let Some(mut template) = server_config(cert_path, key_path, config) else {
         return;
     };
     let sock = match hysteria::Salamander::new(obfs_password) {
@@ -2214,6 +2276,7 @@ pub(crate) fn serve_loop(
         serve,
         masq: Arc::from(masq.clone()),
         routes: HashMap::new(),
+        udp_idle: config.udp_idle,
     };
     let mut buf = Unfilled::<RECV_ROOM>::new();
     if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
@@ -2264,8 +2327,12 @@ mod tests {
 
     #[test]
     fn server_config_refuses_without_a_chain_it_can_read() {
-        let cc = hysteria::Congestion::Bbr;
-        assert!(server_config("/nonexistent.crt", "/nonexistent.key", cc).is_none());
+        assert!(server_config(
+            "/nonexistent.crt",
+            "/nonexistent.key",
+            &hysteria::Config::default()
+        )
+        .is_none());
     }
 
     #[test]

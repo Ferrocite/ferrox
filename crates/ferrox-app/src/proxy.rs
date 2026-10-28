@@ -767,8 +767,8 @@ fn serve_vless_inbound(
             thread::spawn(move || {
                 crate::hysteria::serve_loop(
                     &owned,
-                    &[config.auth],
-                    config.cc,
+                    std::slice::from_ref(&config.auth),
+                    &config,
                     &cert_path,
                     &key_path,
                     &config.obfs_password,
@@ -8229,17 +8229,11 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
     };
     let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
     let owned = address.to_owned();
-    let mut obfs_password = String::new();
-    // A named obfuscation this build cannot honour is refused rather than served in the clear.
-    if let Some(password) = crate::config::salamander_obfs(inbound.get("streamSettings")) {
-        if ferrox_core::hysteria::Salamander::new(&password).is_none() {
-            eprintln!(
-                "hysteria inbound in {path} names an obfuscation it cannot honour: serves nothing"
-            );
-            return false;
-        }
-        obfs_password = password;
-    }
+    let Carrier::Hysteria(config) = crate::config::hysteria_carrier(Some(stream), "hysteria")
+    else {
+        eprintln!("hysteria inbound in {path} names a transport it cannot honour: serves nothing");
+        return false;
+    };
     let serve: crate::hysteria::Serve = Arc::new(move |flow| {
         serve_hysteria_flow(flow, freedom);
     });
@@ -8248,10 +8242,10 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
         crate::hysteria::serve_loop(
             &owned,
             &auths,
-            ferrox_core::hysteria::Congestion::Bbr,
+            &config,
             &cert_path,
             &key_path,
-            &obfs_password,
+            &config.obfs_password,
             &masq,
             &serve,
         );
@@ -41589,7 +41583,7 @@ mod tests {
             crate::hysteria::serve_loop(
                 &address,
                 &auths,
-                ferrox_core::hysteria::Congestion::Bbr,
+                &ferrox_core::hysteria::Config::default(),
                 &cert_path,
                 &key_path,
                 &obfs,

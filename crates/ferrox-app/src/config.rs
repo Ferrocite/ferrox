@@ -1659,7 +1659,155 @@ pub(crate) fn hysteria_version(node: Option<&Json>) -> Option<u32> {
     })
 }
 
-fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
+/// `hysteriaSettings.udpIdleTimeout`: absent or zero is the reference's 60 seconds, 2-600 is carried, and a value outside that is a config xray refuses.
+fn hysteria_udp_idle(hy: Option<&Json>) -> Option<Duration> {
+    let Some(value) = hy.and_then(|h| h.get("udpIdleTimeout")) else {
+        return Some(Duration::from_secs(60));
+    };
+    let seconds = value.as_u32()?;
+    match seconds {
+        0 => Some(Duration::from_secs(60)),
+        2..=600 => Some(Duration::from_secs(u64::from(seconds))),
+        _ => None,
+    }
+}
+
+/// `finalmask.quicParams`, resolved into the transport shape the QUIC lane applies. `Ok(None)` keeps the carrier's own defaults; `Err(())` refuses a value xray refuses.
+fn hysteria_quic_params(
+    stream: Option<&Json>,
+) -> Result<Option<ferrox_core::hysteria::QuicParams>, ()> {
+    use ferrox_core::hysteria::{BbrProfile, Congestion, QuicParams};
+    let Some(quic) = stream
+        .and_then(|s| s.get("finalmask"))
+        .and_then(|f| f.get("quicParams"))
+    else {
+        return Ok(None);
+    };
+    if !matches!(quic, Json::Obj(_)) {
+        return Err(());
+    }
+    let text = |key: &str| -> Result<String, ()> {
+        match quic.get(key) {
+            None => Ok(String::new()),
+            Some(value) => value.as_str().map(str::to_ascii_lowercase).ok_or(()),
+        }
+    };
+    let number = |key: &str| -> Result<u64, ()> {
+        match quic.get(key) {
+            None => Ok(0),
+            Some(value) => json_u64(value).ok_or(()),
+        }
+    };
+    let flag = |key: &str| -> Result<bool, ()> {
+        match quic.get(key) {
+            None => Ok(false),
+            Some(value) => value.as_bool().ok_or(()),
+        }
+    };
+    let congestion_text = text("congestion")?;
+    let congestion = match congestion_text.as_str() {
+        "" | "bbr" => Congestion::Bbr,
+        "reno" => Congestion::Reno,
+        "brutal" | "force-brutal" => Congestion::Brutal,
+        _ => return Err(()),
+    };
+    let bbr_profile = match text("bbrProfile")?.as_str() {
+        "" | "standard" => BbrProfile::Standard,
+        "conservative" => BbrProfile::Conservative,
+        "aggressive" => BbrProfile::Aggressive,
+        _ => return Err(()),
+    };
+    let brutal_up = bandwidth(quic.get("brutalUp"))?;
+    let brutal_down = bandwidth(quic.get("brutalDown"))?;
+    if (brutal_up > 0 && brutal_up < 65_536) || (brutal_down > 0 && brutal_down < 65_536) {
+        return Err(());
+    }
+    if congestion_text == "force-brutal" && brutal_up == 0 {
+        return Err(());
+    }
+    let init_stream_receive_window = number("initStreamReceiveWindow")?;
+    let max_stream_receive_window = number("maxStreamReceiveWindow")?;
+    let init_connection_receive_window = number("initConnectionReceiveWindow")?;
+    let max_connection_receive_window = number("maxConnectionReceiveWindow")?;
+    for window in [
+        init_stream_receive_window,
+        max_stream_receive_window,
+        init_connection_receive_window,
+        max_connection_receive_window,
+    ] {
+        if window > 0 && window < 16_384 {
+            return Err(());
+        }
+    }
+    let max_idle = number("maxIdleTimeout")?;
+    if max_idle != 0 && !(4..=120).contains(&max_idle) {
+        return Err(());
+    }
+    let keep_alive = number("keepAlivePeriod")?;
+    if keep_alive != 0 && !(2..=60).contains(&keep_alive) {
+        return Err(());
+    }
+    let max_incoming_streams = number("maxIncomingStreams")?;
+    if max_incoming_streams != 0 && max_incoming_streams < 8 {
+        return Err(());
+    }
+    Ok(Some(QuicParams {
+        congestion,
+        bbr_profile,
+        brutal_up,
+        brutal_down,
+        brutal_disable_loss_compensation: flag("brutalDisableLossCompensation")?,
+        init_stream_receive_window,
+        max_stream_receive_window,
+        init_connection_receive_window,
+        max_connection_receive_window,
+        max_idle_timeout: Duration::from_secs(max_idle),
+        keep_alive_period: Duration::from_secs(keep_alive),
+        disable_path_mtu_discovery: flag("disablePathMTUDiscovery")?,
+        disable_chrome_parrot: flag("disableChromeParrot")?,
+        disable_gso: flag("disableGSO")?,
+        max_incoming_streams,
+        disable_stateless_reset: flag("disableStatelessReset")?,
+    }))
+}
+
+fn json_u64(value: &Json) -> Option<u64> {
+    match value {
+        Json::Num(number)
+            if number.fract() == 0.0 && (0.0..=9_007_199_254_740_992.0).contains(number) =>
+        {
+            Some(*number as u64)
+        }
+        _ => None,
+    }
+}
+
+/// `Bandwidth.Bps`: the reference trims and lowercases, splits the digits and the unit at the first non-digit, multiplies bytes then divides by eight. A bare number is a different JSON type upstream, so it is refused rather than guessed at.
+fn bandwidth(value: Option<&Json>) -> Result<u64, ()> {
+    let Some(value) = value else {
+        return Ok(0);
+    };
+    let text = value.as_str().ok_or(())?.trim().to_ascii_lowercase();
+    if text.is_empty() {
+        return Ok(0);
+    }
+    let split = text
+        .find(|c: char| !(c.is_ascii_digit() || c == '.'))
+        .unwrap_or(text.len());
+    let (number, unit) = text.split_at(split);
+    let value: f64 = number.parse().map_err(|_| ())?;
+    let multiplier = match unit.trim() {
+        "" | "b" | "bps" => 1.0,
+        "k" | "kb" | "kbps" => 1024.0,
+        "m" | "mb" | "mbps" => 1024.0 * 1024.0,
+        "g" | "gb" | "gbps" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" | "tbps" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        _ => return Err(()),
+    };
+    Ok((value * multiplier) as u64 / 8)
+}
+
+pub(crate) fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
     use ferrox_core::hysteria::{Config, Congestion};
     let hy = settings.and_then(|s| s.get("hysteriaSettings"));
     let version = hysteria_version(hy.and_then(|h| h.get("version"))).unwrap_or(2);
@@ -1673,10 +1821,31 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
         .and_then(Json::as_str)
         .unwrap_or("")
         .to_owned();
-    let cc = Congestion::parse(
-        hy.and_then(|h| h.get("congestion"))
-            .and_then(Json::as_str)
-            .unwrap_or(""),
+    let quic = match hysteria_quic_params(settings) {
+        Ok(params) => params,
+        Err(()) => {
+            return Carrier::Unknown {
+                network: network.to_owned(),
+            };
+        }
+    };
+    let udp_idle = match hysteria_udp_idle(hy) {
+        Some(idle) => idle,
+        None => {
+            return Carrier::Unknown {
+                network: network.to_owned(),
+            };
+        }
+    };
+    let cc = quic.map_or_else(
+        || {
+            Congestion::parse(
+                hy.and_then(|h| h.get("congestion"))
+                    .and_then(Json::as_str)
+                    .unwrap_or(""),
+            )
+        },
+        |params| params.congestion,
     );
     if version == 1 {
         // Version 1 names xplus directly: `tlsSettings.obfs` is the password, not a mask name.
@@ -1687,8 +1856,8 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
             obfs_password: hysteria_v1_obfs(settings).unwrap_or_default(),
             hop: hysteria_hop(hy),
             gecko: None,
-            udp_idle: Duration::from_secs(60),
-            quic: None,
+            udp_idle,
+            quic,
         });
     }
     // Salamander and its gecko fragmentation variant are the datagram obfuscations carried; any other named one, or one whose password is too short to mask with, is refused rather than silently sent in the clear.
@@ -1714,8 +1883,8 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
         obfs_password,
         hop: hysteria_hop(hy),
         gecko,
-        udp_idle: Duration::from_secs(60),
-        quic: None,
+        udp_idle,
+        quic,
     })
 }
 
