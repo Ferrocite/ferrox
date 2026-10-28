@@ -434,6 +434,8 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     if let Some(params) = &dial.config.quic {
         crate::quic::apply_hysteria_quic(&mut config, params, false);
     }
+    // A bulk upload starts at 400 packets: quiche's ten leaves the first window smaller than the server's first read, and BBR then paces every ACK.
+    config.set_initial_congestion_window_packets(400);
     // The client enables the datagram lane exactly as the served connection does: advertising it changes no stream byte of a TCP-only flow, and it is what lets `dgram_max_writable_len` answer for a UDP dial on this connection.
     config.enable_dgram(true, 1024, 1024);
     let Ok(mut conn) = quiche::connect(Some(&dial.host), &cid, local, peer, &mut config) else {
