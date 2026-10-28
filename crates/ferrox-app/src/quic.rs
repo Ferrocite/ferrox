@@ -598,6 +598,9 @@ const SEND_SLOTS: usize = 64;
 
 pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &Datagram) {
     sock.retry_held();
+    if sock.held.holding.load(Ordering::Relaxed) {
+        return;
+    }
     #[cfg(target_os = "linux")]
     if sock.batchable() {
         flush_burst(conn, sock);
@@ -606,7 +609,9 @@ pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &Datagram) {
     let mut room = Unfilled::<MAX_DATAGRAM>::new();
     let out = room.as_mut();
     while let Ok((written, info)) = conn.send(out) {
-        sock.send_or_hold(&out[..written], info.to);
+        if !sock.send_or_hold(&out[..written], info.to) {
+            break;
+        }
     }
 }
 
@@ -2133,12 +2138,14 @@ impl Datagram {
     /// Send one datagram, or hold it when the kernel refused it for a reason that
     /// clears. A QUIC DATAGRAM frame is never retransmitted, so a held datagram is
     /// the difference between a pacing blip and a hole the inner TCP must time out.
-    fn send_or_hold(&self, buf: &[u8], to: SocketAddr) {
+    fn send_or_hold(&self, buf: &[u8], to: SocketAddr) -> bool {
         if let Err(error) = self.send_to(buf, to) {
             if refused(&error) {
                 self.hold(buf, to);
+                return false;
             }
         }
+        true
     }
 
     /// Park a refused datagram behind the ones already waiting, in quiche's order.
