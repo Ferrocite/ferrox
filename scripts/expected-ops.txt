@@ -137,6 +137,8 @@ append_pem 591
 # Re-blessed 51892734 by the b64 one-pass decoder and raw encoder: dns.rs is
 # untouched; the same test binary's thin-LTO inlining moved the frame 54
 # instructions from 51892680, and the bytes and decisions are unchanged.
+# Measured with Rust 1.99.1, Ubuntu 24.04, glibc 2.39 and Valgrind 3.22.0;
+# the identical binary reproduces CI in that userspace; other profiling userspaces differ.
 ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51892734 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
