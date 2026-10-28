@@ -18,6 +18,8 @@ use crate::json::Json;
 
 /// The MTU xray gives a device whose config names none.
 pub(crate) const DEFAULT_MTU: usize = 1420;
+/// The most answers one peer endpoint name offers to the handshake.
+const ENDPOINT_CANDIDATES: usize = 8;
 /// The server's own bogon addresses when the config names none.
 const DEFAULT_ADDRESSES: [&str; 2] = ["10.0.0.1", "fd59:7153:2388:b5fd::1"];
 /// The allowed IPs a peer with none is given: the whole of both families.
@@ -28,6 +30,7 @@ pub(crate) struct PeerConfig {
     pub(crate) public: [u8; 32],
     pub(crate) preshared: [u8; 32],
     pub(crate) endpoint: Option<SocketAddr>,
+    pub(crate) endpoints: Vec<SocketAddr>,
     pub(crate) keepalive: u16,
     pub(crate) allowed: Vec<(IpAddr, u8)>,
 }
@@ -140,12 +143,14 @@ fn peer_from_json(peer: &Json) -> Result<PeerConfig, String> {
         Some(key) if !key.is_empty() => parse_key(key)?,
         _ => [0u8; 32],
     };
-    let endpoint = account
+    let endpoints = account
         .get("endpoint")
         .and_then(Json::as_str)
         .filter(|endpoint| !endpoint.is_empty())
-        .map(parse_endpoint)
-        .transpose()?;
+        .map(parse_endpoints)
+        .transpose()?
+        .unwrap_or_default();
+    let endpoint = endpoints.first().copied();
     let keepalive = match account.get("keepAlive") {
         Some(Json::Num(value)) if *value >= 0.0 && *value <= f64::from(u16::MAX) => *value as u16,
         Some(Json::Str(value)) => value
@@ -167,6 +172,7 @@ fn peer_from_json(peer: &Json) -> Result<PeerConfig, String> {
         public,
         preshared,
         endpoint,
+        endpoints,
         keepalive,
         allowed,
     })
@@ -263,14 +269,23 @@ pub(crate) fn parse_prefix(text: &str) -> Result<(IpAddr, u8), String> {
     Ok((address, bits))
 }
 
-fn parse_endpoint(text: &str) -> Result<SocketAddr, String> {
+fn parse_endpoints(text: &str) -> Result<Vec<SocketAddr>, String> {
     if let Ok(address) = text.parse() {
-        return Ok(address);
+        return Ok(vec![address]);
     }
-    text.to_socket_addrs()
+    let mut addresses: Vec<SocketAddr> = text
+        .to_socket_addrs()
         .map_err(|error| format!("wireguard endpoint `{text}` does not resolve: {error}"))?
-        .next()
-        .ok_or_else(|| format!("wireguard endpoint `{text}` resolves to no address"))
+        .collect();
+    addresses.sort_unstable();
+    addresses.dedup();
+    addresses.truncate(ENDPOINT_CANDIDATES);
+    if addresses.is_empty() {
+        return Err(format!(
+            "wireguard endpoint `{text}` resolves to no address"
+        ));
+    }
+    Ok(addresses)
 }
 
 fn reserved_from_json(value: Option<&Json>) -> Result<[u8; 3], String> {
@@ -415,6 +430,24 @@ mod tests {
         assert_eq!(
             config.peers[1].longest_prefix("10.2.2.3".parse().unwrap()),
             None
+        );
+    }
+
+    #[test]
+    fn a_literal_endpoint_stays_one_candidate() {
+        let config = DeviceConfig::from_json(&json(
+            r#"{"secretKey":"0000000000000000000000000000000000000000000000000000000000000001",
+                "peers":[{"publicKey":"0000000000000000000000000000000000000000000000000000000000000002",
+                          "endpoint":"127.0.0.1:51820"}]}"#,
+        ))
+        .expect("config");
+        assert_eq!(
+            config.peers[0].endpoint,
+            Some("127.0.0.1:51820".parse().unwrap())
+        );
+        assert_eq!(
+            config.peers[0].endpoints,
+            vec!["127.0.0.1:51820".parse().unwrap()]
         );
     }
 
