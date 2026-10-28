@@ -31846,6 +31846,12 @@ mod tests {
         );
     }
 
+    /// A per-process offset below the ephemeral range: two worktrees' suites share these fixed
+    /// probe ports, and a leaked suite must not take another's.
+    fn trojan_probe_base() -> u16 {
+        22000 + (std::process::id() as u16 % 256) * 32
+    }
+
     /// A trojan client that pipelines its first payload with the request header keeps it: the
     /// probe's first read stops at the header and the relay forwards what rode behind it.
     #[test]
@@ -31865,7 +31871,7 @@ mod tests {
                     "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
         ))
         .expect("parses");
-        let port = 22015;
+        let port = trojan_probe_base() + 15;
         let address = format!("127.0.0.1:{port}");
         assert!(serve_trojan_inbound(&address, &inbound, true));
         let waited = Instant::now();
@@ -31926,7 +31932,7 @@ mod tests {
                     "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {key}}}]}}}}}}"#
         ))
         .expect("parses");
-        let port = 22016;
+        let port = trojan_probe_base() + 16;
         let address = format!("127.0.0.1:{port}");
         assert!(serve_trojan_inbound(&address, &inbound, true));
         let waited = Instant::now();
@@ -32166,8 +32172,7 @@ mod tests {
                         "streamSettings": {{{stream}{security}}}}}"#
                 ))
                 .expect("parses");
-                // A fixed port outside the ephemeral range keeps a parallel suite from taking the probe's port.
-                let port = 22000 + (index * 2 + tls_index) as u16;
+                let port = trojan_probe_base() + (index * 2 + tls_index) as u16;
                 let address = format!("127.0.0.1:{port}");
                 assert!(serve_trojan_inbound(&address, &inbound, true), "{tag}");
                 // A KCP listener binds before it returns; a stream listener binds on its own thread.
