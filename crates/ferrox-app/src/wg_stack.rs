@@ -1214,7 +1214,7 @@ fn lane_source_port(
         return Some(*port);
     }
     if owned.len() >= LANE_PORTS {
-        return Some(lane);
+        return None;
     }
     let port = lane_port(routes, sender, lane)?;
     owned.push(port);
