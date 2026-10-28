@@ -25,7 +25,8 @@ vless-hysteria-down-8|server-threads|1.09|696
 vless-kcp-down-8|server-threads|2.10|696
 vless-raw-down-16|server-threads|1.44|696
 vless-raw-down-8|server-threads|1.15|696
-vless-reality-grpc-down-8|server-threads|1.54|696
+vless-raw-down-1|server|0.83|486
+vless-reality-grpc-down-8|server-threads|1.67|696
 vless-reality-raw-down-8|server-threads|1.54|696
 vless-reality-xhttp-down-8|server-cpu|0.00|668
 vless-reality-xhttp-down-8|server-threads|0.00|668
@@ -34,12 +35,15 @@ vless-tls-raw-down-8|server-threads|1.46|696
 vless-tls-ws-down-8|server-threads|1.36|696
 vless-vision-reality-raw-down-8|server-threads|1.54|696
 vless-vision-tls-raw-down-8|server-threads|1.46|696
+vless-tls-raw-up-1|client|0.67|683
+vless-tls-raw-up-1|rust|0.64|683
 vless-vision-tls-raw-up-1|client|0.63|683
 vless-vision-tls-raw-up-1|server|0.79|486
 vless-vision-tls-raw-up-1|server-cpu|1.12|486
 vless-ws-down-8|server-threads|1.36|696
 vless-xhttp-duplex-8|rust|0.69|472
 vless-xhttp-duplex-8|server-threads|1.12|696
+vless-xhttp-down-8|rust|0.54|486
 vless-xhttp-down-8|server-threads|1.27|696
 vless-xhttp-up-1|server-threads|1.09|696
 vmess-tls-ws-down-8|server-threads|1.31|696
