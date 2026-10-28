@@ -1269,6 +1269,27 @@ mod tests {
     }
 
     #[test]
+    fn a_near_cap_block_is_rejected_without_growing() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let half = FRAME_CAP / 2 + 1;
+        session.continuation = Some((1, vec![0u8; half], 0));
+        let body = vec![0u8; half];
+        let mut wire = Wire {
+            stream: Box::new(std::io::Cursor::new(Vec::new())),
+            pending: Vec::new(),
+            closed: false,
+        };
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            session.on(&mut wire, h2::T_CONT, 0, 1, &body);
+        });
+        assert!(session.end, "the oversized block is rejected");
+        assert_eq!(
+            counts.allocs, 0,
+            "the cap is checked before extending: {counts:?}"
+        );
+    }
+
+    #[test]
     fn an_empty_data_frame_sends_no_window_update() {
         let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
         session.request = Some(1);
