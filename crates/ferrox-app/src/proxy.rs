@@ -32754,19 +32754,40 @@ mod tests {
         udp.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
-        let mut back = vec![0u8; UDP_BUF];
+        let payloads = [format!("ping-{echo_port}"), format!("pong-{echo_port}")];
         let mut frame = Vec::new();
-        for payload in [&b"ping"[..], &b"pong"[..]] {
+        for payload in payloads.iter().map(String::as_bytes) {
             let datagram = socks_udp_frame(&mut frame, None, &target, payload);
-            udp.send(datagram).expect("sends");
-            let n = udp
-                .recv(&mut back)
-                .unwrap_or_else(|error| panic!("{tag} association echoes: {error}"));
-            let (source, echoed) = parse_socks_udp(&back[..n]).expect("splits");
-            assert_eq!(source, target, "{tag}");
-            assert_eq!(echoed, payload, "{tag}");
+            assert_eq!(
+                trojan_udp_answer(udp, datagram, payload, tag),
+                target,
+                "{tag}"
+            );
             // Past RELAY_POLL, so an association that polls instead of parking is gone by the second datagram.
             thread::sleep(Duration::from_millis(250));
+        }
+    }
+
+    /// A stale frame can land on a reused relay port and a lane can drop its first datagram: resend until this target's own payload arrives, and skip frames that are not it.
+    fn trojan_udp_answer(udp: &UdpSocket, frame: &[u8], want: &[u8], tag: &str) -> SocketAddr {
+        udp.set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("timeout");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut back = vec![0u8; UDP_BUF];
+        loop {
+            udp.send(frame).expect("sends");
+            let until = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < until {
+                let Ok(n) = udp.recv(&mut back) else {
+                    break;
+                };
+                if let Some((source, payload)) = parse_socks_udp(&back[..n]) {
+                    if payload == want {
+                        return source;
+                    }
+                }
+            }
+            assert!(Instant::now() < deadline, "{tag} never answers {want:?}");
         }
     }
 
