@@ -3608,12 +3608,15 @@ mod tests {
         );
 
         receiver.set_nonblocking(true).expect("a reading queue");
+        let deadline = Instant::now() + Duration::from_secs(5);
         let mut got = Vec::new();
         let mut buf = [0u8; 128];
-        loop {
+        while got.len() < held.len() && Instant::now() < deadline {
             match receiver.recv_from(&mut buf) {
                 Ok((n, _)) => got.push(buf[..n].to_vec()),
-                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
                 Err(error) => panic!("recv: {error}"),
             }
         }
