@@ -28,7 +28,7 @@ pub fn encode(bytes: &[u8]) -> String {
     #[cfg(target_arch = "aarch64")]
     let mut at;
     #[cfg(target_arch = "x86_64")]
-    let group = if std::is_x86_feature_detected!("ssse3") {
+    let group = if bytes.len() >= 16 && std::is_x86_feature_detected!("ssse3") {
         // SAFETY: the feature is present, the wide loop loads only while 16 bytes remain, and the tail loads exactly 12.
         let (done, written) = unsafe { x86::encode_prefix(bytes, ptr) };
         at = written;
