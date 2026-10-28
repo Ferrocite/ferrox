@@ -552,6 +552,7 @@ struct Inbound {
     auth_buf: Vec<u8>,
     served: HashSet<u64>,
     wakes: HashMap<u64, Arc<StreamWake>>,
+    send: Arc<StreamWake>,
     udp: Arc<Mutex<UdpLane>>,
     next_udp: u32,
     client_cid: Vec<u8>,
@@ -881,6 +882,7 @@ impl Router<'_> {
                 auth_buf: Vec::new(),
                 served: HashSet::new(),
                 wakes: HashMap::new(),
+                send: StreamWake::new(),
                 udp: Arc::new(Mutex::new(UdpLane::default())),
                 next_udp: 1,
                 client_cid: client_cid.to_vec(),
@@ -910,6 +912,9 @@ impl Router<'_> {
                 return;
             }
             flush(sock, &mut conn, out.as_mut());
+            if let Some(inbound) = routes.get(dcid) {
+                inbound.send.bump();
+            }
             if !conn.is_established() || conn.is_closed() {
                 return;
             }
@@ -936,12 +941,18 @@ impl Router<'_> {
                 inbound.next_udp = inbound.next_udp.wrapping_add(1);
                 let wake = StreamWake::new();
                 inbound.wakes.insert(id, Arc::clone(&wake));
-                streams.push((id, request_udp, Arc::clone(&inbound.udp), wake));
+                streams.push((
+                    id,
+                    request_udp,
+                    Arc::clone(&inbound.udp),
+                    wake,
+                    Arc::clone(&inbound.send),
+                ));
             }
             for wake in wakes {
                 wake.bump();
             }
-            for (id, next_udp, lane, wake) in streams {
+            for (id, next_udp, lane, wake, send) in streams {
                 let thread_shared = Arc::clone(&shared);
                 let thread_sock = Arc::clone(sock);
                 let thread_serve = Arc::clone(serve);
@@ -956,6 +967,7 @@ impl Router<'_> {
                         next_udp,
                         &lane,
                         &wake,
+                        &send,
                     );
                 });
             }
@@ -985,6 +997,7 @@ impl Router<'_> {
             }
             conn.on_timeout();
             flush(sock, &mut conn, out.as_mut());
+            inbound.send.bump();
             if let Ok(mut lane) = inbound.udp.lock() {
                 lane.flows.retain(|_, flow| {
                     if now.duration_since(flow.last) > UDP_IDLE {
@@ -1010,6 +1023,7 @@ fn serve_tcp_or_udp(
     next_udp: u32,
     lane: &Arc<Mutex<UdpLane>>,
     wake: &Arc<StreamWake>,
+    send: &Arc<StreamWake>,
 ) {
     let mut flow = Flow::from_parts(
         Arc::clone(shared),
@@ -1019,7 +1033,8 @@ fn serve_tcp_or_udp(
         Vec::new(),
         false,
     )
-    .with_wake(Some(Arc::clone(wake)));
+    .with_wake(Some(Arc::clone(wake)))
+    .with_send_wake(Arc::clone(send));
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
     let Some((udp, host, port)) = read_request(&mut flow, deadline) else {
         return;
