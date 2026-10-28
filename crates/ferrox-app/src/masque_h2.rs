@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -27,6 +27,7 @@ const SETTINGS_ENABLE_CONNECT: u16 = 0x8;
 const FRAME_CAP: usize = 1 << 20;
 const QUEUED_CAP: usize = 64;
 const DEFAULT_WINDOW: i64 = 65_535;
+const H2_CONNECTIONS: usize = 256;
 
 #[derive(Clone, Default)]
 struct Deadline(Arc<AtomicU64>);
@@ -154,6 +155,39 @@ impl ferrox_core::tls::RecordAlignment for DeadlineStream {}
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
+/// The h2 listener's live-connection table: a thread per admitted connection, and a
+/// refused accept once the table is full so an unauthenticated peer cannot grow it without bound.
+struct H2Slots {
+    live: AtomicUsize,
+    cap: usize,
+}
+
+struct H2Slot(Arc<H2Slots>);
+
+impl H2Slots {
+    fn new(cap: usize) -> Arc<Self> {
+        Arc::new(Self {
+            live: AtomicUsize::new(0),
+            cap,
+        })
+    }
+
+    fn acquire(self: &Arc<Self>) -> Option<H2Slot> {
+        self.live
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |live| {
+                (live < self.cap).then_some(live + 1)
+            })
+            .ok()?;
+        Some(H2Slot(Arc::clone(self)))
+    }
+}
+
+impl Drop for H2Slot {
+    fn drop(&mut self) {
+        self.0.live.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// The TCP half of a MASQUE inbound: a listener on the port the QUIC socket
 /// already owns, one thread per HTTP/2 connection. A port the platform will
 /// not give twice leaves h3 serving and names the h2 listener it could not raise.
@@ -168,9 +202,13 @@ pub(crate) fn serve(
         eprintln!("masque: no HTTP/2 listener on {address}; h3 still serves");
         return;
     };
+    let slots = H2Slots::new(H2_CONNECTIONS);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else {
+                continue;
+            };
+            let Some(slot) = slots.acquire() else {
                 continue;
             };
             let _ = stream.set_nodelay(true);
@@ -178,7 +216,15 @@ pub(crate) fn serve(
             let shared = Arc::clone(&shared);
             let spec = Arc::clone(&spec);
             let identity = Arc::clone(&identity);
-            std::thread::spawn(move || connection(stream, &identity, shared, spec));
+            if let Err(error) = std::thread::Builder::new()
+                .name("ferrox-masque-h2".into())
+                .spawn(move || {
+                    let _slot = slot;
+                    connection(stream, &identity, shared, spec);
+                })
+            {
+                eprintln!("masque: cannot spawn HTTP/2 connection handler: {error}");
+            }
         }
     });
 }
@@ -1186,6 +1232,23 @@ mod tests {
 
     use super::*;
     use crate::json::Json;
+
+    #[test]
+    fn a_full_h2_slot_table_refuses_another_connection() {
+        let slots = H2Slots::new(2);
+        let first = slots.acquire().expect("the first slot");
+        let second = slots.acquire().expect("the second slot");
+        assert!(
+            slots.acquire().is_none(),
+            "a full table admitted another connection"
+        );
+        drop(first);
+        assert!(
+            slots.acquire().is_some(),
+            "a released slot was not reusable"
+        );
+        drop(second);
+    }
 
     fn bare_client() -> Client {
         Client {
