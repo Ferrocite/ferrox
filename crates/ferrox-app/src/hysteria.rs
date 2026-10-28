@@ -916,7 +916,7 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
 
     let mut up = flow.clone();
     let forward = Arc::clone(&done);
-    let mut buffer = crate::proxy::RelayBuf::new();
+    let mut buffer = crate::proxy::RelayBuf::with_len(crate::proxy::RELAY_BUFFER);
     crate::proxy::lane_pool::submit(
         Box::new(move || {
             let next = match tcp_read.read(buffer.as_mut()) {
@@ -953,7 +953,7 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
 
     let mut back = flow.clone();
     let backward = Arc::clone(&done);
-    let mut buffer = crate::proxy::RelayBuf::new();
+    let mut buffer = crate::proxy::RelayBuf::with_len(crate::proxy::RELAY_BUFFER);
     crate::proxy::lane_pool::submit(
         Box::new(move || {
             let next = match back.read_step(buffer.as_mut()) {
