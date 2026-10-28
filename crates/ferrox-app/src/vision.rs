@@ -1396,7 +1396,11 @@ mod tests {
         let mut got = Vec::new();
         let mut buf = vec![0u8; 65_536];
         loop {
-            let n = link.read(&mut buf).expect("reads");
+            let n = match link.read(&mut buf) {
+                Ok(n) => n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => panic!("reads: {error}"),
+            };
             if n == 0 {
                 break;
             }
