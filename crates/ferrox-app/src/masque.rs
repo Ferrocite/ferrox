@@ -1218,12 +1218,20 @@ impl AddressPool {
     }
 
     fn assign(&mut self) -> Vec<IpAddr> {
+        let v4 = self.v4.as_mut().and_then(Family::allocate);
+        let v6 = self.v6.as_mut().and_then(Family::allocate);
         let mut addrs = Vec::with_capacity(2);
-        if let Some(ip) = self.v4.as_mut().and_then(Family::allocate) {
+        if let Some(ip) = v4 {
             addrs.push(IpAddr::V4(Ipv4Addr::from(ip as u32)));
         }
-        if let Some(ip) = self.v6.as_mut().and_then(Family::allocate) {
+        if let Some(ip) = v6 {
             addrs.push(IpAddr::V6(Ipv6Addr::from(ip)));
+        }
+        if (self.v4.is_some() && v4.is_none()) || (self.v6.is_some() && v6.is_none()) {
+            for address in &addrs {
+                self.release(*address);
+            }
+            addrs.clear();
         }
         addrs
     }
@@ -2131,11 +2139,9 @@ mod tests {
 
     #[test]
     fn a_dual_stack_pool_grants_nothing_when_one_family_is_full() {
-        let mut pool = AddressPool::from_prefixes(&[
-            "10.14.0.1/30".to_owned(),
-            "fd14::1/126".to_owned(),
-        ])
-        .expect("a pool");
+        let mut pool =
+            AddressPool::from_prefixes(&["10.14.0.1/30".to_owned(), "fd14::1/126".to_owned()])
+                .expect("a pool");
         assert_eq!(pool.assign().len(), 2);
         assert!(
             pool.assign().is_empty(),
