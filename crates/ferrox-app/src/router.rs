@@ -1905,6 +1905,24 @@ impl SetRule {
             .is_none_or(|networks| networks.contains(&network))
     }
 
+    /// Whether any flow on this network can reach this rule, counting an inverted child as reachable.
+    fn reachable_on(&self, network: Network) -> bool {
+        let Some(logical) = &self.logical else {
+            return self.matches_network(network);
+        };
+        if logical.all {
+            logical
+                .rules
+                .iter()
+                .all(|rule| rule.invert || rule.reachable_on(network))
+        } else {
+            logical
+                .rules
+                .iter()
+                .any(|rule| rule.invert || rule.reachable_on(network))
+        }
+    }
+
     fn needs_source(&self, network: Network) -> bool {
         if !self.matches_network(network) {
             return false;
@@ -1914,7 +1932,7 @@ impl SetRule {
         };
         if logical.all {
             for rule in &logical.rules {
-                if !rule.matches_network(network) {
+                if !rule.reachable_on(network) {
                     if rule.invert {
                         continue;
                     }
