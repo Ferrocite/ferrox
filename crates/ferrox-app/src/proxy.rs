@@ -22923,7 +22923,7 @@ fn loopback_dial(
         "vless" if vless_security_supported(stream_security(inbound)) => {
             let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
             let encryption =
-                vless_client_encryption(crate::config::server_decryption_string(inbound))?;
+                vless_loopback_encryption(crate::config::server_decryption_string(inbound))?;
             Ok(Outbound::Vless(VlessOut {
                 address: address.to_owned(),
                 port,
@@ -24429,6 +24429,19 @@ fn vless_client_encryption(
         return Ok(None);
     };
     let config = ferrox_core::vless_encryption::ClientConfig::parse(value)?;
+    Ok(Some(ferrox_core::vless_encryption::Client::with_clock(
+        config,
+        Arc::new(crate::config::unix_seconds),
+    )))
+}
+
+fn vless_loopback_encryption(
+    value: Option<&str>,
+) -> Result<Option<Arc<ferrox_core::vless_encryption::Client>>, String> {
+    let Some(value) = value.filter(|value| !value.is_empty() && *value != "none") else {
+        return Ok(None);
+    };
+    let config = ferrox_core::vless_encryption::ClientConfig::from_server(value)?;
     Ok(Some(ferrox_core::vless_encryption::Client::with_clock(
         config,
         Arc::new(crate::config::unix_seconds),
@@ -44901,6 +44914,27 @@ mod tests {
         );
         let error = resolve_loopback(&root, "tunnel-in", true).expect_err("refused");
         assert!(error.contains("tunnel-in"), "{error}");
+    }
+
+    /// The inbound's decryption string names the server's public keys, so the
+    /// re-injected dial derives its client from those keys rather than failing
+    /// the client parser on the server's ticket lifetime.
+    #[test]
+    fn a_loopback_derives_its_dial_from_the_inbound_decryption() {
+        let id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let (_, decryption) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600s");
+        let root = loopback_root(&format!(
+            r#"{{"tag":"tunnel-in","protocol":"vless","listen":"127.0.0.1","port":1234,"settings":{{"clients":[{{"id":"{id}"}}],"decryption":"{decryption}"}}}}"#,
+        ));
+        let Outbound::Vless(dial) = resolve_loopback(&root, "tunnel-in", true).expect("resolves")
+        else {
+            panic!("a sealed vless inbound resolves to a sealed vless dial");
+        };
+        assert!(
+            dial.encryption.is_some(),
+            "the dial carries the derived client"
+        );
     }
 
     /// The re-injected flow carries a real handshake on the loopback wire: a
