@@ -1032,6 +1032,17 @@ mod tests {
     }
 
     #[test]
+    fn an_incomplete_capsule_cannot_grow_past_the_frame_cap() {
+        let mut client = bare_client();
+        let mut partial = Vec::new();
+        frames::quic_varint(&mut partial, 0);
+        frames::quic_varint(&mut partial, (FRAME_CAP + 2) as u64);
+        partial.resize(FRAME_CAP + 1, 0);
+        client.capsules(&partial);
+        assert!(client.end, "an incomplete capsule grew past the frame cap");
+    }
+
+    #[test]
     fn a_dial_refused_until_the_edge_binds_is_retried() {
         let edge = TcpListener::bind("127.0.0.1:0").expect("edge");
         let address = edge.local_addr().expect("addr");
