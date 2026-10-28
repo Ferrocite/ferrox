@@ -174,7 +174,7 @@ impl H2Slots {
 
     fn acquire(self: &Arc<Self>) -> Option<H2Slot> {
         self.live
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |live| {
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |live| {
                 (live < self.cap).then_some(live + 1)
             })
             .ok()?;
