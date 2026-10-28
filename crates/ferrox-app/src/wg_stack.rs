@@ -1050,6 +1050,7 @@ pub(crate) fn client_udp(
     let mut buf = crate::proxy::udp_buffer();
     let mut frame = Vec::new();
     let mut app: Option<SocketAddr> = None;
+    let mut winner: Option<SocketAddr> = None;
     let mut quiet = StdInstant::now();
     'lane: loop {
         while let Ok(inner) = reply_rx.try_recv() {
@@ -1065,6 +1066,10 @@ pub(crate) fn client_udp(
             let Some(remote) = socket_addr(datagram.source, datagram.source_port) else {
                 continue;
             };
+            if winner.is_some_and(|won| won != remote) {
+                continue;
+            }
+            winner.get_or_insert(remote);
             let out = crate::proxy::socks_udp_frame(&mut frame, None, &remote, datagram.payload);
             let _ = relay.send_to(out, app);
             quiet = StdInstant::now();
@@ -1080,10 +1085,17 @@ pub(crate) fn client_udp(
                     continue;
                 }
                 app = Some(sender);
-                let targets = match destination {
+                let mut targets = match destination {
                     Destination::Address(address) => vec![address],
                     Destination::Name(host, port) => resolve(&host, port),
                 };
+                if let Some(won) = winner {
+                    if targets.contains(&won) {
+                        targets = vec![won];
+                    } else {
+                        winner = None;
+                    }
+                }
                 for target in targets.into_iter().take(RACES) {
                     let Some(inner_source) = config
                         .addresses
