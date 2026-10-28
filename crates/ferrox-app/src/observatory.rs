@@ -850,7 +850,7 @@ mod tests {
     }
 
     #[test]
-    fn a_whitespace_http_method_is_head_like_the_json_build() {
+    fn a_whitespace_http_method_is_get_but_reads_no_body() {
         let method = |value: &str| {
             BurstSettings::parse(&Json::Obj(vec![(
                 "httpMethod".to_owned(),
@@ -860,7 +860,7 @@ mod tests {
             .method
         };
         assert_eq!(method(""), "HEAD");
-        assert_eq!(method(" "), "HEAD");
+        assert_eq!(method(" "), "GET");
         assert_eq!(method(" get "), "get");
     }
 

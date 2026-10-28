@@ -5287,10 +5287,10 @@ mod tests {
         assert!(matches!(ping, Json::Obj(pairs) if pairs.is_empty()));
     }
 
-    /// A whitespace-only protobuf method trims to `GET`, as the reference's
-    /// `http.NewRequest` does with the trimmed empty method.
+    /// A whitespace-only protobuf method stays blank so the probe can send the
+    /// `GET` the reference's empty method produces without reading the body.
     #[test]
-    fn a_whitespace_ping_method_decodes_to_get() {
+    fn a_whitespace_ping_method_stays_blank_for_the_probe() {
         let ping = message(&[bytes_field(6, b" ")]);
         let burst = message(&[bytes_field(3, &ping)]);
         let config = message(&[bytes_field(
@@ -5303,7 +5303,7 @@ mod tests {
             .and_then(|burst| burst.get("pingConfig"))
             .and_then(|ping| ping.get("httpMethod"))
             .and_then(Json::as_str);
-        assert_eq!(method, Some("GET"));
+        assert_eq!(method, Some(" "));
     }
 
     /// Both observatory apps decode to the keys the probe loop reads, so a
