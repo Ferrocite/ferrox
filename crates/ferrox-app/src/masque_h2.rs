@@ -340,6 +340,10 @@ impl Client {
             if self.wire.closed || self.end {
                 break;
             }
+            self.flush();
+            if self.wire.closed || self.end {
+                break;
+            }
             for _ in 0..QUEUED_CAP {
                 if self.end {
                     break;
@@ -890,7 +894,7 @@ impl Session {
                 return;
             };
             if i64::try_from(answer.len()).unwrap_or(i64::MAX) > self.send_window {
-                return;
+                break;
             }
             let Some(answer) = self.queued.pop_front() else {
                 return;
@@ -1068,6 +1072,28 @@ mod tests {
             "a stalled window keeps at most {QUEUED_CAP} capsules"
         );
         assert!(session.end, "the capsule past the cap ends the session");
+    }
+
+    #[test]
+    fn a_blocked_queue_head_still_drains_outgoing_to_the_cap() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        session.request = Some(1);
+        session.send_window = 0;
+        let (sender, outgoing) = mpsc::sync_channel(masque::QUEUE);
+        session.outgoing = Some(outgoing);
+        let mut wire = Wire {
+            stream: Box::new(std::io::Cursor::new(Vec::new())),
+            pending: Vec::new(),
+            closed: false,
+        };
+        let mut capsule = Vec::new();
+        datagram(&udp_packet(53), &mut capsule);
+        for _ in 0..QUEUED_CAP {
+            session.capsule(&mut wire, &capsule);
+        }
+        sender.send(udp_packet(53)).expect("a packet");
+        session.flush(&mut wire);
+        assert!(session.end, "a full queue ends the session");
     }
 
     #[test]
