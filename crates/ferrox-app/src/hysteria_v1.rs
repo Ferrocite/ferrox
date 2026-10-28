@@ -11,7 +11,7 @@ use ferrox_core::hysteria_v1 as wire;
 use ferrox_core::hysteria_v1::{Defrag, UdpMessage, XPlus};
 
 use crate::conn::Connection;
-use crate::hysteria::{Dial, Flow, Session};
+use crate::hysteria::{Dial, Driver, Flow, Session, StreamWake};
 use crate::quic::{Mask, Unfilled, MAX_DATAGRAM, RECV_ROOM};
 
 const FIRST_FLOW_STREAM: u64 = 4;
@@ -117,6 +117,7 @@ fn connect(dial: &Dial) -> Option<Session> {
         local,
         udp_supported: true,
         driver: None,
+        send_wake: None,
     };
     let mut hello = Vec::with_capacity(20 + dial.config.auth.len());
     wire::encode_client_hello(
@@ -138,11 +139,23 @@ fn connect(dial: &Dial) -> Option<Session> {
     Some(session)
 }
 
-fn read_response(session: &Session, stream: u64) -> Option<bool> {
-    let head = read_until(session, stream, |head| {
-        wire::decode_server_response(head).is_ok()
-    })?;
-    Some(wire::decode_server_response(&head).ok()?.0.ok)
+fn read_response(flow: &mut Flow) -> Option<bool> {
+    let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
+    let mut head = Vec::new();
+    let mut buf = [0u8; 64];
+    loop {
+        if let Ok((response, _)) = wire::decode_server_response(&head) {
+            return Some(response.ok);
+        }
+        if head.len() > HEAD_CAP || Instant::now() >= deadline {
+            return None;
+        }
+        match flow.read_step(&mut buf) {
+            Ok(Some(0)) | Err(_) => return None,
+            Ok(Some(n)) => head.extend_from_slice(&buf[..n]),
+            Ok(None) => {}
+        }
+    }
 }
 
 fn open_flow(session: &Session, stream: u64, host: &str, port: u16) -> Option<Flow> {
@@ -156,20 +169,27 @@ fn open_flow(session: &Session, stream: u64, host: &str, port: u16) -> Option<Fl
         &[],
         &mut request,
     );
-    if !send_all(session, stream, &request) {
-        return None;
-    }
-    if !read_response(session, stream)? {
-        return None;
-    }
-    Some(Flow::from_parts(
+    let (drive, wake) = match session.driver.as_ref() {
+        Some(driver) if driver.running() => (false, Some(driver.register(stream))),
+        _ => (true, None),
+    };
+    let mut flow = Flow::from_parts(
         Arc::clone(&session.shared),
         Arc::clone(&session.sock),
         session.local,
         stream,
         Vec::new(),
-        true,
-    ))
+        drive,
+    )
+    .with_wake(wake)
+    .with_session(session);
+    if !send_all(session, stream, &request) {
+        return None;
+    }
+    if !read_response(&mut flow)? {
+        return None;
+    }
+    Some(flow)
 }
 
 struct Pooled {
@@ -249,7 +269,16 @@ fn evict(dial: &Dial, session: &Session) {
     let Some(entries) = pool.get_mut(&server_of(dial)) else {
         return;
     };
-    entries.retain(|entry| !Arc::ptr_eq(&entry.session.shared, &session.shared));
+    entries.retain(|entry| {
+        if Arc::ptr_eq(&entry.session.shared, &session.shared) {
+            if let Some(driver) = &entry.session.driver {
+                driver.stop();
+            }
+            false
+        } else {
+            true
+        }
+    });
 }
 
 fn keep(dial: &Dial, session: Session, next_stream: u64) {
@@ -272,8 +301,13 @@ fn open_pooled(dial: &Dial, host: &str, port: u16) -> Option<Flow> {
             evict(dial, &session);
         }
     }
-    let session = connect(dial)?;
-    let flow = open_flow(&session, FIRST_FLOW_STREAM, host, port)?;
+    let mut session = connect(dial)?;
+    let driver = Driver::new();
+    driver.attach(&mut session);
+    let Some(flow) = open_flow(&session, FIRST_FLOW_STREAM, host, port) else {
+        driver.stop();
+        return None;
+    };
     keep(dial, session, FIRST_FLOW_STREAM + 4);
     Some(flow)
 }
@@ -517,6 +551,7 @@ struct Inbound {
     authed: bool,
     auth_buf: Vec<u8>,
     served: HashSet<u64>,
+    wakes: HashMap<u64, Arc<StreamWake>>,
     udp: Arc<Mutex<UdpLane>>,
     next_udp: u32,
     client_cid: Vec<u8>,
@@ -845,6 +880,7 @@ impl Router<'_> {
                 authed: false,
                 auth_buf: Vec::new(),
                 served: HashSet::new(),
+                wakes: HashMap::new(),
                 udp: Arc::new(Mutex::new(UdpLane::default())),
                 next_udp: 1,
                 client_cid: client_cid.to_vec(),
@@ -881,6 +917,7 @@ impl Router<'_> {
                 return;
             }
             let mut streams = Vec::new();
+            let mut wakes = Vec::new();
             for id in conn.readable() {
                 if id < FIRST_FLOW_STREAM || id % 4 != 0 {
                     continue;
@@ -888,15 +925,23 @@ impl Router<'_> {
                 let Some(inbound) = routes.get_mut(dcid) else {
                     return;
                 };
+                if let Some(wake) = inbound.wakes.get(&id) {
+                    wakes.push(Arc::clone(wake));
+                }
                 if inbound.served.contains(&id) {
                     continue;
                 }
                 inbound.served.insert(id);
                 let request_udp = inbound.next_udp;
                 inbound.next_udp = inbound.next_udp.wrapping_add(1);
-                streams.push((id, request_udp, Arc::clone(&inbound.udp)));
+                let wake = StreamWake::new();
+                inbound.wakes.insert(id, Arc::clone(&wake));
+                streams.push((id, request_udp, Arc::clone(&inbound.udp), wake));
             }
-            for (id, next_udp, lane) in streams {
+            for wake in wakes {
+                wake.bump();
+            }
+            for (id, next_udp, lane, wake) in streams {
                 let thread_shared = Arc::clone(&shared);
                 let thread_sock = Arc::clone(sock);
                 let thread_serve = Arc::clone(serve);
@@ -910,6 +955,7 @@ impl Router<'_> {
                         &thread_serve,
                         next_udp,
                         &lane,
+                        &wake,
                     );
                 });
             }
@@ -954,6 +1000,7 @@ impl Router<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_tcp_or_udp(
     shared: &Arc<Mutex<quiche::Connection>>,
     sock: &Arc<crate::quic::Datagram>,
@@ -962,6 +1009,7 @@ fn serve_tcp_or_udp(
     serve: &Serve,
     next_udp: u32,
     lane: &Arc<Mutex<UdpLane>>,
+    wake: &Arc<StreamWake>,
 ) {
     let mut flow = Flow::from_parts(
         Arc::clone(shared),
@@ -970,7 +1018,8 @@ fn serve_tcp_or_udp(
         stream,
         Vec::new(),
         false,
-    );
+    )
+    .with_wake(Some(Arc::clone(wake)));
     let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
     let Some((udp, host, port)) = read_request(&mut flow, deadline) else {
         return;
@@ -1018,49 +1067,28 @@ pub(crate) fn serve_loop(
     if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
         return;
     }
+    #[cfg(target_os = "linux")]
+    let mut batch = crate::quic::Batch::new();
     loop {
-        match router.sock.recv_from(buf.as_mut()) {
-            Ok((n, from)) => {
-                let packet = buf.as_mut();
-                let Ok(header) = quiche::Header::from_slice(&mut packet[..n], SCID_LEN) else {
-                    continue;
-                };
-                if header.ty != quiche::Type::Short && header.version != quiche::PROTOCOL_VERSION {
-                    continue;
+        #[cfg(target_os = "linux")]
+        match crate::quic::recv_batch(&router.sock, &mut batch) {
+            crate::quic::Drain::Read => {
+                for at in 0..batch.len() {
+                    let Some((packet, from)) = batch.at(at) else {
+                        continue;
+                    };
+                    route_packet(&mut router, &mut template, packet, from);
                 }
-                let initial = header.ty == quiche::Type::Initial;
-                let dcid = header.dcid.as_ref();
-                let peer_cid = header.scid.as_ref();
-                if dcid.len() > 20 || peer_cid.len() > 20 {
-                    continue;
-                }
-                let mut dcid_buf = [0u8; 20];
-                dcid_buf[..dcid.len()].copy_from_slice(dcid);
-                let mut peer_buf = [0u8; 20];
-                peer_buf[..peer_cid.len()].copy_from_slice(peer_cid);
-                let dcid = &dcid_buf[..dcid.len()];
-                let peer_cid = &peer_buf[..peer_cid.len()];
-                if initial {
-                    let known = router.routes.contains_key(dcid);
-                    let retransmit = router.routes.iter().find_map(|(key, inbound)| {
-                        ((!inbound.initial_dcid.is_empty()
-                            && inbound.initial_dcid.as_slice() == dcid)
-                            || (!peer_cid.is_empty()
-                                && !inbound.client_cid.is_empty()
-                                && inbound.client_cid.as_slice() == peer_cid))
-                            .then(|| key.clone())
-                    });
-                    if known {
-                        router.drive(dcid, &mut packet[..n], from);
-                    } else if let Some(key) = retransmit {
-                        router.drive(&key, &mut packet[..n], from);
-                    } else {
-                        router.accept(&mut packet[..n], from, &mut template, peer_cid, dcid);
-                    }
-                } else {
-                    router.drive(dcid, &mut packet[..n], from);
-                }
+                continue;
             }
+            crate::quic::Drain::Empty => {
+                router.idle();
+                continue;
+            }
+            crate::quic::Drain::Unbatchable => {}
+        }
+        match router.sock.recv_from(buf.as_mut()) {
+            Ok((n, from)) => route_packet(&mut router, &mut template, &mut buf.as_mut()[..n], from),
             Err(ref error) if error.kind() == std::io::ErrorKind::InvalidData => {}
             Err(ref error)
                 if matches!(
@@ -1072,6 +1100,51 @@ pub(crate) fn serve_loop(
             }
             Err(_) => return,
         }
+    }
+}
+
+fn route_packet(
+    router: &mut Router<'_>,
+    template: &mut quiche::Config,
+    packet: &mut [u8],
+    from: SocketAddr,
+) {
+    let Ok(header) = quiche::Header::from_slice(packet, SCID_LEN) else {
+        return;
+    };
+    if header.ty != quiche::Type::Short && header.version != quiche::PROTOCOL_VERSION {
+        return;
+    }
+    let initial = header.ty == quiche::Type::Initial;
+    let dcid = header.dcid.as_ref();
+    let peer_cid = header.scid.as_ref();
+    if dcid.len() > 20 || peer_cid.len() > 20 {
+        return;
+    }
+    let mut dcid_buf = [0u8; 20];
+    dcid_buf[..dcid.len()].copy_from_slice(dcid);
+    let mut peer_buf = [0u8; 20];
+    peer_buf[..peer_cid.len()].copy_from_slice(peer_cid);
+    let dcid = &dcid_buf[..dcid.len()];
+    let peer_cid = &peer_buf[..peer_cid.len()];
+    if initial {
+        let known = router.routes.contains_key(dcid);
+        let retransmit = router.routes.iter().find_map(|(key, inbound)| {
+            ((!inbound.initial_dcid.is_empty() && inbound.initial_dcid.as_slice() == dcid)
+                || (!peer_cid.is_empty()
+                    && !inbound.client_cid.is_empty()
+                    && inbound.client_cid.as_slice() == peer_cid))
+                .then(|| key.clone())
+        });
+        if known {
+            router.drive(dcid, packet, from);
+        } else if let Some(key) = retransmit {
+            router.drive(&key, packet, from);
+        } else {
+            router.accept(packet, from, template, peer_cid, dcid);
+        }
+    } else {
+        router.drive(dcid, packet, from);
     }
 }
 
