@@ -122,7 +122,10 @@ fn scheduler() -> &'static Arc<Scheduler> {
             wake: Notifier::new(),
         });
         let weak = Arc::downgrade(&scheduler);
-        thread::spawn(move || scheduler_loop(&weak));
+        thread::Builder::new()
+            .name("kcp-flush".to_owned())
+            .spawn(move || scheduler_loop(&weak))
+            .expect("spawns the flush thread");
         scheduler
     })
 }

@@ -42363,20 +42363,30 @@ mod tests {
         port
     }
 
+    /// The tasks the process runs under one name: a delta over the whole task table counts the
+    /// harness's own threads and moves with the load, while the named count is the claim.
+    #[cfg(target_os = "linux")]
+    fn kcp_threads(name: &str) -> usize {
+        let mut count = 0;
+        for entry in std::fs::read_dir("/proc/self/task")
+            .expect("reads the task table")
+            .flatten()
+        {
+            if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) {
+                count += usize::from(comm.trim() == name);
+            }
+        }
+        count
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn sixteen_kcp_dials_share_one_feed_thread() {
-        fn threads() -> usize {
-            std::fs::read_dir("/proc/self/task")
-                .expect("reads the task table")
-                .count()
-        }
         let listener = ferrox_core::kcp::Listener::bind(
             "127.0.0.1:0".parse().expect("addr"),
             ferrox_core::kcp::Config::default(),
         )
         .expect("binds");
-        let before = threads();
         let mut conns = Vec::new();
         for _ in 0..16 {
             conns.push(
@@ -42388,12 +42398,7 @@ mod tests {
                 .expect("dials"),
             );
         }
-        let after = threads();
-        assert!(
-            after - before < 8,
-            "sixteen dials added {} feed threads",
-            after - before
-        );
+        assert_eq!(kcp_threads("kcp-feed"), 1, "sixteen dials, one feed thread");
         drop(conns);
         listener.close();
     }
@@ -42401,12 +42406,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sixteen_kcp_connections_share_one_flush_thread() {
-        fn threads() -> usize {
-            std::fs::read_dir("/proc/self/task")
-                .expect("reads the task table")
-                .count()
-        }
-        let before = threads();
         let local = "127.0.0.1:1".parse().expect("addr");
         let mut conns = Vec::new();
         for conversation in 1..=16u16 {
@@ -42421,11 +42420,10 @@ mod tests {
                 ferrox_core::kcp::Config::default(),
             ));
         }
-        let after = threads();
-        assert!(
-            after - before < 8,
-            "sixteen connections added {} flush threads",
-            after - before
+        assert_eq!(
+            kcp_threads("kcp-flush"),
+            1,
+            "sixteen connections, one flush thread"
         );
         drop(conns);
     }
