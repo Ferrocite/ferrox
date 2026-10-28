@@ -1625,11 +1625,12 @@ fn service(
             if !parse_head(tunnel, spec) {
                 continue;
             }
+            if tunnel.pending.is_none() {
+                accept(conn, shared, spec, tunnel);
+            }
             if let Some(head) = tunnel.pending.take() {
                 send_stream(conn, id, &head, true).ok();
                 tunnel.rejected = true;
-            } else {
-                accept(conn, shared, spec, tunnel);
             }
         } else if !tunnel.rejected {
             parse_capsules(conn, tunnel);
