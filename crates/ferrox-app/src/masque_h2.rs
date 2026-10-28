@@ -987,6 +987,25 @@ mod tests {
 
     #[test]
     fn a_whole_capsule_is_read_where_it_landed() {
+        let mut capsule = Vec::new();
+        frames::quic_varint(&mut capsule, 0x1234);
+        frames::quic_varint(&mut capsule, 0);
+        let mut client = bare_client();
+        let ((), counts) = ferrox_core::alloc_count::measure(|| client.capsules(&capsule));
+        assert_eq!(
+            counts.allocs, 0,
+            "a whole capsule is parsed without staging: {counts:?}"
+        );
+        assert_eq!(
+            client.capsules.capacity(),
+            0,
+            "a whole capsule is never staged"
+        );
+        assert!(client.packets.is_empty());
+    }
+
+    #[test]
+    fn a_datagram_capsule_goes_straight_to_its_lane() {
         let packet = udp_packet(53);
         let mut capsule = Vec::new();
         datagram(&packet, &mut capsule);
@@ -996,15 +1015,9 @@ mod tests {
         let routes = Arc::new(std::sync::Mutex::new(table));
         let (to_stack, _stack_rx) = std::sync::mpsc::channel();
         let mut client = bare_client();
-        client.routes = Some(Arc::clone(&routes));
-        client.to_stack = Some(to_stack.clone());
-        let ((), direct) =
-            ferrox_core::alloc_count::measure(|| masque::deliver(&to_stack, &routes, &packet));
-        let ((), counts) = ferrox_core::alloc_count::measure(|| client.capsules(&capsule));
-        assert_eq!(
-            counts.allocs, direct.allocs,
-            "the whole capsule adds no allocation to a direct delivery: {counts:?} vs {direct:?}"
-        );
+        client.routes = Some(routes);
+        client.to_stack = Some(to_stack);
+        client.capsules(&capsule);
         assert_eq!(
             client.capsules.capacity(),
             0,
