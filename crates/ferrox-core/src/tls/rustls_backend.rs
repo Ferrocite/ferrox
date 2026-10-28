@@ -1079,6 +1079,60 @@ impl std::fmt::Debug for ServerConfigCacheInner {
 
 pub type ServerConfigCache = std::sync::Arc<std::sync::Mutex<ServerConfigCacheInner>>;
 
+/// The single identity, refused when the SNI matches no certificate name.
+#[derive(Debug)]
+struct SniResolver {
+    key: Arc<rustls::sign::CertifiedKey>,
+    names: Vec<String>,
+}
+
+impl rustls::server::ResolvesServerCert for SniResolver {
+    fn resolve(
+        &self,
+        hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        hello
+            .server_name()
+            .filter(|sni| sni_matches(&self.names, sni))
+            .map(|_| Arc::clone(&self.key))
+    }
+}
+
+/// xray matches the exact name or a certificate's `*.suffix`, which covers one label only.
+fn sni_matches(names: &[String], sni: &str) -> bool {
+    let wildcard = match sni.find('.') {
+        Some(at) => format!("*{}", &sni[at..]),
+        None => "*".to_owned(),
+    };
+    names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(sni) || name.eq_ignore_ascii_case(&wildcard))
+}
+
+/// The names xray compares an SNI against: the leaf's DNS SANs and subject common name.
+fn certificate_names(leaf: &[u8]) -> Vec<String> {
+    let Ok(cert) = boring::x509::X509::from_der(leaf) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    if let Some(sans) = cert.subject_alt_names() {
+        for san in sans {
+            if let Some(name) = san.dnsname() {
+                names.push(name.to_ascii_lowercase());
+            }
+        }
+    }
+    for entry in cert
+        .subject_name()
+        .entries_by_nid(boring::nid::Nid::COMMONNAME)
+    {
+        if let Ok(name) = entry.data().as_utf8() {
+            names.push(name.to_string().to_ascii_lowercase());
+        }
+    }
+    names
+}
+
 pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::ServerConfig, TlsError> {
     use super::ServerKeyKind as Kind;
     let certs: Vec<rustls::pki_types::CertificateDer<'_>> = cfg
@@ -1097,21 +1151,37 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
             rustls::pki_types::PrivatePkcs1KeyDer::from(cfg.key_der),
         ),
     };
-    let mut provider = (*provider()).clone();
+    let crypto_provider = provider();
+    let mut ordered = (*crypto_provider).clone();
     if !cfg.cipher_suites.is_empty() {
-        order_cipher_suites(&mut provider, &cfg.cipher_suites);
+        order_cipher_suites(&mut ordered, &cfg.cipher_suites);
     }
     let versions = server_versions(cfg.min_version, cfg.max_version)?;
-    let builder = rustls::ServerConfig::builder_with_provider(Arc::new(provider));
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::new(ordered));
     let builder = match versions.as_deref() {
         Some(versions) => builder.with_protocol_versions(versions),
         None => builder.with_safe_default_protocol_versions(),
     }
     .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?;
-    let mut config = builder
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?;
+    let mut config = if cfg.reject_unknown_sni {
+        let names = certs
+            .first()
+            .map(|leaf| certificate_names(leaf.as_ref()))
+            .unwrap_or_default();
+        let key = rustls::sign::CertifiedKey::from_der(certs, key, crypto_provider.as_ref())
+            .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?;
+        builder
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(SniResolver {
+                key: Arc::new(key),
+                names,
+            }))
+    } else {
+        builder
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?
+    };
     config.alpn_protocols.clear();
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
     // rustls sends two tickets by default; REALITY arrivals carry none.
@@ -1515,11 +1585,37 @@ pub(crate) fn ech_server_context_builder(
     cfg: &super::TlsServerConfig,
     keys: &[u8],
 ) -> Result<boring::ssl::SslContextBuilder, TlsError> {
+    let builder = server_identity_builder(cfg)?;
+    let parsed = crate::tls::ech::parse_server_keys(keys).map_err(TlsError::Other)?;
+    let mut ech = boring::ssl::SslEchKeys::builder().map_err(|error| boring_error(&error))?;
+    for key in parsed {
+        let hpke = boring::hpke::HpkeKey::dhkem_p256_sha256(&key.private_key)
+            .map_err(|error| boring_error(&error))?;
+        // BoringSSL refuses a set with no retry config; every xray key can answer a rejected offer.
+        ech.add_key(true, &key.config, hpke)
+            .map_err(|error| boring_error(&error))?;
+    }
+    builder
+        .set_ech_keys(&ech.build())
+        .map_err(|error| boring_error(&error))?;
+    Ok(builder)
+}
+
+/// A QUIC server's TLS context: the identity, ALPN and the SNI rule, ready for quiche.
+pub fn quic_server_context_builder(
+    cfg: &super::TlsServerConfig,
+) -> Result<boring::ssl::SslContextBuilder, TlsError> {
+    server_identity_builder(cfg)
+}
+
+fn server_identity_builder(
+    cfg: &super::TlsServerConfig,
+) -> Result<boring::ssl::SslContextBuilder, TlsError> {
     use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
     let mut chain = cfg.cert_chain.iter();
     let leaf = chain
         .next()
-        .ok_or_else(|| TlsError::Other("ech server identity has no certificate".to_owned()))?;
+        .ok_or_else(|| TlsError::Other("server identity has no certificate".to_owned()))?;
     let mut builder =
         SslContextBuilder::new(SslMethod::tls()).map_err(|error| boring_error(&error))?;
     builder.set_verify(SslVerifyMode::NONE);
@@ -1542,6 +1638,19 @@ pub(crate) fn ech_server_context_builder(
     builder
         .check_private_key()
         .map_err(|error| boring_error(&error))?;
+    if cfg.reject_unknown_sni {
+        let names = certificate_names(&cfg.cert_chain[0]);
+        builder.set_servername_callback(move |ssl, alert| {
+            if ssl
+                .servername(boring::ssl::NameType::HOST_NAME)
+                .is_some_and(|sni| sni_matches(&names, sni))
+            {
+                return Ok(());
+            }
+            *alert = boring::ssl::SslAlert::UNRECOGNIZED_NAME;
+            Err(boring::ssl::SniError::ALERT_FATAL)
+        });
+    }
     if !cfg.alpn.is_empty() {
         let wanted = cfg.alpn.clone();
         builder.set_alpn_select_callback(move |_, client| {
@@ -1567,18 +1676,6 @@ pub(crate) fn ech_server_context_builder(
     if !cfg.send_tickets {
         builder.set_options(boring::ssl::SslOptions::NO_TICKET);
     }
-    let parsed = crate::tls::ech::parse_server_keys(keys).map_err(TlsError::Other)?;
-    let mut ech = boring::ssl::SslEchKeys::builder().map_err(|error| boring_error(&error))?;
-    for key in parsed {
-        let hpke = boring::hpke::HpkeKey::dhkem_p256_sha256(&key.private_key)
-            .map_err(|error| boring_error(&error))?;
-        // BoringSSL refuses a set with no retry config; every xray key can answer a rejected offer.
-        ech.add_key(true, &key.config, hpke)
-            .map_err(|error| boring_error(&error))?;
-    }
-    builder
-        .set_ech_keys(&ech.build())
-        .map_err(|error| boring_error(&error))?;
     Ok(builder)
 }
 
@@ -2810,6 +2907,16 @@ mod tests {
         });
     }
 
+    #[test]
+    fn an_sni_matches_an_exact_or_one_label_wildcard_name() {
+        let names = vec!["tls.test".to_owned(), "*.wild.test".to_owned()];
+        assert!(sni_matches(&names, "tls.test"));
+        assert!(sni_matches(&names, "TLS.TEST"));
+        assert!(sni_matches(&names, "a.wild.test"));
+        assert!(!sni_matches(&names, "a.b.wild.test"));
+        assert!(!sni_matches(&names, "other.test"));
+    }
+
     fn plain_identity() -> crate::tls::TlsServerConfig {
         let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
         let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
@@ -2930,6 +3037,7 @@ mod tests {
         let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
         let mut identity = crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses");
         identity.ech_server_keys = Some(keys.into());
+        identity.reject_unknown_sni = true;
         identity.alpn = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();

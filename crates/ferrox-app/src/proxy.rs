@@ -29987,6 +29987,7 @@ mod tests {
             key_der: CARRIER_KEY.to_vec(),
             key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
             send_tickets: true,
+            reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
         });

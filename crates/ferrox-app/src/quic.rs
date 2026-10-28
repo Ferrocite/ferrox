@@ -479,13 +479,16 @@ pub(crate) fn serve_config(identity: &ferrox_core::tls::TlsServerConfig) -> Opti
     let mut config = if identity.ech_server_keys.is_some() {
         let builder = identity.ech_server_context_builder().ok()?;
         quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder).ok()?
+    } else if identity.reject_unknown_sni {
+        let builder = ferrox_core::tls::quic_server_context_builder(identity).ok()?;
+        quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder).ok()?
     } else {
         quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?
     };
     if !tune(&mut config, ALPN) {
         return None;
     }
-    if identity.ech_server_keys.is_some() {
+    if identity.ech_server_keys.is_some() || identity.reject_unknown_sni {
         return Some(config);
     }
     let label = match identity.key_kind {
@@ -4120,6 +4123,7 @@ mod tests {
             max_version: None,
             cipher_suites: Vec::new(),
             send_tickets: true,
+            reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
         }
@@ -4166,6 +4170,12 @@ mod tests {
     #[test]
     fn serve_config_loads_a_minted_identity() {
         assert!(serve_config(&minted_identity()).is_some());
+        let mut rejecting = minted_identity();
+        rejecting.reject_unknown_sni = true;
+        assert!(
+            serve_config(&rejecting).is_some(),
+            "the SNI rule builds on the QUIC context"
+        );
     }
 
     #[test]
@@ -4187,6 +4197,7 @@ mod tests {
             max_version: None,
             cipher_suites: Vec::new(),
             send_tickets: true,
+            reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
         };
