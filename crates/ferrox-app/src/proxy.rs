@@ -19533,12 +19533,12 @@ pub(crate) mod lane_pool {
         /// A lane inserted with an earlier deadline must not wait for the deadline already parked.
         #[test]
         fn an_earlier_deadline_wakes_the_parker() {
-            let pool = spawn_pool();
+            let pool = TestPool(spawn_pool());
             assert!(grow(&pool));
             let ran = Arc::new(Mutex::new(None));
             let mut later = marker(Arc::clone(&ran));
             later.idle = 2;
-            let parker = Arc::clone(&pool);
+            let parker = Arc::clone(&*pool);
             let handle = thread::spawn(move || {
                 park_with(&parker, later, Duration::from_millis(50));
             });
@@ -19566,10 +19566,10 @@ pub(crate) mod lane_pool {
         /// A batch belongs to the pool that parked it, not to every pool in the process.
         #[test]
         fn a_pool_counts_its_own_batches() {
-            let a = spawn_pool();
-            let b = spawn_pool();
+            let a = TestPool(spawn_pool());
+            let b = TestPool(spawn_pool());
             let before = parker_batches(&b);
-            let parker = Arc::clone(&a);
+            let parker = Arc::clone(&*a);
             thread::spawn(move || {
                 park_with(
                     &parker,
