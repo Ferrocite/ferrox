@@ -4,6 +4,7 @@
 vless-hysteria-down-8|server|0.04|670
 vless-hysteria-up-1|client|0.00|670
 vless-hysteria-up-1|server|0.24|670
+vless-hysteria-up-1|server-cpu|2.67|670
 vless-hysteria-duplex-8|client|0.73|670
 vless-hysteria-duplex-8|server|0.31|670
 vless-reality-grpc-down-8|server|0.71|468
