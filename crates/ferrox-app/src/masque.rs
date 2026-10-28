@@ -9,7 +9,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -1328,6 +1328,22 @@ fn dispatch(shared: &Shared, from_stack: Receiver<Vec<u8>>) {
 type Routes = Arc<Mutex<HashMap<Vec<u8>, (u64, Sender<Arrival>)>>>;
 
 static WORKERS: AtomicU64 = AtomicU64::new(0);
+/// Enough for a busy edge, small enough that a spoofed Initial flood cannot exhaust the process.
+const MAX_WORKERS: usize = 1024;
+
+struct WorkerSlot(Arc<AtomicUsize>);
+
+impl Drop for WorkerSlot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+#[allow(clippy::unnecessary_wraps)]
+fn admit_worker(live: &Arc<AtomicUsize>, _cap: usize) -> Option<WorkerSlot> {
+    live.fetch_add(1, Ordering::AcqRel);
+    Some(WorkerSlot(Arc::clone(live)))
+}
 
 #[allow(clippy::needless_pass_by_value)]
 fn demux(
@@ -1338,6 +1354,7 @@ fn demux(
     spec: Arc<ServerSpec>,
 ) {
     let routes: Routes = Arc::new(Mutex::new(HashMap::new()));
+    let live = Arc::new(AtomicUsize::new(0));
     let mut buf = vec![0u8; 65535];
     loop {
         let Ok((n, from)) = sock.recv_from(&mut buf) else {
@@ -1365,6 +1382,9 @@ fn demux(
             continue;
         }
         let scid = quiche::ConnectionId::from_ref(&scid);
+        let Some(slot) = admit_worker(&live, MAX_WORKERS) else {
+            continue;
+        };
         let Ok(mut guard) = config.lock() else {
             continue;
         };
@@ -1400,6 +1420,7 @@ fn demux(
             if let Ok(mut table) = keys.lock() {
                 table.retain(|_, (owner, _)| *owner != worker_id);
             }
+            drop(slot);
         });
     }
 }
@@ -1951,6 +1972,24 @@ fn peer_key(addrs: &[IpAddr]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn workers_stop_at_the_cap() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let mut slots = Vec::new();
+        for _ in 0..MAX_WORKERS {
+            slots.push(admit_worker(&live, MAX_WORKERS).expect("below the cap"));
+        }
+        assert!(
+            admit_worker(&live, MAX_WORKERS).is_none(),
+            "the cap admitted another worker"
+        );
+        slots.pop();
+        assert!(
+            admit_worker(&live, MAX_WORKERS).is_some(),
+            "a released slot was not reusable"
+        );
+    }
 
     #[test]
     fn pins_are_checked_even_when_the_hello_is_insecure() {
