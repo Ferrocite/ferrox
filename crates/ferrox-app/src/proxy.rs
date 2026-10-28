@@ -24281,9 +24281,20 @@ mod tests {
             .expect("routing");
         let portals = crate::reverse::Portals::default();
         let shared = route_shared(&root, routing, &portals, None).expect("shared");
-        let dynamic =
-            crate::json::parse(r#"{"inbounds":[{"tag":"dyn","protocol":"masque","port":0}]}"#)
-                .expect("parses");
+        let (cert, key, _) = tls_cert_json();
+        let dynamic = crate::json::parse(&format!(
+            r#"{{"inbounds":[{{"tag":"dyn","protocol":"masque","listen":"127.0.0.1","port":0,"settings":{{"users":[{{"email":"u@example.com","pass":"p"}}],"address":["10.14.0.1/24"]}},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"certificates":[{{"certificate":{cert},"key":{key}}}]}}}}}}]}}"#
+        ))
+        .expect("parses");
+        let inbound = dynamic
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .and_then(|list| list.first())
+            .expect("an inbound");
+        assert!(
+            refuse_source(Some(&shared), inbound, "commander", "MASQUE", false),
+            "the source rule is refused"
+        );
         let (served, _) = serve_inbounds_counted(
             "commander",
             &dynamic,
