@@ -910,7 +910,7 @@ impl Session {
             let start = self.queued_at;
             if self.send_window <= 0 {
                 self.queued.push_front(answer);
-                return;
+                break;
             }
             let take =
                 (answer.len() - start).min(usize::try_from(self.send_window).unwrap_or(usize::MAX));
