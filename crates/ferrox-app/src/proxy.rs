@@ -32125,6 +32125,7 @@ mod tests {
         let relay_addr = relay.local_addr().expect("addr");
         let served = Arc::clone(&relay);
         thread::spawn(move || serve_socks_udp_trojan(&served, &trojan));
+        udp.connect(relay_addr).expect("the association relay");
         udp.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
@@ -32132,9 +32133,9 @@ mod tests {
         let mut frame = Vec::new();
         for payload in [&b"ping"[..], &b"pong"[..]] {
             let datagram = socks_udp_frame(&mut frame, None, &target, payload);
-            udp.send_to(datagram, relay_addr).expect("sends");
-            let (n, _) = udp
-                .recv_from(&mut back)
+            udp.send(datagram).expect("sends");
+            let n = udp
+                .recv(&mut back)
                 .unwrap_or_else(|error| panic!("{tag} association echoes: {error}"));
             let (source, echoed) = parse_socks_udp(&back[..n]).expect("splits");
             assert_eq!(source, target, "{tag}");
