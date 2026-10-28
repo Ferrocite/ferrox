@@ -1482,6 +1482,17 @@ mod tests {
     }
 
     #[test]
+    fn a_protobuf_service_uses_the_pinned_observatory_name() {
+        let service = typed("xray.core.app.observatory.command.Config", &[]);
+        let mut config = Vec::new();
+        field_bytes(&mut config, 2, &service);
+        assert!(
+            ApiConfig::from_proto(&config).expect("parses").observatory,
+            "the pinned protobuf name selects the observatory"
+        );
+    }
+
+    #[test]
     fn the_observatory_service_serializes_the_live_snapshot() {
         let root = crate::json::parse(r#"{"api":{"tag":"api","services":["observatoryService"]}}"#)
             .expect("parses");
