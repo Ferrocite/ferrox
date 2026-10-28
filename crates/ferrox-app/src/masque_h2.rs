@@ -173,8 +173,11 @@ impl H2Slots {
     }
 
     fn acquire(self: &Arc<Self>) -> Option<H2Slot> {
-        let _ = self.cap;
-        self.live.fetch_add(1, Ordering::Relaxed);
+        self.live
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |live| {
+                (live < self.cap).then_some(live + 1)
+            })
+            .ok()?;
         Some(H2Slot(Arc::clone(self)))
     }
 }
