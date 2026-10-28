@@ -39714,12 +39714,7 @@ mod tests {
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         push_socks_addr(&mut datagram, &target);
         datagram.extend_from_slice(b"ping");
-        udp.send_to(&datagram, relay).expect("sends");
-        let mut back = vec![0u8; UDP_BUF];
-        let (n, _) = udp.recv_from(&mut back).expect("echoes");
-        let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
-        assert_eq!(source, target);
-        assert_eq!(payload, b"ping");
+        assert_eq!(udp_roundtrip(&udp, relay, &datagram, b"ping"), target);
         drop(client);
         stop.store(true, Ordering::Relaxed);
         driver.join().expect("joins");
@@ -39791,18 +39786,13 @@ mod tests {
         let mut datagram = vec![0u8, 0, 0];
         push_socks_addr(&mut datagram, &target);
         datagram.extend_from_slice(b"ping");
-        udp.send_to(&datagram, relay).expect("sends");
-        let mut back = vec![0u8; UDP_BUF];
-        let (n, _) = udp.recv_from(&mut back).expect("echoes");
-        assert_eq!(parse_socks_udp(&back[..n]).expect("splits").1, b"ping");
+        udp_roundtrip(&udp, relay, &datagram, b"ping");
         // The reader's own poll is shorter than this gap: a quiet mux stream is not an ended one.
         thread::sleep(Duration::from_millis(300));
         let mut datagram = vec![0u8, 0, 0];
         push_socks_addr(&mut datagram, &target);
         datagram.extend_from_slice(b"pong");
-        udp.send_to(&datagram, relay).expect("sends after the gap");
-        let (n, _) = udp.recv_from(&mut back).expect("echoes after the gap");
-        assert_eq!(parse_socks_udp(&back[..n]).expect("splits").1, b"pong");
+        udp_roundtrip(&udp, relay, &datagram, b"pong");
         drop(client);
         stop.store(true, Ordering::Relaxed);
         driver.join().expect("joins");
@@ -42298,6 +42288,33 @@ mod tests {
     }
 
     /// A UDP echo target: one bound socket that returns every datagram to whoever sent it, the far end the hysteria relay is measured against.
+    /// Loopback UDP loses nothing, but an association that has just opened a lane can drop the
+    /// first datagram while the lane is still being routed: resend the frame until its answer
+    /// arrives rather than failing on one quiet poll.
+    fn udp_roundtrip(udp: &UdpSocket, relay: SocketAddr, frame: &[u8], want: &[u8]) -> SocketAddr {
+        udp.set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("timeout");
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut back = vec![0u8; UDP_BUF];
+        loop {
+            udp.send_to(frame, relay).expect("sends");
+            let until = Instant::now() + Duration::from_millis(250);
+            while Instant::now() < until {
+                let Ok((n, _)) = udp.recv_from(&mut back) else {
+                    break;
+                };
+                let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+                if payload == want {
+                    return source;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no answer to {want:?} within 30s"
+            );
+        }
+    }
+
     fn udp_echo_loop() -> u16 {
         let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let port = echo.local_addr().expect("addr").port();
@@ -45289,13 +45306,8 @@ end
             udp.recv_from(&mut back).is_err(),
             "the blocked lane never answers"
         );
-        udp.set_read_timeout(Some(Duration::from_secs(30)))
-            .expect("timeout");
-        udp.send_to(&frame(allowed, b"ping"), relay).expect("sends");
-        let (n, _) = udp.recv_from(&mut back).expect("echoes");
-        let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        let source = udp_roundtrip(&udp, relay, &frame(allowed, b"ping"), b"ping");
         assert_eq!(source.port(), allowed);
-        assert_eq!(payload, b"ping");
     }
 
     /// A split association keeps the client's name: a domain rule drops the datagram before any
