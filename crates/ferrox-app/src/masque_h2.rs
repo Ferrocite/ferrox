@@ -1135,7 +1135,10 @@ mod tests {
         client.send_window = 10;
         client.connection_window = 10;
         client.flush();
-        assert!(client.queued.is_empty(), "the last part finished the capsule");
+        assert!(
+            client.queued.is_empty(),
+            "the last part finished the capsule"
+        );
         assert_eq!(client.queued_at, 0);
     }
 

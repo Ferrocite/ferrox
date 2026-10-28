@@ -1270,7 +1270,7 @@ impl AddressPool {
 }
 
 #[cfg(test)]
-pub(crate) fn test_pool() -> AddressPool {
+fn test_pool() -> AddressPool {
     AddressPool::from_prefixes(&["10.14.0.0/24".to_owned()]).expect("a test pool")
 }
 
