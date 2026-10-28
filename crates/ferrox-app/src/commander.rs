@@ -66,7 +66,9 @@ impl ApiConfig {
             "xray.app.proxyman.command.Config" => self.handler = true,
             "xray.app.stats.command.Config" => self.stats = true,
             "xray.app.log.command.Config" => self.logger = true,
-            "xray.app.observatory.command.Config" => self.observatory = true,
+            "xray.core.app.observatory.command.Config" | "xray.app.observatory.command.Config" => {
+                self.observatory = true
+            }
             "xray.app.commander.ReflectionConfig" => {}
             other => eprintln!("commander: service `{other}` is not carried; skipped"),
         }
