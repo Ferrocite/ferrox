@@ -332,8 +332,9 @@ mod x86 {
     }
 }
 
-/// The same sixteen-byte lane as `x86`, in NEON: `tbl` indexes the offset table by
-/// the high nibble, and a nibble bitset rejects a byte outside the alphabet.
+/// The same sixteen-byte lane as `x86`, in NEON: the encoder maps the sextets through
+/// the sixty-four-byte alphabet in one `tbl`, and the decoder indexes the offset table
+/// by the high nibble, with a nibble bitset rejecting a byte outside the alphabet.
 #[cfg(target_arch = "aarch64")]
 mod neon {
     #[allow(
@@ -353,9 +354,6 @@ mod neon {
     ];
     const PACK: [u8; 16] = [0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 0, 0, 0, 0];
     const ENCODE_SHUFFLE: [u8; 16] = [1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10];
-    const ENCODE_OFFSETS: [u8; 16] = [
-        65, 71, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 237, 240, 0, 0,
-    ];
 
     #[allow(clippy::inline_always)]
     #[inline(always)]
@@ -422,9 +420,7 @@ mod neon {
     fn encode_block(
         raw: uint8x16_t,
         shuffle: uint8x16_t,
-        offsets: uint8x16_t,
-        fifty_one: uint8x16_t,
-        twenty_five: uint8x16_t,
+        alphabet: uint8x16x4_t,
         mul_high: uint16x8_t,
         mul_low: uint16x8_t,
     ) -> uint8x16_t {
@@ -435,11 +431,7 @@ mod neon {
             let t2 = vandq_u32(vreinterpretq_u32_u8(raw), vdupq_n_u32(0x003f_03f0));
             let t3 = vmulq_u16(vreinterpretq_u16_u32(t2), mul_low);
             let sextets = vorrq_u32(vreinterpretq_u32_u16(t1), vreinterpretq_u32_u16(t3));
-            let sextets = vreinterpretq_u8_u32(sextets);
-            let reduced = vqsubq_u8(sextets, fifty_one);
-            let mask = vcgtq_u8(sextets, twenty_five);
-            let reduced = vsubq_u8(reduced, mask);
-            vaddq_u8(sextets, vqtbl1q_u8(offsets, reduced))
+            vqtbl4q_u8(alphabet, vreinterpretq_u8_u32(sextets))
         }
     }
 
@@ -449,24 +441,14 @@ mod neon {
         // SAFETY: NEON is mandatory on aarch64, the wide loop loads only while 16 bytes remain, the tail loads exactly 12, and every store fills its window.
         unsafe {
             let shuffle = vld1q_u8(ENCODE_SHUFFLE.as_ptr());
-            let offsets = vld1q_u8(ENCODE_OFFSETS.as_ptr());
-            let fifty_one = vdupq_n_u8(51);
-            let twenty_five = vdupq_n_u8(25);
+            let alphabet = vld1q_u8_x4(super::STD.as_ptr());
             let mul_high = vreinterpretq_u16_u32(vdupq_n_u32(0x0400_0040));
             let mul_low = vreinterpretq_u16_u32(vdupq_n_u32(0x0100_0010));
             let mut at = 0usize;
             let mut out_at = 0usize;
             while at + 16 <= bytes.len() {
                 let raw = vld1q_u8(bytes.as_ptr().add(at));
-                let ascii = encode_block(
-                    raw,
-                    shuffle,
-                    offsets,
-                    fifty_one,
-                    twenty_five,
-                    mul_high,
-                    mul_low,
-                );
+                let ascii = encode_block(raw, shuffle, alphabet, mul_high, mul_low);
                 vst1q_u8(out.add(out_at), ascii);
                 at += 12;
                 out_at += 16;
@@ -475,15 +457,7 @@ mod neon {
                 let low = vld1_u8(bytes.as_ptr().add(at));
                 let high = vld1_lane_u32::<0>(bytes.as_ptr().add(at + 8).cast(), vdup_n_u32(0));
                 let raw = vcombine_u8(low, vreinterpret_u8_u32(high));
-                let ascii = encode_block(
-                    raw,
-                    shuffle,
-                    offsets,
-                    fifty_one,
-                    twenty_five,
-                    mul_high,
-                    mul_low,
-                );
+                let ascii = encode_block(raw, shuffle, alphabet, mul_high, mul_low);
                 vst1q_u8(out.add(out_at), ascii);
                 at += 12;
                 out_at += 16;
