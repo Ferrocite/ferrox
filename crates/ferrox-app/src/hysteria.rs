@@ -483,6 +483,11 @@ impl Flow {
         self
     }
 
+    pub(crate) fn with_send_wake(mut self, wake: Arc<StreamWake>) -> Self {
+        self.session.send_wake = Some(wake);
+        self
+    }
+
     /// Carries the dial's reader and send wake onto the flow, so a pooled flow's writer waits on the ACK the driver takes instead of a 5 ms poll.
     pub(crate) fn with_session(mut self, session: &Session) -> Self {
         self.session.driver.clone_from(&session.driver);
