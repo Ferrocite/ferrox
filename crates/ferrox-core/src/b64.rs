@@ -23,7 +23,10 @@ pub fn encode(bytes: &[u8]) -> String {
     // The buffer is opened to the exact coded length and every byte of it is written below, so the four alphabet octets of a group are four stores and one cursor add rather than four capacity checks and a length reload each.
     let ptr = out.as_mut_ptr();
     let (whole, rest) = bytes.as_chunks::<3>();
+    #[cfg(not(target_arch = "aarch64"))]
     let mut at = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    let mut at;
     #[cfg(target_arch = "x86_64")]
     let group = if std::is_x86_feature_detected!("ssse3") {
         // SAFETY: the feature is present, the wide loop loads only while 16 bytes remain, and the tail loads exactly 12.
@@ -410,7 +413,7 @@ mod neon {
                     vshlq_n_u32::<12>(vmovl_u16(vget_low_u16(even_pairs))),
                     vmovl_u16(vget_low_u16(odd_pairs)),
                 );
-                let bytes = vrev32q_u8(vshlq_n_u32::<8>(groups));
+                let bytes = vrev32q_u8(vreinterpretq_u8_u32(vshlq_n_u32::<8>(groups)));
                 vst1q_u8(out.add(out_at), vqtbl1q_u8(bytes, pack));
                 at += 16;
                 out_at += 12;
@@ -535,8 +538,14 @@ fn group_tail(rest: &[u8]) -> Option<[u8; 3]> {
 pub fn decode(text: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() / 4 * 3 + 4);
     let ptr: *mut u8 = out.as_mut_ptr();
+    #[cfg(not(target_arch = "aarch64"))]
     let mut out_at = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    let mut out_at;
+    #[cfg(not(target_arch = "aarch64"))]
     let mut at = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    let mut at;
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("ssse3") {
         // SAFETY: the feature is present, and the buffer reserves four bytes past the exact decoded length, so the wide store stays inside it.
