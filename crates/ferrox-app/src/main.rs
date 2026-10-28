@@ -57,6 +57,8 @@ mod veepn;
 mod vision;
 mod vmess;
 mod wg;
+#[cfg(target_os = "linux")]
+mod wg_kernel;
 mod wg_stack;
 mod wireguard;
 mod ws;

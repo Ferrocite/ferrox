@@ -18272,7 +18272,7 @@ fn relay(client: &Connection, target: &Connection) {
 /// Hand a flow to the readiness workers and return: the accepted connection's thread is done
 /// with the flow once its socket descriptors belong to the workers, which is what keeps the
 /// thread count a property of the machine rather than of the flow count.
-fn relay_handoff(client: &Connection, target: &Connection) {
+pub(crate) fn relay_handoff(client: &Connection, target: &Connection) {
     let Ok(client_read) = client.try_clone() else {
         return;
     };

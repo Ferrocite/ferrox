@@ -9,6 +9,8 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream, UdpSocket};
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -24,11 +26,14 @@ use ferrox_core::wireguard::handshake::{
 };
 use ferrox_core::wireguard::transport::{
     check_mac2, clear_reserved, cookie_encryption_key, create_reply, COOKIE_NONCE_SIZE,
+    HEADER_SIZE as WG_HEADER_SIZE, TAG_SIZE as WG_TAG_SIZE,
 };
 
 use crate::conn::Connection;
 use crate::json::Json;
 use crate::proxy::{Destination, Outbound};
+#[cfg(target_os = "linux")]
+use crate::wg_kernel::KernelWireGuard;
 use crate::wg_stack::{self, ip_bytes, ClientFlow, Packet, UdpRoutes};
 use crate::wireguard::{DeviceConfig, PeerConfig};
 
@@ -63,6 +68,19 @@ const DNS_PORT_LAST: u16 = 49_152;
 const DNS_CACHE: usize = 256;
 /// Seconds a failed lookup is remembered, so a dead name does not stall a lane per datagram.
 const DNS_NEGATIVE_TTL: u32 = 5;
+/// The most kernel destinations one flow races, and the lane's idle tick.
+#[cfg(target_os = "linux")]
+const KERNEL_RACES: usize = 8;
+#[cfg(target_os = "linux")]
+const KERNEL_UDP_POLL: Duration = Duration::from_millis(10);
+#[cfg(target_os = "linux")]
+const KERNEL_RACE_AGAIN: Duration = Duration::from_secs(2);
+#[cfg(target_os = "linux")]
+const KERNEL_UPLINKS: usize = 64;
+#[cfg(target_os = "linux")]
+type KernelLaneKey = (String, u16);
+/// One DNS exchange a client name can take through either path.
+type Exchange<'a> = dyn Fn(IpAddr, IpAddr, &str, u16) -> Option<(Vec<IpAddr>, u32)> + Sync + 'a;
 /// The reference's cookie lifetime and its one-second under-load tail.
 const COOKIE_REFRESH: u64 = 120_000;
 const UNDER_LOAD: u64 = 1_000;
@@ -184,6 +202,8 @@ pub(crate) struct WireGuardOut {
     dns_port_next: AtomicU16,
     dns_id: AtomicU16,
     resolved: Mutex<HashMap<String, Resolved>>,
+    #[cfg(target_os = "linux")]
+    kernel: Option<Arc<KernelWireGuard>>,
 }
 
 impl WireGuardOut {
@@ -195,16 +215,28 @@ impl WireGuardOut {
         if config.is_client == Some(false) {
             return Err("a wireguard outbound must set `isClient: true`".to_owned());
         }
-        if !config.no_kernel_tun {
-            eprintln!(
-                "wireguard: `noKernelTun` is false, so the reference opens a kernel TUN; this tree opens none and serves the userspace stack"
-            );
-        }
         let dns_servers = if config.dns.is_empty() {
             DEFAULT_DNS.to_vec()
         } else {
             config.dns.clone()
         };
+        #[cfg(target_os = "linux")]
+        if !config.no_kernel_tun {
+            match KernelWireGuard::new(&config) {
+                Ok(kernel) => {
+                    return Ok(Self::with_kernel(config, kernel, dns_servers, dns_port));
+                }
+                Err(error) => eprintln!(
+                    "wireguard: kernel mode unavailable, using the userspace stack: {error}"
+                ),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        if !config.no_kernel_tun {
+            eprintln!(
+                "wireguard: `noKernelTun` is false, but the kernel device is Linux-only; serving the userspace stack"
+            );
+        }
         let socket = bind_socket(&config)?;
         let (packets_tx, packets_rx) = mpsc::channel();
         let (to_tunnel, from_tunnel) = mpsc::channel();
@@ -241,7 +273,33 @@ impl WireGuardOut {
             dns_port_next: AtomicU16::new(0),
             dns_id: AtomicU16::new(0),
             resolved: Mutex::new(HashMap::new()),
+            #[cfg(target_os = "linux")]
+            kernel: None,
         })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_kernel(
+        config: DeviceConfig,
+        kernel: KernelWireGuard,
+        dns_servers: Vec<IpAddr>,
+        dns_port: u16,
+    ) -> Self {
+        let (flows, _) = mpsc::channel();
+        let (to_tunnel, _) = mpsc::channel();
+        Self {
+            config: Arc::new(config),
+            flows,
+            to_tunnel,
+            routes: Arc::default(),
+            stop: Arc::new(AtomicBool::new(false)),
+            dns_servers,
+            dns_port,
+            dns_port_next: AtomicU16::new(0),
+            dns_id: AtomicU16::new(0),
+            resolved: Mutex::new(HashMap::new()),
+            kernel: Some(Arc::new(kernel)),
+        }
     }
 
     pub(crate) fn edge(&self) -> Option<SocketAddr> {
@@ -249,6 +307,11 @@ impl WireGuardOut {
     }
 
     pub(crate) fn serve_tcp(&self, client: Connection, asked: &Destination, prefix: &[u8]) {
+        #[cfg(target_os = "linux")]
+        if let Some(kernel) = &self.kernel {
+            self.serve_tcp_kernel(kernel, client, asked, prefix);
+            return;
+        }
         let destinations = self.destinations(asked);
         if destinations.is_empty() {
             eprintln!("wireguard: no peer allows `{asked:?}`");
@@ -268,6 +331,11 @@ impl WireGuardOut {
     }
 
     pub(crate) fn serve_udp(&self, relay: &UdpSocket, associate: Option<&Connection>) {
+        #[cfg(target_os = "linux")]
+        if let Some(kernel) = &self.kernel {
+            self.serve_udp_kernel(kernel, relay, associate);
+            return;
+        }
         wg_stack::client_udp(
             relay,
             &self.config,
@@ -276,6 +344,198 @@ impl WireGuardOut {
             associate,
             &|host, port| self.destinations(&Destination::Name(host.to_owned(), port)),
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn serve_tcp_kernel(
+        &self,
+        kernel: &Arc<KernelWireGuard>,
+        client: Connection,
+        asked: &Destination,
+        prefix: &[u8],
+    ) {
+        let destinations = self.destinations(asked);
+        if destinations.is_empty() {
+            eprintln!("wireguard: no peer allows `{asked:?}`");
+            return;
+        }
+        let kernel = Arc::clone(kernel);
+        let prefix = prefix.to_vec();
+        std::thread::spawn(move || {
+            let (sender, receiver) = mpsc::channel();
+            for target in destinations.into_iter().take(KERNEL_RACES) {
+                let sender = sender.clone();
+                let kernel = Arc::clone(&kernel);
+                std::thread::spawn(move || {
+                    if let Ok(stream) = kernel.connect_tcp(target, crate::budgets::dial()) {
+                        let _ = sender.send(stream);
+                    }
+                });
+            }
+            drop(sender);
+            let Ok(stream) = receiver.recv() else {
+                eprintln!("wireguard: kernel dial failed");
+                return;
+            };
+            let mut upstream = Connection::from(stream);
+            if !prefix.is_empty() && upstream.write_all(&prefix).is_err() {
+                return;
+            }
+            crate::proxy::relay_handoff(&client, &upstream);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[allow(clippy::too_many_lines)]
+    fn serve_udp_kernel(
+        &self,
+        kernel: &KernelWireGuard,
+        relay: &UdpSocket,
+        associate: Option<&Connection>,
+    ) {
+        let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        let winner: Arc<Mutex<HashMap<KernelLaneKey, (SocketAddr, Instant)>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+        let replies = Arc::new(AtomicU64::new(0));
+        let (closed, closed_rx) = mpsc::channel();
+        let mut uplinks: HashMap<(Option<KernelLaneKey>, SocketAddr), UdpSocket> = HashMap::new();
+        let mut buf = crate::proxy::udp_buffer();
+        let mut app = None;
+        let mut seen = 0u64;
+        let mut quiet = Instant::now();
+        let _ = relay.set_read_timeout(Some(KERNEL_UDP_POLL));
+        if let Some(associate) = associate {
+            let _ = associate.set_read_timeout(Some(crate::budgets::SESSION_POLL));
+        }
+        'lane: loop {
+            while let Ok(closed_key) = closed_rx.try_recv() {
+                uplinks.remove(&closed_key);
+            }
+            if associate.is_some_and(crate::proxy::peer_left) {
+                break;
+            }
+            let (n, src) = match relay.recv_from(&mut buf) {
+                Ok(read) => read,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    let now = replies.load(Ordering::Relaxed);
+                    if now != seen {
+                        seen = now;
+                        quiet = Instant::now();
+                    }
+                    if quiet.elapsed() >= crate::budgets::udp_idle() {
+                        break;
+                    }
+                    continue;
+                }
+                Err(_) => break,
+            };
+            quiet = Instant::now();
+            seen = replies.load(Ordering::Relaxed);
+            let Some((dest, payload)) = crate::proxy::parse_socks_udp_dest(&buf[..n]) else {
+                continue;
+            };
+            if app.is_some_and(|bound| bound != src) {
+                continue;
+            }
+            app = Some(src);
+            if let Ok(mut slot) = source.lock() {
+                *slot = Some(src);
+            }
+            let key: Option<KernelLaneKey> = match &dest {
+                Destination::Name(host, port) => Some((host.clone(), *port)),
+                Destination::Address(_) => None,
+            };
+            let mut targets = self.destinations(&dest);
+            if targets.is_empty() {
+                continue;
+            }
+            if let Some(key) = &key {
+                if let Ok(mut slot) = winner.lock() {
+                    match slot.get(key) {
+                        Some((pin, at))
+                            if at.elapsed() < KERNEL_RACE_AGAIN && targets.contains(pin) =>
+                        {
+                            targets = vec![*pin];
+                        }
+                        Some(_) => {
+                            slot.remove(key);
+                        }
+                        None => {}
+                    }
+                }
+            }
+            for target in targets.into_iter().take(KERNEL_RACES) {
+                let uplink = (key.clone(), target);
+                if let Some(up) = uplinks.get(&uplink) {
+                    let _ = up.send(payload);
+                    continue;
+                }
+                if uplinks.len() >= KERNEL_UPLINKS {
+                    break 'lane;
+                }
+                let Ok(up) = kernel.udp_socket(target) else {
+                    continue;
+                };
+                let Ok(writer) = up.try_clone() else {
+                    continue;
+                };
+                let peer = Arc::clone(&source);
+                let won = Arc::clone(&winner);
+                let answered = Arc::clone(&replies);
+                let closed = closed.clone();
+                let Ok(relay_write) = relay.try_clone() else {
+                    continue;
+                };
+                let key = key.clone();
+                let closed_key = uplink.clone();
+                let _ = up.set_read_timeout(Some(crate::budgets::udp_idle()));
+                std::thread::spawn(move || {
+                    let mut back = crate::proxy::udp_buffer();
+                    let mut framed = Vec::with_capacity(64 + crate::proxy::UDP_BUF);
+                    while let Ok(read) = up.recv(&mut back) {
+                        let Some(app) = peer.lock().ok().and_then(|slot| *slot) else {
+                            continue;
+                        };
+                        let chosen = if let Some(key) = &key {
+                            let Ok(mut slot) = won.lock() else {
+                                continue;
+                            };
+                            match slot.get(key) {
+                                Some((pin, _)) if *pin != target => false,
+                                Some(_) => true,
+                                None => {
+                                    slot.insert(key.clone(), (target, Instant::now()));
+                                    true
+                                }
+                            }
+                        } else {
+                            true
+                        };
+                        if !chosen {
+                            continue;
+                        }
+                        let out = crate::proxy::socks_udp_frame(
+                            &mut framed,
+                            None,
+                            &target,
+                            &back[..read],
+                        );
+                        if relay_write.send_to(out, app).is_err() {
+                            break;
+                        }
+                        answered.fetch_add(1, Ordering::Relaxed);
+                    }
+                    let _ = closed.send(closed_key);
+                });
+                uplinks.insert(uplink.clone(), writer);
+                let _ = uplinks[&uplink].send(payload);
+            }
+        }
     }
 
     /// The addresses to race: a literal stands, and a name becomes every answer
@@ -315,9 +575,12 @@ impl WireGuardOut {
                 }
             }
         }
-        let (addrs, ttl) = self
-            .query(host)
-            .unwrap_or_else(|| (Vec::new(), DNS_NEGATIVE_TTL));
+        let answer = if self.kernel_active() {
+            self.query_kernel(host)
+        } else {
+            self.query(host)
+        };
+        let (addrs, ttl) = answer.unwrap_or_else(|| (Vec::new(), DNS_NEGATIVE_TTL));
         if let Ok(mut cache) = self.resolved.lock() {
             if cache.len() >= DNS_CACHE {
                 cache.clear();
@@ -334,6 +597,25 @@ impl WireGuardOut {
     }
 
     fn query(&self, host: &str) -> Option<(Vec<IpAddr>, u32)> {
+        self.query_with(host, &|source, server, name, qtype| {
+            self.exchange(source, server, name, qtype)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn query_kernel(&self, host: &str) -> Option<(Vec<IpAddr>, u32)> {
+        let kernel = self.kernel.as_ref()?;
+        self.query_with(host, &|_source, server, name, qtype| {
+            self.exchange_kernel(kernel, server, name, qtype)
+        })
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn query_kernel(&self, _host: &str) -> Option<(Vec<IpAddr>, u32)> {
+        None
+    }
+
+    fn query_with(&self, host: &str, exchange: &Exchange<'_>) -> Option<(Vec<IpAddr>, u32)> {
         let name = if host.ends_with('.') {
             host.to_owned()
         } else {
@@ -357,8 +639,8 @@ impl WireGuardOut {
                 continue;
             };
             let (v4, v6) = std::thread::scope(|scope| {
-                let v4 = has_v4.then(|| scope.spawn(|| self.exchange(source, *server, &name, 1)));
-                let v6 = has_v6.then(|| scope.spawn(|| self.exchange(source, *server, &name, 28)));
+                let v4 = has_v4.then(|| scope.spawn(|| exchange(source, *server, &name, 1)));
+                let v6 = has_v6.then(|| scope.spawn(|| exchange(source, *server, &name, 28)));
                 (
                     v4.and_then(|handle| handle.join().ok().flatten()),
                     v6.and_then(|handle| handle.join().ok().flatten()),
@@ -373,6 +655,111 @@ impl WireGuardOut {
             }
         }
         (!answers.is_empty()).then_some((answers, ttl))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn kernel_active(&self) -> bool {
+        self.kernel.is_some()
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn kernel_active(&self) -> bool {
+        false
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exchange_kernel(
+        &self,
+        kernel: &KernelWireGuard,
+        server: IpAddr,
+        name: &str,
+        qtype: u16,
+    ) -> Option<(Vec<IpAddr>, u32)> {
+        let id = self.dns_id.fetch_add(1, Ordering::Relaxed);
+        let query = build_query(id, name.as_bytes(), qtype, None)?;
+        let socket = kernel
+            .udp_socket(SocketAddr::new(server, self.dns_port))
+            .ok()?;
+        let mut buf = [0u8; 4096];
+        let deadline = Instant::now() + DNS_TIMEOUT;
+        let mut resend_at = Instant::now();
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            if now >= resend_at {
+                socket.send(&query).ok()?;
+                resend_at = now + DNS_RETRY;
+            }
+            let until = resend_at.min(deadline);
+            if until <= now {
+                return None;
+            }
+            socket.set_read_timeout(Some(until - now)).ok()?;
+            match socket.recv(&mut buf) {
+                Ok(read) => {
+                    let payload = &buf[..read];
+                    if let Some(header) = payload.get(..12) {
+                        let response_id = u16::from_be_bytes([header[0], header[1]]);
+                        let flags = u16::from_be_bytes([header[2], header[3]]);
+                        if response_id == id && flags.trailing_zeros() >= 4 && flags & 0x0200 != 0 {
+                            return self.exchange_kernel_tcp(kernel, server, &query, id, qtype);
+                        }
+                    }
+                    let Some(answer) = parse_answer(payload) else {
+                        continue;
+                    };
+                    if answer.id != id {
+                        continue;
+                    }
+                    if answer.rcode != 0 {
+                        return None;
+                    }
+                    return addresses(&answer, qtype);
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                    ) => {}
+                Err(_) => return None,
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exchange_kernel_tcp(
+        &self,
+        kernel: &KernelWireGuard,
+        server: IpAddr,
+        query: &[u8],
+        id: u16,
+        qtype: u16,
+    ) -> Option<(Vec<IpAddr>, u32)> {
+        let mut stream = kernel
+            .connect_tcp(SocketAddr::new(server, self.dns_port), DNS_TIMEOUT)
+            .ok()?;
+        stream.set_read_timeout(Some(DNS_TIMEOUT)).ok()?;
+        stream.set_write_timeout(Some(DNS_TIMEOUT)).ok()?;
+        let len = u16::try_from(query.len()).ok()?;
+        stream.write_all(&len.to_be_bytes()).ok()?;
+        stream.write_all(query).ok()?;
+        let mut prefix = [0u8; 2];
+        stream.read_exact(&mut prefix).ok()?;
+        let len = usize::from(u16::from_be_bytes(prefix));
+        if len == 0 {
+            return None;
+        }
+        let mut response = vec![0u8; len];
+        stream.read_exact(&mut response).ok()?;
+        let answer = parse_answer(&response)?;
+        if answer.id != id || answer.rcode != 0 || answer.truncated {
+            return None;
+        }
+        addresses(&answer, qtype)
     }
 
     fn exchange(
@@ -392,7 +779,8 @@ impl WireGuardOut {
         } else {
             IPV6_HEADER
         };
-        let mut packet = Vec::with_capacity(header + UDP_HEADER + query.len());
+        let mut packet =
+            Vec::with_capacity(header + UDP_HEADER + query.len() + WG_HEADER_SIZE + WG_TAG_SIZE);
         if !udp_datagram(
             &UdpDatagram {
                 source: &source_bytes,
@@ -598,6 +986,7 @@ fn io(
     let started = Instant::now();
     let mut buf = vec![0u8; 65_535];
     let mut incoming = Vec::new();
+    let mut events = Vec::new();
     loop {
         if stop
             .as_ref()
@@ -606,7 +995,6 @@ fn io(
             return;
         }
         let now = started.elapsed().as_millis() as u64;
-        let mut events = Vec::new();
         for _ in 0..TX_DRAIN {
             let packet = match from_tunnel.try_recv() {
                 Ok(packet) => packet,
@@ -619,7 +1007,7 @@ fn io(
             let Some(index) = peer_for(&peers, destination) else {
                 continue;
             };
-            peers[index].tunnel.send(now, &packet, &mut events);
+            peers[index].tunnel.send_owned(now, packet, &mut events);
             flush(
                 &mut events,
                 &socket,
@@ -643,64 +1031,106 @@ fn io(
             );
         }
 
-        match socket.recv_from(&mut buf) {
-            Ok((n, source)) if n >= 4 => {
-                let source = recv_endpoint(source, ipv6_socket);
-                let kind = u32::from(buf[0]);
-                if kind == TYPE_INITIATION && n == INITIATION_SIZE {
-                    let under_load = cookies.observe(now);
-                    let mut packet = buf[..n].to_vec();
-                    clear_reserved(&mut packet);
-                    handle_initiation(
+        let mut received = 0;
+        let mut nonblocking = false;
+        loop {
+            match socket.recv_from(&mut buf) {
+                Ok((n, source)) if n >= 4 => {
+                    let source = recv_endpoint(source, ipv6_socket);
+                    receive_datagram(
                         &mut peers,
+                        &mut cookies,
                         now,
                         source,
-                        &packet,
+                        &mut buf[..n],
                         &socket,
                         &to_stack,
-                        &mut cookies,
-                        under_load,
-                    );
-                } else {
-                    let at = if kind == TYPE_RESPONSE { 8 } else { 4 };
-                    let receiver = u32::from_le_bytes(buf[at..at + 4].try_into().unwrap_or([0; 4]));
-                    let Some(index) = peers.iter().position(|peer| peer.tunnel.owns(receiver))
-                    else {
-                        continue;
-                    };
-                    peers[index]
-                        .tunnel
-                        .receive(now, source, &mut buf[..n], &mut incoming);
-                    flush(
                         &mut incoming,
-                        &socket,
-                        &to_stack,
                         routes.as_ref(),
-                        &peers,
-                        Some(index),
                         ipv6_socket,
                     );
+                    received += 1;
+                    if received >= RX_BURST {
+                        break;
+                    }
+                    if !nonblocking {
+                        if socket.set_nonblocking(true).is_err() {
+                            break;
+                        }
+                        nonblocking = true;
+                    }
+                }
+                Ok(_) => break,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                            | std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::ConnectionRefused
+                    ) =>
+                {
+                    break;
+                }
+                Err(_) => {
+                    if nonblocking {
+                        let _ = socket.set_nonblocking(false);
+                    }
+                    return;
                 }
             }
-            Ok(_) => {}
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::WouldBlock
-                        | std::io::ErrorKind::TimedOut
-                        | std::io::ErrorKind::Interrupted
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionRefused
-                ) => {}
-            Err(_) => return,
+        }
+        if nonblocking {
+            let _ = socket.set_nonblocking(false);
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn receive_datagram(
+    peers: &mut [Peer],
+    cookies: &mut CookieGuard,
+    now: u64,
+    source: SocketAddr,
+    packet: &mut [u8],
+    socket: &UdpSocket,
+    to_stack: &Sender<Packet>,
+    incoming: &mut Vec<Event>,
+    routes: Option<&UdpRoutes>,
+    ipv6_socket: bool,
+) {
+    let kind = u32::from(packet[0]);
+    if kind == TYPE_INITIATION && packet.len() == INITIATION_SIZE {
+        let under_load = cookies.observe(now);
+        clear_reserved(packet);
+        handle_initiation(
+            peers, now, source, &*packet, socket, to_stack, cookies, under_load,
+        );
+        return;
+    }
+    let at = if kind == TYPE_RESPONSE { 8 } else { 4 };
+    let receiver = u32::from_le_bytes(packet[at..at + 4].try_into().unwrap_or([0; 4]));
+    let Some(index) = peers.iter().position(|peer| peer.tunnel.owns(receiver)) else {
+        return;
+    };
+    peers[index].tunnel.receive(now, source, packet, incoming);
+    flush(
+        incoming,
+        socket,
+        to_stack,
+        routes,
+        peers,
+        Some(index),
+        ipv6_socket,
+    );
 }
 
 /// The most tunnel packets one socket turn forwards before it reads again, so
 /// a backlog on the stack's channel cannot leave a burst wider than a peer's
 /// receive queue.
-const TX_DRAIN: usize = 64;
+const RX_BURST: usize = 256;
+const TX_DRAIN: usize = 128;
 
 #[allow(clippy::too_many_arguments)]
 fn handle_initiation(

@@ -48,7 +48,21 @@ matrix_server_serves() {
 # here rather than letting the cell fail as a workload fault: the reason reaches the bundle's
 # skipped list, so a reader sees which side is behind instead of a zero.
 matrix_engine_skip_reason() {
-  local engine="$1" id="$2"
+  local engine="$1" id="$2" role="${3:-client}"
+  if [[ "$id" == wireguard-kernel-* ]]; then
+    if [[ "$(uname -s)" != Linux ]]; then
+      printf '%s\n' "the kernel WireGuard device is Linux-only"
+      return 0
+    fi
+    if [[ "$role" == client && "$engine" != ferrox ]]; then
+      printf '%s\n' "only ferrox opens the kernel WireGuard device in this matrix"
+      return 0
+    fi
+    if [[ "$role" == client && ! -d /sys/module/wireguard ]]; then
+      printf '%s\n' "this runner has no wireguard module"
+      return 0
+    fi
+  fi
   if [[ "$engine" == "leaf" && "$id" == vless-* && "$id" != *-vision-* ]]; then
     printf '%s\n' "leaf at this pin only sends VLESS with the Vision flow, which this scenario does not configure"
     return 0
@@ -329,8 +343,12 @@ wireguard_server() {
 }
 
 wireguard_client() {
-  local port="$1"
-  echo "\"tag\": \"proxy\", \"protocol\": \"wireguard\", \"settings\": {\"isClient\": true, \"noKernelTun\": true, \"secretKey\": \"$(matrix_wireguard_client_private)\", \"address\": [\"10.0.0.2/32\", \"fd00::2/128\"], \"mtu\": 1420, \"peers\": [{\"publicKey\": \"$(matrix_wireguard_server_public)\", \"endpoint\": \"127.0.0.1:$port\", \"allowedIPs\": [\"0.0.0.0/0\", \"::/0\"]}]}"
+  local port="$1" kernel="${2:-true}"
+  echo "\"tag\": \"proxy\", \"protocol\": \"wireguard\", \"settings\": {\"isClient\": true, \"noKernelTun\": $kernel, \"secretKey\": \"$(matrix_wireguard_client_private)\", \"address\": [\"10.0.0.2/32\", \"fd00::2/128\"], \"mtu\": 1420, \"peers\": [{\"publicKey\": \"$(matrix_wireguard_server_public)\", \"endpoint\": \"127.0.0.1:$port\", \"allowedIPs\": [\"0.0.0.0/0\", \"::/0\"]}]}"
+}
+
+wireguard_kernel_client() {
+  wireguard_client "$1" false
 }
 
 vless_server_vision() {
@@ -380,6 +398,7 @@ scenario_config() {
     vless-kcp-*) server_config "$(vless_server ", $(kcp_settings)")" "$(vless_client ", $(kcp_settings)" "$port")" "$port" ;;
     vless-hysteria-*) server_config "$(vless_server ", $(hysteria_server_settings)")" "$(vless_client ", $(hysteria_client_settings)" "$port")" "$port" ;;
     hysteria-v1-*) server_config "$(hysteria_v1_server_settings)" "$(hysteria_v1_client_settings "$port")" "$port" ;;
+    wireguard-kernel-raw-*) server_config "$(wireguard_server)" "$(wireguard_kernel_client "$port")" "$port" ;;
     wireguard-raw-*) server_config "$(wireguard_server)" "$(wireguard_client "$port")" "$port" ;;
     vmess-tls-ws-*) server_config "\"protocol\": \"vmess\", \"settings\": {\"clients\": [{\"id\": \"$UUID\"}]}, $(tls_ws_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"vmess\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"users\": [{\"id\": \"$UUID\", \"security\": \"auto\"}]}]}, $(tls_ws_client_settings)" "$port" ;;
     trojan-tls-ws-*) server_config "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}, $(tls_ws_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"password\": \"$PASSWORD\"}]}, $(tls_ws_client_settings)" "$port" ;;
@@ -424,6 +443,7 @@ standard_scenarios() {
   echo "vless-hysteria-down-8 download 8 256 65536"
   echo "hysteria-v1-down-8 download 8 256 65536"
   echo "wireguard-raw-down-8 download 8 256 65536"
+  echo "wireguard-kernel-raw-down-8 download 8 256 65536"
   echo "shadowsocks2022-raw-down-8 download 8 256 65536"
   echo "vmess-tls-ws-down-8 download 8 256 65536"
   echo "trojan-tls-ws-down-8 download 8 256 65536"
@@ -464,6 +484,8 @@ scenarios() {
       echo "hysteria-v1-duplex-8 full-duplex 8 128 65536"
       echo "wireguard-raw-up-1 upload 1 2048 65536"
       echo "wireguard-raw-duplex-8 full-duplex 8 128 65536"
+      echo "wireguard-kernel-raw-up-1 upload 1 2048 65536"
+      echo "wireguard-kernel-raw-duplex-8 full-duplex 8 128 65536"
       echo "vless-reality-raw-up-1 upload 1 2048 65536"
       echo "vless-reality-raw-duplex-8 full-duplex 8 128 65536"
       echo "vless-vision-tls-raw-up-1 upload 1 2048 65536"

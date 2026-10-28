@@ -107,6 +107,18 @@ jobs:
         with:
           path: target/parity-engines
           key: matrix-engines-${{ inputs.os }}-${{ hashFiles('upstream/pins.toml', 'scripts/lib-engines.sh', 'scripts/patch-sing-box.py') }}
+      - name: allow the kernel WireGuard client to open a link
+        if: runner.os == 'Linux' && contains(inputs.cells, 'wireguard-kernel')
+        shell: bash
+        run: |
+          sudo modprobe wireguard || true
+          sudo ip link add ferrox-wg-probe type wireguard
+          sudo ip link del ferrox-wg-probe
+          command -v setcap >/dev/null || {
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq libcap2-bin
+          }
+          sudo setcap cap_net_admin+ep target/release/ferrox-app
       - name: run one cell with handed-over binaries
         shell: bash
         env:
