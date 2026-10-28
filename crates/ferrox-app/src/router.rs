@@ -4556,6 +4556,61 @@ mod tests {
     }
 
     #[test]
+    fn a_nested_tcp_group_does_not_refuse_the_udp_rule() {
+        let nested = object(vec![
+            ("tag", text("nested")),
+            (
+                "rules",
+                array(vec![object(vec![
+                    ("type", text("logical")),
+                    ("mode", text("and")),
+                    (
+                        "rules",
+                        array(vec![
+                            object(vec![
+                                ("type", text("logical")),
+                                ("mode", text("or")),
+                                (
+                                    "rules",
+                                    array(vec![object(vec![
+                                        ("network", text("tcp")),
+                                        ("ip_cidr", array(vec![text("198.51.100.0/24")])),
+                                    ])]),
+                                ),
+                            ]),
+                            object(vec![
+                                ("network", text("udp")),
+                                ("source_ip_cidr", array(vec![text("192.0.2.0/24")])),
+                            ]),
+                        ]),
+                    ),
+                ])]),
+            ),
+        ]);
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                ("ruleSets", array(vec![nested])),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "direct",
+                        vec![
+                            ("inboundTag", array(vec![text("tun")])),
+                            ("network", text("udp")),
+                            ("ruleSet", array(vec![text("nested")])),
+                        ],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(routing.source_refusal(Some("tun")), None);
+    }
+
+    #[test]
     fn a_tun_inbound_may_use_a_script_but_a_server_inbound_may_not() {
         let dir = dir();
         std::fs::write(
