@@ -168,6 +168,7 @@ impl BurstSettings {
         let mut samples = 0i32;
         let mut timeout = None;
         let mut method = None;
+        let mut method_blank = false;
         for (key, field) in pairs {
             match key.as_str() {
                 "destination" => destination = field.as_str().map(str::to_owned),
@@ -185,6 +186,9 @@ impl BurstSettings {
                 }
                 "timeout" => timeout = crate::config::go_duration(field)?,
                 "httpMethod" => method = field.as_str().map(str::to_owned),
+                "httpMethodBlank" => {
+                    method_blank = field.as_bool().unwrap_or(false);
+                }
                 _ => {}
             }
         }
@@ -201,19 +205,23 @@ impl BurstSettings {
             .and_then(|nanos| u64::try_from(nanos).ok())
             .filter(|nanos| *nanos != 0)
             .map_or(BURST_TIMEOUT, Duration::from_nanos);
-        let (method, reads_body) = method.map_or_else(
-            || ("HEAD".to_owned(), true),
-            |raw| {
-                let method = raw.trim();
-                if raw.is_empty() {
-                    ("HEAD".to_owned(), true)
-                } else if method.is_empty() {
-                    ("GET".to_owned(), false)
-                } else {
-                    (method.to_owned(), true)
-                }
-            },
-        );
+        let (method, reads_body) = if method_blank {
+            ("GET".to_owned(), false)
+        } else {
+            method.map_or_else(
+                || ("HEAD".to_owned(), true),
+                |raw| {
+                    let method = raw.trim();
+                    if raw.is_empty() {
+                        ("HEAD".to_owned(), true)
+                    } else if method.is_empty() {
+                        ("GET".to_owned(), false)
+                    } else {
+                        (method.to_owned(), true)
+                    }
+                },
+            )
+        };
         Ok(Self {
             destination: destination
                 .map(|url| url.trim().to_owned())
@@ -868,6 +876,13 @@ mod tests {
         assert!(!settings(" ").reads_body);
         assert_eq!(settings(" get ").method, "get");
         assert!(settings(" get ").reads_body);
+        let bridged = BurstSettings::parse(&Json::Obj(vec![
+            ("httpMethod".to_owned(), Json::Str("GET".to_owned())),
+            ("httpMethodBlank".to_owned(), Json::Bool(true)),
+        ]))
+        .expect("parses");
+        assert_eq!(bridged.method, "GET");
+        assert!(!bridged.reads_body);
     }
 
     struct HeadOnly {

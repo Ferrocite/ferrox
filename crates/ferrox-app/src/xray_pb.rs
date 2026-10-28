@@ -3398,8 +3398,16 @@ fn healthping_settings(bytes: &[u8]) -> Result<Json, String> {
     if let Some(timeout) = timeout.filter(|nanos| *nanos != 0) {
         pairs.push(("timeout", Json::Str(format!("{timeout}ns"))));
     }
-    if let Some(method) = method.filter(|method| !method.is_empty()) {
-        pairs.push(("httpMethod", Json::Str(method)));
+    if let Some(raw) = method {
+        let method = raw.trim();
+        if method.is_empty() {
+            if !raw.is_empty() {
+                pairs.push(("httpMethod", Json::Str("GET".to_owned())));
+                pairs.push(("httpMethodBlank", Json::Bool(true)));
+            }
+        } else {
+            pairs.push(("httpMethod", Json::Str(method.to_owned())));
+        }
     }
     Ok(object(pairs))
 }
@@ -5280,10 +5288,10 @@ mod tests {
         assert!(matches!(ping, Json::Obj(pairs) if pairs.is_empty()));
     }
 
-    /// A whitespace-only protobuf method stays blank so the probe can send the
-    /// `GET` the reference's empty method produces without reading the body.
+    /// A whitespace-only protobuf method decodes to `GET`, with a marker so the
+    /// probe does not read the body the reference's empty method leaves alone.
     #[test]
-    fn a_whitespace_ping_method_stays_blank_for_the_probe() {
+    fn a_whitespace_ping_method_decodes_to_get_without_a_body() {
         let ping = message(&[bytes_field(6, b" ")]);
         let burst = message(&[bytes_field(3, &ping)]);
         let config = message(&[bytes_field(
@@ -5296,7 +5304,13 @@ mod tests {
             .and_then(|burst| burst.get("pingConfig"))
             .and_then(|ping| ping.get("httpMethod"))
             .and_then(Json::as_str);
-        assert_eq!(method, Some(" "));
+        assert_eq!(method, Some("GET"));
+        let blank = json
+            .get("burstObservatory")
+            .and_then(|burst| burst.get("pingConfig"))
+            .and_then(|ping| ping.get("httpMethodBlank"))
+            .and_then(Json::as_bool);
+        assert_eq!(blank, Some(true));
     }
 
     /// Both observatory apps decode to the keys the probe loop reads, so a
