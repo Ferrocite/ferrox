@@ -446,6 +446,10 @@ impl Client {
                         return;
                     }
                     block.extend_from_slice(strip_padding(flags, body));
+                    if block.len() > FRAME_CAP {
+                        self.end = true;
+                        return;
+                    }
                     if flags & h2::F_END_HEADERS != 0 {
                         self.head(&block);
                     } else {
@@ -491,6 +495,9 @@ impl Client {
     }
 
     fn window(&mut self, length: usize) {
+        if length == 0 {
+            return;
+        }
         let length = u32::try_from(length).unwrap_or(u32::MAX).to_be_bytes();
         self.wire.send(h2::T_WINDOW, 0, 0, &length);
         self.wire.send(h2::T_WINDOW, 0, self.stream, &length);
@@ -653,6 +660,10 @@ impl Session {
     }
 
     fn run(&mut self, wire: &mut Wire) {
+        self.run_until(wire, Instant::now() + HANDSHAKE);
+    }
+
+    fn run_until(&mut self, wire: &mut Wire, deadline: Instant) {
         let mut settings = Vec::new();
         settings.extend_from_slice(&SETTINGS_ENABLE_CONNECT.to_be_bytes());
         settings.extend_from_slice(&1u32.to_be_bytes());
@@ -686,6 +697,10 @@ impl Session {
                 pending.drain(..at);
             }
             wire.pending = pending;
+            if self.request.is_none() && Instant::now() >= deadline {
+                self.end = true;
+                break;
+            }
             self.flush(wire);
             if wire.closed || self.end {
                 break;
@@ -743,6 +758,10 @@ impl Session {
                         return;
                     }
                     block.extend_from_slice(strip_padding(flags, body));
+                    if block.len() > FRAME_CAP {
+                        self.end = true;
+                        return;
+                    }
                     if flags & h2::F_END_HEADERS != 0 {
                         self.request(wire, id, &block);
                     } else {
@@ -845,6 +864,9 @@ impl Session {
         let Some(request) = self.request else {
             return;
         };
+        if length == 0 {
+            return;
+        }
         let length = u32::try_from(length).expect("a frame fits four bytes");
         wire.send(h2::T_WINDOW, 0, 0, &length.to_be_bytes());
         wire.send(h2::T_WINDOW, 0, request, &length.to_be_bytes());
@@ -968,7 +990,9 @@ fn datagram(packet: &[u8], out: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
     use std::net::UdpSocket;
+    use std::sync::Mutex;
 
     use ferrox_core::foxy::connectip::{self, UdpDatagram};
     use ferrox_core::tls::TlsConfig;
@@ -1167,6 +1191,100 @@ mod tests {
         ]);
         session.on(&mut wire, h2::T_HEADERS, h2::F_END_HEADERS, 1, &block);
         assert_eq!(session.send_window, 0, "CONNECT keeps the peer's window");
+    }
+
+    struct Quiet {
+        reads: usize,
+    }
+
+    impl Read for Quiet {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.reads == 0 {
+                return Ok(0);
+            }
+            self.reads -= 1;
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        }
+    }
+
+    impl Write for Quiet {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_silent_peer_is_ended_after_the_handshake() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut wire = Wire {
+            stream: Box::new(Quiet { reads: 1_000 }),
+            pending: Vec::new(),
+            closed: false,
+        };
+        let deadline = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .expect("a past deadline");
+        session.run_until(&mut wire, deadline);
+        assert!(session.end, "a silent peer is ended at the deadline");
+    }
+
+    #[test]
+    fn a_continuation_block_cannot_grow_past_the_frame_cap() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut wire = Wire {
+            stream: Box::new(std::io::Cursor::new(Vec::new())),
+            pending: Vec::new(),
+            closed: false,
+        };
+        let half = vec![0u8; FRAME_CAP / 2 + 1];
+        session.on(&mut wire, h2::T_HEADERS, 0, 1, &half);
+        assert!(session.continuation.is_some(), "the header block is open");
+        session.on(&mut wire, h2::T_CONT, 0, 1, &half);
+        assert!(session.end, "the accumulated block is capped");
+    }
+
+    struct Recorder {
+        out: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Read for Recorder {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.out.lock().expect("a recorder").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_empty_data_frame_sends_no_window_update() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        session.request = Some(1);
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut wire = Wire {
+            stream: Box::new(Recorder {
+                out: Arc::clone(&out),
+            }),
+            pending: Vec::new(),
+            closed: false,
+        };
+        session.on(&mut wire, h2::T_DATA, h2::F_END, 1, &[]);
+        assert!(
+            out.lock().expect("a recorder").is_empty(),
+            "an empty DATA frame credits nothing"
+        );
     }
 
     #[test]
