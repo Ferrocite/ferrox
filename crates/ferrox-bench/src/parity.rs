@@ -24,6 +24,11 @@ const RUN_TIMEOUT: Duration = Duration::from_secs(120);
 const FLOW_IO_TIMEOUT: Duration = Duration::from_secs(30);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// A completed transfer whose slowest flow finished this far behind the median is a runner straggler - a descheduled flow or one TCP retransmit (Linux's 200 ms `RTO_MIN`) - not the engine: the bytes are whole and the rest of the cell is at the fast mode, so the run is re-measured.
+const STRAGGLER_TAIL: Duration = Duration::from_millis(150);
+/// The tail a straggler can explain: one retransmit timeout plus scheduling. A flow further behind is a stall to bank, not a runner artifact to re-measure.
+const STRAGGLER_TAIL_MAX: Duration = Duration::from_millis(1_000);
+
 const MAX_REQUEST_BYTES: usize = 262_144;
 
 const MAX_ITERATIONS: usize = 262_144;
@@ -932,7 +937,7 @@ impl Drop for Engine {
     }
 }
 
-// Three runner disturbances are measured on macos-15 and belong to neither engine: a forged validated byte, seen on ferrox and the reference alike, a short bulk transfer whose every reason is a socket-layer transient, and a transfer that never finished inside the run cap because the flows stalled - a saturated runner cannot always move 8 GiB full duplex at all, and it does so to every engine in the cell. None says anything about the engine under test, so each is re-measured, up to this many attempts and inside the wall time the cell has left; a disturbance that survives every attempt still fails as a workload fault. The attempt bound keeps a retry from becoming a silent re-run of a genuine regression, and the cell bound keeps a storm from spending the window the CI job gave the cell - a job cut off at its timeout reports nothing at all, which is worse than the fault it never printed.
+// Four runner disturbances belong to neither engine: a forged validated byte, seen on ferrox and the reference alike, a short bulk transfer whose every reason is a socket-layer transient, a transfer that never finished inside the run cap because the flows stalled, and a completed transfer whose slowest flow finished an RTO (~200 ms) after the rest on the arm64 raw-duplex cells against both servers - a saturated runner cannot always move 8 GiB full duplex at all, and it does so to every engine in the cell. None says anything about the engine under test, so each is re-measured, up to this many attempts and inside the wall time the cell has left; a disturbance that survives every attempt still fails as a workload fault. The attempt bound keeps a retry from becoming a silent re-run of a genuine regression, and the cell bound keeps a storm from spending the window the CI job gave the cell - a job cut off at its timeout reports nothing at all, which is worse than the fault it never printed.
 const REMEASURE_ATTEMPTS: usize = 4;
 /// The most wall time one measure may spend on attempts after its first. A cell cuts this to what it has left, and `the_cell_window_leaves_room_for_the_job_timeout_the_matrix_declares` bounds the worst case this allows against the CI window the matrix declares.
 pub const REMEASURE_BUDGET: Duration = Duration::from_secs(240);
@@ -1159,6 +1164,13 @@ fn validate_transfer(
         return Err(Error::Desync(forged));
     }
     if moved.sent + moved.received == expected {
+        if let Some(tail) = straggler_tail(&moved.flow_windows) {
+            return Err(Error::Transient(format!(
+                "the slowest of {} flows finished {:.0} ms after the median: a runner straggler, not a number",
+                moved.flow_windows.len(),
+                tail.as_secs_f64() * 1_000.0
+            )));
+        }
         return Ok(());
     }
     let mut why = if moved.all_stopped.is_empty() {
@@ -1182,6 +1194,21 @@ fn validate_transfer(
         moved.sent + moved.received,
         joined
     )))
+}
+
+/// The slowest flow's excess over the median, when it is a straggler the runner explains.
+fn straggler_tail(windows: &[Duration]) -> Option<Duration> {
+    if windows.len() < 2 {
+        return None;
+    }
+    let mut sorted = windows.to_vec();
+    sorted.sort_unstable();
+    let median = sorted[(sorted.len() - 1) / 2];
+    let slowest = *sorted.last()?;
+    let tail = slowest.saturating_sub(median);
+    (STRAGGLER_TAIL..=STRAGGLER_TAIL_MAX)
+        .contains(&tail)
+        .then_some(tail)
 }
 
 /// The server process beside the client: sampled from the same clock, stopped from `Drop` so a
@@ -1345,6 +1372,7 @@ struct Moved {
     sent: u64,
     received: u64,
     window: Option<(Instant, Instant)>,
+    flow_windows: Vec<Duration>,
     setup: Vec<Setup>,
     stopped: Option<String>,
     all_stopped: Vec<String>,
@@ -1359,6 +1387,7 @@ fn collect_flows(
         sent: 0,
         received: 0,
         window: None,
+        flow_windows: Vec::new(),
         setup: Vec::new(),
         stopped: None,
         all_stopped: Vec::new(),
@@ -1390,6 +1419,9 @@ fn collect_flows(
             (Some((a, b)), Some((c, d))) => Some((a.min(c), b.max(d))),
             (current, None) => current,
         };
+        if let Some((a, b)) = result.window {
+            moved.flow_windows.push(b.saturating_duration_since(a));
+        }
     }
     Ok(moved)
 }
@@ -2986,6 +3018,57 @@ mod tests {
             "the bound converts a persistent storm, reason and all, never a number: {storm:?}"
         );
         assert_eq!(calls, REMEASURE_ATTEMPTS, "exactly the bound ran");
+    }
+
+    /// The arm64 raw-duplex slow mode: one flow finishes an RTO (~200 ms) after the rest while every byte is whole, against the reference server as much as this one. That is the runner, so the run is re-measured; a uniformly slow cell is the engine and stays a number.
+    #[test]
+    fn a_straggler_flow_is_remeasured_and_a_uniformly_slow_cell_is_not() {
+        let desync: Desync = Arc::new(std::sync::Mutex::new(None));
+        let expected = 128 * 1024 * 1024;
+        let moved = |windows: Vec<Duration>| Moved {
+            sent: expected / 2,
+            received: expected / 2,
+            window: Some((Instant::now(), Instant::now())),
+            flow_windows: windows,
+            setup: Vec::new(),
+            stopped: None,
+            all_stopped: Vec::new(),
+        };
+        let mut one_late = vec![Duration::from_millis(80); 7];
+        one_late.push(Duration::from_millis(280));
+        let straggled = validate_transfer(&moved(one_late.clone()), expected, &[], &desync);
+        assert!(
+            matches!(&straggled, Err(Error::Transient(m)) if m.contains("runner straggler")),
+            "one flow an RTO behind the rest is re-measured: {straggled:?}"
+        );
+        let mut calls = 0usize;
+        let storm = remeasure_disturbed(REMEASURE_ATTEMPTS, REMEASURE_BUDGET, || {
+            calls += 1;
+            validate_transfer(&moved(one_late.clone()), expected, &[], &desync)
+        });
+        assert!(
+            matches!(&storm, Err(Error::Workload(m))
+                if m.contains("runner straggler") && m.contains("survives every retry")),
+            "a straggler that survives every attempt converts, never a number: {storm:?}"
+        );
+        assert_eq!(calls, REMEASURE_ATTEMPTS, "exactly the bound ran");
+        let uniform = validate_transfer(
+            &moved(vec![Duration::from_millis(280); 8]),
+            expected,
+            &[],
+            &desync,
+        );
+        assert!(
+            uniform.is_ok(),
+            "a uniformly slow cell is the engine, not a straggler: {uniform:?}"
+        );
+        let mut stalled = vec![Duration::from_millis(80); 7];
+        stalled.push(Duration::from_millis(1_500));
+        let beyond = validate_transfer(&moved(stalled), expected, &[], &desync);
+        assert!(
+            beyond.is_ok(),
+            "a tail past the retransmit band is banked, not re-measured: {beyond:?}"
+        );
     }
 
     /// The second bound: a stalled attempt costs the full run cap, so a repeat whose wall time runs past the budget converts even while attempts remain - the re-measure cannot spend the cell's CI window. A slow-disturbed closure with a 100 ms budget converts inside the first one or two attempts, before the attempt bound.
