@@ -616,21 +616,22 @@ impl ClientStack {
                 return;
             }
         }
+        let mut retiring = std::mem::take(&mut self.retiring);
         self.flows.retain_mut(|flow| {
             if flow.done {
                 let _ = flow.local.shutdown(Shutdown::Both);
                 self.sockets.remove(flow.handle);
                 self.ports.remove(&flow.local_port);
                 for (handle, port) in flow.races.drain(..) {
-                    self.sockets.remove(handle);
-                    self.ports.remove(&port);
-                    self.race_bytes -= RACE_BYTES;
+                    self.sockets.get_mut::<TcpSocket>(handle).abort();
+                    retiring.push((handle, port, true));
                 }
                 false
             } else {
                 true
             }
         });
+        self.retiring = retiring;
     }
 
     fn now(&self) -> Instant {
