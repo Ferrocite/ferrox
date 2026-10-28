@@ -66,7 +66,9 @@ impl ApiConfig {
             "xray.app.proxyman.command.Config" => self.handler = true,
             "xray.app.stats.command.Config" => self.stats = true,
             "xray.app.log.command.Config" => self.logger = true,
-            "xray.app.observatory.command.Config" => self.observatory = true,
+            "xray.core.app.observatory.command.Config" | "xray.app.observatory.command.Config" => {
+                self.observatory = true;
+            }
             "xray.app.commander.ReflectionConfig" => {}
             other => eprintln!("commander: service `{other}` is not carried; skipped"),
         }
@@ -1478,6 +1480,17 @@ mod tests {
                 "/xray.app.log.command.LoggerService/Unknown is not a method this server carries"
                     .to_owned()
             )
+        );
+    }
+
+    #[test]
+    fn a_protobuf_service_uses_the_pinned_observatory_name() {
+        let service = typed("xray.core.app.observatory.command.Config", &[]);
+        let mut config = Vec::new();
+        field_bytes(&mut config, 2, &service);
+        assert!(
+            ApiConfig::from_proto(&config).expect("parses").observatory,
+            "the pinned protobuf name selects the observatory"
         );
     }
 
