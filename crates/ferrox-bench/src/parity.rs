@@ -2454,25 +2454,37 @@ pub fn harness_ceiling(connections: usize, payload_size: usize, bytes: u64) -> R
         ));
     }
 
-    let mut best = 0.0f64;
+    let mut measured = Vec::with_capacity(flows.len());
     for (index, flow) in flows {
-        let Ok((rate, why)) = flow.join() else {
+        let Ok((read, elapsed, why)) = flow.join() else {
             continue;
         };
         if let Some(why) = why {
             eprintln!("harness ceiling flow {index}: {why}");
         }
-        best = best.max(rate);
+        measured.push((read, elapsed));
     }
     let _ = sink.join();
-    if best <= 0.0 {
-        return Err(Error::Workload(
+    ceiling_rate(&measured).ok_or_else(|| {
+        Error::Workload(
             "the harness ceiling moved no bytes; a row compared against it would \
              be meaningless, so it is reported as unmeasured"
                 .into(),
-        ));
+        )
+    })
+}
+
+/// What the sink served to every flow at once, MiB/s: not the fastest flow, whose rate is a block already queued in the socket buffer.
+fn ceiling_rate(flows: &[(u64, f64)]) -> Option<f64> {
+    let mut moved = 0u64;
+    let mut wall = 0.0f64;
+    for &(read, elapsed) in flows {
+        if read > 0 && elapsed > 0.0 {
+            moved += read;
+            wall = wall.max(elapsed);
+        }
     }
-    Ok(best)
+    (moved > 0 && wall > 0.0).then(|| moved as f64 / wall / (1024.0 * 1024.0))
 }
 
 fn ceiling_flow(
@@ -2481,9 +2493,9 @@ fn ceiling_flow(
     index: usize,
     flows: usize,
     bytes: u64,
-) -> (f64, Option<String>) {
+) -> (u64, f64, Option<String>) {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(10)) else {
-        return (0.0, Some("could not connect to the sink".to_owned()));
+        return (0, 0.0, Some("could not connect to the sink".to_owned()));
     };
     let _ = stream.set_nodelay(true);
     apply_flow_timeouts(&stream);
@@ -2495,18 +2507,25 @@ fn ceiling_flow(
     };
     let elapsed = started.elapsed();
     let _ = stream.shutdown(Shutdown::Both);
-    if elapsed.is_zero() || read_total == 0 {
-        return (0.0, why);
-    }
-    (
-        read_total as f64 / elapsed.as_secs_f64() / (1024.0 * 1024.0),
-        why,
-    )
+    (read_total, elapsed.as_secs_f64(), why)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ceiling_is_the_aggregate_not_the_fastest_flow() {
+        let block = 16 * 1024 * 1024u64;
+        // The first flow reads a block the sink had already queued (4 GiB/s); the other two take 100 ms.
+        let flows = [(block, 0.004f64), (block, 0.100), (block, 0.100)];
+        let rate = ceiling_rate(&flows).expect("a rate");
+        assert!(
+            (rate - 480.0).abs() < 1.0,
+            "the ceiling read {rate} MiB/s, not the aggregate 480"
+        );
+        assert_eq!(ceiling_rate(&[(0, 1.0), (block, 0.0)]), None);
+    }
 
     #[test]
     fn flow_sockets_carry_the_io_timeout() {
