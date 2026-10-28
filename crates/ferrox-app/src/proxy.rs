@@ -18841,6 +18841,12 @@ pub(crate) mod lane_pool {
     /// one-flow cell holds two lanes where it used to hold all seven.
     const RELAY_LANES: usize = 7;
 
+    /// How many steps a lane may take back to back before it rejoins the queue. A cell queues two
+    /// lanes per stream against fewer threads, so a lane that never parks while it has bytes holds
+    /// one of them for the life of its flow and the lanes behind it do not run: eight steps is
+    /// shorter than the read clock it would otherwise hide behind.
+    const LANE_STREAK: usize = 8;
+
     fn pool() -> std::sync::Arc<Pool> {
         std::sync::Arc::clone(POOL.get_or_init(spawn_pool))
     }
@@ -18900,14 +18906,25 @@ pub(crate) mod lane_pool {
                     pool.idle.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
                 }
             };
+            let mut streak = 0usize;
             loop {
                 let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _step = crate::proxy::RelayStep::enter();
                     lane.run()
                 }));
                 match stepped {
-                    // Still has bytes: a requeue pays the pool's lock and wakeup on every read.
-                    Ok(Next::More) => {}
+                    // Still has bytes: keep the worker for a streak, then rejoin the queue behind the lanes waiting there.
+                    Ok(Next::More) => {
+                        streak += 1;
+                        if streak < LANE_STREAK {
+                            continue;
+                        }
+                        let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                        ready.push_back(lane);
+                        drop(ready);
+                        pool.notify.notify_one();
+                        break;
+                    }
                     Ok(Next::Idle) => {
                         let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
                         ready.push_back(lane);
@@ -19074,6 +19091,50 @@ pub(crate) mod lane_pool {
             assert_eq!(
                 waiting, lanes,
                 "{waiting} of {lanes} lanes reached their read: the pool cannot carry the cell"
+            );
+            assert_eq!(finished.load(Ordering::Relaxed), lanes);
+        }
+
+        /// A cell queues two lanes per stream against fewer threads, and a lane that never parks
+        /// must still hand its worker on: the lanes behind it are the other direction of a stream
+        /// that cannot free its window until they run.
+        #[test]
+        fn a_saturated_cell_still_steps_the_lanes_behind_a_busy_one() {
+            let pool = spawn_pool();
+            let lanes = RELAY_LANES * 2;
+            let started = Arc::new(AtomicUsize::new(0));
+            let finished = Arc::new(AtomicUsize::new(0));
+            for _ in 0..lanes {
+                let started = Arc::clone(&started);
+                let finished = Arc::clone(&finished);
+                let mut began = false;
+                submit_to(
+                    &pool,
+                    Box::new(move || {
+                        if !began {
+                            began = true;
+                            started.fetch_add(1, Ordering::Relaxed);
+                        }
+                        if started.load(Ordering::Relaxed) < lanes {
+                            Next::More
+                        } else {
+                            Next::Done
+                        }
+                    }),
+                    Box::new(move || {
+                        finished.fetch_add(1, Ordering::Relaxed);
+                    }),
+                );
+            }
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while finished.load(Ordering::Relaxed) < lanes && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                started.load(Ordering::Relaxed),
+                lanes,
+                "a lane that never parked kept its worker: {} of {lanes} lanes never ran",
+                started.load(Ordering::Relaxed)
             );
             assert_eq!(finished.load(Ordering::Relaxed), lanes);
         }
