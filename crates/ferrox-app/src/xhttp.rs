@@ -330,6 +330,13 @@ struct Packer {
 }
 
 impl Packets {
+    fn new(up: Arc<Packer>, poster: Option<std::thread::JoinHandle<()>>) -> Self {
+        Self {
+            up,
+            poster: Mutex::new(poster),
+        }
+    }
+
     fn send(&self, data: &[u8]) -> bool {
         let mut at = 0;
         while at < data.len() {
@@ -614,10 +621,7 @@ impl XhttpWriter {
         };
         Self {
             shared: Arc::new(Shared {
-                body: Body::Packets(Box::new(Packets {
-                    up,
-                    poster: Mutex::new(poster),
-                })),
+                body: Body::Packets(Box::new(Packets::new(up, poster))),
                 finished: AtomicBool::new(false),
             }),
             h2: OnceLock::new(),
@@ -3840,6 +3844,46 @@ mod tests {
         let posts = posts.lock().expect("posts");
         assert_eq!(posts.len(), 2);
         assert_eq!(posts[1].1, b"efgh");
+    }
+
+    /// A poster the OS refuses to spawn must fail the upload instead of parking it on a queue nobody drains.
+    #[test]
+    fn a_failed_poster_fails_the_upload_instead_of_parking_it() {
+        let mut settings = packet_settings(XhttpMode::PacketUp);
+        settings.sc_max_each_post = 4;
+        settings.sc_min_posts_interval_ms = (0, 0);
+        let (wrote_first, _first_written) = std::sync::mpsc::sync_channel(1);
+        let (release, answer) = std::sync::mpsc::channel();
+        let up = Arc::new(Packer {
+            stream: Mutex::new(Box::new(HeldUp {
+                posts: Arc::new(Mutex::new(Vec::new())),
+                wrote_first,
+                answer: Mutex::new(answer),
+                answered: AtomicBool::new(false),
+                reply_at: 0,
+            })),
+            queue: Mutex::new(vec![0u8; 4]),
+            cv: Condvar::new(),
+            closed: AtomicBool::new(false),
+            failed: AtomicBool::new(false),
+            host: "h".to_owned(),
+            settings,
+            session: "session".to_owned(),
+            seq: AtomicU64::new(0),
+            last: Mutex::new(None),
+        });
+        let packets = Packets::new(Arc::clone(&up), None);
+        let (sent, got) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = sent.send(packets.send(b"x"));
+        });
+        assert_eq!(
+            got.recv_timeout(Duration::from_secs(2)),
+            Ok(false),
+            "a failed poster must fail instead of parking"
+        );
+        assert!(up.failed.load(Ordering::SeqCst), "the failure is recorded");
+        drop(release);
     }
 
     /// Any tail the relay hands over rides the post it queued behind, and the posts put the upload back byte for byte.
