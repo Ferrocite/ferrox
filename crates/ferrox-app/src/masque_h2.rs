@@ -1217,6 +1217,44 @@ mod tests {
         assert_eq!(session.send_window, 0, "CONNECT keeps the peer's window");
     }
 
+    fn initial_window(value: u32) -> Vec<u8> {
+        let mut settings = Vec::new();
+        settings.extend_from_slice(&SETTINGS_INITIAL_WINDOW.to_be_bytes());
+        settings.extend_from_slice(&value.to_be_bytes());
+        settings
+    }
+
+    #[test]
+    fn a_repeated_initial_window_keeps_the_client_credit() {
+        let mut client = bare_client();
+        client.on(h2::T_SETTINGS, 0, 0, &initial_window(100));
+        client.on(h2::T_WINDOW, 0, 1, &1_000u32.to_be_bytes());
+        assert_eq!(client.send_window, 1_100, "the update grants credit");
+        client.on(h2::T_SETTINGS, 0, 0, &initial_window(100));
+        assert_eq!(
+            client.send_window, 1_100,
+            "repeating the initial value moves the window by zero"
+        );
+    }
+
+    #[test]
+    fn a_repeated_initial_window_keeps_the_server_credit() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut wire = Wire {
+            stream: Box::new(std::io::Cursor::new(Vec::new())),
+            pending: Vec::new(),
+            closed: false,
+        };
+        session.on(&mut wire, h2::T_SETTINGS, 0, 0, &initial_window(100));
+        session.on(&mut wire, h2::T_WINDOW, 0, 0, &1_000u32.to_be_bytes());
+        assert_eq!(session.send_window, 1_100, "the update grants credit");
+        session.on(&mut wire, h2::T_SETTINGS, 0, 0, &initial_window(100));
+        assert_eq!(
+            session.send_window, 1_100,
+            "repeating the initial value moves the window by zero"
+        );
+    }
+
     struct Quiet {
         reads: usize,
     }
