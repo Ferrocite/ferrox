@@ -19,7 +19,7 @@ vless-encryption-raw-down-8|server-threads|1.73|696
 vless-encryption-reality-raw-down-8|server-threads|1.82|696
 vless-encryption-tls-raw-down-8|server-threads|1.73|696
 vless-grpc-down-8|server-threads|1.58|696
-vless-httpupgrade-down-8|server-threads|1.36|696
+vless-httpupgrade-down-8|server-threads|1.46|696
 vless-hysteria-down-8|server-cpu|2.06|696
 vless-hysteria-down-8|server-threads|1.09|696
 vless-kcp-down-8|server-threads|2.10|696
@@ -44,3 +44,4 @@ vless-xhttp-duplex-8|server-threads|1.12|696
 vless-xhttp-down-8|server-threads|1.27|696
 vless-xhttp-up-1|server-threads|1.09|696
 vmess-tls-ws-down-8|server-threads|1.31|696
+wireguard-raw-down-8|server|0.81|486
