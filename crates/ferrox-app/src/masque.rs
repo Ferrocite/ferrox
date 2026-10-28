@@ -2116,6 +2116,43 @@ mod tests {
     }
 
     #[test]
+    fn a_full_tunnel_queue_does_not_stall_dispatch_for_other_tunnels() {
+        let (packets, _packets_rx) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            pool: Mutex::new(AddressPool::default()),
+            tunnels: Mutex::new(HashMap::new()),
+            packets,
+            local: Vec::new(),
+        });
+        let (blocked_tx, blocked_rx) = mpsc::sync_channel(1);
+        let (open_tx, open_rx) = mpsc::sync_channel(4);
+        let blocked: IpAddr = "10.14.0.3".parse().expect("an address");
+        let open: IpAddr = "10.14.0.4".parse().expect("an address");
+        blocked_tx.send(vec![0]).expect("fill the queue");
+        {
+            let mut tunnels = shared.tunnels.lock().expect("tunnels");
+            tunnels.insert(blocked, TunnelQueue::new(blocked_tx, None));
+            tunnels.insert(open, TunnelQueue::new(open_tx, None));
+        }
+        let (stack, from_stack) = mpsc::channel();
+        let dispatcher = std::thread::spawn(move || dispatch(&shared, from_stack));
+        stack
+            .send(ipv4_packet([10, 14, 0, 2], [10, 14, 0, 3]))
+            .expect("a packet for the full tunnel");
+        stack
+            .send(ipv4_packet([10, 14, 0, 2], [10, 14, 0, 4]))
+            .expect("a packet for the free tunnel");
+        let delivered = open_rx.recv_timeout(Duration::from_secs(2));
+        drop(blocked_rx);
+        drop(stack);
+        dispatcher.join().expect("the dispatcher");
+        assert!(
+            delivered.is_ok(),
+            "a full tunnel queue held the dispatcher and starved another tunnel"
+        );
+    }
+
+    #[test]
     fn a_subnet_grant_names_its_first_host() {
         let grant = Assigned {
             request_id: 0,
