@@ -38,6 +38,7 @@ use crate::wireguard::DeviceConfig;
 /// transfer needs no window larger than this, and five concurrent flows stay
 /// under a few megabytes.
 const TCP_BUFFER: usize = 256 * 1024;
+const TCP_LARGE_BUFFER: usize = 1 << 20;
 /// The most listeners one inbound may hold across every destination port. Each
 /// listener owns both TCP buffers, so a spoofed SYN stream must not grow the
 /// set past a fixed share of memory.
@@ -321,8 +322,8 @@ impl ClientStack {
             ));
         };
         let mut socket = TcpSocket::new(
-            SocketBuffer::new(vec![0u8; TCP_BUFFER]),
-            SocketBuffer::new(vec![0u8; TCP_BUFFER]),
+            SocketBuffer::new(vec![0u8; TCP_LARGE_BUFFER]),
+            SocketBuffer::new(vec![0u8; TCP_LARGE_BUFFER]),
         );
         socket.set_nagle_enabled(false);
         socket.set_congestion_control(CongestionControl::Reno);
