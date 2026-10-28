@@ -1990,6 +1990,64 @@ impl Router<'_> {
     }
 
     fn drive(&mut self, dcid: &[u8], packet: &mut [u8], from: SocketAddr) {
+        let Some(shared) = self.routes.get(dcid).map(|i| Arc::clone(&i.conn)) else {
+            return;
+        };
+        let info = quiche::RecvInfo {
+            from,
+            to: self.local,
+        };
+        let Ok(mut conn) = shared.lock() else {
+            return;
+        };
+        if conn.recv(packet, info).is_err() {
+            return;
+        }
+        self.after_recv(dcid, from, &shared, &mut conn);
+    }
+
+    /// A run of datagrams for one lane pays one lock, one recv sweep and one readable pass: the batch the socket handed over is already in the route's own order.
+    #[cfg(target_os = "linux")]
+    fn drive_batch(
+        &mut self,
+        dcid: &[u8],
+        batch: &mut crate::quic::Batch,
+        start: usize,
+        end: usize,
+    ) {
+        let Some(shared) = self.routes.get(dcid).map(|i| Arc::clone(&i.conn)) else {
+            return;
+        };
+        let Ok(mut conn) = shared.lock() else {
+            return;
+        };
+        let mut from = None;
+        for at in start..end {
+            let Some((packet, peer)) = batch.at(at) else {
+                continue;
+            };
+            let info = quiche::RecvInfo {
+                from: peer,
+                to: self.local,
+            };
+            if conn.recv(packet, info).is_err() {
+                return;
+            }
+            from = Some(peer);
+        }
+        let Some(from) = from else {
+            return;
+        };
+        self.after_recv(dcid, from, &shared, &mut conn);
+    }
+
+    fn after_recv(
+        &mut self,
+        dcid: &[u8],
+        from: SocketAddr,
+        shared: &Arc<Mutex<quiche::Connection>>,
+        conn: &mut quiche::Connection,
+    ) {
         let Self {
             routes,
             sock,
@@ -1999,18 +2057,8 @@ impl Router<'_> {
             masq,
             local,
         } = self;
-        let Some(shared) = routes.get(dcid).map(|i| Arc::clone(&i.conn)) else {
-            return;
-        };
-        let info = quiche::RecvInfo { from, to: *local };
         {
-            let Ok(mut conn) = shared.lock() else {
-                return;
-            };
-            if conn.recv(packet, info).is_err() {
-                return;
-            }
-            flush(sock, &mut conn, out.as_mut());
+            flush(sock, conn, out.as_mut());
             if !conn.is_established() || conn.is_closed() {
                 return;
             }
@@ -2021,7 +2069,7 @@ impl Router<'_> {
                 return;
             };
             if !settings_done {
-                settings_done = drain_settings(&mut conn);
+                settings_done = drain_settings(conn);
                 if settings_done {
                     if let Some(inbound) = routes.get_mut(dcid) {
                         inbound.settings_done = true;
@@ -2034,7 +2082,7 @@ impl Router<'_> {
                 frames::quic_varint(&mut settings, 0x04);
                 frames::quic_varint(&mut settings, 0);
                 let _ = conn.stream_send(3, &settings, true);
-                flush(sock, &mut conn, out.as_mut());
+                flush(sock, conn, out.as_mut());
                 if let Some(inbound) = routes.get_mut(dcid) {
                     inbound.settings_sent = true;
                 }
@@ -2043,14 +2091,13 @@ impl Router<'_> {
                 let Some(inbound) = routes.get_mut(dcid) else {
                     return;
                 };
-                let Some(ok) =
-                    auth_exchange(sock, out.as_mut(), &mut conn, auths, inbound, from, masq)
+                let Some(ok) = auth_exchange(sock, out.as_mut(), conn, auths, inbound, from, masq)
                 else {
                     return;
                 };
                 if !ok {
                     let _ = conn.close(false, 0, b"refused");
-                    flush(sock, &mut conn, out.as_mut());
+                    flush(sock, conn, out.as_mut());
                     return;
                 }
             }
@@ -2066,7 +2113,7 @@ impl Router<'_> {
                     continue;
                 }
                 inbound.served.insert(id);
-                let thread_shared = Arc::clone(&shared);
+                let thread_shared = Arc::clone(shared);
                 let thread_sock = Arc::clone(sock);
                 let thread_serve = Arc::clone(serve);
                 let thread_masq = Arc::clone(masq);
@@ -2085,8 +2132,8 @@ impl Router<'_> {
                     );
                 });
             }
-            relay_datagrams(routes, sock, &shared, dcid, &mut conn);
-            flush(sock, &mut conn, out.as_mut());
+            relay_datagrams(routes, sock, shared, dcid, conn);
+            flush(sock, conn, out.as_mut());
         }
     }
 
@@ -2225,11 +2272,28 @@ pub(crate) fn serve_loop(
         #[cfg(target_os = "linux")]
         match crate::quic::recv_batch(&router.sock, &mut batch) {
             crate::quic::Drain::Read => {
-                for at in 0..batch.len() {
-                    let Some((packet, from)) = batch.at(at) else {
+                let mut at = 0;
+                while at < batch.len() {
+                    let Some(key) = batch.key_with(at, SCID_LEN).map(<[u8]>::to_vec) else {
+                        at += 1;
                         continue;
                     };
-                    route_packet(&mut router, &mut template, packet, from);
+                    let mut end = at + 1;
+                    while end < batch.len() && batch.key_with(end, SCID_LEN) == Some(key.as_slice())
+                    {
+                        end += 1;
+                    }
+                    if router.routes.contains_key(&key) {
+                        router.drive_batch(&key, &mut batch, at, end);
+                    } else {
+                        for index in at..end {
+                            let Some((packet, from)) = batch.at(index) else {
+                                continue;
+                            };
+                            route_packet(&mut router, &mut template, packet, from);
+                        }
+                    }
+                    at = end;
                 }
                 router.wake();
                 continue;

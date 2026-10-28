@@ -755,12 +755,17 @@ impl Batch {
 
     /// The routing key of one slot, borrowed from the bytes the kernel wrote there: a run of datagrams for one lane is compared and looked up without copying a key out of the batch.
     pub(crate) fn key(&self, at: usize) -> Option<&[u8]> {
+        self.key_with(at, quiche::MAX_CONN_ID_LEN)
+    }
+
+    /// The same key under a lane whose short header carries a shorter connection id than quiche's ceiling.
+    pub(crate) fn key_with(&self, at: usize, short: usize) -> Option<&[u8]> {
         if at >= self.len {
             return None;
         }
         // SAFETY: `recv_batch` writes this slot's length before it publishes the slot in `len`, and `at` is below `len`.
         let len = usize::try_from(unsafe { *self.lens.get(at)?.assume_init_ref() }).ok()?;
-        packet_key(self.slots.get(at)?.written(len))
+        packet_key_with(self.slots.get(at)?.written(len), short)
     }
 }
 
@@ -3252,9 +3257,13 @@ fn learn_ids(
 
 /// The routing key a packet carries, read without building a header: a short-header DCID is the fixed-width server id at a known offset, and that is every packet on an established lane, so the lookup copies nothing and allocates nothing. A long header names its DCID length at byte five.
 fn packet_key(buf: &[u8]) -> Option<&[u8]> {
+    packet_key_with(buf, quiche::MAX_CONN_ID_LEN)
+}
+
+fn packet_key_with(buf: &[u8], short: usize) -> Option<&[u8]> {
     let first = *buf.first()?;
     if first & 0x80 == 0 {
-        return buf.get(1..1 + quiche::MAX_CONN_ID_LEN);
+        return buf.get(1..1 + short);
     }
     let dcid_len = usize::from(*buf.get(5)?);
     if dcid_len > quiche::MAX_CONN_ID_LEN {
