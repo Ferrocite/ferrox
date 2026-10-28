@@ -273,19 +273,42 @@ fn parse_endpoints(text: &str) -> Result<Vec<SocketAddr>, String> {
     if let Ok(address) = text.parse() {
         return Ok(vec![address]);
     }
-    let mut addresses: Vec<SocketAddr> = text
+    let addresses: Vec<SocketAddr> = text
         .to_socket_addrs()
         .map_err(|error| format!("wireguard endpoint `{text}` does not resolve: {error}"))?
         .collect();
-    addresses.sort_unstable();
-    addresses.dedup();
-    addresses.truncate(ENDPOINT_CANDIDATES);
+    let addresses = limit_candidates(addresses);
     if addresses.is_empty() {
         return Err(format!(
             "wireguard endpoint `{text}` resolves to no address"
         ));
     }
     Ok(addresses)
+}
+
+/// The candidate list keeps one answer of each family before it fills the
+/// remaining slots, so a v4-heavy name cannot crowd out its v6 answer.
+fn limit_candidates(mut addresses: Vec<SocketAddr>) -> Vec<SocketAddr> {
+    addresses.sort_unstable();
+    addresses.dedup();
+    if addresses.len() <= ENDPOINT_CANDIDATES {
+        return addresses;
+    }
+    let mut kept = Vec::with_capacity(ENDPOINT_CANDIDATES);
+    for family in [true, false] {
+        if let Some(address) = addresses.iter().find(|address| address.is_ipv4() == family) {
+            kept.push(*address);
+        }
+    }
+    for address in addresses {
+        if kept.len() >= ENDPOINT_CANDIDATES {
+            break;
+        }
+        if !kept.contains(&address) {
+            kept.push(address);
+        }
+    }
+    kept
 }
 
 fn reserved_from_json(value: Option<&Json>) -> Result<[u8; 3], String> {
@@ -449,6 +472,19 @@ mod tests {
             config.peers[0].endpoints,
             vec!["127.0.0.1:51820".parse().unwrap()]
         );
+    }
+
+    #[test]
+    fn the_candidate_limit_keeps_one_of_each_family() {
+        let mut input: Vec<SocketAddr> = (1..=9)
+            .map(|last| format!("192.0.2.{last}:9").parse().unwrap())
+            .collect();
+        input.push("[2001:db8::1]:9".parse().unwrap());
+        input.reverse();
+        let kept = limit_candidates(input);
+        assert_eq!(kept.len(), ENDPOINT_CANDIDATES);
+        assert!(kept.iter().any(SocketAddr::is_ipv4));
+        assert!(kept.iter().any(SocketAddr::is_ipv6));
     }
 
     #[test]

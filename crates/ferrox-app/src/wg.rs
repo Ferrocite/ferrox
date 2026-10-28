@@ -875,7 +875,16 @@ fn bind_socket(config: &DeviceConfig) -> Result<UdpSocket, String> {
         return Err("wireguard client: no peer has an `endpoint`".to_owned());
     }
     if v4 && v6 {
-        return bind_dual_stack();
+        match bind_dual_stack() {
+            Ok(socket) => return Ok(socket),
+            Err(dual) if v4 => {
+                let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+                return UdpSocket::bind(address).map_err(|ipv4| {
+                    format!("cannot bind wireguard's UDP socket: dual-stack: {dual}; IPv4: {ipv4}")
+                });
+            }
+            Err(error) => return Err(error),
+        }
     }
     let unspecified = if v4 {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
@@ -926,6 +935,9 @@ fn send_packet(
         _ => std::slice::from_ref(&endpoint),
     };
     for target in targets {
+        if !ipv6 && target.is_ipv6() {
+            continue;
+        }
         let _ = socket.send_to(packet, send_endpoint(*target, ipv6));
     }
 }
@@ -1389,6 +1401,24 @@ mod tests {
         assert!(
             v6.recv_from(&mut buf).is_err(),
             "data follows the pinned endpoint"
+        );
+        let Ok(v4_only) = UdpSocket::bind("127.0.0.1:0") else {
+            return;
+        };
+        send_packet(
+            &v4_only,
+            false,
+            candidates[0],
+            &initiation,
+            Some(&candidates),
+        );
+        assert_eq!(
+            v4.recv_from(&mut buf).expect("v4 fallback").0,
+            INITIATION_SIZE
+        );
+        assert!(
+            v6.recv_from(&mut buf).is_err(),
+            "a v4-only socket skips the v6 candidate"
         );
     }
 
