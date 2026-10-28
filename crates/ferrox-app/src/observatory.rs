@@ -8,7 +8,7 @@ use ferrox_core::tls::TlsProvider as _;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const LEGACY_URL: &str = "https://www.google.com/generate_204";
 const BURST_URL: &str = "https://connectivitycheck.gstatic.com/generate_204";
@@ -21,6 +21,12 @@ const FAILED: i64 = i64::MAX;
 const UNTESTED: i64 = i64::MAX - 1;
 const CHROME_MAJOR: u8 = 144;
 static RANDOM: AtomicU64 = AtomicU64::new(0);
+
+fn unix_now() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs() as i64)
+}
 
 /// The latest reading for every selected outbound, shared with every route plan.
 #[derive(Debug)]
@@ -40,6 +46,13 @@ impl Observatory {
         if let Ok(mut snapshot) = self.snapshot.lock() {
             *snapshot = Arc::from(statuses.to_vec());
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn seeded(statuses: &[Observed]) -> Arc<Self> {
+        Arc::new(Self {
+            snapshot: Mutex::new(Arc::from(statuses.to_vec())),
+        })
     }
 }
 
@@ -367,17 +380,28 @@ fn update_legacy_status(
         Ok(delay) => (true, delay.as_millis() as i64),
         Err(_) => (false, 99_999_999),
     };
-    if let Some(status) = statuses.iter_mut().find(|status| status.tag == tag) {
-        status.alive = alive;
-        status.delay_ms = delay;
-        status.health = None;
+    let now = unix_now();
+    let index = statuses.iter().position(|status| status.tag == tag);
+    let index = match index {
+        Some(index) => index,
+        None => {
+            statuses.push(Observed {
+                tag: tag.to_owned(),
+                ..Observed::default()
+            });
+            statuses.len() - 1
+        }
+    };
+    let status = &mut statuses[index];
+    status.alive = alive;
+    status.delay_ms = delay;
+    status.health = None;
+    status.last_try = now;
+    if alive {
+        status.last_seen = now;
+        status.last_error.clear();
     } else {
-        statuses.push(Observed {
-            tag: tag.to_owned(),
-            alive,
-            delay_ms: delay,
-            health: None,
-        });
+        status.last_error = result.as_ref().err().cloned().unwrap_or_default();
     }
     observatory.publish(statuses);
 }
@@ -503,6 +527,7 @@ fn publish_burst(observatory: &Observatory, results: &[(String, Ring)]) {
                 alive: stats.all != stats.fail,
                 delay_ms: stats.average / 1_000_000,
                 health: Some(stats),
+                ..Observed::default()
             }
         })
         .collect();

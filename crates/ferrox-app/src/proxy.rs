@@ -227,10 +227,11 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>) -> 
         }
     }
     let route = routing.map(|routing| {
-        route_shared_with_api(root, routing, &portals, observatory, api.as_ref())
+        route_shared_with_api(root, routing, &portals, observatory.clone(), api.as_ref())
             .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
     });
     if let Some(api) = api.as_ref() {
+        api.set_observatory(observatory);
         api.set_runtime(Arc::new(Runtime::new(
             outbound.clone(),
             route.clone(),

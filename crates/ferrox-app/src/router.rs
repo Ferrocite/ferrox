@@ -126,6 +126,9 @@ pub(crate) struct Observed {
     pub(crate) alive: bool,
     pub(crate) delay_ms: i64,
     pub(crate) health: Option<HealthPing>,
+    pub(crate) last_error: String,
+    pub(crate) last_seen: i64,
+    pub(crate) last_try: i64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -5044,6 +5047,7 @@ mod tests {
             alive,
             delay_ms,
             health: None,
+            ..Observed::default()
         }
     }
 
