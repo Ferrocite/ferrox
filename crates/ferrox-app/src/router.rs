@@ -5166,14 +5166,22 @@ mod tests {
                 ("servers", array(vec![text("localhost")])),
                 (
                     "hosts",
-                    object(vec![(
-                        "dual.test",
-                        array(vec![text("10.0.0.1"), text("2001:db8::1")]),
-                    )]),
+                    object(vec![
+                        (
+                            "dual.test",
+                            array(vec![text("10.0.0.1"), text("2001:db8::1")]),
+                        ),
+                        ("localhost", array(vec![text("2001:db8::1")])),
+                    ]),
                 ),
             ]),
         )]);
         crate::dnsapp::install(&root).expect("install");
+        let (ips, _) = resolve_ips_ttl("localhost", 0);
+        assert!(
+            ips.is_empty(),
+            "an authoritative empty answer is not retried through the system"
+        );
         let (ips, ttl) = resolve_ips_ttl("dual.test", 0);
         assert_eq!(ttl, 10);
         assert_eq!(ips, vec!["10.0.0.1".parse::<IpAddr>().expect("ipv4")]);
