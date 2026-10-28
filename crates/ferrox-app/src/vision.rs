@@ -580,6 +580,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             }
             if self.have[dot..dot + 16] != self.uuid {
                 // the uuid is a window, not a gate: a raw-target proxy passes everything through, exactly as the staged path did
+                self.session.disarm_record_alignment();
                 self.read.padding = false;
                 return 0;
             }
@@ -625,6 +626,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                     if command == VisionCommand::Continue.byte() {
                         continue 'frames;
                     }
+                    self.session.disarm_record_alignment();
                     self.read.padding = false;
                     if command == VisionCommand::Direct.byte() {
                         if let Some(direct) = self.direct {
@@ -694,6 +696,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 continue 'frames;
             }
             // a command that is not a continue ends the framing; its tail is content
+            self.session.disarm_record_alignment();
             self.read.padding = false;
             if walk.command == VisionCommand::Direct.byte() {
                 if let Some(direct) = self.direct {
@@ -931,6 +934,7 @@ mod tests {
     struct Fake {
         read: Cursor<Vec<u8>>,
         written: Vec<u8>,
+        disarmed: usize,
     }
 
     impl Fake {
@@ -938,6 +942,7 @@ mod tests {
             Self {
                 read: Cursor::new(input.to_vec()),
                 written: Vec::new(),
+                disarmed: 0,
             }
         }
     }
@@ -959,7 +964,11 @@ mod tests {
         }
     }
 
-    impl RecordAlignment for Fake {}
+    impl RecordAlignment for Fake {
+        fn disarm_record_alignment(&mut self) {
+            self.disarmed += 1;
+        }
+    }
 
     const UUID: [u8; 16] = [0x11; 16];
 
@@ -990,6 +999,10 @@ mod tests {
         let mut out = Vec::new();
         link.read_to_end(&mut out).expect("reads");
         assert_eq!(out, b"firstsecondthirdraw tail");
+        assert_eq!(
+            link.session.disarmed, 1,
+            "the end of the framing stops the limiter"
+        );
     }
 
     #[test]
