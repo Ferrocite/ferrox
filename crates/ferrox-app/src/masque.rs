@@ -2470,6 +2470,19 @@ mod tests {
     }
 
     #[test]
+    fn an_insecure_edge_still_checks_its_pin() {
+        let (_inbound, port) = serve("127.0.0.1:1");
+        let pin = "00".repeat(32);
+        let outbound = crate::json::parse(&format!(
+            r#"{{"settings":{{"address":"127.0.0.1","port":{port}}},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"serverName":"localhost","allowInsecure":true,"pinnedPeerCertSha256":"{pin}"}},"masqueSettings":{{"headers":{{"Authorization":"Basic dUBleGFtcGxlLmNvbTpw"}}}}}}}}"#
+        ))
+        .expect("a pinned masque outbound");
+        let spec = ClientSpec::from(&outbound).expect("spec");
+        let reason = open(&spec).expect_err("an insecure dial still answers the pin");
+        assert!(reason.contains("does not match the pins"), "{reason}");
+    }
+
+    #[test]
     fn the_authority_prefers_a_configured_host() {
         let outbound = crate::json::parse(
             r#"{"settings":{"server":{"address":"127.0.0.1","port":8443}},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"host":"edge.example:443"}}}"#,
