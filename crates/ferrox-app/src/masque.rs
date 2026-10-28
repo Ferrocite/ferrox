@@ -1320,7 +1320,8 @@ fn dispatch(shared: &Shared, from_stack: Receiver<Vec<u8>>) {
                     let _ = wake.send(Arrival::Ready);
                 }
             }
-            let _ = tunnel.sender.send(packet);
+            // A full queue drops the packet; the dispatcher must keep serving other tunnels.
+            let _ = tunnel.sender.try_send(packet);
         }
     }
 }
