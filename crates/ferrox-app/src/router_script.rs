@@ -532,7 +532,7 @@ fn install(lua: &Lua, hooks: &Arc<CallHooks>, dirs: &Arc<Vec<PathBuf>>) -> LuaRe
                         crate::dnsapp::Lookup::Records(addrs, ttl) => {
                             dns_answer(lua, addrs, ttl, ipv4, ipv6)
                         }
-                        crate::dnsapp::Lookup::Empty => Ok((
+                        crate::dnsapp::Lookup::Empty | crate::dnsapp::Lookup::Skipped => Ok((
                             Value::Nil,
                             0.0,
                             Some(LuaError::RuntimeError("empty response".to_owned())),

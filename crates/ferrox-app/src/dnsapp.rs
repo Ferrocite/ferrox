@@ -192,13 +192,14 @@ pub(crate) enum Lookup {
     Empty,
     Rcode(u16),
     Failed,
+    Skipped,
 }
 
 impl Lookup {
     fn records(self) -> Option<(Vec<IpAddr>, u32)> {
         match self {
             Self::Records(ips, ttl) => Some((ips, ttl)),
-            Self::Empty | Self::Rcode(_) | Self::Failed => None,
+            Self::Empty | Self::Rcode(_) | Self::Failed | Self::Skipped => None,
         }
     }
 }
@@ -339,6 +340,10 @@ impl Resolver {
     /// response and an rcode as themselves instead of calling both a hard error.
     pub(crate) fn lookup_result(self: &Arc<Self>, name: &str) -> Lookup {
         self.lookup_inner(name, false, false)
+    }
+
+    pub(crate) fn families(&self) -> (bool, bool) {
+        self.strategy.families()
     }
 
     pub(crate) fn lookup_families(
@@ -483,17 +488,23 @@ impl Resolver {
     ) -> Lookup {
         let mut last_rcode = None;
         let mut empty = false;
+        let mut skipped = false;
         for &index in order {
             match self.query_server(index, name, v4, v6, fake_enabled, force_local) {
                 Lookup::Records(ips, ttl) if !ips.is_empty() => return Lookup::Records(ips, ttl),
                 Lookup::Records(_, _) | Lookup::Empty => empty = true,
                 Lookup::Rcode(code) => last_rcode = Some(code),
                 Lookup::Failed => {}
+                Lookup::Skipped => skipped = true,
             }
         }
-        last_rcode
-            .map(Lookup::Rcode)
-            .unwrap_or(if empty { Lookup::Empty } else { Lookup::Failed })
+        last_rcode.map(Lookup::Rcode).unwrap_or(if empty {
+            Lookup::Empty
+        } else if skipped {
+            Lookup::Skipped
+        } else {
+            Lookup::Failed
+        })
     }
 
     /// Every group starts together; one group's answer wins and the next group is consulted
@@ -522,6 +533,7 @@ impl Resolver {
         let mut results: Vec<Option<Lookup>> = (0..order.len()).map(|_| None).collect();
         let mut last_rcode = None;
         let mut empty = false;
+        let mut skipped = false;
         let mut start = 0;
         while start < order.len() {
             let mut end = start + 1;
@@ -554,13 +566,18 @@ impl Resolver {
                     Lookup::Records(_, _) | Lookup::Empty => empty = true,
                     Lookup::Rcode(code) => last_rcode = Some(*code),
                     Lookup::Failed => {}
+                    Lookup::Skipped => skipped = true,
                 }
             }
             start = end;
         }
-        last_rcode
-            .map(Lookup::Rcode)
-            .unwrap_or(if empty { Lookup::Empty } else { Lookup::Failed })
+        last_rcode.map(Lookup::Rcode).unwrap_or(if empty {
+            Lookup::Empty
+        } else if skipped {
+            Lookup::Skipped
+        } else {
+            Lookup::Failed
+        })
     }
 
     #[allow(clippy::fn_params_excessive_bools)]
@@ -575,13 +592,14 @@ impl Resolver {
     ) -> Lookup {
         let server = &self.servers[index];
         if server.transport == Transport::Fake && !fake_enabled {
-            return Lookup::Empty;
+            return Lookup::Skipped;
         }
         let mut ips = Vec::new();
         let mut ttl = u32::MAX;
         let mut families = 0u8;
         let mut rcode = None;
         let mut empty = false;
+        let mut failed = false;
         if v4 && server.v4 {
             match self.family(index, name, Family::A, force_local) {
                 Lookup::Records(mut found, found_ttl) => {
@@ -591,7 +609,8 @@ impl Resolver {
                 }
                 Lookup::Rcode(code) => rcode = Some(code),
                 Lookup::Empty => empty = true,
-                Lookup::Failed => {}
+                Lookup::Failed => failed = true,
+                Lookup::Skipped => {}
             }
         }
         if v6 && server.v6 {
@@ -603,7 +622,8 @@ impl Resolver {
                 }
                 Lookup::Rcode(code) => rcode = Some(code),
                 Lookup::Empty => empty = true,
-                Lookup::Failed => {}
+                Lookup::Failed => failed = true,
+                Lookup::Skipped => {}
             }
         }
         if !ips.is_empty() {
@@ -620,7 +640,9 @@ impl Resolver {
         if let Some(code) = rcode {
             return Lookup::Rcode(code);
         }
-        if empty {
+        if failed {
+            Lookup::Failed
+        } else if empty {
             Lookup::Empty
         } else {
             Lookup::Failed
@@ -700,7 +722,7 @@ impl Resolver {
             Lookup::Records(ips, ttl) => Some((ips.clone(), 0, *ttl)),
             Lookup::Rcode(code) => Some((Vec::new(), *code, DEFAULT_TTL)),
             Lookup::Empty => Some((Vec::new(), 0, DEFAULT_TTL)),
-            Lookup::Failed => None,
+            Lookup::Failed | Lookup::Skipped => None,
         };
         if let Some((ips, rcode, ttl)) = cacheable {
             if !server.cache.disable {

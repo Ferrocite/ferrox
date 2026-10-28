@@ -3103,7 +3103,27 @@ pub(crate) fn resolve_ips(host: &str, port: u16) -> Vec<IpAddr> {
 }
 
 pub(crate) fn resolve_ips_ttl(host: &str, port: u16) -> (Vec<IpAddr>, u32) {
-    resolve_ips_script(host, port, false, true, true)
+    resolve_ips_ttl_with(crate::dnsapp::installed().as_ref(), host, port)
+}
+
+fn resolve_ips_ttl_with(
+    resolver: Option<&Arc<crate::dnsapp::Resolver>>,
+    host: &str,
+    port: u16,
+) -> (Vec<IpAddr>, u32) {
+    if let Some(resolver) = resolver {
+        match resolver.lookup_result(host) {
+            crate::dnsapp::Lookup::Records(ips, ttl) => return (ips, ttl),
+            crate::dnsapp::Lookup::Empty | crate::dnsapp::Lookup::Rcode(_) => {
+                return (Vec::new(), 0);
+            }
+            crate::dnsapp::Lookup::Failed | crate::dnsapp::Lookup::Skipped => {
+                let (v4, v6) = resolver.families();
+                return resolve_ips_system(host, port, v4, v6);
+            }
+        }
+    }
+    resolve_ips_system(host, port, true, true)
 }
 
 pub(crate) fn resolve_ips_script(
@@ -3113,12 +3133,16 @@ pub(crate) fn resolve_ips_script(
     v4: bool,
     v6: bool,
 ) -> (Vec<IpAddr>, u32) {
-    use std::net::ToSocketAddrs;
     if let Some(resolver) = crate::dnsapp::installed() {
         if let Some(answer) = resolver.lookup_families(host, v4, v6, fake) {
             return answer;
         }
     }
+    resolve_ips_system(host, port, v4, v6)
+}
+
+fn resolve_ips_system(host: &str, port: u16, v4: bool, v6: bool) -> (Vec<IpAddr>, u32) {
+    use std::net::ToSocketAddrs;
     let ips = (host, port)
         .to_socket_addrs()
         .map(|addrs| {
@@ -5145,5 +5169,101 @@ mod tests {
             .map(|rule| rule.target.as_str())
             .collect();
         assert_eq!(targets, ["a", "b"]);
+    }
+
+    fn resolver(root: &Json) -> Arc<crate::dnsapp::Resolver> {
+        Arc::new(
+            crate::dnsapp::Resolver::from_root(root)
+                .expect("resolver")
+                .expect("configured"),
+        )
+    }
+
+    #[test]
+    fn a_routed_lookup_uses_the_configured_family_strategy() {
+        let root = object(vec![(
+            "dns",
+            object(vec![
+                ("queryStrategy", text("UseIPv4")),
+                ("servers", array(vec![text("localhost")])),
+                (
+                    "hosts",
+                    object(vec![
+                        (
+                            "dual.test",
+                            array(vec![text("10.0.0.1"), text("2001:db8::1")]),
+                        ),
+                        ("localhost", array(vec![text("2001:db8::1")])),
+                    ]),
+                ),
+            ]),
+        )]);
+        let resolver = resolver(&root);
+        let (ips, ttl) = resolve_ips_ttl_with(Some(&resolver), "dual.test", 0);
+        assert_eq!(ttl, 10);
+        assert_eq!(ips, vec!["10.0.0.1".parse::<IpAddr>().expect("ipv4")]);
+        let (ips, _) = resolve_ips_ttl_with(Some(&resolver), "localhost", 0);
+        assert!(
+            ips.is_empty(),
+            "an authoritative empty answer is not retried through the system"
+        );
+    }
+
+    #[test]
+    fn a_skipped_fake_server_falls_back_to_the_system() {
+        let root = crate::json::parse(
+            r#"{"dns":{"servers":["fakedns"],"queryStrategy":"UseIP"},"fakeDns":{"ipPool":"198.18.0.0/15","poolSize":32768}}"#,
+        )
+        .expect("parses");
+        let resolver = resolver(&root);
+        let (ips, _) = resolve_ips_ttl_with(Some(&resolver), "192.0.2.7", 0);
+        assert_eq!(
+            ips,
+            vec!["192.0.2.7".parse::<IpAddr>().expect("ipv4")],
+            "a skipped fake server falls back to the system"
+        );
+    }
+
+    #[test]
+    fn a_failed_family_still_falls_back_to_the_system() {
+        let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("timeout");
+        let port = socket.local_addr().expect("addr").port();
+        let fixture = std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            let mut qtypes = Vec::new();
+            for _ in 0..2 {
+                let Ok((len, peer)) = socket.recv_from(&mut buf) else {
+                    return qtypes;
+                };
+                let Some(question) = ferrox_core::dns::parse_query(&buf[..len]) else {
+                    continue;
+                };
+                qtypes.push(question.qtype);
+                let reply = if question.qtype == 28 {
+                    b"not a dns answer".to_vec()
+                } else {
+                    ferrox_core::dns::ip_answer(&question, 0, 60, &[]).expect("answer")
+                };
+                socket.send_to(&reply, peer).expect("reply");
+            }
+            qtypes
+        });
+        let root = crate::json::parse(&format!(
+            r#"{{"dns":{{"servers":["udp://127.0.0.1:{port}"],"queryStrategy":"UseIP"}}}}"#
+        ))
+        .expect("parses");
+        let resolver = resolver(&root);
+        let (ips, _) = resolve_ips_ttl_with(Some(&resolver), "192.0.2.7", 0);
+        let mut qtypes = fixture.join().expect("fixture");
+        qtypes.sort_unstable();
+        assert_eq!(qtypes, [1, 28], "the fixture must receive both queries");
+        assert_eq!(
+            ips,
+            vec!["192.0.2.7".parse::<IpAddr>().expect("ipv4")],
+            "a failed family is not an authoritative empty answer"
+        );
     }
 }
