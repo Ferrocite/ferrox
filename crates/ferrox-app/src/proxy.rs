@@ -2876,7 +2876,8 @@ fn serve_vless_grpc(
     if !writer.send(&[0, 0]) {
         return;
     }
-    reader.set_poll(Some(RELAY_POLL));
+    // The frame that grants this lane's window arrives on this read, so it waits out the stall rather than a quantum: a read that hands back its worker every millisecond parses the credit a millisecond late, and the writer waits on it. A peer silent for a whole stall still parks the lane.
+    reader.set_poll(Some(budgets::relay_stall()));
     crate::proxy::relay_sink(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
 }
 
