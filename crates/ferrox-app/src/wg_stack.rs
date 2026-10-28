@@ -1905,6 +1905,101 @@ mod client_tests {
     }
 
     #[test]
+    fn a_replied_client_datagram_lane_sends_the_next_datagram_only_to_the_winner() {
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
+        let relay_address = relay.local_addr().expect("address");
+        let app = UdpSocket::bind("127.0.0.1:0").expect("app");
+        app.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let (to_tunnel, packets) = std::sync::mpsc::channel();
+        let routes: UdpRoutes = Arc::default();
+        let thread_relay = relay.try_clone().expect("clone");
+        let thread_config = config();
+        let thread_routes = Arc::clone(&routes);
+        let targets: Vec<SocketAddr> = vec![
+            "192.0.2.7:53".parse().unwrap(),
+            "192.0.2.8:53".parse().unwrap(),
+        ];
+        let wanted = targets.clone();
+        std::thread::spawn(move || {
+            client_udp(
+                &thread_relay,
+                &thread_config,
+                &to_tunnel,
+                &thread_routes,
+                None,
+                &|host, port| {
+                    assert_eq!(host, "example.test");
+                    assert_eq!(port, 53);
+                    wanted.clone()
+                },
+            );
+        });
+        let port = relay_address.port();
+        for _ in 0..100 {
+            if routes.lock().expect("routes").contains_key(&port) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(routes.lock().expect("routes").contains_key(&port));
+
+        let name = b"example.test";
+        let mut frame = vec![0, 0, 0, 3, name.len() as u8];
+        frame.extend_from_slice(name);
+        frame.extend_from_slice(&53u16.to_be_bytes());
+        frame.extend_from_slice(b"query");
+        app.send_to(&frame, relay_address).expect("send");
+        let mut raced = Vec::new();
+        for _ in 0..targets.len() {
+            let inner = packets.recv_timeout(Duration::from_secs(5)).expect("inner");
+            let datagram = udp_from_packet(&inner).expect("packet");
+            raced.push(socket_addr(datagram.destination, 53).expect("target"));
+        }
+        assert_eq!(raced, targets, "the first datagram races every answer");
+
+        let winner = targets[0];
+        let mut source_room = [0u8; 16];
+        let source = ip_bytes_into(winner.ip(), &mut source_room);
+        let mut reply = Vec::new();
+        assert!(udp_datagram(
+            &UdpDatagram {
+                source,
+                destination: &[10, 0, 0, 2],
+                source_port: winner.port(),
+                destination_port: port,
+                payload: b"answer",
+            },
+            &mut reply,
+        ));
+        routes
+            .lock()
+            .expect("routes")
+            .get(&port)
+            .expect("lane")
+            .send(reply)
+            .expect("reply");
+
+        let mut received = [0u8; 2048];
+        let (n, _) = app.recv_from(&mut received).expect("framed reply");
+        let (remote, payload) = crate::proxy::parse_socks_udp(&received[..n]).expect("frame");
+        assert_eq!(remote, winner);
+        assert_eq!(payload, b"answer");
+
+        app.send_to(&frame, relay_address).expect("send again");
+        let inner = packets.recv_timeout(Duration::from_secs(5)).expect("inner");
+        let datagram = udp_from_packet(&inner).expect("packet");
+        assert_eq!(
+            socket_addr(datagram.destination, 53).expect("target"),
+            winner
+        );
+        assert!(
+            packets.recv_timeout(Duration::from_millis(150)).is_err(),
+            "a replied lane must not fan the next datagram out"
+        );
+    }
+
+    #[test]
     fn a_packet_too_big_narrows_the_device_mtu() {
         let mut inner = vec![0u8; 28];
         inner[0] = 0x45;
