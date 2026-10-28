@@ -1027,6 +1027,7 @@ struct Inbound {
     auth_buf: Vec<u8>,
     served: HashSet<u64>,
     wakes: Arc<Driver>,
+    send: Arc<StreamWake>,
     udp: HashMap<u32, UdpFlow>,
 }
 
@@ -1074,6 +1075,7 @@ fn serve_stream(
     peer: SocketAddr,
     masq: &Masquerade,
     wake: Arc<StreamWake>,
+    send: Arc<StreamWake>,
 ) {
     let mut head = Vec::with_capacity(8);
     let mut room = Unfilled::<64>::new();
@@ -1133,6 +1135,7 @@ fn serve_stream(
         false,
     );
     flow.wake = Some(wake);
+    flow.session.send_wake = Some(send);
     // The prefix stays in the buffer and the cursor steps over it, so no payload byte is moved.
     flow.at = prefix;
     serve(flow);
@@ -1984,6 +1987,7 @@ impl Router<'_> {
                 auth_buf: Vec::new(),
                 served: HashSet::new(),
                 wakes: Driver::new(),
+                send: StreamWake::new(),
                 udp: HashMap::new(),
             },
         );
@@ -2070,6 +2074,7 @@ impl Router<'_> {
                 let thread_sock = Arc::clone(sock);
                 let thread_serve = Arc::clone(serve);
                 let thread_masq = Arc::clone(masq);
+                let thread_send = Arc::clone(&inbound.send);
                 let local = *local;
                 let peer = from;
                 std::thread::spawn(move || {
@@ -2082,6 +2087,7 @@ impl Router<'_> {
                         peer,
                         &thread_masq,
                         wake,
+                        thread_send,
                     );
                 });
             }
@@ -2092,6 +2098,7 @@ impl Router<'_> {
 
     fn wake(&self) {
         for inbound in self.routes.values() {
+            inbound.send.bump();
             let Ok(conn) = inbound.conn.lock() else {
                 continue;
             };
@@ -2122,6 +2129,7 @@ impl Router<'_> {
             }
             conn.on_timeout();
             flush(sock, &mut conn, out.as_mut());
+            inbound.send.bump();
             inbound.udp.retain(|_, flow| {
                 if now.duration_since(flow.last) > UDP_IDLE {
                     flow.stop.store(true, Ordering::Relaxed);
