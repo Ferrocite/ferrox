@@ -1377,6 +1377,11 @@ mod tests {
         let Ok(sender) = bind_dual_stack() else {
             return;
         };
+        for socket in [&v4, &v6] {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("timeout");
+        }
         let candidates = vec![
             v4.local_addr().expect("v4 address"),
             v6.local_addr().expect("v6 address"),
