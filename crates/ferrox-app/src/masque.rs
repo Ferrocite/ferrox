@@ -1921,6 +1921,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pins_are_checked_even_when_the_hello_is_insecure() {
+        let spec = ClientSpec {
+            address: "127.0.0.1".to_owned(),
+            port: 443,
+            tls: Arc::new(TlsConfig {
+                server_name: "edge.example".to_owned(),
+                insecure: true,
+                cert_pins: vec![[7u8; 32]].into(),
+                ..TlsConfig::default()
+            }),
+            path: DEFAULT_PATH.to_owned(),
+            host: None,
+            headers: Vec::new(),
+        };
+        let mut config = client_config(&spec).expect("config");
+        let cid = quiche::ConnectionId::from_ref(&[0u8; 16]);
+        let local: SocketAddr = "127.0.0.1:50000".parse().expect("local");
+        let peer: SocketAddr = "127.0.0.1:443".parse().expect("peer");
+        let conn = quiche::connect(Some(&spec.tls.server_name), &cid, local, peer, &mut config)
+            .expect("connection");
+        assert!(
+            verify_edge(&spec, &conn).is_err(),
+            "a pinned edge with no certificate chain was accepted"
+        );
+    }
+
+    #[test]
     fn a_pool_skips_its_server_and_wraps() {
         let mut pool = AddressPool::from_prefixes(&["10.14.0.1/30".to_owned()]).expect("a pool");
         assert_eq!(
