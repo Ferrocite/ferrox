@@ -6,6 +6,8 @@ The server is the part xray-core owns that row 20 did not: an address pool built
 
 The dialer collapses xray's user-agent selector to the pinned Chrome UA for `chrome`, `firefox`, `safari`, `edge` and `curl`; `golang` and an empty value send no user agent, and an absent value sends the same Chrome UA. A configured `remoteDNS` is warned about and names resolve on the host, because resolving them inside the tunnel would need the DNS forwarder this row does not carry. `enable_dgram` receives quiche's `MAX_DATAGRAM` as the receive queue depth on both roles and `DGRAM_INFLIGHT` (32) as the send queue depth, which is the reference's `maxDatagramSendQueueLen`: a peer drops datagrams above its own receive queue, and an inner TCP that loses a burst backs off for seconds, so a full send queue holds the packet and the caller retries it after a flush instead of dropping it. `dispatch` also wakes the worker whose queue it just wrote, so a burst leaves on arrival rather than on the 10 ms tick that now only drives retransmission timeouts. An h2 edge that refuses the first dial because its listener is still binding is dialed again for a second, which is the window the QUIC handshake's retransmission already covers; `masque_h2::tests::a_dial_refused_until_the_edge_binds_is_retried` and the pinned `TestMasqueServerHTTP2` are the checkers. After every received event the worker sweeps a QUIC deadline that has already fallen due, so a peer that keeps datagrams arriving inside the wait cannot defer loss recovery or the draining and idle timers; `ferrox-app-masque::tests::a_due_quic_deadline_is_swept_after_an_event` is the checker.
 
+The HTTP/2 client and server retain at most 64 capsules while a send window is stalled. The next capsule ends the session, and its packet channel stops draining; a peer granting credit before overflow can still drain the queue. `masque_h2::tests::a_stalled_send_window_bounds_the_queued_capsules`, `an_overflow_stops_draining_the_packet_channels` and `queued_capsules_flush_when_the_peer_grants_window` check the boundary, termination and recovery. Ended or closed sessions leave pending capsules and packet channels untouched, checked by `ended_or_closed_sessions_leave_capsules_and_channels_untouched`. The capsule encoding and DATA framing are unchanged; the cap counts capsules rather than bytes, and their retained payload allocations remain.
+
 ## Data path
 
 ```mermaid
@@ -76,6 +78,7 @@ graph TD
 | h2-frame-body-allocations | 0 | ferrox-app-masque-h2::tests::a_frame_body_is_read_where_it_landed |
 | h2-capsule-staging-allocations | 0 | ferrox-app-masque-h2::tests::a_whole_capsule_is_read_where_it_landed |
 | h2-datagram-packet-queue-copies | 0 | ferrox-app-masque-h2::tests::a_datagram_capsule_goes_straight_to_its_lane |
+| h2-queued-capsule-cap | 64 | ferrox-app-masque-h2::tests::a_stalled_send_window_bounds_the_queued_capsules |
 <!-- counts:end -->
 
 ## Time
