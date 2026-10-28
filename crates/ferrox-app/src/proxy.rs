@@ -2884,7 +2884,8 @@ fn serve_vless_grpc(
     if !writer.send(&[0, 0]) {
         return;
     }
-    reader.set_poll(Some(RELAY_POLL));
+    // The frame that grants this lane's window arrives on this read, so it waits out the stall rather than a quantum: a read that hands back its worker every millisecond parses the credit a millisecond late, and the writer waits on it. A peer silent for a whole stall still parks the lane.
+    reader.set_poll(Some(budgets::relay_stall()));
     crate::proxy::relay_sink(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
 }
 
@@ -18817,7 +18818,7 @@ pub(crate) mod lane_pool {
     use std::thread;
 
     /// What one step did: moved bytes keep the lane at the head, a parked read yields to the queue, and a finished lane hands its worker on.
-    #[derive(Clone, Copy, PartialEq, Eq)]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(crate) enum Next {
         Done,
         /// Nothing to read yet: the lane waits off the workers for a poll quantum.
@@ -19958,22 +19959,45 @@ where
 
 const CLOSE_BEFORE_JOIN: bool = true;
 
+/// A window the peer has not granted yet is another lane's frame away at most a queue turn; only a peer that grants nothing for this many turns is waited out.
+const RELAY_SPINS: u32 = 8;
+
 const CLOSE_AFTER_JOIN: bool = false;
 
+/// Where one forward leg stands: the bytes the peer has not taken, and the turns it has spent waiting on its window.
+struct Forward {
+    first: bool,
+    pending: usize,
+    sent: usize,
+    spins: u32,
+}
+
+impl Forward {
+    fn new() -> Self {
+        Self {
+            first: true,
+            pending: 0,
+            sent: 0,
+            spins: 0,
+        }
+    }
+}
+
 /// Offers the bytes a parked window still owes; `Some` ends or parks the lane, `None` means the window is clear and the leg may read again.
-fn forward_flush(
-    buffer: &RelayBuf,
-    uplink: &impl CarrierSink,
-    first: &mut bool,
-    pending: &mut usize,
-    sent: &mut usize,
-) -> Option<Next> {
-    while *sent < *pending {
-        match uplink.push(&buffer.prefix(*pending)[*sent..]) {
-            Push::Took(n) if n > 0 => *sent += n,
-            Push::Took(_) => return Some(Next::Retry),
-            Push::Parked => {
-                // A parked window has no read to wait in, so the lane sleeps here and comes back next turn, not a quantum later.
+fn forward_flush(buffer: &RelayBuf, uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
+    while at.sent < at.pending {
+        match uplink.push(&buffer.prefix(at.pending)[at.sent..]) {
+            Push::Took(n) if n > 0 => {
+                at.sent += n;
+                at.spins = 0;
+            }
+            // A full window is another lane's frame away, so the leg rejoins the queue at once: a quantum spent here is a window the peer cannot grant.
+            Push::Took(_) | Push::Parked => {
+                at.spins += 1;
+                if at.spins < RELAY_SPINS {
+                    return Some(Next::Retry);
+                }
+                at.spins = 0;
                 std::thread::sleep(crate::budgets::RELAY_POLL);
                 return Some(Next::Retry);
             }
@@ -19983,14 +20007,14 @@ fn forward_flush(
             }
         }
     }
-    if *pending > 0 {
-        if *first {
+    if at.pending > 0 {
+        if at.first {
             echo_trace("relay fwd sent");
             echo_trace("relay fwd first send ok");
-            *first = false;
+            at.first = false;
         }
-        *pending = 0;
-        *sent = 0;
+        at.pending = 0;
+        at.sent = 0;
     }
     None
 }
@@ -20001,21 +20025,19 @@ fn forward_finished(
     read: std::io::Result<usize>,
     buffer: &mut RelayBuf,
     uplink: &impl CarrierSink,
-    first: &mut bool,
-    pending: &mut usize,
-    sent: &mut usize,
+    at: &mut Forward,
     ended_and_drained: impl FnOnce() -> bool,
 ) -> Next {
     match read {
         Ok(n) if n > 0 => {
-            if *first {
+            if at.first {
                 echo_trace("relay fwd first read");
                 echo_trace("relay fwd sending");
             }
-            *pending = n;
-            *sent = 0;
+            at.pending = n;
+            at.sent = 0;
             let _ = buffer.filled(n);
-            forward_flush(buffer, uplink, first, pending, sent).unwrap_or(Next::More)
+            forward_flush(buffer, uplink, at).unwrap_or(Next::More)
         }
         Err(error) if is_timeout(&error) => {
             if ended_and_drained() {
@@ -20127,28 +20149,19 @@ where
     let forward_flow = Arc::clone(&flow);
     let mut peer_read = peer_read;
     let mut buffer = RelayBuf::new();
-    let mut first = true;
-    let mut pending = 0usize;
-    let mut sent = 0usize;
+    let mut at = Forward::new();
     lane_pool::submit(
         Box::new(move || {
-            if let Some(next) = forward_flush(&buffer, &uplink, &mut first, &mut pending, &mut sent)
-            {
+            if let Some(next) = forward_flush(&buffer, &uplink, &mut at) {
                 return next;
             }
             let read = {
                 census!("carrier-read", crate::census::handle(&peer_read), read_arm);
                 peer_read.read(buffer.as_mut())
             };
-            let next = forward_finished(
-                read,
-                &mut buffer,
-                &uplink,
-                &mut first,
-                &mut pending,
-                &mut sent,
-                || forward_flow.ended_and_drained(),
-            );
+            let next = forward_finished(read, &mut buffer, &uplink, &mut at, || {
+                forward_flow.ended_and_drained()
+            });
             if next != Next::Done {
                 return next;
             }
@@ -26796,11 +26809,62 @@ mod tests {
             2,
             "both refusals parked and the third attempt took the window"
         );
-        let parked_at = sink.parked_at.lock().expect("parked at");
-        assert_eq!(parked_at.len(), 2, "both refusals were timed");
+    }
+
+    /// A full window takes the leg's next turn at once, since the frame that grants it is another lane's; only a peer that grants nothing across a whole burst of turns is waited out.
+    #[test]
+    fn a_parked_window_takes_the_next_turn_and_backs_off_after_a_burst() {
+        #[derive(Clone)]
+        struct Sink {
+            refusals: std::cell::Cell<usize>,
+        }
+
+        impl CarrierSink for Sink {
+            fn send(&self, _: &[u8]) -> bool {
+                false
+            }
+            fn push(&self, bytes: &[u8]) -> Push {
+                if self.refusals.get() > 0 {
+                    self.refusals.set(self.refusals.get() - 1);
+                    return Push::Parked;
+                }
+                Push::Took(bytes.len())
+            }
+            fn close(&self) {}
+        }
+
+        let mut buffer = RelayBuf::new();
+        buffer.as_mut()[..8].copy_from_slice(b"abcdefgh");
+        let _ = buffer.filled(8);
+        let mut at = Forward::new();
+        at.pending = 8;
+
+        let once = Sink {
+            refusals: std::cell::Cell::new(1),
+        };
+        assert_eq!(forward_flush(&buffer, &once, &mut at), Some(Next::Retry));
+        assert_eq!(at.spins, 1, "the refusal took the next turn");
+        assert_eq!(at.sent, 0);
+        assert_eq!(forward_flush(&buffer, &once, &mut at), None);
+        assert_eq!(at.spins, 0, "the granted window cleared the streak");
+        assert_eq!(at.sent, 0);
+        assert_eq!(at.pending, 0);
+
+        let mut at = Forward::new();
+        at.pending = 8;
+        let never = Sink {
+            refusals: std::cell::Cell::new(usize::MAX),
+        };
+        for turn in 1..RELAY_SPINS {
+            assert_eq!(forward_flush(&buffer, &never, &mut at), Some(Next::Retry));
+            assert_eq!(at.spins, turn);
+        }
+        let began = std::time::Instant::now();
+        assert_eq!(forward_flush(&buffer, &never, &mut at), Some(Next::Retry));
+        assert_eq!(at.spins, 0, "the burst's end waits out a quantum");
         assert!(
-            parked_at[1].duration_since(parked_at[0]) >= crate::budgets::RELAY_POLL,
-            "a parked window waited a relay quantum before its next turn"
+            began.elapsed() >= crate::budgets::RELAY_POLL,
+            "the backoff turn slept its quantum"
         );
     }
 
