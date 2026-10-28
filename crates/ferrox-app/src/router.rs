@@ -4427,6 +4427,34 @@ mod tests {
     }
 
     #[test]
+    fn a_shadowed_udp_source_rule_does_not_refuse_the_tun() {
+        let root = object(vec![(
+            "routing",
+            routing(vec![
+                rule(
+                    "direct",
+                    vec![
+                        ("inboundTag", array(vec![text("tun")])),
+                        ("network", text("udp")),
+                    ],
+                ),
+                rule(
+                    "direct",
+                    vec![
+                        ("inboundTag", array(vec![text("tun")])),
+                        ("network", text("udp")),
+                        ("source", array(vec![text("192.0.2.0/24")])),
+                    ],
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(routing.source_refusal(Some("tun")), None);
+    }
+
+    #[test]
     fn a_tun_inbound_may_use_a_script_but_a_server_inbound_may_not() {
         let dir = dir();
         std::fs::write(
