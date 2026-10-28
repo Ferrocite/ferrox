@@ -514,6 +514,9 @@ impl Client {
         }
         self.capsules = capsules;
         self.capsule_at = at;
+        if self.capsules.len() > FRAME_CAP {
+            self.end = true;
+        }
         for answer in answers {
             self.capsule(&answer);
         }
@@ -846,6 +849,9 @@ impl Session {
             self.capsules.drain(..self.capsule_at);
             self.capsule_at = 0;
         }
+        if self.capsules.len() > FRAME_CAP {
+            self.end = true;
+        }
         for answer in answers {
             self.capsule(wire, &answer);
         }
@@ -1029,6 +1035,17 @@ mod tests {
             "the packet went straight to its lane"
         );
         assert_eq!(received.recv().expect("delivered"), packet);
+    }
+
+    #[test]
+    fn an_incomplete_capsule_cannot_grow_past_the_frame_cap() {
+        let mut client = bare_client();
+        let mut partial = Vec::new();
+        frames::quic_varint(&mut partial, 0);
+        frames::quic_varint(&mut partial, (FRAME_CAP + 2) as u64);
+        partial.resize(FRAME_CAP + 1, 0);
+        client.capsules(&partial);
+        assert!(client.end, "an incomplete capsule grew past the frame cap");
     }
 
     #[test]
