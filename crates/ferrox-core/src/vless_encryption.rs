@@ -1231,6 +1231,8 @@ impl ReadSide {
                 };
                 let len = decode_header(&header)
                     .ok_or_else(|| invalid("invalid VLESS encryption record header"))?;
+                // The header was staged in `input`; a timed-out body read must not serve it.
+                self.input.clear();
                 self.take_wire(inner, len)?;
                 self.header = None;
                 self.in_mask.apply(&mut self.input, false);
@@ -1900,6 +1902,74 @@ mod tests {
             (counts.allocs, counts.bytes, counts.zeroed),
             (0, 0, 0),
             "a record write reuses its staging buffer"
+        );
+    }
+
+    /// The header read and the body read are separate `read` calls; a poll timeout
+    /// between them must resume the body, not hand the header back as plaintext.
+    #[test]
+    fn a_timeout_between_a_record_header_and_its_body_does_not_leak_the_header() {
+        use std::io::Write as _;
+
+        struct SplitRead {
+            wire: Vec<u8>,
+            at: usize,
+            reads: usize,
+        }
+
+        impl Read for SplitRead {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                if self.reads == 2 {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                let take = if self.reads == 1 {
+                    HEADER_LEN.min(buf.len())
+                } else {
+                    (self.wire.len() - self.at).min(buf.len())
+                };
+                buf[..take].copy_from_slice(&self.wire[self.at..self.at + take]);
+                self.at += take;
+                Ok(take)
+            }
+        }
+
+        let key = vec![7u8; 32];
+        let context = b"record header timeout";
+        let plaintext = [0x5au8; 300];
+        let mut wire = Vec::new();
+        EncryptedStream::new(
+            &mut wire,
+            key.clone(),
+            Aead::new(context, &key),
+            None,
+            ReadStage::Records,
+        )
+        .write_all(&plaintext)
+        .unwrap();
+
+        let mut stream = EncryptedStream::new(
+            SplitRead {
+                wire,
+                at: 0,
+                reads: 0,
+            },
+            key.clone(),
+            Aead::new(context, &key),
+            Some(Aead::new(context, &key)),
+            ReadStage::Records,
+        );
+        let mut buf = [0u8; 300];
+        let first = stream.read(&mut buf);
+        assert_eq!(
+            first.as_ref().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        let n = stream.read(&mut buf).unwrap();
+        assert_eq!(
+            &buf[..n],
+            &plaintext,
+            "a retried read resumes the body, not the record header"
         );
     }
 }
