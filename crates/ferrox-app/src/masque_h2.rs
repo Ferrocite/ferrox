@@ -61,6 +61,7 @@ pub(crate) fn serve(
 
 fn handshake_timeouts(stream: &TcpStream) {
     let _ = stream.set_read_timeout(Some(HANDSHAKE));
+    let _ = stream.set_write_timeout(Some(HANDSHAKE));
 }
 
 fn connection(
