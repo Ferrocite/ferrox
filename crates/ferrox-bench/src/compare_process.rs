@@ -961,6 +961,7 @@ const SCENARIO_PROTOCOLS: &[&str] = &[
     "shadowsocks",
     "shadowsocks2022",
     "hysteria",
+    "wireguard",
     "socks",
     "http",
     "tun",

@@ -385,6 +385,11 @@ while read -r id traffic connections iterations payload; do
   build_engine_args "${cell_engines[@]}"
   for server in "${servers[@]}"; do
     matrix_server_serves "$server" "$id" || continue
+    if skip_reason="$(matrix_engine_skip_reason "$server" "$id")"; then
+      note "skipping $id on $server: $skip_reason"
+      echo "# $id--srv-$server: skipped, $skip_reason" >>"$out/commands.sh"
+      continue
+    fi
     cell="$id--srv-$server"
     celldir="$out/cells/$cell"
     rm -rf "$celldir"

@@ -833,7 +833,9 @@ fn relay_downlink<R: Read>(reader: R, recv: Recv, out: &mut dyn Write) -> bool {
         let handshaking = !matches!(link, Downlink::Aead { .. });
         match link.step(out, None) {
             crate::proxy::lane_pool::Next::Done => return !handshaking,
-            crate::proxy::lane_pool::Next::Idle | crate::proxy::lane_pool::Next::More => {}
+            crate::proxy::lane_pool::Next::Idle
+            | crate::proxy::lane_pool::Next::More
+            | crate::proxy::lane_pool::Next::Retry => {}
         }
     }
 }
