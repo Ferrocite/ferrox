@@ -25,7 +25,7 @@ static RANDOM: AtomicU64 = AtomicU64::new(0);
 fn unix_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_secs() as i64)
+        .map_or(0, |elapsed| elapsed.as_secs().cast_signed())
 }
 
 /// The latest reading for every selected outbound, shared with every route plan.
@@ -382,15 +382,14 @@ fn update_legacy_status(
     };
     let now = unix_now();
     let index = statuses.iter().position(|status| status.tag == tag);
-    let index = match index {
-        Some(index) => index,
-        None => {
-            statuses.push(Observed {
-                tag: tag.to_owned(),
-                ..Observed::default()
-            });
-            statuses.len() - 1
-        }
+    let index = if let Some(index) = index {
+        index
+    } else {
+        statuses.push(Observed {
+            tag: tag.to_owned(),
+            ..Observed::default()
+        });
+        statuses.len() - 1
     };
     let status = &mut statuses[index];
     status.alive = alive;

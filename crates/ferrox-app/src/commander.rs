@@ -18,6 +18,7 @@ use crate::vmess;
 /// What the `api` app names: the tag routing reaches in outbound mode, and the address a listener
 /// answers on in listen mode. xray treats the two as independent: a config may name either or both.
 #[derive(Clone, Debug, Default)]
+#[allow(clippy::struct_excessive_bools)]
 pub(crate) struct ApiConfig {
     pub(crate) tag: String,
     pub(crate) listen: Option<String>,
@@ -155,6 +156,7 @@ impl std::fmt::Debug for Api {
             .field("mutation", &self.mutation.try_lock().is_ok())
             .field("start", &self.start)
             .field("runtime", &self.runtime.get().is_some())
+            .field("observatory", &self.observatory.get().is_some())
             .finish()
     }
 }
@@ -1524,7 +1526,7 @@ mod tests {
             last_seen: 100,
             last_try: 101,
         };
-        selected.set_observatory(Some(crate::observatory::seeded(&[observed])));
+        selected.set_observatory(Some(crate::observatory::Observatory::seeded(&[observed])));
         let answer = selected.dispatch(path, &[]).expect("answers the call");
         let status = request_bytes(&answer, 1).expect("status");
         let entry = request_bytes(status, 1).expect("one outbound");
