@@ -774,3 +774,9 @@ carrier-masque h2-datagram-round-trips 1 ferrox-app-masque-h2::tests::an_h2_tunn
 carrier-masque h2-dialer-round-trips 1 ferrox-app-masque::tests::a_datagram_flow_crosses_the_h2_tunnel_to_a_freedom_dial
 carrier-masque h2-tcp-echo-round-trips 1 ferrox-app-masque::tests::a_tcp_flow_crosses_the_h2_tunnel_to_a_freedom_dial
 carrier-masque carrier-alpn-choices-witnessed 5 ferrox-app-masque::tests::the_carrier_follows_the_alpn_list
+carrier-masque h3-datagram-send-allocations 0 ferrox-app-masque::tests::a_queued_datagram_is_the_buffer_the_caller_built
+carrier-masque h3-forward-buffer-reallocations 0 ferrox-app-masque::tests::a_forwarded_datagram_is_the_buffer_that_arrived
+carrier-masque h3-deliver-buffer-reallocations 0 ferrox-app-masque::tests::a_delivered_datagram_is_the_buffer_that_arrived
+carrier-masque h2-frame-body-allocations 0 ferrox-app-masque-h2::tests::a_frame_body_is_read_where_it_landed
+carrier-masque h2-capsule-staging-allocations 0 ferrox-app-masque-h2::tests::a_whole_capsule_is_read_where_it_landed
+carrier-masque h2-datagram-packet-queue-copies 0 ferrox-app-masque-h2::tests::a_datagram_capsule_goes_straight_to_its_lane
