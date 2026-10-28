@@ -3398,15 +3398,8 @@ fn healthping_settings(bytes: &[u8]) -> Result<Json, String> {
     if let Some(timeout) = timeout.filter(|nanos| *nanos != 0) {
         pairs.push(("timeout", Json::Str(format!("{timeout}ns"))));
     }
-    if let Some(raw) = method {
-        let method = raw.trim();
-        if method.is_empty() {
-            if !raw.is_empty() {
-                pairs.push(("httpMethod", Json::Str("GET".to_owned())));
-            }
-        } else {
-            pairs.push(("httpMethod", Json::Str(method.to_owned())));
-        }
+    if let Some(method) = method.filter(|method| !method.is_empty()) {
+        pairs.push(("httpMethod", Json::Str(method)));
     }
     Ok(object(pairs))
 }

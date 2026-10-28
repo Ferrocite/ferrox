@@ -156,6 +156,7 @@ struct BurstSettings {
     samples: usize,
     timeout: Duration,
     method: String,
+    reads_body: bool,
 }
 
 impl BurstSettings {
@@ -200,14 +201,16 @@ impl BurstSettings {
             .and_then(|nanos| u64::try_from(nanos).ok())
             .filter(|nanos| *nanos != 0)
             .map_or(BURST_TIMEOUT, Duration::from_nanos);
-        let method = method.map_or_else(
-            || "HEAD".to_owned(),
-            |method| {
-                let method = method.trim();
-                if method.is_empty() {
-                    "HEAD".to_owned()
+        let (method, reads_body) = method.map_or_else(
+            || ("HEAD".to_owned(), true),
+            |raw| {
+                let method = raw.trim();
+                if raw.is_empty() {
+                    ("HEAD".to_owned(), true)
+                } else if method.is_empty() {
+                    ("GET".to_owned(), false)
                 } else {
-                    method.to_owned()
+                    (method.to_owned(), true)
                 }
             },
         );
@@ -225,6 +228,7 @@ impl BurstSettings {
             },
             timeout,
             method,
+            reads_body,
         })
     }
 }
@@ -428,11 +432,12 @@ fn burst_check(
             let destination = settings.destination.clone();
             let connectivity = settings.connectivity.clone();
             let method = settings.method.clone();
+            let reads_body = settings.reads_body;
             let timeout = settings.timeout;
             let delay = random_below(window_nanos);
             std::thread::spawn(move || {
                 std::thread::sleep(Duration::from_nanos(delay));
-                let value = match probe(&outbound, &destination, &method, timeout, true) {
+                let value = match probe(&outbound, &destination, &method, timeout, reads_body) {
                     Ok(delay) => delay.as_nanos() as i64,
                     Err(_) if !connectivity.is_empty() => {
                         if probe(
@@ -440,7 +445,7 @@ fn burst_check(
                             &connectivity,
                             &method,
                             timeout,
-                            true,
+                            reads_body,
                         )
                         .is_ok()
                         {
@@ -851,17 +856,111 @@ mod tests {
 
     #[test]
     fn a_whitespace_http_method_is_get_but_reads_no_body() {
-        let method = |value: &str| {
+        let settings = |value: &str| {
             BurstSettings::parse(&Json::Obj(vec![(
                 "httpMethod".to_owned(),
                 Json::Str(value.to_owned()),
             )]))
             .expect("parses")
-            .method
         };
-        assert_eq!(method(""), "HEAD");
-        assert_eq!(method(" "), "GET");
-        assert_eq!(method(" get "), "get");
+        assert_eq!(settings("").method, "HEAD");
+        assert_eq!(settings(" ").method, "GET");
+        assert!(!settings(" ").reads_body);
+        assert_eq!(settings(" get ").method, "get");
+        assert!(settings(" get ").reads_body);
+    }
+
+    struct HeadOnly {
+        head: &'static [u8],
+        read: bool,
+    }
+
+    impl Read for HeadOnly {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.read {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "the body was read",
+                ));
+            }
+            self.read = true;
+            let len = self.head.len().min(buf.len());
+            buf[..len].copy_from_slice(&self.head[..len]);
+            Ok(len)
+        }
+    }
+
+    impl Write for HeadOnly {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_blank_ping_method_records_a_slow_body_as_alive() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).expect("reads") == 0 {
+                    return;
+                }
+                head.push(byte[0]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 32\r\n\r\n")
+                .expect("writes");
+            std::thread::sleep(Duration::from_secs(5));
+        });
+        let settings = BurstSettings::parse(&Json::Obj(vec![
+            (
+                "destination".to_owned(),
+                Json::Str(format!("http://127.0.0.1:{port}/generate_204")),
+            ),
+            ("timeout".to_owned(), Json::Str("2s".to_owned())),
+            ("sampling".to_owned(), Json::Num(1.0)),
+            ("httpMethod".to_owned(), Json::Str(" ".to_owned())),
+        ]))
+        .expect("parses");
+        let targets = vec![("proxy".to_owned(), Outbound::Freedom(Arc::default()))];
+        let observatory = Observatory {
+            snapshot: Mutex::new(Arc::from(Vec::new())),
+        };
+        let mut results = Vec::new();
+        burst_check(
+            &observatory,
+            &targets,
+            &settings,
+            &mut results,
+            1,
+            Duration::ZERO,
+        );
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.stats().all, 1);
+    }
+
+    #[test]
+    fn a_blank_ping_method_stops_after_the_headers() {
+        let settings = BurstSettings::parse(&Json::Obj(vec![(
+            "httpMethod".to_owned(),
+            Json::Str(" ".to_owned()),
+        )]))
+        .expect("parses");
+        let mut io = HeadOnly {
+            head: b"HTTP/1.1 200 OK\r\nContent-Length: 32\r\n\r\n",
+            read: false,
+        };
+        let url = ProbeUrl::parse("http://example.com/").expect("parses");
+        round_trip(&mut io, &url, &settings.method, settings.reads_body)
+            .expect("the headers are enough");
+        assert!(io.read);
     }
 
     #[test]
