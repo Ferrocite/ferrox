@@ -29303,6 +29303,7 @@ mod tests {
         175, 165, 189, 32, 28, 94, 83, 15, 239, 210, 113, 16, 253,
     ];
 
+    /// Keep the echo peer alive until its bytes are verified, so unread carrier framing cannot reset an in-flight reply.
     fn carried_round_trip(
         name: &str,
         accept: impl FnOnce(Connection) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>
@@ -29312,6 +29313,7 @@ mod tests {
     ) {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
+        let (verified, wait_verified) = std::sync::mpsc::sync_channel(0);
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             let (reader, writer) = accept(stream).expect("accepts carrier");
@@ -29320,6 +29322,7 @@ mod tests {
             stream.read_exact(&mut buf).expect("reads");
             stream.write_all(&buf).expect("echoes");
             stream.flush().expect("flushes");
+            wait_verified.recv().expect("peer verifies the echo");
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
@@ -29333,6 +29336,9 @@ mod tests {
         let mut back = vec![0u8; 16 * 1024];
         stream.read_exact(&mut back).expect("reads");
         assert_eq!(back, sent, "{name} round trips");
+        verified
+            .send(())
+            .expect("peer stays alive for verification");
         server.join().expect("joins");
     }
 
