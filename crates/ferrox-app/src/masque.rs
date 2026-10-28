@@ -2130,6 +2130,24 @@ mod tests {
     }
 
     #[test]
+    fn a_dual_stack_pool_grants_nothing_when_one_family_is_full() {
+        let mut pool = AddressPool::from_prefixes(&[
+            "10.14.0.1/30".to_owned(),
+            "fd14::1/126".to_owned(),
+        ])
+        .expect("a pool");
+        assert_eq!(pool.assign().len(), 2);
+        assert!(
+            pool.assign().is_empty(),
+            "a tunnel was granted only one family"
+        );
+        assert!(
+            pool.assign().is_empty(),
+            "the released v6 address was handed out alone"
+        );
+    }
+
+    #[test]
     fn a_v6_pool_keeps_its_last_host() {
         let mut pool = AddressPool::from_prefixes(&["fd14::1/126".to_owned()]).expect("a pool");
         assert_eq!(
