@@ -5202,4 +5202,20 @@ mod tests {
             "an authoritative empty answer is not retried through the system"
         );
     }
+
+    #[test]
+    fn a_skipped_fake_server_falls_back_to_the_system() {
+        let _guard = crate::stats::test_lock();
+        let _clear = ClearResolver;
+        let root = crate::json::parse(
+            r#"{"dns":{"servers":["fakedns"],"queryStrategy":"UseIP"},"fakeDns":{"ipPool":"198.18.0.0/15","poolSize":32768}}"#,
+        )
+        .expect("parses");
+        crate::dnsapp::install(&root).expect("install");
+        let (ips, _) = resolve_ips_ttl("localhost", 0);
+        assert!(
+            !ips.is_empty(),
+            "a skipped fake server falls back to the system"
+        );
+    }
 }
