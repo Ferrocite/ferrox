@@ -2122,20 +2122,29 @@ mod tests {
             },
         );
         let sender = inner.to_tunnel.clone();
+        let (filled, filling) = mpsc::channel();
         let (sent, done) = mpsc::channel();
-        std::thread::spawn(move || {
-            for packet in 0..=QUEUE {
-                if sender.send(vec![packet as u8]).is_err() {
-                    return;
-                }
+        let producer = std::thread::spawn(move || {
+            for packet in 0..QUEUE {
+                sender
+                    .send(vec![packet as u8])
+                    .expect("a packet below the bound");
             }
+            let _ = filled.send(());
+            sender.send(vec![0]).expect("the queue drains");
             let _ = sent.send(());
         });
+        filling
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the producer filled the queue");
         assert!(
             done.recv_timeout(Duration::from_millis(250)).is_err(),
             "the tunnel queue accepted more than {QUEUE} packets"
         );
         let _ = release.send(());
+        done.recv_timeout(Duration::from_secs(2))
+            .expect("the producer completed after the queue drained");
+        producer.join().expect("the producer thread");
     }
 
     #[test]
