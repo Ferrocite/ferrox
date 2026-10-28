@@ -1664,6 +1664,9 @@ fn hysteria_udp_idle(hy: Option<&Json>) -> Option<Duration> {
     let Some(value) = hy.and_then(|h| h.get("udpIdleTimeout")) else {
         return Some(Duration::from_secs(60));
     };
+    if matches!(value, Json::Null) {
+        return Some(Duration::from_secs(60));
+    }
     let seconds = value.as_u32()?;
     match seconds {
         0 => Some(Duration::from_secs(60)),
@@ -1684,23 +1687,27 @@ fn hysteria_quic_params(
         return Ok(None);
     };
     if !matches!(quic, Json::Obj(_)) {
-        return Err(());
+        return if matches!(quic, Json::Null) {
+            Ok(None)
+        } else {
+            Err(())
+        };
     }
     let text = |key: &str| -> Result<String, ()> {
         match quic.get(key) {
-            None => Ok(String::new()),
+            None | Some(Json::Null) => Ok(String::new()),
             Some(value) => value.as_str().map(str::to_ascii_lowercase).ok_or(()),
         }
     };
     let number = |key: &str| -> Result<u64, ()> {
         match quic.get(key) {
-            None => Ok(0),
+            None | Some(Json::Null) => Ok(0),
             Some(value) => json_u64(value).ok_or(()),
         }
     };
     let flag = |key: &str| -> Result<bool, ()> {
         match quic.get(key) {
-            None => Ok(false),
+            None | Some(Json::Null) => Ok(false),
             Some(value) => value.as_bool().ok_or(()),
         }
     };
@@ -1787,6 +1794,9 @@ fn bandwidth(value: Option<&Json>) -> Result<u64, ()> {
     let Some(value) = value else {
         return Ok(0);
     };
+    if matches!(value, Json::Null) {
+        return Ok(0);
+    }
     let text = value.as_str().ok_or(())?.trim().to_ascii_lowercase();
     if text.is_empty() {
         return Ok(0);
@@ -2469,6 +2479,121 @@ mod tests {
         assert_eq!(quic.max_idle_timeout, Duration::from_secs(10));
         assert_eq!(quic.max_incoming_streams, 64);
         assert!(quic.disable_path_mtu_discovery);
+    }
+
+    #[test]
+    fn a_hysteria_carrier_defaults_and_refuses_the_quic_bounds() {
+        use ferrox_core::hysteria::{BbrProfile, Congestion};
+        let carrier = |text: &str| {
+            stream_carrier(
+                crate::json::parse(text)
+                    .expect("parses")
+                    .get("streamSettings"),
+            )
+        };
+        // Absent and zero are both the reference's sixty seconds; the bounds themselves are carried.
+        for (json, want) in [
+            (
+                r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}}"#,
+                60,
+            ),
+            (
+                r#"{"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": 0}}"#,
+                60,
+            ),
+            (
+                r#"{"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": 2}}"#,
+                2,
+            ),
+            (
+                r#"{"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": 600}}"#,
+                600,
+            ),
+            (
+                r#"{"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": null}}"#,
+                60,
+            ),
+        ] {
+            let Carrier::Hysteria(config) = carrier(json) else {
+                panic!("a v2 hysteria carrier");
+            };
+            assert_eq!(config.udp_idle, Duration::from_secs(want));
+        }
+        for json in [
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": 1}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": 601}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": "60"}}"#,
+        ] {
+            assert!(
+                matches!(carrier(json), Carrier::Unknown { .. }),
+                "a refused idle reaches no lane: {json}"
+            );
+        }
+        // No block keeps the carrier's own shape, and the tree's extra congestion spelling still applies.
+        let Carrier::Hysteria(plain) = carrier(
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2, "congestion": "reno"}}"#,
+        ) else {
+            panic!("a plain hysteria carrier");
+        };
+        assert!(plain.quic.is_none(), "no block moves no QUIC field");
+        assert_eq!(plain.cc, Congestion::Reno);
+        // An empty block is the reference's own defaults, not the old carrier shape.
+        let Carrier::Hysteria(empty) = carrier(
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {}}}"#,
+        ) else {
+            panic!("an empty block is still read");
+        };
+        let quic = empty.quic.expect("the block is present");
+        assert_eq!(quic.congestion, Congestion::Bbr);
+        assert_eq!(quic.bbr_profile, BbrProfile::Standard);
+        assert_eq!(quic.init_stream_receive_window, 0, "zero means default");
+        // A null block is absent, and a null field is the zero the reference's unmarshal leaves.
+        let Carrier::Hysteria(absent) = carrier(
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": null}}"#,
+        ) else {
+            panic!("a null block is no block");
+        };
+        assert!(absent.quic.is_none());
+        let Carrier::Hysteria(nulls) = carrier(
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"congestion": null, "maxIdleTimeout": null, "disableGSO": null, "brutalUp": null}}}"#,
+        ) else {
+            panic!("null fields are the zero value");
+        };
+        let quic = nulls.quic.expect("the block is present");
+        assert_eq!(quic.congestion, Congestion::Bbr);
+        assert_eq!(quic.max_idle_timeout, Duration::ZERO);
+        assert!(!quic.disable_gso);
+        assert_eq!(quic.brutal_up, 0);
+        // The reference's validation, field by field.
+        for json in [
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"congestion": "cubic"}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"bbrProfile": "turbo"}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"congestion": "force-brutal"}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"brutalUp": "64 kbps"}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"initStreamReceiveWindow": 16383}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"maxIdleTimeout": 3}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"maxIdleTimeout": 121}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"keepAlivePeriod": 1}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"maxIncomingStreams": 7}}}"#,
+        ] {
+            assert!(
+                matches!(carrier(json), Carrier::Unknown { .. }),
+                "a value the reference refuses is refused: {json}"
+            );
+        }
+        // Both bounds of each accepted window are carried unchanged.
+        let Carrier::Hysteria(bounds) = carrier(
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"initStreamReceiveWindow": 16384, "maxStreamReceiveWindow": 16384, "initConnectionReceiveWindow": 16384, "maxConnectionReceiveWindow": 16384, "maxIdleTimeout": 4, "keepAlivePeriod": 2, "maxIncomingStreams": 8, "brutalUp": "512 kbps", "brutalDown": "512 kbps"}}}"#,
+        ) else {
+            panic!("the bounds are accepted");
+        };
+        let quic = bounds.quic.expect("quic params");
+        assert_eq!(quic.init_stream_receive_window, 16_384);
+        assert_eq!(quic.max_idle_timeout, Duration::from_secs(4));
+        assert_eq!(quic.keep_alive_period, Duration::from_secs(2));
+        assert_eq!(quic.max_incoming_streams, 8);
+        assert_eq!(quic.brutal_up, 65_536, "512 kbps is 65536 bytes a second");
+        assert_eq!(quic.brutal_down, 65_536);
     }
 
     #[test]

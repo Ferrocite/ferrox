@@ -2059,6 +2059,7 @@ impl Router<'_> {
             serve,
             masq,
             local,
+            udp_idle: _,
         } = self;
         let Some(shared) = routes.get(dcid).map(|i| Arc::clone(&i.conn)) else {
             return;
@@ -2333,6 +2334,188 @@ mod tests {
             &hysteria::Config::default()
         )
         .is_none());
+    }
+
+    #[test]
+    fn quic_params_move_the_wire_shape_and_the_defaults_stay() {
+        // The no-block path is the old lane byte for byte: the same idle, credit and stream cap the carrier has always advertised.
+        let default = peer_transport_params(&hysteria::Config::default());
+        assert_eq!(default.max_idle_timeout, crate::quic::IDLE_TIMEOUT_MS);
+        assert_eq!(default.initial_max_data, crate::quic::MAX_DATA);
+        assert_eq!(
+            default.initial_max_stream_data_bidi_remote,
+            crate::quic::MAX_STREAM_DATA
+        );
+        assert_eq!(default.initial_max_streams_bidi, crate::quic::MAX_STREAMS);
+        // A block moves every field the reference maps into the QUIC config.
+        let params = hysteria::QuicParams {
+            congestion: hysteria::Congestion::Reno,
+            bbr_profile: hysteria::BbrProfile::Aggressive,
+            brutal_up: 0,
+            brutal_down: 0,
+            brutal_disable_loss_compensation: false,
+            init_stream_receive_window: 65_536,
+            max_stream_receive_window: 131_072,
+            init_connection_receive_window: 196_608,
+            max_connection_receive_window: 262_144,
+            max_idle_timeout: Duration::from_secs(10),
+            keep_alive_period: Duration::ZERO,
+            disable_path_mtu_discovery: true,
+            disable_chrome_parrot: false,
+            disable_gso: false,
+            max_incoming_streams: 64,
+            disable_stateless_reset: true,
+        };
+        let config = hysteria::Config {
+            quic: Some(params),
+            ..hysteria::Config::default()
+        };
+        let shaped = peer_transport_params(&config);
+        assert_eq!(shaped.initial_max_data, 196_608);
+        assert_eq!(shaped.initial_max_stream_data_bidi_local, 65_536);
+        assert_eq!(shaped.initial_max_stream_data_bidi_remote, 65_536);
+        assert_eq!(shaped.initial_max_stream_data_uni, 65_536);
+        assert_eq!(shaped.initial_max_streams_bidi, 64);
+        assert_eq!(shaped.initial_max_streams_uni, 64);
+        assert_eq!(shaped.max_idle_timeout, 10_000);
+        assert!(shaped.stateless_reset_token.is_none(), "reset is disabled");
+    }
+
+    /// The server's transport parameters as a client reads them off a real handshake: the only place quiche exposes the shape it was configured with.
+    fn peer_transport_params(config: &hysteria::Config) -> quiche::TransportParams {
+        let minted = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("mints a certificate");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tag = format!("ferrox-hysteria-shape-{}-{stamp}", std::process::id());
+        let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+        let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+        std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
+        std::fs::write(
+            &key_path,
+            crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY"),
+        )
+        .expect("stages key");
+        let mut server = server_config(
+            cert_path.to_str().expect("ascii"),
+            key_path.to_str().expect("ascii"),
+            config,
+        )
+        .expect("a server config");
+        let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
+        client_config.verify_peer(false);
+        client_config
+            .set_application_protos(&[crate::quic::ALPN])
+            .expect("negotiates");
+        let client_addr = "127.0.0.1:50000".parse().expect("addr");
+        let server_addr = "127.0.0.1:443".parse().expect("addr");
+        let client_cid = [1u8; SCID_LEN];
+        let server_cid = [2u8; SCID_LEN];
+        let mut client = quiche::connect(
+            None,
+            &quiche::ConnectionId::from_ref(&client_cid),
+            client_addr,
+            server_addr,
+            &mut client_config,
+        )
+        .expect("connects");
+        let mut server = quiche::accept(
+            &quiche::ConnectionId::from_ref(&server_cid),
+            None,
+            server_addr,
+            client_addr,
+            &mut server,
+        )
+        .expect("accepts");
+        let mut up = Unfilled::<MAX_DATAGRAM>::new();
+        let mut down = Unfilled::<MAX_DATAGRAM>::new();
+        for _ in 0..4 {
+            while let Ok((n, _)) = client.send(up.as_mut()) {
+                server
+                    .recv(
+                        &mut up.as_mut()[..n],
+                        quiche::RecvInfo {
+                            from: client_addr,
+                            to: server_addr,
+                        },
+                    )
+                    .expect("drives the server");
+            }
+            while let Ok((n, _)) = server.send(down.as_mut()) {
+                client
+                    .recv(
+                        &mut down.as_mut()[..n],
+                        quiche::RecvInfo {
+                            from: server_addr,
+                            to: client_addr,
+                        },
+                    )
+                    .expect("drives the client");
+            }
+            if client.is_established() {
+                break;
+            }
+        }
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+        client
+            .peer_transport_params()
+            .cloned()
+            .expect("the server's shape arrived")
+    }
+
+    #[test]
+    fn a_datagram_association_reaps_on_the_configured_idle() {
+        let session = idle_session();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut udp = HashMap::new();
+        udp.insert(
+            1u32,
+            UdpFlow {
+                target: Arc::new(UdpSocket::bind("127.0.0.1:0").expect("binds")),
+                defrag: Defrag::new(),
+                last: Instant::now() - Duration::from_secs(3),
+                stop: Arc::clone(&stop),
+            },
+        );
+        let route = vec![0u8; SCID_LEN];
+        let mut routes = HashMap::new();
+        routes.insert(
+            route.clone(),
+            Inbound {
+                conn: Arc::clone(&session.shared),
+                client_cid: Vec::new(),
+                initial_dcid: Vec::new(),
+                authed: true,
+                settings_sent: true,
+                settings_done: true,
+                auth_buf: Vec::new(),
+                served: HashSet::new(),
+                wakes: Driver::new(),
+                udp,
+            },
+        );
+        let serve: Serve = Arc::new(|_| {});
+        let auths = Vec::new();
+        let mut router = Router {
+            sock: Arc::clone(&session.sock),
+            local: session.local,
+            out: Unfilled::new(),
+            auths: &auths,
+            serve: &serve,
+            masq: Arc::from(Masquerade::NotFound),
+            routes,
+            udp_idle: Duration::from_secs(2),
+        };
+        router.idle();
+        let inbound = router.routes.get(&route).expect("the connection survives");
+        assert!(
+            inbound.udp.is_empty(),
+            "a three-second-quiet association was not reaped at two"
+        );
+        assert!(stop.load(Ordering::Relaxed), "its reader is told to stop");
     }
 
     #[test]
