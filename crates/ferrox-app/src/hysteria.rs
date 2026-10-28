@@ -122,6 +122,14 @@ impl Driver {
         })
     }
 
+    fn wake(&self, stream: u64) {
+        if let Ok(streams) = self.streams.lock() {
+            if let Some(wake) = streams.get(&stream) {
+                wake.bump();
+            }
+        }
+    }
+
     fn spawn(self: &Arc<Self>, session: &Session) {
         let shared = Arc::clone(&session.shared);
         let sock = Arc::clone(&session.sock);
@@ -562,50 +570,55 @@ impl Flow {
             self.at += n;
             return Ok(Some(n));
         }
-        let before = self.wake.as_ref().map_or(0, |wake| wake.seen());
-        let read = {
-            let Ok(mut conn) = self.session.shared.lock() else {
-                return Err(broken());
-            };
-            if conn.is_closed() {
-                return Ok(Some(0));
-            }
-            match conn.stream_recv(self.stream, buf) {
-                Ok((n, _)) => {
-                    crate::quic::flush_egress(&mut conn, &self.session.sock);
-                    Some(n)
+        loop {
+            let before = self.wake.as_ref().map_or(0, |wake| wake.seen());
+            let read = {
+                let Ok(mut conn) = self.session.shared.lock() else {
+                    return Err(broken());
+                };
+                if conn.is_closed() {
+                    return Ok(Some(0));
                 }
-                Err(quiche::Error::Done) => None,
-                Err(_) => return Err(broken()),
-            }
-        };
-        if let Some(n) = read {
-            return Ok(Some(n));
-        }
-        if self.drive {
-            let _ = drive_once(&self.session, STREAM_POLL);
-            return Ok(None);
-        }
-        let pumped = self.wake.is_some()
-            && self
-                .session
-                .driver
-                .as_ref()
-                .is_none_or(|driver| driver.running());
-        if let Some(wake) = self.wake.as_ref().filter(|_| pumped) {
-            wake.wait(before, STREAM_POLL);
-            return Ok(None);
-        }
-        {
-            let Ok(conn) = self.session.shared.lock() else {
-                return Err(broken());
+                match conn.stream_recv(self.stream, buf) {
+                    Ok((n, _)) => {
+                        crate::quic::flush_egress(&mut conn, &self.session.sock);
+                        Some(n)
+                    }
+                    Err(quiche::Error::Done) => None,
+                    Err(_) => return Err(broken()),
+                }
             };
-            if conn.is_closed() {
-                return Ok(Some(0));
+            if let Some(n) = read {
+                return Ok(Some(n));
             }
+            if self.drive {
+                let _ = drive_once(&self.session, STREAM_POLL);
+                return Ok(None);
+            }
+            let pumped = self.wake.is_some()
+                && self
+                    .session
+                    .driver
+                    .as_ref()
+                    .is_none_or(|driver| driver.running());
+            if let Some(wake) = self.wake.as_ref().filter(|_| pumped) {
+                wake.wait(before, STREAM_POLL);
+                if wake.seen() != before {
+                    continue;
+                }
+                return Ok(None);
+            }
+            {
+                let Ok(conn) = self.session.shared.lock() else {
+                    return Err(broken());
+                };
+                if conn.is_closed() {
+                    return Ok(Some(0));
+                }
+            }
+            std::thread::sleep(STREAM_POLL);
+            return Ok(None);
         }
-        std::thread::sleep(STREAM_POLL);
-        Ok(None)
     }
 }
 
@@ -2010,7 +2023,6 @@ impl Router<'_> {
                     return;
                 };
                 let wake = inbound.wakes.register(id);
-                wake.bump();
                 if inbound.served.contains(&id) {
                     continue;
                 }
@@ -2036,6 +2048,19 @@ impl Router<'_> {
             }
             relay_datagrams(routes, sock, &shared, dcid, &mut conn);
             flush(sock, &mut conn, out.as_mut());
+        }
+    }
+
+    fn wake(&self) {
+        for inbound in self.routes.values() {
+            let Ok(conn) = inbound.conn.lock() else {
+                continue;
+            };
+            for id in conn.readable() {
+                if id >= FIRST_FLOW_STREAM && id % 4 == 0 {
+                    inbound.wakes.wake(id);
+                }
+            }
         }
     }
 
@@ -2167,6 +2192,7 @@ pub(crate) fn serve_loop(
                     };
                     route_packet(&mut router, &mut template, packet, from);
                 }
+                router.wake();
                 continue;
             }
             crate::quic::Drain::Empty => {
@@ -2178,6 +2204,7 @@ pub(crate) fn serve_loop(
         match router.sock.recv_from(buf.as_mut()) {
             Ok((n, from)) => {
                 route_packet(&mut router, &mut template, &mut buf.as_mut()[..n], from);
+                router.wake();
             }
             Err(e)
                 if matches!(
