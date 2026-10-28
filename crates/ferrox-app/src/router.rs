@@ -5146,4 +5146,36 @@ mod tests {
             .collect();
         assert_eq!(targets, ["a", "b"]);
     }
+
+    struct ClearResolver;
+
+    impl Drop for ClearResolver {
+        fn drop(&mut self) {
+            let _ = crate::dnsapp::install(&object(vec![]));
+        }
+    }
+
+    #[test]
+    fn a_routed_lookup_uses_the_configured_family_strategy() {
+        let _guard = crate::stats::test_lock();
+        let _clear = ClearResolver;
+        let root = object(vec![(
+            "dns",
+            object(vec![
+                ("queryStrategy", text("UseIPv4")),
+                ("servers", array(vec![text("localhost")])),
+                (
+                    "hosts",
+                    object(vec![(
+                        "dual.test",
+                        array(vec![text("10.0.0.1"), text("2001:db8::1")]),
+                    )]),
+                ),
+            ]),
+        )]);
+        crate::dnsapp::install(&root).expect("install");
+        let (ips, ttl) = resolve_ips_ttl("dual.test", 0);
+        assert_eq!(ttl, 10);
+        assert_eq!(ips, vec!["10.0.0.1".parse::<IpAddr>().expect("ipv4")]);
+    }
 }
