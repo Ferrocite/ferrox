@@ -154,20 +154,14 @@ impl ferrox_core::tls::RecordAlignment for DeadlineStream {}
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
-/// The TCP half of a MASQUE inbound: a listener on the port the QUIC socket
-/// already owns, one thread per HTTP/2 connection. A port the platform will
-/// not give twice leaves h3 serving and names the h2 listener it could not raise.
+/// The TCP half of a MASQUE inbound: one thread per HTTP/2 connection on the
+/// listener the inbound bound beside its QUIC socket.
 pub(crate) fn serve(
     identity: Arc<TlsServerConfig>,
     shared: Arc<Shared>,
     spec: Arc<ServerSpec>,
-    local: SocketAddr,
+    listener: TcpListener,
 ) {
-    let address = SocketAddr::new(local.ip(), local.port());
-    let Ok(listener) = TcpListener::bind(address) else {
-        eprintln!("masque: no HTTP/2 listener on {address}; h3 still serves");
-        return;
-    };
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else {
