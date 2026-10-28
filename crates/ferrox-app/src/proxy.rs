@@ -18856,6 +18856,16 @@ pub(crate) mod lane_pool {
         pool
     }
 
+    /// How many reads a lane with bytes runs before it hands its worker back: a download that never empties would otherwise hold a worker for the life of the cell and starve every queued upload.
+    const MORE_BURST: usize = 8;
+
+    fn park(pool: &Pool, lane: Lane) {
+        let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        ready.push_back(lane);
+        drop(ready);
+        pool.notify.notify_one();
+    }
+
     fn worker_loop(pool: &Pool) {
         loop {
             let mut lane = {
@@ -18870,6 +18880,7 @@ pub(crate) mod lane_pool {
                         .unwrap_or_else(PoisonError::into_inner);
                 }
             };
+            let mut burst = 0usize;
             loop {
                 let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     let _step = crate::proxy::RelayStep::enter();
@@ -18877,12 +18888,16 @@ pub(crate) mod lane_pool {
                 }));
                 match stepped {
                     // Still has bytes: a requeue pays the pool's lock and wakeup on every read.
-                    Ok(Next::More) => {}
+                    Ok(Next::More) => {
+                        burst += 1;
+                        if burst < MORE_BURST {
+                            continue;
+                        }
+                        park(pool, lane);
+                        break;
+                    }
                     Ok(Next::Idle) => {
-                        let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
-                        ready.push_back(lane);
-                        drop(ready);
-                        pool.notify.notify_one();
+                        park(pool, lane);
                         break;
                     }
                     Ok(Next::Done) => {
@@ -19036,6 +19051,49 @@ pub(crate) mod lane_pool {
                 "{waiting} of {lanes} lanes reached their read: the pool cannot carry the cell"
             );
             assert_eq!(finished.load(Ordering::Relaxed), lanes);
+        }
+
+        /// A lane that always has bytes must hand its worker back: with every worker holding a
+        /// download, a queued upload never runs and the cell's other direction times out.
+        #[test]
+        fn a_moving_lane_yields_to_the_cell() {
+            let pool = spawn_pool();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let reached = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            for _ in 0..worker_count() {
+                let stop = Arc::clone(&stop);
+                submit_to(
+                    &pool,
+                    Box::new(move || {
+                        if stop.load(Ordering::Relaxed) {
+                            Next::Done
+                        } else {
+                            Next::More
+                        }
+                    }),
+                    Box::new(|| {}),
+                );
+            }
+            let stop_for_upload = Arc::clone(&stop);
+            let reached_for_upload = Arc::clone(&reached);
+            submit_to(
+                &pool,
+                Box::new(move || {
+                    reached_for_upload.store(true, Ordering::Relaxed);
+                    stop_for_upload.store(true, Ordering::Relaxed);
+                    Next::Done
+                }),
+                Box::new(|| {}),
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !reached.load(Ordering::Relaxed) && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            stop.store(true, Ordering::Relaxed);
+            assert!(
+                reached.load(Ordering::Relaxed),
+                "a lane that always had bytes starved the cell's upload"
+            );
         }
     }
 }
