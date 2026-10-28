@@ -50,12 +50,23 @@ pub(crate) struct Session {
     pub(crate) udp_supported: bool,
     /// The pooled connection's one socket reader; `None` on a dial that drives the socket itself.
     pub(crate) driver: Option<Arc<Driver>>,
+    /// Wakes a writer whose stream filled its window when the reader has taken a datagram: an ACK frees send capacity, and a 5 ms poll on a loopback ACK is fifty times too coarse.
+    pub(crate) send_wake: Option<Arc<StreamWake>>,
 }
 
 /// One stream's latch: the pump bumps it when a datagram filled the stream, and the flow reading it parks until then instead of waiting on the shared socket with the others.
-struct StreamWake {
+pub(crate) struct StreamWake {
     gen: Mutex<u64>,
     cv: Condvar,
+}
+
+impl StreamWake {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            gen: Mutex::new(0),
+            cv: Condvar::new(),
+        })
+    }
 }
 
 impl StreamWake {
@@ -63,7 +74,7 @@ impl StreamWake {
         self.gen.lock().map_or(0, |gen| *gen)
     }
 
-    fn bump(&self) {
+    pub(crate) fn bump(&self) {
         if let Ok(mut gen) = self.gen.lock() {
             *gen = gen.wrapping_add(1);
         }
@@ -85,34 +96,52 @@ pub(crate) struct Driver {
     alive: AtomicBool,
     stop: AtomicBool,
     streams: Mutex<HashMap<u64, Arc<StreamWake>>>,
+    send: Arc<StreamWake>,
 }
 
 impl Driver {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             alive: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             streams: Mutex::new(HashMap::new()),
+            send: StreamWake::new(),
         })
     }
 
-    fn running(&self) -> bool {
+    pub(crate) fn running(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
 
-    fn stop(&self) {
+    pub(crate) fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    fn register(&self, stream: u64) -> Arc<StreamWake> {
-        let wake = Arc::new(StreamWake {
-            gen: Mutex::new(0),
-            cv: Condvar::new(),
-        });
+    pub(crate) fn register(&self, stream: u64) -> Arc<StreamWake> {
         if let Ok(mut streams) = self.streams.lock() {
+            if let Some(wake) = streams.get(&stream) {
+                return Arc::clone(wake);
+            }
+            let wake = StreamWake::new();
             streams.insert(stream, Arc::clone(&wake));
+            return wake;
         }
-        wake
+        StreamWake::new()
+    }
+
+    /// Binds this reader to a session and starts it: the session, its flows and its writers all hold one driver.
+    pub(crate) fn attach(self: &Arc<Self>, session: &mut Session) {
+        session.driver = Some(Arc::clone(self));
+        session.send_wake = Some(Arc::clone(&self.send));
+        self.spawn(session);
+    }
+
+    fn wake(&self, stream: u64) {
+        if let Ok(streams) = self.streams.lock() {
+            if let Some(wake) = streams.get(&stream) {
+                wake.bump();
+            }
+        }
     }
 
     fn spawn(self: &Arc<Self>, session: &Session) {
@@ -128,6 +157,7 @@ impl Driver {
                 local,
                 udp_supported: false,
                 driver: None,
+                send_wake: None,
             };
             let mut ready = Vec::with_capacity(16);
             while !pump.stop.load(Ordering::Relaxed) {
@@ -142,6 +172,7 @@ impl Driver {
                     std::thread::sleep(STREAM_POLL);
                     continue;
                 }
+                pump.send.bump();
                 ready.clear();
                 if let Ok(conn) = session.shared.lock() {
                     ready.extend(conn.readable());
@@ -166,6 +197,7 @@ impl Driver {
 pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
     let deadline = Instant::now() + crate::quic::SEND_WAIT;
     loop {
+        let before = session.send_wake.as_ref().map_or(0, |wake| wake.seen());
         let last = buf.is_empty();
         if last && !fin {
             return true;
@@ -180,7 +212,10 @@ pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool
                 if buf.is_empty() && (!fin || last) {
                     return true;
                 }
-                if written == 0 && Instant::now() >= deadline {
+                if written > 0 {
+                    continue;
+                }
+                if Instant::now() >= deadline {
                     return false;
                 }
             }
@@ -192,7 +227,11 @@ pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool
             Err(_) => return false,
         }
         drop(conn);
-        std::thread::sleep(STREAM_POLL);
+        if let Some(wake) = session.send_wake.as_ref() {
+            wake.wait(before, STREAM_POLL);
+        } else {
+            std::thread::sleep(STREAM_POLL);
+        }
     }
 }
 
@@ -414,6 +453,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         local,
         udp_supported: false,
         driver: None,
+        send_wake: None,
     };
     if !control_settings(&session) {
         return None;
@@ -438,6 +478,18 @@ pub(crate) struct Flow {
 }
 
 impl Flow {
+    pub(crate) fn with_wake(mut self, wake: Option<Arc<StreamWake>>) -> Self {
+        self.wake = wake;
+        self
+    }
+
+    /// Carries the dial's reader and send wake onto the flow, so a pooled flow's writer waits on the ACK the driver takes instead of a 5 ms poll.
+    pub(crate) fn with_session(mut self, session: &Session) -> Self {
+        self.session.driver.clone_from(&session.driver);
+        self.session.send_wake.clone_from(&session.send_wake);
+        self
+    }
+
     pub(crate) fn from_parts(
         shared: Arc<Mutex<quiche::Connection>>,
         sock: Arc<crate::quic::Datagram>,
@@ -453,6 +505,7 @@ impl Flow {
                 local,
                 udp_supported: false,
                 driver: None,
+                send_wake: None,
             },
             stream,
             backlog,
@@ -514,11 +567,12 @@ impl Flow {
                 let _ = drive_once(&self.session, STREAM_POLL);
                 continue;
             }
-            let pumped = self
-                .session
-                .driver
-                .as_ref()
-                .is_some_and(|driver| driver.running());
+            let pumped = self.wake.is_some()
+                && self
+                    .session
+                    .driver
+                    .as_ref()
+                    .is_none_or(|driver| driver.running());
             if let Some(wake) = self.wake.as_ref().filter(|_| pumped) {
                 wake.wait(before, STREAM_POLL);
                 continue;
@@ -540,7 +594,7 @@ impl Flow {
     /// and found nothing. The relay's fixed lane re-queues on `None`, so a quiet flow hands its
     /// worker back instead of parking it for the life of the stream; `Read` loops over the same
     /// step, which is what a caller that asked for a blocking read still gets.
-    fn read_step(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+    pub(crate) fn read_step(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
         if buf.is_empty() {
             return Ok(Some(0));
         }
@@ -551,49 +605,55 @@ impl Flow {
             self.at += n;
             return Ok(Some(n));
         }
-        let before = self.wake.as_ref().map_or(0, |wake| wake.seen());
-        let read = {
-            let Ok(mut conn) = self.session.shared.lock() else {
-                return Err(broken());
-            };
-            if conn.is_closed() {
-                return Ok(Some(0));
-            }
-            match conn.stream_recv(self.stream, buf) {
-                Ok((n, _)) => {
-                    crate::quic::flush_egress(&mut conn, &self.session.sock);
-                    Some(n)
+        loop {
+            let before = self.wake.as_ref().map_or(0, |wake| wake.seen());
+            let read = {
+                let Ok(mut conn) = self.session.shared.lock() else {
+                    return Err(broken());
+                };
+                if conn.is_closed() {
+                    return Ok(Some(0));
                 }
-                Err(quiche::Error::Done) => None,
-                Err(_) => return Err(broken()),
-            }
-        };
-        if let Some(n) = read {
-            return Ok(Some(n));
-        }
-        if self.drive {
-            let _ = drive_once(&self.session, STREAM_POLL);
-            return Ok(None);
-        }
-        let pumped = self
-            .session
-            .driver
-            .as_ref()
-            .is_some_and(|driver| driver.running());
-        if let Some(wake) = self.wake.as_ref().filter(|_| pumped) {
-            wake.wait(before, STREAM_POLL);
-            return Ok(None);
-        }
-        {
-            let Ok(conn) = self.session.shared.lock() else {
-                return Err(broken());
+                match conn.stream_recv(self.stream, buf) {
+                    Ok((n, _)) => {
+                        crate::quic::flush_egress(&mut conn, &self.session.sock);
+                        Some(n)
+                    }
+                    Err(quiche::Error::Done) => None,
+                    Err(_) => return Err(broken()),
+                }
             };
-            if conn.is_closed() {
-                return Ok(Some(0));
+            if let Some(n) = read {
+                return Ok(Some(n));
             }
+            if self.drive {
+                let _ = drive_once(&self.session, STREAM_POLL);
+                return Ok(None);
+            }
+            let pumped = self.wake.is_some()
+                && self
+                    .session
+                    .driver
+                    .as_ref()
+                    .is_none_or(|driver| driver.running());
+            if let Some(wake) = self.wake.as_ref().filter(|_| pumped) {
+                wake.wait(before, STREAM_POLL);
+                if wake.seen() != before {
+                    continue;
+                }
+                return Ok(None);
+            }
+            {
+                let Ok(conn) = self.session.shared.lock() else {
+                    return Err(broken());
+                };
+                if conn.is_closed() {
+                    return Ok(Some(0));
+                }
+            }
+            std::thread::sleep(STREAM_POLL);
+            return Ok(None);
         }
-        std::thread::sleep(STREAM_POLL);
-        Ok(None)
     }
 }
 
@@ -812,8 +872,7 @@ fn open_pooled(dial: &Dial, header: &[u8]) -> Option<Flow> {
     }
     let mut session = connect(dial)?;
     let driver = Driver::new();
-    session.driver = Some(Arc::clone(&driver));
-    driver.spawn(&session);
+    driver.attach(&mut session);
     let Some(flow) = open_flow(&session, FIRST_FLOW_STREAM, header) else {
         driver.stop();
         return None;
@@ -962,6 +1021,7 @@ struct Inbound {
     settings_done: bool,
     auth_buf: Vec<u8>,
     served: HashSet<u64>,
+    wakes: Arc<Driver>,
     udp: HashMap<u32, UdpFlow>,
 }
 
@@ -999,6 +1059,7 @@ fn drain_settings(conn: &mut quiche::Connection) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_stream(
     shared: &Arc<Mutex<quiche::Connection>>,
     sock: &Arc<crate::quic::Datagram>,
@@ -1007,6 +1068,7 @@ fn serve_stream(
     serve: &Serve,
     peer: SocketAddr,
     masq: &Masquerade,
+    wake: Arc<StreamWake>,
 ) {
     let mut head = Vec::with_capacity(8);
     let mut room = Unfilled::<64>::new();
@@ -1014,6 +1076,7 @@ fn serve_stream(
         if head.len() >= 8 {
             return;
         }
+        let before = wake.seen();
         let read = {
             let Ok(mut conn) = shared.lock() else {
                 return;
@@ -1035,7 +1098,7 @@ fn serve_stream(
                     return;
                 }
             }
-            std::thread::sleep(STREAM_POLL);
+            wake.wait(before, STREAM_POLL);
             continue;
         }
         if head.is_empty() {
@@ -1064,6 +1127,7 @@ fn serve_stream(
         head,
         false,
     );
+    flow.wake = Some(wake);
     // The prefix stays in the buffer and the cursor steps over it, so no payload byte is moved.
     flow.at = prefix;
     serve(flow);
@@ -1914,6 +1978,7 @@ impl Router<'_> {
                 settings_done: false,
                 auth_buf: Vec::new(),
                 served: HashSet::new(),
+                wakes: Driver::new(),
                 udp: HashMap::new(),
             },
         );
@@ -1991,6 +2056,7 @@ impl Router<'_> {
                 let Some(inbound) = routes.get_mut(dcid) else {
                     return;
                 };
+                let wake = inbound.wakes.register(id);
                 if inbound.served.contains(&id) {
                     continue;
                 }
@@ -2010,11 +2076,25 @@ impl Router<'_> {
                         &thread_serve,
                         peer,
                         &thread_masq,
+                        wake,
                     );
                 });
             }
             relay_datagrams(routes, sock, &shared, dcid, &mut conn);
             flush(sock, &mut conn, out.as_mut());
+        }
+    }
+
+    fn wake(&self) {
+        for inbound in self.routes.values() {
+            let Ok(conn) = inbound.conn.lock() else {
+                continue;
+            };
+            for id in conn.readable() {
+                if id >= FIRST_FLOW_STREAM && id % 4 == 0 {
+                    inbound.wakes.wake(id);
+                }
+            }
         }
     }
 
@@ -2146,6 +2226,7 @@ pub(crate) fn serve_loop(
                     };
                     route_packet(&mut router, &mut template, packet, from);
                 }
+                router.wake();
                 continue;
             }
             crate::quic::Drain::Empty => {
@@ -2157,6 +2238,7 @@ pub(crate) fn serve_loop(
         match router.sock.recv_from(buf.as_mut()) {
             Ok((n, from)) => {
                 route_packet(&mut router, &mut template, &mut buf.as_mut()[..n], from);
+                router.wake();
             }
             Err(e)
                 if matches!(
@@ -2239,6 +2321,7 @@ mod tests {
             local,
             udp_supported: false,
             driver: None,
+            send_wake: None,
         }
     }
 
