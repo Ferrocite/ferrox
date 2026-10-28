@@ -185,6 +185,7 @@ pub(crate) struct Client {
     status: Option<u16>,
     continuation: Option<(u32, Vec<u8>)>,
     send_window: i64,
+    peer_window: i64,
     connection_window: i64,
     queued: VecDeque<Vec<u8>>,
     queued_at: usize,
@@ -255,6 +256,7 @@ impl Client {
             status: None,
             continuation: None,
             send_window: DEFAULT_WINDOW,
+            peer_window: DEFAULT_WINDOW,
             connection_window: DEFAULT_WINDOW,
             queued: VecDeque::new(),
             queued_at: 0,
@@ -415,7 +417,9 @@ impl Client {
                         body[at + 5],
                     ]);
                     if setting == SETTINGS_INITIAL_WINDOW {
-                        self.send_window = i64::from(value);
+                        let next = i64::from(value);
+                        self.send_window += next - self.peer_window;
+                        self.peer_window = next;
                     }
                     at += 6;
                 }
@@ -640,6 +644,7 @@ struct Session {
     queued: VecDeque<Vec<u8>>,
     queued_at: usize,
     send_window: i64,
+    peer_window: i64,
     granted: Option<Granted>,
     addrs: Vec<IpAddr>,
     end: bool,
@@ -659,6 +664,7 @@ impl Session {
             queued: VecDeque::new(),
             queued_at: 0,
             send_window: DEFAULT_WINDOW,
+            peer_window: DEFAULT_WINDOW,
             granted: None,
             addrs: Vec::new(),
             end: false,
@@ -730,7 +736,9 @@ impl Session {
                         body[at + 5],
                     ]);
                     if setting == SETTINGS_INITIAL_WINDOW {
-                        self.send_window = i64::from(value);
+                        let next = i64::from(value);
+                        self.send_window += next - self.peer_window;
+                        self.peer_window = next;
                     }
                     at += 6;
                 }
@@ -1019,6 +1027,7 @@ mod tests {
             status: None,
             continuation: None,
             send_window: DEFAULT_WINDOW,
+            peer_window: DEFAULT_WINDOW,
             connection_window: DEFAULT_WINDOW,
             queued: std::collections::VecDeque::new(),
             queued_at: 0,
@@ -1225,20 +1234,20 @@ mod tests {
     }
 
     #[test]
-    fn a_repeated_initial_window_keeps_the_client_credit() {
+    fn a_changed_initial_window_keeps_the_client_credit() {
         let mut client = bare_client();
         client.on(h2::T_SETTINGS, 0, 0, &initial_window(100));
         client.on(h2::T_WINDOW, 0, 1, &1_000u32.to_be_bytes());
         assert_eq!(client.send_window, 1_100, "the update grants credit");
-        client.on(h2::T_SETTINGS, 0, 0, &initial_window(100));
+        client.on(h2::T_SETTINGS, 0, 0, &initial_window(50));
         assert_eq!(
-            client.send_window, 1_100,
-            "repeating the initial value moves the window by zero"
+            client.send_window, 1_050,
+            "the new initial value moves the window by its difference"
         );
     }
 
     #[test]
-    fn a_repeated_initial_window_keeps_the_server_credit() {
+    fn a_changed_initial_window_keeps_the_server_credit() {
         let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
         let mut wire = Wire {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
@@ -1248,10 +1257,10 @@ mod tests {
         session.on(&mut wire, h2::T_SETTINGS, 0, 0, &initial_window(100));
         session.on(&mut wire, h2::T_WINDOW, 0, 0, &1_000u32.to_be_bytes());
         assert_eq!(session.send_window, 1_100, "the update grants credit");
-        session.on(&mut wire, h2::T_SETTINGS, 0, 0, &initial_window(100));
+        session.on(&mut wire, h2::T_SETTINGS, 0, 0, &initial_window(50));
         assert_eq!(
-            session.send_window, 1_100,
-            "repeating the initial value moves the window by zero"
+            session.send_window, 1_050,
+            "the new initial value moves the window by its difference"
         );
     }
 
