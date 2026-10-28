@@ -283,19 +283,49 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
         return false;
     }
     let mut room = Unfilled::<RECV_ROOM>::new();
-    let incoming = match session.sock.recv_from(room.as_mut()) {
-        Ok(found) => Some(found),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
-        {
-            None
+    #[cfg(target_os = "linux")]
+    let mut batch = crate::quic::Batch::new();
+    #[cfg(target_os = "linux")]
+    let mut batched = false;
+    let incoming = {
+        #[cfg(target_os = "linux")]
+        match crate::quic::recv_batch(&session.sock, &mut batch) {
+            crate::quic::Drain::Read => {
+                batched = true;
+                Some((0, session.local))
+            }
+            crate::quic::Drain::Empty => None,
+            crate::quic::Drain::Unbatchable => match session.sock.recv_from(room.as_mut()) {
+                Ok(found) => Some(found),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    None
+                }
+                Err(_) => {
+                    std::thread::sleep(wait);
+                    return false;
+                }
+            },
         }
-        Err(_) => {
-            std::thread::sleep(wait);
-            return false;
+        #[cfg(not(target_os = "linux"))]
+        match session.sock.recv_from(room.as_mut()) {
+            Ok(found) => Some(found),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                None
+            }
+            Err(_) => {
+                std::thread::sleep(wait);
+                return false;
+            }
         }
     };
     let Ok(mut conn) = session.shared.lock() else {
@@ -303,6 +333,22 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
     };
     if conn.is_closed() {
         return false;
+    }
+    #[cfg(target_os = "linux")]
+    if batched {
+        for at in 0..batch.len() {
+            let Some((bytes, from)) = batch.at(at) else {
+                continue;
+            };
+            let info = quiche::RecvInfo {
+                from,
+                to: session.local,
+            };
+            let _ = conn.recv(bytes, info);
+        }
+        take_queued(&mut conn, session);
+        crate::quic::flush_egress(&mut conn, &session.sock);
+        return true;
     }
     match incoming {
         Some((n, from)) => {
@@ -1057,15 +1103,14 @@ pub(crate) fn server_config(
     config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
     // A served connection always carries an auth validator, and the reference enables the datagram lane exactly when one is present, so the lane is on unconditionally here; the depths are the peer's unsent-datagram queue, matching `udpMessageChanSize`.
     config.enable_dgram(true, 1024, 1024);
-    config.set_max_idle_timeout(crate::quic::IDLE_TIMEOUT_MS);
-    config.set_initial_max_data(crate::quic::MAX_DATA);
-    config.set_initial_max_stream_data_bidi_local(crate::quic::MAX_STREAM_DATA);
-    config.set_initial_max_stream_data_bidi_remote(crate::quic::MAX_STREAM_DATA);
-    config.set_initial_max_stream_data_uni(crate::quic::MAX_STREAM_DATA);
-    config.set_initial_max_streams_bidi(crate::quic::MAX_STREAMS);
-    config.set_initial_max_streams_uni(crate::quic::MAX_STREAMS);
-    if let Some(params) = quic {
-        crate::quic::apply_hysteria_quic(&mut config, params, true);
+    match quic {
+        Some(params) => {
+            crate::quic::apply_hysteria_quic(&mut config, params, true);
+            config.set_max_send_udp_payload_size(crate::quic::MAX_DATAGRAM);
+            config.set_max_recv_udp_payload_size(crate::quic::MAX_DATAGRAM);
+        }
+        // The served side carries the same ceilings as the dial: without them quiche's autotuner has no room above the initial window, and a peer's upload is paced by `window / rtt` for its whole life.
+        None => crate::quic::tune_transport(&mut config),
     }
     config.load_cert_chain_from_pem_file(cert_path).ok()?;
     config.load_priv_key_from_pem_file(key_path).ok()?;
@@ -2075,8 +2120,9 @@ impl Router<'_> {
             if conn.recv(packet, info).is_err() {
                 return;
             }
-            flush(sock, &mut conn, out.as_mut());
+            // An established lane's acknowledgements leave with the batch that carried the packet, in `wake`, not one send per datagram.
             if !conn.is_established() || conn.is_closed() {
+                flush(sock, &mut conn, out.as_mut());
                 return;
             }
             let Some((mut settings_done, settings_sent, authed)) = routes
@@ -2151,13 +2197,15 @@ impl Router<'_> {
                 });
             }
             relay_datagrams(routes, sock, &shared, dcid, &mut conn);
-            flush(sock, &mut conn, out.as_mut());
         }
     }
 
-    fn wake(&self) {
-        for inbound in self.routes.values() {
-            let Ok(conn) = inbound.conn.lock() else {
+    fn wake(&mut self) {
+        let Self {
+            routes, sock, out, ..
+        } = self;
+        for inbound in routes.values() {
+            let Ok(mut conn) = inbound.conn.lock() else {
                 continue;
             };
             for id in conn.readable() {
@@ -2165,6 +2213,7 @@ impl Router<'_> {
                     inbound.wakes.wake(id);
                 }
             }
+            flush(sock, &mut conn, out.as_mut());
         }
     }
 
