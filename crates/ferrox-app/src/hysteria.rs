@@ -61,11 +61,20 @@ pub(crate) struct StreamWake {
 }
 
 impl StreamWake {
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            gen: Mutex::new(0),
+            cv: Condvar::new(),
+        })
+    }
+}
+
+impl StreamWake {
     fn seen(&self) -> u64 {
         self.gen.lock().map_or(0, |gen| *gen)
     }
 
-    fn bump(&self) {
+    pub(crate) fn bump(&self) {
         if let Ok(mut gen) = self.gen.lock() {
             *gen = gen.wrapping_add(1);
         }
@@ -91,46 +100,40 @@ pub(crate) struct Driver {
 }
 
 impl Driver {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             alive: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             streams: Mutex::new(HashMap::new()),
-            send: Arc::new(StreamWake {
-                gen: Mutex::new(0),
-                cv: Condvar::new(),
-            }),
+            send: StreamWake::new(),
         })
     }
 
-    fn running(&self) -> bool {
+    pub(crate) fn running(&self) -> bool {
         self.alive.load(Ordering::Relaxed)
     }
 
-    fn stop(&self) {
+    pub(crate) fn stop(&self) {
         self.stop.store(true, Ordering::Relaxed);
     }
 
-    fn register(&self, stream: u64) -> Arc<StreamWake> {
+    pub(crate) fn register(&self, stream: u64) -> Arc<StreamWake> {
         if let Ok(mut streams) = self.streams.lock() {
             if let Some(wake) = streams.get(&stream) {
                 return Arc::clone(wake);
             }
-            let wake = Arc::new(StreamWake {
-                gen: Mutex::new(0),
-                cv: Condvar::new(),
-            });
+            let wake = StreamWake::new();
             streams.insert(stream, Arc::clone(&wake));
             return wake;
         }
-        Arc::new(StreamWake {
-            gen: Mutex::new(0),
-            cv: Condvar::new(),
-        })
+        StreamWake::new()
     }
 
-    fn send_wake(&self) -> Arc<StreamWake> {
-        Arc::clone(&self.send)
+    /// Binds this reader to a session and starts it: the session, its flows and its writers all hold one driver.
+    pub(crate) fn attach(self: &Arc<Self>, session: &mut Session) {
+        session.driver = Some(Arc::clone(self));
+        session.send_wake = Some(Arc::clone(&self.send));
+        self.spawn(session);
     }
 
     fn wake(&self, stream: u64) {
@@ -475,6 +478,11 @@ pub(crate) struct Flow {
 }
 
 impl Flow {
+    pub(crate) fn with_wake(mut self, wake: Option<Arc<StreamWake>>) -> Self {
+        self.wake = wake;
+        self
+    }
+
     pub(crate) fn from_parts(
         shared: Arc<Mutex<quiche::Connection>>,
         sock: Arc<crate::quic::Datagram>,
@@ -579,7 +587,7 @@ impl Flow {
     /// and found nothing. The relay's fixed lane re-queues on `None`, so a quiet flow hands its
     /// worker back instead of parking it for the life of the stream; `Read` loops over the same
     /// step, which is what a caller that asked for a blocking read still gets.
-    fn read_step(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
+    pub(crate) fn read_step(&mut self, buf: &mut [u8]) -> std::io::Result<Option<usize>> {
         if buf.is_empty() {
             return Ok(Some(0));
         }
@@ -857,9 +865,7 @@ fn open_pooled(dial: &Dial, header: &[u8]) -> Option<Flow> {
     }
     let mut session = connect(dial)?;
     let driver = Driver::new();
-    session.driver = Some(Arc::clone(&driver));
-    session.send_wake = Some(driver.send_wake());
-    driver.spawn(&session);
+    driver.attach(&mut session);
     let Some(flow) = open_flow(&session, FIRST_FLOW_STREAM, header) else {
         driver.stop();
         return None;
