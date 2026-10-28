@@ -3,6 +3,8 @@
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/wg.rs, crates/ferrox-app/src/wg_stack.rs, crates/ferrox-app/src/wireguard.rs, crates/ferrox-core/src/wireguard/device.rs, crates/ferrox-core/src/wireguard/handshake.rs, crates/ferrox-core/src/wireguard/transport.rs
 - symbols: find_wireguard_outbound, wireguard_settings
+- scenarios: wireguard-raw
+- engines: xray-core, sing-box
 - go: ./proxy/wireguard/...
 <!-- scope:end -->
 
@@ -67,7 +69,7 @@ The size rows are the constants the record and handshake write, asserted against
 
 ## Time
 
-**Not measured.** `scripts/lib-matrix.sh` carries no benchmark cell for this row and no scenario id names wireguard, so `bench.yml` and `parity.yml` gate nothing here. What is argued is the shape: one userspace stack per device, one thread per tunnel direction, a 10 ms reader tick that bounds both the timer check and a queued packet's wait, 256 KiB per TCP direction, up to eight listeners per destination port and 64 per inbound with a 60 s reap, one lane per server datagram tuple capped at 4096 and reaped on the UDP idle budget, and a scoped A/AAAA pair only while a name is resolved, so an uncached name waits for the slower family rather than for both in sequence. A duration would come from a CI runner, and no CI artefact has been read for this row.
+`benchmark-matrix.yml`, tier `full`, five repeats on 2026-10-28 (`AMD EPYC 9V45`, `wireguard-raw-*`). Legs are ferrox against xray-core in the same cell: down-8 client 165 vs 167 MiB/s (0.99x) and server 165 vs 170 (0.97x); duplex-8 client 106 vs 111 (0.95x) and server 117 vs 111 (1.05x); up-1 client 178 vs 192 (0.93x) and server 183 vs 192 (0.95x). CPU per GiB on the server leg is 8.8 s against xray-core's 10.4 s for down-8, 13.0 s against 16.6 s for duplex-8, and 6.0 s against 8.2 s for up-1; peak RSS is 12-29 MiB against 63-109 MiB. The shape behind it: one `smoltcp` stack and one socket thread per device, a 1 ms stack tick (10 ms for UDP lanes), a 512 KiB receive and 1 MiB send buffer per TCP direction, Cubic with immediate acknowledgements, and 256 received / 64 sent datagrams per stack turn. The socket asks for a 7 MiB queue, which Linux clamps to about 212 KiB, so a turn is bounded to what the peer can hold. A ferrox client through a ferrox server moves 64 MiB/s duplex against xray-core's 117, so the win is measured against the reference legs, not between two ferrox ends. An earlier full run on an EPYC 7763 measured 1.19x/1.00x down, 0.90x/1.00x duplex and 1.03x/1.11x up, so the shape holds across hosts.
 
 ## What we removed
 
@@ -75,11 +77,11 @@ The kernel device. The reference's client opens a TUN when `noKernelTun` is fals
 
 The gVisor dependency. The reference's netstack pulls gVisor's `tcpip`; this tree's `smoltcp` is one small crate, and its only new transitive licence is `0BSD` (`managed`), now in `deny.toml`. It is a dependency change, not a measured speed claim.
 
-Against sing-box and ZeroNet, nothing is removed because neither pin carries a WireGuard proxy lane to remove: sing-box's pinned path is `protocol/shadowsocks`, and ZeroNet's is the Zray oracle. The pinned AmneziaWG device is a third implementation of the same wire format, not the source of this row; its kernel device and hand-rolled ChaCha20 are left where they are.
+Against sing-box, nothing is removed: its pinned WireGuard endpoint is a separate implementation, now the matrix's third server, and the translator maps this row's Xray-shaped config onto it. ZeroNet's pin carries no WireGuard lane. The pinned AmneziaWG device is a third implementation of the same wire format, not the source of this row; its kernel device and hand-rolled ChaCha20 are left where they are.
 
 ## What was not removed
 
-No syscall or copy claim is made. The tunnel still copies an inner packet into a transport record and copies it out again; the stack owns two 256 KiB buffers per connected flow, which is memory the reference's netstack also spends; a server datagram lane owns a loopback relay and two threads, and is reclaimed after the UDP idle budget, within the 4096 cap. Remote DNS dials the first answer a peer routes instead of racing every address the resolver returned; `noKernelTun: false` does not open a kernel device, so a config that expected the host's routes to see the tunnel does not get them; the responder does not issue cookie replies; and an explicit `isClient` that contradicts the handler's position is a startup refusal rather than a silent role swap. The UDP reply reader takes every answer the lane's relay returns, including one a freedom `redirect` rewrote, and reports it to the client as the original target the inner packet named; a lane still drops a datagram whose framing it cannot parse. A client whose peers name endpoints in both address families is refused, because the client binds one UDP socket and this row does not open a second; a single peer keeps either family.
+No syscall or copy claim is made. The tunnel still copies an inner packet into a transport record and copies it out again; the stack owns a 512 KiB receive and a 1 MiB send buffer per connected flow and up to eight such pairs while a TCP flow races resolved answers, which is memory the reference's netstack also spends; a server datagram lane owns a loopback relay and two threads, and is reclaimed after the UDP idle budget, within the 4096 cap. Remote DNS races up to eight answers a peer routes for a TCP flow, and sends a datagram to up to eight for UDP; the first completed handshake or reply wins. `noKernelTun: false` does not open a kernel device, so a config that expected the host's routes to see the tunnel does not get them, and an explicit `isClient` that contradicts the handler's position is a startup refusal rather than a silent role swap. A client whose peers name endpoints in both address families binds one dual-stack UDP socket and maps IPv4 endpoints through it; a single peer keeps either family. After 128 initiations in a second the responder answers a missing or stale `mac2` with a rotatable cookie reply, and the retry is accepted under the same load. The UDP reply reader takes every answer the lane's relay returns, including one a freedom `redirect` rewrote, and reports it to the client as the original target the inner packet named; a lane still drops a datagram whose framing it cannot parse.
 
 ## Pins
 
@@ -89,4 +91,5 @@ No syscall or copy claim is made. The tunnel still copies an inner packet into a
 | the JSON defaults and key parsing | `upstream/xray-core/infra/conf/wireguard.go` |
 | the netstack the userspace stack replaces | `upstream/xray-core/proxy/wireguard/netstack.go` |
 | the scenario both roles answer | `upstream/xray-core/testing/scenarios/wireguard_test.go` |
+| the endpoint the matrix translates to | `upstream/sing-box/option/wireguard.go`, `upstream/sing-box/transport/wireguard/endpoint.go` |
 | the smoltcp stack and its device trait | `upstream/` nothing vendored; crate `smoltcp` 0.14 |
