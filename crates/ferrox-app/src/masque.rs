@@ -1218,12 +1218,20 @@ impl AddressPool {
     }
 
     fn assign(&mut self) -> Vec<IpAddr> {
+        let v4 = self.v4.as_mut().and_then(Family::allocate);
+        let v6 = self.v6.as_mut().and_then(Family::allocate);
         let mut addrs = Vec::with_capacity(2);
-        if let Some(ip) = self.v4.as_mut().and_then(Family::allocate) {
+        if let Some(ip) = v4 {
             addrs.push(IpAddr::V4(Ipv4Addr::from(ip as u32)));
         }
-        if let Some(ip) = self.v6.as_mut().and_then(Family::allocate) {
+        if let Some(ip) = v6 {
             addrs.push(IpAddr::V6(Ipv6Addr::from(ip)));
+        }
+        if (self.v4.is_some() && v4.is_none()) || (self.v6.is_some() && v6.is_none()) {
+            for address in &addrs {
+                self.release(*address);
+            }
+            addrs.clear();
         }
         addrs
     }
@@ -1625,11 +1633,12 @@ fn service(
             if !parse_head(tunnel, spec) {
                 continue;
             }
+            if tunnel.pending.is_none() {
+                accept(conn, shared, spec, tunnel);
+            }
             if let Some(head) = tunnel.pending.take() {
                 send_stream(conn, id, &head, true).ok();
                 tunnel.rejected = true;
-            } else {
-                accept(conn, shared, spec, tunnel);
             }
         } else if !tunnel.rejected {
             parse_capsules(conn, tunnel);
@@ -2129,6 +2138,22 @@ mod tests {
     }
 
     #[test]
+    fn a_dual_stack_pool_grants_nothing_when_one_family_is_full() {
+        let mut pool =
+            AddressPool::from_prefixes(&["10.14.0.1/30".to_owned(), "fd14::1/126".to_owned()])
+                .expect("a pool");
+        assert_eq!(pool.assign().len(), 2);
+        assert!(
+            pool.assign().is_empty(),
+            "a tunnel was granted only one family"
+        );
+        assert!(
+            pool.assign().is_empty(),
+            "the released v6 address was handed out alone"
+        );
+    }
+
+    #[test]
     fn a_v6_pool_keeps_its_last_host() {
         let mut pool = AddressPool::from_prefixes(&["fd14::1/126".to_owned()]).expect("a pool");
         assert_eq!(
@@ -2148,6 +2173,23 @@ mod tests {
         assert!(pool.holds("10.14.0.0".parse().expect("an address")));
         assert!(pool.holds("10.14.0.255".parse().expect("an address")));
         assert!(!pool.holds("10.15.0.1".parse().expect("an address")));
+    }
+
+    #[test]
+    fn a_full_pool_answers_503() {
+        let inbound = inbound(
+            r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/30"]}"#,
+        );
+        let port = serve_inbound(&inbound, &freedom("127.0.0.1:1"), "127.0.0.1:0").expect("serve");
+        let first = MasqueOut::new(&outbound(port)).expect("the first tunnel");
+        first.ensure().expect("the first tunnel opens");
+        let second = MasqueOut::new(&outbound(port)).expect("the second tunnel");
+        let error = second.ensure().expect_err("the full pool answered 200");
+        assert!(
+            error.contains("the edge answered 503"),
+            "unexpected error: {error}"
+        );
+        drop(first);
     }
 
     fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> Vec<u8> {
