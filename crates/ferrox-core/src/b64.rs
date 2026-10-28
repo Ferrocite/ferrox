@@ -24,7 +24,18 @@ pub fn encode(bytes: &[u8]) -> String {
     let ptr = out.as_mut_ptr();
     let (whole, rest) = bytes.as_chunks::<3>();
     let mut at = 0usize;
-    for [a, b, c] in whole {
+    #[cfg(target_arch = "x86_64")]
+    let group = if std::is_x86_feature_detected!("ssse3") {
+        // SAFETY: the feature is present, and every 12-byte group has 16 bytes to load, so the wide load stays inside `bytes`.
+        let (done, written) = unsafe { x86::encode_prefix(bytes, ptr) };
+        at = written;
+        done / 3
+    } else {
+        0
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let group = 0usize;
+    for [a, b, c] in &whole[group..] {
         let word = (u32::from(*a) << 16) | (u32::from(*b) << 8) | u32::from(*c);
         let first = ENC12[((word >> 12) & 0xfff) as usize];
         let second = ENC12[(word & 0xfff) as usize];
@@ -189,6 +200,107 @@ const fn digit_table() -> [u8; 256] {
 
 const DIGITS: [u8; 256] = digit_table();
 
+/// One 16-byte lane is four 12-bit groups: `pshufb` indexes the offset table by the
+/// high nibble, and a nibble bitset rejects a byte outside the alphabet.
+#[cfg(target_arch = "x86_64")]
+mod x86 {
+    #[allow(
+        clippy::wildcard_imports,
+        reason = "arch intrinsics: the module's whole API is register operations"
+    )]
+    use core::arch::x86_64::*;
+
+    const OFFSETS: [i8; 16] = [-1, 16, 19, 4, -65, -65, -71, -71, 0, 0, 0, 0, 0, 0, 0, 0];
+    const LO: [i8; 16] = [
+        0x15, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x13, 0x1a, 0x1b, 0x1b, 0x1b,
+        0x1a,
+    ];
+    const HI: [i8; 16] = [
+        0x10, 0x10, 0x01, 0x02, 0x04, 0x08, 0x04, 0x08, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
+        0x10,
+    ];
+    const PACK: [i8; 16] = [2, 1, 0, 6, 5, 4, 10, 9, 8, 14, 13, 12, -1, -1, -1, -1];
+    const ENCODE_SHUFFLE: [i8; 16] = [1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10];
+    const ENCODE_OFFSETS: [i8; 16] = [
+        65, 71, -4, -4, -4, -4, -4, -4, -4, -4, -4, -4, -19, -16, 0, 0,
+    ];
+
+    /// Decodes the whole 16-byte blocks of `text` into `out`, returning how much of
+    /// each was consumed. The caller checks `ssse3` and has four bytes of output slop.
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn decode_prefix(text: &[u8], out: *mut u8) -> (usize, usize) {
+        unsafe {
+            let offsets = _mm_loadu_si128(OFFSETS.as_ptr().cast());
+            let low_lut = _mm_loadu_si128(LO.as_ptr().cast());
+            let high_lut = _mm_loadu_si128(HI.as_ptr().cast());
+            let pack = _mm_loadu_si128(PACK.as_ptr().cast());
+            let first = _mm_set1_epi32(0x0140_0140);
+            let second = _mm_set1_epi32(0x0001_1000);
+            let low_mask = _mm_set1_epi8(0x0f);
+            let mut at = 0usize;
+            let mut out_at = 0usize;
+            while at + 16 <= text.len() {
+                let raw = _mm_loadu_si128(text.as_ptr().add(at).cast());
+                let dash = _mm_cmpeq_epi8(raw, _mm_set1_epi8(45));
+                let under = _mm_cmpeq_epi8(raw, _mm_set1_epi8(95));
+                let raw = _mm_or_si128(
+                    _mm_and_si128(dash, _mm_set1_epi8(43)),
+                    _mm_andnot_si128(dash, raw),
+                );
+                let raw = _mm_or_si128(
+                    _mm_and_si128(under, _mm_set1_epi8(47)),
+                    _mm_andnot_si128(under, raw),
+                );
+                let high = _mm_and_si128(_mm_srli_epi16::<4>(raw), low_mask);
+                let slash = _mm_cmpeq_epi8(raw, _mm_set1_epi8(47));
+                let hash = _mm_add_epi8(high, slash);
+                let sextets = _mm_add_epi8(raw, _mm_shuffle_epi8(offsets, hash));
+                let low_bits = _mm_shuffle_epi8(low_lut, _mm_and_si128(raw, low_mask));
+                let high_bits = _mm_shuffle_epi8(high_lut, high);
+                let valid = _mm_cmpeq_epi8(_mm_and_si128(low_bits, high_bits), _mm_setzero_si128());
+                if _mm_movemask_epi8(valid) != 0xffff {
+                    break;
+                }
+                let packed = _mm_madd_epi16(_mm_maddubs_epi16(sextets, first), second);
+                _mm_storeu_si128(out.add(out_at).cast(), _mm_shuffle_epi8(packed, pack));
+                at += 16;
+                out_at += 12;
+            }
+            (at, out_at)
+        }
+    }
+
+    /// Encodes the whole 12-byte groups of `bytes` into `out`, returning how much of
+    /// each was consumed. The caller checks `ssse3` and has a 16-byte load to spare.
+    #[target_feature(enable = "ssse3")]
+    pub(super) unsafe fn encode_prefix(bytes: &[u8], out: *mut u8) -> (usize, usize) {
+        unsafe {
+            let shuffle = _mm_loadu_si128(ENCODE_SHUFFLE.as_ptr().cast());
+            let offsets = _mm_loadu_si128(ENCODE_OFFSETS.as_ptr().cast());
+            let fifty_one = _mm_set1_epi8(51);
+            let twenty_five = _mm_set1_epi8(25);
+            let mut at = 0usize;
+            let mut out_at = 0usize;
+            while at + 16 <= bytes.len() {
+                let raw = _mm_shuffle_epi8(_mm_loadu_si128(bytes.as_ptr().add(at).cast()), shuffle);
+                let t0 = _mm_and_si128(raw, _mm_set1_epi32(0x0fc0_fc00));
+                let t1 = _mm_mulhi_epu16(t0, _mm_set1_epi32(0x0400_0040));
+                let t2 = _mm_and_si128(raw, _mm_set1_epi32(0x003f_03f0));
+                let t3 = _mm_mullo_epi16(t2, _mm_set1_epi32(0x0100_0010));
+                let sextets = _mm_or_si128(t1, t3);
+                let reduced = _mm_subs_epu8(sextets, fifty_one);
+                let mask = _mm_cmpgt_epi8(sextets, twenty_five);
+                let reduced = _mm_sub_epi8(reduced, mask);
+                let ascii = _mm_add_epi8(sextets, _mm_shuffle_epi8(offsets, reduced));
+                _mm_storeu_si128(out.add(out_at).cast(), ascii);
+                at += 12;
+                out_at += 16;
+            }
+            (at, out_at)
+        }
+    }
+}
+
 pub fn value(byte: u8) -> Option<u8> {
     match DIGITS[usize::from(byte)] {
         255 => None,
@@ -228,11 +340,18 @@ fn group_tail(rest: &[u8]) -> Option<[u8; 3]> {
 /// One pass over the text and one output buffer: a pair of whole groups is eight table loads and one eight-byte store, whitespace is skipped where it lies, padding ends the text, and a 2..=3 digit tail keeps the bytes its padded group would have held.
 #[must_use]
 pub fn decode(text: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::with_capacity(text.len() / 4 * 3 + 3);
+    let mut out = Vec::with_capacity(text.len() / 4 * 3 + 4);
     let ptr: *mut u8 = out.as_mut_ptr();
     let mut out_at = 0usize;
     let mut at = 0usize;
-    let (pairs, _) = text.as_chunks::<8>();
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("ssse3") {
+        // SAFETY: the feature is present, and the buffer reserves four bytes past the exact decoded length, so the wide store stays inside it.
+        let (done, written) = unsafe { x86::decode_prefix(text, ptr) };
+        at = done;
+        out_at = written;
+    }
+    let (pairs, _) = text[at..].as_chunks::<8>();
     for pair in pairs {
         let t0 = u32::from(DIGITS[usize::from(pair[0])]);
         let t1 = u32::from(DIGITS[usize::from(pair[1])]);
@@ -475,6 +594,38 @@ mod tests {
                 input.push(alphabet[(word as usize >> 11) % alphabet.len()]);
             }
             assert_eq!(decode(&input), decode_staged(&input), "{input:?}");
+        }
+    }
+
+    /// The wide block and the scalar walk agree on every byte in every lane: a
+    /// 32-byte fill of each value, then each value at each of the thirty-two positions.
+    #[test]
+    fn the_wide_block_is_the_scalar_walk_at_every_byte() {
+        for fill in 0..=255u8 {
+            let input = [fill; 32];
+            assert_eq!(decode(&input), decode_staged(&input), "fill {fill}");
+        }
+        for byte in 0..=255u8 {
+            for at in 0..32 {
+                let mut input = *b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+                input[at] = byte;
+                assert_eq!(decode(&input), decode_staged(&input), "byte {byte} at {at}");
+            }
+        }
+    }
+
+    /// The wide coder is the window coder at every length through several blocks and
+    /// every tail, so a group the wide loop takes and one the scalar loop takes agree.
+    #[test]
+    fn the_wide_coder_is_the_window_coder_at_every_length() {
+        for len in 0..=400usize {
+            let bytes: Vec<u8> = (0..len)
+                .map(|i| (i as u32).wrapping_mul(2_654_435_761) as u8)
+                .collect();
+            let mut window = vec![0u8; encoded_len(len)];
+            let written = encode_parts_into(&[&bytes], &mut window).expect("exact length");
+            assert_eq!(written, window.len(), "coded length for {len}");
+            assert_eq!(encode(&bytes).as_bytes(), window.as_slice(), "{len} bytes");
         }
     }
 
