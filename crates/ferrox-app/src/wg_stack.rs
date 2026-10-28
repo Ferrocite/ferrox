@@ -2116,6 +2116,11 @@ mod client_tests {
     #[test]
     #[allow(clippy::too_many_lines)]
     fn a_replied_client_datagram_lane_sends_the_next_datagram_only_to_the_winner() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            udp_idle: Some(Duration::from_secs(300)),
+            ..Default::default()
+        });
         let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
         let relay_address = relay.local_addr().expect("address");
         let app = UdpSocket::bind("127.0.0.1:0").expect("app");
@@ -2275,6 +2280,7 @@ mod client_tests {
             ],
             "another destination on the same lane still races"
         );
+        crate::budgets::clear();
     }
 
     #[test]
