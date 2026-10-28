@@ -19066,12 +19066,9 @@ pub(crate) mod lane_pool {
         let spawned = thread::Builder::new()
             .name("ferrox-relay-lane".into())
             .spawn(move || worker_loop(&worker));
-        let worker = match spawned {
-            Ok(worker) => worker,
-            Err(_) => {
-                pool.workers.fetch_sub(1, Relaxed);
-                return false;
-            }
+        let Ok(worker) = spawned else {
+            pool.workers.fetch_sub(1, Relaxed);
+            return false;
         };
         #[cfg(test)]
         pool.handles
