@@ -628,18 +628,18 @@ fn io(
                 ipv6_socket,
             );
         }
-        for peer in &mut peers {
-            peer.tunnel.poll(now, &mut events);
+        for index in 0..peers.len() {
+            peers[index].tunnel.poll(now, &mut events);
+            flush(
+                &mut events,
+                &socket,
+                &to_stack,
+                routes.as_ref(),
+                &peers,
+                Some(index),
+                ipv6_socket,
+            );
         }
-        flush(
-            &mut events,
-            &socket,
-            &to_stack,
-            routes.as_ref(),
-            &peers,
-            None,
-            ipv6_socket,
-        );
 
         match socket.recv_from(&mut buf) {
             Ok((n, source)) if n >= 4 => {
@@ -772,7 +772,13 @@ fn flush(
     for event in events.drain(..) {
         match event {
             Event::Send { endpoint, packet } => {
-                let _ = socket.send_to(&packet, send_endpoint(endpoint, ipv6_socket));
+                send_packet(
+                    socket,
+                    ipv6_socket,
+                    endpoint,
+                    &packet,
+                    peer.map(|index| peers[index].config.endpoints.as_slice()),
+                );
             }
             Event::Data(inner) => {
                 let Some(index) = peer else {
@@ -855,19 +861,30 @@ fn bind_socket(config: &DeviceConfig) -> Result<UdpSocket, String> {
     let mut v4 = false;
     let mut v6 = false;
     let mut any = false;
-    for endpoint in config.peers.iter().filter_map(|peer| peer.endpoint) {
-        any = true;
-        if endpoint.is_ipv4() {
-            v4 = true;
-        } else {
-            v6 = true;
+    for peer in &config.peers {
+        for endpoint in peer.endpoints.iter().copied().chain(peer.endpoint) {
+            any = true;
+            if endpoint.is_ipv4() {
+                v4 = true;
+            } else {
+                v6 = true;
+            }
         }
     }
     if !any {
         return Err("wireguard client: no peer has an `endpoint`".to_owned());
     }
     if v4 && v6 {
-        return bind_dual_stack();
+        match bind_dual_stack() {
+            Ok(socket) => return Ok(socket),
+            Err(dual) if v4 => {
+                let address = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+                return UdpSocket::bind(address).map_err(|ipv4| {
+                    format!("cannot bind wireguard's UDP socket: dual-stack: {dual}; IPv4: {ipv4}")
+                });
+            }
+            Err(error) => return Err(error),
+        }
     }
     let unspecified = if v4 {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
@@ -899,6 +916,35 @@ fn widen(socket: &UdpSocket) {
     let sock = socket2::SockRef::from(socket);
     let _ = sock.set_recv_buffer_size(SOCKET_BUFFER);
     let _ = sock.set_send_buffer_size(SOCKET_BUFFER);
+}
+
+/// Send a handshake to every configured endpoint candidate, so a name that
+/// resolves to two families or two hosts is raced; data follows the endpoint
+/// the responder pinned.
+fn send_packet(
+    socket: &UdpSocket,
+    ipv6: bool,
+    endpoint: SocketAddr,
+    packet: &[u8],
+    candidates: Option<&[SocketAddr]>,
+) {
+    let initiation = packet.len() == INITIATION_SIZE
+        && u32::from_le_bytes(packet[..4].try_into().unwrap_or([0; 4])) == TYPE_INITIATION;
+    if initiation {
+        if ipv6 || endpoint.is_ipv4() {
+            let _ = socket.send_to(packet, send_endpoint(endpoint, ipv6));
+        }
+        for target in candidates.unwrap_or_default() {
+            if *target == endpoint || (!ipv6 && target.is_ipv6()) {
+                continue;
+            }
+            let _ = socket.send_to(packet, send_endpoint(*target, ipv6));
+        }
+        return;
+    }
+    if ipv6 || endpoint.is_ipv4() {
+        let _ = socket.send_to(packet, send_endpoint(endpoint, ipv6));
+    }
 }
 
 fn send_endpoint(endpoint: SocketAddr, ipv6: bool) -> SocketAddr {
@@ -946,6 +992,7 @@ mod tests {
                     public: [0x22; 32],
                     preshared: [0; 32],
                     endpoint: None,
+                    endpoints: Vec::new(),
                     keepalive: 0,
                     allowed: vec![("10.0.0.2".parse().unwrap(), 32)],
                 },
@@ -953,6 +1000,7 @@ mod tests {
                     public: [0x33; 32],
                     preshared: [0; 32],
                     endpoint: None,
+                    endpoints: Vec::new(),
                     keepalive: 0,
                     allowed: vec![("10.0.0.0".parse().unwrap(), 8)],
                 },
@@ -1146,6 +1194,7 @@ mod tests {
                     public: server_public,
                     preshared: [0; 32],
                     endpoint: Some(dead.local_addr().expect("dead address")),
+                    endpoints: vec![dead.local_addr().expect("dead address")],
                     keepalive: 0,
                     allowed: vec![("192.0.2.1".parse().unwrap(), 32)],
                 },
@@ -1153,6 +1202,7 @@ mod tests {
                     public: server_public,
                     preshared: [0; 32],
                     endpoint: Some(format!("127.0.0.1:{port}").parse().unwrap()),
+                    endpoints: vec![format!("127.0.0.1:{port}").parse().unwrap()],
                     keepalive: 0,
                     allowed: vec![("127.0.0.1".parse().unwrap(), 32)],
                 },
@@ -1289,25 +1339,19 @@ mod tests {
 
     #[test]
     fn a_client_with_peers_in_both_families_binds_a_dual_stack_socket() {
+        let v4: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let v6: SocketAddr = "[::1]:9".parse().unwrap();
         let config = DeviceConfig {
             secret: [0x11; 32],
             addresses: vec!["10.0.0.2".parse().unwrap()],
-            peers: vec![
-                PeerConfig {
-                    public: [0x22; 32],
-                    preshared: [0; 32],
-                    endpoint: Some("127.0.0.1:9".parse().unwrap()),
-                    keepalive: 0,
-                    allowed: vec![("0.0.0.0".parse().unwrap(), 0)],
-                },
-                PeerConfig {
-                    public: [0x33; 32],
-                    preshared: [0; 32],
-                    endpoint: Some("[::1]:9".parse().unwrap()),
-                    keepalive: 0,
-                    allowed: vec![("::".parse().unwrap(), 0)],
-                },
-            ],
+            peers: vec![PeerConfig {
+                public: [0x22; 32],
+                preshared: [0; 32],
+                endpoint: Some(v4),
+                endpoints: vec![v4, v6],
+                keepalive: 0,
+                allowed: vec![("0.0.0.0".parse().unwrap(), 0)],
+            }],
             mtu: 1420,
             reserved: [0; 3],
             is_client: Some(true),
@@ -1320,6 +1364,128 @@ mod tests {
         let mapped = send_endpoint(v4, true);
         assert_eq!(mapped, "[::ffff:127.0.0.1]:7".parse().unwrap());
         assert_eq!(recv_endpoint(mapped, true), v4);
+    }
+
+    #[test]
+    fn a_handshake_races_every_endpoint_candidate_and_data_follows_one() {
+        let Ok(v4) = UdpSocket::bind("127.0.0.1:0") else {
+            return;
+        };
+        let Ok(v6) = UdpSocket::bind("[::1]:0") else {
+            return;
+        };
+        let Ok(sender) = bind_dual_stack() else {
+            return;
+        };
+        for socket in [&v4, &v6] {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("timeout");
+        }
+        let candidates = vec![
+            v4.local_addr().expect("v4 address"),
+            v6.local_addr().expect("v6 address"),
+        ];
+        let mut initiation = vec![0u8; INITIATION_SIZE];
+        initiation[..4].copy_from_slice(&TYPE_INITIATION.to_le_bytes());
+        send_packet(&sender, true, candidates[0], &initiation, Some(&candidates));
+        let mut buf = [0u8; 256];
+        assert_eq!(
+            v4.recv_from(&mut buf).expect("v4 initiation").0,
+            INITIATION_SIZE
+        );
+        assert_eq!(
+            v6.recv_from(&mut buf).expect("v6 initiation").0,
+            INITIATION_SIZE
+        );
+        let mut transport = vec![0u8; 32];
+        transport[..4]
+            .copy_from_slice(&ferrox_core::wireguard::transport::TYPE_TRANSPORT.to_le_bytes());
+        send_packet(&sender, true, candidates[0], &transport, Some(&candidates));
+        assert_eq!(
+            v4.recv_from(&mut buf).expect("v4 transport").0,
+            transport.len()
+        );
+        v6.set_read_timeout(Some(Duration::from_millis(300)))
+            .expect("timeout");
+        assert!(
+            v6.recv_from(&mut buf).is_err(),
+            "data follows the pinned endpoint"
+        );
+        let Ok(v4_only) = UdpSocket::bind("127.0.0.1:0") else {
+            return;
+        };
+        send_packet(
+            &v4_only,
+            false,
+            candidates[0],
+            &initiation,
+            Some(&candidates),
+        );
+        assert_eq!(
+            v4.recv_from(&mut buf).expect("v4 fallback").0,
+            INITIATION_SIZE
+        );
+        assert!(
+            v6.recv_from(&mut buf).is_err(),
+            "a v4-only socket skips the v6 candidate"
+        );
+    }
+
+    #[test]
+    fn a_roamed_endpoint_still_receives_a_rekey() {
+        let Ok(v4) = UdpSocket::bind("127.0.0.1:0") else {
+            return;
+        };
+        let Ok(v6) = UdpSocket::bind("[::1]:0") else {
+            return;
+        };
+        let Ok(roamed) = UdpSocket::bind("127.0.0.1:0") else {
+            return;
+        };
+        let Ok(sender) = bind_dual_stack() else {
+            return;
+        };
+        let candidates = vec![
+            v4.local_addr().expect("v4 address"),
+            v6.local_addr().expect("v6 address"),
+        ];
+        let roamed_address = roamed.local_addr().expect("roamed address");
+        for socket in [&v4, &v6, &roamed] {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("timeout");
+        }
+        let mut initiation = vec![0u8; INITIATION_SIZE];
+        initiation[..4].copy_from_slice(&TYPE_INITIATION.to_le_bytes());
+        send_packet(
+            &sender,
+            true,
+            roamed_address,
+            &initiation,
+            Some(&candidates),
+        );
+        let mut buf = [0u8; 256];
+        assert_eq!(
+            v4.recv_from(&mut buf).expect("v4 initiation").0,
+            INITIATION_SIZE
+        );
+        assert_eq!(
+            v6.recv_from(&mut buf).expect("v6 initiation").0,
+            INITIATION_SIZE
+        );
+        assert_eq!(
+            roamed.recv_from(&mut buf).expect("roamed initiation").0,
+            INITIATION_SIZE
+        );
+        let mut transport = vec![0u8; 32];
+        transport[..4]
+            .copy_from_slice(&ferrox_core::wireguard::transport::TYPE_TRANSPORT.to_le_bytes());
+        send_packet(&sender, true, roamed_address, &transport, Some(&candidates));
+        assert_eq!(
+            roamed.recv_from(&mut buf).expect("roamed data").0,
+            transport.len()
+        );
     }
 
     #[test]
@@ -1357,6 +1523,7 @@ mod tests {
                 public: client_public,
                 preshared: [0; 32],
                 endpoint: None,
+                endpoints: Vec::new(),
                 keepalive: 0,
                 allowed: vec![("10.0.0.2".parse().unwrap(), 32)],
             }],
