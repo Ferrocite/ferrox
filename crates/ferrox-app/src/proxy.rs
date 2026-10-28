@@ -28260,12 +28260,14 @@ mod tests {
             );
         });
         let user = Connection::connect(addr).expect("connects");
-        user.set_read_timeout(Some(Duration::from_secs(30)))
+        user.set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeout");
         rx.recv_timeout(Duration::from_secs(30)).expect("dials");
         let mut inner = ferrox_core::tls::connect(&client_config, user).expect("inner configures");
         inner.handshake().expect("inner handshakes");
         let widths = [18usize, 511, 20_021];
+        // A stalled echo must name its round: a read that retries its own timeout forever once left this test silent past the detector's 240 s.
+        let began = Instant::now();
         for round in 0..180u32 {
             let width = widths[round as usize % widths.len()];
             let payload: Vec<u8> = (0..width)
@@ -28274,13 +28276,26 @@ mod tests {
             inner.write_all(&payload).expect("writes");
             inner.flush().expect("flushes");
             let mut echoed = vec![0u8; width];
-            ferrox_core::tls::read_exact(&mut inner, &mut echoed).expect("echoes");
+            let mut filled = 0usize;
+            while filled < width {
+                match inner.read(&mut echoed[filled..]) {
+                    Ok(0) => panic!("round {round}, {width} B: the echo closed after {filled} B"),
+                    Ok(read) => filled += read,
+                    Err(error) if is_timeout(&error) => assert!(
+                        began.elapsed() < Duration::from_secs(120),
+                        "round {round}, {width} B: {} of 180 rounds done and {filled} of {width} B back in {:?}",
+                        round,
+                        began.elapsed()
+                    ),
+                    Err(error) => panic!("round {round}, {width} B: {error}"),
+                }
+            }
             assert_eq!(echoed, payload);
         }
         drop(inner);
-        dialled.join().expect("joins");
-        echo.join().expect("joins");
-        pair.front.join().expect("joins");
+        join_thread_within(dialled, Duration::from_secs(30), "the dialling front");
+        join_thread_within(echo, Duration::from_secs(30), "the inner TLS echo");
+        join_thread_within(pair.front, Duration::from_secs(30), "the REALITY front");
     }
 
     #[test]
