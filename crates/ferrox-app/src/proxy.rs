@@ -12464,11 +12464,7 @@ fn ride_carrier<S: Dialed, D: Dialed>(
                 }
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            let mut reader = reader;
-            if read_vless_response(&mut reader).is_none() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            relay_sink(reader, &writer, client, |_| {});
+            relay_sink(ReplyReader::new(reader), &writer, client, |_| {});
         }
         Carrier::HttpUpgrade { path, ed, .. } => {
             let Some((reader, sink)) = tls_httpupgrade(
@@ -12490,11 +12486,7 @@ fn ride_carrier<S: Dialed, D: Dialed>(
                 }
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            let mut reader = reader;
-            if read_vless_response(&mut reader).is_none() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            relay_sink(reader, &sink, client, |_| {});
+            relay_sink(ReplyReader::new(reader), &sink, client, |_| {});
         }
         Carrier::Grpc(settings) => {
             let Some((reader, writer)) = tls_grpc(server, session, &vless.host, settings) else {
@@ -12508,14 +12500,12 @@ fn ride_carrier<S: Dialed, D: Dialed>(
                 }
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            let mut reader = reader;
             if !writer.send(header) {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            if read_vless_response(&mut reader).is_none() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
+            relay_sink(ReplyReader::new(reader), &writer, client, |reader| {
+                crate::grpc::mark_reader_dead(reader.inner_mut());
+            });
         }
         Carrier::Xhttp { settings, .. } => {
             let Some((reader, writer)) = tls_xhttp(server, session, second, &vless.host, settings)
@@ -12530,14 +12520,10 @@ fn ride_carrier<S: Dialed, D: Dialed>(
                 }
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            let mut reader = reader;
             if !writer.send(header) {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            if read_vless_response(&mut reader).is_none() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            relay_sink_drained(reader, &writer, client);
+            relay_sink_drained(ReplyReader::new(reader), &writer, client);
         }
         Carrier::HttpHeader { path } => {
             let Some((reader, sink)) =
@@ -12553,14 +12539,11 @@ fn ride_carrier<S: Dialed, D: Dialed>(
                 }
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            let (mut reader, mut sink) = (reader, sink);
+            let mut sink = sink;
             if sink.write_all(header).is_err() {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            if read_vless_response(&mut reader).is_none() {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            relay_sink(reader, &sink, client, |_| {});
+            relay_sink(ReplyReader::new(reader), &sink, client, |_| {});
         }
         Carrier::Raw(_)
         | Carrier::Quic
@@ -20911,6 +20894,56 @@ impl Pump {
             join(&running);
         }
         self.sent.load(Ordering::Relaxed)
+    }
+}
+
+/// The VLESS answer is stripped on the first read, not before the relay starts: a server may hold `[0, 0]` until it sees payload, and the upload then moves through the relay itself instead of a pump thread.
+struct ReplyReader<R> {
+    inner: R,
+    head: [u8; 2],
+    filled: u8,
+    answered: bool,
+}
+
+impl<R> ReplyReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            head: [0u8; 2],
+            filled: 0,
+            answered: false,
+        }
+    }
+
+    fn inner_mut(&mut self) -> &mut R {
+        &mut self.inner
+    }
+}
+
+impl<R: Read> Read for ReplyReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if !self.answered {
+            while self.filled < 2 {
+                match self.inner.read(&mut self.head[usize::from(self.filled)..]) {
+                    Ok(0) => {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                    }
+                    Ok(n) => self.filled += n as u8,
+                    Err(error) => return Err(error),
+                }
+            }
+            if ferrox_core::vless::VlessLink::decode_response_header(&self.head).is_err() {
+                return Err(std::io::Error::other("vless answer refused"));
+            }
+            if echo_trace_on() {
+                echo_trace("response ok");
+            }
+            self.answered = true;
+        }
+        self.inner.read(buf)
     }
 }
 
@@ -31356,6 +31389,117 @@ mod tests {
         drop(sock);
         relay.join().expect("joins");
         server.join().expect("joins");
+    }
+
+    /// xray-core buffers the VLESS `[0, 0]` until the target first writes, so a TLS-carried client must pump before it waits for the answer, as every plain carrier already does.
+    #[test]
+    fn vless_tls_carried_client_pumps_the_upload_before_the_response() {
+        for carrier in [
+            Carrier::Ws {
+                path: "/vless-ws".to_owned(),
+                ed: 0,
+            },
+            Carrier::Grpc(crate::config::GrpcSettings::path("/vless-grpc")),
+        ] {
+            vless_tls_carried_upload_before_response(carrier);
+        }
+    }
+
+    fn vless_tls_carried_upload_before_response(carrier: Carrier) {
+        const UPLOAD: usize = 2 * 1024 * 1024;
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x4Cu8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (uploaded_tx, uploaded_rx) = std::sync::mpsc::channel();
+        let served_carrier = carrier.clone();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let raw = stream.try_clone().expect("clones");
+            let session = accept_tls_session(stream, &server_config).expect("tls");
+            let (reader, writer) = session_halves(session, raw);
+            let (mut reader, mut writer): (Box<dyn Read + Send>, Box<dyn Write + Send>) =
+                match &served_carrier {
+                    Carrier::Ws { path, .. } => {
+                        let (reader, writer) =
+                            crate::ws::accept_split(reader, writer, path).expect("ws upgrade");
+                        (Box::new(reader), Box::new(writer))
+                    }
+                    Carrier::Grpc(settings) => {
+                        let (reader, writer) =
+                            crate::grpc::accept_split_with(reader, writer, settings)
+                                .expect("grpc accept");
+                        (Box::new(reader), Box::new(writer))
+                    }
+                    _ => unreachable!("the test drives the two tls carried carriers"),
+                };
+            let Some((got, _flow, cmd, _target)) = decode_request(&mut reader) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(cmd, 1);
+            let mut chunk = vec![0u8; 64 * 1024];
+            let mut total = 0;
+            while total < UPLOAD {
+                let want = (UPLOAD - total).min(chunk.len());
+                read_exact(&mut reader, &mut chunk[..want])
+                    .expect("the upload arrives before the response header");
+                total += want;
+            }
+            uploaded_tx.send(()).expect("signals");
+            writer.write_all(&[0, 0]).expect("response header");
+            writer.write_all(b"pong").expect("echoes after the header");
+            writer.flush().expect("flushes");
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let downstream_port = downstream.local_addr().expect("addr").port();
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier,
+            host: "127.0.0.1".to_owned(),
+            mux: false,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: Some(Arc::new(client_config)),
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let relaying = thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            dial_vless(
+                &client,
+                &server,
+                &vless,
+                Some(&Destination::from(target)),
+                Ladder::global(),
+            );
+        });
+        let mut sock = Connection::connect(("127.0.0.1", downstream_port)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let uploading = thread::spawn(move || {
+            let upload = vec![0x5Au8; UPLOAD];
+            sock.write_all(&upload).expect("writes");
+            sock
+        });
+        uploaded_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the server saw the upload before flushing the header");
+        let mut sock = uploading.join().expect("joins");
+        let mut reply = [0u8; 4];
+        read_exact(&mut sock, &mut reply).expect("reads after the header");
+        assert_eq!(&reply, b"pong");
+        drop(sock);
+        server.join().expect("joins");
+        relaying.join().expect("joins");
     }
 
     /// The listener's ECH path reaches the same VLESS relay as a plain TLS listener: the client's
