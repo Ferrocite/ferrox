@@ -8658,7 +8658,11 @@ fn xdrive_dial_session(carrier: &Carrier, address: &str, port: u16) -> Option<cr
 }
 
 /// Both directions of a stream the store carries: the app's bytes land in the write log, the read log's bytes go back, and the store's own poll quantum bounds each wait, so neither leg holds a thread while the other's objects are in flight.
-fn xdrive_relay(app: &Connection, mut down: crate::xdrive::Conn) {
+fn xdrive_relay(app: &Connection, down: crate::xdrive::Conn) {
+    xdrive_relay_until(app, down, budgets::relay_stall());
+}
+
+fn xdrive_relay_until(app: &Connection, mut down: crate::xdrive::Conn, response_wait: Duration) {
     let Ok(app_read) = app.try_clone() else {
         return;
     };
@@ -8681,14 +8685,13 @@ fn xdrive_relay(app: &Connection, mut down: crate::xdrive::Conn) {
         }
         let _ = up.end_write();
     });
-    let linger = down.linger();
     let mut ended = false;
-    let mut quiet = Instant::now();
+    let mut response_deadline = None;
     let mut buf = RelayBuf::new().into_vec();
     loop {
         match down.read(&mut buf) {
             Ok(n) if n > 0 => {
-                quiet = Instant::now();
+                response_deadline = Some(Instant::now() + response_wait);
                 if app_write.write_all(&buf[..n]).is_err() {
                     break;
                 }
@@ -8696,9 +8699,9 @@ fn xdrive_relay(app: &Connection, mut down: crate::xdrive::Conn) {
             Err(error) if is_timeout(&error) => {
                 if !ended && done.try_recv().is_ok() {
                     ended = true;
-                    quiet = Instant::now();
+                    response_deadline = Some(Instant::now() + response_wait);
                 }
-                if ended && quiet.elapsed() >= linger {
+                if response_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     break;
                 }
             }
@@ -32870,6 +32873,11 @@ mod tests {
     /// A store peer that goes quiet without publishing an end cannot pin the relay: once our own source is done the report stops after the store's own round trip of silence.
     #[test]
     fn an_xdrive_relay_leaves_a_peer_that_never_ends() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(100)),
+            ..Default::default()
+        });
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -32901,6 +32909,7 @@ mod tests {
         join_thread_within(relay, Duration::from_secs(5), "a peer that never ends");
         peer.join().expect("the peer closes");
         let _ = std::fs::remove_dir_all(&dir);
+        budgets::clear();
     }
 
     fn vmess_carriers() -> Vec<Carrier> {
