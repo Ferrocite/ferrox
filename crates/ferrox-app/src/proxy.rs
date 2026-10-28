@@ -32808,6 +32808,7 @@ mod tests {
     #[test]
     fn an_xdrive_relay_reads_a_response_after_the_upload_ends() {
         let _guard = budgets::lock();
+        let _clear = ClearBudgets;
         budgets::apply(&crate::config::Budgets {
             relay_stall: Some(Duration::from_secs(2)),
             ..Default::default()
@@ -32867,13 +32868,13 @@ mod tests {
         drop(sock);
         join_thread_within(relay, Duration::from_secs(30), "the delayed response");
         let _ = std::fs::remove_dir_all(&dir);
-        budgets::clear();
     }
 
     /// A store peer that goes quiet without publishing an end cannot pin the relay: once our own source is done the report stops after the store's own round trip of silence.
     #[test]
     fn an_xdrive_relay_leaves_a_peer_that_never_ends() {
         let _guard = budgets::lock();
+        let _clear = ClearBudgets;
         budgets::apply(&crate::config::Budgets {
             relay_stall: Some(Duration::from_millis(100)),
             ..Default::default()
@@ -32909,7 +32910,6 @@ mod tests {
         join_thread_within(relay, Duration::from_secs(5), "a peer that never ends");
         peer.join().expect("the peer closes");
         let _ = std::fs::remove_dir_all(&dir);
-        budgets::clear();
     }
 
     fn vmess_carriers() -> Vec<Carrier> {
@@ -42551,6 +42551,14 @@ mod tests {
         port
     }
 
+    struct ClearBudgets;
+
+    impl Drop for ClearBudgets {
+        fn drop(&mut self) {
+            budgets::clear();
+        }
+    }
+
     fn delayed_echo_loop(delay: Duration) -> u16 {
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = echo.local_addr().expect("addr").port();
@@ -42558,12 +42566,13 @@ mod tests {
             for stream in echo.incoming().flatten() {
                 thread::spawn(move || {
                     let mut stream = stream;
-                    let mut buf = [0u8; 4];
-                    let mut at = 0;
-                    while at < buf.len() {
-                        match stream.read(&mut buf[at..]) {
-                            Ok(0) | Err(_) => return,
-                            Ok(n) => at += n,
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            Err(_) => return,
                         }
                     }
                     thread::sleep(delay);
