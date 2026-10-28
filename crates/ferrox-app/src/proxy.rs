@@ -18998,12 +18998,11 @@ pub(crate) mod lane_pool {
         idle: std::sync::atomic::AtomicUsize,
     }
 
-    /// Lanes with nothing to read wait here, not in a worker a flow with bytes needs, each with the
-    /// instant it is due another turn.
+    /// Lanes with nothing to read wait here, each with the instant it is due another turn.
     #[derive(Default)]
     struct Parked {
         lanes: Vec<(std::time::Instant, Lane)>,
-        running: bool,
+        waking: bool,
     }
 
     static POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
@@ -19066,7 +19065,7 @@ pub(crate) mod lane_pool {
         true
     }
 
-    fn worker_loop(pool: &std::sync::Arc<Pool>) {
+    fn worker_loop(pool: &Pool) {
         loop {
             let mut lane = {
                 let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
@@ -19133,59 +19132,30 @@ pub(crate) mod lane_pool {
         }
     }
 
-    /// Hands an idle lane to the parker; one parker thread pays the wait for every parked lane, so
-    /// no worker sleeps and a flow with bytes never queues behind a lane that has none.
-    fn park(pool: &std::sync::Arc<Pool>, lane: Lane) {
-        let due = std::time::Instant::now() + wait_for(lane.idle);
-        let start = {
+    /// Parks an idle lane with the instant it is due another turn; one worker pays the wait for the
+    /// whole batch, so the lanes with bytes keep the workers and the wait grows per empty round.
+    fn park(pool: &Pool, lane: Lane) {
+        let mut due = std::time::Instant::now() + wait_for(lane.idle);
+        {
             let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
             parked.lanes.push((due, lane));
-            if parked.running {
-                false
-            } else {
-                parked.running = true;
-                true
+            if parked.waking {
+                return;
             }
-        };
-        if !start {
-            return;
+            parked.waking = true;
+            due = parked
+                .lanes
+                .iter()
+                .map(|(due, _)| *due)
+                .min()
+                .unwrap_or(due);
         }
-        let parker = std::sync::Arc::clone(pool);
-        let spawned = thread::Builder::new()
-            .name("ferrox-relay-park".into())
-            .spawn(move || run_parker(&parker));
-        if spawned.is_err() {
-            run_parker(pool);
-        }
-    }
-
-    /// The wait before an idle lane's next turn: one poll quantum, doubling per round that found
-    /// nothing, so a direction nobody writes to costs the pool almost nothing while a direction that
-    /// starts writing is still picked up within 16 ms.
-    fn wait_for(idle: u32) -> std::time::Duration {
-        crate::budgets::RELAY_POLL * (1u32 << idle.min(4))
-    }
-
-    /// Moves each parked lane back to the queue when its wait is up, and returns once none is left.
-    fn run_parker(pool: &std::sync::Arc<Pool>) {
         loop {
-            let next = {
-                let parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
-                if parked.lanes.is_empty() {
-                    // Whoever parks next finds the flag clear and starts a parker of its own.
-                    let mut parked = parked;
-                    parked.running = false;
-                    return;
-                }
-                parked.lanes.iter().map(|(due, _)| *due).min()
-            };
-            if let Some(next) = next {
-                let now = std::time::Instant::now();
-                if next > now {
-                    thread::sleep(next - now);
-                }
+            let now = std::time::Instant::now();
+            if due > now {
+                thread::sleep(due - now);
             }
-            let batch = {
+            let (batch, next) = {
                 let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
                 let now = std::time::Instant::now();
                 let mut batch = Vec::new();
@@ -19198,17 +19168,32 @@ pub(crate) mod lane_pool {
                     }
                 }
                 parked.lanes = waiting;
-                batch
+                let next = parked.lanes.iter().map(|(due, _)| *due).min();
+                if next.is_none() {
+                    // A lane parked after this point finds the flag clear and pays its own wait.
+                    parked.waking = false;
+                }
+                (batch, next)
             };
-            if batch.is_empty() {
-                continue;
+            if !batch.is_empty() {
+                PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                ready.extend(batch);
+                drop(ready);
+                pool.notify.notify_all();
             }
-            PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
-            ready.extend(batch);
-            drop(ready);
-            pool.notify.notify_all();
+            match next {
+                Some(next) => due = next,
+                None => return,
+            }
         }
+    }
+
+    /// The wait before an idle lane's next turn: one poll quantum, doubling per round that found
+    /// nothing, so a direction nobody writes to costs the pool almost nothing while a direction that
+    /// starts writing is still picked up within 16 ms.
+    fn wait_for(idle: u32) -> std::time::Duration {
+        crate::budgets::RELAY_POLL * (1u32 << idle.min(4))
     }
 
     fn run_to_end(mut lane: Lane) {
