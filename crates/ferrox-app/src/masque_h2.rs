@@ -603,8 +603,8 @@ impl Client {
             {
                 return;
             }
-            self.send_window -= take as i64;
-            self.connection_window -= take as i64;
+            self.send_window -= i64::try_from(take).unwrap_or(i64::MAX);
+            self.connection_window -= i64::try_from(take).unwrap_or(i64::MAX);
             self.queued_at = start + take;
             if self.queued_at < answer.len() {
                 self.queued.push_front(answer);
@@ -917,7 +917,7 @@ impl Session {
             if !wire.send(h2::T_DATA, 0, id, &answer[start..start + take]) {
                 return;
             }
-            self.send_window -= take as i64;
+            self.send_window -= i64::try_from(take).unwrap_or(i64::MAX);
             self.queued_at = start + take;
             if self.queued_at < answer.len() {
                 self.queued.push_front(answer);
