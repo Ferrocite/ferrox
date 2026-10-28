@@ -5,8 +5,9 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use ferrox_core::foxy::{connectip, frames};
@@ -26,6 +27,129 @@ const SETTINGS_ENABLE_CONNECT: u16 = 0x8;
 const FRAME_CAP: usize = 1 << 20;
 const QUEUED_CAP: usize = 64;
 const DEFAULT_WINDOW: i64 = 65_535;
+
+#[derive(Clone, Default)]
+struct Deadline(Arc<AtomicU64>);
+
+fn monotonic_nanos() -> u64 {
+    static BASE: OnceLock<Instant> = OnceLock::new();
+    u64::try_from(BASE.get_or_init(Instant::now).elapsed().as_nanos()).unwrap_or(u64::MAX)
+}
+
+impl Deadline {
+    fn arm(&self, at: Instant) {
+        let left = u64::try_from(at.saturating_duration_since(Instant::now()).as_nanos())
+            .unwrap_or(u64::MAX);
+        self.0.store(
+            monotonic_nanos().saturating_add(left).max(1),
+            Ordering::Relaxed,
+        );
+    }
+
+    fn clear(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+
+    fn remaining(&self) -> Option<Duration> {
+        let at = self.0.load(Ordering::Relaxed);
+        (at != 0).then(|| Duration::from_nanos(at.saturating_sub(monotonic_nanos())))
+    }
+}
+
+struct DeadlineStream {
+    io: TcpStream,
+    deadline: Deadline,
+    read_wait: std::cell::Cell<Duration>,
+    read_tight: std::cell::Cell<bool>,
+    write_tight: std::cell::Cell<bool>,
+}
+
+impl DeadlineStream {
+    fn new(io: TcpStream, deadline: Deadline) -> Self {
+        Self {
+            io,
+            deadline,
+            read_wait: std::cell::Cell::new(HANDSHAKE),
+            read_tight: std::cell::Cell::new(false),
+            write_tight: std::cell::Cell::new(false),
+        }
+    }
+
+    fn set_read_timeout(&self, wait: Option<Duration>) {
+        let wait = wait.unwrap_or(HANDSHAKE);
+        self.read_wait.set(wait);
+        if !self.read_tight.get() {
+            let _ = self.io.set_read_timeout(Some(wait));
+        }
+    }
+
+    fn prepare_read(&self) -> std::io::Result<()> {
+        match self.deadline.remaining() {
+            None => {
+                if self.read_tight.replace(false) {
+                    let _ = self.io.set_read_timeout(Some(self.read_wait.get()));
+                }
+                Ok(())
+            }
+            Some(left) if left.is_zero() => Err(std::io::ErrorKind::TimedOut.into()),
+            Some(left) => {
+                self.io
+                    .set_read_timeout(Some(left.min(self.read_wait.get())))?;
+                self.read_tight.set(true);
+                Ok(())
+            }
+        }
+    }
+
+    fn prepare_write(&self) -> std::io::Result<()> {
+        match self.deadline.remaining() {
+            None => {
+                if self.write_tight.replace(false) {
+                    let _ = self.io.set_write_timeout(Some(HANDSHAKE));
+                }
+                Ok(())
+            }
+            Some(left) if left.is_zero() => Err(std::io::ErrorKind::TimedOut.into()),
+            Some(left) => {
+                self.io.set_write_timeout(Some(left.min(HANDSHAKE)))?;
+                self.write_tight.set(true);
+                Ok(())
+            }
+        }
+    }
+}
+
+fn handshake_stream(tcp: TcpStream) -> (DeadlineStream, Deadline) {
+    let _ = tcp.set_nodelay(true);
+    let deadline = Deadline::default();
+    deadline.arm(Instant::now() + HANDSHAKE);
+    (DeadlineStream::new(tcp, deadline.clone()), deadline)
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.prepare_read()?;
+        self.io.read(buf)
+    }
+}
+
+impl Write for DeadlineStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.prepare_write()?;
+        let written = self.io.write(buf)?;
+        if self.deadline.remaining().is_some_and(|left| left.is_zero()) {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.prepare_write()?;
+        self.io.flush()
+    }
+}
+
+impl ferrox_core::tls::RecordAlignment for DeadlineStream {}
 
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
@@ -70,17 +194,21 @@ fn connection(
     shared: Arc<Shared>,
     spec: Arc<ServerSpec>,
 ) {
-    let Ok(mut tls) = ferrox_core::tls::accept(identity, stream) else {
+    let deadline = Deadline::default();
+    deadline.arm(Instant::now() + HANDSHAKE);
+    let io = DeadlineStream::new(stream, deadline.clone());
+    let Ok(mut tls) = ferrox_core::tls::accept(identity, io) else {
         return;
     };
     if tls.handshake().is_err() || tls.alpn() != Some(b"h2") {
         return;
     }
-    let _ = tls.get_ref().get_ref().set_read_timeout(Some(READ_WAIT));
+    tls.get_ref().get_ref().set_read_timeout(Some(READ_WAIT));
     let mut wire = Wire {
         stream: Box::new(tls),
         pending: Vec::new(),
         closed: false,
+        deadline,
     };
     if wire.preface() {
         Session::new(shared, spec).run(&mut wire);
@@ -91,6 +219,7 @@ struct Wire {
     stream: Box<dyn ReadWrite + Send>,
     pending: Vec<u8>,
     closed: bool,
+    deadline: Deadline,
 }
 
 impl Wire {
@@ -121,7 +250,14 @@ impl Wire {
                 self.pending.extend_from_slice(&room[..n]);
                 true
             }
-            Err(error) if ferrox_core::tls::TlsError::is_timeout(&error) => true,
+            Err(error) if ferrox_core::tls::TlsError::is_timeout(&error) => {
+                if self.deadline.remaining().is_some_and(|left| left.is_zero()) {
+                    self.closed = true;
+                    false
+                } else {
+                    true
+                }
+            }
             Err(_) => {
                 self.closed = true;
                 false
@@ -223,6 +359,26 @@ fn connect_edge(edge: SocketAddr) -> Result<TcpStream, String> {
     dial_until_bound(edge, |edge| TcpStream::connect_timeout(&edge, HANDSHAKE))
 }
 
+fn request_fields<'a>(
+    authority: &'a str,
+    path: &'a str,
+    headers: &'a [(String, String)],
+) -> Vec<(&'a str, &'a str)> {
+    let mut fields = Vec::with_capacity(6 + headers.len());
+    fields.push((":method", "CONNECT"));
+    fields.push((":protocol", "connect-ip"));
+    fields.push((":scheme", "https"));
+    fields.push((":path", path));
+    fields.push((":authority", authority));
+    fields.push(("capsule-protocol", "?1"));
+    fields.extend(
+        headers
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str())),
+    );
+    fields
+}
+
 impl Client {
     pub(crate) fn dial(
         tls_config: &TlsConfig,
@@ -232,9 +388,9 @@ impl Client {
         headers: &[(String, String)],
     ) -> Result<Self, String> {
         let tcp = connect_edge(edge)?;
-        let _ = tcp.set_nodelay(true);
         let _ = tcp.set_read_timeout(Some(HANDSHAKE));
         let _ = tcp.set_write_timeout(Some(HANDSHAKE));
+        let (tcp, deadline) = handshake_stream(tcp);
         let mut tls =
             ferrox_core::tls::connect(tls_config, tcp).map_err(|error| format!("tls: {error}"))?;
         tls.handshake()
@@ -242,7 +398,7 @@ impl Client {
         if tls.alpn() != Some(b"h2".as_slice()) {
             return Err("the edge did not negotiate h2".to_owned());
         }
-        let _ = tls.get_ref().set_read_timeout(Some(READ_WAIT));
+        tls.get_ref().set_read_timeout(Some(READ_WAIT));
         tls.write_all(h2::MAGIC)
             .map_err(|error| format!("preface: {error}"))?;
         let mut client = Self {
@@ -250,6 +406,7 @@ impl Client {
                 stream: Box::new(tls),
                 pending: Vec::new(),
                 closed: false,
+                deadline,
             },
             decoder: Decoder::default(),
             stream: 1,
@@ -280,17 +437,7 @@ impl Client {
         {
             return Err("the edge closed while settings were written".to_owned());
         }
-        let mut fields: Vec<(&str, &str)> = Vec::with_capacity(6 + headers.len());
-        fields.push((":method", "CONNECT"));
-        fields.push((":protocol", "connect-ip"));
-        fields.push((":scheme", "https"));
-        fields.push((":path", path));
-        fields.push((":authority", authority));
-        fields.push(("capsule-protocol", "?1"));
-        for (name, value) in headers {
-            fields.push((name, value));
-        }
-        let block = h2::block_encode(&fields);
+        let block = h2::block_encode(&request_fields(authority, path, headers));
         if !client
             .wire
             .send(h2::T_HEADERS, h2::F_END_HEADERS, client.stream, &block)
@@ -329,6 +476,7 @@ impl Client {
             }
             client.wire.fill();
         }
+        client.wire.deadline.clear();
         Ok(client)
     }
 
@@ -871,6 +1019,9 @@ impl Session {
         control.clear();
         connectip::route_advert_encode(&masque::routes(&self.addrs), &mut control);
         self.capsule(wire, &control);
+        if !wire.closed {
+            wire.deadline.clear();
+        }
     }
 
     fn reply(&mut self, wire: &mut Wire, id: u32, status: u16) {
@@ -1042,6 +1193,7 @@ mod tests {
                 stream: Box::new(std::io::Cursor::new(Vec::new())),
                 pending: Vec::new(),
                 closed: false,
+                deadline: Deadline::default(),
             },
             decoder: Decoder::default(),
             stream: 1,
@@ -1161,6 +1313,7 @@ mod tests {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
             closed: false,
+            deadline: Deadline::default(),
         };
         let mut capsule = Vec::new();
         datagram(&udp_packet(53), &mut capsule);
@@ -1186,6 +1339,7 @@ mod tests {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
             closed: false,
+            deadline: Deadline::default(),
         };
         let mut capsule = Vec::new();
         datagram(&udp_packet(53), &mut capsule);
@@ -1229,6 +1383,7 @@ mod tests {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
             closed: false,
+            deadline: Deadline::default(),
         };
         let mut settings = Vec::new();
         settings.extend_from_slice(&SETTINGS_INITIAL_WINDOW.to_be_bytes());
@@ -1276,6 +1431,7 @@ mod tests {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
             closed: false,
+            deadline: Deadline::default(),
         };
         session.on(&mut wire, h2::T_SETTINGS, 0, 0, &initial_window(100));
         session.on(&mut wire, h2::T_WINDOW, 0, 0, &1_000u32.to_be_bytes());
@@ -1312,12 +1468,64 @@ mod tests {
     }
 
     #[test]
+    fn an_expired_handshake_deadline_stops_a_trickled_read() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("a listener");
+        let address = listener.local_addr().expect("an address");
+        let peer = std::thread::spawn(move || {
+            let mut stream = TcpStream::connect(address).expect("connects");
+            for _ in 0..20 {
+                if stream.write_all(&[0]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        });
+        let (stream, _) = listener.accept().expect("accepts");
+        let deadline = Deadline::default();
+        deadline.arm(Instant::now());
+        let mut stream = DeadlineStream::new(stream, deadline);
+        let start = Instant::now();
+        let mut error = None;
+        let mut byte = [0u8; 1];
+        while start.elapsed() < Duration::from_millis(500) {
+            match stream.read(&mut byte) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(reason) => {
+                    error = Some(reason);
+                    break;
+                }
+            }
+        }
+        let _ = peer.join();
+        assert!(
+            error.is_some_and(|reason| reason.kind() == std::io::ErrorKind::TimedOut),
+            "the read outlived its absolute deadline"
+        );
+    }
+
+    #[test]
+    fn a_timeout_after_the_deadline_closes_the_wire() {
+        let deadline = Deadline::default();
+        deadline.arm(Instant::now());
+        let mut wire = Wire {
+            stream: Box::new(Quiet { reads: 1_000 }),
+            pending: Vec::new(),
+            closed: false,
+            deadline,
+        };
+        assert!(!wire.fill(), "an expired deadline ends the read");
+        assert!(wire.closed, "the wire is closed, not retried as idle");
+    }
+
+    #[test]
     fn a_silent_peer_is_ended_after_the_handshake() {
         let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
         let mut wire = Wire {
             stream: Box::new(Quiet { reads: 1_000 }),
             pending: Vec::new(),
             closed: false,
+            deadline: Deadline::default(),
         };
         let deadline = Instant::now()
             .checked_sub(Duration::from_millis(1))
@@ -1333,6 +1541,7 @@ mod tests {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
             closed: false,
+            deadline: Deadline::default(),
         };
         let half = vec![0u8; FRAME_CAP / 2 + 1];
         session.on(&mut wire, h2::T_HEADERS, 0, 1, &half);
@@ -1387,6 +1596,7 @@ mod tests {
             stream: Box::new(std::io::Cursor::new(Vec::new())),
             pending: Vec::new(),
             closed: false,
+            deadline: Deadline::default(),
         };
         let ((), counts) = ferrox_core::alloc_count::measure(|| {
             session.on(&mut wire, h2::T_CONT, 0, 1, &body);
@@ -1409,6 +1619,7 @@ mod tests {
             }),
             pending: Vec::new(),
             closed: false,
+            deadline: Deadline::default(),
         };
         session.on(&mut wire, h2::T_DATA, h2::F_END, 1, &[]);
         assert!(
