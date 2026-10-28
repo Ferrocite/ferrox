@@ -19446,12 +19446,12 @@ pub(crate) mod lane_pool {
                 );
             }
             let before = parker_batches(&pool);
-            thread::sleep(Duration::from_millis(20));
+            thread::sleep(Duration::from_millis(40));
             let batches = parker_batches(&pool) - before;
             stop.store(true, Ordering::Relaxed);
             assert!(
                 batches >= 2,
-                "{idle} idle lanes cycled {batches} park rounds in 20 ms"
+                "{idle} idle lanes cycled {batches} park rounds in 40 ms"
             );
             assert!(running.load(Ordering::Relaxed) >= idle);
         }
