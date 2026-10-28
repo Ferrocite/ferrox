@@ -599,6 +599,7 @@ impl Resolver {
         let mut families = 0u8;
         let mut rcode = None;
         let mut empty = false;
+        let mut failed = false;
         if v4 && server.v4 {
             match self.family(index, name, Family::A, force_local) {
                 Lookup::Records(mut found, found_ttl) => {
@@ -608,7 +609,8 @@ impl Resolver {
                 }
                 Lookup::Rcode(code) => rcode = Some(code),
                 Lookup::Empty => empty = true,
-                Lookup::Failed | Lookup::Skipped => {}
+                Lookup::Failed => failed = true,
+                Lookup::Skipped => {}
             }
         }
         if v6 && server.v6 {
@@ -620,7 +622,8 @@ impl Resolver {
                 }
                 Lookup::Rcode(code) => rcode = Some(code),
                 Lookup::Empty => empty = true,
-                Lookup::Failed | Lookup::Skipped => {}
+                Lookup::Failed => failed = true,
+                Lookup::Skipped => {}
             }
         }
         if !ips.is_empty() {
@@ -637,7 +640,9 @@ impl Resolver {
         if let Some(code) = rcode {
             return Lookup::Rcode(code);
         }
-        if empty {
+        if failed {
+            Lookup::Failed
+        } else if empty {
             Lookup::Empty
         } else {
             Lookup::Failed
