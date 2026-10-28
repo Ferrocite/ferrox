@@ -1008,27 +1008,32 @@ impl Routing {
         }
     }
 
-    /// The first selector a `tun` flow cannot answer, if a rule that could reach it names one.
+    /// The first selector a source-less flow cannot answer, if a rule that could reach it on either network names one.
     pub(crate) fn source_refusal(&self, inbound: Option<&str>) -> Option<&'static str> {
-        for rule in &self.rules {
-            if !rule.reachable(inbound, Network::Tcp) || !rule.local_os_matches() {
-                continue;
-            }
-            if rule
-                .sets
-                .as_ref()
-                .is_some_and(|sets| sets.iter().any(|set| set.needs_source()))
-            {
-                return Some("ruleSet");
-            }
-            for (present, name) in [
-                (rule.source_ips.is_some(), "source"),
-                (rule.source_ports.is_some(), "sourcePort"),
-                (rule.local_ips.is_some(), "localIP"),
-                (rule.local_ports.is_some(), "localPort"),
-            ] {
-                if present {
-                    return Some(name);
+        for network in [Network::Tcp, Network::Udp] {
+            for rule in &self.rules {
+                if !rule.reachable(inbound, network) || !rule.local_os_matches() {
+                    continue;
+                }
+                if rule
+                    .sets
+                    .as_ref()
+                    .is_some_and(|sets| sets.iter().any(|set| set.needs_source(network)))
+                {
+                    return Some("ruleSet");
+                }
+                for (present, name) in [
+                    (rule.source_ips.is_some(), "source"),
+                    (rule.source_ports.is_some(), "sourcePort"),
+                    (rule.local_ips.is_some(), "localIP"),
+                    (rule.local_ports.is_some(), "localPort"),
+                ] {
+                    if present {
+                        return Some(name);
+                    }
+                }
+                if rule.catch_all() {
+                    break;
                 }
             }
         }
@@ -1223,9 +1228,9 @@ impl Rule {
         }))
     }
 
-    fn association_stable(&self) -> bool {
-        !self.balancer
-            && self.ports.is_none()
+    /// True when no selector beyond the inbound, network and local OS narrows this rule.
+    fn catch_all(&self) -> bool {
+        self.ports.is_none()
             && self.source_ports.is_none()
             && self.local_ports.is_none()
             && self.domains.is_none()
@@ -1234,6 +1239,10 @@ impl Rule {
             && self.local_ips.is_none()
             && self.protocols.is_none()
             && self.sets.is_none()
+    }
+
+    fn association_stable(&self) -> bool {
+        !self.balancer && self.catch_all()
     }
 
     fn server_always(&self) -> bool {
@@ -1564,8 +1573,8 @@ impl RuleSet {
         verdict
     }
 
-    fn needs_source(&self) -> bool {
-        self.rules.iter().any(SetRule::needs_source)
+    fn needs_source(&self, network: Network) -> bool {
+        self.rules.iter().any(|rule| rule.needs_source(network))
     }
 
     fn has_domains(&self) -> bool {
@@ -1890,13 +1899,52 @@ impl SetRule {
         }
     }
 
-    fn needs_source(&self) -> bool {
-        self.source_ports.is_some()
-            || self.source_ips.is_some()
-            || self
-                .logical
-                .as_ref()
-                .is_some_and(|logical| logical.rules.iter().any(SetRule::needs_source))
+    fn matches_network(&self, network: Network) -> bool {
+        self.networks
+            .as_ref()
+            .is_none_or(|networks| networks.contains(&network))
+    }
+
+    /// Whether any flow on this network can reach this rule, counting an inverted child as reachable.
+    fn reachable_on(&self, network: Network) -> bool {
+        let Some(logical) = &self.logical else {
+            return self.matches_network(network);
+        };
+        if logical.all {
+            logical
+                .rules
+                .iter()
+                .all(|rule| rule.invert || rule.reachable_on(network))
+        } else {
+            logical
+                .rules
+                .iter()
+                .any(|rule| rule.invert || rule.reachable_on(network))
+        }
+    }
+
+    fn needs_source(&self, network: Network) -> bool {
+        if !self.matches_network(network) {
+            return false;
+        }
+        let Some(logical) = &self.logical else {
+            return self.source_ports.is_some() || self.source_ips.is_some();
+        };
+        if logical.all {
+            for rule in &logical.rules {
+                if !rule.reachable_on(network) {
+                    if rule.invert {
+                        continue;
+                    }
+                    return false;
+                }
+                if rule.needs_source(network) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        logical.rules.iter().any(|rule| rule.needs_source(network))
     }
 
     fn has_domains(&self) -> bool {
@@ -4422,6 +4470,162 @@ mod tests {
             .expect("routing");
         assert_eq!(routing.source_refusal(Some("tun")), Some("source"));
         assert_eq!(routing.source_refusal(Some("other")), None);
+    }
+
+    #[test]
+    fn a_shadowed_udp_source_rule_does_not_refuse_the_tun() {
+        let root = object(vec![(
+            "routing",
+            routing(vec![
+                rule(
+                    "direct",
+                    vec![
+                        ("inboundTag", array(vec![text("tun")])),
+                        ("network", text("udp")),
+                    ],
+                ),
+                rule(
+                    "direct",
+                    vec![
+                        ("inboundTag", array(vec![text("tun")])),
+                        ("network", text("udp")),
+                        ("source", array(vec![text("192.0.2.0/24")])),
+                    ],
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(routing.source_refusal(Some("tun")), None);
+    }
+
+    #[test]
+    fn a_rule_set_source_selector_is_checked_on_the_flow_network() {
+        let mixed = object(vec![
+            ("tag", text("mixed")),
+            (
+                "rules",
+                array(vec![
+                    object(vec![
+                        ("network", text("tcp")),
+                        ("source_ip_cidr", array(vec![text("192.0.2.0/24")])),
+                    ]),
+                    object(vec![
+                        ("network", text("udp")),
+                        ("ip_cidr", array(vec![text("198.51.100.0/24")])),
+                    ]),
+                ]),
+            ),
+        ]);
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                ("ruleSets", array(vec![mixed])),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "direct",
+                        vec![
+                            ("inboundTag", array(vec![text("tun")])),
+                            ("network", text("udp")),
+                            ("ruleSet", array(vec![text("mixed")])),
+                        ],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(routing.source_refusal(Some("tun")), None);
+
+        let source = object(vec![
+            ("tag", text("source")),
+            (
+                "rules",
+                array(vec![object(vec![
+                    ("network", text("udp")),
+                    ("source_ip_cidr", array(vec![text("192.0.2.0/24")])),
+                ])]),
+            ),
+        ]);
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                ("ruleSets", array(vec![source])),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "direct",
+                        vec![
+                            ("inboundTag", array(vec![text("tun")])),
+                            ("network", text("udp")),
+                            ("ruleSet", array(vec![text("source")])),
+                        ],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(routing.source_refusal(Some("tun")), Some("ruleSet"));
+    }
+
+    #[test]
+    fn a_nested_tcp_group_does_not_refuse_the_udp_rule() {
+        let nested = object(vec![
+            ("tag", text("nested")),
+            (
+                "rules",
+                array(vec![object(vec![
+                    ("type", text("logical")),
+                    ("mode", text("and")),
+                    (
+                        "rules",
+                        array(vec![
+                            object(vec![
+                                ("type", text("logical")),
+                                ("mode", text("or")),
+                                (
+                                    "rules",
+                                    array(vec![object(vec![
+                                        ("network", text("tcp")),
+                                        ("ip_cidr", array(vec![text("198.51.100.0/24")])),
+                                    ])]),
+                                ),
+                            ]),
+                            object(vec![
+                                ("network", text("udp")),
+                                ("source_ip_cidr", array(vec![text("192.0.2.0/24")])),
+                            ]),
+                        ]),
+                    ),
+                ])]),
+            ),
+        ]);
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                ("ruleSets", array(vec![nested])),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "direct",
+                        vec![
+                            ("inboundTag", array(vec![text("tun")])),
+                            ("network", text("udp")),
+                            ("ruleSet", array(vec![text("nested")])),
+                        ],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(routing.source_refusal(Some("tun")), None);
     }
 
     #[test]

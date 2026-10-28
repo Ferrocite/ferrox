@@ -100,8 +100,20 @@ pub(crate) fn timed_row(
     ours: &mut dyn FnMut() -> usize,
     base: &mut dyn FnMut() -> usize,
 ) -> Row {
+    timed_row_at(name, bytes, iters, crate::BAR, ours, base)
+}
+
+/// A row gated tighter than the report's bar: a first reading that lands under `bar` gets the same four-times pass a slower row does, so one loaded round cannot fail a claim the coder meets.
+pub(crate) fn timed_row_at(
+    name: String,
+    bytes: usize,
+    iters: u64,
+    bar: f64,
+    ours: &mut dyn FnMut() -> usize,
+    base: &mut dyn FnMut() -> usize,
+) -> Row {
     let first = paired(iters, base, ours);
-    if ratio_of(first) >= crate::BAR {
+    if ratio_of(first) >= bar {
         return Row {
             name,
             bytes,

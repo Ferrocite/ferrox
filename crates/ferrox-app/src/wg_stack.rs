@@ -13,6 +13,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, Shutdown, SocketAddr, UdpSocket};
+#[cfg(unix)]
+use std::os::fd::AsRawFd as _;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -24,7 +26,9 @@ use ferrox_core::foxy::connectip::{
 };
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::tcp::{RecvError, SendError, Socket as TcpSocket, SocketBuffer, State};
+use smoltcp::socket::tcp::{
+    CongestionControl, RecvError, SendError, Socket as TcpSocket, SocketBuffer, State,
+};
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 
@@ -32,10 +36,15 @@ use crate::conn::Connection;
 use crate::proxy::{serve_device_flow, serve_udp_lane, Destination, Outbound};
 use crate::wireguard::DeviceConfig;
 
-/// The bytes one direction of a TCP flow may buffer inside `smoltcp`: a 1 MiB
-/// transfer needs no window larger than this, and five concurrent flows stay
-/// under a few megabytes.
-const TCP_BUFFER: usize = 256 * 1024;
+/// The receive side of one flow: a peer may have this much in flight before a
+/// window update, which is the reference's order of magnitude.
+const TCP_RECV_BUFFER: usize = 512 * 1024;
+/// The send side of one flow: a stream moves this queue per round trip, and a
+/// tunnel's round trip is milliseconds, so the smaller queue capped a fast
+/// link well below the interface.
+const TCP_SEND_BUFFER: usize = 1024 * 1024;
+/// The most answers a client races for one target.
+const RACES: usize = 8;
 /// The most listeners one inbound may hold across every destination port. Each
 /// listener owns both TCP buffers, so a spoofed SYN stream must not grow the
 /// set past a fixed share of memory.
@@ -46,12 +55,24 @@ const LISTENERS_PER_PORT: usize = 8;
 /// How long a listener may wait for a handshake before it is reclaimed, so a
 /// spoofed SYN cannot hold a slot for the life of the inbound.
 const LISTENER_TTL: Duration = Duration::from_secs(60);
-/// The stack's poll interval when no packet arrived: retransmit timers are
-/// seconds, so ten milliseconds is latency without a spin.
-const TICK: Duration = Duration::from_millis(10);
+/// The stack's poll interval when no packet arrived: a target's answer can be
+/// ready with no tunnel packet to wake the stack, so the wait bounds a request's
+/// round trip and stays short.
+const TICK: Duration = Duration::from_millis(1);
+/// Datagram lanes are idle most of their life; a ten millisecond wake is a
+/// poll of their own, not a bound on a request.
+const LANE_TICK: Duration = Duration::from_millis(10);
 /// The most inner packets the tunnel reader may queue before the stack drains
 /// them; past it the oldest is dropped, as a full device would drop.
 const RX_PACKETS: usize = 4096;
+/// The most datagrams one stack turn consumes before it polls: a turn that
+/// drained a long ACK backlog would answer with a burst the peer's socket
+/// cannot hold, and a TCP retransmit costs more than the poll saves.
+const RX_BURST: usize = 256;
+/// The most datagrams one stack turn emits: a peer's default UDP socket holds
+/// about 212 KiB, so a 64 KiB chunk per flow would overflow it and lose tail
+/// segments, whose retransmit costs a whole RTO.
+const TX_BURST: usize = 64;
 /// The most server datagram lanes one inbound may hold.
 const UDP_FLOWS: usize = 4096;
 
@@ -64,7 +85,7 @@ pub(crate) struct Packet {
 /// One local stream the client asks the stack to connect.
 pub(crate) struct ClientFlow {
     pub(crate) client: Connection,
-    pub(crate) destination: SocketAddr,
+    pub(crate) destinations: Vec<SocketAddr>,
     pub(crate) prefix: Vec<u8>,
 }
 
@@ -166,6 +187,70 @@ impl Device for QueueDevice {
     }
 }
 
+/// Which local streams have bytes to read: one `poll` over every flow, so an
+/// idle flow costs no read syscall per stack turn.
+#[cfg(unix)]
+struct Readiness {
+    fds: Vec<libc::pollfd>,
+    ready: Vec<bool>,
+}
+
+#[cfg(unix)]
+impl Readiness {
+    fn new() -> Self {
+        Self {
+            fds: Vec::new(),
+            ready: Vec::new(),
+        }
+    }
+
+    fn sync(&mut self, flows: &[Flow]) -> &[bool] {
+        self.sync_locals(flows.iter().map(|flow| &flow.local))
+    }
+
+    fn sync_locals<'a>(&mut self, locals: impl Iterator<Item = &'a Connection>) -> &[bool] {
+        self.fds.clear();
+        for local in locals {
+            self.fds.push(libc::pollfd {
+                fd: local.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
+        let answered =
+            unsafe { libc::poll(self.fds.as_mut_ptr(), self.fds.len() as libc::nfds_t, 0) };
+        self.ready.clear();
+        for entry in &self.fds {
+            self.ready.push(
+                answered < 0
+                    || (answered > 0
+                        && entry.revents
+                            & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
+                            != 0),
+            );
+        }
+        &self.ready
+    }
+}
+
+#[cfg(not(unix))]
+struct Readiness {
+    ready: Vec<bool>,
+}
+
+#[cfg(not(unix))]
+impl Readiness {
+    fn new() -> Self {
+        Self { ready: Vec::new() }
+    }
+
+    fn sync(&mut self, flows: &[Flow]) -> &[bool] {
+        self.ready.clear();
+        self.ready.resize(flows.len(), true);
+        &self.ready
+    }
+}
+
 /// One TCP flow and the local stream on the other side of it. `pending_down`
 /// holds bytes the local socket refused because its send buffer was full;
 /// `pending_up` holds bytes read locally that the TCP window has not accepted.
@@ -174,6 +259,7 @@ struct Flow {
     handle: SocketHandle,
     local: Connection,
     local_port: u16,
+    races: Vec<(SocketHandle, u16)>,
     pending_down: VecDeque<Vec<u8>>,
     pending_up: Vec<u8>,
     up_eof: bool,
@@ -190,6 +276,7 @@ impl Flow {
             handle,
             local,
             local_port,
+            races: Vec::new(),
             pending_down: VecDeque::new(),
             pending_up: Vec::new(),
             up_eof: false,
@@ -200,12 +287,91 @@ impl Flow {
             done: false,
         }
     }
+
+    fn adopt(&mut self, sockets: &mut SocketSet<'_>, ports: &mut HashSet<u16>) {
+        if self.races.is_empty() {
+            if !self.established && sockets.get::<TcpSocket>(self.handle).state() == State::Closed {
+                self.done = true;
+            }
+            return;
+        }
+        loop {
+            let primary = sockets.get::<TcpSocket>(self.handle).state();
+            if matches!(primary, State::Established | State::CloseWait) {
+                for (handle, port) in self.races.drain(..) {
+                    sockets.remove(handle);
+                    ports.remove(&port);
+                }
+                return;
+            }
+            let winner = self.races.iter().position(|(handle, _)| {
+                matches!(
+                    sockets.get::<TcpSocket>(*handle).state(),
+                    State::Established | State::CloseWait
+                )
+            });
+            if let Some(winner) = winner {
+                let (handle, port) = self.races.remove(winner);
+                sockets.remove(self.handle);
+                ports.remove(&self.local_port);
+                for (handle, port) in self.races.drain(..) {
+                    sockets.remove(handle);
+                    ports.remove(&port);
+                }
+                self.handle = handle;
+                self.local_port = port;
+                return;
+            }
+            if primary != State::Closed {
+                break;
+            }
+            let next = self
+                .races
+                .iter()
+                .position(|(handle, _)| sockets.get::<TcpSocket>(*handle).state() != State::Closed);
+            let Some(next) = next else {
+                for (handle, port) in self.races.drain(..) {
+                    sockets.remove(handle);
+                    ports.remove(&port);
+                }
+                self.done = true;
+                return;
+            };
+            sockets.remove(self.handle);
+            ports.remove(&self.local_port);
+            let (handle, port) = self.races.remove(next);
+            self.handle = handle;
+            self.local_port = port;
+        }
+        let closed: Vec<usize> = self
+            .races
+            .iter()
+            .enumerate()
+            .filter_map(|(index, (handle, _))| {
+                (sockets.get::<TcpSocket>(*handle).state() == State::Closed).then_some(index)
+            })
+            .collect();
+        for index in closed.into_iter().rev() {
+            let (handle, port) = self.races.swap_remove(index);
+            sockets.remove(handle);
+            ports.remove(&port);
+        }
+    }
 }
 
 /// What a stack loop sends the tunnel writer.
 type ToTunnel = Sender<Vec<u8>>;
 /// What the tunnel reader sends the stack.
 type Packets = Receiver<Packet>;
+
+/// One packet the reader decrypted into the client stack.
+fn receive_client(stack: &mut ClientStack, packet: Packet) {
+    if inner_protocol(&packet.bytes) == Some(PROTOCOL_TCP) {
+        stack.device.push(packet.bytes);
+    } else if !stack.answer_echo(&packet.bytes) {
+        stack.device.absorb(&packet.bytes);
+    }
+}
 
 /// Run the client stack until the outbound is dropped.
 #[allow(clippy::needless_pass_by_value)]
@@ -218,29 +384,25 @@ pub(crate) fn client(
     let mut stack = ClientStack::new(&config, to_tunnel);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        let mut progress = false;
         while let Ok(flow) = flows.try_recv() {
             if let Err(error) = stack.connect(flow) {
                 eprintln!("wireguard client: {error}");
             }
-            progress = true;
         }
         match packets.recv_timeout(TICK) {
             Ok(packet) => {
-                if inner_protocol(&packet.bytes) == Some(PROTOCOL_TCP) {
-                    stack.device.push(packet.bytes);
-                    progress = true;
-                } else if stack.answer_echo(&packet.bytes) || stack.device.absorb(&packet.bytes) {
-                    progress = true;
+                receive_client(&mut stack, packet);
+                for _ in 1..RX_BURST {
+                    let Ok(packet) = packets.try_recv() else {
+                        break;
+                    };
+                    receive_client(&mut stack, packet);
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
         stack.poll(&mut buf);
-        if progress {
-            stack.poll(&mut buf);
-        }
     }
 }
 
@@ -251,7 +413,15 @@ pub(crate) fn server(config: DeviceConfig, to_tunnel: ToTunnel, packets: Packets
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         match packets.recv_timeout(TICK) {
-            Ok(packet) => stack.receive(packet),
+            Ok(packet) => {
+                stack.receive(packet);
+                for _ in 1..RX_BURST {
+                    let Ok(packet) = packets.try_recv() else {
+                        break;
+                    };
+                    stack.receive(packet);
+                }
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
@@ -264,6 +434,7 @@ struct ClientStack {
     iface: Interface,
     sockets: SocketSet<'static>,
     flows: Vec<Flow>,
+    readiness: Readiness,
     ports: HashSet<u16>,
     next_port: u16,
     to_tunnel: ToTunnel,
@@ -286,6 +457,7 @@ impl ClientStack {
             iface,
             sockets: SocketSet::new(Vec::new()),
             flows: Vec::new(),
+            readiness: Readiness::new(),
             ports: HashSet::new(),
             next_port: 49_152,
             to_tunnel,
@@ -299,39 +471,45 @@ impl ClientStack {
     }
 
     fn connect(&mut self, flow: ClientFlow) -> std::io::Result<()> {
-        if flow.destination.port() == 0 || flow.destination.ip().is_unspecified() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!("destination {} is not a TCP endpoint", flow.destination),
-            ));
+        let mut candidates = Vec::new();
+        let mut refused = None;
+        for destination in flow.destinations.iter().take(RACES) {
+            if destination.port() == 0 || destination.ip().is_unspecified() {
+                refused = Some(format!("destination {destination} is not a TCP endpoint"));
+                continue;
+            }
+            let Some(local_port) = self.free_port() else {
+                break;
+            };
+            let mut socket = TcpSocket::new(
+                SocketBuffer::new(vec![0u8; TCP_RECV_BUFFER]),
+                SocketBuffer::new(vec![0u8; TCP_SEND_BUFFER]),
+            );
+            socket.set_nagle_enabled(false);
+            socket.set_ack_delay(None);
+            socket.set_congestion_control(CongestionControl::Cubic);
+            if let Err(error) = socket.connect(
+                self.iface.context(),
+                IpEndpoint::from(*destination),
+                IpListenEndpoint::from(local_port),
+            ) {
+                refused = Some(format!("cannot connect {destination}: {error:?}"));
+                continue;
+            }
+            let handle = self.sockets.add(socket);
+            self.ports.insert(local_port);
+            candidates.push((handle, local_port));
         }
-        let Some(local_port) = self.free_port() else {
+        let Some((handle, local_port)) = candidates.first().copied() else {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AddrNotAvailable,
-                "wireguard has no free local ephemeral port",
+                refused.unwrap_or_else(|| "wireguard has no routable destination".to_owned()),
             ));
         };
-        let mut socket = TcpSocket::new(
-            SocketBuffer::new(vec![0u8; TCP_BUFFER]),
-            SocketBuffer::new(vec![0u8; TCP_BUFFER]),
-        );
-        socket.set_nagle_enabled(false);
-        socket
-            .connect(
-                self.iface.context(),
-                IpEndpoint::from(flow.destination),
-                IpListenEndpoint::from(local_port),
-            )
-            .map_err(|error| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("cannot connect {}: {error:?}", flow.destination),
-                )
-            })?;
+        candidates.remove(0);
         flow.client.set_nonblocking(true)?;
-        let handle = self.sockets.add(socket);
-        self.ports.insert(local_port);
         let mut routed = Flow::new(handle, flow.client, local_port);
+        routed.races = candidates;
         routed.pending_up = flow.prefix;
         self.flows.push(routed);
         Ok(())
@@ -352,20 +530,29 @@ impl ClientStack {
     fn poll(&mut self, buf: &mut [u8]) {
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
-        for flow in &mut self.flows {
-            pump(flow, &mut self.sockets, buf);
+        let ready = self.readiness.sync(&self.flows);
+        for (flow, &up_ready) in self.flows.iter_mut().zip(ready) {
+            flow.adopt(&mut self.sockets, &mut self.ports);
+            pump(flow, &mut self.sockets, buf, up_ready);
         }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
-        while let Some(packet) = self.device.tx.pop_front() {
+        for _ in 0..TX_BURST {
+            let Some(packet) = self.device.tx.pop_front() else {
+                break;
+            };
             if self.to_tunnel.send(packet).is_err() {
                 return;
             }
         }
-        self.flows.retain(|flow| {
+        self.flows.retain_mut(|flow| {
             if flow.done {
                 let _ = flow.local.shutdown(Shutdown::Both);
                 self.sockets.remove(flow.handle);
                 self.ports.remove(&flow.local_port);
+                for (handle, port) in flow.races.drain(..) {
+                    self.sockets.remove(handle);
+                    self.ports.remove(&port);
+                }
                 false
             } else {
                 true
@@ -398,6 +585,7 @@ struct ServerStack {
     iface: Interface,
     sockets: SocketSet<'static>,
     flows: Vec<Flow>,
+    readiness: Readiness,
     listeners: HashMap<u16, Vec<Listener>>,
     udp: HashMap<([u8; 32], SocketAddr, SocketAddr), UdpLane>,
     to_tunnel: ToTunnel,
@@ -422,6 +610,7 @@ impl ServerStack {
             iface,
             sockets: SocketSet::new(Vec::new()),
             flows: Vec::new(),
+            readiness: Readiness::new(),
             listeners: HashMap::new(),
             udp: HashMap::new(),
             to_tunnel,
@@ -498,11 +687,15 @@ impl ServerStack {
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.handoff();
-        for flow in &mut self.flows {
-            pump(flow, &mut self.sockets, buf);
+        let ready = self.readiness.sync(&self.flows);
+        for (flow, &up_ready) in self.flows.iter_mut().zip(ready) {
+            pump(flow, &mut self.sockets, buf, up_ready);
         }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
-        while let Some(packet) = self.device.tx.pop_front() {
+        for _ in 0..TX_BURST {
+            let Some(packet) = self.device.tx.pop_front() else {
+                break;
+            };
             if self.to_tunnel.send(packet).is_err() {
                 return;
             }
@@ -562,10 +755,12 @@ impl ServerStack {
             return;
         }
         let mut socket = TcpSocket::new(
-            SocketBuffer::new(vec![0u8; TCP_BUFFER]),
-            SocketBuffer::new(vec![0u8; TCP_BUFFER]),
+            SocketBuffer::new(vec![0u8; TCP_RECV_BUFFER]),
+            SocketBuffer::new(vec![0u8; TCP_SEND_BUFFER]),
         );
         socket.set_nagle_enabled(false);
+        socket.set_ack_delay(None);
+        socket.set_congestion_control(CongestionControl::Cubic);
         if socket.listen(IpListenEndpoint { addr: None, port }).is_ok() {
             let handle = self.sockets.add(socket);
             listeners.push(Listener {
@@ -629,7 +824,7 @@ impl ServerStack {
 /// Move bytes between one flow's local stream and its TCP socket. Every read and
 /// write is nonblocking, so a slow local peer parks only its own buffers.
 #[allow(clippy::too_many_lines)]
-fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8]) {
+fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: bool) {
     let socket = sockets.get_mut::<TcpSocket>(flow.handle);
     if matches!(socket.state(), State::Established | State::CloseWait) {
         flow.established = true;
@@ -692,7 +887,7 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8]) {
         }
     }
 
-    if flow.pending_up.is_empty() && !flow.up_eof && socket.can_send() {
+    if up_ready && flow.pending_up.is_empty() && !flow.up_eof && socket.can_send() {
         match flow.local.read(buf) {
             Ok(0) => flow.up_eof = true,
             Ok(n) => match socket.send_slice(&buf[..n]) {
@@ -838,7 +1033,7 @@ pub(crate) fn client_udp(
     to_tunnel: &ToTunnel,
     routes: &UdpRoutes,
     associate: Option<&Connection>,
-    resolve: &dyn Fn(&str, u16) -> Option<SocketAddr>,
+    resolve: &dyn Fn(&str, u16) -> Vec<SocketAddr>,
 ) {
     let Ok(local) = relay.local_addr() else {
         return;
@@ -848,7 +1043,7 @@ pub(crate) fn client_udp(
     if let Ok(mut table) = routes.lock() {
         table.insert(port, reply_tx);
     }
-    let _ = relay.set_read_timeout(Some(TICK));
+    let _ = relay.set_read_timeout(Some(LANE_TICK));
     if let Some(associate) = associate {
         let _ = associate.set_read_timeout(Some(crate::budgets::SESSION_POLL));
     }
@@ -856,7 +1051,7 @@ pub(crate) fn client_udp(
     let mut frame = Vec::new();
     let mut app: Option<SocketAddr> = None;
     let mut quiet = StdInstant::now();
-    loop {
+    'lane: loop {
         while let Ok(inner) = reply_rx.try_recv() {
             let Some(datagram) = udp_from_packet(&inner) else {
                 continue;
@@ -885,39 +1080,36 @@ pub(crate) fn client_udp(
                     continue;
                 }
                 app = Some(sender);
-                let target = match destination {
-                    Destination::Address(address) => address,
-                    Destination::Name(host, port) => {
-                        let Some(address) = resolve(&host, port) else {
-                            continue;
-                        };
-                        address
+                let targets = match destination {
+                    Destination::Address(address) => vec![address],
+                    Destination::Name(host, port) => resolve(&host, port),
+                };
+                for target in targets.into_iter().take(RACES) {
+                    let Some(inner_source) = config
+                        .addresses
+                        .iter()
+                        .find(|address| address.is_ipv4() == target.is_ipv4())
+                    else {
+                        continue;
+                    };
+                    let mut source_room = [0u8; 16];
+                    let mut destination_room = [0u8; 16];
+                    let source_bytes = ip_bytes_into(*inner_source, &mut source_room);
+                    let destination_bytes = ip_bytes_into(target.ip(), &mut destination_room);
+                    let mut packet = Vec::with_capacity(IPV4_HEADER + 8 + payload.len());
+                    let datagram = UdpDatagram {
+                        source: source_bytes,
+                        destination: destination_bytes,
+                        source_port: port,
+                        destination_port: target.port(),
+                        payload,
+                    };
+                    if !udp_datagram(&datagram, &mut packet) {
+                        continue;
                     }
-                };
-                let Some(inner_source) = config
-                    .addresses
-                    .iter()
-                    .find(|address| address.is_ipv4() == target.is_ipv4())
-                else {
-                    continue;
-                };
-                let mut source_bytes = [0u8; 16];
-                let mut destination_bytes = [0u8; 16];
-                let source_bytes = ip_bytes_into(*inner_source, &mut source_bytes);
-                let destination_bytes = ip_bytes_into(target.ip(), &mut destination_bytes);
-                let mut packet = Vec::with_capacity(IPV4_HEADER + 8 + payload.len());
-                let datagram = UdpDatagram {
-                    source: source_bytes,
-                    destination: destination_bytes,
-                    source_port: port,
-                    destination_port: target.port(),
-                    payload,
-                };
-                if !udp_datagram(&datagram, &mut packet) {
-                    continue;
-                }
-                if to_tunnel.send(packet).is_err() {
-                    break;
+                    if to_tunnel.send(packet).is_err() {
+                        break 'lane;
+                    }
                 }
             }
             Err(error)
@@ -976,7 +1168,7 @@ pub(crate) fn server_udp(
     let tunnel = to_tunnel.clone();
     std::thread::spawn(move || {
         let mut buf = crate::proxy::udp_buffer();
-        let _ = reader.set_read_timeout(Some(TICK));
+        let _ = reader.set_read_timeout(Some(LANE_TICK));
         loop {
             if reader_stop.load(Ordering::Relaxed) {
                 break;
@@ -1224,7 +1416,7 @@ mod tests {
         stack
             .connect(ClientFlow {
                 client: Connection::from(proxy),
-                destination: "192.0.2.1:80".parse().expect("destination"),
+                destinations: vec!["192.0.2.1:80".parse().expect("destination")],
                 prefix: Vec::new(),
             })
             .expect("connect");
@@ -1501,6 +1693,12 @@ mod client_tests {
     use super::*;
     use std::time::Duration;
 
+    fn resolve_one(host: &str, port: u16) -> Vec<SocketAddr> {
+        crate::proxy::resolve_endpoint(host, port)
+            .into_iter()
+            .collect()
+    }
+
     fn config() -> DeviceConfig {
         DeviceConfig {
             secret: [0u8; 32],
@@ -1538,7 +1736,7 @@ mod client_tests {
                 &to_tunnel,
                 &thread_routes,
                 Some(&Connection::from(associate)),
-                &crate::proxy::resolve_endpoint,
+                &resolve_one,
             );
             let _ = done_tx.send(());
         });
@@ -1570,7 +1768,7 @@ mod client_tests {
                 &to_tunnel,
                 &thread_routes,
                 None,
-                &crate::proxy::resolve_endpoint,
+                &resolve_one,
             );
             let _ = done_tx.send(());
         });
@@ -1599,7 +1797,7 @@ mod client_tests {
                 &to_tunnel,
                 &thread_routes,
                 None,
-                &crate::proxy::resolve_endpoint,
+                &resolve_one,
             );
         });
         let port = relay_address.port();
@@ -1647,7 +1845,7 @@ mod client_tests {
     }
 
     #[test]
-    fn a_client_datagram_name_uses_the_supplied_resolver() {
+    fn a_client_datagram_name_races_every_supplied_answer() {
         let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
         let relay_address = relay.local_addr().expect("address");
         let app = UdpSocket::bind("127.0.0.1:0").expect("app");
@@ -1658,7 +1856,11 @@ mod client_tests {
         let thread_relay = relay.try_clone().expect("clone");
         let thread_config = config();
         let thread_routes = Arc::clone(&routes);
-        let target: SocketAddr = "192.0.2.7:53".parse().unwrap();
+        let targets: Vec<SocketAddr> = vec![
+            "192.0.2.7:53".parse().unwrap(),
+            "192.0.2.8:53".parse().unwrap(),
+        ];
+        let wanted = targets.clone();
         std::thread::spawn(move || {
             client_udp(
                 &thread_relay,
@@ -1669,7 +1871,7 @@ mod client_tests {
                 &|host, port| {
                     assert_eq!(host, "example.test");
                     assert_eq!(port, 53);
-                    Some(target)
+                    wanted.clone()
                 },
             );
         });
@@ -1688,11 +1890,18 @@ mod client_tests {
         frame.extend_from_slice(&53u16.to_be_bytes());
         frame.extend_from_slice(b"query");
         app.send_to(&frame, relay_address).expect("send");
-        let inner = packets.recv_timeout(Duration::from_secs(5)).expect("inner");
-        let datagram = udp_from_packet(&inner).expect("packet");
-        assert_eq!(datagram.destination, ip_bytes(target.ip()).as_slice());
-        assert_eq!(datagram.destination_port, 53);
-        assert_eq!(datagram.payload, b"query");
+        let mut sent = Vec::new();
+        for _ in 0..targets.len() {
+            let inner = packets.recv_timeout(Duration::from_secs(5)).expect("inner");
+            let datagram = udp_from_packet(&inner).expect("packet");
+            assert_eq!(datagram.destination_port, 53);
+            assert_eq!(datagram.payload, b"query");
+            sent.push(socket_addr(datagram.destination, 53).expect("target"));
+        }
+        sent.sort();
+        let mut expected = targets;
+        expected.sort();
+        assert_eq!(sent, expected);
     }
 
     #[test]
@@ -1727,5 +1936,22 @@ mod client_tests {
         let mut forged = too_big;
         forged[40] = 3;
         assert!(!device.absorb(&forged), "not a packet too big");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod readiness_tests {
+    use super::*;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn readiness_names_only_the_stream_with_bytes() {
+        let (first, mut first_peer) = UnixStream::pair().expect("first pair");
+        let (second, _second_peer) = UnixStream::pair().expect("second pair");
+        let locals = [Connection::from(first), Connection::from(second)];
+        let mut readiness = Readiness::new();
+        assert_eq!(readiness.sync_locals(locals.iter()), &[false, false]);
+        first_peer.write_all(b"x").expect("write");
+        assert_eq!(readiness.sync_locals(locals.iter()), &[true, false]);
     }
 }

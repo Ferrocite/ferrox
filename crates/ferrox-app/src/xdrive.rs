@@ -1299,6 +1299,7 @@ pub(crate) struct Conn {
     writer: Arc<Writer>,
     reader: Arc<Reader>,
     wake: Arc<Wake>,
+    params: Arc<Params>,
 }
 
 impl Conn {
@@ -1318,12 +1319,18 @@ impl Conn {
                 Arc::clone(&wake),
             )),
             wake,
+            params: Arc::clone(params),
         }
     }
 
     /// End only the write log, so a relay whose source went quiet lets the peer read its `.end` while our own reader keeps serving the reply.
     pub(crate) fn end_write(&self) -> io::Result<()> {
         self.writer.close()
+    }
+
+    /// The longest silence a peer can leave and still publish its end: both pumps make one poll and the writer one flush.
+    pub(crate) fn linger(&self) -> Duration {
+        self.params.max_poll.saturating_mul(2) + self.params.flush
     }
 
     /// End the read mailbox too, for a caller that is done with both directions and must not leave its reader parked.
