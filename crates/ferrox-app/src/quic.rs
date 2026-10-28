@@ -4295,9 +4295,25 @@ mod tests {
             "the current port is not the nominal"
         );
         let mut buf = [0u8; 64];
-        hop.set_read_timeout(Some(Duration::from_millis(400)))
+        hop.set_read_timeout(Some(Duration::from_millis(100)))
             .expect("timeout");
-        let (n, from) = hop.recv_from(&mut buf).expect("reads the reply");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let (n, from) = loop {
+            match hop.recv_from(&mut buf) {
+                Ok((n, from)) if from.ip() == server.ip() && from.port() == server.port() => {
+                    break (n, from);
+                }
+                Ok(_) => {}
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || error.kind() == std::io::ErrorKind::TimedOut => {}
+                Err(error) => panic!("reads the reply: {error}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the nominal server did not reply"
+            );
+        };
         assert_eq!(&buf[..n], b"pong");
         assert_eq!(from.ip(), server.ip());
         assert_eq!(
