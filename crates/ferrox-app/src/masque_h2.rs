@@ -1001,7 +1001,7 @@ mod tests {
             0,
             "a whole capsule is never staged"
         );
-        assert!(client.packets.is_empty());
+        assert_eq!(client.packets.len(), 0);
     }
 
     #[test]
@@ -1023,8 +1023,9 @@ mod tests {
             0,
             "a whole capsule is never staged"
         );
-        assert!(
-            client.packets.is_empty(),
+        assert_eq!(
+            client.packets.len(),
+            0,
             "the packet went straight to its lane"
         );
         assert_eq!(received.recv().expect("delivered"), packet);
