@@ -29322,7 +29322,9 @@ mod tests {
             stream.read_exact(&mut buf).expect("reads");
             stream.write_all(&buf).expect("echoes");
             stream.flush().expect("flushes");
-            wait_verified.recv().expect("peer verifies the echo");
+            wait_verified
+                .recv_timeout(Duration::from_secs(30))
+                .expect("peer verifies the echo");
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
@@ -33008,6 +33010,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A configured TCP inbound binds on its worker, so the TLS dial waits until that listener answers.
     #[test]
     fn a_vmess_inbound_naming_tls_answers_the_session() {
         let echo_port = echo_loop();
@@ -33062,6 +33065,7 @@ mod tests {
             None,
         );
         assert_eq!(opened, 1, "a vmess inbound that names tls is served");
+        drop(connect_until(port));
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let tls = carried_tls_configs();
         let out = vmess_test_out(port, id, Carrier::Raw(Chain::default()), Some(&tls));

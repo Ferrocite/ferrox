@@ -1206,22 +1206,29 @@ mod tests {
                 }
             })
             .expect("a port free for both DNS transports");
-        std::thread::spawn(move || {
+        udp.set_read_timeout(Some(Duration::from_millis(100)))
+            .expect("DNS server poll");
+        let stopped = Arc::new(AtomicBool::new(false));
+        let udp_stopped = Arc::clone(&stopped);
+        let dns_udp = std::thread::spawn(move || {
             let mut buf = [0u8; 512];
-            let Ok((n, from)) = udp.recv_from(&mut buf) else {
-                return;
-            };
-            let Some(question) = ferrox_core::dns::parse_query(&buf[..n]) else {
-                return;
-            };
-            let Some(mut reply) =
-                ferrox_core::dns::ip_answer(&question, 0, 60, &[vec![192, 0, 2, 9]])
-            else {
-                return;
-            };
-            reply[2] |= 0x02;
-            reply.truncate(reply.len() - 4);
-            let _ = udp.send_to(&reply, from);
+            while !udp_stopped.load(Ordering::Relaxed) {
+                let (n, from) = match udp.recv_from(&mut buf) {
+                    Ok(received) => received,
+                    Err(error) if crate::proxy::is_timeout(&error) => continue,
+                    Err(error) => panic!("DNS UDP: {error}"),
+                };
+                let Some(question) = ferrox_core::dns::parse_query(&buf[..n]) else {
+                    continue;
+                };
+                let Some(mut reply) =
+                    ferrox_core::dns::ip_answer(&question, 0, 60, &[vec![192, 0, 2, 9]])
+                else {
+                    continue;
+                };
+                reply[2] |= 0x02;
+                udp.send_to(&reply, from).expect("truncated DNS reply");
+            }
         });
         std::thread::spawn(move || {
             let Ok((mut stream, _)) = tcp.accept() else {
@@ -1274,10 +1281,10 @@ mod tests {
         )
         .expect("device");
         let wireguard = WireGuardOut::with_dns_port(client, dns_address.port()).expect("outbound");
-        assert_eq!(
-            wireguard.resolve("example.test", 7),
-            vec!["127.0.0.1:7".parse().expect("address")]
-        );
+        let answer = wireguard.resolve("example.test", 7);
+        stopped.store(true, Ordering::Relaxed);
+        dns_udp.join().expect("DNS UDP server");
+        assert_eq!(answer, vec!["127.0.0.1:7".parse().expect("address")]);
     }
 
     #[test]
