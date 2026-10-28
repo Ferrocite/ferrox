@@ -2598,17 +2598,17 @@ mod tests {
         identity: &Arc<ferrox_core::tls::TlsServerConfig>,
         cert: Vec<u8>,
         sni: &str,
-    ) -> bool {
+    ) -> (bool, bool) {
         use ferrox_core::tls::TlsProvider as _;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         std::thread::scope(|scope| {
-            scope.spawn(|| {
+            let server = scope.spawn(|| {
                 let (stream, _) = listener.accept().expect("accepts");
                 let Ok(mut server) = ferrox_core::tls::accept(identity, stream) else {
-                    return;
+                    return false;
                 };
-                let _ = server.handshake();
+                server.handshake().is_ok()
             });
             let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connects");
             let config = ferrox_core::tls::TlsConfig {
@@ -2616,22 +2616,23 @@ mod tests {
                 roots: vec![cert].into(),
                 ..ferrox_core::tls::TlsConfig::default()
             };
-            let Ok(mut client) = ferrox_core::tls::connect(&config, stream) else {
-                return false;
-            };
-            client.handshake().is_ok()
+            let client = ferrox_core::tls::connect(&config, stream)
+                .is_ok_and(|mut client| client.handshake().is_ok());
+            (server.join().expect("server thread"), client)
         })
     }
 
     #[test]
     fn a_tls_listener_refuses_an_unknown_sni_when_asked() {
         let (identity, cert) = inbound_tls_identity_with(r#""rejectUnknownSni": true"#);
-        assert!(
+        assert_eq!(
             tls_handshake(&identity, cert.clone(), "tls.test"),
-            "the certificate's own name still completes"
+            (true, true),
+            "the certificate's own name still completes both sides"
         );
-        assert!(
-            !tls_handshake(&identity, cert, "other.test"),
+        assert_eq!(
+            tls_handshake(&identity, cert, "other.test"),
+            (false, false),
             "rejectUnknownSni aborts an SNI no certificate name matches"
         );
     }

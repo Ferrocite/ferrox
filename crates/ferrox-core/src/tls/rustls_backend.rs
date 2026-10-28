@@ -1585,11 +1585,37 @@ pub(crate) fn ech_server_context_builder(
     cfg: &super::TlsServerConfig,
     keys: &[u8],
 ) -> Result<boring::ssl::SslContextBuilder, TlsError> {
+    let builder = server_identity_builder(cfg)?;
+    let parsed = crate::tls::ech::parse_server_keys(keys).map_err(TlsError::Other)?;
+    let mut ech = boring::ssl::SslEchKeys::builder().map_err(|error| boring_error(&error))?;
+    for key in parsed {
+        let hpke = boring::hpke::HpkeKey::dhkem_p256_sha256(&key.private_key)
+            .map_err(|error| boring_error(&error))?;
+        // BoringSSL refuses a set with no retry config; every xray key can answer a rejected offer.
+        ech.add_key(true, &key.config, hpke)
+            .map_err(|error| boring_error(&error))?;
+    }
+    builder
+        .set_ech_keys(&ech.build())
+        .map_err(|error| boring_error(&error))?;
+    Ok(builder)
+}
+
+/// A QUIC server's TLS context: the identity, ALPN and the SNI rule, ready for quiche.
+pub fn quic_server_context_builder(
+    cfg: &super::TlsServerConfig,
+) -> Result<boring::ssl::SslContextBuilder, TlsError> {
+    server_identity_builder(cfg)
+}
+
+fn server_identity_builder(
+    cfg: &super::TlsServerConfig,
+) -> Result<boring::ssl::SslContextBuilder, TlsError> {
     use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
     let mut chain = cfg.cert_chain.iter();
     let leaf = chain
         .next()
-        .ok_or_else(|| TlsError::Other("ech server identity has no certificate".to_owned()))?;
+        .ok_or_else(|| TlsError::Other("server identity has no certificate".to_owned()))?;
     let mut builder =
         SslContextBuilder::new(SslMethod::tls()).map_err(|error| boring_error(&error))?;
     builder.set_verify(SslVerifyMode::NONE);
@@ -1612,6 +1638,19 @@ pub(crate) fn ech_server_context_builder(
     builder
         .check_private_key()
         .map_err(|error| boring_error(&error))?;
+    if cfg.reject_unknown_sni {
+        let names = certificate_names(&cfg.cert_chain[0]);
+        builder.set_servername_callback(move |ssl, alert| {
+            if ssl
+                .servername(boring::ssl::NameType::HOST_NAME)
+                .is_some_and(|sni| sni_matches(&names, sni))
+            {
+                return Ok(());
+            }
+            *alert = boring::ssl::SslAlert::UNRECOGNIZED_NAME;
+            Err(boring::ssl::SniError::ALERT_FATAL)
+        });
+    }
     if !cfg.alpn.is_empty() {
         let wanted = cfg.alpn.clone();
         builder.set_alpn_select_callback(move |_, client| {
@@ -1637,18 +1676,6 @@ pub(crate) fn ech_server_context_builder(
     if !cfg.send_tickets {
         builder.set_options(boring::ssl::SslOptions::NO_TICKET);
     }
-    let parsed = crate::tls::ech::parse_server_keys(keys).map_err(TlsError::Other)?;
-    let mut ech = boring::ssl::SslEchKeys::builder().map_err(|error| boring_error(&error))?;
-    for key in parsed {
-        let hpke = boring::hpke::HpkeKey::dhkem_p256_sha256(&key.private_key)
-            .map_err(|error| boring_error(&error))?;
-        // BoringSSL refuses a set with no retry config; every xray key can answer a rejected offer.
-        ech.add_key(true, &key.config, hpke)
-            .map_err(|error| boring_error(&error))?;
-    }
-    builder
-        .set_ech_keys(&ech.build())
-        .map_err(|error| boring_error(&error))?;
     Ok(builder)
 }
 
@@ -3010,6 +3037,7 @@ mod tests {
         let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
         let mut identity = crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses");
         identity.ech_server_keys = Some(keys.into());
+        identity.reject_unknown_sni = true;
         identity.alpn = vec![b"http/1.1".to_vec(), b"h2".to_vec()];
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
