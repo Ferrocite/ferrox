@@ -356,12 +356,6 @@ mod neon {
     const ENCODE_OFFSETS: [u8; 16] = [
         65, 71, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 237, 240, 0, 0,
     ];
-    const MUL_HIGH: [u16; 8] = [
-        0x0040, 0x0400, 0x0040, 0x0400, 0x0040, 0x0400, 0x0040, 0x0400,
-    ];
-    const MUL_LOW: [u16; 8] = [
-        0x0010, 0x0100, 0x0010, 0x0100, 0x0010, 0x0100, 0x0010, 0x0100,
-    ];
 
     #[inline(always)]
     fn mulhi_u16(a: uint16x8_t, b: uint16x8_t) -> uint16x8_t {
@@ -456,8 +450,8 @@ mod neon {
             let offsets = vld1q_u8(ENCODE_OFFSETS.as_ptr());
             let fifty_one = vdupq_n_u8(51);
             let twenty_five = vdupq_n_u8(25);
-            let mul_high = vld1q_u16(MUL_HIGH.as_ptr());
-            let mul_low = vld1q_u16(MUL_LOW.as_ptr());
+            let mul_high = vreinterpretq_u16_u32(vdupq_n_u32(0x0400_0040));
+            let mul_low = vreinterpretq_u16_u32(vdupq_n_u32(0x0100_0010));
             let mut at = 0usize;
             let mut out_at = 0usize;
             while at + 16 <= bytes.len() {
