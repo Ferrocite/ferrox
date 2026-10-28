@@ -24263,6 +24263,34 @@ mod tests {
     }
 
     #[test]
+    fn a_dynamic_inbound_naming_a_source_selector_is_not_served() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"}],"routing":{"rules":[{"type":"field","outboundTag":"direct","inboundTag":["dyn"],"source":["192.0.2.0/24"]}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = crate::reverse::Portals::default();
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let dynamic =
+            crate::json::parse(r#"{"inbounds":[{"tag":"dyn","protocol":"masque","port":0}]}"#)
+                .expect("parses");
+        let (served, _) = serve_inbounds_counted(
+            "commander",
+            &dynamic,
+            None,
+            Some(&shared),
+            false,
+            false,
+            &portals,
+            None,
+            None,
+        );
+        assert_eq!(served, 0, "the dynamic inbound is refused, not served");
+    }
+
+    #[test]
     fn a_dynamic_outbound_is_routable_and_removable() {
         let root = crate::json::parse(
             r#"{"outbounds":[{"tag":"default","protocol":"freedom"},{"tag":"alt","protocol":"freedom"}],"routing":{"rules":[{"type":"field","outboundTag":"alt","domain":["example.test"]}]}}"#,
