@@ -3576,52 +3576,43 @@ mod tests {
         }
     }
 
-    /// A peer that stops reading pushes a burst past its queue, and the kernel
-    /// refuses the tail. Every refused datagram is held and retried once the peer
-    /// reads again, so a QUIC DATAGRAM frame is never silently lost.
-    #[cfg(target_os = "linux")]
+    /// A halted sweep leaves datagrams held, and the next one retries them in the
+    /// order quiche wrote. Loopback drops a datagram a full queue cannot take rather
+    /// than refusing the write, so a live refusal cannot be staged here: what this
+    /// holds is the queue's order and the flag that makes the retry free, and the
+    /// masque matrix cell is where a kernel refusal meets the hold for real.
     #[test]
-    fn a_refused_datagram_is_held_until_the_peer_reads() {
-        use std::os::fd::AsRawFd as _;
+    fn a_held_datagram_is_retried_in_order() {
         let receiver = UdpSocket::bind("127.0.0.1:0").expect("bind the receiver");
-        let size: libc::c_int = 4096;
-        // SAFETY: the option, the buffer and its length all belong to this socket and this frame.
-        let armed = unsafe {
-            libc::setsockopt(
-                receiver.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                std::ptr::from_ref(&size).cast(),
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            )
-        };
-        assert_eq!(armed, 0, "a receive queue this test can fill");
         let to = receiver.local_addr().expect("the receiver's address");
         let sender = Datagram::plain(UdpSocket::bind("127.0.0.1:0").expect("bind the sender"));
-        let sent: Vec<Vec<u8>> = (0..128u8).map(|index| vec![index; 1024]).collect();
-        for bytes in &sent {
-            sender.send_or_hold(bytes, to);
+        let held: Vec<Vec<u8>> = (0..8u8).map(|index| vec![index; 64]).collect();
+        for bytes in &held {
+            sender.hold(bytes, to);
         }
-        let held = sender.held.queue.lock().expect("the held queue").len();
-        assert!(held > 0, "a burst past the queue is refused somewhere");
-        assert!(held < HELD_LIMIT, "the burst is inside what one lane holds");
+        assert!(
+            sender.held.holding.load(Ordering::Relaxed),
+            "a hold is what a sweep retries"
+        );
+        sender.retry_held();
+        assert!(
+            !sender.held.holding.load(Ordering::Relaxed),
+            "an empty queue arms no retry"
+        );
 
         receiver.set_nonblocking(true).expect("a reading queue");
         let mut got = Vec::new();
-        let mut buf = [0u8; 2048];
-        for _ in 0..(sent.len() * 4) {
-            loop {
-                match receiver.recv_from(&mut buf) {
-                    Ok((n, _)) => got.push(buf[..n].to_vec()),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(error) => panic!("recv: {error}"),
-                }
+        let mut buf = [0u8; 128];
+        loop {
+            match receiver.recv_from(&mut buf) {
+                Ok((n, _)) => got.push(buf[..n].to_vec()),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("recv: {error}"),
             }
-            sender.retry_held();
         }
         assert_eq!(
-            got, sent,
-            "every datagram arrives once, in the order it was written"
+            got, held,
+            "every held datagram arrives once, in the order it was held"
         );
     }
 
