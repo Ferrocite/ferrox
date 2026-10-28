@@ -1032,6 +1032,9 @@ impl Routing {
                         return Some(name);
                     }
                 }
+                if rule.catch_all() {
+                    break;
+                }
             }
         }
         None
@@ -1225,9 +1228,9 @@ impl Rule {
         }))
     }
 
-    fn association_stable(&self) -> bool {
-        !self.balancer
-            && self.ports.is_none()
+    /// True when no selector beyond the inbound, network and local OS narrows this rule.
+    fn catch_all(&self) -> bool {
+        self.ports.is_none()
             && self.source_ports.is_none()
             && self.local_ports.is_none()
             && self.domains.is_none()
@@ -1236,6 +1239,10 @@ impl Rule {
             && self.local_ips.is_none()
             && self.protocols.is_none()
             && self.sets.is_none()
+    }
+
+    fn association_stable(&self) -> bool {
+        !self.balancer && self.catch_all()
     }
 
     fn server_always(&self) -> bool {
@@ -4424,6 +4431,34 @@ mod tests {
             .expect("routing");
         assert_eq!(routing.source_refusal(Some("tun")), Some("source"));
         assert_eq!(routing.source_refusal(Some("other")), None);
+    }
+
+    #[test]
+    fn a_shadowed_udp_source_rule_does_not_refuse_the_tun() {
+        let root = object(vec![(
+            "routing",
+            routing(vec![
+                rule(
+                    "direct",
+                    vec![
+                        ("inboundTag", array(vec![text("tun")])),
+                        ("network", text("udp")),
+                    ],
+                ),
+                rule(
+                    "direct",
+                    vec![
+                        ("inboundTag", array(vec![text("tun")])),
+                        ("network", text("udp")),
+                        ("source", array(vec![text("192.0.2.0/24")])),
+                    ],
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(routing.source_refusal(Some("tun")), None);
     }
 
     #[test]
