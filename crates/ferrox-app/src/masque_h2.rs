@@ -690,7 +690,8 @@ impl Session {
             return;
         };
         let (sender, outgoing) = mpsc::sync_channel::<Vec<u8>>(masque::QUEUE);
-        let Some(granted) = masque::register(&self.shared, &addrs, &sender) else {
+        let queue = masque::TunnelQueue::new(sender, None);
+        let Some(granted) = masque::register(&self.shared, &addrs, &queue) else {
             masque::release(&self.shared, &addrs);
             self.reply(wire, id, 503);
             return;
