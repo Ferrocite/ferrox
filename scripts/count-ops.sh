@@ -10,11 +10,14 @@ trap 'rm -rf "$outdir"' EXIT
 test_bin() {
     cargo test --release "$@" --no-run --locked --message-format=json \
         | python3 -c 'import json,sys
+executable = None
 for line in sys.stdin:
     try: m = json.loads(line)
     except ValueError: continue
     if m.get("reason") == "compiler-artifact" and m.get("executable"):
-        print(m["executable"]); break'
+        executable = executable or m["executable"]
+if executable:
+    print(executable)'
 }
 
 app_bin="$(test_bin --bin ferrox-app)"
@@ -30,7 +33,7 @@ find_bin() {
         ferrox_core*) order=("$core_bin" "$app_bin") ;;
     esac
     for candidate in "${order[@]}"; do
-        if "$candidate" --exact "$filter" --list 2>/dev/null | grep -q "^$filter: test$"; then
+        if "$candidate" --exact "$filter" --list 2>/dev/null | grep -Fx "$filter: test" >/dev/null; then
             printf '%s\n' "$candidate"
             return 0
         fi

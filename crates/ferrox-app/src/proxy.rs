@@ -25846,6 +25846,25 @@ mod tests {
         let raw = session.try_clone().expect("shares the fd");
         #[cfg(unix)]
         let probe = session.try_clone().expect("probes the fd");
+        #[cfg(unix)]
+        let (relay_poll, session_poll) = {
+            let Connection::Tcp(tcp) = &edge else {
+                unreachable!("the loopback edge is TCP")
+            };
+            tcp.set_read_timeout(Some(RELAY_POLL))
+                .expect("native idle grain");
+            let idle = tcp
+                .read_timeout()
+                .expect("reads the idle grain")
+                .expect("armed idle");
+            tcp.set_read_timeout(Some(SESSION_POLL))
+                .expect("native moving grain");
+            let moving = tcp
+                .read_timeout()
+                .expect("reads the moving grain")
+                .expect("armed moving");
+            (idle, moving)
+        };
         drop(lane);
 
         let id = [0x5Au8; 16];
@@ -25872,7 +25891,7 @@ mod tests {
         #[cfg(unix)]
         {
             let idle = Instant::now() + Duration::from_secs(5);
-            while probe.read_timeout().ok().flatten() != Some(RELAY_POLL) {
+            while probe.read_timeout().ok().flatten() != Some(relay_poll) {
                 assert!(
                     Instant::now() < idle,
                     "an idle shared read must arm the relay grain"
@@ -25881,7 +25900,7 @@ mod tests {
             }
             edge.write_all(b"x").expect("moves the flow");
             let moving = Instant::now() + Duration::from_secs(5);
-            while probe.read_timeout().ok().flatten() != Some(SESSION_POLL) {
+            while probe.read_timeout().ok().flatten() != Some(session_poll) {
                 assert!(
                     Instant::now() < moving,
                     "a write must return the shared read to one tick"
@@ -29284,6 +29303,7 @@ mod tests {
         175, 165, 189, 32, 28, 94, 83, 15, 239, 210, 113, 16, 253,
     ];
 
+    /// Keep the echo peer alive until its bytes are verified, so unread carrier framing cannot reset an in-flight reply.
     fn carried_round_trip(
         name: &str,
         accept: impl FnOnce(Connection) -> Option<(Box<dyn Read + Send>, Box<dyn Write + Send>)>
@@ -29293,6 +29313,7 @@ mod tests {
     ) {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
+        let (verified, wait_verified) = std::sync::mpsc::sync_channel(0);
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             let (reader, writer) = accept(stream).expect("accepts carrier");
@@ -29301,6 +29322,9 @@ mod tests {
             stream.read_exact(&mut buf).expect("reads");
             stream.write_all(&buf).expect("echoes");
             stream.flush().expect("flushes");
+            wait_verified
+                .recv_timeout(Duration::from_secs(30))
+                .expect("peer verifies the echo");
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         stream
@@ -29314,6 +29338,9 @@ mod tests {
         let mut back = vec![0u8; 16 * 1024];
         stream.read_exact(&mut back).expect("reads");
         assert_eq!(back, sent, "{name} round trips");
+        verified
+            .send(())
+            .expect("peer stays alive for verification");
         server.join().expect("joins");
     }
 
@@ -32112,6 +32139,7 @@ mod tests {
         let relay_addr = relay.local_addr().expect("addr");
         let served = Arc::clone(&relay);
         thread::spawn(move || serve_socks_udp_trojan(&served, &trojan));
+        udp.connect(relay_addr).expect("the association relay");
         udp.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
@@ -32119,9 +32147,9 @@ mod tests {
         let mut frame = Vec::new();
         for payload in [&b"ping"[..], &b"pong"[..]] {
             let datagram = socks_udp_frame(&mut frame, None, &target, payload);
-            udp.send_to(datagram, relay_addr).expect("sends");
-            let (n, _) = udp
-                .recv_from(&mut back)
+            udp.send(datagram).expect("sends");
+            let n = udp
+                .recv(&mut back)
                 .unwrap_or_else(|error| panic!("{tag} association echoes: {error}"));
             let (source, echoed) = parse_socks_udp(&back[..n]).expect("splits");
             assert_eq!(source, target, "{tag}");
@@ -32987,6 +33015,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A configured TCP inbound binds on its worker, so the TLS dial waits until that listener answers.
     #[test]
     fn a_vmess_inbound_naming_tls_answers_the_session() {
         let echo_port = echo_loop();
@@ -33041,6 +33070,7 @@ mod tests {
             None,
         );
         assert_eq!(opened, 1, "a vmess inbound that names tls is served");
+        drop(connect_until(port));
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         let tls = carried_tls_configs();
         let out = vmess_test_out(port, id, Carrier::Raw(Chain::default()), Some(&tls));
@@ -42384,6 +42414,7 @@ mod tests {
         count
     }
 
+    /// Sixteen simultaneous KCP dials share a feed worker within the original thread-growth bound.
     #[cfg(target_os = "linux")]
     #[test]
     fn sixteen_kcp_dials_share_one_feed_thread() {
@@ -42408,6 +42439,7 @@ mod tests {
         listener.close();
     }
 
+    /// Sixteen live KCP connections share flush workers within the original thread-growth bound.
     #[cfg(target_os = "linux")]
     #[test]
     fn sixteen_kcp_connections_share_one_flush_thread() {
