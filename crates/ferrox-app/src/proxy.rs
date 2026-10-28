@@ -12464,7 +12464,7 @@ fn ride_carrier<S: Dialed, D: Dialed>(
                 }
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            relay_sink(ReplyReader::new(reader), &writer, client, |_| {});
+            relay_sink_drained(ReplyReader::new(reader), &writer, client);
         }
         Carrier::HttpUpgrade { path, ed, .. } => {
             let Some((reader, sink)) = tls_httpupgrade(
@@ -20275,7 +20275,7 @@ where
                 &mut peer_write,
                 stall,
                 &mut first,
-                || upload_flow.ended(),
+                || upload_flow.ended_and_drained(),
             );
             if next != Next::Done {
                 return next;
@@ -31391,7 +31391,7 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// xray-core buffers the VLESS `[0, 0]` until the target first writes, so a TLS-carried client must pump before it waits for the answer, as every plain carrier already does.
+    /// xray-core buffers the VLESS `[0, 0]` until the target first writes, so a TLS-carried relay must start before it waits for the answer.
     #[test]
     fn vless_tls_carried_client_pumps_the_upload_before_the_response() {
         for carrier in [
@@ -31401,11 +31401,24 @@ mod tests {
             },
             Carrier::Grpc(crate::config::GrpcSettings::path("/vless-grpc")),
         ] {
-            vless_tls_carried_upload_before_response(carrier);
+            vless_tls_carried_upload_before_response(carrier, false);
         }
     }
 
-    fn vless_tls_carried_upload_before_response(carrier: Carrier) {
+    /// A client that has sent its last byte may half-close and still receive the answer, so the ws close frame waits for the response lane.
+    #[test]
+    fn vless_tls_ws_answers_after_the_client_half_closes() {
+        vless_tls_carried_upload_before_response(
+            Carrier::Ws {
+                path: "/vless-ws".to_owned(),
+                ed: 0,
+            },
+            true,
+        );
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn vless_tls_carried_upload_before_response(carrier: Carrier, half_close: bool) {
         const UPLOAD: usize = 2 * 1024 * 1024;
         let (server_config, client_config) = carried_tls_configs();
         let id = [0x4Cu8; 16];
@@ -31446,10 +31459,17 @@ mod tests {
                     .expect("the upload arrives before the response header");
                 total += want;
             }
+            if half_close {
+                writer.write_all(&[0, 0]).expect("response header");
+                writer.write_all(b"pong").expect("echoes after the header");
+                writer.flush().expect("flushes");
+            }
             uploaded_tx.send(()).expect("signals");
-            writer.write_all(&[0, 0]).expect("response header");
-            writer.write_all(b"pong").expect("echoes after the header");
-            writer.flush().expect("flushes");
+            if !half_close {
+                writer.write_all(&[0, 0]).expect("response header");
+                writer.write_all(b"pong").expect("echoes after the header");
+                writer.flush().expect("flushes");
+            }
         });
         let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let downstream_port = downstream.local_addr().expect("addr").port();
@@ -31494,8 +31514,11 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the server saw the upload before flushing the header");
         let mut sock = uploading.join().expect("joins");
+        if half_close {
+            sock.shutdown(Shutdown::Write).expect("half-closes");
+        }
         let mut reply = [0u8; 4];
-        read_exact(&mut sock, &mut reply).expect("reads after the header");
+        Read::read_exact(&mut sock, &mut reply).expect("reads after the header");
         assert_eq!(&reply, b"pong");
         drop(sock);
         server.join().expect("joins");
