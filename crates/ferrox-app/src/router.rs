@@ -3103,7 +3103,19 @@ pub(crate) fn resolve_ips(host: &str, port: u16) -> Vec<IpAddr> {
 }
 
 pub(crate) fn resolve_ips_ttl(host: &str, port: u16) -> (Vec<IpAddr>, u32) {
-    resolve_ips_script(host, port, false, true, true)
+    if let Some(resolver) = crate::dnsapp::installed() {
+        match resolver.lookup_result(host) {
+            crate::dnsapp::Lookup::Records(ips, ttl) => return (ips, ttl),
+            crate::dnsapp::Lookup::Empty | crate::dnsapp::Lookup::Rcode(_) => {
+                return (Vec::new(), 0);
+            }
+            crate::dnsapp::Lookup::Failed => {
+                let (v4, v6) = resolver.families();
+                return resolve_ips_system(host, port, v4, v6);
+            }
+        }
+    }
+    resolve_ips_system(host, port, true, true)
 }
 
 pub(crate) fn resolve_ips_script(
@@ -3113,12 +3125,16 @@ pub(crate) fn resolve_ips_script(
     v4: bool,
     v6: bool,
 ) -> (Vec<IpAddr>, u32) {
-    use std::net::ToSocketAddrs;
     if let Some(resolver) = crate::dnsapp::installed() {
         if let Some(answer) = resolver.lookup_families(host, v4, v6, fake) {
             return answer;
         }
     }
+    resolve_ips_system(host, port, v4, v6)
+}
+
+fn resolve_ips_system(host: &str, port: u16, v4: bool, v6: bool) -> (Vec<IpAddr>, u32) {
+    use std::net::ToSocketAddrs;
     let ips = (host, port)
         .to_socket_addrs()
         .map(|addrs| {
@@ -5177,13 +5193,13 @@ mod tests {
             ]),
         )]);
         crate::dnsapp::install(&root).expect("install");
+        let (ips, ttl) = resolve_ips_ttl("dual.test", 0);
+        assert_eq!(ttl, 10);
+        assert_eq!(ips, vec!["10.0.0.1".parse::<IpAddr>().expect("ipv4")]);
         let (ips, _) = resolve_ips_ttl("localhost", 0);
         assert!(
             ips.is_empty(),
             "an authoritative empty answer is not retried through the system"
         );
-        let (ips, ttl) = resolve_ips_ttl("dual.test", 0);
-        assert_eq!(ttl, 10);
-        assert_eq!(ips, vec!["10.0.0.1".parse::<IpAddr>().expect("ipv4")]);
     }
 }

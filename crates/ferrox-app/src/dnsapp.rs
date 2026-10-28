@@ -341,6 +341,10 @@ impl Resolver {
         self.lookup_inner(name, false, false)
     }
 
+    pub(crate) fn families(&self) -> (bool, bool) {
+        self.strategy.families()
+    }
+
     pub(crate) fn lookup_families(
         self: &Arc<Self>,
         name: &str,
