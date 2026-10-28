@@ -279,18 +279,16 @@ mod x86 {
         fifty_one: __m128i,
         twenty_five: __m128i,
     ) -> __m128i {
-        unsafe {
-            let raw = _mm_shuffle_epi8(raw, shuffle);
-            let t0 = _mm_and_si128(raw, _mm_set1_epi32(0x0fc0_fc00));
-            let t1 = _mm_mulhi_epu16(t0, _mm_set1_epi32(0x0400_0040));
-            let t2 = _mm_and_si128(raw, _mm_set1_epi32(0x003f_03f0));
-            let t3 = _mm_mullo_epi16(t2, _mm_set1_epi32(0x0100_0010));
-            let sextets = _mm_or_si128(t1, t3);
-            let reduced = _mm_subs_epu8(sextets, fifty_one);
-            let mask = _mm_cmpgt_epi8(sextets, twenty_five);
-            let reduced = _mm_sub_epi8(reduced, mask);
-            _mm_add_epi8(sextets, _mm_shuffle_epi8(offsets, reduced))
-        }
+        let raw = _mm_shuffle_epi8(raw, shuffle);
+        let t0 = _mm_and_si128(raw, _mm_set1_epi32(0x0fc0_fc00));
+        let t1 = _mm_mulhi_epu16(t0, _mm_set1_epi32(0x0400_0040));
+        let t2 = _mm_and_si128(raw, _mm_set1_epi32(0x003f_03f0));
+        let t3 = _mm_mullo_epi16(t2, _mm_set1_epi32(0x0100_0010));
+        let sextets = _mm_or_si128(t1, t3);
+        let reduced = _mm_subs_epu8(sextets, fifty_one);
+        let mask = _mm_cmpgt_epi8(sextets, twenty_five);
+        let reduced = _mm_sub_epi8(reduced, mask);
+        _mm_add_epi8(sextets, _mm_shuffle_epi8(offsets, reduced))
     }
 
     /// Encodes the whole 12-byte groups of `bytes` into `out`, returning how much of
