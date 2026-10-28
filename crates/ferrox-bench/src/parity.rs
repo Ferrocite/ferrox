@@ -1206,9 +1206,14 @@ fn straggler_tail(windows: &[Duration]) -> Option<Duration> {
     let median = sorted[(sorted.len() - 1) / 2];
     let slowest = *sorted.last()?;
     let tail = slowest.saturating_sub(median);
-    (STRAGGLER_TAIL..=STRAGGLER_TAIL_MAX)
-        .contains(&tail)
-        .then_some(tail)
+    if !(STRAGGLER_TAIL..=STRAGGLER_TAIL_MAX).contains(&tail) {
+        return None;
+    }
+    let second = *sorted.get(sorted.len() - 2)?;
+    if second.saturating_sub(median) >= STRAGGLER_TAIL {
+        return None;
+    }
+    Some(tail)
 }
 
 /// The server process beside the client: sampled from the same clock, stopped from `Drop` so a
@@ -3061,6 +3066,21 @@ mod tests {
         assert!(
             uniform.is_ok(),
             "a uniformly slow cell is the engine, not a straggler: {uniform:?}"
+        );
+        let half_slow = vec![
+            Duration::from_millis(80),
+            Duration::from_millis(80),
+            Duration::from_millis(80),
+            Duration::from_millis(80),
+            Duration::from_millis(280),
+            Duration::from_millis(280),
+            Duration::from_millis(280),
+            Duration::from_millis(280),
+        ];
+        let split = validate_transfer(&moved(half_slow), expected, &[], &desync);
+        assert!(
+            split.is_ok(),
+            "half the flows slow is not an isolated straggler: {split:?}"
         );
         let mut stalled = vec![Duration::from_millis(80); 7];
         stalled.push(Duration::from_millis(1_500));
