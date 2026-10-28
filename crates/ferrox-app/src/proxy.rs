@@ -8658,7 +8658,11 @@ fn xdrive_dial_session(carrier: &Carrier, address: &str, port: u16) -> Option<cr
 }
 
 /// Both directions of a stream the store carries: the app's bytes land in the write log, the read log's bytes go back, and the store's own poll quantum bounds each wait, so neither leg holds a thread while the other's objects are in flight.
-fn xdrive_relay(app: &Connection, mut down: crate::xdrive::Conn) {
+fn xdrive_relay(app: &Connection, down: crate::xdrive::Conn) {
+    xdrive_relay_until(app, down, budgets::relay_stall());
+}
+
+fn xdrive_relay_until(app: &Connection, mut down: crate::xdrive::Conn, response_wait: Duration) {
     let Ok(app_read) = app.try_clone() else {
         return;
     };
@@ -8681,14 +8685,15 @@ fn xdrive_relay(app: &Connection, mut down: crate::xdrive::Conn) {
         }
         let _ = up.end_write();
     });
-    let linger = down.linger();
     let mut ended = false;
-    let mut quiet = Instant::now();
+    let mut response_deadline = None;
     let mut buf = RelayBuf::new().into_vec();
     loop {
         match down.read(&mut buf) {
             Ok(n) if n > 0 => {
-                quiet = Instant::now();
+                if ended {
+                    response_deadline = Some(Instant::now() + response_wait);
+                }
                 if app_write.write_all(&buf[..n]).is_err() {
                     break;
                 }
@@ -8696,9 +8701,9 @@ fn xdrive_relay(app: &Connection, mut down: crate::xdrive::Conn) {
             Err(error) if is_timeout(&error) => {
                 if !ended && done.try_recv().is_ok() {
                     ended = true;
-                    quiet = Instant::now();
+                    response_deadline = Some(Instant::now() + response_wait);
                 }
-                if ended && quiet.elapsed() >= linger {
+                if ended && response_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     break;
                 }
             }
@@ -8738,6 +8743,15 @@ fn dial_vless_xdrive(client: &Connection, vless: &VlessOut, target: &Destination
 }
 
 fn dial_trojan_xdrive(client: &Connection, trojan: &TrojanOut, target: &Destination) {
+    dial_trojan_xdrive_until(client, trojan, target, budgets::relay_stall());
+}
+
+fn dial_trojan_xdrive_until(
+    client: &Connection,
+    trojan: &TrojanOut,
+    target: &Destination,
+    response_wait: Duration,
+) {
     let Some(mut session) = xdrive_dial_session(&trojan.carrier, &trojan.address, trojan.port)
     else {
         return;
@@ -8748,7 +8762,7 @@ fn dial_trojan_xdrive(client: &Connection, trojan: &TrojanOut, target: &Destinat
     {
         return;
     }
-    xdrive_relay(client, session);
+    xdrive_relay_until(client, session, response_wait);
 }
 
 fn dial_vmess_xdrive(client: &Connection, vmess: &VmessOut, target: &Destination) {
@@ -32801,6 +32815,66 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A target that answers only after the upload ends still reaches the app: the response wait is a relay budget, not the store's poll linger.
+    #[test]
+    fn an_xdrive_relay_reads_a_response_after_the_upload_ends() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-xdrive-late-{}-{stamp}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let folder = dir.to_str().expect("utf-8 folder").replace('\\', "\\\\");
+        let settings = format!(
+            r#""network": "xdrive", "security": "tls",
+                "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
+                    "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
+                "tlsSettings": {{"allowInsecure": true}}"#
+        );
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(
+            serve_trojan_inbound("127.0.0.1:9", &inbound, true),
+            "the store listener arms"
+        );
+        let Outbound::Trojan(trojan) = find_outbound(&trojan_tls_root(&settings))
+            .expect("parses")
+            .expect("the config names a trojan outbound")
+        else {
+            panic!("the outbound dials trojan");
+        };
+        let echo_port = delayed_echo_loop(Duration::from_millis(100));
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_trojan_xdrive_until(&socket, &trojan, &target, Duration::from_secs(2));
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        sock.shutdown(Shutdown::Write).expect("ends the upload");
+        assert_eq!(
+            &read_echo(&mut sock),
+            b"ping",
+            "a response after the upload ends reaches the app"
+        );
+        drop(sock);
+        join_thread_within(relay, Duration::from_secs(30), "the delayed response");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A store peer that goes quiet without publishing an end cannot pin the relay: once our own source is done the report stops after the store's own round trip of silence.
     #[test]
     fn an_xdrive_relay_leaves_a_peer_that_never_ends() {
@@ -32831,7 +32905,9 @@ mod tests {
             drop(socket);
         });
         let app = Connection::connect(("127.0.0.1", port)).expect("connects");
-        let relay = thread::spawn(move || xdrive_relay(&app, session));
+        let relay = thread::spawn(move || {
+            xdrive_relay_until(&app, session, Duration::from_millis(100));
+        });
         join_thread_within(relay, Duration::from_secs(5), "a peer that never ends");
         peer.join().expect("the peer closes");
         let _ = std::fs::remove_dir_all(&dir);
@@ -42470,6 +42546,31 @@ mod tests {
                             return;
                         }
                     }
+                });
+            }
+        });
+        port
+    }
+
+    fn delayed_echo_loop(delay: Duration) -> u16 {
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for stream in echo.incoming().flatten() {
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            Err(_) => return,
+                        }
+                    }
+                    thread::sleep(delay);
+                    let _ = stream.write_all(&buf);
+                    let _ = stream.shutdown(Shutdown::Write);
                 });
             }
         });
