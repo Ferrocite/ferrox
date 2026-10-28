@@ -698,9 +698,8 @@ impl ServerStack {
             Some(PROTOCOL_TCP) => self.device.push(packet.bytes),
             Some(PROTOCOL_UDP) => self.datagram(packet.peer, &packet.bytes),
             _ => {
-                if !self.answer_echo(&packet.bytes) {
-                    self.device.absorb(&packet.bytes);
-                }
+                // A client's ICMP must not narrow the MTU every tunnel shares.
+                self.answer_echo(&packet.bytes);
             }
         }
     }
