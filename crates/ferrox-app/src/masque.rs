@@ -1446,7 +1446,11 @@ struct Tunnel {
     granted: Option<Granted>,
 }
 
-fn sweep_due_timer(_conn: &mut quiche::Connection) {}
+fn sweep_due_timer(conn: &mut quiche::Connection) {
+    if conn.timeout().is_some_and(|left| left.is_zero()) {
+        conn.on_timeout();
+    }
+}
 
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn worker(
@@ -2627,8 +2631,14 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:8".parse().expect("peer address");
         let cid = [3u8; 16];
         let cid = quiche::ConnectionId::from_ref(&cid);
-        let mut conn =
-            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connection");
+        let mut conn = quiche::connect(
+            Some("localhost"),
+            &cid,
+            local,
+            peer,
+            &mut config,
+        )
+        .expect("connection");
         let mut packet = vec![0u8; 1350];
         let (n, _) = conn.send(&mut packet).expect("initial");
         assert!(n > 0, "the client produced an initial packet");
