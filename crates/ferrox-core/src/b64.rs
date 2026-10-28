@@ -1,5 +1,18 @@
 const STD: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/// Two alphabet octets for one twelve-bit group, in native byte order: a three-byte input is two table probes and two stores instead of four shifts, four probes and four stores.
+const ENC12: [[u8; 2]; 4096] = encoded_pairs();
+
+const fn encoded_pairs() -> [[u8; 2]; 4096] {
+    let mut table = [[0u8; 2]; 4096];
+    let mut word = 0usize;
+    while word < 4096 {
+        table[word] = [STD[word >> 6], STD[word & 63]];
+        word += 1;
+    }
+    table
+}
+
 /// The `String`-returning coder, one read a group with no intermediate buffer to zero and no validation pass afterwards.
 ///
 /// [`encode_parts_into`] is the other route to these bytes and the one that writes where the caller already has a window; `the_window_coder_matches_the_alphabet_at_every_length` holds the two byte-identical, which is why this shape survives instead of delegating and paying a fill plus a UTF-8 walk per call.
@@ -12,13 +25,17 @@ pub fn encode(bytes: &[u8]) -> String {
     let (whole, rest) = bytes.as_chunks::<3>();
     let mut at = 0usize;
     for [a, b, c] in whole {
-        let word = u32::from_be_bytes([0, *a, *b, *c]);
+        let word = (u32::from(*a) << 16) | (u32::from(*b) << 8) | u32::from(*c);
+        let first = ENC12[((word >> 12) & 0xfff) as usize];
+        let second = ENC12[(word & 0xfff) as usize];
         // SAFETY: `at + 4 <= len` for every whole group, and the four bytes written are alphabet octets, so the `String` below is valid UTF-8.
         unsafe {
-            ptr.add(at).write(STD[(word >> 18 & 63) as usize]);
-            ptr.add(at + 1).write(STD[(word >> 12 & 63) as usize]);
-            ptr.add(at + 2).write(STD[(word >> 6 & 63) as usize]);
-            ptr.add(at + 3).write(STD[(word & 63) as usize]);
+            ptr.add(at)
+                .cast::<u16>()
+                .write_unaligned(u16::from_ne_bytes(first));
+            ptr.add(at + 2)
+                .cast::<u16>()
+                .write_unaligned(u16::from_ne_bytes(second));
         }
         at += 4;
     }
@@ -74,12 +91,9 @@ pub fn encode_parts_into(parts: &[&[u8]], out: &mut [u8]) -> std::io::Result<usi
     for group in 0..groups {
         let word = source.triple();
         let at = group * 4;
-        out[at..at + 4].copy_from_slice(&[
-            STD[(word >> 18 & 63) as usize],
-            STD[(word >> 12 & 63) as usize],
-            STD[(word >> 6 & 63) as usize],
-            STD[(word & 63) as usize],
-        ]);
+        let first = ENC12[((word >> 12) & 0xfff) as usize];
+        let second = ENC12[(word & 0xfff) as usize];
+        out[at..at + 4].copy_from_slice(&[first[0], first[1], second[0], second[1]]);
     }
     // The 1..=2 bytes that did not fill a group take the padding their empty lanes would have coded.
     let at = groups * 4;
@@ -211,18 +225,48 @@ fn group_tail(rest: &[u8]) -> Option<[u8; 3]> {
     Some([bytes[1], bytes[2], bytes[3]])
 }
 
-/// One pass over the text and one output buffer: whole groups are four table loads and three stores, whitespace is skipped where it lies, padding ends the text, and a 2..=3 digit tail keeps the bytes its padded group would have held.
+/// One pass over the text and one output buffer: a pair of whole groups is eight table loads and one eight-byte store, whitespace is skipped where it lies, padding ends the text, and a 2..=3 digit tail keeps the bytes its padded group would have held.
 #[must_use]
 pub fn decode(text: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() / 4 * 3 + 3);
+    let ptr: *mut u8 = out.as_mut_ptr();
+    let mut out_at = 0usize;
     let mut at = 0usize;
-    while at + 4 <= text.len() {
-        let Some(bytes) = group_word([text[at], text[at + 1], text[at + 2], text[at + 3]]) else {
+    let (pairs, _) = text.as_chunks::<8>();
+    for pair in pairs {
+        let t0 = u32::from(DIGITS[usize::from(pair[0])]);
+        let t1 = u32::from(DIGITS[usize::from(pair[1])]);
+        let t2 = u32::from(DIGITS[usize::from(pair[2])]);
+        let t3 = u32::from(DIGITS[usize::from(pair[3])]);
+        let t4 = u32::from(DIGITS[usize::from(pair[4])]);
+        let t5 = u32::from(DIGITS[usize::from(pair[5])]);
+        let t6 = u32::from(DIGITS[usize::from(pair[6])]);
+        let t7 = u32::from(DIGITS[usize::from(pair[7])]);
+        if (t0 | t1 | t2 | t3 | t4 | t5 | t6 | t7) & 0xc0 != 0 {
             break;
-        };
-        out.extend_from_slice(&bytes);
-        at += 4;
+        }
+        let first = (t0 << 18) | (t1 << 12) | (t2 << 6) | t3;
+        let second = (t4 << 18) | (t5 << 12) | (t6 << 6) | t7;
+        // SAFETY: a pair writes eight bytes at a six-byte stride, and the buffer's `+3` slack covers the two bytes past the logical length; the last pair's own store lands inside it.
+        unsafe {
+            ptr.add(out_at)
+                .cast::<u64>()
+                .write_unaligned(u64::from_ne_bytes([
+                    (first >> 16) as u8,
+                    (first >> 8) as u8,
+                    first as u8,
+                    (second >> 16) as u8,
+                    (second >> 8) as u8,
+                    second as u8,
+                    0,
+                    0,
+                ]));
+        }
+        out_at += 6;
+        at += 8;
     }
+    // SAFETY: `out_at` counts the bytes the loop wrote, and every one of them was written above.
+    unsafe { out.set_len(out_at) };
     if at == text.len() {
         return (!out.is_empty()).then_some(out);
     }

@@ -628,6 +628,7 @@ impl ServerStack {
 
 /// Move bytes between one flow's local stream and its TCP socket. Every read and
 /// write is nonblocking, so a slow local peer parks only its own buffers.
+#[allow(clippy::too_many_lines)]
 fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8]) {
     let socket = sockets.get_mut::<TcpSocket>(flow.handle);
     if matches!(socket.state(), State::Established | State::CloseWait) {
@@ -694,7 +695,14 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8]) {
     if flow.pending_up.is_empty() && !flow.up_eof && socket.can_send() {
         match flow.local.read(buf) {
             Ok(0) => flow.up_eof = true,
-            Ok(n) => flow.pending_up.extend_from_slice(&buf[..n]),
+            Ok(n) => match socket.send_slice(&buf[..n]) {
+                Ok(sent) if sent < n => flow.pending_up.extend_from_slice(&buf[sent..n]),
+                Ok(_) => {}
+                Err(SendError::InvalidState) => {
+                    flow.done = true;
+                    socket.abort();
+                }
+            },
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => {
                 flow.done = true;
@@ -845,6 +853,7 @@ pub(crate) fn client_udp(
         let _ = associate.set_read_timeout(Some(crate::budgets::SESSION_POLL));
     }
     let mut buf = crate::proxy::udp_buffer();
+    let mut frame = Vec::new();
     let mut app: Option<SocketAddr> = None;
     let mut quiet = StdInstant::now();
     loop {
@@ -861,7 +870,6 @@ pub(crate) fn client_udp(
             let Some(remote) = socket_addr(datagram.source, datagram.source_port) else {
                 continue;
             };
-            let mut frame = Vec::with_capacity(32 + datagram.payload.len());
             let out = crate::proxy::socks_udp_frame(&mut frame, None, &remote, datagram.payload);
             let _ = relay.send_to(out, app);
             quiet = StdInstant::now();
@@ -893,12 +901,14 @@ pub(crate) fn client_udp(
                 else {
                     continue;
                 };
-                let source_bytes = ip_bytes(*inner_source);
-                let destination_bytes = ip_bytes(target.ip());
+                let mut source_bytes = [0u8; 16];
+                let mut destination_bytes = [0u8; 16];
+                let source_bytes = ip_bytes_into(*inner_source, &mut source_bytes);
+                let destination_bytes = ip_bytes_into(target.ip(), &mut destination_bytes);
                 let mut packet = Vec::with_capacity(IPV4_HEADER + 8 + payload.len());
                 let datagram = UdpDatagram {
-                    source: &source_bytes,
-                    destination: &destination_bytes,
+                    source: source_bytes,
+                    destination: destination_bytes,
                     source_port: port,
                     destination_port: target.port(),
                     payload,
@@ -976,12 +986,14 @@ pub(crate) fn server_udp(
                     let Some((_, payload)) = crate::proxy::parse_socks_udp(&buf[..n]) else {
                         continue;
                     };
-                    let source_bytes = ip_bytes(target.ip());
-                    let destination_bytes = ip_bytes(source.ip());
+                    let mut source_bytes = [0u8; 16];
+                    let mut destination_bytes = [0u8; 16];
+                    let source_bytes = ip_bytes_into(target.ip(), &mut source_bytes);
+                    let destination_bytes = ip_bytes_into(source.ip(), &mut destination_bytes);
                     let mut packet = Vec::with_capacity(IPV4_HEADER + 8 + payload.len());
                     let datagram = UdpDatagram {
-                        source: &source_bytes,
-                        destination: &destination_bytes,
+                        source: source_bytes,
+                        destination: destination_bytes,
                         source_port: target.port(),
                         destination_port: source.port(),
                         payload,
@@ -1024,6 +1036,20 @@ pub(crate) fn ip_bytes(address: IpAddr) -> Vec<u8> {
     match address {
         IpAddr::V4(address) => address.octets().to_vec(),
         IpAddr::V6(address) => address.octets().to_vec(),
+    }
+}
+
+/// The same octets in the caller's stack room, so a datagram lane builds a packet without a heap buffer per address.
+fn ip_bytes_into(address: IpAddr, out: &mut [u8; 16]) -> &[u8] {
+    match address {
+        IpAddr::V4(address) => {
+            out[..4].copy_from_slice(&address.octets());
+            &out[..4]
+        }
+        IpAddr::V6(address) => {
+            out.copy_from_slice(&address.octets());
+            &out[..]
+        }
     }
 }
 
@@ -1133,6 +1159,159 @@ mod tests {
         assert!(!stack.listeners.contains_key(&expired));
         stack.listen(10_000 + LISTENERS as u16 + 20);
         assert_eq!(stack.listeners.len(), LISTENERS);
+    }
+
+    fn checksum(bytes: &[u8]) -> u16 {
+        let mut sum = 0u32;
+        for pair in bytes.chunks(2) {
+            sum += if pair.len() == 2 {
+                u32::from(u16::from_be_bytes([pair[0], pair[1]]))
+            } else {
+                u32::from(pair[0]) << 8
+            };
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        !(sum as u16)
+    }
+
+    /// The SYN-ACK a peer would answer a client's SYN with, so the upload path runs on an established socket without a second stack.
+    fn syn_ack(syn: &[u8]) -> Vec<u8> {
+        let ihl = usize::from(syn[0] & 0x0f) * 4;
+        let source: [u8; 4] = syn[12..16].try_into().expect("source");
+        let destination: [u8; 4] = syn[16..20].try_into().expect("destination");
+        let source_port = u16::from_be_bytes([syn[ihl], syn[ihl + 1]]);
+        let destination_port = u16::from_be_bytes([syn[ihl + 2], syn[ihl + 3]]);
+        let sequence = u32::from_be_bytes(
+            syn[ihl + 4..ihl + 8]
+                .try_into()
+                .expect("the client's sequence"),
+        );
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&40u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = 6;
+        packet[12..16].copy_from_slice(&destination);
+        packet[16..20].copy_from_slice(&source);
+        let header_sum = checksum(&packet[..20]);
+        packet[10..12].copy_from_slice(&header_sum.to_be_bytes());
+        let tcp = &mut packet[20..];
+        tcp[0..2].copy_from_slice(&destination_port.to_be_bytes());
+        tcp[2..4].copy_from_slice(&source_port.to_be_bytes());
+        tcp[4..8].copy_from_slice(&0x1234u32.to_be_bytes());
+        tcp[8..12].copy_from_slice(&(sequence + 1).to_be_bytes());
+        tcp[12] = 0x50;
+        tcp[13] = 0x12;
+        tcp[14..16].copy_from_slice(&0xffffu16.to_be_bytes());
+        let mut pseudo = Vec::with_capacity(12 + tcp.len());
+        pseudo.extend_from_slice(&destination);
+        pseudo.extend_from_slice(&source);
+        pseudo.extend_from_slice(&[0, 6]);
+        pseudo.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
+        pseudo.extend_from_slice(tcp);
+        let tcp_sum = checksum(&pseudo);
+        tcp[16..18].copy_from_slice(&tcp_sum.to_be_bytes());
+        packet
+    }
+
+    #[test]
+    fn a_direct_upload_never_builds_the_staging_buffer() {
+        let (mut app, proxy) = loopback().expect("pair");
+        let (to_tunnel, packets) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&device(&["10.0.0.2"], true), to_tunnel);
+        stack
+            .connect(ClientFlow {
+                client: Connection::from(proxy),
+                destination: "192.0.2.1:80".parse().expect("destination"),
+                prefix: Vec::new(),
+            })
+            .expect("connect");
+        let mut buf = [0u8; 2048];
+        stack.poll(&mut buf);
+        let syn = packets
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the client's SYN");
+        assert_eq!(syn[9], 6, "the inner packet is TCP");
+        stack.device.push(syn_ack(&syn));
+        stack.poll(&mut buf);
+        assert_eq!(
+            stack
+                .sockets
+                .get::<TcpSocket>(stack.flows[0].handle)
+                .state(),
+            State::Established,
+            "the SYN-ACK establishes the flow"
+        );
+        while packets.try_recv().is_ok() {}
+
+        app.write_all(b"hello").expect("write");
+        let mut seen = false;
+        for _ in 0..50 {
+            stack.poll(&mut buf);
+            while let Ok(packet) = packets.try_recv() {
+                if packet
+                    .windows(b"hello".len())
+                    .any(|window| window == b"hello")
+                {
+                    seen = true;
+                }
+            }
+            if seen {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            stack.flows[0].pending_up.capacity(),
+            0,
+            "an accepted upload is never copied into pending_up"
+        );
+        assert!(seen, "the accepted bytes leave on the tunnel");
+    }
+
+    #[test]
+    fn a_datagram_address_is_written_in_stack_room_and_the_bytes_are_the_allocated_ones() {
+        let source: IpAddr = "2001:db8::2".parse().unwrap();
+        let destination: IpAddr = "2001:db8::7".parse().unwrap();
+        let payload = b"addresses";
+        let mut packet = Vec::with_capacity(IPV6_HEADER + 8 + payload.len());
+
+        let ((), new) = ferrox_core::alloc_count::measure(|| {
+            let mut source_room = [0u8; 16];
+            let mut destination_room = [0u8; 16];
+            let source_bytes = ip_bytes_into(source, &mut source_room);
+            let destination_bytes = ip_bytes_into(destination, &mut destination_room);
+            let datagram = UdpDatagram {
+                source: source_bytes,
+                destination: destination_bytes,
+                source_port: 1234,
+                destination_port: 53,
+                payload,
+            };
+            assert!(udp_datagram(&datagram, &mut packet));
+        });
+        assert_eq!(new.allocs, 0, "the address build takes no heap: {new:?}");
+
+        let mut reference = Vec::with_capacity(IPV6_HEADER + 8 + payload.len());
+        let ((), old) = ferrox_core::alloc_count::measure(|| {
+            let source_bytes = ip_bytes(source);
+            let destination_bytes = ip_bytes(destination);
+            let datagram = UdpDatagram {
+                source: &source_bytes,
+                destination: &destination_bytes,
+                source_port: 1234,
+                destination_port: 53,
+                payload,
+            };
+            assert!(udp_datagram(&datagram, &mut reference));
+        });
+        assert_eq!(
+            old.allocs, 2,
+            "the old build allocated each address: {old:?}"
+        );
+        assert_eq!(packet, reference, "the stack room writes the same packet");
     }
 
     #[test]
