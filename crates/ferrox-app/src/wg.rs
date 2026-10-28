@@ -1242,6 +1242,33 @@ mod tests {
         assert_eq!(&received, b"headhello");
     }
 
+    #[test]
+    fn a_failed_name_is_remembered() {
+        let config = DeviceConfig {
+            secret: [0x11; 32],
+            addresses: vec!["10.0.0.2".parse().unwrap()],
+            peers: vec![PeerConfig {
+                public: [0x22; 32],
+                preshared: [0; 32],
+                endpoint: Some("127.0.0.1:9".parse().unwrap()),
+                endpoints: Vec::new(),
+                keepalive: 0,
+                allowed: vec![("192.0.2.0".parse().unwrap(), 24)],
+            }],
+            mtu: 1420,
+            reserved: [0; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            dns: vec!["127.0.0.1".parse().unwrap()],
+        };
+        let wireguard = WireGuardOut::new(config).expect("outbound");
+        assert!(wireguard.lookup("missing.example").is_empty());
+        let cache = wireguard.resolved.lock().expect("cache");
+        let entry = cache.get("missing.example").expect("negative entry");
+        assert!(entry.addrs.is_empty());
+        assert!(entry.until > Instant::now());
+    }
+
     /// A truncated UDP response retries the same DNS question over TCP on the reserved server port.
     #[test]
     fn a_truncated_answer_is_asked_again_over_tcp() {
