@@ -445,11 +445,12 @@ impl Client {
                         self.end = true;
                         return;
                     }
-                    block.extend_from_slice(strip_padding(flags, body));
-                    if block.len() > FRAME_CAP {
+                    let data = strip_padding(flags, body);
+                    if block.len() + data.len() > FRAME_CAP {
                         self.end = true;
                         return;
                     }
+                    block.extend_from_slice(data);
                     if flags & h2::F_END_HEADERS != 0 {
                         self.head(&block);
                     } else {
@@ -757,11 +758,12 @@ impl Session {
                         self.end = true;
                         return;
                     }
-                    block.extend_from_slice(strip_padding(flags, body));
-                    if block.len() > FRAME_CAP {
+                    let data = strip_padding(flags, body);
+                    if block.len() + data.len() > FRAME_CAP {
                         self.end = true;
                         return;
                     }
+                    block.extend_from_slice(data);
                     if flags & h2::F_END_HEADERS != 0 {
                         self.request(wire, id, &block);
                     } else {
