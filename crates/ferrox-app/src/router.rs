@@ -5216,9 +5216,10 @@ mod tests {
         )
         .expect("parses");
         let resolver = resolver(&root);
-        let (ips, _) = resolve_ips_ttl_with(Some(&resolver), "localhost", 0);
-        assert!(
-            !ips.is_empty(),
+        let (ips, _) = resolve_ips_ttl_with(Some(&resolver), "192.0.2.7", 0);
+        assert_eq!(
+            ips,
+            vec!["192.0.2.7".parse::<IpAddr>().expect("ipv4")],
             "a skipped fake server falls back to the system"
         );
     }
