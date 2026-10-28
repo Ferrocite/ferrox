@@ -19539,7 +19539,7 @@ pub(crate) mod lane_pool {
             let mut later = marker(Arc::clone(&ran));
             later.idle = 2;
             let parker = Arc::clone(&pool);
-            let parked = thread::spawn(move || {
+            let handle = thread::spawn(move || {
                 park_with(&parker, later, Duration::from_millis(50));
             });
             thread::sleep(Duration::from_millis(20));
@@ -19560,7 +19560,7 @@ pub(crate) mod lane_pool {
                 "the earlier lane waited {:?}",
                 at.elapsed()
             );
-            parked.join().unwrap();
+            handle.join().unwrap();
         }
 
         /// A batch belongs to the pool that parked it, not to every pool in the process.
