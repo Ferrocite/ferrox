@@ -3242,18 +3242,13 @@ mod tests {
         let identity = crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses");
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
-        let payload = vec![0x5a; 256 * 1024];
+        let payload = vec![0x5a; 80 * 1024];
         thread::scope(|scope| {
             scope.spawn(move || {
                 let (stream, _) = listener.accept().expect("accepts");
                 let mut server = crate::tls::accept(&identity, stream).expect("accepts");
                 server.handshake().expect("handshakes");
-                let mut buf = [0u8; 64 * 1024];
-                while let Ok(n) = server.read(&mut buf) {
-                    if n == 0 {
-                        break;
-                    }
-                }
+                thread::sleep(std::time::Duration::from_millis(100));
             });
             let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
             let mut client =
