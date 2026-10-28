@@ -1715,6 +1715,16 @@ fn inbound_tag(inbound: &Json) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The reason a MASQUE inbound cannot answer a rule that names a source or local address.
+fn masque_source_refusal(shared: &RouteShared, inbound: &Json) -> Option<String> {
+    let tag = inbound_tag(inbound);
+    let selector = shared.routing.source_refusal(tag.as_deref())?;
+    Some(format!(
+        "masque inbound {} names `{selector}`, which a masque flow cannot answer",
+        tag.as_deref().unwrap_or("<untagged>")
+    ))
+}
+
 /// The outbound one configured entry names, with the reason when this tree cannot dial it: a tag a
 /// rule can reach is built at startup, so a missing or unbuildable one stops the process, not a flow.
 pub(crate) fn build_outbound(config: &Json, tag: &str) -> Result<Outbound, String> {
@@ -24003,6 +24013,25 @@ mod tests {
             "gone"
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_masque_inbound_refuses_a_source_rule_it_cannot_answer() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"default","protocol":"freedom"}],"routing":{"rules":[{"type":"field","inboundTag":["masque"],"network":"udp","source":["192.0.2.0/24"],"outboundTag":"default"}]}}"#,
+        )
+        .expect("config");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("shared");
+        let inbound =
+            crate::json::parse(r#"{"tag":"masque","protocol":"masque"}"#).expect("inbound");
+        assert_eq!(
+            masque_source_refusal(&shared, &inbound).as_deref(),
+            Some("masque inbound masque names `source`, which a masque flow cannot answer")
+        );
     }
 
     #[test]
