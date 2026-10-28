@@ -331,6 +331,10 @@ struct Packer {
 
 impl Packets {
     fn new(up: Arc<Packer>, poster: Option<std::thread::JoinHandle<()>>) -> Self {
+        if poster.is_none() {
+            up.failed.store(true, Ordering::SeqCst);
+            up.cv.notify_all();
+        }
         Self {
             up,
             poster: Mutex::new(poster),
