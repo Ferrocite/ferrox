@@ -439,14 +439,19 @@ impl WireGuardOut {
             {
                 continue;
             }
-            let Some(answer) = parse_answer(datagram.payload) else {
+            let payload = datagram.payload;
+            if let Some(header) = payload.get(..12) {
+                let response_id = u16::from_be_bytes([header[0], header[1]]);
+                let flags = u16::from_be_bytes([header[2], header[3]]);
+                if response_id == id && flags.trailing_zeros() >= 4 && flags & 0x0200 != 0 {
+                    break self.exchange_tcp(server, &query, id, qtype);
+                }
+            }
+            let Some(answer) = parse_answer(payload) else {
                 continue;
             };
             if answer.id != id || answer.rcode != 0 {
                 continue;
-            }
-            if answer.truncated {
-                break self.exchange_tcp(server, &query, id, qtype);
             }
             break addresses(&answer, qtype);
         };
@@ -1211,6 +1216,7 @@ mod tests {
                 return;
             };
             reply[2] |= 0x02;
+            reply.truncate(reply.len() - 4);
             let _ = udp.send_to(&reply, from);
         });
         std::thread::spawn(move || {
