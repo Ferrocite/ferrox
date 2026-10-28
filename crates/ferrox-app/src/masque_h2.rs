@@ -24,7 +24,6 @@ const PREFACE: usize = 24;
 const SETTINGS_INITIAL_WINDOW: u16 = 0x4;
 const SETTINGS_ENABLE_CONNECT: u16 = 0x8;
 const FRAME_CAP: usize = 1 << 20;
-const QUEUED_CAP: usize = 64;
 const DEFAULT_WINDOW: i64 = 65_535;
 
 trait ReadWrite: Read + Write {}
@@ -1013,6 +1012,7 @@ mod tests {
 
     #[test]
     fn a_stalled_send_window_bounds_the_queued_capsules() {
+        const QUEUED_CAP: usize = 64;
         let mut client = bare_client();
         client.send_window = 0;
         client.connection_window = 0;
