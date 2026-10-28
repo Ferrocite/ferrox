@@ -743,12 +743,14 @@ impl Stream {
             return Err("masque: the edge closed the connection".to_owned());
         }
         self.read_stream(conn)?;
-        let mut room = vec![0u8; 65535];
-        while let Ok(n) = conn.dgram_recv(&mut room) {
-            if let Some((stream, packet)) = connectip::datagram_split(&room[..n]) {
-                if stream == self.id {
-                    self.packets.push(packet.to_vec());
-                }
+        while let Ok(mut datagram) = conn.dgram_recv_buf() {
+            let Some((stream, packet)) = connectip::datagram_split(&datagram) else {
+                continue;
+            };
+            if stream == self.id {
+                let offset = datagram.len() - packet.len();
+                datagram.drain(..offset);
+                self.packets.push(datagram);
             }
         }
         Ok(())
@@ -838,7 +840,6 @@ fn io(
         id: stream,
         ..Stream::default()
     };
-    let mut room = vec![0u8; 65535];
     let mut unsent: Option<Vec<u8>> = None;
     loop {
         while let Some(packet) = unsent.take().or_else(|| from_tunnel.try_recv().ok()) {
@@ -875,36 +876,75 @@ fn io(
         if withdrew || control.done {
             break;
         }
-        while let Ok(n) = conn.dgram_recv(&mut room) {
-            let Some((id, packet)) = connectip::datagram_split(&room[..n]) else {
+        while let Ok(datagram) = conn.dgram_recv_buf() {
+            let Some((id, packet)) = connectip::datagram_split(&datagram) else {
                 continue;
             };
             if id != stream {
                 continue;
             }
-            deliver(&to_stack, &routes, packet);
+            let offset = datagram.len() - packet.len();
+            deliver_owned(&to_stack, &routes, datagram, offset);
         }
         quic::flush_egress(&mut conn, sock);
     }
 }
 
-pub(crate) fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u8]) {
+enum Delivery {
+    Udp(Sender<Vec<u8>>),
+    Stack,
+}
+
+fn delivery(routes: &UdpRoutes, packet: &[u8]) -> Option<Delivery> {
     if let Some(datagram) = connectip::udp_from_packet(packet) {
         if !datagram.verified {
-            return;
+            return None;
         }
-        if let Ok(table) = routes.lock() {
-            if let Some(lane) = table.get(&datagram.destination_port) {
-                let _ = lane.send(packet.to_vec());
-            }
-        }
-        return;
+        return routes
+            .lock()
+            .ok()?
+            .get(&datagram.destination_port)
+            .cloned()
+            .map(Delivery::Udp);
     }
-    if wg_stack::inner_protocol(packet) == Some(6) {
-        let _ = to_stack.send(Packet {
-            peer: [0u8; 32],
-            bytes: packet.to_vec(),
-        });
+    (wg_stack::inner_protocol(packet) == Some(6)).then_some(Delivery::Stack)
+}
+
+pub(crate) fn deliver(to_stack: &Sender<Packet>, routes: &UdpRoutes, packet: &[u8]) {
+    match delivery(routes, packet) {
+        Some(Delivery::Udp(lane)) => {
+            let _ = lane.send(packet.to_vec());
+        }
+        Some(Delivery::Stack) => {
+            let _ = to_stack.send(Packet {
+                peer: [0u8; 32],
+                bytes: packet.to_vec(),
+            });
+        }
+        None => {}
+    }
+}
+
+fn deliver_owned(
+    to_stack: &Sender<Packet>,
+    routes: &UdpRoutes,
+    mut datagram: Vec<u8>,
+    offset: usize,
+) {
+    let Some(to) = delivery(routes, &datagram[offset..]) else {
+        return;
+    };
+    datagram.drain(..offset);
+    match to {
+        Delivery::Udp(lane) => {
+            let _ = lane.send(datagram);
+        }
+        Delivery::Stack => {
+            let _ = to_stack.send(Packet {
+                peer: [0u8; 32],
+                bytes: datagram,
+            });
+        }
     }
 }
 
@@ -932,8 +972,8 @@ fn send_datagram(conn: &mut quiche::Connection, stream: u64, packet: &[u8]) -> E
         };
         return Emission::TooLarge(icmp);
     }
-    // Only a full queue asks for the packet back; any other failure is the connection ending, which the loop's own close check ends.
-    match conn.dgram_send(&datagram) {
+    // Only a full queue asks for the packet back; any other failure is the connection ending, which the loop's own close check ends. The prefixed datagram is handed to quiche's queue, not copied into it.
+    match conn.dgram_send_buf(datagram) {
         Err(quiche::Error::Done) => Emission::Full,
         _ => Emission::Queued,
     }
@@ -1865,46 +1905,88 @@ fn read_datagrams(
     spec: &ServerSpec,
     tunnel: &mut Tunnel,
 ) {
-    let mut room = vec![0u8; 65535];
-    while let Ok(n) = conn.dgram_recv(&mut room) {
-        let Some((stream, packet)) = connectip::datagram_split(&room[..n]) else {
+    while let Ok(datagram) = conn.dgram_recv_buf() {
+        let Some((stream, packet)) = connectip::datagram_split(&datagram) else {
             continue;
         };
         if tunnel.stream != Some(stream) {
             continue;
         }
-        forward(shared, spec, &tunnel.addrs, packet);
+        let offset = datagram.len() - packet.len();
+        forward_owned(shared, spec, &tunnel.addrs, datagram, offset);
     }
 }
 
-pub(crate) fn forward(shared: &Arc<Shared>, spec: &ServerSpec, addrs: &[IpAddr], packet: &[u8]) {
-    let Some(source) = packet_source(packet) else {
-        return;
-    };
+enum Forward {
+    Tunnel(SyncSender<Vec<u8>>),
+    Stack,
+}
+
+fn forward_to(
+    shared: &Arc<Shared>,
+    spec: &ServerSpec,
+    addrs: &[IpAddr],
+    packet: &[u8],
+) -> Option<Forward> {
+    let source = packet_source(packet)?;
     if !addrs.contains(&source) {
-        return;
+        return None;
     }
-    let Some(destination) = packet_destination(packet) else {
-        return;
-    };
+    let destination = packet_destination(packet)?;
     if dropped_destination(destination) {
-        return;
+        return None;
     }
     if let Ok(tunnels) = shared.tunnels.lock() {
         if let Some(other) = tunnels.get(&destination) {
             if !addrs.contains(&destination) {
-                let _ = other.sender.try_send(packet.to_vec());
+                return Some(Forward::Tunnel(other.sender.clone()));
             }
-            return;
+            return None;
         }
     }
     if spec.pool.holds(destination) && !shared.local.contains(&destination) {
-        return;
+        return None;
     }
-    let _ = shared.packets.send(Packet {
-        peer: peer_key(addrs),
-        bytes: packet.to_vec(),
-    });
+    Some(Forward::Stack)
+}
+
+pub(crate) fn forward(shared: &Arc<Shared>, spec: &ServerSpec, addrs: &[IpAddr], packet: &[u8]) {
+    match forward_to(shared, spec, addrs, packet) {
+        Some(Forward::Tunnel(other)) => {
+            let _ = other.try_send(packet.to_vec());
+        }
+        Some(Forward::Stack) => {
+            let _ = shared.packets.send(Packet {
+                peer: peer_key(addrs),
+                bytes: packet.to_vec(),
+            });
+        }
+        None => {}
+    }
+}
+
+fn forward_owned(
+    shared: &Arc<Shared>,
+    spec: &ServerSpec,
+    addrs: &[IpAddr],
+    mut datagram: Vec<u8>,
+    offset: usize,
+) {
+    let Some(to) = forward_to(shared, spec, addrs, &datagram[offset..]) else {
+        return;
+    };
+    datagram.drain(..offset);
+    match to {
+        Forward::Tunnel(other) => {
+            let _ = other.try_send(datagram);
+        }
+        Forward::Stack => {
+            let _ = shared.packets.send(Packet {
+                peer: peer_key(addrs),
+                bytes: datagram,
+            });
+        }
+    }
 }
 
 fn reject(tunnel: &mut Tunnel, status: u16) {
@@ -2150,6 +2232,109 @@ mod tests {
         assert!(
             delivered.is_ok(),
             "a full tunnel queue held the dispatcher and starved another tunnel"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_datagram_is_the_buffer_that_arrived() {
+        let (packets, packets_rx) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            pool: Mutex::new(AddressPool::default()),
+            tunnels: Mutex::new(HashMap::new()),
+            packets,
+            local: Vec::new(),
+        });
+        let spec = ServerSpec {
+            users: Vec::new(),
+            path: DEFAULT_PATH.to_owned(),
+            pool: AddressPool::default(),
+            mtu: DEFAULT_MTU,
+        };
+        let owner: IpAddr = "10.14.0.2".parse().expect("an address");
+        let packet = ipv4_packet([10, 14, 0, 2], [192, 0, 2, 1]);
+        let mut datagram = Vec::with_capacity(2 + packet.len());
+        connectip::datagram_prefix(4, &mut datagram);
+        datagram.extend_from_slice(&packet);
+        let base = datagram.as_ptr();
+        let capacity = datagram.capacity();
+        let offset = datagram.len() - packet.len();
+        forward_owned(&shared, &spec, &[owner], datagram, offset);
+        let forwarded = packets_rx.recv().expect("forwarded");
+        assert_eq!(forwarded.bytes, packet);
+        assert_eq!(
+            forwarded.bytes.as_ptr(),
+            base,
+            "the forwarded packet is the buffer that arrived"
+        );
+        assert_eq!(
+            forwarded.bytes.capacity(),
+            capacity,
+            "the buffer did not grow on its way to the stack"
+        );
+    }
+
+    #[test]
+    fn a_delivered_datagram_is_the_buffer_that_arrived() {
+        let (to_stack, stack_rx) = mpsc::channel();
+        let routes = Arc::new(Mutex::new(HashMap::new()));
+        let mut packet = ipv4_packet([10, 14, 0, 2], [192, 0, 2, 1]);
+        packet[9] = 6;
+        let mut datagram = Vec::with_capacity(2 + packet.len());
+        connectip::datagram_prefix(4, &mut datagram);
+        datagram.extend_from_slice(&packet);
+        let base = datagram.as_ptr();
+        let capacity = datagram.capacity();
+        let offset = datagram.len() - packet.len();
+        deliver_owned(&to_stack, &routes, datagram, offset);
+        let delivered = stack_rx.recv().expect("delivered");
+        assert_eq!(delivered.bytes, packet);
+        assert_eq!(
+            delivered.bytes.as_ptr(),
+            base,
+            "the delivered packet is the buffer that arrived"
+        );
+        assert_eq!(
+            delivered.bytes.capacity(),
+            capacity,
+            "the buffer did not grow on its way to the stack"
+        );
+    }
+
+    #[test]
+    fn a_queued_datagram_is_the_buffer_the_caller_built() {
+        let (_inbound, port) = serve("127.0.0.1:1");
+        let spec = ClientSpec::from(&outbound(port)).expect("spec");
+        let (sock, peer, local) = quic::udp_to_server(&spec.address, spec.port).expect("resolve");
+        let sock = Datagram::plain(sock);
+        let mut lane = establish(&spec, &sock, peer, local).expect("lane");
+        let packet = ipv4_packet([10, 14, 0, 2], [192, 0, 2, 1]);
+        let mut warm = Vec::with_capacity(3 + packet.len());
+        connectip::datagram_prefix(lane.stream, &mut warm);
+        warm.extend_from_slice(&packet);
+        lane.conn.dgram_send_buf(warm).expect("warm");
+        quic::flush_egress(&mut lane.conn, &sock);
+        assert_eq!(lane.conn.dgram_send_queue_len(), 0, "the warm packet left");
+
+        let mut datagram = Vec::with_capacity(3 + packet.len());
+        connectip::datagram_prefix(lane.stream, &mut datagram);
+        datagram.extend_from_slice(&packet);
+        let ((), new) = ferrox_core::alloc_count::measure(|| {
+            lane.conn.dgram_send_buf(datagram).expect("queued");
+        });
+        assert_eq!(
+            new.allocs, 0,
+            "the prefixed datagram is the buffer quiche queues: {new:?}"
+        );
+
+        let mut copied = Vec::with_capacity(3 + packet.len());
+        connectip::datagram_prefix(lane.stream, &mut copied);
+        copied.extend_from_slice(&packet);
+        let ((), old) = ferrox_core::alloc_count::measure(|| {
+            lane.conn.dgram_send(&copied).expect("queued");
+        });
+        assert_eq!(
+            old.allocs, 1,
+            "the old handoff copied the datagram into a second buffer: {old:?}"
         );
     }
 
