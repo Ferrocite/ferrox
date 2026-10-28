@@ -22126,6 +22126,19 @@ fn diagnose_outbounds(root: &Json) -> Vec<String> {
 }
 
 fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
+    let Some(first) = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .and_then(|list| list.first())
+    else {
+        return Ok(None);
+    };
+    // The default is the first configured outbound, so the finders below are shown only that entry.
+    let only = Json::Obj(vec![(
+        "outbounds".to_owned(),
+        Json::Arr(vec![first.clone()]),
+    )]);
+    let root = &only;
     if let Some(foxy) = find_foxy_outbound(root) {
         return Ok(Some(Outbound::Foxy(Box::new(foxy))));
     }
@@ -45019,6 +45032,19 @@ end
             panic!("the sink is the only outbound");
         };
         assert_eq!(answer.bytes(), ferrox_core::blackhole::HTTP_403);
+    }
+
+    /// The default is the first configured outbound, not the first protocol the finders happen to support.
+    #[test]
+    fn the_first_outbound_is_the_default_when_a_later_one_is_buildable() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom","settings":{}},{"tag":"edge","protocol":"masque","settings":{"address":"127.0.0.1","port":443},"streamSettings":{"network":"masque","security":"tls","tlsSettings":{"serverName":"edge.example","allowInsecure":true}}}]}"#,
+        )
+        .expect("parses");
+        assert!(
+            matches!(find_outbound(&root), Ok(Some(Outbound::Freedom(_)))),
+            "a later masque outbound became the default"
+        );
     }
 
     /// xray's `direct` outbound is the handler `freedom` names: a config with only that outbound serves the direct lane.
