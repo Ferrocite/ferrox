@@ -39349,6 +39349,8 @@ mod tests {
                 obfs_password: String::new(),
                 hop: None,
                 gecko: None,
+                udp_idle: std::time::Duration::from_secs(60),
+                quic: None,
             },
             roots: Some(roots.into()),
         };
@@ -41619,6 +41621,8 @@ mod tests {
                 obfs_password: obfs.to_owned(),
                 hop: None,
                 gecko: None,
+                udp_idle: std::time::Duration::from_secs(60),
+                quic: None,
             },
             roots: Some(roots.into()),
         };
@@ -41810,6 +41814,8 @@ mod tests {
                 obfs_password: String::new(),
                 hop: None,
                 gecko: None,
+                udp_idle: std::time::Duration::from_secs(60),
+                quic: None,
             },
             roots: Some(roots.into()),
         };
@@ -42613,6 +42619,8 @@ mod tests {
                 obfs_password: String::new(),
                 hop: None,
                 gecko: None,
+                udp_idle: std::time::Duration::from_secs(60),
+                quic: None,
             }),
             host: "localhost".to_owned(),
             mux: false,
@@ -42707,6 +42715,8 @@ mod tests {
                 obfs_password: String::new(),
                 hop: None,
                 gecko: None,
+                udp_idle: std::time::Duration::from_secs(60),
+                quic: None,
             },
             roots: Some(roots.into()),
         };
@@ -42749,6 +42759,8 @@ mod tests {
                 obfs_password: String::new(),
                 hop: None,
                 gecko: None,
+                udp_idle: std::time::Duration::from_secs(60),
+                quic: None,
             },
             roots: Some(roots.into()),
         };
@@ -42789,6 +42801,8 @@ mod tests {
                 obfs_password: "gawrgura".to_owned(),
                 hop: None,
                 gecko: None,
+                udp_idle: std::time::Duration::from_secs(60),
+                quic: None,
             },
             roots: Some(roots.into()),
         };
@@ -42845,6 +42859,8 @@ mod tests {
                 obfs_password: String::new(),
                 hop: None,
                 gecko: None,
+                udp_idle: std::time::Duration::from_secs(60),
+                quic: None,
             },
             roots: Some(roots.into()),
         };

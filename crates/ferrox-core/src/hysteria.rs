@@ -1,6 +1,7 @@
 //! Hysteria version 2 framing: the bytes around the QUIC streams and datagrams — every TCP flow is one bidirectional stream opening with the `0x401` type as a QUIC varint, the connection authenticates by HTTP/3 `POST /auth` answered with status `233`, and the UDP lane rides QUIC datagrams each carrying a `BE32` session id ahead of a packet id, fragment metadata, a varint address and its payload.
 
 use crate::foxy::{frames, head_end, hpack};
+use std::time::Duration;
 
 pub const TCP_FRAME: u64 = 0x401;
 
@@ -16,11 +17,41 @@ pub const CC_RX_HEADER: &str = "hysteria-cc-rx";
 
 pub const UDP_HEADER: &str = "hysteria-udp";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Congestion {
     Reno,
     Bbr,
     Brutal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BbrProfile {
+    Conservative,
+    Standard,
+    Aggressive,
+}
+
+/// The `finalmask.quicParams` a hysteria transport names. A zero field keeps the
+/// carrier's own default; the reference fills the QUIC defaults only when the
+/// block is present, so `Config::quic == None` is the byte-identical old path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct QuicParams {
+    pub congestion: Congestion,
+    pub bbr_profile: BbrProfile,
+    pub brutal_up: u64,
+    pub brutal_down: u64,
+    pub brutal_disable_loss_compensation: bool,
+    pub init_stream_receive_window: u64,
+    pub max_stream_receive_window: u64,
+    pub init_connection_receive_window: u64,
+    pub max_connection_receive_window: u64,
+    pub max_idle_timeout: Duration,
+    pub keep_alive_period: Duration,
+    pub disable_path_mtu_discovery: bool,
+    pub disable_chrome_parrot: bool,
+    pub disable_gso: bool,
+    pub max_incoming_streams: u64,
+    pub disable_stateless_reset: bool,
 }
 
 impl Congestion {
@@ -146,6 +177,10 @@ pub struct Config {
     /// into, or `None` for a plain salamander (or cleartext) lane. `obfs_password`
     /// still holds the key salamander masks each frame with.
     pub gecko: Option<Gecko>,
+    /// The server's datagram-association idle window, `hysteriaSettings.udpIdleTimeout`, default 60 seconds.
+    pub udp_idle: Duration,
+    /// The `finalmask.quicParams` this transport names, or `None` to keep the carrier's own QUIC shape.
+    pub quic: Option<QuicParams>,
 }
 
 impl Default for Config {
@@ -157,6 +192,8 @@ impl Default for Config {
             obfs_password: String::new(),
             hop: None,
             gecko: None,
+            udp_idle: Duration::from_secs(60),
+            quic: None,
         }
     }
 }

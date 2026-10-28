@@ -2282,6 +2282,8 @@ mod tests {
                 obfs_password: String::new(),
                 hop,
                 gecko: None,
+                udp_idle: std::time::Duration::from_secs(60),
+                quic: None,
             },
             roots: None,
         };

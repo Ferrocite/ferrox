@@ -1687,6 +1687,8 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
             obfs_password: hysteria_v1_obfs(settings).unwrap_or_default(),
             hop: hysteria_hop(hy),
             gecko: None,
+            udp_idle: Duration::from_secs(60),
+            quic: None,
         });
     }
     // Salamander and its gecko fragmentation variant are the datagram obfuscations carried; any other named one, or one whose password is too short to mask with, is refused rather than silently sent in the clear.
@@ -1712,6 +1714,8 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
         obfs_password,
         hop: hysteria_hop(hy),
         gecko,
+        udp_idle: Duration::from_secs(60),
+        quic: None,
     })
 }
 
@@ -1734,6 +1738,8 @@ pub(crate) fn hysteria_v1_config(stream: Option<&Json>) -> ferrox_core::hysteria
         obfs_password: hysteria_v1_obfs(stream).unwrap_or_default(),
         hop: hysteria_hop(hy),
         gecko: None,
+        udp_idle: Duration::from_secs(60),
+        quic: None,
     }
 }
 
@@ -2271,6 +2277,29 @@ mod tests {
             ),
             Carrier::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn a_hysteria_carrier_reads_udp_idle_and_quic_params() {
+        use ferrox_core::hysteria::{BbrProfile, Congestion};
+        let parsed = crate::json::parse(
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": 5}, "finalmask": {"quicParams": {"congestion": "reno", "bbrProfile": "aggressive", "initStreamReceiveWindow": 65536, "maxStreamReceiveWindow": 131072, "initConnectionReceiveWindow": 196608, "maxConnectionReceiveWindow": 262144, "maxIdleTimeout": 10, "maxIncomingStreams": 64, "disablePathMTUDiscovery": true}}}}"#,
+        )
+        .expect("parses");
+        let Carrier::Hysteria(config) = stream_carrier(parsed.get("streamSettings")) else {
+            panic!("a v2 hysteria carrier");
+        };
+        assert_eq!(config.udp_idle, Duration::from_secs(5));
+        let quic = config.quic.expect("quic params");
+        assert_eq!(quic.congestion, Congestion::Reno);
+        assert_eq!(quic.bbr_profile, BbrProfile::Aggressive);
+        assert_eq!(quic.init_stream_receive_window, 65_536);
+        assert_eq!(quic.max_stream_receive_window, 131_072);
+        assert_eq!(quic.init_connection_receive_window, 196_608);
+        assert_eq!(quic.max_connection_receive_window, 262_144);
+        assert_eq!(quic.max_idle_timeout, Duration::from_secs(10));
+        assert_eq!(quic.max_incoming_streams, 64);
+        assert!(quic.disable_path_mtu_discovery);
     }
 
     #[test]
