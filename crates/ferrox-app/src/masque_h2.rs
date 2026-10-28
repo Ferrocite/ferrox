@@ -514,6 +514,9 @@ impl Client {
         }
         self.capsules = capsules;
         self.capsule_at = at;
+        if self.capsules.len() > FRAME_CAP {
+            self.end = true;
+        }
         for answer in answers {
             self.capsule(&answer);
         }
@@ -845,6 +848,9 @@ impl Session {
         if self.capsule_at > 0 {
             self.capsules.drain(..self.capsule_at);
             self.capsule_at = 0;
+        }
+        if self.capsules.len() > FRAME_CAP {
+            self.end = true;
         }
         for answer in answers {
             self.capsule(wire, &answer);
