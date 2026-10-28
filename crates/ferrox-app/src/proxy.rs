@@ -8691,7 +8691,9 @@ fn xdrive_relay_until(app: &Connection, mut down: crate::xdrive::Conn, response_
     loop {
         match down.read(&mut buf) {
             Ok(n) if n > 0 => {
-                response_deadline = Some(Instant::now() + response_wait);
+                if ended {
+                    response_deadline = Some(Instant::now() + response_wait);
+                }
                 if app_write.write_all(&buf[..n]).is_err() {
                     break;
                 }
@@ -8701,7 +8703,7 @@ fn xdrive_relay_until(app: &Connection, mut down: crate::xdrive::Conn, response_
                     ended = true;
                     response_deadline = Some(Instant::now() + response_wait);
                 }
-                if response_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                if ended && response_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
                     break;
                 }
             }
@@ -8741,6 +8743,15 @@ fn dial_vless_xdrive(client: &Connection, vless: &VlessOut, target: &Destination
 }
 
 fn dial_trojan_xdrive(client: &Connection, trojan: &TrojanOut, target: &Destination) {
+    dial_trojan_xdrive_until(client, trojan, target, budgets::relay_stall());
+}
+
+fn dial_trojan_xdrive_until(
+    client: &Connection,
+    trojan: &TrojanOut,
+    target: &Destination,
+    response_wait: Duration,
+) {
     let Some(mut session) = xdrive_dial_session(&trojan.carrier, &trojan.address, trojan.port)
     else {
         return;
@@ -8751,7 +8762,7 @@ fn dial_trojan_xdrive(client: &Connection, trojan: &TrojanOut, target: &Destinat
     {
         return;
     }
-    xdrive_relay(client, session);
+    xdrive_relay_until(client, session, response_wait);
 }
 
 fn dial_vmess_xdrive(client: &Connection, vmess: &VmessOut, target: &Destination) {
@@ -32807,12 +32818,6 @@ mod tests {
     /// A target that answers only after the upload ends still reaches the app: the response wait is a relay budget, not the store's poll linger.
     #[test]
     fn an_xdrive_relay_reads_a_response_after_the_upload_ends() {
-        let _guard = budgets::lock();
-        let _clear = ClearBudgets;
-        budgets::apply(&crate::config::Budgets {
-            relay_stall: Some(Duration::from_secs(2)),
-            ..Default::default()
-        });
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -32853,7 +32858,7 @@ mod tests {
         let dport = downstream.local_addr().expect("addr").port();
         let relay = thread::spawn(move || {
             let (socket, _) = downstream.accept().expect("accepts");
-            dial_trojan_xdrive(&socket, &trojan, &target);
+            dial_trojan_xdrive_until(&socket, &trojan, &target, Duration::from_secs(2));
         });
         let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(30)))
@@ -32873,12 +32878,6 @@ mod tests {
     /// A store peer that goes quiet without publishing an end cannot pin the relay: once our own source is done the report stops after the store's own round trip of silence.
     #[test]
     fn an_xdrive_relay_leaves_a_peer_that_never_ends() {
-        let _guard = budgets::lock();
-        let _clear = ClearBudgets;
-        budgets::apply(&crate::config::Budgets {
-            relay_stall: Some(Duration::from_millis(100)),
-            ..Default::default()
-        });
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -32906,7 +32905,9 @@ mod tests {
             drop(socket);
         });
         let app = Connection::connect(("127.0.0.1", port)).expect("connects");
-        let relay = thread::spawn(move || xdrive_relay(&app, session));
+        let relay = thread::spawn(move || {
+            xdrive_relay_until(&app, session, Duration::from_millis(100));
+        });
         join_thread_within(relay, Duration::from_secs(5), "a peer that never ends");
         peer.join().expect("the peer closes");
         let _ = std::fs::remove_dir_all(&dir);
@@ -42549,14 +42550,6 @@ mod tests {
             }
         });
         port
-    }
-
-    struct ClearBudgets;
-
-    impl Drop for ClearBudgets {
-        fn drop(&mut self) {
-            budgets::clear();
-        }
     }
 
     fn delayed_echo_loop(delay: Duration) -> u16 {
