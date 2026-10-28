@@ -1206,9 +1206,14 @@ fn straggler_tail(windows: &[Duration]) -> Option<Duration> {
     let median = sorted[(sorted.len() - 1) / 2];
     let slowest = *sorted.last()?;
     let tail = slowest.saturating_sub(median);
-    (STRAGGLER_TAIL..=STRAGGLER_TAIL_MAX)
-        .contains(&tail)
-        .then_some(tail)
+    if !(STRAGGLER_TAIL..=STRAGGLER_TAIL_MAX).contains(&tail) {
+        return None;
+    }
+    let second = *sorted.get(sorted.len() - 2)?;
+    if second.saturating_sub(median) >= STRAGGLER_TAIL {
+        return None;
+    }
+    Some(tail)
 }
 
 /// The server process beside the client: sampled from the same clock, stopped from `Drop` so a
