@@ -381,7 +381,7 @@ impl Flow {
 /// What a stack loop sends the tunnel writer. The bound is the caller's: a
 /// carrier whose writer can fall behind uses `sync_channel`, so a fast inner
 /// producer stalls instead of growing the queue without limit.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) enum ToTunnel {
     Unbounded(Sender<Vec<u8>>),
     Bounded(SyncSender<Vec<u8>>),
