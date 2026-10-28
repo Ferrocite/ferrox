@@ -68,6 +68,18 @@ def median_server_metric(cell, engine, metric):
     return None
 
 
+def median_ceiling(cell):
+    """The harness's own loopback ceiling for the cell, MiB/s, or None."""
+    if cell is None:
+        return None
+    samples = [
+        value
+        for value in cell.get("harness_ceilings_mib_s", [])
+        if isinstance(value, (int, float)) and value > 0
+    ]
+    return statistics.median(samples) if samples else None
+
+
 def cells_by_scenario(cells_dir):
     """(base scenario, server) -> cell document."""
     grouped = {}
@@ -146,6 +158,20 @@ def check_grouped(grouped, threshold, cpu_threshold, threads_threshold):
         server_leg = (
             median_throughput(server_cell, REFERENCE) if server_cell is not None else None
         )
+        # The server leg compares two cells, so a runner that was faster in one
+        # of them is not a server loss: each cell's own harness ceiling is the
+        # common denominator. The client leg stays raw; both clients share a cell.
+        reference_ceiling = median_ceiling(reference)
+        server_ceiling = median_ceiling(server_cell)
+        server_ratio = (
+            server_leg / reference_mib_s
+            if server_leg is not None and reference_mib_s
+            else None
+        )
+        if server_ratio is not None and reference_ceiling and server_ceiling:
+            server_ratio = (server_leg / server_ceiling) / (
+                reference_mib_s / reference_ceiling
+            )
         rust_client = median_throughput(reference, "xray-core-rust")
         checked += 1
         measured.add(base)
@@ -172,14 +198,15 @@ def check_grouped(grouped, threshold, cpu_threshold, threads_threshold):
                 "ratio": 0.0,
                 "text": f"{base}: xray-core client landed no number on the ferrox server: the server leg lost",
             })
-        elif server_leg is not None and server_leg < reference_mib_s * threshold:
+        elif server_ratio is not None and server_ratio < threshold:
+            basis = " of the harness ceiling" if reference_ceiling and server_ceiling else ""
             holes.append({
                 "base": base,
                 "leg": "server",
-                "ratio": server_leg / reference_mib_s,
+                "ratio": server_ratio,
                 "text": f"{base}: ferrox server {server_leg:.1f} MiB/s vs "
                         f"{reference_mib_s:.1f} MiB/s (xray-core server) with the xray-core "
-                        f"client, {server_leg / reference_mib_s:.2f}x: the server leg lost",
+                        f"client, {server_ratio:.2f}x{basis}: the server leg lost",
             })
         if (
             rust_client is not None
@@ -309,6 +336,27 @@ def selftest():
         if proc.returncode == 0 or "server CPU was not sampled" not in proc.stderr:
             return f"an unsampled ferrox server passed the gate: {proc.stderr}"
 
+        # A slower runner in the ferrox-server cell is not a server loss: the
+        # ceiling measured in each cell is the common denominator.
+        for server, throughput, ceiling in (
+            ("xray-core", 1000.0, 2000.0),
+            ("ferrox", 800.0, 1000.0),
+        ):
+            write_fixture(cells, server, 100.0, 8.0, throughput, ceiling)
+        proc = run_self(cells)
+        if proc.returncode != 0:
+            return f"a server leg at its cell's ceiling share failed the gate: {proc.stderr}"
+
+        # The same raw ratio at the same ceiling on both cells is a real loss.
+        for server, throughput, ceiling in (
+            ("xray-core", 1000.0, 1000.0),
+            ("ferrox", 800.0, 1000.0),
+        ):
+            write_fixture(cells, server, 100.0, 8.0, throughput, ceiling)
+        proc = run_self(cells)
+        if proc.returncode == 0:
+            return "a server leg below 0.85x at the same ceiling passed the gate"
+
     for leg, ratio, filed, want in (
         ("client", 0.50, 0.56, True),
         ("client", 0.40, 0.56, False),
@@ -326,7 +374,7 @@ def selftest():
     return None
 
 
-def write_fixture(cells, server, cpu, threads, throughput):
+def write_fixture(cells, server, cpu, threads, throughput, ceiling=None):
     """One scenario for both servers; `cpu`/`threads` None omits the measurement."""
     base = "selftest-vless-raw-down-8"
     scenario = f"{base}--srv-{server}"
@@ -347,6 +395,8 @@ def write_fixture(cells, server, cpu, threads, throughput):
         ],
         "failures": [],
     }
+    if ceiling is not None:
+        doc["harness_ceilings_mib_s"] = [ceiling] * 3
     path = cells / scenario / "cell.json"
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(doc))
