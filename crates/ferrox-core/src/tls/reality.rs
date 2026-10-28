@@ -161,6 +161,7 @@ impl<S: Stream> RealityServer<S> {
             key_der: ed25519_pkcs8(),
             key_kind: super::ServerKeyKind::Pkcs8,
             send_tickets: false,
+            reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
         };
@@ -2385,6 +2386,7 @@ mod tests {
             key_der: ed25519_pkcs8(),
             key_kind: super::super::ServerKeyKind::Pkcs8,
             send_tickets: false,
+            reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
         };

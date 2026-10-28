@@ -4120,6 +4120,7 @@ mod tests {
             max_version: None,
             cipher_suites: Vec::new(),
             send_tickets: true,
+            reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
         }
@@ -4187,6 +4188,7 @@ mod tests {
             max_version: None,
             cipher_suites: Vec::new(),
             send_tickets: true,
+            reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
         };

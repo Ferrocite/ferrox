@@ -1079,6 +1079,60 @@ impl std::fmt::Debug for ServerConfigCacheInner {
 
 pub type ServerConfigCache = std::sync::Arc<std::sync::Mutex<ServerConfigCacheInner>>;
 
+/// The single identity, refused when the SNI matches no certificate name.
+#[derive(Debug)]
+struct SniResolver {
+    key: Arc<rustls::sign::CertifiedKey>,
+    names: Vec<String>,
+}
+
+impl rustls::server::ResolvesServerCert for SniResolver {
+    fn resolve(
+        &self,
+        hello: rustls::server::ClientHello<'_>,
+    ) -> Option<Arc<rustls::sign::CertifiedKey>> {
+        hello
+            .server_name()
+            .filter(|sni| sni_matches(&self.names, sni))
+            .map(|_| Arc::clone(&self.key))
+    }
+}
+
+/// xray matches the exact name or a certificate's `*.suffix`, which covers one label only.
+fn sni_matches(names: &[String], sni: &str) -> bool {
+    let wildcard = match sni.find('.') {
+        Some(at) => format!("*{}", &sni[at..]),
+        None => "*".to_owned(),
+    };
+    names
+        .iter()
+        .any(|name| name.eq_ignore_ascii_case(sni) || name.eq_ignore_ascii_case(&wildcard))
+}
+
+/// The names xray compares an SNI against: the leaf's DNS SANs and subject common name.
+fn certificate_names(leaf: &[u8]) -> Vec<String> {
+    let Ok(cert) = boring::x509::X509::from_der(leaf) else {
+        return Vec::new();
+    };
+    let mut names = Vec::new();
+    if let Some(sans) = cert.subject_alt_names() {
+        for san in sans {
+            if let Some(name) = san.dnsname() {
+                names.push(name.to_ascii_lowercase());
+            }
+        }
+    }
+    for entry in cert
+        .subject_name()
+        .entries_by_nid(boring::nid::Nid::COMMONNAME)
+    {
+        if let Ok(name) = entry.data().as_utf8() {
+            names.push(name.to_string().to_ascii_lowercase());
+        }
+    }
+    names
+}
+
 pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::ServerConfig, TlsError> {
     use super::ServerKeyKind as Kind;
     let certs: Vec<rustls::pki_types::CertificateDer<'_>> = cfg
@@ -1097,21 +1151,37 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
             rustls::pki_types::PrivatePkcs1KeyDer::from(cfg.key_der),
         ),
     };
-    let mut provider = (*provider()).clone();
+    let crypto_provider = provider();
+    let mut ordered = (*crypto_provider).clone();
     if !cfg.cipher_suites.is_empty() {
-        order_cipher_suites(&mut provider, &cfg.cipher_suites);
+        order_cipher_suites(&mut ordered, &cfg.cipher_suites);
     }
     let versions = server_versions(cfg.min_version, cfg.max_version)?;
-    let builder = rustls::ServerConfig::builder_with_provider(Arc::new(provider));
+    let builder = rustls::ServerConfig::builder_with_provider(Arc::new(ordered));
     let builder = match versions.as_deref() {
         Some(versions) => builder.with_protocol_versions(versions),
         None => builder.with_safe_default_protocol_versions(),
     }
     .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?;
-    let mut config = builder
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?;
+    let mut config = if cfg.reject_unknown_sni {
+        let names = certs
+            .first()
+            .map(|leaf| certificate_names(leaf.as_ref()))
+            .unwrap_or_default();
+        let key = rustls::sign::CertifiedKey::from_der(certs, key, crypto_provider.as_ref())
+            .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?;
+        builder
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(SniResolver {
+                key: Arc::new(key),
+                names,
+            }))
+    } else {
+        builder
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?
+    };
     config.alpn_protocols.clear();
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
     // rustls sends two tickets by default; REALITY arrivals carry none.
@@ -2808,6 +2878,16 @@ mod tests {
             client.read_exact(&mut buf).expect("reads");
             assert_eq!(&buf, b"ping");
         });
+    }
+
+    #[test]
+    fn an_sni_matches_an_exact_or_one_label_wildcard_name() {
+        let names = vec!["tls.test".to_owned(), "*.wild.test".to_owned()];
+        assert!(sni_matches(&names, "tls.test"));
+        assert!(sni_matches(&names, "TLS.TEST"));
+        assert!(sni_matches(&names, "a.wild.test"));
+        assert!(!sni_matches(&names, "a.b.wild.test"));
+        assert!(!sni_matches(&names, "other.test"));
     }
 
     fn plain_identity() -> crate::tls::TlsServerConfig {

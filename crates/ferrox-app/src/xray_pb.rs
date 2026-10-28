@@ -930,6 +930,7 @@ fn tls_settings(bytes: &[u8]) -> Result<(&'static str, Json), String> {
     let mut max_version = String::new();
     let mut cipher_suites = String::new();
     let mut fingerprint = String::new();
+    let mut reject_unknown_sni = false;
     let mut pinned: Vec<&[u8]> = Vec::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
@@ -954,7 +955,7 @@ fn tls_settings(bytes: &[u8]) -> Result<(&'static str, Json), String> {
             (8, 2) => max_version = account_text(&mut reader)?,
             (9, 2) => cipher_suites = account_text(&mut reader)?,
             (11, 2) => fingerprint = account_text(&mut reader)?,
-            (12, 0) => return Err(reader.uncarried("reject_unknown_sni")),
+            (12, 0) => reject_unknown_sni = reader.varint()? != 0,
             (22, 2) => pinned.push(reader.bytes()?),
             _ => return Err(reader.refuse(field, wire)),
         }
@@ -987,6 +988,9 @@ fn tls_settings(bytes: &[u8]) -> Result<(&'static str, Json), String> {
     if !pinned.is_empty() {
         let text: Vec<String> = pinned.iter().map(|pin| hex(pin)).collect();
         pairs.push(("pinnedPeerCertSha256", Json::Str(text.join(","))));
+    }
+    if reject_unknown_sni {
+        pairs.push(("rejectUnknownSni", Json::Bool(true)));
     }
     Ok(("tlsSettings", object(pairs)))
 }
@@ -4592,6 +4596,40 @@ mod tests {
         );
         let key = tls.get("key").and_then(Json::as_str).expect("key text");
         assert_eq!(key, key_text, "the key bytes path through verbatim");
+    }
+
+    #[test]
+    fn a_vless_tls_receiver_carries_reject_unknown_sni() {
+        let tcp = tcp_stream("xray.transport.internet.tls.Config", &varint_field(12, 1));
+        let inbound = message(&[
+            bytes_field(
+                2,
+                &typed(
+                    "xray.app.proxyman.ReceiverConfig",
+                    &receiver_stream(5000, &tcp),
+                ),
+            ),
+            bytes_field(
+                3,
+                &typed(
+                    "xray.proxy.vless.inbound.Config",
+                    &bytes_field(1, &vless_user(&vless_account(b"a", None, None))),
+                ),
+            ),
+        ]);
+        let json = to_json(&config(&inbound, &freedom_outbound())).expect("tls receiver decodes");
+        let tls = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("streamSettings")
+            .and_then(|s| s.get("tlsSettings"))
+            .expect("tls settings");
+        assert_eq!(
+            tls.get("rejectUnknownSni").and_then(Json::as_bool),
+            Some(true),
+            "the protocol bool reaches the dialect the identity parse reads"
+        );
     }
 
     /// The shape `TestVlessTls`'s client names: a sender whose stream pins the peer leaf by

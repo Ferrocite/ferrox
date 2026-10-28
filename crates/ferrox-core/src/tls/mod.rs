@@ -249,6 +249,8 @@ pub struct TlsServerConfig {
     /// Whether to send TLS 1.3 session tickets. REALITY declines them, as both
     /// references do, so an authenticated handshake is followed by no records.
     pub send_tickets: bool,
+    /// Whether an SNI no certificate name matches aborts the handshake.
+    pub reject_unknown_sni: bool,
     /// Memoised server-config builds, one per identity kind.
     pub server_config_cache: crate::tls::rustls_backend::ServerConfigCache,
     /// ECH server keys as the xray TLV: `u16 key || u16 config`, repeated.
@@ -303,6 +305,7 @@ pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerCo
                 key_kind: key_kind(&key_der).unwrap_or(ServerKeyKind::Pkcs1),
                 key_der,
                 send_tickets: true,
+                reject_unknown_sni: false,
                 server_config_cache: std::sync::Arc::default(),
                 ech_server_keys: None,
             });
