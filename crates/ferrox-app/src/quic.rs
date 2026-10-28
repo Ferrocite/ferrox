@@ -4214,6 +4214,7 @@ mod tests {
     /// really rewritten and that the move opens a real, delivering socket.
     #[test]
     fn a_hopped_dial_spreads_its_datagrams_over_more_than_one_server_port() {
+        const MAGIC: &[u8] = b"hop-spread";
         let mut ports = Vec::new();
         let mut listeners = Vec::new();
         for _ in 0..4 {
@@ -4228,15 +4229,15 @@ mod tests {
             .expect("hops");
         let sends = 200;
         for _ in 0..sends {
-            hop.send_to(b"ping", server).expect("sends");
+            hop.send_to(MAGIC, server).expect("sends");
         }
         let mut received = 0usize;
         let mut touched = std::collections::HashSet::new();
         for listener in &listeners {
             let mut buf = [0u8; 64];
             while let Ok((n, _)) = listener.recv_from(&mut buf) {
-                if n == 0 {
-                    break;
+                if n != MAGIC.len() || &buf[..n] != MAGIC {
+                    continue;
                 }
                 received += 1;
                 touched.insert(listener.local_addr().expect("addr").port());
@@ -4266,6 +4267,7 @@ mod tests {
         }
         let server: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().expect("addr");
         let first = UdpSocket::bind("0.0.0.0:0").expect("binds");
+        let first_port = first.local_addr().expect("addr").port();
         let still = u64::MAX / 4;
         let hop = Datagram::hopped(
             server,
@@ -4280,12 +4282,15 @@ mod tests {
         let mut landed = None;
         for listener in &listeners {
             let mut buf = [0u8; 64];
-            if let Ok((n, src)) = listener.recv_from(&mut buf) {
-                if n > 0 {
+            while let Ok((n, src)) = listener.recv_from(&mut buf) {
+                if n > 0 && src.port() == first_port {
                     listener.send_to(b"pong", src).expect("replies");
                     landed = Some(listener.local_addr().expect("addr").port());
                     break;
                 }
+            }
+            if landed.is_some() {
+                break;
             }
         }
         let hop_port = landed.expect("the burst landed on a hopped port");
@@ -4338,6 +4343,7 @@ mod tests {
     #[test]
     fn a_gecko_dial_reassembles_its_split_long_header() {
         let a = UdpSocket::bind("0.0.0.0:0").expect("binds");
+        let writer_port = a.local_addr().expect("addr").port();
         let b = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let b_addr = b.local_addr().expect("addr");
         b.set_read_timeout(Some(Duration::from_millis(400)))
@@ -4349,13 +4355,23 @@ mod tests {
         packet[0] |= ferrox_core::hysteria::GECKO_FLAG;
         writer.send_to(&packet, b_addr).expect("sends");
         let mut buf = [0u8; 2048];
-        let (n, _from) = reader.recv_from(&mut buf).expect("reassembles");
+        let (n, _from) = loop {
+            let (n, from) = reader.recv_from(&mut buf).expect("reassembles");
+            if from.port() == writer_port {
+                break (n, from);
+            }
+        };
         assert_eq!(&buf[..n], &packet[..], "the split packet rebuilt exactly");
         assert_eq!(n, packet.len());
         // A short-header packet is masked whole and comes back as a single pass-through.
         let short = vec![0x40u8; 40];
         writer.send_to(&short, b_addr).expect("sends short");
-        let (m, _) = reader.recv_from(&mut buf).expect("reads short");
+        let (m, _) = loop {
+            let (m, from) = reader.recv_from(&mut buf).expect("reads short");
+            if from.port() == writer_port {
+                break (m, from);
+            }
+        };
         assert_eq!(&buf[..m], &short[..], "a short header is not fragmented");
     }
 
@@ -4371,13 +4387,17 @@ mod tests {
             .set_read_timeout(Some(Duration::from_millis(200)))
             .expect("timeout");
         let client = UdpSocket::bind("0.0.0.0:0").expect("binds");
+        let client_port = client.local_addr().expect("addr").port();
         let writer = Datagram::gecked(client, gecko_salamander(), gecko_window()).expect("geckos");
         let mut packet: Vec<u8> = vec![0xab; 900];
         packet[0] = ferrox_core::hysteria::GECKO_FLAG;
         writer.send_to(&packet, server_addr).expect("sends");
         let mut datagrams = 0usize;
         let mut buf = [0u8; 2048];
-        while let Ok((n, _)) = server.recv_from(&mut buf) {
+        while let Ok((n, from)) = server.recv_from(&mut buf) {
+            if from.port() != client_port {
+                continue;
+            }
             if n == 0 {
                 break;
             }
