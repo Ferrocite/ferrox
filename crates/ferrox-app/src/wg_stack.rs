@@ -24,7 +24,9 @@ use ferrox_core::foxy::connectip::{
 };
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
-use smoltcp::socket::tcp::{RecvError, SendError, Socket as TcpSocket, SocketBuffer, State};
+use smoltcp::socket::tcp::{
+    CongestionControl, RecvError, SendError, Socket as TcpSocket, SocketBuffer, State,
+};
 use smoltcp::time::Instant;
 use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr, IpEndpoint, IpListenEndpoint};
 
@@ -323,6 +325,7 @@ impl ClientStack {
             SocketBuffer::new(vec![0u8; TCP_BUFFER]),
         );
         socket.set_nagle_enabled(false);
+        socket.set_congestion_control(CongestionControl::Reno);
         socket
             .connect(
                 self.iface.context(),
@@ -573,6 +576,7 @@ impl ServerStack {
             SocketBuffer::new(vec![0u8; TCP_BUFFER]),
         );
         socket.set_nagle_enabled(false);
+        socket.set_congestion_control(CongestionControl::Reno);
         if socket.listen(IpListenEndpoint { addr: None, port }).is_ok() {
             let handle = self.sockets.add(socket);
             listeners.push(Listener {
