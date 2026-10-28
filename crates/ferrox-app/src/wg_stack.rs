@@ -1027,6 +1027,7 @@ pub(crate) fn inner_addresses(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
 /// inner UDP packet, and the reply the tunnel returns is framed back to the last
 /// app that spoke. The lane's relay port is also its inner source port, so the
 /// reader routes a reply to exactly one lane.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn client_udp(
     relay: &UdpSocket,
     config: &DeviceConfig,
