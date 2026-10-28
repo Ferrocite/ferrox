@@ -1625,11 +1625,12 @@ fn service(
             if !parse_head(tunnel, spec) {
                 continue;
             }
+            if tunnel.pending.is_none() {
+                accept(conn, shared, spec, tunnel);
+            }
             if let Some(head) = tunnel.pending.take() {
                 send_stream(conn, id, &head, true).ok();
                 tunnel.rejected = true;
-            } else {
-                accept(conn, shared, spec, tunnel);
             }
         } else if !tunnel.rejected {
             parse_capsules(conn, tunnel);
@@ -2148,6 +2149,23 @@ mod tests {
         assert!(pool.holds("10.14.0.0".parse().expect("an address")));
         assert!(pool.holds("10.14.0.255".parse().expect("an address")));
         assert!(!pool.holds("10.15.0.1".parse().expect("an address")));
+    }
+
+    #[test]
+    fn a_full_pool_answers_503() {
+        let inbound = inbound(
+            r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/30"]}"#,
+        );
+        let port = serve_inbound(&inbound, &freedom("127.0.0.1:1"), "127.0.0.1:0").expect("serve");
+        let first = MasqueOut::new(&outbound(port)).expect("the first tunnel");
+        first.ensure().expect("the first tunnel opens");
+        let second = MasqueOut::new(&outbound(port)).expect("the second tunnel");
+        let error = second.ensure().expect_err("the full pool answered 200");
+        assert!(
+            error.contains("the edge answered 503"),
+            "unexpected error: {error}"
+        );
+        drop(first);
     }
 
     fn ipv4_packet(source: [u8; 4], destination: [u8; 4]) -> Vec<u8> {
