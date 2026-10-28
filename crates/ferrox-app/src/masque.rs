@@ -2109,6 +2109,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_tunnel_queue_is_bounded() {
+        let (release, held) = mpsc::channel();
+        let inner = assemble(
+            Vec::new(),
+            DEFAULT_MTU,
+            Vec::new(),
+            Arc::new(AtomicBool::new(true)),
+            move |_from_tunnel, _to_stack, _routes| {
+                let _ = held.recv();
+            },
+        );
+        for packet in 0..QUEUE {
+            inner
+                .to_tunnel
+                .try_send(vec![packet as u8])
+                .expect("a packet below the bound");
+        }
+        assert!(
+            matches!(
+                inner.to_tunnel.try_send(vec![0]),
+                Err(mpsc::TrySendError::Full(_))
+            ),
+            "the tunnel queue accepted more than {QUEUE} packets"
+        );
+        let _ = release.send(());
+    }
+
+    #[test]
     fn workers_stop_at_the_cap() {
         let live = Arc::new(AtomicUsize::new(0));
         let mut slots = Vec::new();
