@@ -653,6 +653,10 @@ impl Session {
     }
 
     fn run(&mut self, wire: &mut Wire) {
+        self.run_until(wire, Instant::now() + HANDSHAKE);
+    }
+
+    fn run_until(&mut self, wire: &mut Wire, _deadline: Instant) {
         let mut settings = Vec::new();
         settings.extend_from_slice(&SETTINGS_ENABLE_CONNECT.to_be_bytes());
         settings.extend_from_slice(&1u32.to_be_bytes());
@@ -968,6 +972,7 @@ fn datagram(packet: &[u8], out: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Read, Write};
     use std::net::UdpSocket;
 
     use ferrox_core::foxy::connectip::{self, UdpDatagram};
@@ -1167,6 +1172,57 @@ mod tests {
         ]);
         session.on(&mut wire, h2::T_HEADERS, h2::F_END_HEADERS, 1, &block);
         assert_eq!(session.send_window, 0, "CONNECT keeps the peer's window");
+    }
+
+    struct Quiet {
+        reads: usize,
+    }
+
+    impl Read for Quiet {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.reads == 0 {
+                return Ok(0);
+            }
+            self.reads -= 1;
+            Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+        }
+    }
+
+    impl Write for Quiet {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_silent_peer_is_ended_after_the_handshake() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut wire = Wire {
+            stream: Box::new(Quiet { reads: 1_000 }),
+            pending: Vec::new(),
+            closed: false,
+        };
+        session.run_until(&mut wire, Instant::now() - Duration::from_millis(1));
+        assert!(session.end, "a silent peer is ended at the deadline");
+    }
+
+    #[test]
+    fn a_continuation_block_cannot_grow_past_the_frame_cap() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut wire = Wire {
+            stream: Box::new(std::io::Cursor::new(Vec::new())),
+            pending: Vec::new(),
+            closed: false,
+        };
+        let half = vec![0u8; FRAME_CAP / 2 + 1];
+        session.on(&mut wire, h2::T_HEADERS, 0, 1, &half);
+        assert!(session.continuation.is_some(), "the header block is open");
+        session.on(&mut wire, h2::T_CONT, 0, 1, &half);
+        assert!(session.end, "the accumulated block is capped");
     }
 
     #[test]
