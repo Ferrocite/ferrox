@@ -1887,6 +1887,32 @@ mod tests {
         });
         assert!(replies.try_recv().is_err(), "an address it does not own");
     }
+
+    #[test]
+    fn a_client_cannot_narrow_the_server_mtu() {
+        let (to_tunnel, _) = std::sync::mpsc::channel();
+        let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
+        let mut stack = ServerStack::new(&device(&["10.13.0.1"], false), to_tunnel, out);
+        let before = stack.device.capabilities().max_transmission_unit;
+        let mut inner = vec![0u8; 28];
+        inner[0] = 0x45;
+        inner[2..4].copy_from_slice(&28u16.to_be_bytes());
+        inner[8] = 64;
+        inner[9] = PROTOCOL_UDP;
+        inner[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        inner[16..20].copy_from_slice(&[198, 51, 100, 7]);
+        let too_big =
+            ferrox_core::foxy::connectip::icmp_too_large(&inner, 1170).expect("a v4 answer");
+        stack.receive(Packet {
+            peer: [0u8; 32],
+            bytes: too_big,
+        });
+        assert_eq!(
+            stack.device.capabilities().max_transmission_unit,
+            before,
+            "a client narrowed the MTU every tunnel shares"
+        );
+    }
 }
 
 #[cfg(test)]
