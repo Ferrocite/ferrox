@@ -1189,9 +1189,14 @@ mod tests {
 
     #[test]
     fn a_truncated_answer_is_asked_again_over_tcp() {
-        let tcp = TcpListener::bind("127.0.0.1:0").expect("dns tcp");
-        let dns_address = tcp.local_addr().expect("dns address");
-        let udp = UdpSocket::bind(dns_address).expect("dns udp");
+        let (tcp, udp, dns_address) = (0..64)
+            .find_map(|_| {
+                let udp = UdpSocket::bind("127.0.0.1:0").ok()?;
+                let address = udp.local_addr().ok()?;
+                let tcp = TcpListener::bind(address).ok()?;
+                Some((tcp, udp, address))
+            })
+            .expect("dns pair");
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
             let Ok((n, from)) = udp.recv_from(&mut buf) else {
