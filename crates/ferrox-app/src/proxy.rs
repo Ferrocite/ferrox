@@ -19299,7 +19299,7 @@ pub(crate) mod lane_pool {
     }
 
     #[cfg(test)]
-    pub(crate) fn parker_batches(pool: &Pool) -> usize {
+    fn parker_batches(pool: &Pool) -> usize {
         let _ = pool;
         PARKS.load(std::sync::atomic::Ordering::Relaxed)
     }
