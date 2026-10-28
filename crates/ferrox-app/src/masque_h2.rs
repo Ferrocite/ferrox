@@ -27,7 +27,7 @@ const SETTINGS_ENABLE_CONNECT: u16 = 0x8;
 const FRAME_CAP: usize = 1 << 20;
 const QUEUED_CAP: usize = 64;
 const DEFAULT_WINDOW: i64 = 65_535;
-const H2_CONNECTIONS: usize = 1024;
+const H2_CONNECTIONS: usize = 256;
 
 #[derive(Clone, Default)]
 struct Deadline(Arc<AtomicU64>);
