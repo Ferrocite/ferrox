@@ -19179,7 +19179,17 @@ pub(crate) mod lane_pool {
         loop {
             let now = std::time::Instant::now();
             if due > now {
-                thread::sleep(due - now);
+                // Waiting on the queue's condvar, not sleeping: a queued lane wakes this worker at once.
+                let ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                let (ready, _) = pool
+                    .notify
+                    .wait_timeout(ready, due - now)
+                    .unwrap_or_else(PoisonError::into_inner);
+                let queued = !ready.is_empty();
+                drop(ready);
+                if queued {
+                    pool.notify.notify_all();
+                }
             }
             let (batch, next) = {
                 let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
