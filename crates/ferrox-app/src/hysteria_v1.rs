@@ -181,7 +181,8 @@ fn open_flow(session: &Session, stream: u64, host: &str, port: u16) -> Option<Fl
         Vec::new(),
         drive,
     )
-    .with_wake(wake);
+    .with_wake(wake)
+    .with_session(session);
     if !send_all(session, stream, &request) {
         return None;
     }

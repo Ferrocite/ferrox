@@ -483,6 +483,13 @@ impl Flow {
         self
     }
 
+    /// Carries the dial's reader and send wake onto the flow, so a pooled flow's writer waits on the ACK the driver takes instead of a 5 ms poll.
+    pub(crate) fn with_session(mut self, session: &Session) -> Self {
+        self.session.driver.clone_from(&session.driver);
+        self.session.send_wake.clone_from(&session.send_wake);
+        self
+    }
+
     pub(crate) fn from_parts(
         shared: Arc<Mutex<quiche::Connection>>,
         sock: Arc<crate::quic::Datagram>,
