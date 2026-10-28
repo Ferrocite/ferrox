@@ -972,20 +972,24 @@ impl Session {
     }
 }
 
-fn strip_padding(flags: u8, body: &[u8], _headers: bool) -> &[u8] {
-    if flags & h2::F_PADDED == 0 {
-        return body;
+fn strip_padding(flags: u8, body: &[u8], headers: bool) -> &[u8] {
+    if flags & h2::F_PADDED != 0 {
+        let Some((&padding, rest)) = body.split_first() else {
+            return body;
+        };
+        let rest = if headers && flags & h2::F_PRIORITY != 0 {
+            rest.get(5..).unwrap_or_default()
+        } else {
+            rest
+        };
+        return rest
+            .get(..rest.len().saturating_sub(usize::from(padding)))
+            .unwrap_or_default();
     }
-    let Some((&padding, rest)) = body.split_first() else {
-        return body;
-    };
-    let rest = if flags & h2::F_PRIORITY != 0 {
-        rest.get(5..).unwrap_or_default()
-    } else {
-        rest
-    };
-    rest.get(..rest.len().saturating_sub(usize::from(padding)))
-        .unwrap_or_default()
+    if headers && flags & h2::F_PRIORITY != 0 {
+        return body.get(5..).unwrap_or_default();
+    }
+    body
 }
 
 fn datagram(packet: &[u8], out: &mut Vec<u8>) {
