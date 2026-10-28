@@ -3109,7 +3109,7 @@ pub(crate) fn resolve_ips_ttl(host: &str, port: u16) -> (Vec<IpAddr>, u32) {
             crate::dnsapp::Lookup::Empty | crate::dnsapp::Lookup::Rcode(_) => {
                 return (Vec::new(), 0);
             }
-            crate::dnsapp::Lookup::Failed => {
+            crate::dnsapp::Lookup::Failed | crate::dnsapp::Lookup::Skipped => {
                 let (v4, v6) = resolver.families();
                 return resolve_ips_system(host, port, v4, v6);
             }

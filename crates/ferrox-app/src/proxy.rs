@@ -16833,7 +16833,9 @@ fn dns_lookup(name: &[u8]) -> ferrox_core::dns::Resolve {
                     .collect(),
                 ttl,
             },
-            crate::dnsapp::Lookup::Empty => ferrox_core::dns::Resolve::AnsweredEmpty,
+            crate::dnsapp::Lookup::Empty | crate::dnsapp::Lookup::Skipped => {
+                ferrox_core::dns::Resolve::AnsweredEmpty
+            }
             crate::dnsapp::Lookup::Rcode(code) => ferrox_core::dns::Resolve::Refused(code),
             crate::dnsapp::Lookup::Failed => ferrox_core::dns::Resolve::ErrHard,
         };
