@@ -495,6 +495,9 @@ impl Client {
     }
 
     fn window(&mut self, length: usize) {
+        if length == 0 {
+            return;
+        }
         let length = u32::try_from(length).unwrap_or(u32::MAX).to_be_bytes();
         self.wire.send(h2::T_WINDOW, 0, 0, &length);
         self.wire.send(h2::T_WINDOW, 0, self.stream, &length);
@@ -861,6 +864,9 @@ impl Session {
         let Some(request) = self.request else {
             return;
         };
+        if length == 0 {
+            return;
+        }
         let length = u32::try_from(length).expect("a frame fits four bytes");
         wire.send(h2::T_WINDOW, 0, 0, &length.to_be_bytes());
         wire.send(h2::T_WINDOW, 0, request, &length.to_be_bytes());
@@ -986,6 +992,7 @@ fn datagram(packet: &[u8], out: &mut Vec<u8>) {
 mod tests {
     use std::io::{Read, Write};
     use std::net::UdpSocket;
+    use std::sync::Mutex;
 
     use ferrox_core::foxy::connectip::{self, UdpDatagram};
     use ferrox_core::tls::TlsConfig;
@@ -1238,6 +1245,46 @@ mod tests {
         assert!(session.continuation.is_some(), "the header block is open");
         session.on(&mut wire, h2::T_CONT, 0, 1, &half);
         assert!(session.end, "the accumulated block is capped");
+    }
+
+    struct Recorder {
+        out: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Read for Recorder {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.out.lock().expect("a recorder").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn an_empty_data_frame_sends_no_window_update() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        session.request = Some(1);
+        let out = Arc::new(Mutex::new(Vec::new()));
+        let mut wire = Wire {
+            stream: Box::new(Recorder {
+                out: Arc::clone(&out),
+            }),
+            pending: Vec::new(),
+            closed: false,
+        };
+        session.on(&mut wire, h2::T_DATA, h2::F_END, 1, &[]);
+        assert!(
+            out.lock().expect("a recorder").is_empty(),
+            "an empty DATA frame credits nothing"
+        );
     }
 
     #[test]
