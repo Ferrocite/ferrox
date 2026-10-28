@@ -24,6 +24,7 @@ const PREFACE: usize = 24;
 const SETTINGS_INITIAL_WINDOW: u16 = 0x4;
 const SETTINGS_ENABLE_CONNECT: u16 = 0x8;
 const FRAME_CAP: usize = 1 << 20;
+const QUEUED_CAP: usize = 64;
 const DEFAULT_WINDOW: i64 = 65_535;
 
 trait ReadWrite: Read + Write {}
@@ -568,8 +569,10 @@ impl Client {
                 self.send_window -= length;
                 self.connection_window -= length;
             }
-        } else {
+        } else if self.queued.len() < QUEUED_CAP {
             self.queued.push_back(capsule.to_vec());
+        } else {
+            self.end = true;
         }
     }
 
@@ -865,8 +868,10 @@ impl Session {
             if wire.send(h2::T_DATA, 0, id, capsule) {
                 self.send_window -= i64::try_from(capsule.len()).unwrap_or(i64::MAX);
             }
-        } else {
+        } else if self.queued.len() < QUEUED_CAP {
             self.queued.push_back(capsule.to_vec());
+        } else {
+            self.end = true;
         }
     }
 
@@ -1012,7 +1017,6 @@ mod tests {
 
     #[test]
     fn a_stalled_send_window_bounds_the_queued_capsules() {
-        const QUEUED_CAP: usize = 64;
         let mut client = bare_client();
         client.send_window = 0;
         client.connection_window = 0;
