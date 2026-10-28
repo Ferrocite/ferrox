@@ -495,6 +495,9 @@ impl Client {
     }
 
     fn window(&mut self, length: usize) {
+        if length == 0 {
+            return;
+        }
         let length = u32::try_from(length).unwrap_or(u32::MAX).to_be_bytes();
         self.wire.send(h2::T_WINDOW, 0, 0, &length);
         self.wire.send(h2::T_WINDOW, 0, self.stream, &length);
@@ -861,6 +864,9 @@ impl Session {
         let Some(request) = self.request else {
             return;
         };
+        if length == 0 {
+            return;
+        }
         let length = u32::try_from(length).expect("a frame fits four bytes");
         wire.send(h2::T_WINDOW, 0, 0, &length.to_be_bytes());
         wire.send(h2::T_WINDOW, 0, request, &length.to_be_bytes());
