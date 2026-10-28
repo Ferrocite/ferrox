@@ -3205,6 +3205,54 @@ mod tests {
         });
     }
 
+    /// A relay-sized write is larger than rustls's 64 KiB output buffer; the writer must
+    /// drain between partial writes instead of returning `WriteZero` on the next retry.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_relay_sized_write_crosses_the_tls_buffer() {
+        use crate::tls::TlsProvider as _;
+
+        let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
+        let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
+        let identity = crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses");
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let payload = vec![0x5a; 256 * 1024];
+        let (sent, received) = std::sync::mpsc::channel();
+        thread::scope(|scope| {
+            scope.spawn(move || {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut server = crate::tls::accept(&identity, stream).expect("accepts");
+                server.handshake().expect("handshakes");
+                let mut buf = [0u8; 64 * 1024];
+                let mut got = 0usize;
+                loop {
+                    match server.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => got += n,
+                    }
+                }
+                sent.send(got).expect("reports");
+            });
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut client =
+                RustlsProvider::connect(&client("tls.test", &[]), stream).expect("configures");
+            client.handshake().expect("handshakes");
+            client
+                .write_all_slices(&[&payload])
+                .expect("a relay-sized write");
+            client.flush().expect("flushes");
+        });
+        assert_eq!(
+            received.recv().expect("the server finished"),
+            payload.len(),
+            "the whole relay-sized write reached the peer"
+        );
+    }
+
     /// A served session stops on the peer's close the same way a dialled one does: the
     /// `close_notify` carries no plaintext, so the EOF has to be the session's own state.
     #[test]
