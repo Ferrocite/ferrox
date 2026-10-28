@@ -61,6 +61,8 @@ const DNS_PORT_FIRST: u16 = 1024;
 const DNS_PORT_LAST: u16 = 49_152;
 /// The most names one outbound caches.
 const DNS_CACHE: usize = 256;
+/// Seconds a failed lookup is remembered, so a dead name does not stall a lane per datagram.
+const DNS_NEGATIVE_TTL: u32 = 5;
 /// The reference's cookie lifetime and its one-second under-load tail.
 const COOKIE_REFRESH: u64 = 120_000;
 const UNDER_LOAD: u64 = 1_000;
@@ -313,9 +315,9 @@ impl WireGuardOut {
                 }
             }
         }
-        let Some((addrs, ttl)) = self.query(host) else {
-            return Vec::new();
-        };
+        let (addrs, ttl) = self
+            .query(host)
+            .unwrap_or_else(|| (Vec::new(), DNS_NEGATIVE_TTL));
         if let Ok(mut cache) = self.resolved.lock() {
             if cache.len() >= DNS_CACHE {
                 cache.clear();
@@ -1240,6 +1242,33 @@ mod tests {
         let mut received = [0u8; 9];
         app.read_exact(&mut received).expect("read");
         assert_eq!(&received, b"headhello");
+    }
+
+    #[test]
+    fn a_failed_name_is_remembered() {
+        let config = DeviceConfig {
+            secret: [0x11; 32],
+            addresses: vec!["10.0.0.2".parse().unwrap()],
+            peers: vec![PeerConfig {
+                public: [0x22; 32],
+                preshared: [0; 32],
+                endpoint: Some("127.0.0.1:9".parse().unwrap()),
+                endpoints: Vec::new(),
+                keepalive: 0,
+                allowed: vec![("192.0.2.0".parse().unwrap(), 24)],
+            }],
+            mtu: 1420,
+            reserved: [0; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            dns: vec!["127.0.0.1".parse().unwrap()],
+        };
+        let wireguard = WireGuardOut::new(config).expect("outbound");
+        assert_eq!(wireguard.lookup("missing.example"), Vec::<IpAddr>::new());
+        let cache = wireguard.resolved.lock().expect("cache");
+        let entry = cache.get("missing.example").expect("negative entry");
+        assert_eq!(entry.addrs, Vec::<IpAddr>::new());
+        assert!(entry.until > Instant::now());
     }
 
     /// A truncated UDP response retries the same DNS question over TCP on the reserved server port.
