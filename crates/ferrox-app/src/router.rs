@@ -4462,6 +4462,79 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_set_source_selector_is_checked_on_the_flow_network() {
+        let mixed = object(vec![
+            ("tag", text("mixed")),
+            (
+                "rules",
+                array(vec![
+                    object(vec![
+                        ("network", text("tcp")),
+                        ("source_ip_cidr", array(vec![text("192.0.2.0/24")])),
+                    ]),
+                    object(vec![
+                        ("network", text("udp")),
+                        ("ip_cidr", array(vec![text("198.51.100.0/24")])),
+                    ]),
+                ]),
+            ),
+        ]);
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                ("ruleSets", array(vec![mixed])),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "direct",
+                        vec![
+                            ("inboundTag", array(vec![text("tun")])),
+                            ("network", text("udp")),
+                            ("ruleSet", array(vec![text("mixed")])),
+                        ],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(routing.source_refusal(Some("tun")), None);
+
+        let source = object(vec![
+            ("tag", text("source")),
+            (
+                "rules",
+                array(vec![object(vec![
+                    ("network", text("udp")),
+                    ("source_ip_cidr", array(vec![text("192.0.2.0/24")])),
+                ])]),
+            ),
+        ]);
+        let root = object(vec![(
+            "routing",
+            object(vec![
+                ("ruleSets", array(vec![source])),
+                (
+                    "rules",
+                    array(vec![rule(
+                        "direct",
+                        vec![
+                            ("inboundTag", array(vec![text("tun")])),
+                            ("network", text("udp")),
+                            ("ruleSet", array(vec![text("source")])),
+                        ],
+                    )]),
+                ),
+            ]),
+        )]);
+        let routing = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(routing.source_refusal(Some("tun")), Some("ruleSet"));
+    }
+
+    #[test]
     fn a_tun_inbound_may_use_a_script_but_a_server_inbound_may_not() {
         let dir = dir();
         std::fs::write(
