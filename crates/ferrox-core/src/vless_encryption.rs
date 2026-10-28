@@ -293,6 +293,38 @@ impl ClientConfig {
             padding_gaps,
         })
     }
+
+    /// The client a server string names: the inbound's public keys drive the dial's
+    /// encapsulation, so a loopback re-inject runs the same handshake its listener expects.
+    pub fn from_server(value: &str) -> Result<Self, String> {
+        let server = ServerConfig::parse(value)?;
+        let mut keys = Vec::with_capacity(server.public_keys.len());
+        for bytes in &server.public_keys {
+            if bytes.len() == X25519_LEN {
+                keys.push(NfsKey::X25519(
+                    bytes.as_slice().try_into().expect("32 bytes"),
+                ));
+            } else {
+                let encoded: MlKemKey<EncapsulationKey768> = bytes
+                    .as_slice()
+                    .try_into()
+                    .map_err(|_| "ML-KEM-768 public key has the wrong length".to_string())?;
+                let key = EncapsulationKey768::new(&encoded)
+                    .map_err(|_| "ML-KEM-768 public key is invalid".to_string())?;
+                keys.push(NfsKey::MlKem(Box::new(key)));
+            }
+        }
+        Ok(Self {
+            keys,
+            key_bytes: server.public_keys,
+            hash32s: server.hash32s,
+            relays_len: server.relays_len,
+            xor_mode: server.xor_mode,
+            zero_rtt: false,
+            padding_lens: server.padding_lens,
+            padding_gaps: server.padding_gaps,
+        })
+    }
 }
 
 enum ServerKey {
@@ -1796,6 +1828,31 @@ mod tests {
             generate_pair(false, mode, if zero_rtt { "0rtt" } else { "1rtt" }, "600s");
         let server = Server::new(ServerConfig::parse(&decryption).unwrap());
         let client = Client::new(ClientConfig::parse(&encryption).unwrap());
+        let (a, b) = UnixStream::pair().unwrap();
+        let server_thread = std::thread::spawn(move || {
+            let mut stream = server.handshake(b).unwrap();
+            let mut buf = [0u8; 5];
+            stream.read_exact(&mut buf).unwrap();
+            assert_eq!(&buf, b"hello");
+            stream.write_all(b"world").unwrap();
+            stream.flush().unwrap();
+        });
+        let mut stream = client.handshake(a).unwrap();
+        stream.write_all(b"hello").unwrap();
+        stream.flush().unwrap();
+        let mut buf = [0u8; 5];
+        stream.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"world");
+        server_thread.join().unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_server_derived_client_exchanges_bytes() {
+        use std::os::unix::net::UnixStream;
+        let (_, decryption) = generate_pair(true, "native", "1rtt", "600s");
+        let server = Server::new(ServerConfig::parse(&decryption).unwrap());
+        let client = Client::new(ClientConfig::from_server(&decryption).unwrap());
         let (a, b) = UnixStream::pair().unwrap();
         let server_thread = std::thread::spawn(move || {
             let mut stream = server.handshake(b).unwrap();
