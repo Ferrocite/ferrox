@@ -32,7 +32,11 @@ const HEAD_TIMEOUT: Duration = Duration::from_secs(10);
 const ESTABLISH_TIMEOUT: Duration = Duration::from_secs(10);
 const DEFAULT_PATH: &str = "/.well-known/masque/ip/*/*/";
 pub(crate) const DEFAULT_MTU: usize = 1280;
-pub(crate) const QUEUE: usize = 512;
+/// Packets one tunnel may hold between the stack and its stream writer: the
+/// reference queues 1024, and a whole window of an established flow arriving
+/// at once is what a smaller queue turned into a dropped segment, a
+/// retransmission timeout and a stalled read.
+pub(crate) const QUEUE: usize = 1024;
 /// Frames the connection may hold before `dgram_send` refuses more: the
 /// reference queues 32, and a peer that drains slower drops what the wire
 /// delivers above its own receive queue, which the inner TCP then backs off

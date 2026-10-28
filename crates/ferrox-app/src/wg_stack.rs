@@ -52,6 +52,10 @@ const TICK: Duration = Duration::from_millis(10);
 /// The most inner packets the tunnel reader may queue before the stack drains
 /// them; past it the oldest is dropped, as a full device would drop.
 const RX_PACKETS: usize = 4096;
+/// The most segments one poll may hand to the tunnel: half the queue the
+/// stream writer drains, so a burst of every flow's window cannot overrun it
+/// and the stack keeps the rest, closing its window, instead of losing it.
+const TX_PACKETS: usize = crate::masque::QUEUE / 2;
 /// The most server datagram lanes one inbound may hold.
 const UDP_FLOWS: usize = 4096;
 
@@ -155,6 +159,9 @@ impl Device for QueueDevice {
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
+        if self.tx.len() >= TX_PACKETS {
+            return None;
+        }
         Some(QueueTx { tx: &mut self.tx })
     }
 
@@ -1693,6 +1700,24 @@ mod client_tests {
         assert_eq!(datagram.destination, ip_bytes(target.ip()).as_slice());
         assert_eq!(datagram.destination_port, 53);
         assert_eq!(datagram.payload, b"query");
+    }
+
+    #[test]
+    fn a_poll_hands_at_most_tx_packets_to_the_tunnel() {
+        use smoltcp::phy::{Device, TxToken};
+
+        let mut device = QueueDevice::new(1420);
+        for _ in 0..TX_PACKETS {
+            let token = device.transmit(Instant::from_millis(0)).expect("room left");
+            token.consume(1280, |buffer| buffer.fill(0));
+        }
+        assert_eq!(device.tx.len(), TX_PACKETS);
+        assert!(
+            device.transmit(Instant::from_millis(0)).is_none(),
+            "past the bound the stack keeps the segment and closes its window"
+        );
+        device.tx.clear();
+        assert!(device.transmit(Instant::from_millis(0)).is_some());
     }
 
     #[test]
