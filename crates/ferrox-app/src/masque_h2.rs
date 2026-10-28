@@ -182,6 +182,7 @@ pub(crate) struct Client {
     send_window: i64,
     connection_window: i64,
     queued: VecDeque<Vec<u8>>,
+    queued_at: usize,
     capsules: Vec<u8>,
     capsule_at: usize,
     pub(crate) addresses: Vec<IpAddr>,
@@ -251,6 +252,7 @@ impl Client {
             send_window: DEFAULT_WINDOW,
             connection_window: DEFAULT_WINDOW,
             queued: VecDeque::new(),
+            queued_at: 0,
             capsules: Vec::new(),
             capsule_at: 0,
             addresses: Vec::new(),
@@ -587,19 +589,27 @@ impl Client {
     }
 
     fn flush(&mut self) {
-        while let Some(answer) = self.queued.front() {
-            let length = i64::try_from(answer.len()).unwrap_or(i64::MAX);
-            if length > self.send_window.min(self.connection_window) {
+        while let Some(answer) = self.queued.pop_front() {
+            let start = self.queued_at;
+            let room = self.send_window.min(self.connection_window);
+            if room <= 0 {
+                self.queued.push_front(answer);
                 return;
             }
-            let Some(answer) = self.queued.pop_front() else {
+            let take = (answer.len() - start).min(usize::try_from(room).unwrap_or(usize::MAX));
+            if !self
+                .wire
+                .send(h2::T_DATA, 0, self.stream, &answer[start..start + take])
+            {
                 return;
-            };
-            if self.wire.send(h2::T_DATA, 0, self.stream, &answer) {
-                self.send_window -= length;
-                self.connection_window -= length;
+            }
+            self.send_window -= take as i64;
+            self.connection_window -= take as i64;
+            self.queued_at = start + take;
+            if self.queued_at < answer.len() {
+                self.queued.push_front(answer);
             } else {
-                return;
+                self.queued_at = 0;
             }
         }
     }
@@ -615,6 +625,7 @@ struct Session {
     continuation: Option<(u32, Vec<u8>, u8)>,
     outgoing: Option<Receiver<Vec<u8>>>,
     queued: VecDeque<Vec<u8>>,
+    queued_at: usize,
     send_window: i64,
     granted: Option<Granted>,
     addrs: Vec<IpAddr>,
@@ -633,6 +644,7 @@ impl Session {
             continuation: None,
             outgoing: None,
             queued: VecDeque::new(),
+            queued_at: 0,
             send_window: DEFAULT_WINDOW,
             granted: None,
             addrs: Vec::new(),
@@ -808,7 +820,6 @@ impl Session {
         self.granted = Some(granted);
         self.outgoing = Some(outgoing);
         self.request = Some(id);
-        self.send_window = DEFAULT_WINDOW;
         let block = h2::block_encode(&[(":status", "200"), ("capsule-protocol", "?1")]);
         wire.send(h2::T_HEADERS, h2::F_END_HEADERS, id, &block);
         let mut control = Vec::new();
@@ -891,20 +902,27 @@ impl Session {
     }
 
     fn flush(&mut self, wire: &mut Wire) {
-        while let Some(answer) = self.queued.front() {
+        while let Some(answer) = self.queued.pop_front() {
             let Some(id) = self.request else {
+                self.queued.push_front(answer);
                 return;
             };
-            if i64::try_from(answer.len()).unwrap_or(i64::MAX) > self.send_window {
-                break;
+            let start = self.queued_at;
+            if self.send_window <= 0 {
+                self.queued.push_front(answer);
+                return;
             }
-            let Some(answer) = self.queued.pop_front() else {
+            let take =
+                (answer.len() - start).min(usize::try_from(self.send_window).unwrap_or(usize::MAX));
+            if !wire.send(h2::T_DATA, 0, id, &answer[start..start + take]) {
                 return;
-            };
-            if wire.send(h2::T_DATA, 0, id, &answer) {
-                self.send_window -= i64::try_from(answer.len()).unwrap_or(i64::MAX);
+            }
+            self.send_window -= take as i64;
+            self.queued_at = start + take;
+            if self.queued_at < answer.len() {
+                self.queued.push_front(answer);
             } else {
-                return;
+                self.queued_at = 0;
             }
         }
         for _ in 0..QUEUED_CAP {
@@ -972,6 +990,7 @@ mod tests {
             send_window: DEFAULT_WINDOW,
             connection_window: DEFAULT_WINDOW,
             queued: std::collections::VecDeque::new(),
+            queued_at: 0,
             capsules: Vec::new(),
             capsule_at: 0,
             addresses: Vec::new(),
@@ -1096,6 +1115,55 @@ mod tests {
         sender.send(udp_packet(53)).expect("a packet");
         session.flush(&mut wire);
         assert!(session.end, "a full queue ends the session");
+    }
+
+    #[test]
+    fn a_capsule_larger_than_the_window_is_sent_in_parts() {
+        let mut client = bare_client();
+        client.send_window = 10;
+        client.connection_window = 10;
+        client.capsule(&[0u8; 25]);
+        assert_eq!(client.queued.len(), 1, "the capsule waits for room");
+        client.flush();
+        assert_eq!(client.queued_at, 10, "the first part used the window");
+        assert_eq!(client.queued.len(), 1);
+        client.send_window = 10;
+        client.connection_window = 10;
+        client.flush();
+        assert_eq!(client.queued_at, 20, "the second part used the window");
+        assert_eq!(client.queued.len(), 1);
+        client.send_window = 10;
+        client.connection_window = 10;
+        client.flush();
+        assert!(client.queued.is_empty(), "the last part finished the capsule");
+        assert_eq!(client.queued_at, 0);
+    }
+
+    #[test]
+    fn connect_keeps_the_peer_initial_window() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        let mut wire = Wire {
+            stream: Box::new(std::io::Cursor::new(Vec::new())),
+            pending: Vec::new(),
+            closed: false,
+        };
+        let mut settings = Vec::new();
+        settings.extend_from_slice(&SETTINGS_INITIAL_WINDOW.to_be_bytes());
+        settings.extend_from_slice(&0u32.to_be_bytes());
+        session.on(&mut wire, h2::T_SETTINGS, 0, 0, &settings);
+        assert_eq!(session.send_window, 0, "the peer's window is recorded");
+        let path = session.spec.path.clone();
+        let block = h2::block_encode(&[
+            (":method", "CONNECT"),
+            (":protocol", "connect-ip"),
+            (":scheme", "https"),
+            (":path", &path),
+            (":authority", "edge"),
+            ("capsule-protocol", "?1"),
+            ("authorization", "Basic YTpi"),
+        ]);
+        session.on(&mut wire, h2::T_HEADERS, h2::F_END_HEADERS, 1, &block);
+        assert_eq!(session.send_window, 0, "CONNECT keeps the peer's window");
     }
 
     #[test]
