@@ -38666,20 +38666,9 @@ mod tests {
         let mut datagram = vec![0u8, 0, 0];
         push_socks_addr(&mut datagram, &target);
         datagram.extend_from_slice(b"lane-ping");
-        let mut back = vec![0u8; UDP_BUF];
         // The lane's handshake is not paid before the relay reads, so an early datagram is simply resent until the association is up.
-        let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
-        let answer = loop {
-            let _ = client.send_to(&datagram, relay_addr);
-            match client.recv_from(&mut back) {
-                Ok((n, _)) => break n,
-                Err(_) if std::time::Instant::now() < deadline => {}
-                Err(error) => panic!("echo never returns: {error}"),
-            }
-        };
-        let (source, payload) = parse_socks_udp(&back[..answer]).expect("splits");
+        let source = udp_roundtrip(&client, relay_addr, &datagram, b"lane-ping");
         assert_eq!(source, target);
-        assert_eq!(payload, b"lane-ping");
     }
 
     #[test]
@@ -39889,10 +39878,7 @@ mod tests {
         let mut reply = [0u8; 10];
         client.read_exact(&mut reply).expect("replies");
         assert_eq!(reply[1], 0);
-        client.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        client.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
+        stream_echo(&mut client, b"ping");
         drop(client);
         stop.store(true, Ordering::Relaxed);
         driver.join().expect("joins");
@@ -39955,10 +39941,7 @@ mod tests {
         let mut reply = [0u8; 10];
         client.read_exact(&mut reply).expect("replies");
         assert_eq!(reply[1], 0);
-        client.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        client.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
+        stream_echo(&mut client, b"ping");
         drop(client);
         stop.store(true, Ordering::Relaxed);
         driver.join().expect("joins");
@@ -40099,10 +40082,7 @@ mod tests {
         let mut reply = [0u8; 10];
         client.read_exact(&mut reply).expect("replies");
         assert_eq!(reply[1], 0);
-        client.write_all(b"ping").expect("writes");
-        let mut back = [0u8; 4];
-        client.read_exact(&mut back).expect("echoes");
-        assert_eq!(&back, b"ping");
+        stream_echo(&mut client, b"ping");
         drop(client);
         stop.store(true, Ordering::Relaxed);
         driver.join().expect("joins");
@@ -42338,15 +42318,39 @@ mod tests {
                 let Ok((n, _)) = udp.recv_from(&mut back) else {
                     break;
                 };
-                let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
-                if payload == want {
-                    return source;
+                // A datagram that is not this association's is not an answer: the claim is the payload, not the first frame's shape.
+                if let Some((source, payload)) = parse_socks_udp(&back[..n]) {
+                    if payload == want {
+                        return source;
+                    }
                 }
             }
             assert!(
                 Instant::now() < deadline,
                 "no answer to {want:?} within 30s"
             );
+        }
+    }
+
+    /// A mux stream's first frame can be lost while the lane opens: resend the payload and read
+    /// again rather than failing the first quiet read. The echo answers every write, so a reply
+    /// that arrives late still carries the bytes asserted here.
+    fn stream_echo(client: &mut Connection, want: &[u8]) {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let mut back = vec![0u8; want.len()];
+        loop {
+            client
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .expect("timeout");
+            client.write_all(want).expect("writes");
+            if client.read_exact(&mut back).is_ok() {
+                assert_eq!(back, want, "the stream echoes");
+                client
+                    .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+                    .expect("timeout");
+                return;
+            }
+            assert!(Instant::now() < deadline, "no echo of {want:?} within 30s");
         }
     }
 
