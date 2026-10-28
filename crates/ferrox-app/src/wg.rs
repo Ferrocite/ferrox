@@ -443,7 +443,7 @@ impl WireGuardOut {
             if let Some(header) = payload.get(..12) {
                 let response_id = u16::from_be_bytes([header[0], header[1]]);
                 let flags = u16::from_be_bytes([header[2], header[3]]);
-                if response_id == id && flags & 0x000f == 0 && flags & 0x0200 != 0 {
+                if response_id == id && flags.trailing_zeros() >= 4 && flags & 0x0200 != 0 {
                     break self.exchange_tcp(server, &query, id, qtype);
                 }
             }
