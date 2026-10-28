@@ -443,7 +443,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                         continue;
                     }
                     if self.dot > was {
-                        // A frame with no content yields the session lock to the writer.
+                        // A pass that moves without content yields the session lock to the writer.
                         return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
                     }
                 }
