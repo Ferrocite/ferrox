@@ -575,7 +575,9 @@ fn relay_downlink<R: Read>(reader: R, recv: Recv, out: &mut dyn Write) -> bool {
         let handshaking = matches!(link, Downlink::Handshake { .. });
         match link.step(out, None) {
             crate::proxy::lane_pool::Next::Done => return !handshaking,
-            crate::proxy::lane_pool::Next::Idle | crate::proxy::lane_pool::Next::More => {}
+            crate::proxy::lane_pool::Next::Idle
+            | crate::proxy::lane_pool::Next::More
+            | crate::proxy::lane_pool::Next::Retry => {}
         }
     }
 }
@@ -1527,7 +1529,7 @@ mod tests {
         let mut link = Downlink::new(&mut reader, Recv::StreamReady(recv));
         while back.is_empty() {
             match link.step(&mut back, None) {
-                crate::proxy::lane_pool::Next::More => {}
+                crate::proxy::lane_pool::Next::More | crate::proxy::lane_pool::Next::Retry => {}
                 crate::proxy::lane_pool::Next::Done | crate::proxy::lane_pool::Next::Idle => break,
             }
         }

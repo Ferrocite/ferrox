@@ -18812,8 +18812,11 @@ pub(crate) mod lane_pool {
     #[derive(Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Next {
         Done,
+        /// Nothing to read yet: the lane waits off the workers for a poll quantum.
         Idle,
         More,
+        /// Ready as soon as the queue gives it a turn: the step already spent its own wait.
+        Retry,
     }
 
     pub(crate) type Step = Box<dyn FnMut() -> Next + Send + 'static>;
@@ -18839,12 +18842,22 @@ pub(crate) mod lane_pool {
 
     struct Pool {
         ready: Mutex<VecDeque<Lane>>,
+        parked: Mutex<Parked>,
         notify: Condvar,
         workers: std::sync::atomic::AtomicUsize,
         idle: std::sync::atomic::AtomicUsize,
     }
 
+    /// Lanes with nothing to read wait here, not in a worker a flow with bytes needs.
+    #[derive(Default)]
+    struct Parked {
+        lanes: Vec<Lane>,
+        waking: bool,
+    }
+
     static POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
+
+    static PARKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// The widest standard cell (eight connections) needs one lane per flow, less the one the
     /// serving process's accept threads already keep warm: a blocking read is the concurrency,
@@ -18866,6 +18879,7 @@ pub(crate) mod lane_pool {
     fn spawn_pool() -> std::sync::Arc<Pool> {
         std::sync::Arc::new(Pool {
             ready: Mutex::new(VecDeque::new()),
+            parked: Mutex::new(Parked::default()),
             notify: Condvar::new(),
             workers: std::sync::atomic::AtomicUsize::new(0),
             idle: std::sync::atomic::AtomicUsize::new(0),
@@ -18938,6 +18952,10 @@ pub(crate) mod lane_pool {
                         break;
                     }
                     Ok(Next::Idle) => {
+                        park(pool, lane);
+                        break;
+                    }
+                    Ok(Next::Retry) => {
                         let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
                         ready.push_back(lane);
                         drop(ready);
@@ -18962,6 +18980,37 @@ pub(crate) mod lane_pool {
         }
     }
 
+    /// Hands an idle lane to the parker; one worker per quantum pays the sleep for every lane.
+    fn park(pool: &Pool, lane: Lane) {
+        let chosen = {
+            let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
+            parked.lanes.push(lane);
+            if parked.waking {
+                false
+            } else {
+                parked.waking = true;
+                true
+            }
+        };
+        if !chosen {
+            return;
+        }
+        thread::sleep(crate::budgets::RELAY_POLL);
+        let batch = {
+            let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
+            parked.waking = false;
+            std::mem::take(&mut parked.lanes)
+        };
+        if batch.is_empty() {
+            return;
+        }
+        PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        ready.extend(batch);
+        drop(ready);
+        pool.notify.notify_all();
+    }
+
     fn run_to_end(mut lane: Lane) {
         loop {
             let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -18969,7 +19018,7 @@ pub(crate) mod lane_pool {
                 lane.run()
             }));
             match stepped {
-                Ok(Next::Idle | Next::More) => {}
+                Ok(Next::Idle | Next::More | Next::Retry) => {}
                 Ok(Next::Done) | Err(_) => {
                     let _ =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.finish()));
@@ -19007,6 +19056,11 @@ pub(crate) mod lane_pool {
             .unwrap_or_else(PoisonError::into_inner)
             .push_back(lane);
         pool.notify.notify_one();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn parker_batches() -> usize {
+        PARKS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(all(test, target_os = "linux"))]
@@ -19105,6 +19159,40 @@ pub(crate) mod lane_pool {
                 "{waiting} of {lanes} lanes reached their read: the pool cannot carry the cell"
             );
             assert_eq!(finished.load(Ordering::Relaxed), lanes);
+        }
+
+        /// An idle lane must not hold a worker: the pool parks it, one worker pays the quantum
+        /// for every parked lane, and a flow with bytes still gets its turn.
+        #[test]
+        fn an_idle_lane_waits_off_the_worker() {
+            let pool = spawn_pool();
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let running = Arc::new(AtomicUsize::new(0));
+            let idle = RELAY_LANES - 1;
+            for _ in 0..idle {
+                let stop = Arc::clone(&stop);
+                let running = Arc::clone(&running);
+                submit_to(
+                    &pool,
+                    Box::new(move || {
+                        if stop.load(Ordering::Relaxed) {
+                            return Next::Done;
+                        }
+                        running.fetch_add(1, Ordering::Relaxed);
+                        Next::Idle
+                    }),
+                    Box::new(|| {}),
+                );
+            }
+            let before = parker_batches();
+            thread::sleep(Duration::from_millis(20));
+            let batches = parker_batches() - before;
+            stop.store(true, Ordering::Relaxed);
+            assert!(
+                batches >= 2,
+                "{idle} idle lanes cycled {batches} park rounds in 20 ms"
+            );
+            assert!(running.load(Ordering::Relaxed) >= idle);
         }
 
         /// A cell queues two lanes per stream against fewer threads, and a lane that never parks
@@ -19875,11 +19963,11 @@ fn forward_flush(
     while *sent < *pending {
         match uplink.push(&buffer.prefix(*pending)[*sent..]) {
             Push::Took(n) if n > 0 => *sent += n,
-            Push::Took(_) => return Some(Next::Idle),
+            Push::Took(_) => return Some(Next::Retry),
             Push::Parked => {
-                // A parked window has no read to wait in, so the lane must sleep here or its next turn spins against the same full queue.
+                // A parked window has no read to wait in, so the lane sleeps here and comes back next turn, not a quantum later.
                 std::thread::sleep(crate::budgets::RELAY_POLL);
-                return Some(Next::Idle);
+                return Some(Next::Retry);
             }
             Push::Lost => {
                 echo_trace("relay fwd send failed");
