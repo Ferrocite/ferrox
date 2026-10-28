@@ -22126,6 +22126,19 @@ fn diagnose_outbounds(root: &Json) -> Vec<String> {
 }
 
 fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
+    let Some(first) = root
+        .get("outbounds")
+        .and_then(Json::as_arr)
+        .and_then(|list| list.first())
+    else {
+        return Ok(None);
+    };
+    // The default is the first configured outbound, so the finders below are shown only that entry.
+    let only = Json::Obj(vec![(
+        "outbounds".to_owned(),
+        Json::Arr(vec![first.clone()]),
+    )]);
+    let root = &only;
     if let Some(foxy) = find_foxy_outbound(root) {
         return Ok(Some(Outbound::Foxy(Box::new(foxy))));
     }
