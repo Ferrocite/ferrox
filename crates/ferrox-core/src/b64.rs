@@ -23,7 +23,10 @@ pub fn encode(bytes: &[u8]) -> String {
     // The buffer is opened to the exact coded length and every byte of it is written below, so the four alphabet octets of a group are four stores and one cursor add rather than four capacity checks and a length reload each.
     let ptr = out.as_mut_ptr();
     let (whole, rest) = bytes.as_chunks::<3>();
+    #[cfg(not(target_arch = "aarch64"))]
     let mut at = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    let mut at;
     #[cfg(target_arch = "x86_64")]
     let group = if std::is_x86_feature_detected!("ssse3") {
         // SAFETY: the feature is present, the wide loop loads only while 16 bytes remain, and the tail loads exactly 12.
@@ -33,7 +36,13 @@ pub fn encode(bytes: &[u8]) -> String {
     } else {
         0
     };
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(target_arch = "aarch64")]
+    let group = {
+        let (done, written) = neon::encode_prefix(bytes, ptr);
+        at = written;
+        done / 3
+    };
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
     let group = 0usize;
     for [a, b, c] in &whole[group..] {
         let word = (u32::from(*a) << 16) | (u32::from(*b) << 8) | u32::from(*c);
@@ -323,6 +332,165 @@ mod x86 {
     }
 }
 
+/// The same sixteen-byte lane as `x86`, in NEON: `tbl` indexes the offset table by
+/// the high nibble, and a nibble bitset rejects a byte outside the alphabet.
+#[cfg(target_arch = "aarch64")]
+mod neon {
+    #[allow(
+        clippy::wildcard_imports,
+        reason = "arch intrinsics: the module's whole API is register operations"
+    )]
+    use core::arch::aarch64::*;
+
+    const OFFSETS: [u8; 16] = [255, 16, 19, 4, 191, 191, 185, 185, 0, 0, 0, 0, 0, 0, 0, 0];
+    const LO: [u8; 16] = [
+        0x15, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x13, 0x1a, 0x1b, 0x1b, 0x1b,
+        0x1a,
+    ];
+    const HI: [u8; 16] = [
+        0x10, 0x10, 0x01, 0x02, 0x04, 0x08, 0x04, 0x08, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x10,
+        0x10,
+    ];
+    const PACK: [u8; 16] = [0, 1, 2, 4, 5, 6, 8, 9, 10, 12, 13, 14, 0, 0, 0, 0];
+    const ENCODE_SHUFFLE: [u8; 16] = [1, 0, 2, 1, 4, 3, 5, 4, 7, 6, 8, 7, 10, 9, 11, 10];
+    const ENCODE_OFFSETS: [u8; 16] = [
+        65, 71, 252, 252, 252, 252, 252, 252, 252, 252, 252, 252, 237, 240, 0, 0,
+    ];
+
+    #[inline(always)]
+    fn mulhi_u16(a: uint16x8_t, b: uint16x8_t) -> uint16x8_t {
+        unsafe {
+            let low = vshrn_n_u32::<16>(vmull_u16(vget_low_u16(a), vget_low_u16(b)));
+            let high = vshrn_n_u32::<16>(vmull_u16(vget_high_u16(a), vget_high_u16(b)));
+            vcombine_u16(low, high)
+        }
+    }
+
+    /// Decodes the whole 16-byte blocks of `text` into `out`, returning how much of
+    /// each was consumed. The caller has four bytes of output slop.
+    pub(super) fn decode_prefix(text: &[u8], out: *mut u8) -> (usize, usize) {
+        // SAFETY: NEON is mandatory on aarch64, every load stays inside `text`, and every store stays inside the caller's four-byte-slack buffer.
+        unsafe {
+            let offsets = vld1q_u8(OFFSETS.as_ptr());
+            let low_lut = vld1q_u8(LO.as_ptr());
+            let high_lut = vld1q_u8(HI.as_ptr());
+            let pack = vld1q_u8(PACK.as_ptr());
+            let low_mask = vdupq_n_u8(0x0f);
+            let mut at = 0usize;
+            let mut out_at = 0usize;
+            while at + 16 <= text.len() {
+                let raw = vld1q_u8(text.as_ptr().add(at));
+                let dash = vceqq_u8(raw, vdupq_n_u8(b'-'));
+                let under = vceqq_u8(raw, vdupq_n_u8(b'_'));
+                let raw = vbslq_u8(dash, vdupq_n_u8(b'+'), raw);
+                let raw = vbslq_u8(under, vdupq_n_u8(b'/'), raw);
+                let high = vshrq_n_u8::<4>(raw);
+                let low = vandq_u8(raw, low_mask);
+                let slash = vceqq_u8(raw, vdupq_n_u8(b'/'));
+                let hash = vaddq_u8(high, slash);
+                let sextets = vaddq_u8(raw, vqtbl1q_u8(offsets, hash));
+                let low_bits = vqtbl1q_u8(low_lut, low);
+                let high_bits = vqtbl1q_u8(high_lut, high);
+                let valid = vceqq_u8(vandq_u8(low_bits, high_bits), vdupq_n_u8(0));
+                if vminvq_u8(valid) != 0xff {
+                    break;
+                }
+                let even = vuzp1q_u8(sextets, sextets);
+                let odd = vuzp2q_u8(sextets, sextets);
+                let pairs = vorrq_u16(
+                    vshlq_n_u16::<6>(vmovl_u8(vget_low_u8(even))),
+                    vmovl_u8(vget_low_u8(odd)),
+                );
+                let even_pairs = vuzp1q_u16(pairs, pairs);
+                let odd_pairs = vuzp2q_u16(pairs, pairs);
+                let groups = vorrq_u32(
+                    vshlq_n_u32::<12>(vmovl_u16(vget_low_u16(even_pairs))),
+                    vmovl_u16(vget_low_u16(odd_pairs)),
+                );
+                let bytes = vrev32q_u8(vreinterpretq_u8_u32(vshlq_n_u32::<8>(groups)));
+                vst1q_u8(out.add(out_at), vqtbl1q_u8(bytes, pack));
+                at += 16;
+                out_at += 12;
+            }
+            (at, out_at)
+        }
+    }
+
+    #[inline(always)]
+    fn encode_block(
+        raw: uint8x16_t,
+        shuffle: uint8x16_t,
+        offsets: uint8x16_t,
+        fifty_one: uint8x16_t,
+        twenty_five: uint8x16_t,
+        mul_high: uint16x8_t,
+        mul_low: uint16x8_t,
+    ) -> uint8x16_t {
+        unsafe {
+            let raw = vqtbl1q_u8(raw, shuffle);
+            let t0 = vandq_u32(vreinterpretq_u32_u8(raw), vdupq_n_u32(0x0fc0_fc00));
+            let t1 = mulhi_u16(vreinterpretq_u16_u32(t0), mul_high);
+            let t2 = vandq_u32(vreinterpretq_u32_u8(raw), vdupq_n_u32(0x003f_03f0));
+            let t3 = vmulq_u16(vreinterpretq_u16_u32(t2), mul_low);
+            let sextets = vorrq_u32(vreinterpretq_u32_u16(t1), vreinterpretq_u32_u16(t3));
+            let sextets = vreinterpretq_u8_u32(sextets);
+            let reduced = vqsubq_u8(sextets, fifty_one);
+            let mask = vcgtq_u8(sextets, twenty_five);
+            let reduced = vsubq_u8(reduced, mask);
+            vaddq_u8(sextets, vqtbl1q_u8(offsets, reduced))
+        }
+    }
+
+    /// Encodes the whole 12-byte groups of `bytes` into `out`, returning how much of
+    /// each was consumed.
+    pub(super) fn encode_prefix(bytes: &[u8], out: *mut u8) -> (usize, usize) {
+        // SAFETY: NEON is mandatory on aarch64, the wide loop loads only while 16 bytes remain, the tail loads exactly 12, and every store fills its window.
+        unsafe {
+            let shuffle = vld1q_u8(ENCODE_SHUFFLE.as_ptr());
+            let offsets = vld1q_u8(ENCODE_OFFSETS.as_ptr());
+            let fifty_one = vdupq_n_u8(51);
+            let twenty_five = vdupq_n_u8(25);
+            let mul_high = vreinterpretq_u16_u32(vdupq_n_u32(0x0400_0040));
+            let mul_low = vreinterpretq_u16_u32(vdupq_n_u32(0x0100_0010));
+            let mut at = 0usize;
+            let mut out_at = 0usize;
+            while at + 16 <= bytes.len() {
+                let raw = vld1q_u8(bytes.as_ptr().add(at));
+                let ascii = encode_block(
+                    raw,
+                    shuffle,
+                    offsets,
+                    fifty_one,
+                    twenty_five,
+                    mul_high,
+                    mul_low,
+                );
+                vst1q_u8(out.add(out_at), ascii);
+                at += 12;
+                out_at += 16;
+            }
+            if at + 12 <= bytes.len() {
+                let low = vld1_u8(bytes.as_ptr().add(at));
+                let high = vld1_lane_u32::<0>(bytes.as_ptr().add(at + 8).cast(), vdup_n_u32(0));
+                let raw = vcombine_u8(low, vreinterpret_u8_u32(high));
+                let ascii = encode_block(
+                    raw,
+                    shuffle,
+                    offsets,
+                    fifty_one,
+                    twenty_five,
+                    mul_high,
+                    mul_low,
+                );
+                vst1q_u8(out.add(out_at), ascii);
+                at += 12;
+                out_at += 16;
+            }
+            (at, out_at)
+        }
+    }
+}
+
 pub fn value(byte: u8) -> Option<u8> {
     match DIGITS[usize::from(byte)] {
         255 => None,
@@ -364,12 +532,24 @@ fn group_tail(rest: &[u8]) -> Option<[u8; 3]> {
 pub fn decode(text: &[u8]) -> Option<Vec<u8>> {
     let mut out = Vec::with_capacity(text.len() / 4 * 3 + 4);
     let ptr: *mut u8 = out.as_mut_ptr();
+    #[cfg(not(target_arch = "aarch64"))]
     let mut out_at = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    let mut out_at;
+    #[cfg(not(target_arch = "aarch64"))]
     let mut at = 0usize;
+    #[cfg(target_arch = "aarch64")]
+    let mut at;
     #[cfg(target_arch = "x86_64")]
     if std::is_x86_feature_detected!("ssse3") {
         // SAFETY: the feature is present, and the buffer reserves four bytes past the exact decoded length, so the wide store stays inside it.
         let (done, written) = unsafe { x86::decode_prefix(text, ptr) };
+        at = done;
+        out_at = written;
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        let (done, written) = neon::decode_prefix(text, ptr);
         at = done;
         out_at = written;
     }
