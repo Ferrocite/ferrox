@@ -1269,6 +1269,33 @@ impl AddressPool {
     }
 }
 
+#[cfg(test)]
+fn test_pool() -> AddressPool {
+    AddressPool::from_prefixes(&["10.14.0.0/24".to_owned()]).expect("a test pool")
+}
+
+#[cfg(test)]
+pub(crate) fn test_shared() -> Arc<Shared> {
+    let (packets, _packets_rx) = mpsc::channel();
+    let pool = test_pool();
+    Arc::new(Shared {
+        local: pool.server.clone(),
+        pool: Mutex::new(pool),
+        tunnels: Mutex::new(HashMap::new()),
+        packets,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_spec() -> ServerSpec {
+    ServerSpec {
+        users: vec![("a".to_owned(), "b".to_owned())],
+        path: DEFAULT_PATH.to_owned(),
+        pool: test_pool(),
+        mtu: DEFAULT_MTU,
+    }
+}
+
 impl Family {
     fn new(server: u128, prefix: u8, bits: u8) -> Result<Self, String> {
         let mask = if prefix == 0 {
