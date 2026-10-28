@@ -23,7 +23,7 @@ use crate::conn::Connection;
 use crate::json::Json;
 use crate::proxy::{Destination, Outbound};
 use crate::quic::{self, Datagram};
-use crate::wg_stack::{self, ClientFlow, Packet, UdpRoutes};
+use crate::wg_stack::{self, ClientFlow, Packet, ToTunnel, UdpRoutes};
 use crate::wireguard::DeviceConfig;
 
 const TICK: Duration = Duration::from_millis(10);
@@ -58,7 +58,7 @@ pub(crate) struct MasqueOut {
 struct Inner {
     config: Arc<DeviceConfig>,
     flows: Sender<ClientFlow>,
-    to_tunnel: Sender<Vec<u8>>,
+    to_tunnel: ToTunnel,
     routes: UdpRoutes,
     alive: Arc<AtomicBool>,
 }
@@ -247,7 +247,7 @@ fn assemble(
         dns: Vec::new(),
     });
     let (packets_tx, packets_rx) = mpsc::channel();
-    let (to_tunnel, from_tunnel) = mpsc::channel();
+    let (to_tunnel, from_tunnel) = mpsc::sync_channel(QUEUE);
     let (flows, flow_rx) = mpsc::channel();
     let routes: UdpRoutes = Arc::default();
     let stack_config = Arc::clone(&config);
@@ -267,7 +267,7 @@ fn assemble(
     Inner {
         config,
         flows,
-        to_tunnel,
+        to_tunnel: to_tunnel.into(),
         routes,
         alive,
     }
@@ -1005,7 +1005,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         packets,
         local: spec.pool.server.clone(),
     });
-    let (to_tunnel, from_stack) = mpsc::channel();
+    let (to_tunnel, from_stack) = mpsc::sync_channel(QUEUE);
     let dispatcher = Arc::clone(&shared);
     std::thread::spawn(move || dispatch(&dispatcher, from_stack));
     if identity.alpn.iter().any(|alpn| alpn == b"h2") {
@@ -2107,6 +2107,45 @@ fn peer_key(addrs: &[IpAddr]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tunnel_queue_is_bounded() {
+        let (release, held) = mpsc::channel();
+        let inner = assemble(
+            Vec::new(),
+            DEFAULT_MTU,
+            Vec::new(),
+            Arc::new(AtomicBool::new(true)),
+            move |from_tunnel, _to_stack, _routes| {
+                let _ = held.recv();
+                for _ in from_tunnel.iter().take(QUEUE + 1) {}
+            },
+        );
+        let sender = inner.to_tunnel.clone();
+        let (filled, filling) = mpsc::channel();
+        let (sent, done) = mpsc::channel();
+        let producer = std::thread::spawn(move || {
+            for packet in 0..QUEUE {
+                sender
+                    .send(vec![packet as u8])
+                    .expect("a packet below the bound");
+            }
+            let _ = filled.send(());
+            sender.send(vec![0]).expect("the queue drains");
+            let _ = sent.send(());
+        });
+        filling
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the producer filled the queue");
+        assert!(
+            done.recv_timeout(Duration::from_millis(250)).is_err(),
+            "the tunnel queue accepted more than {QUEUE} packets"
+        );
+        let _ = release.send(());
+        done.recv_timeout(Duration::from_secs(2))
+            .expect("the producer completed after the queue drained");
+        producer.join().expect("the producer thread");
+    }
 
     #[test]
     fn workers_stop_at_the_cap() {

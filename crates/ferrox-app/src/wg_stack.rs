@@ -16,7 +16,7 @@ use std::net::{IpAddr, Shutdown, SocketAddr, UdpSocket};
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -378,8 +378,35 @@ impl Flow {
     }
 }
 
-/// What a stack loop sends the tunnel writer.
-type ToTunnel = Sender<Vec<u8>>;
+/// What a stack loop sends the tunnel writer. The bound is the caller's: a
+/// carrier whose writer can fall behind uses `sync_channel`, so a fast inner
+/// producer stalls instead of growing the queue without limit.
+#[derive(Clone, Debug)]
+pub(crate) enum ToTunnel {
+    Unbounded(Sender<Vec<u8>>),
+    Bounded(SyncSender<Vec<u8>>),
+}
+
+impl ToTunnel {
+    pub(crate) fn send(&self, packet: Vec<u8>) -> Result<(), mpsc::SendError<Vec<u8>>> {
+        match self {
+            Self::Unbounded(sender) => sender.send(packet),
+            Self::Bounded(sender) => sender.send(packet),
+        }
+    }
+}
+
+impl From<Sender<Vec<u8>>> for ToTunnel {
+    fn from(sender: Sender<Vec<u8>>) -> Self {
+        Self::Unbounded(sender)
+    }
+}
+
+impl From<SyncSender<Vec<u8>>> for ToTunnel {
+    fn from(sender: SyncSender<Vec<u8>>) -> Self {
+        Self::Bounded(sender)
+    }
+}
 /// What the tunnel reader sends the stack.
 type Packets = Receiver<Packet>;
 
@@ -396,7 +423,7 @@ fn receive_client(stack: &mut ClientStack, packet: Packet) {
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn client(
     config: DeviceConfig,
-    to_tunnel: ToTunnel,
+    to_tunnel: impl Into<ToTunnel>,
     packets: Packets,
     flows: Receiver<ClientFlow>,
 ) {
@@ -447,7 +474,12 @@ fn retire(
 
 /// Run the server stack until its inbound is dropped.
 #[allow(clippy::needless_pass_by_value)]
-pub(crate) fn server(config: DeviceConfig, to_tunnel: ToTunnel, packets: Packets, out: Outbound) {
+pub(crate) fn server(
+    config: DeviceConfig,
+    to_tunnel: impl Into<ToTunnel>,
+    packets: Packets,
+    out: Outbound,
+) {
     let mut stack = ServerStack::new(&config, to_tunnel, out);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
@@ -485,7 +517,7 @@ struct ClientStack {
 }
 
 impl ClientStack {
-    fn new(config: &DeviceConfig, to_tunnel: ToTunnel) -> Self {
+    fn new(config: &DeviceConfig, to_tunnel: impl Into<ToTunnel>) -> Self {
         let mut device = QueueDevice::new(config.mtu);
         let mut iface = Interface::new(
             iface_config(0x5eed_1234),
@@ -504,7 +536,7 @@ impl ClientStack {
             next_port: 49_152,
             race_bytes: 0,
             retiring: Vec::new(),
-            to_tunnel,
+            to_tunnel: to_tunnel.into(),
             addresses: config.addresses.clone(),
             peers: config.peers.clone(),
             started: StdInstant::now(),
@@ -698,7 +730,7 @@ struct ServerStack {
 }
 
 impl ServerStack {
-    fn new(config: &DeviceConfig, to_tunnel: ToTunnel, out: Outbound) -> Self {
+    fn new(config: &DeviceConfig, to_tunnel: impl Into<ToTunnel>, out: Outbound) -> Self {
         let mut device = QueueDevice::new(config.mtu);
         let mut iface = Interface::new(
             iface_config(0x5eed_5678),
@@ -716,7 +748,7 @@ impl ServerStack {
             readiness: Readiness::new(),
             listeners: HashMap::new(),
             udp: HashMap::new(),
-            to_tunnel,
+            to_tunnel: to_tunnel.into(),
             out,
             addresses: config.addresses.clone(),
             started: StdInstant::now(),
@@ -1257,14 +1289,15 @@ fn lane_source_port(
 /// inner UDP packet, and the reply the tunnel returns is framed back to the last
 /// app that spoke. Each name gets its own inner source port, so a reply pins
 /// only the name that raced it, and the relay port serves a literal address.
-pub(crate) fn client_udp(
+pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
     relay: &UdpSocket,
     config: &DeviceConfig,
-    to_tunnel: &ToTunnel,
+    to_tunnel: &T,
     routes: &UdpRoutes,
     associate: Option<&Connection>,
     resolve: &dyn Fn(&str, u16) -> Vec<SocketAddr>,
 ) {
+    let to_tunnel: ToTunnel = to_tunnel.clone().into();
     let Ok(local) = relay.local_addr() else {
         return;
     };
@@ -1336,7 +1369,7 @@ pub(crate) fn client_udp(
                 };
                 let targets = lane_targets(destination, resolve, &config.addresses, winner);
                 for target in targets {
-                    if !lane_send(config, source_port, target, payload, to_tunnel) {
+                    if !lane_send(config, source_port, target, payload, &to_tunnel) {
                         break 'lane;
                     }
                 }
@@ -1367,12 +1400,12 @@ pub(crate) fn client_udp(
 /// so its loopback relay carries only that pair. The tree's own UDP dispatcher
 /// dials the outbound, and a reader wraps every answer as the packet the client
 /// expects back.
-pub(crate) fn server_udp(
+pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
     flow: ([u8; 32], SocketAddr, SocketAddr),
     started: StdInstant,
     last_used: &Arc<AtomicU64>,
     out: &Outbound,
-    to_tunnel: &ToTunnel,
+    to_tunnel: &T,
 ) -> Option<(UdpSocket, Arc<AtomicBool>)> {
     let relay = UdpSocket::bind("127.0.0.1:0").ok()?;
     let relay_address = relay.local_addr().ok()?;
@@ -1396,7 +1429,7 @@ pub(crate) fn server_udp(
     let stop = Arc::new(AtomicBool::new(false));
     let reader_stop = Arc::clone(&stop);
     let reader_activity = Arc::clone(last_used);
-    let tunnel = to_tunnel.clone();
+    let tunnel = to_tunnel.clone().into();
     std::thread::spawn(move || {
         let mut buf = crate::proxy::udp_buffer();
         let _ = reader.set_read_timeout(Some(LANE_TICK));
