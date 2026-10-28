@@ -326,7 +326,7 @@ impl ClientStack {
             SocketBuffer::new(vec![0u8; TCP_LARGE_BUFFER]),
         );
         socket.set_nagle_enabled(false);
-        socket.set_congestion_control(CongestionControl::Cubic);
+        socket.set_congestion_control(CongestionControl::Reno);
         socket
             .connect(
                 self.iface.context(),
@@ -577,7 +577,7 @@ impl ServerStack {
             SocketBuffer::new(vec![0u8; TCP_BUFFER]),
         );
         socket.set_nagle_enabled(false);
-        socket.set_congestion_control(CongestionControl::Cubic);
+        socket.set_congestion_control(CongestionControl::Reno);
         if socket.listen(IpListenEndpoint { addr: None, port }).is_ok() {
             let handle = self.sockets.add(socket);
             listeners.push(Listener {
