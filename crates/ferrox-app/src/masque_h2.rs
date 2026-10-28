@@ -51,8 +51,8 @@ impl Deadline {
     }
 
     fn remaining(&self) -> Option<Duration> {
-        let _ = self.0.load(Ordering::Relaxed);
-        None
+        let at = self.0.load(Ordering::Relaxed);
+        (at != 0).then(|| Duration::from_nanos(at.saturating_sub(monotonic_nanos())))
     }
 }
 
