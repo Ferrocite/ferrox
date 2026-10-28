@@ -526,7 +526,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     }
 
     fn engage(&mut self) {
-        if self.tls.snapshot().enable_xtls {
+        if self.read.padding && self.tls.snapshot().enable_xtls {
             self.session.engage_record_alignment();
         }
     }
