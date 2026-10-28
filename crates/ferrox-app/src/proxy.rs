@@ -3439,6 +3439,7 @@ fn serve_sealed_session<S>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_sealed_raw<
     S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'static,
     R: SealedRelay<S>,
@@ -3464,11 +3465,10 @@ fn serve_sealed_raw<
     }
     let ask = reverse_ask(users, &got, flow, cmd);
     if !matches!(ask, ReverseAsk::NotReverse) {
-        let shared = Arc::new(SealedShared {
-            stream: Mutex::new(sealed),
-            writing: Mutex::new(false),
-            cv: std::sync::Condvar::new(),
-        });
+        let shared = Arc::new(SealedShared::new(
+            sealed,
+            crate::stats::user(&user.email, user.level),
+        ));
         let attached = match ask {
             ReverseAsk::Allowed(portal) => attach_reverse(
                 portal,
@@ -3488,11 +3488,10 @@ fn serve_sealed_raw<
             if sealed.write_all(&[0, 0]).is_err() {
                 return;
             }
-            let shared = Arc::new(SealedShared {
-                stream: Mutex::new(sealed),
-                writing: Mutex::new(false),
-                cv: std::sync::Condvar::new(),
-            });
+            let shared = Arc::new(SealedShared::new(
+                sealed,
+                crate::stats::user(&user.email, user.level),
+            ));
             serve_udp_stream(
                 SealedHalf(Arc::clone(&shared)),
                 SealedHalf(shared),
@@ -3505,12 +3504,19 @@ fn serve_sealed_raw<
             if sealed.write_all(&[0, 0]).is_err() {
                 return;
             }
-            serve_sealed_mux(sealed, Arc::clone(closer));
+            serve_sealed_mux(
+                sealed,
+                crate::stats::user(&user.email, user.level),
+                Arc::clone(closer),
+            );
         }
         1 => {
             let Some(uplink) = dial_or_report(&target) else {
                 return;
             };
+            let uplink = uplink
+                .with_meter(crate::stats::user(&user.email, user.level).reversed())
+                .with_policy(Some(crate::policy::flow(user.level)));
             if sealed.write_all(&[0, 0]).is_err() {
                 return;
             }
@@ -3613,6 +3619,15 @@ fn serve_sealed_split_with<R, W, C>(
     let ask = reverse_ask(users, &got, flow, cmd);
     if !matches!(ask, ReverseAsk::NotReverse) {
         if let ReverseAsk::Allowed(portal) = ask {
+            let meter = crate::stats::user(&user.email, user.level);
+            let reader = MeteredIo {
+                inner: reader,
+                meter: meter.clone(),
+            };
+            let writer = MeteredIo {
+                inner: writer,
+                meter,
+            };
             if !attach_reverse(portal, reader, writer, Arc::clone(&closer)) {
                 closer();
             }
@@ -3621,23 +3636,43 @@ fn serve_sealed_split_with<R, W, C>(
         }
         return;
     }
+    let meter = crate::stats::user(&user.email, user.level);
     match cmd {
         2 => {
             if writer.write_all(&[0, 0]).is_err() {
                 return;
             }
+            let reader = MeteredIo {
+                inner: reader,
+                meter: meter.clone(),
+            };
+            let writer = MeteredIo {
+                inner: writer,
+                meter,
+            };
             serve_udp_stream(reader, writer, &target, Vec::new(), &closer);
         }
         3 => {
             if writer.write_all(&[0, 0]).is_err() {
                 return;
             }
+            let writer = MeteredIo {
+                inner: writer,
+                meter: meter.clone(),
+            };
+            let reader = MeteredIo {
+                inner: reader,
+                meter,
+            };
             serve_sealed_mux_split(reader, writer, closer);
         }
         1 => {
             let Some(uplink) = dial_or_report(&target) else {
                 return;
             };
+            let uplink = uplink
+                .with_meter(crate::stats::user(&user.email, user.level).reversed())
+                .with_policy(Some(crate::policy::flow(user.level)));
             if writer.write_all(&[0, 0]).is_err() {
                 return;
             }
@@ -3678,13 +3713,42 @@ where
     serve_mux_wire(&wire, &dial, &udp, None, &[]);
 }
 
+struct MeteredIo<T> {
+    inner: T,
+    meter: crate::stats::Meter,
+}
+
+impl<T: Read> Read for MeteredIo<T> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.meter.read(n);
+        Ok(n)
+    }
+}
+
+impl<T: Write> Write for MeteredIo<T> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.meter.write(n);
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
 fn serve_sealed_mux<S>(
     sealed: ferrox_core::vless_encryption::EncryptedStream<S>,
+    meter: crate::stats::Meter,
     close: Arc<dyn Fn() + Send + Sync>,
 ) where
     S: Read + Write + Send + 'static,
 {
-    let stream: Arc<Mutex<Box<dyn ReadWrite + Send>>> = Arc::new(Mutex::new(Box::new(sealed)));
+    let stream: Arc<Mutex<Box<dyn ReadWrite + Send>>> = Arc::new(Mutex::new(Box::new(MeteredIo {
+        inner: sealed,
+        meter,
+    })));
     let wire = MuxWire::Stream { stream, close };
     let io = MuxIo {
         dial: dial_or_report,
@@ -3719,7 +3783,14 @@ fn relay_split<R, W>(
         close();
         return;
     };
-    let stall = budgets::relay_stall();
+    let policy = plain.policy();
+    let stall = policy
+        .and_then(|flow| flow.conn_idle())
+        .unwrap_or_else(budgets::relay_stall);
+    let window = policy
+        .and_then(|flow| flow.buffer())
+        .filter(|window| *window > 0)
+        .map_or(RELAY_SMALL_BUFFER, |window| window.min(RELAY_BUFFER));
     let _ = plain_read.set_read_timeout(Some(stall));
     let _ = plain_write.set_write_timeout(Some(stall));
     let ended = Arc::new(AtomicBool::new(false));
@@ -3727,7 +3798,7 @@ fn relay_split<R, W>(
     let forward_close = Arc::clone(close);
     let done = thread::spawn(move || {
         let mut sealed_write = sealed_write;
-        let mut buf = RelayBuf::new();
+        let mut buf = RelayBuf::with_window(window);
         loop {
             match plain_read.read(buf.as_mut()) {
                 Ok(0) => break,
@@ -3747,7 +3818,7 @@ fn relay_split<R, W>(
         forward_close();
         forward_ended.store(true, Ordering::Relaxed);
     });
-    let mut buf = RelayBuf::new();
+    let mut buf = RelayBuf::with_window(window);
     loop {
         match sealed_read.read(buf.as_mut()) {
             Ok(0) => break,
@@ -3778,11 +3849,7 @@ fn relay_sealed<S: Read + Write + Send + 'static>(
     let Ok(plain) = plain.try_clone() else {
         return;
     };
-    let shared = Arc::new(SealedShared {
-        stream: Mutex::new(sealed),
-        writing: Mutex::new(false),
-        cv: std::sync::Condvar::new(),
-    });
+    let shared = Arc::new(SealedShared::new(sealed, crate::stats::Meter::default()));
     relay_shared(
         Half::split(SealedHalf(Arc::clone(&shared)), SealedHalf(shared)),
         Half::socket(plain),
@@ -3819,6 +3886,7 @@ fn relay_link<S: Read + Write + Send + ferrox_core::tls::RecordAlignment + 'stat
 /// out, and a flow then waits for a write that never gets the lock.
 struct SealedShared<S> {
     stream: Mutex<ferrox_core::vless_encryption::EncryptedStream<S>>,
+    meter: crate::stats::Meter,
     writing: Mutex<bool>,
     cv: std::sync::Condvar,
 }
@@ -3826,6 +3894,18 @@ struct SealedShared<S> {
 struct SealedHalf<S>(Arc<SealedShared<S>>);
 
 impl<S: Read + Write> SealedShared<S> {
+    fn new(
+        stream: ferrox_core::vless_encryption::EncryptedStream<S>,
+        meter: crate::stats::Meter,
+    ) -> Self {
+        Self {
+            stream: Mutex::new(stream),
+            meter,
+            writing: Mutex::new(false),
+            cv: std::sync::Condvar::new(),
+        }
+    }
+
     fn read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut writing = self
             .writing
@@ -3842,7 +3922,10 @@ impl<S: Read + Write> SealedShared<S> {
             .stream
             .lock()
             .map_err(|_| std::io::Error::other("sealed relay"))?;
-        stream.read(buf)
+        let n = stream.read(buf)?;
+        drop(stream);
+        self.meter.read(n);
+        Ok(n)
     }
 
     fn write(&self, buf: &[u8]) -> std::io::Result<()> {
@@ -3860,6 +3943,9 @@ impl<S: Read + Write> SealedShared<S> {
                 .map_err(|_| std::io::Error::other("sealed relay"))?;
             stream.write_all(buf).and_then(|()| stream.flush())
         };
+        if result.is_ok() {
+            self.meter.write(buf.len());
+        }
         if let Ok(mut writing) = self.writing.lock() {
             *writing = false;
             self.cv.notify_all();
@@ -5605,12 +5691,16 @@ fn serve_vless_quic_sealed(
     }
     let fin = stop.clone();
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || stop.close());
+    let meter = crate::stats::user(&user.email, user.level);
     match cmd {
         1 => {
             let Some(uplink) = dial_or_report(&target) else {
                 close();
                 return;
             };
+            let uplink = uplink
+                .with_meter(crate::stats::user(&user.email, user.level).reversed())
+                .with_policy(Some(crate::policy::flow(user.level)));
             if uplink.set_read_timeout(Some(RELAY_POLL)).is_err() {
                 close();
                 return;
@@ -5635,6 +5725,14 @@ fn serve_vless_quic_sealed(
                 close();
                 return;
             };
+            let reader = MeteredIo {
+                inner: reader,
+                meter: meter.clone(),
+            };
+            let writer = MeteredIo {
+                inner: writer,
+                meter,
+            };
             serve_udp_stream(reader, writer, &target, Vec::new(), &close);
         }
         3 => {
@@ -5645,6 +5743,14 @@ fn serve_vless_quic_sealed(
             let Some((reader, writer)) = sealed.into_split() else {
                 close();
                 return;
+            };
+            let writer = MeteredIo {
+                inner: writer,
+                meter: meter.clone(),
+            };
+            let reader = MeteredIo {
+                inner: reader,
+                meter,
             };
             serve_sealed_mux_split(reader, writer, close);
         }
@@ -12265,8 +12371,8 @@ impl<S, R> DrivenHalf<S, R> {
     }
 }
 
-impl<S: CipherOpen, R: Read> Read for DrivenHalf<S, R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+impl<S: CipherOpen, R: Read> DrivenHalf<S, R> {
+    fn read_unmetered(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.scratch.is_empty() {
             self.scratch = unfilled(DRIVEN_CIPHERTEXT);
         }
@@ -12329,6 +12435,12 @@ impl<S: CipherOpen, R: Read> Read for DrivenHalf<S, R> {
             self.pending_at = 0;
             self.pending_end = read;
         }
+    }
+}
+
+impl<S: CipherOpen, R: Read> Read for DrivenHalf<S, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read_unmetered(buf)
     }
 }
 
@@ -18748,6 +18860,7 @@ pub(crate) const RELAY_SMALL_BUFFER: usize = 16 * 1024;
 pub(crate) struct RelayBuf {
     bytes: Vec<u8>,
     moved: usize,
+    promote_to: usize,
 }
 
 impl RelayBuf {
@@ -18766,7 +18879,19 @@ impl RelayBuf {
         let mut bytes = Vec::with_capacity(len);
         // SAFETY: only the prefix a read reports is ever read back, so the uninitialised tail is unreachable.
         unsafe { bytes.set_len(len) };
-        Self { bytes, moved: 0 }
+        Self {
+            bytes,
+            moved: 0,
+            promote_to: RELAY_BUFFER,
+        }
+    }
+
+    /// A window the caller chose, kept at that size when a read fills it.
+    #[must_use]
+    pub fn with_window(len: usize) -> Self {
+        let mut buf = Self::with_len(len);
+        buf.promote_to = len;
+        buf
     }
 
     #[must_use]
@@ -18788,11 +18913,12 @@ impl RelayBuf {
     )]
     pub fn filled(&mut self, n: usize) -> &[u8] {
         self.moved = self.moved.saturating_add(n);
-        if self.bytes.len() < RELAY_BUFFER && (n == self.bytes.len() || self.moved >= RELAY_BUFFER)
+        if self.bytes.len() < self.promote_to
+            && (n == self.bytes.len() || self.moved >= self.promote_to)
         {
-            self.bytes.reserve(RELAY_BUFFER - self.bytes.len());
+            self.bytes.reserve(self.promote_to - self.bytes.len());
             // SAFETY: added room sits past the prefix and the next read overwrites it from index 0.
-            unsafe { self.bytes.set_len(RELAY_BUFFER) };
+            unsafe { self.bytes.set_len(self.promote_to) };
         }
         &self.bytes[..n]
     }
@@ -21747,6 +21873,16 @@ fn one_vless_user(id: &[u8; 16]) -> [VlessUser; 1] {
         level: 0,
         reverse: None,
     }]
+}
+
+#[cfg(all(test, unix))]
+fn enable_user_stats() {
+    let root = crate::json::parse(
+        r#"{"stats":{},"policy":{"levels":{"1":{"statsUserUplink":true,"statsUserDownlink":true,"statsUserOnline":true}}}}"#,
+    )
+    .expect("stats config");
+    crate::policy::install(&root).expect("policy installs");
+    crate::stats::install(&root).expect("stats installs");
 }
 
 fn same_vless_user(a: &[u8; 16], b: &[u8; 16]) -> bool {
@@ -24995,6 +25131,10 @@ mod tests {
     fn an_encrypted_vless_raw_session_echoes_over_loopback() {
         use std::os::unix::net::UnixStream;
 
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        enable_user_stats();
+
         let (client_string, server_string) =
             ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
         let client = vless_client_encryption(Some(&client_string))
@@ -25024,11 +25164,18 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the server");
         let server_addr = listener.local_addr().expect("addr");
         let id = [0x42u8; 16];
-        thread::spawn(move || {
+        let user = VlessUser {
+            id,
+            flow: Flow::None,
+            email: "sealed@example".to_owned(),
+            level: 1,
+            reverse: None,
+        };
+        let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless(
                 stream,
-                &one_vless_user(&id),
+                &[user],
                 &Carrier::Raw(Chain::default()),
                 true,
                 None,
@@ -25072,6 +25219,20 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         peer.read_exact(&mut got).expect("reads the echo");
         assert_eq!(&got, payload);
+        let snapshot = crate::stats::snapshot();
+        assert_eq!(
+            snapshot.online.get("sealed@example"),
+            Some(&1),
+            "the authenticated sealed session holds the user's online lease"
+        );
+        let traffic = snapshot
+            .user
+            .get("sealed@example")
+            .expect("the sealed session counts the user's traffic");
+        assert!(traffic.uplink > 0 && traffic.downlink > 0);
+        drop(peer);
+        serving.join().expect("serves");
+        crate::stats::clear();
     }
 
     /// The sealed session rides a carrier: the upgrade, the hello, the VLESS header and the
