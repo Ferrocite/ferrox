@@ -1206,6 +1206,7 @@ mod tests {
                 return;
             };
             reply[2] |= 0x02;
+            reply.truncate(reply.len() - 4);
             let _ = udp.send_to(&reply, from);
         });
         std::thread::spawn(move || {
