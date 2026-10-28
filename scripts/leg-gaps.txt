@@ -23,6 +23,7 @@ vless-httpupgrade-down-8|server-threads|1.36|696
 vless-hysteria-down-8|server-cpu|2.06|696
 vless-hysteria-down-8|server-threads|1.09|696
 vless-kcp-down-8|server-threads|2.10|696
+vless-raw-down-16|server-threads|1.44|696
 vless-raw-down-8|server-threads|1.15|696
 vless-reality-grpc-down-8|server-threads|1.54|696
 vless-reality-raw-down-8|server-threads|1.54|696
@@ -33,8 +34,6 @@ vless-tls-raw-down-8|server-threads|1.46|696
 vless-tls-ws-down-8|server-threads|1.36|696
 vless-vision-reality-raw-down-8|server-threads|1.54|696
 vless-vision-tls-raw-down-8|server-threads|1.46|696
-vless-tls-raw-up-1|client|0.84|683
-vless-tls-raw-up-1|rust|0.83|683
 vless-vision-tls-raw-up-1|client|0.63|683
 vless-vision-tls-raw-up-1|server|0.79|486
 vless-vision-tls-raw-up-1|server-cpu|1.12|486
