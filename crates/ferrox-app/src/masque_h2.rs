@@ -352,7 +352,7 @@ impl Client {
                 break;
             }
             for _ in 0..QUEUED_CAP {
-                if self.end {
+                if self.end || self.wire.closed {
                     break;
                 }
                 let Ok(packet) = from_tunnel.try_recv() else {
@@ -588,6 +588,9 @@ impl Client {
     }
 
     fn capsule(&mut self, capsule: &[u8]) {
+        if self.end || self.wire.closed {
+            return;
+        }
         let length = i64::try_from(capsule.len()).unwrap_or(i64::MAX);
         if self.queued.is_empty() && length <= self.send_window.min(self.connection_window) {
             if self.wire.send(h2::T_DATA, 0, self.stream, capsule) {
@@ -602,6 +605,9 @@ impl Client {
     }
 
     fn flush(&mut self) {
+        if self.end || self.wire.closed {
+            return;
+        }
         while let Some(answer) = self.queued.pop_front() {
             let start = self.queued_at;
             let room = self.send_window.min(self.connection_window);
@@ -914,6 +920,9 @@ impl Session {
     }
 
     fn capsule(&mut self, wire: &mut Wire, capsule: &[u8]) {
+        if self.end || wire.closed {
+            return;
+        }
         let Some(id) = self.request else {
             return;
         };
@@ -931,6 +940,9 @@ impl Session {
     }
 
     fn flush(&mut self, wire: &mut Wire) {
+        if self.end || wire.closed {
+            return;
+        }
         while let Some(answer) = self.queued.pop_front() {
             let Some(id) = self.request else {
                 self.queued.push_front(answer);
@@ -1108,20 +1120,21 @@ mod tests {
 
     #[test]
     fn a_stalled_send_window_bounds_the_queued_capsules() {
-        let mut client = bare_client();
-        client.send_window = 0;
-        client.connection_window = 0;
-        let mut capsule = Vec::new();
-        datagram(&udp_packet(53), &mut capsule);
-        for _ in 0..=QUEUED_CAP {
-            client.capsule(&capsule);
+        for (stream, connection) in [(0, 0), (0, DEFAULT_WINDOW), (DEFAULT_WINDOW, 0)] {
+            let mut client = bare_client();
+            client.send_window = stream;
+            client.connection_window = connection;
+            for _ in 0..QUEUED_CAP {
+                client.capsule(&[0, 2, 0, 42]);
+            }
+            assert_eq!(client.queued.len(), QUEUED_CAP);
+            assert!(!client.end, "the cap itself is accepted");
+            for _ in 0..QUEUED_CAP {
+                client.capsule(&[0, 2, 0, 42]);
+            }
+            assert_eq!(client.queued.len(), QUEUED_CAP);
+            assert!(client.end, "the next capsule ends the session");
         }
-        assert_eq!(
-            client.queued.len(),
-            QUEUED_CAP,
-            "a stalled window keeps at most {QUEUED_CAP} capsules"
-        );
-        assert!(client.end, "the capsule past the cap ends the session");
     }
 
     #[test]
@@ -1349,6 +1362,126 @@ mod tests {
             out.lock().expect("a recorder").is_empty(),
             "an empty DATA frame credits nothing"
         );
+    }
+
+    #[test]
+    fn queued_capsules_flush_when_the_peer_grants_window() {
+        let capsule = [0, 2, 0, 42];
+        let mut client = bare_client();
+        client.send_window = 0;
+        client.connection_window = 0;
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        session.request = Some(1);
+        session.send_window = 0;
+        let mut wire = bare_client().wire;
+        for _ in 0..QUEUED_CAP {
+            client.capsule(&capsule);
+            session.capsule(&mut wire, &capsule);
+        }
+        let window = u32::try_from(QUEUED_CAP * capsule.len())
+            .expect("window")
+            .to_be_bytes();
+        client.on(h2::T_WINDOW, 0, 0, &window);
+        client.flush();
+        assert_eq!(client.queued.len(), QUEUED_CAP, "stream is still blocked");
+        client.on(h2::T_WINDOW, 0, 1, &window);
+        session.on(&mut wire, h2::T_WINDOW, 0, 1, &window);
+        client.flush();
+        session.flush(&mut wire);
+        assert!(client.queued.is_empty());
+        assert!(session.queued.is_empty());
+        assert_eq!(client.send_window, 0);
+        assert_eq!(client.connection_window, 0);
+        assert_eq!(session.send_window, 0);
+        assert!(!client.end);
+        assert!(!session.end);
+        assert!(!client.wire.closed);
+        assert!(!wire.closed);
+    }
+
+    #[test]
+    fn an_overflow_stops_draining_the_packet_channels() {
+        let (sender, receiver) = mpsc::sync_channel(masque::QUEUE);
+        sender.send(vec![42]).expect("a packet");
+        sender.send(vec![42]).expect("a packet");
+        let mut client = bare_client();
+        client.send_window = 0;
+        for _ in 0..QUEUED_CAP {
+            client.capsule(&[0, 2, 0, 42]);
+        }
+        let (to_stack, _) = mpsc::channel();
+        let routes = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        client.run(&receiver, &to_stack, &routes);
+        assert!(client.end);
+        assert_eq!(client.queued.len(), QUEUED_CAP);
+        assert_eq!(receiver.try_iter().count(), 1);
+
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        session.request = Some(1);
+        session.send_window = 0;
+        let (sender, receiver) = mpsc::sync_channel(masque::QUEUE);
+        sender.send(vec![42]).expect("a packet");
+        sender.send(vec![42]).expect("a packet");
+        session.outgoing = Some(receiver);
+        let mut wire = bare_client().wire;
+        for _ in 0..QUEUED_CAP {
+            session.capsule(&mut wire, &[0, 2, 0, 42]);
+        }
+        session.flush(&mut wire);
+        assert!(session.end);
+        assert_eq!(session.queued.len(), QUEUED_CAP);
+        assert_eq!(
+            session
+                .outgoing
+                .as_ref()
+                .expect("receiver")
+                .try_iter()
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn ended_or_closed_sessions_leave_capsules_and_channels_untouched() {
+        for (ended, closed) in [(true, false), (false, true)] {
+            let mut client = bare_client();
+            client.send_window = 0;
+            client.capsule(&[0, 2, 0, 42]);
+            client.end = ended;
+            client.wire.closed = closed;
+            client.capsule(&[0, 2, 0, 43]);
+            assert_eq!(client.queued.len(), 1, "no enqueue after termination");
+            client.send_window = DEFAULT_WINDOW;
+            client.flush();
+            assert_eq!(client.queued.len(), 1, "no flush after termination");
+            assert_eq!(client.send_window, DEFAULT_WINDOW);
+
+            let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+            session.request = Some(1);
+            session.send_window = 0;
+            let mut wire = bare_client().wire;
+            session.capsule(&mut wire, &[0, 2, 0, 42]);
+            session.end = ended;
+            wire.closed = closed;
+            session.capsule(&mut wire, &[0, 2, 0, 43]);
+            assert_eq!(session.queued.len(), 1, "no enqueue after termination");
+            let (sender, receiver) = mpsc::sync_channel(masque::QUEUE);
+            sender.send(vec![42]).expect("a packet");
+            session.outgoing = Some(receiver);
+            session.send_window = DEFAULT_WINDOW;
+            session.flush(&mut wire);
+            assert_eq!(session.queued.len(), 1, "no flush after termination");
+            assert_eq!(session.send_window, DEFAULT_WINDOW);
+            assert_eq!(
+                session
+                    .outgoing
+                    .as_ref()
+                    .expect("receiver")
+                    .try_iter()
+                    .count(),
+                1
+            );
+        }
     }
 
     #[test]
