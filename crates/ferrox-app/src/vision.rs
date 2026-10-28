@@ -624,6 +624,9 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                     }
                     dot += content + padding;
                     if command == VisionCommand::Continue.byte() {
+                        if held == 0 {
+                            break 'frames held;
+                        }
                         continue 'frames;
                     }
                     self.session.disarm_record_alignment();
@@ -693,6 +696,9 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             }
             if walk.command == VisionCommand::Continue.byte() {
                 walk.want_header = 5;
+                if held == 0 {
+                    break 'frames held;
+                }
                 continue 'frames;
             }
             // a command that is not a continue ends the framing; its tail is content
