@@ -18996,6 +18996,10 @@ pub(crate) mod lane_pool {
         notify: Condvar,
         workers: std::sync::atomic::AtomicUsize,
         idle: std::sync::atomic::AtomicUsize,
+        #[cfg(test)]
+        stop: std::sync::atomic::AtomicBool,
+        #[cfg(test)]
+        handles: Mutex<Vec<std::thread::JoinHandle<()>>>,
     }
 
     /// Lanes with nothing to read wait here, each with the instant it is due another turn.
@@ -19032,6 +19036,10 @@ pub(crate) mod lane_pool {
             notify: Condvar::new(),
             workers: std::sync::atomic::AtomicUsize::new(0),
             idle: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            stop: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            handles: Mutex::new(Vec::new()),
         })
     }
 
@@ -19058,18 +19066,35 @@ pub(crate) mod lane_pool {
         let spawned = thread::Builder::new()
             .name("ferrox-relay-lane".into())
             .spawn(move || worker_loop(&worker));
-        if spawned.is_err() {
+        let Ok(worker) = spawned else {
             pool.workers.fetch_sub(1, Relaxed);
             return false;
-        }
+        };
+        #[cfg(test)]
+        pool.handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(worker);
+        #[cfg(not(test))]
+        drop(worker);
         true
     }
 
     fn worker_loop(pool: &Pool) {
         loop {
+            if stopping(pool) {
+                pool.workers
+                    .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
             let mut lane = {
                 let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
                 loop {
+                    if stopping(pool) {
+                        pool.workers
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
                     if let Some(lane) = ready.pop_front() {
                         break lane;
                     }
@@ -19196,6 +19221,30 @@ pub(crate) mod lane_pool {
         crate::budgets::RELAY_POLL * (1u32 << idle.min(4))
     }
 
+    #[cfg(test)]
+    fn stopping(pool: &Pool) -> bool {
+        pool.stop.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(not(test))]
+    fn stopping(_: &Pool) -> bool {
+        false
+    }
+
+    #[cfg(test)]
+    fn shutdown(pool: &std::sync::Arc<Pool>) {
+        use std::sync::atomic::Ordering::SeqCst;
+        let ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        pool.stop.store(true, SeqCst);
+        pool.notify.notify_all();
+        drop(ready);
+        let handles =
+            std::mem::take(&mut *pool.handles.lock().unwrap_or_else(PoisonError::into_inner));
+        for handle in handles {
+            let _ = handle.join();
+        }
+    }
+
     fn run_to_end(mut lane: Lane) {
         loop {
             let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -19261,6 +19310,22 @@ pub(crate) mod lane_pool {
         use std::sync::Arc;
         use std::time::{Duration, Instant};
 
+        struct TestPool(Arc<Pool>);
+
+        impl std::ops::Deref for TestPool {
+            type Target = Arc<Pool>;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        impl Drop for TestPool {
+            fn drop(&mut self) {
+                shutdown(&self.0);
+            }
+        }
+
         struct Gate {
             state: Mutex<(usize, bool)>,
             wake: Condvar,
@@ -19308,7 +19373,7 @@ pub(crate) mod lane_pool {
         /// sink cannot feed.
         #[test]
         fn every_lane_of_a_full_cell_has_a_worker() {
-            let pool = spawn_pool();
+            let pool = TestPool(spawn_pool());
             // The widest cell's eight flows are blocking reads; one is the accept thread's.
             let lanes = RELAY_LANES;
             assert!(
@@ -19351,7 +19416,7 @@ pub(crate) mod lane_pool {
         /// for every parked lane, and a flow with bytes still gets its turn.
         #[test]
         fn an_idle_lane_waits_off_the_worker() {
-            let pool = spawn_pool();
+            let pool = TestPool(spawn_pool());
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let running = Arc::new(AtomicUsize::new(0));
             let idle = RELAY_LANES - 1;
@@ -19381,12 +19446,44 @@ pub(crate) mod lane_pool {
             assert!(running.load(Ordering::Relaxed) >= idle);
         }
 
+        /// A private pool's workers must not outlive the test that made them: repeated parallel
+        /// runs would otherwise leave parked lane threads behind and skew the process-wide counts.
+        #[test]
+        fn a_private_pool_stops_its_workers_before_the_test_ends() {
+            let pool = spawn_pool();
+            let weak = Arc::downgrade(&pool);
+            submit_to(&pool, Box::new(|| Next::Idle), Box::new(|| {}));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while pool.workers.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert!(
+                pool.workers.load(Ordering::Relaxed) > 0,
+                "the private pool never started a worker"
+            );
+            shutdown(&pool);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while pool.workers.load(Ordering::Relaxed) > 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                pool.workers.load(Ordering::Relaxed),
+                0,
+                "shutdown left a private worker running"
+            );
+            drop(pool);
+            assert!(
+                weak.upgrade().is_none(),
+                "a private worker kept the pool alive"
+            );
+        }
+
         /// A direction nobody writes to must cost the pool almost nothing: the wait before an idle
         /// lane's next turn doubles each round, so a quiet lane is re-queued a handful of times a
         /// fifth of a second instead of once a millisecond.
         #[test]
         fn an_idle_lane_backs_off_its_next_turn() {
-            let pool = spawn_pool();
+            let pool = TestPool(spawn_pool());
             let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let rounds = Arc::new(AtomicUsize::new(0));
             let stop_lane = Arc::clone(&stop);
@@ -19417,7 +19514,7 @@ pub(crate) mod lane_pool {
         /// that cannot free its window until they run.
         #[test]
         fn a_saturated_cell_still_steps_the_lanes_behind_a_busy_one() {
-            let pool = spawn_pool();
+            let pool = TestPool(spawn_pool());
             let lanes = RELAY_LANES * 2;
             let started = Arc::new(AtomicUsize::new(0));
             let finished = Arc::new(AtomicUsize::new(0));
@@ -19460,7 +19557,7 @@ pub(crate) mod lane_pool {
         /// one-flow server does not hold a full cell's threads for a session that never needs them.
         #[test]
         fn a_narrow_cell_starts_only_the_lanes_it_queues() {
-            let pool = spawn_pool();
+            let pool = TestPool(spawn_pool());
             let gate = Arc::new(Gate {
                 state: Mutex::new((0, false)),
                 wake: Condvar::new(),
@@ -19481,6 +19578,7 @@ pub(crate) mod lane_pool {
                 );
             }
             let waiting = gate.wait_for(2, Duration::from_secs(5));
+            gate.release();
             assert_eq!(
                 waiting, 2,
                 "both lanes of the narrow cell reached their read"
@@ -19491,7 +19589,6 @@ pub(crate) mod lane_pool {
                 "the pool started {} workers for the two lanes a one-flow cell queues",
                 pool.workers.load(Ordering::Relaxed)
             );
-            gate.release();
             let deadline = Instant::now() + Duration::from_secs(5);
             while finished.load(Ordering::Relaxed) < 2 && Instant::now() < deadline {
                 thread::sleep(Duration::from_millis(1));
