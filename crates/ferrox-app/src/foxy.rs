@@ -5643,12 +5643,13 @@ pub(crate) mod loopback {
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            // The poll clock is for the reads after the handshake: armed before it, a 50 ms gap between records on a loaded runner aborts the handshake and the lane's open spends its head budget before the retry (Windows over 60 s in three runs).
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
             let mut preface = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut preface) {
                 return;
