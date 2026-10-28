@@ -514,6 +514,7 @@ impl ClientStack {
     }
 
     fn connect(&mut self, flow: ClientFlow) -> std::io::Result<()> {
+        flow.client.set_nonblocking(true)?;
         let mut candidates = Vec::new();
         let mut refused = None;
         for destination in &flow.destinations {
@@ -566,7 +567,6 @@ impl ClientStack {
             ));
         };
         candidates.remove(0);
-        flow.client.set_nonblocking(true)?;
         let mut routed = Flow::new(handle, flow.client, local_port);
         routed.races = candidates;
         routed.pending_up = flow.prefix;
