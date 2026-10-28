@@ -434,7 +434,7 @@ impl Client {
                 self.wire.send(h2::T_PING, h2::F_ACK, 0, body);
             }
             h2::T_HEADERS if id == self.stream => {
-                let block = strip_padding(flags, body);
+                let block = strip_padding(flags, body, true);
                 if flags & h2::F_END_HEADERS != 0 {
                     self.head(block);
                 } else {
@@ -450,7 +450,7 @@ impl Client {
                         self.end = true;
                         return;
                     }
-                    let data = strip_padding(flags, body);
+                    let data = strip_padding(flags, body, false);
                     if block.len() + data.len() > FRAME_CAP {
                         self.end = true;
                         return;
@@ -465,7 +465,7 @@ impl Client {
             }
             h2::T_DATA if id == self.stream => {
                 let length = body.len();
-                let data = strip_padding(flags, body);
+                let data = strip_padding(flags, body, false);
                 self.window(length);
                 self.capsules(data);
                 if flags & h2::F_END != 0 {
@@ -750,7 +750,7 @@ impl Session {
                 if self.request.is_some() {
                     return;
                 }
-                let block = strip_padding(flags, body);
+                let block = strip_padding(flags, body, true);
                 if flags & h2::F_END_HEADERS != 0 {
                     self.request(wire, id, block);
                 } else {
@@ -763,7 +763,7 @@ impl Session {
                         self.end = true;
                         return;
                     }
-                    let data = strip_padding(flags, body);
+                    let data = strip_padding(flags, body, false);
                     if block.len() + data.len() > FRAME_CAP {
                         self.end = true;
                         return;
@@ -781,7 +781,7 @@ impl Session {
                     return;
                 }
                 let length = body.len();
-                let data = strip_padding(flags, body);
+                let data = strip_padding(flags, body, false);
                 self.window(wire, length);
                 self.capsules(wire, data);
                 if flags & h2::F_END != 0 {
@@ -972,7 +972,7 @@ impl Session {
     }
 }
 
-fn strip_padding(flags: u8, body: &[u8]) -> &[u8] {
+fn strip_padding(flags: u8, body: &[u8], _headers: bool) -> &[u8] {
     if flags & h2::F_PADDED == 0 {
         return body;
     }
@@ -1290,6 +1290,21 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn priority_bytes_are_stripped_from_headers_alone() {
+        let body = [0u8, 0, 0, 0, 0, 0xaa];
+        assert_eq!(
+            strip_padding(h2::F_PRIORITY, &body, true),
+            &[0xaa],
+            "the priority fields are not part of the HPACK block"
+        );
+        assert_eq!(
+            strip_padding(h2::F_PRIORITY, &body, false),
+            &body,
+            "the priority bit has no meaning outside HEADERS"
+        );
     }
 
     #[test]
