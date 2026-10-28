@@ -18867,12 +18867,11 @@ pub(crate) mod lane_pool {
 
     static PARKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-    /// The widest standard cell (eight connections) needs one lane per flow, less the one the
-    /// serving process's accept threads already keep warm: a blocking read is the concurrency,
-    /// and the client fell behind xray-core-rust on every eight-flow cell with four. This is the
-    /// ceiling, not the shape: a worker starts when a lane is queued and no worker is idle, so a
-    /// one-flow cell holds two lanes where it used to hold all seven.
-    const RELAY_LANES: usize = 7;
+    /// The widest standard cell (eight connections) queues one download read per flow, and every
+    /// one of them must sit in its read at once: a lane without a worker is a flow the peer's
+    /// window cannot refill. This is the ceiling, not the shape: a worker starts when a lane is
+    /// queued and no worker is idle, so a one-flow cell holds two lanes.
+    const RELAY_LANES: usize = 8;
 
     /// How many steps a lane may take back to back before it rejoins the queue. A cell queues two
     /// lanes per stream against fewer threads, so a lane that never parks while it has bytes holds
@@ -19134,7 +19133,7 @@ pub(crate) mod lane_pool {
             // The widest cell's eight flows are blocking reads; one is the accept thread's.
             let lanes = RELAY_LANES;
             assert!(
-                lanes >= 7,
+                lanes >= 8,
                 "the pool carries {lanes} lanes, below the widest cell's flows"
             );
             let gate = Arc::new(Gate {
@@ -25720,7 +25719,7 @@ mod tests {
             let _ = peer.shutdown(Shutdown::Both);
         }
         let lanes = lane_pool::workers();
-        assert!(lanes >= 7, "the lane count is the bound: {lanes}");
+        assert!(lanes >= 8, "the lane count is the bound: {lanes}");
         assert!(
             grown <= lanes + 8,
             "{flows} wrapped flows grew the process by {grown} threads, past {lanes} lanes plus slack"
