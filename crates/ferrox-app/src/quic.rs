@@ -3616,6 +3616,53 @@ mod tests {
         );
     }
 
+    /// A retry that cannot drain must stop the sweep before new datagrams overtake it.
+    #[test]
+    fn a_blocked_retry_stops_the_sweep() {
+        let peer = UdpSocket::bind("127.0.0.1:0").expect("bind the peer");
+        peer.set_nonblocking(true).expect("nonblocking");
+        let to = peer.local_addr().expect("the peer's address");
+        let socket = bind_datagram("127.0.0.1:0").expect("bind the sender");
+        let local = socket.local_addr().expect("the sender's address");
+        let sock = Datagram::plain(socket);
+
+        sock.hold(b"older", to);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = sock.held.queue.lock().expect("lock the queue");
+            panic!("poison the held queue");
+        }));
+        assert!(poisoned.is_err(), "the queue is left holding");
+        assert!(sock.held.holding.load(Ordering::Relaxed));
+
+        let mut scid = [0u8; SCID_LEN];
+        getrandom::fill(&mut scid).expect("random");
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
+        config.set_application_protos(&[ALPN]).expect("alpn");
+        let mut conn =
+            quiche::connect(Some("held.test"), &cid, local, to, &mut config).expect("connects");
+
+        flush_egress(&mut conn, &sock);
+        let mut buf = [0u8; 2048];
+        let mut received = false;
+        for _ in 0..50 {
+            match peer.recv_from(&mut buf) {
+                Ok(_) => {
+                    received = true;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(_) => break,
+            }
+        }
+        assert!(
+            !received,
+            "a blocked retry must stop the sweep before new datagrams"
+        );
+    }
+
     /// The store is read once, not once per dial: two calls name the same allocation rather than the same bytes.
     #[test]
     fn the_platform_anchors_are_read_once() {
