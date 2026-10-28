@@ -2631,14 +2631,8 @@ mod tests {
         let peer: SocketAddr = "127.0.0.1:8".parse().expect("peer address");
         let cid = [3u8; 16];
         let cid = quiche::ConnectionId::from_ref(&cid);
-        let mut conn = quiche::connect(
-            Some("localhost"),
-            &cid,
-            local,
-            peer,
-            &mut config,
-        )
-        .expect("connection");
+        let mut conn =
+            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connection");
         let mut packet = vec![0u8; 1350];
         let (n, _) = conn.send(&mut packet).expect("initial");
         assert!(n > 0, "the client produced an initial packet");
