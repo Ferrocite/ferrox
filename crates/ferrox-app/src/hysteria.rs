@@ -50,10 +50,12 @@ pub(crate) struct Session {
     pub(crate) udp_supported: bool,
     /// The pooled connection's one socket reader; `None` on a dial that drives the socket itself.
     pub(crate) driver: Option<Arc<Driver>>,
+    /// Wakes a writer whose stream filled its window when the reader has taken a datagram: an ACK frees send capacity, and a 5 ms poll on a loopback ACK is fifty times too coarse.
+    pub(crate) send_wake: Option<Arc<StreamWake>>,
 }
 
 /// One stream's latch: the pump bumps it when a datagram filled the stream, and the flow reading it parks until then instead of waiting on the shared socket with the others.
-struct StreamWake {
+pub(crate) struct StreamWake {
     gen: Mutex<u64>,
     cv: Condvar,
 }
@@ -85,6 +87,7 @@ pub(crate) struct Driver {
     alive: AtomicBool,
     stop: AtomicBool,
     streams: Mutex<HashMap<u64, Arc<StreamWake>>>,
+    send: Arc<StreamWake>,
 }
 
 impl Driver {
@@ -93,6 +96,10 @@ impl Driver {
             alive: AtomicBool::new(false),
             stop: AtomicBool::new(false),
             streams: Mutex::new(HashMap::new()),
+            send: Arc::new(StreamWake {
+                gen: Mutex::new(0),
+                cv: Condvar::new(),
+            }),
         })
     }
 
@@ -122,6 +129,10 @@ impl Driver {
         })
     }
 
+    fn send_wake(&self) -> Arc<StreamWake> {
+        Arc::clone(&self.send)
+    }
+
     fn wake(&self, stream: u64) {
         if let Ok(streams) = self.streams.lock() {
             if let Some(wake) = streams.get(&stream) {
@@ -143,6 +154,7 @@ impl Driver {
                 local,
                 udp_supported: false,
                 driver: None,
+                send_wake: None,
             };
             let mut ready = Vec::with_capacity(16);
             while !pump.stop.load(Ordering::Relaxed) {
@@ -157,6 +169,7 @@ impl Driver {
                     std::thread::sleep(STREAM_POLL);
                     continue;
                 }
+                pump.send.bump();
                 ready.clear();
                 if let Ok(conn) = session.shared.lock() {
                     ready.extend(conn.readable());
@@ -181,6 +194,7 @@ impl Driver {
 pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
     let deadline = Instant::now() + crate::quic::SEND_WAIT;
     loop {
+        let before = session.send_wake.as_ref().map_or(0, |wake| wake.seen());
         let last = buf.is_empty();
         if last && !fin {
             return true;
@@ -210,7 +224,11 @@ pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool
             Err(_) => return false,
         }
         drop(conn);
-        std::thread::sleep(STREAM_POLL);
+        if let Some(wake) = session.send_wake.as_ref() {
+            wake.wait(before, STREAM_POLL);
+        } else {
+            std::thread::sleep(STREAM_POLL);
+        }
     }
 }
 
@@ -432,6 +450,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         local,
         udp_supported: false,
         driver: None,
+        send_wake: None,
     };
     if !control_settings(&session) {
         return None;
@@ -471,6 +490,7 @@ impl Flow {
                 local,
                 udp_supported: false,
                 driver: None,
+                send_wake: None,
             },
             stream,
             backlog,
@@ -838,6 +858,7 @@ fn open_pooled(dial: &Dial, header: &[u8]) -> Option<Flow> {
     let mut session = connect(dial)?;
     let driver = Driver::new();
     session.driver = Some(Arc::clone(&driver));
+    session.send_wake = Some(driver.send_wake());
     driver.spawn(&session);
     let Some(flow) = open_flow(&session, FIRST_FLOW_STREAM, header) else {
         driver.stop();
@@ -2287,6 +2308,7 @@ mod tests {
             local,
             udp_supported: false,
             driver: None,
+            send_wake: None,
         }
     }
 

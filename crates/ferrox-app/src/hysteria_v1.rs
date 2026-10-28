@@ -117,6 +117,7 @@ fn connect(dial: &Dial) -> Option<Session> {
         local,
         udp_supported: true,
         driver: None,
+        send_wake: None,
     };
     let mut hello = Vec::with_capacity(20 + dial.config.auth.len());
     wire::encode_client_hello(
