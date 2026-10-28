@@ -3062,6 +3062,21 @@ mod tests {
             uniform.is_ok(),
             "a uniformly slow cell is the engine, not a straggler: {uniform:?}"
         );
+        let half_slow = vec![
+            Duration::from_millis(80),
+            Duration::from_millis(80),
+            Duration::from_millis(80),
+            Duration::from_millis(80),
+            Duration::from_millis(280),
+            Duration::from_millis(280),
+            Duration::from_millis(280),
+            Duration::from_millis(280),
+        ];
+        let split = validate_transfer(&moved(half_slow), expected, &[], &desync);
+        assert!(
+            split.is_ok(),
+            "half the flows slow is not an isolated straggler: {split:?}"
+        );
         let mut stalled = vec![Duration::from_millis(80); 7];
         stalled.push(Duration::from_millis(1_500));
         let beyond = validate_transfer(&moved(stalled), expected, &[], &desync);
