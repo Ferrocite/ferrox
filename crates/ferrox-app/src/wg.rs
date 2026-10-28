@@ -1196,12 +1196,15 @@ mod tests {
     fn a_truncated_answer_is_asked_again_over_tcp() {
         let (tcp, udp, dns_address) = (0..64)
             .find_map(|_| {
-                let udp = UdpSocket::bind("127.0.0.1:0").ok()?;
-                let address = udp.local_addr().ok()?;
-                let tcp = TcpListener::bind(address).ok()?;
-                Some((tcp, udp, address))
+                let udp = UdpSocket::bind("127.0.0.1:0").expect("dns udp");
+                let address = udp.local_addr().expect("dns address");
+                match TcpListener::bind(address) {
+                    Ok(tcp) => Some((tcp, udp, address)),
+                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+                    Err(error) => panic!("dns tcp: {error}"),
+                }
             })
-            .expect("dns pair");
+            .expect("a port free for both DNS transports");
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
             let Ok((n, from)) = udp.recv_from(&mut buf) else {

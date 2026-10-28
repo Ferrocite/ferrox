@@ -244,11 +244,11 @@ expect() {
   fi
 }
 
-sed -i '' 's#upstream/zeronet/fuzz##' "$matrix"
+sed -i.bak 's#upstream/zeronet/fuzz##' "$matrix"
 expect 'upstream/zeronet/fuzz` is a method directory' "uncited catalogue"
-sed -i '' 's/| implemented |/| maybe |/' "$matrix"
+sed -i.bak 's/| implemented |/| maybe |/' "$matrix"
 expect "state 'maybe' is not one of" "unknown state"
-sed -i '' 's/| probe-page |/| probe |/' "$matrix"
+sed -i.bak 's/| probe-page |/| probe |/' "$matrix"
 expect "no matrix row is named for it" "renamed row"
 printf '%s\n' 'check-method-superset: self-test passed (three mutations refused)'
 

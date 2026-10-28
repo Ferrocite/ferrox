@@ -1124,15 +1124,15 @@ mod tests {
             let mut client = bare_client();
             client.send_window = stream;
             client.connection_window = connection;
-            for _ in 0..QUEUED_CAP {
+            for _ in 0..64 {
                 client.capsule(&[0, 2, 0, 42]);
             }
-            assert_eq!(client.queued.len(), QUEUED_CAP);
+            assert_eq!(client.queued.len(), 64);
             assert!(!client.end, "the cap itself is accepted");
-            for _ in 0..QUEUED_CAP {
+            for _ in 0..64 {
                 client.capsule(&[0, 2, 0, 42]);
             }
-            assert_eq!(client.queued.len(), QUEUED_CAP);
+            assert_eq!(client.queued.len(), 64);
             assert!(client.end, "the next capsule ends the session");
         }
     }
@@ -1439,6 +1439,25 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn a_closed_wire_stops_draining_the_packet_channel() {
+        let (sender, receiver) = mpsc::sync_channel(masque::QUEUE);
+        sender.send(vec![42]).expect("a packet");
+        sender.send(vec![43]).expect("a packet");
+        let mut client = bare_client();
+        client.wire.stream = Box::new(std::io::Cursor::new(Vec::<u8>::new().into_boxed_slice()));
+        let (to_stack, _) = mpsc::channel();
+        let routes = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        client.run(&receiver, &to_stack, &routes);
+        assert!(client.wire.closed);
+        assert!(!client.end, "write failure alone closes the wire");
+        assert_eq!(
+            receiver.try_recv().expect("the next packet stays queued"),
+            [43]
+        );
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
