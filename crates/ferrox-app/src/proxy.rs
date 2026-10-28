@@ -18995,8 +18995,10 @@ pub(crate) mod lane_pool {
         ready: Mutex<VecDeque<Lane>>,
         parked: Mutex<Parked>,
         notify: Condvar,
+        park_wake: Condvar,
         workers: std::sync::atomic::AtomicUsize,
         idle: std::sync::atomic::AtomicUsize,
+        parks: std::sync::atomic::AtomicUsize,
         #[cfg(test)]
         stop: std::sync::atomic::AtomicBool,
         #[cfg(test)]
@@ -19011,8 +19013,6 @@ pub(crate) mod lane_pool {
     }
 
     static POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
-
-    static PARKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// The widest standard cell (eight connections) queues one download read per flow, and every
     /// one of them must sit in its read at once: a lane without a worker is a flow the peer's
@@ -19035,8 +19035,10 @@ pub(crate) mod lane_pool {
             ready: Mutex::new(VecDeque::new()),
             parked: Mutex::new(Parked::default()),
             notify: Condvar::new(),
+            park_wake: Condvar::new(),
             workers: std::sync::atomic::AtomicUsize::new(0),
             idle: std::sync::atomic::AtomicUsize::new(0),
+            parks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             stop: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -19164,66 +19166,69 @@ pub(crate) mod lane_pool {
         park_with(pool, lane, crate::budgets::RELAY_POLL);
     }
 
+    /// A lane inserted with an earlier deadline wakes the parker instead of waiting for the
+    /// deadline already parked.
     fn park_with(pool: &Pool, lane: Lane, quantum: std::time::Duration) {
-        let mut due = std::time::Instant::now() + wait_for(lane.idle, quantum);
-        {
-            let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
-            parked.lanes.push((due, lane));
-            if parked.waking {
-                return;
-            }
-            parked.waking = true;
-            due = parked
+        let due = std::time::Instant::now() + wait_for(lane.idle, quantum);
+        let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
+        if parked.waking {
+            let earlier = parked
                 .lanes
                 .iter()
-                .map(|(due, _)| *due)
+                .map(|(earliest, _)| *earliest)
                 .min()
-                .unwrap_or(due);
+                .is_none_or(|earliest| due < earliest);
+            parked.lanes.push((due, lane));
+            if earlier {
+                pool.park_wake.notify_one();
+            }
+            return;
         }
+        parked.waking = true;
+        parked.lanes.push((due, lane));
         loop {
             let now = std::time::Instant::now();
-            if due > now {
-                thread::sleep(due - now);
-            }
-            let (batch, next) = {
-                let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
-                let now = std::time::Instant::now();
-                let mut batch = Vec::new();
-                let mut waiting = Vec::with_capacity(parked.lanes.len());
-                for (due, lane) in std::mem::take(&mut parked.lanes) {
-                    if due <= now {
-                        batch.push(lane);
-                    } else {
-                        waiting.push((due, lane));
-                    }
+            let next = parked.lanes.iter().map(|(due, _)| *due).min();
+            match next {
+                Some(next) if next > now => {
+                    let (guard, _) = pool
+                        .park_wake
+                        .wait_timeout(parked, next - now)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    parked = guard;
                 }
-                parked.lanes = waiting;
-                let next = parked.lanes.iter().map(|(due, _)| *due).min();
-                if next.is_none() {
+                None => {
                     // A lane parked after this point finds the flag clear and pays its own wait.
                     parked.waking = false;
+                    return;
                 }
-                (batch, next)
-            };
-            if !batch.is_empty() {
-                PARKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
-                ready.extend(batch);
-                drop(ready);
-                pool.notify.notify_all();
-            }
-            match next {
-                Some(next) => due = next,
-                None => return,
+                Some(_) => {
+                    let mut batch = Vec::new();
+                    let mut waiting = Vec::with_capacity(parked.lanes.len());
+                    for (due, lane) in std::mem::take(&mut parked.lanes) {
+                        if due <= now {
+                            batch.push(lane);
+                        } else {
+                            waiting.push((due, lane));
+                        }
+                    }
+                    parked.lanes = waiting;
+                    pool.parks
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                    ready.extend(batch);
+                    drop(ready);
+                    pool.notify.notify_all();
+                }
             }
         }
     }
 
     /// The wait before an idle lane's next turn: one poll quantum, doubling per round that found
     /// nothing, so a direction nobody writes to costs the pool almost nothing while a direction that
-    /// starts writing is still picked up within 16 ms.
+    /// starts writing is still picked up within 16 ms. The first idle round waits one quantum.
     fn wait_for(idle: u32, quantum: std::time::Duration) -> std::time::Duration {
-        quantum * (1u32 << idle.min(4))
+        quantum * (1u32 << idle.saturating_sub(1).min(4))
     }
 
     #[cfg(test)]
@@ -19300,8 +19305,7 @@ pub(crate) mod lane_pool {
 
     #[cfg(test)]
     fn parker_batches(pool: &Pool) -> usize {
-        let _ = pool;
-        PARKS.load(std::sync::atomic::Ordering::Relaxed)
+        pool.parks.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(all(test, target_os = "linux"))]
