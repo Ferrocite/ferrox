@@ -1,5 +1,5 @@
 use crate::conn::Connection;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -597,6 +597,7 @@ fn debug_staged(staged: Option<Instant>) {
 const SEND_SLOTS: usize = 64;
 
 pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &Datagram) {
+    sock.retry_held();
     #[cfg(target_os = "linux")]
     if sock.batchable() {
         flush_burst(conn, sock);
@@ -605,7 +606,7 @@ pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &Datagram) {
     let mut room = Unfilled::<MAX_DATAGRAM>::new();
     let out = room.as_mut();
     while let Ok((written, info)) = conn.send(out) {
-        let _ = sock.send_to(&out[..written], info.to);
+        sock.send_or_hold(&out[..written], info.to);
     }
 }
 
@@ -620,6 +621,8 @@ fn flush_burst(conn: &mut quiche::Connection, sock: &Datagram) {
         std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
     let mut batch: [std::mem::MaybeUninit<libc::mmsghdr>; SEND_SLOTS] =
         std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
+    let mut lens = [0usize; SEND_SLOTS];
+    let mut tos: [Option<SocketAddr>; SEND_SLOTS] = [None; SEND_SLOTS];
     // The sweep is over when quiche has nothing more to hand, so a frame wider than the slots leaves in batch after batch, exactly as the per-packet loop drained it.
     let mut at = 0usize;
     let mut drained = false;
@@ -628,6 +631,8 @@ fn flush_burst(conn: &mut quiche::Connection, sock: &Datagram) {
             Ok((written, info)) if written > 0 => {
                 let (storage, len) = crate::proxy::sockaddr_of(info.to);
                 peers[at].write(storage);
+                lens[at] = written;
+                tos[at] = Some(info.to);
                 parts[at].write(libc::iovec {
                     iov_base: slots[at].as_mut().as_mut_ptr().cast(),
                     iov_len: written,
@@ -649,18 +654,27 @@ fn flush_burst(conn: &mut quiche::Connection, sock: &Datagram) {
             Ok(_) | Err(_) => drained = true,
         }
         if at == SEND_SLOTS {
-            send_batch(sock, &mut batch, at);
+            if !send_batch(sock, &mut batch, &slots, at, &lens, &tos) {
+                drained = true;
+            }
             at = 0;
         }
     }
     if at > 0 {
-        send_batch(sock, &mut batch, at);
+        send_batch(sock, &mut batch, &slots, at, &lens, &tos);
     }
 }
 
-/// One `sendmmsg` over the slots the sweep filled, retried from the first message the kernel did not take. A refusal is what the per-packet loop's ignored `send_to` already gave: those datagrams are dropped, quiche retransmits them, and the sweep moves on to whatever it offers next.
+/// One `sendmmsg` over the slots the sweep filled, retried from the first message the kernel did not take. A datagram the kernel still refuses is held for the next sweep rather than dropped: quiche never retransmits a DATAGRAM frame, so the loss would be an inner TCP hole only a retransmit timer repairs. Nothing is held back when every message was taken.
 #[cfg(target_os = "linux")]
-fn send_batch(sock: &Datagram, batch: &mut [std::mem::MaybeUninit<libc::mmsghdr>], want: usize) {
+fn send_batch(
+    sock: &Datagram,
+    batch: &mut [std::mem::MaybeUninit<libc::mmsghdr>],
+    slots: &[Unfilled<MAX_DATAGRAM>; SEND_SLOTS],
+    want: usize,
+    lens: &[usize],
+    tos: &[Option<SocketAddr>],
+) -> bool {
     use std::os::fd::AsRawFd as _;
     let mut done = 0usize;
     while done < want {
@@ -675,10 +689,21 @@ fn send_batch(sock: &Datagram, batch: &mut [std::mem::MaybeUninit<libc::mmsghdr>
             )
         };
         match sent {
-            n if n <= 0 => return,
+            n if n <= 0 => {
+                if refused(&std::io::Error::last_os_error()) {
+                    for (i, slot) in slots.iter().enumerate().take(want).skip(done) {
+                        if let Some(to) = tos[i] {
+                            sock.hold(slot.written(lens[i]), to);
+                        }
+                    }
+                    return false;
+                }
+                return true;
+            }
             n => done += usize::try_from(n).unwrap_or(0),
         }
     }
+    true
 }
 
 /// The datagrams one receive takes at a time, the mirror of the send side's `SEND_SLOTS`: a 16 KiB DATA frame is a dozen QUIC packets, and one `recvfrom` each paid a syscall and a timer set per packet. A lane with no batched call reads the same count one at a time.
@@ -1483,6 +1508,33 @@ pub(crate) struct Datagram {
     /// `SO_RCVTIMEO` belongs to the socket and not the handle: a wait remembered per
     /// holder lets the next read by another holder skip an arm the first one undid.
     armed: Arc<Mutex<Arm>>,
+    /// The datagrams a full peer queue refused, retried before the next sweep.
+    /// Shared behind an `Arc` because a clone describes the same file description
+    /// and the same peer, and a datagram one clone holds must be retried by both.
+    held: Arc<Held>,
+}
+
+/// The datagrams the kernel refused that a later sweep retries, in the order quiche
+/// wrote them: a QUIC DATAGRAM frame is never retransmitted, so a dropped write is an
+/// inner TCP hole only a retransmit timer repairs. `holding` gates the lock, so the
+/// path that never refuses pays one atomic load.
+#[derive(Default)]
+struct Held {
+    queue: Mutex<VecDeque<(Vec<u8>, SocketAddr)>>,
+    holding: AtomicBool,
+}
+
+/// The most datagrams one lane holds for a peer that is not reading: the queue is
+/// drained by the next sweep, so a peer this far behind is not coming back.
+const HELD_LIMIT: usize = 256;
+
+/// A write the kernel refused for a reason that clears: a non-blocking socket with a
+/// full path, or a full queue on the far side. Any other error is the path ending.
+fn refused(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+    ) || error.raw_os_error() == Some(libc::ENOBUFS)
 }
 
 /// Where datagrams go. The association's control connection is held, never read: dropping it ends it.
@@ -1983,6 +2035,7 @@ impl Datagram {
             hop: None,
             gecko: None,
             armed: Arc::default(),
+            held: Arc::default(),
         }
     }
 
@@ -1995,6 +2048,7 @@ impl Datagram {
             hop: None,
             gecko: None,
             armed: Arc::default(),
+            held: Arc::default(),
         }
     }
 
@@ -2007,6 +2061,7 @@ impl Datagram {
             hop: None,
             gecko: None,
             armed: Arc::default(),
+            held: Arc::default(),
         }
     }
 
@@ -2021,6 +2076,7 @@ impl Datagram {
             hop: None,
             gecko: None,
             armed: Arc::default(),
+            held: Arc::default(),
         }
     }
 
@@ -2040,6 +2096,7 @@ impl Datagram {
             hop: None,
             gecko: Some(Arc::new(Gecko::new(handle, obfs, window))),
             armed: Arc::default(),
+            held: Arc::default(),
         })
     }
 
@@ -2063,6 +2120,7 @@ impl Datagram {
             hop: Some(Arc::new(hopper)),
             gecko: None,
             armed: Arc::default(),
+            held: Arc::default(),
         })
     }
 
@@ -2070,6 +2128,48 @@ impl Datagram {
     #[cfg(target_os = "linux")]
     fn batchable(&self) -> bool {
         self.gecko.is_none() && self.hop.is_none() && self.obfs.is_none() && self.relay.is_none()
+    }
+
+    /// Send one datagram, or hold it when the kernel refused it for a reason that
+    /// clears. A QUIC DATAGRAM frame is never retransmitted, so a held datagram is
+    /// the difference between a pacing blip and a hole the inner TCP must time out.
+    fn send_or_hold(&self, buf: &[u8], to: SocketAddr) {
+        if let Err(error) = self.send_to(buf, to) {
+            if refused(&error) {
+                self.hold(buf, to);
+            }
+        }
+    }
+
+    /// Park a refused datagram behind the ones already waiting, in quiche's order.
+    fn hold(&self, buf: &[u8], to: SocketAddr) {
+        let Ok(mut queue) = self.held.queue.lock() else {
+            return;
+        };
+        if queue.len() < HELD_LIMIT {
+            queue.push_back((buf.to_vec(), to));
+            self.held.holding.store(true, Ordering::Relaxed);
+        }
+    }
+
+    /// Retry what a refusal left behind, oldest first, stopping at the first
+    /// refusal so a peer sees the order quiche wrote.
+    fn retry_held(&self) {
+        if !self.held.holding.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(mut queue) = self.held.queue.lock() else {
+            return;
+        };
+        while let Some((bytes, to)) = queue.pop_front() {
+            if let Err(error) = self.send_to(&bytes, to) {
+                if refused(&error) {
+                    queue.push_front((bytes, to));
+                    return;
+                }
+            }
+        }
+        self.held.holding.store(false, Ordering::Relaxed);
     }
 
     pub(crate) fn send_to(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
@@ -2147,6 +2247,7 @@ impl Datagram {
             hop: self.hop.clone(),
             gecko: self.gecko.clone(),
             armed: Arc::clone(&self.armed),
+            held: Arc::clone(&self.held),
         })
     }
 
@@ -3454,6 +3555,75 @@ pub(crate) fn server_accept(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a refusal that clears is retried: a held datagram is a second chance, and a
+    /// path that has ended has no next sweep to take it.
+    #[test]
+    fn a_refusal_that_clears_is_the_only_one_held() {
+        for clears in [
+            std::io::Error::from(std::io::ErrorKind::WouldBlock),
+            std::io::Error::from(std::io::ErrorKind::Interrupted),
+            std::io::Error::from_raw_os_error(libc::ENOBUFS),
+        ] {
+            assert!(refused(&clears), "{clears} clears");
+        }
+        for ended in [
+            std::io::Error::from_raw_os_error(libc::ECONNREFUSED),
+            std::io::Error::from_raw_os_error(libc::ENETUNREACH),
+            std::io::Error::from(std::io::ErrorKind::InvalidInput),
+        ] {
+            assert!(!refused(&ended), "{ended} does not clear");
+        }
+    }
+
+    /// A peer that stops reading pushes a burst past its queue, and the kernel
+    /// refuses the tail. Every refused datagram is held and retried once the peer
+    /// reads again, so a QUIC DATAGRAM frame is never silently lost.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_refused_datagram_is_held_until_the_peer_reads() {
+        use std::os::fd::AsRawFd as _;
+        let receiver = UdpSocket::bind("127.0.0.1:0").expect("bind the receiver");
+        let size: libc::c_int = 4096;
+        // SAFETY: the option, the buffer and its length all belong to this socket and this frame.
+        let armed = unsafe {
+            libc::setsockopt(
+                receiver.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                std::ptr::from_ref(&size).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(armed, 0, "a receive queue this test can fill");
+        let to = receiver.local_addr().expect("the receiver's address");
+        let sender = Datagram::plain(UdpSocket::bind("127.0.0.1:0").expect("bind the sender"));
+        let sent: Vec<Vec<u8>> = (0..128u8).map(|index| vec![index; 1024]).collect();
+        for bytes in &sent {
+            sender.send_or_hold(bytes, to);
+        }
+        let held = sender.held.queue.lock().expect("the held queue").len();
+        assert!(held > 0, "a burst past the queue is refused somewhere");
+        assert!(held < HELD_LIMIT, "the burst is inside what one lane holds");
+
+        receiver.set_nonblocking(true).expect("a reading queue");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 2048];
+        for _ in 0..(sent.len() * 4) {
+            loop {
+                match receiver.recv_from(&mut buf) {
+                    Ok((n, _)) => got.push(buf[..n].to_vec()),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                    Err(error) => panic!("recv: {error}"),
+                }
+            }
+            sender.retry_held();
+        }
+        assert_eq!(
+            got, sent,
+            "every datagram arrives once, in the order it was written"
+        );
+    }
 
     /// The store is read once, not once per dial: two calls name the same allocation rather than the same bytes.
     #[test]
