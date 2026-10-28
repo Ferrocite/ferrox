@@ -24279,11 +24279,11 @@ mod tests {
         let routing = crate::router::Routing::parse_in(&root, Vec::new())
             .expect("parses")
             .expect("routing");
-        let portals = crate::reverse::Portals::default();
+        let portals = Arc::new(crate::reverse::Portals::default());
         let shared = route_shared(&root, routing, &portals, None).expect("shared");
         let (cert, key, _) = tls_cert_json();
         let dynamic = crate::json::parse(&format!(
-            r#"{{"inbounds":[{{"tag":"dyn","protocol":"masque","listen":"127.0.0.1","port":0,"settings":{{"users":[{{"email":"u@example.com","pass":"p"}}],"address":["10.14.0.1/24"]}},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"certificates":[{{"certificate":{cert},"key":{key}}}]}}}}}}]}}"#
+            r#"{{"inbounds":[{{"tag":"dyn","protocol":"masque","listen":"127.0.0.1","port":443,"settings":{{"users":[{{"email":"u@example.com","pass":"p"}}],"address":["10.14.0.1/24"]}},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"certificates":[{{"certificate":{cert},"key":{key}}}]}}}}}}]}}"#
         ))
         .expect("parses");
         let inbound = dynamic
@@ -24295,17 +24295,10 @@ mod tests {
             refuse_source(Some(&shared), inbound, "commander", "MASQUE", false),
             "the source rule is refused"
         );
-        let (served, _) = serve_inbounds_counted(
-            "commander",
-            &dynamic,
-            None,
-            Some(&shared),
-            false,
-            false,
-            &portals,
-            None,
-            None,
-        );
+        let runtime = Runtime::new(None, Some(Arc::clone(&shared)), false, Arc::clone(&portals));
+        let api = crate::commander::Api::new(crate::commander::ApiConfig::default());
+        let seed = crate::xray_pb::Seed::default();
+        let (served, _) = serve_dynamic_inbounds(&runtime, &dynamic, &seed, &api);
         assert_eq!(served, 0, "the dynamic inbound is refused, not served");
     }
 
