@@ -1171,6 +1171,10 @@ impl<S: Stream + super::RecordAlignment> super::RecordAlignment for RealityClien
         self.inner.engage_record_alignment();
     }
 
+    fn disarm_record_alignment(&mut self) {
+        self.inner.disarm_record_alignment();
+    }
+
     fn write_all_slices(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
         self.inner.write_all_slices(parts)
     }
