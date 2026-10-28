@@ -216,10 +216,15 @@ pub(crate) fn serve(
             let shared = Arc::clone(&shared);
             let spec = Arc::clone(&spec);
             let identity = Arc::clone(&identity);
-            std::thread::spawn(move || {
-                let _slot = slot;
-                connection(stream, &identity, shared, spec);
-            });
+            if let Err(error) = std::thread::Builder::new()
+                .name("ferrox-masque-h2".into())
+                .spawn(move || {
+                    let _slot = slot;
+                    connection(stream, &identity, shared, spec);
+                })
+            {
+                eprintln!("masque: cannot spawn HTTP/2 connection handler: {error}");
+            }
         }
     });
 }
