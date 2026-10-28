@@ -330,6 +330,7 @@ impl Client {
         Ok(client)
     }
 
+    /// Delivers queued packets and pumps bounded tunnel batches until the session or wire ends.
     pub(crate) fn run(
         &mut self,
         from_tunnel: &Receiver<Vec<u8>>,
@@ -587,6 +588,7 @@ impl Client {
         }
     }
 
+    /// Sends within peer credit or queues up to the cap; terminated sessions accept nothing.
     fn capsule(&mut self, capsule: &[u8]) {
         if self.end || self.wire.closed {
             return;
@@ -604,6 +606,7 @@ impl Client {
         }
     }
 
+    /// Drains queued capsule bytes within peer credit while preserving a partial front capsule.
     fn flush(&mut self) {
         if self.end || self.wire.closed {
             return;
@@ -919,6 +922,7 @@ impl Session {
         }
     }
 
+    /// Sends or bounds queued reply capsules only while the request and wire remain live.
     fn capsule(&mut self, wire: &mut Wire, capsule: &[u8]) {
         if self.end || wire.closed {
             return;
@@ -939,6 +943,7 @@ impl Session {
         }
     }
 
+    /// Drains live reply capsules in order, preserving any suffix blocked by peer credit.
     fn flush(&mut self, wire: &mut Wire) {
         if self.end || wire.closed {
             return;
@@ -1118,6 +1123,7 @@ mod tests {
         assert_eq!(client.packets.len(), 0);
     }
 
+    /// Each exhausted window independently enforces the documented 64-capsule limit and overflow termination.
     #[test]
     fn a_stalled_send_window_bounds_the_queued_capsules() {
         for (stream, connection) in [(0, 0), (0, DEFAULT_WINDOW), (DEFAULT_WINDOW, 0)] {
@@ -1364,6 +1370,7 @@ mod tests {
         );
     }
 
+    /// Restored stream and connection credit drains the accepted capsules in their original order.
     #[test]
     fn queued_capsules_flush_when_the_peer_grants_window() {
         let capsule = [0, 2, 0, 42];
@@ -1399,6 +1406,7 @@ mod tests {
         assert!(!wire.closed);
     }
 
+    /// Overflow terminates a bounded batch without consuming the next tunnel or reply packet.
     #[test]
     fn an_overflow_stops_draining_the_packet_channels() {
         let (sender, receiver) = mpsc::sync_channel(masque::QUEUE);
@@ -1441,6 +1449,7 @@ mod tests {
         );
     }
 
+    /// A failed wire write leaves the next tunnel packet available to its receiver.
     #[test]
     fn a_closed_wire_stops_draining_the_packet_channel() {
         let (sender, receiver) = mpsc::sync_channel(masque::QUEUE);
@@ -1460,6 +1469,7 @@ mod tests {
         assert!(receiver.try_recv().is_err());
     }
 
+    /// Terminal calls preserve queue contents, partial offsets, window credit and wire output.
     #[test]
     fn ended_or_closed_sessions_leave_capsules_and_channels_untouched() {
         for (ended, closed) in [(true, false), (false, true)] {

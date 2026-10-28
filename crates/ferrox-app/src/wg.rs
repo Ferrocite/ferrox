@@ -1192,6 +1192,7 @@ mod tests {
         assert_eq!(&received, b"headhello");
     }
 
+    /// A truncated UDP response retries the same DNS question over TCP on the reserved server port.
     #[test]
     fn a_truncated_answer_is_asked_again_over_tcp() {
         let (tcp, udp, dns_address) = (0..64)
