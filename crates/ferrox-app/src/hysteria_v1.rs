@@ -1066,49 +1066,28 @@ pub(crate) fn serve_loop(
     if router.sock.set_read_timeout(Some(ROUTE_POLL)).is_err() {
         return;
     }
+    #[cfg(target_os = "linux")]
+    let mut batch = crate::quic::Batch::new();
     loop {
-        match router.sock.recv_from(buf.as_mut()) {
-            Ok((n, from)) => {
-                let packet = buf.as_mut();
-                let Ok(header) = quiche::Header::from_slice(&mut packet[..n], SCID_LEN) else {
-                    continue;
-                };
-                if header.ty != quiche::Type::Short && header.version != quiche::PROTOCOL_VERSION {
-                    continue;
+        #[cfg(target_os = "linux")]
+        match crate::quic::recv_batch(&router.sock, &mut batch) {
+            crate::quic::Drain::Read => {
+                for at in 0..batch.len() {
+                    let Some((packet, from)) = batch.at(at) else {
+                        continue;
+                    };
+                    route_packet(&mut router, &mut template, packet, from);
                 }
-                let initial = header.ty == quiche::Type::Initial;
-                let dcid = header.dcid.as_ref();
-                let peer_cid = header.scid.as_ref();
-                if dcid.len() > 20 || peer_cid.len() > 20 {
-                    continue;
-                }
-                let mut dcid_buf = [0u8; 20];
-                dcid_buf[..dcid.len()].copy_from_slice(dcid);
-                let mut peer_buf = [0u8; 20];
-                peer_buf[..peer_cid.len()].copy_from_slice(peer_cid);
-                let dcid = &dcid_buf[..dcid.len()];
-                let peer_cid = &peer_buf[..peer_cid.len()];
-                if initial {
-                    let known = router.routes.contains_key(dcid);
-                    let retransmit = router.routes.iter().find_map(|(key, inbound)| {
-                        ((!inbound.initial_dcid.is_empty()
-                            && inbound.initial_dcid.as_slice() == dcid)
-                            || (!peer_cid.is_empty()
-                                && !inbound.client_cid.is_empty()
-                                && inbound.client_cid.as_slice() == peer_cid))
-                            .then(|| key.clone())
-                    });
-                    if known {
-                        router.drive(dcid, &mut packet[..n], from);
-                    } else if let Some(key) = retransmit {
-                        router.drive(&key, &mut packet[..n], from);
-                    } else {
-                        router.accept(&mut packet[..n], from, &mut template, peer_cid, dcid);
-                    }
-                } else {
-                    router.drive(dcid, &mut packet[..n], from);
-                }
+                continue;
             }
+            crate::quic::Drain::Empty => {
+                router.idle();
+                continue;
+            }
+            crate::quic::Drain::Unbatchable => {}
+        }
+        match router.sock.recv_from(buf.as_mut()) {
+            Ok((n, from)) => route_packet(&mut router, &mut template, &mut buf.as_mut()[..n], from),
             Err(ref error) if error.kind() == std::io::ErrorKind::InvalidData => {}
             Err(ref error)
                 if matches!(
@@ -1120,6 +1099,51 @@ pub(crate) fn serve_loop(
             }
             Err(_) => return,
         }
+    }
+}
+
+fn route_packet(
+    router: &mut Router<'_>,
+    template: &mut quiche::Config,
+    packet: &mut [u8],
+    from: SocketAddr,
+) {
+    let Ok(header) = quiche::Header::from_slice(packet, SCID_LEN) else {
+        return;
+    };
+    if header.ty != quiche::Type::Short && header.version != quiche::PROTOCOL_VERSION {
+        return;
+    }
+    let initial = header.ty == quiche::Type::Initial;
+    let dcid = header.dcid.as_ref();
+    let peer_cid = header.scid.as_ref();
+    if dcid.len() > 20 || peer_cid.len() > 20 {
+        return;
+    }
+    let mut dcid_buf = [0u8; 20];
+    dcid_buf[..dcid.len()].copy_from_slice(dcid);
+    let mut peer_buf = [0u8; 20];
+    peer_buf[..peer_cid.len()].copy_from_slice(peer_cid);
+    let dcid = &dcid_buf[..dcid.len()];
+    let peer_cid = &peer_buf[..peer_cid.len()];
+    if initial {
+        let known = router.routes.contains_key(dcid);
+        let retransmit = router.routes.iter().find_map(|(key, inbound)| {
+            ((!inbound.initial_dcid.is_empty() && inbound.initial_dcid.as_slice() == dcid)
+                || (!peer_cid.is_empty()
+                    && !inbound.client_cid.is_empty()
+                    && inbound.client_cid.as_slice() == peer_cid))
+                .then(|| key.clone())
+        });
+        if known {
+            router.drive(dcid, packet, from);
+        } else if let Some(key) = retransmit {
+            router.drive(&key, packet, from);
+        } else {
+            router.accept(packet, from, template, peer_cid, dcid);
+        }
+    } else {
+        router.drive(dcid, packet, from);
     }
 }
 
