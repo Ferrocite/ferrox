@@ -23,6 +23,7 @@ pub(crate) struct ApiConfig {
     pub(crate) listen: Option<String>,
     pub(crate) handler: bool,
     pub(crate) stats: bool,
+    pub(crate) logger: bool,
 }
 
 impl ApiConfig {
@@ -62,6 +63,7 @@ impl ApiConfig {
         match name {
             "xray.app.proxyman.command.Config" => self.handler = true,
             "xray.app.stats.command.Config" => self.stats = true,
+            "xray.app.log.command.Config" => self.logger = true,
             "xray.app.commander.ReflectionConfig" => {}
             other => eprintln!("commander: service `{other}` is not carried; skipped"),
         }
@@ -84,6 +86,7 @@ impl ApiConfig {
             listen,
             handler: false,
             stats: false,
+            logger: false,
         };
         if let Some(services) = api.get("services").and_then(Json::as_arr) {
             for service in services.iter().filter_map(Json::as_str) {
@@ -91,6 +94,8 @@ impl ApiConfig {
                     config.handler = true;
                 } else if service.eq_ignore_ascii_case("StatsService") {
                     config.stats = true;
+                } else if service.eq_ignore_ascii_case("LoggerService") {
+                    config.logger = true;
                 } else if service.eq_ignore_ascii_case("ReflectionService") {
                 } else {
                     eprintln!("commander: service `{service}` is not carried; skipped");
@@ -390,6 +395,14 @@ impl Api {
 
     fn dispatch(&self, path: &str, request: &[u8]) -> Result<Vec<u8>, (u32, String)> {
         let (service, method) = path.rsplit_once('/').unwrap_or(("", path));
+        if service == "/xray.app.log.command.LoggerService" {
+            if method == "RestartLogger" && self.config.logger {
+                return crate::accesslog::restart()
+                    .map(|()| Vec::new())
+                    .map_err(|error| (13, error));
+            }
+            return Err((12, format!("{path} is not a method this server carries")));
+        }
         let handler = service == "/xray.app.proxyman.command.HandlerService";
         let stats = service == "/xray.app.stats.command.StatsService";
         match (method, handler, stats) {
@@ -1047,6 +1060,7 @@ mod tests {
             listen: None,
             handler: true,
             stats: false,
+            logger: false,
         });
         let inbound = vec![0x0a, 0x01, b'd'];
         api.register_inbound(
@@ -1087,6 +1101,7 @@ mod tests {
             listen: None,
             handler: true,
             stats: false,
+            logger: false,
         });
         let first = [0x11u8; 16];
         let second = [0x22u8; 16];
@@ -1258,6 +1273,7 @@ mod tests {
             listen: None,
             handler: true,
             stats: false,
+            logger: false,
         });
         api.set_runtime(std::sync::Arc::new(crate::proxy::test_runtime(&root)));
         let raw = freedom_outbound("new");
@@ -1292,6 +1308,7 @@ mod tests {
             listen: None,
             handler: true,
             stats: false,
+            logger: false,
         });
         api.set_runtime(std::sync::Arc::new(crate::proxy::test_runtime(&root)));
         let first = free_port();
@@ -1337,6 +1354,52 @@ mod tests {
         assert_eq!(
             Api::alter_outbound(&request),
             Err((2, "unknown operation".to_owned()))
+        );
+    }
+
+    #[test]
+    fn the_logger_service_answers_only_when_the_config_lists_it() {
+        let _guard = crate::stats::test_lock();
+        let root = crate::json::parse(r#"{"api":{"tag":"api","services":["loggerService"]}}"#)
+            .expect("parses");
+        assert!(
+            ApiConfig::from_json(&root).expect("api block").logger,
+            "the service name is case-insensitive"
+        );
+        let path = "/xray.app.log.command.LoggerService/RestartLogger";
+        let unselected = Api::new(ApiConfig {
+            tag: "api".to_owned(),
+            listen: None,
+            handler: false,
+            stats: false,
+            logger: false,
+        });
+        assert_eq!(
+            unselected
+                .dispatch(path, &[])
+                .expect_err("service is not selected"),
+            (12, format!("{path} is not a method this server carries"))
+        );
+        let selected = Api::new(ApiConfig {
+            tag: "api".to_owned(),
+            listen: None,
+            handler: false,
+            stats: false,
+            logger: true,
+        });
+        assert_eq!(
+            selected.dispatch(path, &[]).expect("answers the call"),
+            Vec::<u8>::new()
+        );
+        assert_eq!(
+            selected
+                .dispatch("/xray.app.log.command.LoggerService/Unknown", &[])
+                .expect_err("unknown method"),
+            (
+                12,
+                "/xray.app.log.command.LoggerService/Unknown is not a method this server carries"
+                    .to_owned()
+            )
         );
     }
 

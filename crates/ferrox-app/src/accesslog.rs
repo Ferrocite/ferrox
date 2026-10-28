@@ -107,20 +107,35 @@ pub(crate) fn parse(root: &Json) -> Result<Config, String> {
 /// Install the access sink before any inbound opens; a path that cannot be opened stops startup.
 pub(crate) fn install(root: &Json) -> Result<Config, String> {
     let config = parse(root)?;
-    let writer: Option<Box<dyn Write + Send>> = match config.access.as_deref() {
-        Some("-") => Some(Box::new(std::io::stdout())),
-        Some(path) => Some(Box::new(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(path)
-                .map_err(|error| format!("cannot open access log `{path}`: {error}"))?,
-        )),
-        None => None,
-    };
+    let writer = open_access(config.access.as_deref())?;
     *sink() = writer;
     *lock() = Some(config.clone());
     Ok(config)
+}
+
+/// Reopen the access path on `RestartLogger`, so a rotated file is picked up without a restart.
+/// The new writer is opened before the old one is dropped; a path that cannot be opened leaves
+/// the running sink in place and answers the call with the failure.
+pub(crate) fn restart() -> Result<(), String> {
+    let Some(config) = lock().clone() else {
+        return Ok(());
+    };
+    let writer = open_access(config.access.as_deref())?;
+    *sink() = writer;
+    Ok(())
+}
+
+fn open_access(access: Option<&str>) -> Result<Option<Box<dyn Write + Send>>, String> {
+    match access {
+        Some("-") => Ok(Some(Box::new(std::io::stdout()))),
+        Some(path) => OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .map(|file| Some(Box::new(file) as Box<dyn Write + Send>))
+            .map_err(|error| format!("cannot open access log `{path}`: {error}")),
+        None => Ok(None),
+    }
 }
 
 /// One reference access line: `from <source> <accepted|rejected> <destination> [detour] reason email: <email>`.
@@ -283,5 +298,38 @@ mod tests {
         let peer: SocketAddr = "192.0.2.10:443".parse().expect("address");
         assert_eq!(address(peer, true), "192:443");
         assert_eq!(address(peer, false), "192.0.2.10:443");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restart_reopens_the_rotated_access_path() {
+        let _guard = crate::stats::test_lock();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-access-restart-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("creates the log directory");
+        let path = dir.join("access.log");
+        let rotated = dir.join("access.log.1");
+        let mut quoted = String::new();
+        crate::json::write(&Json::Str(path.to_string_lossy().into_owned()), &mut quoted);
+        let root =
+            crate::json::parse(&format!(r#"{{"log":{{"access":{quoted}}}}}"#)).expect("parses");
+        install(&root).expect("access log installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        record(Some(source), true, &"first.example:443", None, "", "");
+        std::fs::rename(&path, &rotated).expect("rotates the access log");
+        restart().expect("reopens the path");
+        record(Some(source), true, &"second.example:443", None, "", "");
+        let opened = std::fs::read_to_string(&path).expect("reads the new file");
+        let previous = std::fs::read_to_string(&rotated).expect("reads the rotated file");
+        assert_eq!(opened, "from 192.0.2.10:1234 accepted second.example:443\n");
+        assert_eq!(
+            previous,
+            "from 192.0.2.10:1234 accepted first.example:443\n"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
     }
 }
