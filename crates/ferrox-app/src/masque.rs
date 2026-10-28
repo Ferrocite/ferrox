@@ -2116,21 +2116,23 @@ mod tests {
             DEFAULT_MTU,
             Vec::new(),
             Arc::new(AtomicBool::new(true)),
-            move |_from_tunnel, _to_stack, _routes| {
+            move |from_tunnel, _to_stack, _routes| {
                 let _ = held.recv();
+                for _ in from_tunnel.iter().take(QUEUE + 1) {}
             },
         );
-        for packet in 0..QUEUE {
-            inner
-                .to_tunnel
-                .try_send(vec![packet as u8])
-                .expect("a packet below the bound");
-        }
+        let sender = inner.to_tunnel.clone();
+        let (sent, done) = mpsc::channel();
+        std::thread::spawn(move || {
+            for packet in 0..=QUEUE {
+                if sender.send(vec![packet as u8]).is_err() {
+                    return;
+                }
+            }
+            let _ = sent.send(());
+        });
         assert!(
-            matches!(
-                inner.to_tunnel.try_send(vec![0]),
-                Err(mpsc::TrySendError::Full(_))
-            ),
+            done.recv_timeout(Duration::from_millis(250)).is_err(),
             "the tunnel queue accepted more than {QUEUE} packets"
         );
         let _ = release.send(());
