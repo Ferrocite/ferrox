@@ -12294,6 +12294,22 @@ impl<R: Read> Read for CipherReader<R> {
     }
 }
 
+impl<R: ferrox_core::tls::RecordAlignment> ferrox_core::tls::RecordAlignment for CipherReader<R> {
+    fn engage_record_alignment(&mut self) {
+        match self {
+            Self::Plain(io) => io.engage_record_alignment(),
+            Self::Record(io) => io.engage_record_alignment(),
+        }
+    }
+
+    fn disarm_record_alignment(&mut self) {
+        match self {
+            Self::Plain(io) => io.disarm_record_alignment(),
+            Self::Record(io) => io.disarm_record_alignment(),
+        }
+    }
+}
+
 type DrivenLink<S> = Half<crate::vision::Link<DrivenHalf<S, CipherReader<Connection>>>>;
 
 /// A Vision link over a driven session: the reader takes ciphertext off the transport with no
@@ -12533,18 +12549,24 @@ impl<S: CipherOpen, R> Write for DrivenHalf<S, R> {
     }
 }
 
-impl<S: CipherOpen + ferrox_core::tls::RecordAlignment, R> ferrox_core::tls::RecordAlignment
-    for DrivenHalf<S, R>
+impl<S: CipherOpen + ferrox_core::tls::RecordAlignment, R: ferrox_core::tls::RecordAlignment>
+    ferrox_core::tls::RecordAlignment for DrivenHalf<S, R>
 {
     fn engage_record_alignment(&mut self) {
         if let Ok(mut session) = self.session.lock() {
             session.engage_record_alignment();
+        }
+        if let Ok(mut reader) = self.reader.lock() {
+            reader.engage_record_alignment();
         }
     }
 
     fn disarm_record_alignment(&mut self) {
         if let Ok(mut session) = self.session.lock() {
             session.disarm_record_alignment();
+        }
+        if let Ok(mut reader) = self.reader.lock() {
+            reader.disarm_record_alignment();
         }
     }
 
@@ -12563,16 +12585,26 @@ impl<S: ferrox_core::tls::TlsProvider, R> Write for TlsHalf<S, R> {
     }
 }
 
-impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send, R: Send>
-    ferrox_core::tls::RecordAlignment for TlsHalf<S, R>
+impl<
+        S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send,
+        R: ferrox_core::tls::RecordAlignment + Send,
+    > ferrox_core::tls::RecordAlignment for TlsHalf<S, R>
 {
     fn engage_record_alignment(&mut self) {
+        if let Some(driven) = self.driven.as_mut() {
+            driven.engage_record_alignment();
+            return;
+        }
         if let Ok(mut session) = self.session.lock() {
             session.engage_record_alignment();
         }
     }
 
     fn disarm_record_alignment(&mut self) {
+        if let Some(driven) = self.driven.as_mut() {
+            driven.disarm_record_alignment();
+            return;
+        }
         if let Ok(mut session) = self.session.lock() {
             session.disarm_record_alignment();
         }
@@ -25367,6 +25399,8 @@ mod tests {
             }
         }
 
+        impl ferrox_core::tls::RecordAlignment for ParkedReader {}
+
         let (entered_tx, entered_rx) = mpsc::channel();
         let (written_tx, written_rx) = mpsc::channel();
         let (released_tx, released_rx) = mpsc::channel();
@@ -25398,6 +25432,101 @@ mod tests {
         );
         let _ = released_tx.send(());
         let _ = leg.join().expect("joins");
+    }
+
+    /// The switch's disarm has to reach the ciphertext reader, not only the session: a flow that
+    /// ends framing without going direct would otherwise stay capped at one record per read.
+    #[test]
+    fn a_vision_switch_disarms_the_cipher_reader() {
+        struct CopySession;
+
+        impl ferrox_core::tls::TlsProvider for CopySession {
+            fn name() -> &'static str {
+                "copy"
+            }
+
+            fn suites(&self) -> Vec<String> {
+                Vec::new()
+            }
+
+            fn handshake(&mut self) -> Result<(), ferrox_core::tls::TlsError> {
+                Ok(())
+            }
+
+            fn alpn(&self) -> Option<&[u8]> {
+                None
+            }
+
+            fn open(
+                &mut self,
+                ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                let n = ciphertext.len().min(buf.len());
+                buf[..n].copy_from_slice(&ciphertext[..n]);
+                Ok((n, n))
+            }
+        }
+
+        impl Read for CopySession {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        impl Write for CopySession {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl ferrox_core::tls::RecordAlignment for CopySession {}
+
+        struct Wire<'a>(&'a [u8]);
+
+        impl Read for Wire<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.0.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.0[..n]);
+                self.0 = &self.0[n..];
+                Ok(n)
+            }
+        }
+
+        impl ferrox_core::tls::RecordAlignment for Wire<'_> {}
+
+        let mut wire = vec![0x17, 0x03, 0x03, 0, 100];
+        wire.extend_from_slice(&[1u8; 100]);
+        wire.extend_from_slice(&[0x17, 0x03, 0x03, 0, 200]);
+        wire.extend_from_slice(&[2u8; 200]);
+
+        let session = Arc::new(Mutex::new(CopySession));
+        let out = Arc::new(Mutex::new(Sealed::new(std::io::sink())));
+        let mut reader = TlsHalf {
+            session: Arc::clone(&session),
+            out: Arc::clone(&out),
+            driven: Some(DrivenHalf::new(
+                session,
+                Arc::new(Mutex::new(CipherReader::Record(
+                    ferrox_core::tls::reality::RecordLimiter::new(Wire(wire.as_slice())),
+                ))),
+                out,
+            )),
+            sleep_on_timeout: false,
+        };
+
+        reader.disarm_record_alignment();
+        let mut buf = [0u8; 4096];
+        let n = reader.read(&mut buf).expect("reads");
+        assert_eq!(
+            n,
+            wire.len(),
+            "the disarmed cipher reader takes both records in one read"
+        );
     }
 
     /// A session that seals into the caller's buffer and never touches a transport, as the real
