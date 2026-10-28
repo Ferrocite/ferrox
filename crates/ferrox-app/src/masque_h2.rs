@@ -574,9 +574,7 @@ impl Client {
 
     fn capsule(&mut self, capsule: &[u8]) {
         let length = i64::try_from(capsule.len()).unwrap_or(i64::MAX);
-        if self.queued.is_empty()
-            && length <= self.send_window.min(self.connection_window)
-        {
+        if self.queued.is_empty() && length <= self.send_window.min(self.connection_window) {
             if self.wire.send(h2::T_DATA, 0, self.stream, capsule) {
                 self.send_window -= length;
                 self.connection_window -= length;
