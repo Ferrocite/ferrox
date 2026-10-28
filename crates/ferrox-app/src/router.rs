@@ -5231,15 +5231,17 @@ mod tests {
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .expect("timeout");
         let port = socket.local_addr().expect("addr").port();
-        std::thread::spawn(move || {
+        let fixture = std::thread::spawn(move || {
             let mut buf = [0u8; 512];
+            let mut qtypes = Vec::new();
             for _ in 0..2 {
                 let Ok((len, peer)) = socket.recv_from(&mut buf) else {
-                    return;
+                    return qtypes;
                 };
                 let Some(question) = ferrox_core::dns::parse_query(&buf[..len]) else {
                     continue;
                 };
+                qtypes.push(question.qtype);
                 let reply = if question.qtype == 28 {
                     b"not a dns answer".to_vec()
                 } else {
@@ -5247,6 +5249,7 @@ mod tests {
                 };
                 socket.send_to(&reply, peer).expect("reply");
             }
+            qtypes
         });
         let root = crate::json::parse(&format!(
             r#"{{"dns":{{"servers":["udp://127.0.0.1:{port}"],"queryStrategy":"UseIP"}}}}"#
@@ -5254,6 +5257,9 @@ mod tests {
         .expect("parses");
         let resolver = resolver(&root);
         let (ips, _) = resolve_ips_ttl_with(Some(&resolver), "192.0.2.7", 0);
+        let mut qtypes = fixture.join().expect("fixture");
+        qtypes.sort_unstable();
+        assert_eq!(qtypes, [1, 28], "the fixture must receive both queries");
         assert_eq!(
             ips,
             vec!["192.0.2.7".parse::<IpAddr>().expect("ipv4")],
