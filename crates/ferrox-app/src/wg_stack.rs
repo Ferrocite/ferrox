@@ -15,7 +15,7 @@ use std::io::{Read as _, Write as _};
 use std::net::{IpAddr, Shutdown, SocketAddr, UdpSocket};
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
@@ -45,6 +45,15 @@ const TCP_RECV_BUFFER: usize = 512 * 1024;
 const TCP_SEND_BUFFER: usize = 1024 * 1024;
 /// The most answers a client races for one target.
 const RACES: usize = 8;
+/// A pinned lane re-races its answers after this long without a reply.
+const LANE_RACE_AGAIN: Duration = Duration::from_secs(2);
+/// The most names one lane gives their own tunnel source port.
+const LANE_PORTS: usize = 256;
+static NEXT_LANE_PORT: AtomicU16 = AtomicU16::new(0);
+/// One racing candidate's two socket buffers.
+const RACE_BYTES: usize = TCP_RECV_BUFFER + TCP_SEND_BUFFER;
+/// The most memory every flow's extra candidates may reserve together.
+const RACE_BUDGET: usize = 256 * 1024 * 1024;
 /// The most listeners one inbound may hold across every destination port. Each
 /// listener owns both TCP buffers, so a spoofed SYN stream must not grow the
 /// set past a fixed share of memory.
@@ -288,7 +297,13 @@ impl Flow {
         }
     }
 
-    fn adopt(&mut self, sockets: &mut SocketSet<'_>, ports: &mut HashSet<u16>) {
+    fn adopt(
+        &mut self,
+        sockets: &mut SocketSet<'_>,
+        ports: &mut HashSet<u16>,
+        retiring: &mut Vec<(SocketHandle, u16, bool)>,
+        race_bytes: &mut usize,
+    ) {
         if self.races.is_empty() {
             if !self.established && sockets.get::<TcpSocket>(self.handle).state() == State::Closed {
                 self.done = true;
@@ -299,8 +314,8 @@ impl Flow {
             let primary = sockets.get::<TcpSocket>(self.handle).state();
             if matches!(primary, State::Established | State::CloseWait) {
                 for (handle, port) in self.races.drain(..) {
-                    sockets.remove(handle);
-                    ports.remove(&port);
+                    sockets.get_mut::<TcpSocket>(handle).abort();
+                    retiring.push((handle, port, true));
                 }
                 return;
             }
@@ -312,14 +327,15 @@ impl Flow {
             });
             if let Some(winner) = winner {
                 let (handle, port) = self.races.remove(winner);
-                sockets.remove(self.handle);
-                ports.remove(&self.local_port);
+                sockets.get_mut::<TcpSocket>(self.handle).abort();
+                retiring.push((self.handle, self.local_port, false));
                 for (handle, port) in self.races.drain(..) {
-                    sockets.remove(handle);
-                    ports.remove(&port);
+                    sockets.get_mut::<TcpSocket>(handle).abort();
+                    retiring.push((handle, port, true));
                 }
                 self.handle = handle;
                 self.local_port = port;
+                *race_bytes -= RACE_BYTES;
                 return;
             }
             if primary != State::Closed {
@@ -333,6 +349,7 @@ impl Flow {
                 for (handle, port) in self.races.drain(..) {
                     sockets.remove(handle);
                     ports.remove(&port);
+                    *race_bytes -= RACE_BYTES;
                 }
                 self.done = true;
                 return;
@@ -342,6 +359,7 @@ impl Flow {
             let (handle, port) = self.races.remove(next);
             self.handle = handle;
             self.local_port = port;
+            *race_bytes -= RACE_BYTES;
         }
         let closed: Vec<usize> = self
             .races
@@ -355,6 +373,7 @@ impl Flow {
             let (handle, port) = self.races.swap_remove(index);
             sockets.remove(handle);
             ports.remove(&port);
+            *race_bytes -= RACE_BYTES;
         }
     }
 }
@@ -406,6 +425,26 @@ pub(crate) fn client(
     }
 }
 
+/// Abort was already called; remove each socket once its poll has emitted the RST.
+fn retire(
+    sockets: &mut SocketSet<'_>,
+    ports: &mut HashSet<u16>,
+    retiring: &mut Vec<(SocketHandle, u16, bool)>,
+    race_bytes: &mut usize,
+) {
+    retiring.retain(|(handle, port, charged)| {
+        if sockets.get::<TcpSocket>(*handle).state() != State::Closed {
+            return true;
+        }
+        sockets.remove(*handle);
+        ports.remove(port);
+        if *charged {
+            *race_bytes -= RACE_BYTES;
+        }
+        false
+    });
+}
+
 /// Run the server stack until its inbound is dropped.
 #[allow(clippy::needless_pass_by_value)]
 pub(crate) fn server(config: DeviceConfig, to_tunnel: ToTunnel, packets: Packets, out: Outbound) {
@@ -437,6 +476,8 @@ struct ClientStack {
     readiness: Readiness,
     ports: HashSet<u16>,
     next_port: u16,
+    race_bytes: usize,
+    retiring: Vec<(SocketHandle, u16, bool)>,
     to_tunnel: ToTunnel,
     addresses: Vec<IpAddr>,
     started: StdInstant,
@@ -460,6 +501,8 @@ impl ClientStack {
             readiness: Readiness::new(),
             ports: HashSet::new(),
             next_port: 49_152,
+            race_bytes: 0,
+            retiring: Vec::new(),
             to_tunnel,
             addresses: config.addresses.clone(),
             started: StdInstant::now(),
@@ -473,10 +516,23 @@ impl ClientStack {
     fn connect(&mut self, flow: ClientFlow) -> std::io::Result<()> {
         let mut candidates = Vec::new();
         let mut refused = None;
-        for destination in flow.destinations.iter().take(RACES) {
+        for destination in &flow.destinations {
+            if candidates.len() == RACES {
+                break;
+            }
             if destination.port() == 0 || destination.ip().is_unspecified() {
                 refused = Some(format!("destination {destination} is not a TCP endpoint"));
                 continue;
+            }
+            if !self
+                .addresses
+                .iter()
+                .any(|address| address.is_ipv4() == destination.ip().is_ipv4())
+            {
+                continue;
+            }
+            if !candidates.is_empty() && self.race_bytes + RACE_BYTES > RACE_BUDGET {
+                break;
             }
             let Some(local_port) = self.free_port() else {
                 break;
@@ -498,6 +554,9 @@ impl ClientStack {
             }
             let handle = self.sockets.add(socket);
             self.ports.insert(local_port);
+            if !candidates.is_empty() {
+                self.race_bytes += RACE_BYTES;
+            }
             candidates.push((handle, local_port));
         }
         let Some((handle, local_port)) = candidates.first().copied() else {
@@ -531,11 +590,24 @@ impl ClientStack {
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         let ready = self.readiness.sync(&self.flows);
+        let mut retiring = std::mem::take(&mut self.retiring);
         for (flow, &up_ready) in self.flows.iter_mut().zip(ready) {
-            flow.adopt(&mut self.sockets, &mut self.ports);
+            flow.adopt(
+                &mut self.sockets,
+                &mut self.ports,
+                &mut retiring,
+                &mut self.race_bytes,
+            );
             pump(flow, &mut self.sockets, buf, up_ready);
         }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+        retire(
+            &mut self.sockets,
+            &mut self.ports,
+            &mut retiring,
+            &mut self.race_bytes,
+        );
+        self.retiring = retiring;
         for _ in 0..TX_BURST {
             let Some(packet) = self.device.tx.pop_front() else {
                 break;
@@ -552,6 +624,7 @@ impl ClientStack {
                 for (handle, port) in flow.races.drain(..) {
                     self.sockets.remove(handle);
                     self.ports.remove(&port);
+                    self.race_bytes -= RACE_BYTES;
                 }
                 false
             } else {
@@ -1023,11 +1096,138 @@ pub(crate) fn inner_addresses(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
     }
 }
 
+/// A replied lane sends only to its winner; an unanswered one races the answers
+/// its configured source addresses can reach.
+fn lane_targets(
+    destination: Destination,
+    resolve: &dyn Fn(&str, u16) -> Vec<SocketAddr>,
+    addresses: &[IpAddr],
+    winner: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    if let Some(won) = winner {
+        return vec![won];
+    }
+    let raced = match destination {
+        Destination::Address(address) => vec![address],
+        Destination::Name(host, port) => resolve(&host, port),
+    };
+    raced
+        .into_iter()
+        .filter(|target| {
+            addresses
+                .iter()
+                .any(|address| address.is_ipv4() == target.ip().is_ipv4())
+        })
+        .take(RACES)
+        .collect()
+}
+
+/// Build and send one datagram to a target; false means the tunnel is gone.
+fn lane_send(
+    config: &DeviceConfig,
+    source_port: u16,
+    target: SocketAddr,
+    payload: &[u8],
+    to_tunnel: &ToTunnel,
+) -> bool {
+    let Some(inner_source) = config
+        .addresses
+        .iter()
+        .find(|address| address.is_ipv4() == target.is_ipv4())
+    else {
+        return true;
+    };
+    let mut source_room = [0u8; 16];
+    let mut destination_room = [0u8; 16];
+    let source = ip_bytes_into(*inner_source, &mut source_room);
+    let destination = ip_bytes_into(target.ip(), &mut destination_room);
+    let mut packet = Vec::with_capacity(IPV4_HEADER + 8 + payload.len());
+    let datagram = UdpDatagram {
+        source,
+        destination,
+        source_port,
+        destination_port: target.port(),
+        payload,
+    };
+    udp_datagram(&datagram, &mut packet) && to_tunnel.send(packet).is_ok()
+}
+
+/// Record the reply's source as this name's winner; false means the name had
+/// already pinned a different target.
+fn lane_reply(
+    winners: &mut HashMap<(String, u16), (SocketAddr, StdInstant)>,
+    key: &(String, u16),
+    remote: SocketAddr,
+) -> bool {
+    match winners.get(key) {
+        Some((won, _)) if *won != remote => false,
+        Some(_) => true,
+        None => {
+            winners.insert(key.clone(), (remote, StdInstant::now()));
+            true
+        }
+    }
+}
+
+/// Reserve a tunnel source port for one name on this lane.
+fn lane_port(routes: &UdpRoutes, sender: &Sender<Vec<u8>>, lane: u16) -> Option<u16> {
+    let mut table = routes.lock().ok()?;
+    for _ in 0..LANE_PORTS {
+        let port = 20000 + (NEXT_LANE_PORT.fetch_add(1, Ordering::Relaxed) % 40000);
+        if port != lane && !table.contains_key(&port) {
+            table.insert(port, sender.clone());
+            return Some(port);
+        }
+    }
+    None
+}
+
+/// The name's unexpired winner, dropping a pin that has gone quiet.
+fn lane_winner(
+    winners: &mut HashMap<(String, u16), (SocketAddr, StdInstant)>,
+    key: Option<&(String, u16)>,
+) -> Option<SocketAddr> {
+    let key = key?;
+    match winners.get(key) {
+        Some((won, at)) if at.elapsed() < LANE_RACE_AGAIN => Some(*won),
+        Some(_) => {
+            winners.remove(key);
+            None
+        }
+        None => None,
+    }
+}
+
+/// Give a name its own tunnel source port so its reply pins only its own race.
+fn lane_source_port(
+    key: Option<&(String, u16)>,
+    sources: &mut HashMap<(String, u16), u16>,
+    replies: &mut HashMap<u16, (String, u16)>,
+    owned: &mut Vec<u16>,
+    routes: &UdpRoutes,
+    sender: &Sender<Vec<u8>>,
+    lane: u16,
+) -> Option<u16> {
+    let Some(key) = key else {
+        return Some(lane);
+    };
+    if let Some(port) = sources.get(key) {
+        return Some(*port);
+    }
+    if owned.len() >= LANE_PORTS {
+        return Some(lane);
+    }
+    let port = lane_port(routes, sender, lane)?;
+    owned.push(port);
+    sources.insert(key.clone(), port);
+    replies.insert(port, key.clone());
+    Some(port)
+}
+
 /// A client datagram lane: every frame the local SOCKS5 front writes becomes an
 /// inner UDP packet, and the reply the tunnel returns is framed back to the last
-/// app that spoke. The lane's relay port is also its inner source port, so the
-/// reader routes a reply to exactly one lane.
-#[allow(clippy::too_many_lines)]
+/// app that spoke. Each name gets its own inner source port, so a reply pins
+/// only the name that raced it, and the relay port serves a literal address.
 pub(crate) fn client_udp(
     relay: &UdpSocket,
     config: &DeviceConfig,
@@ -1042,7 +1242,7 @@ pub(crate) fn client_udp(
     let port = local.port();
     let (reply_tx, reply_rx) = std::sync::mpsc::channel();
     if let Ok(mut table) = routes.lock() {
-        table.insert(port, reply_tx);
+        table.insert(port, reply_tx.clone());
     }
     let _ = relay.set_read_timeout(Some(LANE_TICK));
     if let Some(associate) = associate {
@@ -1051,26 +1251,29 @@ pub(crate) fn client_udp(
     let mut buf = crate::proxy::udp_buffer();
     let mut frame = Vec::new();
     let mut app: Option<SocketAddr> = None;
-    let mut winner: Option<SocketAddr> = None;
+    let mut winners: HashMap<(String, u16), (SocketAddr, StdInstant)> = HashMap::new();
+    let mut sources: HashMap<(String, u16), u16> = HashMap::new();
+    let mut replies: HashMap<u16, (String, u16)> = HashMap::new();
+    let mut owned = vec![port];
     let mut quiet = StdInstant::now();
     'lane: loop {
         while let Ok(inner) = reply_rx.try_recv() {
             let Some(datagram) = udp_from_packet(&inner) else {
                 continue;
             };
-            if datagram.destination_port != port {
-                continue;
-            }
             let Some(app) = app else {
                 continue;
             };
             let Some(remote) = socket_addr(datagram.source, datagram.source_port) else {
                 continue;
             };
-            if winner.is_some_and(|won| won != remote) {
+            if let Some(key) = replies.get(&datagram.destination_port) {
+                if !lane_reply(&mut winners, key, remote) {
+                    continue;
+                }
+            } else if datagram.destination_port != port {
                 continue;
             }
-            winner.get_or_insert(remote);
             let out = crate::proxy::socks_udp_frame(&mut frame, None, &remote, datagram.payload);
             let _ = relay.send_to(out, app);
             quiet = StdInstant::now();
@@ -1086,41 +1289,25 @@ pub(crate) fn client_udp(
                     continue;
                 }
                 app = Some(sender);
-                let mut targets = match destination {
-                    Destination::Address(address) => vec![address],
-                    Destination::Name(host, port) => resolve(&host, port),
+                let key = match &destination {
+                    Destination::Name(host, port) => Some((host.clone(), *port)),
+                    Destination::Address(_) => None,
                 };
-                if let Some(won) = winner {
-                    if targets.contains(&won) {
-                        targets = vec![won];
-                    } else {
-                        winner = None;
-                    }
-                }
-                for target in targets.into_iter().take(RACES) {
-                    let Some(inner_source) = config
-                        .addresses
-                        .iter()
-                        .find(|address| address.is_ipv4() == target.is_ipv4())
-                    else {
-                        continue;
-                    };
-                    let mut source_room = [0u8; 16];
-                    let mut destination_room = [0u8; 16];
-                    let source_bytes = ip_bytes_into(*inner_source, &mut source_room);
-                    let destination_bytes = ip_bytes_into(target.ip(), &mut destination_room);
-                    let mut packet = Vec::with_capacity(IPV4_HEADER + 8 + payload.len());
-                    let datagram = UdpDatagram {
-                        source: source_bytes,
-                        destination: destination_bytes,
-                        source_port: port,
-                        destination_port: target.port(),
-                        payload,
-                    };
-                    if !udp_datagram(&datagram, &mut packet) {
-                        continue;
-                    }
-                    if to_tunnel.send(packet).is_err() {
+                let winner = lane_winner(&mut winners, key.as_ref());
+                let Some(source_port) = lane_source_port(
+                    key.as_ref(),
+                    &mut sources,
+                    &mut replies,
+                    &mut owned,
+                    routes,
+                    &reply_tx,
+                    port,
+                ) else {
+                    break 'lane;
+                };
+                let targets = lane_targets(destination, resolve, &config.addresses, winner);
+                for target in targets {
+                    if !lane_send(config, source_port, target, payload, to_tunnel) {
                         break 'lane;
                     }
                 }
@@ -1141,7 +1328,9 @@ pub(crate) fn client_udp(
         }
     }
     if let Ok(mut table) = routes.lock() {
-        table.remove(&port);
+        for port in owned {
+            table.remove(&port);
+        }
     }
 }
 
@@ -1882,6 +2071,13 @@ mod client_tests {
                 &thread_routes,
                 None,
                 &|host, port| {
+                    if host == "other.test" {
+                        assert_eq!(port, 54);
+                        return vec![
+                            "192.0.2.9:54".parse().unwrap(),
+                            "192.0.2.10:54".parse().unwrap(),
+                        ];
+                    }
                     assert_eq!(host, "example.test");
                     assert_eq!(port, 53);
                     wanted.clone()
@@ -1918,6 +2114,7 @@ mod client_tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn a_replied_client_datagram_lane_sends_the_next_datagram_only_to_the_winner() {
         let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
         let relay_address = relay.local_addr().expect("address");
@@ -1942,6 +2139,13 @@ mod client_tests {
                 &thread_routes,
                 None,
                 &|host, port| {
+                    if host == "other.test" {
+                        assert_eq!(port, 54);
+                        return vec![
+                            "192.0.2.9:54".parse().unwrap(),
+                            "192.0.2.10:54".parse().unwrap(),
+                        ];
+                    }
                     assert_eq!(host, "example.test");
                     assert_eq!(port, 53);
                     wanted.clone()
@@ -1964,12 +2168,18 @@ mod client_tests {
         frame.extend_from_slice(b"query");
         app.send_to(&frame, relay_address).expect("send");
         let mut raced = Vec::new();
+        let mut source_port = 0;
         for _ in 0..targets.len() {
             let inner = packets.recv_timeout(Duration::from_secs(5)).expect("inner");
             let datagram = udp_from_packet(&inner).expect("packet");
+            if source_port == 0 {
+                source_port = datagram.source_port;
+            }
+            assert_eq!(datagram.source_port, source_port, "one port per name");
             raced.push(socket_addr(datagram.destination, 53).expect("target"));
         }
         assert_eq!(raced, targets, "the first datagram races every answer");
+        assert_ne!(source_port, port, "a name gets its own tunnel source port");
 
         let winner = targets[0];
         let mut source_room = [0u8; 16];
@@ -1980,8 +2190,36 @@ mod client_tests {
                 source,
                 destination: &[10, 0, 0, 2],
                 source_port: winner.port(),
-                destination_port: port,
+                destination_port: source_port,
                 payload: b"answer",
+            },
+            &mut reply,
+        ));
+        routes
+            .lock()
+            .expect("routes")
+            .get(&source_port)
+            .expect("lane")
+            .send(reply)
+            .expect("reply");
+
+        let mut received = [0u8; 2048];
+        let (n, _) = app.recv_from(&mut received).expect("framed reply");
+        let (remote, payload) = crate::proxy::parse_socks_udp(&received[..n]).expect("frame");
+        assert_eq!(remote, winner);
+        assert_eq!(payload, b"answer");
+
+        let loser = targets[1];
+        let mut source_room = [0u8; 16];
+        let source = ip_bytes_into(loser.ip(), &mut source_room);
+        let mut reply = Vec::new();
+        assert!(udp_datagram(
+            &UdpDatagram {
+                source,
+                destination: &[10, 0, 0, 2],
+                source_port: loser.port(),
+                destination_port: source_port,
+                payload: b"loser",
             },
             &mut reply,
         ));
@@ -1992,12 +2230,14 @@ mod client_tests {
             .expect("lane")
             .send(reply)
             .expect("reply");
-
-        let mut received = [0u8; 2048];
-        let (n, _) = app.recv_from(&mut received).expect("framed reply");
-        let (remote, payload) = crate::proxy::parse_socks_udp(&received[..n]).expect("frame");
-        assert_eq!(remote, winner);
-        assert_eq!(payload, b"answer");
+        app.set_read_timeout(Some(Duration::from_millis(150)))
+            .expect("timeout");
+        assert!(
+            app.recv_from(&mut received).is_err(),
+            "a reply from outside the pinned target is dropped"
+        );
+        app.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
 
         app.send_to(&frame, relay_address).expect("send again");
         let inner = packets.recv_timeout(Duration::from_secs(5)).expect("inner");
@@ -2009,6 +2249,31 @@ mod client_tests {
         assert!(
             packets.recv_timeout(Duration::from_millis(150)).is_err(),
             "a replied lane must not fan the next datagram out"
+        );
+
+        let name = b"other.test";
+        let mut other = vec![0, 0, 0, 3, name.len() as u8];
+        other.extend_from_slice(name);
+        other.extend_from_slice(&54u16.to_be_bytes());
+        other.extend_from_slice(b"other");
+        app.send_to(&other, relay_address).expect("send other");
+        let mut raced = Vec::new();
+        let mut other_port = 0;
+        for _ in 0..2 {
+            let inner = packets.recv_timeout(Duration::from_secs(5)).expect("inner");
+            let datagram = udp_from_packet(&inner).expect("packet");
+            assert_eq!(datagram.destination_port, 54);
+            other_port = datagram.source_port;
+            raced.push(socket_addr(datagram.destination, 54).expect("target"));
+        }
+        assert_ne!(other_port, source_port, "each name races on its own port");
+        assert_eq!(
+            raced,
+            vec![
+                "192.0.2.9:54".parse::<SocketAddr>().unwrap(),
+                "192.0.2.10:54".parse::<SocketAddr>().unwrap()
+            ],
+            "another destination on the same lane still races"
         );
     }
 
