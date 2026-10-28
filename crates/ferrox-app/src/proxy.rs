@@ -18824,33 +18824,36 @@ pub(crate) mod lane_pool {
 
     static POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
 
-    /// The reader and the writer of a wrap both spend most of their time parked, so more workers
-    /// than cores buys no bandwidth and costs the process a thread the peak census sees.
+    /// One lane per flow of the widest standard cell (eight connections), less the one the
+    /// serving process's accept threads already keep warm: a blocking read is the concurrency,
+    /// and the client fell behind xray-core-rust on every eight-flow cell with four.
+    const RELAY_LANES: usize = 7;
+
     fn worker_count() -> usize {
-        thread::available_parallelism()
-            .map_or(2, std::num::NonZeroUsize::get)
-            .clamp(2, 6)
+        RELAY_LANES
     }
 
     fn pool() -> std::sync::Arc<Pool> {
-        std::sync::Arc::clone(POOL.get_or_init(|| {
-            let pool = std::sync::Arc::new(Pool {
-                ready: Mutex::new(VecDeque::new()),
-                notify: Condvar::new(),
-                workers: std::sync::atomic::AtomicUsize::new(0),
-            });
-            for _ in 0..worker_count() {
-                let worker = std::sync::Arc::clone(&pool);
-                let spawned = thread::Builder::new()
-                    .name("ferrox-relay-lane".into())
-                    .spawn(move || worker_loop(&worker));
-                if spawned.is_ok() {
-                    pool.workers
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                }
+        std::sync::Arc::clone(POOL.get_or_init(spawn_pool))
+    }
+
+    fn spawn_pool() -> std::sync::Arc<Pool> {
+        let pool = std::sync::Arc::new(Pool {
+            ready: Mutex::new(VecDeque::new()),
+            notify: Condvar::new(),
+            workers: std::sync::atomic::AtomicUsize::new(0),
+        });
+        for _ in 0..worker_count() {
+            let worker = std::sync::Arc::clone(&pool);
+            let spawned = thread::Builder::new()
+                .name("ferrox-relay-lane".into())
+                .spawn(move || worker_loop(&worker));
+            if spawned.is_ok() {
+                pool.workers
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
-            pool
-        }))
+        }
+        pool
     }
 
     fn worker_loop(pool: &Pool) {
@@ -18867,29 +18870,36 @@ pub(crate) mod lane_pool {
                         .unwrap_or_else(PoisonError::into_inner);
                 }
             };
-            let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _step = crate::proxy::RelayStep::enter();
-                lane.run()
-            }));
-            match stepped {
-                Ok(Next::More) => {
-                    let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
-                    ready.push_front(lane);
-                    drop(ready);
-                    pool.notify.notify_one();
-                    continue;
+            loop {
+                let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let _step = crate::proxy::RelayStep::enter();
+                    lane.run()
+                }));
+                match stepped {
+                    // Still has bytes: a requeue pays the pool's lock and wakeup on every read.
+                    Ok(Next::More) => {}
+                    Ok(Next::Idle) => {
+                        let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                        ready.push_back(lane);
+                        drop(ready);
+                        pool.notify.notify_one();
+                        break;
+                    }
+                    Ok(Next::Done) => {
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            lane.finish();
+                        }));
+                        break;
+                    }
+                    Err(_) => {
+                        eprintln!("ferrox-app: a relay lane panicked");
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            lane.finish();
+                        }));
+                        break;
+                    }
                 }
-                Ok(Next::Idle) => {
-                    let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
-                    ready.push_back(lane);
-                    drop(ready);
-                    pool.notify.notify_one();
-                    continue;
-                }
-                Ok(Next::Done) => {}
-                Err(_) => eprintln!("ferrox-app: a relay lane panicked"),
             }
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.finish()));
         }
     }
 
@@ -18911,11 +18921,14 @@ pub(crate) mod lane_pool {
     }
 
     pub(crate) fn submit(step: Step, complete: Complete) {
+        submit_to(&pool(), step, complete);
+    }
+
+    fn submit_to(pool: &Pool, step: Step, complete: Complete) {
         let lane = Lane {
             step,
             complete: Some(complete),
         };
-        let pool = pool();
         if pool.workers.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             // A thread the process could not start still does the lane's work on the caller.
             run_to_end(lane);
@@ -18930,6 +18943,100 @@ pub(crate) mod lane_pool {
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn workers() -> usize {
         pool().workers.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::{Duration, Instant};
+
+        struct Gate {
+            state: Mutex<(usize, bool)>,
+            wake: Condvar,
+        }
+
+        impl Gate {
+            fn arrive_and_wait(&self) {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.0 += 1;
+                self.wake.notify_all();
+                while !state.1 {
+                    state = self
+                        .wake
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            }
+
+            fn wait_for(&self, lanes: usize, budget: Duration) -> usize {
+                let deadline = Instant::now() + budget;
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                while state.0 < lanes {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        break;
+                    }
+                    let (next, _) = self
+                        .wake
+                        .wait_timeout(state, left)
+                        .unwrap_or_else(PoisonError::into_inner);
+                    state = next;
+                }
+                state.0
+            }
+
+            fn release(&self) {
+                let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+                state.1 = true;
+                self.wake.notify_all();
+            }
+        }
+
+        /// Every lane in the fixed set must be able to sit in its own read at once: a cell's
+        /// download lanes each cost a blocking wait, and a lane without a worker is a flow the
+        /// sink cannot feed.
+        #[test]
+        fn every_lane_of_a_full_cell_has_a_worker() {
+            let pool = spawn_pool();
+            // The widest cell's eight flows are blocking reads; one is the accept thread's.
+            let lanes = worker_count();
+            assert!(
+                lanes >= 7,
+                "the pool carries {lanes} lanes, below the widest cell's flows"
+            );
+            let gate = Arc::new(Gate {
+                state: Mutex::new((0, false)),
+                wake: Condvar::new(),
+            });
+            let finished = Arc::new(AtomicUsize::new(0));
+            for _ in 0..lanes {
+                let gate = Arc::clone(&gate);
+                let finished = Arc::clone(&finished);
+                submit_to(
+                    &pool,
+                    Box::new(move || {
+                        gate.arrive_and_wait();
+                        Next::Done
+                    }),
+                    Box::new(move || {
+                        finished.fetch_add(1, Ordering::Relaxed);
+                    }),
+                );
+            }
+            let waiting = gate.wait_for(lanes, Duration::from_secs(5));
+            gate.release();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while finished.load(Ordering::Relaxed) < lanes && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(
+                waiting, lanes,
+                "{waiting} of {lanes} lanes reached their read: the pool cannot carry the cell"
+            );
+            assert_eq!(finished.load(Ordering::Relaxed), lanes);
+        }
     }
 }
 
@@ -25303,10 +25410,7 @@ mod tests {
             let _ = peer.shutdown(Shutdown::Both);
         }
         let lanes = lane_pool::workers();
-        assert!(
-            (2..=6).contains(&lanes),
-            "the lane count is the bound: {lanes}"
-        );
+        assert!(lanes >= 7, "the lane count is the bound: {lanes}");
         assert!(
             grown <= lanes + 8,
             "{flows} wrapped flows grew the process by {grown} threads, past {lanes} lanes plus slack"
