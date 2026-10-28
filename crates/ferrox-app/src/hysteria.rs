@@ -105,14 +105,21 @@ impl Driver {
     }
 
     fn register(&self, stream: u64) -> Arc<StreamWake> {
-        let wake = Arc::new(StreamWake {
+        if let Ok(mut streams) = self.streams.lock() {
+            if let Some(wake) = streams.get(&stream) {
+                return Arc::clone(wake);
+            }
+            let wake = Arc::new(StreamWake {
+                gen: Mutex::new(0),
+                cv: Condvar::new(),
+            });
+            streams.insert(stream, Arc::clone(&wake));
+            return wake;
+        }
+        Arc::new(StreamWake {
             gen: Mutex::new(0),
             cv: Condvar::new(),
-        });
-        if let Ok(mut streams) = self.streams.lock() {
-            streams.insert(stream, Arc::clone(&wake));
-        }
-        wake
+        })
     }
 
     fn spawn(self: &Arc<Self>, session: &Session) {
@@ -180,7 +187,10 @@ pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool
                 if buf.is_empty() && (!fin || last) {
                     return true;
                 }
-                if written == 0 && Instant::now() >= deadline {
+                if written > 0 {
+                    continue;
+                }
+                if Instant::now() >= deadline {
                     return false;
                 }
             }
@@ -514,11 +524,12 @@ impl Flow {
                 let _ = drive_once(&self.session, STREAM_POLL);
                 continue;
             }
-            let pumped = self
-                .session
-                .driver
-                .as_ref()
-                .is_some_and(|driver| driver.running());
+            let pumped = self.wake.is_some()
+                && self
+                    .session
+                    .driver
+                    .as_ref()
+                    .is_none_or(|driver| driver.running());
             if let Some(wake) = self.wake.as_ref().filter(|_| pumped) {
                 wake.wait(before, STREAM_POLL);
                 continue;
@@ -575,11 +586,12 @@ impl Flow {
             let _ = drive_once(&self.session, STREAM_POLL);
             return Ok(None);
         }
-        let pumped = self
-            .session
-            .driver
-            .as_ref()
-            .is_some_and(|driver| driver.running());
+        let pumped = self.wake.is_some()
+            && self
+                .session
+                .driver
+                .as_ref()
+                .is_none_or(|driver| driver.running());
         if let Some(wake) = self.wake.as_ref().filter(|_| pumped) {
             wake.wait(before, STREAM_POLL);
             return Ok(None);
@@ -962,6 +974,7 @@ struct Inbound {
     settings_done: bool,
     auth_buf: Vec<u8>,
     served: HashSet<u64>,
+    wakes: Arc<Driver>,
     udp: HashMap<u32, UdpFlow>,
 }
 
@@ -999,6 +1012,7 @@ fn drain_settings(conn: &mut quiche::Connection) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve_stream(
     shared: &Arc<Mutex<quiche::Connection>>,
     sock: &Arc<crate::quic::Datagram>,
@@ -1007,6 +1021,7 @@ fn serve_stream(
     serve: &Serve,
     peer: SocketAddr,
     masq: &Masquerade,
+    wake: Arc<StreamWake>,
 ) {
     let mut head = Vec::with_capacity(8);
     let mut room = Unfilled::<64>::new();
@@ -1014,6 +1029,7 @@ fn serve_stream(
         if head.len() >= 8 {
             return;
         }
+        let before = wake.seen();
         let read = {
             let Ok(mut conn) = shared.lock() else {
                 return;
@@ -1035,7 +1051,7 @@ fn serve_stream(
                     return;
                 }
             }
-            std::thread::sleep(STREAM_POLL);
+            wake.wait(before, STREAM_POLL);
             continue;
         }
         if head.is_empty() {
@@ -1064,6 +1080,7 @@ fn serve_stream(
         head,
         false,
     );
+    flow.wake = Some(wake);
     // The prefix stays in the buffer and the cursor steps over it, so no payload byte is moved.
     flow.at = prefix;
     serve(flow);
@@ -1914,6 +1931,7 @@ impl Router<'_> {
                 settings_done: false,
                 auth_buf: Vec::new(),
                 served: HashSet::new(),
+                wakes: Driver::new(),
                 udp: HashMap::new(),
             },
         );
@@ -1991,6 +2009,8 @@ impl Router<'_> {
                 let Some(inbound) = routes.get_mut(dcid) else {
                     return;
                 };
+                let wake = inbound.wakes.register(id);
+                wake.bump();
                 if inbound.served.contains(&id) {
                     continue;
                 }
@@ -2010,6 +2030,7 @@ impl Router<'_> {
                         &thread_serve,
                         peer,
                         &thread_masq,
+                        wake,
                     );
                 });
             }
