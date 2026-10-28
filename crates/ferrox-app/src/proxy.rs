@@ -24981,6 +24981,15 @@ mod tests {
     fn an_encrypted_vless_raw_session_echoes_over_loopback() {
         use std::os::unix::net::UnixStream;
 
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        let stats = crate::json::parse(
+            r#"{"stats":{},"policy":{"levels":{"1":{"statsUserUplink":true,"statsUserDownlink":true,"statsUserOnline":true}}}}"#,
+        )
+        .expect("stats config");
+        crate::policy::install(&stats).expect("policy installs");
+        crate::stats::install(&stats).expect("stats installs");
+
         let (client_string, server_string) =
             ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
         let client = vless_client_encryption(Some(&client_string))
@@ -25010,11 +25019,18 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the server");
         let server_addr = listener.local_addr().expect("addr");
         let id = [0x42u8; 16];
-        thread::spawn(move || {
+        let user = VlessUser {
+            id,
+            flow: Flow::None,
+            email: "sealed@example".to_owned(),
+            level: 1,
+            reverse: None,
+        };
+        let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless(
                 stream,
-                &one_vless_user(&id),
+                &[user],
                 &Carrier::Raw(Chain::default()),
                 true,
                 None,
@@ -25058,6 +25074,20 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         peer.read_exact(&mut got).expect("reads the echo");
         assert_eq!(&got, payload);
+        let snapshot = crate::stats::snapshot();
+        assert_eq!(
+            snapshot.online.get("sealed@example"),
+            Some(&1),
+            "the authenticated sealed session holds the user's online lease"
+        );
+        let traffic = snapshot
+            .user
+            .get("sealed@example")
+            .expect("the sealed session counts the user's traffic");
+        assert!(traffic.uplink > 0 && traffic.downlink > 0);
+        drop(peer);
+        serving.join().expect("serves");
+        crate::stats::clear();
     }
 
     /// The sealed session rides a carrier: the upgrade, the hello, the VLESS header and the
