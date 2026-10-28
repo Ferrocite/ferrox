@@ -548,9 +548,12 @@ impl ClientStack {
         answer_echo(packet, &self.addresses, &self.to_tunnel)
     }
 
-    /// A Packet Too Big narrows the shared MTU only when it quotes a flow this
-    /// peer routes and this client sent.
+    /// A Packet Too Big narrows the shared MTU only on a single-peer client, when
+    /// it quotes a flow that peer routes and this client sent.
     fn absorb(&mut self, packet: &Packet) {
+        if self.peers.len() > 1 {
+            return;
+        }
         let Some((source, destination)) = icmp_quoted(&packet.bytes) else {
             return;
         };
