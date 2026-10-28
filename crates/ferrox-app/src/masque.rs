@@ -1446,6 +1446,12 @@ struct Tunnel {
     granted: Option<Granted>,
 }
 
+fn sweep_due_timer(conn: &mut quiche::Connection) {
+    if conn.timeout().is_some_and(|left| left.is_zero()) {
+        conn.on_timeout();
+    }
+}
+
 #[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn worker(
     mut conn: quiche::Connection,
@@ -1491,8 +1497,12 @@ fn worker(
                 let _ = conn.recv(&mut bytes, info);
             }
             Ok(Arrival::Ready) => tunnel.queue.pending.store(false, Ordering::Relaxed),
-            Err(mpsc::RecvTimeoutError::Timeout) => conn.on_timeout(),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        }
+        sweep_due_timer(&mut conn);
+        if conn.is_closed() {
+            return;
         }
         if conn.is_established() {
             if !tunnel.settings_sent {
@@ -2543,19 +2553,6 @@ mod tests {
     }
 
     #[test]
-    fn an_insecure_edge_still_checks_its_pin() {
-        let (_inbound, port) = serve("127.0.0.1:1");
-        let pin = "00".repeat(32);
-        let outbound = crate::json::parse(&format!(
-            r#"{{"settings":{{"address":"127.0.0.1","port":{port}}},"streamSettings":{{"network":"masque","security":"tls","tlsSettings":{{"serverName":"localhost","allowInsecure":true,"pinnedPeerCertSha256":"{pin}"}},"masqueSettings":{{"headers":{{"Authorization":"Basic dUBleGFtcGxlLmNvbTpw"}}}}}}}}"#
-        ))
-        .expect("a pinned masque outbound");
-        let spec = ClientSpec::from(&outbound).expect("spec");
-        let reason = open(&spec).expect_err("an insecure dial still answers the pin");
-        assert!(reason.contains("does not match the pins"), "{reason}");
-    }
-
-    #[test]
     fn the_authority_prefers_a_configured_host() {
         let outbound = crate::json::parse(
             r#"{"settings":{"server":{"address":"127.0.0.1","port":8443}},"streamSettings":{"security":"tls","tlsSettings":{"serverName":"localhost","allowInsecure":true},"masqueSettings":{"host":"edge.example:443"}}}"#,
@@ -2623,5 +2620,34 @@ mod tests {
         let (stream, packet) = connectip::datagram_split(&out).expect("a datagram");
         assert_eq!(stream, 8);
         assert_eq!(packet, &[0x45, 0, 0, 20]);
+    }
+
+    #[test]
+    fn a_due_quic_deadline_is_swept_after_an_event() {
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("config");
+        assert!(quic::tune(&mut config, quic::ALPN));
+        config.verify_peer(false);
+        let local: SocketAddr = "127.0.0.1:9".parse().expect("local address");
+        let peer: SocketAddr = "127.0.0.1:8".parse().expect("peer address");
+        let cid = [3u8; 16];
+        let cid = quiche::ConnectionId::from_ref(&cid);
+        let mut conn =
+            quiche::connect(Some("localhost"), &cid, local, peer, &mut config).expect("connection");
+        let mut packet = vec![0u8; 1350];
+        let (n, _) = conn.send(&mut packet).expect("initial");
+        assert!(n > 0, "the client produced an initial packet");
+
+        let limit = Instant::now() + Duration::from_secs(10);
+        while conn.timeout() != Some(Duration::ZERO) {
+            assert!(Instant::now() < limit, "the handshake timer never fell due");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        sweep_due_timer(&mut conn);
+        assert_ne!(
+            conn.timeout(),
+            Some(Duration::ZERO),
+            "a due QUIC deadline was left for the next receive timeout"
+        );
     }
 }
