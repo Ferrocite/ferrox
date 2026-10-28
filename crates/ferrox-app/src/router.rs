@@ -1018,7 +1018,7 @@ impl Routing {
                 if rule
                     .sets
                     .as_ref()
-                    .is_some_and(|sets| sets.iter().any(|set| set.needs_source()))
+                    .is_some_and(|sets| sets.iter().any(|set| set.needs_source(network)))
                 {
                     return Some("ruleSet");
                 }
@@ -1573,8 +1573,8 @@ impl RuleSet {
         verdict
     }
 
-    fn needs_source(&self) -> bool {
-        self.rules.iter().any(SetRule::needs_source)
+    fn needs_source(&self, network: Network) -> bool {
+        self.rules.iter().any(|rule| rule.needs_source(network))
     }
 
     fn has_domains(&self) -> bool {
@@ -1899,13 +1899,34 @@ impl SetRule {
         }
     }
 
-    fn needs_source(&self) -> bool {
-        self.source_ports.is_some()
-            || self.source_ips.is_some()
-            || self
-                .logical
-                .as_ref()
-                .is_some_and(|logical| logical.rules.iter().any(SetRule::needs_source))
+    fn matches_network(&self, network: Network) -> bool {
+        self.networks
+            .as_ref()
+            .is_none_or(|networks| networks.contains(&network))
+    }
+
+    fn needs_source(&self, network: Network) -> bool {
+        if !self.matches_network(network) {
+            return false;
+        }
+        let Some(logical) = &self.logical else {
+            return self.source_ports.is_some() || self.source_ips.is_some();
+        };
+        if logical.all {
+            for rule in &logical.rules {
+                if !rule.matches_network(network) {
+                    if rule.invert {
+                        continue;
+                    }
+                    return false;
+                }
+                if rule.needs_source(network) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        logical.rules.iter().any(|rule| rule.needs_source(network))
     }
 
     fn has_domains(&self) -> bool {
