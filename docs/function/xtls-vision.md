@@ -28,7 +28,7 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 29568 | scripts/count-ops.sh |
+| ops-retired-instructions | 29632 | scripts/count-ops.sh |
 | padding-command-bytes | 5 | ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid |
 | first-frame-uuid-bytes | 16 | ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid |
 | largest-framed-block-bytes | 8171 | ferrox-app-vision::tests::a_bulk_write_frames_every_block_inside_the_bound |
@@ -55,7 +55,7 @@ graph TD
   'vision::Linkferrox_app::vision::tests::Fake::pump'
 ```
 
-`29568` retired instructions, the frame the probe walks through 512 frames carrying six content bytes and four padding bytes each, with the filter spent and no caller buffer, so the walk parses, delivers, pads over and dispatches each frame without pricing the copy or the scan. The same probe prices the walk before the whole-frame pass at `35584` in the same binary: 6,016 fewer, 16.9%. The row names the monomorphized frame the probe builds because `count-ops.sh` drops the angle brackets from a generic frame; the row it replaced named `unpad`, which the walk no longer has, so it read as an inlined frame rather than a measurement. The probe's own row is in `scripts/expected-ops.txt`. The earlier empty-frame probe sat at 17,152 while the steady-read feed's `Option` was priced here and at 16,896 after the vless-encryption layout moved it; it walked no content, so it could not see the one-pass delivery, and the probe now carries the frame shape the wire does.
+`29632` retired instructions, the frame the probe walks through 512 frames carrying six content bytes and four padding bytes each, with the filter spent and no caller buffer, so the walk parses, delivers, pads over and dispatches each frame without pricing the copy or the scan. The framing-exit disarm moved the probe from `29568` to `29632` (+64) for the one call that ends the framing; the frames, commands and bytes are unchanged. The same probe prices the walk before the whole-frame pass at `35584` in the same binary: 5,952 fewer, 16.7%. The row names the monomorphized frame the probe builds because `count-ops.sh` drops the angle brackets from a generic frame; the row it replaced named `unpad`, which the walk no longer has, so it read as an inlined frame rather than a measurement. The probe's own row is in `scripts/expected-ops.txt`. The earlier empty-frame probe sat at 17,152 while the steady-read feed's `Option` was priced here and at 16,896 after the vless-encryption layout moved it; it walked no content, so it could not see the one-pass delivery, and the probe now carries the frame shape the wire does.
 
 ## Time
 
@@ -94,6 +94,8 @@ Vision was the worst-shaped carrier in this tree before the change, and the reas
 - **A stream that never carried Vision now stops paying for the check.** If the first 16 bytes are not the user UUID the stream is not addressed to this session and never will be; `unpad` records that by clearing `padding`, so the pass-through path drops from three copies to zero instead of re-comparing 16 bytes per read for the life of the connection.
 - **One pooled buffer per incoming buffer, unconditionally.** Xray's `XtlsUnpadding` (`proxy/proxy.go:561`) takes a fresh 8 KiB `buf.Buffer` for *every* buffer that arrives once Vision is engaged, before any header check beyond the UUID compare, and `IsCompleteRecord` (`:410`) allocates a slice the size of the whole `MultiBuffer` and copies the whole thing into it on every padded write — so while padding, Xray copies every byte three times too. This tree's `staging` buffer is cleared and reused, and `ferrox-bench`'s `gate_vision_allocs` requires zero allocations at every length.
 - **A flush that reads through the wrong layer.** `Link::flush` pushed the outer session, whose `complete_io` reads as well as writes; after the write side went direct that read ate raw bytes and the session died on the spot, which is the `BadRecordMac`-then-silence the direct-switch row failed with. The flush now follows the same dispatch as the write, and `vision_direct_switch_carries_inner_tls_over_loopback` is what says so.
+- **A limiter that outlived the framing.** The walk armed the record limiter when the filter committed to 1.3 and never disarmed it when a `1`/`2` command or a uuid miss ended the framing, so every post-switch read stayed capped at one record for no benefit. The three exits now disarm it, and `a_continue_then_end_sequence_reads_back_as_content` counts the disarm. The probe moved from `29568` to `29632` (+64) for the exit call; the bytes are unchanged, and the post-switch read granularity is no longer record-bounded.
+
 - **A bound paid before it can matter.** The `Link` throws the alignment switch itself the moment its filter commits to 1.3, so the plain-`TLS` accept only tracks record ends until then and bulk lanes that never see a `ServerHello` never engage.
 
 - **Five single-byte header iterations read as one five-byte load.** The read loop's header trips have no observable in between, so a whole header parses at once and a split one keeps the byte loop; `seeded_splits_read_back_as_whole_content` replays one seeded chunking against whole content, tail included.
