@@ -340,7 +340,10 @@ impl Client {
             if self.wire.closed || self.end {
                 break;
             }
-            while let Ok(packet) = from_tunnel.try_recv() {
+            while !self.end {
+                let Ok(packet) = from_tunnel.try_recv() else {
+                    break;
+                };
                 capsule.clear();
                 datagram(&packet, &mut capsule);
                 self.capsule(&capsule);
@@ -892,12 +895,14 @@ impl Session {
                 return;
             }
         }
-        let packets: Vec<Vec<u8>> = self
-            .outgoing
-            .as_ref()
-            .map(|outgoing| outgoing.try_iter().collect())
-            .unwrap_or_default();
-        for packet in packets {
+        while !self.end {
+            let Some(packet) = self
+                .outgoing
+                .as_ref()
+                .and_then(|outgoing| outgoing.try_recv().ok())
+            else {
+                break;
+            };
             let mut capsule = Vec::with_capacity(packet.len() + 8);
             datagram(&packet, &mut capsule);
             self.capsule(wire, &capsule);
@@ -1031,6 +1036,29 @@ mod tests {
             "a stalled window keeps at most {QUEUED_CAP} capsules"
         );
         assert!(client.end, "the capsule past the cap ends the session");
+    }
+
+    #[test]
+    fn a_stalled_server_send_window_bounds_the_queued_capsules() {
+        let mut session = Session::new(masque::test_shared(), Arc::new(masque::test_spec()));
+        session.request = Some(1);
+        session.send_window = 0;
+        let mut wire = Wire {
+            stream: Box::new(std::io::Cursor::new(Vec::new())),
+            pending: Vec::new(),
+            closed: false,
+        };
+        let mut capsule = Vec::new();
+        datagram(&udp_packet(53), &mut capsule);
+        for _ in 0..=QUEUED_CAP {
+            session.capsule(&mut wire, &capsule);
+        }
+        assert_eq!(
+            session.queued.len(),
+            QUEUED_CAP,
+            "a stalled window keeps at most {QUEUED_CAP} capsules"
+        );
+        assert!(session.end, "the capsule past the cap ends the session");
     }
 
     #[test]

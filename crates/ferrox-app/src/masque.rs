@@ -1269,6 +1269,27 @@ impl AddressPool {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn test_shared() -> Arc<Shared> {
+    let (packets, _packets_rx) = mpsc::channel();
+    Arc::new(Shared {
+        pool: Mutex::new(AddressPool::default()),
+        tunnels: Mutex::new(HashMap::new()),
+        packets,
+        local: Vec::new(),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn test_spec() -> ServerSpec {
+    ServerSpec {
+        users: Vec::new(),
+        path: DEFAULT_PATH.to_owned(),
+        pool: AddressPool::default(),
+        mtu: DEFAULT_MTU,
+    }
+}
+
 impl Family {
     fn new(server: u128, prefix: u8, bits: u8) -> Result<Self, String> {
         let mask = if prefix == 0 {
