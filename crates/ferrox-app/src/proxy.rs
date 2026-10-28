@@ -19161,7 +19161,11 @@ pub(crate) mod lane_pool {
     /// Parks an idle lane with the instant it is due another turn; one worker pays the wait for the
     /// whole batch, so the lanes with bytes keep the workers and the wait grows per empty round.
     fn park(pool: &Pool, lane: Lane) {
-        let mut due = std::time::Instant::now() + wait_for(lane.idle);
+        park_with(pool, lane, crate::budgets::RELAY_POLL);
+    }
+
+    fn park_with(pool: &Pool, lane: Lane, quantum: std::time::Duration) {
+        let mut due = std::time::Instant::now() + wait_for(lane.idle, quantum);
         {
             let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
             parked.lanes.push((due, lane));
@@ -19218,8 +19222,8 @@ pub(crate) mod lane_pool {
     /// The wait before an idle lane's next turn: one poll quantum, doubling per round that found
     /// nothing, so a direction nobody writes to costs the pool almost nothing while a direction that
     /// starts writing is still picked up within 16 ms.
-    fn wait_for(idle: u32) -> std::time::Duration {
-        crate::budgets::RELAY_POLL * (1u32 << idle.min(4))
+    fn wait_for(idle: u32, quantum: std::time::Duration) -> std::time::Duration {
+        quantum * (1u32 << idle.min(4))
     }
 
     #[cfg(test)]
@@ -19295,7 +19299,8 @@ pub(crate) mod lane_pool {
     }
 
     #[cfg(test)]
-    pub(crate) fn parker_batches() -> usize {
+    pub(crate) fn parker_batches(pool: &Pool) -> usize {
+        let _ = pool;
         PARKS.load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -19436,9 +19441,9 @@ pub(crate) mod lane_pool {
                     Box::new(|| {}),
                 );
             }
-            let before = parker_batches();
+            let before = parker_batches(&pool);
             thread::sleep(Duration::from_millis(20));
-            let batches = parker_batches() - before;
+            let batches = parker_batches(&pool) - before;
             stop.store(true, Ordering::Relaxed);
             assert!(
                 batches >= 2,
@@ -19500,14 +19505,92 @@ pub(crate) mod lane_pool {
                 }),
                 Box::new(|| {}),
             );
-            let before = parker_batches();
+            let before = parker_batches(&pool);
             thread::sleep(Duration::from_millis(200));
-            let batches = parker_batches() - before;
+            let batches = parker_batches(&pool) - before;
             stop.store(true, Ordering::Relaxed);
             assert!(
                 (3..40).contains(&batches),
                 "one idle lane was re-queued {batches} times in 200 ms"
             );
+        }
+
+        fn marker(ran: Arc<Mutex<Option<Instant>>>) -> Lane {
+            Lane {
+                step: Box::new(move || {
+                    *ran.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
+                    Next::Done
+                }),
+                complete: Some(Box::new(|| {})),
+                idle: 0,
+            }
+        }
+
+        /// A lane inserted with an earlier deadline must not wait for the deadline already parked.
+        #[test]
+        fn an_earlier_deadline_wakes_the_parker() {
+            let pool = spawn_pool();
+            assert!(grow(&pool));
+            let ran = Arc::new(Mutex::new(None));
+            let mut later = marker(Arc::clone(&ran));
+            later.idle = 2;
+            let parker = Arc::clone(&pool);
+            let parked = thread::spawn(move || {
+                park_with(&parker, later, Duration::from_millis(50));
+            });
+            thread::sleep(Duration::from_millis(20));
+            let at = Instant::now();
+            park_with(&pool, marker(Arc::clone(&ran)), Duration::from_millis(50));
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while ran.lock().unwrap_or_else(PoisonError::into_inner).is_none()
+                && Instant::now() < deadline
+            {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                ran.lock().unwrap_or_else(PoisonError::into_inner).is_some(),
+                "the earlier lane never ran"
+            );
+            assert!(
+                at.elapsed() < Duration::from_millis(150),
+                "the earlier lane waited {:?}",
+                at.elapsed()
+            );
+            parked.join().unwrap();
+        }
+
+        /// A batch belongs to the pool that parked it, not to every pool in the process.
+        #[test]
+        fn a_pool_counts_its_own_batches() {
+            let a = spawn_pool();
+            let b = spawn_pool();
+            let before = parker_batches(&b);
+            let parker = Arc::clone(&a);
+            thread::spawn(move || {
+                park_with(
+                    &parker,
+                    marker(Arc::new(Mutex::new(None))),
+                    Duration::from_millis(1),
+                );
+            })
+            .join()
+            .unwrap();
+            assert!(parker_batches(&a) >= 1);
+            assert_eq!(
+                parker_batches(&b) - before,
+                0,
+                "another pool's batch was counted here"
+            );
+        }
+
+        /// The first idle round waits one poll quantum, and the cap is still 16.
+        #[test]
+        fn the_first_idle_wait_is_one_quantum() {
+            let quantum = Duration::from_millis(1);
+            assert_eq!(wait_for(1, quantum), quantum);
+            assert_eq!(wait_for(2, quantum), quantum * 2);
+            assert_eq!(wait_for(5, quantum), quantum * 16);
+            assert_eq!(wait_for(9, quantum), quantum * 16);
         }
 
         /// A cell queues two lanes per stream against fewer threads, and a lane that never parks
