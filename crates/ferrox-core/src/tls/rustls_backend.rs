@@ -389,7 +389,7 @@ struct Material {
     verifier: Option<Arc<dyn rustls::client::danger::ServerCertVerifier>>,
 }
 
-/// The three config fields `build_material` reads. ALPN is not one of them because the anchors and the suite order do not depend on it, and the server name is not one either: it reaches the connection, not the config.
+/// The config fields `build_material` reads. ALPN is not one of them because the anchors and the suite order do not depend on it, and the server name is not one either: it reaches the connection, not the config.
 #[derive(Eq)]
 struct MaterialKey {
     roots: crate::tls::Anchors,
@@ -397,6 +397,8 @@ struct MaterialKey {
     cert_pins: Arc<[[u8; 32]]>,
     verify_names: Arc<[String]>,
     cipher_suites: std::sync::Arc<[u16]>,
+    /// The mode decides whether a named verifier exists, so it belongs to the material it selects.
+    insecure: bool,
 }
 
 /// Two anchor lists name the same trust when one allocation answers for both, which is what sharing them by reference makes the ordinary case; comparing their bytes is a walk of every certificate the platform trusts, and only a set read twice can reach it.
@@ -411,6 +413,7 @@ impl PartialEq for MaterialKey {
             && self.cert_pins.as_ref() == other.cert_pins.as_ref()
             && self.verify_names == other.verify_names
             && self.cipher_suites == other.cipher_suites
+            && self.insecure == other.insecure
     }
 }
 
@@ -422,6 +425,7 @@ impl MaterialKey {
             cert_pins: Arc::clone(&cfg.cert_pins),
             verify_names: Arc::clone(&cfg.verify_names),
             cipher_suites: Arc::clone(&cfg.cipher_suites),
+            insecure: cfg.insecure,
         }
     }
 }
