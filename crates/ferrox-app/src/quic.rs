@@ -894,9 +894,15 @@ fn send_mmsg(
 /// The datagrams one receive takes at a time, the mirror of the send side's `SEND_SLOTS`: a 16 KiB DATA frame is a dozen QUIC packets, and one `recvfrom` each paid a syscall and a timer set per packet. A lane with no batched call reads the same count one at a time.
 pub(crate) const RECV_SLOTS: usize = 64;
 
-/// The largest coalesced datagram a GSO peer can hand back: a full 64-segment burst of `MAX_DATAGRAM` packets.
+/// The most segments one `UDP_GRO` datagram carries, a kernel constant independent of how many
+/// entries a batch reads per call.
 #[cfg(target_os = "linux")]
-const GRO_ROOM: usize = MAX_DATAGRAM * RECV_SLOTS;
+const GRO_SEGMENTS: usize = 64;
+
+/// The largest coalesced datagram a GSO peer can hand back: a full `GRO_SEGMENTS` burst of
+/// `MAX_DATAGRAM` packets.
+#[cfg(target_os = "linux")]
+const GRO_ROOM: usize = MAX_DATAGRAM * GRO_SEGMENTS;
 
 /// Room for one `UDP_GRO` control message, which is a header and a segment size.
 #[cfg(target_os = "linux")]
