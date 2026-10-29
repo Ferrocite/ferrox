@@ -1361,6 +1361,7 @@ fn part_index(name: &str, key: &str, sep: u8, fold: bool) -> Option<usize> {
 
 /// The packet the data parts carry: one walk of the head answers every part name, and the parts decode as their join because the six-bit window crosses the cut.
 fn data_parts(text: &str, settings: &XhttpSettings) -> Option<Vec<u8>> {
+    const INLINE: usize = 512;
     let (key, sep, fields, fold) = match settings.uplink_data_placement {
         Placement::Header => (
             if settings.uplink_data_key.is_empty() {
@@ -1384,7 +1385,6 @@ fn data_parts(text: &str, settings: &XhttpSettings) -> Option<Vec<u8>> {
         ),
         _ => return None,
     };
-    const INLINE: usize = 512;
     let mut slots: Vec<&str> = vec![""; fields.len()];
     let mut inline = [0u64; INLINE / 64];
     let mut overflow: Vec<bool> = Vec::new();
