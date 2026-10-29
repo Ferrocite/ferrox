@@ -1110,6 +1110,7 @@ mod tests {
             protocol: Some("http/1.1"),
             user: Some("a@x"),
             attrs: None,
+            process: None,
         }
     }
 

@@ -49,6 +49,8 @@ pub(crate) struct Flow<'a> {
     pub(crate) user: Option<&'a str>,
     /// The HTTP attributes a front or the sniffer read off the request head, which an `attrs` rule names.
     pub(crate) attrs: Option<&'a Attributes<'a>>,
+    /// The process that owns the client socket, which a `process` rule names.
+    pub(crate) process: Option<&'a crate::process::Owner>,
 }
 
 /// The attributes of one HTTP request head — `:method`, `:path`, then every header — as the front or
@@ -161,6 +163,75 @@ impl UserSelector {
     }
 }
 
+/// A rule's `process` list, split once at startup the way the reference's matcher splits it: `self/`
+/// names this process, `xray/` this executable, a trailing `/` a folder prefix, an interior `/` an
+/// absolute path, and anything else a basename with `.exe` trimmed. The reference drops an `xray/`
+/// whose executable path cannot be read, and so does this split.
+#[derive(Debug)]
+struct ProcessSelector {
+    names: Vec<String>,
+    abs_paths: Vec<String>,
+    folders: Vec<String>,
+    this_process: bool,
+}
+
+impl ProcessSelector {
+    fn parse(names: &[String]) -> Self {
+        let mut literal = Vec::new();
+        let mut folders = Vec::new();
+        let mut abs_paths = Vec::new();
+        let mut this_process = false;
+        for name in names {
+            if name == "self/" {
+                this_process = true;
+                continue;
+            }
+            let named = name.replace('\\', "/");
+            let named = if named == "xray/" {
+                let Ok(executable) = std::env::current_exe() else {
+                    continue;
+                };
+                let Some(executable) = executable.to_str() else {
+                    continue;
+                };
+                executable.to_owned()
+            } else {
+                named
+            };
+            if named.ends_with('/') {
+                folders.push(named);
+                continue;
+            }
+            if named.contains('/') {
+                abs_paths.push(named);
+                continue;
+            }
+            literal.push(named.strip_suffix(".exe").unwrap_or(&named).to_owned());
+        }
+        Self {
+            names: literal,
+            abs_paths,
+            folders,
+            this_process,
+        }
+    }
+
+    fn matches(&self, owner: Option<&crate::process::Owner>) -> bool {
+        let Some(owner) = owner else {
+            return false;
+        };
+        if self.this_process && owner.pid == std::process::id() {
+            return true;
+        }
+        self.names.iter().any(|name| name == &owner.name)
+            || self.abs_paths.iter().any(|path| path == &owner.path)
+            || self
+                .folders
+                .iter()
+                .any(|folder| owner.path.starts_with(folder))
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DomainStrategy {
     AsIs,
@@ -191,6 +262,7 @@ pub(crate) struct Routing {
     script: Option<ScriptRouter>,
     has_domains: bool,
     wants_attrs: bool,
+    wants_process: bool,
 }
 
 /// One `balancers` entry: a tag a rule may name, the outbound-tag prefixes it draws from, and the
@@ -731,6 +803,7 @@ struct Rule {
     users: Option<UserSelector>,
     vless_routes: Option<PortSet>,
     attrs: Option<AttributeSelector>,
+    process: Option<ProcessSelector>,
     sets: Option<Vec<Arc<RuleSet>>>,
 }
 
@@ -909,6 +982,7 @@ impl Routing {
                     .is_some_and(|sets| sets.iter().any(|set| set.has_domains()))
         });
         let wants_attrs = rules.iter().any(|rule| rule.attrs.is_some());
+        let wants_process = rules.iter().any(|rule| rule.process.is_some());
         Ok(Some(Self {
             strategy,
             rules,
@@ -916,12 +990,18 @@ impl Routing {
             script,
             has_domains,
             wants_attrs,
+            wants_process,
         }))
     }
 
     /// Whether any rule reads the flow's HTTP attributes, which is the only reason a front pays to parse them.
     pub(crate) fn wants_attrs(&self) -> bool {
         self.wants_attrs
+    }
+
+    /// Whether any rule names the local process, which is the only reason a flow pays for the lookup.
+    pub(crate) fn wants_process(&self) -> bool {
+        self.wants_process
     }
 
     /// The targets rules name and whether each names a balancer, for the registry that has to
@@ -1116,7 +1196,11 @@ impl Routing {
                 continue;
             }
             // A server inbound never evaluates a rule, reads no sent route id and carries no HTTP head.
-            if rule.users.is_some() || rule.vless_routes.is_some() || rule.attrs.is_some() {
+            if rule.users.is_some()
+                || rule.vless_routes.is_some()
+                || rule.attrs.is_some()
+                || rule.process.is_some()
+            {
                 continue;
             }
             if !direct(&rule.target, rule.balancer) {
@@ -1270,6 +1354,7 @@ impl Rule {
         let mut users = None;
         let mut vless_routes = None;
         let mut attrs = None;
+        let mut process = None;
         let mut rule_sets = None;
         let mut unread = None;
         for (key, field) in pairs {
@@ -1314,7 +1399,12 @@ impl Rule {
                             .ok_or_else(|| "routing ruleSet is empty".to_owned())?,
                     );
                 }
-                "process" | "webhook" => {
+                "process" => {
+                    process = string_list(field, "process")?
+                        .filter(|names| !names.is_empty())
+                        .map(|names| ProcessSelector::parse(&names));
+                }
+                "webhook" => {
                     unread = Some(key);
                 }
                 other => return Err(format!("routing rule field `{other}` is not carried")),
@@ -1367,6 +1457,7 @@ impl Rule {
             users,
             vless_routes,
             attrs,
+            process,
             sets: rule_sets,
         }))
     }
@@ -1387,6 +1478,7 @@ impl Rule {
                 .as_ref()
                 .is_none_or(|routes| routes.contains(0))
             && self.attrs.is_none()
+            && self.process.is_none()
             && self.sets.is_none()
     }
 
@@ -1499,6 +1591,11 @@ impl Rule {
         }
         if let Some(attrs) = &self.attrs {
             if !attrs.matches(flow.attrs) {
+                return false;
+            }
+        }
+        if let Some(process) = &self.process {
+            if !process.matches(flow.process) {
                 return false;
             }
         }
@@ -3476,6 +3573,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(routing.route(&flow("example.test")), Some("direct"));
         assert_eq!(routing.route(&flow("www.example.test")), Some("direct"));
@@ -3510,6 +3608,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(routing.route(&matching), Some("direct"));
         for changed in [
@@ -3554,6 +3653,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(routing.route(&flow), Some("first"));
     }
@@ -3591,6 +3691,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(routing.route(&flow("x.both.test")), Some("direct"));
         assert_eq!(routing.route(&flow("one.test")), None);
@@ -3778,6 +3879,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(
             routing.route(&flow("192.0.2.9".parse().expect("ip"))),
@@ -3847,6 +3949,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -3913,6 +4016,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(
             routing.route_with(&flow, &|_, _| { vec!["192.0.2.9".parse().expect("ip")] }),
@@ -3952,6 +4056,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         let before = DOMAIN_TABLE_READS.with(std::cell::Cell::get);
         let tag = routing.route_with(&flow, &|_, _| vec!["192.0.2.1".parse().expect("ip")]);
@@ -3992,6 +4097,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -4055,6 +4161,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(routing.route(&flow), Some("block"));
         for name in ["exact.test", "name.ends.test"] {
@@ -4138,6 +4245,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(routing.route(&flow), Some("block"));
         assert_eq!(
@@ -4213,6 +4321,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(
             routing.route_with(&flow, &|_, _| vec!["10.1.2.3".parse().expect("ip")]),
@@ -4265,6 +4374,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(routing.route(&flow), Some("direct"));
         assert_eq!(
@@ -4318,6 +4428,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(routing.route(&flow), Some("direct"));
         assert_eq!(
@@ -4512,6 +4623,7 @@ mod tests {
             protocol: Some("http1"),
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(parsed.route(&named), Some("block"));
         let bare = Flow {
@@ -4525,6 +4637,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(parsed.route(&bare), Some("direct"));
     }
@@ -4554,6 +4667,7 @@ mod tests {
             protocol: None,
             user,
             attrs: None,
+            process: None,
         };
 
         let parsed = Routing::parse_in(
@@ -4609,6 +4723,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         let parse = |routes: Json| {
             Routing::parse_in(&route_rule(routes), vec![dir()])
@@ -4661,6 +4776,7 @@ mod tests {
                 protocol: None,
                 user: None,
                 attrs: (!entries.is_empty()).then_some(&attrs),
+                process: None,
             };
             parsed.route(&flow).map(str::to_owned)
         };
@@ -4720,6 +4836,97 @@ mod tests {
         assert!(broken.contains("not a regexp"), "{broken}");
     }
 
+    /// A `process` rule names the process behind the client socket: `self/` holds for a socket this
+    /// process opened, a bare name for this executable's basename (a trailing `.exe` trimmed), an
+    /// absolute path for its path, a trailing `/` for its folder, and a flow with no owner fails.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_process_rule_names_the_process_behind_the_client_socket() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let client =
+            std::net::TcpStream::connect(listener.local_addr().expect("local")).expect("connects");
+        let (_server, _) = listener.accept().expect("accepts");
+        let source = client.local_addr().expect("source");
+        let owner =
+            crate::process::owner(Network::Tcp, source).expect("this process owns the socket");
+        let route = |names: &[&str], owner: Option<&crate::process::Owner>| {
+            let root = object(vec![(
+                "routing",
+                routing(vec![rule(
+                    "block",
+                    vec![(
+                        "process",
+                        array(names.iter().map(|name| text(name)).collect()),
+                    )],
+                )]),
+            )]);
+            let parsed = Routing::parse_in(&root, vec![dir()])
+                .expect("parses")
+                .expect("routing");
+            let flow = Flow {
+                network: Network::Tcp,
+                domain: Some("x.com"),
+                ip: None,
+                port: Some(443),
+                source: Some(source),
+                local: None,
+                inbound_tag: None,
+                protocol: None,
+                user: None,
+                attrs: None,
+                process: owner,
+            };
+            parsed.route(&flow).map(str::to_owned)
+        };
+        assert_eq!(route(&["self/"], Some(&owner)).as_deref(), Some("block"));
+        assert_eq!(
+            route(&["self/"], None).as_deref(),
+            None,
+            "a flow with no owner matches no process rule"
+        );
+        assert_eq!(
+            route(&[owner.name.as_str()], Some(&owner)).as_deref(),
+            Some("block")
+        );
+        let exe = format!("{}.exe", owner.name);
+        assert_eq!(
+            route(&[exe.as_str()], Some(&owner)).as_deref(),
+            Some("block"),
+            "the reference trims a trailing .exe from a bare name"
+        );
+        assert_eq!(
+            route(&[owner.path.as_str()], Some(&owner)).as_deref(),
+            Some("block")
+        );
+        let folder = format!("{}/", owner.path.rsplit_once('/').expect("a folder").0);
+        assert_eq!(
+            route(&[folder.as_str()], Some(&owner)).as_deref(),
+            Some("block")
+        );
+        assert_eq!(route(&["no-such-process"], Some(&owner)).as_deref(), None);
+        assert_eq!(route(&["/no/such/path"], Some(&owner)).as_deref(), None);
+        assert_eq!(route(&["/no/such/folder/"], Some(&owner)).as_deref(), None);
+    }
+
+    /// Off Linux the reference's lookup answers nothing, so the rule is carried and never holds;
+    /// what this proves is that the parser does not drop it.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_process_rule_is_carried_where_no_lookup_exists() {
+        let root = object(vec![(
+            "routing",
+            routing(vec![rule(
+                "block",
+                vec![("process", array(vec![text("self/")]))],
+            )]),
+        )]);
+        let parsed = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(parsed.rules().len(), 1, "the rule survives the parse");
+        assert!(!parsed.rules()[0].catch_all(), "and still narrows");
+    }
+
     #[test]
     fn port_and_network_values_are_read_like_the_reference() {
         let root = object(vec![(
@@ -4746,6 +4953,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(parsed.route(&flow), Some("direct"));
         flow.port = Some(102);
@@ -4781,6 +4989,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(parsed.route(&flow), Some("direct"));
         flow.port = Some(100);
@@ -5096,6 +5305,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, None);
@@ -5125,6 +5335,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("direct"));
@@ -5154,6 +5365,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("direct"));
@@ -5189,6 +5401,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("second"));
@@ -5221,6 +5434,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("first"));
@@ -5253,6 +5467,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -5295,6 +5510,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -5359,6 +5575,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(routing.route(&flow), Some("pool"));
     }
@@ -5548,6 +5765,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(
             parsed.route_target(&flow),

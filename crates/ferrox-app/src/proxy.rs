@@ -1372,7 +1372,11 @@ impl Outbound {
         client: Option<&Connection>,
         user: Option<&str>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
-        self.resolved_lane_with_protocol(asked, network, client, None, user, None)
+        let facts = FlowFacts {
+            user,
+            ..FlowFacts::default()
+        };
+        self.resolved_lane_with_protocol(asked, network, client, facts)
     }
 
     fn resolved_lane_with_protocol(
@@ -1380,16 +1384,17 @@ impl Outbound {
         asked: &Destination,
         network: crate::router::Network,
         client: Option<&Connection>,
-        protocol: Option<&str>,
-        user: Option<&str>,
-        attrs: Option<&crate::router::Attributes<'_>>,
+        facts: FlowFacts<'_>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
-        match self {
-            Self::Route(plan) => {
-                plan.lane_with_protocol(asked, network, client, protocol, user, attrs)
-            }
-            other => (Picked::Static(other), None),
-        }
+        let Self::Route(plan) = self else {
+            return (Picked::Static(self), None);
+        };
+        let owner = plan.process_owner(network, client);
+        let facts = FlowFacts {
+            process: owner.as_ref(),
+            ..facts
+        };
+        plan.lane_with_protocol(asked, network, client, facts)
     }
 
     /// Whether any rule reads the HTTP attributes a front would have to parse off the request head.
@@ -1564,6 +1569,16 @@ pub(crate) fn serve_dynamic_inbounds(
     )
 }
 
+/// What an inbound already resolved about a flow besides its destination: the protocol it read, the
+/// authenticated account, the HTTP head, and the process that owns the client socket.
+#[derive(Clone, Copy, Default)]
+struct FlowFacts<'a> {
+    protocol: Option<&'a str>,
+    user: Option<&'a str>,
+    attrs: Option<&'a crate::router::Attributes<'a>>,
+    process: Option<&'a crate::process::Owner>,
+}
+
 /// One inbound's view of the routes: its tag decides which rules may see a flow, and whether the
 /// transport can answer the selectors that name source and local addresses.
 #[derive(Debug, Clone)]
@@ -1639,7 +1654,11 @@ impl RoutePlan {
         client: Option<&Connection>,
         user: Option<&str>,
     ) -> Picked<'_> {
-        self.pick_with_protocol(asked, network, client, None, user)
+        let facts = FlowFacts {
+            user,
+            ..FlowFacts::default()
+        };
+        self.pick_with_protocol(asked, network, client, facts)
     }
 
     fn pick_with_protocol(
@@ -1647,11 +1666,14 @@ impl RoutePlan {
         asked: &Destination,
         network: crate::router::Network,
         client: Option<&Connection>,
-        protocol: Option<&str>,
-        user: Option<&str>,
+        facts: FlowFacts<'_>,
     ) -> Picked<'_> {
-        self.lane_with_protocol(asked, network, client, protocol, user, None)
-            .0
+        let owner = self.process_owner(network, client);
+        let facts = FlowFacts {
+            process: owner.as_ref(),
+            ..facts
+        };
+        self.lane_with_protocol(asked, network, client, facts).0
     }
 
     /// The outbound one flow takes and the tag that names its lane, or the default when no rule
@@ -1664,7 +1686,23 @@ impl RoutePlan {
         client: Option<&Connection>,
         user: Option<&str>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
-        self.lane_with_protocol(asked, network, client, None, user, None)
+        let facts = FlowFacts {
+            user,
+            ..FlowFacts::default()
+        };
+        self.lane_with_protocol(asked, network, client, facts)
+    }
+
+    /// The process that owns the client socket, looked up once per flow and only when a rule names it.
+    fn process_owner(
+        &self,
+        network: crate::router::Network,
+        client: Option<&Connection>,
+    ) -> Option<crate::process::Owner> {
+        if !self.source_known || !self.shared.routing.wants_process() {
+            return None;
+        }
+        crate::process::owner(network, client?.peer_addr().ok()?)
     }
 
     fn lane_with_protocol(
@@ -1672,9 +1710,7 @@ impl RoutePlan {
         asked: &Destination,
         network: crate::router::Network,
         client: Option<&Connection>,
-        protocol: Option<&str>,
-        user: Option<&str>,
-        attrs: Option<&crate::router::Attributes<'_>>,
+        facts: FlowFacts<'_>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         let (domain, ip) = match asked {
             Destination::Name(host, _) => (Some(host.as_str()), None),
@@ -1692,9 +1728,10 @@ impl RoutePlan {
             source,
             local,
             inbound_tag: self.inbound_tag.as_deref(),
-            protocol,
-            user,
-            attrs,
+            protocol: facts.protocol,
+            user: facts.user,
+            attrs: facts.attrs,
+            process: facts.process,
         };
         if let Some(script) = self.shared.routing.script() {
             let Some(callbacks) = self.shared.script.as_ref() else {
@@ -15243,14 +15280,17 @@ fn sniff_lane<'a>(
         out.wants_attrs(),
     );
     let attrs = (!pairs.is_empty()).then(|| crate::router::Attributes::from_pairs(&pairs));
+    let facts = FlowFacts {
+        user,
+        attrs: attrs.as_ref(),
+        ..FlowFacts::default()
+    };
     let Some(found) = found else {
         let (lane, tag) = out.resolved_lane_with_protocol(
             asked,
             crate::router::Network::Tcp,
             Some(client),
-            None,
-            user,
-            attrs.as_ref(),
+            facts,
         );
         return (None, lane, tag);
     };
@@ -15262,13 +15302,15 @@ fn sniff_lane<'a>(
     } else {
         None
     };
+    let facts = FlowFacts {
+        protocol: Some(found.protocol),
+        ..facts
+    };
     let (resolved, tag) = out.resolved_lane_with_protocol(
         route.as_ref().unwrap_or(asked),
         crate::router::Network::Tcp,
         Some(client),
-        Some(found.protocol),
-        user,
-        attrs.as_ref(),
+        facts,
     );
     (dial, resolved, tag)
 }
@@ -16443,9 +16485,12 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                 &asked,
                 crate::router::Network::Tcp,
                 Some(&client),
-                Some("http/1.1"),
-                user,
-                attrs.as_ref(),
+                FlowFacts {
+                    protocol: Some("http/1.1"),
+                    user,
+                    attrs: attrs.as_ref(),
+                    process: None,
+                },
             );
             serve_connect(client, &out, &asked, Front::Http, &origin, tag.as_deref());
         }
@@ -16826,6 +16871,7 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan, user: Option<
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+    let process = plan.process_owner(crate::router::Network::Udp, Some(&client));
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         if replies.contains_key(&src) {
             if let Some(client) = client_addr {
@@ -16855,9 +16901,12 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan, user: Option<
             &route,
             crate::router::Network::Udp,
             Some(&client),
-            protocol,
-            user,
-            None,
+            FlowFacts {
+                protocol,
+                user,
+                attrs: None,
+                process: process.as_ref(),
+            },
         );
         let key = key.map(std::borrow::Cow::into_owned);
         if matches!(&*out, Outbound::Block(_)) {
