@@ -20,6 +20,8 @@ const TLS13_VERSIONS: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
 /// bits it leaves are the only starts a six-byte compare is worth.
 const BYTE_ONES: u64 = 0x0101_0101_0101_0101;
 const BYTE_HIGHS: u64 = 0x8080_8080_8080_8080;
+/// The needle's second byte, one per byte, for the pair a start must open with.
+const BYTE_2B: u64 = 0x2b2b_2b2b_2b2b_2b2b;
 const TLS_AES_128_CCM_8_SHA256: u16 = 0x1305;
 const SHORTEST_FRAME: usize = 21;
 /// A framed block is one Xray buffer: `buf.Size` (8192) less the uuid and header, which is where the reference reshapes a longer piece and where its reader refuses the frame.
@@ -156,17 +158,24 @@ fn feed_extent(fresh: &[u8], feed: &mut Feeding) {
     scan_extent(fresh, feed);
 }
 
-/// The one pattern the scan hunts, over eight bytes a turn: it opens with a zero
-/// byte, so a word's zero bytes are the only starts worth six more, and a server
-/// hello's scarce zeros leave a compare at a handful of offsets instead of at
-/// every one. Every offset the window form tested is still tested — the word
-/// rounds stop five bytes early so a start near a word's end keeps its six.
+/// The one pattern the scan hunts, over eight bytes a turn: it opens `00 2b`, so a
+/// word's zero bytes and its `2b` bytes, one turn carried onto the other, leave a
+/// six-byte compare at the handful of starts that could still be the extension
+/// instead of at every one. A turn covers seven starts, the eighth being the next
+/// turn's first, so every offset the window form tested is still tested and none
+/// twice — and the last five bytes of the extent fall to the scalar tail.
 fn supports_tls13(bytes: &[u8]) -> bool {
     let mut at = 0;
     while at + 13 <= bytes.len() {
         let word = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or_default());
-        // a byte behind a zero borrows too, so a mark is a candidate, never an answer
-        let mut marks = word.wrapping_sub(BYTE_ONES) & !word & BYTE_HIGHS;
+        // a byte behind a zero borrows and a byte behind a `2b` draws one, so a mark
+        // is a candidate, never an answer
+        let zero = word.wrapping_sub(BYTE_ONES) & !word & BYTE_HIGHS;
+        let flip = word ^ BYTE_2B;
+        let plus = flip.wrapping_sub(BYTE_ONES) & !flip & BYTE_HIGHS;
+        // the `2b` mark at byte i+1 lands on the zero mark at byte i, and byte 8 has
+        // no mark to land, so the word's last start is the next turn's first
+        let mut marks = zero & (plus >> 8);
         while marks != 0 {
             let skip = (marks.trailing_zeros() >> 3) as usize;
             marks &= marks - 1;
@@ -174,7 +183,7 @@ fn supports_tls13(bytes: &[u8]) -> bool {
                 return true;
             }
         }
-        at += 8;
+        at += 7;
     }
     while at + 6 <= bytes.len() {
         if bytes[at..at + 6] == TLS13_VERSIONS {
