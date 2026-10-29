@@ -17,13 +17,18 @@ fn key_words(key: &[u8; WIDTH]) -> [u128; 2] {
     [wide(key, 0), wide(key, STEP)]
 }
 
-/// `dst = src ^ keystream`, sixteen bytes per step: the little-endian xor is the byte xor.
+/// `dst = src ^ keystream`, one whole key per step: the little-endian xor is the byte xor.
 pub(crate) fn encrypt(dst: &mut [u8], src: &[u8], key: &[u8; WIDTH]) {
     debug_assert!(dst.len() >= src.len());
     let words = key_words(key);
     let mut at = 0usize;
-    while at + STEP <= src.len() {
-        store(dst, at, wide(src, at) ^ words[(at / STEP) & 1]);
+    while at + WIDTH <= src.len() {
+        store(dst, at, wide(src, at) ^ words[0]);
+        store(dst, at + STEP, wide(src, at + STEP) ^ words[1]);
+        at += WIDTH;
+    }
+    if at + STEP <= src.len() {
+        store(dst, at, wide(src, at) ^ words[0]);
         at += STEP;
     }
     while at < src.len() {
@@ -36,8 +41,13 @@ pub(crate) fn encrypt(dst: &mut [u8], src: &[u8], key: &[u8; WIDTH]) {
 pub(crate) fn apply(bytes: &mut [u8], key: &[u8; WIDTH]) {
     let words = key_words(key);
     let mut at = 0usize;
-    while at + STEP <= bytes.len() {
-        store(bytes, at, wide(bytes, at) ^ words[(at / STEP) & 1]);
+    while at + WIDTH <= bytes.len() {
+        store(bytes, at, wide(bytes, at) ^ words[0]);
+        store(bytes, at + STEP, wide(bytes, at + STEP) ^ words[1]);
+        at += WIDTH;
+    }
+    if at + STEP <= bytes.len() {
+        store(bytes, at, wide(bytes, at) ^ words[0]);
         at += STEP;
     }
     while at < bytes.len() {
@@ -54,9 +64,15 @@ pub(crate) fn unshift(datagram: &mut [u8], shift: usize, key: &[u8; WIDTH]) -> u
     let payload = datagram.len().saturating_sub(shift);
     let words = key_words(key);
     let mut at = 0usize;
-    while at + STEP <= payload {
-        let plain = wide(datagram, at + shift) ^ words[(at / STEP) & 1];
-        store(datagram, at, plain);
+    while at + WIDTH <= payload {
+        let low = wide(datagram, at + shift) ^ words[0];
+        let high = wide(datagram, at + STEP + shift) ^ words[1];
+        store(datagram, at, low);
+        store(datagram, at + STEP, high);
+        at += WIDTH;
+    }
+    if at + STEP <= payload {
+        store(datagram, at, wide(datagram, at + shift) ^ words[0]);
         at += STEP;
     }
     while at < payload {
