@@ -539,7 +539,7 @@ const BLOCK: usize = 32;
 fn word_sum(bytes: &[u8]) -> u32 {
     // The split is on a block boundary, so the octets the tail reads are at the offsets they held in the whole run.
     let wide = bytes.len() & !(BLOCK - 1);
-    let acc = block_sum(&bytes[..wide]) + tail_sum(&bytes[wide..]);
+    let acc = block_sum(&bytes[..wide]) + lane_sum(&bytes[wide..]);
     // Fold the 64-bit residue into a 32-bit one (`2^32` is again congruent to `1`), then drain the carries twice: two steps bound any run past `0xffff` and callers fold once more.
     let mut sum = (acc >> 32) + (acc & 0xffff_ffff);
     sum = (sum >> 16) + (sum & 0xffff);
@@ -547,7 +547,7 @@ fn word_sum(bytes: &[u8]) -> u32 {
     sum as u32
 }
 
-/// The words of a run of whole blocks, as an exact integer: the vector kernel where AVX2 answers, the four-accumulator walk everywhere else.
+/// The words of a run of whole blocks, as an exact integer: the vector kernel where AVX2 answers, the lane walk everywhere else.
 fn block_sum(bytes: &[u8]) -> u64 {
     #[cfg(target_arch = "x86_64")]
     {
@@ -556,19 +556,7 @@ fn block_sum(bytes: &[u8]) -> u64 {
             return unsafe { avx2_block_sum(bytes) };
         }
     }
-    scalar_block_sum(bytes)
-}
-
-/// Thirty-two octets per block as four byte lanes apiece, so the loop's adds still do not carry into each other.
-fn scalar_block_sum(bytes: &[u8]) -> u64 {
-    let mut lanes = [0u64; 4];
-    for block in bytes.as_chunks::<BLOCK>().0 {
-        for (acc, lane) in lanes.iter_mut().zip(block.as_chunks::<8>().0) {
-            let word = u64::from_be_bytes(*lane);
-            *acc += (word >> 32) + (word & 0xffff_ffff);
-        }
-    }
-    (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
+    lane_sum(bytes)
 }
 
 /// The same run as two byte sums: `256 * every octet - 255 * the odd octets` is the word sum, because an odd octet is its word's high half.
@@ -599,8 +587,8 @@ unsafe fn avx2_block_sum(bytes: &[u8]) -> u64 {
     sum * 256 - high * 255
 }
 
-/// The run past the last whole block, shorter than one: eight octets a lane, and the last three, two or one as words, an eight-octet lane folded the way `2^32 = 1 mod 0xffff` allows.
-fn tail_sum(bytes: &[u8]) -> u64 {
+/// The same sum eight octets a lane, which answers both the run past the last whole block and the whole run where no kernel does: an eight-octet lane folded the way `2^32 = 1 mod 0xffff` allows, then the last three, two or one octets as words.
+fn lane_sum(bytes: &[u8]) -> u64 {
     let (lanes, rem) = bytes.as_chunks::<8>();
     let mut acc = 0u64;
     for lane in lanes {
@@ -1370,9 +1358,9 @@ mod tests {
             .collect()
     }
 
-    /// The vector kernel against the scalar one, whole blocks at a time, wherever the kernel exists: the same words at every block count from none to a whole datagram's worth, so the parity identity is gated on the instruction that computes it and not only on the walk the dispatcher reaches.
+    /// The vector kernel against the lane walk the dispatcher falls back to, whole blocks at a time, wherever the kernel exists: the same words at every block count from none to a whole datagram's worth, so the parity identity is gated on the instruction that computes it and not only on the walk the dispatcher reaches.
     #[test]
-    fn the_vector_block_sum_is_the_scalar_block_sum() {
+    fn the_vector_block_sum_is_the_walk_sum() {
         #[cfg(target_arch = "x86_64")]
         {
             if std::is_x86_feature_detected!("avx2") {
@@ -1382,7 +1370,7 @@ mod tests {
                     // SAFETY: the probe above is the guard.
                     assert_eq!(
                         unsafe { avx2_block_sum(run) },
-                        scalar_block_sum(run),
+                        lane_sum(run),
                         "{blocks} blocks"
                     );
                 }
