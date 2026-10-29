@@ -2760,8 +2760,9 @@ mod tests {
     }
 
     #[test]
-    fn a_certificate_without_a_key_is_skipped_not_refused() {
+    fn an_entry_xray_cannot_load_is_skipped_not_refused() {
         let minted = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).expect("mints");
+        let wrong = rcgen::generate_simple_self_signed(vec!["c.test".to_owned()]).expect("mints");
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -2773,13 +2774,18 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("creates");
         let cert = dir.join("a.pem");
         let key = dir.join("a.key");
+        let other_key = dir.join("c.key");
         std::fs::write(&cert, minted.cert.pem()).expect("cert");
         std::fs::write(&key, minted.signing_key.serialize_pem()).expect("key");
+        std::fs::write(&other_key, wrong.signing_key.serialize_pem()).expect("other key");
         let config = crate::json::parse(&format!(
             r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{
                 "certificates": [{{"certificateFile": "{}"}},
+                                 {{"certificateFile": "{}", "keyFile": "{}"}},
                                  {{"certificateFile": "{}", "keyFile": "{}"}}]}}}}}}"#,
             cert.display(),
+            cert.display(),
+            other_key.display(),
             cert.display(),
             key.display(),
         ))
@@ -2788,7 +2794,7 @@ mod tests {
         assert_eq!(
             identity.certs.len(),
             1,
-            "an entry with no key is skipped like the pair xray cannot parse"
+            "an entry with no key, or a key that does not sign for its leaf, is skipped"
         );
         assert_eq!(
             tls_handshake(&identity, minted.cert.der().to_vec(), "a.test"),

@@ -389,6 +389,12 @@ pub fn parse_pem_entry(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertEntry, Tls
     // The label a key block carries is the writer's, not the key's: xray writes every minted key under `RSA PRIVATE KEY` whichever algorithm fed it, so the DER itself names the kind the parser takes.
     for label in ["PRIVATE KEY", "EC PRIVATE KEY", "RSA PRIVATE KEY"] {
         if let Some(key_der) = pem_blocks(key_pem, label).into_iter().next() {
+            // xray's `X509KeyPair` refuses a key that does not sign for the leaf; the entry is skipped rather than poisoning the names the other identities answer.
+            if !signs_for(&cert_chain[0], &key_der) {
+                return Err(TlsError::Other(
+                    "tls key does not match the certificate".to_owned(),
+                ));
+            }
             return Ok(CertEntry {
                 cert_chain,
                 key_kind: key_kind(&key_der).unwrap_or(ServerKeyKind::Pkcs1),
@@ -400,6 +406,23 @@ pub fn parse_pem_entry(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertEntry, Tls
     Err(TlsError::Other(
         "tls key file holds no recognized private-key block".to_owned(),
     ))
+}
+
+/// Whether a private key's public half is the leaf's own subject key, the pair `X509KeyPair` holds together.
+fn signs_for(cert_der: &[u8], key_der: &[u8]) -> bool {
+    let Ok(cert) = boring::x509::X509::from_der(cert_der) else {
+        return false;
+    };
+    let Ok(key) = boring::pkey::PKey::private_key_from_der(key_der) else {
+        return false;
+    };
+    let Ok(cert_public) = cert.public_key() else {
+        return false;
+    };
+    matches!(
+        (cert_public.public_key_to_der(), key.public_key_to_der()),
+        (Ok(cert_key), Ok(key_public)) if cert_key == key_public
+    )
 }
 
 /// The DER shape a key names: PKCS#8 is version `0` before an algorithm `SEQUENCE`, PKCS#1 is an
