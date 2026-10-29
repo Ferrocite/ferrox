@@ -89,14 +89,14 @@ fn socket_inode(network: Network, source: SocketAddr) -> Option<String> {
     wildcard
 }
 
-/// The local address as the `/proc/net` tables spell it: the address bytes in host order, uppercase
-/// hex, then the port.
+/// The local address as the `/proc/net` tables spell it: each 32-bit word in host byte order, then
+/// the port. IPv4 is one word; IPv6 is four.
 #[cfg(target_os = "linux")]
 fn local_hex(octets: &[u8], port: u16) -> String {
     use std::fmt::Write as _;
     let mut address = String::with_capacity(octets.len() * 2 + 5);
-    for byte in octets.iter().rev() {
-        let _ = write!(address, "{byte:02X}");
+    for word in octets.as_chunks::<4>().0 {
+        let _ = write!(address, "{:08X}", u32::from_ne_bytes(*word));
     }
     let _ = write!(address, ":{port:04X}");
     address
@@ -132,6 +132,20 @@ fn owner_pid(inode: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
+
+    /// The kernel prints IPv4 as one 32-bit word and IPv6 as four, each in host byte order; a
+    /// single byte reversal only matches the one-word spelling.
+    #[test]
+    fn local_hex_spells_each_32_bit_word_as_the_kernel_does() {
+        let (v4, v6) = if cfg!(target_endian = "little") {
+            ("0100007F:0050", "00000000000000000000000001000000:01BB")
+        } else {
+            ("7F000001:0050", "00000000000000000000000000000001:01BB")
+        };
+        assert_eq!(local_hex(&[127, 0, 0, 1], 80), v4);
+        let loopback = std::net::Ipv6Addr::LOCALHOST.octets();
+        assert_eq!(local_hex(&loopback, 443), v6);
+    }
 
     /// The socket this process opened is the socket this process owns: the pid is ours and the path
     /// is our executable, which is what `self/` and a bare name decide on.
