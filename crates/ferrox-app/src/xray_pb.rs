@@ -5604,6 +5604,63 @@ mod tests {
         assert_eq!(route("GET"), None, "the replaced pattern is gone");
     }
 
+    /// The reference lowercases attribute keys into one map, so a key repeated with a different
+    /// spelling keeps the last value instead of adding a second pattern that can never both match.
+    #[test]
+    fn a_pb_attribute_map_collapses_case_differing_keys() {
+        let first = message(&[bytes_field(1, b":method"), bytes_field(2, b"^GET$")]);
+        let last = message(&[bytes_field(1, b":Method"), bytes_field(2, b"^PUT$")]);
+        let rule = message(&[
+            bytes_field(1, b"blocked"),
+            bytes_field(15, &first),
+            bytes_field(15, &last),
+        ]);
+        let router = message(&[bytes_field(2, &rule)]);
+        let outbound = message(&[
+            bytes_field(1, b"blocked"),
+            bytes_field(3, &typed("xray.proxy.blackhole.Config", &[])),
+        ]);
+        let config = message(&[
+            bytes_field(1, &socks_inbound(5000, 0, &[])),
+            bytes_field(2, &outbound),
+            bytes_field(4, &typed("xray.app.router.Config", &router)),
+        ]);
+        let json = to_json(&config).expect("decodes");
+        assert_eq!(
+            json.get("routing")
+                .and_then(|routing| routing.get("rules"))
+                .and_then(Json::as_arr)
+                .and_then(|rules| rules[0].get("attrs")),
+            Some(&Json::Obj(vec![(
+                ":Method".to_owned(),
+                Json::Str("^PUT$".to_owned())
+            )]))
+        );
+        let routing = crate::router::Routing::parse(&json)
+            .expect("parses")
+            .expect("routing");
+        let route = |method: &'static str| {
+            let mut attributes = crate::router::Attributes::new();
+            attributes.push(":Method", std::borrow::Cow::Borrowed(method));
+            let flow = crate::router::Flow {
+                network: crate::router::Network::Tcp,
+                domain: None,
+                ip: None,
+                port: Some(443),
+                source: None,
+                local: None,
+                inbound_tag: None,
+                protocol: None,
+                user: None,
+                attrs: Some(&attributes),
+                process: None,
+            };
+            routing.route(&flow).map(str::to_owned)
+        };
+        assert_eq!(route("PUT"), Some("blocked".to_owned()));
+        assert_eq!(route("GET"), None, "the replaced pattern is gone");
+    }
+
     /// A protobuf rule's `process` list reaches the rule table as the JSON field of the same name.
     #[test]
     fn a_pb_process_rule_reaches_the_router() {
