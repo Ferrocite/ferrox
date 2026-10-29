@@ -575,6 +575,7 @@ impl WireGuardOut {
             .collect()
     }
 
+    /// Answers a name through the kernel when Linux exposes one, and through the tunnel's DNS exchange otherwise.
     fn lookup(&self, host: &str) -> Vec<IpAddr> {
         let key = host.trim_end_matches('.').to_ascii_lowercase();
         if let Ok(cache) = self.resolved.lock() {
@@ -584,11 +585,14 @@ impl WireGuardOut {
                 }
             }
         }
-        let answer = if self.kernel_active() {
+        #[cfg(target_os = "linux")]
+        let answer = if self.kernel.is_some() {
             self.query_kernel(host)
         } else {
             self.query(host)
         };
+        #[cfg(not(target_os = "linux"))]
+        let answer = self.query(host);
         let (addrs, ttl) = answer.unwrap_or_else(|| (Vec::new(), DNS_NEGATIVE_TTL));
         if let Ok(mut cache) = self.resolved.lock() {
             if cache.len() >= DNS_CACHE {
@@ -617,12 +621,6 @@ impl WireGuardOut {
         self.query_with(host, &|_source, server, name, qtype| {
             self.exchange_kernel(kernel, server, name, qtype)
         })
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[allow(clippy::unused_self)]
-    fn query_kernel(&self, _host: &str) -> Option<(Vec<IpAddr>, u32)> {
-        None
     }
 
     fn query_with(&self, host: &str, exchange: &Exchange<'_>) -> Option<(Vec<IpAddr>, u32)> {
@@ -665,17 +663,6 @@ impl WireGuardOut {
             }
         }
         (!answers.is_empty()).then_some((answers, ttl))
-    }
-
-    #[cfg(target_os = "linux")]
-    fn kernel_active(&self) -> bool {
-        self.kernel.is_some()
-    }
-
-    #[cfg(not(target_os = "linux"))]
-    #[allow(clippy::unused_self)]
-    fn kernel_active(&self) -> bool {
-        false
     }
 
     #[cfg(target_os = "linux")]
