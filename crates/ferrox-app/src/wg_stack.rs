@@ -24,7 +24,9 @@ use ferrox_core::foxy::connectip::{
     icmp_echo_reply, udp_datagram, udp_from_packet, UdpDatagram, IPV4_HEADER, IPV6_HEADER,
     PROTOCOL_UDP,
 };
-use ferrox_core::wireguard::transport::{HEADER_SIZE as WG_HEADER_SIZE, TAG_SIZE as WG_TAG_SIZE};
+#[cfg(test)]
+use ferrox_core::wireguard::transport::HEADER_SIZE as WG_HEADER_SIZE;
+use ferrox_core::wireguard::transport::TAG_SIZE as WG_TAG_SIZE;
 use smoltcp::iface::{Config as IfaceConfig, Interface, SocketHandle, SocketSet};
 use smoltcp::phy::{Device, DeviceCapabilities, Medium, RxToken, TxToken};
 use smoltcp::socket::tcp::{
@@ -109,14 +111,16 @@ struct QueueDevice {
     rx: VecDeque<Vec<u8>>,
     tx: VecDeque<Vec<u8>>,
     mtu: usize,
+    headroom: usize,
 }
 
 impl QueueDevice {
-    fn new(mtu: usize) -> Self {
+    fn new(mtu: usize, headroom: usize) -> Self {
         Self {
             rx: VecDeque::new(),
             tx: VecDeque::new(),
             mtu,
+            headroom,
         }
     }
 
@@ -155,6 +159,7 @@ impl RxToken for QueueRx {
 
 struct QueueTx<'a> {
     tx: &'a mut VecDeque<Vec<u8>>,
+    headroom: usize,
 }
 
 impl TxToken for QueueTx<'_> {
@@ -162,9 +167,9 @@ impl TxToken for QueueTx<'_> {
     where
         F: FnOnce(&mut [u8]) -> R,
     {
-        let mut buffer = Vec::with_capacity(len + WG_HEADER_SIZE + WG_TAG_SIZE);
-        buffer.resize(len, 0);
-        let answer = f(&mut buffer);
+        let mut buffer = Vec::with_capacity(self.headroom + len + WG_TAG_SIZE);
+        buffer.resize(self.headroom + len, 0);
+        let answer = f(&mut buffer[self.headroom..]);
         self.tx.push_back(buffer);
         answer
     }
@@ -182,11 +187,20 @@ impl Device for QueueDevice {
 
     fn receive(&mut self, _timestamp: Instant) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
         let buffer = self.rx.pop_front()?;
-        Some((QueueRx { buffer }, QueueTx { tx: &mut self.tx }))
+        Some((
+            QueueRx { buffer },
+            QueueTx {
+                tx: &mut self.tx,
+                headroom: self.headroom,
+            },
+        ))
     }
 
     fn transmit(&mut self, _timestamp: Instant) -> Option<Self::TxToken<'_>> {
-        Some(QueueTx { tx: &mut self.tx })
+        Some(QueueTx {
+            tx: &mut self.tx,
+            headroom: self.headroom,
+        })
     }
 
     fn capabilities(&self) -> DeviceCapabilities {
@@ -427,8 +441,9 @@ pub(crate) fn client(
     to_tunnel: impl Into<ToTunnel>,
     packets: Packets,
     flows: Receiver<ClientFlow>,
+    headroom: usize,
 ) {
-    let mut stack = ClientStack::new(&config, to_tunnel);
+    let mut stack = ClientStack::new(&config, to_tunnel, headroom);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         while let Ok(flow) = flows.try_recv() {
@@ -480,8 +495,9 @@ pub(crate) fn server(
     to_tunnel: impl Into<ToTunnel>,
     packets: Packets,
     out: Outbound,
+    headroom: usize,
 ) {
-    let mut stack = ServerStack::new(&config, to_tunnel, out);
+    let mut stack = ServerStack::new(&config, to_tunnel, out, headroom);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         match packets.recv_timeout(TICK) {
@@ -503,6 +519,7 @@ pub(crate) fn server(
 
 struct ClientStack {
     device: QueueDevice,
+    headroom: usize,
     iface: Interface,
     sockets: SocketSet<'static>,
     flows: Vec<Flow>,
@@ -518,8 +535,8 @@ struct ClientStack {
 }
 
 impl ClientStack {
-    fn new(config: &DeviceConfig, to_tunnel: impl Into<ToTunnel>) -> Self {
-        let mut device = QueueDevice::new(config.mtu);
+    fn new(config: &DeviceConfig, to_tunnel: impl Into<ToTunnel>, headroom: usize) -> Self {
+        let mut device = QueueDevice::new(config.mtu, headroom);
         let mut iface = Interface::new(
             iface_config(0x5eed_1234),
             &mut device,
@@ -529,6 +546,7 @@ impl ClientStack {
         add_default_routes(&mut iface, &config.addresses);
         Self {
             device,
+            headroom,
             iface,
             sockets: SocketSet::new(Vec::new()),
             flows: Vec::new(),
@@ -545,7 +563,7 @@ impl ClientStack {
     }
 
     fn answer_echo(&self, packet: &[u8]) -> bool {
-        answer_echo(packet, &self.addresses, &self.to_tunnel)
+        answer_echo(packet, &self.addresses, &self.to_tunnel, self.headroom)
     }
 
     /// A Packet Too Big narrows the shared MTU only on a single-peer client, when
@@ -721,6 +739,7 @@ fn elapsed_ms(started: StdInstant) -> u64 {
 
 struct ServerStack {
     device: QueueDevice,
+    headroom: usize,
     iface: Interface,
     sockets: SocketSet<'static>,
     flows: Vec<Flow>,
@@ -735,8 +754,13 @@ struct ServerStack {
 }
 
 impl ServerStack {
-    fn new(config: &DeviceConfig, to_tunnel: impl Into<ToTunnel>, out: Outbound) -> Self {
-        let mut device = QueueDevice::new(config.mtu);
+    fn new(
+        config: &DeviceConfig,
+        to_tunnel: impl Into<ToTunnel>,
+        out: Outbound,
+        headroom: usize,
+    ) -> Self {
+        let mut device = QueueDevice::new(config.mtu, headroom);
         let mut iface = Interface::new(
             iface_config(0x5eed_5678),
             &mut device,
@@ -747,6 +771,7 @@ impl ServerStack {
         iface.set_any_ip(true);
         Self {
             device,
+            headroom,
             iface,
             sockets: SocketSet::new(Vec::new()),
             flows: Vec::new(),
@@ -773,7 +798,7 @@ impl ServerStack {
     }
 
     fn answer_echo(&self, packet: &[u8]) -> bool {
-        answer_echo(packet, &self.addresses, &self.to_tunnel)
+        answer_echo(packet, &self.addresses, &self.to_tunnel, self.headroom)
     }
 
     fn datagram(&mut self, peer: [u8; 32], bytes: &[u8]) {
@@ -794,10 +819,15 @@ impl ServerStack {
             if self.udp.len() >= UDP_FLOWS {
                 return;
             }
-            let last_used = Arc::new(AtomicU64::new(now));
-            let Some((uplink, stop)) =
-                server_udp(key, self.started, &last_used, &self.out, &self.to_tunnel)
-            else {
+            let last_used = Arc::new(AtomicU64::new(elapsed_ms(self.started)));
+            let Some((uplink, stop)) = server_udp(
+                key,
+                self.started,
+                &last_used,
+                &self.out,
+                &self.to_tunnel,
+                self.headroom,
+            ) else {
                 return;
             };
             self.udp.insert(
@@ -1202,6 +1232,7 @@ fn lane_send(
     target: SocketAddr,
     payload: &[u8],
     to_tunnel: &ToTunnel,
+    headroom: usize,
 ) -> bool {
     let Some(inner_source) = config
         .addresses
@@ -1214,8 +1245,13 @@ fn lane_send(
     let mut destination_room = [0u8; 16];
     let source = ip_bytes_into(*inner_source, &mut source_room);
     let destination = ip_bytes_into(target.ip(), &mut destination_room);
-    let mut packet =
-        Vec::with_capacity(IPV4_HEADER + 8 + payload.len() + WG_HEADER_SIZE + WG_TAG_SIZE);
+    let header = if source.len() == 4 {
+        IPV4_HEADER
+    } else {
+        IPV6_HEADER
+    };
+    let mut packet = Vec::with_capacity(headroom + header + 8 + payload.len() + WG_TAG_SIZE);
+    packet.resize(headroom, 0);
     let datagram = UdpDatagram {
         source,
         destination,
@@ -1309,6 +1345,7 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
     routes: &UdpRoutes,
     associate: Option<&Connection>,
     resolve: &dyn Fn(&str, u16) -> Vec<SocketAddr>,
+    headroom: usize,
 ) {
     let to_tunnel: ToTunnel = to_tunnel.clone().into();
     let Ok(local) = relay.local_addr() else {
@@ -1382,7 +1419,7 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
                 };
                 let targets = lane_targets(destination, resolve, &config.addresses, winner);
                 for target in targets {
-                    if !lane_send(config, source_port, target, payload, &to_tunnel) {
+                    if !lane_send(config, source_port, target, payload, &to_tunnel, headroom) {
                         break 'lane;
                     }
                 }
@@ -1419,6 +1456,7 @@ pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
     last_used: &Arc<AtomicU64>,
     out: &Outbound,
     to_tunnel: &T,
+    headroom: usize,
 ) -> Option<(UdpSocket, Arc<AtomicBool>)> {
     let relay = UdpSocket::bind("127.0.0.1:0").ok()?;
     let relay_address = relay.local_addr().ok()?;
@@ -1459,9 +1497,14 @@ pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
                     let mut destination_bytes = [0u8; 16];
                     let source_bytes = ip_bytes_into(target.ip(), &mut source_bytes);
                     let destination_bytes = ip_bytes_into(source.ip(), &mut destination_bytes);
-                    let mut packet = Vec::with_capacity(
-                        IPV4_HEADER + 8 + payload.len() + WG_HEADER_SIZE + WG_TAG_SIZE,
-                    );
+                    let header = if source_bytes.len() == 4 {
+                        IPV4_HEADER
+                    } else {
+                        IPV6_HEADER
+                    };
+                    let mut packet =
+                        Vec::with_capacity(headroom + header + 8 + payload.len() + WG_TAG_SIZE);
+                    packet.resize(headroom, 0);
                     let datagram = UdpDatagram {
                         source: source_bytes,
                         destination: destination_bytes,
@@ -1531,7 +1574,7 @@ const PROTOCOL_ICMPV6: u8 = 58;
 
 /// Answer an echo request the tunnel sent to one of this device's own addresses; the reply
 /// rides the same tunnel back, so a ping to the tunnel address returns instead of vanishing.
-fn answer_echo(packet: &[u8], addresses: &[IpAddr], to_tunnel: &ToTunnel) -> bool {
+fn answer_echo(packet: &[u8], addresses: &[IpAddr], to_tunnel: &ToTunnel, headroom: usize) -> bool {
     let Some((source, destination)) = inner_addresses(packet) else {
         return false;
     };
@@ -1541,7 +1584,8 @@ fn answer_echo(packet: &[u8], addresses: &[IpAddr], to_tunnel: &ToTunnel) -> boo
     let Some(message) = icmp_message(packet) else {
         return false;
     };
-    let mut reply = Vec::with_capacity(packet.len() + WG_HEADER_SIZE + WG_TAG_SIZE);
+    let mut reply = Vec::with_capacity(headroom + packet.len() + WG_TAG_SIZE);
+    reply.resize(headroom, 0);
     if !icmp_echo_reply(source, destination, message, &mut reply) {
         return false;
     }
@@ -1648,7 +1692,7 @@ mod tests {
         };
         let (to_tunnel, _) = std::sync::mpsc::channel();
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let mut stack = ServerStack::new(&config, to_tunnel, out);
+        let mut stack = ServerStack::new(&config, to_tunnel, out, 0);
         for port in 0..(LISTENERS as u16 + 10) {
             stack.listen(10_000 + port);
         }
@@ -1733,7 +1777,7 @@ mod tests {
             dns: Vec::new(),
         };
         let (to_tunnel, packets) = std::sync::mpsc::channel();
-        let mut stack = ClientStack::new(&config, to_tunnel);
+        let mut stack = ClientStack::new(&config, to_tunnel, 0);
         stack
             .connect(ClientFlow {
                 client: proxy,
@@ -1850,6 +1894,7 @@ mod tests {
             &last_used,
             &out,
             &to_tunnel,
+            0,
         )
         .expect("lane");
         let mut buf = Vec::new();
@@ -1887,7 +1932,7 @@ mod tests {
         };
         let (to_tunnel, _) = std::sync::mpsc::channel();
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let mut stack = ServerStack::new(&config, to_tunnel.clone(), out.clone());
+        let mut stack = ServerStack::new(&config, to_tunnel.clone(), out.clone(), 0);
         let source: SocketAddr = "10.0.0.2:1234".parse().unwrap();
         let target: SocketAddr = "192.0.2.1:7".parse().unwrap();
         let key = ([0x11; 32], source, target);
@@ -1896,7 +1941,8 @@ mod tests {
             .expect("instant");
         stack.started = started;
         let last_used = Arc::new(AtomicU64::new(0));
-        let (uplink, stop) = server_udp(key, started, &last_used, &out, &to_tunnel).expect("lane");
+        let (uplink, stop) =
+            server_udp(key, started, &last_used, &out, &to_tunnel, 0).expect("lane");
         stack.udp.insert(
             key,
             UdpLane {
@@ -1959,15 +2005,28 @@ mod tests {
     #[test]
     fn an_echo_to_the_devices_own_address_is_answered_on_the_tunnel() {
         let (to_tunnel, replies) = std::sync::mpsc::channel();
-        let stack = ClientStack::new(&device(&["10.0.0.2", "fd00::2"], true), to_tunnel);
+        let stack = ClientStack::new(
+            &device(&["10.0.0.2", "fd00::2"], true),
+            to_tunnel,
+            WG_HEADER_SIZE,
+        );
 
         assert!(stack.answer_echo(&echo_v4([10, 0, 0, 1], [10, 0, 0, 2], b"ping")));
         let reply = replies.try_recv().expect("a v4 reply");
-        assert_eq!(reply[0], 0x45);
-        assert_eq!(&reply[12..16], &[10, 0, 0, 2], "source is this device");
-        assert_eq!(&reply[16..20], &[10, 0, 0, 1], "target is the pinger");
-        assert_eq!(reply[IPV4_HEADER], 0, "an echo reply");
-        assert_eq!(&reply[IPV4_HEADER + 8..], b"ping");
+        assert!(reply[..WG_HEADER_SIZE].iter().all(|&byte| byte == 0));
+        assert_eq!(reply[WG_HEADER_SIZE], 0x45);
+        assert_eq!(
+            &reply[WG_HEADER_SIZE + 12..WG_HEADER_SIZE + 16],
+            &[10, 0, 0, 2],
+            "source is this device"
+        );
+        assert_eq!(
+            &reply[WG_HEADER_SIZE + 16..WG_HEADER_SIZE + 20],
+            &[10, 0, 0, 1],
+            "target is the pinger"
+        );
+        assert_eq!(reply[WG_HEADER_SIZE + IPV4_HEADER], 0, "an echo reply");
+        assert_eq!(&reply[WG_HEADER_SIZE + IPV4_HEADER + 8..], b"ping");
 
         assert!(stack.answer_echo(&echo_v6(
             [0xfd, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
@@ -1975,9 +2034,14 @@ mod tests {
             b"ping",
         )));
         let reply = replies.try_recv().expect("a v6 reply");
-        assert_eq!(reply[0], 0x60);
-        assert_eq!(reply[IPV6_HEADER], 129, "an echo reply");
-        assert_eq!(&reply[IPV6_HEADER + 8..], b"ping", "the message comes back");
+        assert!(reply[..WG_HEADER_SIZE].iter().all(|&byte| byte == 0));
+        assert_eq!(reply[WG_HEADER_SIZE], 0x60);
+        assert_eq!(reply[WG_HEADER_SIZE + IPV6_HEADER], 129, "an echo reply");
+        assert_eq!(
+            &reply[WG_HEADER_SIZE + IPV6_HEADER + 8..],
+            b"ping",
+            "the message comes back"
+        );
 
         assert!(
             !stack.answer_echo(&echo_v4([10, 0, 0, 1], [10, 0, 0, 9], b"ping")),
@@ -1990,16 +2054,30 @@ mod tests {
     fn a_server_answers_an_echo_to_its_own_address() {
         let (to_tunnel, replies) = std::sync::mpsc::channel();
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let mut stack = ServerStack::new(&device(&["10.13.0.1"], false), to_tunnel, out);
+        let mut stack = ServerStack::new(
+            &device(&["10.13.0.1"], false),
+            to_tunnel,
+            out,
+            WG_HEADER_SIZE,
+        );
 
         stack.receive(Packet {
             peer: [0u8; 32],
             bytes: echo_v4([10, 13, 0, 2], [10, 13, 0, 1], b"ping"),
         });
         let reply = replies.try_recv().expect("a reply");
-        assert_eq!(&reply[12..16], &[10, 13, 0, 1], "source is this server");
-        assert_eq!(&reply[16..20], &[10, 13, 0, 2], "target is the pinger");
-        assert_eq!(reply[IPV4_HEADER], 0);
+        assert!(reply[..WG_HEADER_SIZE].iter().all(|&byte| byte == 0));
+        assert_eq!(
+            &reply[WG_HEADER_SIZE + 12..WG_HEADER_SIZE + 16],
+            &[10, 13, 0, 1],
+            "source is this server"
+        );
+        assert_eq!(
+            &reply[WG_HEADER_SIZE + 16..WG_HEADER_SIZE + 20],
+            &[10, 13, 0, 2],
+            "target is the pinger"
+        );
+        assert_eq!(reply[WG_HEADER_SIZE + IPV4_HEADER], 0);
 
         stack.receive(Packet {
             peer: [0u8; 32],
@@ -2012,7 +2090,7 @@ mod tests {
     fn a_client_cannot_narrow_the_server_mtu() {
         let (to_tunnel, _) = std::sync::mpsc::channel();
         let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
-        let mut stack = ServerStack::new(&device(&["10.13.0.1"], false), to_tunnel, out);
+        let mut stack = ServerStack::new(&device(&["10.13.0.1"], false), to_tunnel, out, 0);
         let before = stack.device.capabilities().max_transmission_unit;
         let mut inner = vec![0u8; 28];
         inner[0] = 0x45;
@@ -2084,6 +2162,7 @@ mod client_tests {
                 &thread_routes,
                 Some(&associate),
                 &resolve_one,
+                0,
             );
             let _ = done_tx.send(());
         });
@@ -2116,6 +2195,7 @@ mod client_tests {
                 &thread_routes,
                 None,
                 &resolve_one,
+                0,
             );
             let _ = done_tx.send(());
         });
@@ -2145,6 +2225,7 @@ mod client_tests {
                 &thread_routes,
                 None,
                 &resolve_one,
+                0,
             );
         });
         let port = relay_address.port();
@@ -2227,6 +2308,7 @@ mod client_tests {
                     assert_eq!(port, 53);
                     wanted.clone()
                 },
+                0,
             );
         });
         let port = relay_address.port();
@@ -2300,6 +2382,7 @@ mod client_tests {
                     assert_eq!(port, 53);
                     wanted.clone()
                 },
+                0,
             );
         });
         let port = relay_address.port();
@@ -2439,7 +2522,7 @@ mod client_tests {
         inner[16..20].copy_from_slice(&[198, 51, 100, 7]);
         let too_big =
             ferrox_core::foxy::connectip::icmp_too_large(&inner, 1170).expect("a v4 answer");
-        let mut device = QueueDevice::new(1420);
+        let mut device = QueueDevice::new(1420, 0);
         assert!(device.absorb(&too_big));
         assert_eq!(device.capabilities().max_transmission_unit, 1170);
         assert!(!device.absorb(&too_big), "never wider again");
@@ -2453,7 +2536,7 @@ mod client_tests {
             .copy_from_slice(&[0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 7]);
         let too_big =
             ferrox_core::foxy::connectip::icmp_too_large(&inner, 1280).expect("a v6 answer");
-        let mut device = QueueDevice::new(1420);
+        let mut device = QueueDevice::new(1420, 0);
         assert!(device.absorb(&too_big));
         assert_eq!(device.capabilities().max_transmission_unit, 1280);
 
@@ -2481,7 +2564,7 @@ mod client_tests {
             dns: Vec::new(),
         };
         let (to_tunnel, packets) = std::sync::mpsc::channel();
-        let mut stack = ClientStack::new(&config, to_tunnel);
+        let mut stack = ClientStack::new(&config, to_tunnel, 0);
         let mut inner = vec![0u8; 28];
         inner[0] = 0x45;
         inner[2..4].copy_from_slice(&28u16.to_be_bytes());
@@ -2564,7 +2647,7 @@ mod client_tests {
             dns: Vec::new(),
         };
         let (to_tunnel, _) = std::sync::mpsc::channel();
-        let mut stack = ClientStack::new(&config, to_tunnel);
+        let mut stack = ClientStack::new(&config, to_tunnel, 0);
         let mut inner = vec![0u8; 28];
         inner[0] = 0x45;
         inner[2..4].copy_from_slice(&28u16.to_be_bytes());
@@ -2618,7 +2701,7 @@ mod client_tests {
             dns: Vec::new(),
         };
         let (to_tunnel, _) = std::sync::mpsc::channel();
-        let mut stack = ClientStack::new(&config, to_tunnel);
+        let mut stack = ClientStack::new(&config, to_tunnel, 0);
         let mut inner = vec![0u8; 28];
         inner[0] = 0x45;
         inner[2..4].copy_from_slice(&28u16.to_be_bytes());

@@ -29,7 +29,7 @@ graph TD
     L --> M["kernel wireguard link:<br/>address, MTU, key, peers"]
     K -->|no / fallback| N["smoltcp client: connect the destination"]
     N --> D["inner IP packet"]
-    D --> E["Tunnel::send_owned: handshake, queue, seal<br/>16-byte header + tag"]
+    D --> E["Tunnel::send_prefixed: trigger a handshake when needed; queue data until a session is ready<br/>seal transport records in the caller's buffer using the reserved 16-byte header"]
     E --> F["UDP socket to the peer's endpoint"]
     M --> F
     F --> G["server: Tunnel::receive, allowed-IP check"]

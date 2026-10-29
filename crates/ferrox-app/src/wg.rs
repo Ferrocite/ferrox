@@ -260,7 +260,13 @@ impl WireGuardOut {
         let stack_config = config.clone();
         let stack_tunnel = to_tunnel.clone();
         std::thread::spawn(move || {
-            wg_stack::client(stack_config, stack_tunnel, packets_rx, flow_rx);
+            wg_stack::client(
+                stack_config,
+                stack_tunnel,
+                packets_rx,
+                flow_rx,
+                WG_HEADER_SIZE,
+            );
         });
         Ok(Self {
             config: Arc::new(config),
@@ -343,6 +349,7 @@ impl WireGuardOut {
             &self.routes,
             associate,
             &|host, port| self.destinations(&Destination::Name(host.to_owned(), port)),
+            WG_HEADER_SIZE,
         );
     }
 
@@ -611,6 +618,7 @@ impl WireGuardOut {
     }
 
     #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::unused_self)]
     fn query_kernel(&self, _host: &str) -> Option<(Vec<IpAddr>, u32)> {
         None
     }
@@ -663,6 +671,7 @@ impl WireGuardOut {
     }
 
     #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::unused_self)]
     fn kernel_active(&self) -> bool {
         false
     }
@@ -779,22 +788,29 @@ impl WireGuardOut {
         } else {
             IPV6_HEADER
         };
-        let mut packet =
-            Vec::with_capacity(header + UDP_HEADER + query.len() + WG_HEADER_SIZE + WG_TAG_SIZE);
-        if !udp_datagram(
-            &UdpDatagram {
-                source: &source_bytes,
-                destination: &destination_bytes,
-                source_port: port,
-                destination_port: self.dns_port,
-                payload: &query,
-            },
-            &mut packet,
-        ) {
+        let dns_port = self.dns_port;
+        let build = || {
+            let mut packet = Vec::with_capacity(
+                WG_HEADER_SIZE + header + UDP_HEADER + query.len() + WG_TAG_SIZE,
+            );
+            packet.resize(WG_HEADER_SIZE, 0);
+            udp_datagram(
+                &UdpDatagram {
+                    source: &source_bytes,
+                    destination: &destination_bytes,
+                    source_port: port,
+                    destination_port: dns_port,
+                    payload: &query,
+                },
+                &mut packet,
+            )
+            .then_some(packet)
+        };
+        let Some(packet) = build() else {
             self.remove_dns_route(port);
             return None;
-        }
-        if self.to_tunnel.send(packet.clone()).is_err() {
+        };
+        if self.to_tunnel.send(packet).is_err() {
             self.remove_dns_route(port);
             return None;
         }
@@ -806,7 +822,10 @@ impl WireGuardOut {
                 break None;
             }
             if now >= resend_at {
-                if self.to_tunnel.send(packet.clone()).is_err() {
+                let Some(packet) = build() else {
+                    break None;
+                };
+                if self.to_tunnel.send(packet).is_err() {
                     break None;
                 }
                 resend_at = now + DNS_RETRY;
@@ -954,7 +973,13 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     let stack_tunnel = to_tunnel;
     let stack_out = out.clone();
     std::thread::spawn(move || {
-        wg_stack::server(stack_config, stack_tunnel, packets_rx, stack_out);
+        wg_stack::server(
+            stack_config,
+            stack_tunnel,
+            packets_rx,
+            stack_out,
+            WG_HEADER_SIZE,
+        );
     });
     Ok(port)
 }
@@ -1001,13 +1026,19 @@ fn io(
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => return,
             };
-            let Some((_, destination)) = wg_stack::inner_addresses(&packet) else {
+            if packet.len() < WG_HEADER_SIZE {
+                continue;
+            }
+            let Some((_, destination)) = wg_stack::inner_addresses(&packet[WG_HEADER_SIZE..])
+            else {
                 continue;
             };
             let Some(index) = peer_for(&peers, destination) else {
                 continue;
             };
-            peers[index].tunnel.send_owned(now, packet, &mut events);
+            peers[index]
+                .tunnel
+                .send_prefixed(now, packet, WG_HEADER_SIZE, &mut events);
             flush(
                 &mut events,
                 &socket,
@@ -1553,16 +1584,10 @@ mod tests {
         let (answered, answer) = mpsc::channel();
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
-            let mut seen = 0;
             loop {
                 let Ok((n, from)) = dns.recv_from(&mut buf) else {
                     return;
                 };
-                seen += 1;
-                // A tunnel still handshaking drops the first query; the resolver's retry carries it.
-                if seen == 1 {
-                    continue;
-                }
                 let Some(question) = ferrox_core::dns::parse_query(&buf[..n]) else {
                     continue;
                 };

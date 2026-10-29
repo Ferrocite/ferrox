@@ -712,9 +712,9 @@ const ICMPV6_ECHO_REPLY: u8 = 129;
 
 /// Answer an ICMP echo request that reached a device's own address: its message with the
 /// type flipped and the checksum recomputed, wrapped in an IP header whose addresses are
-/// the request's swapped, rendered into the caller's reused `out` so a ping storm allocates
-/// nothing per reply. A message that is not a well-formed echo request is refused and `out`
-/// is left untouched.
+/// the request's swapped, appended to the caller's reused `out` so a reserved `WireGuard`
+/// header survives and a ping storm allocates nothing per reply. A message that is not a
+/// well-formed echo request is refused and `out` is left untouched.
 pub fn icmp_echo_reply(
     source: IpAddr,
     destination: IpAddr,
@@ -737,7 +737,7 @@ pub fn icmp_echo_reply(
             let Ok(total) = u16::try_from(IPV4_HEADER + message.len()) else {
                 return false;
             };
-            out.clear();
+            let at = out.len();
             out.reserve(usize::from(total));
             let mut head = [0u8; IPV4_HEADER];
             head[0] = 0x45;
@@ -751,17 +751,17 @@ pub fn icmp_echo_reply(
             head[10..12].copy_from_slice(&sum.to_be_bytes());
             out.extend_from_slice(&head);
             out.extend_from_slice(message);
-            out[IPV4_HEADER] = ICMP_ECHO_REPLY;
-            out[IPV4_HEADER + 2..IPV4_HEADER + 4].fill(0);
-            let sum = checksum(&out[IPV4_HEADER..]);
-            out[IPV4_HEADER + 2..IPV4_HEADER + 4].copy_from_slice(&sum.to_be_bytes());
+            out[at + IPV4_HEADER] = ICMP_ECHO_REPLY;
+            out[at + IPV4_HEADER + 2..at + IPV4_HEADER + 4].fill(0);
+            let sum = checksum(&out[at + IPV4_HEADER..]);
+            out[at + IPV4_HEADER + 2..at + IPV4_HEADER + 4].copy_from_slice(&sum.to_be_bytes());
             true
         }
         (IpAddr::V6(source), IpAddr::V6(destination)) => {
             let Ok(payload) = u16::try_from(message.len()) else {
                 return false;
             };
-            out.clear();
+            let at = out.len();
             out.reserve(IPV6_HEADER + message.len());
             let mut head = [0u8; IPV6_HEADER];
             head[0] = 0x60;
@@ -772,15 +772,15 @@ pub fn icmp_echo_reply(
             head[24..40].copy_from_slice(&source.octets());
             out.extend_from_slice(&head);
             out.extend_from_slice(message);
-            out[IPV6_HEADER] = ICMPV6_ECHO_REPLY;
-            out[IPV6_HEADER + 2..IPV6_HEADER + 4].fill(0);
+            out[at + IPV6_HEADER] = ICMPV6_ECHO_REPLY;
+            out[at + IPV6_HEADER + 2..at + IPV6_HEADER + 4].fill(0);
             let sum = pseudo_checksum(
                 &destination.octets(),
                 &source.octets(),
                 ICMPV6_PROTOCOL,
-                &out[IPV6_HEADER..],
+                &out[at + IPV6_HEADER..],
             );
-            out[IPV6_HEADER + 2..IPV6_HEADER + 4].copy_from_slice(&sum.to_be_bytes());
+            out[at + IPV6_HEADER + 2..at + IPV6_HEADER + 4].copy_from_slice(&sum.to_be_bytes());
             true
         }
         _ => false,

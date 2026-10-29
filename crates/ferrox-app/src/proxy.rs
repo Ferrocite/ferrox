@@ -46138,14 +46138,16 @@ mod tests {
             &last_used,
             &plan,
             &to_tunnel,
+            ferrox_core::wireguard::transport::HEADER_SIZE,
         )
         .expect("lane");
         let mut buf = Vec::new();
         let frame = socks_udp_frame(&mut buf, None, &target, b"hi");
         uplink.send(frame).expect("send");
         let packet = replies.recv_timeout(Duration::from_secs(5)).expect("reply");
-        let datagram =
-            ferrox_core::foxy::connectip::udp_from_packet(&packet).expect("inner datagram");
+        let header = ferrox_core::wireguard::transport::HEADER_SIZE;
+        let datagram = ferrox_core::foxy::connectip::udp_from_packet(&packet[header..])
+            .expect("inner datagram");
         assert_eq!(datagram.payload, b"hi");
         assert_eq!(
             datagram.source,
