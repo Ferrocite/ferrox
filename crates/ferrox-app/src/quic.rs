@@ -1195,9 +1195,11 @@ fn gro_segment(header: &libc::msghdr, raw: usize) -> usize {
                 .cmsg_len
                 .saturating_sub(unsafe { libc::CMSG_LEN(0) } as usize);
             if len >= std::mem::size_of::<libc::c_int>() {
-                let data = unsafe { libc::CMSG_DATA(cmsg) }.cast::<libc::c_int>();
+                let data = unsafe { libc::CMSG_DATA(cmsg) };
+                let mut raw = [0u8; std::mem::size_of::<libc::c_int>()];
                 // SAFETY: the header's payload holds the `int` the kernel wrote, which `len` just checked.
-                let seg = usize::try_from(unsafe { data.read_unaligned() }).unwrap_or(0);
+                unsafe { std::ptr::copy_nonoverlapping(data, raw.as_mut_ptr(), raw.len()) };
+                let seg = usize::try_from(libc::c_int::from_ne_bytes(raw)).unwrap_or(0);
                 if seg > 0 && seg <= raw {
                     return seg;
                 }
@@ -2836,6 +2838,17 @@ fn hand_off(
     }
 }
 
+/// Hand every datagram a batch holds to quiche as its own packet, in the order the kernel wrote them.
+fn deliver_batch(conn: &mut quiche::Connection, batch: &mut Batch, local: SocketAddr) {
+    for at in 0..batch.len() {
+        let Some((bytes, from)) = batch.at(at) else {
+            continue;
+        };
+        let info = quiche::RecvInfo { from, to: local };
+        let _ = conn.recv(bytes, info);
+    }
+}
+
 /// Drive one connection's reads and writes until its socket or connection ends, taking a batch of datagrams per turn.
 fn pump(
     shared: &Arc<Mutex<quiche::Connection>>,
@@ -2905,15 +2918,8 @@ fn pump(
             if conn.is_closed() {
                 return;
             }
-            // Every datagram the batch holds is one packet, and they are handed to quiche in the order the kernel wrote them.
             if drain == Drain::Read {
-                for at in 0..batch.len() {
-                    let Some((bytes, from)) = batch.at(at) else {
-                        continue;
-                    };
-                    let info = quiche::RecvInfo { from, to: local };
-                    let _ = conn.recv(bytes, info);
-                }
+                deliver_batch(&mut conn, &mut batch, local);
             }
 
             match incoming {
