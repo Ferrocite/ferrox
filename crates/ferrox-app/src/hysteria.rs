@@ -10,7 +10,7 @@ use ferrox_core::hysteria::{self, Defrag, Masquerade, UdpMessage};
 
 use crate::conn::Connection;
 use crate::proxy::lane_pool::Next;
-use crate::quic::{Unfilled, MAX_DATAGRAM, RECV_ROOM};
+use crate::quic::{Unfilled, RECV_ROOM};
 
 const AUTH_STREAM: u64 = 0;
 
@@ -1750,7 +1750,6 @@ fn udp_reader(
     // One buffer for a whole target reply and one for the wire, both kept at capacity across the association's life so a steady relay never reallocates; the fragments view `buf`, so they are rebuilt each read rather than carried.
     let mut buf = vec![0u8; UDP_TARGET_BUF];
     let mut wire = Vec::new();
-    let mut out = Unfilled::<MAX_DATAGRAM>::new();
     let mut packet = 0u16;
     loop {
         let n = match target.recv(&mut buf) {
@@ -1791,7 +1790,7 @@ fn udp_reader(
                 let _ = conn.dgram_send(&wire);
             }
         }
-        flush(sock, &mut conn, out.as_mut());
+        crate::quic::flush_egress(&mut conn, sock);
     }
 }
 
@@ -1835,7 +1834,6 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
     let mut buf = vec![0u8; UDP_TARGET_BUF];
     // One wire buffer and one packet buffer, kept at capacity across the association's life so a steady relay never reallocates. The fragment list is born in the loop because its messages borrow the message's own bytes.
     let mut wire = Vec::with_capacity(UDP_TARGET_BUF + 64);
-    let mut out = Unfilled::<MAX_DATAGRAM>::new();
     let mut packet = 0u16;
     // Ids the lane stamps, taken in order and never reused on this connection, so a late reply to a retired flow cannot land on a new one.
     let mut next_id = 1u32;
@@ -1898,7 +1896,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
                 let _ = conn.dgram_send(&wire);
             }
         }
-        flush(&session.sock, &mut conn, out.as_mut());
+        crate::quic::flush_egress(&mut conn, &session.sock);
     }
     stop.store(true, Ordering::Relaxed);
     let _ = reader.join();
@@ -1999,7 +1997,6 @@ fn relay_datagrams(
 struct Router<'a> {
     sock: Arc<crate::quic::Datagram>,
     local: SocketAddr,
-    out: Unfilled<MAX_DATAGRAM>,
     auths: &'a [String],
     serve: &'a Serve,
     masq: Arc<Masquerade>,
@@ -2010,12 +2007,6 @@ struct Router<'a> {
     /// Whether an accepted connection advertises the token a peer resets it with; the reference's default, off only when `disableStatelessReset` names it.
     stateless_reset: bool,
     routes: HashMap<Vec<u8>, Inbound>,
-}
-
-fn flush(sock: &crate::quic::Datagram, conn: &mut quiche::Connection, out: &mut [u8]) {
-    while let Ok((written, info)) = conn.send(out) {
-        let _ = sock.send_to(&out[..written], info.to);
-    }
 }
 
 /// A stateless reset token belongs to one connection, so the shared template is minted afresh before each accept; a failed mint refuses the connection rather than sharing one.
@@ -2034,7 +2025,6 @@ fn mint_reset_token(template: &mut quiche::Config, enabled: bool) -> bool {
 
 fn auth_exchange(
     sock: &crate::quic::Datagram,
-    out: &mut [u8],
     conn: &mut quiche::Connection,
     auths: &[String],
     inbound: &mut Inbound,
@@ -2066,7 +2056,7 @@ fn auth_exchange(
         if conn.stream_send(AUTH_STREAM, &reply, true).is_err() {
             return None;
         }
-        flush(sock, conn, out);
+        crate::quic::flush_egress(conn, sock);
         return Some(true);
     }
     let ok = auths
@@ -2075,7 +2065,7 @@ fn auth_exchange(
     if !answer_auth(conn, ok, inbound.cc_rx) {
         return None;
     }
-    flush(sock, conn, out);
+    crate::quic::flush_egress(conn, sock);
     inbound.auth_buf.clear();
     inbound.authed = true;
     Some(ok)
@@ -2106,7 +2096,7 @@ impl Router<'_> {
         if conn.recv(packet, info).is_err() {
             return;
         }
-        flush(&self.sock, &mut conn, self.out.as_mut());
+        crate::quic::flush_egress(&mut conn, &self.sock);
         self.routes.insert(
             scid.to_vec(),
             Inbound {
@@ -2130,7 +2120,6 @@ impl Router<'_> {
         let Self {
             routes,
             sock,
-            out,
             auths,
             serve,
             masq,
@@ -2150,7 +2139,7 @@ impl Router<'_> {
             }
             // An established lane's acknowledgements leave with the batch that carried the packet, in `wake`, not one send per datagram.
             if !conn.is_established() || conn.is_closed() {
-                flush(sock, &mut conn, out.as_mut());
+                crate::quic::flush_egress(&mut conn, sock);
                 return;
             }
             let Some((mut settings_done, settings_sent, authed)) = routes
@@ -2173,7 +2162,7 @@ impl Router<'_> {
                 frames::quic_varint(&mut settings, 0x04);
                 frames::quic_varint(&mut settings, 0);
                 let _ = conn.stream_send(3, &settings, true);
-                flush(sock, &mut conn, out.as_mut());
+                crate::quic::flush_egress(&mut conn, sock);
                 if let Some(inbound) = routes.get_mut(dcid) {
                     inbound.settings_sent = true;
                 }
@@ -2182,14 +2171,12 @@ impl Router<'_> {
                 let Some(inbound) = routes.get_mut(dcid) else {
                     return;
                 };
-                let Some(ok) =
-                    auth_exchange(sock, out.as_mut(), &mut conn, auths, inbound, from, masq)
-                else {
+                let Some(ok) = auth_exchange(sock, &mut conn, auths, inbound, from, masq) else {
                     return;
                 };
                 if !ok {
                     let _ = conn.close(false, 0, b"refused");
-                    flush(sock, &mut conn, out.as_mut());
+                    crate::quic::flush_egress(&mut conn, sock);
                     return;
                 }
             }
@@ -2229,9 +2216,7 @@ impl Router<'_> {
     }
 
     fn wake(&mut self) {
-        let Self {
-            routes, sock, out, ..
-        } = self;
+        let Self { routes, sock, .. } = self;
         for inbound in routes.values() {
             let Ok(mut conn) = inbound.conn.lock() else {
                 continue;
@@ -2241,7 +2226,7 @@ impl Router<'_> {
                     inbound.wakes.wake(id);
                 }
             }
-            flush(sock, &mut conn, out.as_mut());
+            crate::quic::flush_egress(&mut conn, sock);
         }
     }
 
@@ -2249,7 +2234,6 @@ impl Router<'_> {
         let Self {
             routes,
             sock,
-            out,
             udp_idle,
             ..
         } = self;
@@ -2267,7 +2251,7 @@ impl Router<'_> {
                 return false;
             }
             conn.on_timeout();
-            flush(sock, &mut conn, out.as_mut());
+            crate::quic::flush_egress(&mut conn, sock);
             inbound.udp.retain(|_, flow| {
                 if now.duration_since(flow.last) > *udp_idle {
                     flow.stop.store(true, Ordering::Relaxed);
@@ -2357,7 +2341,6 @@ pub(crate) fn serve_loop(
     let mut router = Router {
         sock: Arc::new(sock),
         local,
-        out: Unfilled::<MAX_DATAGRAM>::new(),
         auths,
         serve,
         masq: Arc::from(masq.clone()),
@@ -2414,6 +2397,7 @@ pub(crate) fn serve_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quic::MAX_DATAGRAM;
 
     /// The buffer form the decode had, kept as the bytes every path has to still reach.
     fn the_buffer_decode(input: &str) -> Option<String> {
@@ -2778,7 +2762,6 @@ mod tests {
             let mut router = Router {
                 sock: Arc::clone(&session.sock),
                 local: session.local,
-                out: Unfilled::new(),
                 auths: &auths,
                 serve: &handler,
                 masq: Arc::new(Masquerade::NotFound),
