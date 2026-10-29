@@ -1005,6 +1005,77 @@ pub(crate) fn parse_target(address: &str) -> io::Result<Target> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "address resolved to nothing"))
 }
 
+/// One `http`/`https` URL taken apart for a dial: the scheme's TLS need, the host and port to reach,
+/// the authority a `Host` line repeats, and the path with its query.
+#[derive(Debug, Clone)]
+pub(crate) struct HttpUrl {
+    pub(crate) tls: bool,
+    pub(crate) host: String,
+    pub(crate) port: u16,
+    pub(crate) authority: String,
+    pub(crate) path: String,
+}
+
+impl HttpUrl {
+    pub(crate) fn parse(text: &str) -> Result<Self, String> {
+        let (tls, rest) = match text.split_once("://") {
+            Some(("http", rest)) => (false, rest),
+            Some(("https", rest)) => (true, rest),
+            Some((scheme, _)) => return Err(format!("URL scheme `{scheme}` is not http or https")),
+            None => return Err(format!("URL {text:?} names no scheme")),
+        };
+        let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+        let authority = &rest[..split];
+        let authority = authority.rsplit('@').next().unwrap_or(authority);
+        if authority.is_empty() {
+            return Err(format!("URL {text:?} names no host"));
+        }
+        let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+            let (host, tail) = bracketed
+                .split_once(']')
+                .ok_or_else(|| format!("URL {text:?} has an unclosed IPv6 host"))?;
+            let port = tail
+                .strip_prefix(':')
+                .and_then(|port| port.parse().ok())
+                .unwrap_or(if tls { 443 } else { 80 });
+            (host.to_owned(), port)
+        } else if let Some((host, port)) = authority.rsplit_once(':') {
+            if port.chars().all(|ch| ch.is_ascii_digit()) {
+                (
+                    host.to_owned(),
+                    port.parse()
+                        .map_err(|_| format!("URL {text:?} has an invalid port"))?,
+                )
+            } else {
+                (authority.to_owned(), if tls { 443 } else { 80 })
+            }
+        } else {
+            (authority.to_owned(), if tls { 443 } else { 80 })
+        };
+        if host.is_empty() {
+            return Err(format!("URL {text:?} names no host"));
+        }
+        let mut path = &rest[split..];
+        if let Some(fragment) = path.find('#') {
+            path = &path[..fragment];
+        }
+        let path = if path.is_empty() {
+            "/".to_owned()
+        } else if path.starts_with('/') {
+            path.to_owned()
+        } else {
+            format!("/{path}")
+        };
+        Ok(Self {
+            tls,
+            host,
+            port,
+            authority: authority.to_owned(),
+            path,
+        })
+    }
+}
+
 /// One bound socket yielding `Connection`s, whichever family it was opened in, so the accept
 /// loop keeps the same shape whichever the config named.
 pub(crate) enum Listener {
@@ -1151,6 +1222,14 @@ pub(crate) fn connect(target: &Target, timeout: Duration) -> io::Result<Connecti
         #[cfg(any(unix, windows))]
         Target::Unix(path) => UnixStream::connect(path).map(Connection::Unix),
     }
+}
+
+/// Connect Linux's abstract namespace, whose address is bytes rather than a path.
+#[cfg(target_os = "linux")]
+pub(crate) fn connect_abstract(name: &[u8]) -> io::Result<Connection> {
+    use std::os::linux::net::SocketAddrExt;
+    let address = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
+    std::os::unix::net::UnixStream::connect_addr(&address).map(Connection::Unix)
 }
 
 /// The seam's `AF_UNIX` arm on the host whose `std` keeps `UnixStream` behind the unstable
@@ -1681,6 +1760,18 @@ mod winunix {
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_http_url_keeps_the_authority_and_makes_the_path() {
+        let url = HttpUrl::parse("https://example.test:8443/check?q=1#frag").expect("parses");
+        assert!(url.tls);
+        assert_eq!(url.host, "example.test");
+        assert_eq!(url.port, 8443);
+        assert_eq!(url.authority, "example.test:8443");
+        assert_eq!(url.path, "/check?q=1");
+        let bare = HttpUrl::parse("http://example.test?q=1").expect("parses");
+        assert_eq!(bare.path, "/?q=1");
+    }
 
     #[test]
     fn a_policy_without_counters_does_not_forbid_the_splice_path() {

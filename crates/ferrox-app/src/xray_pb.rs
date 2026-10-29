@@ -2183,6 +2183,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     let mut vless_routes = None;
     let mut attributes = Vec::new();
     let mut processes = Vec::new();
+    let mut webhook = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => {
@@ -2216,7 +2217,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
             (19, 2) => rule_tag = Some(account_text(&mut reader)?),
             (20, 2) => vless_routes = Some(port_selector(reader.bytes()?)?),
             (21, 2) => processes.push(Json::Str(account_text(&mut reader)?)),
-            (22, 2) => return Err(reader.uncarried("a webhook")),
+            (22, 2) => webhook = Some(webhook_config(reader.bytes()?)?),
             (23, 2) => local_os.push(Json::Str(account_text(&mut reader)?)),
             _ => return Err(reader.refuse(field, wire)),
         }
@@ -2262,6 +2263,34 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     }
     if !attributes.is_empty() {
         pairs.push(("attrs", Json::Obj(attribute_map(attributes))));
+    }
+    pairs.extend(webhook.map(|webhook| ("webhook", webhook)));
+    Ok(object(pairs))
+}
+
+/// `xray.app.router.WebhookConfig`: the callback a rule fires once it has picked the flow's tag.
+fn webhook_config(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.router.WebhookConfig");
+    let mut url = None;
+    let mut deduplication = None;
+    let mut headers = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => url = Some(account_text(&mut reader)?),
+            (2, 0) => deduplication = Some(reader.varint()?),
+            (3, 2) => headers.push(attribute_entry(reader.bytes()?)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = Vec::new();
+    if let Some(url) = url {
+        pairs.push(("url", Json::Str(url)));
+    }
+    if let Some(deduplication) = deduplication {
+        pairs.push(("deduplication", exact_count(deduplication)?));
+    }
+    if !headers.is_empty() {
+        pairs.push(("headers", Json::Obj(headers)));
     }
     Ok(object(pairs))
 }

@@ -1,6 +1,7 @@
 //! The health observatory the balancers read: xray's legacy probe loop, its burst sampler,
 //! and the two URL shapes they speak through a configured outbound.
 
+use crate::conn::HttpUrl;
 use crate::json::Json;
 use crate::proxy::{Destination, Outbound};
 use crate::router::{HealthPing, Observed};
@@ -630,7 +631,7 @@ fn probe(
     timeout: Duration,
     read_body: bool,
 ) -> Result<Duration, String> {
-    let url = ProbeUrl::parse(target)?;
+    let url = HttpUrl::parse(target)?;
     let started = Instant::now();
     let destination = Destination::Name(url.host.clone(), url.port);
     let stream = crate::proxy::probe_stream(outbound, &destination, timeout)
@@ -662,7 +663,7 @@ fn probe(
 
 fn round_trip(
     io: &mut (impl Read + Write),
-    url: &ProbeUrl,
+    url: &HttpUrl,
     method: &str,
     read_body: bool,
 ) -> Result<(), String> {
@@ -740,76 +741,6 @@ fn drain(io: &mut impl Read) -> Result<(), String> {
     }
 }
 
-struct ProbeUrl {
-    tls: bool,
-    host: String,
-    port: u16,
-    authority: String,
-    path: String,
-}
-
-impl ProbeUrl {
-    fn parse(text: &str) -> Result<Self, String> {
-        let (tls, rest) = match text.split_once("://") {
-            Some(("http", rest)) => (false, rest),
-            Some(("https", rest)) => (true, rest),
-            Some((scheme, _)) => {
-                return Err(format!("probe scheme `{scheme}` is not http or https"))
-            }
-            None => return Err(format!("probe URL {text:?} names no scheme")),
-        };
-        let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        let authority = &rest[..split];
-        let authority = authority.rsplit('@').next().unwrap_or(authority);
-        if authority.is_empty() {
-            return Err(format!("probe URL {text:?} names no host"));
-        }
-        let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
-            let (host, tail) = bracketed
-                .split_once(']')
-                .ok_or_else(|| format!("probe URL {text:?} has an unclosed IPv6 host"))?;
-            let port = tail
-                .strip_prefix(':')
-                .and_then(|port| port.parse().ok())
-                .unwrap_or(if tls { 443 } else { 80 });
-            (host.to_owned(), port)
-        } else if let Some((host, port)) = authority.rsplit_once(':') {
-            if port.chars().all(|ch| ch.is_ascii_digit()) {
-                (
-                    host.to_owned(),
-                    port.parse()
-                        .map_err(|_| format!("probe URL {text:?} has an invalid port"))?,
-                )
-            } else {
-                (authority.to_owned(), if tls { 443 } else { 80 })
-            }
-        } else {
-            (authority.to_owned(), if tls { 443 } else { 80 })
-        };
-        if host.is_empty() {
-            return Err(format!("probe URL {text:?} names no host"));
-        }
-        let mut path = &rest[split..];
-        if let Some(fragment) = path.find('#') {
-            path = &path[..fragment];
-        }
-        let path = if path.is_empty() {
-            "/".to_owned()
-        } else if path.starts_with('/') {
-            path.to_owned()
-        } else {
-            format!("/{path}")
-        };
-        Ok(Self {
-            tls,
-            host,
-            port,
-            authority: authority.to_owned(),
-            path,
-        })
-    }
-}
-
 fn random_below(limit: u64) -> u64 {
     if limit == 0 {
         return 0;
@@ -831,18 +762,6 @@ fn random_below(limit: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_probe_url_keeps_the_authority_and_makes_the_path() {
-        let url = ProbeUrl::parse("https://example.test:8443/check?q=1#frag").expect("parses");
-        assert!(url.tls);
-        assert_eq!(url.host, "example.test");
-        assert_eq!(url.port, 8443);
-        assert_eq!(url.authority, "example.test:8443");
-        assert_eq!(url.path, "/check?q=1");
-        let bare = ProbeUrl::parse("http://example.test?q=1").expect("parses");
-        assert_eq!(bare.path, "/?q=1");
-    }
 
     #[test]
     fn a_failed_legacy_probe_keeps_the_reference_delay() {
@@ -997,7 +916,7 @@ mod tests {
             head: b"HTTP/1.1 200 OK\r\nContent-Length: 32\r\n\r\n",
             read: false,
         };
-        let url = ProbeUrl::parse("http://example.com/").expect("parses");
+        let url = HttpUrl::parse("http://example.com/").expect("parses");
         round_trip(&mut io, &url, &settings.method, settings.reads_body)
             .expect("the headers are enough");
         assert!(io.read);

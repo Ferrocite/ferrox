@@ -246,11 +246,30 @@ pub(crate) enum RouteTarget<'a> {
     Balancer(&'a str),
 }
 
-fn rule_target(rule: &Rule) -> RouteTarget<'_> {
-    if rule.balancer {
+/// One rule's verdict for a flow: where it sends the flow and the callback it names.
+pub(crate) struct RuleHit<'a> {
+    pub(crate) target: RouteTarget<'a>,
+    pub(crate) webhook: Option<&'a Arc<crate::webhook::Webhook>>,
+}
+
+#[cfg(test)]
+impl<'a> RuleHit<'a> {
+    pub(crate) fn tag(&self) -> &'a str {
+        match self.target {
+            RouteTarget::Outbound(tag) | RouteTarget::Balancer(tag) => tag,
+        }
+    }
+}
+
+fn rule_hit(rule: &Rule) -> RuleHit<'_> {
+    let target = if rule.balancer {
         RouteTarget::Balancer(&rule.target)
     } else {
         RouteTarget::Outbound(&rule.target)
+    };
+    RuleHit {
+        target,
+        webhook: rule.webhook.as_ref(),
     }
 }
 
@@ -804,6 +823,7 @@ struct Rule {
     vless_routes: Option<PortSet>,
     attrs: Option<AttributeSelector>,
     process: Option<ProcessSelector>,
+    webhook: Option<Arc<crate::webhook::Webhook>>,
     sets: Option<Vec<Arc<RuleSet>>>,
 }
 
@@ -1031,28 +1051,23 @@ impl Routing {
     /// The first matching rule's target; `None` leaves the caller's default in place.
     #[cfg(test)]
     pub(crate) fn route(&self, flow: &Flow) -> Option<&str> {
-        self.route_target(flow).map(|target| match target {
-            RouteTarget::Outbound(tag) | RouteTarget::Balancer(tag) => tag,
-        })
+        self.route_target(flow).map(|hit| hit.tag())
     }
 
-    pub(crate) fn route_target(&self, flow: &Flow) -> Option<RouteTarget<'_>> {
+    pub(crate) fn route_target(&self, flow: &Flow) -> Option<RuleHit<'_>> {
         self.route_target_with(flow, &resolve_ips)
     }
 
     #[cfg(test)]
     fn route_with(&self, flow: &Flow, resolve: &dyn Fn(&str, u16) -> Vec<IpAddr>) -> Option<&str> {
-        self.route_target_with(flow, resolve)
-            .map(|target| match target {
-                RouteTarget::Outbound(tag) | RouteTarget::Balancer(tag) => tag,
-            })
+        self.route_target_with(flow, resolve).map(|hit| hit.tag())
     }
 
     fn route_target_with(
         &self,
         flow: &Flow,
         resolve: &dyn Fn(&str, u16) -> Vec<IpAddr>,
-    ) -> Option<RouteTarget<'_>> {
+    ) -> Option<RuleHit<'_>> {
         let lower = OnceCell::new();
         let names = flow.domain.map(|raw| Names {
             raw,
@@ -1062,15 +1077,15 @@ impl Routing {
         match self.strategy {
             DomainStrategy::AsIs => {
                 let mut ips = Ips::never();
-                self.first_match(flow, names, &mut ips).map(rule_target)
+                self.first_match(flow, names, &mut ips).map(rule_hit)
             }
             DomainStrategy::IpOnDemand => {
                 let mut ips = Ips::lazy(resolve);
-                self.first_match(flow, names, &mut ips).map(rule_target)
+                self.first_match(flow, names, &mut ips).map(rule_hit)
             }
             DomainStrategy::IpIfNonMatch => self
                 .first_match_if_non_match(flow, names, resolve)
-                .map(rule_target),
+                .map(rule_hit),
         }
     }
 
@@ -1146,7 +1161,8 @@ impl Routing {
 
     /// The one tag a SOCKS association may use when every datagram reaches it; `None` when a
     /// per-destination rule could split the association, which the caller serves one lane per
-    /// datagram's chosen tag rather than guessing.
+    /// datagram's chosen tag rather than guessing. A rule carrying a `webhook` splits too: its
+    /// event names the datagram's own flow, so a collapsed association could not fire it.
     pub(crate) fn udp_tag<'a>(
         &'a self,
         inbound: Option<&str>,
@@ -1160,7 +1176,7 @@ impl Routing {
             if !rule.reachable(inbound, Network::Udp) || !rule.local_os_matches() {
                 continue;
             }
-            if rule.balancer {
+            if rule.balancer || rule.webhook.is_some() {
                 return Err(());
             }
             if !agree(&mut decided, &rule.target) {
@@ -1209,6 +1225,12 @@ impl Routing {
                     inbound.unwrap_or("<untagged>"),
                     rule.target
                 ));
+            }
+            if rule.webhook.is_some() {
+                eprintln!(
+                    "routing: a webhook on a rule for inbound {} never fires, because the server inbound dials direct",
+                    inbound.unwrap_or("<untagged>")
+                );
             }
             if rule.server_always() {
                 return Ok(());
@@ -1356,7 +1378,7 @@ impl Rule {
         let mut attrs = None;
         let mut process = None;
         let mut rule_sets = None;
-        let mut unread = None;
+        let mut webhook = None;
         for (key, field) in pairs {
             match key.as_str() {
                 "outboundTag" => target = rule_field_target(field, "outboundTag")?,
@@ -1404,9 +1426,7 @@ impl Rule {
                         .filter(|names| !names.is_empty())
                         .map(|names| ProcessSelector::parse(&names));
                 }
-                "webhook" => {
-                    unread = Some(key);
-                }
+                "webhook" => webhook = crate::webhook::parse(field)?,
                 other => return Err(format!("routing rule field `{other}` is not carried")),
             }
         }
@@ -1414,10 +1434,6 @@ impl Rule {
         let target = target
             .or(balancing_target)
             .ok_or_else(|| "routing rule names neither outboundTag nor balancerTag".to_owned())?;
-        if let Some(selector) = unread {
-            eprintln!("routing rule selector `{selector}` is not carried; the rule is skipped");
-            return Ok(None);
-        }
         let rule_sets = match rule_sets {
             Some(tags) => Some(
                 tags.iter()
@@ -1458,6 +1474,7 @@ impl Rule {
             vless_routes,
             attrs,
             process,
+            webhook,
             sets: rule_sets,
         }))
     }
@@ -2526,7 +2543,7 @@ impl PortSet {
     }
 }
 
-fn object<'a>(value: &'a Json, what: &str) -> Result<&'a [(String, Json)], String> {
+pub(crate) fn object<'a>(value: &'a Json, what: &str) -> Result<&'a [(String, Json)], String> {
     match value {
         Json::Obj(pairs) => Ok(pairs),
         _ => Err(format!("{what} is not an object")),
@@ -5768,7 +5785,7 @@ mod tests {
             process: None,
         };
         assert_eq!(
-            parsed.route_target(&flow),
+            parsed.route_target(&flow).map(|hit| hit.target),
             Some(RouteTarget::Outbound("direct")),
             "outboundTag wins over balancerTag, as the reference's switch does"
         );
@@ -5784,6 +5801,81 @@ mod tests {
         )]);
         let error = Routing::parse_in(&root, vec![dir()]).expect_err("refused");
         assert!(error.contains("missing"), "{error}");
+    }
+
+    #[test]
+    fn a_rule_naming_a_webhook_still_routes() {
+        let root = crate::json::parse(
+            r#"{"routing":{"rules":[{"domain":["example.test"],"outboundTag":"direct",
+                "webhook":{"url":"http://127.0.0.1:9/hook"}}]}}"#,
+        )
+        .expect("parses");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("example.test"),
+            ip: None,
+            port: Some(80),
+            source: None,
+            local: None,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        let parsed = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(
+            parsed.route(&flow),
+            Some("direct"),
+            "the rule must keep routing the flow it matches"
+        );
+    }
+
+    #[test]
+    fn a_webhook_action_rides_the_rule_that_names_it() {
+        let routing = |webhook: &str| {
+            crate::json::parse(&format!(
+                r#"{{"routing":{{"rules":[{{"domain":["example.test"],"outboundTag":"direct",
+                    "webhook":{webhook}}}]}}}}"#
+            ))
+            .expect("parses")
+        };
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("example.test"),
+            ip: None,
+            port: Some(80),
+            source: None,
+            local: None,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        let root = routing(r#"{"url":"http://127.0.0.1:9/hook","headers":{"X-Probe":"1"}}"#);
+        let parsed = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let hit = parsed
+            .route_target(&flow)
+            .expect("the webhook rule matches");
+        assert_eq!(hit.tag(), "direct");
+        assert!(hit.webhook.is_some(), "the rule carries its notifier");
+        let root = routing(r#"{"url":""}"#);
+        let parsed = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        let hit = parsed.route_target(&flow).expect("the rule still matches");
+        assert!(
+            hit.webhook.is_none(),
+            "an entry with no URL notifies nobody"
+        );
+        let root = routing(r#"{"url":"http://127.0.0.1:9/hook","headers":["X-Probe"]}"#);
+        let error = Routing::parse_in(&root, vec![dir()]).expect_err("refused");
+        assert!(error.contains("headers"), "{error}");
     }
 
     #[test]

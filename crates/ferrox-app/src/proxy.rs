@@ -280,6 +280,7 @@ fn routed_out(
         Some(shared) => Some(Outbound::Route(Arc::new(RoutePlan::new(
             Arc::clone(shared),
             inbound_tag(inbound),
+            inbound_name(inbound),
             source_known,
         )))),
         None => outbound.cloned(),
@@ -1364,21 +1365,6 @@ impl Outbound {
         }
     }
 
-    /// The outbound and the tag that names its lane, which is what the outbound's counters key on.
-    fn resolved_lane(
-        &self,
-        asked: &Destination,
-        network: crate::router::Network,
-        client: Option<&Connection>,
-        user: Option<&str>,
-    ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
-        let facts = FlowFacts {
-            user,
-            ..FlowFacts::default()
-        };
-        self.resolved_lane_with_protocol(asked, network, client, facts)
-    }
-
     fn resolved_lane_with_protocol(
         &self,
         asked: &Destination,
@@ -1575,8 +1561,13 @@ pub(crate) fn serve_dynamic_inbounds(
 struct FlowFacts<'a> {
     protocol: Option<&'a str>,
     user: Option<&'a str>,
+    level: Option<u32>,
     attrs: Option<&'a crate::router::Attributes<'a>>,
     process: Option<&'a crate::process::Owner>,
+    /// The destination before the sniffer rewrote it, and the rewrite a `routeOnly` sniffer routes
+    /// by but does not dial.
+    original: Option<&'a Destination>,
+    route: Option<&'a Destination>,
 }
 
 /// One inbound's view of the routes: its tag decides which rules may see a flow, and whether the
@@ -1585,6 +1576,7 @@ struct FlowFacts<'a> {
 pub(crate) struct RoutePlan {
     shared: Arc<RouteShared>,
     inbound_tag: Option<String>,
+    inbound_name: Option<String>,
     source_known: bool,
     udp: Association,
 }
@@ -1598,7 +1590,12 @@ pub(crate) enum Association {
 }
 
 impl RoutePlan {
-    fn new(shared: Arc<RouteShared>, inbound_tag: Option<String>, source_known: bool) -> Self {
+    fn new(
+        shared: Arc<RouteShared>,
+        inbound_tag: Option<String>,
+        inbound_name: Option<String>,
+        source_known: bool,
+    ) -> Self {
         let udp = match shared
             .routing
             .udp_tag(inbound_tag.as_deref(), shared.default_tag.as_deref())
@@ -1610,6 +1607,7 @@ impl RoutePlan {
         Self {
             shared,
             inbound_tag,
+            inbound_name,
             source_known,
             udp,
         }
@@ -1749,15 +1747,37 @@ impl RoutePlan {
                 }
             };
         }
-        let Some(target) = self.shared.routing.route_target(&flow) else {
+        let Some(hit) = self.shared.routing.route_target(&flow) else {
             return self.default_lane();
         };
-        let tag = match target {
+        let (lane, tag) = match hit.target {
             crate::router::RouteTarget::Outbound(tag) => {
-                return (self.target(tag), Some(std::borrow::Cow::Borrowed(tag)));
+                (self.target(tag), Some(std::borrow::Cow::Borrowed(tag)))
             }
-            crate::router::RouteTarget::Balancer(tag) => tag,
+            crate::router::RouteTarget::Balancer(tag) => self.pick_balanced(tag),
         };
+        if let Some(webhook) = hit.webhook {
+            webhook.fire(&crate::webhook::Event {
+                email: flow.user,
+                level: facts.level,
+                protocol: flow.protocol,
+                network: flow.network,
+                source: flow.source,
+                destination: asked,
+                original: facts.original,
+                route: facts.route,
+                inbound_tag: flow.inbound_tag,
+                inbound_name: self.inbound_name.as_deref(),
+                local: flow.local,
+                outbound_tag: tag.as_deref().unwrap_or(""),
+            });
+        }
+        (lane, tag)
+    }
+
+    /// The lane a balancer picks for one flow; the event names the picked tag, as the reference's
+    /// `GetTag` resolves a balancer before it fires.
+    fn pick_balanced(&self, tag: &str) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         let Some(balancer) = self.shared.routing.balancer(tag) else {
             return self.default_lane();
         };
@@ -1806,6 +1826,17 @@ fn inbound_tag(inbound: &Json) -> Option<String> {
         .and_then(Json::as_str)
         .filter(|tag| !tag.is_empty())
         .map(str::to_owned)
+}
+
+/// The handler an event names for an inbound: the reference's proxy name, which the `mixed`
+/// spelling shares with `socks`.
+fn inbound_name(inbound: &Json) -> Option<String> {
+    let protocol = canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""));
+    match protocol {
+        "" => None,
+        "mixed" => Some("socks".to_owned()),
+        other => Some(other.to_owned()),
+    }
 }
 
 /// The outbound one configured entry names, with the reason when this tree cannot dial it: a tag a
@@ -4576,7 +4607,7 @@ fn dns_outbound(
     };
     match route {
         Some(shared) => {
-            let plan = RoutePlan::new(shared, tag.map(str::to_owned), false);
+            let plan = RoutePlan::new(shared, tag.map(str::to_owned), None, false);
             Some(plan.pick(dest, network, None, None).clone())
         }
         None => outbound,
@@ -5028,7 +5059,8 @@ struct BridgeLane {
 impl BridgeLane {
     fn of(tag: &str, route: Option<&Arc<RouteShared>>, outbound: Option<&Outbound>) -> Self {
         Self {
-            plan: route.map(|shared| Arc::new(RoutePlan::new(Arc::clone(shared), None, false))),
+            plan: route
+                .map(|shared| Arc::new(RoutePlan::new(Arc::clone(shared), None, None, false))),
             fixed: outbound.cloned(),
             tag: tag.to_owned(),
         }
@@ -15112,24 +15144,29 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
         .as_ref()
         .map_or("", |account| account.email.as_str());
     let user = (!email.is_empty()).then_some(email);
+    let level = handshake.account.as_ref().map(|account| account.level);
     if let Some(account) = &handshake.account {
         client = client
             .with_meter(crate::stats::user(&account.email, account.level))
             .with_policy(Some(crate::policy::flow(account.level)));
     }
     if handshake.cmd == 3 {
-        return serve_socks_udp(client, out, user);
+        return serve_socks_udp(client, out, user, level);
     }
     // The rules decide the lane first; a blocked flow is granted before it closes, so the front's reply is read.
     let destination = handshake.asked.authority();
     crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
     let first = match crate::sniff::current() {
         Some(sniffing) if sniffing.enabled() => None,
-        _ => Some(out.resolved_lane(
+        _ => Some(out.resolved_lane_with_protocol(
             &handshake.asked,
             crate::router::Network::Tcp,
             Some(&client),
-            user,
+            FlowFacts {
+                user,
+                level,
+                ..FlowFacts::default()
+            },
         )),
     };
     if !matches!(
@@ -15146,7 +15183,7 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
     }
     let (dial, out, tag) = match first {
         Some((lane, tag)) => (None, lane, tag),
-        None => sniff_lane(out, &handshake.asked, &client, user),
+        None => sniff_lane(out, &handshake.asked, &client, user, level),
     };
     let asked = dial.as_ref().unwrap_or(&handshake.asked);
     serve_connect(client, &out, asked, Front::Socks, &[], tag.as_deref());
@@ -15163,7 +15200,7 @@ pub(crate) fn serve_device_flow(
     out: &Outbound,
     dest: &Destination,
 ) -> std::io::Result<()> {
-    let (dial, lane, tag) = sniff_lane(out, dest, &client, None);
+    let (dial, lane, tag) = sniff_lane(out, dest, &client, None, None);
     let dest = dial.as_ref().unwrap_or(dest);
     let ((), dial_report) = observe_dial(|| {
         serve_connect(client, &lane, dest, Front::Socks, &[], tag.as_deref());
@@ -15340,13 +15377,24 @@ fn sniff_lane<'a>(
     asked: &Destination,
     client: &Connection,
     user: Option<&str>,
+    level: Option<u32>,
 ) -> (
     Option<Destination>,
     Picked<'a>,
     Option<std::borrow::Cow<'a, str>>,
 ) {
     let Some(sniffing) = crate::sniff::current() else {
-        let (lane, tag) = out.resolved_lane(asked, crate::router::Network::Tcp, Some(client), user);
+        let facts = FlowFacts {
+            user,
+            level,
+            ..FlowFacts::default()
+        };
+        let (lane, tag) = out.resolved_lane_with_protocol(
+            asked,
+            crate::router::Network::Tcp,
+            Some(client),
+            facts,
+        );
         return (None, lane, tag);
     };
     let (found, pairs) = sniffing.inspect(
@@ -15358,7 +15406,9 @@ fn sniff_lane<'a>(
     let attrs = (!pairs.is_empty()).then(|| crate::router::Attributes::from_pairs(&pairs));
     let facts = FlowFacts {
         user,
+        level,
         attrs: attrs.as_ref(),
+        original: Some(asked),
         ..FlowFacts::default()
     };
     let Some(found) = found else {
@@ -15380,6 +15430,8 @@ fn sniff_lane<'a>(
     };
     let facts = FlowFacts {
         protocol: Some(found.protocol),
+        original: Some(asked),
+        route: if dial.is_none() { route.as_ref() } else { None },
         ..facts
     };
     let (resolved, tag) = out.resolved_lane_with_protocol(
@@ -16517,6 +16569,7 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
         .as_ref()
         .map_or("", |account| account.email.as_str());
     let user = (!email.is_empty()).then_some(email);
+    let level = account.as_ref().map(|account| account.level);
     drop_header(&mut head, "proxy-authorization");
     let request_line = out
         .wants_attrs()
@@ -16531,11 +16584,15 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
             crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
             let first = match crate::sniff::current() {
                 Some(sniffing) if sniffing.enabled() => None,
-                _ => Some(out.resolved_lane(
+                _ => Some(out.resolved_lane_with_protocol(
                     &asked,
                     crate::router::Network::Tcp,
                     Some(&client),
-                    user,
+                    FlowFacts {
+                        user,
+                        level,
+                        ..FlowFacts::default()
+                    },
                 )),
             };
             if !matches!(
@@ -16547,7 +16604,7 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
             }
             let (dial, out, tag) = match first {
                 Some((lane, tag)) => (None, lane, tag),
-                None => sniff_lane(out, &asked, &client, user),
+                None => sniff_lane(out, &asked, &client, user, level),
             };
             let asked = dial.as_ref().unwrap_or(&asked);
             serve_connect(client, &out, asked, Front::Http, &[], tag.as_deref());
@@ -16569,8 +16626,9 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                 FlowFacts {
                     protocol: Some("http/1.1"),
                     user,
+                    level,
                     attrs: attrs.as_ref(),
-                    process: None,
+                    ..FlowFacts::default()
                 },
             );
             serve_connect(client, &out, &asked, Front::Http, &origin, tag.as_deref());
@@ -16738,10 +16796,10 @@ fn socks_udp_relay(client: &mut Connection) -> Option<UdpSocket> {
     Some(relay)
 }
 
-fn serve_socks_udp(client: Connection, out: &Outbound, user: Option<&str>) {
+fn serve_socks_udp(client: Connection, out: &Outbound, user: Option<&str>, level: Option<u32>) {
     if let Outbound::Route(plan) = out {
         if plan.split_udp() || crate::sniff::current().is_some_and(|sniffing| sniffing.enabled()) {
-            return serve_socks_udp_split(client, plan, user);
+            return serve_socks_udp_split(client, plan, user, level);
         }
         if let Ok(target) = plan.udp_out() {
             return serve_socks_udp_lane(client, &target);
@@ -16938,7 +16996,12 @@ struct UdpLane {
     handle: thread::JoinHandle<()>,
 }
 
-fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan, user: Option<&str>) {
+fn serve_socks_udp_split(
+    mut client: Connection,
+    plan: &RoutePlan,
+    user: Option<&str>,
+    level: Option<u32>,
+) {
     let Some(relay) = socks_udp_relay(&mut client) else {
         return;
     };
@@ -16966,6 +17029,7 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan, user: Option<
         let mut route = dest.clone();
         let mut dial = None;
         let mut protocol = None;
+        let mut route_only = None;
         if let Some(sniffing) = crate::sniff::current().filter(|sniffing| sniffing.enabled()) {
             if let Some(found) = sniffing.inspect_udp(&dest, payload) {
                 protocol = Some(found.protocol);
@@ -16973,6 +17037,8 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan, user: Option<
                     route = Destination::Name(found.domain.clone(), dest.port());
                     if sniffing.should_dial_override(&found) {
                         dial = route.socket();
+                    } else {
+                        route_only = Some(&route);
                     }
                 }
             }
@@ -16985,8 +17051,11 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan, user: Option<
             FlowFacts {
                 protocol,
                 user,
+                level,
                 attrs: None,
                 process: process.as_ref(),
+                original: Some(&dest),
+                route: route_only,
             },
         );
         let key = key.map(std::borrow::Cow::into_owned);
@@ -22378,7 +22447,7 @@ pub(crate) enum Destination {
 }
 
 impl Destination {
-    fn authority(&self) -> String {
+    pub(crate) fn authority(&self) -> String {
         match self {
             Self::Name(host, port) => ferrox_core::foxy::authority(host, *port),
             Self::Address(address) => address.to_string(),
@@ -25437,7 +25506,7 @@ mod tests {
             .expect("routing");
         let portals = crate::reverse::Portals::default();
         let shared = route_shared(&root, routing, &portals, None).expect("shared");
-        let plan = RoutePlan::new(Arc::clone(&shared), None, true);
+        let plan = RoutePlan::new(Arc::clone(&shared), None, None, true);
         let asked = Destination::Name("example.test".to_owned(), 443);
         let lane = |plan: &RoutePlan| {
             matches!(
@@ -25487,7 +25556,7 @@ mod tests {
             false,
             Arc::clone(&portals),
         );
-        let plan = RoutePlan::new(Arc::clone(&shared), None, true);
+        let plan = RoutePlan::new(Arc::clone(&shared), None, None, true);
         let name = b"xray.proxy.freedom.Config";
         let mut raw = vec![0x0a, 3, b'n', b'e', b'w'];
         raw.push(0x1a);
@@ -47128,6 +47197,7 @@ mod tests {
         Outbound::Route(Arc::new(RoutePlan::new(
             shared,
             tag.map(str::to_owned),
+            None,
             source_known,
         )))
     }
@@ -50885,7 +50955,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
                 .map(|bound| bound.port())
                 .unwrap_or_default();
             let dest = port_map.get(&port).unwrap_or(&dest);
-            let (dial, target, tag) = sniff_lane(&out, dest, &stream, None);
+            let (dial, target, tag) = sniff_lane(&out, dest, &stream, None, None);
             let dest = dial.as_ref().unwrap_or(dest);
             serve_connect(stream, &target, dest, Front::Socks, &[], tag.as_deref());
         }
@@ -51158,7 +51228,7 @@ mod accept_proxy_protocol_tests {
             .expect("routing");
         let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
             .expect("builds the route");
-        let plan = RoutePlan::new(shared, None, true);
+        let plan = RoutePlan::new(shared, None, None, true);
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let client = Connection::connect(addr)
@@ -51185,6 +51255,114 @@ mod accept_proxy_protocol_tests {
             got.starts_with(b"HTTP/1.1 101"),
             "the upgrade after a PROXY v2 header was not answered: {got:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod webhook_route_tests {
+    use super::*;
+
+    /// A receiver that answers `replies` requests with `204` and hands back what it read, head and
+    /// body together, so a test reads the exact bytes the notifier wrote.
+    fn receiver(replies: usize) -> (u16, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (send, receive) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for _ in 0..replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
+                    .expect("arms");
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 512];
+                loop {
+                    let read = stream.read(&mut buf).expect("reads");
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..read]);
+                    let Some(head) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let length: usize = String::from_utf8_lossy(&raw[..head])
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Length: "))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    if raw.len() >= head + 4 + length {
+                        break;
+                    }
+                }
+                send.send(String::from_utf8_lossy(&raw).into_owned()).ok();
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .expect("replies");
+            }
+        });
+        (port, receive)
+    }
+
+    #[test]
+    fn a_webhook_rule_posts_the_event_and_drops_a_duplicate_email_inside_the_window() {
+        let (port, receive) = receiver(2);
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"protocol":"freedom","tag":"direct"}}],
+                "routing":{{"rules":[{{"domain":["example.test"],"outboundTag":"direct",
+                    "webhook":{{"url":"http://127.0.0.1:{port}/hook","deduplication":60,
+                        "headers":{{"X-Probe":"1"}}}}}}]}}}}"#
+        ))
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds the route");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let asked = Destination::Name("example.test".to_owned(), 80);
+
+        let (_, tag) = plan.lane(&asked, crate::router::Network::Tcp, None, Some("a@x"));
+        assert_eq!(
+            tag.as_deref(),
+            Some("direct"),
+            "the webhook rule still routes"
+        );
+        let first = receive
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the POST");
+        assert!(
+            first.starts_with(&format!(
+                "POST /hook HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nX-Probe: 1\r\n"
+            )),
+            "{first}"
+        );
+        for field in [
+            "\"email\":\"a@x\"",
+            "\"network\":\"tcp\"",
+            "\"destination\":\"example.test:80\"",
+            "\"originalTarget\":\"example.test:80\"",
+            "\"inboundTag\":\"\"",
+            "\"inboundName\":null",
+            "\"outboundTag\":\"direct\"",
+        ] {
+            assert!(first.contains(field), "{field} is missing from {first}");
+        }
+
+        let (_, tag) = plan.lane(&asked, crate::router::Network::Tcp, None, Some("a@x"));
+        assert_eq!(tag.as_deref(), Some("direct"), "the duplicate still routes");
+        assert!(
+            receive.recv_timeout(Duration::from_millis(400)).is_err(),
+            "the window dropped the second event for the same email"
+        );
+
+        let (_, tag) = plan.lane(&asked, crate::router::Network::Tcp, None, Some("b@x"));
+        assert_eq!(tag.as_deref(), Some("direct"));
+        let third = receive
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the second POST");
+        assert!(third.contains("\"email\":\"b@x\""), "{third}");
     }
 }
 

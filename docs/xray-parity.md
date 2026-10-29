@@ -61,7 +61,7 @@ What runs against what: `xray-rust` interop (24 tests, seam `XRAY_VLESS_FULL_BIN
 | xray-core | ferrox state |
 | --- | --- |
 | DNS client: DoH, DoQ, local, cached, fakeDNS | `proxy/dns` outbound done (row 26); the resolver app planned (row 82) |
-| Router with rules, balancers (leastload/leastping/random), webhook | planned (rows 80, 81) |
+| Router with rules, balancers (leastload/leastping/random), webhook | rules, the selector set and the `webhook` action done (row 80); the four balancer strategies done, urltest and selector planned (row 81) |
 | Observatory / burst probe | partially planned: QUIC ladder climb/descend, no burst |
 | Reverse portal / bridge | planned (row 83) |
 | Stats, metrics (Prometheus), policy manager | planned: policy.rs is parse-level gate only |
