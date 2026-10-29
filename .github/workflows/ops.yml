@@ -108,3 +108,17 @@ jobs:
           name: method-ops
           path: target/method-ops.md
           if-no-files-found: error
+
+  result:
+    name: result
+    needs: [plan, counts]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: ops
+          needs: ${{ toJSON(needs) }}
+          artifacts: method-ops

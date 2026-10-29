@@ -129,3 +129,17 @@ jobs:
       - name: fail when any shard failed
         if: steps.verdicts.outputs.failed != '0'
         run: exit 1
+
+  result:
+    name: result
+    needs: [miri, report]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: safety
+          needs: ${{ toJSON(needs) }}
+          artifacts: miri-verdict-*

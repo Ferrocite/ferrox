@@ -81,3 +81,17 @@ jobs:
           path: target/bench-report.md
           retention-days: 30
           if-no-files-found: warn
+
+  result:
+    name: result
+    needs: [pins, bench]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: bench
+          needs: ${{ toJSON(needs) }}
+          artifacts: bench-report-*

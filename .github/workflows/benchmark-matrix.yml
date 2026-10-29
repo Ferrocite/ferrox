@@ -246,6 +246,8 @@ jobs:
               --runner "$slug" \
               "${previous[@]}"
             cp "$results/matrix-results.json" "$results/manifest.txt" "$results/README.md" "$dest/"
+            cp "$bundle/table.md" "$results/"
+            cp "$bundle/table.md" "$bundle/table.csv" "$dest/"
             cp -R "$charts"/. "$dest/charts/"
             python3 scripts/validate-benchmark-matrix.py \
               --cells "$dest/cells" \
@@ -254,6 +256,24 @@ jobs:
             published=$((published + 1))
           done
           echo "published $published runner bundle(s)"
+      - name: publish the text tables
+        shell: bash
+        run: |
+          {
+            echo "## Benchmark matrix tables"
+            for table in matrix-published/*/*/table.md; do
+              [[ -f "$table" ]] || continue
+              echo
+              cat "$table"
+              echo
+            done
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-matrix-tables-${{ github.run_id }}
+          path: matrix-published/**/table.*
+          retention-days: 90
+          if-no-files-found: error
       - name: commit the refreshed matrix on a review branch
         env:
           GH_TOKEN: ${{ github.token }}
@@ -278,3 +298,17 @@ jobs:
           path: matrix-published/
           retention-days: 90
           if-no-files-found: error
+
+  result:
+    name: result
+    needs: [setup, fetch, run-os, refresh]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: benchmark-matrix
+          needs: ${{ toJSON(needs) }}
+          artifacts: benchmark-matrix-table-*

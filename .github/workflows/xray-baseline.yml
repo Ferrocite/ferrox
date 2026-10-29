@@ -105,3 +105,17 @@ jobs:
             target/xray-baseline/xray-baseline-summary.md
           retention-days: 30
           if-no-files-found: error
+
+  result:
+    name: result
+    needs: [plan, baseline]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: xray-baseline
+          needs: ${{ toJSON(needs) }}
+          artifacts: xray-baseline-*

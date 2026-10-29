@@ -200,6 +200,30 @@ jobs:
               the run above exited 0 without measuring anything"
             exit 1
           fi
+      - name: publish the text table
+        if: always()
+        shell: bash
+        run: |
+          {
+            if [[ -f target/benchmark-matrix/table.md ]]; then
+              cat target/benchmark-matrix/table.md
+              echo
+              echo "The text-only table is the \`benchmark-matrix-table-${{ inputs.tier }}-${{ inputs.os }}\` artifact; the bundle below is the charts and images."
+            else
+              echo "no text table written"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-matrix-table-${{ inputs.tier }}-${{ inputs.os }}
+          path: |
+            target/benchmark-matrix/table.md
+            target/benchmark-matrix/table.csv
+            target/benchmark-matrix/matrix-results.json
+            target/benchmark-matrix/manifest.txt
+          retention-days: 90
+          if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -207,3 +231,18 @@ jobs:
           path: target/benchmark-matrix/
           retention-days: 30
           if-no-files-found: error
+
+  result:
+    name: result
+    needs: [build, cells, collect]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: benchmark-matrix-os
+          needs: ${{ toJSON(needs) }}
+          artifacts: benchmark-matrix-table-${{ inputs.tier }}-${{ inputs.os }},benchmark-matrix-${{ inputs.tier }}-${{ inputs.os }}
+          suffix: -${{ inputs.os }}

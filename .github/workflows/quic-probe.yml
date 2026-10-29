@@ -47,3 +47,16 @@ jobs:
             --out target/ci/quic-suite.log -- \
             cargo test -p ferrox-app --locked --bin ferrox-app -- \
               proxy::tests::quic --nocapture --test-threads=1
+
+  result:
+    name: result
+    needs: [probe]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: quic-probe
+          needs: ${{ toJSON(needs) }}

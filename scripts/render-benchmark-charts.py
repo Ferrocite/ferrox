@@ -26,6 +26,8 @@ were. `validate-benchmark-matrix.py` re-derives every verdict.
 """
 
 import argparse
+import csv
+import io
 import json
 import random
 import statistics
@@ -915,6 +917,160 @@ def cost_table(results):
     return "\n".join(lines)
 
 
+TABLE_METRICS = (
+    ("throughput_mib_s", "throughput", "MiB/s"),
+    ("cpu_millis_per_gib", "cpu", "ms/GiB"),
+    ("rss_mib", "rss", "MiB"),
+    ("threads_peak", "threads", "threads"),
+    ("startup_seconds", "startup", "s"),
+    ("kernel_calls_per_gib", "kernel", "calls/MiB"),
+    ("transfer_seconds", "transfer", "s"),
+)
+
+
+def result_cell_status(scenario, engine):
+    """pass, fail or empty for one engine in a matrix-results scenario."""
+    if scenario.get("medians", {}).get(engine):
+        return "pass", ""
+    for skipped in scenario.get("skipped", []):
+        if skipped.get("engine") == engine:
+            return "empty", skipped.get("reason", "no reason recorded")
+    for failure in scenario.get("failures", []):
+        if failure.get("engine") == engine:
+            return "fail", failure.get("reason", "no reason recorded")
+    return "empty", "not attempted"
+
+
+def result_verdict(scenario):
+    """The gated throughput verdict and the engine it judges."""
+    for row in scenario.get("rows", []):
+        if row.get("gates") and str(row.get("label", "")).startswith("throughput"):
+            label = str(row.get("label", ""))
+            engine = ""
+            if "(" in label:
+                engine = label.split("(", 1)[1].split(" vs ", 1)[0].strip()
+            return engine, row.get("verdict", "unproven")
+    return "", "unproven"
+
+
+def table_rows(results):
+    """One row per scenario, engine and metric, including the missing sides."""
+    rows = []
+    for scenario in results.get("scenarios", []):
+        medians = scenario.get("medians", {})
+        verdict_engine, verdict = result_verdict(scenario)
+        engines = {name for name in medians if name}
+        engines.update(
+            item["engine"] for item in scenario.get("skipped", []) if item.get("engine")
+        )
+        engines.update(
+            item["engine"] for item in scenario.get("failures", []) if item.get("engine")
+        )
+        ordered = [name for name in ENGINE_ORDER if name in engines]
+        ordered += sorted(engines - set(ordered))
+        for engine in ordered:
+            status, reason = result_cell_status(scenario, engine)
+            values = medians.get(engine, {})
+            for metric, label, unit in TABLE_METRICS:
+                value = values.get(metric)
+                rows.append(
+                    {
+                        "run_date": results.get("date", "?"),
+                        "runner": results.get("runner", "?"),
+                        "tier": results.get("tier", "?"),
+                        "repeats": results.get("repeats", "?"),
+                        "scenario": scenario.get("id", "?"),
+                        "base": scenario.get("base", ""),
+                        "server": scenario.get("server", ""),
+                        "engine": engine,
+                        "metric": label,
+                        "value": "" if value is None else value,
+                        "unit": unit,
+                        "status": status,
+                        "reason": reason,
+                        "verdict": verdict
+                        if engine == verdict_engine and label == "throughput"
+                        else "",
+                        "reference": scenario.get("reference") or "",
+                    }
+                )
+    return rows
+
+
+def table_csv(results):
+    """The tidy table, one measured or missing value per row."""
+    fields = [
+        "run_date", "runner", "tier", "repeats", "scenario", "base", "server",
+        "engine", "metric", "value", "unit", "status", "reason", "verdict",
+        "reference",
+    ]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fields, lineterminator="\n")
+    writer.writeheader()
+    writer.writerows(table_rows(results))
+    return buffer.getvalue()
+
+
+def table_markdown(results):
+    """The complete text table: no image links, so it stays small and greppable."""
+    lines = [
+        f"# ferrox benchmark matrix table \u2014 {results.get('date', '?')} on {results.get('runner', '?')}",
+        "",
+        f"Tier `{results.get('tier', '?')}`, reference `{results.get('reference', 'xray-core')}`, "
+        f"{results.get('repeats', '?')} repeats, host `{results.get('host', '?')}`, "
+        f"CPU `{results.get('cpu', '?')}`, memory `{results.get('memory', '?')}`, "
+        f"load `{results.get('load', '?')}`. Text-only companion to `README.md`: "
+        "the same medians, verdicts and coverage, with no images.",
+        "",
+        "`table.csv` is the tidy long form; only the judged engine's `throughput` "
+        "row carries the gated `verdict`, so it is not repeated across unrelated metrics.",
+        "",
+    ]
+    if results.get("changes") is not None:
+        lines += [
+            "## Changes since the previous run",
+            "",
+            benchstats.changes_markdown(
+                results["changes"],
+                results.get("previous_date", "the previous run"),
+                results.get("change_threshold", benchstats.CHANGE_THRESHOLD),
+            ),
+            "",
+        ]
+    lines += [
+        "## Throughput by test",
+        "",
+        throughput_table(results),
+        "",
+        "## Ferrox against the reference, leg by leg",
+        "",
+        leg_tables(results),
+        "",
+        "The client leg compares ferrox and xray-core as clients of the xray-core server; "
+        "the server leg compares xray-core as a client of the ferrox and xray-core servers. "
+        "A value below 0.85 is marked `gap` and is a hole in this tree, not variance.",
+        "",
+        "## Cost",
+        "",
+        cost_table(results),
+        "",
+        "## Coverage",
+        "",
+        coverage_table(results),
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def write_table_files(input_dir, results):
+    """Write the small table pair beside the bundle's charts."""
+    markdown_path = Path(input_dir) / "table.md"
+    csv_path = Path(input_dir) / "table.csv"
+    markdown_path.write_text(table_markdown(results) + "\n")
+    csv_path.write_text(table_csv(results))
+    print(f"table written to {markdown_path} and {csv_path}")
+
+
 def matrix_markdown(results, image_prefix):
     """The complete bundle document: tables, one multi-metric image per test, coverage."""
     scenarios = results.get("scenarios", [])
@@ -1115,6 +1271,7 @@ def main(argv=None):
     with open(args.results, "w") as handle:
         json.dump(results, handle, indent=2, sort_keys=True)
         handle.write("\n")
+    write_table_files(input_dir, results)
 
     bulk = sorted(s for s in cells if "setup" not in s)
     made = []

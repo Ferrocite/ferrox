@@ -134,3 +134,17 @@ jobs:
             target/live-speedtest/attempts/**/*.json
           retention-days: 30
           if-no-files-found: error
+
+  result:
+    name: result
+    needs: [speedtest]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: speedtest
+          needs: ${{ toJSON(needs) }}
+          artifacts: live-speedtest-*

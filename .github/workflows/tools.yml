@@ -42,3 +42,16 @@ jobs:
         run: cargo test -p ferrox-prompt -p ferrox-bench --locked
       - name: the prompt library is well formed
         run: cargo run --locked --quiet -p ferrox-prompt -- check
+
+  result:
+    name: result
+    needs: [check]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: tools
+          needs: ${{ toJSON(needs) }}

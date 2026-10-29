@@ -73,6 +73,7 @@ if [[ $fast == 0 ]]; then
   step "benchmark and matrix selftests"
   python3 scripts/benchmark-delta.py --selftest
   python3 scripts/check-matrix-legs.py --selftest
+  python3 scripts/workflow-result.py --selftest
   python3 scripts/rewrite-depinfo.py --selftest
 
   step "cli arguments"

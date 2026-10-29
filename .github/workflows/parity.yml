@@ -141,3 +141,17 @@ jobs:
             target/bench-report.md
           retention-days: 30
           if-no-files-found: error
+
+  result:
+    name: result
+    needs: [fetch, parity]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: parity
+          needs: ${{ toJSON(needs) }}
+          artifacts: parity-*
