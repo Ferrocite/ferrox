@@ -1068,6 +1068,10 @@ pub struct ServerConfigCacheInner {
     pub plain: Option<std::sync::Arc<rustls::ServerConfig>>,
     pub reality: Option<std::sync::Arc<rustls::ServerConfig>>,
     pub ech: Option<std::sync::Arc<boring::ssl::SslContext>>,
+    /// The identities the listener currently serves, so a re-read compares against them.
+    pub served: Option<Vec<super::CertEntry>>,
+    /// When the file-backed identities are next re-read; `None` keeps them as loaded.
+    pub renew_at: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for ServerConfigCacheInner {
@@ -1079,22 +1083,34 @@ impl std::fmt::Debug for ServerConfigCacheInner {
 
 pub type ServerConfigCache = std::sync::Arc<std::sync::Mutex<ServerConfigCacheInner>>;
 
-/// The single identity, refused when the SNI matches no certificate name.
+/// The identities a listener serves, in block order: the first whose names match the SNI wins,
+/// element 0 answers an empty or unmatched hello unless `reject` is set.
 #[derive(Debug)]
-struct SniResolver {
-    key: Arc<rustls::sign::CertifiedKey>,
-    names: Vec<String>,
+struct IdentityResolver {
+    identities: Vec<(Arc<rustls::sign::CertifiedKey>, Vec<String>)>,
+    reject: bool,
 }
 
-impl rustls::server::ResolvesServerCert for SniResolver {
+impl rustls::server::ResolvesServerCert for IdentityResolver {
     fn resolve(
         &self,
         hello: rustls::server::ClientHello<'_>,
     ) -> Option<Arc<rustls::sign::CertifiedKey>> {
-        hello
-            .server_name()
-            .filter(|sni| sni_matches(&self.names, sni))
-            .map(|_| Arc::clone(&self.key))
+        let sni = hello.server_name().unwrap_or("");
+        if !self.reject && (self.identities.len() == 1 || sni.is_empty()) {
+            return self.identities.first().map(|(key, _)| Arc::clone(key));
+        }
+        if let Some((key, _)) = self
+            .identities
+            .iter()
+            .find(|(_, names)| sni_matches(names, sni))
+        {
+            return Some(Arc::clone(key));
+        }
+        if self.reject {
+            return None;
+        }
+        self.identities.first().map(|(key, _)| Arc::clone(key))
     }
 }
 
@@ -1133,24 +1149,31 @@ fn certificate_names(leaf: &[u8]) -> Vec<String> {
     names
 }
 
-pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::ServerConfig, TlsError> {
-    use super::ServerKeyKind as Kind;
-    let certs: Vec<rustls::pki_types::CertificateDer<'_>> = cfg
-        .cert_chain
+/// The chain a served identity presents, leaf first.
+fn chain_of(chain: Vec<Vec<u8>>) -> Vec<rustls::pki_types::CertificateDer<'static>> {
+    chain
         .into_iter()
         .map(rustls::pki_types::CertificateDer::from)
-        .collect();
-    let key = match cfg.key_kind {
+        .collect()
+}
+
+/// The signing key a served identity holds, in the shape its DER names.
+fn key_of(entry: &super::CertEntry) -> rustls::pki_types::PrivateKeyDer<'static> {
+    use super::ServerKeyKind as Kind;
+    match entry.key_kind {
         Kind::Pkcs8 => rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(cfg.key_der),
+            rustls::pki_types::PrivatePkcs8KeyDer::from(entry.key_der.clone()),
         ),
         Kind::Sec1 => rustls::pki_types::PrivateKeyDer::Sec1(
-            rustls::pki_types::PrivateSec1KeyDer::from(cfg.key_der),
+            rustls::pki_types::PrivateSec1KeyDer::from(entry.key_der.clone()),
         ),
         Kind::Pkcs1 => rustls::pki_types::PrivateKeyDer::Pkcs1(
-            rustls::pki_types::PrivatePkcs1KeyDer::from(cfg.key_der),
+            rustls::pki_types::PrivatePkcs1KeyDer::from(entry.key_der.clone()),
         ),
-    };
+    }
+}
+
+pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::ServerConfig, TlsError> {
     let crypto_provider = provider();
     let mut ordered = (*crypto_provider).clone();
     if !cfg.cipher_suites.is_empty() {
@@ -1163,24 +1186,36 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
         None => builder.with_safe_default_protocol_versions(),
     }
     .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?;
-    let mut config = if cfg.reject_unknown_sni {
-        let names = certs
-            .first()
-            .map(|leaf| certificate_names(leaf.as_ref()))
-            .unwrap_or_default();
-        let key = rustls::sign::CertifiedKey::from_der(certs, key, crypto_provider.as_ref())
-            .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?;
+    let mut config = if cfg.certs.len() == 1 && !cfg.reject_unknown_sni {
+        let entry = cfg.certs.into_iter().next().expect("one identity");
+        let key = key_of(&entry);
         builder
             .with_no_client_auth()
-            .with_cert_resolver(Arc::new(SniResolver {
-                key: Arc::new(key),
-                names,
-            }))
-    } else {
-        builder
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
+            .with_single_cert(chain_of(entry.cert_chain), key)
             .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?
+    } else {
+        let mut identities = Vec::with_capacity(cfg.certs.len());
+        for entry in cfg.certs {
+            let names = entry
+                .cert_chain
+                .first()
+                .map(|leaf| certificate_names(leaf))
+                .unwrap_or_default();
+            let key = key_of(&entry);
+            let key = rustls::sign::CertifiedKey::from_der(
+                chain_of(entry.cert_chain),
+                key,
+                crypto_provider.as_ref(),
+            )
+            .map_err(|e| TlsError::Other(format!("rustls server identity: {e}")))?;
+            identities.push((Arc::new(key), names));
+        }
+        builder
+            .with_no_client_auth()
+            .with_cert_resolver(Arc::new(IdentityResolver {
+                identities,
+                reject: cfg.reject_unknown_sni,
+            }))
     };
     config.alpn_protocols.clear();
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
@@ -1220,10 +1255,25 @@ pub(crate) fn cached_server_config(
     cfg: &super::TlsServerConfig,
     reality: bool,
 ) -> Result<std::sync::Arc<rustls::ServerConfig>, TlsError> {
+    let interval = cfg.reload_interval();
+    let now = std::time::Instant::now();
     let mut guard = cfg
         .server_config_cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if !reality {
+        if let (Some(interval), Some(at)) = (interval, guard.renew_at) {
+            if now >= at {
+                drop(guard);
+                cfg.renew();
+                guard = cfg
+                    .server_config_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                guard.renew_at = Some(now + interval);
+            }
+        }
+    }
     let slot = if reality {
         &mut guard.reality
     } else {
@@ -1238,6 +1288,10 @@ pub(crate) fn cached_server_config(
         server_config(cfg.clone())?
     });
     *slot = Some(std::sync::Arc::clone(&built));
+    if !reality {
+        guard.served = Some(cfg.certs.clone());
+        guard.renew_at = interval.map(|interval| now + interval);
+    }
     Ok(built)
 }
 
@@ -1271,23 +1325,13 @@ impl rustls::sign::SigningKey for RealitySigningKey {
 pub(crate) fn reality_server_config(
     cfg: super::TlsServerConfig,
 ) -> Result<rustls::ServerConfig, TlsError> {
-    use super::ServerKeyKind as Kind;
-    let certs: Vec<rustls::pki_types::CertificateDer<'_>> = cfg
-        .cert_chain
+    let entry = cfg
+        .certs
         .into_iter()
-        .map(rustls::pki_types::CertificateDer::from)
-        .collect();
-    let key_der = match cfg.key_kind {
-        Kind::Pkcs8 => rustls::pki_types::PrivateKeyDer::Pkcs8(
-            rustls::pki_types::PrivatePkcs8KeyDer::from(cfg.key_der),
-        ),
-        Kind::Sec1 => rustls::pki_types::PrivateKeyDer::Sec1(
-            rustls::pki_types::PrivateSec1KeyDer::from(cfg.key_der),
-        ),
-        Kind::Pkcs1 => rustls::pki_types::PrivateKeyDer::Pkcs1(
-            rustls::pki_types::PrivatePkcs1KeyDer::from(cfg.key_der),
-        ),
-    };
+        .next()
+        .ok_or_else(|| TlsError::Other("server identity has no certificate".to_owned()))?;
+    let key_der = key_of(&entry);
+    let certs = chain_of(entry.cert_chain);
     let inner = provider()
         .key_provider
         .load_private_key(key_der)
@@ -1612,7 +1656,11 @@ fn server_identity_builder(
     cfg: &super::TlsServerConfig,
 ) -> Result<boring::ssl::SslContextBuilder, TlsError> {
     use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
-    let mut chain = cfg.cert_chain.iter();
+    let entry = cfg
+        .certs
+        .first()
+        .ok_or_else(|| TlsError::Other("server identity has no certificate".to_owned()))?;
+    let mut chain = entry.cert_chain.iter();
     let leaf = chain
         .next()
         .ok_or_else(|| TlsError::Other("server identity has no certificate".to_owned()))?;
@@ -1630,7 +1678,7 @@ fn server_identity_builder(
             )
             .map_err(|error| boring_error(&error))?;
     }
-    let key = boring::pkey::PKey::private_key_from_der(&cfg.key_der)
+    let key = boring::pkey::PKey::private_key_from_der(&entry.key_der)
         .map_err(|error| boring_error(&error))?;
     builder
         .set_private_key(&key)
@@ -1639,7 +1687,12 @@ fn server_identity_builder(
         .check_private_key()
         .map_err(|error| boring_error(&error))?;
     if cfg.reject_unknown_sni {
-        let names = certificate_names(&cfg.cert_chain[0]);
+        let names = certificate_names(
+            entry
+                .cert_chain
+                .first()
+                .ok_or_else(|| TlsError::Other("server identity has no certificate".to_owned()))?,
+        );
         builder.set_servername_callback(move |ssl, alert| {
             if ssl
                 .servername(boring::ssl::NameType::HOST_NAME)

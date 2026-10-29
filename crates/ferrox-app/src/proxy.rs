@@ -30349,13 +30349,16 @@ mod tests {
         ferrox_core::tls::TlsConfig,
     ) {
         let server = std::sync::Arc::new(ferrox_core::tls::TlsServerConfig {
+            certs: vec![ferrox_core::tls::CertEntry {
+                cert_chain: vec![CARRIER_CERT.to_vec()],
+                key_der: CARRIER_KEY.to_vec(),
+                key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+                reload: None,
+            }],
             alpn: Vec::default(),
             min_version: None,
             max_version: None,
             cipher_suites: Vec::new(),
-            cert_chain: vec![CARRIER_CERT.to_vec()],
-            key_der: CARRIER_KEY.to_vec(),
-            key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
             send_tickets: true,
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
