@@ -2005,6 +2005,8 @@ struct Router<'a> {
     udp_idle: Duration,
     /// This server's `brutalDown`, answered as the client's `hysteria-cc-rx` hint.
     cc_rx: u64,
+    /// Whether an accepted connection advertises the token a peer resets it with; the reference's default, off only when `disableStatelessReset` names it.
+    stateless_reset: bool,
     routes: HashMap<Vec<u8>, Inbound>,
 }
 
@@ -2012,6 +2014,20 @@ fn flush(sock: &crate::quic::Datagram, conn: &mut quiche::Connection, out: &mut 
     while let Ok((written, info)) = conn.send(out) {
         let _ = sock.send_to(&out[..written], info.to);
     }
+}
+
+/// A stateless reset token belongs to one connection, so the shared template is minted afresh before each accept; a failed mint refuses the connection rather than sharing one.
+fn mint_reset_token(template: &mut quiche::Config, enabled: bool) -> bool {
+    if !enabled {
+        template.set_stateless_reset_token(None);
+        return true;
+    }
+    let mut token = [0u8; 16];
+    if getrandom::fill(&mut token).is_err() {
+        return false;
+    }
+    template.set_stateless_reset_token(Some(u128::from_le_bytes(token)));
+    true
 }
 
 fn auth_exchange(
@@ -2073,7 +2089,8 @@ impl Router<'_> {
         initial_dcid: &[u8],
     ) {
         let mut scid = [0u8; SCID_LEN];
-        if getrandom::fill(&mut scid).is_err() {
+        if getrandom::fill(&mut scid).is_err() || !mint_reset_token(template, self.stateless_reset)
+        {
             return;
         }
         let cid = quiche::ConnectionId::from_ref(&scid);
@@ -2344,6 +2361,7 @@ pub(crate) fn serve_loop(
         masq: Arc::from(masq.clone()),
         udp_idle,
         cc_rx: quic.map_or(0, |params| params.brutal_down),
+        stateless_reset: quic.is_none_or(|params| !params.disable_stateless_reset),
         routes: HashMap::new(),
     };
     let mut buf = Unfilled::<RECV_ROOM>::new();
@@ -2399,6 +2417,132 @@ mod tests {
     fn server_config_refuses_without_a_chain_it_can_read() {
         let cc = hysteria::Congestion::Bbr;
         assert!(server_config("/nonexistent.crt", "/nonexistent.key", cc, None).is_none());
+    }
+
+    #[test]
+    fn a_stateless_reset_token_is_minted_afresh_per_accept() {
+        let config = hysteria::Config {
+            quic: Some(hysteria::QuicParams::default()),
+            ..hysteria::Config::default()
+        };
+        let (mut server, cert_path, key_path) = server_template(&config);
+        let first = peer_params_with(&mut server, true);
+        let second = peer_params_with(&mut server, true);
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+        assert!(
+            first.stateless_reset_token.is_some(),
+            "an enabled reset sends a token"
+        );
+        assert_ne!(
+            first.stateless_reset_token, second.stateless_reset_token,
+            "two connections never share one token"
+        );
+    }
+
+    #[test]
+    fn a_disabled_stateless_reset_sends_no_token() {
+        let config = hysteria::Config::default();
+        let (mut server, cert_path, key_path) = server_template(&config);
+        let params = peer_params_with(&mut server, false);
+        let _ = std::fs::remove_file(&cert_path);
+        let _ = std::fs::remove_file(&key_path);
+        assert!(
+            params.stateless_reset_token.is_none(),
+            "a disabled reset advertises nothing"
+        );
+    }
+
+    /// A server template over a freshly minted certificate; the caller removes both files.
+    fn server_template(
+        config: &hysteria::Config,
+    ) -> (quiche::Config, std::path::PathBuf, std::path::PathBuf) {
+        let minted = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
+            .expect("mints a certificate");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tag = format!("ferrox-hysteria-reset-{}-{stamp}", std::process::id());
+        let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+        let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+        std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
+        std::fs::write(
+            &key_path,
+            crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY"),
+        )
+        .expect("stages key");
+        let server = server_config(
+            cert_path.to_str().expect("ascii"),
+            key_path.to_str().expect("ascii"),
+            config.cc,
+            config.quic.as_ref(),
+        )
+        .expect("a server config");
+        (server, cert_path, key_path)
+    }
+
+    /// One accept off the shared template, then a client handshake to read what it sent.
+    fn peer_params_with(server: &mut quiche::Config, reset: bool) -> quiche::TransportParams {
+        assert!(mint_reset_token(server, reset));
+        let mut client_config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
+        client_config.verify_peer(false);
+        client_config
+            .set_application_protos(&[crate::quic::ALPN])
+            .expect("negotiates");
+        let client_addr = "127.0.0.1:50000".parse().expect("addr");
+        let server_addr = "127.0.0.1:443".parse().expect("addr");
+        let client_cid = [1u8; SCID_LEN];
+        let server_cid = [2u8; SCID_LEN];
+        let mut client = quiche::connect(
+            None,
+            &quiche::ConnectionId::from_ref(&client_cid),
+            client_addr,
+            server_addr,
+            &mut client_config,
+        )
+        .expect("connects");
+        let mut server = quiche::accept(
+            &quiche::ConnectionId::from_ref(&server_cid),
+            None,
+            server_addr,
+            client_addr,
+            server,
+        )
+        .expect("accepts");
+        let mut up = Unfilled::<MAX_DATAGRAM>::new();
+        let mut down = Unfilled::<MAX_DATAGRAM>::new();
+        for _ in 0..4 {
+            while let Ok((n, _)) = client.send(up.as_mut()) {
+                server
+                    .recv(
+                        &mut up.as_mut()[..n],
+                        quiche::RecvInfo {
+                            from: client_addr,
+                            to: server_addr,
+                        },
+                    )
+                    .expect("drives the server");
+            }
+            while let Ok((n, _)) = server.send(down.as_mut()) {
+                client
+                    .recv(
+                        &mut down.as_mut()[..n],
+                        quiche::RecvInfo {
+                            from: server_addr,
+                            to: client_addr,
+                        },
+                    )
+                    .expect("drives the client");
+            }
+            if client.is_established() {
+                break;
+            }
+        }
+        client
+            .peer_transport_params()
+            .cloned()
+            .expect("the server's shape arrived")
     }
 
     #[test]
@@ -2528,6 +2672,7 @@ mod tests {
                 masq: Arc::new(Masquerade::NotFound),
                 udp_idle,
                 cc_rx: 0,
+                stateless_reset: false,
                 routes: by_scid,
             };
             router.idle();
