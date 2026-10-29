@@ -667,7 +667,7 @@ fn udp_reader(
         let Ok(mut conn) = shared.lock() else {
             break;
         };
-        if conn.is_closed() {
+        if stop.load(Ordering::Relaxed) || conn.is_closed() {
             break;
         }
         let Some(max) = conn.dgram_max_writable_len() else {
@@ -1316,5 +1316,55 @@ mod tests {
             .recv_from(&mut buf)
             .expect("a stopped reader leaves its target's queue intact");
         assert_eq!(&buf[..n], b"late");
+    }
+
+    #[test]
+    fn a_stop_while_the_reader_waits_is_not_forwarded() {
+        let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
+        config
+            .set_application_protos(&[crate::quic::ALPN])
+            .expect("negotiates");
+        let scid = [8u8; SCID_LEN];
+        let cid = quiche::ConnectionId::from_ref(&scid);
+        let local = "127.0.0.1:0".parse().expect("addr");
+        let peer = "127.0.0.1:1".parse().expect("addr");
+        let conn = quiche::connect(None, &cid, local, peer, &mut config).expect("connects");
+        let shared = Arc::new(Mutex::new(conn));
+        let sock = Arc::new(crate::quic::Datagram::plain(
+            UdpSocket::bind("127.0.0.1:0").expect("binds the lane"),
+        ));
+
+        let target = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("binds the target"));
+        target
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("binds the sender");
+
+        let stop = AtomicBool::new(false);
+        let reader = std::thread::spawn({
+            let shared = Arc::clone(&shared);
+            let sock = Arc::clone(&sock);
+            let target = Arc::clone(&target);
+            move || udp_reader(&shared, &sock, &target, &stop, 7)
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!reader.is_finished(), "the reader should be waiting");
+
+        let guard = shared.lock().expect("locks");
+        stop.store(true, Ordering::Relaxed);
+        sender
+            .send_to(b"late", target.local_addr().expect("target address"))
+            .expect("wakes the reader");
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while !reader.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let finished = reader.is_finished();
+        drop(guard);
+        reader.join().expect("the reader ends");
+        assert!(
+            finished,
+            "the reader waited for the connection lock after its flow stopped"
+        );
     }
 }
