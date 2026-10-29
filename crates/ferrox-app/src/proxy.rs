@@ -11770,14 +11770,8 @@ where
         }
         None => Arc::new(Mutex::new(session)),
     };
-    if let (Some(raw), Ok(mut sealed)) = (clock, out.lock()) {
-        let session = Arc::clone(&shared);
-        let arm: Box<dyn Fn(Duration) + Send + Sync> = Box::new(move |timeout| {
-            if let Ok(session) = session.lock() {
-                session.arm_write(timeout);
-            }
-        });
-        sealed.raw = Some((raw, arm));
+    if let (Some(wire), Ok(mut sealed)) = (clock, out.lock()) {
+        sealed.wire = Some(wire);
     }
     let reader = TlsHalf {
         session: Arc::clone(&shared),
@@ -11957,15 +11951,13 @@ fn xhttp_rung(
     xhttp_pair(uplink, host, &settings)
 }
 
-type RawArm = (Connection, Box<dyn Fn(Duration) + Send + Sync>);
-
 // The write side of a split session: one seal fills a buffer, and the lock keeps seals and sends in wire order.
 struct Sealed {
     transport: Box<dyn Write + Send>,
+    /// The raw socket the writes actually use: Windows gives each duplicate its own clock, so the
+    /// handle that is armed must be the handle `send` writes.
+    wire: Option<Connection>,
     bytes: Vec<u8>,
-    /// The raw socket behind the transport, when the session exposes one: the write clock lives on
-    /// the descriptor, so a paced carrier arms it without taking the session's lock.
-    raw: Option<RawArm>,
     /// The record behind `bytes` has a clock: a peer that drains nothing leaves its suffix here for
     /// a later settle instead of parking the relay lane's thread in the write.
     paced: bool,
@@ -11979,8 +11971,8 @@ impl Sealed {
     fn new(transport: impl Write + Send + 'static) -> Self {
         Self {
             transport: Box::new(transport),
+            wire: None,
             bytes: Vec::new(),
-            raw: None,
             paced: false,
         }
     }
@@ -11992,15 +11984,21 @@ impl Sealed {
             let written = if self.bytes.is_empty() {
                 Ok(())
             } else {
-                self.transport.write_all(&self.bytes)
+                Self::put_all(&mut self.wire, &mut *self.transport, &self.bytes)
             };
             self.bytes.clear();
             written?;
-            return self.transport.flush();
+            return Self::drain(&mut self.wire, &mut *self.transport);
         }
         let mut at = 0usize;
+        let paced = self.paced;
         while at < self.bytes.len() {
-            match self.transport.write(&self.bytes[at..]) {
+            match Self::put(
+                &mut self.wire,
+                &mut *self.transport,
+                &self.bytes[at..],
+                paced,
+            ) {
                 Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
                 Ok(n) => at += n,
                 Err(error)
@@ -12015,9 +12013,51 @@ impl Sealed {
             self.bytes.drain(..at);
         }
         if self.bytes.is_empty() {
-            return self.transport.flush();
+            return Self::drain(&mut self.wire, &mut *self.transport);
         }
         Ok(())
+    }
+
+    fn put(
+        wire: &mut Option<Connection>,
+        transport: &mut (dyn Write + Send),
+        buf: &[u8],
+        paced: bool,
+    ) -> std::io::Result<usize> {
+        #[cfg(not(windows))]
+        let _ = paced;
+        match wire.as_mut() {
+            Some(wire) => {
+                // Windows drops a timed-out send's byte count, so ask for room and keep the write blocking.
+                #[cfg(windows)]
+                if paced && !wire.writable(RELAY_POLL)? {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                wire.write(buf)
+            }
+            None => transport.write(buf),
+        }
+    }
+
+    fn put_all(
+        wire: &mut Option<Connection>,
+        transport: &mut (dyn Write + Send),
+        buf: &[u8],
+    ) -> std::io::Result<()> {
+        match wire.as_mut() {
+            Some(wire) => wire.write_all(buf),
+            None => transport.write_all(buf),
+        }
+    }
+
+    fn drain(
+        wire: &mut Option<Connection>,
+        transport: &mut (dyn Write + Send),
+    ) -> std::io::Result<()> {
+        match wire.as_mut() {
+            Some(wire) => wire.flush(),
+            None => transport.flush(),
+        }
     }
 
     fn settle(&mut self) -> Settle {
@@ -12141,8 +12181,6 @@ const DRIVEN_CIPHERTEXT: usize = 32 * 1024;
 /// caller keeps it behind the shared shape's lock.
 trait Drivable {
     fn transport(&self) -> Option<Connection>;
-    /// The write clock belongs to the descriptor the session writes, not a duplicate of it.
-    fn arm_write(&self, _timeout: std::time::Duration) {}
 }
 
 impl Drivable
@@ -12153,10 +12191,6 @@ impl Drivable
             return None;
         }
         self.get_ref().get_ref().try_clone().ok()
-    }
-
-    fn arm_write(&self, timeout: std::time::Duration) {
-        let _ = self.get_ref().get_ref().set_write_timeout(Some(timeout));
     }
 }
 
@@ -12172,10 +12206,6 @@ impl Drivable for ferrox_core::tls::RustlsProvider<Connection> {
     fn transport(&self) -> Option<Connection> {
         self.get_ref().try_clone().ok()
     }
-
-    fn arm_write(&self, timeout: std::time::Duration) {
-        let _ = self.get_ref().set_write_timeout(Some(timeout));
-    }
 }
 
 impl Drivable for ferrox_core::tls::RustlsProvider<KcpIo> {
@@ -12187,10 +12217,6 @@ impl Drivable for ferrox_core::tls::RustlsProvider<KcpIo> {
 impl Drivable for ferrox_core::tls::ClientSession<Connection> {
     fn transport(&self) -> Option<Connection> {
         self.get_ref().try_clone().ok()
-    }
-
-    fn arm_write(&self, timeout: std::time::Duration) {
-        let _ = self.get_ref().set_write_timeout(Some(timeout));
     }
 }
 
@@ -12211,10 +12237,6 @@ impl Drivable for ferrox_core::tls::RealityServer<Connection> {
             .try_clone()
             .ok()
     }
-
-    fn arm_write(&self, timeout: std::time::Duration) {
-        let _ = ferrox_core::tls::RealityServer::transport(self).set_write_timeout(Some(timeout));
-    }
 }
 
 impl Drivable for ferrox_core::tls::RealityServer<KcpIo> {
@@ -12228,10 +12250,6 @@ impl Drivable
 {
     fn transport(&self) -> Option<Connection> {
         self.get_ref().get_ref().try_clone().ok()
-    }
-
-    fn arm_write(&self, timeout: std::time::Duration) {
-        let _ = self.get_ref().get_ref().set_write_timeout(Some(timeout));
     }
 }
 
@@ -20777,11 +20795,15 @@ impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send
 
     fn arm_write(&mut self, timeout: Duration) {
         if let Ok(mut out) = self.out.lock() {
-            let Some((raw, arm)) = out.raw.as_ref() else {
+            if out.wire.is_none() {
                 return;
-            };
-            arm(timeout);
-            let _ = raw.set_write_timeout(Some(timeout));
+            }
+            #[cfg(not(windows))]
+            if let Some(wire) = out.wire.as_ref() {
+                let _ = wire.set_write_timeout(Some(timeout));
+            }
+            #[cfg(windows)]
+            let _ = timeout;
             out.paced = true;
         }
     }
