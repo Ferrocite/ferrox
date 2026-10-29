@@ -849,17 +849,27 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool)
     if !freedom || users.is_empty() {
         return;
     }
-    let Ok(upstream) = UdpSocket::bind("0.0.0.0:0") else {
+    let mut upstreams: Vec<(UdpSocket, Option<UdpSocket>)> = Vec::with_capacity(users.len());
+    for _ in users {
+        let Ok(v4) = UdpSocket::bind("0.0.0.0:0") else {
+            return;
+        };
+        upstreams.push((v4, UdpSocket::bind("[::]:0").ok()));
+    }
+    if clients.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
-    };
-    let upstream6 = UdpSocket::bind("[::]:0").ok();
-    for sock in [clients, &upstream].into_iter().chain(upstream6.as_ref()) {
+    }
+    for sock in upstreams
+        .iter()
+        .flat_map(|(v4, v6)| std::iter::once(v4).chain(v6.as_ref()))
+    {
         if sock.set_read_timeout(Some(RELAY_POLL)).is_err() {
             return;
         }
     }
-    // The reply leg is sealed with the client that opened the flow, so a destination remembers both.
-    let mut table: HashMap<SocketAddr, (SocketAddr, usize)> = HashMap::new();
+    // One upstream socket per account: a reply is opened and sealed under the account whose socket it arrived on.
+    let mut tables: Vec<HashMap<SocketAddr, SocketAddr>> =
+        users.iter().map(|_| HashMap::new()).collect();
     let mut buf = crate::proxy::unfilled(DATAGRAM_MAX);
     let mut reply = crate::proxy::unfilled(DATAGRAM_MAX);
     let mut hops: Vec<Option<Cipher>> = users.iter().map(|_| None).collect();
@@ -869,13 +879,14 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool)
                 if let Some((which, dest, payload)) =
                     open_datagram_any(users, &mut buf[SEAL_ROOM..SEAL_ROOM + n], &mut hops)
                 {
-                    if table.len() >= 4096 {
-                        table.clear();
+                    if tables[which].len() >= 4096 {
+                        tables[which].clear();
                     }
-                    table.insert(dest, (src, which));
+                    tables[which].insert(dest, src);
                     let payload = &buf[SEAL_ROOM + payload.start..SEAL_ROOM + payload.end];
+                    let (upstream, upstream6) = &upstreams[which];
                     if dest.is_ipv6() {
-                        if let Some(sock) = &upstream6 {
+                        if let Some(sock) = upstream6 {
                             let _ = sock.send_to(payload, dest);
                         }
                     } else {
@@ -886,20 +897,23 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool)
             Err(error) if crate::proxy::is_timeout(&error) => {}
             Err(_) => break,
         }
-        for sock in [&upstream].into_iter().chain(upstream6.as_ref()) {
-            while let Ok((n, src)) = sock.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
-                if let Some(&(client, which)) = table.get(&src) {
-                    let user = &users[which];
-                    if let Some(packet) = seal_datagram(
-                        &user.master,
-                        user.method,
-                        &src,
-                        &mut reply,
-                        SEAL_ROOM,
-                        n,
-                        &mut hops[which],
-                    ) {
-                        let _ = clients.send_to(packet, client);
+        for (which, (upstream, upstream6)) in upstreams.iter().enumerate() {
+            for sock in std::iter::once(upstream).chain(upstream6.as_ref()) {
+                while let Ok((n, src)) = sock.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF])
+                {
+                    if let Some(&client) = tables[which].get(&src) {
+                        let user = &users[which];
+                        if let Some(packet) = seal_datagram(
+                            &user.master,
+                            user.method,
+                            &src,
+                            &mut reply,
+                            SEAL_ROOM,
+                            n,
+                            &mut hops[which],
+                        ) {
+                            let _ = clients.send_to(packet, client);
+                        }
                     }
                 }
             }
