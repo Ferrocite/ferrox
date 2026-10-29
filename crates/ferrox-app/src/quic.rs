@@ -3527,6 +3527,8 @@ impl QuicStream {
 struct ServerConn {
     conn: Arc<Mutex<quiche::Connection>>,
     seen: Mutex<HashSet<u64>>,
+    visit: AtomicU64,
+    gone: AtomicBool,
 }
 
 /// The per-stream entry point a VLESS inbound serves: one stream, one session, no shared state.
@@ -3539,8 +3541,8 @@ struct Scratch {
     fresh: Vec<(Arc<Mutex<quiche::Connection>>, u64)>,
     learned: Vec<(Vec<u8>, Arc<ServerConn>)>,
     closed: Vec<Vec<u8>>,
-    seen: Vec<*const ServerConn>,
-    gone: Vec<*const ServerConn>,
+    /// The stamp one reap writes on every state it visits, so a second key for that state is a load, not a scan.
+    epoch: u64,
     /// The earliest timer a live connection wants, carried from the reap that read it to the wait it gates.
     deadline: Option<Instant>,
 }
@@ -3563,8 +3565,7 @@ pub(crate) fn serve_loop(
         fresh: Vec::new(),
         learned: Vec::new(),
         closed: Vec::new(),
-        seen: Vec::new(),
-        gone: Vec::new(),
+        epoch: 0,
         deadline: None,
     };
     #[cfg(target_os = "linux")]
@@ -3725,6 +3726,8 @@ fn route(
     let state = Arc::new(ServerConn {
         conn: Arc::new(Mutex::new(conn)),
         seen: Mutex::new(HashSet::new()),
+        visit: AtomicU64::new(0),
+        gone: AtomicBool::new(false),
     });
     conns.insert(scid.to_vec(), Arc::clone(&state));
     conns.insert(header.dcid.as_ref().to_vec(), state);
@@ -3770,8 +3773,9 @@ fn route_batch(
                 };
                 let info = quiche::RecvInfo { from, to: local };
                 let _ = conn.recv(bytes, info);
-                learn_ids(conns, &state, &conn);
             }
+            // The peer cannot use an id before this run's flush carries it, so the run learns once after every packet.
+            learn_ids(conns, &state, &conn);
             flush_egress(&mut conn, sock);
         }
         at = end;
@@ -3788,25 +3792,24 @@ fn reap(
     scratch.fresh.clear();
     scratch.learned.clear();
     scratch.closed.clear();
-    scratch.seen.clear();
-    scratch.gone.clear();
+    scratch.epoch = scratch.epoch.wrapping_add(1);
+    let epoch = scratch.epoch;
     let mut deadline = None;
-    // A state is keyed once per connection id, so the pointer is what keeps one connection's questions asked once.
+    // A state is keyed once per connection id, so the stamp keeps one connection's questions asked once.
     for (key, state) in conns.iter() {
-        let ptr = Arc::as_ptr(state);
-        if scratch.seen.contains(&ptr) {
+        if state.visit.load(Ordering::Relaxed) == epoch {
             // A closed connection still owes every key it routes: they leave together.
-            if scratch.gone.contains(&ptr) {
+            if state.gone.load(Ordering::Relaxed) {
                 scratch.closed.push(key.clone());
             }
             continue;
         }
-        scratch.seen.push(ptr);
+        state.visit.store(epoch, Ordering::Relaxed);
         let Ok(conn) = state.conn.lock() else {
             continue;
         };
         if conn.is_closed() {
-            scratch.gone.push(ptr);
+            state.gone.store(true, Ordering::Relaxed);
             scratch.closed.push(key.clone());
             continue;
         }

@@ -428,6 +428,13 @@ fn cascade_bkd(r: &mut [u8]) {
         i -= 1;
         r[i] ^= r[i - 4];
     }
+    // Four chunks at once from the top down: both sixteen-byte windows are read before either is written, and every later window lies below the one just stored.
+    while i >= 20 {
+        let high = u128::from_le_bytes(r[i - 16..i].try_into().unwrap());
+        let low = u128::from_le_bytes(r[i - 20..i - 4].try_into().unwrap());
+        r[i - 16..i].copy_from_slice(&(high ^ low).to_le_bytes());
+        i -= 16;
+    }
     // Whole chunks from the top down: the higher chunk XORs the lower one, still holding its original bytes.
     while i >= 8 {
         let hi = i - 4;
