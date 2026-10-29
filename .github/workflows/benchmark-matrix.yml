@@ -246,8 +246,8 @@ jobs:
               --runner "$slug" \
               "${previous[@]}"
             cp "$results/matrix-results.json" "$results/manifest.txt" "$results/README.md" "$dest/"
-            cp "$bundle/table.md" "$results/"
-            cp "$bundle/table.md" "$bundle/table.csv" "$dest/"
+            cp "$bundle/table.md" "$bundle/distribution.csv" "$results/"
+            cp "$bundle/table.md" "$bundle/table.csv" "$bundle/distribution.csv" "$dest/"
             cp -R "$charts"/. "$dest/charts/"
             python3 scripts/validate-benchmark-matrix.py \
               --cells "$dest/cells" \
@@ -271,7 +271,9 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-matrix-tables-${{ github.run_id }}
-          path: matrix-published/**/table.*
+          path: |
+            matrix-published/**/table.*
+            matrix-published/**/distribution.csv
           retention-days: 90
           if-no-files-found: error
       - name: commit the refreshed matrix on a review branch

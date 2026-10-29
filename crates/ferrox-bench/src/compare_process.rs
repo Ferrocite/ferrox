@@ -136,6 +136,12 @@ fn run_cell_json(run: &Run) -> Json {
     let mut cell = Json::object();
     cell.insert("throughput_mib_s", Json::Num(run.throughput_mib_s()));
     cell.insert("cpu_millis_per_gib", Json::Num(run.cpu_millis_per_gib()));
+    cell.insert("bytes_sent", Json::Num(run.outcome.bytes_sent as f64));
+    cell.insert(
+        "bytes_received",
+        Json::Num(run.outcome.bytes_received as f64),
+    );
+    cell.insert("bytes_moved", Json::Num(run.bytes_moved() as f64));
     let io = run.io_per_gib();
     cell.insert(
         "kernel_calls_per_gib",
@@ -158,6 +164,27 @@ fn run_cell_json(run: &Run) -> Json {
         "transfer_seconds",
         Json::Num(run.outcome.transfer.as_secs_f64()),
     );
+    cell.insert("wall_seconds", Json::Num(run.outcome.wall.as_secs_f64()));
+    cell.insert(
+        "cpu_user_millis",
+        run.outcome
+            .user_millis
+            .map_or(Json::Null, |value| Json::Num(value as f64)),
+    );
+    cell.insert(
+        "cpu_sys_millis",
+        run.outcome
+            .sys_millis
+            .map_or(Json::Null, |value| Json::Num(value as f64)),
+    );
+    cell.insert(
+        "traffic_samples",
+        Json::Num(run.outcome.traffic_samples as f64),
+    );
+    cell.insert(
+        "startup_cpu_millis",
+        Json::Num(run.outcome.startup_cpu_millis as f64),
+    );
     let server = run.outcome.server.map_or(Json::Null, |server| {
         let mut item = Json::object();
         item.insert(
@@ -171,6 +198,18 @@ fn run_cell_json(run: &Run) -> Json {
                 Some(t) => Json::Num(t as f64),
                 None => Json::Null,
             },
+        );
+        item.insert(
+            "cpu_user_millis",
+            server
+                .user_millis
+                .map_or(Json::Null, |value| Json::Num(value as f64)),
+        );
+        item.insert(
+            "cpu_sys_millis",
+            server
+                .sys_millis
+                .map_or(Json::Null, |value| Json::Num(value as f64)),
         );
         item.insert(
             "rss_mib",
@@ -2521,8 +2560,8 @@ mod tests {
             _ => panic!("engines is an array"),
         };
         assert!(
-            first_run.get("threads_peak").is_some(),
-            "threads_peak travels with the cell"
+            first_run.get("threads_peak").is_some() && first_run.get("bytes_moved").is_some(),
+            "threads_peak and byte counts travel with the cell"
         );
         assert_eq!(
             first_run.get("startup_seconds").and_then(Json::as_num),

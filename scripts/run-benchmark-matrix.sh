@@ -11,6 +11,7 @@ bench_bin="target/release/ferrox-bench"
 only=()
 exclude=()
 probe_only=0
+build_only=0
 no_build=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -22,6 +23,7 @@ while [[ $# -gt 0 ]]; do
     --only) only+=("$2"); shift 2 ;;
     --exclude) exclude+=("$2"); shift 2 ;;
     --probe-only) probe_only=1; shift ;;
+    --build-only) build_only=1; shift ;;
     --no-build) no_build=1; shift ;;
     *) echo "::error::unknown argument $1" >&2; exit 2 ;;
   esac
@@ -143,12 +145,21 @@ manifest() {
     echo "cpu: $(cpu_model)"
     echo "memory: $(memory_total)"
     echo "load: $(load_average)"
-    echo "rustc: $(rustc -vV | tr '\n' ' ')"
+    echo "kernel: $(uname -sr)"
+    echo "cpus: $(cpu_count)"
+    echo "rustc: $( (rustc -vV 2>/dev/null || echo 'no rustc toolchain') | tr '\n' ' ')"
     echo "go: $(go version 2>/dev/null || echo 'no go toolchain')"
     echo "repeats: $repeats"
     ((${#only[@]})) && echo "only: ${only[*]}"
     ((${#exclude[@]})) && echo "exclude: ${exclude[*]}"
     ((probe_only)) && echo "probe-only: true"
+    ((build_only)) && echo "build-only: true"
+    echo "commit: $(git rev-parse HEAD 2>/dev/null || echo 'no git metadata')"
+    echo "run: ${GITHUB_RUN_ID:-local}"
+    echo "attempt: ${GITHUB_RUN_ATTEMPT:-1}"
+    echo "event: ${GITHUB_EVENT_NAME:-local}"
+    echo "ref: ${GITHUB_REF:-local}"
+    echo "image: ${ImageOS:-unknown} ${ImageVersion:-}"
     for have in "${engines[@]}"; do
       label="${have%%=*}"
       echo "engine $label: ${have#*=} sha256=$(python3 -c 'import hashlib,sys;print(hashlib.sha256(open(sys.argv[1],"rb").read()).hexdigest())' "${have#*=}") mib=$(python3 -c 'import os,sys;print(f"{os.path.getsize(sys.argv[1]) / 1048576:.1f}")' "${have#*=}")"
@@ -205,11 +216,25 @@ load_average() {
   fi
 }
 
+cpu_count() {
+  if command -v nproc >/dev/null 2>&1; then
+    nproc
+  elif command -v sysctl >/dev/null 2>&1; then
+    sysctl -n hw.ncpu 2>/dev/null || echo "unknown"
+  else
+    echo "unknown"
+  fi
+}
+
 status=0
 cells_run=0
 cells_failed=()
 
 manifest
+if ((build_only)); then
+  echo "build-only: engines built, no cell configs written"
+  exit 0
+fi
 {
   echo "# Replay: tier $tier on $(date -u +%FT%TZ)"
   echo "# engines: ${engines[*]}"

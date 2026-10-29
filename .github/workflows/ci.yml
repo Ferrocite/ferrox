@@ -89,6 +89,7 @@ jobs:
           exit "$status"
       - name: the benchmark and matrix self-checks
         run: |
+          python3 scripts/benchstats.py
           python3 scripts/benchmark-delta.py --selftest
           python3 scripts/check-matrix-legs.py --selftest
           python3 scripts/workflow-result.py --selftest
