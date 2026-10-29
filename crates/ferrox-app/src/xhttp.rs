@@ -420,6 +420,7 @@ impl Packer {
     }
 
     fn pump(&self) {
+        let mut spare = Vec::new();
         loop {
             let Ok(mut queue) = self.queue.lock() else {
                 self.failed.store(true, Ordering::SeqCst);
@@ -435,8 +436,12 @@ impl Packer {
                 return;
             }
             let take = queue.len().min(self.max());
-            let rest = queue.split_off(take);
-            let piece = std::mem::replace(&mut *queue, rest);
+            let piece = if take == queue.len() {
+                std::mem::replace(&mut *queue, std::mem::take(&mut spare))
+            } else {
+                let rest = queue.split_off(take);
+                std::mem::replace(&mut *queue, rest)
+            };
             self.cv.notify_all();
             drop(queue);
             let Ok(mut stream) = self.stream.lock() else {
@@ -448,6 +453,8 @@ impl Packer {
                 self.cv.notify_all();
                 return;
             }
+            spare = piece;
+            spare.clear();
         }
     }
 
@@ -1316,12 +1323,12 @@ fn cookie_pairs(text: &str) -> Vec<(&str, &str)> {
     pairs
 }
 
-/// Whether a name is `key`, `sep` and the canonical decimal `index`, compared as the lookup spells it: header names fold case, cookie names do not.
-fn names_part(name: &str, key: &str, sep: u8, index: usize, fold: bool) -> bool {
+/// The canonical decimal `index` a name spells for `key`, or `None` when it names another key, a non-canonical decimal, or no part. Header names fold case, cookie names do not.
+fn part_index(name: &str, key: &str, sep: u8, fold: bool) -> Option<usize> {
     let name = name.as_bytes();
     let key = key.as_bytes();
     if name.len() <= key.len() {
-        return false;
+        return None;
     }
     let head = &name[..key.len()];
     let matches = if fold {
@@ -1330,26 +1337,26 @@ fn names_part(name: &str, key: &str, sep: u8, index: usize, fold: bool) -> bool 
         head == key
     };
     if !matches {
-        return false;
+        return None;
     }
     let rest = &name[key.len()..];
-    let mut n = index;
-    let mut digits = 1;
-    while n >= 10 {
-        n /= 10;
-        digits += 1;
+    if rest.first() != Some(&sep) {
+        return None;
     }
-    if rest.len() != digits + 1 || rest[0] != sep {
-        return false;
+    let digits = &rest[1..];
+    if digits.is_empty() || (digits[0] == b'0' && digits.len() > 1) {
+        return None;
     }
-    let mut n = index;
-    for &byte in rest[1..].iter().rev() {
-        if byte != b'0' + (n % 10) as u8 {
-            return false;
+    let mut index = 0usize;
+    for &byte in digits {
+        if !byte.is_ascii_digit() {
+            return None;
         }
-        n /= 10;
+        index = index
+            .checked_mul(10)?
+            .checked_add(usize::from(byte - b'0'))?;
     }
-    true
+    Some(index)
 }
 
 /// The packet the data parts carry: one walk of the head answers every part name, and the parts decode as their join because the six-bit window crosses the cut.
@@ -1377,17 +1384,50 @@ fn data_parts(text: &str, settings: &XhttpSettings) -> Option<Vec<u8>> {
         ),
         _ => return None,
     };
-    let mut parts = Vec::with_capacity(fields.len());
-    for i in 0.. {
-        match fields
-            .iter()
-            .find(|(name, _)| names_part(name, key, sep, i, fold))
-        {
-            Some((_, value)) => parts.push(*value),
-            None => break,
+    const INLINE: usize = 512;
+    let mut slots: Vec<&str> = vec![""; fields.len()];
+    let mut inline = [0u64; INLINE / 64];
+    let mut overflow: Vec<bool> = Vec::new();
+    if fields.len() > INLINE {
+        overflow = vec![false; fields.len()];
+    }
+    for &(name, value) in &fields {
+        let Some(index) = part_index(name, key, sep, fold) else {
+            continue;
+        };
+        if index >= slots.len() {
+            continue;
+        }
+        let bit = 1u64 << (index % 64);
+        let present = if index < INLINE {
+            inline[index / 64] & bit != 0
+        } else {
+            overflow[index]
+        };
+        if present {
+            continue;
+        }
+        slots[index] = value;
+        if index < INLINE {
+            inline[index / 64] |= bit;
+        } else {
+            overflow[index] = true;
         }
     }
-    url_decode_parts(&parts)
+    let mut len = 0;
+    while len < slots.len() {
+        let present = if len < INLINE {
+            inline[len / 64] & (1u64 << (len % 64)) != 0
+        } else {
+            overflow[len]
+        };
+        if !present {
+            break;
+        }
+        len += 1;
+    }
+    slots.truncate(len);
+    url_decode_parts(&slots)
 }
 
 fn extract_padding<'a>(
@@ -1502,6 +1542,9 @@ fn sweep_stalled_sessions(map: &mut HashMap<String, Arc<Session>>) {
 fn get_or_create_session(id: &str) -> Arc<Session> {
     let mut map = sessions().lock().expect("sessions lock");
     sweep_stalled_sessions(&mut map);
+    if let Some(session) = map.get(id) {
+        return Arc::clone(session);
+    }
     map.entry(id.to_owned())
         .or_insert_with(|| {
             Arc::new(Session {
