@@ -186,8 +186,8 @@ unsafe fn head_end_avx2(head: &[u8], last: usize) -> Option<usize> {
     use core::arch::x86_64::{
         __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
     };
-    let cr = _mm256_set1_epi8(b'\r' as i8);
-    let lf = _mm256_set1_epi8(b'\n' as i8);
+    let cr = _mm256_set1_epi8(b'\r'.cast_signed());
+    let lf = _mm256_set1_epi8(b'\n'.cast_signed());
     head_end_by::<WINDOW>(
         |at| {
             let block: __m256i = unsafe { _mm256_loadu_si256(head.as_ptr().add(at).cast()) };
