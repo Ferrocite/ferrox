@@ -745,27 +745,27 @@ fn send_gso(
     to: Option<SocketAddr>,
 ) -> Gso {
     use std::os::fd::AsRawFd as _;
+    #[repr(C)]
+    struct Segment {
+        header: libc::cmsghdr,
+        size: u16,
+    }
     let Some(to) = to else {
         return Gso::Unsupported;
     };
     let mut parts: [std::mem::MaybeUninit<libc::iovec>; SEND_SLOTS] =
         std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
     let mut total = 0usize;
-    for at in 0..want {
+    for (at, part) in parts.iter_mut().enumerate().take(want) {
         let slot = start + at;
         let bytes = slots[slot].written(lens[slot]);
         total += bytes.len();
-        parts[at].write(libc::iovec {
+        part.write(libc::iovec {
             iov_base: bytes.as_ptr().cast_mut().cast(),
             iov_len: bytes.len(),
         });
     }
     let (mut storage, name_len) = crate::proxy::sockaddr_of(to);
-    #[repr(C)]
-    struct Segment {
-        header: libc::cmsghdr,
-        size: u16,
-    }
     let mut control = Segment {
         header: libc::cmsghdr {
             cmsg_len: unsafe { libc::CMSG_LEN(2) } as usize,
@@ -784,7 +784,7 @@ fn send_gso(
         msg_flags: 0,
     };
     // SAFETY: `message` names `parts`, `storage` and `control`, which outlive the call, and each part points at a slot the caller filled for the same sweep.
-    let sent = unsafe { libc::sendmsg(sock.sock.as_raw_fd(), &message, 0) };
+    let sent = unsafe { libc::sendmsg(sock.sock.as_raw_fd(), &raw const message, 0) };
     if sent == isize::try_from(total).unwrap_or(isize::MAX) {
         return Gso::Sent;
     }
@@ -896,6 +896,10 @@ impl BatchData {
 
 #[cfg(target_os = "linux")]
 thread_local! {
+    #[allow(
+        clippy::vec_box,
+        reason = "a batch's slots are megabytes wide, so the pool keeps them behind the box that the batch's stack handle names"
+    )]
     static BATCH_POOL: std::cell::RefCell<Vec<Box<BatchData>>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
@@ -1126,13 +1130,13 @@ fn gro_segment(header: &libc::msghdr, raw: usize) -> usize {
         let control = unsafe { &*cmsg };
         if control.cmsg_level == libc::SOL_UDP && control.cmsg_type == libc::UDP_GRO {
             // SAFETY: `CMSG_DATA` names the payload of a header the kernel wrote, and the length check below keeps the read inside it.
-            let len = usize::try_from(control.cmsg_len)
-                .unwrap_or(0)
+            let len = control
+                .cmsg_len
                 .saturating_sub(unsafe { libc::CMSG_LEN(0) } as usize);
             if len >= std::mem::size_of::<u16>() {
-                let data = unsafe { libc::CMSG_DATA(cmsg) }.cast::<u16>();
+                let data = unsafe { libc::CMSG_DATA(cmsg) };
                 // SAFETY: the header's payload holds at least the two bytes `len` just checked.
-                let seg = usize::from(unsafe { data.read_unaligned() });
+                let seg = usize::from(u16::from_ne_bytes(unsafe { [*data, *data.add(1)] }));
                 if seg > 0 && seg <= raw {
                     return seg;
                 }
