@@ -137,12 +137,14 @@ mod tests {
     /// single byte reversal only matches the one-word spelling.
     #[test]
     fn local_hex_spells_each_32_bit_word_as_the_kernel_does() {
-        assert_eq!(local_hex(&[127, 0, 0, 1], 80), "0100007F:0050");
+        let (v4, v6) = if cfg!(target_endian = "little") {
+            ("0100007F:0050", "00000000000000000000000001000000:01BB")
+        } else {
+            ("7F000001:0050", "00000000000000000000000000000001:01BB")
+        };
+        assert_eq!(local_hex(&[127, 0, 0, 1], 80), v4);
         let loopback = std::net::Ipv6Addr::LOCALHOST.octets();
-        assert_eq!(
-            local_hex(&loopback, 443),
-            "00000000000000000000000001000000:01BB"
-        );
+        assert_eq!(local_hex(&loopback, 443), v6);
     }
 
     /// The socket this process opened is the socket this process owns: the pid is ours and the path
