@@ -4241,6 +4241,79 @@ mod tests {
         relay.join().expect("joins");
     }
 
+    struct DelayedSealed {
+        inner: Sealed,
+        delay: Duration,
+        armed: bool,
+    }
+
+    impl Read for DelayedSealed {
+        fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+            if !self.armed {
+                thread::sleep(self.delay);
+                self.armed = true;
+            }
+            self.inner.read(dst)
+        }
+    }
+
+    impl crate::proxy::RelayPoll for DelayedSealed {
+        fn arm_relay_poll(&mut self) {}
+    }
+
+    #[test]
+    fn a_target_that_ends_its_download_still_takes_the_upload() {
+        let key = [0x55u8; 16];
+        let iv = [0x66u8; 16];
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        let mut sender = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let mut pad = PadSource::fresh().expect("entropy");
+        let mut upload = Vec::new();
+        assert!(
+            stage_frame(&mut sender, b"ping", &mut upload, &mut pad),
+            "seals the upload"
+        );
+
+        let (plain, mut target) = socket_pair();
+        target
+            .shutdown(Shutdown::Write)
+            .expect("the target ends its download");
+
+        let out = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(|| {});
+        let send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let recv = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
+        let flow = pump_relay_carried(
+            &plain,
+            DelayedSealed {
+                inner: Sealed {
+                    held: upload,
+                    at: 0,
+                    grain: usize::MAX,
+                    reads: 0,
+                },
+                delay: Duration::from_millis(500),
+                armed: false,
+            },
+            Collected(std::sync::Arc::clone(&out)),
+            &close,
+            send,
+            recv,
+            None,
+        )
+        .expect("clones the plain socket");
+        flow.wait();
+
+        target
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("arms");
+        let mut got = [0u8; 4];
+        target
+            .read_exact(&mut got)
+            .expect("the upload survives the target's clean end");
+        assert_eq!(&got, b"ping");
+    }
+
     #[test]
     fn the_relay_carries_both_directions() {
         let key = [0x77u8; 16];
