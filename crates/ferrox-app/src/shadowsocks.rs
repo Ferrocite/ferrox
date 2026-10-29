@@ -2265,7 +2265,10 @@ mod tests {
                 crate::proxy::lane_pool::Next::Done,
                 "a forged tag at byte {at} closes the relay"
             );
-            assert!(out.is_empty());
+            assert!(
+                out.is_empty(),
+                "a forged or incomplete chunk writes nothing"
+            );
         }
 
         let mut incomplete = wire;
@@ -2284,7 +2287,10 @@ mod tests {
             crate::proxy::lane_pool::Next::Idle,
             "a chunk that has not finished arriving still waits"
         );
-        assert!(out.is_empty());
+        assert!(
+            out.is_empty(),
+            "a forged or incomplete chunk writes nothing"
+        );
     }
 
     #[test]
