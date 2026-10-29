@@ -1,7 +1,7 @@
 # The DNS outbound
 
 <!-- scope:begin -->
-- paths: crates/ferrox-core/src/dns.rs
+- paths: -
 - symbols: find_dns_outbound, build_dns_outbound, decode_dns_rules, decode_dns_rule, decode_dns_legacy, decode_dns_network, serve_dns_tcp, serve_dns_udp, dns_lookup, dial_dns, read_dns_source, answer_handle, write_dns_frame, send_dns_query, dns_lane_tests, the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 - go: ./proxy/dns/..., ./features/dns/...
 <!-- scope:end -->
@@ -32,6 +32,10 @@ The stream lane rides `serve_connect` after the refuse gate: one connection, fra
 The datagram lane is `serve_socks_udp`'s shape: one association, one lane per client address keyed by the rewritten destination, the first datagram the payload that opens the lane, and the answers written back from the client-named destination. An upstream that has not dialled when the first datagram arrives dials it there, and the handoff parks the answer thread on the dial instead of polling.
 
 The direct rule resolves inline: the name minus its root, the literal-IP fast path, then the engine's cached lookup, and an empty answer writes the reference's empty-answer reply. Name what is left: the syscalls a loopback lane spends are only gated over real sockets as bytes — the counts a dial spends belong to CI's profile, not to a loopback test.
+
+## The probe's frames
+
+The probe that gates this page decides five questions once through every rule shape. The frames it calls — `parse_query`, the rule walk with its one fold, `resolve_step`, `ip_answer` and `reject` — are measured beside it under the same filter, so the row is a sum of measured parts and a change to one frame is visible as its own number.
 
 ## What we removed
 
