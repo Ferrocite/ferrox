@@ -2824,6 +2824,27 @@ mod tests {
         );
     }
 
+    /// A material built for an insecure config has no verifier, so a later secure caller naming the same anchors and names must not reuse it: the key carries the mode that decided whether the verifier exists.
+    #[test]
+    fn an_insecure_material_does_not_stand_in_for_a_named_secure_one() {
+        let mut insecure = client("connection.test", &[b"test-only"]);
+        insecure.verify_names = std::sync::Arc::from(["cache-mode.test".to_owned()]);
+        insecure.insecure = true;
+        let mut secure = insecure.clone();
+        secure.insecure = false;
+
+        let unchecked = material(&insecure).expect("builds");
+        let checked = material(&secure).expect("builds");
+        assert!(
+            unchecked.verifier.is_none(),
+            "an insecure config checks no name"
+        );
+        assert!(
+            checked.verifier.is_some(),
+            "a secure config keeps its configured names when an insecure config built first"
+        );
+    }
+
     /// A repeat dial asks the config cache with the suite order it already named: the key must share that list rather than copy it, so a hit costs no heap buffer.
     #[test]
     fn a_repeat_dial_keys_the_config_without_copying_the_suite_order() {
