@@ -2181,6 +2181,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     let mut local_os = Vec::new();
     let mut users = Vec::new();
     let mut vless_routes = None;
+    let mut attributes = Vec::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => {
@@ -2207,7 +2208,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
                 }
             }
             (14, 2) => ports = Some(port_selector(reader.bytes()?)?),
-            (15, 2) => return Err(reader.uncarried("an attribute rule")),
+            (15, 2) => attributes.push(attribute_entry(reader.bytes()?)?),
             (16, 2) => source_ports = Some(port_selector(reader.bytes()?)?),
             (17, 2) => local_ips.push(Json::Str(ip_rule(reader.bytes()?)?)),
             (18, 2) => local_ports = Some(port_selector(reader.bytes()?)?),
@@ -2257,7 +2258,28 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     if let Some(vless_routes) = vless_routes {
         pairs.push(("vlessRoute", Json::Str(vless_routes)));
     }
+    if !attributes.is_empty() {
+        pairs.push(("attrs", Json::Obj(attributes)));
+    }
     Ok(object(pairs))
+}
+
+/// One `RoutingRule.attributes` entry: the map's key and the regexp its value holds.
+fn attribute_entry(bytes: &[u8]) -> Result<(String, Json), String> {
+    let mut reader = Reader::new(bytes, "xray.app.router.RoutingRule.AttributesEntry");
+    let mut key = None;
+    let mut value = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => key = Some(account_text(&mut reader)?),
+            (2, 2) => value = Some(account_text(&mut reader)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok((
+        key.unwrap_or_default(),
+        Json::Str(value.unwrap_or_default()),
+    ))
 }
 
 fn network_name(value: u64) -> Result<&'static str, String> {
@@ -5276,6 +5298,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(routing.route(&flow), Some("blocked"));
     }
@@ -5321,6 +5344,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(routing.route(&flow), Some("blocked"));
     }
@@ -5427,6 +5451,53 @@ mod tests {
         crate::router::Routing::parse(&json)
             .expect("parses")
             .expect("routing");
+    }
+
+    /// A pb attribute rule reaches the same router the JSON spelling does: the map entry is
+    /// decoded into the selector and the flow it names lands on its outbound.
+    #[test]
+    fn a_pb_attribute_rule_reaches_the_router() {
+        let attrs = message(&[bytes_field(1, b":method"), bytes_field(2, b"^PUT$")]);
+        let rule = message(&[bytes_field(1, b"blocked"), bytes_field(15, &attrs)]);
+        let router = message(&[bytes_field(2, &rule)]);
+        let outbound = message(&[
+            bytes_field(1, b"blocked"),
+            bytes_field(3, &typed("xray.proxy.blackhole.Config", &[])),
+        ]);
+        let config = message(&[
+            bytes_field(1, &socks_inbound(5000, 0, &[])),
+            bytes_field(2, &outbound),
+            bytes_field(4, &typed("xray.app.router.Config", &router)),
+        ]);
+        let json = to_json(&config).expect("decodes");
+        assert_eq!(
+            json.get("routing")
+                .and_then(|routing| routing.get("rules"))
+                .and_then(Json::as_arr)
+                .and_then(|rules| rules[0].get("attrs")),
+            Some(&Json::Obj(vec![(
+                ":method".to_owned(),
+                Json::Str("^PUT$".to_owned())
+            )]))
+        );
+        let routing = crate::router::Routing::parse(&json)
+            .expect("parses")
+            .expect("routing");
+        let mut attributes = crate::router::Attributes::new();
+        attributes.push(":Method", std::borrow::Cow::Borrowed("PUT"));
+        let flow = crate::router::Flow {
+            network: crate::router::Network::Tcp,
+            domain: None,
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: Some(&attributes),
+        };
+        assert_eq!(routing.route(&flow), Some("blocked"));
     }
 
     #[test]

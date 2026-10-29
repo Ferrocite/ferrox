@@ -1372,7 +1372,7 @@ impl Outbound {
         client: Option<&Connection>,
         user: Option<&str>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
-        self.resolved_lane_with_protocol(asked, network, client, None, user)
+        self.resolved_lane_with_protocol(asked, network, client, None, user, None)
     }
 
     fn resolved_lane_with_protocol(
@@ -1382,11 +1382,19 @@ impl Outbound {
         client: Option<&Connection>,
         protocol: Option<&str>,
         user: Option<&str>,
+        attrs: Option<&crate::router::Attributes<'_>>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         match self {
-            Self::Route(plan) => plan.lane_with_protocol(asked, network, client, protocol, user),
+            Self::Route(plan) => {
+                plan.lane_with_protocol(asked, network, client, protocol, user, attrs)
+            }
             other => (Picked::Static(other), None),
         }
+    }
+
+    /// Whether any rule reads the HTTP attributes a front would have to parse off the request head.
+    fn wants_attrs(&self) -> bool {
+        matches!(self, Self::Route(plan) if plan.shared.routing.wants_attrs())
     }
 }
 
@@ -1642,7 +1650,7 @@ impl RoutePlan {
         protocol: Option<&str>,
         user: Option<&str>,
     ) -> Picked<'_> {
-        self.lane_with_protocol(asked, network, client, protocol, user)
+        self.lane_with_protocol(asked, network, client, protocol, user, None)
             .0
     }
 
@@ -1656,7 +1664,7 @@ impl RoutePlan {
         client: Option<&Connection>,
         user: Option<&str>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
-        self.lane_with_protocol(asked, network, client, None, user)
+        self.lane_with_protocol(asked, network, client, None, user, None)
     }
 
     fn lane_with_protocol(
@@ -1666,6 +1674,7 @@ impl RoutePlan {
         client: Option<&Connection>,
         protocol: Option<&str>,
         user: Option<&str>,
+        attrs: Option<&crate::router::Attributes<'_>>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         let (domain, ip) = match asked {
             Destination::Name(host, _) => (Some(host.as_str()), None),
@@ -1685,6 +1694,7 @@ impl RoutePlan {
             inbound_tag: self.inbound_tag.as_deref(),
             protocol,
             user,
+            attrs,
         };
         if let Some(script) = self.shared.routing.script() {
             let Some(callbacks) = self.shared.script.as_ref() else {
@@ -15210,7 +15220,8 @@ fn strategy_name(domain: FreedomDomain) -> &'static str {
 }
 
 /// Sniff the client's first bytes, then pick the lane the reference would: the sniffed name is the
-/// route target, and the original address stays the dial target under `routeOnly`.
+/// route target, and the original address stays the dial target under `routeOnly`. A sniffed HTTP
+/// head also carries the attributes an `attrs` rule reads, whether or not it named a host.
 fn sniff_lane<'a>(
     out: &'a Outbound,
     asked: &Destination,
@@ -15225,8 +15236,22 @@ fn sniff_lane<'a>(
         let (lane, tag) = out.resolved_lane(asked, crate::router::Network::Tcp, Some(client), user);
         return (None, lane, tag);
     };
-    let Some(found) = sniffing.inspect(asked, crate::router::Network::Tcp, client) else {
-        let (lane, tag) = out.resolved_lane(asked, crate::router::Network::Tcp, Some(client), user);
+    let (found, pairs) = sniffing.inspect(
+        asked,
+        crate::router::Network::Tcp,
+        client,
+        out.wants_attrs(),
+    );
+    let attrs = (!pairs.is_empty()).then(|| crate::router::Attributes::from_pairs(&pairs));
+    let Some(found) = found else {
+        let (lane, tag) = out.resolved_lane_with_protocol(
+            asked,
+            crate::router::Network::Tcp,
+            Some(client),
+            None,
+            user,
+            attrs.as_ref(),
+        );
         return (None, lane, tag);
     };
     let route = found
@@ -15243,6 +15268,7 @@ fn sniff_lane<'a>(
         Some(client),
         Some(found.protocol),
         user,
+        attrs.as_ref(),
     );
     (dial, resolved, tag)
 }
@@ -15255,7 +15281,8 @@ fn loopback_asked(
     client: &Connection,
 ) -> Option<Destination> {
     let sniffing = loopback.sniffing.as_ref()?;
-    let found = sniffing.inspect(asked, crate::router::Network::Tcp, client)?;
+    let (found, _) = sniffing.inspect(asked, crate::router::Network::Tcp, client, false);
+    let found = found?;
     sniffing
         .should_dial_override(&found)
         .then(|| Destination::Name(found.domain, asked.port()))
@@ -16203,6 +16230,138 @@ fn drop_header(head: &mut Vec<u8>, name: &str) {
     }
 }
 
+/// The method and path the reference's HTTP inbound reads off the request line it was sent, before
+/// this front rewrites the line to origin-form: the method uppercased, the path percent-decoded and
+/// without its query, and an absolute target with no path naming the empty one the reference parses.
+fn request_line_attributes(head: &[u8]) -> Option<(String, String)> {
+    let end = head.iter().position(|byte| *byte == b'\n')?;
+    let line = head[..end].strip_suffix(b"\r").unwrap_or(&head[..end]);
+    let mut parts = line.split(|byte| *byte == b' ');
+    let method = std::str::from_utf8(parts.next()?).ok()?;
+    let target = std::str::from_utf8(parts.next()?).ok()?;
+    let path = if target.starts_with('/') {
+        target
+    } else {
+        let rest = target.split_once("://").map_or(target, |(_, rest)| rest);
+        rest.find('/').map_or("", |slash| &rest[slash..])
+    };
+    let path = path.split('?').next().unwrap_or("");
+    Some((method.to_ascii_uppercase(), decoded_path(path).into_owned()))
+}
+
+/// The path the reference's `URL.Path` holds: every `%XX` decoded. An escape that is not two hex
+/// digits stays as it was sent, where the reference's parse would have refused the request.
+fn decoded_path(path: &str) -> std::borrow::Cow<'_, str> {
+    let bytes = path.as_bytes();
+    if !bytes.contains(&b'%') {
+        return std::borrow::Cow::Borrowed(path);
+    }
+    let hex = |byte: u8| (byte as char).to_digit(16).map(|digit| digit as u8);
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        let escape = (bytes[at] == b'%' && at + 2 < bytes.len())
+            .then(|| (hex(bytes[at + 1]), hex(bytes[at + 2])));
+        if let Some((Some(high), Some(low))) = escape {
+            out.push(high << 4 | low);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    std::borrow::Cow::Owned(String::from_utf8_lossy(&out).into_owned())
+}
+
+/// Every header the reference's hop-by-hop removal leaves, by the name it was sent with; `host` is
+/// absent because the reference promotes it off the header map.
+fn forward_headers<'a>(head: &'a [u8], attrs: &mut crate::router::Attributes<'a>) {
+    let Some(line_end) = head.iter().position(|byte| *byte == b'\n') else {
+        return;
+    };
+    let named = connection_named(head, line_end + 1);
+    let mut at = line_end + 1;
+    while at < head.len() {
+        let Some(end) = head[at..].iter().position(|byte| *byte == b'\n') else {
+            break;
+        };
+        let raw = &head[at..at + end];
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+            let name = &line[..colon];
+            if !hop_by_hop(name, named) && !name.eq_ignore_ascii_case(b"host") {
+                if let (Ok(name), Ok(value)) = (
+                    std::str::from_utf8(name),
+                    std::str::from_utf8(&line[colon + 1..]),
+                ) {
+                    attrs.push(name, std::borrow::Cow::Borrowed(value.trim()));
+                }
+            }
+        }
+        at += end + 1;
+    }
+}
+
+/// The first `Connection` header's value, whose comma-separated names the reference also drops.
+fn connection_named(head: &[u8], from: usize) -> &[u8] {
+    let mut at = from;
+    while at < head.len() {
+        let Some(end) = head[at..].iter().position(|byte| *byte == b'\n') else {
+            break;
+        };
+        let raw = &head[at..at + end];
+        let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+        if line.is_empty() {
+            break;
+        }
+        if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+            if line[..colon].eq_ignore_ascii_case(b"connection") {
+                return trim_bytes(&line[colon + 1..]);
+            }
+        }
+        at += end + 1;
+    }
+    b""
+}
+
+fn hop_by_hop(name: &[u8], named: &[u8]) -> bool {
+    const FIXED: [&[u8]; 8] = [
+        b"connection",
+        b"proxy-connection",
+        b"proxy-authenticate",
+        b"proxy-authorization",
+        b"te",
+        b"trailers",
+        b"transfer-encoding",
+        b"upgrade",
+    ];
+    FIXED.iter().any(|fixed| name.eq_ignore_ascii_case(fixed))
+        || named
+            .split(|byte| *byte == b',')
+            .any(|piece| trim_bytes(piece).eq_ignore_ascii_case(name))
+}
+
+fn trim_bytes(mut bytes: &[u8]) -> &[u8] {
+    while let [first, rest @ ..] = bytes {
+        if first.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    while let [rest @ .., last] = bytes {
+        if last.is_ascii_whitespace() {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    bytes
+}
+
 /// The `http` front: CONNECT tunnels like SOCKS, plain HTTP forwards its head, unparsable input closes quietly.
 fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) {
     let Some(mut head) = read_http_head(&mut client, HTTP_HEAD_LIMIT, budgets::head_arrival())
@@ -16236,6 +16395,10 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
         .map_or("", |account| account.email.as_str());
     let user = (!email.is_empty()).then_some(email);
     drop_header(&mut head, "proxy-authorization");
+    let request_line = out
+        .wants_attrs()
+        .then(|| request_line_attributes(&head))
+        .flatten();
     let Some(request) = http_proxy_request(head) else {
         return;
     };
@@ -16269,12 +16432,20 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
         ProxyRequest::Forward(asked, origin) => {
             let destination = asked.authority();
             crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
+            let attrs = request_line.map(|(method, path)| {
+                let mut attrs = crate::router::Attributes::new();
+                attrs.push(":method", std::borrow::Cow::Owned(method));
+                attrs.push(":path", std::borrow::Cow::Owned(path));
+                forward_headers(&origin, &mut attrs);
+                attrs
+            });
             let (out, tag) = out.resolved_lane_with_protocol(
                 &asked,
                 crate::router::Network::Tcp,
                 Some(&client),
                 Some("http/1.1"),
                 user,
+                attrs.as_ref(),
             );
             serve_connect(client, &out, &asked, Front::Http, &origin, tag.as_deref());
         }
@@ -16686,6 +16857,7 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan, user: Option<
             Some(&client),
             protocol,
             user,
+            None,
         );
         let key = key.map(std::borrow::Cow::into_owned);
         if matches!(&*out, Outbound::Block(_)) {
@@ -47187,6 +47359,105 @@ end
         let mut back = [0u8; 4];
         allowed.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
+    }
+
+    /// The forward front sets the attributes xray's plain-HTTP handler does: the uppercased method,
+    /// the percent-decoded path without its query, and the head's headers.
+    #[test]
+    fn an_attrs_rule_reads_the_head_a_forward_front_carried() {
+        let echo = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","attrs":{":path":"^/blocked"},"outboundTag":"block"}]}}"#;
+        let blocked_front = http_front_with(route_outbound(config, Some("in"), true));
+        let mut blocked = Connection::connect(("127.0.0.1", blocked_front)).expect("connects");
+        blocked
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        blocked
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{echo}/blo%63ked/x?q=1 HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            blocked.read(&mut buf).expect("closes"),
+            0,
+            "the decoded path names the block"
+        );
+
+        let allowed_front = http_front_with(route_outbound(config, Some("in"), true));
+        let mut allowed = Connection::connect(("127.0.0.1", allowed_front)).expect("connects");
+        allowed
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        allowed
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{echo}/ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let head =
+            read_http_head(&mut allowed, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("echoes the head");
+        assert_eq!(
+            head,
+            format!("GET /ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n").into_bytes()
+        );
+    }
+
+    /// The HTTP sniffer sets the attributes before the rules run, so a head it reads off a socks flow
+    /// routes that flow even though the domain it named is where the flow goes.
+    #[test]
+    fn an_attrs_rule_reads_the_head_the_sniffer_read() {
+        let echo = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","attrs":{":method":"^PUT$"},"outboundTag":"block"}]}}"#;
+        let value =
+            crate::json::parse(r#"{"enabled":true,"destOverride":["http"]}"#).expect("json");
+        let sniffing = crate::sniff::parse(Some(&value)).expect("sniffing");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let out = route_outbound(config, Some("in"), true);
+        thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut blocked = socks_ask(port, SocketAddr::from(([127, 0, 0, 1], echo)));
+        blocked
+            .write_all(
+                format!("PUT /blocked HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n").as_bytes(),
+            )
+            .expect("puts");
+        let mut buf = [0u8; 1];
+        assert!(
+            matches!(blocked.read(&mut buf), Ok(0) | Err(_)),
+            "the sniffed method names the block"
+        );
+
+        let value =
+            crate::json::parse(r#"{"enabled":true,"destOverride":["http"]}"#).expect("json");
+        let sniffing = crate::sniff::parse(Some(&value)).expect("sniffing");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        let out = route_outbound(config, Some("in"), true);
+        thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut allowed = socks_ask(port, SocketAddr::from(([127, 0, 0, 1], echo)));
+        let head = format!("GET /blocked HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n");
+        allowed
+            .write_all(format!("{head}\r\n").as_bytes())
+            .expect("gets");
+        let mut back = vec![0u8; head.len() + 2];
+        allowed.read_exact(&mut back).expect("echoes");
+        assert_eq!(back, format!("{head}\r\n").into_bytes());
     }
 
     /// A datagram names its own destination, so an association the rules could split runs one lane
