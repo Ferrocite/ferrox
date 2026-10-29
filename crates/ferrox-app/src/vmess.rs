@@ -1536,7 +1536,7 @@ where
             let Some(pad) = pad.as_mut() else {
                 return Next::Done;
             };
-            let next = forward_step(
+            let (next, clean) = forward_step(
                 &mut plain_read,
                 &mut buf,
                 &mut writer,
@@ -1547,7 +1547,12 @@ where
                 &forward_flow,
             );
             if next == Next::Done {
-                let _ = plain_read.shutdown(Shutdown::Both);
+                if clean {
+                    // A clean target EOF leaves the upload direction writing to this socket.
+                    let _ = plain_read.shutdown(Shutdown::Read);
+                } else {
+                    let _ = plain_read.shutdown(Shutdown::Both);
+                }
             }
             next
         }),
@@ -1581,7 +1586,7 @@ where
 }
 
 /// One step of the plain leg: read what the target sent, stage it into frames, and hand the lane
-/// back a wait when the socket has nothing yet.
+/// back a wait when the socket has nothing yet. The flag is true only for the target's clean EOF.
 #[allow(clippy::too_many_arguments)]
 fn forward_step(
     plain_read: &mut Connection,
@@ -1592,14 +1597,15 @@ fn forward_step(
     pad: &mut PadSource,
     close: &Close,
     flow: &crate::proxy::RelayFinish,
-) -> Next {
+) -> (Next, bool) {
     match plain_read.read(buf) {
         Ok(0) => {
             // A clean end tells the peer this direction is done; the other direction keeps relaying.
-            if !write_frame(writer, send, &[], staging, pad) {
+            let clean = write_frame(writer, send, &[], staging, pad);
+            if !clean {
                 close();
             }
-            Next::Done
+            (Next::Done, clean)
         }
         Ok(read) => {
             let traced = crate::proxy::echo_trace_on();
@@ -1624,22 +1630,22 @@ fn forward_step(
                 });
             }
             if ok {
-                Next::More
+                (Next::More, false)
             } else {
                 close();
-                Next::Done
+                (Next::Done, false)
             }
         }
         Err(ref error) if crate::proxy::is_timeout(error) => {
             if flow.ended_and_drained() {
-                Next::Done
+                (Next::Done, false)
             } else {
-                Next::Idle
+                (Next::Idle, false)
             }
         }
         Err(_) => {
             close();
-            Next::Done
+            (Next::Done, false)
         }
     }
 }
@@ -4239,6 +4245,83 @@ mod tests {
         let end = read_frame(&mut server, &mut uploader, &mut scratch).expect("the upload marker");
         assert_eq!(end, b"");
         relay.join().expect("joins");
+    }
+
+    struct DelayedSealed {
+        inner: Sealed,
+        delay: Duration,
+        armed: bool,
+    }
+
+    impl Read for DelayedSealed {
+        fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+            if !self.armed {
+                thread::sleep(self.delay);
+                self.armed = true;
+            }
+            self.inner.read(dst)
+        }
+    }
+
+    impl crate::proxy::RelayPoll for DelayedSealed {
+        fn arm_relay_poll(&mut self) {}
+    }
+
+    #[test]
+    fn a_target_that_ends_its_download_still_takes_the_upload() {
+        let key = [0x55u8; 16];
+        let iv = [0x66u8; 16];
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        let mut sender = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let mut pad = PadSource::fresh().expect("entropy");
+        let mut upload = Vec::new();
+        assert!(
+            stage_frame(&mut sender, b"ping", &mut upload, &mut pad),
+            "seals the upload"
+        );
+        assert!(
+            stage_frame(&mut sender, &[], &mut upload, &mut pad),
+            "seals the upload marker"
+        );
+
+        let (plain, mut target) = socket_pair();
+        target
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("arms");
+        target
+            .shutdown(Shutdown::Write)
+            .expect("the target ends its download");
+
+        let out = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(|| {});
+        let send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let recv = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
+        let flow = pump_relay_carried(
+            &plain,
+            DelayedSealed {
+                inner: Sealed {
+                    held: upload,
+                    at: 0,
+                    grain: usize::MAX,
+                    reads: 0,
+                },
+                delay: Duration::from_millis(500),
+                armed: false,
+            },
+            Collected(std::sync::Arc::clone(&out)),
+            &close,
+            send,
+            recv,
+            None,
+        )
+        .expect("clones the plain socket");
+        flow.wait();
+
+        let mut got = [0u8; 4];
+        target
+            .read_exact(&mut got)
+            .expect("the upload survives the target's clean end");
+        assert_eq!(&got, b"ping");
     }
 
     #[test]
