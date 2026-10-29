@@ -7,13 +7,6 @@ name: tools
 # so the roadmap edit is covered here too.
 
 on:
-  pull_request:
-    paths:
-      - "crates/ferrox-prompt/**"
-      - "crates/ferrox-bench/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - ".github/workflows/tools.yml"
   workflow_dispatch:
 
 concurrency:

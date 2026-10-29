@@ -23,8 +23,6 @@ on:
         description: "payload iterations per flow"
         required: false
         type: string
-  schedule:
-    - cron: "23 5 * * *"
 
 concurrency:
   group: parity-${{ github.ref }}

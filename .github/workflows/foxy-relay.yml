@@ -40,11 +40,6 @@ name: Foxy relay (live download check)
 # `bash` with portable helpers only: no `timeout(1)`, no `/dev/tcp`, no
 # `sha256sum`, no `xxd` — none of those exist on all three runners.
 on:
-  pull_request:
-    paths:
-      - .github/workflows/foxy-relay.yml
-      - crates/ferrox-app/**
-      - crates/ferrox-core/src/foxy/**
   workflow_dispatch:
     inputs:
       country:

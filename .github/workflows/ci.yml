@@ -16,7 +16,7 @@ on:
       - "docs/**"
       - "README.md"
       - "AGENTS.md"
-      - ".github/workflows/ci.yml"
+      - ".github/workflows/**"
   workflow_dispatch:
 
 concurrency:
@@ -99,7 +99,7 @@ jobs:
     # clippy run are not owed; the plan already knows the difference.
     if: needs.plan.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -129,7 +129,7 @@ jobs:
     # and scripts answers false here; a schedule, with no diff to read, answers true.
     if: needs.plan.outputs.rust == 'true'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -154,7 +154,7 @@ jobs:
       - name: run the full suite
         id: test
         shell: bash
-        timeout-minutes: 45
+        timeout-minutes: 10
         env:
           # Stage tracing for the loopback echo family: captured per test and
           # printed only on failure, so the next scheduler stall names where
