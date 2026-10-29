@@ -736,7 +736,14 @@ fn send_batch(
                     done += n;
                     continue;
                 }
-                Gso::Refused => return false,
+                Gso::Refused => {
+                    for i in done + n..want {
+                        if let Some(to) = tos[i] {
+                            sock.hold(slots[i].written(lens[i]), to);
+                        }
+                    }
+                    return false;
+                }
                 Gso::Unsupported => {}
             }
         }
@@ -1172,10 +1179,10 @@ fn gro_segment(header: &libc::msghdr, raw: usize) -> usize {
             let len = control
                 .cmsg_len
                 .saturating_sub(unsafe { libc::CMSG_LEN(0) } as usize);
-            if len >= std::mem::size_of::<u16>() {
-                let data = unsafe { libc::CMSG_DATA(cmsg) };
-                // SAFETY: the header's payload holds at least the two bytes `len` just checked.
-                let seg = usize::from(u16::from_ne_bytes(unsafe { [*data, *data.add(1)] }));
+            if len >= std::mem::size_of::<libc::c_int>() {
+                let data = unsafe { libc::CMSG_DATA(cmsg) }.cast::<libc::c_int>();
+                // SAFETY: the header's payload holds the `int` the kernel wrote, which `len` just checked.
+                let seg = usize::try_from(unsafe { data.read_unaligned() }).unwrap_or(0);
                 if seg > 0 && seg <= raw {
                     return seg;
                 }
@@ -1621,26 +1628,50 @@ fn platform_roots() -> Vec<Vec<u8>> {
 /// the segment size in a `UDP_GRO` control message, so the batch splits it before quiche sees a packet. Every lane
 /// asks for a receive buffer before a first datagram can land on it.
 pub(crate) fn bind_datagram(address: &str) -> std::io::Result<UdpSocket> {
+    bind_datagram_gro(address, true)
+}
+
+/// A socket for a lane that reads one datagram per `recv_from`: GRO stays off, because a
+/// coalesced burst would be truncated to the caller's buffer.
+pub(crate) fn bind_datagram_plain(address: &str) -> std::io::Result<UdpSocket> {
+    bind_datagram_gro(address, false)
+}
+
+fn bind_datagram_gro(address: &str, gro: bool) -> std::io::Result<UdpSocket> {
     let sock = UdpSocket::bind(address)?;
     #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd as _;
-        let on: libc::c_int = 1;
-        // SAFETY: `on` outlives the call, and the size is its own.
-        unsafe {
-            libc::setsockopt(
-                sock.as_raw_fd(),
-                libc::SOL_UDP,
-                libc::UDP_GRO,
-                std::ptr::addr_of!(on).cast(),
-                libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
-                    .unwrap_or(libc::socklen_t::MAX),
-            );
-        }
+    if gro {
+        set_gro(&sock, true);
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = gro;
     set_receive_buffer(&sock, DATAGRAM_BUFFER);
     set_send_buffer(&sock, DATAGRAM_BUFFER);
     Ok(sock)
+}
+
+#[cfg(target_os = "linux")]
+fn set_gro(sock: &UdpSocket, on: bool) {
+    use std::os::fd::AsRawFd as _;
+    let value: libc::c_int = libc::c_int::from(on);
+    // SAFETY: `value` outlives the call, and the size is its own.
+    unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_UDP,
+            libc::UDP_GRO,
+            std::ptr::addr_of!(value).cast(),
+            libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
+                .unwrap_or(libc::socklen_t::MAX),
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_gro(_sock: &UdpSocket, _on: bool) {}
+
+fn clear_gro(sock: &UdpSocket) {
+    set_gro(sock, false);
 }
 
 /// The buffer a lane's socket asks for, in each direction: the edge is granted a whole stream window of
@@ -1998,7 +2029,7 @@ impl Hopper {
                 ferrox_core::hysteria::pick_next(&self.ports, state.port, entropy() as usize);
             let stay =
                 Duration::from_millis(ferrox_core::hysteria::stay_ms(self.interval_ms, entropy()));
-            if let Ok(sock) = bind_datagram(self.bind) {
+            if let Ok(sock) = bind_datagram_plain(self.bind) {
                 self.apply_timeout(&sock);
                 let linger = now + Duration::from_millis(HOP_LINGER);
                 state.previous = Some((
@@ -2362,6 +2393,7 @@ impl Datagram {
 
     /// A socket whose every datagram is salamander-masked under `obfs`, the Hysteria v2 `obfs: salamander` lane.
     pub(crate) fn obfuscated(sock: UdpSocket, obfs: ferrox_core::hysteria::Salamander) -> Self {
+        clear_gro(&sock);
         Self {
             sock,
             relay: None,
@@ -2375,6 +2407,7 @@ impl Datagram {
 
     /// A socket whose every datagram is xplus-masked under `obfs`, the Hysteria v1 obfuscation.
     pub(crate) fn xplus(sock: UdpSocket, obfs: ferrox_core::hysteria_v1::XPlus) -> Self {
+        clear_gro(&sock);
         Self {
             sock,
             relay: None,
@@ -2387,6 +2420,7 @@ impl Datagram {
     }
 
     pub(crate) fn relayed(sock: UdpSocket, via: SocketAddr, control: Arc<Connection>) -> Self {
+        clear_gro(&sock);
         Self {
             sock,
             relay: Some(Relay {
@@ -2409,6 +2443,7 @@ impl Datagram {
         obfs: ferrox_core::hysteria::Salamander,
         window: ferrox_core::hysteria::Gecko,
     ) -> std::io::Result<Self> {
+        clear_gro(&sock);
         let handle = sock.try_clone()?;
         Ok(Self {
             sock,
@@ -2433,6 +2468,7 @@ impl Datagram {
         first: &UdpSocket,
         obfs: Option<Mask>,
     ) -> std::io::Result<Self> {
+        clear_gro(first);
         let hopper = Hopper::open(server, ports, interval_ms, bind, first)?;
         Ok(Self {
             sock: first.try_clone()?,
