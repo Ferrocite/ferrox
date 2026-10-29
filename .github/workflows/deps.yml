@@ -32,3 +32,16 @@ jobs:
           deny-path: deny.toml
           command: check advisories bans licenses sources
           use-lockfile: true
+
+  result:
+    name: result
+    needs: [deny]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: deps
+          needs: ${{ toJSON(needs) }}

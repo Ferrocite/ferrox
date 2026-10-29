@@ -894,3 +894,17 @@ jobs:
             echo "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"
             echo "$table"
           } >> "$GITHUB_STEP_SUMMARY"
+
+  result:
+    name: result
+    needs: [plan, foxy-relay]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: foxy-relay
+          needs: ${{ toJSON(needs) }}
+          artifacts: ferrox-relay-log-*

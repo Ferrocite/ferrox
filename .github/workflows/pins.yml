@@ -32,3 +32,16 @@ jobs:
       - name: check the upstream pins resolve
         shell: bash
         run: ./scripts/check-upstream-pins.sh
+
+  result:
+    name: result
+    needs: [pins]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: pins
+          needs: ${{ toJSON(needs) }}

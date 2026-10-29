@@ -493,3 +493,16 @@ jobs:
             echo
             echo "Three commands from any of them: unpack, \`./ferrox-cli.sh up --foxy --vpn\` (or \`--veepn\` for no account), done — the CLI asks for the account the first time."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  result:
+    name: result
+    needs: [plan, build, release]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: release
+          needs: ${{ toJSON(needs) }}

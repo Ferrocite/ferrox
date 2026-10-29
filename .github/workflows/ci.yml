@@ -17,6 +17,7 @@ on:
       - "README.md"
       - "AGENTS.md"
       - ".github/workflows/**"
+      - ".github/actions/**"
   workflow_dispatch:
 
 concurrency:
@@ -90,6 +91,7 @@ jobs:
         run: |
           python3 scripts/benchmark-delta.py --selftest
           python3 scripts/check-matrix-legs.py --selftest
+          python3 scripts/workflow-result.py --selftest
           python3 scripts/rewrite-depinfo.py --selftest
 
   lint:
@@ -190,3 +192,16 @@ jobs:
             exit 1
           fi
 
+  result:
+    name: result
+    needs: [plan, gates, lint, test]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: ci
+          needs: ${{ toJSON(needs) }}
+          artifacts: test-log-*

@@ -1,0 +1,40 @@
+name: result
+description: Publish a workflow run as a human- and machine-readable result.
+
+inputs:
+  title:
+    description: Workflow name shown in the heading.
+    required: true
+  needs:
+    description: The result job's toJSON(needs) context.
+    required: true
+  artifacts:
+    description: Comma-separated artifact names this run produced.
+    required: false
+    default: ""
+  suffix:
+    description: Suffix that keeps artifact names unique across a reusable-workflow matrix.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: write the result
+      shell: bash
+      env:
+        TITLE: ${{ inputs.title }}
+        NEEDS: ${{ inputs.needs }}
+        ARTIFACTS: ${{ inputs.artifacts }}
+      run: |
+        python3 "$GITHUB_WORKSPACE/scripts/workflow-result.py" \
+          --title "$TITLE" --needs "$NEEDS" --artifacts "$ARTIFACTS"
+
+    - name: keep the result
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: result-${{ github.run_id }}-${{ github.job }}${{ inputs.suffix }}
+        path: result/
+        retention-days: 30
+        if-no-files-found: warn

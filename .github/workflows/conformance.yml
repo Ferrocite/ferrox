@@ -143,3 +143,17 @@ jobs:
             target/xray-scenario-map/logs/
           retention-days: 30
           if-no-files-found: error
+
+  result:
+    name: result
+    needs: [plan, suites, scenario-map]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: conformance
+          needs: ${{ toJSON(needs) }}
+          artifacts: xray-scenario-map-*

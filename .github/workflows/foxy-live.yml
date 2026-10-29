@@ -149,3 +149,16 @@ jobs:
             echo "above names the edge, the carriers that refused it and the"
             echo "country the tunnel exited in."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  result:
+    name: result
+    needs: [foxy-live]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: foxy-live
+          needs: ${{ toJSON(needs) }}
