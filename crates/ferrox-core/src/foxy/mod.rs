@@ -108,19 +108,111 @@ pub fn connect_request<'a>(
 
 /// Where the head ends: the offset of the empty line that closes an HTTP/1.1 answer, or `None` while it has not arrived. The lane walks a window at a time and asks this before it reads again, so the delimiter rule lives in one place.
 ///
-/// One word at a time: a SWAR pass marks the `\n` lanes of each eight-byte block and only the byte after a marked `\n` is checked against the whole terminator. Bit-identical to `head.windows(4).position(|w| w == b"\r\n\r\n")` — which compares four bytes at every offset — but this reads eight bytes per load and skips the ~255/256 of offsets that hold no `\n`, doing the four-byte verify only at a real candidate. Portable integer code: no target feature, no unsafe. It is the tree's one terminator scan, and every reader that ends a head at `\r\n\r\n` — this lane's window walk, the `httpUpgrade` and xHTTP head readers, the observatory's probe head and the `hc` front's head reader — reaches it rather than reopening the byte loop.
+/// A window settles twenty-nine starts at once. Two lanes of comparison turn the window into one bit per octet — a `\r` mask and a `\n` mask — and the terminator is then an equation on those masks rather than a walk: `\r` at `j` and `\n` at `j+1` is `cr & (lf >> 1)`, so a whole terminator at `j` is that pair mask and the same pair mask two starts later, `pair & (pair >> 2)`. That is the four-byte weigh `head.windows(4).position(|w| w == b"\r\n\r\n")` makes at every offset, done for twenty-nine offsets in two compares, two mask extracts and six arithmetic ops. On x86-64 the lanes are one AVX2 compare each, behind the cached feature probe this tree's crypto ladder already pays; everywhere else the portable word walk runs — a SWAR pass marks the `\n` lanes of each eight-byte block and only the byte after a marked `\n` is checked against the whole terminator — and the two kernels answer the same offset because the sweeps below assert both against the byte walk. The window is stepped by the starts it proves, so no start is skipped and none is weighed twice, and the last window ends the buffer so the stride's remainder is weighed by a window rather than a start at a time. It is the tree's one terminator scan, and every reader that ends a head at `\r\n\r\n` — this lane's window walk, the `httpUpgrade` and xHTTP head readers, the observatory's probe head and the `hc` front's head reader — reaches it rather than reopening the byte loop.
 #[must_use]
 pub fn head_end(head: &[u8]) -> Option<usize> {
+    // A terminator needs four bytes, so the latest start that can still hold one.
+    match head.len() {
+        0..=3 => None,
+        n => head_end_in(head, n - 4),
+    }
+}
+
+/// The starts one window proves: bit `j` is `\r` at `j`, `\n` at `j+1`, `\r` at `j+2`, `\n` at `j+3`. The pair mask is the window's answer to "is a two-octet word here", and a terminator is that word at `j` and again at `j+2`, so the four-octet weigh is one shift and one and. The window's last three starts are never claimed: the shift that pairs a `\n` with the `\r` before it brings a zero in at the top, and the fourth octet of those starts is the first octet the window does not hold.
+#[cfg(any(target_arch = "x86_64", test))]
+#[inline]
+fn window_hits(cr: u32, lf: u32) -> u32 {
+    let pair = cr & (lf >> 1);
+    pair & (pair >> 2)
+}
+
+/// The starts no window covers, four bytes at a time: the portable kernel, and the whole scan where a window is not worth a kernel.
+fn head_end_at(head: &[u8], last: usize, mut at: usize) -> Option<usize> {
+    while at <= last {
+        if head[at..at + 4] == *b"\r\n\r\n" {
+            return Some(at);
+        }
+        at += 1;
+    }
+    None
+}
+
+/// The octets one probe weighs.
+#[cfg(target_arch = "x86_64")]
+const WINDOW: usize = 32;
+
+/// The scan a kernel runs once a window is one mask pair: `WINDOW` octets are weighed at `at`, the window steps by the starts it proves, and the last one is placed to end the buffer so the stride's remainder costs a window rather than a start at a time.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+fn head_end_by<const WINDOW: usize>(
+    weigh: impl Fn(usize) -> u32,
+    len: usize,
+    last: usize,
+) -> Option<usize> {
+    let stride = WINDOW - 3;
+    let mut at = 0usize;
+    while at + WINDOW <= len {
+        let hits = weigh(at);
+        if hits != 0 {
+            return Some(at + hits.trailing_zeros() as usize);
+        }
+        at += stride;
+    }
+    // The loop only leaves once `at + WINDOW` is past the end, which puts `at` above `base`, so the last window holds every start the stride left and the mask erases only those already weighed.
+    if at <= last {
+        let base = len - WINDOW;
+        let hits = weigh(base) & !((1u32 << (at - base)) - 1);
+        if hits != 0 {
+            return Some(base + hits.trailing_zeros() as usize);
+        }
+    }
+    None
+}
+
+#[cfg(target_arch = "x86_64")]
+fn head_end_in(head: &[u8], last: usize) -> Option<usize> {
+    // Four starts per mask extract, and one probe of the same cached word the crypto ladder reads.
+    if head.len() >= WINDOW && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: the probe above is the guard, and the kernel loads only windows it has proved end inside `head`.
+        return unsafe { head_end_avx2(head, last) };
+    }
+    head_end_words(head, last)
+}
+
+/// Thirty-two octets per two compares, and every start the window can prove.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn head_end_avx2(head: &[u8], last: usize) -> Option<usize> {
+    use core::arch::x86_64::{
+        __m256i, _mm256_cmpeq_epi8, _mm256_loadu_si256, _mm256_movemask_epi8, _mm256_set1_epi8,
+    };
+    let cr = _mm256_set1_epi8(b'\r' as i8);
+    let lf = _mm256_set1_epi8(b'\n' as i8);
+    head_end_by::<WINDOW>(
+        |at| {
+            let block: __m256i = unsafe { _mm256_loadu_si256(head.as_ptr().add(at).cast()) };
+            window_hits(
+                _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, cr)) as u32,
+                _mm256_movemask_epi8(_mm256_cmpeq_epi8(block, lf)) as u32,
+            )
+        },
+        head.len(),
+        last,
+    )
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn head_end_in(head: &[u8], last: usize) -> Option<usize> {
+    head_end_words(head, last)
+}
+
+/// The portable kernel: a SWAR pass over the `\n` lanes of each eight-byte block, the four-byte verify only at a real candidate.
+fn head_end_words(head: &[u8], last: usize) -> Option<usize> {
     const CR: u8 = b'\r';
     const LF: u8 = b'\n';
     const SPREAD: u64 = 0x0101_0101_0101_0101;
     const HIGH: u64 = 0x8080_8080_8080_8080;
     let n = head.len();
-    // A terminator needs four bytes, so the latest start that can still hold one.
-    if n < 4 {
-        return None;
-    }
-    let last = n - 4;
     let want_lf = (LF as u64).wrapping_mul(SPREAD);
     let mut word = 0usize;
     while word + 8 <= n {
@@ -146,14 +238,7 @@ pub fn head_end(head: &[u8]) -> Option<usize> {
         word += 8;
     }
     // Starts past the last whole block, and the one whose first `\n` fell on the block boundary, are too few for SWAR to pay: check them as four-byte windows.
-    let mut s = if word == 0 { 0 } else { word - 1 };
-    while s <= last {
-        if head[s..s + 4] == [CR, LF, CR, LF] {
-            return Some(s);
-        }
-        s += 1;
-    }
-    None
+    head_end_at(head, last, if word == 0 { 0 } else { word - 1 })
 }
 
 pub fn connect_status(head: &[u8]) -> Result<u16, Failure> {
@@ -1326,6 +1411,10 @@ mod tests {
         for len in 0..=130usize {
             sweep(len, 0..len);
         }
+        // Every start across several whole windows of the x86 kernel and every remainder its stride leaves, not only the word boundary a multiple of eight puts a terminator on.
+        for len in [511usize, 512, 513, 527, 528, 529] {
+            sweep(len, 0..len);
+        }
         // At scale, the first two words, mid-buffer, and the final partial word.
         for len in [511usize, 512, 513, 4096, 16 * 1024] {
             sweep(
@@ -1334,6 +1423,155 @@ mod tests {
                     .chain([len / 2, len / 2 + 1])
                     .chain(len.saturating_sub(9)..len),
             );
+        }
+    }
+
+    /// The mask equation a window runs is the four-byte weigh: bit `j` of the answer is set exactly
+    /// when the four octets at `j` are the terminator, for every start the window can hold, and no
+    /// start past the thirteen it proves is ever claimed. This is the half of the scan a kernel
+    /// supplies masks for, so it is swept where a kernel cannot be run at all.
+    #[test]
+    fn a_window_weighs_every_start_it_holds() {
+        fn masks(window: &[u8]) -> (u32, u32) {
+            let mut cr = 0u32;
+            let mut lf = 0u32;
+            for (at, byte) in window.iter().enumerate() {
+                match *byte {
+                    b'\r' => cr |= 1 << at,
+                    b'\n' => lf |= 1 << at,
+                    _ => {}
+                }
+            }
+            (cr, lf)
+        }
+        let weigh = |window: &[u8]| {
+            let (cr, lf) = masks(window);
+            window_hits(cr, lf)
+        };
+        // Every placement of the terminator in a window, and every single-octet near miss of it.
+        for at in 0..=12usize {
+            for damaged in 0..4usize {
+                let mut window = [b'Z'; 16];
+                window[at..at + 4].copy_from_slice(b"\r\n\r\n");
+                window[at + damaged] = b'Q';
+                assert_eq!(
+                    weigh(&window) & (1 << at),
+                    0,
+                    "a start at {at} with octet {damaged} broken is not the terminator"
+                );
+            }
+            let mut window = [b'Z'; 16];
+            window[at..at + 4].copy_from_slice(b"\r\n\r\n");
+            assert_eq!(weigh(&window), 1 << at, "the only start the window holds");
+        }
+        // A terminator past the thirteen proved starts is the next window's, not this one's.
+        for at in 13..16usize {
+            let mut window = [b'Z'; 16];
+            window[at..at + 4.min(16 - at)].copy_from_slice(&b"\r\n\r\n"[..4.min(16 - at)]);
+            assert_eq!(weigh(&window) & !0x1fff, 0, "no start past twelve at {at}");
+        }
+        // A body dense in both octets, swept against the byte walk over the whole window.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for _ in 0..4096usize {
+            let mut window = [0u8; 16];
+            for slot in &mut window {
+                state = state
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                *slot = match (state >> 60) & 3 {
+                    0 => b'\r',
+                    1 => b'\n',
+                    _ => b'Z',
+                };
+            }
+            let wanted = (0..=12usize)
+                .filter(|at| window[*at..*at + 4] == *b"\r\n\r\n")
+                .fold(0u32, |bits, at| bits | (1 << at));
+            assert_eq!(weigh(&window), wanted, "{window:?}");
+        }
+    }
+
+    /// The loop the AVX2 kernel runs is the byte walk at every width a window could be: the stride,
+    /// the starts a window proves, and the one window placed to end the buffer are swept over every
+    /// start of every length with a scalar mask builder, so the arithmetic is proved by the same code
+    /// the kernel hands its own masks to.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn a_window_scan_is_the_byte_walk_at_every_width() {
+        fn weigh(window: &[u8]) -> u32 {
+            let mut cr = 0u32;
+            let mut lf = 0u32;
+            for (at, byte) in window.iter().enumerate() {
+                match *byte {
+                    b'\r' => cr |= 1 << at,
+                    b'\n' => lf |= 1 << at,
+                    _ => {}
+                }
+            }
+            window_hits(cr, lf)
+        }
+        fn check<const WINDOW: usize>(buf: &[u8]) -> Option<usize> {
+            let oracle = buf.windows(4).position(|w| w == b"\r\n\r\n");
+            let scanned =
+                head_end_by::<WINDOW>(|at| weigh(&buf[at..at + WINDOW]), buf.len(), buf.len() - 4);
+            assert_eq!(scanned, oracle, "width {WINDOW} over {buf:?}");
+            scanned
+        }
+        fn sweep<const WINDOW: usize>() {
+            // Every start of every length from the first whole window to well past four strides.
+            for len in WINDOW..=WINDOW * 4 + 40 {
+                for start in 0..len {
+                    let mut buf: Vec<u8> = (0..len)
+                        .map(|i| if i % 5 == 0 { b'\n' } else { b'Z' })
+                        .collect();
+                    if start + 4 <= len {
+                        buf[start..start + 4].copy_from_slice(b"\r\n\r\n");
+                    }
+                    check::<WINDOW>(&buf);
+                }
+                let none = vec![b'Z'; len];
+                assert_eq!(check::<WINDOW>(&none), None, "width {WINDOW} len {len}");
+            }
+            // Two terminators: the earlier is the answer, whichever window holds it.
+            for gap in WINDOW..WINDOW * 2 + 3 {
+                let len = gap + 8;
+                let mut buf = vec![b'Z'; len];
+                buf[0..4].copy_from_slice(b"\r\n\r\n");
+                buf[gap..gap + 4].copy_from_slice(b"\r\n\r\n");
+                assert_eq!(check::<WINDOW>(&buf), Some(0), "width {WINDOW} gap {gap}");
+                let mut late = buf;
+                late[0..4].copy_from_slice(b"ZZZZ");
+                assert_eq!(
+                    check::<WINDOW>(&late),
+                    Some(gap),
+                    "width {WINDOW} gap {gap}"
+                );
+            }
+        }
+        sweep::<8>();
+        sweep::<16>();
+        sweep::<32>();
+    }
+
+    /// The two kernels are one answer: where the feature is present every start of a sweep is asked of the vector kernel, the portable walk and `head_end`, and all three must name the same offset. The dispatch itself is not a behavioural claim — a fallback answers correctly too — so this test holds the kernels, and the count row is what says which one ran.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_vector_kernel_answers_the_word_walk_at_every_start() {
+        if !std::is_x86_feature_detected!("avx2") {
+            return;
+        }
+        for len in WINDOW..=WINDOW * 3 + 7 {
+            for start in 0..len - 3 {
+                let mut buf: Vec<u8> = (0..len)
+                    .map(|i| if i % 5 == 0 { b'\n' } else { b'Z' })
+                    .collect();
+                buf[start..start + 4].copy_from_slice(b"\r\n\r\n");
+                let last = len - 4;
+                // SAFETY: the probe above is the guard, and every load ends inside `buf`.
+                let vector = unsafe { head_end_avx2(&buf, last) };
+                assert_eq!(vector, head_end_words(&buf, last), "len {len} at {start}");
+                assert_eq!(head_end(&buf), vector, "len {len} at {start}");
+            }
         }
     }
 
