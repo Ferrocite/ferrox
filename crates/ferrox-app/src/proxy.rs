@@ -44910,6 +44910,53 @@ mod tests {
         assert_eq!(head[12], 0x21, "PROXY command");
     }
 
+    /// A device flow paired over a Unix socket has no socket peer, so the logical peer the device
+    /// named is the one the PROXY header must carry.
+    #[cfg(unix)]
+    #[test]
+    fn a_device_flow_proxy_header_carries_the_inner_peer() {
+        let sink = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let sink_port = sink.local_addr().expect("addr").port();
+        let (header, got_header) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (mut stream, _) = sink.accept().expect("accepts");
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            while stream.read_exact(&mut byte).is_ok() {
+                line.push(byte[0]);
+                if line.ends_with(b"\r\n") {
+                    break;
+                }
+            }
+            let _ = header.send(line);
+        });
+        let out =
+            freedom_out(r#"{"outbounds":[{"protocol":"freedom","settings":{"proxyProtocol":1}}]}"#);
+        let Outbound::Freedom(freedom) = out else {
+            panic!("a freedom outbound");
+        };
+        let (local, _peer) = std::os::unix::net::UnixStream::pair().expect("pair");
+        let peer: SocketAddr = "10.13.0.2:1234".parse().expect("peer");
+        let client = Connection::Proxied {
+            inner: Box::new(Connection::from(local)),
+            peer,
+        };
+        serve_connect_freedom(
+            &client,
+            &freedom,
+            &Destination::Address(format!("127.0.0.1:{sink_port}").parse().expect("sink")),
+            &[],
+        );
+        let line = got_header
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the proxy header reached the redirected service");
+        let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
+        assert_eq!(fields.first(), Some(&b"PROXY".as_slice()), "{line:?}");
+        assert_eq!(fields.get(1), Some(&b"TCP4".as_slice()), "{line:?}");
+        assert_eq!(fields.get(2), Some(&b"10.13.0.2".as_slice()), "{line:?}");
+        assert_eq!(fields.get(4), Some(&b"1234".as_slice()), "{line:?}");
+    }
+
     /// The family order is the strategy's own: `useipv4v6` takes v4 first, `useipv6v4`
     /// takes v6 first, and the single-family values drop the other family.
     #[test]

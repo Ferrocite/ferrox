@@ -976,19 +976,22 @@ impl ServerStack {
         }
     }
 
+    /// Hands each established listener to a flow that carries the device's address as its peer.
     fn handoff(&mut self) {
         let mut ready = Vec::new();
         for (port, listeners) in &self.listeners {
             for listener in listeners {
                 let socket = self.sockets.get::<TcpSocket>(listener.handle);
                 if socket.state() == State::Established {
-                    if let Some(local) = socket.local_endpoint() {
-                        ready.push((*port, listener.handle, local));
+                    if let (Some(local), Some(remote)) =
+                        (socket.local_endpoint(), socket.remote_endpoint())
+                    {
+                        ready.push((*port, listener.handle, local, remote));
                     }
                 }
             }
         }
-        for (port, handle, local) in ready {
+        for (port, handle, local, remote) in ready {
             if let Some(listeners) = self.listeners.get_mut(&port) {
                 listeners.retain(|listener| listener.handle != handle);
                 if listeners.is_empty() {
@@ -999,13 +1002,21 @@ impl ServerStack {
                 IpAddress::Ipv4(address) => SocketAddr::new(IpAddr::V4(address), local.port),
                 IpAddress::Ipv6(address) => SocketAddr::new(IpAddr::V6(address), local.port),
             };
+            let peer = match remote.addr {
+                IpAddress::Ipv4(address) => SocketAddr::new(IpAddr::V4(address), remote.port),
+                IpAddress::Ipv6(address) => SocketAddr::new(IpAddr::V6(address), remote.port),
+            };
             let Ok((tun, proxy)) = loopback() else {
                 self.sockets.remove(handle);
                 continue;
             };
             let out = self.out.clone();
             std::thread::spawn(move || {
-                let _ = serve_device_flow(proxy, &out, &Destination::Address(destination));
+                let _ = serve_device_flow(
+                    proxy.with_peer(peer),
+                    &out,
+                    &Destination::Address(destination),
+                );
             });
             if tun.set_nonblocking(true).is_err() {
                 self.sockets.remove(handle);
@@ -1797,6 +1808,45 @@ mod tests {
         packet
     }
 
+    /// A TCP segment a device would send to the server at `destination`, with `flags` and no payload.
+    #[allow(clippy::too_many_arguments)]
+    fn tcp_segment(
+        source: [u8; 4],
+        source_port: u16,
+        destination: [u8; 4],
+        destination_port: u16,
+        sequence: u32,
+        acknowledgement: u32,
+        flags: u8,
+    ) -> Vec<u8> {
+        let mut packet = vec![0u8; 40];
+        packet[0] = 0x45;
+        packet[2..4].copy_from_slice(&40u16.to_be_bytes());
+        packet[8] = 64;
+        packet[9] = PROTOCOL_TCP;
+        packet[12..16].copy_from_slice(&source);
+        packet[16..20].copy_from_slice(&destination);
+        let header_sum = checksum(&packet[..20]);
+        packet[10..12].copy_from_slice(&header_sum.to_be_bytes());
+        let tcp = &mut packet[20..];
+        tcp[0..2].copy_from_slice(&source_port.to_be_bytes());
+        tcp[2..4].copy_from_slice(&destination_port.to_be_bytes());
+        tcp[4..8].copy_from_slice(&sequence.to_be_bytes());
+        tcp[8..12].copy_from_slice(&acknowledgement.to_be_bytes());
+        tcp[12] = 0x50;
+        tcp[13] = flags;
+        tcp[14..16].copy_from_slice(&0xffffu16.to_be_bytes());
+        let mut pseudo = Vec::with_capacity(12 + tcp.len());
+        pseudo.extend_from_slice(&source);
+        pseudo.extend_from_slice(&destination);
+        pseudo.extend_from_slice(&[0, PROTOCOL_TCP]);
+        pseudo.extend_from_slice(&(tcp.len() as u16).to_be_bytes());
+        pseudo.extend_from_slice(tcp);
+        let tcp_sum = checksum(&pseudo);
+        tcp[16..18].copy_from_slice(&tcp_sum.to_be_bytes());
+        packet
+    }
+
     /// The TCP payload of an inner IPv4 packet, which is where an upload's bytes ride.
     fn tcp_payload(packet: &[u8]) -> &[u8] {
         let ihl = usize::from(packet[0] & 0x0f) * 4;
@@ -2257,6 +2307,75 @@ mod tests {
             bytes: echo_v4([10, 13, 0, 2], [10, 13, 0, 9], b"ping"),
         });
         assert!(replies.try_recv().is_err(), "an address it does not own");
+    }
+
+    #[test]
+    fn the_handoff_names_the_device_peer_in_the_proxy_header() {
+        let sink = std::net::TcpListener::bind("127.0.0.1:0").expect("sink");
+        let sink_port = sink.local_addr().expect("addr").port();
+        let (header, received) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = sink.accept().expect("accepts");
+            let mut line = Vec::new();
+            while line.len() < 1024 {
+                let mut byte = [0u8; 1];
+                if stream.read_exact(&mut byte).is_err() {
+                    break;
+                }
+                line.push(byte[0]);
+                if line.ends_with(b"\r\n") {
+                    break;
+                }
+            }
+            let _ = header.send(line);
+        });
+
+        let freedom = crate::json::parse(&format!(
+            r#"{{"protocol":"freedom","tag":"f","settings":{{"redirect":"127.0.0.1:{sink_port}","proxyProtocol":1}}}}"#
+        ))
+        .expect("parses");
+        let out = crate::proxy::build_outbound(&freedom, "f").expect("builds");
+        let (to_tunnel, packets) = std::sync::mpsc::channel();
+        let mut stack = ServerStack::new(&device(&["10.13.0.1"], false), to_tunnel, out, 0);
+        let source = [10, 13, 0, 2];
+        let destination = [192, 0, 2, 1];
+        stack.receive(Packet {
+            peer: [0u8; 32],
+            bytes: tcp_segment(source, 1234, destination, 80, 1000, 0, 0x02),
+        });
+        let mut buf = [0u8; 2048];
+        stack.poll(&mut buf);
+        let syn_ack = packets
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the server's SYN-ACK");
+        let ihl = usize::from(syn_ack[0] & 0x0f) * 4;
+        let server_sequence = u32::from_be_bytes(
+            syn_ack[ihl + 4..ihl + 8]
+                .try_into()
+                .expect("the server's sequence"),
+        );
+        stack.receive(Packet {
+            peer: [0u8; 32],
+            bytes: tcp_segment(
+                source,
+                1234,
+                destination,
+                80,
+                1001,
+                server_sequence + 1,
+                0x10,
+            ),
+        });
+        stack.poll(&mut buf);
+
+        let line = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the proxy header reached the redirect");
+        let fields: Vec<&[u8]> = line.split(|byte| *byte == b' ').collect();
+        assert_eq!(fields.first(), Some(&b"PROXY".as_slice()), "{line:?}");
+        assert_eq!(fields.get(1), Some(&b"TCP4".as_slice()), "{line:?}");
+        assert_eq!(fields.get(2), Some(&b"10.13.0.2".as_slice()), "{line:?}");
+        assert_eq!(fields.get(4), Some(&b"1234".as_slice()), "{line:?}");
     }
 
     #[test]
