@@ -2182,6 +2182,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     let mut users = Vec::new();
     let mut vless_routes = None;
     let mut attributes = Vec::new();
+    let mut processes = Vec::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => {
@@ -2214,7 +2215,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
             (18, 2) => local_ports = Some(port_selector(reader.bytes()?)?),
             (19, 2) => rule_tag = Some(account_text(&mut reader)?),
             (20, 2) => vless_routes = Some(port_selector(reader.bytes()?)?),
-            (21, 2) => return Err(reader.uncarried("a process rule")),
+            (21, 2) => processes.push(Json::Str(account_text(&mut reader)?)),
             (22, 2) => return Err(reader.uncarried("a webhook")),
             (23, 2) => local_os.push(Json::Str(account_text(&mut reader)?)),
             _ => return Err(reader.refuse(field, wire)),
@@ -2233,6 +2234,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
         ("localIP", local_ips),
         ("localOS", local_os),
         ("user", users),
+        ("process", processes),
     ] {
         if !values.is_empty() {
             pairs.push((key, Json::Arr(values)));
@@ -5299,6 +5301,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(routing.route(&flow), Some("blocked"));
     }
@@ -5345,6 +5348,7 @@ mod tests {
             protocol: None,
             user: None,
             attrs: None,
+            process: None,
         };
         assert_eq!(routing.route(&flow), Some("blocked"));
     }
@@ -5496,8 +5500,36 @@ mod tests {
             protocol: None,
             user: None,
             attrs: Some(&attributes),
+            process: None,
         };
         assert_eq!(routing.route(&flow), Some("blocked"));
+    }
+
+    /// A protobuf rule's `process` list reaches the rule table as the JSON field of the same name.
+    #[test]
+    fn a_pb_process_rule_reaches_the_router() {
+        let rule = message(&[bytes_field(1, b"blocked"), bytes_field(21, b"self/")]);
+        let router = message(&[bytes_field(2, &rule)]);
+        let outbound = message(&[
+            bytes_field(1, b"blocked"),
+            bytes_field(3, &typed("xray.proxy.blackhole.Config", &[])),
+        ]);
+        let config = message(&[
+            bytes_field(1, &socks_inbound(5000, 0, &[])),
+            bytes_field(2, &outbound),
+            bytes_field(4, &typed("xray.app.router.Config", &router)),
+        ]);
+        let json = to_json(&config).expect("decodes");
+        assert_eq!(
+            json.get("routing")
+                .and_then(|routing| routing.get("rules"))
+                .and_then(Json::as_arr)
+                .and_then(|rules| rules[0].get("process")),
+            Some(&Json::Arr(vec![Json::Str("self/".to_owned())]))
+        );
+        crate::router::Routing::parse(&json)
+            .expect("parses")
+            .expect("routing");
     }
 
     #[test]

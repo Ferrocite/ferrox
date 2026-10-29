@@ -41,6 +41,7 @@ mod masque_h2;
 mod metrics;
 mod observatory;
 mod policy;
+mod process;
 mod proxy;
 mod quic;
 mod reverse;
