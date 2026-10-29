@@ -3,16 +3,19 @@
 const WIDTH: usize = 32;
 const STEP: usize = 16;
 
+/// The 16-byte little-endian word at `at`.
 #[inline]
 fn wide(bytes: &[u8], at: usize) -> u128 {
     u128::from_le_bytes(bytes[at..at + STEP].try_into().unwrap())
 }
 
+/// Write `value` as the 16-byte little-endian word at `at`.
 #[inline]
 fn store(bytes: &mut [u8], at: usize, value: u128) {
     bytes[at..at + STEP].copy_from_slice(&value.to_le_bytes());
 }
 
+/// The key's two 16-byte words, loaded once per call.
 fn key_words(key: &[u8; WIDTH]) -> [u128; 2] {
     [wide(key, 0), wide(key, STEP)]
 }
