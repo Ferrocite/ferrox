@@ -568,6 +568,24 @@ impl Connection {
         }
     }
 
+    /// The socket's own peer, without a PROXY header's reported address: process ownership names a
+    /// socket on this host, which a remote-reported peer cannot.
+    pub(crate) fn socket_peer(&self) -> io::Result<SocketAddr> {
+        match self {
+            Connection::Tcp(stream) => stream.peer_addr(),
+            Connection::Masked(masked) => masked.stream.peer_addr(),
+            Connection::Metered(metered) => metered.inner.socket_peer(),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                inner.socket_peer()
+            }
+            #[cfg(any(unix, windows))]
+            Connection::Unix(_) => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "a unix stream reports no peer address",
+            )),
+        }
+    }
+
     /// The local address, `std`'s `io::Result` shape; `Unsupported` for a Unix stream, which
     /// reports no port.
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {

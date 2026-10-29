@@ -1780,7 +1780,8 @@ impl RoutePlan {
         self.lane_with_protocol(asked, network, client, facts)
     }
 
-    /// The process that owns the client socket, looked up once per flow and only when a rule names it.
+    /// The process that owns the client socket, looked up once per flow and only when a rule names
+    /// it. A PROXY header's reported peer is skipped: it can name another local process.
     fn process_owner(
         &self,
         network: crate::router::Network,
@@ -1789,7 +1790,7 @@ impl RoutePlan {
         if !self.source_known || !self.shared.routing.wants_process() {
             return None;
         }
-        crate::process::owner(network, client?.peer_addr().ok()?)
+        crate::process::owner(network, client?.socket_peer().ok()?)
     }
 
     fn lane_with_protocol(
