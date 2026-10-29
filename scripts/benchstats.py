@@ -193,15 +193,15 @@ def spread(values):
     """
     ordered = sorted(values)
     count = len(ordered)
-    if count < 2 or ordered[0] <= 0:
+    if count < 2 or ordered[-1] <= 0:
         return None
     mean = statistics.fmean(ordered)
     deviation = statistics.stdev(ordered)
-    ratio = ordered[-1] / ordered[0]
+    ratio = ordered[-1] / ordered[0] if ordered[0] > 0 else None
     gaps = [b - a for a, b in pairwise(ordered)]
     gap = max(gaps)
     span = ordered[-1] - ordered[0]
-    split = count >= 3 and ratio >= 1.25 and gap >= span / 2.0
+    split = count >= 3 and (ratio is None or ratio >= 1.25) and gap >= span / 2.0
     state = "split" if split else "wide" if deviation / mean >= 0.10 else "stable"
     return {
         "n": count,
@@ -225,6 +225,9 @@ def selftest():
     assert wide["state"] == "wide"
     stable = spread([100.0, 101.0, 102.0])
     assert stable["state"] == "stable"
+    stalled = spread([0.0, 500.0, 520.0])
+    assert stalled["state"] == "split" and stalled["ratio"] is None
+    assert spread([0.0, 0.0]) is None
     assert spread([100.0]) is None
     print("benchstats: selftest ok")
     return 0
