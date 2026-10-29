@@ -535,7 +535,7 @@ const BLOCK: usize = 32;
 
 /// The one's-complement sum of bytes read as 16-bit big-endian words, the last zero-padded on an odd run.
 ///
-/// A big-endian word is `high * 256 + low`, so the sum over a whole run is `256 * (even octets) + (odd octets)`: two byte sums and no per-word arithmetic at all. `vpsadbw` is exactly a byte sum — eight octets into one 64-bit lane, sixteen lanes a block — so a block costs one load, one shift that moves the odd octets into lanes a sum can see, two sums and two accumulating adds, and the whole run ends in the one subtraction `256 * all - 255 * odd`. Every term is an exact integer, so the magnitude this returns, not only its residue, is the walk's: an octet at an odd offset is the high half of its word and nothing else moves. Witnessed by `the_word_sum_costs_the_words_it_reads` against `the_serial_word_sum_costs_the_same_answer` over the same buffer, and by `the_parallel_accumulators_hold_the_single_accumulator_word_sum`, `word_sum_is_the_word_at_a_time_sum_at_every_tail` and `the_word_fold_is_the_byte_at_a_time_sum` at every length and tail.
+/// A big-endian word is `high * 256 + low`, so the sum over a whole run is `256 * (even octets) + (odd octets)`: two byte sums and no per-word arithmetic at all. `vpsadbw` is exactly a byte sum — eight octets into one 64-bit lane, sixteen lanes a block — so a block costs one load, one shift that moves the odd octets into lanes a sum can see, two sums and two accumulating adds, and the whole run ends in the one subtraction `256 * all - 255 * odd`. Every term is an exact integer, so no octet is rounded away and the folded number this returns is the definition's own residue: an octet at an odd offset is the high half of its word and nothing else moves. The kernel's unwrapped accumulator is the word sum itself, while an aligned eight-octet lane folds to `hi32 + lo32`, which is congruent to its four words and about twenty-eight thousand times larger, so the fold and not the accumulator is what both sides share — `the_vector_block_sum_is_the_walk_sum` pins the kernel's magnitude against sixteen-bit words and its residue against the walk. Witnessed by `the_word_sum_costs_the_words_it_reads` against `the_serial_word_sum_costs_the_same_answer` over the same buffer, and by `the_parallel_accumulators_hold_the_single_accumulator_word_sum`, `word_sum_is_the_word_at_a_time_sum_at_every_tail` and `the_word_fold_is_the_byte_at_a_time_sum` at every length and tail.
 fn word_sum(bytes: &[u8]) -> u32 {
     // The split is on a block boundary, so the octets the tail reads are at the offsets they held in the whole run.
     let wide = bytes.len() & !(BLOCK - 1);
@@ -1358,21 +1358,58 @@ mod tests {
             .collect()
     }
 
-    /// The vector kernel against the lane walk the dispatcher falls back to, whole blocks at a time, wherever the kernel exists: the same words at every block count from none to a whole datagram's worth, so the parity identity is gated on the instruction that computes it and not only on the walk the dispatcher reaches.
+    /// The vector kernel against the three forms of the same sum, whole blocks at a time, wherever the kernel exists: the masked byte sums the kernel is written in against the sixteen-bit words the definition names, those words against the lane walk the dispatcher falls back to over their folded residue (an aligned eight-octet lane folds to `hi32 + lo32` — congruent to its four words mod `0xffff`, larger than them, so only the fold is shared), and the kernel's own magnitude against the words.
     #[test]
     fn the_vector_block_sum_is_the_walk_sum() {
+        // The definition, at its plainest: a big-endian word at a time, the last zero-padded on an odd run.
+        fn by_words(bytes: &[u8]) -> u64 {
+            let mut sum: u64 = bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|word| u64::from(u16::from_be_bytes(*word)))
+                .sum();
+            if let [last] = bytes.as_chunks::<2>().1 {
+                sum += u64::from(*last) << 8;
+            }
+            sum
+        }
+        // The fold `word_sum` ends with, on whichever accumulator it was handed.
+        fn folded(sum: u64) -> u32 {
+            let sum = (sum >> 32) + (sum & 0xffff_ffff);
+            let sum = (sum >> 16) + (sum & 0xffff);
+            let sum = (sum >> 16) + (sum & 0xffff);
+            sum as u32
+        }
+        // The equation the kernel is written in, in scalar form, so the arithmetic is gated on every platform and the intrinsic only has to be shown to compute the same thing.
+        fn by_masks(bytes: &[u8]) -> u64 {
+            let (mut all, mut odd) = (0u64, 0u64);
+            for (at, byte) in bytes.iter().enumerate() {
+                all += u64::from(*byte);
+                if at % 2 == 1 {
+                    odd += u64::from(*byte);
+                }
+            }
+            all * 256 - odd * 255
+        }
+        let bytes = a_datagram_worth();
+        for blocks in 0..=bytes.len() / BLOCK {
+            let run = &bytes[..blocks * BLOCK];
+            assert_eq!(by_masks(run), by_words(run), "{blocks} blocks, as masks");
+            assert_eq!(
+                folded(by_words(run)),
+                folded(lane_sum(run)),
+                "{blocks} blocks, as a residue"
+            );
+        }
         #[cfg(target_arch = "x86_64")]
         {
             if std::is_x86_feature_detected!("avx2") {
-                let bytes = a_datagram_worth();
                 for blocks in 0..=bytes.len() / BLOCK {
                     let run = &bytes[..blocks * BLOCK];
                     // SAFETY: the probe above is the guard.
-                    assert_eq!(
-                        unsafe { avx2_block_sum(run) },
-                        lane_sum(run),
-                        "{blocks} blocks"
-                    );
+                    let kernel = unsafe { avx2_block_sum(run) };
+                    assert_eq!(kernel, by_words(run), "{blocks} blocks, as words");
                 }
             }
         }
