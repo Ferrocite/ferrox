@@ -517,12 +517,6 @@ impl Api {
         };
         let context = RoutingContext::parse(raw)
             .map_err(|reason| (3, format!("routing context: {reason}")))?;
-        if context.vless_route != 0 {
-            return Err((
-                3,
-                "a tested route id is not carried: no flow this tree routes reads one".to_owned(),
-            ));
-        }
         let selectors = request_strs(request, 2);
         let pairs: Vec<(String, String)> = context
             .attrs
@@ -535,9 +529,7 @@ impl Api {
             })
             .collect();
         let attributes = (!pairs.is_empty()).then(|| crate::router::Attributes::from_pairs(&pairs));
-        let probe = context
-            .probe(attributes.as_ref())
-            .map_err(|reason| (3, reason))?;
+        let probe = context.probe(attributes.as_ref());
         let Some(tag) = self
             .runtime()?
             .tested_route(&probe)
@@ -1088,41 +1080,22 @@ impl RoutingContext {
 
     /// The context the table reads: xray reads each address list as any-of, so every choice of
     /// source, target and local address is kept as a list and the earliest matching rule decides.
-    /// A port named without an address is not carried, because a flow's port lives on its address.
+    /// A port is kept apart from its address, so a context naming one without the other still routes.
     fn probe<'a>(
         &'a self,
         attrs: Option<&'a crate::router::Attributes<'a>>,
-    ) -> Result<crate::router::Probe<'a>, String> {
+    ) -> crate::router::Probe<'a> {
         let text =
             |raw: &'a Option<Vec<u8>>| raw.as_deref().and_then(|raw| std::str::from_utf8(raw).ok());
-        let addresses = |raw: &[Vec<u8>], port: u64, role: &str| {
-            let mut out: Vec<Option<std::net::SocketAddr>> = raw
-                .iter()
-                .filter_map(|bytes| ip(bytes))
-                .map(|ip| Some(std::net::SocketAddr::new(ip, port as u16)))
-                .collect();
+        let addresses = |raw: &[Vec<u8>]| {
+            let mut out: Vec<Option<std::net::IpAddr>> =
+                raw.iter().filter_map(|bytes| ip(bytes)).map(Some).collect();
             if out.is_empty() {
-                if port != 0 {
-                    return Err(format!(
-                        "a tested {role} port without a {role} address is not carried"
-                    ));
-                }
                 out.push(None);
             }
-            Ok(out)
+            out
         };
-        let sources = addresses(&self.source_ips, self.source_port, "source")?;
-        let locals = addresses(&self.local_ips, self.local_port, "local")?;
-        let mut targets: Vec<Option<std::net::IpAddr>> = self
-            .target_ips
-            .iter()
-            .filter_map(|bytes| ip(bytes))
-            .map(Some)
-            .collect();
-        if targets.is_empty() {
-            targets.push(None);
-        }
-        Ok(crate::router::Probe {
+        crate::router::Probe {
             network: match self.network {
                 2 => crate::router::Network::Tcp,
                 3 => crate::router::Network::Udp,
@@ -1134,10 +1107,13 @@ impl RoutingContext {
             protocol: text(&self.protocol),
             user: text(&self.user),
             attrs,
-            targets,
-            sources,
-            locals,
-        })
+            targets: addresses(&self.target_ips),
+            sources: addresses(&self.source_ips),
+            source_port: self.source_port as u16,
+            locals: addresses(&self.local_ips),
+            local_port: self.local_port as u16,
+            vless_route: self.vless_route as u16,
+        }
     }
 
     /// The answer, echoing the fields the request's selectors name plus the picked outbound. The
@@ -2094,15 +2070,6 @@ mod tests {
             api.dispatch(path, &[]),
             Err((2, "Invalid routing request.".to_owned()))
         );
-        let mut port_only = Vec::new();
-        field_varint(&mut port_only, 5, 9999);
-        assert_eq!(
-            api.dispatch(path, &test_route_request(&port_only, &[])),
-            Err((
-                3,
-                "a tested source port without a source address is not carried".to_owned()
-            ))
-        );
     }
 
     #[test]
@@ -2135,6 +2102,148 @@ mod tests {
             Some("edge"),
             "the address list is any-of, so the second target reaches the ip rule"
         );
+    }
+
+    #[test]
+    fn test_route_reads_a_source_port_named_without_an_address() {
+        let root = crate::json::parse(
+            r#"{
+                "outbounds": [
+                    {"tag": "direct", "protocol": "freedom"},
+                    {"tag": "edge", "protocol": "freedom"}
+                ],
+                "routing": {"rules": [
+                    {"type": "field", "ruleTag": "sp", "sourcePort": "9999", "outboundTag": "edge"}
+                ]}
+            }"#,
+        )
+        .expect("parses");
+        let api = routing_api(&root);
+        let mut context = Vec::new();
+        field_varint(&mut context, 5, 9999);
+        let answer = api
+            .dispatch(
+                "/xray.app.router.command.RoutingService/TestRoute",
+                &test_route_request(&context, &["outbound"]),
+            )
+            .expect("a port without an address is a context the reference routes");
+        assert_eq!(request_str(&answer, 12).as_deref(), Some("edge"));
+    }
+
+    #[test]
+    fn test_route_reads_the_vless_route_id_the_context_carries() {
+        let root = crate::json::parse(
+            r#"{
+                "outbounds": [
+                    {"tag": "direct", "protocol": "freedom"},
+                    {"tag": "edge", "protocol": "freedom"}
+                ],
+                "routing": {"rules": [
+                    {"type": "field", "ruleTag": "vr", "vlessRoute": "5", "outboundTag": "edge"}
+                ]}
+            }"#,
+        )
+        .expect("parses");
+        let api = routing_api(&root);
+        let mut context = Vec::new();
+        field_varint(&mut context, 15, 5);
+        let answer = api
+            .dispatch(
+                "/xray.app.router.command.RoutingService/TestRoute",
+                &test_route_request(&context, &["outbound"]),
+            )
+            .expect("the tested route id is part of the context");
+        assert_eq!(request_str(&answer, 12).as_deref(), Some("edge"));
+    }
+
+    /// A receiver that answers `replies` requests with `204` and hands back what it read, head and
+    /// body together, so a test reads the exact bytes the notifier wrote.
+    fn webhook_receiver(replies: usize) -> (u16, std::sync::mpsc::Receiver<String>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for _ in 0..replies {
+                let Ok((mut stream, _)) = listener.accept() else {
+                    return;
+                };
+                stream
+                    .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                    .expect("arms");
+                let mut raw = Vec::new();
+                let mut buf = [0u8; 512];
+                loop {
+                    use std::io::Read as _;
+                    let read = stream.read(&mut buf).expect("reads");
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..read]);
+                    let Some(head) = raw.windows(4).position(|window| window == b"\r\n\r\n") else {
+                        continue;
+                    };
+                    let length: usize = String::from_utf8_lossy(&raw[..head])
+                        .lines()
+                        .find_map(|line| line.strip_prefix("Content-Length: "))
+                        .and_then(|value| value.trim().parse().ok())
+                        .unwrap_or(0);
+                    if raw.len() >= head + 4 + length {
+                        break;
+                    }
+                }
+                send.send(String::from_utf8_lossy(&raw).into_owned()).ok();
+                stream
+                    .write_all(b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n")
+                    .expect("replies");
+            }
+        });
+        (port, receive)
+    }
+
+    #[test]
+    fn test_route_fires_the_matched_rules_webhook() {
+        let (port, receive) = webhook_receiver(1);
+        let root = crate::json::parse(&format!(
+            r#"{{
+                "outbounds": [{{"tag": "direct", "protocol": "freedom"}}],
+                "routing": {{"rules": [
+                    {{"type": "field", "ruleTag": "hook", "domain": ["example.test"],
+                      "outboundTag": "direct",
+                      "webhook": {{"url": "http://127.0.0.1:{port}/hook"}}}}
+                ]}}
+            }}"#
+        ))
+        .expect("parses");
+        let api = routing_api(&root);
+        let context = routed_context(2, "example.test");
+        let answer = api
+            .dispatch(
+                "/xray.app.router.command.RoutingService/TestRoute",
+                &test_route_request(&context, &["outbound"]),
+            )
+            .expect("answers the call");
+        assert_eq!(request_str(&answer, 12).as_deref(), Some("direct"));
+        let posted = receive
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the tested route fires the rule's webhook");
+        assert!(
+            posted.starts_with(&format!(
+                "POST /hook HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\n"
+            )),
+            "{posted}"
+        );
+        for field in [
+            "\"level\":null",
+            "\"network\":\"tcp\"",
+            "\"destination\":\"example.test:443\"",
+            "\"originalTarget\":null",
+            "\"routeTarget\":null",
+            "\"inboundTag\":\"socks-in\"",
+            "\"inboundName\":null",
+            "\"outboundTag\":\"direct\"",
+        ] {
+            assert!(posted.contains(field), "{field} is missing from {posted}");
+        }
     }
 
     #[test]
