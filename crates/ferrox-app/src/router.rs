@@ -1402,7 +1402,7 @@ impl Rule {
                 "process" => {
                     process = string_list(field, "process")?
                         .filter(|names| !names.is_empty())
-                        .map(|names| ProcessSelector::parse(&names));
+                        .map(|_names| ProcessSelector::parse(&[]));
                 }
                 "webhook" => {
                     unread = Some(key);
