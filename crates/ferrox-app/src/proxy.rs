@@ -36996,6 +36996,115 @@ mod tests {
         assert_eq!(payload, b"ping");
     }
 
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn shadowsocks_udp_keeps_each_account_on_its_own_reply() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            let mut buf = vec![0u8; UDP_BUF];
+            while held.len() < 2 {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                held.push((buf[..n].to_vec(), src));
+            }
+            for (payload, src) in held {
+                if echo.send_to(&payload, src).is_err() {
+                    return;
+                }
+            }
+        });
+        let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let first = crate::shadowsocks::account("first-password", "aes-256-gcm");
+        let second = crate::shadowsocks::account("second-password", "aes-128-gcm");
+        let users: Vec<crate::shadowsocks::SsUser> =
+            first.iter().chain(second.iter()).cloned().collect();
+        thread::spawn(move || {
+            crate::shadowsocks::serve_udp_on(&front, &users, true);
+        });
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let ask = |password: &str,
+                   method: ferrox_core::shadowsocks::Method,
+                   key_len: usize,
+                   word: &[u8],
+                   from: &UdpSocket,
+                   hop: &mut Option<ferrox_core::shadowsocks::Cipher>| {
+            let master = ferrox_core::shadowsocks::MasterKey::new(password, key_len);
+            let mut wire = vec![0u8; crate::shadowsocks::DATAGRAM_MAX];
+            let at = crate::shadowsocks::SEAL_ROOM;
+            wire[at..at + word.len()].copy_from_slice(word);
+            let packet = crate::shadowsocks::seal_datagram(
+                &master,
+                method,
+                &target,
+                &mut wire,
+                at,
+                word.len(),
+                hop,
+            )
+            .expect("seals")
+            .to_vec();
+            from.send_to(&packet, ("127.0.0.1", front_port))
+                .expect("sends");
+            master
+        };
+        let first_client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let second_client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        for client in [&first_client, &second_client] {
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+        }
+        let mut first_send = None;
+        let first_master = ask(
+            "first-password",
+            ferrox_core::shadowsocks::Method::Aes256Gcm,
+            32,
+            b"alpha",
+            &first_client,
+            &mut first_send,
+        );
+        let mut second_send = None;
+        let second_master = ask(
+            "second-password",
+            ferrox_core::shadowsocks::Method::Aes128Gcm,
+            16,
+            b"bravo",
+            &second_client,
+            &mut second_send,
+        );
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = first_client
+            .recv_from(&mut back)
+            .expect("the first account's reply arrives");
+        let mut first_recv = None;
+        let (source, payload) = crate::shadowsocks::open_datagram(
+            &first_master,
+            ferrox_core::shadowsocks::Method::Aes256Gcm,
+            &mut back[..n],
+            &mut first_recv,
+        )
+        .expect("the first account opens its reply");
+        assert_eq!(source.port(), echo_port);
+        assert_eq!(payload, b"alpha", "the first account reads its own word");
+        let (n, _) = second_client
+            .recv_from(&mut back)
+            .expect("the second account's reply arrives");
+        let mut second_recv = None;
+        let (source, payload) = crate::shadowsocks::open_datagram(
+            &second_master,
+            ferrox_core::shadowsocks::Method::Aes128Gcm,
+            &mut back[..n],
+            &mut second_recv,
+        )
+        .expect("the second account opens its reply");
+        assert_eq!(source.port(), echo_port);
+        assert_eq!(payload, b"bravo", "the second account reads its own word");
+    }
+
     /// xray makes one account per `users` entry, so a handshake under any of them is dialled — and a password none lists is not.
     #[test]
     fn a_shadowsocks_inbound_serves_every_client_in_its_users_list() {
