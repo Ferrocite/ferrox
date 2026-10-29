@@ -232,7 +232,7 @@ fn dial_socket(path: &str, budget: Duration) -> Result<Connection, String> {
     }
 }
 
-/// The abstract name a `@@` spelling pads to: the bytes HAProxy's `sun_path` holds, so a name with
+/// The abstract name a `@@` spelling pads to: the bytes `HAProxy`'s `sun_path` holds, so a name with
 /// a second `@` fills the kernel's field.
 #[cfg(target_os = "linux")]
 fn abstract_name(name: &str) -> Result<Vec<u8>, String> {
