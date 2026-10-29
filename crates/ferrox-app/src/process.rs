@@ -54,8 +54,7 @@ fn socket_inode(network: Network, source: SocketAddr) -> Option<String> {
             local_hex(&ip.octets(), source.port()),
         ),
     };
-    // A UDP socket bound to the wildcard address appears under the zero address, so the port alone
-    // still names it; the reference keeps the last such entry it reads.
+    // A wildcard-bound UDP socket lists under the zero address, so its port alone names it; the reference keeps the last.
     let port = matches!(network, Network::Udp).then(|| format!(":{:04X}", source.port()));
     let mut wildcard = None;
     for file in files {
