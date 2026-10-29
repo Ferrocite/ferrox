@@ -863,7 +863,7 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool)
         .iter()
         .flat_map(|(v4, v6)| std::iter::once(v4).chain(v6.as_ref()))
     {
-        if sock.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        if sock.set_nonblocking(true).is_err() {
             return;
         }
     }
