@@ -2205,7 +2205,7 @@ mod tests {
     }
 
     #[test]
-    fn a_forged_length_or_body_closes_the_downlink_instead_of_waiting() {
+    fn a_forged_tag_closes_the_downlink_and_an_incomplete_chunk_waits() {
         struct Quiet<'a> {
             data: &'a [u8],
             at: usize,
@@ -2251,6 +2251,24 @@ mod tests {
             );
             assert!(out.is_empty());
         }
+
+        let mut incomplete = wire;
+        incomplete.truncate(incomplete.len() - 1);
+        let mut reader = Quiet {
+            data: &incomplete,
+            at: 0,
+        };
+        let mut window = ChunkReader::new(&mut reader);
+        assert!(matches!(window.try_fill(), Fill::Ready));
+        let recv = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
+        let mut out = Vec::new();
+        let (next, _) = aead_step(window, recv, &mut out, None);
+        assert_eq!(
+            next,
+            crate::proxy::lane_pool::Next::Idle,
+            "a chunk that has not finished arriving still waits"
+        );
+        assert!(out.is_empty());
     }
 
     #[test]
