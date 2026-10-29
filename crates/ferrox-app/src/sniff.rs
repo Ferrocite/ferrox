@@ -93,9 +93,10 @@ impl Sniffing {
         asked: &Destination,
         network: Network,
         client: &crate::conn::Connection,
-    ) -> Option<Sniffed> {
+        want_attrs: bool,
+    ) -> (Option<Sniffed>, Vec<(String, String)>) {
         if !self.enabled || network != Network::Tcp {
-            return None;
+            return (None, Vec::new());
         }
         let fake = match asked {
             Destination::Address(address) => {
@@ -104,19 +105,25 @@ impl Sniffing {
             Destination::Name(_, _) => None,
         };
         if let Some(domain) = fake {
-            return Some(self.result(asked, "fakedns", domain, true));
+            return (
+                Some(self.result(asked, "fakedns", domain, true)),
+                Vec::new(),
+            );
         }
         if self.metadata_only {
-            return None;
+            return (None, Vec::new());
         }
         let _ = client.set_read_timeout(Some(SNIFF_WAIT));
         let mut buffer = vec![0u8; SNIFF_LIMIT];
+        let mut attrs = Vec::new();
         let deadline = Instant::now() + SNIFF_WAIT;
         let found = loop {
             match client.peek(&mut buffer) {
                 Ok(0) => break None,
                 Ok(n) => {
-                    if let Some(found) = self.sniff_bytes(asked, &buffer[..n]) {
+                    if let Some(found) =
+                        self.sniff_bytes(asked, &buffer[..n], want_attrs, &mut attrs)
+                    {
                         break Some(found);
                     }
                     if n == buffer.len() || Instant::now() >= deadline {
@@ -139,11 +146,17 @@ impl Sniffing {
             }
         };
         let _ = client.set_read_timeout(None);
-        found
+        (found, attrs)
     }
 
-    fn sniff_bytes(&self, asked: &Destination, bytes: &[u8]) -> Option<Sniffed> {
-        if let Some((protocol, domain)) = sniff_http(bytes) {
+    fn sniff_bytes(
+        &self,
+        asked: &Destination,
+        bytes: &[u8],
+        want_attrs: bool,
+        attrs: &mut Vec<(String, String)>,
+    ) -> Option<Sniffed> {
+        if let Some((protocol, domain)) = sniff_http(bytes, want_attrs.then_some(attrs)) {
             return Some(self.result(asked, protocol, domain, false));
         }
         if let Some(domain) = sniff_tls(bytes) {
@@ -339,7 +352,12 @@ pub(crate) fn parse(value: Option<&Json>) -> Result<Option<Arc<Sniffing>>, Strin
     })))
 }
 
-fn sniff_http(bytes: &[u8]) -> Option<(&'static str, String)> {
+/// The domain a request head names, and — when a rule reads them — the attributes the reference's
+/// sniffer copies onto the content: every header, then `:method` and `:path` from the request line.
+fn sniff_http(
+    bytes: &[u8],
+    attrs: Option<&mut Vec<(String, String)>>,
+) -> Option<(&'static str, String)> {
     let end = bytes.iter().position(|byte| *byte == b'\n')?;
     let first = &bytes[..end];
     let method = first.split(|byte| *byte == b' ').next()?;
@@ -355,6 +373,11 @@ fn sniff_http(bytes: &[u8]) -> Option<(&'static str, String)> {
     if !known.iter().any(|name| method.eq_ignore_ascii_case(name)) {
         return None;
     }
+    let mut attrs = attrs;
+    if let Some(attrs) = attrs.as_deref_mut() {
+        attrs.clear();
+    }
+    let mut host = None;
     let mut at = end + 1;
     while at < bytes.len() {
         let Some(line_end) = bytes[at..].iter().position(|byte| *byte == b'\n') else {
@@ -366,14 +389,46 @@ fn sniff_http(bytes: &[u8]) -> Option<(&'static str, String)> {
             break;
         }
         if let Some(colon) = line.iter().position(|byte| *byte == b':') {
-            if line[..colon].eq_ignore_ascii_case(b"host") {
-                let value = std::str::from_utf8(&line[colon + 1..]).ok()?.trim();
-                return Some(("http1", http_host(value)?.to_ascii_lowercase()));
+            let name = line[..colon].trim_ascii();
+            let value = std::str::from_utf8(&line[colon + 1..]).ok().map(str::trim);
+            if let (Some(attrs), Some(value)) = (attrs.as_deref_mut(), value) {
+                if let Ok(name) = std::str::from_utf8(name) {
+                    set_attr(attrs, name, value);
+                }
+            }
+            if name.eq_ignore_ascii_case(b"host") {
+                host = Some(("http1", http_host(value?)?.to_ascii_lowercase()));
+                if attrs.is_none() {
+                    break;
+                }
             }
         }
         at += line_end + 1;
     }
-    None
+    if let Some(attrs) = attrs {
+        let mut parts = first.split(|byte| *byte == b' ');
+        if let (Some(method), Some(path), Some(_), None) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        {
+            if let (Ok(method), Ok(path)) = (std::str::from_utf8(method), std::str::from_utf8(path))
+            {
+                attrs.push((":method".to_owned(), method.to_owned()));
+                attrs.push((":path".to_owned(), path.to_owned()));
+            }
+        }
+    }
+    host
+}
+
+/// Sets a header the way the reference's sniffer map does: a later line for the same name wins.
+fn set_attr(attrs: &mut Vec<(String, String)>, name: &str, value: &str) {
+    match attrs
+        .iter_mut()
+        .find(|(sent, _)| sent.eq_ignore_ascii_case(name))
+    {
+        Some(entry) => value.clone_into(&mut entry.1),
+        None => attrs.push((name.to_owned(), value.to_owned())),
+    }
 }
 
 fn http_host(value: &str) -> Option<&str> {
@@ -796,7 +851,12 @@ mod tests {
         .unwrap();
         let sniffing = parse(Some(&value)).unwrap().unwrap();
         let found = sniffing
-            .sniff_bytes(&asked, b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            .sniff_bytes(
+                &asked,
+                b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n",
+                false,
+                &mut Vec::new(),
+            )
             .unwrap();
         assert_eq!(found.protocol, "http1");
         assert!(!found.override_destination);
@@ -807,7 +867,12 @@ mod tests {
         .unwrap();
         let sniffing = parse(Some(&value)).unwrap().unwrap();
         let found = sniffing
-            .sniff_bytes(&asked, b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n")
+            .sniff_bytes(
+                &asked,
+                b"GET / HTTP/1.1\r\nHost: example.test\r\n\r\n",
+                false,
+                &mut Vec::new(),
+            )
             .unwrap();
         assert!(!found.override_destination);
     }
@@ -815,15 +880,15 @@ mod tests {
     #[test]
     fn reads_http_host_and_tls_sni() {
         assert_eq!(
-            sniff_http(b"GET / HTTP/1.1\r\nHost: Example.Test\r\n\r\n").unwrap(),
+            sniff_http(b"GET / HTTP/1.1\r\nHost: Example.Test\r\n\r\n", None).unwrap(),
             ("http1", "example.test".to_owned())
         );
         assert_eq!(
-            sniff_http(b"GET / HTTP/1.1\r\nHost: Example.Test:8443\r\n\r\n").unwrap(),
+            sniff_http(b"GET / HTTP/1.1\r\nHost: Example.Test:8443\r\n\r\n", None).unwrap(),
             ("http1", "example.test".to_owned())
         );
         assert_eq!(
-            sniff_http(b"GET / HTTP/1.1\r\nHost: [::1]:8443\r\n\r\n").unwrap(),
+            sniff_http(b"GET / HTTP/1.1\r\nHost: [::1]:8443\r\n\r\n", None).unwrap(),
             ("http1", "::1".to_owned())
         );
         assert_eq!(

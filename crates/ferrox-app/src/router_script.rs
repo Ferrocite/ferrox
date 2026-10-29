@@ -1109,6 +1109,7 @@ mod tests {
             inbound_tag: Some("in"),
             protocol: Some("http/1.1"),
             user: Some("a@x"),
+            attrs: None,
         }
     }
 

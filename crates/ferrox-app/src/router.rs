@@ -47,6 +47,81 @@ pub(crate) struct Flow<'a> {
     pub(crate) protocol: Option<&'a str>,
     /// The authenticated inbound account's email, which is what a `user` rule names.
     pub(crate) user: Option<&'a str>,
+    /// The HTTP attributes a front or the sniffer read off the request head, which an `attrs` rule names.
+    pub(crate) attrs: Option<&'a Attributes<'a>>,
+}
+
+/// The attributes of one HTTP request head — `:method`, `:path`, then every header — as the front or
+/// the sniffer read them. A rule's keys were lowercased at startup and a name is compared without
+/// regard to case, so neither side copies a name per match.
+#[derive(Debug)]
+pub(crate) struct Attributes<'a> {
+    entries: Vec<(Cow<'a, str>, Cow<'a, str>)>,
+}
+
+impl<'a> Attributes<'a> {
+    pub(crate) fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(&mut self, name: &'a str, value: Cow<'a, str>) {
+        self.entries.push((Cow::Borrowed(name), value));
+    }
+
+    /// The pairs a sniffer copied out of a peeked head, which outlives the buffer it read.
+    pub(crate) fn from_pairs(pairs: &'a [(String, String)]) -> Self {
+        Self {
+            entries: pairs
+                .iter()
+                .map(|(name, value)| (Cow::Borrowed(name.as_str()), Cow::Borrowed(value.as_str())))
+                .collect(),
+        }
+    }
+
+    fn get(&self, name: &str) -> Option<&str> {
+        self.entries
+            .iter()
+            .find(|(sent, _)| sent.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_ref())
+    }
+}
+
+/// A rule's `attrs` map: each key lowercased and its value compiled as a regexp, which is what the
+/// reference builds once at startup. An empty map is no selector, and a bad pattern refuses the config
+/// because the reference's `MustCompile` stops the process.
+#[derive(Debug)]
+struct AttributeSelector {
+    keys: Vec<(String, regex::Regex)>,
+}
+
+impl AttributeSelector {
+    fn parse(value: &Json) -> Result<Option<Self>, String> {
+        if matches!(value, Json::Null) {
+            return Ok(None);
+        }
+        let pairs = object(value, "routing attrs")?;
+        let mut keys = Vec::with_capacity(pairs.len());
+        for (key, value) in pairs {
+            let pattern = value
+                .as_str()
+                .ok_or_else(|| format!("routing attrs `{key}` is not a string"))?;
+            let compiled = regex::Regex::new(pattern)
+                .map_err(|error| format!("routing attrs `{key}` is not a regexp: {error}"))?;
+            keys.push((key.to_ascii_lowercase(), compiled));
+        }
+        Ok((!keys.is_empty()).then_some(Self { keys }))
+    }
+
+    fn matches(&self, attrs: Option<&Attributes<'_>>) -> bool {
+        let Some(attrs) = attrs else {
+            return false;
+        };
+        self.keys
+            .iter()
+            .all(|(key, pattern)| attrs.get(key).is_some_and(|value| pattern.is_match(value)))
+    }
 }
 
 /// A rule's `user` list, split once at startup into exact names and compiled `regexp:` patterns;
@@ -115,6 +190,7 @@ pub(crate) struct Routing {
     balancers: Vec<Balancer>,
     script: Option<ScriptRouter>,
     has_domains: bool,
+    wants_attrs: bool,
 }
 
 /// One `balancers` entry: a tag a rule may name, the outbound-tag prefixes it draws from, and the
@@ -654,6 +730,7 @@ struct Rule {
     protocols: Option<Vec<String>>,
     users: Option<UserSelector>,
     vless_routes: Option<PortSet>,
+    attrs: Option<AttributeSelector>,
     sets: Option<Vec<Arc<RuleSet>>>,
 }
 
@@ -831,13 +908,20 @@ impl Routing {
                     .as_ref()
                     .is_some_and(|sets| sets.iter().any(|set| set.has_domains()))
         });
+        let wants_attrs = rules.iter().any(|rule| rule.attrs.is_some());
         Ok(Some(Self {
             strategy,
             rules,
             balancers,
             script,
             has_domains,
+            wants_attrs,
         }))
+    }
+
+    /// Whether any rule reads the flow's HTTP attributes, which is the only reason a front pays to parse them.
+    pub(crate) fn wants_attrs(&self) -> bool {
+        self.wants_attrs
     }
 
     /// The targets rules name and whether each names a balancer, for the registry that has to
@@ -1031,8 +1115,8 @@ impl Routing {
             if !rule.reachable(inbound, Network::Tcp) || !rule.local_os_matches() {
                 continue;
             }
-            // A server inbound never evaluates a rule and reads no sent route id, so neither selector can match.
-            if rule.users.is_some() || rule.vless_routes.is_some() {
+            // A server inbound never evaluates a rule, reads no sent route id and carries no HTTP head.
+            if rule.users.is_some() || rule.vless_routes.is_some() || rule.attrs.is_some() {
                 continue;
             }
             if !direct(&rule.target, rule.balancer) {
@@ -1185,6 +1269,7 @@ impl Rule {
         let mut protocols = None;
         let mut users = None;
         let mut vless_routes = None;
+        let mut attrs = None;
         let mut rule_sets = None;
         let mut unread = None;
         for (key, field) in pairs {
@@ -1221,6 +1306,7 @@ impl Rule {
                 "user" => {
                     users = string_list(field, "user")?.map(|names| UserSelector::parse(&names));
                 }
+                "attrs" => attrs = AttributeSelector::parse(field)?,
                 "vlessRoute" => vless_routes = port_set(field, "vlessRoute")?,
                 "ruleSet" | "rule_set" => {
                     rule_sets = Some(
@@ -1228,7 +1314,7 @@ impl Rule {
                             .ok_or_else(|| "routing ruleSet is empty".to_owned())?,
                     );
                 }
-                "attrs" | "process" | "webhook" => {
+                "process" | "webhook" => {
                     unread = Some(key);
                 }
                 other => return Err(format!("routing rule field `{other}` is not carried")),
@@ -1280,6 +1366,7 @@ impl Rule {
             protocols,
             users,
             vless_routes,
+            attrs,
             sets: rule_sets,
         }))
     }
@@ -1299,6 +1386,7 @@ impl Rule {
                 .vless_routes
                 .as_ref()
                 .is_none_or(|routes| routes.contains(0))
+            && self.attrs.is_none()
             && self.sets.is_none()
     }
 
@@ -1406,6 +1494,11 @@ impl Rule {
         }
         if let Some(users) = &self.users {
             if !users.matches(flow.user) {
+                return false;
+            }
+        }
+        if let Some(attrs) = &self.attrs {
+            if !attrs.matches(flow.attrs) {
                 return false;
             }
         }
@@ -3382,6 +3475,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(routing.route(&flow("example.test")), Some("direct"));
         assert_eq!(routing.route(&flow("www.example.test")), Some("direct"));
@@ -3415,6 +3509,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(routing.route(&matching), Some("direct"));
         for changed in [
@@ -3458,6 +3553,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(routing.route(&flow), Some("first"));
     }
@@ -3494,6 +3590,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(routing.route(&flow("x.both.test")), Some("direct"));
         assert_eq!(routing.route(&flow("one.test")), None);
@@ -3680,6 +3777,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(
             routing.route(&flow("192.0.2.9".parse().expect("ip"))),
@@ -3748,6 +3846,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -3813,6 +3912,7 @@ mod tests {
             inbound_tag: Some("public"),
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(
             routing.route_with(&flow, &|_, _| { vec!["192.0.2.9".parse().expect("ip")] }),
@@ -3851,6 +3951,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         let before = DOMAIN_TABLE_READS.with(std::cell::Cell::get);
         let tag = routing.route_with(&flow, &|_, _| vec!["192.0.2.1".parse().expect("ip")]);
@@ -3890,6 +3991,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -3952,6 +4054,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(routing.route(&flow), Some("block"));
         for name in ["exact.test", "name.ends.test"] {
@@ -4034,6 +4137,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(routing.route(&flow), Some("block"));
         assert_eq!(
@@ -4108,6 +4212,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(
             routing.route_with(&flow, &|_, _| vec!["10.1.2.3".parse().expect("ip")]),
@@ -4159,6 +4264,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(routing.route(&flow), Some("direct"));
         assert_eq!(
@@ -4211,6 +4317,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(routing.route(&flow), Some("direct"));
         assert_eq!(
@@ -4404,6 +4511,7 @@ mod tests {
             inbound_tag: None,
             protocol: Some("http1"),
             user: None,
+            attrs: None,
         };
         assert_eq!(parsed.route(&named), Some("block"));
         let bare = Flow {
@@ -4416,6 +4524,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(parsed.route(&bare), Some("direct"));
     }
@@ -4444,6 +4553,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user,
+            attrs: None,
         };
 
         let parsed = Routing::parse_in(
@@ -4498,6 +4608,7 @@ mod tests {
             inbound_tag: Some("in"),
             protocol: None,
             user: None,
+            attrs: None,
         };
         let parse = |routes: Json| {
             Routing::parse_in(&route_rule(routes), vec![dir()])
@@ -4518,6 +4629,95 @@ mod tests {
             "an empty route list is a matcher that matches nothing, not a skipped rule"
         );
         assert_eq!(empty.route(&flow), Some("direct"));
+    }
+
+    /// An `attrs` rule reads the HTTP head a front or the sniffer parsed: every key must be present
+    /// and its regexp must match, a key compares without regard to case, and a flow carrying no head
+    /// matches no `attrs` rule — a rule whose map is empty is no selector at all.
+    #[test]
+    fn an_attrs_rule_matches_every_key_the_flow_carries() {
+        let attrs_rule = |selectors: Vec<(&str, Json)>| {
+            object(vec![(
+                "routing",
+                routing(vec![
+                    rule("block", vec![("attrs", object(selectors))]),
+                    rule("direct", Vec::new()),
+                ]),
+            )])
+        };
+        let route = |parsed: &Routing, entries: &[(&str, &str)]| {
+            let mut attrs = Attributes::new();
+            for (name, value) in entries {
+                attrs.push(name, Cow::Borrowed(*value));
+            }
+            let flow = Flow {
+                network: Network::Tcp,
+                domain: Some("x.com"),
+                ip: None,
+                port: Some(443),
+                source: None,
+                local: None,
+                inbound_tag: None,
+                protocol: None,
+                user: None,
+                attrs: (!entries.is_empty()).then_some(&attrs),
+            };
+            parsed.route(&flow).map(str::to_owned)
+        };
+        let parsed = Routing::parse_in(
+            &attrs_rule(vec![
+                (":path", text("^/blocked")),
+                ("X-Flag", text("^yes$")),
+            ]),
+            vec![dir()],
+        )
+        .expect("parses")
+        .expect("routing");
+        assert_eq!(
+            route(
+                &parsed,
+                &[
+                    (":method", "GET"),
+                    (":path", "/blocked/x"),
+                    ("x-flag", "yes")
+                ]
+            )
+            .as_deref(),
+            Some("block")
+        );
+        assert_eq!(
+            route(&parsed, &[(":path", "/blocked"), ("X-FLAG", "yes")]).as_deref(),
+            Some("block"),
+            "a key compares without regard to case on either side"
+        );
+        assert_eq!(
+            route(&parsed, &[(":path", "/blocked")]).as_deref(),
+            Some("direct"),
+            "a key the head does not carry fails the rule"
+        );
+        assert_eq!(
+            route(&parsed, &[(":path", "/open"), ("x-flag", "yes")]).as_deref(),
+            Some("direct")
+        );
+        assert_eq!(
+            route(&parsed, &[]).as_deref(),
+            Some("direct"),
+            "no head, no match"
+        );
+
+        let empty = Routing::parse_in(&attrs_rule(Vec::new()), vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(
+            empty.rules().len(),
+            2,
+            "an empty attrs map is no selector, as the reference's length check makes it"
+        );
+        assert_eq!(route(&empty, &[]).as_deref(), Some("block"));
+
+        let broken = Routing::parse_in(&attrs_rule(vec![(":path", text("["))]), vec![dir()])
+            .expect_err("a bad pattern refuses the config");
+        assert!(broken.contains("not a regexp"), "{broken}");
     }
 
     #[test]
@@ -4545,6 +4745,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(parsed.route(&flow), Some("direct"));
         flow.port = Some(102);
@@ -4579,6 +4780,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(parsed.route(&flow), Some("direct"));
         flow.port = Some(100);
@@ -4893,6 +5095,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, None);
@@ -4921,6 +5124,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("direct"));
@@ -4949,6 +5153,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("direct"));
@@ -4983,6 +5188,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("second"));
@@ -5014,6 +5220,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("first"));
@@ -5045,6 +5252,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -5086,6 +5294,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -5149,6 +5358,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(routing.route(&flow), Some("pool"));
     }
@@ -5337,6 +5547,7 @@ mod tests {
             inbound_tag: None,
             protocol: None,
             user: None,
+            attrs: None,
         };
         assert_eq!(
             parsed.route_target(&flow),
