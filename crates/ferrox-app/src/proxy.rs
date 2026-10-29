@@ -25581,6 +25581,35 @@ mod tests {
         assert_eq!(served, 0, "the dynamic inbound is refused, not served");
     }
 
+    /// A `process` rule follows the socket the client really holds: the peer a PROXY header named
+    /// belongs to no local process and must not borrow this one, while routing still reads it.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_proxy_reported_peer_names_no_process_for_the_socket_it_rode() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"default","protocol":"freedom"}],"routing":{"rules":[{"type":"field","process":["self/"],"outboundTag":"default"}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = Arc::new(crate::reverse::Portals::default());
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let plan = RoutePlan::new(Arc::clone(&shared), None, None, true);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let client =
+            std::net::TcpStream::connect(listener.local_addr().expect("local")).expect("connects");
+        let (server, _) = listener.accept().expect("accepts");
+        let reported: std::net::SocketAddr = "192.0.2.9:4444".parse().expect("address");
+        let proxied = Connection::Tcp(server).with_peer(reported);
+        assert_eq!(proxied.peer_addr().expect("reported"), reported);
+        let owner = plan
+            .process_owner(crate::router::Network::Tcp, Some(&proxied))
+            .expect("the real socket belongs to this process");
+        assert_eq!(owner.pid, std::process::id());
+        drop(client);
+    }
+
     #[test]
     fn a_dynamic_outbound_is_routable_and_removable() {
         let root = crate::json::parse(
