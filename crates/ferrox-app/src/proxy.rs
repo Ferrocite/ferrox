@@ -1821,10 +1821,18 @@ impl RoutePlan {
         network: crate::router::Network,
         client: Option<&Connection>,
     ) -> Option<crate::process::Owner> {
+        self.process_owner_from(network, client?.socket_peer().ok()?)
+    }
+
+    fn process_owner_from(
+        &self,
+        network: crate::router::Network,
+        source: SocketAddr,
+    ) -> Option<crate::process::Owner> {
         if !self.source_known || !self.shared.routing.wants_process() {
             return None;
         }
-        crate::process::owner(network, client?.socket_peer().ok()?)
+        crate::process::owner(network, source)
     }
 
     fn lane_with_protocol(
@@ -17165,7 +17173,8 @@ fn serve_socks_udp_split(
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-    let process = plan.process_owner(crate::router::Network::Udp, Some(&client));
+    let mut process = None;
+    let mut process_src = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         if replies.contains_key(&src) {
             if let Some(client) = client_addr {
@@ -17194,6 +17203,10 @@ fn serve_socks_udp_split(
             }
         }
         client_addr = Some(src);
+        if process_src != Some(src) {
+            process = plan.process_owner_from(crate::router::Network::Udp, src);
+            process_src = Some(src);
+        }
         let (out, key) = plan.lane_with_protocol(
             &route,
             crate::router::Network::Udp,
