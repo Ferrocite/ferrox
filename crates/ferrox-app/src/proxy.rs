@@ -11724,7 +11724,11 @@ fn dial_tls_session(
 fn session_halves<S, W>(session: S, transport: W) -> (TlsHalf<S>, TlsHalf<S>)
 where
     W: Write + Send + 'static,
-    S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Drivable,
+    S: ferrox_core::tls::TlsProvider
+        + ferrox_core::tls::RecordAlignment
+        + Drivable
+        + Send
+        + 'static,
 {
     let out = Arc::new(Mutex::new(Sealed::new(transport)));
     let cipher = session.transport().and_then(|cipher| {
@@ -11745,6 +11749,14 @@ where
         }
         None => Arc::new(Mutex::new(session)),
     };
+    if let Ok(mut sealed) = out.lock() {
+        let arm = Arc::clone(&shared);
+        sealed.arm = Some(Box::new(move |timeout| {
+            if let Ok(session) = arm.lock() {
+                session.arm_write(timeout);
+            }
+        }));
+    }
     let reader = TlsHalf {
         session: Arc::clone(&shared),
         out: Arc::clone(&out),
@@ -11933,6 +11945,8 @@ struct Sealed {
     /// The record behind `bytes` has a clock: a peer that drains nothing leaves its suffix here for
     /// a later settle instead of parking the relay lane's thread in the write.
     paced: bool,
+    /// Arms the clock on the session's own transport, not on a duplicate of it.
+    arm: Option<Box<dyn Fn(Duration) + Send + Sync>>,
 }
 
 /// The most sealed plaintext one paced writer keeps ahead of the socket; past it the carrier is
@@ -11946,6 +11960,7 @@ impl Sealed {
             bytes: Vec::new(),
             raw: None,
             paced: false,
+            arm: None,
         }
     }
 
@@ -12105,6 +12120,8 @@ const DRIVEN_CIPHERTEXT: usize = 32 * 1024;
 /// caller keeps it behind the shared shape's lock.
 trait Drivable {
     fn transport(&self) -> Option<Connection>;
+    /// The write clock belongs to the descriptor the session writes, not a duplicate of it.
+    fn arm_write(&self, _timeout: std::time::Duration) {}
 }
 
 impl Drivable
@@ -12115,6 +12132,10 @@ impl Drivable
             return None;
         }
         self.get_ref().get_ref().try_clone().ok()
+    }
+
+    fn arm_write(&self, timeout: std::time::Duration) {
+        let _ = self.get_ref().get_ref().set_write_timeout(Some(timeout));
     }
 }
 
@@ -12130,6 +12151,10 @@ impl Drivable for ferrox_core::tls::RustlsProvider<Connection> {
     fn transport(&self) -> Option<Connection> {
         self.get_ref().try_clone().ok()
     }
+
+    fn arm_write(&self, timeout: std::time::Duration) {
+        let _ = self.get_ref().set_write_timeout(Some(timeout));
+    }
 }
 
 impl Drivable for ferrox_core::tls::RustlsProvider<KcpIo> {
@@ -12141,6 +12166,10 @@ impl Drivable for ferrox_core::tls::RustlsProvider<KcpIo> {
 impl Drivable for ferrox_core::tls::ClientSession<Connection> {
     fn transport(&self) -> Option<Connection> {
         self.get_ref().try_clone().ok()
+    }
+
+    fn arm_write(&self, timeout: std::time::Duration) {
+        let _ = self.get_ref().set_write_timeout(Some(timeout));
     }
 }
 
@@ -12161,6 +12190,10 @@ impl Drivable for ferrox_core::tls::RealityServer<Connection> {
             .try_clone()
             .ok()
     }
+
+    fn arm_write(&self, timeout: std::time::Duration) {
+        let _ = ferrox_core::tls::RealityServer::transport(self).set_write_timeout(Some(timeout));
+    }
 }
 
 impl Drivable for ferrox_core::tls::RealityServer<KcpIo> {
@@ -12174,6 +12207,10 @@ impl Drivable
 {
     fn transport(&self) -> Option<Connection> {
         self.get_ref().get_ref().try_clone().ok()
+    }
+
+    fn arm_write(&self, timeout: std::time::Duration) {
+        let _ = self.get_ref().get_ref().set_write_timeout(Some(timeout));
     }
 }
 
@@ -20719,6 +20756,9 @@ impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send
 
     fn arm_write(&mut self, timeout: Duration) {
         if let Ok(mut out) = self.out.lock() {
+            if let Some(arm) = out.arm.as_ref() {
+                arm(timeout);
+            }
             let Some(raw) = out.raw.as_ref() else {
                 return;
             };
