@@ -89,14 +89,15 @@ fn socket_inode(network: Network, source: SocketAddr) -> Option<String> {
     wildcard
 }
 
-/// The local address as the `/proc/net` tables spell it: the address bytes in host order, uppercase
-/// hex, then the port.
+/// The local address as the `/proc/net` tables spell it: each 32-bit word in host byte order, then
+/// the port. IPv4 is one word; IPv6 is four.
 #[cfg(target_os = "linux")]
 fn local_hex(octets: &[u8], port: u16) -> String {
     use std::fmt::Write as _;
     let mut address = String::with_capacity(octets.len() * 2 + 5);
-    for byte in octets.iter().rev() {
-        let _ = write!(address, "{byte:02X}");
+    for word in octets.chunks_exact(4) {
+        let word = u32::from_ne_bytes([word[0], word[1], word[2], word[3]]);
+        let _ = write!(address, "{word:08X}");
     }
     let _ = write!(address, ":{port:04X}");
     address
