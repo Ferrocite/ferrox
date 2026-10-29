@@ -2261,9 +2261,22 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
         pairs.push(("vlessRoute", Json::Str(vless_routes)));
     }
     if !attributes.is_empty() {
-        pairs.push(("attrs", Json::Obj(attributes)));
+        pairs.push(("attrs", Json::Obj(attribute_map(attributes))));
     }
     Ok(object(pairs))
+}
+
+/// A protobuf map keeps the last value a repeated key carries, so the entries collapse before the
+/// selector reads them; an entry repeated with the same pattern is a replacement, not a second one.
+fn attribute_map(entries: Vec<(String, Json)>) -> Vec<(String, Json)> {
+    let mut map: Vec<(String, Json)> = Vec::with_capacity(entries.len());
+    for entry in entries {
+        match map.iter_mut().find(|(name, _)| *name == entry.0) {
+            Some(slot) => *slot = entry,
+            None => map.push(entry),
+        }
+    }
+    map
 }
 
 /// One `RoutingRule.attributes` entry: the map's key and the regexp its value holds.
@@ -5503,6 +5516,63 @@ mod tests {
             process: None,
         };
         assert_eq!(routing.route(&flow), Some("blocked"));
+    }
+
+    /// A protobuf map keeps the last value of a repeated key, so two `:method` entries leave one
+    /// pattern: the PUT it names matches and the GET it replaced does not.
+    #[test]
+    fn a_pb_attribute_map_keeps_the_last_value_of_a_repeated_key() {
+        let first = message(&[bytes_field(1, b":method"), bytes_field(2, b"^GET$")]);
+        let last = message(&[bytes_field(1, b":method"), bytes_field(2, b"^PUT$")]);
+        let rule = message(&[
+            bytes_field(1, b"blocked"),
+            bytes_field(15, &first),
+            bytes_field(15, &last),
+        ]);
+        let router = message(&[bytes_field(2, &rule)]);
+        let outbound = message(&[
+            bytes_field(1, b"blocked"),
+            bytes_field(3, &typed("xray.proxy.blackhole.Config", &[])),
+        ]);
+        let config = message(&[
+            bytes_field(1, &socks_inbound(5000, 0, &[])),
+            bytes_field(2, &outbound),
+            bytes_field(4, &typed("xray.app.router.Config", &router)),
+        ]);
+        let json = to_json(&config).expect("decodes");
+        assert_eq!(
+            json.get("routing")
+                .and_then(|routing| routing.get("rules"))
+                .and_then(Json::as_arr)
+                .and_then(|rules| rules[0].get("attrs")),
+            Some(&Json::Obj(vec![(
+                ":method".to_owned(),
+                Json::Str("^PUT$".to_owned())
+            )]))
+        );
+        let routing = crate::router::Routing::parse(&json)
+            .expect("parses")
+            .expect("routing");
+        let route = |method: &'static str| {
+            let mut attributes = crate::router::Attributes::new();
+            attributes.push(":Method", std::borrow::Cow::Borrowed(method));
+            let flow = crate::router::Flow {
+                network: crate::router::Network::Tcp,
+                domain: None,
+                ip: None,
+                port: Some(443),
+                source: None,
+                local: None,
+                inbound_tag: None,
+                protocol: None,
+                user: None,
+                attrs: Some(&attributes),
+                process: None,
+            };
+            routing.route(&flow).map(str::to_owned)
+        };
+        assert_eq!(route("PUT"), Some("blocked".to_owned()));
+        assert_eq!(route("GET"), None, "the replaced pattern is gone");
     }
 
     /// A protobuf rule's `process` list reaches the rule table as the JSON field of the same name.
