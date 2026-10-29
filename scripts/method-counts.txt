@@ -105,6 +105,10 @@ vless request-parse-allocations 0 ferrox-core-vless::tests::the_request_parse_al
 vless request-parse-name-copies 0 ferrox-core-vless::tests::the_request_parse_allocates_nothing_and_borrows_the_name
 vless request-flow-decisions 1 ferrox-core-vless::tests::the_flow_is_named_without_building_a_string
 vless handshake-pump-buffer-reallocations 0 ferrox-app-proxy::tests::the_pump_forwards_its_buffer_by_pointer_and_holds_capacity_steady
+vless sealed-record-read-buffers 1 ferrox-core-vless::tests::a_record_is_opened_in_the_buffer_it_landed_in
+vless sealed-record-buffer-moves 0 ferrox-core-vless::tests::a_record_is_opened_in_the_buffer_it_landed_in
+vless sealed-record-buffer-growth 0 ferrox-core-vless::tests::a_record_is_opened_in_the_buffer_it_landed_in
+vless sealed-record-sizes-swept 12 ferrox-core-vless::tests::a_record_of_any_size_reads_back_the_octets_that_were_written
 
 # --- Trojan -----------------------------------------------------------------
 trojan ops-retired-instructions UNBLESSED scripts/count-ops.sh

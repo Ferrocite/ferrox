@@ -1161,58 +1161,85 @@ struct ReadSide {
     in_mask: HeaderMask,
     read_stage: ReadStage,
     zero_rtt: Option<(Arc<Client>, Vec<u8>)>,
-    input: Vec<u8>,
-    input_pos: usize,
     wire: Vec<u8>,
     wire_pos: usize,
-    chunk: Vec<u8>,
+    /// The decrypted record still owed to the caller, as a range of `wire`: the plaintext is the
+    /// ciphertext's own bytes, so a record is unmasked and opened where it landed and read from there.
+    plain_from: usize,
+    plain_to: usize,
     header: Option<[u8; HEADER_LEN]>,
     direct: bool,
 }
 
 impl ReadSide {
-    /// One exact wire read that survives a timeout: the bytes already taken stay in `wire`,
-    /// so a retry resumes where the kernel stopped instead of reading a record header twice.
-    fn take_wire<S: Read>(&mut self, inner: &mut S, len: usize) -> io::Result<()> {
-        while self.wire.len() - self.wire_pos < len {
-            match inner.read(&mut self.chunk) {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::UnexpectedEof,
-                        "failed to fill whole buffer",
-                    ));
-                }
-                Ok(n) => self.wire.extend_from_slice(&self.chunk[..n]),
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-                Err(error) => return Err(error),
+    /// The octets of one read into the wire buffer's spare capacity, so a record crosses user space
+    /// once; the tail is handed to `read` whole and truncated to what it reports, as the head reader does.
+    #[allow(
+        clippy::uninit_vec,
+        reason = "the tail is handed straight to `read`, and every path truncates it first"
+    )]
+    fn pull<S: Read>(&mut self, inner: &mut S) -> io::Result<()> {
+        let base = self.wire.len();
+        if self.wire.capacity() == base {
+            self.wire.reserve(MAX_RECORD);
+        }
+        let room = (self.wire.capacity() - base).min(MAX_RECORD);
+        unsafe { self.wire.set_len(base + room) }
+        let read = inner.read(&mut self.wire[base..]);
+        match read {
+            Ok(0) => {
+                self.wire.truncate(base);
+                Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "failed to fill whole buffer",
+                ))
+            }
+            Ok(n) => {
+                self.wire.truncate(base + n);
+                Ok(())
+            }
+            Err(error) => {
+                self.wire.truncate(base);
+                Err(error)
             }
         }
-        self.input.clear();
-        self.input
-            .extend_from_slice(&self.wire[self.wire_pos..self.wire_pos + len]);
-        self.wire_pos += len;
-        if self.wire_pos == self.wire.len() {
-            self.wire.clear();
-            self.wire_pos = 0;
-        } else if self.wire_pos >= 8192 {
-            self.wire.copy_within(self.wire_pos.., 0);
-            self.wire.truncate(self.wire.len() - self.wire_pos);
-            self.wire_pos = 0;
+    }
+
+    /// The offset the next `len` wire octets start at, once they have all arrived: the bytes already
+    /// taken stay in `wire`, so a retry resumes where the inner reader stopped instead of reading a
+    /// record header twice. Only reached with no plaintext owed, so the prefix is reclaimable here.
+    fn take_wire<S: Read>(&mut self, inner: &mut S, len: usize) -> io::Result<usize> {
+        if self.wire_pos > 0 {
+            if self.wire_pos == self.wire.len() {
+                self.wire.clear();
+                self.wire_pos = 0;
+            } else if self.wire_pos >= 8192 {
+                let left = self.wire.len() - self.wire_pos;
+                self.wire.copy_within(self.wire_pos.., 0);
+                self.wire.truncate(left);
+                self.wire_pos = 0;
+            }
         }
-        Ok(())
+        self.plain_from = 0;
+        self.plain_to = 0;
+        while self.wire.len() - self.wire_pos < len {
+            if let Err(error) = self.pull(inner) {
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+        Ok(self.wire_pos)
     }
 
     fn fill_input<S: Read>(&mut self, inner: &mut S) -> io::Result<()> {
-        self.input.clear();
-        self.input_pos = 0;
         match self.read_stage {
             ReadStage::ServerRandom => {
-                self.take_wire(inner, 16)?;
-                let random: [u8; 16] = self
-                    .input
-                    .as_slice()
+                let at = self.take_wire(inner, 16)?;
+                let random: [u8; 16] = self.wire[at..at + 16]
                     .try_into()
                     .map_err(|_| invalid("VLESS encryption server random is short"))?;
+                self.wire_pos = at + 16;
                 self.peer_aead = Some(Aead::with_cipher(
                     &random,
                     self.united_key.as_slice(),
@@ -1226,13 +1253,14 @@ impl ReadSide {
                 self.fill_input(inner)
             }
             ReadStage::ServerPadding(len) => {
-                self.take_wire(inner, len)?;
-                self.in_mask.apply(&mut self.input, false);
+                let at = self.take_wire(inner, len)?;
+                self.wire_pos = at + len;
+                self.in_mask.apply(&mut self.wire[at..at + len], false);
                 let peer = self
                     .peer_aead
                     .as_mut()
                     .ok_or_else(|| invalid("VLESS encryption is missing its peer key"))?;
-                peer.open_in_place(None, &mut self.input, &[])?;
+                peer.open_in_place(None, &mut self.wire[at..at + len], &[])?;
                 self.read_stage = ReadStage::Records;
                 self.fill_input(inner)
             }
@@ -1240,12 +1268,11 @@ impl ReadSide {
                 let header = if let Some(header) = self.header {
                     header
                 } else {
-                    self.take_wire(inner, HEADER_LEN)?;
-                    let mut header: [u8; HEADER_LEN] = self
-                        .input
-                        .as_slice()
+                    let at = self.take_wire(inner, HEADER_LEN)?;
+                    let mut header: [u8; HEADER_LEN] = self.wire[at..at + HEADER_LEN]
                         .try_into()
                         .map_err(|_| invalid("VLESS encryption record header is short"))?;
+                    self.wire_pos = at + HEADER_LEN;
                     self.in_mask.apply(&mut header, false);
                     if decode_header(&header).is_none() {
                         if let Some((owner, pfs_key)) = self.zero_rtt.take() {
@@ -1263,23 +1290,23 @@ impl ReadSide {
                 };
                 let len = decode_header(&header)
                     .ok_or_else(|| invalid("invalid VLESS encryption record header"))?;
-                // The header was staged in `input`; a timed-out body read must not serve it.
-                self.input.clear();
-                self.take_wire(inner, len)?;
+                let at = self.take_wire(inner, len)?;
                 self.header = None;
-                self.in_mask.apply(&mut self.input, false);
+                self.wire_pos = at + len;
+                self.in_mask.apply(&mut self.wire[at..at + len], false);
                 let peer = self
                     .peer_aead
                     .as_mut()
                     .ok_or_else(|| invalid("VLESS encryption is missing its peer key"))?;
                 let next = (peer.nonce == MAX_NONCE)
-                    .then(|| peer.derive(&self.input, self.united_key.as_slice()));
-                let result = peer.open_in_place(None, &mut self.input, &header);
+                    .then(|| peer.derive(&self.wire[at..at + len], self.united_key.as_slice()));
+                let result = peer.open_in_place(None, &mut self.wire[at..at + len], &header);
                 if let Some(next) = next {
                     *peer = next;
                 }
                 result?;
-                self.input.truncate(len - TAG_LEN);
+                self.plain_from = at;
+                self.plain_to = at + len - TAG_LEN;
                 Ok(())
             }
         }
@@ -1289,11 +1316,10 @@ impl ReadSide {
         if buf.is_empty() {
             return Ok(0);
         }
-        if self.input_pos < self.input.len() {
-            let available = &self.input[self.input_pos..];
-            let n = available.len().min(buf.len());
-            buf[..n].copy_from_slice(&available[..n]);
-            self.input_pos += n;
+        if self.plain_from < self.plain_to {
+            let n = (self.plain_to - self.plain_from).min(buf.len());
+            buf[..n].copy_from_slice(&self.wire[self.plain_from..self.plain_from + n]);
+            self.plain_from += n;
             return Ok(n);
         }
         if self.direct {
@@ -1314,9 +1340,9 @@ impl ReadSide {
             return Ok(n);
         }
         self.fill_input(inner)?;
-        let n = self.input.len().min(buf.len());
-        buf[..n].copy_from_slice(&self.input[..n]);
-        self.input_pos = n;
+        let n = (self.plain_to - self.plain_from).min(buf.len());
+        buf[..n].copy_from_slice(&self.wire[self.plain_from..self.plain_from + n]);
+        self.plain_from += n;
         Ok(n)
     }
 }
@@ -1396,11 +1422,10 @@ impl<S> EncryptedStream<S> {
                 in_mask: HeaderMask::new(None, 0),
                 read_stage,
                 zero_rtt: None,
-                input: Vec::new(),
-                input_pos: 0,
                 wire: Vec::new(),
                 wire_pos: 0,
-                chunk: vec![0u8; MAX_RECORD],
+                plain_from: 0,
+                plain_to: 0,
                 header: None,
                 direct: false,
             },
@@ -1913,7 +1938,6 @@ mod tests {
         let mut buf = [0u8; 300];
         stream.read_exact(&mut buf).unwrap();
         stream.read.wire.reserve(16 * 1024);
-        stream.read.input.reserve(16 * 1024);
         let ((), counts) = crate::alloc_count::measure(|| {
             for _ in 1..rounds {
                 stream.read_exact(&mut buf).unwrap();
@@ -1924,6 +1948,106 @@ mod tests {
             (0, 0, 0),
             "a record read reuses its buffers"
         );
+        writer.join().unwrap();
+    }
+
+    /// The record is opened where the wire octets landed: after a window of records the buffer's own
+    /// pointer is the one it started at and its capacity has not grown, so a second buffer able to hold
+    /// a record cannot have appeared, and the read path cannot have reallocated the one it has.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_is_opened_in_the_buffer_it_landed_in() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        let (encryption, decryption) = generate_pair(false, "native", "1rtt", "600s");
+        let server = Server::new(ServerConfig::parse(&decryption).unwrap());
+        let client = Client::new(ClientConfig::parse(&encryption).unwrap());
+        let (a, b) = UnixStream::pair().unwrap();
+        let payload = [0x5au8; MAX_RECORD_PLAINTEXT];
+        let rounds = 8usize;
+        let writer = std::thread::spawn(move || {
+            let mut stream = server.handshake(b).unwrap();
+            for _ in 0..rounds {
+                stream.write_all(&payload).unwrap();
+            }
+            stream.flush().unwrap();
+        });
+        let mut stream = client.handshake(a).unwrap();
+        let mut buf = [0u8; 256];
+        let window = MAX_RECORD_PLAINTEXT / buf.len();
+        for _ in 0..window {
+            stream.read_exact(&mut buf).unwrap();
+        }
+        let base = stream.read.wire.as_ptr();
+        let steady = stream.read.wire.capacity();
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 1..rounds {
+                for _ in 0..window {
+                    stream.read_exact(&mut buf).unwrap();
+                }
+            }
+        });
+        assert_eq!(stream.read.wire.as_ptr(), base, "the record's buffer moved");
+        assert_eq!(
+            stream.read.wire.capacity(),
+            steady,
+            "the record's buffer grew"
+        );
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "a record read reuses the buffer it landed in"
+        );
+        writer.join().unwrap();
+    }
+
+    /// Every record size the framing writes, written in uneven chunks and read through a window smaller
+    /// than a record, so the plaintext cursor that advances by the caller's window is what is swept.
+    #[cfg(unix)]
+    #[test]
+    fn a_record_of_any_size_reads_back_the_octets_that_were_written() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+
+        const SIZES: &[usize] = &[1, 2, 15, 16, 17, 21, 300, 8191, 8192, 8193, 16384, 32768];
+        const CHUNKS: &[usize] = &[1, 7, 300, MAX_RECORD_PLAINTEXT];
+        fn body(size: usize) -> Vec<u8> {
+            (0..size)
+                .map(|at| (at as u8).wrapping_mul(37).wrapping_add(11))
+                .collect()
+        }
+        let (encryption, decryption) = generate_pair(false, "native", "1rtt", "600s");
+        let server = Server::new(ServerConfig::parse(&decryption).unwrap());
+        let client = Client::new(ClientConfig::parse(&encryption).unwrap());
+        let (a, b) = UnixStream::pair().unwrap();
+        let writer = std::thread::spawn(move || {
+            let mut stream = server.handshake(b).unwrap();
+            for &size in SIZES {
+                let bytes = body(size);
+                let mut at = 0;
+                let mut chunk = 0;
+                while at < size {
+                    let take = CHUNKS[chunk % CHUNKS.len()].min(size - at);
+                    stream.write_all(&bytes[at..at + take]).unwrap();
+                    at += take;
+                    chunk += 1;
+                }
+                stream.flush().unwrap();
+            }
+        });
+        let mut stream = client.handshake(a).unwrap();
+        let mut got = Vec::new();
+        let mut buf = [0u8; 13];
+        for &size in SIZES {
+            while got.len() < size {
+                let n = stream.read(&mut buf).unwrap();
+                assert!(n > 0, "a record of {size} ended {} octets in", got.len());
+                got.extend_from_slice(&buf[..n]);
+            }
+            assert_eq!(got.as_slice(), body(size).as_slice(), "a record of {size}");
+            got.clear();
+        }
         writer.join().unwrap();
     }
 
