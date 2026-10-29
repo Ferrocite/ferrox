@@ -13027,7 +13027,7 @@ fn ride_carrier<S: Dialed, D: Dialed>(
             if !writer.send(header) {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            relay_sink(ReplyReader::new(reader), &writer, client, |reader| {
+            relay_sink_drained_with(ReplyReader::new(reader), &writer, client, |reader| {
                 crate::grpc::mark_reader_dead(reader.inner_mut());
             });
         }
@@ -21392,7 +21392,21 @@ pub(crate) fn relay_sink_drained<R: Read + Send + 'static, W: CarrierSink>(
     writer: &W,
     peer: &Connection,
 ) -> Option<Arc<RelayFinish>> {
-    relay_ordered::<R, W, fn(&mut R), CLOSE_AFTER_JOIN>(reader, writer, peer, |_| {})
+    relay_sink_drained_with(reader, writer, peer, |_| {})
+}
+
+pub(crate) fn relay_sink_drained_with<R, W, F>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+    on_reader_done: F,
+) -> Option<Arc<RelayFinish>>
+where
+    R: Read + Send + 'static,
+    W: CarrierSink,
+    F: FnOnce(&mut R) + Send + 'static,
+{
+    relay_ordered::<R, W, F, CLOSE_AFTER_JOIN>(reader, writer, peer, on_reader_done)
 }
 
 pub(crate) fn relay_carried<R: Read + Send + 'static>(
@@ -23826,9 +23840,28 @@ fn loopback_dial(
     port: u16,
     tag: &str,
 ) -> Result<Outbound, String> {
+    if crate::config::accept_proxy_protocol(inbound.get("streamSettings")) {
+        return Err(format!(
+            "names `{tag}`, whose listener expects a PROXY header no loopback redial sends"
+        ));
+    }
     match protocol {
         "vless" if vless_security_supported(stream_security(inbound)) => {
             let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
+            let flow = inbound_first_client(inbound)
+                .and_then(|client| client.get("flow"))
+                .and_then(Json::as_str)
+                .unwrap_or("");
+            if !flow.is_empty() && flow != "none" && !ferrox_core::vless::is_vision_name(flow) {
+                return Err(format!(
+                    "names `{tag}`, whose first user asks for unknown flow `{flow}`"
+                ));
+            }
+            if ferrox_core::vless::is_vision_name(flow) {
+                return Err(format!(
+                    "names `{tag}`, whose first user asks for the vision flow a plain loopback dial does not carry"
+                ));
+            }
             let encryption =
                 vless_loopback_encryption(crate::config::server_decryption_string(inbound))?;
             Ok(Outbound::Vless(VlessOut {
@@ -34132,10 +34165,10 @@ mod tests {
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let payloads = [format!("ping-{echo_port}"), format!("pong-{echo_port}")];
         let mut frame = Vec::new();
-        for payload in payloads.iter().map(String::as_bytes) {
+        for (index, payload) in payloads.iter().map(String::as_bytes).enumerate() {
             let datagram = socks_udp_frame(&mut frame, None, &target, payload);
             assert_eq!(
-                trojan_udp_answer(udp, datagram, payload, tag),
+                trojan_udp_answer(udp, datagram, payload, tag, index == 0),
                 target,
                 "{tag}"
             );
@@ -34144,14 +34177,24 @@ mod tests {
         }
     }
 
-    /// A stale frame can land on a reused relay port and a lane can drop its first datagram: resend until this target's own payload arrives, and skip frames that are not it.
-    fn trojan_udp_answer(udp: &UdpSocket, frame: &[u8], want: &[u8], tag: &str) -> SocketAddr {
+    /// A stale frame can land on a reused relay port and a lane can drop its first datagram: resend the first, but send the second once so a new association cannot answer it.
+    fn trojan_udp_answer(
+        udp: &UdpSocket,
+        frame: &[u8],
+        want: &[u8],
+        tag: &str,
+        resend: bool,
+    ) -> SocketAddr {
         udp.set_read_timeout(Some(Duration::from_millis(250)))
             .expect("timeout");
         let deadline = Instant::now() + Duration::from_secs(30);
         let mut back = vec![0u8; UDP_BUF];
+        let mut sent = false;
         loop {
-            udp.send(frame).expect("sends");
+            if resend || !sent {
+                udp.send(frame).expect("sends");
+                sent = true;
+            }
             let until = Instant::now() + Duration::from_millis(250);
             while Instant::now() < until {
                 let Ok(n) = udp.recv(&mut back) else {
@@ -34162,6 +34205,12 @@ mod tests {
                         return source;
                     }
                 }
+            }
+            if !resend {
+                assert!(
+                    Instant::now() < deadline,
+                    "{tag} never answered {want:?} after one send"
+                );
             }
             assert!(Instant::now() < deadline, "{tag} never answers {want:?}");
         }
@@ -46768,6 +46817,32 @@ mod tests {
             r#"{"tag":"tunnel-in","protocol":"vless","port":1,"settings":{"clients":[{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}}"#,
         );
         let error = resolve_loopback(&root, "tunnel-in", false).expect_err("refused");
+        assert!(error.contains("tunnel-in"), "{error}");
+    }
+
+    /// The plain redial carries no TLS, so a first user that requires Vision
+    /// cannot be re-injected; the config stops at startup instead of sending a
+    /// header the named inbound refuses.
+    #[test]
+    fn a_loopback_to_a_vision_user_is_refused_by_name() {
+        let root = loopback_root(
+            r#"{"tag":"tunnel-in","protocol":"vless","port":1,"settings":{"clients":[{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee","flow":"xtls-rprx-vision"}]}}"#,
+        );
+        let error = resolve_loopback(&root, "tunnel-in", true).expect_err("refused");
+        assert!(
+            error.contains("tunnel-in") && error.contains("vision"),
+            "{error}"
+        );
+    }
+
+    /// A listener that reads a PROXY header before its carrier would refuse
+    /// the loopback's own first bytes; the named inbound is refused at startup.
+    #[test]
+    fn a_loopback_to_a_proxy_protocol_listener_is_refused_by_name() {
+        let root = loopback_root(
+            r#"{"tag":"tunnel-in","protocol":"vless","port":1,"streamSettings":{"network":"raw","tcpSettings":{"acceptProxyProtocol":true}},"settings":{"clients":[{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}}"#,
+        );
+        let error = resolve_loopback(&root, "tunnel-in", true).expect_err("refused");
         assert!(error.contains("tunnel-in"), "{error}");
     }
 
