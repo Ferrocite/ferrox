@@ -50092,11 +50092,14 @@ mod census_tests {
     }
 
     /// The same line without naming its thread: a lane's park is not the caller's.
-    fn wait_for_any(name: &str) -> String {
+    fn wait_for_any(name: &str, needle: &str) -> String {
         let named = format!("name={name} ");
         let until = Instant::now() + PATIENCE;
         loop {
-            if let Some(found) = census::dump().lines().find(|line| line.contains(&named)) {
+            if let Some(found) = census::dump()
+                .lines()
+                .find(|line| line.contains(&named) && line.contains(needle))
+            {
                 return found.to_owned();
             }
             assert!(
@@ -50246,12 +50249,16 @@ mod census_tests {
             took < STALLED,
             "the carried relay held the caller for {took:?}, past its upload's {STALLED:?} write arm"
         );
-        let held = wait_for_any("carrier-write");
-        assert!(held.contains("armed=250ms "), "{held}");
+        // Another test's carrier write runs under the default arm at the same time: this flow's line is the one that names its own 250 ms clock, and the thread id is what the clean-up follows.
+        let held = wait_for_any("carrier-write", "armed=250ms ");
         assert!(!held.contains("fd=none "), "{held}");
+        let owner = held
+            .split(" waited=")
+            .next()
+            .expect("the census line names its wait");
         budgets::clear();
         let until = Instant::now() + CEILING;
-        while census::dump().contains("name=carrier-write ") {
+        while census::dump().lines().any(|line| line.starts_with(owner)) {
             assert!(
                 Instant::now() < until,
                 "the upload never handed its lane back over a peer that stopped taking bytes:\n{}",
@@ -50262,9 +50269,7 @@ mod census_tests {
         let flow = leg.join().expect("joins");
         flow.wait();
         assert!(
-            census::dump()
-                .lines()
-                .all(|line| !line.contains("name=carrier-write ")),
+            census::dump().lines().all(|line| !line.starts_with(owner)),
             "a lane's write outlived the flow:\n{}",
             census::dump()
         );
