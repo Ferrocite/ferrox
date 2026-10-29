@@ -95,9 +95,8 @@ fn socket_inode(network: Network, source: SocketAddr) -> Option<String> {
 fn local_hex(octets: &[u8], port: u16) -> String {
     use std::fmt::Write as _;
     let mut address = String::with_capacity(octets.len() * 2 + 5);
-    for word in octets.chunks_exact(4) {
-        let word = u32::from_ne_bytes([word[0], word[1], word[2], word[3]]);
-        let _ = write!(address, "{word:08X}");
+    for word in octets.as_chunks::<4>().0 {
+        let _ = write!(address, "{:08X}", u32::from_ne_bytes(*word));
     }
     let _ = write!(address, ":{port:04X}");
     address
