@@ -348,6 +348,7 @@ fn render_tcp_packet(
 /// `out`, so a ping storm allocates nothing per reply. `src` and `dst` are the reply's, the
 /// request's the other way round.
 fn render_icmp_reply(src: [u8; 4], dst: [u8; 4], request: &[u8], out: &mut Vec<u8>) {
+    out.clear();
     let _ = icmp_echo_reply(IpAddr::from(dst), IpAddr::from(src), request, out);
 }
 

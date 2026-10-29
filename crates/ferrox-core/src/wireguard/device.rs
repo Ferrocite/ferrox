@@ -115,7 +115,7 @@ pub struct Tunnel {
     session: Option<Session>,
     previous: Option<Session>,
     next: Option<Session>,
-    queue: VecDeque<Vec<u8>>,
+    queue: VecDeque<(Vec<u8>, usize)>,
     queued_bytes: usize,
     last_send: u64,
     last_recv: u64,
@@ -268,34 +268,33 @@ impl Tunnel {
     /// no session the payload waits and an initiation starts; past the queue
     /// bound the oldest payload is dropped.
     pub fn send(&mut self, now: u64, payload: &[u8], out: &mut Vec<Event>) {
-        if self.established(now) {
-            if self
-                .session
-                .as_ref()
-                .is_some_and(|session| now.saturating_sub(session.created) >= REKEY_AFTER)
-            {
-                self.initiate(now, out);
-            }
-            self.seal(now, payload, out);
-            return;
-        }
-        if payload.len() > QUEUE_BYTES {
-            return;
-        }
-        while self.queued_bytes + payload.len() > QUEUE_BYTES {
-            let Some(old) = self.queue.pop_front() else {
-                break;
-            };
-            self.queued_bytes -= old.len();
-        }
-        self.queue.push_back(payload.to_vec());
-        self.queued_bytes += payload.len();
-        self.initiate(now, out);
+        let total = HEADER_SIZE + payload.len() + TAG_SIZE;
+        let mut packet = Vec::with_capacity(total);
+        packet.extend_from_slice(&[0u8; HEADER_SIZE]);
+        packet.extend_from_slice(payload);
+        self.send_prefixed(now, packet, HEADER_SIZE, out);
     }
 
     /// Send a payload the caller already owns, reusing its buffer for the record
     /// when a session is ready instead of allocating a second one.
     pub fn send_owned(&mut self, now: u64, payload: Vec<u8>, out: &mut Vec<Event>) {
+        self.send_prefixed(now, payload, 0, out);
+    }
+
+    /// Send an inner packet that already carries `headroom` zero bytes ahead of
+    /// its first payload byte, so sealing writes the record header in place
+    /// instead of shifting the packet. The stack's producers reserve
+    /// [`HEADER_SIZE`] bytes; a caller without headroom passes zero.
+    pub fn send_prefixed(
+        &mut self,
+        now: u64,
+        payload: Vec<u8>,
+        headroom: usize,
+        out: &mut Vec<Event>,
+    ) {
+        if headroom != 0 && headroom != HEADER_SIZE || payload.len() < headroom {
+            return;
+        }
         if self.established(now) {
             if self
                 .session
@@ -304,20 +303,21 @@ impl Tunnel {
             {
                 self.initiate(now, out);
             }
-            self.seal_owned(now, payload, out);
+            self.seal(now, payload, headroom, out);
             return;
         }
-        if payload.len() > QUEUE_BYTES {
+        let len = payload.len() - headroom;
+        if len > QUEUE_BYTES {
             return;
         }
-        while self.queued_bytes + payload.len() > QUEUE_BYTES {
-            let Some(old) = self.queue.pop_front() else {
+        while self.queued_bytes + len > QUEUE_BYTES {
+            let Some((old, old_headroom)) = self.queue.pop_front() else {
                 break;
             };
-            self.queued_bytes -= old.len();
+            self.queued_bytes -= old.len() - old_headroom;
         }
-        self.queued_bytes += payload.len();
-        self.queue.push_back(payload);
+        self.queued_bytes += len;
+        self.queue.push_back((payload, headroom));
         self.initiate(now, out);
     }
 
@@ -381,7 +381,9 @@ impl Tunnel {
         let pending = !self.queue.is_empty();
         self.flush(now, out);
         if !pending {
-            self.seal(now, &[], out);
+            let mut packet = vec![0; HEADER_SIZE + TAG_SIZE];
+            packet.truncate(HEADER_SIZE);
+            self.seal(now, packet, HEADER_SIZE, out);
         }
     }
 
@@ -612,7 +614,9 @@ impl Tunnel {
         if self.keepalive > 0
             && now.saturating_sub(self.last_send) >= u64::from(self.keepalive) * 1000
         {
-            self.seal(now, &[], out);
+            let mut packet = vec![0; HEADER_SIZE + TAG_SIZE];
+            packet.truncate(HEADER_SIZE);
+            self.seal(now, packet, HEADER_SIZE, out);
         }
     }
 
@@ -633,77 +637,37 @@ impl Tunnel {
         )
     }
 
-    fn seal(&mut self, now: u64, payload: &[u8], out: &mut Vec<Event>) {
-        let Some(counter) = self
-            .session
-            .as_mut()
-            .and_then(|session| session.counter.advance())
-        else {
+    /// Seal one payload into a transport record, shifting it only when it arrived without headroom.
+    fn seal(&mut self, now: u64, mut payload: Vec<u8>, headroom: usize, out: &mut Vec<Event>) {
+        let next = self.session.as_mut().and_then(|session| {
+            session
+                .counter
+                .advance()
+                .map(|counter| (counter, session.send, session.remote_index))
+        });
+        let Some((counter, key, receiver)) = next else {
             self.session = None;
             self.initiate(now, out);
             return;
         };
-        let Some(session) = self.session.as_ref() else {
-            return;
-        };
-        let len = payload.len();
-        let key = session.send;
-        let receiver = session.remote_index;
-        let total = HEADER_SIZE + len + TAG_SIZE;
-        let mut packet = Vec::with_capacity(total);
-        packet.extend_from_slice(&[0u8; HEADER_SIZE]);
-        packet.extend_from_slice(payload);
-        packet.resize(total, 0);
-        self.seal_packet(now, counter, key, receiver, len, packet, out);
-    }
-
-    fn seal_owned(&mut self, now: u64, mut payload: Vec<u8>, out: &mut Vec<Event>) {
-        let Some(counter) = self
-            .session
-            .as_mut()
-            .and_then(|session| session.counter.advance())
-        else {
-            self.session = None;
-            self.initiate(now, out);
-            return;
-        };
-        let Some(session) = self.session.as_ref() else {
-            return;
-        };
-        let len = payload.len();
-        let key = session.send;
-        let receiver = session.remote_index;
-        payload.reserve(HEADER_SIZE + TAG_SIZE);
+        let len = payload.len() - headroom;
         payload.resize(len + HEADER_SIZE + TAG_SIZE, 0);
-        payload.copy_within(0..len, HEADER_SIZE);
-        self.seal_packet(now, counter, key, receiver, len, payload, out);
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn seal_packet(
-        &mut self,
-        now: u64,
-        counter: u64,
-        key: [u8; 32],
-        receiver: u32,
-        len: usize,
-        mut packet: Vec<u8>,
-        out: &mut Vec<Event>,
-    ) {
-        let total = transport::seal(&key, receiver, counter, len, &mut packet);
-        packet.truncate(total);
-        let packet = self.apply_reserved(packet);
+        if headroom == 0 {
+            payload.copy_within(0..len, HEADER_SIZE);
+        }
+        transport::seal(&key, self.reserved, receiver, counter, len, &mut payload);
         self.last_send = now;
         out.push(Event::Send {
             endpoint: self.endpoint,
-            packet,
+            packet: payload,
         });
     }
 
+    /// Seal every queued payload, keeping each one's reserved headroom.
     fn flush(&mut self, now: u64, out: &mut Vec<Event>) {
-        while let Some(payload) = self.queue.pop_front() {
-            self.queued_bytes -= payload.len();
-            self.seal_owned(now, payload, out);
+        while let Some((payload, headroom)) = self.queue.pop_front() {
+            self.queued_bytes -= payload.len() - headroom;
+            self.seal(now, payload, headroom, out);
         }
     }
 
@@ -1033,6 +997,34 @@ mod tests {
             7 + HEADER_SIZE + TAG_SIZE,
             "the buffer does not grow"
         );
+        let mut received = Vec::new();
+        bob.receive(NOW + 2, ALICE.parse().unwrap(), &mut packet, &mut received);
+        assert!(matches!(&received[0], Event::Data(payload) if payload == b"payload"));
+    }
+
+    #[test]
+    fn a_prefixed_record_reuses_the_stack_headroom() {
+        let (mut alice, mut bob) = establish(0);
+        let mut out = Vec::with_capacity(4);
+        let mut payload = Vec::with_capacity(HEADER_SIZE + 7 + TAG_SIZE);
+        payload.resize(HEADER_SIZE, 0);
+        payload.extend_from_slice(b"payload");
+        let base = payload.as_ptr();
+        let capacity = payload.capacity();
+        let ((), counts) = crate::alloc_count::measure(|| {
+            alice.send_prefixed(NOW + 2, payload, HEADER_SIZE, &mut out);
+        });
+        assert_eq!(
+            counts.allocs, 0,
+            "the stack's packet is the record: {counts:?}"
+        );
+        assert_eq!(counts.zeroed, 0, "the payload is not zeroed: {counts:?}");
+        let Event::Send { mut packet, .. } = out.remove(0) else {
+            panic!("a data event");
+        };
+        assert_eq!(packet.as_ptr(), base, "the record is the stack's buffer");
+        assert_eq!(packet.capacity(), capacity, "the buffer does not grow");
+        assert_eq!(packet.len(), HEADER_SIZE + 7 + TAG_SIZE);
         let mut received = Vec::new();
         bob.receive(NOW + 2, ALICE.parse().unwrap(), &mut packet, &mut received);
         assert!(matches!(&received[0], Event::Data(payload) if payload == b"payload"));

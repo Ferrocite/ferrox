@@ -59,12 +59,20 @@ fn nonce(counter: u64) -> [u8; 12] {
 }
 
 /// Seal the record in place: the plaintext sits at `buf[HEADER_SIZE..]` for `len`
-/// bytes, the buffer is `HEADER_SIZE + len + TAG_SIZE` long, and the type, receiver
-/// index and counter are written ahead. Returns the total record length. The
-/// encryption is the already-proved `aead` seal, so the ciphertext is what a
-/// vanilla peer decrypts — this adds only the header and the counter nonce.
-pub fn seal(key: &[u8; 32], receiver: u32, counter: u64, len: usize, buf: &mut [u8]) -> usize {
-    buf[0..4].copy_from_slice(&TYPE_TRANSPORT.to_le_bytes());
+/// bytes, the buffer is `HEADER_SIZE + len + TAG_SIZE` long, and the type, reserved
+/// bytes, receiver index and counter are written ahead in one 4-byte word and two
+/// stores. Returns the total record length. The encryption is the already-proved
+/// `aead` seal, so the ciphertext is what a vanilla peer decrypts — this adds only
+/// the header and the counter nonce.
+pub fn seal(
+    key: &[u8; 32],
+    reserved: [u8; 3],
+    receiver: u32,
+    counter: u64,
+    len: usize,
+    buf: &mut [u8],
+) -> usize {
+    buf[0..4].copy_from_slice(&[TYPE_TRANSPORT as u8, reserved[0], reserved[1], reserved[2]]);
     buf[4..8].copy_from_slice(&receiver.to_le_bytes());
     buf[8..16].copy_from_slice(&counter.to_le_bytes());
     let body = &mut buf[HEADER_SIZE..HEADER_SIZE + len];
@@ -99,11 +107,14 @@ pub fn open(key: &[u8; 32], buf: &mut [u8], total: usize) -> Option<(u32, u64, u
     if total < MIN_SIZE || buf.len() < total {
         return None;
     }
-    if buf[0] != TYPE_TRANSPORT as u8 {
+    let word = u32::from_le_bytes(buf[0..4].try_into().ok()?);
+    if word as u8 != TYPE_TRANSPORT as u8 {
         return None;
     }
-    let reserved = [buf[1], buf[2], buf[3]];
-    clear_reserved(buf);
+    let reserved = word & 0xffff_ff00;
+    if reserved != 0 {
+        buf[0..4].copy_from_slice(&TYPE_TRANSPORT.to_le_bytes());
+    }
     let opened = (|| {
         let receiver = u32::from_le_bytes(buf[4..8].try_into().ok()?);
         let counter = u64::from_le_bytes(buf[8..16].try_into().ok()?);
@@ -113,8 +124,8 @@ pub fn open(key: &[u8; 32], buf: &mut [u8], total: usize) -> Option<(u32, u64, u
         chacha20_poly1305_decrypt_in_place(key, &nonce(counter), b"", body, tag)?;
         Some((receiver, counter, len))
     })();
-    if opened.is_none() {
-        buf[1..4].copy_from_slice(&reserved);
+    if opened.is_none() && reserved != 0 {
+        buf[0..4].copy_from_slice(&word.to_le_bytes());
     }
     opened
 }
@@ -359,7 +370,7 @@ mod tests {
             let plain: Vec<u8> = (0..len).map(|i| (i as u8).wrapping_mul(11)).collect();
             let mut buf = vec![0u8; HEADER_SIZE + len + TAG_SIZE];
             buf[HEADER_SIZE..HEADER_SIZE + len].copy_from_slice(&plain);
-            let total = seal(KEY, 0xBEEF, counter, len, &mut buf);
+            let total = seal(KEY, [0; 3], 0xBEEF, counter, len, &mut buf);
             assert_eq!(total, buf.len(), "the record fills the buffer");
 
             // Header is the transport type, the receiver and the counter, all little-endian.
@@ -403,7 +414,7 @@ mod tests {
         let plain = b"payload that must not leak".to_vec();
         let mut buf = vec![0u8; HEADER_SIZE + plain.len() + TAG_SIZE];
         buf[HEADER_SIZE..HEADER_SIZE + plain.len()].copy_from_slice(&plain);
-        let total = seal(KEY, 5, 9, plain.len(), &mut buf);
+        let total = seal(KEY, [0; 3], 5, 9, plain.len(), &mut buf);
         set_reserved(&mut buf, [9, 8, 7]);
         let sealed = buf.clone();
         buf[total - 1] ^= 1;
@@ -423,8 +434,7 @@ mod tests {
     #[test]
     fn the_reserved_bytes_are_cleared_and_the_type_is_the_only_one_accepted() {
         let mut buf = [0u8; MIN_SIZE];
-        seal(KEY, 7, 3, 0, &mut buf);
-        set_reserved(&mut buf, [1, 2, 3]);
+        seal(KEY, [1, 2, 3], 7, 3, 0, &mut buf);
         assert_eq!(&buf[1..4], &[1, 2, 3]);
         assert_eq!(open(KEY, &mut buf, MIN_SIZE), Some((7, 3, 0)));
         assert_eq!(&buf[1..4], &[0, 0, 0], "the receiver clears the field");
@@ -435,7 +445,7 @@ mod tests {
     #[test]
     fn an_empty_record_is_a_keepalive() {
         let mut buf = [0u8; MIN_SIZE];
-        let total = seal(KEY, 0xACCE, 42, 0, &mut buf);
+        let total = seal(KEY, [0; 3], 0xACCE, 42, 0, &mut buf);
         assert_eq!(total, MIN_SIZE, "a keepalive is the minimum record");
         let mut opened = buf;
         assert_eq!(open(KEY, &mut opened, total), Some((0xACCE, 42, 0)));
