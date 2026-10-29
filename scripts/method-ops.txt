@@ -166,5 +166,10 @@ security-ech  tls::shaped::hello::tests::an_aes_256_only_config_seals_the_inner_
 security-ech  tls::shaped::hello::tests::an_aes_256_only_config_seals_the_inner_hello  ferrox_core::tls::hpke::Context::open
 engine-observatory  observatory::tests::a_probe_through_freedom_reads_the_headers_and_gives_the_delay  ferrox_app::observatory::probe
 front-healthcheck  proxy::hc_tests::an_hc_get_answers_the_configured_body_after_the_exact_path  ferrox_app::proxy::HcHandler::answer
+# The head that arrives in sixteen windows, walked once and walked again per
+# round: one ops job reports both frames, and only their difference is a claim
+# about the rescan.
+front-healthcheck  proxy::hc_tests::the_front_scan_costs_every_window_it_has_already_walked  ferrox_app::proxy::hc_tests::the_front_scan_costs_every_window_it_has_already_walked
+front-healthcheck  proxy::hc_tests::the_seam_scan_costs_the_bytes_it_has_not_walked  ferrox_app::proxy::hc_tests::the_seam_scan_costs_the_bytes_it_has_not_walked
 carrier-quic  proxy::tests::quic_serves_vless_echo_over_loopback  quic::serve_loop
 wireguard  wireguard::device::tests::a_replayed_transport_counter_is_refused  wireguard::device::Tunnel::send
