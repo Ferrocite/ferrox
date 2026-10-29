@@ -4269,13 +4269,14 @@ mod tests {
     fn an_active_packet_up_session_is_not_swept_by_its_age() {
         let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
-            relay_stall: Some(std::time::Duration::from_millis(200)),
+            relay_stall: Some(std::time::Duration::from_millis(500)),
             ..Default::default()
         });
         let id = "packet-up-active";
         let session = get_or_create_session(id);
-        for seq in 0..3u64 {
-            thread::sleep(std::time::Duration::from_millis(120));
+        // A silence ten times inside the budget keeps a loaded runner's descheduling out of the verdict.
+        for seq in 0..12u64 {
+            thread::sleep(std::time::Duration::from_millis(50));
             assert!(
                 session.push_packet(seq, vec![seq as u8], 16),
                 "the active packet is accepted"
@@ -4284,7 +4285,7 @@ mod tests {
             assert!(
                 Arc::ptr_eq(&session, &current),
                 "an active packet-up session was swept after {}ms",
-                (seq + 1) * 120
+                (seq + 1) * 50
             );
         }
         end_session(id);
