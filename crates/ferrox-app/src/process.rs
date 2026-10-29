@@ -89,17 +89,26 @@ fn socket_inode(network: Network, source: SocketAddr) -> Option<String> {
     wildcard
 }
 
-/// The local address as the `/proc/net` tables spell it: the address bytes in host order, uppercase
-/// hex, then the port.
+/// The local address as the `/proc/net` tables spell it: each 32-bit word in host order, uppercase
+/// hex, then the port; IPv4 is one word and IPv6 four, so only the bytes inside each word reverse.
 #[cfg(target_os = "linux")]
 fn local_hex(octets: &[u8], port: u16) -> String {
-    use std::fmt::Write as _;
     let mut address = String::with_capacity(octets.len() * 2 + 5);
-    for byte in octets.iter().rev() {
-        let _ = write!(address, "{byte:02X}");
+    for word in octets.as_chunks::<4>().0 {
+        push_hex(&mut address, u32::from_ne_bytes(*word), 8);
     }
-    let _ = write!(address, ":{port:04X}");
+    address.push(':');
+    push_hex(&mut address, u32::from(port), 4);
     address
+}
+
+/// Append the low `digits` hex digits of `value`, most significant first.
+#[cfg(target_os = "linux")]
+fn push_hex(out: &mut String, value: u32, digits: u32) {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    for digit in (0..digits).rev() {
+        out.push(HEX[((value >> (digit * 4)) & 0xF) as usize] as char);
+    }
 }
 
 /// The pid holding `inode`, by the one file descriptor that links it to `socket:[inode]`.
@@ -132,6 +141,33 @@ fn owner_pid(inode: &str) -> Option<u32> {
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
+
+    /// The tables spell each 32-bit word in host order, so IPv6 is not the whole address reversed:
+    /// `::1` ends in `01000000` on the little-endian kernel this suite runs on.
+    #[test]
+    fn the_tables_local_address_is_spelled_as_the_kernel_does() {
+        #[cfg(target_endian = "little")]
+        {
+            assert_eq!(local_hex(&[127, 0, 0, 1], 8080), "0100007F:1F90");
+            assert_eq!(local_hex(&[0; 4], 0), "00000000:0000");
+            let mut loopback = [0u8; 16];
+            loopback[15] = 1;
+            assert_eq!(
+                local_hex(&loopback, 443),
+                "00000000000000000000000001000000:01BB"
+            );
+        }
+        #[cfg(target_endian = "big")]
+        {
+            assert_eq!(local_hex(&[127, 0, 0, 1], 8080), "7F000001:1F90");
+            let mut loopback = [0u8; 16];
+            loopback[15] = 1;
+            assert_eq!(
+                local_hex(&loopback, 443),
+                "00000000000000000000000000000001:01BB"
+            );
+        }
+    }
 
     /// The socket this process opened is the socket this process owns: the pid is ours and the path
     /// is our executable, which is what `self/` and a bare name decide on.
