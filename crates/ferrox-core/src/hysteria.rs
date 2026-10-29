@@ -160,6 +160,8 @@ pub struct QuicParams {
     pub keep_alive: u64,
     pub no_path_mtu: bool,
     pub max_incoming_streams: u64,
+    /// The reference's `disableStatelessReset`; absent or false advertises a per-connection token.
+    pub disable_stateless_reset: bool,
 }
 
 impl QuicParams {
