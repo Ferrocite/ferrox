@@ -497,6 +497,8 @@ carrier-hysteria masquerade-answers-browser-on-same-port 1 ferrox-app-proxy::tes
 carrier-hysteria masquerade-answer-allocations-per-response 1 ferrox-core-hysteria::tests::an_h3_answer_allocates_only_its_field_block
 carrier-hysteria auth-request-allocations-per-block 0 ferrox-core-hysteria::tests::an_auth_request_carries_post_auth_and_the_brutal_hint
 carrier-hysteria masquerade-file-bytes-served 1 ferrox-app-proxy::tests::hysteria_serves_a_file_from_the_masquerade_directory
+carrier-hysteria masquerade-file-type-allocations 0 ferrox-core-hysteria::tests::a_static_files_type_is_decided_without_an_allocation
+carrier-hysteria masquerade-chunked-dechunk-allocations 1 ferrox-core-hysteria::tests::a_chunked_body_deframes_into_one_buffer
 carrier-hysteria masquerade-proxied-round-trips 1 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_origin
 carrier-hysteria masquerade-escapes-served 0 ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_path_that_escalates_the_directory
 carrier-hysteria hop-port-set-expanded 4 ferrox-core-hysteria::tests::the_plan_expands_overlapping_ranges_into_one_sorted_set
