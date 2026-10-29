@@ -20912,7 +20912,7 @@ pub(crate) trait CarrierSink: Clone + Send + 'static {
         Settle::Clear
     }
     fn close(&self);
-    /// Ends the request body when the app half-closes, before the carrier's own download ends; only a carrier whose response is gated on that body (xhttp) answers here.
+    /// Ends the request body when the app half-closes, before the carrier's own download ends; only a carrier whose response is gated on that body (xhttp, gRPC) answers here.
     fn upload_done(&self) {}
 }
 
