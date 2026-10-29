@@ -11737,9 +11737,6 @@ where
             .ok()
             .map(|()| cipher)
     });
-    if let (Some(cipher), Ok(mut sealed)) = (cipher.as_ref(), out.lock()) {
-        sealed.raw = cipher.try_clone().ok();
-    }
     let mut session = session;
     let shared = match cipher.as_ref() {
         Some(_) => {
@@ -11749,13 +11746,16 @@ where
         }
         None => Arc::new(Mutex::new(session)),
     };
-    if let Ok(mut sealed) = out.lock() {
-        let arm = Arc::clone(&shared);
-        sealed.arm = Some(Box::new(move |timeout| {
-            if let Ok(session) = arm.lock() {
-                session.arm_write(timeout);
-            }
-        }));
+    if let (Some(cipher), Ok(mut sealed)) = (cipher.as_ref(), out.lock()) {
+        let session = Arc::clone(&shared);
+        sealed.raw = cipher.try_clone().ok().map(|raw| {
+            let arm: Box<dyn Fn(Duration) + Send + Sync> = Box::new(move |timeout| {
+                if let Ok(session) = session.lock() {
+                    session.arm_write(timeout);
+                }
+            });
+            (raw, arm)
+        });
     }
     let reader = TlsHalf {
         session: Arc::clone(&shared),
@@ -11941,12 +11941,10 @@ struct Sealed {
     bytes: Vec<u8>,
     /// The raw socket behind the transport, when the session exposes one: the write clock lives on
     /// the descriptor, so a paced carrier arms it without taking the session's lock.
-    raw: Option<Connection>,
+    raw: Option<(Connection, Box<dyn Fn(Duration) + Send + Sync>)>,
     /// The record behind `bytes` has a clock: a peer that drains nothing leaves its suffix here for
     /// a later settle instead of parking the relay lane's thread in the write.
     paced: bool,
-    /// Arms the clock on the session's own transport, not on a duplicate of it.
-    arm: Option<Box<dyn Fn(Duration) + Send + Sync>>,
 }
 
 /// The most sealed plaintext one paced writer keeps ahead of the socket; past it the carrier is
@@ -11960,7 +11958,6 @@ impl Sealed {
             bytes: Vec::new(),
             raw: None,
             paced: false,
-            arm: None,
         }
     }
 
@@ -20756,12 +20753,10 @@ impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send
 
     fn arm_write(&mut self, timeout: Duration) {
         if let Ok(mut out) = self.out.lock() {
-            if let Some(arm) = out.arm.as_ref() {
-                arm(timeout);
-            }
-            let Some(raw) = out.raw.as_ref() else {
+            let Some((raw, arm)) = out.raw.as_ref() else {
                 return;
             };
+            arm(timeout);
             let _ = raw.set_write_timeout(Some(timeout));
             out.paced = true;
         }
