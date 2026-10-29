@@ -45,6 +45,45 @@ pub(crate) struct Flow<'a> {
     pub(crate) local: Option<SocketAddr>,
     pub(crate) inbound_tag: Option<&'a str>,
     pub(crate) protocol: Option<&'a str>,
+    /// The authenticated inbound account's email, which is what a `user` rule names.
+    pub(crate) user: Option<&'a str>,
+}
+
+/// A rule's `user` list, split once at startup into exact names and compiled `regexp:` patterns;
+/// an entry that is empty or does not compile is ignored, as the reference's matcher ignores it.
+#[derive(Debug)]
+struct UserSelector {
+    literal: Vec<String>,
+    patterns: Vec<regex::Regex>,
+}
+
+impl UserSelector {
+    fn parse(names: &[String]) -> Self {
+        let mut literal = Vec::new();
+        let mut patterns = Vec::new();
+        for name in names {
+            if name.is_empty() {
+                continue;
+            }
+            match name.strip_prefix("regexp:").filter(|_| name.len() > 7) {
+                Some(pattern) => {
+                    if let Ok(pattern) = regex::Regex::new(pattern) {
+                        patterns.push(pattern);
+                    }
+                }
+                None => literal.push(name.clone()),
+            }
+        }
+        Self { literal, patterns }
+    }
+
+    fn matches(&self, user: Option<&str>) -> bool {
+        let Some(user) = user.filter(|user| !user.is_empty()) else {
+            return false;
+        };
+        self.literal.iter().any(|literal| literal == user)
+            || self.patterns.iter().any(|pattern| pattern.is_match(user))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -613,6 +652,7 @@ struct Rule {
     source_ips: Option<IpMatcher>,
     local_ips: Option<IpMatcher>,
     protocols: Option<Vec<String>>,
+    users: Option<UserSelector>,
     sets: Option<Vec<Arc<RuleSet>>>,
 }
 
@@ -990,6 +1030,10 @@ impl Routing {
             if !rule.reachable(inbound, Network::Tcp) || !rule.local_os_matches() {
                 continue;
             }
+            // A server inbound's flow carries no account email, so a `user` rule cannot match it.
+            if rule.users.is_some() {
+                continue;
+            }
             if !direct(&rule.target, rule.balancer) {
                 return Err(format!(
                     "a rule for inbound {} targets `{}`, which the server inbound serves direct",
@@ -1138,6 +1182,7 @@ impl Rule {
         let mut source_ip_value = None;
         let mut local_ips = None;
         let mut protocols = None;
+        let mut users = None;
         let mut rule_sets = None;
         let mut unread = None;
         for (key, field) in pairs {
@@ -1171,13 +1216,16 @@ impl Rule {
                 "inboundTag" => inbound_tags = string_list(field, "inboundTag")?,
                 "localOS" => local_os = string_list(field, "localOS")?,
                 "protocol" => protocols = string_list(field, "protocol")?,
+                "user" => {
+                    users = string_list(field, "user")?.map(|names| UserSelector::parse(&names));
+                }
                 "ruleSet" | "rule_set" => {
                     rule_sets = Some(
                         string_list(field, "ruleSet")?
                             .ok_or_else(|| "routing ruleSet is empty".to_owned())?,
                     );
                 }
-                "attrs" | "user" | "vlessRoute" | "process" | "webhook" => {
+                "attrs" | "vlessRoute" | "process" | "webhook" => {
                     unread = Some(key);
                 }
                 other => return Err(format!("routing rule field `{other}` is not carried")),
@@ -1227,6 +1275,7 @@ impl Rule {
             source_ips,
             local_ips,
             protocols,
+            users,
             sets: rule_sets,
         }))
     }
@@ -1241,6 +1290,7 @@ impl Rule {
             && self.source_ips.is_none()
             && self.local_ips.is_none()
             && self.protocols.is_none()
+            && self.users.is_none()
             && self.sets.is_none()
     }
 
@@ -1343,6 +1393,11 @@ impl Rule {
                 return false;
             };
             if !domains.matches(names.raw, names.lower()) {
+                return false;
+            }
+        }
+        if let Some(users) = &self.users {
+            if !users.matches(flow.user) {
                 return false;
             }
         }
@@ -3312,6 +3367,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(routing.route(&flow("example.test")), Some("direct"));
         assert_eq!(routing.route(&flow("www.example.test")), Some("direct"));
@@ -3344,6 +3400,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(routing.route(&matching), Some("direct"));
         for changed in [
@@ -3386,6 +3443,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(routing.route(&flow), Some("first"));
     }
@@ -3421,6 +3479,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(routing.route(&flow("x.both.test")), Some("direct"));
         assert_eq!(routing.route(&flow("one.test")), None);
@@ -3606,6 +3665,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(
             routing.route(&flow("192.0.2.9".parse().expect("ip"))),
@@ -3673,6 +3733,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -3737,6 +3798,7 @@ mod tests {
             local: None,
             inbound_tag: Some("public"),
             protocol: None,
+            user: None,
         };
         assert_eq!(
             routing.route_with(&flow, &|_, _| { vec!["192.0.2.9".parse().expect("ip")] }),
@@ -3774,6 +3836,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         let before = DOMAIN_TABLE_READS.with(std::cell::Cell::get);
         let tag = routing.route_with(&flow, &|_, _| vec!["192.0.2.1".parse().expect("ip")]);
@@ -3812,6 +3875,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -3873,6 +3937,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(routing.route(&flow), Some("block"));
         for name in ["exact.test", "name.ends.test"] {
@@ -3954,6 +4019,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(routing.route(&flow), Some("block"));
         assert_eq!(
@@ -4027,6 +4093,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(
             routing.route_with(&flow, &|_, _| vec!["10.1.2.3".parse().expect("ip")]),
@@ -4077,6 +4144,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(routing.route(&flow), Some("direct"));
         assert_eq!(
@@ -4128,6 +4196,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(routing.route(&flow), Some("direct"));
         assert_eq!(
@@ -4320,6 +4389,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: Some("http1"),
+            user: None,
         };
         assert_eq!(parsed.route(&named), Some("block"));
         let bare = Flow {
@@ -4331,8 +4401,64 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(parsed.route(&bare), Some("direct"));
+    }
+
+    /// A `user` rule names an account's email literally or as a `regexp:` pattern; a flow without
+    /// an email never matches. An empty list is no selector, while a list whose entries are all
+    /// empty or invalid patterns is a matcher that matches nothing — the reference's split.
+    #[test]
+    fn a_user_rule_matches_only_the_accounts_it_names() {
+        let user_rule = |names: Vec<Json>| {
+            object(vec![(
+                "routing",
+                routing(vec![
+                    rule("block", vec![("user", array(names))]),
+                    rule("direct", Vec::new()),
+                ]),
+            )])
+        };
+        let asked = |user: Option<&'static str>| Flow {
+            network: Network::Tcp,
+            domain: Some("x.com"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: None,
+            protocol: None,
+            user,
+        };
+
+        let parsed = Routing::parse_in(
+            &user_rule(vec![text("a@x"), text("regexp:^b@")]),
+            vec![dir()],
+        )
+        .expect("parses")
+        .expect("routing");
+        assert_eq!(parsed.route(&asked(Some("a@x"))), Some("block"));
+        assert_eq!(parsed.route(&asked(Some("b@y"))), Some("block"));
+        assert_eq!(parsed.route(&asked(Some("c@x"))), Some("direct"));
+        assert_eq!(parsed.route(&asked(None)), Some("direct"));
+        assert_eq!(parsed.route(&asked(Some(""))), Some("direct"));
+
+        let empty = Routing::parse_in(&user_rule(Vec::new()), vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(empty.route(&asked(Some("a@x"))), Some("block"));
+        assert_eq!(empty.route(&asked(None)), Some("block"));
+
+        let nothing = Routing::parse_in(&user_rule(vec![text(""), text("regexp:[")]), vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(
+            nothing.rules().len(),
+            2,
+            "a user matcher with no usable entry still survives"
+        );
+        assert_eq!(nothing.route(&asked(Some("a@x"))), Some("direct"));
     }
 
     #[test]
@@ -4359,6 +4485,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(parsed.route(&flow), Some("direct"));
         flow.port = Some(102);
@@ -4392,6 +4519,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(parsed.route(&flow), Some("direct"));
         flow.port = Some(100);
@@ -4462,6 +4590,16 @@ mod tests {
         routing
             .server_routes(Some("server"), false, direct)
             .expect("the tag's rule pins every flow to direct");
+        let by_user = root(vec![rule(
+            "proxy",
+            vec![("user", array(vec![text("a@x")]))],
+        )]);
+        let routing = Routing::parse_in(&by_user, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        routing
+            .server_routes(Some("server"), true, direct)
+            .expect("a server flow carries no account email for the rule to read");
         let proxy = root(vec![rule("proxy", vec![("port", number(443))])]);
         let routing = Routing::parse_in(&proxy, vec![dir()])
             .expect("parses")
@@ -4695,6 +4833,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, None);
@@ -4722,6 +4861,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("direct"));
@@ -4749,6 +4889,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("direct"));
@@ -4782,6 +4923,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("second"));
@@ -4812,6 +4954,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         let (tag, counts) = ferrox_core::alloc_count::measure(|| routing.route(&flow));
         assert_eq!(tag, Some("first"));
@@ -4842,6 +4985,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -4882,6 +5026,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         let lookups = std::cell::Cell::new(0);
         let tag = routing.route_with(&flow, &|_, _| {
@@ -4944,6 +5089,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(routing.route(&flow), Some("pool"));
     }
@@ -5131,6 +5277,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(
             parsed.route_target(&flow),

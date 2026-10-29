@@ -1363,8 +1363,9 @@ impl Outbound {
         asked: &Destination,
         network: crate::router::Network,
         client: Option<&Connection>,
+        user: Option<&str>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
-        self.resolved_lane_with_protocol(asked, network, client, None)
+        self.resolved_lane_with_protocol(asked, network, client, None, user)
     }
 
     fn resolved_lane_with_protocol(
@@ -1373,9 +1374,10 @@ impl Outbound {
         network: crate::router::Network,
         client: Option<&Connection>,
         protocol: Option<&str>,
+        user: Option<&str>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         match self {
-            Self::Route(plan) => plan.lane_with_protocol(asked, network, client, protocol),
+            Self::Route(plan) => plan.lane_with_protocol(asked, network, client, protocol, user),
             other => (Picked::Static(other), None),
         }
     }
@@ -1620,8 +1622,9 @@ impl RoutePlan {
         asked: &Destination,
         network: crate::router::Network,
         client: Option<&Connection>,
+        user: Option<&str>,
     ) -> Picked<'_> {
-        self.pick_with_protocol(asked, network, client, None)
+        self.pick_with_protocol(asked, network, client, None, user)
     }
 
     fn pick_with_protocol(
@@ -1630,8 +1633,10 @@ impl RoutePlan {
         network: crate::router::Network,
         client: Option<&Connection>,
         protocol: Option<&str>,
+        user: Option<&str>,
     ) -> Picked<'_> {
-        self.lane_with_protocol(asked, network, client, protocol).0
+        self.lane_with_protocol(asked, network, client, protocol, user)
+            .0
     }
 
     /// The outbound one flow takes and the tag that names its lane, or the default when no rule
@@ -1642,8 +1647,9 @@ impl RoutePlan {
         asked: &Destination,
         network: crate::router::Network,
         client: Option<&Connection>,
+        user: Option<&str>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
-        self.lane_with_protocol(asked, network, client, None)
+        self.lane_with_protocol(asked, network, client, None, user)
     }
 
     fn lane_with_protocol(
@@ -1652,6 +1658,7 @@ impl RoutePlan {
         network: crate::router::Network,
         client: Option<&Connection>,
         protocol: Option<&str>,
+        user: Option<&str>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         let (domain, ip) = match asked {
             Destination::Name(host, _) => (Some(host.as_str()), None),
@@ -1670,6 +1677,7 @@ impl RoutePlan {
             local,
             inbound_tag: self.inbound_tag.as_deref(),
             protocol,
+            user,
         };
         if let Some(script) = self.shared.routing.script() {
             let Some(callbacks) = self.shared.script.as_ref() else {
@@ -4515,7 +4523,7 @@ fn dns_outbound(
     match route {
         Some(shared) => {
             let plan = RoutePlan::new(shared, tag.map(str::to_owned), false);
-            Some(plan.pick(dest, network, None).clone())
+            Some(plan.pick(dest, network, None, None).clone())
         }
         None => outbound,
     }
@@ -4974,7 +4982,7 @@ impl BridgeLane {
 
     fn pick(&self, asked: &Destination, network: crate::router::Network) -> Option<Picked<'_>> {
         match &self.plan {
-            Some(plan) => Some(plan.pick(asked, network, None)),
+            Some(plan) => Some(plan.pick(asked, network, None, None)),
             None => self.fixed.as_ref().map(Picked::Static),
         }
     }
@@ -14973,20 +14981,26 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
         .account
         .as_ref()
         .map_or("", |account| account.email.as_str());
+    let user = (!email.is_empty()).then_some(email);
     if let Some(account) = &handshake.account {
         client = client
             .with_meter(crate::stats::user(&account.email, account.level))
             .with_policy(Some(crate::policy::flow(account.level)));
     }
     if handshake.cmd == 3 {
-        return serve_socks_udp(client, out);
+        return serve_socks_udp(client, out, user);
     }
     // The rules decide the lane first; a blocked flow is granted before it closes, so the front's reply is read.
     let destination = handshake.asked.authority();
     crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
     let first = match crate::sniff::current() {
         Some(sniffing) if sniffing.enabled() => None,
-        _ => Some(out.resolved_lane(&handshake.asked, crate::router::Network::Tcp, Some(&client))),
+        _ => Some(out.resolved_lane(
+            &handshake.asked,
+            crate::router::Network::Tcp,
+            Some(&client),
+            user,
+        )),
     };
     if !matches!(
         first.as_ref().map_or(out, |(lane, _)| &**lane),
@@ -15002,7 +15016,7 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
     }
     let (dial, out, tag) = match first {
         Some((lane, tag)) => (None, lane, tag),
-        None => sniff_lane(out, &handshake.asked, &client),
+        None => sniff_lane(out, &handshake.asked, &client, user),
     };
     let asked = dial.as_ref().unwrap_or(&handshake.asked);
     serve_connect(client, &out, asked, Front::Socks, &[], tag.as_deref());
@@ -15019,7 +15033,7 @@ pub(crate) fn serve_device_flow(
     out: &Outbound,
     dest: &Destination,
 ) -> std::io::Result<()> {
-    let (dial, lane, tag) = sniff_lane(out, dest, &client);
+    let (dial, lane, tag) = sniff_lane(out, dest, &client, None);
     let dest = dial.as_ref().unwrap_or(dest);
     let ((), dial_report) = observe_dial(|| {
         serve_connect(client, &lane, dest, Front::Socks, &[], tag.as_deref());
@@ -15194,17 +15208,18 @@ fn sniff_lane<'a>(
     out: &'a Outbound,
     asked: &Destination,
     client: &Connection,
+    user: Option<&str>,
 ) -> (
     Option<Destination>,
     Picked<'a>,
     Option<std::borrow::Cow<'a, str>>,
 ) {
     let Some(sniffing) = crate::sniff::current() else {
-        let (lane, tag) = out.resolved_lane(asked, crate::router::Network::Tcp, Some(client));
+        let (lane, tag) = out.resolved_lane(asked, crate::router::Network::Tcp, Some(client), user);
         return (None, lane, tag);
     };
     let Some(found) = sniffing.inspect(asked, crate::router::Network::Tcp, client) else {
-        let (lane, tag) = out.resolved_lane(asked, crate::router::Network::Tcp, Some(client));
+        let (lane, tag) = out.resolved_lane(asked, crate::router::Network::Tcp, Some(client), user);
         return (None, lane, tag);
     };
     let route = found
@@ -15220,6 +15235,7 @@ fn sniff_lane<'a>(
         crate::router::Network::Tcp,
         Some(client),
         Some(found.protocol),
+        user,
     );
     (dial, resolved, tag)
 }
@@ -16211,6 +16227,7 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
     let email = account
         .as_ref()
         .map_or("", |account| account.email.as_str());
+    let user = (!email.is_empty()).then_some(email);
     drop_header(&mut head, "proxy-authorization");
     let Some(request) = http_proxy_request(head) else {
         return;
@@ -16221,7 +16238,12 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
             crate::accesslog::record(client.peer_addr().ok(), true, &destination, None, "", email);
             let first = match crate::sniff::current() {
                 Some(sniffing) if sniffing.enabled() => None,
-                _ => Some(out.resolved_lane(&asked, crate::router::Network::Tcp, Some(&client))),
+                _ => Some(out.resolved_lane(
+                    &asked,
+                    crate::router::Network::Tcp,
+                    Some(&client),
+                    user,
+                )),
             };
             if !matches!(
                 first.as_ref().map_or(out, |(lane, _)| &**lane),
@@ -16232,7 +16254,7 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
             }
             let (dial, out, tag) = match first {
                 Some((lane, tag)) => (None, lane, tag),
-                None => sniff_lane(out, &asked, &client),
+                None => sniff_lane(out, &asked, &client, user),
             };
             let asked = dial.as_ref().unwrap_or(&asked);
             serve_connect(client, &out, asked, Front::Http, &[], tag.as_deref());
@@ -16245,6 +16267,7 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                 crate::router::Network::Tcp,
                 Some(&client),
                 Some("http/1.1"),
+                user,
             );
             serve_connect(client, &out, &asked, Front::Http, &origin, tag.as_deref());
         }
@@ -16411,10 +16434,10 @@ fn socks_udp_relay(client: &mut Connection) -> Option<UdpSocket> {
     Some(relay)
 }
 
-fn serve_socks_udp(client: Connection, out: &Outbound) {
+fn serve_socks_udp(client: Connection, out: &Outbound, user: Option<&str>) {
     if let Outbound::Route(plan) = out {
         if plan.split_udp() || crate::sniff::current().is_some_and(|sniffing| sniffing.enabled()) {
-            return serve_socks_udp_split(client, plan);
+            return serve_socks_udp_split(client, plan, user);
         }
         if let Ok(target) = plan.udp_out() {
             return serve_socks_udp_lane(client, &target);
@@ -16611,7 +16634,7 @@ struct UdpLane {
     handle: thread::JoinHandle<()>,
 }
 
-fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan) {
+fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan, user: Option<&str>) {
     let Some(relay) = socks_udp_relay(&mut client) else {
         return;
     };
@@ -16650,8 +16673,13 @@ fn serve_socks_udp_split(mut client: Connection, plan: &RoutePlan) {
             }
         }
         client_addr = Some(src);
-        let (out, key) =
-            plan.lane_with_protocol(&route, crate::router::Network::Udp, Some(&client), protocol);
+        let (out, key) = plan.lane_with_protocol(
+            &route,
+            crate::router::Network::Udp,
+            Some(&client),
+            protocol,
+            user,
+        );
         let key = key.map(std::borrow::Cow::into_owned);
         if matches!(&*out, Outbound::Block(_)) {
             continue;
@@ -25099,7 +25127,7 @@ mod tests {
         let asked = Destination::Name("example.test".to_owned(), 443);
         let lane = |plan: &RoutePlan| {
             matches!(
-                &*plan.pick(&asked, crate::router::Network::Tcp, None),
+                &*plan.pick(&asked, crate::router::Network::Tcp, None, None),
                 Outbound::Freedom(_)
             )
         };
@@ -25107,14 +25135,14 @@ mod tests {
         assert!(shared.add_outbound("alt", freedom()).is_err());
         shared.remove_outbound("alt");
         assert!(matches!(
-            &*plan.pick(&asked, crate::router::Network::Tcp, None),
+            &*plan.pick(&asked, crate::router::Network::Tcp, None, None),
             Outbound::Block(_)
         ));
         assert!(shared.add_outbound("alt", freedom()).is_ok());
         assert!(lane(&plan));
         shared.remove_outbound("alt");
         assert!(matches!(
-            &*plan.pick(&asked, crate::router::Network::Tcp, None),
+            &*plan.pick(&asked, crate::router::Network::Tcp, None, None),
             Outbound::Block(_)
         ));
         assert!(shared.add_outbound("alt", freedom()).is_ok());
@@ -46785,14 +46813,14 @@ end
             panic!("the config is routed");
         };
         let blocked = Destination::Name("blocked.test".to_owned(), 80);
-        let (picked, tag) = plan.lane(&blocked, crate::router::Network::Tcp, None);
+        let (picked, tag) = plan.lane(&blocked, crate::router::Network::Tcp, None, None);
         assert_eq!(tag.as_deref(), Some("block"));
         assert!(matches!(&*picked, Outbound::Block(_)));
         let other = Destination::Name("other.test".to_owned(), 80);
-        let (_, tag) = plan.lane(&other, crate::router::Network::Tcp, None);
+        let (_, tag) = plan.lane(&other, crate::router::Network::Tcp, None, None);
         assert_eq!(tag.as_deref(), Some("direct"));
         let broken = Destination::Name("broken.test".to_owned(), 80);
-        let (picked, tag) = plan.lane(&broken, crate::router::Network::Tcp, None);
+        let (picked, tag) = plan.lane(&broken, crate::router::Network::Tcp, None, None);
         assert_eq!(tag, None);
         assert!(matches!(&*picked, Outbound::Block(_)));
     }
@@ -46930,6 +46958,50 @@ end
 
         let other = socks_front_with(route_outbound(config, Some("other"), true));
         let mut allowed = socks_tcp_client(other, echo_port);
+        allowed.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        allowed.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// The authenticated account's email is part of the flow: a `user` rule blocks that account
+    /// and leaves another account of the same front on the default lane.
+    #[test]
+    fn a_user_rule_reaches_only_the_account_it_names() {
+        let echo_port = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","user":["a@x"],"outboundTag":"block"}]}}"#;
+        let accounts = socks_accounts(
+            &crate::json::parse(
+                r#"{"settings":{"auth":"password","accounts":[
+                    {"user":"a","pass":"a","email":"a@x"},
+                    {"user":"b","pass":"b","email":"b@x"}]}}"#,
+            )
+            .expect("parses"),
+        );
+        let blocked_front =
+            socks_front_with_accounts(route_outbound(config, Some("in"), true), accounts.clone());
+        let mut blocked = socks_ask_with_credential(
+            blocked_front,
+            SocketAddr::from(([127, 0, 0, 1], echo_port)),
+            "a",
+            "a",
+        );
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            blocked.read(&mut buf).expect("closes"),
+            0,
+            "the account the rule names is blocked"
+        );
+
+        let allowed_front =
+            socks_front_with_accounts(route_outbound(config, Some("in"), true), accounts);
+        let mut allowed = socks_ask_with_credential(
+            allowed_front,
+            SocketAddr::from(([127, 0, 0, 1], echo_port)),
+            "b",
+            "b",
+        );
         allowed.write_all(b"ping").expect("writes");
         let mut back = [0u8; 4];
         allowed.read_exact(&mut back).expect("echoes");
@@ -47079,17 +47151,17 @@ end
         let asked = Destination::Name("echo.test".to_owned(), 443);
         assert!(
             matches!(
-                &*plan.pick(&asked, crate::router::Network::Tcp, None),
+                &*plan.pick(&asked, crate::router::Network::Tcp, None, None),
                 Outbound::Freedom(_)
             ),
             "candidates are ordered by tag, not by config order"
         );
         assert!(matches!(
-            &*plan.pick(&asked, crate::router::Network::Tcp, None),
+            &*plan.pick(&asked, crate::router::Network::Tcp, None, None),
             Outbound::Block(_)
         ));
         assert!(matches!(
-            &*plan.pick(&asked, crate::router::Network::Tcp, None),
+            &*plan.pick(&asked, crate::router::Network::Tcp, None, None),
             Outbound::Freedom(_)
         ));
 
@@ -47103,7 +47175,7 @@ end
         let Outbound::Route(plan) = &out else {
             panic!("a route plan");
         };
-        let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None);
+        let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None, None);
         assert!(matches!(&*picked, Outbound::Freedom(_)));
         assert_eq!(
             tag.as_deref(),
@@ -47127,7 +47199,7 @@ end
             panic!("a route plan");
         };
         let asked = Destination::Name("echo.test".to_owned(), 443);
-        let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None);
+        let (picked, tag) = plan.lane(&asked, crate::router::Network::Tcp, None, None);
         assert!(matches!(&*picked, Outbound::Freedom(_)));
         assert_eq!(tag.as_deref(), Some("pool"));
     }
@@ -47210,7 +47282,7 @@ end
         };
         let asked = Destination::Address("198.51.100.7:443".parse().expect("addr"));
         let (picked, counts) = ferrox_core::alloc_count::measure(|| {
-            plan.pick(&asked, crate::router::Network::Tcp, None)
+            plan.pick(&asked, crate::router::Network::Tcp, None, None)
         });
         assert!(matches!(&*picked, Outbound::Block(_)), "the rule decides");
         assert_eq!(counts.allocs, 0, "{counts:?}");
@@ -47230,7 +47302,7 @@ end
         };
         let asked = Destination::Name("example.test".to_owned(), 80);
         assert!(matches!(
-            &*plan.pick(&asked, crate::router::Network::Tcp, None),
+            &*plan.pick(&asked, crate::router::Network::Tcp, None, None),
             Outbound::Block(_)
         ));
     }
@@ -50170,7 +50242,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
                 .map(|bound| bound.port())
                 .unwrap_or_default();
             let dest = port_map.get(&port).unwrap_or(&dest);
-            let (dial, target, tag) = sniff_lane(&out, dest, &stream);
+            let (dial, target, tag) = sniff_lane(&out, dest, &stream, None);
             let dest = dial.as_ref().unwrap_or(dest);
             serve_connect(stream, &target, dest, Front::Socks, &[], tag.as_deref());
         }
@@ -50450,7 +50522,7 @@ mod accept_proxy_protocol_tests {
             .expect("connects")
             .with_peer("192.0.2.1:1234".parse().expect("source"));
         let asked = Destination::Address("192.0.2.9:80".parse().expect("target"));
-        let (_, tag) = plan.lane(&asked, crate::router::Network::Tcp, Some(&client));
+        let (_, tag) = plan.lane(&asked, crate::router::Network::Tcp, Some(&client), None);
         assert_eq!(tag.as_deref(), Some("pinned"));
     }
 

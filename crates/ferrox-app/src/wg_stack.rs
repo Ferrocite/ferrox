@@ -1503,6 +1503,7 @@ pub(crate) fn server_udp<T: Clone + Into<ToTunnel>>(
                 &Destination::Address(target),
                 crate::router::Network::Udp,
                 None,
+                None,
             )
             .into_owned(),
         other => other.clone(),
