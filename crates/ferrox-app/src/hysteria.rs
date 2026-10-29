@@ -2471,7 +2471,7 @@ mod tests {
         assert_eq!(escaped.allocs, 1, "an escape opens the one buffer it needs");
     }
 
-    /// The whole static answer over a real file: the path it builds, the one growth that path takes, and the file's own bytes are all a request pays.
+    /// The whole static answer over a real file adds only the path it builds and the one growth that path takes to the platform's own read, measured in the same process so an allocator that opens more for a file is a floor and not a budget.
     #[test]
     fn a_static_file_answer_opens_only_the_path_and_the_file() {
         let stamp = std::time::SystemTime::now()
@@ -2492,6 +2492,12 @@ mod tests {
             body: Vec::new(),
         };
         let root = dir.to_str().expect("ascii").to_owned();
+        // The floor is the platform's own file work on the path `serve_file` resolves, so the difference is this tree's buffers and nothing the standard library opens.
+        let file = dir.join("hello.txt");
+        let ((), floor) = ferrox_core::alloc_count::measure(|| {
+            let _ = std::hint::black_box(&file).is_dir();
+            std::hint::black_box(std::fs::read(std::hint::black_box(&file)).expect("reads"));
+        });
         let mut out = Vec::with_capacity(256);
         serve_file(&root, &request, &mut out);
         assert!(
@@ -2503,8 +2509,9 @@ mod tests {
             serve_file(std::hint::black_box(&root), &request, &mut out);
         });
         assert_eq!(
-            counts.allocs, 3,
-            "the path buffer, its one growth, and the file's own bytes"
+            counts.allocs,
+            floor.allocs + 2,
+            "the path buffer and its one growth are all the answer adds to the platform's own read"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

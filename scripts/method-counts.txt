@@ -507,7 +507,7 @@ carrier-hysteria masquerade-file-bytes-served 1 ferrox-app-proxy::tests::hysteri
 carrier-hysteria masquerade-file-type-allocations 0 ferrox-core-hysteria::tests::a_static_files_type_is_decided_without_an_allocation
 carrier-hysteria masquerade-chunked-dechunk-allocations 1 ferrox-core-hysteria::tests::a_chunked_body_deframes_into_one_buffer
 carrier-hysteria masquerade-path-decode-allocations 0 ferrox-app-hysteria::tests::a_path_with_no_escape_is_lent_back_undecoded
-carrier-hysteria masquerade-static-answer-allocations 3 ferrox-app-hysteria::tests::a_static_file_answer_opens_only_the_path_and_the_file
+carrier-hysteria masquerade-static-answer-allocations 2 ferrox-app-hysteria::tests::a_static_file_answer_opens_only_the_path_and_the_file
 carrier-hysteria masquerade-proxied-round-trips 1 ferrox-app-proxy::tests::hysteria_proxies_a_masquerade_request_to_an_origin
 carrier-hysteria masquerade-escapes-served 0 ferrox-app-proxy::tests::hysteria_refuses_a_masquerade_path_that_escalates_the_directory
 carrier-hysteria hop-port-set-expanded 4 ferrox-core-hysteria::tests::the_plan_expands_overlapping_ranges_into_one_sorted_set
