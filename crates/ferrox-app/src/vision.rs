@@ -16,6 +16,10 @@ const TLS_SERVER_HELLO: [u8; 3] = [0x16, 0x03, 0x03];
 const TLS_HANDSHAKE_START: [u8; 2] = [0x16, 0x03];
 const TLS_APPLICATION_DATA: [u8; 3] = [0x17, 0x03, 0x03];
 const TLS13_VERSIONS: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
+/// One per byte: subtracting these borrows through a zero byte, and the high
+/// bits it leaves are the only starts a six-byte compare is worth.
+const BYTE_ONES: u64 = 0x0101_0101_0101_0101;
+const BYTE_HIGHS: u64 = 0x8080_8080_8080_8080;
 const TLS_AES_128_CCM_8_SHA256: u16 = 0x1305;
 const SHORTEST_FRAME: usize = 21;
 /// A framed block is one Xray buffer: `buf.Size` (8192) less the uuid and header, which is where the reference reshapes a longer piece and where its reader refuses the frame.
@@ -152,6 +156,35 @@ fn feed_extent(fresh: &[u8], feed: &mut Feeding) {
     scan_extent(fresh, feed);
 }
 
+/// The one pattern the scan hunts, over eight bytes a turn: it opens with a zero
+/// byte, so a word's zero bytes are the only starts worth six more, and a server
+/// hello's scarce zeros leave a compare at a handful of offsets instead of at
+/// every one. Every offset the window form tested is still tested — the word
+/// rounds stop five bytes early so a start near a word's end keeps its six.
+fn supports_tls13(bytes: &[u8]) -> bool {
+    let mut at = 0;
+    while at + 13 <= bytes.len() {
+        let word = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or_default());
+        // a byte behind a zero borrows too, so a mark is a candidate, never an answer
+        let mut marks = word.wrapping_sub(BYTE_ONES) & !word & BYTE_HIGHS;
+        while marks != 0 {
+            let skip = (marks.trailing_zeros() >> 3) as usize;
+            marks &= marks - 1;
+            if bytes[at + skip..at + skip + 6] == TLS13_VERSIONS {
+                return true;
+            }
+        }
+        at += 8;
+    }
+    while at + 6 <= bytes.len() {
+        if bytes[at..at + 6] == TLS13_VERSIONS {
+            return true;
+        }
+        at += 1;
+    }
+    false
+}
+
 /// The scan target eats the extent in order; the pattern it hunts can straddle a
 /// boundary, and the span carries the evidence either way.
 fn scan_extent(fresh: &[u8], feed: &mut Feeding) {
@@ -167,11 +200,11 @@ fn scan_extent(fresh: &[u8], feed: &mut Feeding) {
         let mut cross = [0u8; 10];
         cross[..tell].copy_from_slice(&feed.span[held..feed.span_len]);
         cross[tell..tell + open].copy_from_slice(&fresh[..open]);
-        if cross[..tell + open].windows(6).any(|w| w == TLS13_VERSIONS) {
+        if supports_tls13(&cross[..tell + open]) {
             feed.found = true;
         }
     }
-    if share >= 6 && fresh[..share].windows(6).any(|w| w == TLS13_VERSIONS) {
+    if share >= 6 && supports_tls13(&fresh[..share]) {
         feed.found = true;
     }
     // the next boundary's evidence: the newest scanned bytes stay behind
@@ -781,10 +814,7 @@ impl Tls {
         }
         let scan = self.server_hello_left.min(bytes.len());
         self.server_hello_left = self.server_hello_left.saturating_sub(bytes.len());
-        if bytes[..scan]
-            .windows(TLS13_VERSIONS.len())
-            .any(|w| w == TLS13_VERSIONS)
-        {
+        if supports_tls13(&bytes[..scan]) {
             self.enable_xtls = self.cipher != TLS_AES_128_CCM_8_SHA256;
             self.budget = 0;
         } else if self.server_hello_left == 0 {
@@ -900,36 +930,26 @@ fn random_below(bound: u32) -> usize {
     usize::try_from(word % bound).unwrap_or(0)
 }
 
+/// A run of whole application-data records: one header compare and one length
+/// load per record, its body stepped over, and a zero-length record refused
+/// because a record with no body leaves the run nowhere to go.
 fn is_record_run(buf: &[u8]) -> bool {
     let mut at = 0;
-    let mut head = 5;
-    let mut left = 0;
     while at < buf.len() {
-        if head > 0 {
-            let byte = buf[at];
-            at += 1;
-            match head {
-                3..=5 => {
-                    if byte != TLS_APPLICATION_DATA[5 - head as usize] {
-                        return false;
-                    }
-                }
-                2 => left = usize::from(byte) << 8,
-                _ => left |= usize::from(byte),
-            }
-            head -= 1;
-        } else if left > 0 {
-            if buf.len() - at < left {
-                return false;
-            }
-            at += left;
-            left = 0;
-            head = 5;
-        } else {
+        let Some(head) = buf.get(at..at + 5) else {
+            return false;
+        };
+        if head[..3] != TLS_APPLICATION_DATA {
             return false;
         }
+        let left = usize::from(head[3]) << 8 | usize::from(head[4]);
+        at += 5;
+        if left == 0 || buf.len() - at < left {
+            return false;
+        }
+        at += left;
     }
-    head == 5 && left == 0
+    true
 }
 
 #[cfg(test)]
@@ -1216,6 +1236,89 @@ mod tests {
             link.tls.snapshot().enable_xtls,
             "the later fragment still selects Direct"
         );
+    }
+
+    /// The walk the scan replaced, kept as this run's other frame: the same 64 walks of the same
+    /// hello through `windows(6)`, the same pinned fold, so one ops job reports both frames and
+    /// only their difference is a claim about the scan.
+    #[test]
+    fn the_serial_version_scan_costs_the_same_answer() {
+        let hello = scan_probe();
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            let found = std::hint::black_box(&hello)
+                .windows(TLS13_VERSIONS.len())
+                .any(|window| window == TLS13_VERSIONS);
+            fold += u32::from(found);
+        }
+        assert_eq!(fold, 64, "the same 64 walks, six-byte window at a time");
+    }
+
+    /// The scan, and nothing else: 64 walks of one 512-byte hello whose extension sits in its own
+    /// last six bytes, so every round runs the whole length, the hello handed over opaquely so no
+    /// round is answered from the literal.
+    #[test]
+    fn the_word_version_scan_costs_the_scan_and_nothing_else() {
+        let hello = scan_probe();
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            fold += u32::from(supports_tls13(std::hint::black_box(&hello)));
+        }
+        assert_eq!(fold, 64, "64 walks of one hello, folded after each");
+    }
+
+    /// A hello no word's zero bytes answer early: the pattern is the last six bytes, so a round that
+    /// stopped early would fold a miss. Two zeros a word is the worst a real hello's length fields
+    /// and extension types put in one, and every one of them costs the candidate a compare.
+    fn scan_probe() -> Vec<u8> {
+        const NOISE: [u8; 8] = [0x9a, 0x00, 0x71, 0x2b, 0xb5, 0x0d, 0x00, 0xe1];
+        let mut hello = vec![0x16, 0x03, 0x03, 0x00, 0xf0, 0x02];
+        for i in 0..500usize {
+            hello.push(NOISE[i % NOISE.len()]);
+        }
+        hello.extend_from_slice(&TLS13_VERSIONS);
+        hello
+    }
+
+    /// Every start the window form tested is still tested: the pattern is spliced at each offset of
+    /// a hello, and each prefix that ends inside it is compared against `windows(6)` at the same
+    /// length, where the word rounds and the scalar tail meet.
+    #[test]
+    fn the_word_version_scan_finds_every_offset_the_window_found() {
+        const NOISE: [u8; 8] = [0x00, 0x2c, 0x71, 0x2b, 0xb5, 0x0d, 0x00, 0xe1];
+        let mut body = Vec::new();
+        for i in 0..600usize {
+            body.push(NOISE[i % NOISE.len()]);
+        }
+        assert!(!supports_tls13(&body), "the body alone holds no extension");
+        for at in 0..=body.len() {
+            let mut case = body[..at].to_vec();
+            case.extend_from_slice(&TLS13_VERSIONS);
+            case.extend_from_slice(&body[at..]);
+            assert!(supports_tls13(&case), "the pattern spliced at {at}");
+            for cut in at..at + 6 {
+                assert_eq!(
+                    supports_tls13(&case[..cut]),
+                    case[..cut]
+                        .windows(6)
+                        .any(|window| window == TLS13_VERSIONS),
+                    "cut {cut} of the pattern spliced at {at}"
+                );
+            }
+        }
+        for case in [
+            &b"\x00\x01\x00\x01\x00\x01"[..],
+            b"\x00\x00\x00\x00\x00\x00",
+            b"\x00\x2b\x00\x02\x03",
+            b"",
+            b"\x00",
+        ] {
+            assert_eq!(
+                supports_tls13(case),
+                case.windows(6).any(|window| window == TLS13_VERSIONS),
+                "{case:02x?}"
+            );
+        }
     }
 
     /// The scan budget is spent after the handshake; a steady read must not build the
@@ -1747,6 +1850,72 @@ mod tests {
         assert!(!is_record_run(&partial));
         assert!(!is_record_run(&[0x16, 0x03, 0x03, 0x00, 0x05, 0]));
         assert!(!is_record_run(&[0x17, 0x03, 0x04, 0x00, 0x01, 0]));
+    }
+
+    /// The header walk the five-byte steps replaced, kept as the reference: the same verdict on
+    /// every cut, corruption and refused record the run can hold.
+    fn serial_record_run(buf: &[u8]) -> bool {
+        let mut at = 0;
+        let mut head = 5;
+        let mut left = 0;
+        while at < buf.len() {
+            if head > 0 {
+                let byte = buf[at];
+                at += 1;
+                match head {
+                    3..=5 => {
+                        if byte != TLS_APPLICATION_DATA[5 - head as usize] {
+                            return false;
+                        }
+                    }
+                    2 => left = usize::from(byte) << 8,
+                    _ => left |= usize::from(byte),
+                }
+                head -= 1;
+            } else if left > 0 {
+                if buf.len() - at < left {
+                    return false;
+                }
+                at += left;
+                left = 0;
+                head = 5;
+            } else {
+                return false;
+            }
+        }
+        head == 5 && left == 0
+    }
+
+    #[test]
+    fn every_record_run_answers_as_the_byte_walk_did() {
+        let record = application_record();
+        let mut two = record.clone();
+        two.extend_from_slice(&record);
+        let mut corpus: Vec<Vec<u8>> = vec![
+            Vec::new(),
+            vec![0x17],
+            vec![0x17, 0x03],
+            vec![0x17, 0x03, 0x03, 0x00],
+            // a zero-length record is refused, wherever it sits
+            vec![0x17, 0x03, 0x03, 0x00, 0x00],
+            record.clone(),
+            two.clone(),
+        ];
+        // every cut of a two-record run: a short header, a short body, an exact end
+        for cut in 0..=two.len() {
+            corpus.push(two[..cut].to_vec());
+        }
+        // every single-byte corruption of a two-record run, at every offset
+        for at in 0..two.len() {
+            for byte in [0x00u8, 0x01, 0x02, 0x17, 0x03, 0xff] {
+                let mut case = two.clone();
+                case[at] = byte;
+                corpus.push(case);
+            }
+        }
+        for case in &corpus {
+            assert_eq!(is_record_run(case), serial_record_run(case), "{case:02x?}");
+        }
     }
 
     #[test]

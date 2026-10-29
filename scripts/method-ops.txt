@@ -80,6 +80,12 @@ vless  vless::tests::the_flow_decision_probe_costs_the_walk_and_nothing_else  fe
 xtls-vision  vision::tests::the_framing_switch_ends_the_staging  vision::Link::read_direct
 xtls-vision  vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else  vision::Linkferrox_app::vision::tests::Fake::pump
 xtls-vision  vless::tests::the_command_validator_probe_costs_the_match_and_nothing_else  ferrox_core::vless::VisionCommand::from_byte
+# The scan and the six-byte window it replaced, both under a probe over the same
+# 512-byte hello: one ops job reports both frames, and only their difference is a
+# claim about the scan.
+xtls-vision  vision::tests::the_word_version_scan_costs_the_scan_and_nothing_else  vision::supports_tls13
+xtls-vision  vision::tests::the_word_version_scan_costs_the_scan_and_nothing_else  vision::tests::the_word_version_scan_costs_the_scan_and_nothing_else
+xtls-vision  vision::tests::the_serial_version_scan_costs_the_same_answer  vision::tests::the_serial_version_scan_costs_the_same_answer
 carrier-foxy  foxy::loopback::the_http2_carrier_writes_one_literal_header_block_and_relays  foxy::read_frame
 carrier-foxy  foxy::loopback::the_h3_downlink_hands_the_caller_the_frame_without_staging_it  foxy::H3::read
 carrier-foxy  foxy::loopback::the_masque_carrier_opens_connect_udp_and_echoes_a_datagram  masque::datagram_encode
