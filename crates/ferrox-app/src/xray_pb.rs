@@ -2179,6 +2179,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     let mut local_ips = Vec::new();
     let mut local_ports = None;
     let mut local_os = Vec::new();
+    let mut users = Vec::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => {
@@ -2191,7 +2192,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
                 );
             }
             (2, 2) => domains.push(Json::Str(domain_rule(reader.bytes()?)?)),
-            (7, 2) => return Err(reader.uncarried("a user rule")),
+            (7, 2) => users.push(Json::Str(account_text(&mut reader)?)),
             (8, 2) => inbound_tags.push(Json::Str(account_text(&mut reader)?)),
             (9, 2) => return Err(reader.uncarried("a protocol rule")),
             (10, 2) => ips.push(Json::Str(ip_rule(reader.bytes()?)?)),
@@ -2229,6 +2230,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
         ("inboundTag", inbound_tags),
         ("localIP", local_ips),
         ("localOS", local_os),
+        ("user", users),
     ] {
         if !values.is_empty() {
             pairs.push((key, Json::Arr(values)));
@@ -5269,6 +5271,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(routing.route(&flow), Some("blocked"));
     }
@@ -5313,6 +5316,7 @@ mod tests {
             local: None,
             inbound_tag: None,
             protocol: None,
+            user: None,
         };
         assert_eq!(routing.route(&flow), Some("blocked"));
     }
@@ -5357,6 +5361,7 @@ mod tests {
         let rule = message(&[
             bytes_field(1, b"blocked"),
             bytes_field(2, &custom_domain),
+            bytes_field(7, b"a@x"),
             bytes_field(8, b"in"),
             bytes_field(10, &cidr),
             bytes_field(11, &source_cidr),
@@ -5403,6 +5408,7 @@ mod tests {
             Some(&[Json::Str("127.0.0.1/32".to_owned())][..])
         );
         assert_eq!(list("inboundTag"), Some(&[Json::Str("in".to_owned())][..]));
+        assert_eq!(list("user"), Some(&[Json::Str("a@x".to_owned())][..]));
         assert_eq!(list("localOS"), Some(&[Json::Str("linux".to_owned())][..]));
         assert_eq!(rule.get("network").and_then(Json::as_str), Some("tcp,udp"));
         assert_eq!(rule.get("port").and_then(Json::as_str), Some("80"));

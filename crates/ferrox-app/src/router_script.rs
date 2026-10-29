@@ -131,6 +131,7 @@ struct ScriptContext {
     domain: String,
     network: i64,
     protocol: String,
+    user: String,
 }
 
 impl ScriptRouter {
@@ -225,6 +226,7 @@ impl ScriptRouter {
                 Network::Udp => NETWORK_UDP,
             },
             protocol: flow.protocol.unwrap_or("").to_owned(),
+            user: flow.user.unwrap_or("").to_owned(),
         };
         state.hooks.set(callbacks);
         let guard = ClearOnDrop(&state.hooks);
@@ -282,6 +284,7 @@ fn call(lua: &Lua, context: ScriptContext) -> Result<Option<String>, String> {
         domain,
         network,
         protocol,
+        user,
     } = context;
     let context = lua
         .create_userdata(ContextUser {
@@ -301,7 +304,7 @@ fn call(lua: &Lua, context: ScriptContext) -> Result<Option<String>, String> {
             domain,
             network,
             protocol,
-            String::new(),
+            user,
             0,
             false,
         ))
@@ -1105,6 +1108,7 @@ mod tests {
             local: None,
             inbound_tag: Some("in"),
             protocol: Some("http/1.1"),
+            user: Some("a@x"),
         }
     }
 
@@ -1115,11 +1119,12 @@ mod tests {
             dir.join("route.lua"),
             r#"
 local router = require("xray.router")
-function HandleRoute(ctx, inbound, sourcePort, targetPort, localPort, targetDomain, network, protocol)
+function HandleRoute(ctx, inbound, sourcePort, targetPort, localPort, targetDomain, network, protocol, user)
   if inbound ~= "in" or targetDomain ~= "blocked.test" or targetPort ~= 443 then
     return nil
   end
   if network ~= router.NetworkTCP then return nil end
+  if user ~= "a@x" then return nil end
   return router.PickOutbound("proxy"), "scripted"
 end
 "#,
