@@ -653,6 +653,7 @@ struct Rule {
     local_ips: Option<IpMatcher>,
     protocols: Option<Vec<String>>,
     users: Option<UserSelector>,
+    vless_routes: Option<PortSet>,
     sets: Option<Vec<Arc<RuleSet>>>,
 }
 
@@ -1030,8 +1031,8 @@ impl Routing {
             if !rule.reachable(inbound, Network::Tcp) || !rule.local_os_matches() {
                 continue;
             }
-            // A server inbound's flow carries no account email, so a `user` rule cannot match it.
-            if rule.users.is_some() {
+            // A server inbound never evaluates a rule and reads no sent route id, so neither selector can match.
+            if rule.users.is_some() || rule.vless_routes.is_some() {
                 continue;
             }
             if !direct(&rule.target, rule.balancer) {
@@ -1183,6 +1184,7 @@ impl Rule {
         let mut local_ips = None;
         let mut protocols = None;
         let mut users = None;
+        let mut vless_routes = None;
         let mut rule_sets = None;
         let mut unread = None;
         for (key, field) in pairs {
@@ -1219,13 +1221,14 @@ impl Rule {
                 "user" => {
                     users = string_list(field, "user")?.map(|names| UserSelector::parse(&names));
                 }
+                "vlessRoute" => vless_routes = port_set(field, "vlessRoute")?,
                 "ruleSet" | "rule_set" => {
                     rule_sets = Some(
                         string_list(field, "ruleSet")?
                             .ok_or_else(|| "routing ruleSet is empty".to_owned())?,
                     );
                 }
-                "attrs" | "vlessRoute" | "process" | "webhook" => {
+                "attrs" | "process" | "webhook" => {
                     unread = Some(key);
                 }
                 other => return Err(format!("routing rule field `{other}` is not carried")),
@@ -1276,6 +1279,7 @@ impl Rule {
             local_ips,
             protocols,
             users,
+            vless_routes,
             sets: rule_sets,
         }))
     }
@@ -1291,6 +1295,10 @@ impl Rule {
             && self.local_ips.is_none()
             && self.protocols.is_none()
             && self.users.is_none()
+            && self
+                .vless_routes
+                .as_ref()
+                .is_none_or(|routes| routes.contains(0))
             && self.sets.is_none()
     }
 
@@ -1398,6 +1406,12 @@ impl Rule {
         }
         if let Some(users) = &self.users {
             if !users.matches(flow.user) {
+                return false;
+            }
+        }
+        // No flow this tree routes carries a sent route id, so it reads 0 as xray's does off a non-vless inbound.
+        if let Some(routes) = &self.vless_routes {
+            if !routes.contains(0) {
                 return false;
             }
         }
@@ -4459,6 +4473,51 @@ mod tests {
             "a user matcher with no usable entry still survives"
         );
         assert_eq!(nothing.route(&asked(Some("a@x"))), Some("direct"));
+    }
+
+    /// A `vlessRoute` rule matches the route id a vless client sent, and every flow this tree routes
+    /// reads 0, as xray's context does off a non-vless inbound: a list holding 0 fires on all of them.
+    #[test]
+    fn a_vless_route_rule_reads_the_zero_a_routed_flow_carries() {
+        let route_rule = |routes: Json| {
+            object(vec![(
+                "routing",
+                routing(vec![
+                    rule("block", vec![("vlessRoute", routes)]),
+                    rule("direct", Vec::new()),
+                ]),
+            )])
+        };
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("x.com"),
+            ip: None,
+            port: Some(443),
+            source: None,
+            local: None,
+            inbound_tag: Some("in"),
+            protocol: None,
+            user: None,
+        };
+        let parse = |routes: Json| {
+            Routing::parse_in(&route_rule(routes), vec![dir()])
+                .expect("parses")
+                .expect("routing")
+        };
+        let zero = parse(text("0"));
+        assert_eq!(zero.route(&flow), Some("block"));
+        assert_eq!(zero.udp_tag(Some("in"), Some("direct")), Ok(Some("block")));
+        let other = parse(text("7"));
+        assert_eq!(other.route(&flow), Some("direct"));
+        let ranged = parse(array(vec![text("0-3")]));
+        assert_eq!(ranged.route(&flow), Some("block"));
+        let empty = parse(array(Vec::new()));
+        assert_eq!(
+            empty.rules().len(),
+            2,
+            "an empty route list is a matcher that matches nothing, not a skipped rule"
+        );
+        assert_eq!(empty.route(&flow), Some("direct"));
     }
 
     #[test]

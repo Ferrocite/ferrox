@@ -2180,6 +2180,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     let mut local_ports = None;
     let mut local_os = Vec::new();
     let mut users = Vec::new();
+    let mut vless_routes = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => {
@@ -2211,7 +2212,7 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
             (17, 2) => local_ips.push(Json::Str(ip_rule(reader.bytes()?)?)),
             (18, 2) => local_ports = Some(port_selector(reader.bytes()?)?),
             (19, 2) => rule_tag = Some(account_text(&mut reader)?),
-            (20, 2) => return Err(reader.uncarried("a vless route list")),
+            (20, 2) => vless_routes = Some(port_selector(reader.bytes()?)?),
             (21, 2) => return Err(reader.uncarried("a process rule")),
             (22, 2) => return Err(reader.uncarried("a webhook")),
             (23, 2) => local_os.push(Json::Str(account_text(&mut reader)?)),
@@ -2252,6 +2253,9 @@ fn router_rule(bytes: &[u8]) -> Result<Json, String> {
     }
     if let Some(local_ports) = local_ports {
         pairs.push(("localPort", Json::Str(local_ports)));
+    }
+    if let Some(vless_routes) = vless_routes {
+        pairs.push(("vlessRoute", Json::Str(vless_routes)));
     }
     Ok(object(pairs))
 }
@@ -5371,6 +5375,7 @@ mod tests {
             bytes_field(17, &local_cidr),
             bytes_field(18, &port(443, 443)),
             bytes_field(19, b"r"),
+            bytes_field(20, &port(0, 0)),
             bytes_field(23, b"linux"),
         ]);
         let router = message(&[bytes_field(2, &rule)]);
@@ -5418,6 +5423,7 @@ mod tests {
         );
         assert_eq!(rule.get("localPort").and_then(Json::as_str), Some("443"));
         assert_eq!(rule.get("ruleTag").and_then(Json::as_str), Some("r"));
+        assert_eq!(rule.get("vlessRoute").and_then(Json::as_str), Some("0"));
         crate::router::Routing::parse(&json)
             .expect("parses")
             .expect("routing");
