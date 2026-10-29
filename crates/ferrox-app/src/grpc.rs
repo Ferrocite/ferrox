@@ -68,6 +68,7 @@ struct Shared {
     max_frame: Mutex<usize>,
     init: Mutex<u64>,
     ended: AtomicBool,
+    upload_ended: AtomicBool,
     dead: AtomicBool,
     pong: AtomicU64,
 }
@@ -79,6 +80,7 @@ impl std::fmt::Debug for Shared {
             .field("max_frame", &self.max_frame)
             .field("init", &self.init)
             .field("ended", &self.ended)
+            .field("upload_ended", &self.upload_ended)
             .field("dead", &self.dead)
             .field("pong", &self.pong)
             .finish_non_exhaustive()
@@ -982,6 +984,9 @@ impl GrpcWriter {
     /// pays for, so it is taken whole: a half-sent one cannot be offered again without duplicating
     /// the half the peer already has.
     fn try_send(&self, data: &[u8]) -> crate::proxy::Push {
+        if self.shared.dead.load(Ordering::SeqCst) {
+            return crate::proxy::Push::Lost;
+        }
         let max = self.max_frame().max(1);
         // A frame width below two cannot keep one message in one batch, so a peer that asks for it gets the blocking writer.
         if max < 2 {
@@ -1070,8 +1075,25 @@ impl GrpcWriter {
         }
     }
 
+    pub(crate) fn upload_done(&self) {
+        if self.shared.dead.load(Ordering::SeqCst)
+            || self.shared.ended.load(Ordering::SeqCst)
+            || self.shared.upload_ended.swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        let mut batch = Gather::new();
+        self.message(&[], self.max_frame(), true, &mut batch);
+        if batch.flush_blocking(&self.shared) {
+            let _ = Gather::settle_blocking(&self.shared);
+        }
+    }
+
     pub(crate) fn close(&self) {
         if self.shared.ended.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if self.shared.upload_ended.load(Ordering::SeqCst) {
             return;
         }
         let mut batch = Gather::new();
@@ -1452,6 +1474,7 @@ fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
         max_frame: Mutex::new(16_384),
         init: Mutex::new(65_535),
         ended: AtomicBool::new(false),
+        upload_ended: AtomicBool::new(false),
         dead: AtomicBool::new(false),
         pong: AtomicU64::new(0),
     })
@@ -1743,6 +1766,10 @@ impl crate::proxy::CarrierSink for GrpcWriter {
     #[inline]
     fn close(&self) {
         self.close();
+    }
+    #[inline]
+    fn upload_done(&self) {
+        self.upload_done();
     }
 }
 
@@ -2397,6 +2424,31 @@ mod tests {
         assert_ne!(peer.lock().unwrap().writes.len(), 0);
     }
 
+    /// A reader that has already ended loses the next push instead of parking the forward lane on a
+    /// window the dead peer will never raise.
+    #[test]
+    fn a_dead_reader_loses_the_forward_push() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, u64::MAX);
+        writer.shared.dead.store(true, Ordering::SeqCst);
+        assert!(matches!(writer.try_send(b"ping"), crate::proxy::Push::Lost));
+        assert!(
+            peer.lock().unwrap().writes.is_empty(),
+            "a dead reader took bytes"
+        );
+    }
+
+    /// The client half-close sends the gRPC end marker once; the later full close does not repeat it.
+    #[test]
+    fn upload_done_ends_the_request_once() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, u64::MAX);
+        writer.upload_done();
+        writer.close();
+        let peer = peer.lock().unwrap();
+        assert_eq!(peer.writes.concat(), frame(T_DATA, F_END, 1, &message(b"")));
+    }
+
     /// The gathered batch reaches the peer before its own credit parks the writer: a peer grants for
     /// bytes it has seen, so frames held in a batch cannot wait behind the window they are the thing
     /// that would raise. The witness is a write seen while the thread is still inside `send` — with the
@@ -2731,6 +2783,7 @@ mod tests {
                         max_frame: Mutex::new(max),
                         init: Mutex::new(u64::from(WINDOW)),
                         ended: AtomicBool::new(false),
+                        upload_ended: AtomicBool::new(false),
                         dead: AtomicBool::new(false),
                         pong: AtomicU64::new(0),
                     });
