@@ -1821,10 +1821,20 @@ impl RoutePlan {
         network: crate::router::Network,
         client: Option<&Connection>,
     ) -> Option<crate::process::Owner> {
+        self.process_owner_at(network, client.and_then(|client| client.socket_peer().ok()))
+    }
+
+    /// The same lookup for a flow whose source is a datagram sender rather than the control
+    /// socket it rides: a split association's TCP port names no UDP socket.
+    fn process_owner_at(
+        &self,
+        network: crate::router::Network,
+        peer: Option<SocketAddr>,
+    ) -> Option<crate::process::Owner> {
         if !self.source_known || !self.shared.routing.wants_process() {
             return None;
         }
-        crate::process::owner(network, client?.socket_peer().ok()?)
+        crate::process::owner(network, peer?)
     }
 
     fn lane_with_protocol(
@@ -17165,7 +17175,7 @@ fn serve_socks_udp_split(
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-    let process = plan.process_owner(crate::router::Network::Udp, Some(&client));
+    let mut owners: HashMap<SocketAddr, Option<crate::process::Owner>> = HashMap::new();
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         if replies.contains_key(&src) {
             if let Some(client) = client_addr {
@@ -17194,6 +17204,12 @@ fn serve_socks_udp_split(
             }
         }
         client_addr = Some(src);
+        if owners.len() >= 64 {
+            owners.clear();
+        }
+        let process = owners
+            .entry(src)
+            .or_insert_with(|| plan.process_owner_at(crate::router::Network::Udp, Some(src)));
         let (out, key) = plan.lane_with_protocol(
             &route,
             crate::router::Network::Udp,
@@ -25672,6 +25688,65 @@ mod tests {
             .expect("the real socket belongs to this process");
         assert_eq!(owner.pid, std::process::id());
         drop(client);
+    }
+
+    /// A split association's `process` lookup follows the datagram's sender, not the TCP control
+    /// port: the control port names no UDP socket, so `self/` must still block its datagrams.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_split_association_reads_the_process_from_the_datagram_sender() {
+        let _guard = budgets::lock();
+        budgets::apply(&crate::config::Budgets {
+            udp_idle: Some(Duration::from_secs(2)),
+            ..Default::default()
+        });
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"default","protocol":"freedom"},{"tag":"blocked","protocol":"blackhole"}],"routing":{"rules":[{"type":"field","network":"udp","process":["self/"],"outboundTag":"blocked"}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = Arc::new(crate::reverse::Portals::default());
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let plan = RoutePlan::new(Arc::clone(&shared), None, None, true);
+        assert!(plan.split_udp(), "a process rule splits the association");
+        let (associate, mut peer) = association_pair();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let serving = thread::spawn(move || {
+            serve_socks_udp_split(associate, &plan, None, None);
+            let _ = done_tx.send(());
+        });
+        let mut reply = [0u8; 10];
+        peer.read_exact(&mut reply).expect("the relay address");
+        assert_eq!(&reply[..3], &[5, 0, 0]);
+        assert_eq!(reply[3], 1, "an IPv4 relay");
+        let relay = SocketAddr::from((
+            [reply[4], reply[5], reply[6], reply[7]],
+            u16::from_be_bytes([reply[8], reply[9]]),
+        ));
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        echo.set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("timeout");
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut datagram = Vec::new();
+        socks_udp_frame(
+            &mut datagram,
+            None,
+            &echo.local_addr().expect("addr"),
+            b"self",
+        );
+        sender.send_to(&datagram, relay).expect("sends");
+        assert!(
+            echo.recv_from(&mut [0u8; 16]).is_err(),
+            "a self-owned sender is blocked, not relayed"
+        );
+        drop(peer);
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the association ends");
+        budgets::clear();
+        serving.join().expect("joins");
     }
 
     #[test]
