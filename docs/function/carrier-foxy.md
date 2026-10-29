@@ -225,10 +225,10 @@ This lane does not need a bundled root. The pin replaces **who signed the leaf**
   foxy::tests::the_serial_terminator_walk_costs_the_same_answer \
   'ferrox_core::foxy::tests::the_serial_terminator_walk_costs_the_same_answer'
 ./scripts/count-ops.sh report \
-  connectip::tests::the_word_sum_costs_the_words_it_reads \
+  foxy::connectip::tests::the_word_sum_costs_the_words_it_reads \
   'ferrox_core::foxy::connectip::tests::the_word_sum_costs_the_words_it_reads'
 ./scripts/count-ops.sh report \
-  connectip::tests::the_serial_word_sum_costs_the_same_answer \
+  foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer \
   'ferrox_core::foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer'
 ```
 
