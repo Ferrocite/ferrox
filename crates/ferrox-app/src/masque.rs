@@ -1442,16 +1442,18 @@ fn demux(
         let Ok((n, from)) = sock.recv_from(&mut buf) else {
             continue;
         };
-        let (kind, dcid) = {
+        let (kind, queued, dcid) = {
             let Ok(head) = quiche::Header::from_slice(&mut buf[..n], CID_LEN) else {
                 continue;
             };
-            (head.ty, head.dcid.to_vec())
+            let queued = routes
+                .lock()
+                .ok()
+                .and_then(|table| table.get(head.dcid.as_ref()).map(|(_, tx)| tx.clone()));
+            let dcid =
+                (queued.is_none() && head.ty == quiche::Type::Initial).then(|| head.dcid.to_vec());
+            (head.ty, queued, dcid)
         };
-        let queued = routes
-            .lock()
-            .ok()
-            .and_then(|table| table.get(&dcid).map(|(_, tx)| tx.clone()));
         if let Some(tx) = queued {
             let _ = tx.send(Arrival::Datagram(buf[..n].to_vec(), from));
             continue;
@@ -1459,6 +1461,9 @@ fn demux(
         if kind != quiche::Type::Initial {
             continue;
         }
+        let Some(dcid) = dcid else {
+            continue;
+        };
         let mut scid = [0u8; CID_LEN];
         if getrandom::fill(&mut scid).is_err() {
             continue;
@@ -1524,6 +1529,7 @@ struct Tunnel {
     queue: TunnelQueue,
     addrs: Vec<IpAddr>,
     granted: Option<Granted>,
+    registered: Vec<Vec<u8>>,
 }
 
 fn sweep_due_timer(conn: &mut quiche::Connection) {
@@ -1561,6 +1567,7 @@ fn worker(
         queue: TunnelQueue::new(sender, Some(tx.clone())),
         addrs: Vec::new(),
         granted: None,
+        registered: Vec::new(),
     };
     loop {
         if conn.is_closed() {
@@ -1613,9 +1620,19 @@ fn worker(
                 }
             }
         }
-        if let Ok(mut table) = routes.lock() {
-            for id in conn.source_ids() {
-                table.insert(id.to_vec(), (worker_id, tx.clone()));
+        let mut fresh = Vec::new();
+        for id in conn.source_ids() {
+            let id: &[u8] = id.as_ref();
+            if !tunnel.registered.iter().any(|known| known.as_slice() == id) {
+                fresh.push(id.to_vec());
+            }
+        }
+        if !fresh.is_empty() {
+            if let Ok(mut table) = routes.lock() {
+                for id in &fresh {
+                    table.insert(id.clone(), (worker_id, tx.clone()));
+                }
+                tunnel.registered.extend(fresh);
             }
         }
         quic::flush_egress(&mut conn, &sock);
