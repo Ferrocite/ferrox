@@ -1083,6 +1083,20 @@ proxy_mark_armed() {
   mv "$tmp" "$PROXY_STATE" || { rm -f "$tmp"; return 1; }
 }
 
+# networksetup rejects an empty PAC URL, so a service that had none keeps it.
+proxy_pac_restore() {
+  local svc="$1" url="$2" on="$3"
+  if [ "$url" != - ] && [ -n "$url" ]; then
+    networksetup -setautoproxyurl "$svc" "$url" 2>/dev/null || return 1
+  fi
+  networksetup -setautoproxystate "$svc" "$on" 2>/dev/null || return 1
+}
+
+proxy_service_exists() {
+  networksetup -listallnetworkservices 2>/dev/null | tail -n +2 |
+    sed 's/^\*//; s/^[[:space:]]*//' | grep -Fxq "$1"
+}
+
 proxy_restore_one() {
   local svc="$1" kind="$2" on="$3" server="$4" port="$5" auth="$6" set setstate
   case "$kind" in
@@ -1106,6 +1120,7 @@ proxy_restore_service() {
   IFS=$'\t' read -r armed svc s_on s_server s_port s_auth w_on w_server w_port w_auth \
     x_on x_server x_port x_auth p_on p_url a_on bypass <<< "$line"
   [ "$armed" = 1 ] || return 0
+  proxy_service_exists "$svc" || return 0
   proxy_restore_one "$svc" socks "$s_on" "$s_server" "$s_port" "$s_auth" ||
     { say "system proxy: could not restore SOCKS on '$svc'." >&2; rc=1; }
   proxy_restore_one "$svc" web "$w_on" "$w_server" "$w_port" "$w_auth" ||
@@ -1121,14 +1136,7 @@ proxy_restore_service() {
     networksetup -setproxybypassdomains "$svc" "${prior[@]}" 2>/dev/null ||
       { say "system proxy: could not restore the bypass list on '$svc'." >&2; rc=1; }
   fi
-  if [ "$p_url" != - ]; then
-    networksetup -setautoproxyurl "$svc" "$p_url" 2>/dev/null ||
-      { say "system proxy: could not restore the PAC URL on '$svc'." >&2; rc=1; }
-  else
-    networksetup -setautoproxyurl "$svc" "" 2>/dev/null ||
-      { say "system proxy: could not clear the PAC URL on '$svc'." >&2; rc=1; }
-  fi
-  networksetup -setautoproxystate "$svc" "$p_on" 2>/dev/null ||
+  proxy_pac_restore "$svc" "$p_url" "$p_on" ||
     { say "system proxy: could not restore the PAC state on '$svc'." >&2; rc=1; }
   networksetup -setproxyautodiscovery "$svc" "$a_on" 2>/dev/null ||
     { say "system proxy: could not restore auto discovery on '$svc'." >&2; rc=1; }
@@ -1185,11 +1193,6 @@ system_proxy_on() {
     fi
     if ! networksetup -setproxyautodiscovery "$svc" off 2>/dev/null; then
       say "system proxy: cannot disable auto discovery on '$svc'; clearing." >&2
-      system_proxy_off
-      return 1
-    fi
-    if ! networksetup -setautoproxyurl "$svc" "" 2>/dev/null; then
-      say "system proxy: cannot clear the PAC URL on '$svc'; clearing." >&2
       system_proxy_off
       return 1
     fi
@@ -1366,20 +1369,11 @@ system_proxy_off() {
     while IFS=$'\t' read -r svc pac_on pac_url auto_on bypass; do
       [ -z "$svc" ] && continue
       case "$svc" in *\**) continue ;; esac
+      proxy_service_exists "$svc" || continue
       [ "$pac_url" = - ] && pac_url=""
-      if [ -n "$pac_url" ]; then
-        networksetup -setautoproxyurl "$svc" "$pac_url" 2>/dev/null ||
-          { say "system proxy: could not restore the PAC URL on '$svc'." >&2; failed=1; }
-      else
-        networksetup -setautoproxyurl "$svc" "" 2>/dev/null ||
-          { say "system proxy: could not clear the PAC URL on '$svc'." >&2; failed=1; }
-      fi
-      if [ "$pac_on" = on ]; then
-        networksetup -setautoproxystate "$svc" on 2>/dev/null ||
-          { say "system proxy: could not restore the PAC state on '$svc'." >&2; failed=1; }
-      else
-        networksetup -setautoproxystate "$svc" off 2>/dev/null ||
-          { say "system proxy: could not clear the PAC state on '$svc'." >&2; failed=1; }
+      if ! proxy_pac_restore "$svc" "${pac_url:--}" "$pac_on"; then
+        say "system proxy: could not restore the PAC state on '$svc'." >&2
+        failed=1
       fi
       if [ "$auto_on" = on ]; then
         networksetup -setproxyautodiscovery "$svc" on 2>/dev/null ||

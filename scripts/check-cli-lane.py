@@ -150,6 +150,10 @@ case "$command" in
     echo "Enabled: $enabled"
     ;;
   -setautoproxyurl)
+    [ -n "${2:-}" ] || {
+      echo "** Error: The parameters were not valid." >&2
+      exit 4
+    }
     dir="$(directory "$1")"
     write "$dir" "${2:-}" pac-url
     write "$dir" yes pac-enabled
