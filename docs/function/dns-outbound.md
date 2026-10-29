@@ -1,7 +1,7 @@
 # The DNS outbound
 
 <!-- scope:begin -->
-- paths: -
+- paths: crates/ferrox-core/src/dns.rs
 - symbols: find_dns_outbound, build_dns_outbound, decode_dns_rules, decode_dns_rule, decode_dns_legacy, decode_dns_network, serve_dns_tcp, serve_dns_udp, dns_lookup, dial_dns, read_dns_source, answer_handle, write_dns_frame, send_dns_query, dns_lane_tests, the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 - go: ./proxy/dns/..., ./features/dns/...
 <!-- scope:end -->

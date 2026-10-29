@@ -251,37 +251,43 @@ std::thread_local! {
     static NAME_FOLDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The name a rule matches: borrowed when already lowercase, else folded once into the one stack buffer this owns — never once per rule.
+/// The name a rule matches: borrowed when already lowercase, else folded once into the one stack buffer this owns — never once per rule, and written where it lies, so a decide that folds pays no temporary to get it there.
 struct Fold<'q> {
+    looked: bool,
     borrowed: Option<&'q str>,
     folded: Option<([u8; NAME_MAX], usize)>,
 }
 
 impl<'q> Fold<'q> {
-    fn of(question: &'q Question) -> Self {
-        let mut fold = Self {
+    fn empty() -> Self {
+        Self {
+            looked: false,
             borrowed: None,
             folded: None,
-        };
+        }
+    }
+
+    /// Resolves the question's name into this fold, once for the whole rule list.
+    fn look(&mut self, question: &'q Question) {
+        self.looked = true;
         let name = question.name();
         let Some(matchable) = name.get(..name.len().saturating_sub(1)) else {
-            return fold;
+            return;
         };
         let Ok(text) = std::str::from_utf8(matchable) else {
-            return fold;
+            return;
         };
         if !text.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            fold.borrowed = Some(text);
-            return fold;
+            self.borrowed = Some(text);
+            return;
         }
         #[cfg(test)]
         NAME_FOLDS.with(|folds| folds.set(folds.get() + 1));
-        let mut bytes = [0u8; NAME_MAX];
+        let (bytes, len) = self.folded.get_or_insert_with(|| ([0u8; NAME_MAX], 0));
         let lower = &mut bytes[..text.len()];
         lower.copy_from_slice(text.as_bytes());
         lower.make_ascii_lowercase();
-        fold.folded = Some((bytes, text.len()));
-        fold
+        *len = text.len();
     }
 
     fn as_str(&self) -> Option<&str> {
@@ -298,18 +304,21 @@ impl Rule {
     /// it carries domains, the name the parse spelled — lowercased, trimmed
     /// of its trailing dot.
     pub fn applies(&self, question: &Question) -> bool {
-        let mut fold = None;
+        let mut fold = Fold::empty();
         self.applies_with(question, &mut fold)
     }
 
-    fn applies_with<'q>(&self, question: &'q Question, fold: &mut Option<Fold<'q>>) -> bool {
+    fn applies_with<'q>(&self, question: &'q Question, fold: &mut Fold<'q>) -> bool {
         if !self.qtypes.is_empty() && !self.qtypes.contains(&question.qtype) {
             return false;
         }
         let Some(domains) = &self.domains else {
             return true;
         };
-        let Some(name) = fold.get_or_insert_with(|| Fold::of(question)).as_str() else {
+        if !fold.looked {
+            fold.look(question);
+        }
+        let Some(name) = fold.as_str() else {
             return false;
         };
         domains.matches(name)
@@ -351,7 +360,7 @@ pub fn decide(message: &[u8], rules: &[Rule], lookup: &dyn Fn(&[u8]) -> Resolve)
         }
         Action::Direct => Step::Forward,
     };
-    let mut fold = None;
+    let mut fold = Fold::empty();
     for rule in rules {
         if rule.applies_with(&question, &mut fold) {
             return decision(rule.action, rule.rcode);
