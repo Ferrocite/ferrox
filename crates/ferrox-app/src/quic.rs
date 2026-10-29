@@ -714,10 +714,10 @@ fn flush_burst(conn: &mut quiche::Connection, sock: &Datagram) {
     }
 }
 
-/// One GSO datagram carries up to `SEND_SLOTS` full packets: the kernel cuts it at `MAX_DATAGRAM` before the wire,
-/// so a burst that was one `sendmmsg` with sixty-four headers becomes one `sendmsg` with one header and one control
-/// message. A batch that cannot be one GSO datagram — a short packet before the last, or a peer that moved — keeps
-/// the `sendmmsg` path.
+/// One GSO datagram carries up to `GSO_SEGMENTS` packets: the kernel cuts it at `MAX_DATAGRAM` before the wire, so
+/// a burst that was one `sendmmsg` with sixty-four headers becomes one `sendmsg` with one header and one control
+/// message. Every packet in the run goes to the same peer and every one but the last is a full `MAX_DATAGRAM`
+/// segment. A batch that cannot be one GSO datagram keeps the `sendmmsg` path.
 #[cfg(target_os = "linux")]
 fn send_batch(
     sock: &Datagram,
@@ -778,9 +778,9 @@ enum Gso {
     Unsupported,
 }
 
-/// One `sendmsg` with a `UDP_SEGMENT` control message. The packets are copied into one contiguous buffer because
-/// the kernel needs one segment run, and the copy is the price of the single syscall; the kernel still checksums and
-/// cuts every segment itself, so the bytes on the wire are the bytes `sendmmsg` would have written.
+/// One `sendmsg` with a `UDP_SEGMENT` control message: each packet is its own iovec, so the run costs one header and
+/// no copy, and the kernel cuts and checksums every segment itself. The bytes on the wire are the bytes `sendmmsg`
+/// would have written.
 #[cfg(target_os = "linux")]
 fn send_gso(
     sock: &Datagram,
@@ -891,8 +891,10 @@ fn send_mmsg(
     true
 }
 
-/// The datagrams one receive takes at a time, the mirror of the send side's `SEND_SLOTS`: a 16 KiB DATA frame is a dozen QUIC packets, and one `recvfrom` each paid a syscall and a timer set per packet. A lane with no batched call reads the same count one at a time.
-pub(crate) const RECV_SLOTS: usize = 64;
+/// The datagrams one receive takes at a time: sixteen coalesced slots are up to a thousand packets per call, and a
+/// plain peer still fills sixteen per call. A slot is a whole `GRO_ROOM` burst, so this count is the batch's memory
+/// and is kept apart from the segment cap. A lane with no batched call reads one datagram at a time.
+pub(crate) const RECV_SLOTS: usize = 16;
 
 /// The most segments one `UDP_GRO` datagram carries, a kernel constant independent of how many
 /// entries a batch reads per call.
@@ -1094,7 +1096,9 @@ impl Batch {
     }
 }
 
-/// How one batched read ended: `Read` is a batch the kernel filled, `Empty` is a queue with nothing in it, and `Unbatchable` is a lane whose read is a shape of its own.
+/// How one batched read ended: `Read` is a batch the kernel filled, `Empty` is a queue with nothing in it,
+/// `Unbatchable` is a lane whose read is a shape of its own, and `Unreadable` is a batchable lane whose batched read
+/// failed, so its single-datagram fallback must not run against a socket that still coalesces.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[allow(
     dead_code,
@@ -1104,6 +1108,7 @@ pub(crate) enum Drain {
     Read,
     Empty,
     Unbatchable,
+    Unreadable,
 }
 
 /// Every datagram the socket has queued, in at most `RECV_SLOTS` per call, read straight into the batch's own slots.
@@ -1144,25 +1149,33 @@ pub(crate) fn recv_batch(sock: &Datagram, batch: &mut Batch) -> Drain {
     // The timeout is the socket's own arm and not the call's. The first receive of a batch runs without `MSG_DONTWAIT`, so it waits exactly as long as a `recvfrom` on this socket waits — which is the `SO_RCVTIMEO` the lane armed — and the reads behind it carry `MSG_DONTWAIT`, so they take what is already queued and answer at once. A call's own deadline would have been checked only between the reads, never against the first one.
     //
     // SAFETY: every header names a slot of `batch`, a peer of `batch` and a part of `parts`, all of which outlive the call, and the kernel writes each slot only as far as the datagram it read.
-    let got = unsafe {
-        libc::recvmmsg(
-            sock.sock.as_raw_fd(),
-            headers.as_mut_ptr().cast::<libc::mmsghdr>(),
-            RECV_SLOTS as libc::c_uint,
-            libc::MSG_WAITFORONE as _,
-            std::ptr::null_mut(),
-        )
-    };
-    if got < 0 {
-        // A queue with nothing in it is the socket's own arm expiring, and the per-datagram read below would wait for it again: the batch is the answer, so the empty queue is its answer too.
+    let got = loop {
+        let got = unsafe {
+            libc::recvmmsg(
+                sock.sock.as_raw_fd(),
+                headers.as_mut_ptr().cast::<libc::mmsghdr>(),
+                RECV_SLOTS as libc::c_uint,
+                libc::MSG_WAITFORONE as _,
+                std::ptr::null_mut(),
+            )
+        };
+        if got >= 0 {
+            break got;
+        }
+        // A queue with nothing in it is the socket's own arm expiring: the empty batch is that answer.
         let error = std::io::Error::last_os_error();
         data.used = 0;
         data.len = 0;
-        return if error.kind() == std::io::ErrorKind::WouldBlock {
-            Drain::Empty
-        } else {
-            Drain::Unbatchable
-        };
+        match error.kind() {
+            // A signal between the call and the queue took no datagram: the next call waits the rest of the arm.
+            std::io::ErrorKind::Interrupted => {}
+            std::io::ErrorKind::WouldBlock => break -1,
+            // A failed read leaves a coalescing socket: a one-segment fallback would cut the next burst down to it.
+            _ => return Drain::Unreadable,
+        }
+    };
+    if got < 0 {
+        return Drain::Empty;
     }
     if got == 0 {
         data.used = 0;
@@ -1293,6 +1306,8 @@ pub(crate) fn pump_once(
                 return true;
             }
             Drain::Unbatchable => {}
+            // A socket that coalesces must not be read one segment wide.
+            Drain::Unreadable => return false,
         }
         match sock.recv_from(buf) {
             Ok((n, from)) => {
@@ -2911,6 +2926,8 @@ fn pump(
                 }
                 Err(_) => return,
             },
+            // A socket that coalesces must not be read one segment wide.
+            Drain::Unreadable => return,
         };
         ready.clear();
         {
@@ -3587,6 +3604,8 @@ pub(crate) fn serve_loop(
                 continue;
             }
             Drain::Unbatchable => {}
+            // A socket that coalesces must not be read one segment wide.
+            Drain::Unreadable => return,
         }
         match sock.recv_from(&mut scratch.buf) {
             Ok((n, from)) => {
@@ -4884,7 +4903,7 @@ mod tests {
                             }
                         }
                     }
-                    Drain::Empty => return out,
+                    Drain::Empty | Drain::Unreadable => return out,
                     Drain::Unbatchable => break,
                 }
             }

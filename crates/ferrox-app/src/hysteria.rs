@@ -311,6 +311,11 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
                     return false;
                 }
             },
+            // A socket that coalesces must not be read one segment wide.
+            crate::quic::Drain::Unreadable => {
+                std::thread::sleep(wait);
+                return false;
+            }
         }
         #[cfg(not(target_os = "linux"))]
         match session.sock.recv_from(room.as_mut()) {
@@ -388,7 +393,7 @@ fn take_queued(conn: &mut quiche::Connection, session: &Session) {
                 }
                 return;
             }
-            crate::quic::Drain::Empty => return,
+            crate::quic::Drain::Empty | crate::quic::Drain::Unreadable => return,
             crate::quic::Drain::Unbatchable => {}
         }
     }
@@ -2365,6 +2370,8 @@ pub(crate) fn serve_loop(
                 continue;
             }
             crate::quic::Drain::Unbatchable => {}
+            // A socket that coalesces must not be read one segment wide.
+            crate::quic::Drain::Unreadable => return,
         }
         match router.sock.recv_from(buf.as_mut()) {
             Ok((n, from)) => {
