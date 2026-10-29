@@ -765,16 +765,7 @@ fn serve_vless_inbound(
                 serve_vless_hysteria(flow, &users, freedom);
             });
             thread::spawn(move || {
-                crate::hysteria::serve_loop(
-                    &owned,
-                    &[config.auth],
-                    config.cc,
-                    &cert_path,
-                    &key_path,
-                    &config.obfs_password,
-                    &masq,
-                    &serve,
-                );
+                serve_hysteria_thread(&owned, &config, &cert_path, &key_path, &masq, &serve);
             });
             true
         }
@@ -827,6 +818,29 @@ fn serve_vless_inbound(
             true
         }
     }
+}
+
+/// The hysteria listener a vless inbound's carrier hands off to, carrying the same `udpIdleTimeout` and `quicParams` the stream named.
+fn serve_hysteria_thread(
+    address: &str,
+    config: &ferrox_core::hysteria::Config,
+    cert_path: &str,
+    key_path: &str,
+    masq: &ferrox_core::hysteria::Masquerade,
+    serve: &crate::hysteria::Serve,
+) {
+    crate::hysteria::serve_loop(
+        address,
+        std::slice::from_ref(&config.auth),
+        config.cc,
+        cert_path,
+        key_path,
+        &config.obfs_password,
+        masq,
+        serve,
+        std::time::Duration::from_secs(config.udp_idle),
+        config.quic.as_ref(),
+    );
 }
 
 thread_local! {
@@ -8240,6 +8254,27 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
         }
         obfs_password = password;
     }
+    let hy = stream
+        .get("hysteriaSettings")
+        .or_else(|| inbound.get("settings"));
+    let udp_idle = match crate::config::hysteria_udp_idle(hy) {
+        Ok(idle) => std::time::Duration::from_secs(idle),
+        Err(why) => {
+            eprintln!("hysteria inbound in {path}: udpIdleTimeout: {why}; serves nothing");
+            return false;
+        }
+    };
+    let quic = match crate::config::hysteria_quic_params(Some(stream)) {
+        Ok(quic) => quic,
+        Err(why) => {
+            eprintln!("hysteria inbound in {path}: quicParams: {why}; serves nothing");
+            return false;
+        }
+    };
+    let cc = quic
+        .as_ref()
+        .and_then(|params| params.cc)
+        .unwrap_or(ferrox_core::hysteria::Congestion::Bbr);
     let serve: crate::hysteria::Serve = Arc::new(move |flow| {
         serve_hysteria_flow(flow, freedom);
     });
@@ -8248,12 +8283,14 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
         crate::hysteria::serve_loop(
             &owned,
             &auths,
-            ferrox_core::hysteria::Congestion::Bbr,
+            cc,
             &cert_path,
             &key_path,
             &obfs_password,
             &masq,
             &serve,
+            udp_idle,
+            quic.as_ref(),
         );
     });
     true
@@ -8289,26 +8326,19 @@ fn serve_hysteria_v1_inbound(address: &str, inbound: &Json, freedom: bool, path:
         return false;
     };
     let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
-    let obfs_password = stream
-        .get("tlsSettings")
-        .and_then(|tls| tls.get("obfs"))
-        .and_then(Json::as_str)
-        .unwrap_or("")
-        .to_owned();
+    let config = match crate::config::hysteria_v1_config(Some(stream)) {
+        Ok(config) => config,
+        Err(why) => {
+            eprintln!("hysteria inbound in {path}: {why}; serves nothing");
+            return false;
+        }
+    };
     let owned = address.to_owned();
     let serve: crate::hysteria_v1::Serve = Arc::new(move |flow, host, port| {
         serve_hysteria_v1_flow(flow, &host, port, freedom);
     });
     thread::spawn(move || {
-        crate::hysteria_v1::serve_loop(
-            &owned,
-            &auths,
-            ferrox_core::hysteria::Congestion::Bbr,
-            &cert_path,
-            &key_path,
-            &obfs_password,
-            &serve,
-        );
+        crate::hysteria_v1::serve_loop(&owned, &auths, &cert_path, &key_path, &serve, &config);
     });
     true
 }
@@ -23896,7 +23926,13 @@ fn find_hysteria_outbound(root: &Json) -> Option<HysteriaOut> {
         {
             continue;
         }
-        let mut config = crate::config::hysteria_v1_config(stream);
+        let mut config = match crate::config::hysteria_v1_config(stream) {
+            Ok(config) => config,
+            Err(why) => {
+                eprintln!("hysteria v1 outbound: {why}; it is not used");
+                continue;
+            }
+        };
         if let Some(auth) = field("auth").and_then(Json::as_str) {
             auth.clone_into(&mut config.auth);
         }
@@ -39719,6 +39755,7 @@ mod tests {
                 obfs_password: String::new(),
                 hop: None,
                 gecko: None,
+                ..ferrox_core::hysteria::Config::default()
             },
             roots: Some(roots.into()),
         };
@@ -41963,6 +42000,8 @@ mod tests {
                 &obfs,
                 &masq,
                 &serve,
+                std::time::Duration::from_secs(60),
+                None,
             );
         });
         (port, roots)
@@ -41989,6 +42028,7 @@ mod tests {
                 obfs_password: obfs.to_owned(),
                 hop: None,
                 gecko: None,
+                ..ferrox_core::hysteria::Config::default()
             },
             roots: Some(roots.into()),
         };
@@ -42132,7 +42172,7 @@ mod tests {
                 "auth verifies"
             );
             let mut block = Vec::new();
-            ferrox_core::hysteria::build_auth_response(true, &mut block);
+            ferrox_core::hysteria::build_auth_response(true, 0, &mut block);
             let mut frame = Vec::new();
             ferrox_core::foxy::frames::quic_varint(
                 &mut frame,
@@ -42180,6 +42220,7 @@ mod tests {
                 obfs_password: String::new(),
                 hop: None,
                 gecko: None,
+                ..ferrox_core::hysteria::Config::default()
             },
             roots: Some(roots.into()),
         };
@@ -42290,7 +42331,7 @@ mod tests {
             &mut conn, &sock, 2, &settings, true, horizon
         ));
         let mut block = Vec::new();
-        ferrox_core::hysteria::build_auth_request("bisect2-auth", &mut block);
+        ferrox_core::hysteria::build_auth_request("bisect2-auth", 0, &mut block);
         let mut frame = Vec::new();
         h3::quic_varint(&mut frame, h3::H3_HEADERS);
         h3::quic_varint(&mut frame, block.len() as u64);
@@ -42747,7 +42788,7 @@ mod tests {
             &mut conn, &sock, 2, &settings, true, horizon
         ));
         let mut block = Vec::new();
-        ferrox_core::hysteria::build_auth_request("bisect2-auth", &mut block);
+        ferrox_core::hysteria::build_auth_request("bisect2-auth", 0, &mut block);
         let mut frame = Vec::new();
         h3::quic_varint(&mut frame, h3::H3_HEADERS);
         h3::quic_varint(&mut frame, block.len() as u64);
@@ -42820,7 +42861,7 @@ mod tests {
         let horizon = std::time::Instant::now() + Duration::from_secs(15);
         // The right handshake shape — a POST to the auth path — but the wrong password must still refuse and close, never quietly serve the cover page.
         let mut block = Vec::new();
-        ferrox_core::hysteria::build_auth_request("wrong-auth", &mut block);
+        ferrox_core::hysteria::build_auth_request("wrong-auth", 0, &mut block);
         let mut frame = Vec::new();
         h3::quic_varint(&mut frame, h3::H3_HEADERS);
         h3::quic_varint(&mut frame, block.len() as u64);
@@ -42888,7 +42929,7 @@ mod tests {
             &mut conn, &sock, 2, &settings, true, horizon
         ));
         let mut block = Vec::new();
-        ferrox_core::hysteria::build_auth_request("udp-auth", &mut block);
+        ferrox_core::hysteria::build_auth_request("udp-auth", 0, &mut block);
         let mut frame = Vec::new();
         h3::quic_varint(&mut frame, h3::H3_HEADERS);
         h3::quic_varint(&mut frame, block.len() as u64);
@@ -42983,6 +43024,7 @@ mod tests {
                 obfs_password: String::new(),
                 hop: None,
                 gecko: None,
+                ..ferrox_core::hysteria::Config::default()
             }),
             host: "localhost".to_owned(),
             mux: false,
@@ -43077,6 +43119,7 @@ mod tests {
                 obfs_password: String::new(),
                 hop: None,
                 gecko: None,
+                ..ferrox_core::hysteria::Config::default()
             },
             roots: Some(roots.into()),
         };
@@ -43119,6 +43162,7 @@ mod tests {
                 obfs_password: String::new(),
                 hop: None,
                 gecko: None,
+                ..ferrox_core::hysteria::Config::default()
             },
             roots: Some(roots.into()),
         };
@@ -43159,6 +43203,7 @@ mod tests {
                 obfs_password: "gawrgura".to_owned(),
                 hop: None,
                 gecko: None,
+                ..ferrox_core::hysteria::Config::default()
             },
             roots: Some(roots.into()),
         };
@@ -43215,6 +43260,7 @@ mod tests {
                 obfs_password: String::new(),
                 hop: None,
                 gecko: None,
+                ..ferrox_core::hysteria::Config::default()
             },
             roots: Some(roots.into()),
         };

@@ -1659,6 +1659,175 @@ pub(crate) fn hysteria_version(node: Option<&Json>) -> Option<u32> {
     })
 }
 
+/// A JSON integer, as a number or a decimal string; a fractional or non-numeric value names nothing.
+fn as_i64(node: &Json) -> Option<i64> {
+    match node {
+        Json::Num(n) if n.fract() == 0.0 => Some(*n as i64),
+        Json::Str(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn int_field(node: &Json, key: &str) -> Result<Option<i64>, String> {
+    match node.get(key) {
+        None => Ok(None),
+        Some(value) => as_i64(value)
+            .map(Some)
+            .ok_or_else(|| format!("{key} is not an integer")),
+    }
+}
+
+fn flag(node: &Json, key: &str) -> bool {
+    node.get(key).and_then(Json::as_bool).unwrap_or(false)
+}
+
+/// `Bandwidth.Bps`: a decimal number with an optional byte or bit unit, converted to bytes per second exactly as the reference does.
+fn bandwidth(node: &Json) -> Result<u64, String> {
+    let text = match node {
+        // The reference spells a bandwidth as a string; a bare number is the same unitless bit rate.
+        Json::Num(n) if *n >= 0.0 => return Ok(*n as u64 / 8),
+        Json::Str(text) => text.trim().to_lowercase(),
+        _ => return Err("bandwidth is not a number".to_owned()),
+    };
+    if text.is_empty() {
+        return Ok(0);
+    }
+    let at = text
+        .char_indices()
+        .find(|(_, c)| !(c.is_ascii_digit() || *c == '.'))
+        .map_or(text.len(), |(at, _)| at);
+    let value: f64 = text[..at]
+        .parse()
+        .map_err(|_| format!("bandwidth `{text}` has no rate"))?;
+    let unit = text[at..].trim();
+    let multiplier: f64 = match unit {
+        "" | "b" | "bps" => 1.0,
+        "k" | "kb" | "kbps" => 1024.0,
+        "m" | "mb" | "mbps" => 1024.0 * 1024.0,
+        "g" | "gb" | "gbps" => 1024.0 * 1024.0 * 1024.0,
+        "t" | "tb" | "tbps" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
+        other => return Err(format!("unsupported unit: {other}")),
+    };
+    Ok((value * multiplier) as u64 / 8)
+}
+
+/// `hysteriaSettings.udpIdleTimeout`: absent or 0 is the reference's 60-second default, anything else must lie in 2..=600.
+pub(crate) fn hysteria_udp_idle(hy: Option<&Json>) -> Result<u64, String> {
+    let Some(node) = hy.and_then(|h| h.get("udpIdleTimeout")) else {
+        return Ok(60);
+    };
+    let Some(value) = as_i64(node) else {
+        return Err("UdpIdleTimeout is not a number".to_owned());
+    };
+    if value == 0 {
+        return Ok(60);
+    }
+    if !(2..=600).contains(&value) {
+        return Err("UdpIdleTimeout must be between 2 and 600".to_owned());
+    }
+    Ok(value as u64)
+}
+
+/// The `finalmask.quicParams` block, validated under the reference's names and bounds; `None` when the stream names no block.
+pub(crate) fn hysteria_quic_params(
+    stream: Option<&Json>,
+) -> Result<Option<ferrox_core::hysteria::QuicParams>, String> {
+    use ferrox_core::hysteria::{BbrProfile, Congestion, QuicParams};
+    let Some(node) = stream
+        .and_then(|s| s.get("finalmask"))
+        .and_then(|f| f.get("quicParams"))
+    else {
+        return Ok(None);
+    };
+    if !matches!(node, Json::Obj(_)) {
+        return Err("quicParams is not an object".to_owned());
+    }
+    let named = |key: &str| -> Result<String, String> {
+        match node.get(key) {
+            None => Ok(String::new()),
+            Some(value) => value
+                .as_str()
+                .map(str::to_lowercase)
+                .ok_or_else(|| format!("{key} is not a string")),
+        }
+    };
+    let profile_text = named("bbrProfile")?;
+    let bbr_profile = match profile_text.as_str() {
+        "" | "standard" => BbrProfile::Standard,
+        "conservative" => BbrProfile::Conservative,
+        "aggressive" => BbrProfile::Aggressive,
+        _ => return Err("unknown bbr profile".to_owned()),
+    };
+    let up = match node.get("brutalUp") {
+        Some(value) => bandwidth(value)?,
+        None => 0,
+    };
+    let down = match node.get("brutalDown") {
+        Some(value) => bandwidth(value)?,
+        None => 0,
+    };
+    if up > 0 && up < 65536 {
+        return Err("BrutalUp must be at least 65536 bytes per second".to_owned());
+    }
+    if down > 0 && down < 65536 {
+        return Err("BrutalDown must be at least 65536 bytes per second".to_owned());
+    }
+    let congestion_text = named("congestion")?;
+    let cc = match congestion_text.as_str() {
+        "" | "brutal" => Some(Congestion::Brutal),
+        "reno" => Some(Congestion::Reno),
+        "bbr" => Some(Congestion::Bbr),
+        "force-brutal" => {
+            if up == 0 {
+                return Err("force-brutal requires up".to_owned());
+            }
+            Some(Congestion::Brutal)
+        }
+        _ => {
+            return Err(format!(
+                "unknown congestion control: {congestion_text}, valid values: reno, bbr, brutal, force-brutal"
+            ))
+        }
+    };
+    let window = |key: &str| -> Result<u64, String> {
+        let value = int_field(node, key)?.unwrap_or(0);
+        if value != 0 && value < 16384 {
+            return Err(format!("{key} must be at least 16384"));
+        }
+        Ok(value as u64)
+    };
+    let init_stream = window("initStreamReceiveWindow")?;
+    let max_stream = window("maxStreamReceiveWindow")?;
+    let init_connection = window("initConnectionReceiveWindow")?;
+    let max_connection = window("maxConnectionReceiveWindow")?;
+    let max_idle = int_field(node, "maxIdleTimeout")?.unwrap_or(0);
+    if max_idle != 0 && !(4..=120).contains(&max_idle) {
+        return Err("MaxIdleTimeout must be between 4 and 120".to_owned());
+    }
+    let keep_alive = int_field(node, "keepAlivePeriod")?.unwrap_or(0);
+    if keep_alive != 0 && !(2..=60).contains(&keep_alive) {
+        return Err("KeepAlivePeriod must be between 2 and 60".to_owned());
+    }
+    let max_incoming = int_field(node, "maxIncomingStreams")?.unwrap_or(0);
+    if max_incoming != 0 && max_incoming < 8 {
+        return Err("MaxIncomingStreams must be at least 8".to_owned());
+    }
+    Ok(Some(QuicParams {
+        cc,
+        bbr_profile,
+        brutal_up: up,
+        brutal_down: down,
+        init_stream_window: init_stream,
+        max_stream_window: max_stream,
+        init_connection_window: init_connection,
+        max_connection_window: max_connection,
+        max_idle: max_idle as u64,
+        keep_alive: keep_alive as u64,
+        no_path_mtu: flag(node, "disablePathMTUDiscovery"),
+        max_incoming_streams: max_incoming as u64,
+    }))
+}
+
 fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
     use ferrox_core::hysteria::{Config, Congestion};
     let hy = settings.and_then(|s| s.get("hysteriaSettings"));
@@ -1673,11 +1842,34 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
         .and_then(Json::as_str)
         .unwrap_or("")
         .to_owned();
-    let cc = Congestion::parse(
+    let mut cc = Congestion::parse(
         hy.and_then(|h| h.get("congestion"))
             .and_then(Json::as_str)
             .unwrap_or(""),
     );
+    let quic = match hysteria_quic_params(settings) {
+        Ok(quic) => quic,
+        Err(why) => {
+            eprintln!("hysteria quicParams: {why}; the carrier is refused");
+            return Carrier::Unknown {
+                network: network.to_owned(),
+            };
+        }
+    };
+    if let Some(params) = &quic {
+        if let Some(named) = params.cc {
+            cc = named;
+        }
+    }
+    let udp_idle = match hysteria_udp_idle(hy) {
+        Ok(idle) => idle,
+        Err(why) => {
+            eprintln!("hysteria udpIdleTimeout: {why}; the carrier is refused");
+            return Carrier::Unknown {
+                network: network.to_owned(),
+            };
+        }
+    };
     if version == 1 {
         // Version 1 names xplus directly: `tlsSettings.obfs` is the password, not a mask name.
         return Carrier::Hysteria(Config {
@@ -1687,6 +1879,8 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
             obfs_password: hysteria_v1_obfs(settings).unwrap_or_default(),
             hop: hysteria_hop(hy),
             gecko: None,
+            udp_idle,
+            quic,
         });
     }
     // Salamander and its gecko fragmentation variant are the datagram obfuscations carried; any other named one, or one whose password is too short to mask with, is refused rather than silently sent in the clear.
@@ -1712,29 +1906,40 @@ fn hysteria_carrier(settings: Option<&Json>, network: &str) -> Carrier {
         obfs_password,
         hop: hysteria_hop(hy),
         gecko,
+        udp_idle,
+        quic,
     })
 }
 
-/// The v1 outbound config a transport names, independent of which `hysteriaSettings` version it carries: auth, congestion, xplus password and hop.
-pub(crate) fn hysteria_v1_config(stream: Option<&Json>) -> ferrox_core::hysteria::Config {
+/// The v1 outbound config a transport names: auth, congestion, xplus password, hop, and the same `udpIdleTimeout`/`quicParams` the v2 lane reads.
+pub(crate) fn hysteria_v1_config(
+    stream: Option<&Json>,
+) -> Result<ferrox_core::hysteria::Config, String> {
     use ferrox_core::hysteria::{Config, Congestion};
     let hy = stream.and_then(|s| s.get("hysteriaSettings"));
-    Config {
+    let quic = hysteria_quic_params(stream)?;
+    let mut cc = Congestion::parse(
+        hy.and_then(|h| h.get("congestion"))
+            .and_then(Json::as_str)
+            .unwrap_or(""),
+    );
+    if let Some(named) = quic.as_ref().and_then(|params| params.cc) {
+        cc = named;
+    }
+    Ok(Config {
         version: 1,
         auth: hy
             .and_then(|h| h.get("auth"))
             .and_then(Json::as_str)
             .unwrap_or("")
             .to_owned(),
-        cc: Congestion::parse(
-            hy.and_then(|h| h.get("congestion"))
-                .and_then(Json::as_str)
-                .unwrap_or(""),
-        ),
+        cc,
         obfs_password: hysteria_v1_obfs(stream).unwrap_or_default(),
         hop: hysteria_hop(hy),
         gecko: None,
-    }
+        udp_idle: hysteria_udp_idle(hy)?,
+        quic,
+    })
 }
 
 /// The xplus password a Hysteria v1 transport names: `tlsSettings.obfs` itself is the key.
@@ -2232,6 +2437,109 @@ mod tests {
         });
         assert_eq!(key, Some([0u8; 32]));
         assert_eq!(counts.allocs, 0, "the key is decoded into its array");
+    }
+
+    #[test]
+    fn a_hysteria_carrier_reads_the_udp_idle_and_the_quic_params() {
+        use ferrox_core::hysteria::{BbrProfile, Congestion, QuicParams};
+        let carrier = |text: &str| {
+            stream_carrier(
+                crate::json::parse(text)
+                    .expect("parses")
+                    .get("streamSettings"),
+            )
+        };
+        let Carrier::Hysteria(config) = carrier(
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": 5}, "finalmask": {"quicParams": {"congestion": "brutal", "brutalUp": "10 mbps", "brutalDown": "10 mbps", "initStreamReceiveWindow": 65536, "maxIdleTimeout": 10, "keepAlivePeriod": 5, "maxIncomingStreams": 32}}}}"#,
+        ) else {
+            panic!("a tuned hysteria carrier");
+        };
+        assert_eq!(
+            config.udp_idle, 5,
+            "the association reaper takes the config"
+        );
+        let params = config.quic.expect("the block reaches the QUIC config");
+        assert_eq!(params.cc, Some(Congestion::Brutal));
+        assert_eq!(params.brutal_up, 10 * 1024 * 1024 / 8);
+        assert_eq!(params.brutal_down, 10 * 1024 * 1024 / 8);
+        assert_eq!(params.init_stream_window, 65536);
+        assert_eq!(params.max_idle, 10);
+        assert_eq!(params.keep_alive, 5);
+        assert_eq!(params.max_incoming_streams, 32);
+        assert_eq!(params.bbr_profile, BbrProfile::Standard);
+        assert_eq!(
+            QuicParams::stream_window(0, false),
+            8 * 1024 * 1024,
+            "an unset window is the reference's 8 MiB"
+        );
+        assert_eq!(
+            QuicParams::stream_window(0, true),
+            8 * 1024 * 1024 * 5 / 2,
+            "an unset connection window is two and a half stream windows"
+        );
+
+        // Without the block nothing changes: the tree's fixed reaper and tuning stand.
+        let Carrier::Hysteria(plain) = carrier(
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}}}"#,
+        ) else {
+            panic!("a plain hysteria carrier");
+        };
+        assert_eq!(plain.udp_idle, 60);
+        assert_eq!(plain.quic, None);
+
+        // A present block owns the congestion the way xray's does, its own default included; the stream's extra spelling applies only when no block names one.
+        let cc_of = |text: &str| match carrier(text) {
+            Carrier::Hysteria(config) => config.cc,
+            other => panic!("a hysteria carrier, not {other:?}"),
+        };
+        assert_eq!(
+            cc_of(
+                r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "congestion": "reno"}, "finalmask": {"quicParams": {}}}}"#
+            ),
+            Congestion::Brutal,
+            "an empty block is xray's default, not the stream's spelling"
+        );
+        assert_eq!(
+            cc_of(
+                r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "congestion": "reno"}, "finalmask": {"quicParams": {"congestion": "bbr"}}}}"#
+            ),
+            Congestion::Bbr,
+            "the block's name wins"
+        );
+        let Carrier::Hysteria(empty) = carrier(
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {}}}}"#,
+        ) else {
+            panic!("an empty block is carried");
+        };
+        assert_eq!(
+            empty.quic.expect("the empty block still reaches the lane"),
+            QuicParams {
+                cc: Some(Congestion::Brutal),
+                ..QuicParams::default()
+            },
+            "every unset field waits for the reference's default"
+        );
+
+        // The reference's bounds and names refuse the carrier rather than silently applying a default.
+        for bad in [
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": 1}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": 601}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"maxIdleTimeout": 3}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"maxIdleTimeout": 121}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"congestion": "vegas"}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"congestion": "force-brutal"}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"brutalUp": "1000"}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"initStreamReceiveWindow": 100}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"keepAlivePeriod": 1}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"maxIncomingStreams": 7}}}"#,
+            r#"{"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"bbrProfile": "turbo"}}}"#,
+        ] {
+            let text = format!(r#"{{"streamSettings": {bad}}}"#);
+            assert!(
+                matches!(carrier(&text), Carrier::Unknown { .. }),
+                "{text} must be refused"
+            );
+        }
     }
 
     #[test]

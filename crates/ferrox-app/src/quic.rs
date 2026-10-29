@@ -465,6 +465,41 @@ fn tune_transport(config: &mut quiche::Config) {
     config.set_max_recv_udp_payload_size(MAX_DATAGRAM);
 }
 
+/// The reference's `finalmask.quicParams` windows, idle bound and stream cap, a zero field taking the reference's default; `bbrProfile`, `brutal*`, `disableChromeParrot`, `disableGSO` and `disableStatelessReset` are accepted but have no quiche knob.
+pub(crate) fn apply_hysteria_quic(
+    config: &mut quiche::Config,
+    params: &ferrox_core::hysteria::QuicParams,
+    server: bool,
+) {
+    use ferrox_core::hysteria::QuicParams;
+    config.set_max_idle_timeout(params.idle_seconds().saturating_mul(1000));
+    let stream = QuicParams::stream_window(params.init_stream_window, false);
+    config.set_initial_max_stream_data_bidi_local(stream);
+    config.set_initial_max_stream_data_bidi_remote(stream);
+    config.set_initial_max_stream_data_uni(stream);
+    config.set_max_stream_window(QuicParams::stream_window(params.max_stream_window, false));
+    config.set_initial_max_data(QuicParams::stream_window(
+        params.init_connection_window,
+        true,
+    ));
+    config.set_max_connection_window(QuicParams::stream_window(
+        params.max_connection_window,
+        true,
+    ));
+    if server || params.max_incoming_streams != 0 {
+        let streams = if params.max_incoming_streams == 0 {
+            1024
+        } else {
+            params.max_incoming_streams
+        };
+        config.set_initial_max_streams_bidi(streams);
+        config.set_initial_max_streams_uni(streams);
+    }
+    if params.no_path_mtu {
+        config.discover_pmtu(false);
+    }
+}
+
 /// One ALPN and one flow-control shape for the lane: a weaker peer negotiates down, never up.
 pub(crate) fn tune(config: &mut quiche::Config, alpn: &[u8]) -> bool {
     if config.set_application_protos(&[alpn]).is_err() {

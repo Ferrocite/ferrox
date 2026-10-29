@@ -16,7 +16,7 @@ pub const CC_RX_HEADER: &str = "hysteria-cc-rx";
 
 pub const UDP_HEADER: &str = "hysteria-udp";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Congestion {
     Reno,
     Bbr,
@@ -132,6 +132,59 @@ pub fn is_hop_port(ports: &[u16], nominal: u16, port: u16) -> bool {
     port == nominal || ports.contains(&port)
 }
 
+/// The BBR profile a QUIC lane selects, spelled as the reference's `bbrProfile`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum BbrProfile {
+    Conservative,
+    #[default]
+    Standard,
+    Aggressive,
+}
+
+/// The `finalmask.quicParams` block: a zero field is the reference's "unset" spelling and takes that field's default once the block is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct QuicParams {
+    /// The profile itself; `None` keeps the congestion the stream named.
+    pub cc: Option<Congestion>,
+    pub bbr_profile: BbrProfile,
+    pub brutal_up: u64,
+    /// Sent as the `hysteria-cc-rx` hint; the peer caps its Brutal rate at this.
+    pub brutal_down: u64,
+    pub init_stream_window: u64,
+    pub max_stream_window: u64,
+    pub init_connection_window: u64,
+    pub max_connection_window: u64,
+    /// Seconds; 0 is the reference's 30-second default when the block is present.
+    pub max_idle: u64,
+    /// Seconds; 0 disables the keep-alive.
+    pub keep_alive: u64,
+    pub no_path_mtu: bool,
+    pub max_incoming_streams: u64,
+}
+
+impl QuicParams {
+    /// A named receive window, or the reference's 8 MiB default; the connection window is two and a half stream windows.
+    #[must_use]
+    pub fn stream_window(value: u64, connection: bool) -> u64 {
+        if value != 0 {
+            value
+        } else if connection {
+            8 * 1024 * 1024 * 5 / 2
+        } else {
+            8 * 1024 * 1024
+        }
+    }
+
+    #[must_use]
+    pub fn idle_seconds(self) -> u64 {
+        if self.max_idle == 0 {
+            30
+        } else {
+            self.max_idle
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config {
     /// The wire version this config names: `1` for the binary control stream, `2` for the HTTP/3 handshake.
@@ -146,6 +199,10 @@ pub struct Config {
     /// into, or `None` for a plain salamander (or cleartext) lane. `obfs_password`
     /// still holds the key salamander masks each frame with.
     pub gecko: Option<Gecko>,
+    /// How long a datagram association may stay quiet before it is reaped.
+    pub udp_idle: u64,
+    /// The reference's `finalmask.quicParams`, when the stream carried one.
+    pub quic: Option<QuicParams>,
 }
 
 impl Default for Config {
@@ -157,6 +214,8 @@ impl Default for Config {
             obfs_password: String::new(),
             hop: None,
             gecko: None,
+            udp_idle: 60,
+            quic: None,
         }
     }
 }
@@ -722,7 +781,25 @@ impl Gecko {
     }
 }
 
-pub fn build_auth_request(auth: &str, out: &mut Vec<u8>) {
+/// A rate hint written as decimal from the back of the stack buffer, so an auth block names it without a heap string.
+fn rate_hint(value: u64, buf: &mut [u8; 20]) -> &str {
+    let mut at = buf.len();
+    let mut rest = value;
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    std::str::from_utf8(&buf[at..]).expect("decimal digits")
+}
+
+/// `cc_rx` is the receiving side's `brutalDown`, the rate hint the peer reads before choosing Brutal; 0 is "no cap".
+pub fn build_auth_request(auth: &str, cc_rx: u64, out: &mut Vec<u8>) {
+    let mut digits = [0u8; 20];
+    let cc_rx = rate_hint(cc_rx, &mut digits);
     hpack::qpack_literal_many(
         &[
             (":method", "POST"),
@@ -730,18 +807,21 @@ pub fn build_auth_request(auth: &str, out: &mut Vec<u8>) {
             (":authority", AUTH_AUTHORITY),
             (":path", AUTH_PATH),
             (AUTH_HEADER, auth),
-            (CC_RX_HEADER, "0"),
+            (CC_RX_HEADER, cc_rx),
         ],
         out,
     );
 }
 
-pub fn build_auth_response(udp: bool, out: &mut Vec<u8>) {
+/// `cc_rx` is this server's `brutalDown`, the rate hint the client reads before choosing Brutal; 0 is "no cap".
+pub fn build_auth_response(udp: bool, cc_rx: u64, out: &mut Vec<u8>) {
+    let mut digits = [0u8; 20];
+    let cc_rx = rate_hint(cc_rx, &mut digits);
     hpack::qpack_literal_many(
         &[
             (":status", "233"),
             (UDP_HEADER, if udp { "true" } else { "false" }),
-            (CC_RX_HEADER, "0"),
+            (CC_RX_HEADER, cc_rx),
         ],
         out,
     );
@@ -1267,9 +1347,9 @@ mod tests {
     }
 
     #[test]
-    fn an_auth_request_carries_post_auth_and_no_brutal_cap() {
+    fn an_auth_request_carries_post_auth_and_the_brutal_hint() {
         let mut block = Vec::new();
-        build_auth_request("s3cret", &mut block);
+        build_auth_request("s3cret", 0, &mut block);
         assert!(verify_auth_request(&block, "s3cret"));
         assert!(!verify_auth_request(&block, "wrong"));
         assert!(!verify_auth_request(&block, ""));
@@ -1279,6 +1359,31 @@ mod tests {
         assert!(fields.contains(&(b":authority".to_vec(), b"hysteria".to_vec())));
         assert!(fields.contains(&(b":path".to_vec(), b"/auth".to_vec())));
         assert!(fields.contains(&(b"hysteria-cc-rx".to_vec(), b"0".to_vec())));
+        // A configured `brutalDown` is the hint the peer reads before choosing Brutal.
+        let mut hinted = Vec::new();
+        build_auth_request("s3cret", 1_310_720, &mut hinted);
+        let fields = hpack::qpack_fields(&hinted).expect("reads");
+        assert_eq!(find(&fields, CC_RX_HEADER), Some(b"1310720".as_slice()));
+        // The digits land in a stack buffer, so a block built into a roomy buffer costs the heap nothing.
+        let mut out = Vec::with_capacity(256);
+        let capacity = out.capacity();
+        let counts = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                out.clear();
+                build_auth_request("s3cret", 1_310_720, &mut out);
+            }
+        })
+        .1;
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "the hint costs no heap"
+        );
+        assert_eq!(
+            out.capacity(),
+            capacity,
+            "the block stays inside the caller's buffer"
+        );
     }
 
     #[test]
@@ -1309,14 +1414,18 @@ mod tests {
     #[test]
     fn an_auth_response_is_status_233_and_advertises_the_udp_lane() {
         let mut block = Vec::new();
-        build_auth_response(true, &mut block);
+        build_auth_response(true, 0, &mut block);
         assert!(verify_auth_response(&block));
         let fields = hpack::qpack_fields(&block).expect("reads");
         assert_eq!(find(&fields, UDP_HEADER), Some(b"true".as_slice()));
         let mut off = Vec::new();
-        build_auth_response(false, &mut off);
+        build_auth_response(false, 0, &mut off);
         let fields = hpack::qpack_fields(&off).expect("reads");
         assert_eq!(find(&fields, UDP_HEADER), Some(b"false".as_slice()));
+        let mut hinted = Vec::new();
+        build_auth_response(true, 65_536, &mut hinted);
+        let fields = hpack::qpack_fields(&hinted).expect("reads");
+        assert_eq!(find(&fields, CC_RX_HEADER), Some(b"65536".as_slice()));
         let mut block = Vec::new();
         hpack::qpack_literal_many(&[(":status", "200")], &mut block);
         assert!(!verify_auth_response(&block));

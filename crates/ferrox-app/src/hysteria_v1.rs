@@ -24,8 +24,6 @@ const ROUTE_POLL: Duration = Duration::from_millis(100);
 
 const HEAD_CAP: usize = 16 * 1024;
 
-const UDP_IDLE: Duration = Duration::from_secs(60);
-
 const UDP_POLL: Duration = Duration::from_secs(1);
 
 const UDP_TARGET_BUF: usize = wire::MAX_UDP_PAYLOAD;
@@ -78,6 +76,9 @@ fn connect(dial: &Dial) -> Option<Session> {
     let cid = quiche::ConnectionId::from_ref(&scid);
     let mut config =
         crate::quic::quiche_config_alpn(roots, Some(dial.config.cc.quiche_name()), &[wire::ALPN])?;
+    if let Some(params) = &dial.config.quic {
+        crate::quic::apply_hysteria_quic(&mut config, params, false);
+    }
     config.enable_dgram(true, 1024, 1024);
     let Ok(mut conn) = quiche::connect(Some(&dial.host), &cid, local, peer, &mut config) else {
         return None;
@@ -111,6 +112,13 @@ fn connect(dial: &Dial) -> Option<Session> {
         },
     };
     crate::quic::drive_handshake(&mut conn, &sock, local)?;
+    let keep_alive = dial
+        .config
+        .quic
+        .as_ref()
+        .map(|params| params.keep_alive)
+        .filter(|seconds| *seconds != 0)
+        .map(Duration::from_secs);
     let session = Session {
         shared: Arc::new(Mutex::new(conn)),
         sock: Arc::new(sock),
@@ -118,6 +126,7 @@ fn connect(dial: &Dial) -> Option<Session> {
         udp_supported: true,
         driver: None,
         send_wake: None,
+        keep_alive,
     };
     let mut hello = Vec::with_capacity(20 + dial.config.auth.len());
     wire::encode_client_hello(
@@ -516,6 +525,7 @@ fn server_config(
     cert_path: &str,
     key_path: &str,
     cc: ferrox_core::hysteria::Congestion,
+    quic: Option<&ferrox_core::hysteria::QuicParams>,
 ) -> Option<quiche::Config> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
     config.set_application_protos(&[wire::ALPN]).ok()?;
@@ -528,6 +538,9 @@ fn server_config(
     config.set_initial_max_stream_data_uni(8 * 1024 * 1024);
     config.set_initial_max_streams_bidi(crate::quic::MAX_STREAMS);
     config.set_initial_max_streams_uni(crate::quic::MAX_STREAMS);
+    if let Some(params) = quic {
+        crate::quic::apply_hysteria_quic(&mut config, params, true);
+    }
     config.load_cert_chain_from_pem_file(cert_path).ok()?;
     config.load_priv_key_from_pem_file(key_path).ok()?;
     Some(config)
@@ -852,6 +865,7 @@ struct Router<'a> {
     out: Unfilled<MAX_DATAGRAM>,
     auths: &'a [String],
     serve: &'a Serve,
+    udp_idle: Duration,
     routes: HashMap<Vec<u8>, Inbound>,
 }
 
@@ -905,6 +919,7 @@ impl Router<'_> {
             auths,
             serve,
             local,
+            ..
         } = self;
         let Some(shared) = routes.get(dcid).map(|i| Arc::clone(&i.conn)) else {
             return;
@@ -984,7 +999,11 @@ impl Router<'_> {
 
     fn idle(&mut self) {
         let Self {
-            routes, sock, out, ..
+            routes,
+            sock,
+            out,
+            udp_idle,
+            ..
         } = self;
         let now = Instant::now();
         routes.retain(|_, inbound| {
@@ -1006,7 +1025,7 @@ impl Router<'_> {
             inbound.send.bump();
             if let Ok(mut lane) = inbound.udp.lock() {
                 lane.flows.retain(|_, flow| {
-                    if now.duration_since(flow.last) > UDP_IDLE {
+                    if now.duration_since(flow.last) > *udp_idle {
                         flow.stop.store(true, Ordering::Relaxed);
                         false
                     } else {
@@ -1056,11 +1075,10 @@ fn serve_tcp_or_udp(
 pub(crate) fn serve_loop(
     address: &str,
     auths: &[String],
-    cc: ferrox_core::hysteria::Congestion,
     cert_path: &str,
     key_path: &str,
-    obfs_password: &str,
     serve: &Serve,
+    config: &ferrox_core::hysteria::Config,
 ) {
     let Some(bound) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
         return;
@@ -1069,10 +1087,11 @@ pub(crate) fn serve_loop(
         return;
     };
     let local = sock.local_addr().unwrap_or(bound);
-    let Some(mut template) = server_config(cert_path, key_path, cc) else {
+    let Some(mut template) = server_config(cert_path, key_path, config.cc, config.quic.as_ref())
+    else {
         return;
     };
-    let sock = match XPlus::new(obfs_password) {
+    let sock = match XPlus::new(&config.obfs_password) {
         Some(obfs) => crate::quic::Datagram::xplus(sock, obfs),
         None => crate::quic::Datagram::plain(sock),
     };
@@ -1082,6 +1101,7 @@ pub(crate) fn serve_loop(
         out: Unfilled::<MAX_DATAGRAM>::new(),
         auths,
         serve,
+        udp_idle: Duration::from_secs(config.udp_idle),
         routes: HashMap::new(),
     };
     let mut buf = Unfilled::<RECV_ROOM>::new();
@@ -1196,6 +1216,72 @@ mod tests {
     }
 
     #[test]
+    fn a_v1_datagram_association_reaps_on_the_configured_idle() {
+        // The v1 server's reaper takes the stream's `udpIdleTimeout` too: a six-second-old association dies at five and lives at sixty.
+        let reaps = |udp_idle: Duration| {
+            let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
+            config
+                .set_application_protos(&[wire::ALPN])
+                .expect("negotiates");
+            let scid = [7u8; SCID_LEN];
+            let cid = quiche::ConnectionId::from_ref(&scid);
+            let local: SocketAddr = "127.0.0.1:0".parse().expect("addr");
+            let peer: SocketAddr = "127.0.0.1:1".parse().expect("addr");
+            let conn = quiche::connect(None, &cid, local, peer, &mut config).expect("connects");
+            let stop = Arc::new(AtomicBool::new(false));
+            let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            let mut lane = UdpLane::default();
+            lane.sessions.insert(1);
+            lane.flows.insert(
+                1,
+                UdpFlow {
+                    target: Arc::new(target),
+                    defrag: Defrag::new(),
+                    last: Instant::now()
+                        .checked_sub(Duration::from_secs(6))
+                        .expect("six seconds ago"),
+                    stop: Arc::clone(&stop),
+                },
+            );
+            let auths: Vec<String> = Vec::new();
+            let handler: Serve = Arc::new(|_, _, _| {});
+            let mut by_scid = HashMap::new();
+            by_scid.insert(
+                vec![1u8; SCID_LEN],
+                Inbound {
+                    conn: Arc::new(Mutex::new(conn)),
+                    authed: true,
+                    auth_buf: Vec::new(),
+                    served: HashSet::new(),
+                    wakes: HashMap::new(),
+                    send: StreamWake::new(),
+                    udp: Arc::new(Mutex::new(lane)),
+                    next_udp: 2,
+                    client_cid: vec![2u8; 8],
+                    initial_dcid: vec![3u8; 8],
+                },
+            );
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
+            let mut router = Router {
+                sock: Arc::new(crate::quic::Datagram::plain(sock)),
+                local,
+                out: Unfilled::new(),
+                auths: &auths,
+                serve: &handler,
+                udp_idle,
+                routes: by_scid,
+            };
+            router.idle();
+            stop.load(Ordering::Relaxed)
+        };
+        assert!(
+            reaps(Duration::from_secs(5)),
+            "five seconds reaps a six-second-old association"
+        );
+        assert!(!reaps(Duration::from_secs(60)), "sixty seconds keeps it");
+    }
+
+    #[test]
     fn an_unknown_udp_session_never_reaches_its_destination() {
         let canary = UdpSocket::bind("127.0.0.1:0").expect("binds");
         canary
@@ -1227,11 +1313,15 @@ mod tests {
             serve_loop(
                 &address,
                 &["v1-auth".to_owned()],
-                ferrox_core::hysteria::Congestion::Bbr,
                 &cert,
                 &key,
-                "",
                 &serve,
+                &ferrox_core::hysteria::Config {
+                    version: 1,
+                    cc: ferrox_core::hysteria::Congestion::Bbr,
+                    udp_idle: 60,
+                    ..ferrox_core::hysteria::Config::default()
+                },
             );
         });
 
@@ -1246,6 +1336,7 @@ mod tests {
                 obfs_password: String::new(),
                 hop: None,
                 gecko: None,
+                ..ferrox_core::hysteria::Config::default()
             },
             roots: Some(roots.into()),
         };
