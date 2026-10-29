@@ -168,13 +168,11 @@ fn supports_tls13(bytes: &[u8]) -> bool {
     let mut at = 0;
     while at + 13 <= bytes.len() {
         let word = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or_default());
-        // a byte behind a zero borrows and a byte behind a `2b` draws one, so a mark
-        // is a candidate, never an answer
+        // a byte behind a zero borrows and a byte behind 2b draws one: a mark is a candidate
         let zero = word.wrapping_sub(BYTE_ONES) & !word & BYTE_HIGHS;
         let flip = word ^ BYTE_2B;
         let plus = flip.wrapping_sub(BYTE_ONES) & !flip & BYTE_HIGHS;
-        // the `2b` mark at byte i+1 lands on the zero mark at byte i, and byte 8 has
-        // no mark to land, so the word's last start is the next turn's first
+        // byte 8's mark has nowhere to land, so the last start is the next turn's first
         let mut marks = zero & (plus >> 8);
         while marks != 0 {
             let skip = (marks.trailing_zeros() >> 3) as usize;
