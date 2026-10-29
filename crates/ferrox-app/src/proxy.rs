@@ -749,6 +749,13 @@ fn serve_vless_inbound(
             let Carrier::Hysteria(config) = carrier else {
                 return false;
             };
+            if config.version != 2 {
+                eprintln!(
+                    "hysteria v{} carrier in {path} is not the v2 serve `hysteria` names: serves nothing",
+                    config.version
+                );
+                return false;
+            }
             let owned = address.to_owned();
             let Some(settings) = inbound.get("streamSettings") else {
                 eprintln!("unreadable hysteria identity in {path}: serves nothing");
@@ -42419,6 +42426,43 @@ mod tests {
             stream_carrier(Some(&three)),
             Carrier::Unknown { .. }
         ));
+    }
+
+    #[test]
+    fn a_vless_stream_naming_a_v1_hysteria_transport_refuses_the_v2_serve() {
+        let (cert_path, key_path) = staged_hysteria_identity();
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vless", "settings": {{"clients": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}}, "streamSettings": {{"network": "hysteria", "security": "tls", "hysteriaSettings": {{"version": 1, "auth": "inbound-auth"}}, "tlsSettings": {{"alpn": ["h3"], "certificates": [{{"certificateFile": "{cert_path}", "keyFile": "{key_path}"}}]}}}}}}"#
+        ))
+        .expect("parses");
+        assert!(
+            !serve_vless_inbound(
+                "127.0.0.1:0",
+                &inbound,
+                true,
+                "test",
+                &crate::reverse::Portals::default()
+            ),
+            "a vless stream that names the v1 transport does not ride the v2 server"
+        );
+    }
+
+    fn staged_hysteria_identity() -> (String, String) {
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tag = format!("ferrox-hysteria-refusal-{}-{stamp}", std::process::id());
+        let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+        let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
+        std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
+        std::fs::write(&key_path, &key_pem).expect("stages key");
+        let cert = cert_path.to_str().expect("ascii").replace('\\', "/");
+        let key = key_path.to_str().expect("ascii").replace('\\', "/");
+        (cert, key)
     }
 
     #[test]
