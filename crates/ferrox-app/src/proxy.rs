@@ -1700,7 +1700,7 @@ impl RoutePlan {
         if !self.source_known || !self.shared.routing.wants_process() {
             return None;
         }
-        crate::process::owner(network, client?.peer_addr().ok()?)
+        crate::process::owner(network, client?.socket_peer_addr().ok()?)
     }
 
     fn lane_with_protocol(

@@ -568,6 +568,17 @@ impl Connection {
         }
     }
 
+    /// The socket's own peer, ignoring a PROXY protocol address above it; wrappers that do not
+    /// replace the peer keep delegating to it.
+    pub(crate) fn socket_peer_addr(&self) -> io::Result<SocketAddr> {
+        match self {
+            Connection::Proxied { inner, .. }
+            | Connection::Metered(Metered { inner, .. })
+            | Connection::Policied { inner, .. } => inner.socket_peer_addr(),
+            _ => self.peer_addr(),
+        }
+    }
+
     /// The local address, `std`'s `io::Result` shape; `Unsupported` for a Unix stream, which
     /// reports no port.
     pub(crate) fn local_addr(&self) -> io::Result<SocketAddr> {
