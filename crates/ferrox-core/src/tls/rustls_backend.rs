@@ -61,12 +61,100 @@ struct Pinned {
 #[derive(Debug)]
 struct CertPinned {
     cert_pins: Arc<[[u8; 32]]>,
+    names: Arc<[String]>,
 }
 
 impl CertPinned {
     fn holds(&self, certificate: &rustls::pki_types::CertificateDer<'_>) -> bool {
         let digest: [u8; 32] = sha2::Sha256::digest(certificate.as_ref()).into();
         self.cert_pins.contains(&digest)
+    }
+}
+
+/// A chain verified against one name: the connection's server name, or each `verifyPeerCertByName`
+/// entry in turn, where the first name the chain answers accepts it.
+fn named(
+    verifier: &dyn rustls::client::danger::ServerCertVerifier,
+    end_entity: &rustls::pki_types::CertificateDer<'_>,
+    intermediates: &[rustls::pki_types::CertificateDer<'_>],
+    server_name: &rustls::pki_types::ServerName<'_>,
+    ocsp_response: &[u8],
+    now: rustls::pki_types::UnixTime,
+    names: &[String],
+) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+    if names.is_empty() {
+        return verifier.verify_server_cert(
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+        );
+    }
+    for name in names {
+        let Ok(name) = rustls::pki_types::ServerName::try_from(name.clone()) else {
+            continue;
+        };
+        if verifier
+            .verify_server_cert(end_entity, intermediates, &name, ocsp_response, now)
+            .is_ok()
+        {
+            return Ok(rustls::client::danger::ServerCertVerified::assertion());
+        }
+    }
+    Err(rustls::Error::InvalidCertificate(
+        rustls::CertificateError::ApplicationVerificationFailure,
+    ))
+}
+
+/// The reference's `verifyPeerCertByName`: with that field set it skips its own name check and
+/// verifies the chain once per listed name, so the SNI the hello carried is not the name trusted.
+#[derive(Debug)]
+struct Named {
+    inner: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+    names: Arc<[String]>,
+}
+
+impl rustls::client::danger::ServerCertVerifier for Named {
+    fn verify_server_cert(
+        &self,
+        end_entity: &rustls::pki_types::CertificateDer<'_>,
+        intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        server_name: &rustls::pki_types::ServerName<'_>,
+        ocsp_response: &[u8],
+        now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        named(
+            self.inner.as_ref(),
+            end_entity,
+            intermediates,
+            server_name,
+            ocsp_response,
+            now,
+            &self.names,
+        )
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.inner.supported_verify_schemes()
     }
 }
 
@@ -88,11 +176,18 @@ impl rustls::client::danger::ServerCertVerifier for CertPinned {
             }
             // The pinned certificate acts as the only root, exactly as the reference's pinned-CA path does; the chain and the name still check, and a certificate that cannot anchor is refused rather than retried.
             let anchor = anchored(intermediate)?;
-            return anchor
-                .verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
-                .or(Err(rustls::Error::InvalidCertificate(
-                    rustls::CertificateError::ApplicationVerificationFailure,
-                )));
+            return named(
+                anchor.as_ref(),
+                end_entity,
+                intermediates,
+                server_name,
+                ocsp_response,
+                now,
+                &self.names,
+            )
+            .or(Err(rustls::Error::InvalidCertificate(
+                rustls::CertificateError::ApplicationVerificationFailure,
+            )));
         }
         Err(rustls::Error::InvalidCertificate(
             rustls::CertificateError::ApplicationVerificationFailure,
@@ -165,6 +260,7 @@ pub fn verify_cert_pinned(
         .collect();
     let verifier = CertPinned {
         cert_pins: cert_pins.clone(),
+        names: std::sync::Arc::default(),
     };
     rustls::client::danger::ServerCertVerifier::verify_server_cert(
         &verifier,
@@ -299,6 +395,7 @@ struct MaterialKey {
     roots: crate::tls::Anchors,
     pins: crate::foxy::pin::Pins,
     cert_pins: Arc<[[u8; 32]]>,
+    verify_names: Arc<[String]>,
     cipher_suites: std::sync::Arc<[u16]>,
 }
 
@@ -312,6 +409,7 @@ impl PartialEq for MaterialKey {
         same_roots(&self.roots, &other.roots)
             && self.pins == other.pins
             && self.cert_pins.as_ref() == other.cert_pins.as_ref()
+            && self.verify_names == other.verify_names
             && self.cipher_suites == other.cipher_suites
     }
 }
@@ -322,6 +420,7 @@ impl MaterialKey {
             roots: Arc::clone(&cfg.roots),
             pins: cfg.pins.clone(),
             cert_pins: Arc::clone(&cfg.cert_pins),
+            verify_names: Arc::clone(&cfg.verify_names),
             cipher_suites: Arc::clone(&cfg.cipher_suites),
         }
     }
@@ -353,18 +452,36 @@ fn build_material(cfg: &TlsConfig) -> Result<Material, TlsError> {
     let provider = Arc::new(provider);
 
     let chain = OnceLock::new();
+    let names = Arc::clone(&cfg.verify_names);
     let verifier = if !cfg.cert_pins.is_empty() {
         // No anchor work: a cert-pin verdict never needs the webpki chain builder.
         Some(Arc::new(CertPinned {
             cert_pins: Arc::clone(&cfg.cert_pins),
+            names,
         })
             as Arc<dyn rustls::client::danger::ServerCertVerifier>)
     } else if !cfg.pins.is_empty() {
         let plain = build_chain(&roots, &provider)?;
         let _ = chain.set(Ok(Arc::clone(&plain)));
-        Some(Arc::new(Pinned {
+        let pinned: Arc<dyn rustls::client::danger::ServerCertVerifier> = Arc::new(Pinned {
             inner: plain,
             pins: cfg.pins.clone(),
+        });
+        Some(if names.is_empty() {
+            pinned
+        } else {
+            Arc::new(Named {
+                inner: pinned,
+                names,
+            })
+        })
+    } else if !cfg.insecure && !names.is_empty() {
+        // A named chain is the whole contract the way a pin is, so `insecure` outranks it.
+        let plain = build_chain(&roots, &provider)?;
+        let _ = chain.set(Ok(Arc::clone(&plain)));
+        Some(Arc::new(Named {
+            inner: plain,
+            names,
         })
             as Arc<dyn rustls::client::danger::ServerCertVerifier>)
     } else {
@@ -1837,6 +1954,7 @@ mod tests {
             roots: vec![ANCHOR.to_vec()].into(),
             pins: crate::foxy::pin::Pins::default(),
             cert_pins: std::sync::Arc::default(),
+            verify_names: std::sync::Arc::default(),
             cipher_suites: std::sync::Arc::default(),
             insecure: false,
             fingerprint: None,

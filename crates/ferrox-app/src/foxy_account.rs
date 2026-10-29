@@ -473,6 +473,7 @@ impl Endpoint {
             roots: std::sync::Arc::clone(&self.roots),
             pins: ferrox_core::foxy::pin::Pins::default(),
             cert_pins: std::sync::Arc::from(Vec::new()),
+            verify_names: std::sync::Arc::default(),
             cipher_suites: std::sync::Arc::default(),
             insecure: false,
             fingerprint: None,

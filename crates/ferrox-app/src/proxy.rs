@@ -30406,6 +30406,7 @@ mod tests {
             roots: vec![CARRIER_CERT.to_vec()].into(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             cert_pins: std::sync::Arc::default(),
+            verify_names: std::sync::Arc::default(),
             cipher_suites: std::sync::Arc::default(),
             insecure: false,
             fingerprint: None,
@@ -30430,6 +30431,7 @@ mod tests {
             roots: std::sync::Arc::from(Vec::new()),
             pins: ferrox_core::foxy::pin::Pins::default(),
             cert_pins: std::sync::Arc::default(),
+            verify_names: std::sync::Arc::default(),
             cipher_suites: std::sync::Arc::default(),
             insecure: true,
             fingerprint: None,
@@ -31699,7 +31701,11 @@ mod tests {
             .expect("carries tls");
         assert_eq!(tls.server_name, "tls.test");
         assert_eq!(&*tls.alpn, &[b"h2".to_vec()]);
-        assert_eq!(tls.roots.len(), 1);
+        let staged = crate::quic::parse_ca_pem(&std::fs::read(&ca).expect("the staged ca"));
+        assert!(
+            staged.iter().all(|anchor| tls.roots.contains(anchor)),
+            "caCertFile joins the pool the dial verifies with, beside the store"
+        );
         assert!(!tls.insecure, "raw honors allowInsecure=false by default");
         for (want, stream) in tls_stream_cases(&ca_json) {
             let out = find_vless_outbound(&vnext_tls_root("vless", &stream)).expect("finds {want}");
