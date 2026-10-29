@@ -484,23 +484,41 @@ mod tests {
             ("http://example.test/hook".to_owned(), None)
         );
         assert_eq!(
-            split_socket("/tmp/hook.sock"),
-            (
-                "http://localhost/".to_owned(),
-                Some("/tmp/hook.sock".to_owned())
-            )
-        );
-        assert_eq!(
-            split_socket("/tmp/hook.sock:/post"),
-            (
-                "http://localhost/post".to_owned(),
-                Some("/tmp/hook.sock".to_owned())
-            )
-        );
-        assert_eq!(
             split_socket("@name:/post"),
             ("http://localhost/post".to_owned(), Some("@name".to_owned()))
         );
+        // `filepath.IsAbs` names a leading slash absolute only on a host that has that root.
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                split_socket("/tmp/hook.sock"),
+                (
+                    "http://localhost/".to_owned(),
+                    Some("/tmp/hook.sock".to_owned())
+                )
+            );
+            assert_eq!(
+                split_socket("/tmp/hook.sock:/post"),
+                (
+                    "http://localhost/post".to_owned(),
+                    Some("/tmp/hook.sock".to_owned())
+                )
+            );
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                split_socket("/tmp/hook.sock"),
+                ("/tmp/hook.sock".to_owned(), None)
+            );
+            assert_eq!(
+                split_socket(r"C:\tmp\hook.sock:/post"),
+                (
+                    "http://localhost/post".to_owned(),
+                    Some(r"C:\tmp\hook.sock".to_owned())
+                )
+            );
+        }
     }
 
     #[test]
