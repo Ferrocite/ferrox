@@ -71,6 +71,8 @@ No duration is claimed. The answer is one write of a fixed string; benchmarks ar
 
 `an_hc_answer_is_prebuilt_without_allocating` reads the answer for the empty-body `"ok"` case under `ferrox_core::alloc_count`: zero allocations, 85 bytes including the response head and the body. The returned slice starts at the handler's own buffer, that pointer and the buffer's capacity do not change across reads, so a copy or a reallocation fails the identity assertions; a changed header or body fails the byte count. The GET and POST round trips are gated by `an_hc_get_answers_the_configured_body_after_the_exact_path` and `an_hc_post_checks_the_body_and_a_mismatch_answers_nothing`, which assert the exact bytes and the empty refusal.
 
+Two probe pairs price the head scan on `ops.yml` run `40883882281` (x86_64 Linux, artefact `method-ops`, this branch): `the_front_scan_costs_every_window_it_has_already_walked` retires **35 909 473** instructions against `the_seam_scan_costs_the_bytes_it_has_not_walked`'s **2 022 915** — the same eight-kilobyte head arriving in sixteen windows, answered sixty-four times, at the same offset both frames fold into the same pinned `u32` — 0.056× the instructions, **17.8×** fewer. Neither figure is a gate: the gate is `an_hc_head_is_found_at_every_split_of_its_arrival`, which drives every arrival width from one octet to the whole head and asserts the offset, the octets handed on and the terminator itself, so the count is read against a scan already held bit-identical to the whole-buffer walk.
+
 ## Pins
 
 | what | where |

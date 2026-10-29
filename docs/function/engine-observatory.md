@@ -69,6 +69,8 @@ No duration is claimed here. Benchmarks are CI-only, and a local probe measures 
 
 The ring's ten slots are `a_burst_ring_holds_the_sampling_window_and_puts_without_allocating`; the same test puts ten samples under `ferrox_core::alloc_count` and reads zero allocations, so a per-sample buffer fails it. The failure sentinel is `a_failed_legacy_probe_keeps_the_reference_delay`, which publishes a failed legacy status and reads `99999999` back. `burst_settings_default_to_ten_samples_and_head` pins the defaults an empty `pingConfig` block leaves, not a number a run measured.
 
+Two probe pairs price the answer-head scan on `ops.yml` run `40883882281` (x86_64 Linux, artefact `method-ops`, this branch): `the_front_scan_costs_every_window_it_has_already_walked` retires **35 909 345** instructions against `the_seam_scan_costs_the_octets_it_has_not_walked`'s **1 775 408** — the same eight-kilobyte head arriving in sixteen windows, answered sixty-four times, both folding the same end — 0.049× the instructions, **20.2×** fewer. Neither figure is a gate: the gate is `an_answer_head_is_found_at_every_split_of_its_arrival`, which drives every arrival width from one octet to the whole head and asserts the end, the octets kept and the terminator, so the count is read against a scan already held bit-identical to the whole-buffer walk.
+
 ## Pins
 
 | what | where |
