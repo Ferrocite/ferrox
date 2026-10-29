@@ -309,7 +309,7 @@ impl TlsServerConfig {
     }
 
     /// The interval a file-backed entry re-reads at, if any entry re-reads at all.
-    pub(crate) fn reload_interval(&self) -> Option<std::time::Duration> {
+    pub fn reload_interval(&self) -> Option<std::time::Duration> {
         self.certs
             .iter()
             .filter_map(|entry| entry.reload.as_ref())

@@ -1070,8 +1070,6 @@ pub struct ServerConfigCacheInner {
     pub ech: Option<std::sync::Arc<boring::ssl::SslContext>>,
     /// The identities the listener currently serves, so a re-read compares against them.
     pub served: Option<Vec<super::CertEntry>>,
-    /// When the file-backed identities are next re-read; `None` keeps them as loaded.
-    pub renew_at: Option<std::time::Instant>,
 }
 
 impl std::fmt::Debug for ServerConfigCacheInner {
@@ -1255,25 +1253,10 @@ pub(crate) fn cached_server_config(
     cfg: &super::TlsServerConfig,
     reality: bool,
 ) -> Result<std::sync::Arc<rustls::ServerConfig>, TlsError> {
-    let interval = cfg.reload_interval();
-    let now = std::time::Instant::now();
     let mut guard = cfg
         .server_config_cache
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if !reality {
-        if let (Some(interval), Some(at)) = (interval, guard.renew_at) {
-            if now >= at {
-                drop(guard);
-                cfg.renew();
-                guard = cfg
-                    .server_config_cache
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                guard.renew_at = Some(now + interval);
-            }
-        }
-    }
     let slot = if reality {
         &mut guard.reality
     } else {
@@ -1290,7 +1273,6 @@ pub(crate) fn cached_server_config(
     *slot = Some(std::sync::Arc::clone(&built));
     if !reality {
         guard.served = Some(cfg.certs.clone());
-        guard.renew_at = interval.map(|interval| now + interval);
     }
     Ok(built)
 }

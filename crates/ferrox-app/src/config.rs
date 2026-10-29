@@ -623,7 +623,24 @@ pub(crate) fn inbound_tls_identity(
         .and_then(Json::as_bool)
         .unwrap_or(false);
     identity.ech_server_keys = ech;
-    Some(Arc::new(identity))
+    let identity = Arc::new(identity);
+    start_cert_ticker(&identity);
+    Some(identity)
+}
+
+/// xray's `setupOcspTicker`: a file-backed pair re-reads on its interval until the listener drops it.
+fn start_cert_ticker(identity: &Arc<ferrox_core::tls::TlsServerConfig>) {
+    let Some(period) = identity.reload_interval() else {
+        return;
+    };
+    let identity = Arc::downgrade(identity);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(period);
+        let Some(identity) = identity.upgrade() else {
+            return;
+        };
+        identity.renew();
+    });
 }
 
 /// xray's certificate lookup: an absolute path is read as itself; a relative path is
@@ -2858,12 +2875,11 @@ mod tests {
             (true, true),
             "the listener serves the bytes it loaded until the ticker re-reads them"
         );
-        identity.server_config_cache.lock().expect("cache").renew_at =
-            Some(std::time::Instant::now());
+        assert!(identity.renew(), "the re-read replaced the served chain");
         assert_eq!(
             tls_handshake(&identity, first.cert.der().to_vec(), "a.test"),
             (false, false),
-            "a due ticker makes the next handshake re-read, and the disk replaced the chain"
+            "the disk replaced the chain, so the old root no longer completes"
         );
         assert_eq!(
             tls_handshake(&identity, renewed.cert.der().to_vec(), "a.test"),
@@ -2873,6 +2889,53 @@ mod tests {
         assert!(
             !identity.renew(),
             "an unchanged read leaves the listener alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_backed_listener_rereads_on_its_ticker() {
+        let first = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).expect("mints");
+        let renewed = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).expect("mints");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-cert-tick-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let cert = dir.join("a.pem");
+        let key = dir.join("a.key");
+        std::fs::write(&cert, first.cert.pem()).expect("cert");
+        std::fs::write(&key, first.signing_key.serialize_pem()).expect("key");
+        let config = crate::json::parse(&format!(
+            r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{
+                "certificates": [{{"certificateFile": "{}", "keyFile": "{}",
+                    "ocspStapling": 1}}]}}}}}}"#,
+            cert.display(),
+            key.display(),
+        ))
+        .expect("parses");
+        let identity = inbound_tls_identity(&config).expect("the file-backed identity loads");
+        assert_eq!(
+            tls_handshake(&identity, first.cert.der().to_vec(), "a.test"),
+            (true, true),
+            "the listener starts on the pair it read"
+        );
+        std::fs::write(&cert, renewed.cert.pem()).expect("new cert");
+        std::fs::write(&key, renewed.signing_key.serialize_pem()).expect("new key");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut reloaded = false;
+        while std::time::Instant::now() < deadline {
+            if tls_handshake(&identity, renewed.cert.der().to_vec(), "a.test") == (true, true) {
+                reloaded = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            reloaded,
+            "the ocspStapling ticker re-read the pair and the listener serves the renewed chain"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

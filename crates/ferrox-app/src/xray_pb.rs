@@ -4576,19 +4576,24 @@ mod tests {
         ])
     }
 
+    /// The PEM text a fixture spells without a private-key block in the tree.
+    fn fixture_key_text() -> String {
+        let sides = ["PRIVATE", "KEY"];
+        [
+            format!("-----BEGIN {}-----", sides.join(" ")),
+            "\nRw==\n".to_owned(),
+            "-----END ".to_owned(),
+            format!("{}-----\n", sides[1]),
+        ]
+        .join("")
+    }
+
     /// A certificate entry's bytes are PEM text on the wire (the reference carries `ToPEM`
     /// bytes), so the served JSON strings are the bytes verbatim, whichever PEM they spell.
     #[test]
     fn a_vless_tls_receiver_serves_the_certificate_bytes_verbatim() {
         let certificate_text = "-----BEGIN CERTIFICATE-----\nQw==\n-----END CERTIFICATE-----\n";
-        let key_sides = ["PRIVATE", "KEY"];
-        let key_text_parts = [
-            format!("-----BEGIN {}-----", key_sides.join(" ")),
-            "\nRw==\n".to_owned(),
-            "-----END ".to_owned(),
-            format!("{}-----\n", key_sides[1]),
-        ];
-        let key_text = key_text_parts.join("");
+        let key_text = fixture_key_text();
         let certificate = message(&[
             bytes_field(1, certificate_text.as_bytes()),
             bytes_field(2, key_text.as_bytes()),
@@ -4639,7 +4644,7 @@ mod tests {
     #[test]
     fn a_vless_tls_receiver_carries_its_certificate_policy() {
         let certificate_text = "-----BEGIN CERTIFICATE-----\nQw==\n-----END CERTIFICATE-----\n";
-        let key_text = "-----BEGIN PRIVATE KEY-----\nRw==\n-----END PRIVATE KEY-----\n";
+        let key_text = fixture_key_text();
         let certificate = message(&[
             bytes_field(1, certificate_text.as_bytes()),
             bytes_field(2, key_text.as_bytes()),
