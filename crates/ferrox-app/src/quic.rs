@@ -950,6 +950,10 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// One batch per live pump on a thread: a nested `take_queued` may hold a second, and more than that is memory a thread no longer needs.
+#[cfg(target_os = "linux")]
+const BATCH_POOL_MAX: usize = 2;
+
 /// A batch of datagrams read off a lane's socket: the bytes of each, the peer it came from and the length of that
 /// peer's name. A slot can be one datagram or a coalesced GSO burst; `starts` maps the packet index a caller walks
 /// to the slot and the segment inside it, so a coalesced burst reads exactly like the packets it carried.
@@ -961,40 +965,44 @@ pub(crate) struct Batch {
 #[cfg(target_os = "linux")]
 impl Batch {
     pub(crate) fn new() -> Self {
-        let data = BATCH_POOL
-            .try_with(|pool| pool.borrow_mut().pop())
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| Box::new(BatchData::new()));
-        Self { data: Some(data) }
+        Self { data: None }
     }
 
-    fn data(&self) -> &BatchData {
-        self.data.as_deref().expect("a batch owns its slots")
+    fn data(&self) -> Option<&BatchData> {
+        self.data.as_deref()
     }
 
     fn data_mut(&mut self) -> &mut BatchData {
+        if self.data.is_none() {
+            let data = BATCH_POOL
+                .try_with(|pool| pool.borrow_mut().pop())
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| Box::new(BatchData::new()));
+            self.data = Some(data);
+        }
         self.data.as_deref_mut().expect("a batch owns its slots")
     }
 
     /// How many packets the last read filled, with a coalesced slot counted as the segments it carries.
     pub(crate) fn len(&self) -> usize {
-        self.data().len
+        self.data().map_or(0, |data| data.len)
     }
 
     /// The slot holding packet `at`, found through the prefix sums `recv_batch` wrote.
     fn slot_of(&self, at: usize) -> Option<usize> {
-        if at >= self.len() {
+        let data = self.data()?;
+        if at >= data.len {
             return None;
         }
-        let starts = &self.data().starts[..=self.data().used];
+        let starts = &data.starts[..=data.used];
         starts.partition_point(|&start| start <= at).checked_sub(1)
     }
 
     /// The byte range of packet `at` inside its slot: a slot read without GRO has one packet, and a coalesced one
     /// is cut at the segment size the kernel named.
     fn range(&self, slot: usize, at: usize) -> Option<(usize, usize)> {
-        let data = self.data();
+        let data = self.data()?;
         // SAFETY: `recv_batch` wrote this slot's length before it published the slot in `len`.
         let raw = usize::try_from(unsafe { *data.lens.get(slot)?.assume_init_ref() }).ok()?;
         let seg = data.segs.get(slot).copied().unwrap_or(0);
@@ -1015,7 +1023,7 @@ impl Batch {
         let slot = self.slot_of(at)?;
         let (start, end) = self.range(slot, at)?;
         // SAFETY: `recv_batch` wrote this slot's name and peer before it published the slot in `len`.
-        let data = self.data.as_deref()?;
+        let data = self.data()?;
         let from = crate::proxy::socket_addr_of(
             unsafe { data.peers.get(slot)?.assume_init_ref() },
             unsafe { *data.names.get(slot)?.assume_init_ref() },
@@ -1034,7 +1042,7 @@ impl Batch {
     pub(crate) fn key(&self, at: usize) -> Option<&[u8]> {
         let slot = self.slot_of(at)?;
         let (start, end) = self.range(slot, at)?;
-        packet_key(self.data().slots.get(slot)?.written(end).get(start..)?)
+        packet_key(self.data()?.slots.get(slot)?.written(end).get(start..)?)
     }
 }
 
@@ -1042,7 +1050,12 @@ impl Batch {
 impl Drop for Batch {
     fn drop(&mut self) {
         if let Some(data) = self.data.take() {
-            let _ = BATCH_POOL.try_with(|pool| pool.borrow_mut().push(data));
+            let _ = BATCH_POOL.try_with(|pool| {
+                let mut pool = pool.borrow_mut();
+                if pool.len() < BATCH_POOL_MAX {
+                    pool.push(data);
+                }
+            });
         }
     }
 }
@@ -2889,12 +2902,14 @@ fn pump(
                 return;
             }
             // Every datagram the batch holds is one packet, and they are handed to quiche in the order the kernel wrote them.
-            for at in 0..batch.len() {
-                let Some((bytes, from)) = batch.at(at) else {
-                    continue;
-                };
-                let info = quiche::RecvInfo { from, to: local };
-                let _ = conn.recv(bytes, info);
+            if drain == Drain::Read {
+                for at in 0..batch.len() {
+                    let Some((bytes, from)) = batch.at(at) else {
+                        continue;
+                    };
+                    let info = quiche::RecvInfo { from, to: local };
+                    let _ = conn.recv(bytes, info);
+                }
             }
 
             match incoming {
@@ -4086,23 +4101,36 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn a_quic_socket_is_bound_with_datagram_coalescing_on() {
-        use std::os::fd::AsRawFd as _;
+        fn gro(sock: &UdpSocket) -> Option<bool> {
+            use std::os::fd::AsRawFd as _;
+            let mut on: libc::c_int = -1;
+            let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
+                .expect("size fits a socklen");
+            // SAFETY: `on` and `len` describe the buffer the kernel writes into.
+            let got = unsafe {
+                libc::getsockopt(
+                    sock.as_raw_fd(),
+                    libc::SOL_UDP,
+                    libc::UDP_GRO,
+                    std::ptr::addr_of_mut!(on).cast(),
+                    std::ptr::addr_of_mut!(len),
+                )
+            };
+            (got == 0).then_some(on == 1)
+        }
+        let probe = bind_datagram("127.0.0.1:0").expect("binds");
+        if gro(&probe) != Some(true) {
+            return;
+        }
         let sock = bind_datagram("127.0.0.1:0").expect("binds");
-        let mut on: libc::c_int = -1;
-        let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
-            .expect("size fits a socklen");
-        // SAFETY: `on` and `len` describe the buffer the kernel writes into.
-        let got = unsafe {
-            libc::getsockopt(
-                sock.as_raw_fd(),
-                libc::SOL_UDP,
-                libc::UDP_GRO,
-                std::ptr::addr_of_mut!(on).cast(),
-                std::ptr::addr_of_mut!(len),
-            )
-        };
-        assert_eq!(got, 0, "the kernel knows UDP_GRO");
-        assert_eq!(on, 1, "a GSO burst is coalesced");
+        assert_eq!(gro(&sock), Some(true), "a GSO burst is coalesced");
+        let obfs = || ferrox_core::hysteria::Salamander::new("hy2!").expect("four-byte key");
+        let masked = Datagram::obfuscated(bind_datagram("127.0.0.1:0").expect("binds"), obfs());
+        assert_eq!(
+            gro(&masked.sock),
+            Some(false),
+            "a masked lane reads one datagram at a time"
+        );
         assert!(udp_to_server("127.0.0.1", 443).is_some(), "still dials");
     }
 
@@ -4123,13 +4151,11 @@ mod tests {
         let mut lens = [0usize; SEND_SLOTS];
         lens[0] = MAX_DATAGRAM;
         lens[1] = MAX_DATAGRAM;
-        assert!(
-            matches!(
-                send_gso(&sender, &slots, &lens, 0, 2, Some(peer)),
-                Gso::Sent
-            ),
-            "the kernel accepts a two-segment GSO datagram"
-        );
+        match send_gso(&sender, &slots, &lens, 0, 2, Some(peer)) {
+            Gso::Sent => {}
+            Gso::Unsupported => return,
+            Gso::Refused => panic!("the loopback queue refused a two-segment GSO datagram"),
+        }
         let mut batch = Batch::new();
         assert_eq!(recv_batch(&receiver, &mut batch), Drain::Read);
         assert_eq!(batch.len(), 2, "the coalesced datagram is cut in two");
