@@ -1165,6 +1165,7 @@ struct ReadSide {
     input_pos: usize,
     wire: Vec<u8>,
     wire_pos: usize,
+    chunk: Vec<u8>,
     header: Option<[u8; HEADER_LEN]>,
     direct: bool,
 }
@@ -1174,15 +1175,14 @@ impl ReadSide {
     /// so a retry resumes where the kernel stopped instead of reading a record header twice.
     fn take_wire<S: Read>(&mut self, inner: &mut S, len: usize) -> io::Result<()> {
         while self.wire.len() - self.wire_pos < len {
-            let mut chunk = [0u8; 8192];
-            match inner.read(&mut chunk) {
+            match inner.read(&mut self.chunk) {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "failed to fill whole buffer",
                     ));
                 }
-                Ok(n) => self.wire.extend_from_slice(&chunk[..n]),
+                Ok(n) => self.wire.extend_from_slice(&self.chunk[..n]),
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                 Err(error) => return Err(error),
             }
@@ -1400,6 +1400,7 @@ impl<S> EncryptedStream<S> {
                 input_pos: 0,
                 wire: Vec::new(),
                 wire_pos: 0,
+                chunk: vec![0u8; MAX_RECORD],
                 header: None,
                 direct: false,
             },
