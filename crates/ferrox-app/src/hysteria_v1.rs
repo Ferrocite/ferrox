@@ -1340,12 +1340,13 @@ mod tests {
             .expect("timeout");
         let sender = UdpSocket::bind("127.0.0.1:0").expect("binds the sender");
 
-        let stop = AtomicBool::new(false);
+        let stop = Arc::new(AtomicBool::new(false));
         let reader = std::thread::spawn({
             let shared = Arc::clone(&shared);
             let sock = Arc::clone(&sock);
             let target = Arc::clone(&target);
-            move || udp_reader(&shared, &sock, &target, &stop, 7)
+            let stop = Arc::clone(&stop);
+            move || udp_reader(&shared, &sock, &target, stop.as_ref(), 7)
         });
         std::thread::sleep(Duration::from_millis(100));
         assert!(!reader.is_finished(), "the reader should be waiting");
