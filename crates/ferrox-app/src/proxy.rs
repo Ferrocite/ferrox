@@ -1821,10 +1821,18 @@ impl RoutePlan {
         network: crate::router::Network,
         client: Option<&Connection>,
     ) -> Option<crate::process::Owner> {
+        self.process_owner_from(network, client?.socket_peer().ok()?)
+    }
+
+    fn process_owner_from(
+        &self,
+        network: crate::router::Network,
+        source: SocketAddr,
+    ) -> Option<crate::process::Owner> {
         if !self.source_known || !self.shared.routing.wants_process() {
             return None;
         }
-        crate::process::owner(network, client?.socket_peer().ok()?)
+        crate::process::owner(network, source)
     }
 
     fn lane_with_protocol(
@@ -17165,7 +17173,8 @@ fn serve_socks_udp_split(
     let mut client_addr: Option<SocketAddr> = None;
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-    let process = plan.process_owner(crate::router::Network::Udp, Some(&client));
+    let mut process = None;
+    let mut process_src = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         if replies.contains_key(&src) {
             if let Some(client) = client_addr {
@@ -17194,6 +17203,10 @@ fn serve_socks_udp_split(
             }
         }
         client_addr = Some(src);
+        if process_src != Some(src) {
+            process = plan.process_owner_from(crate::router::Network::Udp, src);
+            process_src = Some(src);
+        }
         let (out, key) = plan.lane_with_protocol(
             &route,
             crate::router::Network::Udp,
@@ -48206,6 +48219,66 @@ end
         );
         let source = udp_roundtrip(&udp, relay, &frame(allowed, b"ping"), b"ping");
         assert_eq!(source.port(), allowed);
+    }
+
+    /// A split association resolves the process from the UDP sender, not the TCP control
+    /// connection: the control connection's port names no UDP socket.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_split_udp_association_names_the_process_from_the_datagram_sender() {
+        let echo = udp_echo_loop();
+        let blocked = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","process":["self/"],"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let allowed = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","process":["not-this-process"],"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let associate = |config: &str| {
+            let front = socks_front_with(route_outbound(config, Some("in"), true));
+            let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+            client
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            client.write_all(&[5, 1, 0]).expect("greets");
+            let mut method = [0u8; 2];
+            client.read_exact(&mut method).expect("selects");
+            client
+                .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+                .expect("associates");
+            let mut reply = [0u8; 10];
+            client.read_exact(&mut reply).expect("replies");
+            assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+            let relay: SocketAddr = SocketAddr::new(
+                std::net::IpAddr::V4([127, 0, 0, 1].into()),
+                u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+            );
+            (client, relay)
+        };
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut frame = vec![0u8, 0, 0];
+        push_socks_addr(
+            &mut frame,
+            &format!("127.0.0.1:{echo}").parse().expect("addr"),
+        );
+        frame.extend_from_slice(b"drop");
+        let (_blocked_client, relay) = associate(blocked);
+        udp.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
+        udp.send_to(&frame, relay).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        assert!(
+            udp.recv_from(&mut back).is_err(),
+            "the sender's process names the block"
+        );
+        let (_allowed_client, relay) = associate(allowed);
+        let source = udp_roundtrip(&udp, relay, &frame, b"drop");
+        assert_eq!(
+            source.port(),
+            echo,
+            "the same lane echoes when the rule misses"
+        );
     }
 
     /// A split association keeps the client's name: a domain rule drops the datagram before any
