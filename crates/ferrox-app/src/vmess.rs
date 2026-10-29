@@ -4281,6 +4281,9 @@ mod tests {
 
         let (plain, mut target) = socket_pair();
         target
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("arms");
+        target
             .shutdown(Shutdown::Write)
             .expect("the target ends its download");
 
@@ -4309,9 +4312,6 @@ mod tests {
         .expect("clones the plain socket");
         flow.wait();
 
-        target
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .expect("arms");
         let mut got = [0u8; 4];
         target
             .read_exact(&mut got)
