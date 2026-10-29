@@ -57,6 +57,7 @@ mod tun;
 mod veepn;
 mod vision;
 mod vmess;
+mod webhook;
 mod wg;
 #[cfg(target_os = "linux")]
 mod wg_kernel;
