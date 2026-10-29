@@ -911,6 +911,8 @@ pub fn parse_h3_request(block: &[u8]) -> Option<H3Request> {
 }
 
 /// An HTTP/3 response on a request stream: a `HEADERS` frame carrying `:status` ahead of the caller's fields, then a `DATA` frame only when the body is not empty, each length-prefixed the way the auth answer frames its headers. The caller sends the stream FIN.
+///
+/// The block's length is its fields' lengths summed before a byte of it is written, so the frame prefix goes into the caller's own buffer ahead of the block and the block is written there once — the temporary it used to be assembled in, and the copy that lifted it into the answer, are both gone.
 pub fn encode_h3_response(status: u16, headers: &[(&str, &str)], body: &[u8], out: &mut Vec<u8>) {
     // The code's digits go into the end of a stack buffer: `to_string` is one allocation per answer, and a `fields` list to prepend them to is another.
     let mut code = [0u8; 5];
@@ -924,21 +926,27 @@ pub fn encode_h3_response(status: u16, headers: &[(&str, &str)], body: &[u8], ou
             break;
         }
     }
-    let mut block = Vec::with_capacity(
-        2 + hpack::qpack_field_len(7, code.len() - at)
-            + headers
-                .iter()
-                .map(|(name, value)| hpack::qpack_field_len(name.len(), value.len()))
-                .sum::<usize>(),
-    );
-    hpack::qpack_open(&mut block);
-    hpack::qpack_field(&mut block, ":status", &code[at..]);
-    for (name, value) in headers {
-        hpack::qpack_field(&mut block, name, value.as_bytes());
-    }
+    // `qpack_open` writes the block's two prefix bytes, then one `qpack_field_len` per field is its exact byte count.
+    let block_len = 2
+        + hpack::qpack_field_len(7, code.len() - at)
+        + headers
+            .iter()
+            .map(|(name, value)| hpack::qpack_field_len(name.len(), value.len()))
+            .sum::<usize>();
     frames::quic_varint(out, frames::H3_HEADERS);
-    frames::quic_varint(out, block.len() as u64);
-    out.extend_from_slice(&block);
+    frames::quic_varint(out, block_len as u64);
+    let opened = out.len();
+    hpack::qpack_open(out);
+    hpack::qpack_field(out, ":status", &code[at..]);
+    for (name, value) in headers {
+        hpack::qpack_field(out, name, value.as_bytes());
+    }
+    // The sum the prefix names and the bytes just written are one count, so the frame's block is exactly the fields it opened.
+    debug_assert_eq!(
+        out.len() - opened,
+        block_len,
+        "the block's sum is its bytes"
+    );
     if !body.is_empty() {
         frames::quic_varint(out, frames::H3_DATA);
         frames::quic_varint(out, body.len() as u64);
@@ -1719,23 +1727,77 @@ mod tests {
         assert_eq!(&out[at..at + 2], b"hi");
     }
 
-    /// One block buffer per answer, sized to the bytes it holds: the code's digits go on the wire from a stack array, no field list is joined ahead of them, and the caller's buffer is never grown by the answer.
+    /// The two-pass form the direct answer replaced, kept as the bytes every answer has to still equal: the block assembled in a buffer of its own, then copied into the frame.
+    fn the_block_answer(status: u16, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let code = status.to_string();
+        let mut block = Vec::with_capacity(
+            2 + hpack::qpack_field_len(7, code.len())
+                + headers
+                    .iter()
+                    .map(|(name, value)| hpack::qpack_field_len(name.len(), value.len()))
+                    .sum::<usize>(),
+        );
+        hpack::qpack_open(&mut block);
+        hpack::qpack_field(&mut block, ":status", code.as_bytes());
+        for (name, value) in headers {
+            hpack::qpack_field(&mut block, name, value.as_bytes());
+        }
+        frames::quic_varint(&mut out, frames::H3_HEADERS);
+        frames::quic_varint(&mut out, block.len() as u64);
+        out.extend_from_slice(&block);
+        if !body.is_empty() {
+            frames::quic_varint(&mut out, frames::H3_DATA);
+            frames::quic_varint(&mut out, body.len() as u64);
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    /// Every answer is the bytes the two-pass form assembled, and its prefix names exactly the block its fields wrote: the codes whose digits a five-byte stack buffer has to hold, no field beside a full head, and an empty body beside a long one.
     #[test]
-    fn an_h3_answer_allocates_only_its_field_block() {
+    fn every_answer_is_the_bytes_the_block_assembled() {
+        let heads: &[&[(&str, &str)]] = &[
+            &[],
+            &[("content-type", "text/plain")],
+            &[
+                ("content-type", "text/html; charset=utf-8"),
+                ("server", "nginx"),
+                ("cache-control", "no-store"),
+            ],
+        ];
+        let long = [0xffu8; 300];
+        for status in [0u16, 9, 99, 100, 200, 404, 1034, 65535] {
+            for head in heads {
+                for body in [b"".as_slice(), b"hi".as_slice(), long.as_slice()] {
+                    let mut out = Vec::new();
+                    encode_h3_response(status, head, body, &mut out);
+                    assert_eq!(
+                        out,
+                        the_block_answer(status, head, body),
+                        "status {status}, {} field(s), {} body byte(s)",
+                        head.len(),
+                        body.len()
+                    );
+                    let mut at = 0usize;
+                    let frame = frames::h3_frame(&out, &mut at).expect("a headers frame");
+                    hpack::qpack_fields(&out[at..at + frame.length as usize])
+                        .expect("the length names the block the fields wrote");
+                }
+            }
+        }
+    }
+
+    /// One block buffer per answer, sized to the bytes it holds, is gone: the sum of the field lengths opens the frame in the caller's own buffer, so 4096 answers allocate nothing at all, and the buffer's base and capacity hold across every one.
+    #[test]
+    fn an_h3_answer_writes_its_block_straight_into_the_callers_buffer() {
         let headers = [
             ("content-type", "text/html; charset=utf-8"),
             ("server", "nginx"),
         ];
-        let need = 2
-            + hpack::qpack_field_len(":status".len(), 3)
-            + headers
-                .iter()
-                .map(|(name, value)| hpack::qpack_field_len(name.len(), value.len()))
-                .sum::<usize>();
-        let mut out = Vec::with_capacity(need + 16);
+        let mut out = Vec::with_capacity(256);
         encode_h3_response(200, &headers, b"cover", &mut out);
-        let block = out.as_ptr();
-        let capacity = out.capacity();
+        let (block, capacity) = (out.as_ptr(), out.capacity());
         let ((), counts) = crate::alloc_count::measure(|| {
             for _ in 0..4096 {
                 out.clear();
@@ -1744,14 +1806,61 @@ mod tests {
         });
         assert_eq!(
             (counts.allocs, counts.bytes, counts.zeroed),
-            (4096, 4096 * need, 0),
-            "one block of {need} bytes per answer, and nothing joined or grown on the way"
+            (0, 0, 0),
+            "the answer opened nothing of its own"
         );
         assert_eq!(
             (out.as_ptr(), out.capacity()),
             (block, capacity),
-            "the answer never moved or grew the caller's own buffer"
+            "and never moved or grew the caller's own buffer"
         );
+    }
+
+    /// The temporary's own frame: 512 answers to one three-field head, each block assembled in a buffer of its own and copied into the answer.
+    #[test]
+    fn the_block_answer_costs_the_bytes_it_copies() {
+        let headers = [
+            ("content-type", "text/html; charset=utf-8"),
+            ("server", "nginx"),
+            ("cache-control", "no-store"),
+        ];
+        let want = the_block_answer(200, &headers, b"cover").len() as u32 * 512;
+        let mut fold: u32 = 0;
+        for _ in 0..512 {
+            fold = fold.wrapping_add(
+                the_block_answer(
+                    std::hint::black_box(200),
+                    std::hint::black_box(&headers),
+                    std::hint::black_box(b"cover".as_slice()),
+                )
+                .len() as u32,
+            );
+        }
+        assert_eq!(fold, want, "the same 512 answers, one block each");
+    }
+
+    /// The same 512 answers written straight into the caller's buffer, so one ops job reports both frames and only their difference is a claim about the temporary.
+    #[test]
+    fn the_direct_answer_costs_the_same_bytes_once() {
+        let headers = [
+            ("content-type", "text/html; charset=utf-8"),
+            ("server", "nginx"),
+            ("cache-control", "no-store"),
+        ];
+        let want = the_block_answer(200, &headers, b"cover").len() as u32 * 512;
+        let mut out = Vec::with_capacity(512);
+        let mut fold: u32 = 0;
+        for _ in 0..512 {
+            out.clear();
+            encode_h3_response(
+                std::hint::black_box(200),
+                std::hint::black_box(&headers),
+                std::hint::black_box(b"cover".as_slice()),
+                &mut out,
+            );
+            fold = fold.wrapping_add(out.len() as u32);
+        }
+        assert_eq!(fold, want, "the same 512 answers, no block to copy");
     }
 
     #[test]

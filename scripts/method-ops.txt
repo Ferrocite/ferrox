@@ -139,6 +139,8 @@ carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hyste
 # frames, and only their difference is a claim about the key.
 carrier-hysteria  hysteria::tests::the_word_extension_key_costs_the_word_and_nothing_else  ferrox_core::hysteria::tests::the_word_extension_key_costs_the_word_and_nothing_else
 carrier-hysteria  hysteria::tests::the_lowercase_extension_key_costs_the_same_answer  ferrox_core::hysteria::tests::the_lowercase_extension_key_costs_the_same_answer
+carrier-hysteria  hysteria::tests::the_block_answer_costs_the_bytes_it_copies  ferrox_core::hysteria::tests::the_block_answer_costs_the_bytes_it_copies
+carrier-hysteria  hysteria::tests::the_direct_answer_costs_the_same_bytes_once  ferrox_core::hysteria::tests::the_direct_answer_costs_the_same_bytes_once
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Chain::write
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Fragment::write_hello
 finalmask  finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies  ferrox_core::finalmask::write_record

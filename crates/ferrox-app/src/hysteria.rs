@@ -1425,9 +1425,8 @@ fn serve_file(dir: &str, request: &hysteria::H3Request, out: &mut Vec<u8>) {
 fn safe_path(root: &str, path: &str) -> Option<std::path::PathBuf> {
     let trimmed = path.split(['?', '#']).next().unwrap_or(path);
     let decoded = percent_decode(trimmed)?;
-    let text = std::str::from_utf8(&decoded).ok()?;
     let mut joined = std::path::PathBuf::from(root);
-    for segment in text.split('/') {
+    for segment in decoded.split('/') {
         match segment {
             "" | "." => {}
             ".." => return None,
@@ -1482,8 +1481,11 @@ fn html_escape(text: &str) -> String {
     out
 }
 
-/// Percent-decodes a URL path; a `%` not followed by two hex digits is not valid and rejects the whole path, so a half-decoded traversal never slips through.
-fn percent_decode(input: &str) -> Option<Vec<u8>> {
+/// Percent-decodes a URL path; a `%` not followed by two hex digits is not valid and rejects the whole path, so a half-decoded traversal never slips through. A path with no escape is already the text it decodes to, so it is lent back rather than copied into a buffer the copy would leave unchanged — the browser's own request line almost never escapes anything.
+fn percent_decode(input: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !input.as_bytes().contains(&b'%') {
+        return Some(std::borrow::Cow::Borrowed(input));
+    }
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
@@ -1501,7 +1503,7 @@ fn percent_decode(input: &str) -> Option<Vec<u8>> {
             }
         }
     }
-    Some(out)
+    String::from_utf8(out).ok().map(std::borrow::Cow::Owned)
 }
 
 fn hex_val(byte: u8) -> Option<u8> {
@@ -2412,6 +2414,116 @@ pub(crate) fn serve_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The buffer form the decode had, kept as the bytes every path has to still reach.
+    fn the_buffer_decode(input: &str) -> Option<String> {
+        let bytes = input.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'%' => {
+                    let hi = hex_val(*bytes.get(i + 1)?)?;
+                    let lo = hex_val(*bytes.get(i + 2)?)?;
+                    out.push(hi << 4 | lo);
+                    i += 3;
+                }
+                other => {
+                    out.push(other);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+
+    /// The escapes a browser sends, the multi-byte and literal-percent ones, and the half-escapes that reject the whole path.
+    const DECODED_PATHS: &[&str] = &[
+        "",
+        "/",
+        "/index.html",
+        "/static/css/site.css?v=2",
+        "/a%20b/c.txt",
+        "/%2E%2E/escape",
+        "/%2e%2e%2f",
+        "/caf%C3%A9/menu.json",
+        "/100%25",
+        "/a%2",
+        "/a%zz",
+        "/%",
+        "/%FF",
+        "/sp ace/../x",
+    ];
+
+    /// Every path decodes to the bytes the buffer form produced and rejects exactly the paths it rejected, so lending a percent-free path back changes no answer.
+    #[test]
+    fn every_path_decodes_to_the_bytes_the_buffer_form_decoded() {
+        for path in DECODED_PATHS {
+            assert_eq!(
+                percent_decode(path).as_deref(),
+                the_buffer_decode(path).as_deref(),
+                "path {path:?}"
+            );
+        }
+    }
+
+    /// A path with no escape opens nothing: 4096 static requests are lent the request's own text, and the one buffer is opened only when a `%` can change a byte.
+    #[test]
+    fn a_path_with_no_escape_is_lent_back_undecoded() {
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                std::hint::black_box(percent_decode(std::hint::black_box("/static/css/site.css")));
+            }
+        });
+        assert_eq!(counts.allocs, 0, "no escape, no buffer");
+        assert!(
+            matches!(
+                percent_decode("/static/css/site.css"),
+                Some(std::borrow::Cow::Borrowed(_))
+            ),
+            "the answer is the caller's own text"
+        );
+        let (_, escaped) = ferrox_core::alloc_count::measure(|| percent_decode("/a%20b"));
+        assert_eq!(escaped.allocs, 1, "an escape opens the one buffer it needs");
+    }
+
+    /// The whole static answer over a real file: the path it builds, the one growth that path takes, and the file's own bytes are all a request pays.
+    #[test]
+    fn a_static_file_answer_opens_only_the_path_and_the_file() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-static-answer-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("stages dir");
+        std::fs::write(dir.join("hello.txt"), b"static bytes").expect("stages file");
+        let request = hysteria::H3Request {
+            method: "GET".to_owned(),
+            path: "/hello.txt".to_owned(),
+            authority: "cover.test".to_owned(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let root = dir.to_str().expect("ascii").to_owned();
+        let mut out = Vec::with_capacity(256);
+        serve_file(&root, &request, &mut out);
+        assert!(
+            out.windows(12).any(|window| window == b"static bytes"),
+            "the file's bytes are in the answer"
+        );
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            out.clear();
+            serve_file(std::hint::black_box(&root), &request, &mut out);
+        });
+        assert_eq!(
+            counts.allocs, 3,
+            "the path buffer, its one growth, and the file's own bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn server_config_refuses_without_a_chain_it_can_read() {
