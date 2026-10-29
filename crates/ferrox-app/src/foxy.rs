@@ -5992,6 +5992,7 @@ pub(crate) mod loopback {
             tls.flush().expect("flushes");
             let mut seen = 0u8;
             loop {
+                let mut ended = false;
                 if framed {
                     let mut header = [0u8; frames::H2_HEADER];
                     if !read_exact_poll(&mut tls, &mut header) {
@@ -6002,9 +6003,13 @@ pub(crate) mod loopback {
                     if !read_exact_poll(&mut tls, &mut payload) {
                         return;
                     }
+                    if frame.kind == frames::RST_STREAM {
+                        return;
+                    }
                     if frame.kind != frames::DATA {
                         continue;
                     }
+                    ended = frame.flags & frames::END_STREAM != 0;
                 } else {
                     let mut byte = [0u8; 1];
                     if !read_exact_poll(&mut tls, &mut byte) {
@@ -6013,6 +6018,9 @@ pub(crate) mod loopback {
                 }
                 seen += 1;
                 if arrived_tx.send(seen).is_err() {
+                    return;
+                }
+                if framed && ended {
                     return;
                 }
             }
