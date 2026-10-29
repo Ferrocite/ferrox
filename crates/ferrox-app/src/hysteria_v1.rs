@@ -78,6 +78,9 @@ fn connect(dial: &Dial) -> Option<Session> {
     let cid = quiche::ConnectionId::from_ref(&scid);
     let mut config =
         crate::quic::quiche_config_alpn(roots, Some(dial.config.cc.quiche_name()), &[wire::ALPN])?;
+    if let Some(params) = &dial.config.quic {
+        crate::quic::apply_hysteria_quic(&mut config, params, false);
+    }
     config.enable_dgram(true, 1024, 1024);
     let Ok(mut conn) = quiche::connect(Some(&dial.host), &cid, local, peer, &mut config) else {
         return None;
@@ -111,6 +114,13 @@ fn connect(dial: &Dial) -> Option<Session> {
         },
     };
     crate::quic::drive_handshake(&mut conn, &sock, local)?;
+    let keep_alive = dial
+        .config
+        .quic
+        .as_ref()
+        .map(|params| params.keep_alive)
+        .filter(|seconds| *seconds != 0)
+        .map(Duration::from_secs);
     let session = Session {
         shared: Arc::new(Mutex::new(conn)),
         sock: Arc::new(sock),
@@ -118,6 +128,7 @@ fn connect(dial: &Dial) -> Option<Session> {
         udp_supported: true,
         driver: None,
         send_wake: None,
+        keep_alive,
     };
     let mut hello = Vec::with_capacity(20 + dial.config.auth.len());
     wire::encode_client_hello(
@@ -1246,6 +1257,7 @@ mod tests {
                 obfs_password: String::new(),
                 hop: None,
                 gecko: None,
+                ..ferrox_core::hysteria::Config::default()
             },
             roots: Some(roots.into()),
         };

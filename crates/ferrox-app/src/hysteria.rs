@@ -24,9 +24,6 @@ const STREAM_POLL: Duration = Duration::from_millis(5);
 
 const SCID_LEN: usize = 16;
 
-/// How long a QUIC datagram lane may sit without traffic before its association is reaped, matching the reference's `udp_idle_timeout`.
-const UDP_IDLE: Duration = Duration::from_secs(60);
-
 /// The reader's socket poll, matching the reference's one-second cleanup tick: it bounds how long a reaped association's thread lives, since a UDP socket has no shutdown to wake a blocked read.
 const UDP_POLL: Duration = Duration::from_secs(1);
 
@@ -52,6 +49,8 @@ pub(crate) struct Session {
     pub(crate) driver: Option<Arc<Driver>>,
     /// Wakes a writer whose stream filled its window when the reader has taken a datagram: an ACK frees send capacity, and a 5 ms poll on a loopback ACK is fifty times too coarse.
     pub(crate) send_wake: Option<Arc<StreamWake>>,
+    /// The reference's `keepAlivePeriod`: an idle lane sends an ack-eliciting packet this often so a middlebox or the peer's idle timer cannot retire it.
+    pub(crate) keep_alive: Option<Duration>,
 }
 
 /// One stream's latch: the pump bumps it when a datagram filled the stream, and the flow reading it parks until then instead of waiting on the shared socket with the others.
@@ -148,6 +147,7 @@ impl Driver {
         let shared = Arc::clone(&session.shared);
         let sock = Arc::clone(&session.sock);
         let local = session.local;
+        let keep_alive = session.keep_alive;
         let pump = Arc::clone(self);
         self.alive.store(true, Ordering::Relaxed);
         std::thread::spawn(move || {
@@ -158,8 +158,11 @@ impl Driver {
                 udp_supported: false,
                 driver: None,
                 send_wake: None,
+                keep_alive,
             };
             let mut ready = Vec::with_capacity(16);
+            let mut last_sent = 0usize;
+            let mut last_at = Instant::now();
             while !pump.stop.load(Ordering::Relaxed) {
                 if !drive_once(&session, STREAM_POLL) {
                     let closed = match session.shared.lock() {
@@ -171,6 +174,28 @@ impl Driver {
                     }
                     std::thread::sleep(STREAM_POLL);
                     continue;
+                }
+                if let Some(period) = keep_alive {
+                    let sent = match session.shared.lock() {
+                        Ok(conn) => {
+                            if conn.is_closed() {
+                                break;
+                            }
+                            conn.stats().sent
+                        }
+                        Err(_) => break,
+                    };
+                    if sent != last_sent {
+                        last_sent = sent;
+                        last_at = Instant::now();
+                    } else if last_at.elapsed() >= period {
+                        if let Ok(mut conn) = session.shared.lock() {
+                            let _ = conn.send_ack_eliciting();
+                            crate::quic::flush_egress(&mut conn, &session.sock);
+                            last_sent = conn.stats().sent;
+                        }
+                        last_at = Instant::now();
+                    }
                 }
                 pump.send.bump();
                 ready.clear();
@@ -371,9 +396,9 @@ fn control_settings(session: &Session) -> bool {
     send_all(session, 2, &settings, true)
 }
 
-fn post_auth(session: &Session, auth: &str) -> Option<bool> {
+fn post_auth(session: &Session, auth: &str, cc_rx: u64) -> Option<bool> {
     let mut block = Vec::with_capacity(64 + auth.len());
-    hysteria::build_auth_request(auth, &mut block);
+    hysteria::build_auth_request(auth, cc_rx, &mut block);
     let mut frame = Vec::with_capacity(16 + block.len());
     frames::quic_varint(&mut frame, frames::H3_HEADERS);
     frames::quic_varint(&mut frame, block.len() as u64);
@@ -400,6 +425,9 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     getrandom::fill(&mut scid).ok()?;
     let cid = quiche::ConnectionId::from_ref(&scid);
     let mut config = crate::quic::quiche_config(roots, Some(dial.config.cc.quiche_name()))?;
+    if let Some(params) = &dial.config.quic {
+        crate::quic::apply_hysteria_quic(&mut config, params, false);
+    }
     // The client enables the datagram lane exactly as the served connection does: advertising it changes no stream byte of a TCP-only flow, and it is what lets `dgram_max_writable_len` answer for a UDP dial on this connection.
     config.enable_dgram(true, 1024, 1024);
     let Ok(mut conn) = quiche::connect(Some(&dial.host), &cid, local, peer, &mut config) else {
@@ -447,6 +475,13 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         },
     };
     crate::quic::drive_handshake(&mut conn, &sock, local)?;
+    let keep_alive = dial
+        .config
+        .quic
+        .as_ref()
+        .map(|params| params.keep_alive)
+        .filter(|seconds| *seconds != 0)
+        .map(Duration::from_secs);
     let mut session = Session {
         shared: Arc::new(Mutex::new(conn)),
         sock: Arc::new(sock),
@@ -454,11 +489,17 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         udp_supported: false,
         driver: None,
         send_wake: None,
+        keep_alive,
     };
     if !control_settings(&session) {
         return None;
     }
-    let udp = post_auth(&session, &dial.config.auth)?;
+    let cc_rx = dial
+        .config
+        .quic
+        .as_ref()
+        .map_or(0, |params| params.brutal_down);
+    let udp = post_auth(&session, &dial.config.auth, cc_rx)?;
     session.udp_supported = udp;
     Some(session)
 }
@@ -511,6 +552,7 @@ impl Flow {
                 udp_supported: false,
                 driver: None,
                 send_wake: None,
+                keep_alive: None,
             },
             stream,
             backlog,
@@ -757,6 +799,8 @@ struct Server {
     /// A hop plan is its own connection: a hopped dial never reuses a plain one to the
     /// same address, nor the reverse, since the two move the server port differently.
     hop: Option<hysteria::Hop>,
+    /// A tuned QUIC lane is its own connection: its windows and idle bound were negotiated, so a plain dial may not ride it.
+    quic: Option<hysteria::QuicParams>,
     roots: Option<ferrox_core::tls::Anchors>,
 }
 
@@ -777,6 +821,7 @@ fn server_of(dial: &Dial) -> Server {
         cc: dial.config.cc.quiche_name(),
         auth: dial.config.auth.clone(),
         hop: dial.config.hop.clone(),
+        quic: dial.config.quic,
         roots: dial.roots.clone(),
     }
 }
@@ -997,6 +1042,7 @@ pub(crate) fn server_config(
     cert_path: &str,
     key_path: &str,
     cc: hysteria::Congestion,
+    quic: Option<&hysteria::QuicParams>,
 ) -> Option<quiche::Config> {
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
     config.set_application_protos(&[crate::quic::ALPN]).ok()?;
@@ -1010,6 +1056,9 @@ pub(crate) fn server_config(
     config.set_initial_max_stream_data_uni(crate::quic::MAX_STREAM_DATA);
     config.set_initial_max_streams_bidi(crate::quic::MAX_STREAMS);
     config.set_initial_max_streams_uni(crate::quic::MAX_STREAMS);
+    if let Some(params) = quic {
+        crate::quic::apply_hysteria_quic(&mut config, params, true);
+    }
     config.load_cert_chain_from_pem_file(cert_path).ok()?;
     config.load_priv_key_from_pem_file(key_path).ok()?;
     Some(config)
@@ -1028,6 +1077,8 @@ struct Inbound {
     served: HashSet<u64>,
     wakes: Arc<Driver>,
     udp: HashMap<u32, UdpFlow>,
+    /// The listener's `brutalDown`, answered as this client's `hysteria-cc-rx` hint.
+    cc_rx: u64,
 }
 
 /// One datagram association: the connected target socket the router relays through, the reassembly its inbound fragments run through, the last activity the idle reap watches, and the flag that tells its reader thread to end. A UDP socket cannot be shut down to wake a blocked read, so the reader polls on the timeout and watches the flag the reap sets.
@@ -1038,10 +1089,10 @@ struct UdpFlow {
     stop: Arc<AtomicBool>,
 }
 
-fn answer_auth(conn: &mut quiche::Connection, ok: bool) -> bool {
+fn answer_auth(conn: &mut quiche::Connection, ok: bool, cc_rx: u64) -> bool {
     let mut block = Vec::with_capacity(32);
     if ok {
-        hysteria::build_auth_response(true, &mut block);
+        hysteria::build_auth_response(true, cc_rx, &mut block);
     } else {
         ferrox_core::foxy::hpack::qpack_literal_many(&[(":status", "404")], &mut block);
     }
@@ -1889,6 +1940,10 @@ struct Router<'a> {
     auths: &'a [String],
     serve: &'a Serve,
     masq: Arc<Masquerade>,
+    /// The reference's `udpIdleTimeout`: how long a datagram association may stay quiet.
+    udp_idle: Duration,
+    /// This server's `brutalDown`, answered as the client's `hysteria-cc-rx` hint.
+    cc_rx: u64,
     routes: HashMap<Vec<u8>, Inbound>,
 }
 
@@ -1938,7 +1993,7 @@ fn auth_exchange(
     let ok = auths
         .iter()
         .any(|auth| hysteria::verify_auth_request(body, auth));
-    if !answer_auth(conn, ok) {
+    if !answer_auth(conn, ok, inbound.cc_rx) {
         return None;
     }
     flush(sock, conn, out);
@@ -1985,6 +2040,7 @@ impl Router<'_> {
                 served: HashSet::new(),
                 wakes: Driver::new(),
                 udp: HashMap::new(),
+                cc_rx: self.cc_rx,
             },
         );
     }
@@ -1998,6 +2054,7 @@ impl Router<'_> {
             serve,
             masq,
             local,
+            ..
         } = self;
         let Some(shared) = routes.get(dcid).map(|i| Arc::clone(&i.conn)) else {
             return;
@@ -2105,7 +2162,11 @@ impl Router<'_> {
 
     fn idle(&mut self) {
         let Self {
-            routes, sock, out, ..
+            routes,
+            sock,
+            out,
+            udp_idle,
+            ..
         } = self;
         let now = Instant::now();
         // One pass, one lock per route: the dead are dropped where they are found, the living take their turn of the wheel, and a datagram association idle past the timeout is told to stop so its reader ends within one poll.
@@ -2123,7 +2184,7 @@ impl Router<'_> {
             conn.on_timeout();
             flush(sock, &mut conn, out.as_mut());
             inbound.udp.retain(|_, flow| {
-                if now.duration_since(flow.last) > UDP_IDLE {
+                if now.duration_since(flow.last) > *udp_idle {
                     flow.stop.store(true, Ordering::Relaxed);
                     false
                 } else {
@@ -2191,6 +2252,8 @@ pub(crate) fn serve_loop(
     obfs_password: &str,
     masq: &Masquerade,
     serve: &Serve,
+    udp_idle: Duration,
+    quic: Option<&hysteria::QuicParams>,
 ) {
     let Some(bound) = address.to_socket_addrs().ok().and_then(|mut it| it.next()) else {
         return;
@@ -2199,7 +2262,7 @@ pub(crate) fn serve_loop(
         return;
     };
     let local = sock.local_addr().unwrap_or(bound);
-    let Some(mut template) = server_config(cert_path, key_path, cc) else {
+    let Some(mut template) = server_config(cert_path, key_path, cc, quic) else {
         return;
     };
     let sock = match hysteria::Salamander::new(obfs_password) {
@@ -2213,6 +2276,8 @@ pub(crate) fn serve_loop(
         auths,
         serve,
         masq: Arc::from(masq.clone()),
+        udp_idle,
+        cc_rx: quic.map_or(0, |params| params.brutal_down),
         routes: HashMap::new(),
     };
     let mut buf = Unfilled::<RECV_ROOM>::new();
@@ -2265,7 +2330,7 @@ mod tests {
     #[test]
     fn server_config_refuses_without_a_chain_it_can_read() {
         let cc = hysteria::Congestion::Bbr;
-        assert!(server_config("/nonexistent.crt", "/nonexistent.key", cc).is_none());
+        assert!(server_config("/nonexistent.crt", "/nonexistent.key", cc, None).is_none());
     }
 
     #[test]
@@ -2282,6 +2347,7 @@ mod tests {
                 obfs_password: String::new(),
                 hop,
                 gecko: None,
+                ..hysteria::Config::default()
             },
             roots: None,
         };
@@ -2309,6 +2375,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_quic_tuned_plan_is_its_own_pool_key() {
+        // A tuned lane negotiated its windows and idle bound on its handshake, so a plain dial may not ride it, nor it a plain one.
+        let dial = |quic: Option<hysteria::QuicParams>| Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port: 443,
+            config: hysteria::Config {
+                version: 2,
+                auth: "a".to_owned(),
+                cc: hysteria::Congestion::Bbr,
+                obfs_password: String::new(),
+                quic,
+                ..hysteria::Config::default()
+            },
+            roots: None,
+        };
+        let tuned = hysteria::QuicParams {
+            max_idle: 10,
+            ..hysteria::QuicParams::default()
+        };
+        assert_eq!(
+            server_of(&dial(None)),
+            server_of(&dial(None)),
+            "plain reuses plain"
+        );
+        assert_eq!(
+            server_of(&dial(Some(tuned))),
+            server_of(&dial(Some(tuned))),
+            "a tuned lane reuses itself"
+        );
+        assert_ne!(
+            server_of(&dial(None)),
+            server_of(&dial(Some(tuned))),
+            "a tuned lane never rides a plain connection"
+        );
+    }
+
     fn idle_session() -> Session {
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
         config
@@ -2327,6 +2431,7 @@ mod tests {
             udp_supported: false,
             driver: None,
             send_wake: None,
+            keep_alive: None,
         }
     }
 
