@@ -35,7 +35,7 @@ The direct rule resolves inline: the name minus its root, the literal-IP fast pa
 
 ## The probe's frames
 
-The probe that gates this page decides five questions once through every rule shape. The frames it calls — `parse_query`, the rule walk with its one fold, `resolve_step`, `ip_answer` and `reject` — are measured beside it under the same filter, so the row is a sum of measured parts and a change to one frame is visible as its own number.
+The probe runs four valid queries and one malformed query 4096 times against `return` and `direct` rules. The frames it calls — `parse_query`, the rule walk with its one fold, `resolve_step`, `ip_answer` and `reject` — are measured beside it under the same filter, so the row is a sum of measured parts and a change to one frame is visible as its own number.
 
 ## What we removed
 
