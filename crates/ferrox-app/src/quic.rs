@@ -3770,8 +3770,9 @@ fn route_batch(
                 };
                 let info = quiche::RecvInfo { from, to: local };
                 let _ = conn.recv(bytes, info);
-                learn_ids(conns, &state, &conn);
             }
+            // The peer cannot use an id before this run's flush carries it, so the run learns once after every packet.
+            learn_ids(conns, &state, &conn);
             flush_egress(&mut conn, sock);
         }
         at = end;
