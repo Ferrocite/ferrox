@@ -748,10 +748,15 @@ fn aead_step<R: Read>(
 ) -> (crate::proxy::lane_pool::Next, Downlink<R>) {
     let mut batch = [(0usize, 0usize); CHUNKS_PER_BATCH];
     let opened = window.open_ready(&mut cipher, &mut batch);
-    let next = if opened > 0 {
-        if write_all_runs::<CHUNKS_PER_BATCH>(out, &window.buf, &batch[..opened]).is_err() {
-            return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
-        }
+    if opened.chunks > 0
+        && write_all_runs::<CHUNKS_PER_BATCH>(out, &window.buf, &batch[..opened.chunks]).is_err()
+    {
+        return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
+    }
+    if opened.forged {
+        return (crate::proxy::lane_pool::Next::Done, Downlink::Running);
+    }
+    let next = if opened.chunks > 0 {
         crate::proxy::lane_pool::Next::More
     } else {
         match window.try_fill() {
@@ -985,6 +990,19 @@ fn open_length(recv: &mut Cipher, length: &mut [u8]) -> Option<usize> {
     (size <= MAX_CHUNK).then_some(size)
 }
 
+/// What one chunk's framing found: a plaintext that opened, more bytes still to arrive, or a tag that will not open.
+enum Open {
+    Chunk(usize, usize),
+    Incomplete,
+    Forged,
+}
+
+/// What the window's ready chunks came to: how many opened, and whether a forged tag stopped the batch.
+struct Opened {
+    chunks: usize,
+    forged: bool,
+}
+
 /// One relay connection's downlink window: wire bytes land here once and chunks open where they lie — a length never costs its own read and the payload decrypts in the caller's buffer with no copy; sized for a whole batch of full chunks so one bulk read serves the length, the payloads and usually the next length too.
 struct ChunkReader<R> {
     read: R,
@@ -1025,46 +1043,61 @@ impl<R: Read> ChunkReader<R> {
         }
     }
 
-    /// Open one chunk where it lies and say where its plaintext ended up. `None` is the stream
-    /// ending, a tag that will not open, or a chunk that has not finished arriving — which is why
-    /// its length is drawn once and held rather than drawn again against the next chunk's nonce.
-    fn open_chunk(&mut self, recv: &mut Cipher) -> Option<(usize, usize)> {
+    /// Open one chunk where it lies and say where its plaintext ended up. Incomplete input waits
+    /// for more bytes, while a length or body tag that will not open is forged and ends the relay.
+    fn open_chunk(&mut self, recv: &mut Cipher) -> Open {
         let head = LENGTH_LEN + TAG_LEN;
         let size = if let Some(size) = self.held {
             size
         } else {
             if self.end - self.at < head {
-                return None;
+                return Open::Incomplete;
             }
             let length = &mut self.buf[self.at..self.at + head];
-            let size = open_length(recv, length)?;
+            let Some(size) = open_length(recv, length) else {
+                return Open::Forged;
+            };
             self.held = Some(size);
             size
         };
         let body = size + TAG_LEN;
         if self.end - self.at < head + body {
-            return None;
+            return Open::Incomplete;
         }
         self.held = None;
         let start = self.at + head;
-        let plain = open_into(recv, &mut self.buf[start..start + body])?;
+        let Some(plain) = open_into(recv, &mut self.buf[start..start + body]) else {
+            return Open::Forged;
+        };
         self.at = start + body;
-        Some((start, plain))
+        Open::Chunk(start, plain)
     }
 
     /// Open every chunk the window already holds: a peer that stops to hear back from its own
     /// target must never find the chunk it is waiting on held for a batch that has not arrived.
-    /// The plaintexts are disjoint runs of one buffer, so they leave together in one vectored write.
-    fn open_ready(&mut self, recv: &mut Cipher, out: &mut [(usize, usize)]) -> usize {
-        let mut opened = 0usize;
-        while opened < out.len() {
-            let Some(chunk) = self.open_chunk(recv) else {
-                break;
-            };
-            out[opened] = chunk;
-            opened += 1;
+    /// The plaintexts are disjoint runs of one buffer, so they leave together in one vectored write;
+    /// a forged tag stops the batch, and the chunks opened before it still reach the target.
+    fn open_ready(&mut self, recv: &mut Cipher, out: &mut [(usize, usize)]) -> Opened {
+        let mut chunks = 0usize;
+        while chunks < out.len() {
+            match self.open_chunk(recv) {
+                Open::Chunk(start, plain) => {
+                    out[chunks] = (start, plain);
+                    chunks += 1;
+                }
+                Open::Incomplete => break,
+                Open::Forged => {
+                    return Opened {
+                        chunks,
+                        forged: true,
+                    }
+                }
+            }
         }
-        opened
+        Opened {
+            chunks,
+            forged: false,
+        }
     }
 }
 
@@ -2133,7 +2166,7 @@ mod tests {
         let mut batch = [(0usize, 0usize); CHUNKS_PER_BATCH];
         assert!(matches!(window.try_fill(), Fill::Ready));
         assert_eq!(
-            window.open_ready(&mut recv, &mut batch),
+            window.open_ready(&mut recv, &mut batch).chunks,
             1,
             "the second chunk is still arriving"
         );
@@ -2141,7 +2174,7 @@ mod tests {
         assert_eq!(&window.buf[batch[0].0..batch[0].0 + batch[0].1], &first[..]);
         assert!(matches!(window.try_fill(), Fill::Ready));
         assert_eq!(
-            window.open_ready(&mut recv, &mut batch),
+            window.open_ready(&mut recv, &mut batch).chunks,
             1,
             "the held length opens against its own nonce once the payload lands"
         );
@@ -2185,6 +2218,126 @@ mod tests {
         let mut damaged = std::io::Cursor::new(&tampered);
         let mut fresh = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
         assert!(open_chunk(&mut damaged, &mut fresh, &mut wire_buffer()).is_none());
+    }
+
+    #[test]
+    fn a_forged_tag_closes_the_downlink_and_an_incomplete_chunk_waits() {
+        struct Quiet<'a> {
+            data: &'a [u8],
+            at: usize,
+        }
+        impl Read for Quiet<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.at == self.data.len() {
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                let take = (self.data.len() - self.at).min(buf.len());
+                buf[..take].copy_from_slice(&self.data[self.at..self.at + take]);
+                self.at += take;
+                Ok(take)
+            }
+        }
+
+        let salt = [7u8; SALT_LEN];
+        let method = Method::Aes256Gcm;
+        let mut send = Uplink::Aead(
+            Cipher::new(method, "an-example-shared-password", &salt).expect("derives"),
+        );
+        let mut msg = [0u8; SEAL_HEAD + 17 + TAG_LEN];
+        msg[SEAL_HEAD..SEAL_HEAD + 17].copy_from_slice(b"length-is-framing");
+        let mut wire = Vec::new();
+        seal_all(&mut send, &mut msg, 17, &mut wire).expect("seals");
+
+        for at in [SEAL_HEAD - 1, wire.len() - 1] {
+            let mut tampered = wire.clone();
+            tampered[at] ^= 1;
+            let mut reader = Quiet {
+                data: &tampered,
+                at: 0,
+            };
+            let mut window = ChunkReader::new(&mut reader);
+            assert!(matches!(window.try_fill(), Fill::Ready));
+            let recv = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
+            let mut out = Vec::new();
+            let (next, _) = aead_step(window, recv, &mut out, None);
+            assert_eq!(
+                next,
+                crate::proxy::lane_pool::Next::Done,
+                "a forged tag at byte {at} closes the relay"
+            );
+            assert!(
+                out.is_empty(),
+                "a forged or incomplete chunk writes nothing"
+            );
+        }
+
+        let mut incomplete = wire;
+        incomplete.truncate(incomplete.len() - 1);
+        let mut reader = Quiet {
+            data: &incomplete,
+            at: 0,
+        };
+        let mut window = ChunkReader::new(&mut reader);
+        assert!(matches!(window.try_fill(), Fill::Ready));
+        let recv = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
+        let mut out = Vec::new();
+        let (next, _) = aead_step(window, recv, &mut out, None);
+        assert_eq!(
+            next,
+            crate::proxy::lane_pool::Next::Idle,
+            "a chunk that has not finished arriving still waits"
+        );
+        assert!(
+            out.is_empty(),
+            "a forged or incomplete chunk writes nothing"
+        );
+    }
+
+    #[test]
+    fn an_authenticated_chunk_before_a_forged_one_still_reaches_the_target() {
+        struct Quiet<'a> {
+            data: &'a [u8],
+            at: usize,
+        }
+        impl Read for Quiet<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.at == self.data.len() {
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                let take = (self.data.len() - self.at).min(buf.len());
+                buf[..take].copy_from_slice(&self.data[self.at..self.at + take]);
+                self.at += take;
+                Ok(take)
+            }
+        }
+
+        let salt = [7u8; SALT_LEN];
+        let method = Method::Aes256Gcm;
+        let mut send = Uplink::Aead(
+            Cipher::new(method, "an-example-shared-password", &salt).expect("derives"),
+        );
+        let first: Vec<u8> = (0..17).map(|i| (i % 251) as u8).collect();
+        let second: Vec<u8> = (0..17).map(|i| (i % 197) as u8).collect();
+        let mut wire = Vec::new();
+        for plain in [&first, &second] {
+            let mut msg = vec![0u8; SEAL_HEAD + plain.len() + TAG_LEN];
+            msg[SEAL_HEAD..SEAL_HEAD + plain.len()].copy_from_slice(plain);
+            seal_all(&mut send, &mut msg, plain.len(), &mut wire).expect("seals");
+        }
+        let last = wire.len() - 1;
+        wire[last] ^= 1;
+
+        let mut reader = Quiet { data: &wire, at: 0 };
+        let mut window = ChunkReader::new(&mut reader);
+        assert!(matches!(window.try_fill(), Fill::Ready));
+        let recv = Cipher::new(method, "an-example-shared-password", &salt).expect("derives");
+        let mut out = Vec::new();
+        let (next, _) = aead_step(window, recv, &mut out, None);
+        assert_eq!(next, crate::proxy::lane_pool::Next::Done);
+        assert_eq!(
+            out, first,
+            "the chunk opened before the forged tag still lands"
+        );
     }
 
     #[test]
