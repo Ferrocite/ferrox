@@ -1,6 +1,6 @@
 # Measured legs below the 0.85 bound that are filed already. A new leg, or one
 # worse than its last filed ratio by more than 0.10, still fails the matrix.
-# base|leg|ratio|issue
+# base|leg|ratio|issue|basis, where basis is raw (default) or ceiling.
 vless-hysteria-down-8|server|0.04|670
 vless-hysteria-up-1|client|0.00|670
 vless-hysteria-up-1|server|0.24|670

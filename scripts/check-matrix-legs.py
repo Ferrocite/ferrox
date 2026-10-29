@@ -107,7 +107,7 @@ def attempted(cell, engine):
 
 
 def load_baseline(path):
-    """(base, leg) -> (ratio, issue) for holes already filed and owned."""
+    """(base, leg) -> (ratio, issue, basis) for holes already filed and owned."""
     known = {}
     try:
         lines = Path(path).read_text().splitlines()
@@ -118,14 +118,27 @@ def load_baseline(path):
         if not line or line.startswith("#"):
             continue
         parts = [part.strip() for part in line.split("|")]
-        if len(parts) != 4:
+        if len(parts) not in (4, 5):
             continue
-        base, leg, ratio, issue = parts
+        base, leg, ratio, issue = parts[:4]
+        basis = parts[4] if len(parts) == 5 else "raw"
+        if basis not in ("raw", "ceiling"):
+            continue
         try:
-            known[(base, leg)] = (float(ratio), issue)
+            known[(base, leg)] = (float(ratio), issue, basis)
         except ValueError:
             continue
     return known
+
+
+def filed_basis_ratio(hole, basis):
+    """The current ratio on the basis its baseline was filed on, raw when unavailable."""
+    raw = hole.get("raw_ratio", hole["ratio"])
+    if basis == "ceiling":
+        ceiling = hole.get("ceiling_ratio")
+        if ceiling is not None:
+            return ceiling
+    return raw
 
 
 def within_baseline(leg, ratio, filed):
@@ -163,15 +176,17 @@ def check_grouped(grouped, threshold, cpu_threshold, threads_threshold):
         # common denominator. The client leg stays raw; both clients share a cell.
         reference_ceiling = median_ceiling(reference)
         server_ceiling = median_ceiling(server_cell)
-        server_ratio = (
+        raw_ratio = (
             server_leg / reference_mib_s
             if server_leg is not None and reference_mib_s
             else None
         )
-        if server_ratio is not None and reference_ceiling and server_ceiling:
-            server_ratio = (server_leg / server_ceiling) / (
+        ceiling_ratio = None
+        if raw_ratio is not None and reference_ceiling and server_ceiling:
+            ceiling_ratio = (server_leg / server_ceiling) / (
                 reference_mib_s / reference_ceiling
             )
+        server_ratio = ceiling_ratio if ceiling_ratio is not None else raw_ratio
         rust_client = median_throughput(reference, "xray-core-rust")
         checked += 1
         measured.add(base)
@@ -204,6 +219,8 @@ def check_grouped(grouped, threshold, cpu_threshold, threads_threshold):
                 "base": base,
                 "leg": "server",
                 "ratio": server_ratio,
+                "raw_ratio": raw_ratio,
+                "ceiling_ratio": ceiling_ratio,
                 "text": f"{base}: ferrox server {server_leg:.1f} MiB/s vs "
                         f"{reference_mib_s:.1f} MiB/s (xray-core server) with the xray-core "
                         f"client, {server_ratio:.2f}x{basis}: the server leg lost",
@@ -357,6 +374,36 @@ def selftest():
         if proc.returncode == 0:
             return "a server leg below 0.85x at the same ceiling passed the gate"
 
+        # A raw-filed server ratio is compared on its own basis: a raw 0.70 is
+        # 0.50 of the ferrox cell's ceiling, and that cell is still the filed gap.
+        for server, throughput, ceiling in (
+            ("xray-core", 1000.0, 1000.0),
+            ("ferrox", 700.0, 1400.0),
+        ):
+            write_fixture(cells, server, 100.0, 8.0, throughput, ceiling)
+        baseline = cells / "leg-gaps.txt"
+        baseline.write_text("selftest-vless-raw-down-8|server|0.70|1\n")
+        proc = run_self(cells, baseline)
+        if proc.returncode != 0:
+            return f"a raw baseline was compared against a ceiling ratio: {proc.stderr}"
+
+        # A ceiling-filed entry is compared on the ceiling basis.
+        baseline.write_text("selftest-vless-raw-down-8|server|0.50|1|ceiling\n")
+        proc = run_self(cells, baseline)
+        if proc.returncode != 0:
+            return f"a ceiling baseline was not read: {proc.stderr}"
+
+        # The same ceiling basis still fails a ratio worse than what was filed.
+        for server, throughput, ceiling in (
+            ("xray-core", 1000.0, 1000.0),
+            ("ferrox", 700.0, 1750.0),
+        ):
+            write_fixture(cells, server, 100.0, 8.0, throughput, ceiling)
+        baseline.write_text("selftest-vless-raw-down-8|server|0.55|1|ceiling\n")
+        proc = run_self(cells, baseline)
+        if proc.returncode == 0:
+            return "a ceiling ratio worse than its filed baseline passed the gate"
+
     for leg, ratio, filed, want in (
         ("client", 0.50, 0.56, True),
         ("client", 0.40, 0.56, False),
@@ -402,12 +449,13 @@ def write_fixture(cells, server, cpu, threads, throughput, ceiling=None):
     path.write_text(json.dumps(doc))
 
 
-def run_self(cells):
-    return subprocess.run(
-        [sys.executable, __file__, "--cells", str(cells), "--no-baseline"],
-        text=True,
-        capture_output=True,
-    )
+def run_self(cells, baseline=None):
+    command = [sys.executable, __file__, "--cells", str(cells)]
+    if baseline is None:
+        command.append("--no-baseline")
+    else:
+        command += ["--baseline", str(baseline)]
+    return subprocess.run(command, text=True, capture_output=True)
 
 
 def main():
@@ -461,12 +509,12 @@ def main():
         filed = baseline.get((hole["base"], hole["leg"]))
         if filed is None:
             new.append(hole)
-        elif within_baseline(hole["leg"], hole["ratio"], filed[0]):
+        elif within_baseline(hole["leg"], filed_basis_ratio(hole, filed[2]), filed[0]):
             known.append((hole, filed[1]))
         else:
             new.append(hole)
     seen = {(hole["base"], hole["leg"]) for hole in holes}
-    for key, (ratio, issue) in sorted(baseline.items()):
+    for key, (ratio, issue, _basis) in sorted(baseline.items()):
         if key[0] in measured and key not in seen:
             fixed.append((key, ratio, issue))
 
