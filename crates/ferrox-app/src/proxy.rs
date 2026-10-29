@@ -46964,6 +46964,34 @@ end
         assert_eq!(&back, b"ping");
     }
 
+    /// A `vlessRoute` rule reads the route id a flow carries: a socks flow carries none, so it reads
+    /// 0 and a list holding 0 blocks it, while a list of ids the client never sent leaves it alone.
+    #[test]
+    fn a_vless_route_rule_reads_the_zero_a_socks_flow_carries() {
+        let echo_port = echo_loop();
+        let config = |routes: &str| {
+            format!(
+                r#"{{"outbounds":[{{"tag":"direct","protocol":"freedom"}},{{"tag":"block","protocol":"blackhole"}}],
+                "routing":{{"rules":[{{"type":"field","vlessRoute":{routes},"outboundTag":"block"}}]}}}}"#
+            )
+        };
+        let blocked_front = socks_front_with(route_outbound(&config(r#"["0"]"#), Some("in"), true));
+        let mut blocked = socks_tcp_client(blocked_front, echo_port);
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            blocked.read(&mut buf).expect("closes"),
+            0,
+            "a flow that sent no route id reads 0, which the rule names"
+        );
+
+        let other_front = socks_front_with(route_outbound(&config(r#"["7"]"#), Some("in"), true));
+        let mut allowed = socks_tcp_client(other_front, echo_port);
+        allowed.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        allowed.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
     /// The authenticated account's email is part of the flow: a `user` rule blocks that account
     /// and leaves another account of the same front on the default lane.
     #[test]
