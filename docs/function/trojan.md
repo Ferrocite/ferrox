@@ -4,6 +4,8 @@ Trojan is a header and then nothing, which makes it the cheapest method in the m
 
 The header is `sha224_hex(password) | CRLF | command(1) | address | port | CRLF`. The 56 ASCII bytes are compared without an early exit on the server; after that the stream is the stream and the relay adds no framing bytes at all.
 
+A `settings.clients` list is one key per entry and a header carrying any of them is served, as xray builds one account per client; the compare walks the list only until a key agrees, so a one-client inbound pays the one compare it always did. `a_trojan_inbound_accepts_every_clients_password` holds the second client's header and a stranger's refusal.
+
 A dial that was handed a name writes it as ATYP 3 with its own length, the form this method's reader already accepts, so the edge answers the lookup rather than the client's resolver.
 
 A listener that declares `security: tls` terminates the session its config names and reads the header off it, on each carrier the dial uses — the six TCP carriers, and KCP, where the session wraps the connection itself, and an `xdrive` row, where `security` names the store's own lane handshake rather than a session above it; `a_trojan_inbound_that_declares_tls_answers_every_carrier` dials all six and holds the echo, and `a_trojan_kcp_inbound_that_declares_tls_answers_the_session` / `a_trojan_kcp_dial_under_tls_wraps_the_header_in_the_session` hold the KCP pair from both ends.
