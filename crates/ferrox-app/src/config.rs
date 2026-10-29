@@ -2515,6 +2515,15 @@ fn duration(value: &Json, key: &str) -> Result<Duration, String> {
 mod tests {
     use super::*;
 
+    fn json_path(path: &std::path::Path) -> String {
+        format!(
+            "\"{}\"",
+            path.to_string_lossy()
+                .replace('\\', "\\\\")
+                .replace('"', "\\\"")
+        )
+    }
+
     fn server_ech_key_tlv() -> Vec<u8> {
         let mut config = vec![0xfe, 0x0d, 0x00, 0x00];
         let mut contents = vec![7u8, 0x00, 0x20, 0x00, 0x20];
@@ -3228,8 +3237,8 @@ mod tests {
         let identity = server_identity(&leaf);
         let client = |path: &std::path::Path| {
             crate::json::parse(&format!(
-                r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "tls.test", "disableSystemRoot": true, "certificates": [{{"certificateFile": "{}"}}]}}}}}}"#,
-                path.display()
+                r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "tls.test", "disableSystemRoot": true, "certificates": [{{"certificateFile": {}}}]}}}}}}"#,
+                json_path(path)
             ))
             .expect("parses")
         };
@@ -3273,8 +3282,8 @@ mod tests {
         std::fs::write(&ca, ca_pem).expect("the test ca");
         let config = |disable: bool| {
             let outbound = crate::json::parse(&format!(
-                r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "tls.test", "disableSystemRoot": {disable}, "certificates": [{{"certificateFile": "{}"}}]}}}}}}"#,
-                ca.display()
+                r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "tls.test", "disableSystemRoot": {disable}, "certificates": [{{"certificateFile": {}}}]}}}}}}"#,
+                json_path(&ca)
             ))
             .expect("parses");
             outbound_tls(&outbound, "127.0.0.1").expect("builds")
@@ -3360,12 +3369,12 @@ mod tests {
         let config = |extra: &str| {
             crate::json::parse(&format!(
                 r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{{extra}
-                    "certificates": [{{"certificateFile": "{}", "keyFile": "{}"}},
-                                     {{"certificateFile": "{}", "keyFile": "{}"}}]}}}}}}"#,
-                first_cert.display(),
-                first_key.display(),
-                second_cert.display(),
-                second_key.display(),
+                    "certificates": [{{"certificateFile": {}, "keyFile": {}}},
+                                     {{"certificateFile": {}, "keyFile": {}}}]}}}}}}"#,
+                json_path(&first_cert),
+                json_path(&first_key),
+                json_path(&second_cert),
+                json_path(&second_key),
             ))
             .expect("parses")
         };
@@ -3417,14 +3426,14 @@ mod tests {
         std::fs::write(&other_key, wrong.signing_key.serialize_pem()).expect("other key");
         let config = crate::json::parse(&format!(
             r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{
-                "certificates": [{{"certificateFile": "{}"}},
-                                 {{"certificateFile": "{}", "keyFile": "{}"}},
-                                 {{"certificateFile": "{}", "keyFile": "{}"}}]}}}}}}"#,
-            cert.display(),
-            cert.display(),
-            other_key.display(),
-            cert.display(),
-            key.display(),
+                "certificates": [{{"certificateFile": {}}},
+                                 {{"certificateFile": {}, "keyFile": {}}},
+                                 {{"certificateFile": {}, "keyFile": {}}}]}}}}}}"#,
+            json_path(&cert),
+            json_path(&cert),
+            json_path(&other_key),
+            json_path(&cert),
+            json_path(&key),
         ))
         .expect("parses");
         let identity = inbound_tls_identity(&config).expect("the keyed entry still loads");
@@ -3459,9 +3468,9 @@ mod tests {
         let config = |extra: &str| {
             crate::json::parse(&format!(
                 r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{
-                    "certificates": [{{"certificateFile": "{}", "keyFile": "{}"{extra}}}]}}}}}}"#,
-                cert.display(),
-                key.display(),
+                    "certificates": [{{"certificateFile": {}, "keyFile": {}{extra}}}]}}}}}}"#,
+                json_path(&cert),
+                json_path(&key),
             ))
             .expect("parses")
         };
@@ -3530,10 +3539,10 @@ mod tests {
         std::fs::write(&key, first.signing_key.serialize_pem()).expect("key");
         let config = crate::json::parse(&format!(
             r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{
-                "certificates": [{{"certificateFile": "{}", "keyFile": "{}",
+                "certificates": [{{"certificateFile": {}, "keyFile": {},
                     "ocspStapling": 1}}]}}}}}}"#,
-            cert.display(),
-            key.display(),
+            json_path(&cert),
+            json_path(&key),
         ))
         .expect("parses");
         let identity = inbound_tls_identity(&config).expect("the file-backed identity loads");
