@@ -11,13 +11,6 @@ name: VeePN relay (live download check)
 # app serves is exercised on the same warm lane. A red leg is read from the
 # lane log, which is kept as an artifact.
 on:
-  pull_request:
-    paths:
-      - .github/workflows/veepn-relay.yml
-      - crates/ferrox-app/src/veepn.rs
-      - crates/ferrox-core/src/veepn.rs
-      - crates/ferrox-app/src/foxy.rs
-      - crates/ferrox-app/src/proxy.rs
   workflow_dispatch:
     inputs:
       region:

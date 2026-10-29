@@ -25,7 +25,7 @@ A from-scratch proxy core, **bit-identical to the implementations it replaces** 
 - **quiche is the default QUIC.** Any other QUIC backend must name the rung, the library and the measurement that won.
 - **The reference is not as fast as it looks.** Comparators often ship SIMD behind a cfg nothing sets; every report prints both backends, and a ratio without both names is not a measurement.
 - **Lints and operation counts are local; nothing connection-dependent is.** `./scripts/check.sh` runs before every push; benchmarks, parity, upstream suites and Miri are CI-only.
-- **Nothing runs on a merge.** Every gate fires on the PR; `main` is covered by schedules (benches daily, Miri weekly, pins on input change).
+- **One automatic PR gate.** `ci` is the only workflow a change normally starts; `deps` and `pins` join it only when their own files move. Upstream, conformance, interop, baselines, exact counts and every benchmark matrix are manual dispatch, and `main` is covered by schedules.
 - **Fixed-worker readiness seam on raw TCP; pooled blocking relay on carrier legs.** Raw flows hand their descriptors to `min(cores, 8)` workers and the accept thread returns. Carrier legs hold a thread per parked leg; see [concurrency](docs/concurrency.md).
 
 ## What is checked

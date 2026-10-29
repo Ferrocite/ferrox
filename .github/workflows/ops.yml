@@ -1,25 +1,13 @@
 name: ops
 
 on:
-  pull_request:
-    paths:
-      - 'Cargo.toml'
-      - 'Cargo.lock'
-      - 'crates/ferrox-core/**'
-      - 'crates/ferrox-app/**'
-      - 'scripts/count-ops.sh'
-      - 'scripts/expected-ops.txt'
-      - 'scripts/method-ops.txt'
-      - 'scripts/method-counts.txt'
-      - 'scripts/ci-scope.py'
-      - 'docs/function/**'
-      - '.github/workflows/ops.yml'
   workflow_dispatch:
 
-# Supersede an older run of the same branch on each new push; a manual dispatch keeps its run.
+# The exact-count gate is local (`scripts/check.sh`). A dispatch supersedes an
+# older run of the same ref, since only the latest rebless matters.
 concurrency:
   group: ops-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

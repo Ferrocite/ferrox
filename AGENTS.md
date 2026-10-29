@@ -18,7 +18,9 @@ The split is not negotiable.
 | upstream suites against `ferrox-app` (`conformance.yml`) | **CI only** |
 | Miri (`safety.yml`) | **CI only** |
 
-**Nothing connection-dependent runs on a contributor machine.** Every developer sits behind a VPN and a proxy, so a local benchmark measures a tunnel, a local conformance run measures somebody's exit node, and a local dial measures neither this code nor the reference. Push and read CI instead.
+**Nothing connection-dependent runs on a contributor machine.** Every developer sits behind a VPN and a proxy, so a local benchmark measures a tunnel, a local conformance run measures somebody's exit node, and a local dial measures neither this code nor the reference. Dispatch it in CI instead.
+
+**A PR normally starts one workflow.** `ci.yml` is the automatic gate; `deps.yml` and `pins.yml` join it only when their own inputs move. Every other workflow is manual dispatch or a schedule, and the full benchmark matrix is never automatic.
 
 ```bash
 ./scripts/check.sh    # everything above that is local, in one command

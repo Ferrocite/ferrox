@@ -2,22 +2,13 @@ name: conformance
 
 
 on:
-  pull_request:
-    paths:
-      - "crates/ferrox-app/**/*.rs"
-      - "crates/ferrox-core/**/*.rs"
-      - "upstream/pins.toml"
-      - "scripts/run-upstream-suite.sh"
-      - "scripts/run-xray-scenario-map.sh"
-      - "scripts/xray-scenarios.sh"
-      - ".github/workflows/conformance.yml"
   workflow_dispatch:
   schedule:
     - cron: "23 5 * * 1"
 
 concurrency:
   group: conformance-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read

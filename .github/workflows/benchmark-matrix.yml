@@ -2,36 +2,12 @@ name: benchmark-matrix
 
 
 on:
-  pull_request:
-    paths:
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "crates/ferrox-core/**"
-      - "crates/ferrox-app/**"
-      - "scripts/run-benchmark-matrix.sh"
-      - "scripts/lib-matrix.sh"
-      - "scripts/lib-engines.sh"
-      - "scripts/xray-to-singbox.py"
-      - "scripts/xray-to-leaf.py"
-      - "scripts/benchstats.py"
-      - "scripts/benchmark-delta.py"
-      - "scripts/render-benchmark-charts.py"
-      - "scripts/validate-benchmark-matrix.py"
-      - "scripts/check-matrix-legs.py"
-      - "scripts/requirements-benchmark.txt"
-      - "docs/function/**/*.md"
-      - "docs/benchmarks/matrix.md"
-      - ".github/workflows/benchmark-matrix.yml"
-      - ".github/workflows/benchmark-matrix-os.yml"
-  schedule:
-    - cron: "41 3 * * *"
-    - cron: "17 4 * * 0"
   workflow_dispatch:
     inputs:
       tier:
-        description: "Matrix tier to run"
+        description: "Matrix tier to run (full is never automatic; smoke is the default)"
         required: false
-        default: "standard"
+        default: "smoke"
         type: choice
         options:
           - smoke
@@ -66,7 +42,7 @@ on:
 
 concurrency:
   group: matrix-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -95,61 +71,28 @@ jobs:
       - id: plan
         shell: bash
         env:
-          EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event.pull_request.base.sha }}
           WANT_TIER: ${{ inputs.tier }}
           WANT_ONLY: ${{ inputs.only }}
           WANT_REPEATS: ${{ inputs.repeats }}
           WANT_ENGINES: ${{ inputs.engines }}
           WANT_RUNNER: ${{ inputs.runner }}
-          SCHEDULE: ${{ github.event.schedule }}
         run: |
           matrix=true
-          planned=""
-          planned_engines=""
-          if [[ "$EVENT" == "pull_request" ]]; then
-            # A change that reaches one method is measured there, against every
-            # engine that method's page records as able to serve it, at the full
-            # tier's repeats; the methods it does not reach are not measured on
-            # this run at all. Shared code reaches everything, so a wide plan
-            # keeps the smoke cell and the nightly run carries the depth.
-            if [[ "$(python3 scripts/ci-scope.py scope --base "$BASE" |
-              sed -n 's/^wide=//p')" == "false" ]]; then
-              tier="full"
-              planned="$(python3 scripts/ci-scope.py scenarios)"
-              planned_engines="$(python3 scripts/ci-scope.py engines | paste -sd, -)"
-              [[ -n "$planned" ]] || matrix=false
-            else
-              tier="smoke"
-            fi
-            oses='["ubuntu-latest"]'
-          elif [[ "$EVENT" == "workflow_dispatch" ]]; then
-            tier="${WANT_TIER:-standard}"
-            case "${WANT_RUNNER:-all}" in
-              ubuntu) oses='["ubuntu-latest"]' ;;
-              ubuntu-arm) oses='["ubuntu-24.04-arm"]' ;;
-              macos) oses='["macos-15"]' ;;
-              windows) oses='["windows-latest"]' ;;
-              *) if [[ "$tier" == "full" ]]; then
-                   oses='["ubuntu-latest", "ubuntu-24.04-arm", "macos-15"]'
-                 else
-                   oses='["ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "windows-latest"]'
-                 fi ;;
-            esac
-          elif [[ "$SCHEDULE" == "17 4 * * 0" ]]; then
-            tier="full"
-            oses='["ubuntu-latest", "ubuntu-24.04-arm", "macos-15"]'
-          else
-            tier="standard"
-            oses='["ubuntu-latest"]'
-          fi
+          tier="${WANT_TIER:-smoke}"
+          case "${WANT_RUNNER:-all}" in
+            ubuntu) oses='["ubuntu-latest"]' ;;
+            ubuntu-arm) oses='["ubuntu-24.04-arm"]' ;;
+            macos) oses='["macos-15"]' ;;
+            windows) oses='["windows-latest"]' ;;
+            *) if [[ "$tier" == "full" ]]; then
+                 oses='["ubuntu-latest", "ubuntu-24.04-arm", "macos-15"]'
+               else
+                 oses='["ubuntu-latest", "ubuntu-24.04-arm", "macos-15", "windows-latest"]'
+               fi ;;
+          esac
           case "$tier" in smoke | standard | full) ;; *) echo "::error::unknown tier $tier" >&2; exit 2 ;; esac
           source scripts/lib-matrix.sh
-          if [[ -n "$planned" ]]; then
-            ids="$planned"
-          else
-            ids="$(scenarios "$tier" | awk '{print $1}')"
-          fi
+          ids="$(scenarios "$tier" | awk '{print $1}')"
           if [[ -n "$WANT_ONLY" ]]; then
             kept=""
             IFS=',' read -ra pats <<< "$WANT_ONLY"
@@ -166,9 +109,8 @@ jobs:
           fi
           cells="$(for id in $ids; do printf '"%s",' "$id"; done)"
           cells="[${cells%,}]"
-          # No cell is an error, unless the plan says so: a method the matrix does
-          # not measure yet has nothing to run here and the nightly wide run has it.
-          if [[ "$cells" == "[]" && "$matrix" != "false" ]]; then
+          # No cell is an error: the filter emptied a tier that has scenarios.
+          if [[ "$cells" == "[]" ]]; then
             echo "::error::no scenario survived the filter" >&2
             exit 1
           fi
@@ -178,11 +120,6 @@ jobs:
           if [[ -n "$WANT_ENGINES" ]]; then
             # A typed list is the caller's own, ferrox included or not.
             flags="$flags --engines $WANT_ENGINES"
-          elif [[ -n "$planned_engines" ]]; then
-            # The page ruled the rest out, so this run neither fetches, builds nor
-            # probes them; the nightly wide run still measures everything.
-            flags="$flags --engines ferrox,$planned_engines"
-            trees="$planned_engines"
           elif [[ "$tier" == "smoke" ]]; then
             trees="xray-core,xray-core-rust,sing-box,zeronet"
           fi
@@ -233,7 +170,7 @@ jobs:
   refresh:
     name: publish the dated bundles
     needs: run-os
-    if: github.event_name == 'schedule' && github.event.schedule == '41 3 * * *'
+    if: github.event_name == 'workflow_dispatch' && inputs.tier == 'full'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:
@@ -254,7 +191,7 @@ jobs:
         run: pip install -r scripts/requirements-benchmark.txt
       - uses: actions/download-artifact@v4
         with:
-          pattern: benchmark-matrix-standard-*
+          pattern: benchmark-matrix-full-*
           path: matrix-bundles/
       - name: stamp the bundle date once
         run: echo "STAMP=$(date -u +%F)" >> "$GITHUB_ENV"
@@ -329,7 +266,7 @@ jobs:
           existing="$(gh pr list --head benchmark-matrix/auto --state open --json number --jq '.[0].number // empty')"
           [[ -n "$existing" ]] || gh pr create --base main --head benchmark-matrix/auto \
             --title "docs: refresh benchmark matrix" \
-            --body "Automated refresh of docs/benchmarks/matrix.md and the latest charts from the scheduled matrix run."
+            --body "Automated refresh of docs/benchmarks/matrix.md and the latest charts from the requested full matrix run."
       - uses: actions/upload-artifact@v4
         with:
           name: benchmark-matrix-published-${{ env.STAMP }}
