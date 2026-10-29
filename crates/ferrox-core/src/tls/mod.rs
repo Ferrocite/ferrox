@@ -226,11 +226,34 @@ impl From<std::io::Error> for TlsError {
     }
 }
 
+/// One `certificates` entry: the chain it serves and the key that signs for it.
 #[derive(Debug, Clone)]
-pub struct TlsServerConfig {
+pub struct CertEntry {
     pub cert_chain: Vec<Vec<u8>>,
     pub key_der: Vec<u8>,
     pub key_kind: ServerKeyKind,
+    /// The files a path-backed entry was read from and the interval xray's ticker re-reads
+    /// them at; `None` for an inline entry, which has nothing to re-read.
+    pub reload: Option<CertReload>,
+}
+
+/// xray's hot-reload ticker: `ocspStapling` seconds when the block names it, 3600 otherwise.
+#[derive(Debug, Clone)]
+pub struct CertReload {
+    pub certificate: String,
+    pub key: String,
+    pub interval: std::time::Duration,
+    pub read: CertReader,
+}
+
+/// How a reload re-reads one file: the same resolution a config's path goes through.
+pub type CertReader = fn(&str) -> Option<Vec<u8>>;
+
+#[derive(Debug, Clone)]
+pub struct TlsServerConfig {
+    /// The identities the listener serves, in the order the block lists them: the SNI
+    /// resolver takes the first whose names match, so element 0 is the fallback.
+    pub certs: Vec<CertEntry>,
     /// The protocols to offer, in preference order. Empty means no ALPN, which
     /// is what a server that only ever carries one protocol leaves it at.
     pub alpn: Vec<Vec<u8>>,
@@ -284,9 +307,79 @@ impl TlsServerConfig {
             .ok_or_else(|| TlsError::Other("ech server identity has no keys".to_owned()))?;
         crate::tls::rustls_backend::ech_server_context_builder(self, keys)
     }
+
+    /// The interval a file-backed entry re-reads at, if any entry re-reads at all.
+    pub fn reload_interval(&self) -> Option<std::time::Duration> {
+        self.certs
+            .iter()
+            .filter_map(|entry| entry.reload.as_ref())
+            .map(|reload| reload.interval)
+            .min()
+    }
+
+    /// Swap the live listener onto identities re-read from disk; `false` when a read failed
+    /// or the bytes match what the listener already serves.
+    pub fn renew(&self) -> bool {
+        let mut guard = self
+            .server_config_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let served = guard.served.clone().unwrap_or_else(|| self.certs.clone());
+        let Some(entries) = self.reread(&served) else {
+            return false;
+        };
+        let mut fresh = self.clone();
+        fresh.certs.clone_from(&entries);
+        let Ok(config) = crate::tls::rustls_backend::server_config(fresh) else {
+            return false;
+        };
+        guard.served = Some(entries);
+        guard.plain = Some(std::sync::Arc::new(config));
+        true
+    }
+
+    /// The identities as their files read now, or `None` when a read failed or nothing changed.
+    fn reread(&self, served: &[CertEntry]) -> Option<Vec<CertEntry>> {
+        let mut entries = Vec::with_capacity(self.certs.len());
+        let mut changed = false;
+        for (index, entry) in self.certs.iter().enumerate() {
+            let Some(reload) = &entry.reload else {
+                entries.push(entry.clone());
+                continue;
+            };
+            let parsed = parse_pem_entry(
+                &(reload.read)(&reload.certificate)?,
+                &(reload.read)(&reload.key)?,
+            )
+            .ok()?;
+            changed |= served.get(index).is_none_or(|was| {
+                was.cert_chain != parsed.cert_chain || was.key_der != parsed.key_der
+            });
+            entries.push(CertEntry {
+                reload: Some(reload.clone()),
+                ..parsed
+            });
+        }
+        changed.then_some(entries)
+    }
 }
 
 pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerConfig, TlsError> {
+    Ok(TlsServerConfig {
+        alpn: Vec::new(),
+        min_version: None,
+        max_version: None,
+        cipher_suites: Vec::new(),
+        certs: vec![parse_pem_entry(cert_pem, key_pem)?],
+        send_tickets: true,
+        reject_unknown_sni: false,
+        server_config_cache: std::sync::Arc::default(),
+        ech_server_keys: None,
+    })
+}
+
+/// One identity from a PEM pair: its whole chain, the key that signs for it, and the shape that key names.
+pub fn parse_pem_entry(cert_pem: &[u8], key_pem: &[u8]) -> Result<CertEntry, TlsError> {
     let cert_chain = pem_blocks(cert_pem, "CERTIFICATE");
     if cert_chain.is_empty() {
         return Err(TlsError::Other(
@@ -296,24 +389,40 @@ pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerCo
     // The label a key block carries is the writer's, not the key's: xray writes every minted key under `RSA PRIVATE KEY` whichever algorithm fed it, so the DER itself names the kind the parser takes.
     for label in ["PRIVATE KEY", "EC PRIVATE KEY", "RSA PRIVATE KEY"] {
         if let Some(key_der) = pem_blocks(key_pem, label).into_iter().next() {
-            return Ok(TlsServerConfig {
-                alpn: Vec::new(),
-                min_version: None,
-                max_version: None,
-                cipher_suites: Vec::new(),
+            // xray's `X509KeyPair` refuses a key that does not sign for the leaf; the entry is skipped rather than poisoning the names the other identities answer.
+            if !signs_for(&cert_chain[0], &key_der) {
+                return Err(TlsError::Other(
+                    "tls key does not match the certificate".to_owned(),
+                ));
+            }
+            return Ok(CertEntry {
                 cert_chain,
                 key_kind: key_kind(&key_der).unwrap_or(ServerKeyKind::Pkcs1),
                 key_der,
-                send_tickets: true,
-                reject_unknown_sni: false,
-                server_config_cache: std::sync::Arc::default(),
-                ech_server_keys: None,
+                reload: None,
             });
         }
     }
     Err(TlsError::Other(
         "tls key file holds no recognized private-key block".to_owned(),
     ))
+}
+
+/// Whether a private key's public half is the leaf's own subject key, the pair `X509KeyPair` holds together.
+fn signs_for(cert_der: &[u8], key_der: &[u8]) -> bool {
+    let Ok(cert) = boring::x509::X509::from_der(cert_der) else {
+        return false;
+    };
+    let Ok(key) = boring::pkey::PKey::private_key_from_der(key_der) else {
+        return false;
+    };
+    let Ok(cert_public) = cert.public_key() else {
+        return false;
+    };
+    matches!(
+        (cert_public.public_key_to_der(), key.public_key_to_der()),
+        (Ok(cert_key), Ok(key_public)) if cert_key == key_public
+    )
 }
 
 /// The DER shape a key names: PKCS#8 is version `0` before an algorithm `SEQUENCE`, PKCS#1 is an

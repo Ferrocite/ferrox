@@ -36,7 +36,7 @@ pub(crate) fn inbound_reality_config(
         server_names,
         max_time_skew: reality
             .get("maxTimeDiff")
-            .and_then(as_millis)
+            .and_then(as_whole)
             .map(Duration::from_millis),
         min_client_ver: reality
             .get("minClientVer")
@@ -577,7 +577,7 @@ fn key32(text: &str) -> Option<[u8; 32]> {
     (at == 32).then_some(out)
 }
 
-fn as_millis(node: &Json) -> Option<u64> {
+fn as_whole(node: &Json) -> Option<u64> {
     match node {
         Json::Num(n) if *n >= 0.0 && n.fract() == 0.0 => Some(*n as u64),
         _ => None,
@@ -598,8 +598,21 @@ pub(crate) fn inbound_tls_identity(
             return None;
         }
     };
-    let (cert_pem, key_pem) = tls_cert_pem(settings)?;
-    let mut identity = ferrox_core::tls::parse_pem_identity(&cert_pem, &key_pem).ok()?;
+    let certs = tls_cert_entries(settings)?;
+    if certs.is_empty() {
+        return None;
+    }
+    let mut identity = ferrox_core::tls::TlsServerConfig {
+        certs,
+        alpn: Vec::new(),
+        min_version: None,
+        max_version: None,
+        cipher_suites: Vec::new(),
+        send_tickets: true,
+        reject_unknown_sni: false,
+        server_config_cache: std::sync::Arc::default(),
+        ech_server_keys: None,
+    };
     let tls = settings.get("tlsSettings");
     identity.alpn = tls_alpn(tls);
     identity.min_version = tls_version(tls, "minVersion");
@@ -610,7 +623,24 @@ pub(crate) fn inbound_tls_identity(
         .and_then(Json::as_bool)
         .unwrap_or(false);
     identity.ech_server_keys = ech;
-    Some(Arc::new(identity))
+    let identity = Arc::new(identity);
+    start_cert_ticker(&identity);
+    Some(identity)
+}
+
+/// xray's `setupOcspTicker`: a file-backed pair re-reads on its interval until the listener drops it.
+fn start_cert_ticker(identity: &Arc<ferrox_core::tls::TlsServerConfig>) {
+    let Some(period) = identity.reload_interval() else {
+        return;
+    };
+    let identity = Arc::downgrade(identity);
+    std::thread::spawn(move || loop {
+        std::thread::sleep(period);
+        let Some(identity) = identity.upgrade() else {
+            return;
+        };
+        identity.renew();
+    });
 }
 
 /// xray's certificate lookup: an absolute path is read as itself; a relative path is
@@ -656,35 +686,86 @@ fn ech_server_keys(settings: &Json) -> Result<Option<Arc<[u8]>>, String> {
         .map(Some)
 }
 
-/// PEM for the first certificate entry, in either spelling xray accepts: `certificateFile`/`keyFile` paths, or an inline `certificate`/`key` given as a string or as an array of PEM lines. A peer that hands over a bare TLS listener (a REALITY decoy, say) uses the inline form, so refusing it here leaves the inbound serving nothing.
-fn tls_cert_pem(settings: &Json) -> Option<(Vec<u8>, Vec<u8>)> {
-    let first = settings
-        .get("tlsSettings")?
-        .get("certificates")?
-        .as_arr()?
-        .first()?;
-    if let (Some(cert_path), Some(key_path)) = (
-        first.get("certificateFile").and_then(Json::as_str),
-        first.get("keyFile").and_then(Json::as_str),
-    ) {
-        return Some((read_cert_file(cert_path)?, read_cert_file(key_path)?));
-    }
-    let inline = |field: &str| -> Option<Vec<u8>> {
-        let value = first.get(field)?;
-        if let Some(text) = value.as_str() {
-            return Some(text.as_bytes().to_vec());
+/// Every `certificates` entry xray would serve, in block order: `usage` other than
+/// `encipherment` feeds no handshake, an entry with no key or an unparseable pair is skipped
+/// the way xray warns and moves on, and a named file that cannot be read refuses the listener.
+fn tls_cert_entries(settings: &Json) -> Option<Vec<ferrox_core::tls::CertEntry>> {
+    let list = settings.get("tlsSettings")?.get("certificates")?.as_arr()?;
+    let mut entries = Vec::with_capacity(list.len());
+    for cert in list {
+        if cert
+            .get("usage")
+            .and_then(Json::as_str)
+            .is_some_and(|usage| {
+                usage.eq_ignore_ascii_case("verify") || usage.eq_ignore_ascii_case("issue")
+            })
+        {
+            continue;
         }
-        let lines = value.as_arr()?;
-        Some(
-            lines
-                .iter()
-                .filter_map(Json::as_str)
-                .collect::<Vec<_>>()
-                .join("\n")
-                .into_bytes(),
-        )
-    };
-    Some((inline("certificate")?, inline("key")?))
+        let named = |field: &str| {
+            cert.get(field)
+                .and_then(Json::as_str)
+                .filter(|path| !path.is_empty())
+        };
+        let certificate = named("certificateFile");
+        let key = named("keyFile");
+        let cert_pem = match certificate {
+            Some(path) => read_cert_file(path)?,
+            None => match inline_pem(cert, "certificate") {
+                Some(pem) => pem,
+                None => continue,
+            },
+        };
+        let key_pem = match key {
+            Some(path) => read_cert_file(path)?,
+            None => match inline_pem(cert, "key") {
+                Some(pem) => pem,
+                None => continue,
+            },
+        };
+        let Some(mut entry) = ferrox_core::tls::parse_pem_entry(&cert_pem, &key_pem).ok() else {
+            continue;
+        };
+        let paths = certificate.zip(key);
+        if let Some((certificate, key)) = paths {
+            if !cert
+                .get("oneTimeLoading")
+                .and_then(Json::as_bool)
+                .unwrap_or(false)
+            {
+                let seconds = cert
+                    .get("ocspStapling")
+                    .and_then(as_whole)
+                    .filter(|seconds| *seconds != 0)
+                    .unwrap_or(3600);
+                entry.reload = Some(ferrox_core::tls::CertReload {
+                    certificate: certificate.to_owned(),
+                    key: key.to_owned(),
+                    interval: Duration::from_secs(seconds),
+                    read: read_cert_file,
+                });
+            }
+        }
+        entries.push(entry);
+    }
+    Some(entries)
+}
+
+/// One inline PEM field, given as a string or as an array of lines.
+fn inline_pem(entry: &Json, field: &str) -> Option<Vec<u8>> {
+    let value = entry.get(field)?;
+    if let Some(text) = value.as_str() {
+        return Some(text.as_bytes().to_vec());
+    }
+    Some(
+        value
+            .as_arr()?
+            .iter()
+            .filter_map(Json::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into_bytes(),
+    )
 }
 
 pub(crate) fn tls_cert_paths(settings: &Json) -> Option<(&str, &str)> {
@@ -2942,6 +3023,300 @@ mod tests {
             tls_handshake(&identity, cert, "other.test"),
             (false, false),
             "rejectUnknownSni aborts an SNI no certificate name matches"
+        );
+    }
+
+    #[test]
+    fn a_certificate_list_serves_the_name_its_sni_asks_for() {
+        let first = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).expect("mints");
+        let second = rcgen::generate_simple_self_signed(vec!["b.test".to_owned()]).expect("mints");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-cert-list-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let first_cert = dir.join("a.pem");
+        let first_key = dir.join("a.key");
+        let second_cert = dir.join("b.pem");
+        let second_key = dir.join("b.key");
+        std::fs::write(&first_cert, first.cert.pem()).expect("cert a");
+        std::fs::write(&first_key, first.signing_key.serialize_pem()).expect("key a");
+        std::fs::write(&second_cert, second.cert.pem()).expect("cert b");
+        std::fs::write(&second_key, second.signing_key.serialize_pem()).expect("key b");
+        let config = |extra: &str| {
+            crate::json::parse(&format!(
+                r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{{extra}
+                    "certificates": [{{"certificateFile": "{}", "keyFile": "{}"}},
+                                     {{"certificateFile": "{}", "keyFile": "{}"}}]}}}}}}"#,
+                first_cert.display(),
+                first_key.display(),
+                second_cert.display(),
+                second_key.display(),
+            ))
+            .expect("parses")
+        };
+        let identity = inbound_tls_identity(&config("")).expect("both entries load");
+        assert_eq!(identity.certs.len(), 2, "every listed entry is an identity");
+        assert_eq!(
+            tls_handshake(&identity, second.cert.der().to_vec(), "b.test"),
+            (true, true),
+            "the second entry answers its own name"
+        );
+        assert_eq!(
+            tls_handshake(&identity, first.cert.der().to_vec(), "a.test"),
+            (true, true),
+            "the first entry answers its own name"
+        );
+        assert_eq!(
+            tls_handshake(&identity, first.cert.der().to_vec(), "b.test"),
+            (false, false),
+            "the first entry does not answer b.test's name"
+        );
+        let rejecting = inbound_tls_identity(&config(r#""rejectUnknownSni": true,"#))
+            .expect("both entries load");
+        assert_eq!(
+            tls_handshake(&rejecting, second.cert.der().to_vec(), "b.test"),
+            (true, true),
+            "the SNI rule reads the names of every entry, not only the first"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_entry_xray_cannot_load_is_skipped_not_refused() {
+        let minted = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).expect("mints");
+        let wrong = rcgen::generate_simple_self_signed(vec!["c.test".to_owned()]).expect("mints");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-cert-keyless-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let cert = dir.join("a.pem");
+        let key = dir.join("a.key");
+        let other_key = dir.join("c.key");
+        std::fs::write(&cert, minted.cert.pem()).expect("cert");
+        std::fs::write(&key, minted.signing_key.serialize_pem()).expect("key");
+        std::fs::write(&other_key, wrong.signing_key.serialize_pem()).expect("other key");
+        let config = crate::json::parse(&format!(
+            r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{
+                "certificates": [{{"certificateFile": "{}"}},
+                                 {{"certificateFile": "{}", "keyFile": "{}"}},
+                                 {{"certificateFile": "{}", "keyFile": "{}"}}]}}}}}}"#,
+            cert.display(),
+            cert.display(),
+            other_key.display(),
+            cert.display(),
+            key.display(),
+        ))
+        .expect("parses");
+        let identity = inbound_tls_identity(&config).expect("the keyed entry still loads");
+        assert_eq!(
+            identity.certs.len(),
+            1,
+            "an entry with no key, or a key that does not sign for its leaf, is skipped"
+        );
+        assert_eq!(
+            tls_handshake(&identity, minted.cert.der().to_vec(), "a.test"),
+            (true, true),
+            "the listener serves the entries it could load"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_backed_listener_reloads_the_certificate_it_serves() {
+        let first = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).expect("mints");
+        let renewed = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).expect("mints");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-cert-reload-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let cert = dir.join("a.pem");
+        let key = dir.join("a.key");
+        std::fs::write(&cert, first.cert.pem()).expect("cert");
+        std::fs::write(&key, first.signing_key.serialize_pem()).expect("key");
+        let config = |extra: &str| {
+            crate::json::parse(&format!(
+                r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{
+                    "certificates": [{{"certificateFile": "{}", "keyFile": "{}"{extra}}}]}}}}}}"#,
+                cert.display(),
+                key.display(),
+            ))
+            .expect("parses")
+        };
+        let identity = inbound_tls_identity(&config(r#", "ocspStapling": 7"#))
+            .expect("the file-backed identity loads");
+        let reload = identity.certs[0].reload.as_ref().expect("a path reloads");
+        assert_eq!(
+            reload.interval,
+            Duration::from_secs(7),
+            "ocspStapling is the ticker"
+        );
+        let defaulted = inbound_tls_identity(&config("")).expect("the default interval loads");
+        assert_eq!(
+            defaulted.certs[0]
+                .reload
+                .as_ref()
+                .map(|reload| reload.interval),
+            Some(Duration::from_secs(3600)),
+            "a path with no ocspStapling re-reads on xray's hourly ticker"
+        );
+        let once = inbound_tls_identity(&config(r#", "oneTimeLoading": true"#))
+            .expect("the one-time identity loads");
+        assert!(
+            once.certs[0].reload.is_none(),
+            "oneTimeLoading pins the identity it was read with"
+        );
+        std::fs::write(&cert, renewed.cert.pem()).expect("new cert");
+        std::fs::write(&key, renewed.signing_key.serialize_pem()).expect("new key");
+        assert_eq!(
+            tls_handshake(&identity, first.cert.der().to_vec(), "a.test"),
+            (true, true),
+            "the listener serves the bytes it loaded until the ticker re-reads them"
+        );
+        assert!(identity.renew(), "the re-read replaced the served chain");
+        assert_eq!(
+            tls_handshake(&identity, first.cert.der().to_vec(), "a.test"),
+            (false, false),
+            "the disk replaced the chain, so the old root no longer completes"
+        );
+        assert_eq!(
+            tls_handshake(&identity, renewed.cert.der().to_vec(), "a.test"),
+            (true, true),
+            "after the re-read the listener presents the renewed certificate"
+        );
+        assert!(
+            !identity.renew(),
+            "an unchanged read leaves the listener alone"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_file_backed_listener_rereads_on_its_ticker() {
+        let first = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).expect("mints");
+        let renewed = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).expect("mints");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-cert-tick-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let cert = dir.join("a.pem");
+        let key = dir.join("a.key");
+        std::fs::write(&cert, first.cert.pem()).expect("cert");
+        std::fs::write(&key, first.signing_key.serialize_pem()).expect("key");
+        let config = crate::json::parse(&format!(
+            r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{
+                "certificates": [{{"certificateFile": "{}", "keyFile": "{}",
+                    "ocspStapling": 1}}]}}}}}}"#,
+            cert.display(),
+            key.display(),
+        ))
+        .expect("parses");
+        let identity = inbound_tls_identity(&config).expect("the file-backed identity loads");
+        assert_eq!(
+            tls_handshake(&identity, first.cert.der().to_vec(), "a.test"),
+            (true, true),
+            "the listener starts on the pair it read"
+        );
+        std::fs::write(&cert, renewed.cert.pem()).expect("new cert");
+        std::fs::write(&key, renewed.signing_key.serialize_pem()).expect("new key");
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let mut reloaded = false;
+        while std::time::Instant::now() < deadline {
+            if tls_handshake(&identity, renewed.cert.der().to_vec(), "a.test") == (true, true) {
+                reloaded = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            reloaded,
+            "the ocspStapling ticker re-read the pair and the listener serves the renewed chain"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    static RELOAD_PAIR: std::sync::Mutex<(Vec<u8>, Vec<u8>)> =
+        std::sync::Mutex::new((Vec::new(), Vec::new()));
+    static RELOAD_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    fn reloaded_pair(path: &str) -> Option<Vec<u8>> {
+        RELOAD_READS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let pair = RELOAD_PAIR.lock().expect("pair");
+        match path {
+            "cert.pem" => Some(pair.0.clone()),
+            "key.pem" => Some(pair.1.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_ticker_reads_the_pair_once_and_rebuilds_only_on_a_change() {
+        use std::sync::atomic::Ordering;
+        let first = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).expect("mints");
+        let renewed = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).expect("mints");
+        let pair = |minted: &rcgen::CertifiedKey<rcgen::KeyPair>| {
+            (
+                minted.cert.pem().into_bytes(),
+                minted.signing_key.serialize_pem().into_bytes(),
+            )
+        };
+        *RELOAD_PAIR.lock().expect("pair") = pair(&first);
+        RELOAD_READS.store(0, Ordering::SeqCst);
+        let mut identity = ferrox_core::tls::parse_pem_identity(
+            first.cert.pem().as_bytes(),
+            first.signing_key.serialize_pem().as_bytes(),
+        )
+        .expect("loads");
+        identity.certs[0].reload = Some(ferrox_core::tls::CertReload {
+            certificate: "cert.pem".to_owned(),
+            key: "key.pem".to_owned(),
+            interval: Duration::from_secs(3600),
+            read: reloaded_pair,
+        });
+        let identity = Arc::new(identity);
+        assert!(
+            !identity.renew(),
+            "an unchanged pair leaves the listener alone"
+        );
+        assert_eq!(
+            RELOAD_READS.load(Ordering::SeqCst),
+            2,
+            "a reload reads the certificate and the key once each"
+        );
+        let before = identity.server_config().expect("the first build serves");
+        *RELOAD_PAIR.lock().expect("pair") = pair(&renewed);
+        assert!(identity.renew(), "a changed pair rebuilds the identity");
+        assert_eq!(
+            RELOAD_READS.load(Ordering::SeqCst),
+            4,
+            "the changed reload reads the pair once more"
+        );
+        let after = identity.server_config().expect("the rebuilt config serves");
+        assert!(
+            !Arc::ptr_eq(&before, &after),
+            "the rebuild replaced what the listener serves"
+        );
+        assert_eq!(
+            tls_handshake(&identity, renewed.cert.der().to_vec(), "a.test"),
+            (true, true),
+            "the rebuilt identity presents the re-read certificate"
+        );
+        assert!(
+            Arc::ptr_eq(&after, &identity.server_config().expect("cached")),
+            "a handshake before the ticker serves the cached config"
         );
     }
 

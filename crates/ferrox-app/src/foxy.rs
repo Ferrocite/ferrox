@@ -3994,9 +3994,12 @@ pub(crate) mod loopback {
         let minted = rcgen::generate_simple_self_signed(vec![subject.to_owned()]).expect("mints");
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
         let server = ferrox_core::tls::TlsServerConfig {
-            cert_chain: vec![minted.cert.der().to_vec()],
-            key_der: minted.signing_key.serialize_der(),
-            key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+            certs: vec![ferrox_core::tls::CertEntry {
+                cert_chain: vec![minted.cert.der().to_vec()],
+                key_der: minted.signing_key.serialize_der(),
+                key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+                reload: None,
+            }],
             alpn: vec![alpn.to_vec()],
             min_version: None,
             max_version: None,
@@ -8445,8 +8448,9 @@ pub(crate) mod loopback {
         let (roots, server) = minted(b"http/1.1");
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
-        let right =
-            foxy::pin::Pins::parse([foxy::pin::spki_pin(&server.cert_chain[0]).expect("pins")]);
+        let right = foxy::pin::Pins::parse([
+            foxy::pin::spki_pin(&server.certs[0].cert_chain[0]).expect("pins")
+        ]);
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             stream
@@ -8472,8 +8476,9 @@ pub(crate) mod loopback {
         let (_foreign, server) = minted(b"http/1.1");
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
-        let right =
-            foxy::pin::Pins::parse([foxy::pin::spki_pin(&server.cert_chain[0]).expect("pins")]);
+        let right = foxy::pin::Pins::parse([
+            foxy::pin::spki_pin(&server.certs[0].cert_chain[0]).expect("pins")
+        ]);
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             stream
@@ -8528,8 +8533,9 @@ pub(crate) mod loopback {
         let (_foreign, server) = minted(b"http/1.1");
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
-        let right =
-            foxy::pin::Pins::parse([foxy::pin::spki_pin(&server.cert_chain[0]).expect("pins")]);
+        let right = foxy::pin::Pins::parse([
+            foxy::pin::spki_pin(&server.certs[0].cert_chain[0]).expect("pins")
+        ]);
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)

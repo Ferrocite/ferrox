@@ -526,22 +526,23 @@ pub(crate) fn serve_config(identity: &ferrox_core::tls::TlsServerConfig) -> Opti
     if identity.ech_server_keys.is_some() || identity.reject_unknown_sni {
         return Some(config);
     }
-    let label = match identity.key_kind {
+    let entry = identity.certs.first()?;
+    let label = match entry.key_kind {
         ferrox_core::tls::ServerKeyKind::Pkcs8 => "PRIVATE KEY",
         ferrox_core::tls::ServerKeyKind::Sec1 => "EC PRIVATE KEY",
         ferrox_core::tls::ServerKeyKind::Pkcs1 => "RSA PRIVATE KEY",
     };
     let mut chain = Vec::with_capacity(
-        identity
+        entry
             .cert_chain
             .iter()
             .map(|der| pem_capacity(der.len(), "CERTIFICATE".len()))
             .sum(),
     );
-    for der in &identity.cert_chain {
+    for der in &entry.cert_chain {
         append_pem(&mut chain, der, "CERTIFICATE");
     }
-    let key = der_to_pem(&identity.key_der, label);
+    let key = der_to_pem(&entry.key_der, label);
     let (cert_path, cert_text) = stage_trust_file(&chain)?;
     let (key_path, key_text) = stage_trust_file(&key)?;
     let loaded = config
@@ -4150,9 +4151,12 @@ mod tests {
         let roots = parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         ferrox_core::tls::TlsServerConfig {
-            cert_chain: roots,
-            key_der: minted.signing_key.serialize_der(),
-            key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+            certs: vec![ferrox_core::tls::CertEntry {
+                cert_chain: roots,
+                key_der: minted.signing_key.serialize_der(),
+                key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+                reload: None,
+            }],
             alpn: Vec::new(),
             min_version: None,
             max_version: None,
@@ -4224,9 +4228,7 @@ mod tests {
     #[test]
     fn serve_config_refuses_without_a_chain_or_key() {
         let empty = ferrox_core::tls::TlsServerConfig {
-            cert_chain: Vec::new(),
-            key_der: Vec::new(),
-            key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+            certs: Vec::new(),
             alpn: Vec::new(),
             min_version: None,
             max_version: None,
@@ -4238,7 +4240,7 @@ mod tests {
         };
         assert!(serve_config(&empty).is_none());
         let mut no_key = minted_identity();
-        no_key.key_der = vec![0u8; 16];
+        no_key.certs[0].key_der = vec![0u8; 16];
         assert!(serve_config(&no_key).is_none());
     }
 
@@ -4515,7 +4517,7 @@ mod tests {
     ) -> (Lane, Lane) {
         let mut server_config = serve_config(identity).expect("serves");
         server_config.set_active_connection_id_limit(4);
-        let mut client_config = quiche_config(&identity.cert_chain, None).expect("trusts");
+        let mut client_config = quiche_config(&identity.certs[0].cert_chain, None).expect("trusts");
         client_config.set_active_connection_id_limit(4);
         let server_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
         let server_addr = server_sock.local_addr().expect("addr");
@@ -4732,7 +4734,7 @@ mod tests {
             server_addr,
             local,
             "quic.test",
-            &identity.cert_chain,
+            &identity.certs[0].cert_chain,
             Some(&list),
             Duration::from_secs(5),
         )

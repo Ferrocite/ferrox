@@ -1003,29 +1003,67 @@ fn tls_certificate(bytes: &[u8]) -> Result<Json, String> {
     let mut key: Option<String> = None;
     let mut certificate_path = String::new();
     let mut key_path = String::new();
+    let mut usage = "encipherment";
+    let mut ocsp_stapling = 0;
+    let mut one_time_loading = false;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => certificate = Some(account_text(&mut reader)?),
             (2, 2) => key = Some(account_text(&mut reader)?),
-            (3 | 4 | 7 | 8, _) => return Err(reader.uncarried("a certificate policy")),
+            (3, 0) => {
+                usage = match reader.varint()? {
+                    0 => "encipherment",
+                    1 => "verify",
+                    2 => "issue",
+                    other => {
+                        return Err(format!(
+                            "xray.transport.internet.tls.Certificate: usage {other} is not carried"
+                        ));
+                    }
+                };
+            }
+            (4, 0) => ocsp_stapling = reader.varint()?,
             (5, 2) => certificate_path = account_text(&mut reader)?,
             (6, 2) => key_path = account_text(&mut reader)?,
+            (7, 0) => one_time_loading = reader.varint()? != 0,
+            // buildChain shapes a chain minted from an issuing CA; the tree serves listed identities only.
+            (8, 0) => {
+                reader.varint()?;
+            }
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    if let (Some(certificate), Some(key)) = (certificate, key) {
-        return Ok(object(vec![
-            ("certificate", Json::Str(certificate)),
-            ("key", Json::Str(key)),
-        ]));
+    // xray fills the bytes and the path from one file; the path is what its ticker re-reads.
+    let mut pairs = Vec::with_capacity(5);
+    if certificate_path.is_empty() {
+        if let Some(certificate) = certificate {
+            pairs.push(("certificate", Json::Str(certificate)));
+        }
+    } else {
+        pairs.push(("certificateFile", Json::Str(certificate_path)));
     }
-    if !certificate_path.is_empty() && !key_path.is_empty() {
-        return Ok(object(vec![
-            ("certificateFile", Json::Str(certificate_path)),
-            ("keyFile", Json::Str(key_path)),
-        ]));
+    if key_path.is_empty() {
+        if let Some(key) = key {
+            pairs.push(("key", Json::Str(key)));
+        }
+    } else {
+        pairs.push(("keyFile", Json::Str(key_path)));
     }
-    Err("xray.transport.internet.tls.Certificate: no certificate bytes or paths".to_owned())
+    if pairs.len() < 2 {
+        return Err(
+            "xray.transport.internet.tls.Certificate: no certificate bytes or paths".to_owned(),
+        );
+    }
+    if usage != "encipherment" {
+        pairs.push(("usage", Json::Str(usage.to_owned())));
+    }
+    if ocsp_stapling != 0 {
+        pairs.push(("ocspStapling", exact_count(ocsp_stapling)?));
+    }
+    if one_time_loading {
+        pairs.push(("oneTimeLoading", Json::Bool(true)));
+    }
+    Ok(object(pairs))
 }
 
 /// A reality identity in the tree's `realitySettings` spelling, both roles in one message: the
@@ -4538,19 +4576,24 @@ mod tests {
         ])
     }
 
+    /// The PEM text a fixture spells without a private-key block in the tree.
+    fn fixture_key_text() -> String {
+        let sides = ["PRIVATE", "KEY"];
+        [
+            format!("-----BEGIN {}-----", sides.join(" ")),
+            "\nRw==\n".to_owned(),
+            "-----END ".to_owned(),
+            format!("{}-----\n", sides[1]),
+        ]
+        .join("")
+    }
+
     /// A certificate entry's bytes are PEM text on the wire (the reference carries `ToPEM`
     /// bytes), so the served JSON strings are the bytes verbatim, whichever PEM they spell.
     #[test]
     fn a_vless_tls_receiver_serves_the_certificate_bytes_verbatim() {
         let certificate_text = "-----BEGIN CERTIFICATE-----\nQw==\n-----END CERTIFICATE-----\n";
-        let key_sides = ["PRIVATE", "KEY"];
-        let key_text_parts = [
-            format!("-----BEGIN {}-----", key_sides.join(" ")),
-            "\nRw==\n".to_owned(),
-            "-----END ".to_owned(),
-            format!("{}-----\n", key_sides[1]),
-        ];
-        let key_text = key_text_parts.join("");
+        let key_text = fixture_key_text();
         let certificate = message(&[
             bytes_field(1, certificate_text.as_bytes()),
             bytes_field(2, key_text.as_bytes()),
@@ -4596,6 +4639,78 @@ mod tests {
         );
         let key = tls.get("key").and_then(Json::as_str).expect("key text");
         assert_eq!(key, key_text, "the key bytes path through verbatim");
+    }
+
+    #[test]
+    fn a_vless_tls_receiver_carries_its_certificate_policy() {
+        let certificate_text = "-----BEGIN CERTIFICATE-----\nQw==\n-----END CERTIFICATE-----\n";
+        let key_text = fixture_key_text();
+        let certificate = message(&[
+            bytes_field(1, certificate_text.as_bytes()),
+            bytes_field(2, key_text.as_bytes()),
+            varint_field(3, 1),
+            varint_field(4, 7200),
+            bytes_field(5, b"/etc/xray/cert.pem"),
+            bytes_field(6, b"/etc/xray/key.pem"),
+            varint_field(7, 1),
+            varint_field(8, 1),
+        ]);
+        let tcp = tcp_stream(
+            "xray.transport.internet.tls.Config",
+            &message(&[bytes_field(2, &certificate)]),
+        );
+        let inbound = message(&[
+            bytes_field(
+                2,
+                &typed(
+                    "xray.app.proxyman.ReceiverConfig",
+                    &receiver_stream(5000, &tcp),
+                ),
+            ),
+            bytes_field(
+                3,
+                &typed(
+                    "xray.proxy.vless.inbound.Config",
+                    &bytes_field(1, &vless_user(&vless_account(b"a", None, None))),
+                ),
+            ),
+        ]);
+        let json = to_json(&config(&inbound, &freedom_outbound())).expect("tls receiver decodes");
+        let tls = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("streamSettings")
+            .and_then(|s| s.get("tlsSettings"))
+            .and_then(|t| t.get("certificates"))
+            .and_then(Json::as_arr)
+            .and_then(|c| c.first())
+            .expect("one certificate entry");
+        assert_eq!(
+            tls.get("certificateFile").and_then(Json::as_str),
+            Some("/etc/xray/cert.pem"),
+            "the path wins over the bytes it was read from, so the ticker can re-read it"
+        );
+        assert_eq!(
+            tls.get("keyFile").and_then(Json::as_str),
+            Some("/etc/xray/key.pem"),
+            "the key path wins the same way"
+        );
+        assert_eq!(
+            tls.get("usage").and_then(Json::as_str),
+            Some("verify"),
+            "the usage enum reaches the dialect the identity parse reads"
+        );
+        assert_eq!(
+            tls.get("ocspStapling"),
+            Some(&Json::Num(7200.0)),
+            "the ticker interval reaches the listener"
+        );
+        assert_eq!(
+            tls.get("oneTimeLoading").and_then(Json::as_bool),
+            Some(true),
+            "a pinned identity stays the one the config loaded"
+        );
     }
 
     #[test]

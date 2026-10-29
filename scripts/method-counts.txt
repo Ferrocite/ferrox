@@ -438,6 +438,11 @@ reality-tls tls-arm-cells 4 scripts/run-benchmark-matrix.sh
 reality-tls census-waits-per-relay-read 0 ferrox-app-proxy::tests::a_release_build_registers_no_census_wait
 reality-tls user-space-copies-per-framed-write 0 ferrox-app-proxy::tests::a_frame_reaches_the_tls_session_in_one_call
 reality-tls seal-into-instructions UNBLESSED scripts/count-ops.sh
+reality-tls certificates-served-per-listener 2 ferrox-app-config::tests::a_certificate_list_serves_the_name_its_sni_asks_for
+reality-tls sni-names-answered-by-one-listener 2 ferrox-app-config::tests::a_certificate_list_serves_the_name_its_sni_asks_for
+reality-tls certificate-files-read-per-reload 2 ferrox-app-config::tests::a_ticker_reads_the_pair_once_and_rebuilds_only_on_a_change
+reality-tls identity-rebuilds-per-unchanged-reload 0 ferrox-app-config::tests::a_ticker_reads_the_pair_once_and_rebuilds_only_on_a_change
+reality-tls identity-builds-per-handshake-before-the-ticker 0 ferrox-app-config::tests::a_ticker_reads_the_pair_once_and_rebuilds_only_on_a_change
 
 kcp ops-retired-instructions UNBLESSED scripts/count-ops.sh
 kcp maximum-transmission-unit-bytes 1350 ferrox-core-kcp::tests::the_upstream_defaults_are_these
