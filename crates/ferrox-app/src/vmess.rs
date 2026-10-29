@@ -1536,7 +1536,7 @@ where
             let Some(pad) = pad.as_mut() else {
                 return Next::Done;
             };
-            let next = forward_step(
+            let (next, clean) = forward_step(
                 &mut plain_read,
                 &mut buf,
                 &mut writer,
@@ -1547,8 +1547,12 @@ where
                 &forward_flow,
             );
             if next == Next::Done {
-                // Read side only: a clean target EOF leaves the upload direction writing to this socket.
-                let _ = plain_read.shutdown(Shutdown::Read);
+                if clean {
+                    // A clean target EOF leaves the upload direction writing to this socket.
+                    let _ = plain_read.shutdown(Shutdown::Read);
+                } else {
+                    let _ = plain_read.shutdown(Shutdown::Both);
+                }
             }
             next
         }),
@@ -1582,7 +1586,7 @@ where
 }
 
 /// One step of the plain leg: read what the target sent, stage it into frames, and hand the lane
-/// back a wait when the socket has nothing yet.
+/// back a wait when the socket has nothing yet. The flag is true only for the target's clean EOF.
 #[allow(clippy::too_many_arguments)]
 fn forward_step(
     plain_read: &mut Connection,
@@ -1593,14 +1597,15 @@ fn forward_step(
     pad: &mut PadSource,
     close: &Close,
     flow: &crate::proxy::RelayFinish,
-) -> Next {
+) -> (Next, bool) {
     match plain_read.read(buf) {
         Ok(0) => {
             // A clean end tells the peer this direction is done; the other direction keeps relaying.
-            if !write_frame(writer, send, &[], staging, pad) {
+            let clean = write_frame(writer, send, &[], staging, pad);
+            if !clean {
                 close();
             }
-            Next::Done
+            (Next::Done, clean)
         }
         Ok(read) => {
             let traced = crate::proxy::echo_trace_on();
@@ -1625,22 +1630,22 @@ fn forward_step(
                 });
             }
             if ok {
-                Next::More
+                (Next::More, false)
             } else {
                 close();
-                Next::Done
+                (Next::Done, false)
             }
         }
         Err(ref error) if crate::proxy::is_timeout(error) => {
             if flow.ended_and_drained() {
-                Next::Done
+                (Next::Done, false)
             } else {
-                Next::Idle
+                (Next::Idle, false)
             }
         }
         Err(_) => {
             close();
-            Next::Done
+            (Next::Done, false)
         }
     }
 }
