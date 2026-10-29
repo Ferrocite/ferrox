@@ -2,7 +2,7 @@
 
 <!-- scope:begin -->
 - paths: crates/ferrox-app/src/wg.rs, crates/ferrox-app/src/wg_kernel.rs, crates/ferrox-app/src/wg_stack.rs, crates/ferrox-app/src/wireguard.rs, crates/ferrox-core/src/wireguard/device.rs, crates/ferrox-core/src/wireguard/handshake.rs, crates/ferrox-core/src/wireguard/transport.rs
-- symbols: find_wireguard_outbound, wireguard_settings
+- symbols: find_wireguard_outbound, wireguard_settings, a_wireguard_server_datagram_takes_its_udp_lane_and_redirect
 - scenarios: wireguard-raw, wireguard-kernel-raw
 - engines: xray-core, sing-box
 - go: ./proxy/wireguard/...
@@ -29,7 +29,7 @@ graph TD
     L --> M["kernel wireguard link:<br/>address, MTU, key, peers"]
     K -->|no / fallback| N["smoltcp client: connect the destination"]
     N --> D["inner IP packet"]
-    D --> E["Tunnel::send_owned: handshake, queue, seal<br/>16-byte header + tag"]
+    D --> E["Tunnel::send_prefixed: trigger a handshake when needed; queue data until a session is ready<br/>seal transport records in the caller's buffer using the reserved 16-byte header"]
     E --> F["UDP socket to the peer's endpoint"]
     M --> F
     F --> G["server: Tunnel::receive, allowed-IP check"]
@@ -52,6 +52,8 @@ graph TD
 | server-datagram-bytes-echoed | 2 | ferrox-app-wg-stack::tests::a_server_datagram_lane_echoes_through_freedom |
 | echo-answers-on-the-client | 2 | ferrox-app-wg-stack::tests::an_echo_to_the_devices_own_address_is_answered_on_the_tunnel |
 | echo-answers-on-the-server | 1 | ferrox-app-wg-stack::tests::a_server_answers_an_echo_to_its_own_address |
+| prefixed-record-allocations | 0 | ferrox-core-wireguard::tests::a_prefixed_record_reuses_the_stack_headroom |
+| prefixed-record-zeroed-bytes | 0 | ferrox-core-wireguard::tests::a_prefixed_record_reuses_the_stack_headroom |
 | kernel-rule-priority | 32765 | ferrox-app-wg-kernel::tests::the_rule_marks_the_table |
 | kernel-iif-priority | 32764 | ferrox-app-wg-kernel::tests::the_iif_rule_keeps_the_reverse_path_inside_the_tunnel |
 <!-- counts:end -->
@@ -72,7 +74,7 @@ The size rows are the constants the record and handshake write, asserted against
 
 ## Memory copies
 
-**Not measured.** On the userspace path the plaintext is copied into a transport record and decrypted into the reader's buffer, and an inner packet is copied between `smoltcp` and the local stream. The kernel path removes those userspace copies, but no pointer-identity test observes the kernel's own buffers, so the page makes no copy or allocation row; `ops-retired-instructions` remains `UNBLESSED` for the same reason.
+Zero extra copies on the stack send path. Every producer reserves the 16-byte transport header (`QueueDevice`, `QueueTx`, the client and server datagram lanes, the DNS exchange and the IO loop), and `Tunnel::send_prefixed` seals the record where the packet already lies. `prefixed-record-allocations` and `prefixed-record-zeroed-bytes` are both zero: `a_prefixed_record_reuses_the_stack_headroom` asserts the returned packet's base is the caller's, the caller's pointer does not move and its capacity does not grow, and the peer decrypts it. A caller without headroom still takes the old path: `send_owned` seals in place from offset zero, while `send(&[u8])` allocates one sized buffer and copies the payload once. On receive, both paths copy the decrypted record into the stack's own packet buffer. Neither the `send(&[u8])` copy nor the receive copy is claimed removed.
 
 ## Time
 
@@ -88,7 +90,7 @@ Against sing-box, nothing is removed: its pinned WireGuard endpoint is a separat
 
 ## What was not removed
 
-No syscall or copy claim is made. The userspace tunnel still copies an inner packet into a transport record and copies it out again, though the record reuses the caller's packet buffer where the stack supplies one and is written rather than zero-filled first; the stack owns a 512 KiB receive and a 2 MiB send buffer per connected flow and up to eight such pairs while a TCP flow races resolved answers, which is memory the reference's netstack also spends; a server datagram lane owns a loopback relay and two threads, and is reclaimed after the UDP idle budget, within the 4096 cap. Remote DNS races up to eight peer-routed answers in the configured address families: a TCP flow prefers its primary candidate once established, and UDP sends to up to eight until one name's reply pins that name; another name on the same lane still races, and the kernel lane stops at 64 connected sockets. Kernel mode is Linux-only and needs `CAP_NET_ADMIN` and the `wireguard` module; when it is unavailable the userspace stack serves the same config, and the server role always uses that stack. A non-zero `reserved` value also stays on the userspace stack, because the kernel device has no field for WARP's routing id. An explicit `isClient` that contradicts the handler's position is a startup refusal rather than a silent role swap. A client whose peers name endpoints in both address families binds one dual-stack UDP socket and maps IPv4 endpoints through it; when the host cannot open that socket it falls back to IPv4 and skips the IPv6 candidates rather than refusing a reachable v4 endpoint. A single peer keeps either family, and a name that resolves to several answers keeps one of each family before the eight-slot cap and sends its handshake to the current endpoint and all of them, with the first response pinning the tunnel. After 128 initiations in a second the responder answers a missing or stale `mac2` with a rotatable cookie reply, and the retry is accepted under the same load. The UDP reply reader takes every answer the lane's relay returns, including one a freedom `redirect` rewrote, and reports it to the client as the original target the inner packet named; a lane still drops a datagram whose framing it cannot parse.
+No syscall claim is made. On transmit, non-prefixed userspace paths copy or shift an inner packet into a transport record. The prefixed stack path reuses the caller's packet buffer, seals in place without moving the payload, and writes the record rather than zero-filling it first. On receive, both paths copy the opened payload into `Event::Data`; the stack owns a 512 KiB receive and a 2 MiB send buffer per connected flow and up to eight such pairs while a TCP flow races resolved answers, which is memory the reference's netstack also spends; a server datagram lane owns a loopback relay and two threads, and is reclaimed after the UDP idle budget, within the 4096 cap. Remote DNS races up to eight peer-routed answers in the configured address families: a TCP flow prefers its primary candidate once established, and UDP sends to up to eight until one name's reply pins that name; another name on the same lane still races, and the kernel lane stops at 64 connected sockets. Kernel mode is Linux-only and needs `CAP_NET_ADMIN` and the `wireguard` module; when it is unavailable the userspace stack serves the same config, and the server role always uses that stack. A non-zero `reserved` value also stays on the userspace stack, because the kernel device has no field for WARP's routing id. An explicit `isClient` that contradicts the handler's position is a startup refusal rather than a silent role swap. A client whose peers name endpoints in both address families binds one dual-stack UDP socket and maps IPv4 endpoints through it; when the host cannot open that socket it falls back to IPv4 and skips the IPv6 candidates rather than refusing a reachable v4 endpoint. A single peer keeps either family, and a name that resolves to several answers keeps one of each family before the eight-slot cap and sends its handshake to the current endpoint and all of them, with the first response pinning the tunnel. After 128 initiations in a second the responder answers a missing or stale `mac2` with a rotatable cookie reply, and the retry is accepted under the same load. The UDP reply reader takes every answer the lane's relay returns, including one a freedom `redirect` rewrote, and reports it to the client as the original target the inner packet named; a lane still drops a datagram whose framing it cannot parse.
 
 ## Pins
 

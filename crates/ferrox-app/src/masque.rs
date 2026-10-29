@@ -152,6 +152,7 @@ impl MasqueOut {
                             .into_iter()
                             .collect()
                     },
+                    0,
                 );
             }
             Err(reason) => eprintln!("masque: {reason}"),
@@ -253,7 +254,13 @@ fn assemble(
     let stack_config = Arc::clone(&config);
     let stack_tunnel = to_tunnel.clone();
     std::thread::spawn(move || {
-        wg_stack::client((*stack_config).clone(), stack_tunnel, packets_rx, flow_rx);
+        wg_stack::client(
+            (*stack_config).clone(),
+            stack_tunnel,
+            packets_rx,
+            flow_rx,
+            0,
+        );
     });
     let io_routes = Arc::clone(&routes);
     let watch = Arc::clone(&alive);
@@ -1027,7 +1034,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         dns: Vec::new(),
     };
     let stack_out = out.clone();
-    std::thread::spawn(move || wg_stack::server(device, to_tunnel, packets_rx, stack_out));
+    std::thread::spawn(move || wg_stack::server(device, to_tunnel, packets_rx, stack_out, 0));
     let demux_config = Arc::new(Mutex::new(config));
     let demux_sock = Arc::clone(&sock);
     let demux_shared = Arc::clone(&shared);
