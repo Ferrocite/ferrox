@@ -1818,7 +1818,7 @@ fn as_i64(node: &Json) -> Option<i64> {
 
 fn int_field(node: &Json, key: &str) -> Result<Option<i64>, String> {
     match node.get(key) {
-        None => Ok(None),
+        None | Some(Json::Null) => Ok(None),
         Some(value) => as_i64(value)
             .map(Some)
             .ok_or_else(|| format!("{key} is not an integer")),
@@ -1832,6 +1832,7 @@ fn flag(node: &Json, key: &str) -> bool {
 /// `Bandwidth.Bps`: a decimal number with an optional byte or bit unit, converted to bytes per second exactly as the reference does.
 fn bandwidth(node: &Json) -> Result<u64, String> {
     let text = match node {
+        Json::Null => return Ok(0),
         // The reference spells a bandwidth as a string; a bare number is the same unitless bit rate.
         Json::Num(n) if *n >= 0.0 => return Ok(*n as u64 / 8),
         Json::Str(text) => text.trim().to_lowercase(),
@@ -1864,6 +1865,9 @@ pub(crate) fn hysteria_udp_idle(hy: Option<&Json>) -> Result<u64, String> {
     let Some(node) = hy.and_then(|h| h.get("udpIdleTimeout")) else {
         return Ok(60);
     };
+    if matches!(node, Json::Null) {
+        return Ok(60);
+    }
     let Some(value) = as_i64(node) else {
         return Err("UdpIdleTimeout is not a number".to_owned());
     };
@@ -1887,12 +1891,15 @@ pub(crate) fn hysteria_quic_params(
     else {
         return Ok(None);
     };
+    if matches!(node, Json::Null) {
+        return Ok(None);
+    }
     if !matches!(node, Json::Obj(_)) {
         return Err("quicParams is not an object".to_owned());
     }
     let named = |key: &str| -> Result<String, String> {
         match node.get(key) {
-            None => Ok(String::new()),
+            None | Some(Json::Null) => Ok(String::new()),
             Some(value) => value
                 .as_str()
                 .map(str::to_lowercase)
@@ -1973,6 +1980,7 @@ pub(crate) fn hysteria_quic_params(
         keep_alive: keep_alive as u64,
         no_path_mtu: flag(node, "disablePathMTUDiscovery"),
         max_incoming_streams: max_incoming as u64,
+        disable_stateless_reset: flag(node, "disableStatelessReset"),
     }))
 }
 
@@ -2688,6 +2696,41 @@ mod tests {
                 "{text} must be refused"
             );
         }
+    }
+
+    #[test]
+    fn a_hysteria_carrier_reads_a_null_quic_field_as_the_reference_zero() {
+        use ferrox_core::hysteria::Congestion;
+        let carrier = |text: &str| {
+            stream_carrier(
+                crate::json::parse(text)
+                    .expect("parses")
+                    .get("streamSettings"),
+            )
+        };
+        let Carrier::Hysteria(null_idle) = carrier(
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "udpIdleTimeout": null}}}"#,
+        ) else {
+            panic!("a null idle is the default");
+        };
+        assert_eq!(null_idle.udp_idle, 60);
+        let Carrier::Hysteria(null_block) = carrier(
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": null}}}"#,
+        ) else {
+            panic!("a null block is no block");
+        };
+        assert_eq!(null_block.quic, None);
+        let Carrier::Hysteria(null_fields) = carrier(
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {"congestion": null, "bbrProfile": null, "brutalUp": null, "maxIdleTimeout": null, "disablePathMTUDiscovery": null, "disableStatelessReset": null}}}}"#,
+        ) else {
+            panic!("null fields are zero values");
+        };
+        let params = null_fields.quic.expect("the block is present");
+        assert_eq!(params.cc, Some(Congestion::Brutal));
+        assert_eq!(params.max_idle, 0);
+        assert_eq!(params.brutal_up, 0);
+        assert!(!params.no_path_mtu);
+        assert!(!params.disable_stateless_reset);
     }
 
     #[test]
