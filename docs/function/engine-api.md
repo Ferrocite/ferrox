@@ -1,12 +1,14 @@
 # Commander gRPC management API
 
-The API is xray's `app/commander`: a `HandlerService` spoken over HTTP/2 in clear text, reached either on its own `listen` address or by routing a flow to the app's tag. This tree carries all ten HandlerService calls, all seven StatsService calls, `LoggerService.RestartLogger` and `ObservatoryService.GetOutboundStatus`. `AddInbound` decodes the handler, serves it through the same inbound path the startup config used, and registers it for later removal. `AddOutbound` builds the handler and inserts it into the live route table, so a rule can reach a tag that did not exist at startup; `RemoveOutbound` drops it and blocks a flow that still names it. `AlterInbound` carries the VMess account add/remove operations, and `AlterOutbound` answers with the reference's two errors because no outbound operation exists at this pin. `GetInboundUsers`, `GetInboundUsersCount`, `ListInbounds` and `ListOutbounds` are carried too.
+The API is xray's `app/commander`: a `HandlerService` spoken over HTTP/2 in clear text, reached either on its own `listen` address or by routing a flow to the app's tag. This tree carries all ten HandlerService calls, all seven StatsService calls, `LoggerService.RestartLogger`, `ObservatoryService.GetOutboundStatus` and the routing service's `ListRule`, `TestRoute`, `GetBalancerInfo` and `OverrideBalancerTarget`. `AddInbound` decodes the handler, serves it through the same inbound path the startup config used, and registers it for later removal. `AddOutbound` builds the handler and inserts it into the live route table, so a rule can reach a tag that did not exist at startup; `RemoveOutbound` drops it and blocks a flow that still names it. `AlterInbound` carries the VMess account add/remove operations, and `AlterOutbound` answers with the reference's two errors because no outbound operation exists at this pin. `GetInboundUsers`, `GetInboundUsersCount`, `ListInbounds` and `ListOutbounds` are carried too.
 
-A `listen` config binds a TCP (or unix) socket and answers every connection in its own thread. A config without `listen` names a tag instead: the router sends a flow there and the routed connection itself is the HTTP/2 transport, so no second socket exists to be reached from outside. Both roles parse from xray's protobuf `core.Config` and from JSON, and a handler is served only when the app lists `HandlerService` (case-insensitively in JSON, `xray.app.proxyman.command.Config` in protobuf); the logger service follows the same rule under `LoggerService` / `xray.app.log.command.Config`, the observatory under `ObservatoryService` / `xray.app.observatory.command.Config`, and any other service name is skipped with one line.
+A `listen` config binds a TCP (or unix) socket and answers every connection in its own thread. A config without `listen` names a tag instead: the router sends a flow there and the routed connection itself is the HTTP/2 transport, so no second socket exists to be reached from outside. Both roles parse from xray's protobuf `core.Config` and from JSON, and a handler is served only when the app lists `HandlerService` (case-insensitively in JSON, `xray.app.proxyman.command.Config` in protobuf); the logger service follows the same rule under `LoggerService` / `xray.app.log.command.Config`, the observatory under `ObservatoryService` / `xray.app.observatory.command.Config`, the router under `RoutingService` / `xray.app.router.command.Config`, and any other service name is skipped with one line.
 
 `RestartLogger` reopens the access sink from the path the `log` block installed, so a file rotated under a running process is picked up without a restart. The new handle is opened before the old one is dropped; a path that cannot be opened leaves the current sink in place and answers `grpc-status 13` with the open error, and a config that does not list the service answers `12` as every other unselected service does. The error stream is the process's stderr, so there is nothing to reopen for it.
 
 `GetOutboundStatus` serializes the snapshot the balancers already read: one `OutboundStatus` per observed tag, with aliveness, delay, the last error, the seen/try seconds and the burst health counters. The answer is an `ObservationResult` with the status repeated under it; a service selected without an observatory app answers the same empty result rather than `12`, because the service table was configured and the table is simply empty.
+
+`ListRule` walks the same rule table the flows do and answers each rule's target tag and its `ruleTag`; a balancer rule leaves the tag empty because the reference's one-of never fills it. `TestRoute` rebuilds a flow from the request's `RoutingContext` — inbound, network, the address lists as any-of, ports, domain, protocol, user and attributes — and asks the live table which rule it reaches, so a tested context and a real flow get the same verdict from the same code; the answer echoes exactly the request fields the call's selectors name, plus the picked tag, and a balancer rule resolves to the tag the strategy picked. A context no rule reaches answers `no clue` with status 2 the way the reference's `ErrNoClue` does, and the default outbound is never the answer because the reference leaves that to the caller. `GetBalancerInfo` reports the balancer's forced target and its strategy's principle target (every candidate for `random`/`roundRobin`, the picked one for `leastPing`, the selected set for `leastLoad`), and `OverrideBalancerTarget` forces the pick, empty clearing it. `SubscribeRoutingStats` answers `Routing statistics not enabled.` because the reference registers this service without a statistics channel, so `PublishResult` has nothing to publish into.
 
 `ListInbounds` and `ListOutbounds` answer with the handler and outbound configurations **exactly as they arrived** in protobuf, raw bytes and all, because a re-encoded config this tree did not build would not compare equal to the config the operator sent. A JSON-sourced handler or outbound has no protobuf form here; it lists its tag only, and that gap is named rather than passed off as the original.
 
@@ -37,6 +39,7 @@ graph TD
     S -- Stats --> V["counter map: read or reset by name<br/>inbound and user bytes registered at the flow"]
     S -- Logger --> W["reopen the access path<br/>rotated file picked up, old sink kept on failure"]
     S -- Observatory --> X["observatory snapshot<br/>one OutboundStatus per tag"]
+    S -- Routing --> Y["rule table: list, test a rebuilt flow,<br/>balancer pick and forced override"]
     R --> A["HEADERS 200, DATA message, trailers grpc-status 0"]
     B --> A
     O --> A
@@ -47,6 +50,7 @@ graph TD
     V --> A
     W --> A
     X --> A
+    Y --> A
     E --> A
 ```
 
@@ -58,7 +62,7 @@ graph TD
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 <!-- counts:end -->
 
-The framing, both content paths, the dynamic registry, the stats read/reset, the rotated-logger reopen and the observatory snapshot have workspace tests in `commander.rs`, `accesslog.rs`, `observatory.rs`, `proxy.rs`, `stats.rs` and `vmess.rs`; no per-method instruction count has been taken, so the ops row stays open rather than quoting a number.
+The framing, both content paths, the dynamic registry, the stats read/reset, the rotated-logger reopen, the observatory snapshot and the routing calls have workspace tests in `commander.rs`, `accesslog.rs`, `observatory.rs`, `proxy.rs`, `stats.rs`, `router.rs` and `vmess.rs`; no per-method instruction count has been taken, so the ops row stays open rather than quoting a number.
 
 ## Time
 
@@ -66,7 +70,7 @@ No duration is claimed. Benchmarks and the upstream Commander suite run in CI on
 
 ## What is not removed
 
-The API still does not reload the config: `AddInbound` and `AddOutbound` change one handler or one tag, not the route rules or the process's other lanes, and the old generation keeps running. `RoutingService` is still skipped by name, so `ListRule`, `AddRule` and the other routing calls answer `12`. `GetOutboundStatus` reports only the fields the tree already keeps: the burst `max`/`min` health values are absent from its sample, so they marshal as zero. A JSON handler lists without its receiver and proxy settings, and a JSON outbound lists its tag only; the VMess account table is the only user store the API can change, so VLESS and Trojan users still come from startup only. The stats service counts bytes, not live users: the online counters answer as the reference does, and the policy's outbound gates parse but no outbound counter is registered.
+The API still does not reload the config: `AddInbound` and `AddOutbound` change one handler or one tag, not the route rules or the process's other lanes, and the old generation keeps running. `AddRule` and `RemoveRule` are not carried: the rule table is built once at startup and has no atomic swap, so those two calls answer `12` while the rest of the routing service answers. A tested context that names a source or local port without an address is refused with status 3 rather than answered, because a flow's port lives on its address here; a non-zero `vlessRoute` is refused for the same reason, since no flow this tree routes reads a route id. `TestRoute` does not fire a matched rule's webhook: the reference's `PickRoute` does, so a call that reaches a webhook rule has a silent side effect missing here, and the verdict itself is unchanged. `GetOutboundStatus` reports only the fields the tree already keeps: the burst `max`/`min` health values are absent from its sample, so they marshal as zero. A JSON handler lists without its receiver and proxy settings, and a JSON outbound lists its tag only; the VMess account table is the only user store the API can change, so VLESS and Trojan users still come from startup only. The stats service counts bytes, not live users: the online counters answer as the reference does, and the policy's outbound gates parse but no outbound counter is registered.
 
 ## CI scope
 

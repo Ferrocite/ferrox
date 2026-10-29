@@ -26,6 +26,7 @@ pub(crate) struct ApiConfig {
     pub(crate) stats: bool,
     pub(crate) logger: bool,
     pub(crate) observatory: bool,
+    pub(crate) routing: bool,
 }
 
 impl ApiConfig {
@@ -66,6 +67,7 @@ impl ApiConfig {
             "xray.app.proxyman.command.Config" => self.handler = true,
             "xray.app.stats.command.Config" => self.stats = true,
             "xray.app.log.command.Config" => self.logger = true,
+            "xray.app.router.command.Config" => self.routing = true,
             "xray.core.app.observatory.command.Config" | "xray.app.observatory.command.Config" => {
                 self.observatory = true;
             }
@@ -93,6 +95,7 @@ impl ApiConfig {
             stats: false,
             logger: false,
             observatory: false,
+            routing: false,
         };
         if let Some(services) = api.get("services").and_then(Json::as_arr) {
             for service in services.iter().filter_map(Json::as_str) {
@@ -104,6 +107,8 @@ impl ApiConfig {
                     config.logger = true;
                 } else if service.eq_ignore_ascii_case("ObservatoryService") {
                     config.observatory = true;
+                } else if service.eq_ignore_ascii_case("RoutingService") {
+                    config.routing = true;
                 } else if service.eq_ignore_ascii_case("ReflectionService") {
                 } else {
                     eprintln!("commander: service `{service}` is not carried; skipped");
@@ -427,6 +432,14 @@ impl Api {
             }
             return Err((12, format!("{path} is not a method this server carries")));
         }
+        if service == "/xray.app.router.command.RoutingService"
+            || service == "/v2ray.core.app.router.command.RoutingService"
+        {
+            if self.config.routing {
+                return self.routing_call(method, request, path);
+            }
+            return Err((12, format!("{path} is not a method this server carries")));
+        }
         let handler = service == "/xray.app.proxyman.command.HandlerService";
         let stats = service == "/xray.app.stats.command.StatsService";
         match (method, handler, stats) {
@@ -464,6 +477,106 @@ impl Api {
         let mut out = Vec::new();
         field_bytes(&mut out, 1, &status);
         out
+    }
+
+    fn routing_call(
+        &self,
+        method: &str,
+        request: &[u8],
+        path: &str,
+    ) -> Result<Vec<u8>, (u32, String)> {
+        match method {
+            "ListRule" => self.list_rules(),
+            "TestRoute" => self.test_route(request),
+            "GetBalancerInfo" => self.get_balancer_info(request),
+            "OverrideBalancerTarget" => self.override_balancer_target(request),
+            // The reference registers this service without a statistics channel, so it always says so.
+            "SubscribeRoutingStats" => Err((2, "Routing statistics not enabled.".to_owned())),
+            _ => Err((12, format!("{path} is not a method this server carries"))),
+        }
+    }
+
+    fn list_rules(&self) -> Result<Vec<u8>, (u32, String)> {
+        let mut out = Vec::new();
+        for rule in self.runtime()?.listed_rules() {
+            let mut item = Vec::new();
+            if !rule.balancer {
+                field_str(&mut item, 1, rule.target);
+            }
+            if let Some(tag) = rule.tag {
+                field_str(&mut item, 2, tag);
+            }
+            field_bytes(&mut out, 1, &item);
+        }
+        Ok(out)
+    }
+
+    fn test_route(&self, request: &[u8]) -> Result<Vec<u8>, (u32, String)> {
+        let Some(raw) = request_bytes(request, 1) else {
+            return Err((2, "Invalid routing request.".to_owned()));
+        };
+        let context = RoutingContext::parse(raw)
+            .map_err(|reason| (3, format!("routing context: {reason}")))?;
+        if context.vless_route != 0 {
+            return Err((
+                3,
+                "a tested route id is not carried: no flow this tree routes reads one".to_owned(),
+            ));
+        }
+        let selectors = request_strs(request, 2);
+        let pairs: Vec<(String, String)> = context
+            .attrs
+            .iter()
+            .filter_map(|(name, value)| {
+                Some((
+                    std::str::from_utf8(name).ok()?.to_owned(),
+                    std::str::from_utf8(value).ok()?.to_owned(),
+                ))
+            })
+            .collect();
+        let attributes = (!pairs.is_empty()).then(|| crate::router::Attributes::from_pairs(&pairs));
+        let probe = context
+            .probe(attributes.as_ref())
+            .map_err(|reason| (3, reason))?;
+        let Some(tag) = self
+            .runtime()?
+            .tested_route(&probe)
+            .map_err(|reason| (2, reason))?
+        else {
+            return Err((2, "no clue".to_owned()));
+        };
+        Ok(context.answered(&selectors, &tag))
+    }
+
+    fn get_balancer_info(&self, request: &[u8]) -> Result<Vec<u8>, (u32, String)> {
+        let tag = request_str(request, 1).unwrap_or_default();
+        let (forced, principle) = self
+            .runtime()?
+            .balancer_info(&tag)
+            .map_err(|reason| (2, reason.to_owned()))?;
+        let mut override_info = Vec::new();
+        if !forced.is_empty() {
+            field_str(&mut override_info, 2, &forced);
+        }
+        let mut target = Vec::new();
+        for tag in &principle {
+            field_str(&mut target, 1, tag);
+        }
+        let mut balancer = Vec::new();
+        field_bytes(&mut balancer, 5, &override_info);
+        field_bytes(&mut balancer, 6, &target);
+        let mut out = Vec::new();
+        field_bytes(&mut out, 1, &balancer);
+        Ok(out)
+    }
+
+    fn override_balancer_target(&self, request: &[u8]) -> Result<Vec<u8>, (u32, String)> {
+        let tag = request_str(request, 1).unwrap_or_default();
+        let target = request_str(request, 2).unwrap_or_default();
+        self.runtime()?
+            .override_balancer(&tag, &target)
+            .map_err(|reason| (2, reason.to_owned()))?;
+        Ok(Vec::new())
     }
 
     fn get_stats(request: &[u8]) -> Result<Vec<u8>, (u32, String)> {
@@ -924,6 +1037,209 @@ fn uuid_string(id: [u8; 16]) -> String {
     )
 }
 
+// ---- RoutingService ----
+
+/// One `TestRoute` context as it arrived. The bytes are kept as they came so the answer echoes
+/// exactly what the request carried, and the flows a rule table reads are built from them.
+#[derive(Default)]
+struct RoutingContext {
+    inbound: Option<Vec<u8>>,
+    network: u64,
+    source_ips: Vec<Vec<u8>>,
+    target_ips: Vec<Vec<u8>>,
+    source_port: u64,
+    target_port: u64,
+    domain: Option<Vec<u8>>,
+    protocol: Option<Vec<u8>>,
+    user: Option<Vec<u8>>,
+    attrs: Vec<(Vec<u8>, Vec<u8>)>,
+    local_ips: Vec<Vec<u8>>,
+    local_port: u64,
+    vless_route: u64,
+}
+
+impl RoutingContext {
+    fn parse(bytes: &[u8]) -> Result<Self, String> {
+        let mut context = Self::default();
+        let mut reader = Pb::new(bytes);
+        while let Some((field, value)) = reader.next()? {
+            match (field, value) {
+                (1, Value::Bytes(raw)) => context.inbound = Some(raw.to_vec()),
+                (2, Value::Varint(network)) => context.network = network,
+                (3, Value::Bytes(raw)) => context.source_ips.push(raw.to_vec()),
+                (4, Value::Bytes(raw)) => context.target_ips.push(raw.to_vec()),
+                (5, Value::Varint(port)) => context.source_port = port,
+                (6, Value::Varint(port)) => context.target_port = port,
+                (7, Value::Bytes(raw)) => context.domain = Some(raw.to_vec()),
+                (8, Value::Bytes(raw)) => context.protocol = Some(raw.to_vec()),
+                (9, Value::Bytes(raw)) => context.user = Some(raw.to_vec()),
+                (10, Value::Bytes(entry)) => context.attrs.push((
+                    request_bytes(entry, 1).unwrap_or_default().to_vec(),
+                    request_bytes(entry, 2).unwrap_or_default().to_vec(),
+                )),
+                (13, Value::Bytes(raw)) => context.local_ips.push(raw.to_vec()),
+                (14, Value::Varint(port)) => context.local_port = port,
+                (15, Value::Varint(route)) => context.vless_route = route,
+                _ => {}
+            }
+        }
+        Ok(context)
+    }
+
+    /// The context the table reads: xray reads each address list as any-of, so every choice of
+    /// source, target and local address is kept as a list and the earliest matching rule decides.
+    /// A port named without an address is not carried, because a flow's port lives on its address.
+    fn probe<'a>(
+        &'a self,
+        attrs: Option<&'a crate::router::Attributes<'a>>,
+    ) -> Result<crate::router::Probe<'a>, String> {
+        let text =
+            |raw: &'a Option<Vec<u8>>| raw.as_deref().and_then(|raw| std::str::from_utf8(raw).ok());
+        let addresses = |raw: &[Vec<u8>], port: u64, role: &str| {
+            let mut out: Vec<Option<std::net::SocketAddr>> = raw
+                .iter()
+                .filter_map(|bytes| ip(bytes))
+                .map(|ip| Some(std::net::SocketAddr::new(ip, port as u16)))
+                .collect();
+            if out.is_empty() {
+                if port != 0 {
+                    return Err(format!(
+                        "a tested {role} port without a {role} address is not carried"
+                    ));
+                }
+                out.push(None);
+            }
+            Ok(out)
+        };
+        let sources = addresses(&self.source_ips, self.source_port, "source")?;
+        let locals = addresses(&self.local_ips, self.local_port, "local")?;
+        let mut targets: Vec<Option<std::net::IpAddr>> = self
+            .target_ips
+            .iter()
+            .filter_map(|bytes| ip(bytes))
+            .map(Some)
+            .collect();
+        if targets.is_empty() {
+            targets.push(None);
+        }
+        Ok(crate::router::Probe {
+            network: match self.network {
+                2 => crate::router::Network::Tcp,
+                3 => crate::router::Network::Udp,
+                raw => crate::router::Network::Other(raw as u8),
+            },
+            domain: text(&self.domain),
+            port: Some(self.target_port as u16),
+            inbound_tag: text(&self.inbound),
+            protocol: text(&self.protocol),
+            user: text(&self.user),
+            attrs,
+            targets,
+            sources,
+            locals,
+        })
+    }
+
+    /// The answer, echoing the fields the request's selectors name plus the picked outbound. The
+    /// reference's selectors are prefixes of the field names, and none of them names an address a
+    /// flow's outbound group would carry, so that field is always absent.
+    fn answered(&self, selectors: &[String], outbound: &str) -> Vec<u8> {
+        let wanted = |name: &str| {
+            selectors.is_empty()
+                || selectors
+                    .iter()
+                    .any(|selector| name.starts_with(selector.as_str()))
+        };
+        let mut out = Vec::new();
+        if wanted("inbound") {
+            if let Some(inbound) = self.inbound.as_deref().filter(|raw| !raw.is_empty()) {
+                field_bytes(&mut out, 1, inbound);
+            }
+        }
+        if wanted("network") && self.network != 0 {
+            field_varint(&mut out, 2, self.network);
+        }
+        if wanted("ip_source") {
+            for ip in &self.source_ips {
+                field_bytes(&mut out, 3, ip);
+            }
+        }
+        if wanted("ip_target") {
+            for ip in &self.target_ips {
+                field_bytes(&mut out, 4, ip);
+            }
+        }
+        if wanted("port_source") && self.source_port != 0 {
+            field_varint(&mut out, 5, self.source_port);
+        }
+        if wanted("port_target") && self.target_port != 0 {
+            field_varint(&mut out, 6, self.target_port);
+        }
+        if wanted("domain") {
+            if let Some(domain) = self.domain.as_deref().filter(|raw| !raw.is_empty()) {
+                field_bytes(&mut out, 7, domain);
+            }
+        }
+        if wanted("protocol") {
+            if let Some(protocol) = self.protocol.as_deref().filter(|raw| !raw.is_empty()) {
+                field_bytes(&mut out, 8, protocol);
+            }
+        }
+        if wanted("user") {
+            if let Some(user) = self.user.as_deref().filter(|raw| !raw.is_empty()) {
+                field_bytes(&mut out, 9, user);
+            }
+        }
+        if wanted("attributes") {
+            for (name, value) in &self.attrs {
+                let mut entry = Vec::new();
+                if !name.is_empty() {
+                    field_bytes(&mut entry, 1, name);
+                }
+                if !value.is_empty() {
+                    field_bytes(&mut entry, 2, value);
+                }
+                field_bytes(&mut out, 10, &entry);
+            }
+        }
+        if wanted("outbound") && !outbound.is_empty() {
+            field_str(&mut out, 12, outbound);
+        }
+        if wanted("ip_local") {
+            for ip in &self.local_ips {
+                field_bytes(&mut out, 13, ip);
+            }
+        }
+        if wanted("port_local") && self.local_port != 0 {
+            field_varint(&mut out, 14, self.local_port);
+        }
+        out
+    }
+}
+
+fn ip(raw: &[u8]) -> Option<std::net::IpAddr> {
+    match raw.len() {
+        4 => <[u8; 4]>::try_from(raw).ok().map(std::net::IpAddr::from),
+        16 => <[u8; 16]>::try_from(raw).ok().map(std::net::IpAddr::from),
+        _ => None,
+    }
+}
+
+fn request_strs(bytes: &[u8], field: u64) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut reader = Pb::new(bytes);
+    while let Ok(Some((number, value))) = reader.next() {
+        if number == field {
+            if let Value::Bytes(raw) = value {
+                if let Ok(text) = std::str::from_utf8(raw) {
+                    out.push(text.to_owned());
+                }
+            }
+        }
+    }
+    out
+}
+
 // ---- protobuf wire ----
 
 #[derive(Debug)]
@@ -1055,6 +1371,18 @@ fn request_str(bytes: &[u8], field: u64) -> Option<String> {
     request_bytes(bytes, field).and_then(|raw| std::str::from_utf8(raw).ok().map(str::to_owned))
 }
 
+#[cfg(test)]
+fn all_bytes(bytes: &[u8], field: u64) -> impl Iterator<Item = &[u8]> {
+    let mut reader = Pb::new(bytes);
+    std::iter::from_fn(move || loop {
+        match reader.next() {
+            Ok(Some((number, Value::Bytes(raw)))) if number == field => return Some(raw),
+            Ok(Some(_)) => {}
+            _ => return None,
+        }
+    })
+}
+
 fn request_typed(bytes: &[u8], field: u64) -> Option<(String, &[u8])> {
     typed(request_bytes(bytes, field)?).ok()
 }
@@ -1136,6 +1464,7 @@ mod tests {
             stats: false,
             logger: false,
             observatory: false,
+            routing: false,
         });
         let inbound = vec![0x0a, 0x01, b'd'];
         api.register_inbound(
@@ -1178,6 +1507,7 @@ mod tests {
             stats: false,
             logger: false,
             observatory: false,
+            routing: false,
         });
         let first = [0x11u8; 16];
         let second = [0x22u8; 16];
@@ -1351,6 +1681,7 @@ mod tests {
             stats: false,
             logger: false,
             observatory: false,
+            routing: false,
         });
         api.set_runtime(std::sync::Arc::new(crate::proxy::test_runtime(&root)));
         let raw = freedom_outbound("new");
@@ -1387,6 +1718,7 @@ mod tests {
             stats: false,
             logger: false,
             observatory: false,
+            routing: false,
         });
         api.set_runtime(std::sync::Arc::new(crate::proxy::test_runtime(&root)));
         let first = free_port();
@@ -1452,6 +1784,7 @@ mod tests {
             stats: false,
             logger: false,
             observatory: false,
+            routing: false,
         });
         assert_eq!(
             unselected
@@ -1466,6 +1799,7 @@ mod tests {
             stats: false,
             logger: true,
             observatory: false,
+            routing: false,
         });
         assert_eq!(
             selected.dispatch(path, &[]).expect("answers the call"),
@@ -1510,6 +1844,7 @@ mod tests {
             stats: false,
             logger: false,
             observatory: false,
+            routing: false,
         });
         assert_eq!(
             unselected
@@ -1524,6 +1859,7 @@ mod tests {
             stats: false,
             logger: false,
             observatory: true,
+            routing: false,
         });
         let observed = crate::router::Observed {
             tag: "edge".to_owned(),
@@ -1569,6 +1905,7 @@ mod tests {
             stats: false,
             logger: false,
             observatory: true,
+            routing: false,
         });
         assert_eq!(
             selected
@@ -1592,5 +1929,284 @@ mod tests {
             Err((5, "user>>>nobody>>>traffic>>>uplink not found.".to_owned()))
         );
         crate::stats::clear();
+    }
+
+    const ROUTED: &str = r#"{
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "edge-a", "protocol": "freedom"},
+            {"tag": "edge-b", "protocol": "freedom"}
+        ],
+        "routing": {
+            "rules": [
+                {"type": "field", "ruleTag": "web", "domain": ["example.com"], "outboundTag": "edge-a"},
+                {"type": "field", "ruleTag": "pool", "network": "tcp", "balancerTag": "pool"},
+                {"type": "field", "ruleTag": "udp", "network": "udp", "outboundTag": "direct"}
+            ],
+            "balancers": [{"tag": "pool", "selector": ["edge-"],
+                           "strategy": {"type": "random", "settings": {}}}]
+        }
+    }"#;
+
+    fn routing_api(root: &crate::json::Json) -> Arc<Api> {
+        let api = Api::new(ApiConfig {
+            tag: "api".to_owned(),
+            listen: None,
+            handler: false,
+            stats: false,
+            logger: false,
+            observatory: false,
+            routing: true,
+        });
+        api.set_runtime(std::sync::Arc::new(crate::proxy::test_runtime(root)));
+        api
+    }
+
+    fn test_route_request(context: &[u8], selectors: &[&str]) -> Vec<u8> {
+        let mut request = Vec::new();
+        field_bytes(&mut request, 1, context);
+        for selector in selectors {
+            field_str(&mut request, 2, selector);
+        }
+        request
+    }
+
+    fn routed_context(network: u64, domain: &str) -> Vec<u8> {
+        let mut context = Vec::new();
+        field_str(&mut context, 1, "socks-in");
+        if network != 0 {
+            field_varint(&mut context, 2, network);
+        }
+        field_varint(&mut context, 6, 443);
+        field_str(&mut context, 7, domain);
+        context
+    }
+
+    #[test]
+    fn the_routing_service_answers_only_when_the_config_lists_it() {
+        let root = crate::json::parse(r#"{"api":{"tag":"api","services":["routingService"]}}"#)
+            .expect("parses");
+        assert!(
+            ApiConfig::from_json(&root).expect("api block").routing,
+            "the service name is case-insensitive"
+        );
+        let mut config = Vec::new();
+        field_bytes(
+            &mut config,
+            2,
+            &typed("xray.app.router.command.Config", &[]),
+        );
+        assert!(
+            ApiConfig::from_proto(&config).expect("parses").routing,
+            "the pinned protobuf name selects routing"
+        );
+        let path = "/xray.app.router.command.RoutingService/ListRule";
+        let unselected = Api::new(ApiConfig {
+            tag: "api".to_owned(),
+            listen: None,
+            handler: false,
+            stats: false,
+            logger: false,
+            observatory: false,
+            routing: false,
+        });
+        assert_eq!(
+            unselected
+                .dispatch(path, &[])
+                .expect_err("service is not selected"),
+            (12, format!("{path} is not a method this server carries"))
+        );
+        let routed = crate::json::parse(ROUTED).expect("parses");
+        let selected = routing_api(&routed);
+        assert!(selected.dispatch(path, &[]).is_ok());
+        assert!(
+            selected
+                .dispatch(
+                    "/v2ray.core.app.router.command.RoutingService/ListRule",
+                    &[]
+                )
+                .is_ok(),
+            "the alias path answers too"
+        );
+    }
+
+    #[test]
+    fn list_rule_names_each_rules_target_and_rule_tag() {
+        let root = crate::json::parse(ROUTED).expect("parses");
+        let api = routing_api(&root);
+        let answer = api
+            .dispatch("/xray.app.router.command.RoutingService/ListRule", &[])
+            .expect("lists");
+        let items: Vec<&[u8]> = all_bytes(&answer, 1).collect();
+        assert_eq!(items.len(), 3, "one item per configured rule");
+        assert_eq!(request_str(items[0], 1).as_deref(), Some("edge-a"));
+        assert_eq!(request_str(items[0], 2).as_deref(), Some("web"));
+        assert_eq!(
+            request_bytes(items[1], 1),
+            None,
+            "a balancer rule names no outbound, as the reference's one-of leaves it empty"
+        );
+        assert_eq!(request_str(items[1], 2).as_deref(), Some("pool"));
+        assert_eq!(request_str(items[2], 1).as_deref(), Some("direct"));
+        assert_eq!(request_str(items[2], 2).as_deref(), Some("udp"));
+    }
+
+    #[test]
+    fn test_route_reads_the_rule_table_and_echoes_the_context() {
+        let root = crate::json::parse(ROUTED).expect("parses");
+        let api = routing_api(&root);
+        let path = "/xray.app.router.command.RoutingService/TestRoute";
+        let request = test_route_request(&routed_context(2, "example.com"), &[]);
+        let answer = api.dispatch(path, &request).expect("answers the call");
+        assert_eq!(request_str(&answer, 1).as_deref(), Some("socks-in"));
+        assert_eq!(request_varint(&answer, 2), Some(2), "tcp");
+        assert_eq!(request_varint(&answer, 6), Some(443), "the target port");
+        assert_eq!(request_str(&answer, 7).as_deref(), Some("example.com"));
+        assert_eq!(request_str(&answer, 12).as_deref(), Some("edge-a"));
+
+        let selected =
+            test_route_request(&routed_context(2, "example.com"), &["domain", "outbound"]);
+        let answer = api.dispatch(path, &selected).expect("answers the call");
+        assert_eq!(request_str(&answer, 7).as_deref(), Some("example.com"));
+        assert_eq!(request_str(&answer, 12).as_deref(), Some("edge-a"));
+        assert_eq!(request_str(&answer, 1), None, "a selector drops inbound");
+        assert_eq!(request_varint(&answer, 6), None, "and the port");
+        assert_eq!(request_varint(&answer, 2), None, "and the network");
+
+        let balanced = test_route_request(&routed_context(2, "nowhere.test"), &["outbound"]);
+        let answer = api
+            .dispatch(path, &balanced)
+            .expect("a balancer rule picks");
+        let picked = request_str(&answer, 12).expect("the picked tag");
+        assert!(
+            picked == "edge-a" || picked == "edge-b",
+            "the balancer picks one of its candidates, not the rule's own tag"
+        );
+        assert_eq!(request_str(&answer, 7), None, "the selector drops domain");
+
+        let no_clue = test_route_request(&routed_context(0, "nowhere.test"), &[]);
+        assert_eq!(
+            api.dispatch(path, &no_clue),
+            Err((2, "no clue".to_owned())),
+            "the default outbound is the caller's fallback, never the answer"
+        );
+        assert_eq!(
+            api.dispatch(path, &[]),
+            Err((2, "Invalid routing request.".to_owned()))
+        );
+        let mut port_only = Vec::new();
+        field_varint(&mut port_only, 5, 9999);
+        assert_eq!(
+            api.dispatch(path, &test_route_request(&port_only, &[])),
+            Err((
+                3,
+                "a tested source port without a source address is not carried".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_route_reads_a_multi_address_context_as_any_of() {
+        let root = crate::json::parse(
+            r#"{
+                "outbounds": [
+                    {"tag": "direct", "protocol": "freedom"},
+                    {"tag": "edge", "protocol": "freedom"}
+                ],
+                "routing": {"rules": [
+                    {"type": "field", "ruleTag": "ip", "ip": ["203.0.113.5"], "outboundTag": "edge"}
+                ]}
+            }"#,
+        )
+        .expect("parses");
+        let api = routing_api(&root);
+        let mut context = Vec::new();
+        field_bytes(&mut context, 4, &[198, 51, 100, 1]);
+        field_bytes(&mut context, 4, &[203, 0, 113, 5]);
+        field_varint(&mut context, 6, 443);
+        let answer = api
+            .dispatch(
+                "/xray.app.router.command.RoutingService/TestRoute",
+                &test_route_request(&context, &["outbound"]),
+            )
+            .expect("answers the call");
+        assert_eq!(
+            request_str(&answer, 12).as_deref(),
+            Some("edge"),
+            "the address list is any-of, so the second target reaches the ip rule"
+        );
+    }
+
+    #[test]
+    fn get_balancer_info_reports_the_override_and_the_principle_target() {
+        let root = crate::json::parse(ROUTED).expect("parses");
+        let api = routing_api(&root);
+        let path = "/xray.app.router.command.RoutingService";
+        let mut request = Vec::new();
+        field_str(&mut request, 1, "pool");
+        let answer = api
+            .dispatch(&format!("{path}/GetBalancerInfo"), &request)
+            .expect("answers");
+        let balancer = request_bytes(&answer, 1).expect("the balancer message");
+        let override_info = request_bytes(balancer, 5).expect("override info is always present");
+        assert_eq!(
+            request_str(override_info, 2),
+            None,
+            "no override is an empty target"
+        );
+        let principle = request_bytes(balancer, 6).expect("principle target");
+        assert_eq!(
+            all_bytes(principle, 1)
+                .map(|tag| String::from_utf8_lossy(tag).into_owned())
+                .collect::<Vec<_>>(),
+            vec!["edge-a".to_owned(), "edge-b".to_owned()],
+            "a random strategy draws from every candidate"
+        );
+        let mut unknown = Vec::new();
+        field_str(&mut unknown, 1, "nobody");
+        assert_eq!(
+            api.dispatch(&format!("{path}/GetBalancerInfo"), &unknown),
+            Err((2, "cannot find tag".to_owned()))
+        );
+        let mut force = Vec::new();
+        field_str(&mut force, 1, "pool");
+        field_str(&mut force, 2, "edge-b");
+        assert_eq!(
+            api.dispatch(&format!("{path}/OverrideBalancerTarget"), &force),
+            Ok(Vec::new())
+        );
+        let answer = api
+            .dispatch(&format!("{path}/GetBalancerInfo"), &request)
+            .expect("answers");
+        let override_info =
+            request_bytes(request_bytes(&answer, 1).expect("balancer"), 5).expect("override info");
+        assert_eq!(request_str(override_info, 2).as_deref(), Some("edge-b"));
+        let test = test_route_request(&routed_context(2, "nowhere.test"), &["outbound"]);
+        let answer = api
+            .dispatch(&format!("{path}/TestRoute"), &test)
+            .expect("answers");
+        assert_eq!(
+            request_str(&answer, 12).as_deref(),
+            Some("edge-b"),
+            "the override decides the pick the strategy would have made"
+        );
+        assert_eq!(
+            api.dispatch(&format!("{path}/OverrideBalancerTarget"), &unknown),
+            Err((2, "cannot find tag".to_owned()))
+        );
+    }
+
+    #[test]
+    fn subscribe_routing_stats_says_it_is_not_enabled() {
+        let root = crate::json::parse(ROUTED).expect("parses");
+        let api = routing_api(&root);
+        assert_eq!(
+            api.dispatch(
+                "/xray.app.router.command.RoutingService/SubscribeRoutingStats",
+                &[]
+            ),
+            Err((2, "Routing statistics not enabled.".to_owned())),
+            "the reference registers this service without a statistics channel"
+        );
     }
 }

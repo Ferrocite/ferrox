@@ -1479,6 +1479,45 @@ impl RouteShared {
             self.changed.store(true, Ordering::Relaxed);
         }
     }
+
+    /// The tag a tested context routes to: the same table, the same balancer pick and the same
+    /// script a live flow would get, without the default outbound the reference leaves to the caller.
+    fn routed_tag(&self, probe: &crate::router::Probe<'_>) -> Result<Option<String>, String> {
+        if let Some(script) = self.routing.script() {
+            let Some(callbacks) = self.script.as_ref() else {
+                return Ok(None);
+            };
+            let first = probe.flow(probe.targets[0], probe.sources[0], probe.locals[0]);
+            return script.route(&first, callbacks);
+        }
+        let Some(target) = self.routing.probe_target(probe) else {
+            return Ok(None);
+        };
+        let tag = match target {
+            crate::router::RouteTarget::Outbound(tag) => tag.to_owned(),
+            crate::router::RouteTarget::Balancer(tag) => {
+                let Some(balancer) = self.routing.balancer(tag) else {
+                    return Ok(None);
+                };
+                let candidates = self
+                    .balancers
+                    .get(tag)
+                    .expect("startup built every balancer's candidates");
+                let observed = self
+                    .observatory
+                    .as_deref()
+                    .map(crate::observatory::Observatory::snapshot);
+                if let Some(picked) = balancer.pick(candidates, observed.as_deref()) {
+                    picked.into_owned()
+                } else if let Some(fallback) = balancer.fallback() {
+                    fallback.to_owned()
+                } else {
+                    return Err("balancing strategy returns empty tag".to_owned());
+                }
+            }
+        };
+        Ok(Some(tag))
+    }
 }
 
 /// What an inbound added after startup needs to open: the same lanes, portals, counters and policy
@@ -1521,6 +1560,56 @@ impl Runtime {
         if let Some(route) = &self.route {
             route.remove_outbound(tag);
         }
+    }
+
+    /// Every rule in table order, for `RoutingService.ListRule`; an unconfigured table lists none.
+    pub(crate) fn listed_rules(&self) -> impl Iterator<Item = crate::router::ListedRule<'_>> {
+        self.route
+            .iter()
+            .flat_map(|route| route.routing.listed_rules())
+    }
+
+    /// The tag a `RoutingService.TestRoute` context routes to, or `None` for xray's no-clue.
+    pub(crate) fn tested_route(
+        &self,
+        probe: &crate::router::Probe<'_>,
+    ) -> Result<Option<String>, String> {
+        let Some(route) = &self.route else {
+            return Ok(None);
+        };
+        route.routed_tag(probe)
+    }
+
+    /// A balancer's forced tag and its strategy's principle target; an unknown tag is the
+    /// reference's `cannot find tag`.
+    pub(crate) fn balancer_info(&self, tag: &str) -> Result<(String, Vec<&str>), &'static str> {
+        let Some(route) = &self.route else {
+            return Err("cannot find tag");
+        };
+        let Some(balancer) = route.routing.balancer(tag) else {
+            return Err("cannot find tag");
+        };
+        let candidates = route.balancers.get(tag).map_or(&[][..], Vec::as_slice);
+        let observed = route
+            .observatory
+            .as_deref()
+            .map(crate::observatory::Observatory::snapshot);
+        Ok((
+            balancer.forced(),
+            balancer.principle(candidates, observed.as_deref()),
+        ))
+    }
+
+    /// Force a balancer's pick; an empty target hands it back to the strategy.
+    pub(crate) fn override_balancer(&self, tag: &str, target: &str) -> Result<(), &'static str> {
+        let Some(route) = &self.route else {
+            return Err("cannot find tag");
+        };
+        let Some(balancer) = route.routing.balancer(tag) else {
+            return Err("cannot find tag");
+        };
+        balancer.force(target);
+        Ok(())
     }
 }
 
@@ -1792,10 +1881,7 @@ impl RoutePlan {
             .as_deref()
             .map(crate::observatory::Observatory::snapshot);
         if let Some(picked) = balancer.pick(candidates, observed.as_deref()) {
-            return (
-                self.target(picked),
-                Some(std::borrow::Cow::Borrowed(picked)),
-            );
+            return (self.target(&picked), Some(picked));
         }
         if let Some(fallback) = balancer.fallback() {
             return (
@@ -2102,7 +2188,7 @@ fn pick_script_outbound(
         let candidates = balancers.get(tag).map_or(&[][..], Vec::as_slice);
         let observed = observatory.map(crate::observatory::Observatory::snapshot);
         if let Some(picked) = balancer.pick(candidates, observed.as_deref()) {
-            return Ok(picked.to_owned());
+            return Ok(picked.into_owned());
         }
         if let Some(fallback) = balancer.fallback() {
             return Ok(fallback.to_owned());
