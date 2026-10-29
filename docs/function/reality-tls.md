@@ -187,7 +187,7 @@ What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`]
 
 <!-- scope:begin -->
 - paths: crates/ferrox-core/src/tls/mod.rs, crates/ferrox-core/src/tls/reality.rs, crates/ferrox-core/src/tls/rustls_backend.rs, crates/ferrox-core/src/tls/cipher_suites.rs
-- symbols: reality, dial_tls_session, session_halves, TlsHalf, Sealed, Drivable, arm_write, FrameWrite
+- symbols: reality, dial_tls_session, session_halves, TlsHalf, Sealed, Drivable, arm_write, FrameWrite, RawArm
 - oracle: reality
 - scenarios: vless-tls-raw, vless-reality
 - go: ./transport/internet/tls/...

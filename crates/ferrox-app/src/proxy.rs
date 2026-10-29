@@ -11935,13 +11935,15 @@ fn xhttp_rung(
     xhttp_pair(uplink, host, &settings)
 }
 
+type RawArm = (Connection, Box<dyn Fn(Duration) + Send + Sync>);
+
 // The write side of a split session: one seal fills a buffer, and the lock keeps seals and sends in wire order.
 struct Sealed {
     transport: Box<dyn Write + Send>,
     bytes: Vec<u8>,
     /// The raw socket behind the transport, when the session exposes one: the write clock lives on
     /// the descriptor, so a paced carrier arms it without taking the session's lock.
-    raw: Option<(Connection, Box<dyn Fn(Duration) + Send + Sync>)>,
+    raw: Option<RawArm>,
     /// The record behind `bytes` has a clock: a peer that drains nothing leaves its suffix here for
     /// a later settle instead of parking the relay lane's thread in the write.
     paced: bool,
