@@ -990,6 +990,25 @@ fn send_datagram(conn: &mut quiche::Connection, stream: u64, packet: &[u8]) -> E
     }
 }
 
+/// Bind the h2 listener first on an ephemeral port, then join the QUIC socket to it,
+/// retrying a UDP collision. A failed pair falls back to UDP-first so h3 still serves.
+fn pair_h2_ephemeral(
+    address: &str,
+) -> std::io::Result<(UdpSocket, SocketAddr, Option<TcpListener>)> {
+    let mut tries = 0;
+    loop {
+        let listener = TcpListener::bind(address)?;
+        let local = listener.local_addr()?;
+        match UdpSocket::bind(local) {
+            Ok(sock) => return Ok((sock, local, Some(listener))),
+            Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && tries < 8 => {
+                tries += 1;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
 /// Open a server inbound's socket and spawn its demultiplexer, stack and forwarder.
 pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Result<u16, String> {
     let spec = Arc::new(ServerSpec::from(inbound)?);
@@ -1000,22 +1019,13 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     };
     config.enable_dgram(true, quic::MAX_DATAGRAM, DGRAM_INFLIGHT);
     let h2 = identity.alpn.iter().any(|alpn| alpn == b"h2");
-    let (sock, local, h2_listener) = if h2 && address.ends_with(":0") {
-        let mut tries = 0;
-        loop {
-            let listener = TcpListener::bind(address)
-                .map_err(|error| format!("cannot bind masque `{address}`: {error}"))?;
-            let local = listener
-                .local_addr()
-                .map_err(|error| format!("masque `{address}` has no local address: {error}"))?;
-            match UdpSocket::bind(local) {
-                Ok(sock) => break (sock, local, Some(listener)),
-                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && tries < 8 => {
-                    tries += 1;
-                }
-                Err(error) => return Err(format!("cannot bind masque `{local}`: {error}")),
-            }
-        }
+    let paired = if h2 && address.ends_with(":0") {
+        pair_h2_ephemeral(address).ok()
+    } else {
+        None
+    };
+    let (sock, local, h2_listener) = if let Some(paired) = paired {
+        paired
     } else {
         let sock = UdpSocket::bind(address)
             .map_err(|error| format!("cannot bind masque `{address}`: {error}"))?;
