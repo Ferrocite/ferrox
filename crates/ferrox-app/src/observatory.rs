@@ -641,6 +641,7 @@ fn probe(
             alpn: Vec::new().into(),
             roots: crate::quic::system_roots(),
             cert_pins: std::sync::Arc::default(),
+            verify_names: std::sync::Arc::default(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: std::sync::Arc::default(),
             insecure: false,

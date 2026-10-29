@@ -829,6 +829,75 @@ pub(crate) fn tls_ca_roots(outbound: &Json) -> Option<ferrox_core::tls::Anchors>
         .filter(|roots| !roots.is_empty())
 }
 
+/// Every certificate a `tlsSettings` names as a trust anchor: xray's `getCertPool` appends each
+/// `certificates` entry's PEM to the client pool whatever its `usage`, and `caCertFile` is this
+/// tree's one-field spelling of the same thing. A named file that cannot be read refuses the dial,
+/// which is the reference's `TLSCertConfig.Build` error; an entry naming no certificate is skipped.
+fn tls_named_anchors(tls: Option<&Json>) -> Result<Vec<Vec<u8>>, String> {
+    let mut anchors = Vec::new();
+    let file = |field: &str, path: &str| {
+        read_cert_file(path).ok_or_else(|| format!("tlsSettings {field} `{path}` cannot be read"))
+    };
+    if let Some(path) = tls
+        .and_then(|s| s.get("caCertFile"))
+        .and_then(Json::as_str)
+        .filter(|path| !path.is_empty())
+    {
+        anchors.extend(crate::quic::parse_ca_pem(&file("caCertFile", path)?));
+    }
+    let entries = tls
+        .and_then(|s| s.get("certificates"))
+        .and_then(Json::as_arr)
+        .unwrap_or_default();
+    for entry in entries {
+        let pem = match entry
+            .get("certificateFile")
+            .and_then(Json::as_str)
+            .filter(|path| !path.is_empty())
+        {
+            Some(path) => file("certificateFile", path)?,
+            None => match inline_pem(entry, "certificate") {
+                Some(pem) => pem,
+                None => continue,
+            },
+        };
+        anchors.extend(crate::quic::parse_ca_pem(&pem));
+    }
+    Ok(anchors)
+}
+
+/// The names `verifyPeerCertByName` checks the peer chain against instead of the SNI: a comma
+/// list, trimmed, empty entries skipped the way the reference's config build does.
+fn tls_verify_names(settings: Option<&Json>) -> std::sync::Arc<[String]> {
+    settings
+        .and_then(|s| s.get("verifyPeerCertByName"))
+        .and_then(Json::as_str)
+        .map(|text| {
+            text.split(',')
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+        .into()
+}
+
+/// The anchors a client verifies with: the platform store, plus every certificate the config
+/// names. A config that names none keeps the store's one allocation, which is the ordinary case.
+fn tls_client_roots(
+    named: Vec<Vec<u8>>,
+    system: ferrox_core::tls::Anchors,
+) -> ferrox_core::tls::Anchors {
+    if named.is_empty() {
+        return system;
+    }
+    let mut all = Vec::with_capacity(system.len() + named.len());
+    all.extend_from_slice(&system);
+    all.extend(named);
+    all.into()
+}
+
 fn tls_alpn(settings: Option<&Json>) -> Vec<Vec<u8>> {
     let Some(alpn) = settings.and_then(|s| s.get("alpn")) else {
         return Vec::new();
@@ -995,22 +1064,19 @@ pub(crate) fn outbound_tls(
         tls.and_then(|s| s.get("disableSystemRoot")),
         Some(Json::Bool(true))
     );
-    let roots = tls_ca_roots(outbound).or_else(|| {
-        (!insecure && system_only && cert_pins.is_empty())
-            .then(crate::quic::system_roots)
-            .filter(|r| !r.is_empty())
-    });
-    let roots = match roots {
-        Some(roots) if !roots.is_empty() => roots,
-        // The skip verifier reads no anchor, so an insecure dial needs none and loads none; a pin verifier answers from its own pins before any chain question, so it needs none either.
-        _ if insecure || !cert_pins.is_empty() => std::sync::Arc::from(Vec::new()),
-        _ => {
-            return Err(
-                "no certificate authorities: no caCertFile and the system roots are empty"
-                    .to_owned(),
-            )
-        }
-    };
+    let named = tls_named_anchors(tls)?;
+    let system = (!insecure && system_only && cert_pins.is_empty())
+        .then(crate::quic::system_roots)
+        .filter(|roots| !roots.is_empty())
+        .unwrap_or_default();
+    let roots = tls_client_roots(named, system);
+    // The skip verifier reads no anchor, so an insecure dial needs none and loads none; a pin verifier answers from its own pins before any chain question, so it needs none either.
+    if roots.is_empty() && !insecure && cert_pins.is_empty() {
+        return Err(
+            "no certificate authorities: no caCertFile or certificates, and the system roots are empty"
+                .to_owned(),
+        );
+    }
     let ech_config_list = tls_ech_config(tls, &server_name)?;
     // xray's empty name is Chrome and a name it does not know returns nil, which dials stock.
     let fingerprint = tls
@@ -1027,6 +1093,7 @@ pub(crate) fn outbound_tls(
         roots,
         pins: ferrox_core::foxy::pin::Pins::default(),
         cert_pins: std::sync::Arc::from(cert_pins),
+        verify_names: tls_verify_names(tls),
         cipher_suites: tls_cipher_suites(tls).into(),
         insecure,
         fingerprint: Some(fingerprint),
@@ -3023,6 +3090,208 @@ mod tests {
             tls_handshake(&identity, cert, "other.test"),
             (false, false),
             "rejectUnknownSni aborts an SNI no certificate name matches"
+        );
+    }
+
+    /// A private CA and the leaf it signs: the pair a config that names its own trust anchor carries.
+    fn ca_and_leaf(host: &str) -> (String, rcgen::CertifiedKey<rcgen::KeyPair>) {
+        let mut ca_params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("params");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::DigitalSignature,
+        ];
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "ferrox test ca");
+        let ca_key = rcgen::KeyPair::generate().expect("ca key");
+        let ca = ca_params.self_signed(&ca_key).expect("ca");
+        let mut leaf_params = rcgen::CertificateParams::new(vec![host.to_owned()]).expect("params");
+        leaf_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, host);
+        let leaf_key = rcgen::KeyPair::generate().expect("leaf key");
+        let leaf = leaf_params
+            .signed_by(&leaf_key, &rcgen::Issuer::from_params(&ca_params, &ca_key))
+            .expect("leaf");
+        (
+            ca.pem(),
+            rcgen::CertifiedKey {
+                cert: leaf,
+                signing_key: leaf_key,
+            },
+        )
+    }
+
+    fn server_identity(
+        leaf: &rcgen::CertifiedKey<rcgen::KeyPair>,
+    ) -> Arc<ferrox_core::tls::TlsServerConfig> {
+        let string_json = |pem: &str| {
+            format!(
+                "\"{}\"",
+                pem.trim_end().replace('\r', "").replace('\n', "\\n")
+            )
+        };
+        let config = crate::json::parse(&format!(
+            r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"certificates": [{{"certificate": {}, "key": {}}}]}}}}}}"#,
+            string_json(&leaf.cert.pem()),
+            string_json(&leaf.signing_key.serialize_pem())
+        ))
+        .expect("parses");
+        inbound_tls_identity(&config).expect("the leaf is an identity")
+    }
+
+    /// Whether an outbound built from this JSON verifies the listener: the config builds, the hello
+    /// completes on both sides, and the peer answers.
+    fn outbound_handshake(
+        identity: &Arc<ferrox_core::tls::TlsServerConfig>,
+        outbound: &Json,
+    ) -> bool {
+        use ferrox_core::tls::TlsProvider as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        std::thread::scope(|scope| {
+            let server = scope.spawn(|| {
+                let (stream, _) = listener.accept().expect("accepts");
+                ferrox_core::tls::accept(identity, stream)
+                    .is_ok_and(|mut server| server.handshake().is_ok())
+            });
+            let stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let client = outbound_tls(outbound, "127.0.0.1").is_ok_and(|config| {
+                ferrox_core::tls::connect(&config, stream)
+                    .is_ok_and(|mut client| client.handshake().is_ok())
+            });
+            client && server.join().expect("server thread")
+        })
+    }
+
+    #[test]
+    fn an_outbound_trusts_the_certificates_its_config_names() {
+        let (ca_pem, leaf) = ca_and_leaf("tls.test");
+        let (other_pem, _other) = ca_and_leaf("tls.test");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-client-anchor-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let ca = dir.join("ca.pem");
+        let other = dir.join("other.pem");
+        std::fs::write(&ca, ca_pem).expect("the test ca");
+        std::fs::write(&other, other_pem).expect("a second ca");
+        let identity = server_identity(&leaf);
+        let client = |path: &std::path::Path| {
+            crate::json::parse(&format!(
+                r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "tls.test", "disableSystemRoot": true, "certificates": [{{"certificateFile": "{}"}}]}}}}}}"#,
+                path.display()
+            ))
+            .expect("parses")
+        };
+        let trusted = outbound_handshake(&identity, &client(&ca));
+        let wrong = outbound_handshake(&identity, &client(&other));
+        let missing = outbound_handshake(
+            &identity,
+            &crate::json::parse(
+                r#"{"streamSettings": {"security": "tls", "tlsSettings": {"serverName": "tls.test", "disableSystemRoot": true}}}"#,
+            )
+            .expect("parses"),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            trusted,
+            "a certificates entry is a trust anchor, so the leaf's chain verifies"
+        );
+        assert!(
+            !wrong,
+            "a different CA's certificate does not anchor this chain"
+        );
+        assert!(
+            !missing,
+            "with no anchor at all the same listener is refused"
+        );
+    }
+
+    #[test]
+    fn a_named_anchor_joins_the_platform_store() {
+        let (ca_pem, _leaf) = ca_and_leaf("tls.test");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-client-union-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let ca = dir.join("ca.pem");
+        std::fs::write(&ca, ca_pem).expect("the test ca");
+        let config = |disable: bool| {
+            let outbound = crate::json::parse(&format!(
+                r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "tls.test", "disableSystemRoot": {disable}, "certificates": [{{"certificateFile": "{}"}}]}}}}}}"#,
+                ca.display()
+            ))
+            .expect("parses");
+            outbound_tls(&outbound, "127.0.0.1").expect("builds")
+        };
+        let strict = config(true);
+        let union = config(false);
+        let system = crate::quic::system_roots();
+        let untouched = tls_client_roots(Vec::new(), std::sync::Arc::clone(&system));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(
+            std::sync::Arc::ptr_eq(&untouched, &system),
+            "a config that names no anchor keeps the store's one allocation"
+        );
+        assert_eq!(
+            strict.roots.len(),
+            1,
+            "disableSystemRoot keeps the named anchor alone"
+        );
+        assert!(
+            union.roots.iter().any(|der| der == &strict.roots[0]),
+            "the named anchor survives the union"
+        );
+        assert_eq!(
+            union.roots.len(),
+            system.len() + 1,
+            "the named anchor is appended to the store, not instead of it"
+        );
+    }
+
+    #[test]
+    fn verify_peer_cert_by_name_checks_the_name_the_config_names() {
+        let (ca_pem, leaf) = ca_and_leaf("a.test");
+        let identity = server_identity(&leaf);
+        let pem_json = |pem: &str| {
+            format!(
+                "\"{}\"",
+                pem.trim_end().replace('\r', "").replace('\n', "\\n")
+            )
+        };
+        let client = |names: Option<&str>| {
+            let named = names
+                .map(|names| format!(r#""verifyPeerCertByName": "{names}","#))
+                .unwrap_or_default();
+            crate::json::parse(&format!(
+                r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "b.test", {named} "certificates": [{{"certificate": {}}}]}}}}}}"#,
+                pem_json(&ca_pem)
+            ))
+            .expect("parses")
+        };
+        assert!(
+            outbound_handshake(&identity, &client(Some("c.test, a.test"))),
+            "the second listed name matches the leaf, so the chain verifies"
+        );
+        assert!(
+            !outbound_handshake(&identity, &client(Some("c.test"))),
+            "a chain none of the listed names names is refused"
+        );
+        assert!(
+            !outbound_handshake(&identity, &client(None)),
+            "without the field the hello's serverName is the name checked, and it does not match"
         );
     }
 

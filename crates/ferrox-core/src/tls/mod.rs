@@ -35,6 +35,10 @@ pub struct TlsConfig {
     /// verifies the chain with that certificate as the only root and the server name alongside.
     /// Empty pins nothing, so the ordinary chain verifier stands.
     pub cert_pins: std::sync::Arc<[[u8; 32]]>,
+    /// The names `verifyPeerCertByName` checks the chain against instead of the SNI, in config
+    /// order: the reference turns its own name check off and verifies once per listed name.
+    /// Empty keeps the connection's server name, the ordinary case.
+    pub verify_names: std::sync::Arc<[String]>,
     /// The browser hello to shape, or `None` to keep the stock rustls hello.
     pub fingerprint: Option<shaped::Fingerprint>,
     /// The ECH config list a client encrypts its inner hello with, fetched or decoded
