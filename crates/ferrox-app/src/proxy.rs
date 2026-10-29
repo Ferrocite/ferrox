@@ -11720,16 +11720,40 @@ fn dial_tls_session(
     Some(session)
 }
 
+// The handle a sealed writer puts its records on: the write clock must live on this duplicate, not on the session's own descriptor, because Windows gives each duplicate its own clock.
+trait WriteClock {
+    fn write_clock(&self) -> Option<Connection>;
+}
+
+impl WriteClock for Connection {
+    fn write_clock(&self) -> Option<Connection> {
+        self.try_clone().ok()
+    }
+}
+
+impl WriteClock for KcpIo {
+    fn write_clock(&self) -> Option<Connection> {
+        None
+    }
+}
+
+impl WriteClock for std::io::Sink {
+    fn write_clock(&self) -> Option<Connection> {
+        None
+    }
+}
+
 // One session, two owners: the reader drives the transport when the session exposes one, so its parked read holds no session lock.
 fn session_halves<S, W>(session: S, transport: W) -> (TlsHalf<S>, TlsHalf<S>)
 where
-    W: Write + Send + 'static,
+    W: Write + Send + 'static + WriteClock,
     S: ferrox_core::tls::TlsProvider
         + ferrox_core::tls::RecordAlignment
         + Drivable
         + Send
         + 'static,
 {
+    let clock = transport.write_clock();
     let out = Arc::new(Mutex::new(Sealed::new(transport)));
     let cipher = session.transport().and_then(|cipher| {
         cipher
@@ -11746,16 +11770,14 @@ where
         }
         None => Arc::new(Mutex::new(session)),
     };
-    if let (Some(cipher), Ok(mut sealed)) = (cipher.as_ref(), out.lock()) {
+    if let (Some(raw), Ok(mut sealed)) = (clock, out.lock()) {
         let session = Arc::clone(&shared);
-        sealed.raw = cipher.try_clone().ok().map(|raw| {
-            let arm: Box<dyn Fn(Duration) + Send + Sync> = Box::new(move |timeout| {
-                if let Ok(session) = session.lock() {
-                    session.arm_write(timeout);
-                }
-            });
-            (raw, arm)
+        let arm: Box<dyn Fn(Duration) + Send + Sync> = Box::new(move |timeout| {
+            if let Ok(session) = session.lock() {
+                session.arm_write(timeout);
+            }
         });
+        sealed.raw = Some((raw, arm));
     }
     let reader = TlsHalf {
         session: Arc::clone(&shared),
@@ -38831,6 +38853,12 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    impl WriteClock for CountedTransport {
+        fn write_clock(&self) -> Option<Connection> {
+            None
         }
     }
 
