@@ -54,7 +54,7 @@ The decision's retired instructions are the decide probe's frame — `ferrox-cor
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 51892686 | scripts/count-ops.sh |
+| ops-retired-instructions | 51892734 | scripts/count-ops.sh |
 | answer-cases-replayed | 21 | ferrox-core-dns::tests::the_answer_is_the_bytes_the_pinned_go_writes |
 | parse-refusals-replayed | 8 | ferrox-core-dns::tests::the_parse_refuses_what_the_reference_refuses |
 | pointer-hop-cap | 10 | ferrox-core-dns::tests::the_pointer_loop_refuses_at_the_cap |
