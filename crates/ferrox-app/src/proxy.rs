@@ -48152,42 +48152,57 @@ end
     #[test]
     fn a_split_udp_association_names_the_process_from_the_datagram_sender() {
         let echo = udp_echo_loop();
-        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+        let blocked = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
             "routing":{"rules":[
                 {"type":"field","process":["self/"],"outboundTag":"block"},
                 {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
-        let front = socks_front_with(route_outbound(config, Some("in"), true));
-        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
-        client
-            .set_read_timeout(Some(Duration::from_secs(30)))
-            .expect("timeout");
-        client.write_all(&[5, 1, 0]).expect("greets");
-        let mut method = [0u8; 2];
-        client.read_exact(&mut method).expect("selects");
-        client
-            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
-            .expect("associates");
-        let mut reply = [0u8; 10];
-        client.read_exact(&mut reply).expect("replies");
-        assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
-        let relay: SocketAddr = SocketAddr::new(
-            std::net::IpAddr::V4([127, 0, 0, 1].into()),
-            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
-        );
+        let allowed = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","process":["not-this-process"],"outboundTag":"block"},
+                {"type":"field","inboundTag":["in"],"outboundTag":"direct"}]}}"#;
+        let associate = |config: &str| {
+            let front = socks_front_with(route_outbound(config, Some("in"), true));
+            let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+            client
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            client.write_all(&[5, 1, 0]).expect("greets");
+            let mut method = [0u8; 2];
+            client.read_exact(&mut method).expect("selects");
+            client
+                .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+                .expect("associates");
+            let mut reply = [0u8; 10];
+            client.read_exact(&mut reply).expect("replies");
+            assert_eq!(reply[1], 0, "the split association is served: {reply:?}");
+            let relay: SocketAddr = SocketAddr::new(
+                std::net::IpAddr::V4([127, 0, 0, 1].into()),
+                u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+            );
+            (client, relay)
+        };
         let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
-        udp.set_read_timeout(Some(Duration::from_millis(500)))
-            .expect("timeout");
         let mut frame = vec![0u8, 0, 0];
         push_socks_addr(
             &mut frame,
             &format!("127.0.0.1:{echo}").parse().expect("addr"),
         );
         frame.extend_from_slice(b"drop");
+        let (_blocked_client, relay) = associate(blocked);
+        udp.set_read_timeout(Some(Duration::from_millis(500)))
+            .expect("timeout");
         udp.send_to(&frame, relay).expect("sends");
         let mut back = vec![0u8; UDP_BUF];
         assert!(
             udp.recv_from(&mut back).is_err(),
             "the sender's process names the block"
+        );
+        let (_allowed_client, relay) = associate(allowed);
+        let source = udp_roundtrip(&udp, relay, &frame, b"drop");
+        assert_eq!(
+            source.port(),
+            echo,
+            "the same lane echoes when the rule misses"
         );
     }
 
