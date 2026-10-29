@@ -2856,8 +2856,8 @@ fn ss_user(bytes: &[u8]) -> Result<SsAccount, String> {
     account.ok_or("xray.common.protocol.User: no account".to_owned())
 }
 
-/// The method and password a shadowsocks inbound serves. Its `network` list is checked, not
-/// carried: this front serves TCP and UDP on every shadowsocks inbound.
+/// The clients a shadowsocks inbound serves, one account per `users` entry. Its `network` list is
+/// checked, not carried: this front serves TCP and UDP on every shadowsocks inbound.
 fn ss_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.proxy.shadowsocks.ServerConfig");
     let mut users = Vec::new();
@@ -2884,19 +2884,16 @@ fn ss_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
             ));
         }
     }
-    let (password, method) = match users.len() {
-        0 => return Err("xray.proxy.shadowsocks.ServerConfig: no user".to_owned()),
-        1 => users.pop().expect("one user"),
-        count => {
-            return Err(format!(
-                "xray.proxy.shadowsocks.ServerConfig: {count} users, one method and password served"
-            ))
-        }
-    };
-    Ok(object(vec![
-        ("method", Json::Str(method.to_owned())),
-        ("password", Json::Str(password)),
-    ]))
+    let clients: Vec<Json> = users
+        .into_iter()
+        .map(|(password, method)| {
+            object(vec![
+                ("method", Json::Str(method.to_owned())),
+                ("password", Json::Str(password)),
+            ])
+        })
+        .collect();
+    Ok(object(vec![("users", Json::Arr(clients))]))
 }
 
 /// A shadowsocks outbound dials the one server its config names.
@@ -4999,12 +4996,14 @@ mod tests {
             Some("shadowsocks")
         );
         let settings = server.get("settings").expect("settings");
+        let clients = settings.get("users").and_then(Json::as_arr).expect("users");
+        assert_eq!(clients.len(), 1);
         assert_eq!(
-            settings.get("method").and_then(Json::as_str),
+            clients[0].get("method").and_then(Json::as_str),
             Some("aes-256-gcm")
         );
         assert_eq!(
-            settings.get("password").and_then(Json::as_str),
+            clients[0].get("password").and_then(Json::as_str),
             Some("shadowsocks-password")
         );
         let client = &json
@@ -5674,15 +5673,29 @@ mod tests {
     }
 
     #[test]
-    fn two_shadowsocks_users_are_refused() {
+    fn two_shadowsocks_users_decode_as_two_clients() {
         let settings = message(&[
             bytes_field(1, &ss_user(&ss_account(b"a", 6), None)),
             bytes_field(1, &ss_user(&ss_account(b"b", 6), None)),
             bytes_field(2, &[2]),
         ]);
-        let error = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
-            .expect_err("refused");
-        assert!(error.contains("2 users"), "{error}");
+        let json = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
+            .expect("both clients decode");
+        let server = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0];
+        let users = server
+            .get("settings")
+            .and_then(|settings| settings.get("users"))
+            .and_then(Json::as_arr)
+            .expect("users");
+        assert_eq!(users.len(), 2, "one account per user, not the first");
+        assert_eq!(
+            users[1].get("password").and_then(Json::as_str),
+            Some("b"),
+            "the second client keeps its own password"
+        );
     }
 
     #[test]
