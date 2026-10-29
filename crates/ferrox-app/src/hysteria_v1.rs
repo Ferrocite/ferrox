@@ -1127,6 +1127,8 @@ pub(crate) fn serve_loop(
                 continue;
             }
             crate::quic::Drain::Unbatchable => {}
+            // A socket that coalesces must not be read one segment wide.
+            crate::quic::Drain::Unreadable => return,
         }
         match router.sock.recv_from(buf.as_mut()) {
             Ok((n, from)) => route_packet(&mut router, &mut template, &mut buf.as_mut()[..n], from),

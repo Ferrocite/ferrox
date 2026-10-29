@@ -209,8 +209,8 @@ const SILENT_HANDSHAKE: Duration = Duration::from_secs(5);
 pub(crate) const IDLE_TIMEOUT_MS: u64 = 300_000;
 
 /// The receive credit an edge may hold against this process at the first byte: quiche parks every delivered byte here until the app reads it, so the advertised window is the memory the edge gets to spend before the first `MAX_STREAM_DATA` update.
-pub(crate) const MAX_DATA: u64 = 2_097_152;
-pub(crate) const MAX_STREAM_DATA: u64 = 1_048_576;
+pub(crate) const MAX_DATA: u64 = 16_777_216;
+pub(crate) const MAX_STREAM_DATA: u64 = 4_194_304;
 pub(crate) const MAX_STREAMS: u64 = 100;
 
 /// The rate every window in this file is sized for, in bytes per second: 1 Gbit/s, the fastest link a lane's own socket is expected to feed.
@@ -450,7 +450,7 @@ fn stage_at(path: &std::path::Path, bundle: &[u8]) -> Option<(std::path::PathBuf
 /// The transport shape every lane in this file shares, in one place: the initial credit, the ceiling its autotuner may grow to, and the datagram both ends are bounded to.
 ///
 /// The datagram is the whole arithmetic of a QUIC lane's syscall count. A packet carries 1350 bytes of UDP payload instead of the 1200 quiche defaults to, so a megabyte leaves in 776 datagrams rather than 874 — 11.2 percent fewer sends, fewer ACKs, and fewer receive interrupts for the same bytes, and the lane's own receive buffer is already exactly this wide, so what it advertises is what it can hold.
-fn tune_transport(config: &mut quiche::Config) {
+pub(crate) fn tune_transport(config: &mut quiche::Config) {
     config.set_max_idle_timeout(IDLE_TIMEOUT_MS);
     config.set_initial_max_data(MAX_DATA);
     config.set_initial_max_stream_data_bidi_local(MAX_STREAM_DATA);
@@ -635,6 +635,11 @@ fn debug_staged(staged: Option<Instant>) {
 #[cfg(target_os = "linux")]
 const SEND_SLOTS: usize = 64;
 
+/// The most full packets one GSO datagram may carry: 48 × 1350 stays under the 65507-byte UDP ceiling, so a
+/// sixty-four packet sweep leaves as two GSO datagrams instead of one that the kernel refuses whole.
+#[cfg(target_os = "linux")]
+const GSO_SEGMENTS: usize = 48;
+
 pub(crate) fn flush_egress(conn: &mut quiche::Connection, sock: &Datagram) {
     sock.retry_held();
     if sock.held.holding.load(Ordering::Relaxed) {
@@ -709,7 +714,10 @@ fn flush_burst(conn: &mut quiche::Connection, sock: &Datagram) {
     }
 }
 
-/// One `sendmmsg` over the slots the sweep filled, retried from the first message the kernel did not take. A datagram the kernel still refuses is held for the next sweep rather than dropped: quiche never retransmits a DATAGRAM frame, so the loss would be an inner TCP hole only a retransmit timer repairs. Nothing is held back when every message was taken.
+/// One GSO datagram carries up to `GSO_SEGMENTS` packets: the kernel cuts it at `MAX_DATAGRAM` before the wire, so
+/// a burst that was one `sendmmsg` with sixty-four headers becomes one `sendmsg` with one header and one control
+/// message. Every packet in the run goes to the same peer and every one but the last is a full `MAX_DATAGRAM`
+/// segment. A batch that cannot be one GSO datagram keeps the `sendmmsg` path.
 #[cfg(target_os = "linux")]
 fn send_batch(
     sock: &Datagram,
@@ -719,8 +727,141 @@ fn send_batch(
     lens: &[usize],
     tos: &[Option<SocketAddr>],
 ) -> bool {
-    use std::os::fd::AsRawFd as _;
     let mut done = 0usize;
+    while done < want {
+        let n = (want - done).min(GSO_SEGMENTS);
+        if n >= 2 && can_gso(&lens[done..done + n], &tos[done..done + n]) {
+            match send_gso(sock, slots, lens, done, n, tos[done]) {
+                Gso::Sent => {
+                    done += n;
+                    continue;
+                }
+                Gso::Refused => {
+                    for i in done + n..want {
+                        if let Some(to) = tos[i] {
+                            sock.hold(slots[i].written(lens[i]), to);
+                        }
+                    }
+                    return false;
+                }
+                Gso::Unsupported => {}
+            }
+        }
+        return send_mmsg(sock, batch, slots, want, done, lens, tos);
+    }
+    true
+}
+
+/// Whether the slots below `want` are one GSO datagram: every packet but the last is a full `MAX_DATAGRAM` segment,
+/// and every packet goes to the same peer.
+#[cfg(target_os = "linux")]
+fn can_gso(lens: &[usize], tos: &[Option<SocketAddr>]) -> bool {
+    let Some(to) = tos.first().copied().flatten() else {
+        return false;
+    };
+    lens.len() >= 2
+        && tos.iter().all(|peer| *peer == Some(to))
+        && lens[..lens.len() - 1]
+            .iter()
+            .all(|len| *len == MAX_DATAGRAM)
+        && lens
+            .last()
+            .is_some_and(|len| *len > 0 && *len <= MAX_DATAGRAM)
+}
+
+/// The result of trying the one-datagram path: `Unsupported` is the kernel refusing the control message, which
+/// falls back to `sendmmsg`; `Refused` is a full queue, which holds the whole burst for the next sweep.
+#[cfg(target_os = "linux")]
+enum Gso {
+    Sent,
+    Refused,
+    Unsupported,
+}
+
+/// One `sendmsg` with a `UDP_SEGMENT` control message: each packet is its own iovec, so the run costs one header and
+/// no copy, and the kernel cuts and checksums every segment itself. The bytes on the wire are the bytes `sendmmsg`
+/// would have written.
+#[cfg(target_os = "linux")]
+fn send_gso(
+    sock: &Datagram,
+    slots: &[Unfilled<MAX_DATAGRAM>; SEND_SLOTS],
+    lens: &[usize],
+    start: usize,
+    want: usize,
+    to: Option<SocketAddr>,
+) -> Gso {
+    use std::os::fd::AsRawFd as _;
+    #[repr(C)]
+    struct Segment {
+        header: libc::cmsghdr,
+        size: u16,
+    }
+    let Some(to) = to else {
+        return Gso::Unsupported;
+    };
+    let mut parts: [std::mem::MaybeUninit<libc::iovec>; SEND_SLOTS] =
+        std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
+    let mut total = 0usize;
+    for (at, part) in parts.iter_mut().enumerate().take(want) {
+        let slot = start + at;
+        let bytes = slots[slot].written(lens[slot]);
+        total += bytes.len();
+        part.write(libc::iovec {
+            iov_base: bytes.as_ptr().cast_mut().cast(),
+            iov_len: bytes.len(),
+        });
+    }
+    let (mut storage, name_len) = crate::proxy::sockaddr_of(to);
+    let mut control = Segment {
+        header: libc::cmsghdr {
+            cmsg_len: unsafe { libc::CMSG_LEN(2) } as usize,
+            cmsg_level: libc::SOL_UDP,
+            cmsg_type: libc::UDP_SEGMENT,
+        },
+        size: MAX_DATAGRAM as u16,
+    };
+    let message = libc::msghdr {
+        msg_name: (&raw mut storage).cast(),
+        msg_namelen: name_len,
+        msg_iov: parts.as_mut_ptr().cast(),
+        msg_iovlen: want,
+        msg_control: (&raw mut control).cast(),
+        msg_controllen: unsafe { libc::CMSG_SPACE(2) } as usize,
+        msg_flags: 0,
+    };
+    // SAFETY: `message` names `parts`, `storage` and `control`, which outlive the call, and each part points at a slot the caller filled for the same sweep.
+    let sent = unsafe { libc::sendmsg(sock.sock.as_raw_fd(), &raw const message, 0) };
+    if sent == isize::try_from(total).unwrap_or(isize::MAX) {
+        return Gso::Sent;
+    }
+    if sent < 0 {
+        let error = std::io::Error::last_os_error();
+        if refused(&error) {
+            for i in start..start + want {
+                sock.hold(slots[i].written(lens[i]), to);
+            }
+            return Gso::Refused;
+        }
+    }
+    Gso::Unsupported
+}
+
+/// One `sendmmsg` over the slots the sweep filled, retried from the first message the kernel did not take. A datagram
+/// the kernel still refuses is held for the next sweep rather than dropped: quiche never retransmits a DATAGRAM frame,
+/// so the loss would be an inner TCP hole only a retransmit timer repairs. Nothing is held back when every message was
+/// taken.
+#[cfg(target_os = "linux")]
+fn send_mmsg(
+    sock: &Datagram,
+    batch: &mut [std::mem::MaybeUninit<libc::mmsghdr>],
+    slots: &[Unfilled<MAX_DATAGRAM>; SEND_SLOTS],
+    want: usize,
+    start: usize,
+    lens: &[usize],
+    tos: &[Option<SocketAddr>],
+) -> bool {
+    use std::os::fd::AsRawFd as _;
+    let mut done = start;
     while done < want {
         let rest = &mut batch[done..want];
         // SAFETY: every header below `want` was written by the caller this iteration, `MaybeUninit` is transparent over the header the call reads, and the buffers each names outlive the caller's frame.
@@ -750,56 +891,182 @@ fn send_batch(
     true
 }
 
-/// The datagrams one receive takes at a time, the mirror of the send side's `SEND_SLOTS`: a 16 KiB DATA frame is a dozen QUIC packets, and one `recvfrom` each paid a syscall and a timer set per packet. A lane with no batched call reads the same count one at a time.
-pub(crate) const RECV_SLOTS: usize = 64;
+/// The datagrams one receive takes at a time: sixteen coalesced slots are up to a thousand packets per call, and a
+/// plain peer still fills sixteen per call. A slot is a whole `GRO_ROOM` burst, so this count is the batch's memory
+/// and is kept apart from the segment cap. A lane with no batched call reads one datagram at a time.
+pub(crate) const RECV_SLOTS: usize = 16;
 
-/// A batch of datagrams read off a lane's socket: the bytes of each, the peer it came from and the length of that peer's name. The batch owns its slots, so a read costs no allocation and a caller takes each datagram by its place in the batch.
+/// The most segments one `UDP_GRO` datagram carries, a kernel constant independent of how many
+/// entries a batch reads per call.
+#[cfg(target_os = "linux")]
+const GRO_SEGMENTS: usize = 64;
+
+/// The largest coalesced datagram a GSO peer can hand back: a full `GRO_SEGMENTS` burst of
+/// `MAX_DATAGRAM` packets.
+#[cfg(target_os = "linux")]
+const GRO_ROOM: usize = MAX_DATAGRAM * GRO_SEGMENTS;
+
+/// Room for one `UDP_GRO` control message, which is a header and a segment size.
+#[cfg(target_os = "linux")]
+const CONTROL_ROOM: usize = 64;
+
+/// The arrays one thread's batch reads into. Kept out of `Batch` itself so a pool can hand the same allocation to
+/// every pump on a thread: the slots are a GSO burst wide, which is too much to build again for each visit.
+#[cfg(target_os = "linux")]
+struct BatchData {
+    slots: Vec<Unfilled<GRO_ROOM>>,
+    peers: Vec<std::mem::MaybeUninit<libc::sockaddr_storage>>,
+    names: Vec<std::mem::MaybeUninit<libc::socklen_t>>,
+    lens: Vec<std::mem::MaybeUninit<libc::c_uint>>,
+    controls: Vec<[u8; CONTROL_ROOM]>,
+    segs: Vec<usize>,
+    starts: Vec<usize>,
+    used: usize,
+    len: usize,
+}
+
+#[cfg(target_os = "linux")]
+impl BatchData {
+    fn new() -> Self {
+        Self {
+            slots: (0..RECV_SLOTS).map(|_| Unfilled::new()).collect(),
+            peers: (0..RECV_SLOTS)
+                .map(|_| std::mem::MaybeUninit::uninit())
+                .collect(),
+            names: (0..RECV_SLOTS)
+                .map(|_| std::mem::MaybeUninit::uninit())
+                .collect(),
+            lens: (0..RECV_SLOTS)
+                .map(|_| std::mem::MaybeUninit::uninit())
+                .collect(),
+            controls: vec![[0u8; CONTROL_ROOM]; RECV_SLOTS],
+            segs: vec![0; RECV_SLOTS],
+            starts: vec![0; RECV_SLOTS + 1],
+            used: 0,
+            len: 0,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+thread_local! {
+    #[allow(
+        clippy::vec_box,
+        reason = "a batch's slots are megabytes wide, so the pool keeps them behind the box that the batch's stack handle names"
+    )]
+    static BATCH_POOL: std::cell::RefCell<Vec<Box<BatchData>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// One batch per live pump on a thread: a nested `take_queued` may hold a second, and more than that is memory a thread no longer needs.
+#[cfg(target_os = "linux")]
+const BATCH_POOL_MAX: usize = 2;
+
+/// A batch of datagrams read off a lane's socket: the bytes of each, the peer it came from and the length of that
+/// peer's name. A slot can be one datagram or a coalesced GSO burst; `starts` maps the packet index a caller walks
+/// to the slot and the segment inside it, so a coalesced burst reads exactly like the packets it carried.
 #[cfg(target_os = "linux")]
 pub(crate) struct Batch {
-    slots: [Unfilled<MAX_DATAGRAM>; RECV_SLOTS],
-    peers: [std::mem::MaybeUninit<libc::sockaddr_storage>; RECV_SLOTS],
-    names: [std::mem::MaybeUninit<libc::socklen_t>; RECV_SLOTS],
-    lens: [std::mem::MaybeUninit<libc::c_uint>; RECV_SLOTS],
-    len: usize,
+    data: Option<Box<BatchData>>,
 }
 
 #[cfg(target_os = "linux")]
 impl Batch {
     pub(crate) fn new() -> Self {
-        Self {
-            slots: std::array::from_fn(|_| Unfilled::<MAX_DATAGRAM>::new()),
-            peers: [std::mem::MaybeUninit::uninit(); RECV_SLOTS],
-            names: [std::mem::MaybeUninit::uninit(); RECV_SLOTS],
-            lens: [std::mem::MaybeUninit::uninit(); RECV_SLOTS],
-            len: 0,
+        Self { data: None }
+    }
+
+    fn data(&self) -> Option<&BatchData> {
+        self.data.as_deref()
+    }
+
+    /// The slots this batch reads into, taken from the thread's pool on its first read.
+    fn data_mut(&mut self) -> &mut BatchData {
+        if self.data.is_none() {
+            let data = BATCH_POOL
+                .try_with(|pool| pool.borrow_mut().pop())
+                .ok()
+                .flatten()
+                .unwrap_or_else(|| Box::new(BatchData::new()));
+            self.data = Some(data);
         }
+        self.data.as_deref_mut().expect("a batch owns its slots")
     }
 
-    /// How many datagrams the last read filled.
+    /// How many packets the last read filled, with a coalesced slot counted as the segments it carries.
     pub(crate) fn len(&self) -> usize {
-        self.len
+        self.data().map_or(0, |data| data.len)
     }
 
-    /// One datagram of the batch, with the peer it came from: the bytes are read out of the slot the kernel wrote, and the address out of the storage it filled.
+    /// The slot holding packet `at`, found through the prefix sums `recv_batch` wrote.
+    fn slot_of(&self, at: usize) -> Option<usize> {
+        let data = self.data()?;
+        if at >= data.len {
+            return None;
+        }
+        let starts = &data.starts[..=data.used];
+        starts.partition_point(|&start| start <= at).checked_sub(1)
+    }
+
+    /// The byte range of packet `at` inside its slot: a slot read without GRO has one packet, and a coalesced one
+    /// is cut at the segment size the kernel named.
+    fn range(&self, slot: usize, at: usize) -> Option<(usize, usize)> {
+        let data = self.data()?;
+        // SAFETY: `recv_batch` wrote this slot's length before it published the slot in `len`.
+        let raw = usize::try_from(unsafe { *data.lens.get(slot)?.assume_init_ref() }).ok()?;
+        let seg = data.segs.get(slot).copied().unwrap_or(0);
+        if seg == 0 {
+            return Some((0, raw));
+        }
+        let index = at.checked_sub(*data.starts.get(slot)?)?;
+        let start = index.checked_mul(seg)?;
+        if start >= raw {
+            return None;
+        }
+        Some((start, (start + seg).min(raw)))
+    }
+
+    /// One packet of the batch, with the peer it came from: the bytes are read out of the slot the kernel wrote, and
+    /// the address out of the storage it filled.
     pub(crate) fn at(&mut self, at: usize) -> Option<(&mut [u8], SocketAddr)> {
-        // SAFETY: `recv_batch` writes this slot's length, name and peer before it publishes the slot in `len`, and `at` only visits `0..len`.
-        let len = usize::try_from(unsafe { *self.lens[at].assume_init_ref() }).ok()?;
-        let from =
-            crate::proxy::socket_addr_of(unsafe { self.peers[at].assume_init_ref() }, unsafe {
-                *self.names[at].assume_init_ref()
-            })?;
-        let bytes = self.slots[at].as_mut().get_mut(..len)?;
+        let slot = self.slot_of(at)?;
+        let (start, end) = self.range(slot, at)?;
+        // SAFETY: `recv_batch` wrote this slot's name and peer before it published the slot in `len`.
+        let data = self.data()?;
+        let from = crate::proxy::socket_addr_of(
+            unsafe { data.peers.get(slot)?.assume_init_ref() },
+            unsafe { *data.names.get(slot)?.assume_init_ref() },
+        )?;
+        let bytes = self
+            .data_mut()
+            .slots
+            .get_mut(slot)?
+            .as_mut()
+            .get_mut(start..end)?;
         Some((bytes, from))
     }
 
-    /// The routing key of one slot, borrowed from the bytes the kernel wrote there: a run of datagrams for one lane is compared and looked up without copying a key out of the batch.
+    /// The routing key of one packet, borrowed from the bytes the kernel wrote there: a run of datagrams for one lane
+    /// is compared and looked up without copying a key out of the batch.
     pub(crate) fn key(&self, at: usize) -> Option<&[u8]> {
-        if at >= self.len {
-            return None;
+        let slot = self.slot_of(at)?;
+        let (start, end) = self.range(slot, at)?;
+        packet_key(self.data()?.slots.get(slot)?.written(end).get(start..)?)
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Batch {
+    /// Return the slots to the thread's pool, keeping only the batches a live pump may still ask for.
+    fn drop(&mut self) {
+        if let Some(data) = self.data.take() {
+            let _ = BATCH_POOL.try_with(|pool| {
+                let mut pool = pool.borrow_mut();
+                if pool.len() < BATCH_POOL_MAX {
+                    pool.push(data);
+                }
+            });
         }
-        // SAFETY: `recv_batch` writes this slot's length before it publishes the slot in `len`, and `at` is below `len`.
-        let len = usize::try_from(unsafe { *self.lens.get(at)?.assume_init_ref() }).ok()?;
-        packet_key(self.slots.get(at)?.written(len))
     }
 }
 
@@ -829,8 +1096,10 @@ impl Batch {
     }
 }
 
-/// How one batched read ended: `Read` is a batch the kernel filled, `Empty` is a queue with nothing in it, and `Unbatchable` is a lane whose read is a shape of its own.
-#[derive(PartialEq, Eq, Clone, Copy)]
+/// How one batched read ended: `Read` is a batch the kernel filled, `Empty` is a queue with nothing in it,
+/// `Unbatchable` is a lane whose read is a shape of its own, and `Unreadable` is a batchable lane whose batched read
+/// failed, so its single-datagram fallback must not run against a socket that still coalesces.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 #[allow(
     dead_code,
     reason = "a platform with no batched call never reads a batch, so it never builds one either"
@@ -839,32 +1108,37 @@ pub(crate) enum Drain {
     Read,
     Empty,
     Unbatchable,
+    Unreadable,
 }
 
-/// Every datagram the socket has queued, in at most `RECV_SLOTS` per call, read straight into the batch's own slots. A lane that reads one datagram per syscall is paced by the syscall, not by the wire: a QUIC packet is 1350 bytes, and a fast link delivers one every ten microseconds, which a syscall per packet cannot keep up with.
+/// Every datagram the socket has queued, in at most `RECV_SLOTS` per call, read straight into the batch's own slots.
+/// A lane that reads one datagram per syscall is paced by the syscall, not by the wire: a QUIC packet is 1350 bytes,
+/// and a fast link delivers one every ten microseconds, which a syscall per packet cannot keep up with. A GSO peer's
+/// burst lands as one large datagram and is cut back into packets here, so quiche still sees one packet per call.
 #[cfg(target_os = "linux")]
 pub(crate) fn recv_batch(sock: &Datagram, batch: &mut Batch) -> Drain {
     use std::os::fd::AsRawFd as _;
     if !sock.batchable() {
         return Drain::Unbatchable;
     }
+    let data = batch.data_mut();
     let mut parts: [libc::iovec; RECV_SLOTS] = std::array::from_fn(|_| libc::iovec {
         iov_base: std::ptr::null_mut(),
-        iov_len: MAX_DATAGRAM,
+        iov_len: GRO_ROOM,
     });
     let mut headers: [std::mem::MaybeUninit<libc::mmsghdr>; RECV_SLOTS] =
         std::array::from_fn(|_| std::mem::MaybeUninit::uninit());
     let room = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     for at in 0..RECV_SLOTS {
-        parts[at].iov_base = batch.slots[at].as_mut().as_mut_ptr().cast();
+        parts[at].iov_base = data.slots[at].as_mut().as_mut_ptr().cast();
         headers[at].write(libc::mmsghdr {
             msg_hdr: libc::msghdr {
-                msg_name: batch.peers[at].as_mut_ptr().cast(),
+                msg_name: data.peers[at].as_mut_ptr().cast(),
                 msg_namelen: room,
                 msg_iov: (&raw mut parts[at]).cast(),
                 msg_iovlen: 1,
-                msg_control: std::ptr::null_mut(),
-                msg_controllen: 0,
+                msg_control: data.controls[at].as_mut_ptr().cast(),
+                msg_controllen: CONTROL_ROOM,
                 msg_flags: 0,
             },
             msg_len: 0,
@@ -875,39 +1149,84 @@ pub(crate) fn recv_batch(sock: &Datagram, batch: &mut Batch) -> Drain {
     // The timeout is the socket's own arm and not the call's. The first receive of a batch runs without `MSG_DONTWAIT`, so it waits exactly as long as a `recvfrom` on this socket waits — which is the `SO_RCVTIMEO` the lane armed — and the reads behind it carry `MSG_DONTWAIT`, so they take what is already queued and answer at once. A call's own deadline would have been checked only between the reads, never against the first one.
     //
     // SAFETY: every header names a slot of `batch`, a peer of `batch` and a part of `parts`, all of which outlive the call, and the kernel writes each slot only as far as the datagram it read.
-    let got = unsafe {
-        libc::recvmmsg(
-            sock.sock.as_raw_fd(),
-            headers.as_mut_ptr().cast::<libc::mmsghdr>(),
-            RECV_SLOTS as libc::c_uint,
-            libc::MSG_WAITFORONE as _,
-            std::ptr::null_mut(),
-        )
+    let got = loop {
+        let got = unsafe {
+            libc::recvmmsg(
+                sock.sock.as_raw_fd(),
+                headers.as_mut_ptr().cast::<libc::mmsghdr>(),
+                RECV_SLOTS as libc::c_uint,
+                libc::MSG_WAITFORONE as _,
+                std::ptr::null_mut(),
+            )
+        };
+        if got >= 0 {
+            break got;
+        }
+        // A queue with nothing in it is the socket's own arm expiring: the empty batch is that answer.
+        let error = std::io::Error::last_os_error();
+        data.used = 0;
+        data.len = 0;
+        match error.kind() {
+            // A signal between the call and the queue took no datagram: the next call waits the rest of the arm.
+            std::io::ErrorKind::Interrupted => {}
+            std::io::ErrorKind::WouldBlock => break -1,
+            // A failed read leaves a coalescing socket: a one-segment fallback would cut the next burst down to it.
+            _ => return Drain::Unreadable,
+        }
     };
     if got < 0 {
-        // A queue with nothing in it is the socket's own arm expiring, and the per-datagram read below would wait for it again: the batch is the answer, so the empty queue is its answer too.
-        let error = std::io::Error::last_os_error();
-        batch.len = 0;
-        return if error.kind() == std::io::ErrorKind::WouldBlock {
-            Drain::Empty
-        } else {
-            Drain::Unbatchable
-        };
+        return Drain::Empty;
     }
     if got == 0 {
-        batch.len = 0;
+        data.used = 0;
+        data.len = 0;
         return Drain::Empty;
     }
     // A read that ran dry after some datagrams is the count, not the error: the kernel answers with what it took.
     let got = usize::try_from(got).unwrap_or(0).min(RECV_SLOTS);
+    data.starts[0] = 0;
     for (at, header) in headers.iter().enumerate().take(got) {
         // SAFETY: `recvmmsg` wrote `msg_len` for every message it reported, and the name length is the one the kernel filled beside it.
         let header = unsafe { header.assume_init_ref() };
-        batch.lens[at].write(header.msg_len);
-        batch.names[at].write(header.msg_hdr.msg_namelen);
+        let raw = usize::try_from(header.msg_len).unwrap_or(0);
+        data.lens[at].write(header.msg_len);
+        data.names[at].write(header.msg_hdr.msg_namelen);
+        let seg = gro_segment(&header.msg_hdr, raw);
+        data.segs[at] = seg;
+        let count = if seg == 0 { 1 } else { raw.div_ceil(seg) };
+        data.starts[at + 1] = data.starts[at] + count;
     }
-    batch.len = got;
+    data.used = got;
+    data.len = data.starts[got];
     Drain::Read
+}
+
+/// The segment size the kernel named for a coalesced read, or zero when the datagram is one packet.
+#[cfg(target_os = "linux")]
+fn gro_segment(header: &libc::msghdr, raw: usize) -> usize {
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(header) };
+    while !cmsg.is_null() {
+        // SAFETY: the kernel wrote each header the linked list names inside the control buffer the caller owns.
+        let control = unsafe { &*cmsg };
+        if control.cmsg_level == libc::SOL_UDP && control.cmsg_type == libc::UDP_GRO {
+            // SAFETY: `CMSG_DATA` names the payload of a header the kernel wrote, and the length check below keeps the read inside it.
+            let len = control
+                .cmsg_len
+                .saturating_sub(unsafe { libc::CMSG_LEN(0) } as usize);
+            if len >= std::mem::size_of::<libc::c_int>() {
+                let data = unsafe { libc::CMSG_DATA(cmsg) };
+                let mut bytes = [0u8; std::mem::size_of::<libc::c_int>()];
+                // SAFETY: the header's payload holds the `int` the kernel wrote, which `len` just checked.
+                unsafe { std::ptr::copy_nonoverlapping(data, bytes.as_mut_ptr(), bytes.len()) };
+                let seg = usize::try_from(libc::c_int::from_ne_bytes(bytes)).unwrap_or(0);
+                if seg > 0 && seg <= raw {
+                    return seg;
+                }
+            }
+        }
+        cmsg = unsafe { libc::CMSG_NXTHDR(header, cmsg) };
+    }
+    0
 }
 
 /// A platform with no batched call has no batch: the read is one datagram at a time, and the lane says so.
@@ -987,6 +1306,8 @@ pub(crate) fn pump_once(
                 return true;
             }
             Drain::Unbatchable => {}
+            // A socket that coalesces must not be read one segment wide.
+            Drain::Unreadable => return false,
         }
         match sock.recv_from(buf) {
             Ok((n, from)) => {
@@ -1341,29 +1662,55 @@ fn platform_roots() -> Vec<Vec<u8>> {
     Vec::new()
 }
 
-/// A socket read one packet at a time: Linux coalesces loopback skbs, so GRO is switched off per socket,
-/// and every lane asks for a receive buffer before a first datagram can land on it.
+/// A socket that accepts the kernel's coalesced datagrams: Linux hands a GSO burst back as one buffer and names
+/// the segment size in a `UDP_GRO` control message, so the batch splits it before quiche sees a packet. Every lane
+/// asks for a receive buffer before a first datagram can land on it.
 pub(crate) fn bind_datagram(address: &str) -> std::io::Result<UdpSocket> {
+    bind_datagram_gro(address, true)
+}
+
+/// A socket for a lane that reads one datagram per `recv_from`: GRO stays off, because a
+/// coalesced burst would be truncated to the caller's buffer.
+pub(crate) fn bind_datagram_plain(address: &str) -> std::io::Result<UdpSocket> {
+    bind_datagram_gro(address, false)
+}
+
+/// Bind a datagram socket with a lane's buffers, coalescing only when the lane can read a coalesced datagram.
+fn bind_datagram_gro(address: &str, gro: bool) -> std::io::Result<UdpSocket> {
     let sock = UdpSocket::bind(address)?;
     #[cfg(target_os = "linux")]
-    {
-        use std::os::fd::AsRawFd as _;
-        let off: libc::c_int = 0;
-        // SAFETY: `off` outlives the call, and the size is its own.
-        unsafe {
-            libc::setsockopt(
-                sock.as_raw_fd(),
-                libc::SOL_UDP,
-                libc::UDP_GRO,
-                std::ptr::addr_of!(off).cast(),
-                libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
-                    .unwrap_or(libc::socklen_t::MAX),
-            );
-        }
+    if gro {
+        set_gro(&sock, true);
     }
+    #[cfg(not(target_os = "linux"))]
+    let _ = gro;
     set_receive_buffer(&sock, DATAGRAM_BUFFER);
     set_send_buffer(&sock, DATAGRAM_BUFFER);
     Ok(sock)
+}
+
+#[cfg(target_os = "linux")]
+fn set_gro(sock: &UdpSocket, on: bool) {
+    use std::os::fd::AsRawFd as _;
+    let value: libc::c_int = libc::c_int::from(on);
+    // SAFETY: `value` outlives the call, and the size is its own.
+    unsafe {
+        libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_UDP,
+            libc::UDP_GRO,
+            std::ptr::addr_of!(value).cast(),
+            libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
+                .unwrap_or(libc::socklen_t::MAX),
+        );
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_gro(_sock: &UdpSocket, _on: bool) {}
+
+fn clear_gro(sock: &UdpSocket) {
+    set_gro(sock, false);
 }
 
 /// The buffer a lane's socket asks for, in each direction: the edge is granted a whole stream window of
@@ -1721,7 +2068,7 @@ impl Hopper {
                 ferrox_core::hysteria::pick_next(&self.ports, state.port, entropy() as usize);
             let stay =
                 Duration::from_millis(ferrox_core::hysteria::stay_ms(self.interval_ms, entropy()));
-            if let Ok(sock) = bind_datagram(self.bind) {
+            if let Ok(sock) = bind_datagram_plain(self.bind) {
                 self.apply_timeout(&sock);
                 let linger = now + Duration::from_millis(HOP_LINGER);
                 state.previous = Some((
@@ -2085,6 +2432,7 @@ impl Datagram {
 
     /// A socket whose every datagram is salamander-masked under `obfs`, the Hysteria v2 `obfs: salamander` lane.
     pub(crate) fn obfuscated(sock: UdpSocket, obfs: ferrox_core::hysteria::Salamander) -> Self {
+        clear_gro(&sock);
         Self {
             sock,
             relay: None,
@@ -2098,6 +2446,7 @@ impl Datagram {
 
     /// A socket whose every datagram is xplus-masked under `obfs`, the Hysteria v1 obfuscation.
     pub(crate) fn xplus(sock: UdpSocket, obfs: ferrox_core::hysteria_v1::XPlus) -> Self {
+        clear_gro(&sock);
         Self {
             sock,
             relay: None,
@@ -2110,6 +2459,7 @@ impl Datagram {
     }
 
     pub(crate) fn relayed(sock: UdpSocket, via: SocketAddr, control: Arc<Connection>) -> Self {
+        clear_gro(&sock);
         Self {
             sock,
             relay: Some(Relay {
@@ -2132,6 +2482,7 @@ impl Datagram {
         obfs: ferrox_core::hysteria::Salamander,
         window: ferrox_core::hysteria::Gecko,
     ) -> std::io::Result<Self> {
+        clear_gro(&sock);
         let handle = sock.try_clone()?;
         Ok(Self {
             sock,
@@ -2156,6 +2507,7 @@ impl Datagram {
         first: &UdpSocket,
         obfs: Option<Mask>,
     ) -> std::io::Result<Self> {
+        clear_gro(first);
         let hopper = Hopper::open(server, ports, interval_ms, bind, first)?;
         Ok(Self {
             sock: first.try_clone()?,
@@ -2507,6 +2859,18 @@ fn hand_off(
     }
 }
 
+/// Hand every datagram a batch holds to quiche as its own packet, in the order the kernel wrote them.
+fn deliver_batch(conn: &mut quiche::Connection, batch: &mut Batch, local: SocketAddr) {
+    for at in 0..batch.len() {
+        let Some((bytes, from)) = batch.at(at) else {
+            continue;
+        };
+        let info = quiche::RecvInfo { from, to: local };
+        let _ = conn.recv(bytes, info);
+    }
+}
+
+/// Drive one connection's reads and writes until its socket or connection ends, taking a batch of datagrams per turn.
 fn pump(
     shared: &Arc<Mutex<quiche::Connection>>,
     table: &Arc<Mutex<PooledState>>,
@@ -2562,6 +2926,8 @@ fn pump(
                 }
                 Err(_) => return,
             },
+            // A socket that coalesces must not be read one segment wide.
+            Drain::Unreadable => return,
         };
         ready.clear();
         {
@@ -2575,13 +2941,8 @@ fn pump(
             if conn.is_closed() {
                 return;
             }
-            // Every datagram the batch holds is one packet, and they are handed to quiche in the order the kernel wrote them.
-            for at in 0..batch.len() {
-                let Some((bytes, from)) = batch.at(at) else {
-                    continue;
-                };
-                let info = quiche::RecvInfo { from, to: local };
-                let _ = conn.recv(bytes, info);
+            if drain == Drain::Read {
+                deliver_batch(&mut conn, &mut batch, local);
             }
 
             match incoming {
@@ -3243,6 +3604,8 @@ pub(crate) fn serve_loop(
                 continue;
             }
             Drain::Unbatchable => {}
+            // A socket that coalesces must not be read one segment wide.
+            Drain::Unreadable => return,
         }
         match sock.recv_from(&mut scratch.buf) {
             Ok((n, from)) => {
@@ -3769,28 +4132,78 @@ mod tests {
         );
     }
 
-    /// The read option is why the edge stops losing packets, so it is read back rather than assumed.
+    /// The read option is why a GSO burst is one syscall on the receive side, so it is read back rather than assumed.
     #[test]
     #[cfg(target_os = "linux")]
-    fn a_quic_socket_is_bound_with_datagram_coalescing_off() {
-        use std::os::fd::AsRawFd as _;
+    fn a_quic_socket_is_bound_with_datagram_coalescing_on() {
+        fn gro(sock: &UdpSocket) -> Option<bool> {
+            use std::os::fd::AsRawFd as _;
+            let mut on: libc::c_int = -1;
+            let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
+                .expect("size fits a socklen");
+            // SAFETY: `on` and `len` describe the buffer the kernel writes into.
+            let got = unsafe {
+                libc::getsockopt(
+                    sock.as_raw_fd(),
+                    libc::SOL_UDP,
+                    libc::UDP_GRO,
+                    std::ptr::addr_of_mut!(on).cast(),
+                    std::ptr::addr_of_mut!(len),
+                )
+            };
+            (got == 0).then_some(on == 1)
+        }
+        let probe = bind_datagram("127.0.0.1:0").expect("binds");
+        if gro(&probe) != Some(true) {
+            return;
+        }
         let sock = bind_datagram("127.0.0.1:0").expect("binds");
-        let mut on: libc::c_int = -1;
-        let mut len = libc::socklen_t::try_from(std::mem::size_of::<libc::c_int>())
-            .expect("size fits a socklen");
-        // SAFETY: `on` and `len` describe the buffer the kernel writes into.
-        let got = unsafe {
-            libc::getsockopt(
-                sock.as_raw_fd(),
-                libc::SOL_UDP,
-                libc::UDP_GRO,
-                std::ptr::addr_of_mut!(on).cast(),
-                std::ptr::addr_of_mut!(len),
-            )
-        };
-        assert_eq!(got, 0, "the kernel knows UDP_GRO");
-        assert_eq!(on, 0, "one recv_from carries one packet");
+        assert_eq!(gro(&sock), Some(true), "a GSO burst is coalesced");
+        let obfs = || ferrox_core::hysteria::Salamander::new("hy2!").expect("four-byte key");
+        let masked = Datagram::obfuscated(bind_datagram("127.0.0.1:0").expect("binds"), obfs());
+        assert_eq!(
+            gro(&masked.sock),
+            Some(false),
+            "a masked lane reads one datagram at a time"
+        );
         assert!(udp_to_server("127.0.0.1", 443).is_some(), "still dials");
+    }
+
+    /// A GSO burst is one `sendmsg` on the wire and the same packets on the read side: the segment size the kernel
+    /// reports is what `recv_batch` cuts, so a coalesced slot hands quiche the packets `sendmmsg` would have handed it.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_gso_burst_arrives_as_its_segments() {
+        let receiver = Datagram::plain(bind_datagram("127.0.0.1:0").expect("receiver binds"));
+        let peer = receiver.local_addr().expect("receiver address");
+        let sender = Datagram::plain(bind_datagram("127.0.0.1:0").expect("sender binds"));
+        let mut slots: [Unfilled<MAX_DATAGRAM>; SEND_SLOTS] =
+            std::array::from_fn(|_| Unfilled::<MAX_DATAGRAM>::new());
+        for (at, slot) in slots.iter_mut().enumerate().take(2) {
+            slot.as_mut()
+                .fill(u8::try_from(at + 1).expect("two slots fit a byte"));
+        }
+        let mut lens = [0usize; SEND_SLOTS];
+        lens[0] = MAX_DATAGRAM;
+        lens[1] = MAX_DATAGRAM;
+        match send_gso(&sender, &slots, &lens, 0, 2, Some(peer)) {
+            Gso::Sent => {}
+            Gso::Unsupported => return,
+            Gso::Refused => panic!("the loopback queue refused a two-segment GSO datagram"),
+        }
+        let mut batch = Batch::new();
+        assert_eq!(recv_batch(&receiver, &mut batch), Drain::Read);
+        assert_eq!(batch.len(), 2, "the coalesced datagram is cut in two");
+        for at in 0..2 {
+            let (bytes, _) = batch.at(at).expect("segment");
+            assert_eq!(bytes.len(), MAX_DATAGRAM);
+            assert!(
+                bytes
+                    .iter()
+                    .all(|byte| *byte == u8::try_from(at + 1).unwrap()),
+                "segment {at} keeps its own bytes"
+            );
+        }
     }
 
     /// The lane asks for a receive buffer before a first datagram can land on it, and the ask is read back rather than assumed: a parked lane holds whatever the edge sent while no pump owned the socket, and a default buffer would drop it. The send side is the same ask: a burst quiche has already accounted for is lost if the kernel's queue is a macOS default.
@@ -3826,16 +4239,16 @@ mod tests {
         let pattern: Vec<u8> = (0..16 * 1024).map(|i| (i % 251) as u8).collect();
         let wrote = server.conn.stream_send(1, &pattern, false).expect("writes");
         flush_egress(&mut server.conn, &server.sock);
-        let mut room = [0u8; 2048];
         let _ = client
             .sock
             .set_read_timeout(Some(Duration::from_millis(20)));
-        let mut widest = 0usize;
-        let mut datagrams = 0usize;
-        while let Ok((n, _)) = client.sock.recv_from(&mut room) {
-            datagrams += 1;
-            widest = widest.max(n);
-        }
+        let packets = drain_packets(&client.sock);
+        let datagrams = packets.len();
+        let widest = packets
+            .iter()
+            .map(|(bytes, _)| bytes.len())
+            .max()
+            .unwrap_or(0);
         assert!(
             datagrams > 1,
             "the frame leaves as a burst, saw {datagrams}"
@@ -4475,6 +4888,33 @@ mod tests {
         (sock, local, conn)
     }
 
+    /// Every packet a lane's socket holds, with a coalesced GSO burst cut back into the packets it carried.
+    fn drain_packets(lane: &Datagram) -> Vec<(Vec<u8>, SocketAddr)> {
+        let mut out = Vec::new();
+        #[cfg(target_os = "linux")]
+        {
+            let mut batch = Batch::new();
+            loop {
+                match recv_batch(lane, &mut batch) {
+                    Drain::Read => {
+                        for at in 0..batch.len() {
+                            if let Some((bytes, from)) = batch.at(at) {
+                                out.push((bytes.to_vec(), from));
+                            }
+                        }
+                    }
+                    Drain::Empty | Drain::Unreadable => return out,
+                    Drain::Unbatchable => break,
+                }
+            }
+        }
+        let mut room = [0u8; MAX_DATAGRAM];
+        while let Ok((n, peer)) = lane.recv_from(&mut room) {
+            out.push((room[..n].to_vec(), peer));
+        }
+        out
+    }
+
     /// One side's sweep, then everything its peer's socket holds delivered into that peer: the handshake and the gate both ride the batched path rather than a ferry of their own.
     fn pass(
         from: &mut quiche::Connection,
@@ -4485,13 +4925,12 @@ mod tests {
     ) {
         flush_egress(from, from_sock);
         let _ = to_lane.set_read_timeout(Some(Duration::from_millis(20)));
-        let mut room = [0u8; MAX_DATAGRAM];
-        while let Ok((n, peer)) = to_lane.recv_from(&mut room) {
+        for (mut bytes, peer) in drain_packets(to_lane) {
             let info = quiche::RecvInfo {
                 from: peer,
                 to: to_addr,
             };
-            let _ = to.recv(&mut room[..n], info);
+            let _ = to.recv(&mut bytes, info);
         }
     }
 
@@ -4762,18 +5201,17 @@ mod tests {
             server.conn.send(&mut left).is_err(),
             "the sweep took every datagram quiche was ready to hand over"
         );
-        let mut room = [0u8; MAX_DATAGRAM];
         let _ = client
             .sock
             .set_read_timeout(Some(Duration::from_millis(20)));
         let mut got = 0usize;
-        while let Ok((n, peer)) = client.sock.recv_from(&mut room) {
+        for (mut bytes, peer) in drain_packets(&client.sock) {
             got += 1;
             let info = quiche::RecvInfo {
                 from: peer,
                 to: client.addr,
             };
-            let _ = client.conn.recv(&mut room[..n], info);
+            let _ = client.conn.recv(&mut bytes, info);
         }
         assert!(
             got >= 2,

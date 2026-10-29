@@ -2,11 +2,6 @@
 # worse than its last filed ratio by more than 0.10, still fails the matrix.
 # base|leg|ratio|issue|basis, where basis is raw (default) or ceiling.
 vless-hysteria-down-8|server|0.04|670
-vless-hysteria-up-1|client|0.00|670
-vless-hysteria-up-1|server|0.24|670
-vless-hysteria-up-1|server-cpu|2.67|670
-vless-hysteria-duplex-8|client|0.73|670
-vless-hysteria-duplex-8|server|0.31|670
 masque-down-8|server|0.15|861
 masque-down-8|server-threads|1.40|861
 vless-reality-xhttp-down-8|client|0.00|668
@@ -20,7 +15,6 @@ vless-encryption-reality-raw-down-8|server-threads|1.82|696
 vless-encryption-tls-raw-down-8|server-threads|1.73|696
 vless-grpc-down-8|server-threads|1.58|696
 vless-httpupgrade-down-8|server-threads|1.46|696
-vless-hysteria-down-8|server-cpu|2.06|696
 vless-hysteria-down-8|server-threads|1.09|696
 vless-kcp-down-8|server-threads|2.10|696
 vless-raw-down-16|server-threads|1.44|696

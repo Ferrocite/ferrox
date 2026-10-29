@@ -219,8 +219,10 @@ impl Driver {
     }
 }
 
+/// Write a stream's whole buffer under the send budget, releasing the pacer before it parks so a reader can answer.
 pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
     let deadline = Instant::now() + crate::quic::SEND_WAIT;
+    let mut paced = false;
     loop {
         let before = session.send_wake.as_ref().map_or(0, |wake| wake.seen());
         let last = buf.is_empty();
@@ -238,20 +240,25 @@ pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool
                     return true;
                 }
                 if written > 0 {
+                    paced = false;
                     continue;
                 }
-                if Instant::now() >= deadline {
-                    return false;
-                }
             }
-            Err(quiche::Error::Done) => {
-                if Instant::now() >= deadline {
-                    return false;
-                }
-            }
+            Err(quiche::Error::Done) => {}
             Err(_) => return false,
         }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        if !paced {
+            // A pacer holding the next packet is released by the wheel's timer, not by another `send`.
+            conn.on_timeout();
+            crate::quic::flush_egress(&mut conn, &session.sock);
+            paced = true;
+            continue;
+        }
         drop(conn);
+        paced = false;
         if let Some(wake) = session.send_wake.as_ref() {
             wake.wait(before, STREAM_POLL);
         } else {
@@ -277,19 +284,54 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
         return false;
     }
     let mut room = Unfilled::<RECV_ROOM>::new();
-    let incoming = match session.sock.recv_from(room.as_mut()) {
-        Ok(found) => Some(found),
-        Err(e)
-            if matches!(
-                e.kind(),
-                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-            ) =>
-        {
-            None
+    #[cfg(target_os = "linux")]
+    let mut batch = crate::quic::Batch::new();
+    #[cfg(target_os = "linux")]
+    let mut batched = false;
+    let incoming = {
+        #[cfg(target_os = "linux")]
+        match crate::quic::recv_batch(&session.sock, &mut batch) {
+            crate::quic::Drain::Read => {
+                batched = true;
+                Some((0, session.local))
+            }
+            crate::quic::Drain::Empty => None,
+            crate::quic::Drain::Unbatchable => match session.sock.recv_from(room.as_mut()) {
+                Ok(found) => Some(found),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    None
+                }
+                Err(_) => {
+                    std::thread::sleep(wait);
+                    return false;
+                }
+            },
+            // A socket that coalesces must not be read one segment wide.
+            crate::quic::Drain::Unreadable => {
+                std::thread::sleep(wait);
+                return false;
+            }
         }
-        Err(_) => {
-            std::thread::sleep(wait);
-            return false;
+        #[cfg(not(target_os = "linux"))]
+        match session.sock.recv_from(room.as_mut()) {
+            Ok(found) => Some(found),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                None
+            }
+            Err(_) => {
+                std::thread::sleep(wait);
+                return false;
+            }
         }
     };
     let Ok(mut conn) = session.shared.lock() else {
@@ -297,6 +339,22 @@ pub(crate) fn drive_once(session: &Session, wait: Duration) -> bool {
     };
     if conn.is_closed() {
         return false;
+    }
+    #[cfg(target_os = "linux")]
+    if batched {
+        for at in 0..batch.len() {
+            let Some((bytes, from)) = batch.at(at) else {
+                continue;
+            };
+            let info = quiche::RecvInfo {
+                from,
+                to: session.local,
+            };
+            let _ = conn.recv(bytes, info);
+        }
+        take_queued(&mut conn, session);
+        crate::quic::flush_egress(&mut conn, &session.sock);
+        return true;
     }
     match incoming {
         Some((n, from)) => {
@@ -335,7 +393,7 @@ fn take_queued(conn: &mut quiche::Connection, session: &Session) {
                 }
                 return;
             }
-            crate::quic::Drain::Empty => return,
+            crate::quic::Drain::Empty | crate::quic::Drain::Unreadable => return,
             crate::quic::Drain::Unbatchable => {}
         }
     }
@@ -416,6 +474,7 @@ fn post_auth(session: &Session, auth: &str, cc_rx: u64) -> Option<bool> {
 pub(crate) static HANDSHAKES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Dial the configured lane, wrap its socket in the mask or hop it names, and finish the QUIC handshake and auth.
 pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     #[cfg(test)]
     HANDSHAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -428,6 +487,8 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     if let Some(params) = &dial.config.quic {
         crate::quic::apply_hysteria_quic(&mut config, params, false);
     }
+    // A bulk upload starts at 400 packets: quiche's ten leaves the first window smaller than the server's first read, and BBR then paces every ACK.
+    config.set_initial_congestion_window_packets(400);
     // The client enables the datagram lane exactly as the served connection does: advertising it changes no stream byte of a TCP-only flow, and it is what lets `dgram_max_writable_len` answer for a UDP dial on this connection.
     config.enable_dgram(true, 1024, 1024);
     let Ok(mut conn) = quiche::connect(Some(&dial.host), &cid, local, peer, &mut config) else {
@@ -1038,6 +1099,7 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
     );
 }
 
+/// A serving identity's QUIC config: the lane's transport tuning, its certificate, and its congestion controller.
 pub(crate) fn server_config(
     cert_path: &str,
     key_path: &str,
@@ -1049,15 +1111,14 @@ pub(crate) fn server_config(
     config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
     // A served connection always carries an auth validator, and the reference enables the datagram lane exactly when one is present, so the lane is on unconditionally here; the depths are the peer's unsent-datagram queue, matching `udpMessageChanSize`.
     config.enable_dgram(true, 1024, 1024);
-    config.set_max_idle_timeout(crate::quic::IDLE_TIMEOUT_MS);
-    config.set_initial_max_data(crate::quic::MAX_DATA);
-    config.set_initial_max_stream_data_bidi_local(crate::quic::MAX_STREAM_DATA);
-    config.set_initial_max_stream_data_bidi_remote(crate::quic::MAX_STREAM_DATA);
-    config.set_initial_max_stream_data_uni(crate::quic::MAX_STREAM_DATA);
-    config.set_initial_max_streams_bidi(crate::quic::MAX_STREAMS);
-    config.set_initial_max_streams_uni(crate::quic::MAX_STREAMS);
-    if let Some(params) = quic {
-        crate::quic::apply_hysteria_quic(&mut config, params, true);
+    match quic {
+        Some(params) => {
+            crate::quic::apply_hysteria_quic(&mut config, params, true);
+            config.set_max_send_udp_payload_size(crate::quic::MAX_DATAGRAM);
+            config.set_max_recv_udp_payload_size(crate::quic::MAX_DATAGRAM);
+        }
+        // The served side carries the same ceilings as the dial: without them quiche's autotuner has no room above the initial window, and a peer's upload is paced by `window / rtt` for its whole life.
+        None => crate::quic::tune_transport(&mut config),
     }
     config.load_cert_chain_from_pem_file(cert_path).ok()?;
     config.load_priv_key_from_pem_file(key_path).ok()?;
@@ -2045,6 +2106,7 @@ impl Router<'_> {
         );
     }
 
+    /// Hand one received packet to the route it names, then let every route that took it send once.
     fn drive(&mut self, dcid: &[u8], packet: &mut [u8], from: SocketAddr) {
         let Self {
             routes,
@@ -2067,8 +2129,9 @@ impl Router<'_> {
             if conn.recv(packet, info).is_err() {
                 return;
             }
-            flush(sock, &mut conn, out.as_mut());
+            // An established lane's acknowledgements leave with the batch that carried the packet, in `wake`, not one send per datagram.
             if !conn.is_established() || conn.is_closed() {
+                flush(sock, &mut conn, out.as_mut());
                 return;
             }
             let Some((mut settings_done, settings_sent, authed)) = routes
@@ -2143,13 +2206,15 @@ impl Router<'_> {
                 });
             }
             relay_datagrams(routes, sock, &shared, dcid, &mut conn);
-            flush(sock, &mut conn, out.as_mut());
         }
     }
 
-    fn wake(&self) {
-        for inbound in self.routes.values() {
-            let Ok(conn) = inbound.conn.lock() else {
+    fn wake(&mut self) {
+        let Self {
+            routes, sock, out, ..
+        } = self;
+        for inbound in routes.values() {
+            let Ok(mut conn) = inbound.conn.lock() else {
                 continue;
             };
             for id in conn.readable() {
@@ -2157,6 +2222,7 @@ impl Router<'_> {
                     inbound.wakes.wake(id);
                 }
             }
+            flush(sock, &mut conn, out.as_mut());
         }
     }
 
@@ -2304,6 +2370,8 @@ pub(crate) fn serve_loop(
                 continue;
             }
             crate::quic::Drain::Unbatchable => {}
+            // A socket that coalesces must not be read one segment wide.
+            crate::quic::Drain::Unreadable => return,
         }
         match router.sock.recv_from(buf.as_mut()) {
             Ok((n, from)) => {

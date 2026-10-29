@@ -40512,19 +40512,22 @@ mod tests {
             }
             total
         };
-        let first = fill(1);
-        assert_eq!(first, stream_cap, "one stream stops at its window");
-        let second = fill(5);
-        assert_eq!(
-            first + second,
-            cap,
-            "the connection stops the second stream"
-        );
-        let third = pipe.server.stream_send(9, &block, false).unwrap_or(0);
-        assert_eq!(third, 0, "a third stream finds no credit at all");
+        let streams = cap / stream_cap;
+        let mut parked = 0usize;
+        for at in 0..streams {
+            let stream = 1 + 4 * at as u64;
+            let sent = fill(stream);
+            assert_eq!(sent, stream_cap, "a stream stops at its own window");
+            parked += sent;
+        }
+        assert_eq!(parked, cap, "the connection stops the last stream");
+        let next = 1 + 4 * streams as u64;
+        let third = pipe.server.stream_send(next, &block, false).unwrap_or(0);
+        assert_eq!(third, 0, "the next stream finds no credit at all");
         // And the credit rolls: a lane that consumes the parked bytes hands the credit back, so a capped window is a rolling one, not a spent one. One stream is not enough to reopen the connection — the credit updates only once the available window falls below half — so the lane drains both streams the edge parked against it.
         let mut piece = vec![0u8; 64 * 1024];
-        for stream in [1, 5] {
+        for at in 0..streams {
+            let stream = 1 + 4 * at as u64;
             let mut taken = 0usize;
             for _ in 0..20_000 {
                 ferry.run(&mut pipe);
