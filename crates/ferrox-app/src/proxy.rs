@@ -11689,6 +11689,9 @@ where
             .ok()
             .map(|()| cipher)
     });
+    if let (Some(cipher), Ok(mut sealed)) = (cipher.as_ref(), out.lock()) {
+        sealed.raw = cipher.try_clone().ok();
+    }
     let mut session = session;
     let shared = match cipher.as_ref() {
         Some(_) => {
@@ -11880,27 +11883,72 @@ fn xhttp_rung(
 struct Sealed {
     transport: Box<dyn Write + Send>,
     bytes: Vec<u8>,
+    /// The raw socket behind the transport, when the session exposes one: the write clock lives on
+    /// the descriptor, so a paced carrier arms it without taking the session's lock.
+    raw: Option<Connection>,
+    /// The record behind `bytes` has a clock: a peer that drains nothing leaves its suffix here for
+    /// a later settle instead of parking the relay lane's thread in the write.
+    paced: bool,
 }
+
+/// The most sealed plaintext one paced writer keeps ahead of the socket; past it the carrier is
+/// full and the lane parks, so a peer that never reads costs a bounded tail rather than the flow.
+const PACED_TAIL: usize = 256 * 1024;
 
 impl Sealed {
     fn new(transport: impl Write + Send + 'static) -> Self {
         Self {
             transport: Box::new(transport),
             bytes: Vec::new(),
+            raw: None,
+            paced: false,
         }
     }
 
     /// The record goes out with no session lock held, so a peer that is not draining this
     /// direction parks this write alone.
     fn send(&mut self) -> std::io::Result<()> {
-        let written = if self.bytes.is_empty() {
-            Ok(())
-        } else {
-            self.transport.write_all(&self.bytes)
-        };
-        self.bytes.clear();
-        written?;
-        self.transport.flush()
+        if !self.paced {
+            let written = if self.bytes.is_empty() {
+                Ok(())
+            } else {
+                self.transport.write_all(&self.bytes)
+            };
+            self.bytes.clear();
+            written?;
+            return self.transport.flush();
+        }
+        let mut at = 0usize;
+        while at < self.bytes.len() {
+            match self.transport.write(&self.bytes[at..]) {
+                Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+                Ok(n) => at += n,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock || is_timeout(&error) =>
+                {
+                    break
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        if at > 0 {
+            self.bytes.drain(..at);
+        }
+        if self.bytes.is_empty() {
+            return self.transport.flush();
+        }
+        Ok(())
+    }
+
+    fn settle(&mut self) -> Settle {
+        if !self.paced {
+            return Settle::Clear;
+        }
+        match self.send() {
+            Ok(()) if self.bytes.is_empty() => Settle::Clear,
+            Ok(()) => Settle::Parked,
+            Err(_) => Settle::Lost,
+        }
     }
 }
 
@@ -20251,19 +20299,61 @@ pub(crate) trait CarrierSink: Clone + Send + 'static {
             Push::Lost
         }
     }
+    /// Bytes a parked push accepted but the socket did not take yet: a lane that owes none still
+    /// drains them, so a stalled record is not stranded behind an idle read.
+    fn settle(&self) -> Settle {
+        Settle::Clear
+    }
     fn close(&self);
     /// Ends the request body when the app half-closes, before the carrier's own download ends; only a carrier whose response is gated on that body (xhttp) answers here.
     fn upload_done(&self) {}
 }
 
+/// What one offer of framed bytes did: the transport took all of them (possibly into its own paced
+/// tail), took none and asks for the same bytes again, or the carrier is gone.
+pub(crate) enum Accepted {
+    All,
+    Full,
+    Lost,
+}
+
+/// What a settle found: the paced tail is empty, it still owes the socket bytes, or the carrier died.
+pub(crate) enum Settle {
+    Clear,
+    Parked,
+    Lost,
+}
+
 // Vectored write with and without a file descriptor: the socket packs into one `writev` or one `WSASend`, the session feeds its record batcher.
 pub(crate) trait FrameWrite: Write + Send {
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool;
+
+    /// Every byte is taken, but a transport with a paced tail may not have put it on the wire yet:
+    /// it owns the rest, so a lane never waits on a socket the peer has not drained.
+    fn offer_slices(&mut self, parts: &[&[u8]]) -> Accepted {
+        if self.write_slices(parts) {
+            Accepted::All
+        } else {
+            Accepted::Lost
+        }
+    }
+
+    /// Drains a paced tail without waiting; `Clear` when there is nothing left to write.
+    fn settle(&mut self) -> Settle {
+        Settle::Clear
+    }
+
+    /// Arms the writer's clock so a peer that drains nothing parks the lane instead of the thread.
+    fn arm_write(&mut self, _timeout: Duration) {}
 }
 
 impl FrameWrite for Connection {
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
         write_all_parts::<VECTOR_PARTS>(self, parts).is_ok()
+    }
+
+    fn arm_write(&mut self, timeout: Duration) {
+        let _ = self.set_write_timeout(Some(timeout));
     }
 }
 
@@ -20324,6 +20414,60 @@ impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send
         }
         out.send().is_ok()
     }
+
+    fn offer_slices(&mut self, parts: &[&[u8]]) -> Accepted {
+        let Ok(mut out) = self.out.lock() else {
+            return Accepted::Lost;
+        };
+        if !out.paced {
+            drop(out);
+            return if <Self as FrameWrite>::write_slices(self, parts) {
+                Accepted::All
+            } else {
+                Accepted::Lost
+            };
+        }
+        // An over-full tail parks the caller before more plaintext is sealed, so a peer that reads nothing costs the bound and not the process's memory.
+        if out.bytes.len() >= PACED_TAIL {
+            match out.settle() {
+                Settle::Clear => {}
+                Settle::Parked => return Accepted::Full,
+                Settle::Lost => return Accepted::Lost,
+            }
+        }
+        let start = out.bytes.len();
+        let session = Arc::clone(&self.session);
+        let sealed = write_windows(parts, |window| match session.lock() {
+            Ok(mut session) => session.seal_slices_into(window, &mut out.bytes).is_ok(),
+            Err(_) => false,
+        });
+        if !sealed {
+            // A refused seal is a partial record; the bytes accepted before this call stay paced.
+            out.bytes.truncate(start);
+            return Accepted::Lost;
+        }
+        match out.send() {
+            Ok(()) => Accepted::All,
+            Err(_) => Accepted::Lost,
+        }
+    }
+
+    fn settle(&mut self) -> Settle {
+        match self.out.lock() {
+            Ok(mut out) => out.settle(),
+            Err(_) => Settle::Lost,
+        }
+    }
+
+    fn arm_write(&mut self, timeout: Duration) {
+        if let Ok(mut out) = self.out.lock() {
+            let Some(raw) = out.raw.as_ref() else {
+                return;
+            };
+            let _ = raw.set_write_timeout(Some(timeout));
+            out.paced = true;
+        }
+    }
 }
 
 pub(crate) fn relay_sink<R, W, F>(
@@ -20353,6 +20497,7 @@ struct Forward {
     pending: usize,
     sent: usize,
     spins: u32,
+    parked: Option<std::time::Instant>,
 }
 
 impl Forward {
@@ -20362,7 +20507,33 @@ impl Forward {
             pending: 0,
             sent: 0,
             spins: 0,
+            parked: None,
         }
+    }
+}
+
+/// A paced carrier may still owe bytes no caller offered again: drain them before a read that would
+/// otherwise park the only lane able to hand the peer the grant the parked write waits for.
+fn settle_lane(uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
+    match uplink.settle() {
+        Settle::Clear => {
+            at.parked = None;
+            None
+        }
+        Settle::Parked => {
+            let now = std::time::Instant::now();
+            let since = *at.parked.get_or_insert(now);
+            if now.duration_since(since) >= crate::budgets::relay_stall() {
+                return Some(Next::Done);
+            }
+            at.spins += 1;
+            if at.spins >= RELAY_SPINS {
+                at.spins = 0;
+                std::thread::sleep(crate::budgets::RELAY_POLL);
+            }
+            Some(Next::Retry)
+        }
+        Settle::Lost => Some(Next::Done),
     }
 }
 
@@ -20536,6 +20707,9 @@ where
     let mut at = Forward::new();
     lane_pool::submit(
         Box::new(move || {
+            if let Some(next) = settle_lane(&uplink, &mut at) {
+                return next;
+            }
             if let Some(next) = forward_flush(&buffer, &uplink, &mut at) {
                 return next;
             }
@@ -28736,6 +28910,200 @@ mod tests {
         dialled.join().expect("joins");
         pair.echo.join().expect("joins");
         pair.front.join().expect("joins");
+    }
+
+    #[test]
+    fn reality_grpc_dial_reaches_echo_through_the_relay() {
+        let pair = reality_pair_with(
+            "",
+            "grpc",
+            Carrier::Grpc(crate::config::GrpcSettings::path("//Tun")),
+        );
+        let (mut user, dialled) = dial_pair(&pair);
+        let payload: Vec<u8> = (0..200_000u32)
+            .map(|index| (index as u8).wrapping_mul(41).wrapping_add(13))
+            .collect();
+        let back = echo_bulk(&mut user, &payload);
+        assert_eq!(
+            back, payload,
+            "payload came back altered through the carried REALITY gRPC session"
+        );
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+    }
+
+    fn run_grpc_client(
+        outbound: Outbound,
+        server: SocketAddr,
+        target: SocketAddr,
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let dial = thread::spawn(move || {
+            let (client, _) = front.accept().expect("accepts");
+            tx.send(()).expect("signals");
+            dial_socks_outbound(&client, &outbound, &server, &Destination::from(target));
+        });
+        let mut user = Connection::connect(addr).expect("connects");
+        user.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        rx.recv_timeout(Duration::from_secs(30)).expect("dials");
+        let mut back = vec![0u8; payload.len()];
+        user.read_exact(&mut back).expect("reads the download");
+        drop(user);
+        dial.join().expect("joins");
+        back
+    }
+
+    #[derive(Clone, Copy, PartialEq)]
+    enum GrpcCarry {
+        Plain,
+        Tls,
+        Reality,
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn grpc_multi_leg(carry: GrpcCarry, payload: &[u8], clients: usize) -> Duration {
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        let download = payload.to_vec();
+        let echo_handle = thread::spawn(move || {
+            let mut handles = Vec::new();
+            for _ in 0..clients {
+                let (mut stream, _) = echo.accept().expect("accepts");
+                let payload = download.clone();
+                handles.push(thread::spawn(move || {
+                    let _ = stream.write_all(&payload);
+                }));
+            }
+            for handle in handles {
+                handle.join().expect("joins");
+            }
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr = front.local_addr().expect("addr");
+        let carrier = Carrier::Grpc(crate::config::GrpcSettings::path("//Tun"));
+        let reality = carry == GrpcCarry::Reality;
+        let id = if reality {
+            uuid_bytes(REALITY_TEST_ID).expect("id")
+        } else {
+            [0x45u8; 16]
+        };
+        let reality_config = reality_server_config();
+        let (tls_server, tls_client) = carried_tls_configs();
+        let server_carrier = carrier.clone();
+        let server_handle = thread::spawn(move || {
+            let mut handles = Vec::new();
+            for _ in 0..clients {
+                let (stream, _) = front.accept().expect("accepts");
+                let carrier = server_carrier.clone();
+                handles.push(match carry {
+                    GrpcCarry::Plain => thread::spawn(move || {
+                        serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
+                    }),
+                    GrpcCarry::Tls => {
+                        let config = std::sync::Arc::clone(&tls_server);
+                        thread::spawn(move || {
+                            serve_vless_tls(
+                                stream,
+                                &one_vless_user(&id),
+                                true,
+                                &carrier,
+                                &config,
+                                None,
+                                None,
+                            );
+                        })
+                    }
+                    GrpcCarry::Reality => {
+                        let config = reality_config.clone();
+                        thread::spawn(move || {
+                            serve_vless_reality(
+                                stream,
+                                &one_vless_user(&id),
+                                true,
+                                &carrier,
+                                &config,
+                                None,
+                                None,
+                            );
+                        })
+                    }
+                });
+            }
+            for handle in handles {
+                handle.join().expect("joins");
+            }
+        });
+        let outbound = if reality {
+            let public =
+                x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+            let root = crate::json::parse(&reality_network_json(
+                server_addr.port(),
+                &b64url(&public),
+                "",
+                "grpc",
+            ))
+            .expect("parses");
+            find_outbound(&root)
+                .expect("a REALITY outbound")
+                .expect("the config names one")
+        } else {
+            let tls = if carry == GrpcCarry::Tls {
+                Some(std::sync::Arc::new(tls_client))
+            } else {
+                None
+            };
+            Outbound::Vless(VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port: server_addr.port(),
+                id,
+                carrier: carrier.clone(),
+                host: String::new(),
+                mux: false,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls,
+                flow: String::new(),
+                reality: None,
+                headers: crate::config::carrier_headers(None).0,
+                heartbeat: crate::config::carrier_headers(None).1,
+                encryption: None,
+            })
+        };
+        let mut workers = Vec::new();
+        let start = std::time::Instant::now();
+        for _ in 0..clients {
+            let outbound = outbound.clone();
+            let payload = payload.to_vec();
+            workers.push(thread::spawn(move || {
+                run_grpc_client(outbound, server_addr, echo_addr, &payload)
+            }));
+        }
+        for worker in workers {
+            let back = worker.join().expect("joins");
+            assert_eq!(back, payload, "payload came back altered");
+        }
+        let elapsed = start.elapsed();
+        server_handle.join().expect("joins");
+        echo_handle.join().expect("joins");
+        elapsed
+    }
+
+    /// Eight downloads share one carrier each way: with one lane per direction and eight workers, a
+    /// worker parked in a full socket used to be the worker the sibling's credit needed, so every
+    /// flow stopped at the same frame. The payload is large enough to fill both send buffers.
+    #[test]
+    fn eight_downloads_finish_over_each_grpc_carrier() {
+        let payload = vec![0x5au8; 4 * 1024 * 1024];
+        for carry in [GrpcCarry::Plain, GrpcCarry::Tls, GrpcCarry::Reality] {
+            grpc_multi_leg(carry, &payload, 8);
+        }
     }
 
     #[test]

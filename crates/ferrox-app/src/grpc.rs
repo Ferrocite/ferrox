@@ -5,6 +5,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use crate::proxy::{Accepted, FrameWrite, Settle};
+
 use crate::h2::{
     block_encode, frame_head, write_frame, Decoder, E_REFUSED, FRAME_CAP, F_ACK, F_END,
     F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_CONCURRENT, S_MAX_FRAME, S_WINDOW,
@@ -108,6 +110,19 @@ fn take_window(shared: &Shared, need: u64, wait: bool) -> bool {
     send.conn -= need;
     send.stream -= need;
     true
+}
+
+/// A batch the transport refused gives its window back: the bytes never left, so the peer will
+/// never grant for them, and the caller's retry must find the credit it took.
+fn refund(shared: &Shared, need: u64) {
+    if need == 0 {
+        return;
+    }
+    let mut send = shared.send.lock().unwrap_or_else(PoisonError::into_inner);
+    send.conn += need;
+    send.stream += need;
+    drop(send);
+    shared.wake.notify_all();
 }
 
 /// Which of the service's two methods a call used, and so what shape its messages have.
@@ -835,6 +850,8 @@ struct Gather<'a> {
     slots: [[u8; SLOT]; FRAMES_PER_WRITE],
     held: [(&'a [u8], usize); FRAMES_PER_WRITE],
     used: usize,
+    /// The window this batch took and the transport has not confirmed: a refused flush gives it back.
+    credit: u64,
 }
 
 impl<'a> Gather<'a> {
@@ -843,6 +860,7 @@ impl<'a> Gather<'a> {
             slots: [[0u8; SLOT]; FRAMES_PER_WRITE],
             held: [(NO_FRAME, 0); FRAMES_PER_WRITE],
             used: 0,
+            credit: 0,
         }
     }
 
@@ -855,18 +873,20 @@ impl<'a> Gather<'a> {
     fn add(&mut self, id: u32, flags: u8, prefix: &[u8], payload: &'a [u8]) {
         let at = self.used;
         self.used += 1;
-        let head = frame_head(prefix.len() + payload.len(), T_DATA, flags, id);
+        let load = prefix.len() + payload.len();
+        self.credit += load as u64;
+        let head = frame_head(load, T_DATA, flags, id);
         self.slots[at][..9].copy_from_slice(&head);
         self.slots[at][9..9 + prefix.len()].copy_from_slice(prefix);
         self.held[at] = (payload, prefix.len());
     }
 
-    /// The batch as one write, in the order the frames go out: a head slot and then the payload run it
-    /// opens, for every frame held. An empty batch takes neither lock nor call, and a held batch is
-    /// emptied by the write, so the frames that follow it start a new one.
-    fn flush(&mut self, shared: &Arc<Shared>) -> bool {
+    /// The batch as one offer, in the order the frames go out: a head slot and then the payload run
+    /// it opens, for every frame held. A refused batch keeps its frames and gives its window back, so
+    /// the caller's retry re-takes exactly what it took; an accepted batch is emptied.
+    fn flush(&mut self, shared: &Arc<Shared>) -> Accepted {
         if self.used == 0 {
-            return true;
+            return Accepted::All;
         }
         let mut parts: [&[u8]; 2 * FRAMES_PER_WRITE] = [NO_FRAME; 2 * FRAMES_PER_WRITE];
         let mut pieces = 0;
@@ -882,11 +902,64 @@ impl<'a> Gather<'a> {
                 pieces += 1;
             }
         }
-        self.used = 0;
-        let Ok(mut stream) = shared.stream.lock() else {
-            return false;
+        let took = match shared.stream.lock() {
+            Ok(mut stream) => stream.offer_slices(&parts[..pieces]),
+            Err(_) => Accepted::Lost,
         };
-        stream.write_slices(&parts[..pieces])
+        match took {
+            Accepted::All => {
+                self.used = 0;
+                self.credit = 0;
+                Accepted::All
+            }
+            Accepted::Full => {
+                refund(shared, self.credit);
+                Accepted::Full
+            }
+            Accepted::Lost => Accepted::Lost,
+        }
+    }
+
+    /// The same offer for a caller that may wait: a refused batch drains the paced tail and takes
+    /// its window again before the next try.
+    fn flush_blocking(&mut self, shared: &Arc<Shared>) -> bool {
+        let deadline = Instant::now() + crate::budgets::relay_stall();
+        loop {
+            match self.flush(shared) {
+                Accepted::All => return true,
+                Accepted::Lost => return false,
+                Accepted::Full => {
+                    if Instant::now() >= deadline || !settle_blocking(shared) {
+                        return false;
+                    }
+                    if !take_window(shared, self.credit, true) {
+                        return false;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Waits out a paced tail for the blocking writer: the framed relay never takes this path, so the
+/// wait costs a lane only when a caller asked for every byte before it returned.
+fn settle_blocking(shared: &Shared) -> bool {
+    let deadline = Instant::now() + crate::budgets::relay_stall();
+    loop {
+        let settled = match shared.stream.lock() {
+            Ok(mut stream) => stream.settle(),
+            Err(_) => Settle::Lost,
+        };
+        match settled {
+            Settle::Clear => return true,
+            Settle::Lost => return false,
+            Settle::Parked => {
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(crate::budgets::RELAY_POLL);
+            }
+        }
     }
 }
 
@@ -901,7 +974,101 @@ impl GrpcWriter {
                 return false;
             }
         }
-        batch.flush(&self.shared)
+        batch.flush_blocking(&self.shared)
+    }
+
+    /// The same frames as `send`, but a window the peer has not granted parks the bytes instead of
+    /// holding the worker the lane that reads the credit needs. A message is the unit a window
+    /// pays for, so it is taken whole: a half-sent one cannot be offered again without duplicating
+    /// the half the peer already has.
+    fn try_send(&self, data: &[u8]) -> crate::proxy::Push {
+        let max = self.max_frame().max(1);
+        // A frame width below two cannot keep one message in one batch; a peer that asks for it
+        // gets the blocking writer rather than a batch it does not fit.
+        if max < 2 {
+            return if self.send(data) {
+                crate::proxy::Push::Took(data.len())
+            } else {
+                crate::proxy::Push::Lost
+            };
+        }
+        let payload = message_payload(max.saturating_sub(1)).max(1);
+        let mut batch = Gather::new();
+        let mut flushed = 0usize;
+        let mut held = 0usize;
+        for piece in data.chunks(payload) {
+            let mut prefix = [0u8; 16];
+            let plen = frame_prefix(piece.len(), &mut prefix);
+            let total = plen + piece.len();
+            let frames = total.div_ceil(max);
+            if batch.used + frames > FRAMES_PER_WRITE {
+                if let Some(stop) =
+                    Self::flush_held(&self.shared, &mut batch, &mut flushed, &mut held)
+                {
+                    return stop;
+                }
+            }
+            if !take_window(&self.shared, total as u64, false) {
+                if let Some(stop) =
+                    Self::flush_held(&self.shared, &mut batch, &mut flushed, &mut held)
+                {
+                    return stop;
+                }
+                if !take_window(&self.shared, total as u64, false) {
+                    return Self::took_or_parked(flushed);
+                }
+            }
+            let mut at = 0;
+            while at < total {
+                let n = (total - at).min(max);
+                if at + n <= plen {
+                    batch.add(self.stream, 0, &prefix[at..at + n], &[]);
+                } else if at >= plen {
+                    batch.add(self.stream, 0, &[], &piece[at - plen..at - plen + n]);
+                } else {
+                    batch.add(self.stream, 0, &prefix[at..plen], &piece[..n - (plen - at)]);
+                }
+                at += n;
+            }
+            held += piece.len();
+        }
+        match batch.flush(&self.shared) {
+            Accepted::All => Self::took_or_parked(flushed + held),
+            Accepted::Full => Self::took_or_parked(flushed),
+            Accepted::Lost => crate::proxy::Push::Lost,
+        }
+    }
+
+    fn flush_held(
+        shared: &Arc<Shared>,
+        batch: &mut Gather<'_>,
+        flushed: &mut usize,
+        held: &mut usize,
+    ) -> Option<crate::proxy::Push> {
+        match batch.flush(shared) {
+            Accepted::All => {
+                *flushed += *held;
+                *held = 0;
+                None
+            }
+            Accepted::Full => Some(Self::took_or_parked(*flushed)),
+            Accepted::Lost => Some(crate::proxy::Push::Lost),
+        }
+    }
+
+    fn took_or_parked(sent: usize) -> crate::proxy::Push {
+        if sent == 0 {
+            crate::proxy::Push::Parked
+        } else {
+            crate::proxy::Push::Took(sent)
+        }
+    }
+
+    pub(crate) fn settle(&self) -> Settle {
+        match self.shared.stream.lock() {
+            Ok(mut stream) => stream.settle(),
+            Err(_) => Settle::Lost,
+        }
     }
 
     pub(crate) fn close(&self) {
@@ -910,7 +1077,7 @@ impl GrpcWriter {
         }
         let mut batch = Gather::new();
         self.message(&[], self.max_frame(), true, &mut batch);
-        batch.flush(&self.shared);
+        batch.flush_blocking(&self.shared);
     }
 
     fn max_frame(&self) -> usize {
@@ -927,7 +1094,7 @@ impl GrpcWriter {
         if take_window(&self.shared, need, false) {
             return true;
         }
-        if !batch.flush(&self.shared) {
+        if !batch.flush_blocking(&self.shared) {
             return false;
         }
         take_window(&self.shared, need, true)
@@ -945,7 +1112,7 @@ impl GrpcWriter {
             if !self.credit(batch, n as u64) {
                 return false;
             }
-            if batch.full() && !batch.flush(&self.shared) {
+            if batch.full() && !batch.flush_blocking(&self.shared) {
                 return false;
             }
             let flags = if last && end { F_END } else { 0 };
@@ -1105,9 +1272,172 @@ pub(crate) fn accept_with(
     // A head's clock only bites when a read answers it, so the preface and the request headers are polled at the relay's grain and ended by the deadline; the relay behind them waits blocking again.
     read.set_read_timeout(Some(crate::budgets::RELAY_POLL))
         .ok()?;
+    let write = Tail::new(Box::new(write) as Box<dyn crate::proxy::FrameWrite + Send>);
     let mut accepted = accept_split_with(read, write, settings)?;
     accepted.0.set_poll(None);
     Some(accepted)
+}
+
+/// The plaintext a bare socket cannot hold itself: an offer is taken whole into this tail and the
+/// socket drains it at its own pace, so a lane never parks in a full send buffer and the bytes an
+/// offer acknowledged are still owed a write.
+struct Tail {
+    inner: Box<dyn crate::proxy::FrameWrite + Send>,
+    bytes: Vec<u8>,
+    at: usize,
+    lost: bool,
+}
+
+impl Tail {
+    fn new(inner: Box<dyn crate::proxy::FrameWrite + Send>) -> Self {
+        Self {
+            inner,
+            bytes: Vec::new(),
+            at: 0,
+            lost: false,
+        }
+    }
+
+    /// The bytes the socket did not take, kept until a settle writes them.
+    fn keep(&mut self, parts: &[&[u8]], mut skip: usize) {
+        for part in parts {
+            if skip >= part.len() {
+                skip -= part.len();
+                continue;
+            }
+            self.bytes.extend_from_slice(&part[skip..]);
+            skip = 0;
+        }
+    }
+
+    /// Waits the tail down to empty for a caller that asked for every byte before it returns.
+    fn drain_until(&mut self, deadline: &Instant) -> bool {
+        loop {
+            match self.drain() {
+                Settle::Clear => return true,
+                Settle::Lost => return false,
+                Settle::Parked => {
+                    if Instant::now() >= *deadline {
+                        return false;
+                    }
+                    std::thread::sleep(crate::budgets::RELAY_POLL);
+                }
+            }
+        }
+    }
+
+    fn drain(&mut self) -> Settle {
+        if self.lost {
+            return Settle::Lost;
+        }
+        while self.at < self.bytes.len() {
+            match self.inner.write(&self.bytes[self.at..]) {
+                Ok(0) => {
+                    self.lost = true;
+                    return Settle::Lost;
+                }
+                Ok(n) => self.at += n,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || crate::proxy::is_timeout(&error) =>
+                {
+                    return Settle::Parked;
+                }
+                Err(_) => {
+                    self.lost = true;
+                    return Settle::Lost;
+                }
+            }
+        }
+        self.bytes.clear();
+        self.at = 0;
+        Settle::Clear
+    }
+}
+
+impl std::io::Write for Tail {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        match self.offer_slices(&[data]) {
+            Accepted::All => Ok(data.len()),
+            Accepted::Full => Err(std::io::ErrorKind::WouldBlock.into()),
+            Accepted::Lost => Err(std::io::ErrorKind::BrokenPipe.into()),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self.drain() {
+            Settle::Lost => Err(std::io::ErrorKind::BrokenPipe.into()),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl crate::proxy::FrameWrite for Tail {
+    fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+        let deadline = Instant::now() + crate::budgets::relay_stall();
+        loop {
+            match self.offer_slices(parts) {
+                Accepted::All => break,
+                Accepted::Lost => return false,
+                Accepted::Full => {
+                    if Instant::now() >= deadline || !self.drain_until(&deadline) {
+                        return false;
+                    }
+                }
+            }
+        }
+        self.drain_until(&deadline)
+    }
+
+    /// The caller's parts go straight to the socket when it has room; only the suffix a timed-out
+    /// write left behind is copied, because the relay buffer behind it is overwritten next read.
+    fn offer_slices(&mut self, parts: &[&[u8]]) -> Accepted {
+        if self.lost {
+            return Accepted::Lost;
+        }
+        if self.at < self.bytes.len() {
+            match self.drain() {
+                Settle::Clear => {}
+                Settle::Parked => return Accepted::Full,
+                Settle::Lost => return Accepted::Lost,
+            }
+        }
+        let total = parts.iter().map(|part| part.len()).sum::<usize>();
+        let mut bufs = [std::io::IoSlice::new(NO_FRAME); 2 * FRAMES_PER_WRITE];
+        for (buf, part) in bufs.iter_mut().zip(parts) {
+            *buf = std::io::IoSlice::new(part);
+        }
+        match self.inner.write_vectored(&bufs[..parts.len()]) {
+            Ok(0) => {
+                self.lost = true;
+                Accepted::Lost
+            }
+            Ok(n) if n == total => Accepted::All,
+            Ok(n) => {
+                self.keep(parts, n);
+                Accepted::All
+            }
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || crate::proxy::is_timeout(&error) =>
+            {
+                self.keep(parts, 0);
+                Accepted::All
+            }
+            Err(_) => {
+                self.lost = true;
+                Accepted::Lost
+            }
+        }
+    }
+
+    fn settle(&mut self) -> Settle {
+        self.drain()
+    }
+
+    fn arm_write(&mut self, timeout: Duration) {
+        self.inner.arm_write(timeout);
+    }
 }
 
 fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
@@ -1175,9 +1505,10 @@ pub(crate) fn accept_split<R: Read, W: crate::proxy::FrameWrite + 'static>(
 
 pub(crate) fn accept_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
     mut read: R,
-    write: W,
+    mut write: W,
     settings: &GrpcSettings,
 ) -> Option<(GrpcReader<R>, GrpcWriter)> {
+    write.arm_write(crate::budgets::RELAY_POLL);
     let until = std::time::Instant::now() + crate::budgets::handshake();
     let mut magic = [0u8; 24];
     crate::proxy::read_exact(
@@ -1252,6 +1583,7 @@ pub(crate) fn connect_with(
     let Ok(write) = read.try_clone() else {
         return None;
     };
+    let write = Tail::new(Box::new(write) as Box<dyn crate::proxy::FrameWrite + Send>);
     connect_split_with(read, write, host, settings)
 }
 
@@ -1272,6 +1604,7 @@ pub(crate) fn connect_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>
     host: &str,
     settings: &GrpcSettings,
 ) -> Option<(GrpcReader<R>, GrpcWriter)> {
+    write.arm_write(crate::budgets::RELAY_POLL);
     if !write.write_slices(&[MAGIC, &preface(settings.initial_window_size)]) {
         return None;
     }
@@ -1397,6 +1730,14 @@ impl crate::proxy::CarrierSink for GrpcWriter {
     #[inline]
     fn send(&self, bytes: &[u8]) -> bool {
         self.send(bytes)
+    }
+    #[inline]
+    fn push(&self, bytes: &[u8]) -> crate::proxy::Push {
+        self.try_send(bytes)
+    }
+    #[inline]
+    fn settle(&self) -> Settle {
+        self.settle()
     }
     #[inline]
     fn close(&self) {
@@ -1989,6 +2330,72 @@ mod tests {
         assert_eq!(wire, want, "the same frames, in the same order, whole");
     }
 
+    /// The plaintext tail hands the socket the caller's own slice, not a copy of it: the relay
+    /// buffer behind a payload is overwritten by the next read, so a copy here would be invisible to
+    /// a byte test and paid on every byte of a plaintext gRPC flow.
+    #[test]
+    fn the_tail_hands_the_payload_to_the_socket_by_pointer() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let mut tail = Tail::new(Box::new(Recorder(Arc::clone(&peer))));
+        let payload = vec![0x5au8; 4096];
+        let base = payload.as_ptr() as usize;
+        let capacity = payload.capacity();
+        assert!(matches!(tail.offer_slices(&[&payload]), Accepted::All));
+        let seen = peer.lock().unwrap();
+        assert_eq!(
+            seen.parts,
+            vec![(base, payload.len())],
+            "the socket saw a copy, not the caller's bytes"
+        );
+        assert_eq!(payload.capacity(), capacity, "the caller's buffer grew");
+    }
+
+    /// A socket that takes a hundred bytes a call: the tail keeps the suffix the first write did not,
+    /// and settle puts it all on the wire in the same order.
+    #[test]
+    fn the_tail_keeps_what_a_timed_out_socket_did_not_take() {
+        struct Short(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Short {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                let take = data.len().min(100);
+                self.0.lock().unwrap().extend_from_slice(&data[..take]);
+                Ok(take)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::proxy::FrameWrite for Short {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                for part in parts {
+                    let _ = self.write(part);
+                }
+                true
+            }
+        }
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let mut tail = Tail::new(Box::new(Short(Arc::clone(&got))));
+        let payload: Vec<u8> = (0..1000).map(|i| i as u8).collect();
+        assert!(matches!(tail.offer_slices(&[&payload]), Accepted::All));
+        assert!(matches!(tail.settle(), Settle::Clear));
+        assert_eq!(*got.lock().unwrap(), payload);
+    }
+
+    /// A peer that advertises a one-byte frame cannot overflow the eight batch slots: `try_send`
+    /// hands the message to the blocking writer, whose frame-by-frame shape
+    /// `messages_frame_identically_at_every_chunk_size` already holds.
+    #[test]
+    fn a_one_byte_frame_does_not_overflow_the_batch() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), 1, u64::MAX);
+        let data: Vec<u8> = (0..64).map(|i| i as u8).collect();
+        assert!(matches!(
+            writer.try_send(&data),
+            crate::proxy::Push::Took(64)
+        ));
+        assert!(!peer.lock().unwrap().writes.is_empty());
+    }
+
     /// The gathered batch reaches the peer before its own credit parks the writer: a peer grants for
     /// bytes it has seen, so frames held in a batch cannot wait behind the window they are the thing
     /// that would raise. The witness is a write seen while the thread is still inside `send` — with the
@@ -2332,7 +2739,10 @@ mod tests {
                         writer.message(&data, max, true, &mut batch),
                         "max {max} len {len}"
                     );
-                    assert!(batch.flush(&writer.shared), "max {max} len {len}");
+                    assert!(
+                        matches!(batch.flush(&writer.shared), Accepted::All),
+                        "max {max} len {len}"
+                    );
                 });
                 let mut read = Connection::connect(("127.0.0.1", port)).expect("connects");
                 let mut wire = Vec::new();
