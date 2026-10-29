@@ -270,8 +270,10 @@ struct Flow {
     local: Connection,
     local_port: u16,
     races: Vec<(SocketHandle, u16)>,
-    pending_down: VecDeque<Vec<u8>>,
+    pending_down: Vec<u8>,
+    pending_down_at: usize,
     pending_up: Vec<u8>,
+    pending_up_at: usize,
     up_eof: bool,
     sent_fin: bool,
     down_eof: bool,
@@ -287,8 +289,10 @@ impl Flow {
             local,
             local_port,
             races: Vec::new(),
-            pending_down: VecDeque::new(),
+            pending_down: Vec::new(),
+            pending_down_at: 0,
             pending_up: Vec::new(),
+            pending_up_at: 0,
             up_eof: false,
             sent_fin: false,
             down_eof: false,
@@ -296,6 +300,26 @@ impl Flow {
             established: false,
             done: false,
         }
+    }
+
+    fn down_pending(&self) -> bool {
+        self.pending_down_at < self.pending_down.len()
+    }
+
+    fn up_pending(&self) -> bool {
+        self.pending_up_at < self.pending_up.len()
+    }
+
+    fn stage_down(&mut self, bytes: &[u8]) {
+        self.pending_down.clear();
+        self.pending_down.extend_from_slice(bytes);
+        self.pending_down_at = 0;
+    }
+
+    fn stage_up(&mut self, bytes: &[u8]) {
+        self.pending_up.clear();
+        self.pending_up.extend_from_slice(bytes);
+        self.pending_up_at = 0;
     }
 
     fn adopt(
@@ -972,19 +996,14 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
         flow.done = true;
     }
 
-    let mut pending = std::mem::take(&mut flow.pending_down);
-    while let Some(front) = pending.front_mut() {
-        match flow.local.write(front) {
+    while flow.down_pending() {
+        let at = flow.pending_down_at;
+        match flow.local.write(&flow.pending_down[at..]) {
             Ok(0) => {
                 flow.down_eof = true;
                 break;
             }
-            Ok(n) => {
-                front.drain(..n);
-                if front.is_empty() {
-                    pending.pop_front();
-                }
-            }
+            Ok(n) => flow.pending_down_at += n,
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(_) => {
                 flow.done = true;
@@ -993,9 +1012,12 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
             }
         }
     }
-    flow.pending_down = pending;
+    if !flow.down_pending() {
+        flow.pending_down.clear();
+        flow.pending_down_at = 0;
+    }
 
-    while flow.pending_down.is_empty() {
+    while !flow.down_pending() {
         match socket.recv_slice(buf) {
             Ok(0) | Err(RecvError::InvalidState) => break,
             Ok(n) => {
@@ -1008,7 +1030,7 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
                         }
                         Ok(written) => at += written,
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            flow.pending_down.push_back(buf[at..n].to_vec());
+                            flow.stage_down(&buf[at..n]);
                             at = n;
                         }
                         Err(_) => {
@@ -1026,11 +1048,11 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
         }
     }
 
-    if up_ready && flow.pending_up.is_empty() && !flow.up_eof && socket.can_send() {
+    if up_ready && !flow.up_pending() && !flow.up_eof && socket.can_send() {
         match flow.local.read(buf) {
             Ok(0) => flow.up_eof = true,
             Ok(n) => match socket.send_slice(&buf[..n]) {
-                Ok(sent) if sent < n => flow.pending_up.extend_from_slice(&buf[sent..n]),
+                Ok(sent) if sent < n => flow.stage_up(&buf[sent..n]),
                 Ok(_) => {}
                 Err(SendError::InvalidState) => {
                     flow.done = true;
@@ -1044,11 +1066,16 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
             }
         }
     }
-    if !flow.pending_up.is_empty() && socket.can_send() {
-        match socket.send_slice(&flow.pending_up) {
+    if flow.up_pending() && socket.can_send() {
+        let at = flow.pending_up_at;
+        match socket.send_slice(&flow.pending_up[at..]) {
             Ok(0) => {}
             Ok(n) => {
-                flow.pending_up.drain(..n);
+                flow.pending_up_at += n;
+                if !flow.up_pending() {
+                    flow.pending_up.clear();
+                    flow.pending_up_at = 0;
+                }
             }
             Err(SendError::InvalidState) => {
                 flow.done = true;
@@ -1056,15 +1083,15 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
             }
         }
     }
-    if flow.up_eof && flow.pending_up.is_empty() && socket.is_open() && !flow.sent_fin {
+    if flow.up_eof && !flow.up_pending() && socket.is_open() && !flow.sent_fin {
         socket.close();
         flow.sent_fin = true;
     }
-    if flow.down_eof && !flow.down_shutdown && flow.pending_down.is_empty() {
+    if flow.down_eof && !flow.down_shutdown && !flow.down_pending() {
         let _ = flow.local.shutdown(Shutdown::Write);
         flow.down_shutdown = true;
     }
-    if socket.state() == State::Closed && flow.established && flow.pending_down.is_empty() {
+    if socket.state() == State::Closed && flow.established && !flow.down_pending() {
         flow.down_eof = true;
         flow.done = true;
     }
@@ -1719,9 +1746,47 @@ mod tests {
         packet
     }
 
-    #[test]
-    fn a_direct_upload_never_builds_the_staging_buffer() {
-        let (mut app, proxy) = loopback().expect("pair");
+    /// The TCP payload of an inner IPv4 packet, which is where an upload's bytes ride.
+    fn tcp_payload(packet: &[u8]) -> &[u8] {
+        let ihl = usize::from(packet[0] & 0x0f) * 4;
+        let offset = ihl + usize::from(packet[ihl + 12] >> 4) * 4;
+        let total = usize::from(u16::from_be_bytes([packet[2], packet[3]]));
+        &packet[offset..total.min(packet.len())]
+    }
+
+    /// Every byte the stack handed the tunnel since the last drain, with the TCP headers removed.
+    fn tunnel_payload(packets: &std::sync::mpsc::Receiver<Vec<u8>>) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        while let Ok(packet) = packets.try_recv() {
+            if packet.get(9) == Some(&PROTOCOL_TCP) {
+                bytes.extend_from_slice(tcp_payload(&packet));
+            }
+        }
+        bytes
+    }
+
+    /// Poll the stack until the tunnel has carried `want` payload bytes, which may take a turn beyond the one that drained the staging buffer.
+    fn tunnel_bytes(
+        stack: &mut ClientStack,
+        packets: &std::sync::mpsc::Receiver<Vec<u8>>,
+        buf: &mut [u8],
+        want: usize,
+    ) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for _ in 0..50 {
+            stack.poll(buf);
+            bytes.extend_from_slice(&tunnel_payload(packets));
+            if bytes.len() >= want {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        bytes
+    }
+
+    /// A client stack whose first flow is established, its handshake packets drained, and the local end of the flow kept alive by the returned handle.
+    fn established_client() -> (ClientStack, std::sync::mpsc::Receiver<Vec<u8>>, Connection) {
+        let (app, proxy) = loopback().expect("pair");
         let config = DeviceConfig {
             secret: [0u8; 32],
             addresses: vec!["10.0.0.2".parse().unwrap()],
@@ -1758,6 +1823,107 @@ mod tests {
             "the SYN-ACK establishes the flow"
         );
         while packets.try_recv().is_ok() {}
+        (stack, packets, app)
+    }
+
+    /// The bytes a refused write leaves staged are written where they lie, and the same buffer takes the next stage instead of a fresh allocation.
+    #[test]
+    fn a_staged_direction_reuses_its_buffer_across_a_drain() {
+        let (mut stack, packets, mut app) = established_client();
+        app.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("a read timeout, so a lost download fails rather than hangs");
+        let mut buf = [0u8; 2048];
+
+        let upload = [b'u'; 512];
+        stack.flows[0].stage_up(&upload);
+        let cap = stack.flows[0].pending_up.capacity();
+        let base = stack.flows[0].pending_up.as_ptr();
+        assert!(cap >= upload.len(), "the upload landed in a buffer");
+        stack.poll(&mut buf);
+        assert!(
+            !stack.flows[0].up_pending(),
+            "the socket takes the staged upload"
+        );
+        assert_eq!(
+            tunnel_bytes(&mut stack, &packets, &mut buf, upload.len()),
+            upload,
+            "the staged upload leaves unchanged"
+        );
+        assert_eq!(
+            stack.flows[0].pending_up.capacity(),
+            cap,
+            "a drained upload released its buffer"
+        );
+        assert_eq!(
+            stack.flows[0].pending_up.as_ptr(),
+            base,
+            "a drained upload moved its buffer"
+        );
+        stack.flows[0].stage_up(&upload);
+        assert_eq!(
+            stack.flows[0].pending_up.capacity(),
+            cap,
+            "a same-sized upload reallocated"
+        );
+        assert_eq!(
+            stack.flows[0].pending_up.as_ptr(),
+            base,
+            "a same-sized upload moved its buffer"
+        );
+        stack.poll(&mut buf);
+        assert!(!stack.flows[0].up_pending());
+        assert_eq!(
+            tunnel_bytes(&mut stack, &packets, &mut buf, upload.len()),
+            upload,
+            "a reused upload leaves unchanged"
+        );
+
+        let download = [b'd'; 512];
+        stack.flows[0].stage_down(&download);
+        let cap = stack.flows[0].pending_down.capacity();
+        let base = stack.flows[0].pending_down.as_ptr();
+        assert!(cap >= download.len(), "the download landed in a buffer");
+        stack.poll(&mut buf);
+        assert!(
+            !stack.flows[0].down_pending(),
+            "the local socket takes the staged download"
+        );
+        let mut got = [0u8; 512];
+        app.read_exact(&mut got)
+            .expect("the local peer reads the download");
+        assert_eq!(got, download, "the staged download arrives unchanged");
+        assert_eq!(
+            stack.flows[0].pending_down.capacity(),
+            cap,
+            "a drained download released its buffer"
+        );
+        assert_eq!(
+            stack.flows[0].pending_down.as_ptr(),
+            base,
+            "a drained download moved its buffer"
+        );
+        stack.flows[0].stage_down(&download);
+        assert_eq!(
+            stack.flows[0].pending_down.capacity(),
+            cap,
+            "a same-sized download reallocated"
+        );
+        assert_eq!(
+            stack.flows[0].pending_down.as_ptr(),
+            base,
+            "a same-sized download moved its buffer"
+        );
+        stack.poll(&mut buf);
+        assert!(!stack.flows[0].down_pending());
+        app.read_exact(&mut got)
+            .expect("the local peer reads the reused download");
+        assert_eq!(got, download, "a reused download arrives unchanged");
+    }
+
+    #[test]
+    fn a_direct_upload_never_builds_the_staging_buffer() {
+        let (mut stack, packets, mut app) = established_client();
+        let mut buf = [0u8; 2048];
 
         app.write_all(b"hello").expect("write");
         let mut seen = false;
