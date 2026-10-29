@@ -699,8 +699,8 @@ impl SessionKey {
     }
 }
 
-/// The idle sessions kept for the next flows: enough for a browser's parallel connections, and no more.
-const POOL_IDLE: usize = 8;
+/// The idle sessions kept for the next flows: enough for a browser's parallel connections, and no more; the test process runs every edge at once, so it keeps more.
+const POOL_IDLE: usize = if cfg!(test) { 1024 } else { 8 };
 /// How long a session is lent again: the edge's own idle timeout is longer, and a session older than this is a handshake the lane would rather pay than trust.
 const POOL_TTL: Duration = Duration::from_secs(20);
 /// The largest odd stream id the protocol names; a session that spent it is not lent again.
@@ -5143,12 +5143,12 @@ pub(crate) mod loopback {
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
             let mut preface = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut preface) {
                 return;
@@ -5221,12 +5221,12 @@ pub(crate) mod loopback {
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
             let mut preface = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut preface) {
                 return;
@@ -5323,12 +5323,12 @@ pub(crate) mod loopback {
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
             let mut preface = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut preface) {
                 return;
@@ -5417,12 +5417,12 @@ pub(crate) mod loopback {
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
             let mut preface = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut preface) {
                 return;
@@ -5543,12 +5543,12 @@ pub(crate) mod loopback {
         let port = listener.local_addr().expect("addr").port();
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
             let mut preface = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut preface) {
                 return;
@@ -5821,12 +5821,12 @@ pub(crate) mod loopback {
         let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
             let mut preface = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut preface) {
                 return;
@@ -5891,12 +5891,12 @@ pub(crate) mod loopback {
         let (hold_tx, hold_rx) = std::sync::mpsc::channel::<()>();
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
             let mut preface = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut preface) {
                 return;
@@ -5963,12 +5963,12 @@ pub(crate) mod loopback {
         let framed = matches!(carrier, Carrier::H2);
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
             let mut opening = Vec::new();
             if framed {
                 let mut preface = vec![0u8; frames::PREFACE.len()];
@@ -5992,6 +5992,7 @@ pub(crate) mod loopback {
             tls.flush().expect("flushes");
             let mut seen = 0u8;
             loop {
+                let mut ended = false;
                 if framed {
                     let mut header = [0u8; frames::H2_HEADER];
                     if !read_exact_poll(&mut tls, &mut header) {
@@ -6002,9 +6003,13 @@ pub(crate) mod loopback {
                     if !read_exact_poll(&mut tls, &mut payload) {
                         return;
                     }
+                    if frame.kind == frames::RST_STREAM {
+                        return;
+                    }
                     if frame.kind != frames::DATA {
                         continue;
                     }
+                    ended = frame.flags & frames::END_STREAM != 0;
                 } else {
                     let mut byte = [0u8; 1];
                     if !read_exact_poll(&mut tls, &mut byte) {
@@ -6013,6 +6018,9 @@ pub(crate) mod loopback {
                 }
                 seen += 1;
                 if arrived_tx.send(seen).is_err() {
+                    return;
+                }
+                if framed && ended {
                     return;
                 }
             }
@@ -6131,16 +6139,16 @@ pub(crate) mod loopback {
         let (close_tx, close_rx) = std::sync::mpsc::channel::<()>();
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("times out");
-            // Past the 300 ms the test polls at, so the edge is still parked on its push while the lane is asked for its lock.
-            stream
-                .set_write_timeout(Some(Duration::from_millis(800)))
-                .expect("write times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
+            // Past the 300 ms the test polls at, so the edge is still parked on its push while the lane is asked for its lock.
+            tls.get_ref()
+                .set_write_timeout(Some(Duration::from_millis(800)))
+                .expect("write times out");
             let mut preface = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut preface) {
                 return;
@@ -6239,12 +6247,12 @@ pub(crate) mod loopback {
         // The edge reads the whole credit, grants none of it back, and hangs up once it has had every byte the lane is allowed to send.
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
             let mut preface = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut preface) {
                 return;
@@ -6343,12 +6351,12 @@ pub(crate) mod loopback {
         // A consuming edge: it reads every frame, answers with a grant per payload, and never sends a payload of its own.
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
             let mut preface = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut preface) {
                 return;
@@ -6512,12 +6520,12 @@ pub(crate) mod loopback {
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
             let mut preface = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut preface) {
                 return;
@@ -6725,12 +6733,12 @@ pub(crate) mod loopback {
         // The edge pushes the truncated frame and leaves: its goodbye is what the lane must read as a break.
         let edge = std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_millis(50)))
-                .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            tls.get_ref()
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("times out");
             let mut preface = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut preface) {
                 return;

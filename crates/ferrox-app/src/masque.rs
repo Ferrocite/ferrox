@@ -2702,17 +2702,19 @@ mod tests {
             .parse()
             .expect("a target");
         std::thread::spawn(move || {
-            let Ok((mut stream, _)) = echo.accept() else {
-                return;
-            };
-            let mut buf = [0u8; 1024];
-            loop {
-                let Ok(n) = stream.read(&mut buf) else {
-                    return;
-                };
-                if n == 0 || stream.write_all(&buf[..n]).is_err() {
-                    return;
-                }
+            for stream in echo.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let Ok(n) = stream.read(&mut buf) else {
+                            return;
+                        };
+                        if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                });
             }
         });
         let (_inbound, port) = serve(&echo_address.to_string());
@@ -2741,17 +2743,19 @@ mod tests {
             .parse()
             .expect("a target");
         std::thread::spawn(move || {
-            let Ok((mut stream, _)) = echo.accept() else {
-                return;
-            };
-            let mut buf = [0u8; 1024];
-            loop {
-                let Ok(n) = stream.read(&mut buf) else {
-                    return;
-                };
-                if n == 0 || stream.write_all(&buf[..n]).is_err() {
-                    return;
-                }
+            for stream in echo.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let Ok(n) = stream.read(&mut buf) else {
+                            return;
+                        };
+                        if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                });
             }
         });
         let (_inbound, port) = serve(&echo_address.to_string());
@@ -2778,17 +2782,19 @@ mod tests {
             .parse()
             .expect("a target");
         std::thread::spawn(move || {
-            let Ok((mut stream, _)) = echo.accept() else {
-                return;
-            };
-            let mut buf = [0u8; 1024];
-            loop {
-                let Ok(n) = stream.read(&mut buf) else {
-                    return;
-                };
-                if n == 0 || stream.write_all(&buf[..n]).is_err() {
-                    return;
-                }
+            for stream in echo.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let Ok(n) = stream.read(&mut buf) else {
+                            return;
+                        };
+                        if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                });
             }
         });
         let (_inbound, port) = serve_h2(&echo_address.to_string());
@@ -2815,7 +2821,7 @@ mod tests {
             .expect("a target");
         std::thread::spawn(move || {
             let mut buf = [0u8; 1500];
-            if let Ok((n, from)) = echo.recv_from(&mut buf) {
+            while let Ok((n, from)) = echo.recv_from(&mut buf) {
                 let _ = echo.send_to(&buf[..n], from);
             }
         });
@@ -2848,7 +2854,7 @@ mod tests {
             .expect("a target");
         std::thread::spawn(move || {
             let mut buf = [0u8; 1500];
-            if let Ok((n, from)) = echo.recv_from(&mut buf) {
+            while let Ok((n, from)) = echo.recv_from(&mut buf) {
                 let _ = echo.send_to(&buf[..n], from);
             }
         });
