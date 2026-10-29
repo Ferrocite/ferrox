@@ -290,6 +290,16 @@ fn wide(edge: &SocketAddr) -> [u8; 16] {
     }
 }
 
+/// The same edge with an IPv4 address in its IPv4-mapped IPv6 form, so a `TCP6` line
+/// never carries a bare dotted quad.
+fn wide_socket(edge: SocketAddr) -> SocketAddr {
+    let mapped = match edge.ip() {
+        std::net::IpAddr::V4(v4) => std::net::IpAddr::V6(v4.to_ipv6_mapped()),
+        std::net::IpAddr::V6(v6) => std::net::IpAddr::V6(v6),
+    };
+    SocketAddr::new(mapped, edge.port())
+}
+
 /// The PROXY-protocol header, either the text form or the binary one, written
 /// before the hello so the cover origin sees who really connected.
 pub fn write_proxy_protocol<W: Write>(
@@ -305,6 +315,11 @@ pub fn write_proxy_protocol<W: Write>(
                         "TCP4"
                     } else {
                         "TCP6"
+                    };
+                    let (local, peer) = if family == "TCP6" {
+                        (wide_socket(local), wide_socket(peer))
+                    } else {
+                        (local, peer)
                     };
                     // The longest line is two full IPv6 addresses and two ports.
                     let mut out = [0u8; 128];
@@ -1767,6 +1782,20 @@ mod tests {
             let after = verdict.cover.len() - bytes.len();
             assert_eq!(&verdict.cover[after..], &bytes[..]);
         }
+    }
+
+    #[test]
+    fn a_tcp6_text_header_writes_a_v4_edge_in_mapped_form() {
+        let edges = Edges {
+            local: Some("10.0.0.1:1234".parse().expect("local")),
+            peer: Some("[2001:db8::1]:80".parse().expect("peer")),
+        };
+        let mut out = Vec::new();
+        write_proxy_protocol(&mut out, 1, edges).expect("writes a header");
+        assert_eq!(
+            out, b"PROXY TCP6 ::ffff:10.0.0.1 2001:db8::1 1234 80\r\n",
+            "a TCP6 line carries no bare dotted quad"
+        );
     }
 
     #[cfg_attr(miri, ignore = "needs a loopback TCP socket")]
