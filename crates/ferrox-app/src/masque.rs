@@ -999,7 +999,7 @@ fn pair_h2_ephemeral(
     loop {
         let listener = TcpListener::bind(address)?;
         let local = listener.local_addr()?;
-        match UdpSocket::bind(local) {
+        match lane_udp_bind(&local.to_string()) {
             Ok(sock) => return Ok((sock, local, Some(listener))),
             Err(error) if error.kind() == std::io::ErrorKind::AddrInUse && tries < 8 => {
                 tries += 1;
@@ -1007,6 +1007,27 @@ fn pair_h2_ephemeral(
             Err(error) => return Err(error),
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The UDP binds a test thread refuses before one is let through, one number the budget
+    /// driving test sets so it owns the collision without owning the kernel.
+    static HELD_H2_UDP_BINDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// The inbound lane's UDP bind, one seam for the tests: a thread that wants the pair's port
+/// budget driven without owning the kernel claims the first binds through one counter.
+fn lane_udp_bind(address: &str) -> std::io::Result<UdpSocket> {
+    #[cfg(test)]
+    if HELD_H2_UDP_BINDS.with(std::cell::Cell::get) > 0 {
+        HELD_H2_UDP_BINDS.with(|held| held.set(held.get() - 1));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::AddrInUse,
+            "the lane the test holds",
+        ));
+    }
+    UdpSocket::bind(address)
 }
 
 /// Open a server inbound's socket and spawn its demultiplexer, stack and forwarder.
@@ -1027,7 +1048,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
     let (sock, local, h2_listener) = if let Some(paired) = paired {
         paired
     } else {
-        let sock = UdpSocket::bind(address)
+        let sock = lane_udp_bind(address)
             .map_err(|error| format!("cannot bind masque `{address}`: {error}"))?;
         let local = sock
             .local_addr()
@@ -2638,6 +2659,18 @@ mod tests {
         );
         let port = serve_inbound(&inbound, &freedom(redirect), "127.0.0.1:0").expect("serve");
         (inbound, port)
+    }
+
+    /// The pair's port budget is what the h2 listener competes for: once the budget is spent, the inbound must fall back to UDP-first so h3 still binds, not give up serving.
+    #[test]
+    fn an_h2_pair_exhausting_the_udp_budget_still_serves_h3() {
+        let exhaustion = 9;
+        HELD_H2_UDP_BINDS.with(|held| held.set(exhaustion));
+        let inbound = inbound_h2(
+            r#"{"users":[{"email":"u@example.com","pass":"p"}],"address":["10.14.0.1/24","fd14::1/64"]}"#,
+        );
+        let _port = serve_inbound(&inbound, &freedom("127.0.0.1:0"), "127.0.0.1:0")
+            .expect("h3 survives the pair failing to converge");
     }
 
     fn freedom(redirect: &str) -> Outbound {
