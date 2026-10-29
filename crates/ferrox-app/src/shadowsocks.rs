@@ -884,21 +884,21 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool)
                     }
                     tables[which].insert(dest, src);
                     let payload = &buf[SEAL_ROOM + payload.start..SEAL_ROOM + payload.end];
-                    let (upstream, upstream6) = &upstreams[which];
+                    let (v4, v6) = &upstreams[which];
                     if dest.is_ipv6() {
-                        if let Some(sock) = upstream6 {
+                        if let Some(sock) = v6 {
                             let _ = sock.send_to(payload, dest);
                         }
                     } else {
-                        let _ = upstream.send_to(payload, dest);
+                        let _ = v4.send_to(payload, dest);
                     }
                 }
             }
             Err(error) if crate::proxy::is_timeout(&error) => {}
             Err(_) => break,
         }
-        for (which, (upstream, upstream6)) in upstreams.iter().enumerate() {
-            for sock in std::iter::once(upstream).chain(upstream6.as_ref()) {
+        for (which, (v4, v6)) in upstreams.iter().enumerate() {
+            for sock in std::iter::once(v4).chain(v6.as_ref()) {
                 while let Ok((n, src)) = sock.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF])
                 {
                     if let Some(&client) = tables[which].get(&src) {
