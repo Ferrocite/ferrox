@@ -224,6 +224,7 @@ impl ScriptRouter {
             network: match flow.network {
                 Network::Tcp => NETWORK_TCP,
                 Network::Udp => NETWORK_UDP,
+                Network::Other(raw) => i64::from(raw),
             },
             protocol: flow.protocol.unwrap_or("").to_owned(),
             user: flow.user.unwrap_or("").to_owned(),

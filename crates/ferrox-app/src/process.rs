@@ -53,6 +53,7 @@ fn socket_inode(network: Network, source: SocketAddr) -> Option<String> {
             &["/proc/net/udp6", "/proc/net/udp"],
             local_hex(&ip.octets(), source.port()),
         ),
+        (Network::Other(_), _) => return None,
     };
     // A wildcard-bound UDP socket lists under the zero address, so its port alone names it; the reference keeps the last.
     let port = matches!(network, Network::Udp).then(|| format!(":{:04X}", source.port()));

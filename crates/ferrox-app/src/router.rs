@@ -21,6 +21,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) enum Network {
     Tcp,
     Udp,
+    /// A network no selector this tree accepts names — xray's `unknown` (0) or `unix` (4) — with
+    /// the value it arrived as, so a tested context reaches a script unchanged.
+    Other(u8),
 }
 
 impl Network {
@@ -51,6 +54,45 @@ pub(crate) struct Flow<'a> {
     pub(crate) attrs: Option<&'a Attributes<'a>>,
     /// The process that owns the client socket, which a `process` rule names.
     pub(crate) process: Option<&'a crate::process::Owner>,
+}
+
+/// A context `RoutingService.TestRoute` hands to the table: xray's routing context names a list per
+/// address role rather than one address, so every combination is a flow that could match.
+pub(crate) struct Probe<'a> {
+    pub(crate) network: Network,
+    pub(crate) domain: Option<&'a str>,
+    pub(crate) port: Option<u16>,
+    pub(crate) inbound_tag: Option<&'a str>,
+    pub(crate) protocol: Option<&'a str>,
+    pub(crate) user: Option<&'a str>,
+    pub(crate) attrs: Option<&'a Attributes<'a>>,
+    pub(crate) targets: Vec<Option<IpAddr>>,
+    pub(crate) sources: Vec<Option<SocketAddr>>,
+    pub(crate) locals: Vec<Option<SocketAddr>>,
+}
+
+impl Probe<'_> {
+    /// One combination of the named addresses, as a live flow would carry it.
+    pub(crate) fn flow(
+        &self,
+        ip: Option<IpAddr>,
+        source: Option<SocketAddr>,
+        local: Option<SocketAddr>,
+    ) -> Flow<'_> {
+        Flow {
+            network: self.network,
+            domain: self.domain,
+            ip,
+            port: self.port,
+            source,
+            local,
+            inbound_tag: self.inbound_tag,
+            protocol: self.protocol,
+            user: self.user,
+            attrs: self.attrs,
+            process: None,
+        }
+    }
 }
 
 /// The attributes of one HTTP request head — `:method`, `:path`, then every header — as the front or
@@ -273,6 +315,15 @@ fn rule_hit(rule: &Rule) -> RuleHit<'_> {
     }
 }
 
+/// One rule as `RoutingService.ListRule` lists it: the tag the rule names (empty when it names a
+/// balancer, as the reference's one-of leaves `Tag` empty) and the rule's own tag.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ListedRule<'a> {
+    pub(crate) target: &'a str,
+    pub(crate) balancer: bool,
+    pub(crate) tag: Option<&'a str>,
+}
+
 #[derive(Debug)]
 pub(crate) struct Routing {
     strategy: DomainStrategy,
@@ -295,6 +346,8 @@ pub(crate) struct Balancer {
     index: AtomicUsize,
     seed: AtomicU64,
     weights: std::sync::Mutex<HashMap<String, f64>>,
+    /// The tag `OverrideBalancerTarget` forced, which the strategy never sees until it is cleared.
+    forced: std::sync::Mutex<Option<Arc<str>>>,
 }
 
 #[derive(Debug)]
@@ -360,6 +413,38 @@ impl Balancer {
         self.fallback.as_deref()
     }
 
+    /// The tag `RoutingService.OverrideBalancerTarget` forced, empty when the strategy decides.
+    pub(crate) fn forced(&self) -> String {
+        self.forced
+            .lock()
+            .ok()
+            .and_then(|forced| forced.as_deref().map(str::to_owned))
+            .unwrap_or_default()
+    }
+
+    /// Force every flow this balancer routes to `target`; an empty target hands the pick back.
+    pub(crate) fn force(&self, target: &str) {
+        if let Ok(mut forced) = self.forced.lock() {
+            *forced = (!target.is_empty()).then(|| Arc::from(target));
+        }
+    }
+
+    /// The tags `RoutingService.GetBalancerInfo` reports as the strategy's principle target: every
+    /// candidate the strategy would draw from, which is what each of the reference's four names.
+    pub(crate) fn principle<'a>(
+        &self,
+        candidates: &'a [String],
+        observed: Option<&[Observed]>,
+    ) -> Vec<&'a str> {
+        match &self.strategy {
+            Strategy::RoundRobin | Strategy::Random => {
+                candidates.iter().map(String::as_str).collect()
+            }
+            Strategy::LeastPing => vec![least_ping(candidates, observed).unwrap_or("")],
+            Strategy::LeastLoad(settings) => self.least_load_tags(candidates, observed, settings),
+        }
+    }
+
     /// The candidate for one flow. The two health strategies name nothing without a reading, so
     /// the caller falls back exactly as the reference does without an observatory. `random` and
     /// `roundRobin` drop a candidate the observatory reports dead only when a `fallbackTag` makes
@@ -368,7 +453,12 @@ impl Balancer {
         &self,
         candidates: &'a [String],
         observed: Option<&[Observed]>,
-    ) -> Option<&'a str> {
+    ) -> Option<Cow<'a, str>> {
+        if let Ok(forced) = self.forced.lock() {
+            if let Some(forced) = forced.as_deref() {
+                return Some(Cow::Owned(forced.to_owned()));
+            }
+        }
         if candidates.is_empty() {
             return None;
         }
@@ -380,7 +470,7 @@ impl Balancer {
                     return None;
                 }
                 let at = self.index.fetch_add(1, Ordering::Relaxed) % count;
-                Some(alive[at].as_str())
+                Some(Cow::Borrowed(alive[at].as_str()))
             }
             Strategy::Random => {
                 let alive = self.alive_candidates(candidates, observed);
@@ -389,10 +479,17 @@ impl Balancer {
                     return None;
                 }
                 let at = self.random_index(count);
-                Some(alive[at].as_str())
+                Some(Cow::Borrowed(alive[at].as_str()))
             }
-            Strategy::LeastPing => least_ping(candidates, observed),
-            Strategy::LeastLoad(settings) => self.least_load(candidates, observed, settings),
+            Strategy::LeastPing => least_ping(candidates, observed).map(Cow::Borrowed),
+            Strategy::LeastLoad(settings) => {
+                let tags = self.least_load_tags(candidates, observed, settings);
+                match tags.len() {
+                    0 => None,
+                    1 => Some(Cow::Borrowed(tags[0])),
+                    count => Some(Cow::Borrowed(tags[self.random_index(count)])),
+                }
+            }
         }
     }
 
@@ -424,14 +521,18 @@ impl Balancer {
         (state % count as u64) as usize
     }
 
+    /// The tags the strategy draws from, best first: the qualified nodes the baselines and the
+    /// expected count leave, borrowed from `candidates` so a caller can hand them out.
     #[allow(clippy::cast_precision_loss)]
-    fn least_load<'a>(
+    fn least_load_tags<'a>(
         &self,
         candidates: &'a [String],
         observed: Option<&[Observed]>,
         settings: &LeastLoad,
-    ) -> Option<&'a str> {
-        let observed = observed?;
+    ) -> Vec<&'a str> {
+        let Some(observed) = observed else {
+            return Vec::new();
+        };
         let mut nodes: Vec<Node> = observed
             .iter()
             .filter(|status| settings.selects(status, candidates))
@@ -456,7 +557,7 @@ impl Balancer {
             })
             .collect();
         if nodes.is_empty() {
-            return None;
+            return Vec::new();
         }
         nodes.sort_by(|left, right| {
             left.cost
@@ -467,16 +568,15 @@ impl Balancer {
                 .then(left.tag.cmp(right.tag))
         });
         let count = settings.selected(&nodes);
-        let chosen = if count > 1 {
-            self.random_index(count)
-        } else {
-            0
-        };
-        let tag = nodes[chosen].tag;
-        candidates
+        nodes[..count]
             .iter()
-            .find(|candidate| candidate.as_str() == tag)
-            .map(String::as_str)
+            .filter_map(|node| {
+                candidates
+                    .iter()
+                    .find(|candidate| candidate.as_str() == node.tag)
+                    .map(String::as_str)
+            })
+            .collect()
     }
 
     fn weight_for(&self, tag: &str, settings: &LeastLoad) -> f64 {
@@ -534,6 +634,7 @@ impl Balancer {
             index: AtomicUsize::new(0),
             seed: AtomicU64::new(seed),
             weights: std::sync::Mutex::new(HashMap::new()),
+            forced: std::sync::Mutex::new(None),
         })
     }
 }
@@ -1036,6 +1137,15 @@ impl Routing {
         })
     }
 
+    /// Every rule in table order, for the management API's listing.
+    pub(crate) fn listed_rules(&self) -> impl Iterator<Item = ListedRule<'_>> {
+        self.rules.iter().map(|rule| ListedRule {
+            target: rule.target.as_str(),
+            balancer: rule.balancer,
+            tag: rule.tag.as_deref(),
+        })
+    }
+
     pub(crate) fn balancers(&self) -> impl Iterator<Item = &Balancer> {
         self.balancers.iter()
     }
@@ -1058,6 +1168,27 @@ impl Routing {
         self.route_target_with(flow, &resolve_ips)
     }
 
+    /// The target the earliest rule that any of a tested context's address choices matches names:
+    /// xray reads each address list as any-of, where a live flow carries one address per role.
+    pub(crate) fn probe_target(&self, probe: &Probe<'_>) -> Option<RouteTarget<'_>> {
+        let mut best = None;
+        for ip in &probe.targets {
+            for source in &probe.sources {
+                for local in &probe.locals {
+                    if let Some(at) =
+                        self.route_index_with(&probe.flow(*ip, *source, *local), &resolve_ips)
+                    {
+                        best = Some(best.map_or(at, |best: usize| best.min(at)));
+                        if at == 0 {
+                            return Some(rule_hit(&self.rules[0]).target);
+                        }
+                    }
+                }
+            }
+        }
+        best.map(|at| rule_hit(&self.rules[at]).target)
+    }
+
     #[cfg(test)]
     fn route_with(&self, flow: &Flow, resolve: &dyn Fn(&str, u16) -> Vec<IpAddr>) -> Option<&str> {
         self.route_target_with(flow, resolve).map(|hit| hit.tag())
@@ -1068,6 +1199,15 @@ impl Routing {
         flow: &Flow,
         resolve: &dyn Fn(&str, u16) -> Vec<IpAddr>,
     ) -> Option<RuleHit<'_>> {
+        self.route_index_with(flow, resolve)
+            .map(|at| rule_hit(&self.rules[at]))
+    }
+
+    fn route_index_with(
+        &self,
+        flow: &Flow,
+        resolve: &dyn Fn(&str, u16) -> Vec<IpAddr>,
+    ) -> Option<usize> {
         let lower = OnceCell::new();
         let names = flow.domain.map(|raw| Names {
             raw,
@@ -1077,38 +1217,36 @@ impl Routing {
         match self.strategy {
             DomainStrategy::AsIs => {
                 let mut ips = Ips::never();
-                self.first_match(flow, names, &mut ips).map(rule_hit)
+                self.first_match(flow, names, &mut ips)
             }
             DomainStrategy::IpOnDemand => {
                 let mut ips = Ips::lazy(resolve);
-                self.first_match(flow, names, &mut ips).map(rule_hit)
+                self.first_match(flow, names, &mut ips)
             }
-            DomainStrategy::IpIfNonMatch => self
-                .first_match_if_non_match(flow, names, resolve)
-                .map(rule_hit),
+            DomainStrategy::IpIfNonMatch => self.first_match_if_non_match(flow, names, resolve),
         }
     }
 
-    fn first_match<'a>(
-        &'a self,
+    fn first_match(
+        &self,
         flow: &Flow,
         names: Option<Names<'_>>,
         ips: &mut Ips<'_>,
-    ) -> Option<&'a Rule> {
+    ) -> Option<usize> {
         self.rules
             .iter()
-            .find(|rule| rule.matches(flow, names, ips))
+            .position(|rule| rule.matches(flow, names, ips))
     }
 
     /// `IpIfNonMatch` only resolves when a rule whose other selectors already hold still has an
     /// address set to test, and the second pass visits only those rules: a rule that failed on a
     /// port, a name or a source cannot be turned by an address it never names.
-    fn first_match_if_non_match<'a>(
-        &'a self,
+    fn first_match_if_non_match(
+        &self,
         flow: &Flow,
         names: Option<Names<'_>>,
         resolve: &dyn Fn(&str, u16) -> Vec<IpAddr>,
-    ) -> Option<&'a Rule> {
+    ) -> Option<usize> {
         let mut pending = [0u64; 4];
         let mut spilled = false;
         for (at, rule) in self.rules.iter().enumerate() {
@@ -1119,7 +1257,7 @@ impl Routing {
             let needs_ip = rule.ips.is_some() || matches!(verdict, Verdict::Unknown);
             if !needs_ip {
                 if matches!(verdict, Verdict::Yes) {
-                    return Some(rule);
+                    return Some(at);
                 }
                 continue;
             }
@@ -1127,7 +1265,7 @@ impl Routing {
                 if matches!(rule.set_verdict(flow, names, Some(&[ip])), Verdict::Yes)
                     && rule.ip_matches_any(&[ip])
                 {
-                    return Some(rule);
+                    return Some(at);
                 }
             } else if at < pending.len() * 64 {
                 pending[at / 64] |= 1 << (at % 64);
@@ -1146,15 +1284,19 @@ impl Routing {
             if pending[at / 64] & (1 << (at % 64)) != 0
                 && self.rules[at].matches_tail(flow, names, &addrs)
             {
-                return Some(&self.rules[at]);
+                return Some(at);
             }
         }
         if spilled {
-            return self.rules[pending.len() * 64..].iter().find(|rule| {
-                rule.base_matches(flow, names)
-                    && rule.needs_ip(flow, names)
-                    && rule.matches_tail(flow, names, &addrs)
-            });
+            let offset = pending.len() * 64;
+            return self.rules[offset..]
+                .iter()
+                .position(|rule| {
+                    rule.base_matches(flow, names)
+                        && rule.needs_ip(flow, names)
+                        && rule.matches_tail(flow, names, &addrs)
+                })
+                .map(|at| offset + at);
         }
         None
     }
@@ -5578,9 +5720,9 @@ mod tests {
         assert!(balancer.selects("lane-a") && balancer.selects("lane-b"));
         assert!(!balancer.selects("direct"));
         let candidates = vec!["lane-a".to_owned(), "lane-b".to_owned()];
-        assert_eq!(balancer.pick(&candidates, None), Some("lane-a"));
-        assert_eq!(balancer.pick(&candidates, None), Some("lane-b"));
-        assert_eq!(balancer.pick(&candidates, None), Some("lane-a"));
+        assert_eq!(balancer.pick(&candidates, None).as_deref(), Some("lane-a"));
+        assert_eq!(balancer.pick(&candidates, None).as_deref(), Some("lane-b"));
+        assert_eq!(balancer.pick(&candidates, None).as_deref(), Some("lane-a"));
         let flow = Flow {
             network: Network::Tcp,
             domain: Some("echo.test"),
@@ -5616,9 +5758,15 @@ mod tests {
         let balancer = routing.balancer("pool").expect("the balancer");
         let candidates = vec!["lane-a".to_owned(), "lane-b".to_owned()];
         let first = [observed("lane-a", true, 30), observed("lane-b", true, 10)];
-        assert_eq!(balancer.pick(&candidates, Some(&first)), Some("lane-b"));
+        assert_eq!(
+            balancer.pick(&candidates, Some(&first)).as_deref(),
+            Some("lane-b")
+        );
         let dead = [observed("lane-a", false, 1), observed("lane-b", true, 90)];
-        assert_eq!(balancer.pick(&candidates, Some(&dead)), Some("lane-b"));
+        assert_eq!(
+            balancer.pick(&candidates, Some(&dead)).as_deref(),
+            Some("lane-b")
+        );
     }
 
     #[test]
@@ -5667,7 +5815,10 @@ mod tests {
             average: 10_000_000,
         });
         let observed = [observed("lane-a", true, 10), b];
-        assert_eq!(balancer.pick(&candidates, Some(&observed)), Some("lane-a"));
+        assert_eq!(
+            balancer.pick(&candidates, Some(&observed)).as_deref(),
+            Some("lane-a")
+        );
     }
 
     #[test]
@@ -5699,7 +5850,8 @@ mod tests {
                     .pick(&candidates, Some(&observed))
             })
             .collect::<Vec<_>>();
-        assert!(picks.contains(&Some("lane-a")) && picks.contains(&Some("lane-b")));
+        assert!(picks.iter().any(|p| p.as_deref() == Some("lane-a")));
+        assert!(picks.iter().any(|p| p.as_deref() == Some("lane-b")));
         let filtered = Routing::parse_in(&parse(true), vec![dir()])
             .expect("parses")
             .expect("routing");
@@ -5708,7 +5860,8 @@ mod tests {
                 filtered
                     .balancer("pool")
                     .expect("balancer")
-                    .pick(&candidates, Some(&observed)),
+                    .pick(&candidates, Some(&observed))
+                    .as_deref(),
                 Some("lane-b")
             );
         }

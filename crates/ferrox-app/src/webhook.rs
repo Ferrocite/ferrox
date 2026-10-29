@@ -304,6 +304,8 @@ fn event_body(event: &Event<'_>) -> String {
     let network = match event.network {
         Network::Tcp => "tcp",
         Network::Udp => "udp",
+        Network::Other(4) => "unix",
+        Network::Other(_) => "unknown",
     };
     let mut out = String::with_capacity(320);
     out.push_str("{\"email\":");
