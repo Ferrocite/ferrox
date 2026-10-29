@@ -1198,13 +1198,13 @@ enum Role {
         decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
     },
     Trojan {
-        key: [u8; 56],
+        keys: std::sync::Arc<[[u8; 56]]>,
         carrier: Carrier,
         freedom: bool,
         account: InboundAccount,
     },
     TrojanTls {
-        key: [u8; 56],
+        keys: std::sync::Arc<[[u8; 56]]>,
         carrier: Carrier,
         freedom: bool,
         server: Arc<ferrox_core::tls::TlsServerConfig>,
@@ -8549,7 +8549,7 @@ fn serve_vless_kcp_reality(
     }
 }
 
-fn serve_trojan_kcp(conn: &Arc<ferrox_core::kcp::Connection>, key: &[u8; 56], freedom: bool) {
+fn serve_trojan_kcp(conn: &Arc<ferrox_core::kcp::Connection>, key: &[[u8; 56]], freedom: bool) {
     let mut io = KcpIo {
         conn: Arc::clone(conn),
     };
@@ -8575,7 +8575,7 @@ fn serve_trojan_kcp(conn: &Arc<ferrox_core::kcp::Connection>, key: &[u8; 56], fr
 
 fn serve_trojan_kcp_tls(
     conn: &Arc<ferrox_core::kcp::Connection>,
-    key: &[u8; 56],
+    key: &[[u8; 56]],
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
 ) {
@@ -8987,7 +8987,7 @@ fn serve_vless_xdrive(mut session: crate::xdrive::Conn, users: &[VlessUser], fre
     xdrive_relay(&uplink, session);
 }
 
-fn serve_trojan_xdrive(mut session: crate::xdrive::Conn, key: &[u8; 56], freedom: bool) {
+fn serve_trojan_xdrive(mut session: crate::xdrive::Conn, key: &[[u8; 56]], freedom: bool) {
     let Some((cmd, target)) = decode_trojan_request(&mut session, key) else {
         return;
     };
@@ -9210,7 +9210,7 @@ fn hc_content_length(head: &str) -> Option<usize> {
 }
 
 fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
-    let key = trojan_key(&inbound_password(inbound));
+    let key = inbound_trojan_keys(inbound);
     let account = inbound_account(inbound);
     let sec = stream_security(inbound);
     // A REALITY inbound has no Trojan arm yet, and reading only `tls` here would serve it as plaintext.
@@ -9271,7 +9271,7 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
                 inbound_role(
                     inbound,
                     Role::TrojanTls {
-                        key,
+                        keys: key,
                         carrier,
                         freedom,
                         server,
@@ -9289,7 +9289,7 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
                 inbound_role(
                     inbound,
                     Role::Trojan {
-                        key,
+                        keys: key,
                         carrier,
                         freedom,
                         account,
@@ -14084,7 +14084,7 @@ fn dial_ss_xhttp(
     true
 }
 
-fn serve_trojan(stream: Connection, key: &[u8; 56], carrier: &Carrier, freedom: bool) {
+fn serve_trojan(stream: Connection, key: &[[u8; 56]], carrier: &Carrier, freedom: bool) {
     match carrier {
         Carrier::Raw(_) => serve_trojan_raw(stream, key, freedom),
         Carrier::Ws { path, .. } => serve_trojan_ws(stream, key, path.as_str(), freedom),
@@ -14102,7 +14102,7 @@ fn serve_trojan(stream: Connection, key: &[u8; 56], carrier: &Carrier, freedom: 
     }
 }
 
-fn serve_trojan_raw(mut stream: Connection, key: &[u8; 56], freedom: bool) {
+fn serve_trojan_raw(mut stream: Connection, key: &[[u8; 56]], freedom: bool) {
     // Bound only the opening request read to a wall-clock budget, then restore the blocking relay reads behind it.
     let budget = budgets::handshake();
     let _ = stream.set_read_timeout(Some(budget));
@@ -14253,7 +14253,7 @@ fn pump_trojan_replies(
     }
 }
 
-fn serve_trojan_ws(stream: Connection, key: &[u8; 56], path: &str, freedom: bool) {
+fn serve_trojan_ws(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bool) {
     let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
         return;
     };
@@ -14280,7 +14280,7 @@ fn serve_trojan_ws(stream: Connection, key: &[u8; 56], path: &str, freedom: bool
 
 fn serve_trojan_httpupgrade(
     stream: Connection,
-    key: &[u8; 56],
+    key: &[[u8; 56]],
     path: &str,
     host: &str,
     freedom: bool,
@@ -14315,7 +14315,7 @@ fn serve_trojan_httpupgrade(
 
 fn serve_trojan_grpc(
     stream: Connection,
-    key: &[u8; 56],
+    key: &[[u8; 56]],
     settings: &crate::config::GrpcSettings,
     freedom: bool,
 ) {
@@ -14344,7 +14344,7 @@ fn serve_trojan_grpc(
     crate::proxy::relay_sink(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
 }
 
-fn serve_trojan_xhttp(stream: Connection, key: &[u8; 56], path: &str, freedom: bool) {
+fn serve_trojan_xhttp(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bool) {
     let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
@@ -14369,7 +14369,7 @@ fn serve_trojan_xhttp(stream: Connection, key: &[u8; 56], path: &str, freedom: b
     crate::proxy::relay_sink_drained(reader, &writer, &uplink);
 }
 
-fn serve_trojan_httpheader(stream: Connection, key: &[u8; 56], path: &str, freedom: bool) {
+fn serve_trojan_httpheader(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bool) {
     let Some((mut reader, write)) = crate::httpheader::accept(stream, path) else {
         return;
     };
@@ -14401,7 +14401,7 @@ fn serve_trojan_httpheader(stream: Connection, key: &[u8; 56], path: &str, freed
 /// The session a trojan listener that declares `security: tls` answers: the raw carrier reads its request off the records, and every other carrier parses the stream the session already is.
 fn serve_trojan_tls(
     stream: Connection,
-    key: &[u8; 56],
+    key: &[[u8; 56]],
     carrier: &Carrier,
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
@@ -14473,7 +14473,7 @@ fn relay_trojan<S>(
     mut session: S,
     raw: Option<Connection>,
     kcp: Option<Arc<ferrox_core::kcp::Connection>>,
-    key: &[u8; 56],
+    key: &[[u8; 56]],
     freedom: bool,
 ) where
     S: std::io::Read
@@ -14503,7 +14503,7 @@ fn relay_trojan_with_fallbacks<S>(
     mut session: S,
     raw: Option<Connection>,
     kcp: Option<Arc<ferrox_core::kcp::Connection>>,
-    key: &[u8; 56],
+    key: &[[u8; 56]],
     freedom: bool,
     fallbacks: Option<&[Fallback]>,
     front: &FrontNames,
@@ -14531,7 +14531,7 @@ fn relay_trojan_with_fallbacks<S>(
             Ok(n) => n,
         }
     };
-    if n < 58 || window[56] != b'\r' || !key_agrees(&window[..56], key) {
+    if n < 58 || window[56] != b'\r' || !key.iter().any(|key| key_agrees(&window[..56], key)) {
         let Some(raw) = raw.as_ref() else {
             return;
         };
@@ -14651,7 +14651,7 @@ fn serve_session_trojan_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     read: R,
     write: W,
     path: &str,
-    key: &[u8; 56],
+    key: &[[u8; 56]],
     freedom: bool,
 ) {
     let Some((mut creader, cwriter)) = crate::ws::accept_split(read, write, path) else {
@@ -14690,7 +14690,7 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
-    key: &[u8; 56],
+    key: &[[u8; 56]],
     freedom: bool,
 ) {
     let Some((mut creader, cwriter)) =
@@ -14735,7 +14735,7 @@ fn serve_session_trojan_httpupgrade<R: Read + Send + 'static, W: Write + Clone +
     raw: Connection,
     path: &str,
     host: &str,
-    key: &[u8; 56],
+    key: &[[u8; 56]],
     freedom: bool,
 ) {
     let raw = Arc::new(raw);
@@ -14796,7 +14796,7 @@ fn serve_session_trojan_httpheader<R: Read + Send + 'static, W: Write + Clone + 
     write: W,
     raw: Connection,
     path: &str,
-    key: &[u8; 56],
+    key: &[[u8; 56]],
     freedom: bool,
 ) {
     let Some((mut creader, cwriter)) = crate::httpheader::accept_split(read, write, path) else {
@@ -14844,7 +14844,7 @@ fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     read: R,
     write: W,
     settings: &crate::config::GrpcSettings,
-    key: &[u8; 56],
+    key: &[[u8; 56]],
     freedom: bool,
 ) {
     let Some((mut creader, cwriter)) = crate::grpc::accept_split_with(read, write, settings) else {
@@ -21518,11 +21518,11 @@ fn trojan_take(
 }
 
 /// The whole header in one read, parsed in place: 2-3 reads where the field-at-a-time parse spent 7-8.
-fn decode_trojan_request(stream: &mut dyn Read, key: &[u8; 56]) -> Option<(u8, SocketAddr)> {
+fn decode_trojan_request(stream: &mut dyn Read, key: &[[u8; 56]]) -> Option<(u8, SocketAddr)> {
     let mut head = [0u8; TROJAN_HEAD_MAX];
     let mut filled = 0usize;
     if !trojan_take(stream, &mut head, &mut filled, 60)
-        || !key_agrees(&head[..56], key)
+        || !key.iter().any(|key| key_agrees(&head[..56], key))
         || head[56..58] != *b"\r\n"
     {
         return None;
@@ -22583,6 +22583,26 @@ fn inbound_password(inbound: &Json) -> String {
         .and_then(Json::as_str)
         .unwrap_or("")
         .to_owned()
+}
+
+/// Every password a trojan inbound lists: any of them opens it, as xray builds one account per client.
+fn inbound_trojan_keys(inbound: &Json) -> std::sync::Arc<[[u8; 56]]> {
+    let keys: Vec<[u8; 56]> = inbound
+        .get("settings")
+        .and_then(|s| s.get("clients"))
+        .and_then(Json::as_arr)
+        .map(|clients| {
+            clients
+                .iter()
+                .filter_map(|client| client.get("password").and_then(Json::as_str))
+                .map(trojan_key)
+                .collect()
+        })
+        .unwrap_or_default();
+    if keys.is_empty() {
+        return std::sync::Arc::from([trojan_key(&inbound_password(inbound))]);
+    }
+    std::sync::Arc::from(keys)
 }
 
 fn hysteria_transport(outbound: &Json) -> bool {
@@ -27973,7 +27993,7 @@ mod tests {
             for stream in server.incoming().take(2) {
                 let Ok(stream) = stream else { continue };
                 thread::spawn(move || {
-                    serve_trojan_raw(stream, &trojan_key("an-example-shared-password"), true);
+                    serve_trojan_raw(stream, &[trojan_key("an-example-shared-password")], true);
                 });
             }
         });
@@ -28039,7 +28059,7 @@ mod tests {
                 wire: &wire,
                 reads: 0,
             };
-            let (cmd, _) = decode_trojan_request(&mut reader, &key)
+            let (cmd, _) = decode_trojan_request(&mut reader, &[key])
                 .unwrap_or_else(|| panic!("decodes {addr:?}"));
             assert_eq!(cmd, 1, "{addr:?}");
             assert_eq!(reader.reads, reads, "{addr:?}");
@@ -28141,6 +28161,33 @@ mod tests {
             assert!(!key_agrees(&other, &key), "byte {at} differs");
         }
         assert!(!key_agrees(&key[..55], &key), "a short read never agrees");
+    }
+
+    /// xray makes one account per `clients` entry, so a header carrying any of them opens the inbound.
+    #[test]
+    fn a_trojan_inbound_accepts_every_clients_password() {
+        let inbound = crate::json::parse(
+            r#"{"protocol": "trojan", "settings": {"clients": [
+                {"password": "first-password"}, {"password": "second-password"}]}}"#,
+        )
+        .expect("parses");
+        let keys = inbound_trojan_keys(&inbound);
+        let ask = |password: &str| {
+            let mut header = trojan_key(password).to_vec();
+            header.extend_from_slice(b"\r\n\x01\x01\x7f\x00\x00\x01\x1f\x90\r\n");
+            header
+        };
+        let mut second = std::io::Cursor::new(ask("second-password"));
+        let (cmd, target) =
+            decode_trojan_request(&mut second, &keys).expect("the second client authenticates");
+        assert_eq!(cmd, 1);
+        assert_eq!(target.port(), 8080);
+        assert_eq!(keys.len(), 2, "one key per client");
+        let mut stranger = std::io::Cursor::new(ask("nobody-lists-this"));
+        assert!(
+            decode_trojan_request(&mut stranger, &keys).is_none(),
+            "a password no client lists is refused"
+        );
     }
 
     #[test]
@@ -30734,7 +30781,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_trojan_raw(stream, &key, true);
+            serve_trojan_raw(stream, &[key], true);
             let _ = done_tx.send(());
         });
         let _peer = Connection::connect(addr).expect("connects");
@@ -31017,7 +31064,12 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_trojan_grpc(stream, &key, &crate::config::GrpcSettings::path("/p"), true);
+            serve_trojan_grpc(
+                stream,
+                &[key],
+                &crate::config::GrpcSettings::path("/p"),
+                true,
+            );
             let _ = done_tx.send(());
         });
         let stream = Connection::connect(addr).expect("connects");
@@ -31078,7 +31130,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_trojan_raw(stream, &key, true);
+            serve_trojan_raw(stream, &[key], true);
             let _ = done_tx.send(());
         });
         let mut peer = Connection::connect(addr).expect("connects");
@@ -32674,7 +32726,7 @@ mod tests {
             let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
             tls.handshake().expect("handshakes");
             echo_trace(&format!("srv {port} handshook"));
-            let Some((cmd, _target)) = decode_trojan_request(&mut tls, &key) else {
+            let Some((cmd, _target)) = decode_trojan_request(&mut tls, &[key]) else {
                 panic!("reads a trojan header");
             };
             assert_eq!(cmd, 1);
@@ -33386,7 +33438,7 @@ mod tests {
             )
             .expect("accepts");
             assert!(shake_tls(&mut tls), "handshakes");
-            let (cmd, _asked) = decode_trojan_request(&mut tls, &key).expect("reads the header");
+            let (cmd, _asked) = decode_trojan_request(&mut tls, &[key]).expect("reads the header");
             assert_eq!(cmd, 1);
             let mut back = [0u8; 4];
             ferrox_core::tls::read_exact(&mut tls, &mut back).expect("reads ping");
@@ -34541,7 +34593,7 @@ mod tests {
                     echo_trace(&format!("srv {port} echoed vless"));
                 }
                 TlsEcho::Trojan(key) => {
-                    let Some((cmd, _target)) = decode_trojan_request(&mut reader, &key) else {
+                    let Some((cmd, _target)) = decode_trojan_request(&mut reader, &[key]) else {
                         panic!("reads a trojan header");
                     };
                     assert_eq!(cmd, 1);
@@ -35201,7 +35253,7 @@ mod tests {
         let front_port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_trojan_ws(stream, &trojan_key("secret"), "/tunnel", true);
+            serve_trojan_ws(stream, &[trojan_key("secret")], "/tunnel", true);
         });
         let uplink = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         uplink
@@ -36279,7 +36331,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_trojan_raw(stream, &key, true);
+            serve_trojan_raw(stream, &[key], true);
         });
         let mut stream = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
         stream
@@ -36325,7 +36377,7 @@ mod tests {
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = tunnel.accept().expect("accepts");
-            serve_trojan_raw(stream, &trojan_key("secret"), true);
+            serve_trojan_raw(stream, &[trojan_key("secret")], true);
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -38372,7 +38424,7 @@ mod tests {
         let front_port = front.local_addr().expect("addr").port();
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
-            serve_trojan_ws(stream, &trojan_key("secret"), "/tunnel", true);
+            serve_trojan_ws(stream, &[trojan_key("secret")], "/tunnel", true);
         });
         let uplink = Connection::connect(("127.0.0.1", front_port)).expect("connects");
         uplink
@@ -38717,7 +38769,7 @@ mod tests {
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
                 let Ok(stream) = stream else { continue };
-                serve_trojan_ws(stream, &trojan_key("secret"), "/tunnel", true);
+                serve_trojan_ws(stream, &[trojan_key("secret")], "/tunnel", true);
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -38783,7 +38835,7 @@ mod tests {
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
                 let Ok(stream) = stream else { continue };
-                serve_trojan_httpupgrade(stream, &trojan_key("secret"), "/tunnel", "", true);
+                serve_trojan_httpupgrade(stream, &[trojan_key("secret")], "/tunnel", "", true);
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -38852,7 +38904,7 @@ mod tests {
                 let Ok(stream) = stream else { continue };
                 serve_trojan_grpc(
                     stream,
-                    &trojan_key("secret"),
+                    &[trojan_key("secret")],
                     &crate::config::GrpcSettings::path("/Tun"),
                     true,
                 );
@@ -38918,7 +38970,7 @@ mod tests {
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
                 let Ok(stream) = stream else { continue };
-                serve_trojan_xhttp(stream, &trojan_key("secret"), "/tunnel", true);
+                serve_trojan_xhttp(stream, &[trojan_key("secret")], "/tunnel", true);
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -38983,7 +39035,7 @@ mod tests {
         thread::spawn(move || {
             for stream in tunnel.incoming().take(LADDER_TEST_UPLINKS) {
                 let Ok(stream) = stream else { continue };
-                serve_trojan_httpheader(stream, &trojan_key("secret"), "/tunnel", true);
+                serve_trojan_httpheader(stream, &[trojan_key("secret")], "/tunnel", true);
             }
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -39163,7 +39215,7 @@ mod tests {
     fn a_role_arms_its_carriers_chain() {
         let settings = crate::json::parse(FRAGMENT).expect("parses");
         let role = Role::Trojan {
-            key: [0u8; 56],
+            keys: std::sync::Arc::from([[0u8; 56]]),
             carrier: stream_carrier(Some(&settings)),
             freedom: false,
             account: InboundAccount::default(),
@@ -44649,7 +44701,7 @@ mod tests {
             front_dispatch(
                 stream,
                 Role::Trojan {
-                    key,
+                    keys: std::sync::Arc::from([key]),
                     carrier: Carrier::Raw(Chain::default()),
                     freedom: true,
                     account,
@@ -46085,7 +46137,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
             let conn = listener.accept().expect("accepts");
-            serve_trojan_kcp(&conn, &key, true);
+            serve_trojan_kcp(&conn, &[key], true);
             // The relay hands off, so the session outlives this call: keep the listener's feed alive.
             let _ = done_rx.recv();
         });
@@ -46120,7 +46172,7 @@ mod tests {
     fn socks_dials_trojan_over_kcp_to_echo() {
         let echo_port = echo_loop();
         let key = trojan_key("secret");
-        let serve: KcpServe = Arc::new(move |conn| serve_trojan_kcp(conn, &key, true));
+        let serve: KcpServe = Arc::new(move |conn| serve_trojan_kcp(conn, &[key], true));
         let kcp_port = kcp_loop_with(serve);
         let front_port = socks_front_with(Outbound::Trojan(TrojanOut {
             address: "127.0.0.1".to_owned(),
@@ -49649,13 +49701,13 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             decryption.as_deref(),
         ),
         Role::Trojan {
-            key,
+            keys,
             carrier,
             freedom,
             account: _,
-        } => serve_trojan(stream, &key, &carrier, freedom),
+        } => serve_trojan(stream, &keys, &carrier, freedom),
         Role::TrojanTls {
-            key,
+            keys,
             carrier,
             freedom,
             server,
@@ -49663,7 +49715,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             account: _,
         } => serve_trojan_tls(
             stream,
-            &key,
+            &keys,
             &carrier,
             freedom,
             &server,
