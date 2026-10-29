@@ -517,12 +517,6 @@ impl Api {
         };
         let context = RoutingContext::parse(raw)
             .map_err(|reason| (3, format!("routing context: {reason}")))?;
-        if context.vless_route != 0 {
-            return Err((
-                3,
-                "a tested route id is not carried: no flow this tree routes reads one".to_owned(),
-            ));
-        }
         let selectors = request_strs(request, 2);
         let pairs: Vec<(String, String)> = context
             .attrs
@@ -535,9 +529,7 @@ impl Api {
             })
             .collect();
         let attributes = (!pairs.is_empty()).then(|| crate::router::Attributes::from_pairs(&pairs));
-        let probe = context
-            .probe(attributes.as_ref())
-            .map_err(|reason| (3, reason))?;
+        let probe = context.probe(attributes.as_ref());
         let Some(tag) = self
             .runtime()?
             .tested_route(&probe)
@@ -1088,41 +1080,22 @@ impl RoutingContext {
 
     /// The context the table reads: xray reads each address list as any-of, so every choice of
     /// source, target and local address is kept as a list and the earliest matching rule decides.
-    /// A port named without an address is not carried, because a flow's port lives on its address.
+    /// A port is kept apart from its address, so a context naming one without the other still routes.
     fn probe<'a>(
         &'a self,
         attrs: Option<&'a crate::router::Attributes<'a>>,
-    ) -> Result<crate::router::Probe<'a>, String> {
+    ) -> crate::router::Probe<'a> {
         let text =
             |raw: &'a Option<Vec<u8>>| raw.as_deref().and_then(|raw| std::str::from_utf8(raw).ok());
-        let addresses = |raw: &[Vec<u8>], port: u64, role: &str| {
-            let mut out: Vec<Option<std::net::SocketAddr>> = raw
-                .iter()
-                .filter_map(|bytes| ip(bytes))
-                .map(|ip| Some(std::net::SocketAddr::new(ip, port as u16)))
-                .collect();
+        let addresses = |raw: &[Vec<u8>]| {
+            let mut out: Vec<Option<std::net::IpAddr>> =
+                raw.iter().filter_map(|bytes| ip(bytes)).map(Some).collect();
             if out.is_empty() {
-                if port != 0 {
-                    return Err(format!(
-                        "a tested {role} port without a {role} address is not carried"
-                    ));
-                }
                 out.push(None);
             }
-            Ok(out)
+            out
         };
-        let sources = addresses(&self.source_ips, self.source_port, "source")?;
-        let locals = addresses(&self.local_ips, self.local_port, "local")?;
-        let mut targets: Vec<Option<std::net::IpAddr>> = self
-            .target_ips
-            .iter()
-            .filter_map(|bytes| ip(bytes))
-            .map(Some)
-            .collect();
-        if targets.is_empty() {
-            targets.push(None);
-        }
-        Ok(crate::router::Probe {
+        crate::router::Probe {
             network: match self.network {
                 2 => crate::router::Network::Tcp,
                 3 => crate::router::Network::Udp,
@@ -1134,10 +1107,13 @@ impl RoutingContext {
             protocol: text(&self.protocol),
             user: text(&self.user),
             attrs,
-            targets,
-            sources,
-            locals,
-        })
+            targets: addresses(&self.target_ips),
+            sources: addresses(&self.source_ips),
+            source_port: self.source_port as u16,
+            locals: addresses(&self.local_ips),
+            local_port: self.local_port as u16,
+            vless_route: self.vless_route as u16,
+        }
     }
 
     /// The answer, echoing the fields the request's selectors name plus the picked outbound. The
@@ -2093,15 +2069,6 @@ mod tests {
         assert_eq!(
             api.dispatch(path, &[]),
             Err((2, "Invalid routing request.".to_owned()))
-        );
-        let mut port_only = Vec::new();
-        field_varint(&mut port_only, 5, 9999);
-        assert_eq!(
-            api.dispatch(path, &test_route_request(&port_only, &[])),
-            Err((
-                3,
-                "a tested source port without a source address is not carried".to_owned()
-            ))
         );
     }
 

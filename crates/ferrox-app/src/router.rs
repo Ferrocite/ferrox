@@ -10,7 +10,7 @@ use crate::xray_pb::Reader;
 use std::borrow::Cow;
 use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::path::{Component, Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -37,15 +37,20 @@ impl Network {
 }
 
 /// One connection as the rules see it: absent fields match no rule, which is what keeps a selector
-/// from turning into an unconditional match on a front that cannot answer it.
+/// from turning into an unconditional match on a front that cannot answer it. An address and its
+/// port are apart because a tested context may name the port alone; `0` is unnamed, as `net.Port(0)` is.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Flow<'a> {
     pub(crate) network: Network,
     pub(crate) domain: Option<&'a str>,
     pub(crate) ip: Option<IpAddr>,
     pub(crate) port: Option<u16>,
-    pub(crate) source: Option<SocketAddr>,
-    pub(crate) local: Option<SocketAddr>,
+    pub(crate) source: Option<IpAddr>,
+    pub(crate) source_port: u16,
+    pub(crate) local: Option<IpAddr>,
+    pub(crate) local_port: u16,
+    /// The route id a VLESS client sent, which a `vlessRoute` rule names; 0 off such an inbound.
+    pub(crate) vless_route: u16,
     pub(crate) inbound_tag: Option<&'a str>,
     pub(crate) protocol: Option<&'a str>,
     /// The authenticated inbound account's email, which is what a `user` rule names.
@@ -67,8 +72,11 @@ pub(crate) struct Probe<'a> {
     pub(crate) user: Option<&'a str>,
     pub(crate) attrs: Option<&'a Attributes<'a>>,
     pub(crate) targets: Vec<Option<IpAddr>>,
-    pub(crate) sources: Vec<Option<SocketAddr>>,
-    pub(crate) locals: Vec<Option<SocketAddr>>,
+    pub(crate) sources: Vec<Option<IpAddr>>,
+    pub(crate) source_port: u16,
+    pub(crate) locals: Vec<Option<IpAddr>>,
+    pub(crate) local_port: u16,
+    pub(crate) vless_route: u16,
 }
 
 impl Probe<'_> {
@@ -76,8 +84,8 @@ impl Probe<'_> {
     pub(crate) fn flow(
         &self,
         ip: Option<IpAddr>,
-        source: Option<SocketAddr>,
-        local: Option<SocketAddr>,
+        source: Option<IpAddr>,
+        local: Option<IpAddr>,
     ) -> Flow<'_> {
         Flow {
             network: self.network,
@@ -85,7 +93,10 @@ impl Probe<'_> {
             ip,
             port: self.port,
             source,
+            source_port: self.source_port,
             local,
+            local_port: self.local_port,
+            vless_route: self.vless_route,
             inbound_tag: self.inbound_tag,
             protocol: self.protocol,
             user: self.user,
@@ -1168,25 +1179,26 @@ impl Routing {
         self.route_target_with(flow, &resolve_ips)
     }
 
-    /// The target the earliest rule that any of a tested context's address choices matches names:
-    /// xray reads each address list as any-of, where a live flow carries one address per role.
-    pub(crate) fn probe_target(&self, probe: &Probe<'_>) -> Option<RouteTarget<'_>> {
-        let mut best = None;
+    /// The earliest rule any of a tested context's address choices reaches: xray reads each address
+    /// list as any-of, where a live flow carries one address per role.
+    pub(crate) fn probe_rule(&self, probe: &Probe<'_>) -> Option<RuleHit<'_>> {
+        let mut best: Option<usize> = None;
         for ip in &probe.targets {
             for source in &probe.sources {
                 for local in &probe.locals {
-                    if let Some(at) =
-                        self.route_index_with(&probe.flow(*ip, *source, *local), &resolve_ips)
-                    {
-                        best = Some(best.map_or(at, |best: usize| best.min(at)));
+                    let flow = probe.flow(*ip, *source, *local);
+                    if let Some(at) = self.route_index_with(&flow, &resolve_ips) {
                         if at == 0 {
-                            return Some(rule_hit(&self.rules[0]).target);
+                            return Some(rule_hit(&self.rules[0]));
+                        }
+                        if best.is_none_or(|best| at < best) {
+                            best = Some(at);
                         }
                     }
                 }
             }
         }
-        best.map(|at| rule_hit(&self.rules[at]).target)
+        best.map(|at| rule_hit(&self.rules[at]))
     }
 
     #[cfg(test)]
@@ -1723,15 +1735,12 @@ impl Rule {
             }
         }
         if let Some(ports) = &self.source_ports {
-            if !flow
-                .source
-                .is_some_and(|source| ports.contains(source.port()))
-            {
+            if !ports.contains(flow.source_port) {
                 return false;
             }
         }
         if let Some(ports) = &self.local_ports {
-            if !flow.local.is_some_and(|local| ports.contains(local.port())) {
+            if !ports.contains(flow.local_port) {
                 return false;
             }
         }
@@ -1758,22 +1767,18 @@ impl Rule {
                 return false;
             }
         }
-        // No flow this tree routes carries a sent route id, so it reads 0 as xray's does off a non-vless inbound.
         if let Some(routes) = &self.vless_routes {
-            if !routes.contains(0) {
+            if !routes.contains(flow.vless_route) {
                 return false;
             }
         }
         if let Some(matcher) = &self.source_ips {
-            if !flow
-                .source
-                .is_some_and(|source| matcher.matches(source.ip()))
-            {
+            if !flow.source.is_some_and(|ip| matcher.matches(ip)) {
                 return false;
             }
         }
         if let Some(matcher) = &self.local_ips {
-            if !flow.local.is_some_and(|local| matcher.matches(local.ip())) {
+            if !flow.local.is_some_and(|ip| matcher.matches(ip)) {
                 return false;
             }
         }
@@ -2277,10 +2282,7 @@ impl SetRule {
             }
         }
         if let Some(ports) = &self.source_ports {
-            if !flow
-                .source
-                .is_some_and(|source| ports.contains(source.port()))
-            {
+            if !ports.contains(flow.source_port) {
                 return Verdict::No;
             }
         }
@@ -2293,10 +2295,7 @@ impl SetRule {
             }
         }
         if let Some(matcher) = &self.source_ips {
-            if !flow
-                .source
-                .is_some_and(|source| matcher.matches(source.ip()))
-            {
+            if !flow.source.is_some_and(|ip| matcher.matches(ip)) {
                 return Verdict::No;
             }
         }
@@ -3727,7 +3726,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -3762,7 +3764,10 @@ mod tests {
             ip: None,
             port,
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -3807,7 +3812,10 @@ mod tests {
             ip: None,
             port: Some(80),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -3845,7 +3853,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -4033,7 +4044,10 @@ mod tests {
             ip: Some(ip),
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -4103,7 +4117,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -4170,7 +4187,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: Some("public"),
             protocol: None,
             user: None,
@@ -4210,7 +4230,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -4251,7 +4274,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -4315,7 +4341,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -4399,7 +4428,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -4475,7 +4507,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -4528,7 +4563,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -4582,7 +4620,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -4777,7 +4818,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: Some("http1"),
             user: None,
@@ -4791,7 +4835,10 @@ mod tests {
             ip: None,
             port: None,
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -4821,7 +4868,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user,
@@ -4877,7 +4927,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: Some("in"),
             protocol: None,
             user: None,
@@ -4930,7 +4983,10 @@ mod tests {
                 ip: None,
                 port: Some(443),
                 source: None,
+                source_port: 0,
                 local: None,
+                local_port: 0,
+                vless_route: 0,
                 inbound_tag: None,
                 protocol: None,
                 user: None,
@@ -5027,8 +5083,11 @@ mod tests {
                 domain: Some("x.com"),
                 ip: None,
                 port: Some(443),
-                source: Some(source),
+                source: Some(source.ip()),
+                source_port: source.port(),
                 local: None,
+                local_port: 0,
+                vless_route: 0,
                 inbound_tag: None,
                 protocol: None,
                 user: None,
@@ -5107,7 +5166,10 @@ mod tests {
             ip: None,
             port: Some(100),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -5143,7 +5205,10 @@ mod tests {
             ip: Some("198.51.100.7".parse().expect("ip")),
             port: Some(101),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -5459,7 +5524,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -5489,7 +5557,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -5519,7 +5590,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -5555,7 +5629,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -5588,7 +5665,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -5621,7 +5701,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -5664,7 +5747,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -5679,7 +5765,8 @@ mod tests {
         assert_eq!(tag, None);
         assert_eq!(lookups.get(), 0);
         let from_source = Flow {
-            source: Some("10.1.2.3:4242".parse().expect("source")),
+            source: Some("10.1.2.3".parse().expect("source")),
+            source_port: 4242,
             ..flow
         };
         let lookups = std::cell::Cell::new(0);
@@ -5729,7 +5816,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -5930,7 +6020,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -5969,7 +6062,10 @@ mod tests {
             ip: None,
             port: Some(80),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,
@@ -6001,7 +6097,10 @@ mod tests {
             ip: None,
             port: Some(80),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: None,
             protocol: None,
             user: None,

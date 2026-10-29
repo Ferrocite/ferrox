@@ -1482,6 +1482,7 @@ impl RouteShared {
 
     /// The tag a tested context routes to: the same table, the same balancer pick and the same
     /// script a live flow would get, without the default outbound the reference leaves to the caller.
+    /// A matched rule's webhook fires here too, as the reference's `PickRoute` fires it.
     fn routed_tag(&self, probe: &crate::router::Probe<'_>) -> Result<Option<String>, String> {
         if let Some(script) = self.routing.script() {
             let Some(callbacks) = self.script.as_ref() else {
@@ -1490,10 +1491,10 @@ impl RouteShared {
             let first = probe.flow(probe.targets[0], probe.sources[0], probe.locals[0]);
             return script.route(&first, callbacks);
         }
-        let Some(target) = self.routing.probe_target(probe) else {
+        let Some(hit) = self.routing.probe_rule(probe) else {
             return Ok(None);
         };
-        let tag = match target {
+        let tag = match hit.target {
             crate::router::RouteTarget::Outbound(tag) => tag.to_owned(),
             crate::router::RouteTarget::Balancer(tag) => {
                 let Some(balancer) = self.routing.balancer(tag) else {
@@ -1516,7 +1517,40 @@ impl RouteShared {
                 }
             }
         };
+        if let Some(webhook) = hit.webhook {
+            let destination = destination_of(probe);
+            webhook.fire(&crate::webhook::Event {
+                email: probe.user,
+                level: None,
+                protocol: probe.protocol,
+                network: probe.network,
+                source: event_address(probe.sources.first().copied().flatten(), probe.source_port),
+                destination: destination.as_ref(),
+                original: None,
+                route: None,
+                inbound_tag: probe.inbound_tag,
+                inbound_name: None,
+                local: event_address(probe.locals.first().copied().flatten(), probe.local_port),
+                outbound_tag: &tag,
+            });
+        }
         Ok(Some(tag))
+    }
+}
+
+/// An event address: the reference joins a named address with its port, whether or not it is named.
+fn event_address(ip: Option<std::net::IpAddr>, port: u16) -> Option<std::net::SocketAddr> {
+    ip.map(|ip| std::net::SocketAddr::new(ip, port))
+}
+
+/// The destination a tested context names: a domain first, then its first target address, and none
+/// when it names neither, which the reference's event renders as null.
+fn destination_of(probe: &crate::router::Probe<'_>) -> Option<Destination> {
+    let port = probe.port.unwrap_or(0);
+    match (probe.domain, probe.targets.first().copied().flatten()) {
+        (Some(domain), _) => Some(Destination::Name(domain.to_owned(), port)),
+        (None, Some(ip)) => Some(Destination::Address(std::net::SocketAddr::new(ip, port))),
+        (None, None) => None,
     }
 }
 
@@ -1804,9 +1838,18 @@ impl RoutePlan {
             Destination::Name(host, _) => (Some(host.as_str()), None),
             Destination::Address(address) => (None, Some(address.ip())),
         };
-        let (source, local) = match (self.source_known, client) {
-            (true, Some(client)) => (client.peer_addr().ok(), client.local_addr().ok()),
-            _ => (None, None),
+        let (source, source_port, local, local_port) = match (self.source_known, client) {
+            (true, Some(client)) => {
+                let source = client.peer_addr().ok();
+                let local = client.local_addr().ok();
+                (
+                    source.map(|addr| addr.ip()),
+                    source.map_or(0, |addr| addr.port()),
+                    local.map(|addr| addr.ip()),
+                    local.map_or(0, |addr| addr.port()),
+                )
+            }
+            _ => (None, 0, None, 0),
         };
         let flow = crate::router::Flow {
             network,
@@ -1814,7 +1857,10 @@ impl RoutePlan {
             ip,
             port: Some(asked.port()),
             source,
+            source_port,
             local,
+            local_port,
+            vless_route: 0,
             inbound_tag: self.inbound_tag.as_deref(),
             protocol: facts.protocol,
             user: facts.user,
@@ -1852,13 +1898,13 @@ impl RoutePlan {
                 level: facts.level,
                 protocol: flow.protocol,
                 network: flow.network,
-                source: flow.source,
-                destination: asked,
-                original: facts.original,
+                source: event_address(flow.source, flow.source_port),
+                destination: Some(asked),
+                original: Some(facts.original.unwrap_or(asked)),
                 route: facts.route,
                 inbound_tag: flow.inbound_tag,
                 inbound_name: self.inbound_name.as_deref(),
-                local: flow.local,
+                local: event_address(flow.local, flow.local_port),
                 outbound_tag: tag.as_deref().unwrap_or(""),
             });
         }

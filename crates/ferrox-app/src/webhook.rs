@@ -39,14 +39,15 @@ struct Seen {
     swept: Instant,
 }
 
-/// The facts a matched flow hands the event, as the reference's `buildEvent` reads them.
+/// The facts a matched flow hands the event, as the reference's `buildEvent` reads them. A destination
+/// or original the flow does not name is null, which is what a tested context's event carries.
 pub(crate) struct Event<'a> {
     pub(crate) email: Option<&'a str>,
     pub(crate) level: Option<u32>,
     pub(crate) protocol: Option<&'a str>,
     pub(crate) network: Network,
     pub(crate) source: Option<SocketAddr>,
-    pub(crate) destination: &'a crate::proxy::Destination,
+    pub(crate) destination: Option<&'a crate::proxy::Destination>,
     pub(crate) original: Option<&'a crate::proxy::Destination>,
     pub(crate) route: Option<&'a crate::proxy::Destination>,
     pub(crate) inbound_tag: Option<&'a str>,
@@ -319,17 +320,11 @@ fn event_body(event: &Event<'_>) -> String {
     out.push_str(",\"source\":");
     push_address(&mut out, event.source);
     out.push_str(",\"destination\":");
-    push_string(&mut out, &event.destination.authority());
+    push_destination(&mut out, event.destination);
     out.push_str(",\"originalTarget\":");
-    push_string(
-        &mut out,
-        &event.original.unwrap_or(event.destination).authority(),
-    );
+    push_destination(&mut out, event.original);
     out.push_str(",\"routeTarget\":");
-    match event.route {
-        Some(route) => push_string(&mut out, &route.authority()),
-        None => out.push_str("null"),
-    }
+    push_destination(&mut out, event.route);
     out.push_str(",\"inboundTag\":");
     push_string(&mut out, event.inbound_tag.unwrap_or(""));
     out.push_str(",\"inboundName\":");
@@ -351,6 +346,14 @@ fn event_body(event: &Event<'_>) -> String {
 fn push_optional(out: &mut String, value: Option<&str>) {
     match value {
         Some(value) => push_string(out, value),
+        None => out.push_str("null"),
+    }
+}
+
+/// A destination as `host:port`, or the reference's nil pointer as `null`.
+fn push_destination(out: &mut String, value: Option<&crate::proxy::Destination>) {
+    match value {
+        Some(value) => push_string(out, &value.authority()),
         None => out.push_str("null"),
     }
 }
@@ -409,7 +412,7 @@ mod tests {
             protocol: None,
             network: Network::Tcp,
             source: None,
-            destination,
+            destination: Some(destination),
             original: None,
             route: None,
             inbound_tag: None,
@@ -435,7 +438,7 @@ mod tests {
             protocol: Some("http/1.1"),
             network: Network::Tcp,
             source: Some("127.0.0.1:1234".parse().expect("address")),
-            destination: &destination,
+            destination: Some(&destination),
             original: Some(&original),
             route: Some(&route),
             inbound_tag: Some("in"),
@@ -474,7 +477,7 @@ mod tests {
             head,
             "{\"email\":null,\"level\":null,\"protocol\":\"\",\"network\":\"tcp\",\
              \"source\":null,\"destination\":\"a\\\"\\u003cb\\u003e\\u0026\\\\c:1\",\
-             \"originalTarget\":\"a\\\"\\u003cb\\u003e\\u0026\\\\c:1\",\"routeTarget\":null,\
+             \"originalTarget\":null,\"routeTarget\":null,\
              \"inboundTag\":\"\",\"inboundName\":null,\"inboundLocal\":null,\"outboundTag\":\"direct\""
         );
     }

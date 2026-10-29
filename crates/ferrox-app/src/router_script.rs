@@ -213,13 +213,13 @@ impl ScriptRouter {
     ) -> Result<Option<String>, String> {
         let state = self.acquire()?;
         let context = ScriptContext {
-            source: flow.source.map(|addr| vec![addr.ip()]).unwrap_or_default(),
+            source: flow.source.map(|ip| vec![ip]).unwrap_or_default(),
             target: flow.ip.map(|ip| vec![ip]).unwrap_or_default(),
-            local: flow.local.map(|addr| vec![addr.ip()]).unwrap_or_default(),
+            local: flow.local.map(|ip| vec![ip]).unwrap_or_default(),
             inbound: flow.inbound_tag.unwrap_or("").to_owned(),
-            source_port: flow.source.map_or(0, |addr| addr.port()),
+            source_port: flow.source_port,
             target_port: flow.port.unwrap_or(0),
-            local_port: flow.local.map_or(0, |addr| addr.port()),
+            local_port: flow.local_port,
             domain: flow.domain.unwrap_or("").to_ascii_lowercase(),
             network: match flow.network {
                 Network::Tcp => NETWORK_TCP,
@@ -1106,7 +1106,10 @@ mod tests {
             ip: None,
             port: Some(443),
             source: None,
+            source_port: 0,
             local: None,
+            local_port: 0,
+            vless_route: 0,
             inbound_tag: Some("in"),
             protocol: Some("http/1.1"),
             user: Some("a@x"),
