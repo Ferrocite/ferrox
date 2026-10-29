@@ -25529,6 +25529,145 @@ mod tests {
         );
     }
 
+    /// The framing exit itself, not a direct call to the hook, has to disarm the ciphertext
+    /// reader: an `end` command leaves no inner TLS to hand over, and the next read must cross
+    /// record boundaries rather than stop at the first one.
+    #[allow(clippy::too_many_lines)]
+    #[test]
+    fn a_framing_exit_disarms_the_cipher_reader() {
+        struct RecordSession {
+            header: [u8; 5],
+            header_len: usize,
+            payload_left: usize,
+        }
+
+        impl ferrox_core::tls::TlsProvider for RecordSession {
+            fn name() -> &'static str {
+                "record"
+            }
+
+            fn suites(&self) -> Vec<String> {
+                Vec::new()
+            }
+
+            fn handshake(&mut self) -> Result<(), ferrox_core::tls::TlsError> {
+                Ok(())
+            }
+
+            fn alpn(&self) -> Option<&[u8]> {
+                None
+            }
+
+            fn open(
+                &mut self,
+                ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                let mut taken = 0;
+                let mut plain = 0;
+                while taken < ciphertext.len() {
+                    if self.header_len < self.header.len() {
+                        self.header[self.header_len] = ciphertext[taken];
+                        self.header_len += 1;
+                        taken += 1;
+                        if self.header_len == self.header.len() {
+                            self.payload_left =
+                                usize::from(u16::from_be_bytes([self.header[3], self.header[4]]));
+                            if self.payload_left == 0 {
+                                self.header_len = 0;
+                            }
+                        }
+                        continue;
+                    }
+                    let room = buf.len() - plain;
+                    if room == 0 {
+                        break;
+                    }
+                    let n = (ciphertext.len() - taken).min(self.payload_left).min(room);
+                    buf[plain..plain + n].copy_from_slice(&ciphertext[taken..taken + n]);
+                    plain += n;
+                    taken += n;
+                    self.payload_left -= n;
+                    if self.payload_left == 0 {
+                        self.header_len = 0;
+                    }
+                }
+                Ok((plain, taken))
+            }
+        }
+
+        impl Read for RecordSession {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        impl Write for RecordSession {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        impl ferrox_core::tls::RecordAlignment for RecordSession {}
+
+        struct Wire {
+            bytes: Vec<u8>,
+            at: usize,
+        }
+
+        impl Read for Wire {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = (self.bytes.len() - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+
+        impl ferrox_core::tls::RecordAlignment for Wire {}
+
+        fn record(payload: &[u8]) -> Vec<u8> {
+            let len = u16::try_from(payload.len()).expect("record fits");
+            let mut out = vec![0x17, 0x03, 0x03];
+            out.extend_from_slice(&len.to_be_bytes());
+            out.extend_from_slice(payload);
+            out
+        }
+
+        let uuid = [0xAA; 16];
+        let mut framed = uuid.to_vec();
+        framed.extend_from_slice(&[1, 0, 3, 0, 0]);
+        framed.extend_from_slice(b"end");
+        let mut bytes = record(&framed);
+        bytes.extend_from_slice(&record(&[0x11; 100]));
+        bytes.extend_from_slice(&record(&[0x22; 200]));
+
+        let session = Arc::new(Mutex::new(RecordSession {
+            header: [0; 5],
+            header_len: 0,
+            payload_left: 0,
+        }));
+        let reader = Arc::new(Mutex::new(CipherReader::Record(
+            ferrox_core::tls::reality::RecordLimiter::new(Wire { bytes, at: 0 }),
+        )));
+        let out = Arc::new(Mutex::new(Sealed::new(std::io::sink())));
+        let half = DrivenHalf::new(Arc::clone(&session), reader, out);
+        let mut link = crate::vision::Link::new(half, None, &uuid);
+
+        let mut buf = [0u8; 4096];
+        let n = link.read(&mut buf).expect("reads the frame");
+        assert_eq!(&buf[..n], b"end", "the end command's content came out");
+        let n = link.read(&mut buf).expect("reads past the frame");
+        assert_eq!(
+            n, 300,
+            "the framing exit disarmed the cipher reader, so both records come out in one read"
+        );
+    }
+
     /// A session that seals into the caller's buffer and never touches a transport, as the real
     /// one does, and whose `open` answers four bytes without a transport read.
     struct WritingSession;
