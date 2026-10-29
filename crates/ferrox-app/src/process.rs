@@ -133,6 +133,18 @@ mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
 
+    /// The kernel prints IPv4 as one 32-bit word and IPv6 as four, each in host byte order; a
+    /// single byte reversal only matches the one-word spelling.
+    #[test]
+    fn local_hex_spells_each_32_bit_word_as_the_kernel_does() {
+        assert_eq!(local_hex(&[127, 0, 0, 1], 80), "0100007F:0050");
+        let loopback = std::net::Ipv6Addr::LOCALHOST.octets();
+        assert_eq!(
+            local_hex(&loopback, 443),
+            "00000000000000000000000001000000:01BB"
+        );
+    }
+
     /// The socket this process opened is the socket this process owns: the pid is ours and the path
     /// is our executable, which is what `self/` and a bare name decide on.
     #[test]
