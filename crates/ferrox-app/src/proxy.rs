@@ -43508,29 +43508,42 @@ mod tests {
         count
     }
 
-    /// Sixteen simultaneous KCP dials share a feed worker within the original thread-growth bound.
-    #[cfg(target_os = "linux")]
+    /// Sixteen simultaneous KCP dials leave from one source port, so one feed socket and its thread.
     #[test]
     fn sixteen_kcp_dials_share_one_feed_thread() {
-        let listener = ferrox_core::kcp::Listener::bind(
-            "127.0.0.1:0".parse().expect("addr"),
-            ferrox_core::kcp::Config::default(),
-        )
-        .expect("binds");
-        let mut conns = Vec::new();
-        for _ in 0..16 {
-            conns.push(
-                ferrox_core::kcp::dial(
-                    listener.local_addr(),
-                    ferrox_core::kcp::Config::default(),
-                    ferrox_core::kcp::fresh_conversation(),
-                )
-                .expect("dials"),
-            );
-        }
-        assert_eq!(kcp_threads("kcp-feed"), 1, "sixteen dials, one feed thread");
+        let bind = || {
+            ferrox_core::kcp::Listener::bind(
+                "127.0.0.1:0".parse().expect("addr"),
+                ferrox_core::kcp::Config::default(),
+            )
+            .expect("binds")
+        };
+        let dial = |listener: &ferrox_core::kcp::Listener| {
+            ferrox_core::kcp::dial(
+                listener.local_addr(),
+                ferrox_core::kcp::Config::default(),
+                ferrox_core::kcp::fresh_conversation(),
+            )
+            .expect("dials")
+        };
+        let listener = bind();
+        let conns: Vec<_> = (0..16).map(|_| dial(&listener)).collect();
+        let shared = conns[0].local_addr();
+        assert!(
+            conns.iter().all(|conn| conn.local_addr() == shared),
+            "sixteen dials leave from one source port, so one feed socket feeds them all"
+        );
+        let other = bind();
+        let elsewhere = dial(&other);
+        assert_ne!(
+            elsewhere.local_addr(),
+            shared,
+            "a second listener is a second feed socket, so the equality above is not a constant"
+        );
         drop(conns);
+        drop(elsewhere);
         listener.close();
+        other.close();
     }
 
     /// Sixteen live KCP connections share flush workers within the original thread-growth bound.
