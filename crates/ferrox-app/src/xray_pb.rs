@@ -2296,11 +2296,15 @@ fn webhook_config(bytes: &[u8]) -> Result<Json, String> {
 }
 
 /// A protobuf map keeps the last value a repeated key carries, so the entries collapse before the
-/// selector reads them; an entry repeated with the same pattern is a replacement, not a second one.
+/// selector reads them; the selector lowercases keys, so a repeated entry replaces the first one
+/// even when the two spellings differ only in case.
 fn attribute_map(entries: Vec<(String, Json)>) -> Vec<(String, Json)> {
     let mut map: Vec<(String, Json)> = Vec::with_capacity(entries.len());
     for entry in entries {
-        match map.iter_mut().find(|(name, _)| *name == entry.0) {
+        match map
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case(&entry.0))
+        {
             Some(slot) => *slot = entry,
             None => map.push(entry),
         }
