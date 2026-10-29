@@ -1196,10 +1196,10 @@ fn gro_segment(header: &libc::msghdr, raw: usize) -> usize {
                 .saturating_sub(unsafe { libc::CMSG_LEN(0) } as usize);
             if len >= std::mem::size_of::<libc::c_int>() {
                 let data = unsafe { libc::CMSG_DATA(cmsg) };
-                let mut raw = [0u8; std::mem::size_of::<libc::c_int>()];
+                let mut bytes = [0u8; std::mem::size_of::<libc::c_int>()];
                 // SAFETY: the header's payload holds the `int` the kernel wrote, which `len` just checked.
-                unsafe { std::ptr::copy_nonoverlapping(data, raw.as_mut_ptr(), raw.len()) };
-                let seg = usize::try_from(libc::c_int::from_ne_bytes(raw)).unwrap_or(0);
+                unsafe { std::ptr::copy_nonoverlapping(data, bytes.as_mut_ptr(), bytes.len()) };
+                let seg = usize::try_from(libc::c_int::from_ne_bytes(bytes)).unwrap_or(0);
                 if seg > 0 && seg <= raw {
                     return seg;
                 }
