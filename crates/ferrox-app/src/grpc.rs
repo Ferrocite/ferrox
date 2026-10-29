@@ -983,8 +983,7 @@ impl GrpcWriter {
     /// the half the peer already has.
     fn try_send(&self, data: &[u8]) -> crate::proxy::Push {
         let max = self.max_frame().max(1);
-        // A frame width below two cannot keep one message in one batch; a peer that asks for it
-        // gets the blocking writer rather than a batch it does not fit.
+        // A frame width below two cannot keep one message in one batch, so a peer that asks for it gets the blocking writer.
         if max < 2 {
             return if self.send(data) {
                 crate::proxy::Push::Took(data.len())
