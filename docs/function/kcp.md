@@ -46,6 +46,8 @@ Two inputs the reference accepts are refused at build time rather than half-impl
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| syscalls-per-datagram | UNBLESSED | scripts/count-ops.sh |
+| seconds-per-datagram | UNBLESSED | CI bench.yml (no cell yet) |
 | maximum-transmission-unit-bytes | 1350 | ferrox-core-kcp::tests::the_upstream_defaults_are_these |
 | command-only-segment-bytes | 16 | ferrox-core-kcp::tests::the_command_only_layout_is_sixteen_bytes |
 | oracle-runs-against-the-pinned-go | 1 | ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go |
@@ -82,7 +84,7 @@ Two inputs the reference accepts are refused at build time rather than half-impl
 
 ## Time
 
-**Not measured yet.** `ferrox-core/examples/kcp_bench.rs` exists and is not wired to a workflow that runs it on a named runner, so no throughput figure is quoted. A KCP number measured over a VPN is a measurement of the VPN.
+**Not measured yet.** A syscall count for one datagram is `UNBLESSED` until an `ops.yml` artefact measures this method, and the throughput row is `UNBLESSED` too; `scripts/count-ops.sh` does not exist on macOS/aarch64, so both gates are CI-only here. `ferrox-core/examples/kcp_bench.rs` exists and is not wired to a workflow that runs it on a named runner, so no throughput figure is quoted. A KCP number measured over a VPN is a measurement of the VPN.
 
 ## What we removed
 

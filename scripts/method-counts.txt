@@ -448,6 +448,8 @@ reality-tls identity-rebuilds-per-unchanged-reload 0 ferrox-app-config::tests::a
 reality-tls identity-builds-per-handshake-before-the-ticker 0 ferrox-app-config::tests::a_ticker_reads_the_pair_once_and_rebuilds_only_on_a_change
 
 kcp ops-retired-instructions UNBLESSED scripts/count-ops.sh
+kcp syscalls-per-datagram UNBLESSED scripts/count-ops.sh
+kcp seconds-per-datagram UNBLESSED CI bench.yml (no cell yet)
 kcp maximum-transmission-unit-bytes 1350 ferrox-core-kcp::tests::the_upstream_defaults_are_these
 kcp command-only-segment-bytes 16 ferrox-core-kcp::tests::the_command_only_layout_is_sixteen_bytes
 kcp oracle-runs-against-the-pinned-go 1 ferrox-core-kcp::oracle::the_scripted_core_matches_the_pinned_go
