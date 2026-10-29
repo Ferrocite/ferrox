@@ -176,18 +176,18 @@ struct ProcessSelector {
 }
 
 impl ProcessSelector {
-    fn parse(names: &[String]) -> Self {
+    fn parse(list: &[String]) -> Self {
         let mut literal = Vec::new();
         let mut folders = Vec::new();
         let mut abs_paths = Vec::new();
         let mut this_process = false;
-        for name in names {
+        for name in list {
             if name == "self/" {
                 this_process = true;
                 continue;
             }
-            let named = name.replace('\\', "/");
-            let named = if named == "xray/" {
+            let path = name.replace('\\', "/");
+            let path = if path == "xray/" {
                 let Ok(executable) = std::env::current_exe() else {
                     continue;
                 };
@@ -196,17 +196,17 @@ impl ProcessSelector {
                 };
                 executable.to_owned()
             } else {
-                named
+                path
             };
-            if named.ends_with('/') {
-                folders.push(named);
+            if path.ends_with('/') {
+                folders.push(path);
                 continue;
             }
-            if named.contains('/') {
-                abs_paths.push(named);
+            if path.contains('/') {
+                abs_paths.push(path);
                 continue;
             }
-            literal.push(named.strip_suffix(".exe").unwrap_or(&named).to_owned());
+            literal.push(path.strip_suffix(".exe").unwrap_or(&path).to_owned());
         }
         Self {
             names: literal,
