@@ -1547,7 +1547,8 @@ where
                 &forward_flow,
             );
             if next == Next::Done {
-                let _ = plain_read.shutdown(Shutdown::Both);
+                // Read side only: a clean target EOF leaves the upload direction writing to this socket.
+                let _ = plain_read.shutdown(Shutdown::Read);
             }
             next
         }),
@@ -4272,6 +4273,10 @@ mod tests {
         assert!(
             stage_frame(&mut sender, b"ping", &mut upload, &mut pad),
             "seals the upload"
+        );
+        assert!(
+            stage_frame(&mut sender, &[], &mut upload, &mut pad),
+            "seals the upload marker"
         );
 
         let (plain, mut target) = socket_pair();
