@@ -51239,6 +51239,35 @@ mod accept_proxy_protocol_tests {
         assert_eq!(tag.as_deref(), Some("pinned"));
     }
 
+    /// A PROXY header names a source the socket does not have, so a `process` rule must not resolve
+    /// ownership from it: the attacker could otherwise name a local process and borrow its outbound.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_proxy_reported_source_does_not_name_the_process() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","tag":"direct"},{"protocol":"blackhole","tag":"block"}],
+                "routing":{"rules":[{"type":"field","process":["self/"],"outboundTag":"block"}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds the route");
+        let plan = RoutePlan::new(shared, None, None, true);
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let client = Connection::connect(addr)
+            .expect("connects")
+            .with_peer("192.0.2.1:1234".parse().expect("source"));
+        let asked = Destination::Address("192.0.2.9:80".parse().expect("target"));
+        let picked = plan.pick(&asked, crate::router::Network::Tcp, Some(&client), None);
+        assert!(
+            matches!(&*picked, Outbound::Block(_)),
+            "the reported source must not stand in for the socket's own process"
+        );
+    }
+
     #[test]
     fn a_ws_inbound_with_accept_proxy_protocol_reads_the_binary_header() {
         let port = free_port();
