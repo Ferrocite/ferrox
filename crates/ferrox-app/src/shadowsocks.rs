@@ -28,18 +28,57 @@ pub(crate) enum Uplink {
     Stream(Rc4),
 }
 
-pub(crate) fn serve(mut stream: Connection, password: &str, method: &str, freedom: bool) {
-    let Some(method) = Method::parse(method) else {
-        return;
-    };
-    if !freedom {
+/// One client a shadowsocks listener serves: the cipher its password derives, as xray builds one account per `users` entry.
+#[derive(Clone)]
+pub(crate) struct SsUser {
+    pub(crate) method: Method,
+    pub(crate) master: MasterKey,
+}
+
+pub(crate) type SsUsers = std::sync::Arc<[SsUser]>;
+
+/// An inbound's clients, plus the single password a 2022 inbound's PSK list is read from.
+pub(crate) struct SsAccounts {
+    pub(crate) users: SsUsers,
+    pub(crate) password: String,
+    pub(crate) method: String,
+    pub(crate) is_2022: bool,
+}
+
+impl std::fmt::Debug for SsAccounts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SsAccounts")
+            .field("users", &self.users.len())
+            .field("method", &self.method)
+            .field("is_2022", &self.is_2022)
+            .finish_non_exhaustive()
+    }
+}
+
+/// A stream method authenticates nothing, so its account is the whole inbound, the way the reference returns the first non-AEAD user without probing.
+fn stream_user(users: &[SsUser]) -> Option<&SsUser> {
+    users.iter().find(|user| user.method.is_stream())
+}
+
+/// The one client an inbound without a `users` list serves, or none when the method is one this tree cannot open.
+pub(crate) fn account(password: &str, method: &str) -> SsUsers {
+    match Method::parse(method) {
+        Some(method) => std::sync::Arc::from([SsUser {
+            method,
+            master: MasterKey::new(password, method.key_len()),
+        }]),
+        None => SsUsers::default(),
+    }
+}
+
+pub(crate) fn serve(mut stream: Connection, users: &[SsUser], freedom: bool) {
+    if !freedom || users.is_empty() {
         return;
     }
-    if method.is_stream() {
-        return serve_stream(stream, password);
+    if let Some(user) = stream_user(users) {
+        let master = user.master.clone();
+        return serve_stream(stream, &master);
     }
-    let master = MasterKey::new(password, method.key_len());
-    let salt_len = method.key_len();
     let mut head = wire_buffer();
     // Bound the salt and first-chunk reads to a wall-clock budget, then restore the relay's blocking reads.
     let budget = crate::budgets::handshake();
@@ -49,35 +88,36 @@ pub(crate) fn serve(mut stream: Connection, password: &str, method: &str, freedo
             inner: &mut stream,
             until: std::time::Instant::now() + budget,
         };
-        let mut salt = [0u8; SALT_LEN];
-        read_exact(&mut bounded, &mut salt[..salt_len])
-            .ok()
-            .and_then(|()| Cipher::from_master_key(method, &master, &salt[..salt_len]))
-            .and_then(|mut recv| {
-                open_chunk(&mut bounded, &mut recv, &mut head).map(|chunk| (recv, chunk))
-            })
+        match accept_cipher(&mut bounded, users) {
+            Some((user, mut recv, size)) => {
+                open_chunk_after(&mut bounded, &mut recv, &mut head, size)
+                    .map(|chunk| (user, recv, chunk))
+            }
+            None => None,
+        }
     };
     let _ = stream.set_read_timeout(None);
-    let Some((recv, chunk)) = opened else {
+    let Some((user, recv, chunk)) = opened else {
         return;
     };
-    let Some((target, used)) = parse_addr_header(chunk) else {
+    let Some((target, header_len)) = parse_addr_header(chunk) else {
         return;
     };
     crate::accesslog::record_current(&target);
     let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
-    if uplink.write_all(&chunk[used..]).is_err() {
+    if uplink.write_all(&chunk[header_len..]).is_err() {
         return;
     }
     // The relay allocates its own chunk buffer, so this one stops costing 16 KiB.
     drop(head);
+    let salt_len = user.method.key_len();
     let mut salt = [0u8; SALT_LEN];
     if getrandom::fill(&mut salt[..salt_len]).is_err() {
         return;
     }
-    let Some(send) = Cipher::from_master_key(method, &master, &salt[..salt_len]) else {
+    let Some(send) = Cipher::from_master_key(user.method, &user.master, &salt[..salt_len]) else {
         return;
     };
     if stream.write_all(&salt[..salt_len]).is_err() {
@@ -86,9 +126,43 @@ pub(crate) fn serve(mut stream: Connection, password: &str, method: &str, freedo
     pump_relay(&uplink, &stream, Uplink::Aead(send), Recv::Ready(recv));
 }
 
+/// The first chunk's length frame opened against every client: the salts are tried smallest first, so a match never reads past the salt that matched.
+fn accept_cipher<'u>(
+    reader: &mut dyn Read,
+    users: &'u [SsUser],
+) -> Option<(&'u SsUser, Cipher, usize)> {
+    let mut probe = [0u8; SALT_LEN + LENGTH_LEN + TAG_LEN];
+    let mut have = 0usize;
+    // The two salt lengths the methods use: AES-128's 16 bytes, every other method 32.
+    for salt_len in [16, SALT_LEN] {
+        if !users
+            .iter()
+            .any(|user| user.method.key_len() == salt_len && !user.method.is_stream())
+        {
+            continue;
+        }
+        let need = salt_len + LENGTH_LEN + TAG_LEN;
+        if have < need {
+            read_exact(reader, &mut probe[have..need]).ok()?;
+            have = need;
+        }
+        for user in users
+            .iter()
+            .filter(|user| !user.method.is_stream() && user.method.key_len() == salt_len)
+        {
+            let mut recv = Cipher::from_master_key(user.method, &user.master, &probe[..salt_len])?;
+            let mut length = [0u8; LENGTH_LEN + TAG_LEN];
+            length.copy_from_slice(&probe[salt_len..need]);
+            if let Some(size) = open_length(&mut recv, &mut length) {
+                return Some((user, recv, size));
+            }
+        }
+    }
+    None
+}
+
 /// The stream handshake: a 16-byte IV in the clear, then the address header rides the RC4 stream itself, so the first read already carries payload and whatever arrived with the header is forwarded, not re-read.
-fn serve_stream(mut stream: Connection, password: &str) {
-    let master = MasterKey::new(password, Method::Rc4Md5.key_len());
+fn serve_stream(mut stream: Connection, master: &MasterKey) {
     let mut head = [0u8; 512];
     // Bound the IV and address-header reads to a wall-clock budget, then restore the relay's blocking reads.
     let budget = crate::budgets::handshake();
@@ -154,18 +228,11 @@ fn serve_stream(mut stream: Connection, password: &str) {
     );
 }
 
-pub(crate) fn serve_ws(
-    stream: Connection,
-    password: &str,
-    method: &str,
-    path: &str,
-    freedom: bool,
-) {
+pub(crate) fn serve_ws(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
     let Some((mut reader, mut writer)) = crate::ws::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, password, method, freedom)
-    else {
+    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, users, freedom) else {
         return;
     };
     let closer = writer.clone();
@@ -175,8 +242,7 @@ pub(crate) fn serve_ws(
 
 pub(crate) fn serve_httpupgrade(
     stream: Connection,
-    password: &str,
-    method: &str,
+    users: &[SsUser],
     path: &str,
     host: &str,
     freedom: bool,
@@ -184,8 +250,7 @@ pub(crate) fn serve_httpupgrade(
     let Some((mut reader, mut writer)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, password, method, freedom)
-    else {
+    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, users, freedom) else {
         return;
     };
     let Ok(closer) = writer.try_clone() else {
@@ -201,8 +266,7 @@ pub(crate) fn serve_httpupgrade(
 #[cfg(test)]
 pub(crate) fn serve_httpupgrade_answering_after_the_request(
     stream: Connection,
-    password: &str,
-    method: &str,
+    users: &[SsUser],
     _path: &str,
     freedom: bool,
 ) {
@@ -228,8 +292,7 @@ pub(crate) fn serve_httpupgrade_answering_after_the_request(
     if write.write_all(crate::httpupgrade::SWITCH).is_err() {
         return;
     }
-    let Some((uplink, send, recv)) = accept_on(&mut read, &mut write, password, method, freedom)
-    else {
+    let Some((uplink, send, recv)) = accept_on(&mut read, &mut write, users, freedom) else {
         return;
     };
     let Ok(closer) = write.try_clone() else {
@@ -242,17 +305,10 @@ pub(crate) fn serve_httpupgrade_answering_after_the_request(
 }
 
 #[cfg(test)]
-pub(crate) fn serve_grpc(
-    stream: Connection,
-    password: &str,
-    method: &str,
-    path: &str,
-    freedom: bool,
-) {
+pub(crate) fn serve_grpc(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
     serve_grpc_with(
         stream,
-        password,
-        method,
+        users,
         &crate::config::GrpcSettings::path(path),
         freedom,
     );
@@ -260,8 +316,7 @@ pub(crate) fn serve_grpc(
 
 pub(crate) fn serve_grpc_with(
     stream: Connection,
-    password: &str,
-    method: &str,
+    users: &[SsUser],
     settings: &crate::config::GrpcSettings,
     freedom: bool,
 ) {
@@ -269,7 +324,7 @@ pub(crate) fn serve_grpc_with(
         return;
     };
     let Some((uplink, send, recv)) = under_handshake(&mut reader, |read| {
-        accept_on(read, &mut writer, password, method, freedom)
+        accept_on(read, &mut writer, users, freedom)
     }) else {
         return;
     };
@@ -278,18 +333,11 @@ pub(crate) fn serve_grpc_with(
     pump_relay_carried(&uplink, reader, writer, &close, send, recv);
 }
 
-pub(crate) fn serve_xhttp(
-    stream: Connection,
-    password: &str,
-    method: &str,
-    path: &str,
-    freedom: bool,
-) {
+pub(crate) fn serve_xhttp(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
     let Some((mut reader, mut writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, password, method, freedom)
-    else {
+    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, users, freedom) else {
         return;
     };
     let closer = writer.clone();
@@ -298,18 +346,11 @@ pub(crate) fn serve_xhttp(
     pump_relay_carried(&uplink, reader, writer, &close, send, recv);
 }
 
-pub(crate) fn serve_httpheader(
-    stream: Connection,
-    password: &str,
-    method: &str,
-    path: &str,
-    freedom: bool,
-) {
+pub(crate) fn serve_httpheader(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
     let Some((mut reader, mut writer)) = crate::httpheader::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, password, method, freedom)
-    else {
+    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, users, freedom) else {
         return;
     };
     let Ok(closer) = writer.try_clone() else {
@@ -324,8 +365,7 @@ pub(crate) fn serve_httpheader(
 pub(crate) fn serve_session<R, W>(
     mut reader: R,
     mut writer: W,
-    password: &str,
-    method: &str,
+    users: &[SsUser],
     freedom: bool,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
 ) where
@@ -335,8 +375,7 @@ pub(crate) fn serve_session<R, W>(
     let Some((uplink, send, recv)) = accept_on(
         &mut reader as &mut dyn Read,
         &mut writer as &mut dyn Write,
-        password,
-        method,
+        users,
         freedom,
     ) else {
         close();
@@ -348,8 +387,7 @@ pub(crate) fn serve_session<R, W>(
 pub(crate) fn serve_kcp<R, W>(
     mut reader: R,
     mut writer: W,
-    password: &str,
-    method: &str,
+    users: &[SsUser],
     freedom: bool,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
 ) where
@@ -359,8 +397,7 @@ pub(crate) fn serve_kcp<R, W>(
     let Some((uplink, send, recv)) = accept_on(
         &mut reader as &mut dyn Read,
         &mut writer as &mut dyn Write,
-        password,
-        method,
+        users,
         freedom,
     ) else {
         return;
@@ -409,32 +446,27 @@ fn accept_stream(
 fn accept_on(
     reader: &mut dyn Read,
     writer: &mut dyn Write,
-    password: &str,
-    method: &str,
+    users: &[SsUser],
     freedom: bool,
 ) -> Option<(Connection, Uplink, Recv)> {
-    let method = Method::parse(method)?;
     if !freedom {
         return None;
     }
-    let master = MasterKey::new(password, method.key_len());
-    if method.is_stream() {
-        return accept_stream(reader, writer, &master);
+    if let Some(user) = stream_user(users) {
+        return accept_stream(reader, writer, &user.master);
     }
-    let salt_len = method.key_len();
-    let mut salt = [0u8; SALT_LEN];
-    read_exact(reader, &mut salt[..salt_len]).ok()?;
-    let mut recv = Cipher::from_master_key(method, &master, &salt[..salt_len])?;
     let mut head = wire_buffer();
-    let chunk = open_chunk(reader, &mut recv, &mut head)?;
-    let (target, used) = parse_addr_header(chunk)?;
+    let (user, mut recv, size) = accept_cipher(reader, users)?;
+    let chunk = open_chunk_after(reader, &mut recv, &mut head, size)?;
+    let (target, header_len) = parse_addr_header(chunk)?;
     crate::accesslog::record_current(&target);
     let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
-    uplink.write_all(&chunk[used..]).ok()?;
+    uplink.write_all(&chunk[header_len..]).ok()?;
     drop(head);
+    let salt_len = user.method.key_len();
     let mut salt = [0u8; SALT_LEN];
     getrandom::fill(&mut salt[..salt_len]).ok()?;
-    let send = Cipher::from_master_key(method, &master, &salt[..salt_len])?;
+    let send = Cipher::from_master_key(user.method, &user.master, &salt[..salt_len])?;
     writer.write_all(&salt[..salt_len]).ok()?;
     Some((uplink, Uplink::Aead(send), Recv::Ready(recv)))
 }
@@ -806,21 +838,17 @@ fn waited(flow: Option<&crate::proxy::RelayFinish>) -> crate::proxy::lane_pool::
     }
 }
 
-pub(crate) fn serve_udp(address: &str, password: &str, method: &str, freedom: bool) {
+pub(crate) fn serve_udp(address: &str, users: &[SsUser], freedom: bool) {
     let Ok(clients) = UdpSocket::bind(address) else {
         return;
     };
-    serve_udp_on(&clients, password, method, freedom);
+    serve_udp_on(&clients, users, freedom);
 }
 
-pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, freedom: bool) {
-    let Some(method) = Method::parse(method) else {
-        return;
-    };
-    if !freedom {
+pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool) {
+    if !freedom || users.is_empty() {
         return;
     }
-    let master = MasterKey::new(password, method.key_len());
     let Ok(upstream) = UdpSocket::bind("0.0.0.0:0") else {
         return;
     };
@@ -830,23 +858,22 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
             return;
         }
     }
-    let mut table: HashMap<SocketAddr, SocketAddr> = HashMap::new();
+    // The reply leg is sealed with the client that opened the flow, so a destination remembers both.
+    let mut table: HashMap<SocketAddr, (SocketAddr, usize)> = HashMap::new();
     let mut buf = crate::proxy::unfilled(DATAGRAM_MAX);
     let mut reply = crate::proxy::unfilled(DATAGRAM_MAX);
-    let mut hop: Option<Cipher> = None;
+    let mut hops: Vec<Option<Cipher>> = users.iter().map(|_| None).collect();
     loop {
         match clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
             Ok((n, src)) => {
-                if let Some((dest, payload)) = open_datagram(
-                    &master,
-                    method,
-                    &mut buf[SEAL_ROOM..SEAL_ROOM + n],
-                    &mut hop,
-                ) {
+                if let Some((which, dest, payload)) =
+                    open_datagram_any(users, &mut buf[SEAL_ROOM..SEAL_ROOM + n], &mut hops)
+                {
                     if table.len() >= 4096 {
                         table.clear();
                     }
-                    table.insert(dest, src);
+                    table.insert(dest, (src, which));
+                    let payload = &buf[SEAL_ROOM + payload.start..SEAL_ROOM + payload.end];
                     if dest.is_ipv6() {
                         if let Some(sock) = &upstream6 {
                             let _ = sock.send_to(payload, dest);
@@ -861,10 +888,17 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, password: &str, method: &str, fr
         }
         for sock in [&upstream].into_iter().chain(upstream6.as_ref()) {
             while let Ok((n, src)) = sock.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
-                if let Some(client) = table.get(&src) {
-                    if let Some(packet) =
-                        seal_datagram(&master, method, &src, &mut reply, SEAL_ROOM, n, &mut hop)
-                    {
+                if let Some(&(client, which)) = table.get(&src) {
+                    let user = &users[which];
+                    if let Some(packet) = seal_datagram(
+                        &user.master,
+                        user.method,
+                        &src,
+                        &mut reply,
+                        SEAL_ROOM,
+                        n,
+                        &mut hops[which],
+                    ) {
                         let _ = clients.send_to(packet, client);
                     }
                 }
@@ -963,15 +997,25 @@ fn read_slots(read: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<usize> {
 }
 
 /// Read one wire chunk out of `chunk`'s prefix: `chunk` is the caller's, sized [`WIRE_MAX`] once and opened in place — no allocation, no zero-fill — and the handshake opens exactly one chunk because whatever the peer pipelined after it belongs to the relay.
+#[cfg(test)]
 fn open_chunk<'a>(
     stream: &mut dyn Read,
     recv: &mut Cipher,
     chunk: &'a mut [u8],
 ) -> Option<&'a [u8]> {
-    use crate::proxy::read_exact;
     let mut length = [0u8; LENGTH_LEN + TAG_LEN];
     read_exact(stream, &mut length).ok()?;
     let size = open_length(recv, &mut length)?;
+    open_chunk_after(stream, recv, chunk, size)
+}
+
+/// The body of a chunk whose length a probe already opened: reads `size` bytes and their tag into the caller's buffer and opens them where they lie, so the cipher that matched a salt carries on from the length's block.
+fn open_chunk_after<'a>(
+    stream: &mut dyn Read,
+    recv: &mut Cipher,
+    chunk: &'a mut [u8],
+    size: usize,
+) -> Option<&'a [u8]> {
     if size + TAG_LEN > chunk.len() {
         return None;
     }
@@ -1226,6 +1270,30 @@ pub(crate) fn open_datagram<'a>(
     Some((target, &body[used..len]))
 }
 
+/// Open one wire datagram against every client: the first whose tag verifies names the flow and seals its replies, and a failed probe leaves the buffer untouched because the tag is checked before the body opens. A stream client has no tag to probe, so it owns the listener the way it owns the tcp side.
+pub(crate) fn open_datagram_any(
+    users: &[SsUser],
+    packet: &mut [u8],
+    hops: &mut [Option<Cipher>],
+) -> Option<(usize, SocketAddr, std::ops::Range<usize>)> {
+    let base = packet.as_ptr() as usize;
+    if let Some(which) = users.iter().position(|user| user.method.is_stream()) {
+        let user = &users[which];
+        let (target, payload) = open_datagram(&user.master, user.method, packet, &mut hops[which])?;
+        let start = payload.as_ptr() as usize - base;
+        return Some((which, target, start..start + payload.len()));
+    }
+    for (which, user) in users.iter().enumerate() {
+        if let Some((target, payload)) =
+            open_datagram(&user.master, user.method, &mut *packet, &mut hops[which])
+        {
+            let start = payload.as_ptr() as usize - base;
+            return Some((which, target, start..start + payload.len()));
+        }
+    }
+    None
+}
+
 fn parse_addr_header(buf: &[u8]) -> Option<(SocketAddr, usize)> {
     let kind = match buf.first()? {
         1 => crate::proxy::AddrKind::V4,
@@ -1290,7 +1358,11 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve(stream, "an-example-shared-password", "aes-256-gcm", true);
+            serve(
+                stream,
+                &account("an-example-shared-password", "aes-256-gcm"),
+                true,
+            );
             let _ = done_tx.send(());
         });
         let _peer = Connection::connect(addr).expect("connects");
@@ -1313,7 +1385,11 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve(stream, "an-example-shared-password", "rc4-md5", true);
+            serve(
+                stream,
+                &account("an-example-shared-password", "rc4-md5"),
+                true,
+            );
             let _ = done_tx.send(());
         });
         let _peer = Connection::connect(addr).expect("connects");
@@ -1360,7 +1436,11 @@ mod tests {
                     let Ok(stream) = stream else { continue };
                     let announced = announced.clone();
                     thread::spawn(move || {
-                        serve(stream, "an-example-shared-password", &announced, true);
+                        serve(
+                            stream,
+                            &account("an-example-shared-password", &announced),
+                            true,
+                        );
                     });
                 }
             });
@@ -1428,7 +1508,11 @@ mod tests {
                     let Ok(stream) = stream else { continue };
                     let refused = refused.clone();
                     thread::spawn(move || {
-                        serve(stream, "an-example-shared-password", &refused, true);
+                        serve(
+                            stream,
+                            &account("an-example-shared-password", &refused),
+                            true,
+                        );
                     });
                 }
             });
@@ -1469,7 +1553,11 @@ mod tests {
             for stream in server.incoming().take(1) {
                 let Ok(stream) = stream else { continue };
                 thread::spawn(move || {
-                    serve(stream, "an-example-shared-password", "rc4-md5", true);
+                    serve(
+                        stream,
+                        &account("an-example-shared-password", "rc4-md5"),
+                        true,
+                    );
                 });
             }
         });
@@ -1526,8 +1614,7 @@ mod tests {
             let (stream, _) = server.accept().expect("accepts");
             serve_ws(
                 stream,
-                "an-example-shared-password",
-                "rc4-md5",
+                &account("an-example-shared-password", "rc4-md5"),
                 "/ss-ws",
                 true,
             );
@@ -1667,6 +1754,57 @@ mod tests {
         Some((target, payload.to_vec()))
     }
 
+    /// One listener on a list of ciphers: a datagram opens under the client whose key sealed it and the reply takes that client's salt length, while a password none lists opens nothing.
+    #[test]
+    fn a_datagram_opens_under_each_clients_own_cipher() {
+        let target: SocketAddr = "203.0.113.9:53".parse().expect("addr");
+        let users: Vec<SsUser> = [
+            ("first-password", Method::Aes256Gcm),
+            ("second-password", Method::Aes128Gcm),
+        ]
+        .into_iter()
+        .map(|(password, method)| SsUser {
+            method,
+            master: MasterKey::new(password, method.key_len()),
+        })
+        .collect();
+        let mut hops: Vec<Option<Cipher>> = users.iter().map(|_| None).collect();
+        let mut wire = seal_to_wire(&users[1].master, users[1].method, &target, b"ping");
+        let (which, got, payload) = open_datagram_any(&users, &mut wire, &mut hops)
+            .expect("the second client's datagram opens");
+        assert_eq!(which, 1, "the matched client names the flow");
+        assert_eq!(got, target);
+        assert_eq!(&wire[payload], b"ping");
+        let mut reply = vec![0u8; DATAGRAM_MAX];
+        reply[SEAL_ROOM..SEAL_ROOM + 4].copy_from_slice(b"pong");
+        let sealed = seal_datagram(
+            &users[1].master,
+            users[1].method,
+            &target,
+            &mut reply,
+            SEAL_ROOM,
+            4,
+            &mut hops[1],
+        )
+        .expect("seals");
+        assert_eq!(
+            sealed.len(),
+            16 + 7 + 4 + TAG_LEN,
+            "the reply carries aes-128's sixteen-byte salt"
+        );
+        let (_, back) = open_from_wire(&users[1].master, users[1].method, sealed)
+            .expect("the client opens its reply");
+        assert_eq!(back, b"pong");
+        let stranger = seal_to_wire(
+            &MasterKey::new("nobody-lists-this", 32),
+            Method::Aes256Gcm,
+            &target,
+            b"ping",
+        );
+        let mut wire = stranger;
+        assert!(open_datagram_any(&users, &mut wire, &mut hops).is_none());
+    }
+
     #[test]
     fn stream_udp_round_trips_and_rejects_damage() {
         let method = Method::Rc4Md5;
@@ -1718,8 +1856,7 @@ mod tests {
             let (stream, _) = listener.accept().expect("accepts");
             serve_grpc(
                 stream,
-                "an-example-shared-password",
-                "aes-256-gcm",
+                &account("an-example-shared-password", "aes-256-gcm"),
                 "/p",
                 true,
             );
@@ -1783,23 +1920,22 @@ mod tests {
             };
             answers(reader, writer, send, recv);
         }
-        fn tunnel(serve: fn(Connection, &str, &str, &str, bool), path: &'static str) -> Connection {
+        fn tunnel(serve: fn(Connection, &[SsUser], &str, bool), path: &'static str) -> Connection {
             let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let port = server.local_addr().expect("addr").port();
             thread::spawn(move || {
                 let (stream, _) = server.accept().expect("accepts");
-                serve(stream, PASSWORD, METHOD, path, true);
+                serve(stream, &account(PASSWORD, METHOD), path, true);
             });
             Connection::connect(("127.0.0.1", port)).expect("connects")
         }
         fn serve_httpupgrade_without_host(
             stream: Connection,
-            password: &str,
-            method: &str,
+            users: &[SsUser],
             path: &str,
             freedom: bool,
         ) {
-            serve_httpupgrade(stream, password, method, path, "", freedom);
+            serve_httpupgrade(stream, users, path, "", freedom);
         }
         fn sealed(target: &Destination) -> (Vec<u8>, Uplink, Recv) {
             let mut packet = Vec::new();

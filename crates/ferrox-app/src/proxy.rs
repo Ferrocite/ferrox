@@ -1225,8 +1225,7 @@ enum Role {
         account: InboundAccount,
     },
     Shadowsocks {
-        password: String,
-        method: String,
+        accounts: Arc<crate::shadowsocks::SsAccounts>,
         carrier: Carrier,
         freedom: bool,
         tls: Option<Arc<ferrox_core::tls::TlsServerConfig>>,
@@ -2482,17 +2481,17 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
 }
 fn serve_shadowsocks(
     stream: Connection,
-    password: &str,
-    method: &str,
+    accounts: &crate::shadowsocks::SsAccounts,
     carrier: &Carrier,
     freedom: bool,
     tls: Option<&ferrox_core::tls::TlsServerConfig>,
 ) {
     if let Some(server) = tls {
-        serve_shadowsocks_tls(stream, password, method, carrier, freedom, server);
+        serve_shadowsocks_tls(stream, accounts, carrier, freedom, server);
         return;
     }
-    if ferrox_core::shadowsocks2022::Method::parse(method).is_some() {
+    if accounts.is_2022 {
+        let (password, method) = (accounts.password.as_str(), accounts.method.as_str());
         match carrier {
             Carrier::Raw(_) => crate::shadowsocks2022::serve(stream, password, method, freedom),
             Carrier::Ws { path, .. } => {
@@ -2535,35 +2534,23 @@ fn serve_shadowsocks(
         }
         return;
     }
+    let users = &accounts.users;
     match carrier {
-        Carrier::Raw(_) => crate::shadowsocks::serve(stream, password, method, freedom),
+        Carrier::Raw(_) => crate::shadowsocks::serve(stream, users, freedom),
         Carrier::Ws { path, .. } => {
-            crate::shadowsocks::serve_ws(stream, password, method, path.as_str(), freedom);
+            crate::shadowsocks::serve_ws(stream, users, path.as_str(), freedom);
         }
         Carrier::HttpUpgrade { path, host, .. } => {
-            crate::shadowsocks::serve_httpupgrade(
-                stream,
-                password,
-                method,
-                path.as_str(),
-                host,
-                freedom,
-            );
+            crate::shadowsocks::serve_httpupgrade(stream, users, path.as_str(), host, freedom);
         }
         Carrier::Grpc(settings) => {
-            crate::shadowsocks::serve_grpc_with(stream, password, method, settings, freedom);
+            crate::shadowsocks::serve_grpc_with(stream, users, settings, freedom);
         }
         Carrier::Xhttp { settings, .. } => {
-            crate::shadowsocks::serve_xhttp(
-                stream,
-                password,
-                method,
-                settings.path.as_str(),
-                freedom,
-            );
+            crate::shadowsocks::serve_xhttp(stream, users, settings.path.as_str(), freedom);
         }
         Carrier::HttpHeader { path } => {
-            crate::shadowsocks::serve_httpheader(stream, password, method, path.as_str(), freedom);
+            crate::shadowsocks::serve_httpheader(stream, users, path.as_str(), freedom);
         }
         refused_carriers!() => {}
     }
@@ -2571,8 +2558,7 @@ fn serve_shadowsocks(
 
 fn serve_shadowsocks_tls(
     stream: Connection,
-    password: &str,
-    method: &str,
+    accounts: &crate::shadowsocks::SsAccounts,
     carrier: &Carrier,
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
@@ -2580,7 +2566,6 @@ fn serve_shadowsocks_tls(
     if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
-    let is_2022 = ferrox_core::shadowsocks2022::Method::parse(method).is_some();
     match carrier {
         Carrier::Raw(_) => {
             let Ok(raw) = stream.try_clone() else { return };
@@ -2594,7 +2579,7 @@ fn serve_shadowsocks_tls(
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                 let _ = raw.shutdown(Shutdown::Both);
             });
-            serve_ss_tls_session(reader, writer, password, method, freedom, &close, is_2022);
+            serve_ss_tls_session(reader, writer, accounts, freedom, &close);
         }
         Carrier::Ws { path, .. } => {
             let Ok(out) = stream.try_clone() else { return };
@@ -2607,7 +2592,7 @@ fn serve_shadowsocks_tls(
             };
             let closer = writer.clone();
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
-            serve_ss_tls_session(reader, writer, password, method, freedom, &close, is_2022);
+            serve_ss_tls_session(reader, writer, accounts, freedom, &close);
         }
         Carrier::HttpUpgrade { path, host, .. } => {
             let Ok(raw) = stream.try_clone() else { return };
@@ -2625,7 +2610,7 @@ fn serve_shadowsocks_tls(
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                 let _ = raw.shutdown(Shutdown::Both);
             });
-            serve_ss_tls_session(reader, writer, password, method, freedom, &close, is_2022);
+            serve_ss_tls_session(reader, writer, accounts, freedom, &close);
         }
         Carrier::Grpc(settings) => {
             let Ok(out) = stream.try_clone() else { return };
@@ -2639,7 +2624,7 @@ fn serve_shadowsocks_tls(
             };
             let closer = writer.clone();
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
-            serve_ss_tls_session(reader, writer, password, method, freedom, &close, is_2022);
+            serve_ss_tls_session(reader, writer, accounts, freedom, &close);
         }
         Carrier::Xhttp { settings, .. } => {
             let Ok(out) = stream.try_clone() else { return };
@@ -2654,7 +2639,7 @@ fn serve_shadowsocks_tls(
             };
             let closer = writer.clone();
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
-            serve_ss_tls_session(reader, writer, password, method, freedom, &close, is_2022);
+            serve_ss_tls_session(reader, writer, accounts, freedom, &close);
         }
         Carrier::HttpHeader { path } => {
             let Ok(raw) = stream.try_clone() else { return };
@@ -2670,7 +2655,7 @@ fn serve_shadowsocks_tls(
             let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
                 let _ = raw.shutdown(Shutdown::Both);
             });
-            serve_ss_tls_session(reader, writer, password, method, freedom, &close, is_2022);
+            serve_ss_tls_session(reader, writer, accounts, freedom, &close);
         }
         refused_carriers!() => {}
     }
@@ -2679,19 +2664,24 @@ fn serve_shadowsocks_tls(
 fn serve_ss_tls_session<R, W>(
     reader: R,
     writer: W,
-    password: &str,
-    method: &str,
+    accounts: &crate::shadowsocks::SsAccounts,
     freedom: bool,
     close: &Arc<dyn Fn() + Send + Sync>,
-    is_2022: bool,
 ) where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    if is_2022 {
-        crate::shadowsocks2022::serve_session(reader, writer, password, method, freedom, close);
+    if accounts.is_2022 {
+        crate::shadowsocks2022::serve_session(
+            reader,
+            writer,
+            &accounts.password,
+            &accounts.method,
+            freedom,
+            close,
+        );
     } else {
-        crate::shadowsocks::serve_session(reader, writer, password, method, freedom, close);
+        crate::shadowsocks::serve_session(reader, writer, &accounts.users, freedom, close);
     }
 }
 
@@ -8749,10 +8739,8 @@ fn dial_ss_kcp(
 
 fn serve_ss_kcp_tls(
     conn: &Arc<ferrox_core::kcp::Connection>,
-    password: &str,
-    method: &str,
+    accounts: &crate::shadowsocks::SsAccounts,
     freedom: bool,
-    is_2022: bool,
     server: &ferrox_core::tls::TlsServerConfig,
 ) {
     let Ok(mut tls) = ferrox_core::tls::accept(
@@ -8773,10 +8761,17 @@ fn serve_ss_kcp_tls(
         },
     );
     let close = kcp_close(conn);
-    if is_2022 {
-        crate::shadowsocks2022::serve_kcp(reader, writer, password, method, freedom, &close);
+    if accounts.is_2022 {
+        crate::shadowsocks2022::serve_kcp(
+            reader,
+            writer,
+            &accounts.password,
+            &accounts.method,
+            freedom,
+            &close,
+        );
     } else {
-        crate::shadowsocks::serve_kcp(reader, writer, password, method, freedom, &close);
+        crate::shadowsocks::serve_kcp(reader, writer, &accounts.users, freedom, &close);
     }
 }
 
@@ -9008,24 +9003,22 @@ fn serve_vmess_xdrive(session: crate::xdrive::Conn, users: &crate::vmess::Users,
 
 fn serve_ss_xdrive(
     session: crate::xdrive::Conn,
-    password: &str,
-    method: &str,
+    accounts: &crate::shadowsocks::SsAccounts,
     freedom: bool,
-    is_2022: bool,
 ) {
     let close = xdrive_close(&session);
-    if is_2022 {
+    if accounts.is_2022 {
         crate::shadowsocks2022::serve_kcp(
             session.clone(),
             session,
-            password,
-            method,
+            &accounts.password,
+            &accounts.method,
             freedom,
             &close,
         );
         return;
     }
-    crate::shadowsocks::serve_kcp(session.clone(), session, password, method, freedom, &close);
+    crate::shadowsocks::serve_kcp(session.clone(), session, &accounts.users, freedom, &close);
 }
 
 /// Bind before answering, so a port already taken is the listener's refusal and not a thread's later accident.
@@ -9598,20 +9591,16 @@ fn inbound_ss_destinations(inbound: &Json, method: &str) -> Vec<(Vec<u8>, Socket
     out
 }
 
-#[allow(clippy::too_many_arguments)]
 fn serve_ss_kcp_listener(
     address: &str,
     inbound: &Json,
     config: ferrox_core::kcp::Config,
-    password: &str,
-    method: &str,
+    accounts: &Arc<crate::shadowsocks::SsAccounts>,
     freedom: bool,
-    is_2022: bool,
     email: &str,
     level: u32,
 ) -> bool {
-    let password = password.to_owned();
-    let method = method.to_owned();
+    let accounts = Arc::clone(accounts);
     let email = email.to_owned();
     let serve: KcpServe = if stream_security(inbound) == "tls" {
         let Some(server) = inbound_tls_identity(inbound) else {
@@ -9619,20 +9608,26 @@ fn serve_ss_kcp_listener(
             return false;
         };
         let email = email.clone();
+        let accounts = Arc::clone(&accounts);
         Arc::new(move |conn| {
             let _flow = crate::accesslog::flow(None, &email, level);
-            serve_ss_kcp_tls(conn, &password, &method, freedom, is_2022, &server);
+            serve_ss_kcp_tls(conn, &accounts, freedom, &server);
         })
     } else {
         Arc::new(move |conn| {
             let _flow = crate::accesslog::flow(None, &email, level);
             let (reader, writer, close) = kcp_parts(conn);
-            if is_2022 {
+            if accounts.is_2022 {
                 crate::shadowsocks2022::serve_kcp(
-                    reader, writer, &password, &method, freedom, &close,
+                    reader,
+                    writer,
+                    &accounts.password,
+                    &accounts.method,
+                    freedom,
+                    &close,
                 );
             } else {
-                crate::shadowsocks::serve_kcp(reader, writer, &password, &method, freedom, &close);
+                crate::shadowsocks::serve_kcp(reader, writer, &accounts.users, freedom, &close);
             }
         })
     };
@@ -9685,12 +9680,10 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     let method = inbound_method(inbound);
     let carrier = inbound_carrier(inbound);
     let udp_raw = matches!(carrier, Carrier::Raw(_));
-    let udp_address = address.to_owned();
-    let udp_password = password.clone();
-    let udp_method = method.clone();
-    let is_2022 = ferrox_core::shadowsocks2022::Method::parse(&method).is_some();
+    let accounts = ss_accounts(inbound, address, password, method);
+    let udp_accounts = udp_raw.then(|| Arc::clone(&accounts));
     if matches!(carrier, Carrier::Raw(_))
-        && serve_ss_relay_inbound(address, inbound, &password, &method)
+        && serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method)
     {
         return;
     }
@@ -9700,10 +9693,8 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
                 address,
                 inbound,
                 config,
-                &password,
-                &method,
+                &accounts,
                 freedom,
-                is_2022,
                 &account.email,
                 account.level,
             ) {
@@ -9711,13 +9702,12 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
             }
         }
         Carrier::Xdrive { settings } => {
-            let password = password.clone();
-            let method = method.clone();
+            let accounts = Arc::clone(&accounts);
             let email = account.email.clone();
             let level = account.level;
             let accept: crate::xdrive::Accept = Arc::new(move |session| {
                 let _flow = crate::accesslog::flow(None, &email, level);
-                serve_ss_xdrive(session, &password, &method, freedom, is_2022);
+                serve_ss_xdrive(session, &accounts, freedom);
             });
             serve_xdrive_loop(&settings, address, accept);
         }
@@ -9731,8 +9721,7 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
                 inbound_role(
                     inbound,
                     Role::Shadowsocks {
-                        password,
-                        method,
+                        accounts,
                         carrier,
                         freedom,
                         tls: Some(server),
@@ -9751,8 +9740,7 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
             inbound_role(
                 inbound,
                 Role::Shadowsocks {
-                    password,
-                    method,
+                    accounts,
                     carrier: other,
                     freedom,
                     tls: None,
@@ -9762,17 +9750,18 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
             inbound_tag(inbound),
         ),
     }
-    if udp_raw {
+    if let Some(accounts) = udp_accounts {
+        let udp_address = address.to_owned();
         thread::spawn(move || {
-            if ferrox_core::shadowsocks2022::Method::parse(&udp_method).is_some() {
+            if accounts.is_2022 {
                 crate::shadowsocks2022::serve_udp(
                     &udp_address,
-                    &udp_password,
-                    &udp_method,
+                    &accounts.password,
+                    &accounts.method,
                     freedom,
                 );
             } else {
-                crate::shadowsocks::serve_udp(&udp_address, &udp_password, &udp_method, freedom);
+                crate::shadowsocks::serve_udp(&udp_address, &accounts.users, freedom);
             }
         });
     }
@@ -22607,6 +22596,67 @@ pub(crate) fn inbound_ss_password(inbound: &Json) -> String {
         .and_then(Json::as_str)
         .unwrap_or("")
         .to_owned()
+}
+
+/// Every client a shadowsocks inbound names: `clients` replaces `users` whenever the key is there, an empty list serves nobody, and with neither the inbound's own password is its one account. A client this tree cannot serve is named once and skipped, so the rest of the list still serves.
+fn inbound_ss_users(
+    inbound: &Json,
+    password: &str,
+    method: &str,
+    address: &str,
+) -> crate::shadowsocks::SsUsers {
+    let listed = inbound
+        .get("settings")
+        .and_then(|settings| settings.get("clients").or_else(|| settings.get("users")))
+        .and_then(Json::as_arr);
+    let Some(listed) = listed else {
+        return crate::shadowsocks::account(password, method);
+    };
+    let mut users = Vec::with_capacity(listed.len());
+    for client in listed {
+        let named = client
+            .get("method")
+            .and_then(Json::as_str)
+            .unwrap_or(method);
+        let client_password = client.get("password").and_then(Json::as_str);
+        let Some(client_password) = client_password.filter(|password| !password.is_empty()) else {
+            eprintln!("shadowsocks client `{named}` on {address}: no password, skipped");
+            continue;
+        };
+        let Some(client_method) = ferrox_core::shadowsocks::Method::parse(named) else {
+            eprintln!("shadowsocks client `{named}` on {address}: unsupported cipher, skipped");
+            continue;
+        };
+        users.push(crate::shadowsocks::SsUser {
+            method: client_method,
+            master: ferrox_core::shadowsocks::MasterKey::new(
+                client_password,
+                client_method.key_len(),
+            ),
+        });
+    }
+    std::sync::Arc::from(users)
+}
+
+/// An inbound's parsed accounts: 2022 reads its PSK list from the single password, everything else from the client list.
+fn ss_accounts(
+    inbound: &Json,
+    address: &str,
+    password: String,
+    method: String,
+) -> Arc<crate::shadowsocks::SsAccounts> {
+    let is_2022 = ferrox_core::shadowsocks2022::Method::parse(&method).is_some();
+    let users = if is_2022 {
+        crate::shadowsocks::SsUsers::default()
+    } else {
+        inbound_ss_users(inbound, &password, &method, address)
+    };
+    Arc::new(crate::shadowsocks::SsAccounts {
+        users,
+        password,
+        method,
+        is_2022,
+    })
 }
 
 fn inbound_password(inbound: &Json) -> String {
@@ -35503,7 +35553,13 @@ mod tests {
         path: &str,
         freedom: bool,
     ) {
-        crate::shadowsocks::serve_httpupgrade(stream, password, method, path, "", freedom);
+        crate::shadowsocks::serve_httpupgrade(
+            stream,
+            &crate::shadowsocks::account(password, method),
+            path,
+            "",
+            freedom,
+        );
     }
 
     fn serve_ss2022_httpupgrade(
@@ -35516,9 +35572,23 @@ mod tests {
         crate::shadowsocks2022::serve_httpupgrade(stream, password, method, path, "", freedom);
     }
 
+    /// Adapt a single-account legacy server to the ladder harness's password-and-method shape.
+    fn ss_serve(
+        serve: fn(Connection, &[crate::shadowsocks::SsUser], &str, bool),
+    ) -> impl Fn(Connection, &str, &str, &str, bool) {
+        move |stream, password, method, path, freedom| {
+            serve(
+                stream,
+                &crate::shadowsocks::account(password, method),
+                path,
+                freedom,
+            );
+        }
+    }
+
     fn socks_dials_ss_via(
         carrier: Carrier,
-        serve: fn(Connection, &str, &str, &str, bool),
+        serve: impl Fn(Connection, &str, &str, &str, bool) + Send + 'static,
         path: &str,
         key: (&str, &str),
     ) {
@@ -35591,7 +35661,7 @@ mod tests {
                 path: "/ss-ws".to_owned(),
                 ed: 0,
             },
-            crate::shadowsocks::serve_ws,
+            ss_serve(crate::shadowsocks::serve_ws),
             "/ss-ws",
             ("aes-256-gcm", "an-example-shared-password"),
         );
@@ -35620,7 +35690,7 @@ mod tests {
                 host: String::new(),
                 ed: 64,
             },
-            crate::shadowsocks::serve_httpupgrade_answering_after_the_request,
+            ss_serve(crate::shadowsocks::serve_httpupgrade_answering_after_the_request),
             "/ss-upgrade",
             ("aes-256-gcm", "an-example-shared-password"),
         );
@@ -35650,7 +35720,7 @@ mod tests {
             Carrier::Grpc(crate::config::GrpcSettings::path(
                 "/TunnelService/Tun".to_owned(),
             )),
-            crate::shadowsocks::serve_grpc,
+            ss_serve(crate::shadowsocks::serve_grpc),
             "/TunnelService/Tun",
             ("aes-256-gcm", "an-example-shared-password"),
         );
@@ -35662,7 +35732,7 @@ mod tests {
             Carrier::Xhttp {
                 settings: xhttp_settings("/ss-xhttp"),
             },
-            crate::shadowsocks::serve_xhttp,
+            ss_serve(crate::shadowsocks::serve_xhttp),
             "/ss-xhttp",
             ("aes-256-gcm", "an-example-shared-password"),
         );
@@ -35674,7 +35744,7 @@ mod tests {
             Carrier::HttpHeader {
                 path: "/ss-camouflage".to_owned(),
             },
-            crate::shadowsocks::serve_httpheader,
+            ss_serve(crate::shadowsocks::serve_httpheader),
             "/ss-camouflage",
             ("aes-256-gcm", "an-example-shared-password"),
         );
@@ -36810,8 +36880,9 @@ mod tests {
         let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let password = "an-example-shared-password";
+        let users = crate::shadowsocks::account(password, "aes-256-gcm");
         thread::spawn(move || {
-            crate::shadowsocks::serve_udp_on(&front, password, "aes-256-gcm", true);
+            crate::shadowsocks::serve_udp_on(&front, &users, true);
         });
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let master = ferrox_core::shadowsocks::MasterKey::new(password, 32);
@@ -36838,6 +36909,74 @@ mod tests {
         assert_eq!(payload, b"ping");
     }
 
+    /// xray makes one account per `users` entry, so a handshake under any of them is dialled — and a password none lists is not.
+    #[test]
+    fn a_shadowsocks_inbound_serves_every_client_in_its_users_list() {
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        let (dialed_tx, dialed_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for stream in echo.incoming() {
+                if stream.is_err() || dialed_tx.send(()).is_err() {
+                    return;
+                }
+            }
+        });
+        let inbound = crate::json::parse(
+            r#"{"protocol": "shadowsocks", "settings": {"method": "aes-256-gcm", "users": [
+                {"method": "aes-256-gcm", "password": "first-password"},
+                {"method": "aes-128-gcm", "password": "second-password"}]}}"#,
+        )
+        .expect("parses");
+        let users = inbound_ss_users(&inbound, "", "aes-256-gcm", "test");
+        let listed = users.len();
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for stream in tunnel.incoming().take(2) {
+                let Ok(stream) = stream else { continue };
+                let users = users.clone();
+                thread::spawn(move || crate::shadowsocks::serve(stream, &users, true));
+            }
+        });
+        let target = Destination::from(SocketAddr::from(([127, 0, 0, 1], echo_port)));
+        let mut second = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
+        second
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        assert!(
+            crate::shadowsocks::client_send_handshake(
+                &mut second,
+                "second-password",
+                "aes-128-gcm",
+                &target
+            )
+            .is_some(),
+            "a client seals its own handshake"
+        );
+        dialed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the second client's password opens the inbound");
+        let mut stranger = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
+        stranger
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        assert!(crate::shadowsocks::client_send_handshake(
+            &mut stranger,
+            "nobody-lists-this",
+            "aes-256-gcm",
+            &target
+        )
+        .is_some());
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            stranger.read(&mut byte).unwrap_or(0),
+            0,
+            "a password no client lists is refused"
+        );
+        assert_eq!(listed, 2, "one account per user");
+    }
+
     #[test]
     fn socks_associate_reaches_udp_echo_via_shadowsocks() {
         let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
@@ -36857,12 +36996,8 @@ mod tests {
         let tunnel = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let tunnel_port = tunnel.local_addr().expect("addr").port();
         thread::spawn(move || {
-            crate::shadowsocks::serve_udp_on(
-                &tunnel,
-                "an-example-shared-password",
-                "aes-256-gcm",
-                true,
-            );
+            let users = crate::shadowsocks::account("an-example-shared-password", "aes-256-gcm");
+            crate::shadowsocks::serve_udp_on(&tunnel, &users, true);
         });
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
@@ -47051,18 +47186,10 @@ end
         let echo_port = echo_loop();
         let password = "an-example-shared-password".to_owned();
         let method = "aes-256-gcm".to_owned();
-        let serve_password = password.clone();
-        let serve_method = method.clone();
+        let serve_users = crate::shadowsocks::account(&password, &method);
         let serve: KcpServe = Arc::new(move |conn| {
             let (reader, writer, close) = kcp_parts(conn);
-            crate::shadowsocks::serve_kcp(
-                reader,
-                writer,
-                &serve_password,
-                &serve_method,
-                true,
-                &close,
-            );
+            crate::shadowsocks::serve_kcp(reader, writer, &serve_users, true, &close);
         });
         let kcp_port = kcp_loop_with(serve);
         let front_port = socks_front_with(Outbound::Shadowsocks(ShadowsocksOut {
@@ -49969,20 +50096,12 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             account: _,
         } => serve_vmess_tls(stream, &users, &carrier, freedom, &server),
         Role::Shadowsocks {
-            password,
-            method,
+            accounts,
             carrier,
             freedom,
             tls,
             account: _,
-        } => serve_shadowsocks(
-            stream,
-            &password,
-            &method,
-            &carrier,
-            freedom,
-            tls.as_deref(),
-        ),
+        } => serve_shadowsocks(stream, &accounts, &carrier, freedom, tls.as_deref()),
         Role::Socks { out, accounts } => serve_socks(stream, &out, &accounts),
         Role::Http { out, accounts } => serve_http(stream, &out, &accounts),
         Role::Mixed { out, accounts } => serve_mixed(stream, &out, &accounts),
