@@ -530,34 +530,88 @@ pub fn udp_head(body: &[u8]) -> Option<(UdpHead, &[u8])> {
     ))
 }
 
-/// The one's-complement sum of bytes read as 16-bit big-endian words, the last zero-padded on an odd run, and eight bytes are one add rather than four: `0xffff = 2^16 - 1` makes `2^16` and `2^32` congruent to 1 mod `0xffff`, so a lane folded as `(hi32 + lo32)` lands in the same residue class as the four words it holds — witnessed by `the_word_fold_is_the_byte_at_a_time_sum`, `word_sum_is_the_word_at_a_time_sum_at_every_tail` and `the_parallel_accumulators_hold_the_single_accumulator_word_sum`.
+/// The octets one block holds: two octets per word, sixteen words, and a multiple of two so every octet keeps the parity of its own offset.
+const BLOCK: usize = 32;
+
+/// The one's-complement sum of bytes read as 16-bit big-endian words, the last zero-padded on an odd run.
+///
+/// A big-endian word is `high * 256 + low`, so the sum over a whole run is `256 * (even octets) + (odd octets)`: two byte sums and no per-word arithmetic at all. `vpsadbw` is exactly a byte sum — eight octets into one 64-bit lane, sixteen lanes a block — so a block costs one load, one shift that moves the odd octets into lanes a sum can see, two sums and two accumulating adds, and the whole run ends in the one subtraction `256 * all - 255 * odd`. Every term is an exact integer, so the magnitude this returns, not only its residue, is the walk's: an octet at an odd offset is the high half of its word and nothing else moves. Witnessed by `the_word_sum_costs_the_words_it_reads` against `the_serial_word_sum_costs_the_same_answer` over the same buffer, and by `the_parallel_accumulators_hold_the_single_accumulator_word_sum`, `word_sum_is_the_word_at_a_time_sum_at_every_tail` and `the_word_fold_is_the_byte_at_a_time_sum` at every length and tail.
 fn word_sum(bytes: &[u8]) -> u32 {
-    let (lanes, rem) = bytes.as_chunks::<8>();
-    // Four independent accumulators break the loop-carried add a single one imposes; their total is the same u64 because addition modulo 2^64 associates and commutes, so word_sum returns the very magnitude pseudo_sum's single fold reads at every lane count and remainder.
-    let (quads, singles) = lanes.as_chunks::<4>();
-    let (mut a0, mut a1, mut a2, mut a3) = (0u64, 0u64, 0u64, 0u64);
-    for quad in quads {
-        let w0 = u64::from_be_bytes(quad[0]);
-        let w1 = u64::from_be_bytes(quad[1]);
-        let w2 = u64::from_be_bytes(quad[2]);
-        let w3 = u64::from_be_bytes(quad[3]);
-        a0 += (w0 >> 32) + (w0 & 0xffff_ffff);
-        a1 += (w1 >> 32) + (w1 & 0xffff_ffff);
-        a2 += (w2 >> 32) + (w2 & 0xffff_ffff);
-        a3 += (w3 >> 32) + (w3 & 0xffff_ffff);
+    // The split is on a block boundary, so the octets the tail reads are at the offsets they held in the whole run.
+    let wide = bytes.len() & !(BLOCK - 1);
+    let acc = block_sum(&bytes[..wide]) + tail_sum(&bytes[wide..]);
+    // Fold the 64-bit residue into a 32-bit one (`2^32` is again congruent to `1`), then drain the carries twice: two steps bound any run past `0xffff` and callers fold once more.
+    let mut sum = (acc >> 32) + (acc & 0xffff_ffff);
+    sum = (sum >> 16) + (sum & 0xffff);
+    sum = (sum >> 16) + (sum & 0xffff);
+    sum as u32
+}
+
+/// The words of a run of whole blocks, as an exact integer: the vector kernel where AVX2 answers, the four-accumulator walk everywhere else.
+fn block_sum(bytes: &[u8]) -> u64 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx2") {
+            // SAFETY: the probe above is the guard, and the kernel reads only whole blocks of a run that is a whole number of them.
+            return unsafe { avx2_block_sum(bytes) };
+        }
     }
-    for lane in singles {
-        let word = u64::from_be_bytes(*lane);
-        a0 += (word >> 32) + (word & 0xffff_ffff);
+    scalar_block_sum(bytes)
+}
+
+/// Thirty-two octets per block as four byte lanes apiece, so the loop's adds still do not carry into each other.
+fn scalar_block_sum(bytes: &[u8]) -> u64 {
+    let mut lanes = [0u64; 4];
+    for block in bytes.as_chunks::<BLOCK>().0 {
+        for (acc, lane) in lanes.iter_mut().zip(block.as_chunks::<8>().0) {
+            let word = u64::from_be_bytes(*lane);
+            *acc += (word >> 32) + (word & 0xffff_ffff);
+        }
     }
-    let mut acc = (a0 + a1) + (a2 + a3);
-    // The run left is shorter than a lane: every group taken here is even so pairs still begin on an even byte, and a lone trailing byte is the high half of a zero-padded word.
+    (lanes[0] + lanes[1]) + (lanes[2] + lanes[3])
+}
+
+/// The same run as two byte sums: `256 * every octet - 255 * the odd octets` is the word sum, because an odd octet is its word's high half.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn avx2_block_sum(bytes: &[u8]) -> u64 {
+    use core::arch::x86_64::{
+        __m256i, _mm256_add_epi64, _mm256_loadu_si256, _mm256_sad_epu8, _mm256_setzero_si256,
+        _mm256_srli_epi16, _mm256_storeu_si256,
+    };
+    let zero = _mm256_setzero_si256();
+    let (mut every, mut odd) = (_mm256_setzero_si256(), _mm256_setzero_si256());
     let mut at = 0usize;
-    if rem.len() - at >= 4 {
-        acc += u64::from(u32::from_be_bytes(
-            rem[at..at + 4].try_into().expect("four bytes"),
-        ));
-        at += 4;
+    while at + BLOCK <= bytes.len() {
+        let block: __m256i = unsafe { _mm256_loadu_si256(bytes.as_ptr().add(at).cast()) };
+        every = _mm256_add_epi64(every, _mm256_sad_epu8(block, zero));
+        // Byte `2k + 1` of each word moves into byte `2k`, so the same sum now answers the odd octets.
+        let high = _mm256_srli_epi16(block, 8);
+        odd = _mm256_add_epi64(odd, _mm256_sad_epu8(high, zero));
+        at += BLOCK;
+    }
+    let mut every_lanes = [0u64; 4];
+    let mut odd_lanes = [0u64; 4];
+    unsafe { _mm256_storeu_si256(every_lanes.as_mut_ptr().cast(), every) };
+    unsafe { _mm256_storeu_si256(odd_lanes.as_mut_ptr().cast(), odd) };
+    let sum: u64 = every_lanes.iter().sum();
+    let high: u64 = odd_lanes.iter().sum();
+    sum * 256 - high * 255
+}
+
+/// The run past the last whole block, shorter than one: eight octets a lane, and the last three, two or one as words, an eight-octet lane folded the way `2^32 = 1 mod 0xffff` allows.
+fn tail_sum(bytes: &[u8]) -> u64 {
+    let (lanes, rem) = bytes.as_chunks::<8>();
+    let mut acc = 0u64;
+    for lane in lanes {
+        let word = u64::from_be_bytes(*lane);
+        acc += (word >> 32) + (word & 0xffff_ffff);
+    }
+    // Every group taken here is even so pairs still begin on an even byte, and a lone trailing byte is the high half of a zero-padded word.
+    let mut at = 0usize;
+    if rem.len() >= 4 {
+        acc += u64::from(u32::from_be_bytes(rem[..4].try_into().expect("four bytes")));
+        at = 4;
     }
     if rem.len() - at >= 2 {
         acc += u64::from(u16::from_be_bytes(
@@ -568,11 +622,7 @@ fn word_sum(bytes: &[u8]) -> u32 {
     if rem.len() - at == 1 {
         acc += u64::from(rem[at]) << 8;
     }
-    // Fold the 64-bit residue into a 32-bit one (`2^32` is again congruent to `1`), then drain the carries twice: two steps bound any run past `0xffff` and callers fold once more.
-    let mut sum = (acc >> 32) + (acc & 0xffff_ffff);
-    sum = (sum >> 16) + (sum & 0xffff);
-    sum = (sum >> 16) + (sum & 0xffff);
-    sum as u32
+    acc
 }
 
 /// The fold a checksum ends with: add the halves until nothing is left to carry, at most two steps for a 32-bit accumulator.
@@ -1269,6 +1319,101 @@ mod tests {
         let written = ipv4_checksum(&header);
         header[10..12].copy_from_slice(&written.to_be_bytes());
         assert_eq!(fold(word_sum(&header)), 0xffff);
+    }
+
+    /// The word sum as it stood: four accumulators over eight-octet lanes, a word at a time. Kept verbatim as the second side of the probe pair, so one `ops.yml` run prices both over the same buffer and the two folds cannot differ.
+    fn word_sum_serial(bytes: &[u8]) -> u32 {
+        let (lanes, rem) = bytes.as_chunks::<8>();
+        let (quads, singles) = lanes.as_chunks::<4>();
+        let (mut a0, mut a1, mut a2, mut a3) = (0u64, 0u64, 0u64, 0u64);
+        for quad in quads {
+            let w0 = u64::from_be_bytes(quad[0]);
+            let w1 = u64::from_be_bytes(quad[1]);
+            let w2 = u64::from_be_bytes(quad[2]);
+            let w3 = u64::from_be_bytes(quad[3]);
+            a0 += (w0 >> 32) + (w0 & 0xffff_ffff);
+            a1 += (w1 >> 32) + (w1 & 0xffff_ffff);
+            a2 += (w2 >> 32) + (w2 & 0xffff_ffff);
+            a3 += (w3 >> 32) + (w3 & 0xffff_ffff);
+        }
+        for lane in singles {
+            let word = u64::from_be_bytes(*lane);
+            a0 += (word >> 32) + (word & 0xffff_ffff);
+        }
+        let mut acc = (a0 + a1) + (a2 + a3);
+        let mut at = 0usize;
+        if rem.len() - at >= 4 {
+            acc += u64::from(u32::from_be_bytes(
+                rem[at..at + 4].try_into().expect("four bytes"),
+            ));
+            at += 4;
+        }
+        if rem.len() - at >= 2 {
+            acc += u64::from(u16::from_be_bytes(
+                rem[at..at + 2].try_into().expect("two bytes"),
+            ));
+            at += 2;
+        }
+        if rem.len() - at == 1 {
+            acc += u64::from(rem[at]) << 8;
+        }
+        let mut sum = (acc >> 32) + (acc & 0xffff_ffff);
+        sum = (sum >> 16) + (sum & 0xffff);
+        sum = (sum >> 16) + (sum & 0xffff);
+        sum as u32
+    }
+
+    /// One datagram's worth of payload, the width a CONNECT-IP packet's own checksum covers: the same bytes both probes below sum.
+    fn a_datagram_worth() -> Vec<u8> {
+        (0..1342usize)
+            .map(|i| (i as u32).wrapping_mul(2_654_435_761) as u8)
+            .collect()
+    }
+
+    /// The vector kernel against the scalar one, whole blocks at a time, wherever the kernel exists: the same words at every block count from none to a whole datagram's worth, so the parity identity is gated on the instruction that computes it and not only on the walk the dispatcher reaches.
+    #[test]
+    fn the_vector_block_sum_is_the_scalar_block_sum() {
+        #[cfg(target_arch = "x86_64")]
+        {
+            if std::is_x86_feature_detected!("avx2") {
+                let bytes = a_datagram_worth();
+                for blocks in 0..=bytes.len() / BLOCK {
+                    let run = &bytes[..blocks * BLOCK];
+                    // SAFETY: the probe above is the guard.
+                    assert_eq!(
+                        unsafe { avx2_block_sum(run) },
+                        scalar_block_sum(run),
+                        "{blocks} blocks"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The sum the vector kernel returns: sixty-four sums of the same 1342-octet buffer, folded so neither can be folded away, pinned so a run reads the same answer every time.
+    #[test]
+    fn the_word_sum_costs_the_words_it_reads() {
+        let payload = a_datagram_worth();
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            fold = fold.wrapping_mul(31).wrapping_add(word_sum(&payload));
+        }
+        std::hint::black_box(fold);
+        assert_eq!(fold, 3_545_888_768, "sixty-four parity sums");
+    }
+
+    /// The same sixty-four sums of the same buffer through the word-at-a-time walk, which is the price this slice traded away.
+    #[test]
+    fn the_serial_word_sum_costs_the_same_answer() {
+        let payload = a_datagram_worth();
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(word_sum_serial(&payload));
+        }
+        std::hint::black_box(fold);
+        assert_eq!(fold, 3_545_888_768, "the same sixty-four sums");
     }
 
     /// The word-at-a-time fold is the byte-at-a-time sum it replaces, at every length that has a boundary inside it and past the point an accumulator wraps.

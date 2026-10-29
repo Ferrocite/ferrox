@@ -358,6 +358,9 @@ carrier-foxy server-roles 0 ferrox-app-proxy::tests::quic_serve_closes_without_h
 carrier-foxy dialled-without-ca-cert-file 0 ferrox-app-proxy::tests::quic_outbound_reads_ca_cert_file
 carrier-foxy address-assign-capsule-bytes-per-grant 9 ferrox-core-foxy::connectip::tests::the_assign_a_proxy_writes_is_the_assign_the_lane_reads
 carrier-foxy route-advert-capsule-bytes-per-route 12 ferrox-core-foxy::connectip::tests::the_route_advert_a_proxy_writes_is_the_route_advert_the_lane_reads
+carrier-foxy word-sum-blocks-compared 42 ferrox-core-foxy::connectip::tests::the_vector_block_sum_is_the_scalar_block_sum
+carrier-foxy word-sum-magnitudes-agreed 135 ferrox-core-foxy::connectip::tests::the_parallel_accumulators_hold_the_single_accumulator_word_sum
+carrier-foxy word-sum-probe-octets 1342 ferrox-core-foxy::connectip::tests::the_word_sum_costs_the_words_it_reads
 carrier-foxy edges-preferred-by-verified-exit 1 ferrox-app-proxy::foxy_exit_tests::the_preferred_edge_is_the_first_one_whose_exit_agrees_not_the_first_one_opened
 carrier-foxy tcp-connections-asked-of-an-untrusted-edge 1 ferrox-app-foxy::loopback::an_untrusted_edge_is_named_and_asked_once
 carrier-foxy catalogue-edges-kept-across-a-failed-fetch 4 ferrox-app-foxy_catalog::tests::a_fetch_that_failed_keeps_the_edges_already_known
