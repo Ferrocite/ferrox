@@ -148,6 +148,13 @@ finalmask  finalmask::tests::the_last_configured_width_governs_every_later_segme
 reverse  proxy::reverse_tests::a_sixteen_kib_downlink_is_echoed_whole  reverse::Session::read_loop
 http-proxy  proxy::tests::the_connect_request_builds_in_one_buffer  proxy::http_connect_request
 http-proxy  proxy::tests::http_request_parses_connect_and_both_get_forms  proxy::http_proxy_request
+# The head walk and the octet walk it replaced, both under a probe over the same
+# forwarded head: one ops job reports both frames, and only their difference is a
+# claim about the scan.
+http-proxy  proxy::tests::the_head_walk_costs_the_head_and_nothing_else  proxy::drop_header
+http-proxy  proxy::tests::the_head_walk_costs_the_head_and_nothing_else  proxy::connection_named
+http-proxy  proxy::tests::the_head_walk_costs_the_head_and_nothing_else  proxy::tests::the_head_walk_costs_the_head_and_nothing_else
+http-proxy  proxy::tests::the_byte_walk_header_costs_the_same_answer  proxy::tests::the_byte_walk_header_costs_the_same_answer
 front-tun  tun::tests::an_emitted_packet_reuses_its_render_buffer  ferrox_app::tun::render_tcp_packet
 socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_core::socks::greeting
 socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_core::socks::user_pass

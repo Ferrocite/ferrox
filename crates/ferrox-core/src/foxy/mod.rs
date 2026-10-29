@@ -241,6 +241,32 @@ fn head_end_words(head: &[u8], last: usize) -> Option<usize> {
     head_end_at(head, last, if word == 0 { 0 } else { word - 1 })
 }
 
+/// The first octet equal to `needle` at or after `from`, or `None` — eight octets a step and one mask a step.
+///
+/// Subtracting a byte-at-a-time `0x01` from the block with the needle folded out of it underflows to `0xff` at every octet that equals the needle, and `& !miss` keeps only those underflows, so one and-mask marks every hit in eight octets. Reading the mask low to high is exact: every octet below the first hit is nonzero, so no borrow reaches it from below, the subtraction leaves its high bit clear or takes it away with `& !miss`, and the lowest set high bit is therefore the first hit's own — `trailing_zeros / 8` names it, and the loop never looks back. A line, a field name and a request line are all shorter than a vector is wide, so this walks a word at a time on every target: eight octets a step is already the whole line for the spans a head is made of, where a thirty-two-octet window would spend more in its broadcast and its mask extract than the line has octets to weigh.
+#[must_use]
+#[inline]
+pub fn octet_in(bytes: &[u8], from: usize, needle: u8) -> Option<usize> {
+    const LOW: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    let tail = bytes.get(from..)?;
+    let repeated = u64::from(needle).wrapping_mul(LOW);
+    let mut at = 0;
+    while at + 8 <= tail.len() {
+        let block = u64::from_le_bytes(tail[at..at + 8].try_into().expect("one eight-byte block"));
+        let miss = block ^ repeated;
+        let hits = miss.wrapping_sub(LOW) & !miss & HIGH;
+        if hits != 0 {
+            return Some(from + at + (hits.trailing_zeros() / 8) as usize);
+        }
+        at += 8;
+    }
+    tail[at..]
+        .iter()
+        .position(|byte| *byte == needle)
+        .map(|hit| from + at + hit)
+}
+
 pub fn connect_status(head: &[u8]) -> Result<u16, Failure> {
     let line_end = head_end(head).ok_or(Failure::Frame)?;
     let line = &head[..line_end];
@@ -1604,5 +1630,72 @@ mod tests {
             fold, 0x734b_5000,
             "the same 64 walks, byte-window at a time"
         );
+    }
+
+    /// `octet_in` is the tree's one octet scan, and every line, field-name and request-line walk reaches it in place of `iter().position`; this sweep is its oracle. A hit at every offset of every length across four whole blocks, asked from every start past it, is what puts a hit inside the word step's last octet, on its boundary and one octet either side.
+    #[test]
+    fn the_octet_scan_is_the_byte_walk_at_every_start() {
+        let oracle = |bytes: &[u8], from: usize, needle: u8| {
+            bytes
+                .get(from..)
+                .and_then(|tail| tail.iter().position(|byte| *byte == needle))
+                .map(|hit| hit + from)
+        };
+        for needle in [b'\n', b':', b'\r', b' ', 0x00, 0xff] {
+            let other = needle.wrapping_add(1);
+            for len in 0..=32usize {
+                for plant in 0..len {
+                    let body: Vec<u8> = (0..len)
+                        .map(|at| if at == plant { needle } else { other })
+                        .collect();
+                    for from in 0..=len + 1 {
+                        assert_eq!(
+                            octet_in(&body, from, needle),
+                            oracle(&body, from, needle),
+                            "needle {needle} len {len} plant {plant} from {from}"
+                        );
+                    }
+                }
+            }
+            let all = vec![needle; 40];
+            let none = vec![other; 40];
+            for from in 0..=41usize {
+                assert_eq!(octet_in(&all, from, needle), oracle(&all, from, needle));
+                assert_eq!(octet_in(&none, from, needle), oracle(&none, from, needle));
+            }
+        }
+        // The borrows the mask must not report: an octet the subtraction turns into `0xff` right behind a hit, and four hits in one word.
+        for body in [
+            vec![b'\n', 1, 1, 1, 1, 1, 1, 1, 1, 1],
+            vec![1, 1, 1, 1, 1, 1, 1, b'\n', 1, 1],
+            vec![1, b'\n', 1, b'\n', 1, b'\n', 1, b'\n', 1, 1],
+        ] {
+            for from in 0..=body.len() {
+                assert_eq!(
+                    octet_in(&body, from, b'\n'),
+                    oracle(&body, from, b'\n'),
+                    "{body:?} from {from}"
+                );
+            }
+        }
+        // A body dense in every needle, walked from every start.
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let body: Vec<u8> = (0..4096)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                (seed >> 56) as u8 % 16
+            })
+            .collect();
+        for from in 0..=body.len() {
+            for needle in [b'\n', b'\r', b':', 0x00] {
+                assert_eq!(
+                    octet_in(&body, from, needle),
+                    oracle(&body, from, needle),
+                    "dense body from {from}"
+                );
+            }
+        }
     }
 }
