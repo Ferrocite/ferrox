@@ -920,6 +920,28 @@ impl<'a> Gather<'a> {
         }
     }
 
+    /// Waits out a paced tail for the blocking writer: the framed relay never takes this path, so the
+    /// wait costs a lane only when a caller asked for every byte before it returned.
+    fn settle_blocking(shared: &Shared) -> bool {
+        let deadline = Instant::now() + crate::budgets::relay_stall();
+        loop {
+            let settled = match shared.stream.lock() {
+                Ok(mut stream) => stream.settle(),
+                Err(_) => Settle::Lost,
+            };
+            match settled {
+                Settle::Clear => return true,
+                Settle::Lost => return false,
+                Settle::Parked => {
+                    if Instant::now() >= deadline {
+                        return false;
+                    }
+                    std::thread::sleep(crate::budgets::RELAY_POLL);
+                }
+            }
+        }
+    }
+
     /// The same offer for a caller that may wait: a refused batch drains the paced tail and takes
     /// its window again before the next try.
     fn flush_blocking(&mut self, shared: &Arc<Shared>) -> bool {
@@ -929,35 +951,13 @@ impl<'a> Gather<'a> {
                 Accepted::All => return true,
                 Accepted::Lost => return false,
                 Accepted::Full => {
-                    if Instant::now() >= deadline || !settle_blocking(shared) {
+                    if Instant::now() >= deadline || !Self::settle_blocking(shared) {
                         return false;
                     }
                     if !take_window(shared, self.credit, true) {
                         return false;
                     }
                 }
-            }
-        }
-    }
-}
-
-/// Waits out a paced tail for the blocking writer: the framed relay never takes this path, so the
-/// wait costs a lane only when a caller asked for every byte before it returned.
-fn settle_blocking(shared: &Shared) -> bool {
-    let deadline = Instant::now() + crate::budgets::relay_stall();
-    loop {
-        let settled = match shared.stream.lock() {
-            Ok(mut stream) => stream.settle(),
-            Err(_) => Settle::Lost,
-        };
-        match settled {
-            Settle::Clear => return true,
-            Settle::Lost => return false,
-            Settle::Parked => {
-                if Instant::now() >= deadline {
-                    return false;
-                }
-                std::thread::sleep(crate::budgets::RELAY_POLL);
             }
         }
     }
@@ -1076,7 +1076,9 @@ impl GrpcWriter {
         }
         let mut batch = Gather::new();
         self.message(&[], self.max_frame(), true, &mut batch);
-        batch.flush_blocking(&self.shared);
+        if batch.flush_blocking(&self.shared) {
+            let _ = Gather::settle_blocking(&self.shared);
+        }
     }
 
     fn max_frame(&self) -> usize {

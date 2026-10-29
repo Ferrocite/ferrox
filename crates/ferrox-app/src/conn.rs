@@ -601,6 +601,48 @@ impl Connection {
         }
     }
 
+    /// Whether a write can take at least one byte now. Windows keeps no byte count on a timed-out
+    /// send, so a paced carrier asks this first and only writes when the socket has room.
+    #[cfg(windows)]
+    pub(crate) fn writable(&self, timeout: Duration) -> io::Result<bool> {
+        use std::os::windows::io::AsRawSocket as _;
+        use windows_sys::Win32::Networking::WinSock::{
+            select, FD_SET, FD_SETSIZE, SOCKET_ERROR, TIMEVAL,
+        };
+        let socket = match self {
+            Connection::Tcp(stream) => stream.as_raw_socket(),
+            Connection::Masked(masked) => masked.stream.as_raw_socket(),
+            Connection::Metered(metered) => return metered.inner.writable(timeout),
+            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
+                return inner.writable(timeout);
+            }
+            Connection::Unix(stream) => stream.as_raw_socket(),
+        };
+        let mut set = FD_SET {
+            fd_count: 1,
+            fd_array: [0; FD_SETSIZE as usize],
+        };
+        set.fd_array[0] = socket as usize;
+        let wait = TIMEVAL {
+            tv_sec: i32::try_from(timeout.as_secs()).unwrap_or(i32::MAX),
+            tv_usec: i32::try_from(timeout.subsec_micros()).unwrap_or(999_999),
+        };
+        // SAFETY: `set` holds this socket and lives for the call; no read or exception set is asked for.
+        let ready = unsafe {
+            select(
+                0,
+                std::ptr::null_mut(),
+                &mut set,
+                std::ptr::null_mut(),
+                &wait,
+            )
+        };
+        if ready == SOCKET_ERROR {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(ready > 0)
+    }
+
     /// Arm the read side's wait bound. TCP uses `SO_RCVTIMEO`; on a Unix stream `std` omits the
     /// setter, so the same `timeval` goes through `setsockopt` at `SOL_SOCKET`, the level that
     /// carries it for `AF_UNIX` too. `None` clears the bound and lets the read block.

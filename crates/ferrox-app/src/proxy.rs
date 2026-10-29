@@ -11720,12 +11720,40 @@ fn dial_tls_session(
     Some(session)
 }
 
+// The handle a sealed writer puts its records on: the write clock must live on this duplicate, not on the session's own descriptor, because Windows gives each duplicate its own clock.
+trait WriteClock {
+    fn write_clock(&self) -> Option<Connection>;
+}
+
+impl WriteClock for Connection {
+    fn write_clock(&self) -> Option<Connection> {
+        self.try_clone().ok()
+    }
+}
+
+impl WriteClock for KcpIo {
+    fn write_clock(&self) -> Option<Connection> {
+        None
+    }
+}
+
+impl WriteClock for std::io::Sink {
+    fn write_clock(&self) -> Option<Connection> {
+        None
+    }
+}
+
 // One session, two owners: the reader drives the transport when the session exposes one, so its parked read holds no session lock.
 fn session_halves<S, W>(session: S, transport: W) -> (TlsHalf<S>, TlsHalf<S>)
 where
-    W: Write + Send + 'static,
-    S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Drivable,
+    W: Write + Send + 'static + WriteClock,
+    S: ferrox_core::tls::TlsProvider
+        + ferrox_core::tls::RecordAlignment
+        + Drivable
+        + Send
+        + 'static,
 {
+    let clock = transport.write_clock();
     let out = Arc::new(Mutex::new(Sealed::new(transport)));
     let cipher = session.transport().and_then(|cipher| {
         cipher
@@ -11733,9 +11761,6 @@ where
             .ok()
             .map(|()| cipher)
     });
-    if let (Some(cipher), Ok(mut sealed)) = (cipher.as_ref(), out.lock()) {
-        sealed.raw = cipher.try_clone().ok();
-    }
     let mut session = session;
     let shared = match cipher.as_ref() {
         Some(_) => {
@@ -11745,6 +11770,9 @@ where
         }
         None => Arc::new(Mutex::new(session)),
     };
+    if let (Some(wire), Ok(mut sealed)) = (clock, out.lock()) {
+        sealed.wire = Some(wire);
+    }
     let reader = TlsHalf {
         session: Arc::clone(&shared),
         out: Arc::clone(&out),
@@ -11926,10 +11954,10 @@ fn xhttp_rung(
 // The write side of a split session: one seal fills a buffer, and the lock keeps seals and sends in wire order.
 struct Sealed {
     transport: Box<dyn Write + Send>,
+    /// The raw socket the writes actually use: Windows gives each duplicate its own clock, so the
+    /// handle that is armed must be the handle `send` writes.
+    wire: Option<Connection>,
     bytes: Vec<u8>,
-    /// The raw socket behind the transport, when the session exposes one: the write clock lives on
-    /// the descriptor, so a paced carrier arms it without taking the session's lock.
-    raw: Option<Connection>,
     /// The record behind `bytes` has a clock: a peer that drains nothing leaves its suffix here for
     /// a later settle instead of parking the relay lane's thread in the write.
     paced: bool,
@@ -11943,8 +11971,8 @@ impl Sealed {
     fn new(transport: impl Write + Send + 'static) -> Self {
         Self {
             transport: Box::new(transport),
+            wire: None,
             bytes: Vec::new(),
-            raw: None,
             paced: false,
         }
     }
@@ -11956,15 +11984,21 @@ impl Sealed {
             let written = if self.bytes.is_empty() {
                 Ok(())
             } else {
-                self.transport.write_all(&self.bytes)
+                Self::put_all(&mut self.wire, &mut *self.transport, &self.bytes)
             };
             self.bytes.clear();
             written?;
-            return self.transport.flush();
+            return Self::drain(&mut self.wire, &mut *self.transport);
         }
         let mut at = 0usize;
+        let paced = self.paced;
         while at < self.bytes.len() {
-            match self.transport.write(&self.bytes[at..]) {
+            match Self::put(
+                &mut self.wire,
+                &mut *self.transport,
+                &self.bytes[at..],
+                paced,
+            ) {
                 Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
                 Ok(n) => at += n,
                 Err(error)
@@ -11979,9 +12013,51 @@ impl Sealed {
             self.bytes.drain(..at);
         }
         if self.bytes.is_empty() {
-            return self.transport.flush();
+            return Self::drain(&mut self.wire, &mut *self.transport);
         }
         Ok(())
+    }
+
+    fn put(
+        wire: &mut Option<Connection>,
+        transport: &mut (dyn Write + Send),
+        buf: &[u8],
+        paced: bool,
+    ) -> std::io::Result<usize> {
+        #[cfg(not(windows))]
+        let _ = paced;
+        match wire.as_mut() {
+            Some(wire) => {
+                // Windows drops a timed-out send's byte count, so ask for room and keep the write blocking.
+                #[cfg(windows)]
+                if paced && !wire.writable(RELAY_POLL)? {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                wire.write(buf)
+            }
+            None => transport.write(buf),
+        }
+    }
+
+    fn put_all(
+        wire: &mut Option<Connection>,
+        transport: &mut (dyn Write + Send),
+        buf: &[u8],
+    ) -> std::io::Result<()> {
+        match wire.as_mut() {
+            Some(wire) => wire.write_all(buf),
+            None => transport.write_all(buf),
+        }
+    }
+
+    fn drain(
+        wire: &mut Option<Connection>,
+        transport: &mut (dyn Write + Send),
+    ) -> std::io::Result<()> {
+        match wire.as_mut() {
+            Some(wire) => wire.flush(),
+            None => transport.flush(),
+        }
     }
 
     fn settle(&mut self) -> Settle {
@@ -20719,10 +20795,15 @@ impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send
 
     fn arm_write(&mut self, timeout: Duration) {
         if let Ok(mut out) = self.out.lock() {
-            let Some(raw) = out.raw.as_ref() else {
+            if out.wire.is_none() {
                 return;
-            };
-            let _ = raw.set_write_timeout(Some(timeout));
+            }
+            #[cfg(not(windows))]
+            if let Some(wire) = out.wire.as_ref() {
+                let _ = wire.set_write_timeout(Some(timeout));
+            }
+            #[cfg(windows)]
+            let _ = timeout;
             out.paced = true;
         }
     }
@@ -38794,6 +38875,12 @@ mod tests {
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
+        }
+    }
+
+    impl WriteClock for CountedTransport {
+        fn write_clock(&self) -> Option<Connection> {
+            None
         }
     }
 
