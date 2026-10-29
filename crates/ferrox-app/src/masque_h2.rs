@@ -514,7 +514,9 @@ impl Client {
             if client.wire.closed || client.end {
                 return Err("the edge closed before assigning an address".to_owned());
             }
-            client.wire.fill();
+            if client.addresses.is_empty() {
+                client.wire.fill();
+            }
         }
         client.wire.deadline.clear();
         Ok(client)
@@ -1059,7 +1061,7 @@ impl Session {
         control.clear();
         connectip::route_advert_encode(&masque::routes(&self.addrs), &mut control);
         self.capsule(wire, &control);
-        if !wire.closed {
+        if !wire.closed && self.queued.is_empty() {
             wire.deadline.clear();
         }
     }
@@ -1184,6 +1186,9 @@ impl Session {
             let mut capsule = Vec::with_capacity(packet.len() + 8);
             datagram(&packet, &mut capsule);
             self.capsule(wire, &capsule);
+        }
+        if self.request.is_some() && !wire.closed && self.queued.is_empty() {
+            wire.deadline.clear();
         }
     }
 }
@@ -1696,10 +1701,15 @@ mod tests {
         session.request = Some(1);
         session.send_window = 0;
         let mut wire = bare_client().wire;
+        wire.deadline.arm(Instant::now() + Duration::from_secs(1));
         for _ in 0..QUEUED_CAP {
             client.capsule(&capsule);
             session.capsule(&mut wire, &capsule);
         }
+        assert!(
+            wire.deadline.remaining().is_some(),
+            "a queued capsule must keep the handshake clock armed"
+        );
         let window = u32::try_from(QUEUED_CAP * capsule.len())
             .expect("window")
             .to_be_bytes();
@@ -1712,6 +1722,10 @@ mod tests {
         session.flush(&mut wire);
         assert!(client.queued.is_empty());
         assert!(session.queued.is_empty());
+        assert!(
+            wire.deadline.remaining().is_none(),
+            "an empty queue releases the handshake clock"
+        );
         assert_eq!(client.send_window, 0);
         assert_eq!(client.connection_window, 0);
         assert_eq!(session.send_window, 0);
