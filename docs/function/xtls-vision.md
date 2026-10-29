@@ -29,6 +29,8 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | 30848 | scripts/count-ops.sh |
+| syscalls-per-framed-read | UNBLESSED | scripts/count-ops.sh |
+| seconds-per-framed-read | UNBLESSED | CI bench.yml (no cell yet) |
 | padding-command-bytes | 5 | ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid |
 | first-frame-uuid-bytes | 16 | ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid |
 | largest-framed-block-bytes | 8171 | ferrox-app-vision::tests::a_bulk_write_frames_every_block_inside_the_bound |
@@ -59,7 +61,7 @@ graph TD
 
 ## Time
 
-**Not measured yet.** `ferrox-bench` runs a Vision allocation gate (`gate_vision_allocs`) over content lengths 0, 1, 64, 1400 and 8171 and refuses any allocation, any allocated byte and any zero-fill; the wall clock for this framing is not separately timed and no duration is quoted here. Allocation counts are deterministic and are gated; durations are not. `Link`'s own working set is gated by capacity, not by an allocator window, and the next paragraphs say what that gate sees.
+**Not measured yet.** A syscall count for the framed read is `UNBLESSED` until an `ops.yml` artefact measures this method, and no `bench.yml` cell times the framing, so the duration row is `UNBLESSED` too; `scripts/count-ops.sh` does not exist on macOS/aarch64, so both gates are CI-only here. `ferrox-bench` runs a Vision allocation gate (`gate_vision_allocs`) over content lengths 0, 1, 64, 1400 and 8171 and refuses any allocation, any allocated byte and any zero-fill; the wall clock for this framing is not separately timed and no duration is quoted here. Allocation counts are deterministic and are gated; durations are not. `Link`'s own working set is gated by capacity, not by an allocator window, and the next paragraphs say what that gate sees.
 
 One row on this page names a gate that does not cover it, and it is renamed rather than deleted so the claim stays true: `seal-open-staging-allocations 0` is `ferrox-bench-gate-2`, and gate 2 drives the **stateless** `vless::VisionSeal`/`vless::VisionOpen` pair in `ferrox-core`. That pair is a second, independent implementation of this framing. It shares nothing with `vision::Link` in `ferrox-app` — no `have`, no `out`, no `hat`/`oat`, no `tls.budget` filter, no `read_direct` — and the data path above is `Link` throughout.
 
