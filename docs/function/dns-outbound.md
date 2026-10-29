@@ -33,6 +33,10 @@ The datagram lane is `serve_socks_udp`'s shape: one association, one lane per cl
 
 The direct rule resolves inline: the name minus its root, the literal-IP fast path, then the engine's cached lookup, and an empty answer writes the reference's empty-answer reply. Name what is left: the syscalls a loopback lane spends are only gated over real sockets as bytes — the counts a dial spends belong to CI's profile, not to a loopback test.
 
+## The probe's frames
+
+The probe runs four valid queries and one malformed query 4096 times against `return` and `direct` rules. The frames it calls — `parse_query`, the rule walk with its one fold, `resolve_step`, `ip_answer` and `reject` — are measured beside it under the same filter, so the row is a sum of measured parts and a change to one frame is visible as its own number.
+
 ## What we removed
 
 - **A copy of the resolver's address vector on every cache hit.** `cached_lookup` cloned the cached `Vec<SocketAddr>` and the answer was built from the clone; the entry now holds an `Arc<[SocketAddr]>`, so a hit is one refcount and the answer's own buffers are the only allocations, gated by `a_cached_lookup_answers_without_a_copy_of_the_cache` (`allocations-per-cached-lookup 2` — the record list and its one address). The entry and the first answer share the same address bytes, which the decision copies out of as before.
@@ -47,14 +51,14 @@ Nothing here is timed by a local run — every dial through this outbound is a c
 
 ## Gated counts
 
-The decision's retired instructions are the decide probe's frame — `ferrox-core-dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else`, walked 4096 times — read by `scripts/count-ops.sh` under the probe's own filter, the row the count gate now accepts per test. The inline question and rule buffers of #507 moved the frame from 55,544,745 to 60,123,580; two ops runs after that change returned 60,123,580. Folding the name once per question instead of once per domain rule moved it to 47,810,992, the number the ops run on 86e28e9 returned. The vless-encryption module's layout moved `decide` into the probe's own frame under thin LTO, so the five calls each turn now count here: 51,892,686, with the bytes and decisions unchanged. The record-buffer reuse and the b64 one-pass decoder moved the same test binary's inlining up to 51,892,734; the record-header timeout fix moved it back 48 instructions, and `dns.rs` is untouched. The TLS layout from #934 restored the 51,892,734 frame — the bytes and decisions are unchanged — and that is the number the gate files.
+The decision's retired instructions are the decide probe's frame — `ferrox-core-dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else`, walked 4096 times — read by `scripts/count-ops.sh` under the probe's own filter, the row the count gate now accepts per test. The inline question and rule buffers of #507 moved the frame from 55,544,745 to 60,123,580; two ops runs after that change returned 60,123,580. Folding the name once per question instead of once per domain rule moved it to 47,810,992, the number the ops run on 86e28e9 returned. The vless-encryption module's layout moved `decide` into the probe's own frame under thin LTO, so the five calls each turn now count here: 51,892,686, with the bytes and decisions unchanged. The record-buffer reuse and the b64 one-pass decoder moved the same test binary's inlining up to 51,892,734; the record-header timeout fix moved it back 48 instructions, and `dns.rs` is untouched. The TLS layout from #934 restored the 51,892,734 frame — the bytes and decisions are unchanged. The sealed-record read side and the head walk's signed cast moved it 40 instructions to 51,892,694, and the arithmetic is what says the decision is untouched: the probe walks its five decisions 4096 times, and 40 is not a multiple of that walk, so the loop that decides is byte for byte the same frame and the 40 is in its setup — the same layout drift this row has recorded at 48 and 54.
 
 ## Measured
 
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 51892734 | scripts/count-ops.sh |
+| ops-retired-instructions | 51892694 | scripts/count-ops.sh |
 | answer-cases-replayed | 21 | ferrox-core-dns::tests::the_answer_is_the_bytes_the_pinned_go_writes |
 | parse-refusals-replayed | 8 | ferrox-core-dns::tests::the_parse_refuses_what_the_reference_refuses |
 | pointer-hop-cap | 10 | ferrox-core-dns::tests::the_pointer_loop_refuses_at_the_cap |

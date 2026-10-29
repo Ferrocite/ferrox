@@ -10,7 +10,7 @@ use ferrox_core::hysteria::{self, Defrag, Masquerade, UdpMessage};
 
 use crate::conn::Connection;
 use crate::proxy::lane_pool::Next;
-use crate::quic::{Unfilled, MAX_DATAGRAM, RECV_ROOM};
+use crate::quic::{Unfilled, RECV_ROOM};
 
 const AUTH_STREAM: u64 = 0;
 
@@ -1425,9 +1425,8 @@ fn serve_file(dir: &str, request: &hysteria::H3Request, out: &mut Vec<u8>) {
 fn safe_path(root: &str, path: &str) -> Option<std::path::PathBuf> {
     let trimmed = path.split(['?', '#']).next().unwrap_or(path);
     let decoded = percent_decode(trimmed)?;
-    let text = std::str::from_utf8(&decoded).ok()?;
     let mut joined = std::path::PathBuf::from(root);
-    for segment in text.split('/') {
+    for segment in decoded.split('/') {
         match segment {
             "" | "." => {}
             ".." => return None,
@@ -1482,8 +1481,11 @@ fn html_escape(text: &str) -> String {
     out
 }
 
-/// Percent-decodes a URL path; a `%` not followed by two hex digits is not valid and rejects the whole path, so a half-decoded traversal never slips through.
-fn percent_decode(input: &str) -> Option<Vec<u8>> {
+/// Percent-decodes a URL path; a `%` not followed by two hex digits is not valid and rejects the whole path, so a half-decoded traversal never slips through. A path with no escape is already the text it decodes to, so it is lent back rather than copied into a buffer the copy would leave unchanged — the browser's own request line almost never escapes anything.
+fn percent_decode(input: &str) -> Option<std::borrow::Cow<'_, str>> {
+    if !input.as_bytes().contains(&b'%') {
+        return Some(std::borrow::Cow::Borrowed(input));
+    }
     let bytes = input.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0usize;
@@ -1501,7 +1503,7 @@ fn percent_decode(input: &str) -> Option<Vec<u8>> {
             }
         }
     }
-    Some(out)
+    String::from_utf8(out).ok().map(std::borrow::Cow::Owned)
 }
 
 fn hex_val(byte: u8) -> Option<u8> {
@@ -1748,7 +1750,6 @@ fn udp_reader(
     // One buffer for a whole target reply and one for the wire, both kept at capacity across the association's life so a steady relay never reallocates; the fragments view `buf`, so they are rebuilt each read rather than carried.
     let mut buf = vec![0u8; UDP_TARGET_BUF];
     let mut wire = Vec::new();
-    let mut out = Unfilled::<MAX_DATAGRAM>::new();
     let mut packet = 0u16;
     loop {
         let n = match target.recv(&mut buf) {
@@ -1789,7 +1790,7 @@ fn udp_reader(
                 let _ = conn.dgram_send(&wire);
             }
         }
-        flush(sock, &mut conn, out.as_mut());
+        crate::quic::flush_egress(&mut conn, sock);
     }
 }
 
@@ -1833,7 +1834,6 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
     let mut buf = vec![0u8; UDP_TARGET_BUF];
     // One wire buffer and one packet buffer, kept at capacity across the association's life so a steady relay never reallocates. The fragment list is born in the loop because its messages borrow the message's own bytes.
     let mut wire = Vec::with_capacity(UDP_TARGET_BUF + 64);
-    let mut out = Unfilled::<MAX_DATAGRAM>::new();
     let mut packet = 0u16;
     // Ids the lane stamps, taken in order and never reused on this connection, so a late reply to a retired flow cannot land on a new one.
     let mut next_id = 1u32;
@@ -1896,7 +1896,7 @@ pub(crate) fn serve_udp(relay: &UdpSocket, dial: &Dial) {
                 let _ = conn.dgram_send(&wire);
             }
         }
-        flush(&session.sock, &mut conn, out.as_mut());
+        crate::quic::flush_egress(&mut conn, &session.sock);
     }
     stop.store(true, Ordering::Relaxed);
     let _ = reader.join();
@@ -1997,7 +1997,6 @@ fn relay_datagrams(
 struct Router<'a> {
     sock: Arc<crate::quic::Datagram>,
     local: SocketAddr,
-    out: Unfilled<MAX_DATAGRAM>,
     auths: &'a [String],
     serve: &'a Serve,
     masq: Arc<Masquerade>,
@@ -2008,12 +2007,6 @@ struct Router<'a> {
     /// Whether an accepted connection advertises the token a peer resets it with; the reference's default, off only when `disableStatelessReset` names it.
     stateless_reset: bool,
     routes: HashMap<Vec<u8>, Inbound>,
-}
-
-fn flush(sock: &crate::quic::Datagram, conn: &mut quiche::Connection, out: &mut [u8]) {
-    while let Ok((written, info)) = conn.send(out) {
-        let _ = sock.send_to(&out[..written], info.to);
-    }
 }
 
 /// A stateless reset token belongs to one connection, so the shared template is minted afresh before each accept; a failed mint refuses the connection rather than sharing one.
@@ -2032,7 +2025,6 @@ fn mint_reset_token(template: &mut quiche::Config, enabled: bool) -> bool {
 
 fn auth_exchange(
     sock: &crate::quic::Datagram,
-    out: &mut [u8],
     conn: &mut quiche::Connection,
     auths: &[String],
     inbound: &mut Inbound,
@@ -2064,7 +2056,7 @@ fn auth_exchange(
         if conn.stream_send(AUTH_STREAM, &reply, true).is_err() {
             return None;
         }
-        flush(sock, conn, out);
+        crate::quic::flush_egress(conn, sock);
         return Some(true);
     }
     let ok = auths
@@ -2073,7 +2065,7 @@ fn auth_exchange(
     if !answer_auth(conn, ok, inbound.cc_rx) {
         return None;
     }
-    flush(sock, conn, out);
+    crate::quic::flush_egress(conn, sock);
     inbound.auth_buf.clear();
     inbound.authed = true;
     Some(ok)
@@ -2104,7 +2096,7 @@ impl Router<'_> {
         if conn.recv(packet, info).is_err() {
             return;
         }
-        flush(&self.sock, &mut conn, self.out.as_mut());
+        crate::quic::flush_egress(&mut conn, &self.sock);
         self.routes.insert(
             scid.to_vec(),
             Inbound {
@@ -2128,7 +2120,6 @@ impl Router<'_> {
         let Self {
             routes,
             sock,
-            out,
             auths,
             serve,
             masq,
@@ -2148,7 +2139,7 @@ impl Router<'_> {
             }
             // An established lane's acknowledgements leave with the batch that carried the packet, in `wake`, not one send per datagram.
             if !conn.is_established() || conn.is_closed() {
-                flush(sock, &mut conn, out.as_mut());
+                crate::quic::flush_egress(&mut conn, sock);
                 return;
             }
             let Some((mut settings_done, settings_sent, authed)) = routes
@@ -2171,7 +2162,7 @@ impl Router<'_> {
                 frames::quic_varint(&mut settings, 0x04);
                 frames::quic_varint(&mut settings, 0);
                 let _ = conn.stream_send(3, &settings, true);
-                flush(sock, &mut conn, out.as_mut());
+                crate::quic::flush_egress(&mut conn, sock);
                 if let Some(inbound) = routes.get_mut(dcid) {
                     inbound.settings_sent = true;
                 }
@@ -2180,14 +2171,12 @@ impl Router<'_> {
                 let Some(inbound) = routes.get_mut(dcid) else {
                     return;
                 };
-                let Some(ok) =
-                    auth_exchange(sock, out.as_mut(), &mut conn, auths, inbound, from, masq)
-                else {
+                let Some(ok) = auth_exchange(sock, &mut conn, auths, inbound, from, masq) else {
                     return;
                 };
                 if !ok {
                     let _ = conn.close(false, 0, b"refused");
-                    flush(sock, &mut conn, out.as_mut());
+                    crate::quic::flush_egress(&mut conn, sock);
                     return;
                 }
             }
@@ -2227,9 +2216,7 @@ impl Router<'_> {
     }
 
     fn wake(&mut self) {
-        let Self {
-            routes, sock, out, ..
-        } = self;
+        let Self { routes, sock, .. } = self;
         for inbound in routes.values() {
             let Ok(mut conn) = inbound.conn.lock() else {
                 continue;
@@ -2239,7 +2226,7 @@ impl Router<'_> {
                     inbound.wakes.wake(id);
                 }
             }
-            flush(sock, &mut conn, out.as_mut());
+            crate::quic::flush_egress(&mut conn, sock);
         }
     }
 
@@ -2247,7 +2234,6 @@ impl Router<'_> {
         let Self {
             routes,
             sock,
-            out,
             udp_idle,
             ..
         } = self;
@@ -2265,7 +2251,7 @@ impl Router<'_> {
                 return false;
             }
             conn.on_timeout();
-            flush(sock, &mut conn, out.as_mut());
+            crate::quic::flush_egress(&mut conn, sock);
             inbound.udp.retain(|_, flow| {
                 if now.duration_since(flow.last) > *udp_idle {
                     flow.stop.store(true, Ordering::Relaxed);
@@ -2355,7 +2341,6 @@ pub(crate) fn serve_loop(
     let mut router = Router {
         sock: Arc::new(sock),
         local,
-        out: Unfilled::<MAX_DATAGRAM>::new(),
         auths,
         serve,
         masq: Arc::from(masq.clone()),
@@ -2412,6 +2397,124 @@ pub(crate) fn serve_loop(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::quic::MAX_DATAGRAM;
+
+    /// The buffer form the decode had, kept as the bytes every path has to still reach.
+    fn the_buffer_decode(input: &str) -> Option<String> {
+        let bytes = input.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0usize;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'%' => {
+                    let hi = hex_val(*bytes.get(i + 1)?)?;
+                    let lo = hex_val(*bytes.get(i + 2)?)?;
+                    out.push(hi << 4 | lo);
+                    i += 3;
+                }
+                other => {
+                    out.push(other);
+                    i += 1;
+                }
+            }
+        }
+        String::from_utf8(out).ok()
+    }
+
+    /// The escapes a browser sends, the multi-byte and literal-percent ones, and the half-escapes that reject the whole path.
+    const DECODED_PATHS: &[&str] = &[
+        "",
+        "/",
+        "/index.html",
+        "/static/css/site.css?v=2",
+        "/a%20b/c.txt",
+        "/%2E%2E/escape",
+        "/%2e%2e%2f",
+        "/caf%C3%A9/menu.json",
+        "/100%25",
+        "/a%2",
+        "/a%zz",
+        "/%",
+        "/%FF",
+        "/sp ace/../x",
+    ];
+
+    /// Every path decodes to the bytes the buffer form produced and rejects exactly the paths it rejected, so lending a percent-free path back changes no answer.
+    #[test]
+    fn every_path_decodes_to_the_bytes_the_buffer_form_decoded() {
+        for path in DECODED_PATHS {
+            assert_eq!(
+                percent_decode(path).as_deref(),
+                the_buffer_decode(path).as_deref(),
+                "path {path:?}"
+            );
+        }
+    }
+
+    /// A path with no escape opens nothing: 4096 static requests are lent the request's own text, and the one buffer is opened only when a `%` can change a byte.
+    #[test]
+    fn a_path_with_no_escape_is_lent_back_undecoded() {
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                std::hint::black_box(percent_decode(std::hint::black_box("/static/css/site.css")));
+            }
+        });
+        assert_eq!(counts.allocs, 0, "no escape, no buffer");
+        assert!(
+            matches!(
+                percent_decode("/static/css/site.css"),
+                Some(std::borrow::Cow::Borrowed(_))
+            ),
+            "the answer is the caller's own text"
+        );
+        let (_, escaped) = ferrox_core::alloc_count::measure(|| percent_decode("/a%20b"));
+        assert_eq!(escaped.allocs, 1, "an escape opens the one buffer it needs");
+    }
+
+    /// The whole static answer over a real file adds only the path it builds and the one growth that path takes to the platform's own read, measured in the same process so an allocator that opens more for a file is a floor and not a budget.
+    #[test]
+    fn a_static_file_answer_opens_only_the_path_and_the_file() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-static-answer-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("stages dir");
+        std::fs::write(dir.join("hello.txt"), b"static bytes").expect("stages file");
+        let request = hysteria::H3Request {
+            method: "GET".to_owned(),
+            path: "/hello.txt".to_owned(),
+            authority: "cover.test".to_owned(),
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let root = dir.to_str().expect("ascii").to_owned();
+        // The floor is the platform's own file work on the path `serve_file` resolves, so the difference is this tree's buffers and nothing the standard library opens.
+        let file = dir.join("hello.txt");
+        let ((), floor) = ferrox_core::alloc_count::measure(|| {
+            let _ = std::hint::black_box(&file).is_dir();
+            std::hint::black_box(std::fs::read(std::hint::black_box(&file)).expect("reads"));
+        });
+        let mut out = Vec::with_capacity(256);
+        serve_file(&root, &request, &mut out);
+        assert!(
+            out.windows(12).any(|window| window == b"static bytes"),
+            "the file's bytes are in the answer"
+        );
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            out.clear();
+            serve_file(std::hint::black_box(&root), &request, &mut out);
+        });
+        assert_eq!(
+            counts.allocs,
+            floor.allocs + 2,
+            "the path buffer and its one growth are all the answer adds to the platform's own read"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn server_config_refuses_without_a_chain_it_can_read() {
@@ -2666,7 +2769,6 @@ mod tests {
             let mut router = Router {
                 sock: Arc::clone(&session.sock),
                 local: session.local,
-                out: Unfilled::new(),
                 auths: &auths,
                 serve: &handler,
                 masq: Arc::new(Masquerade::NotFound),

@@ -141,9 +141,14 @@ append_pem 591
 # the same test binary's thin-LTO inlining moved the frame 48 instructions back.
 # Re-blessed 51892734 by the TLS identity layout (#934): dns.rs is untouched; the
 # same thin-LTO frame moved 48 instructions forward again, bytes and decisions unchanged.
+# Re-blessed 51892694 by the sealed-record read side (89df8114) and the head
+# walk's signed cast (533fbb29): dns.rs is byte-identical to main's and the probe
+# still walks its five decisions 4096 times, so the 40 retired instructions are
+# not a multiple of that walk -- the loop that decides is unchanged and the move
+# is in the frame's own setup, the layout drift this row has recorded before.
 # Measured with Rust 1.99.1, Ubuntu 24.04, glibc 2.39 and Valgrind 3.22.0;
 # the identical binary reproduces CI in that userspace; other profiling userspaces differ.
-ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51892734 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else 51892694 dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
 # Re-blessed 16896 by the Vision walk's local state: the parser probe (512
 # empty frames) read and wrote every Walk field through self each turn and
 # loaded the five header bytes one at a time. It now keeps the cursor and the

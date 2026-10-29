@@ -9329,6 +9329,27 @@ fn serve_hc_inbound(address: &str, inbound: &Json) -> bool {
     true
 }
 
+/// The `hc` request's head and the octets behind it, one window at a time: the terminator scan resumes three octets before the bytes that just arrived, so a head that arrives in pieces is walked once rather than once per piece, and it reaches the tree's one `\r\n\r\n` scan rather than reopening the four-byte window.
+fn read_hc_head(stream: &mut dyn Read) -> Option<(Vec<u8>, usize)> {
+    let mut data = Vec::with_capacity(1024);
+    let mut buf = [0u8; 8192];
+    loop {
+        let read = match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return None,
+            Ok(read) => read,
+        };
+        // A terminator straddles the seam at most three octets into what was already here.
+        let from = data.len().saturating_sub(3);
+        data.extend_from_slice(&buf[..read]);
+        if let Some(end) = ferrox_core::foxy::head_end(&data[from..]).map(|hit| hit + from) {
+            return Some((data, end + 4));
+        }
+        if data.len() > 65_536 {
+            return None;
+        }
+    }
+}
+
 struct HcHandler {
     path: String,
     request: String,
@@ -9355,24 +9376,12 @@ impl HcHandler {
     }
 
     fn serve(&self, mut stream: Connection) {
-        let mut data = Vec::with_capacity(1024);
-        let mut buf = [0u8; 8192];
-        loop {
-            let read = match stream.read(&mut buf) {
-                Ok(0) | Err(_) => return,
-                Ok(read) => read,
-            };
-            data.extend_from_slice(&buf[..read]);
-            if let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n") {
-                let (head, body) = data.split_at(end + 4);
-                if self.answer(&mut stream, head, body).is_ok() {
-                    let _ = stream.shutdown(Shutdown::Both);
-                }
-                return;
-            }
-            if data.len() > 65_536 {
-                return;
-            }
+        let Some((data, end)) = read_hc_head(&mut stream) else {
+            return;
+        };
+        let (head, body) = data.split_at(end);
+        if self.answer(&mut stream, head, body).is_ok() {
+            let _ = stream.shutdown(Shutdown::Both);
         }
     }
 
@@ -16337,7 +16346,7 @@ enum ProxyRequest {
 
 /// CONNECT tunnels; absolute- and origin-form forward the head with its line rewritten to origin-form.
 fn http_proxy_request(mut head: Vec<u8>) -> Option<ProxyRequest> {
-    let line_end = head.iter().position(|byte| *byte == b'\n');
+    let line_end = ferrox_core::foxy::octet_in(&head, 0, b'\n');
     let raw = &head[..line_end.unwrap_or(head.len())];
     let line = raw.strip_suffix(b"\r").unwrap_or(raw);
     let mut parts = line.split(|byte| *byte == b' ');
@@ -16354,7 +16363,7 @@ fn http_proxy_request(mut head: Vec<u8>) -> Option<ProxyRequest> {
         return None;
     }
     if let Some(rest) = target.strip_prefix(b"http://") {
-        let (authority, path) = match rest.iter().position(|byte| *byte == b'/') {
+        let (authority, path) = match ferrox_core::foxy::octet_in(rest, 0, b'/') {
             Some(at) => (&rest[..at], &rest[at..]),
             None => (rest, b"/".as_slice()),
         };
@@ -16411,7 +16420,7 @@ fn connect_authority(target: &[u8]) -> &[u8] {
         .into_iter()
         .find_map(|scheme| target.strip_prefix(scheme))
         .unwrap_or(target);
-    match rest.iter().position(|byte| *byte == b'/') {
+    match ferrox_core::foxy::octet_in(rest, 0, b'/') {
         Some(at) => &rest[..at],
         None => rest,
     }
@@ -16508,14 +16517,22 @@ fn http_credential_account<'a>(
     accounts.account(&decoded[..colon], &decoded[colon + 1..])
 }
 
+/// The octets of the next `\r\n` line end, from a line's first octet: the first `\n` that a `\r` precedes, which is the two-octet window a walk would have matched, found one octet at a time.
+fn crlf_in(head: &[u8], mut at: usize) -> Option<usize> {
+    loop {
+        let hit = ferrox_core::foxy::octet_in(head, at, b'\n')?;
+        if hit > at && head[hit - 1] == b'\r' {
+            return Some(hit - 1 - at);
+        }
+        at = hit + 1;
+    }
+}
+
 /// Removes every line naming a header, in place; the credential is the proxy's, not the origin's.
 fn drop_header(head: &mut Vec<u8>, name: &str) {
-    let mut at = head
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map_or(head.len(), |at| at + 1);
+    let mut at = ferrox_core::foxy::octet_in(head, 0, b'\n').map_or(head.len(), |at| at + 1);
     while at < head.len() {
-        let Some(end) = head[at..].windows(2).position(|pair| pair == b"\r\n") else {
+        let Some(end) = crlf_in(head, at) else {
             return;
         };
         let named = {
@@ -16537,7 +16554,7 @@ fn drop_header(head: &mut Vec<u8>, name: &str) {
 /// this front rewrites the line to origin-form: the method uppercased, the path percent-decoded and
 /// without its query, and an absolute target with no path naming the empty one the reference parses.
 fn request_line_attributes(head: &[u8]) -> Option<(String, String)> {
-    let end = head.iter().position(|byte| *byte == b'\n')?;
+    let end = ferrox_core::foxy::octet_in(head, 0, b'\n')?;
     let line = head[..end].strip_suffix(b"\r").unwrap_or(&head[..end]);
     let mut parts = line.split(|byte| *byte == b' ');
     let method = std::str::from_utf8(parts.next()?).ok()?;
@@ -16579,22 +16596,22 @@ fn decoded_path(path: &str) -> std::borrow::Cow<'_, str> {
 /// Every header the reference's hop-by-hop removal leaves, by the name it was sent with, plus the
 /// empty `User-Agent` it inserts when the client sent none; `host` is promoted off the header map.
 fn forward_headers<'a>(head: &'a [u8], attrs: &mut crate::router::Attributes<'a>) {
-    let Some(line_end) = head.iter().position(|byte| *byte == b'\n') else {
+    let Some(line_end) = ferrox_core::foxy::octet_in(head, 0, b'\n') else {
         return;
     };
     let named = connection_named(head, line_end + 1);
     let mut user_agent = false;
     let mut at = line_end + 1;
     while at < head.len() {
-        let Some(end) = head[at..].iter().position(|byte| *byte == b'\n') else {
+        let Some(end) = ferrox_core::foxy::octet_in(head, at, b'\n') else {
             break;
         };
-        let raw = &head[at..at + end];
+        let raw = &head[at..end];
         let line = raw.strip_suffix(b"\r").unwrap_or(raw);
         if line.is_empty() {
             break;
         }
-        if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+        if let Some(colon) = ferrox_core::foxy::octet_in(line, 0, b':') {
             let name = &line[..colon];
             if !hop_by_hop(name, named) && !name.eq_ignore_ascii_case(b"host") {
                 if let (Ok(name), Ok(value)) = (
@@ -16606,7 +16623,7 @@ fn forward_headers<'a>(head: &'a [u8], attrs: &mut crate::router::Attributes<'a>
                 }
             }
         }
-        at += end + 1;
+        at = end + 1;
     }
     if !user_agent {
         attrs.push("user-agent", std::borrow::Cow::Borrowed(""));
@@ -16617,20 +16634,20 @@ fn forward_headers<'a>(head: &'a [u8], attrs: &mut crate::router::Attributes<'a>
 fn connection_named(head: &[u8], from: usize) -> &[u8] {
     let mut at = from;
     while at < head.len() {
-        let Some(end) = head[at..].iter().position(|byte| *byte == b'\n') else {
+        let Some(end) = ferrox_core::foxy::octet_in(head, at, b'\n') else {
             break;
         };
-        let raw = &head[at..at + end];
+        let raw = &head[at..end];
         let line = raw.strip_suffix(b"\r").unwrap_or(raw);
         if line.is_empty() {
             break;
         }
-        if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+        if let Some(colon) = ferrox_core::foxy::octet_in(line, 0, b':') {
             if line[..colon].eq_ignore_ascii_case(b"connection") {
                 return trim_bytes(&line[colon + 1..]);
             }
         }
-        at += end + 1;
+        at = end + 1;
     }
     b""
 }
@@ -46352,6 +46369,88 @@ mod tests {
         }
     }
 
+    /// A forwarded request's head, carrying the two lines the front's walks are about: a `Connection` whose tokens the hop-by-hop removal reads and a credential line it drops, beside ten fields it keeps.
+    const FORWARDED: &[u8] = b"GET /assets/abcdef0123456789/panel.json?cache=4f2a HTTP/1.1\r\nHost: edge.example.net\r\nUser-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)\r\nAccept: application/json\r\nAccept-Language: en-US,en;q=0.9\r\nAccept-Encoding: gzip, deflate, br\r\nConnection: keep-alive\r\nProxy-Authorization: Basic dXNlcjpwYXNzd29yZA==\r\nCookie: session=8f14e45fceea167a5a36dedd4bea2543\r\nReferer: https://edge.example.net/panel\r\nX-Request-Id: 0123456789abcdef\r\n\r\n";
+
+    /// The two full-head walks a forwarded request pays — the credential's line dropped, then the `Connection` value read — in one frame: 64 rounds over the same head, folded after each, so the pair prices the octet scan without a second CI run being trusted to agree with the first.
+    #[test]
+    fn the_head_walk_costs_the_head_and_nothing_else() {
+        let mut room = Vec::with_capacity(FORWARDED.len());
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            room.clear();
+            room.extend_from_slice(std::hint::black_box(FORWARDED));
+            drop_header(&mut room, "proxy-authorization");
+            let named = connection_named(std::hint::black_box(room.as_slice()), 0);
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(room.len() as u32 + named.len() as u32);
+        }
+        assert_eq!(fold, 0xb74e_4000, "64 walks of one head, folded after each");
+    }
+
+    /// The two walks as they stood, kept as this run's other frame: the same head, the same 64 rounds, the same pinned fold, so one ops job reports both and only their difference is a claim about the scan.
+    fn byte_walk_drop_header(head: &mut Vec<u8>, name: &str) {
+        let mut at = head
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(head.len(), |at| at + 1);
+        while at < head.len() {
+            let Some(end) = head[at..].windows(2).position(|pair| pair == b"\r\n") else {
+                return;
+            };
+            let named = {
+                let line = &head[at..at + end];
+                line.len() > name.len()
+                    && line[name.len()] == b':'
+                    && line[..name.len()].eq_ignore_ascii_case(name.as_bytes())
+            };
+            if named {
+                head.copy_within(at + end + 2.., at);
+                head.truncate(head.len() - end - 2);
+                continue;
+            }
+            at += end + 2;
+        }
+    }
+
+    fn byte_walk_connection_named(head: &[u8], from: usize) -> &[u8] {
+        let mut at = from;
+        while at < head.len() {
+            let Some(end) = head[at..].iter().position(|byte| *byte == b'\n') else {
+                break;
+            };
+            let raw = &head[at..at + end];
+            let line = raw.strip_suffix(b"\r").unwrap_or(raw);
+            if line.is_empty() {
+                break;
+            }
+            if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+                if line[..colon].eq_ignore_ascii_case(b"connection") {
+                    return trim_bytes(&line[colon + 1..]);
+                }
+            }
+            at += end + 1;
+        }
+        b""
+    }
+
+    #[test]
+    fn the_byte_walk_header_costs_the_same_answer() {
+        let mut room = Vec::with_capacity(FORWARDED.len());
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            room.clear();
+            room.extend_from_slice(std::hint::black_box(FORWARDED));
+            byte_walk_drop_header(&mut room, "proxy-authorization");
+            let named = byte_walk_connection_named(std::hint::black_box(room.as_slice()), 0);
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(room.len() as u32 + named.len() as u32);
+        }
+        assert_eq!(fold, 0xb74e_4000, "the same 64 walks, one octet at a time");
+    }
+
     fn http_out(user: Option<&str>, pass: Option<&str>, headers: &[(&str, &str)]) -> HttpOut {
         HttpOut {
             address: "proxy.example".to_string(),
@@ -47877,6 +47976,58 @@ end
             format!("GET /ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nUser-Agent: probe\r\n\r\n")
                 .into_bytes()
         );
+    }
+
+    /// What the origin sees after the removal is the head minus the credential line, in place; what the rules see is that head minus every field the hop-by-hop list owns. Both are asserted on one request, so a walk that kept a line or lost one shows up as bytes.
+    #[test]
+    fn the_forwarded_head_is_what_the_removal_left() {
+        let echo = echo_loop();
+        let front = |attrs: &str| {
+            let config = format!(
+                r#"{{"outbounds":[{{"tag":"direct","protocol":"freedom"}},{{"tag":"block","protocol":"blackhole"}}],
+                    "routing":{{"rules":[{{"type":"field","attrs":{attrs},"outboundTag":"block"}}]}}}}"#
+            );
+            http_front_with(route_outbound(&config, Some("in"), true))
+        };
+        let ask = |front: u16| {
+            let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+            client
+                .set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            client
+                .write_all(
+                    format!(
+                        "GET http://127.0.0.1:{echo}/ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\
+                         User-Agent: probe\r\nX-Request-Id: 0123\r\n\
+                         Connection: keep-alive\r\nProxy-Authorization: Basic dXNlcjpwYXNz\r\n\r\n"
+                    )
+                    .as_bytes(),
+                )
+                .expect("gets");
+            client
+        };
+        let mut blocked = ask(front(r#"{"user-agent":"^probe$"}"#));
+        let mut one = [0u8; 1];
+        assert_eq!(
+            blocked.read(&mut one).expect("closes"),
+            0,
+            "a field the head sent under its own name reaches the rules"
+        );
+        let left = format!(
+            "GET /ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nUser-Agent: probe\r\n\
+             X-Request-Id: 0123\r\nConnection: keep-alive\r\n\r\n"
+        )
+        .into_bytes();
+        for attrs in [
+            r#"{"proxy-authorization":"^Basic"}"#,
+            r#"{"connection":"^keep-alive$"}"#,
+            r#"{"keep-alive":"^$"}"#,
+        ] {
+            let mut client = ask(front(attrs));
+            let head = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE)
+                .expect("echoes the head");
+            assert_eq!(head, left, "{attrs} names a field the removal took");
+        }
     }
 
     /// The HTTP sniffer sets the attributes before the rules run, so a head it reads off a socks flow
@@ -51612,6 +51763,101 @@ mod hc_tests {
             exchange(port, b"GET /health HTTP/1.1\r\nHost: probe\r\n\r\n"),
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\nok"
         );
+    }
+
+    /// A reader that hands over `window` octets a call, so a head arriving in pieces is the same reader every run.
+    struct Trickle<'a> {
+        bytes: &'a [u8],
+        window: usize,
+    }
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let take = self.bytes.len().min(out.len()).min(self.window);
+            out[..take].copy_from_slice(&self.bytes[..take]);
+            self.bytes = &self.bytes[take..];
+            Ok(take)
+        }
+    }
+
+    /// The head is found at every arrival pattern: the scan resumes three octets before the seam, so a terminator split across two rounds is still found where the whole-buffer walk would have found it, and the octets handed on are the ones that arrived.
+    #[test]
+    fn an_hc_head_is_found_at_every_split_of_its_arrival() {
+        let request: &[u8] =
+            b"GET /health HTTP/1.1\r\nHost: probe\r\nX-Fill: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\npayload";
+        let head = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("a terminator")
+            + 4;
+        for window in 1..=request.len() {
+            let (data, end) = read_hc_head(&mut Trickle {
+                bytes: request,
+                window,
+            })
+            .unwrap_or_else(|| panic!("no head at window {window}"));
+            assert_eq!(end, head, "window {window}");
+            assert_eq!(data.as_slice(), &request[..data.len()], "window {window}");
+            assert_eq!(&data[head - 4..head], b"\r\n\r\n", "window {window}");
+        }
+    }
+
+    /// An eight-kilobyte head that arrives in sixteen 512-byte windows, its terminator in the last four octets: the shape both scans below are read on.
+    fn sixteen_windows() -> Vec<Vec<u8>> {
+        let mut head = b"GET /health HTTP/1.1\r\nHost: probe\r\n".to_vec();
+        let line: &[u8] = b"X-Fill: 0123456789012345678901234567890123456789012\r\n";
+        while head.len() + line.len() <= 8188 {
+            head.extend_from_slice(line);
+        }
+        // Whole lines only, so the filler's own octets hold no terminator.
+        head.resize(8188, b'.');
+        head.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(head.len(), 8192, "a full eight-kilobyte head");
+        head.chunks(512).map(<[u8]>::to_vec).collect()
+    }
+
+    /// The scan as it stood: the whole head re-walked at four-byte windows after every round.
+    fn scan_from_the_front(rounds: &[Vec<u8>]) -> Option<usize> {
+        let mut data = Vec::new();
+        for round in rounds {
+            data.extend_from_slice(round);
+            if let Some(end) = data.windows(4).position(|window| window == b"\r\n\r\n") {
+                return Some(end + 4);
+            }
+        }
+        None
+    }
+
+    /// The front-to-back rescan and the resumed walk, on the same eight-kilobyte head arriving in sixteen windows: both answer the same offset, and only their difference is a claim about the walk. Sixty-four passes each, the offsets folded into a pinned `u32` so neither can be folded away.
+    #[test]
+    fn the_front_scan_costs_every_window_it_has_already_walked() {
+        let rounds = sixteen_windows();
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            let end = scan_from_the_front(&rounds).expect("a head");
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(u32::try_from(end).expect("an offset"));
+        }
+        assert_eq!(fold, 0x1080_0000, "sixty-four front-to-back walks");
+    }
+
+    #[test]
+    fn the_seam_scan_costs_the_bytes_it_has_not_walked() {
+        let joined = sixteen_windows().concat();
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            let end = read_hc_head(&mut Trickle {
+                bytes: &joined,
+                window: 512,
+            })
+            .map(|(_, end)| end)
+            .expect("a head");
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(u32::try_from(end).expect("an offset"));
+        }
+        assert_eq!(fold, 0x1080_0000, "the same sixty-four heads");
     }
 
     #[test]

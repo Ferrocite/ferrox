@@ -78,8 +78,15 @@ vless  vless::tests::first_method_header_is_stable  ferrox_core::vless::VlessLin
 vless  vless::tests::the_request_parse_probe_costs_the_read_and_nothing_else  ferrox_core::vless::decode_request
 vless  vless::tests::the_flow_decision_probe_costs_the_walk_and_nothing_else  ferrox_core::vless::flow_of
 xtls-vision  vision::tests::the_framing_switch_ends_the_staging  vision::Link::read_direct
-xtls-vision  vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else  vision::Linkferrox_app::vision::tests::Fake::pump
+xtls-vision  vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else  vision::Link
+xtls-vision  vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else  ferrox_app::vision::tests::Fake::pump
 xtls-vision  vless::tests::the_command_validator_probe_costs_the_match_and_nothing_else  ferrox_core::vless::VisionCommand::from_byte
+# The scan and the six-byte window it replaced, both under a probe over the same
+# 512-byte hello: one ops job reports both frames, and only their difference is a
+# claim about the scan.
+xtls-vision  vision::tests::the_word_version_scan_costs_the_scan_and_nothing_else  vision::supports_tls13
+xtls-vision  vision::tests::the_word_version_scan_costs_the_scan_and_nothing_else  vision::tests::the_word_version_scan_costs_the_scan_and_nothing_else
+xtls-vision  vision::tests::the_serial_version_scan_costs_the_same_answer  vision::tests::the_serial_version_scan_costs_the_same_answer
 carrier-foxy  foxy::loopback::the_http2_carrier_writes_one_literal_header_block_and_relays  foxy::read_frame
 carrier-foxy  foxy::loopback::the_h3_downlink_hands_the_caller_the_frame_without_staging_it  foxy::H3::read
 carrier-foxy  foxy::loopback::the_masque_carrier_opens_connect_udp_and_echoes_a_datagram  masque::datagram_encode
@@ -88,6 +95,9 @@ carrier-foxy  foxy::hpack::tests::the_huffman_probe_costs_the_decode_and_nothing
 carrier-foxy  foxy::tests::the_head_walk_costs_the_scan_and_nothing_else  ferrox_core::foxy::head_end
 carrier-foxy  foxy::tests::the_head_walk_costs_the_scan_and_nothing_else  ferrox_core::foxy::tests::the_head_walk_costs_the_scan_and_nothing_else
 carrier-foxy  foxy::tests::the_serial_terminator_walk_costs_the_same_answer  ferrox_core::foxy::tests::the_serial_terminator_walk_costs_the_same_answer
+carrier-foxy  foxy::connectip::tests::the_word_sum_costs_the_words_it_reads  ferrox_core::foxy::connectip::word_sum
+carrier-foxy  foxy::connectip::tests::the_word_sum_costs_the_words_it_reads  ferrox_core::foxy::connectip::tests::the_word_sum_costs_the_words_it_reads
+carrier-foxy  foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer  ferrox_core::foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer
 carrier-grpc  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
 carrier-veepn  veepn::tests::the_domain_walk_costs_the_labels_and_nothing_else  ferrox_core::veepn::api_domain
 carrier-veepn  veepn::tests::the_domain_walk_costs_the_labels_and_nothing_else  ferrox_core::veepn::tests::the_domain_walk_costs_the_labels_and_nothing_else
@@ -127,6 +137,13 @@ carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hyste
 carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::read_request
 carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::auth_exchange
 carrier-hysteria  proxy::tests::hysteria_carries_vless_echo_over_loopback  hysteria::open_pooled
+# The type a static masquerade file answers with, asked of the whole table 64 times, and
+# the lowercase match it replaced asked the same 64 times: one ops job reports both
+# frames, and only their difference is a claim about the key.
+carrier-hysteria  hysteria::tests::the_word_extension_key_costs_the_word_and_nothing_else  ferrox_core::hysteria::tests::the_word_extension_key_costs_the_word_and_nothing_else
+carrier-hysteria  hysteria::tests::the_lowercase_extension_key_costs_the_same_answer  ferrox_core::hysteria::tests::the_lowercase_extension_key_costs_the_same_answer
+carrier-hysteria  hysteria::tests::the_block_answer_costs_the_bytes_it_copies  ferrox_core::hysteria::tests::the_block_answer_costs_the_bytes_it_copies
+carrier-hysteria  hysteria::tests::the_direct_answer_costs_the_same_bytes_once  ferrox_core::hysteria::tests::the_direct_answer_costs_the_same_bytes_once
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Chain::write
 finalmask  finalmask::tests::a_hello_record_is_cut_into_records_of_the_configured_widths  ferrox_core::finalmask::Fragment::write_hello
 finalmask  finalmask::tests::a_delayed_piece_hands_the_body_over_where_it_lies  ferrox_core::finalmask::write_record
@@ -134,6 +151,13 @@ finalmask  finalmask::tests::the_last_configured_width_governs_every_later_segme
 reverse  proxy::reverse_tests::a_sixteen_kib_downlink_is_echoed_whole  reverse::Session::read_loop
 http-proxy  proxy::tests::the_connect_request_builds_in_one_buffer  proxy::http_connect_request
 http-proxy  proxy::tests::http_request_parses_connect_and_both_get_forms  proxy::http_proxy_request
+# The head walk and the octet walk it replaced, both under a probe over the same
+# forwarded head: one ops job reports both frames, and only their difference is a
+# claim about the scan.
+http-proxy  proxy::tests::the_head_walk_costs_the_head_and_nothing_else  proxy::drop_header
+http-proxy  proxy::tests::the_head_walk_costs_the_head_and_nothing_else  proxy::connection_named
+http-proxy  proxy::tests::the_head_walk_costs_the_head_and_nothing_else  proxy::tests::the_head_walk_costs_the_head_and_nothing_else
+http-proxy  proxy::tests::the_byte_walk_header_costs_the_same_answer  proxy::tests::the_byte_walk_header_costs_the_same_answer
 front-tun  tun::tests::an_emitted_packet_reuses_its_render_buffer  ferrox_app::tun::render_tcp_packet
 socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_core::socks::greeting
 socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_core::socks::user_pass
@@ -143,9 +167,24 @@ socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_co
 socks  socks::tests::the_socks4_request_is_the_bytes_the_pinned_writer_writes  ferrox_core::socks::request4
 socks  socks::tests::the_socks4_reply_is_the_bytes_the_pinned_server_writes  ferrox_core::socks::grant4
 dns-outbound  dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else  ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# The queue hit and the slot hit, on the same full pool and after the same fill:
+# one ops job reports both frames, and only their difference is a claim about
+# the walk the slot list removed.
+engine-dns  dnsapp::resolver_tests::the_queue_hit_costs_the_held_names  ferrox_app::dnsapp::resolver_tests::the_queue_hit_costs_the_held_names
+engine-dns  dnsapp::resolver_tests::the_slot_hit_costs_two_index_writes  ferrox_app::dnsapp::resolver_tests::the_slot_hit_costs_two_index_writes
 security-ech  tls::shaped::hello::tests::an_aes_256_only_config_seals_the_inner_hello  ferrox_core::tls::hpke::Context::seal
 security-ech  tls::shaped::hello::tests::an_aes_256_only_config_seals_the_inner_hello  ferrox_core::tls::hpke::Context::open
 engine-observatory  observatory::tests::a_probe_through_freedom_reads_the_headers_and_gives_the_delay  ferrox_app::observatory::probe
+# The same eight-kilobyte answer head through the front-to-back rescan and
+# through the resumed walk: one ops job reports both frames, and only their
+# difference is a claim about the rescan.
+engine-observatory  observatory::tests::the_front_scan_costs_every_window_it_has_already_walked  ferrox_app::observatory::tests::the_front_scan_costs_every_window_it_has_already_walked
+engine-observatory  observatory::tests::the_seam_scan_costs_the_octets_it_has_not_walked  ferrox_app::observatory::tests::the_seam_scan_costs_the_octets_it_has_not_walked
 front-healthcheck  proxy::hc_tests::an_hc_get_answers_the_configured_body_after_the_exact_path  ferrox_app::proxy::HcHandler::answer
+# The head that arrives in sixteen windows, walked once and walked again per
+# round: one ops job reports both frames, and only their difference is a claim
+# about the rescan.
+front-healthcheck  proxy::hc_tests::the_front_scan_costs_every_window_it_has_already_walked  ferrox_app::proxy::hc_tests::the_front_scan_costs_every_window_it_has_already_walked
+front-healthcheck  proxy::hc_tests::the_seam_scan_costs_the_bytes_it_has_not_walked  ferrox_app::proxy::hc_tests::the_seam_scan_costs_the_bytes_it_has_not_walked
 carrier-quic  proxy::tests::quic_serves_vless_echo_over_loopback  quic::serve_loop
 wireguard  wireguard::device::tests::a_replayed_transport_counter_is_refused  wireguard::device::Tunnel::send

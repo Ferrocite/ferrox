@@ -10,7 +10,7 @@ use crate::json::Json;
 use crate::router::{add_domain, asset_dirs, ip_matcher, Assets, DomainMatcher, IpMatcher};
 use ferrox_core::dns::{build_query, parse_answer, Edns};
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -1467,14 +1467,27 @@ impl FakePools {
             let Ok(mut pool) = pool.lock() else {
                 continue;
             };
-            if let Some(name) = pool.by_ip.get(&ip) {
-                let name = name.clone();
-                pool.touch(&name);
-                return Some(name);
-            }
+            let Some(&at) = pool.by_ip.get(&ip) else {
+                continue;
+            };
+            let Some(slot) = pool.slots[at].as_ref() else {
+                continue;
+            };
+            let name = slot.name.to_string();
+            pool.recency(at);
+            return Some(name);
         }
         None
     }
+}
+
+/// One name the pool holds: the recency order is threaded through these slots, so a hit is two index writes instead of a walk of every held name, and the name is held once where the name map, the reverse map and the queue each kept a copy.
+#[derive(Debug)]
+struct Slot {
+    name: Arc<str>,
+    ip: IpAddr,
+    prev: Option<usize>,
+    next: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -1483,36 +1496,48 @@ struct FakePool {
     base: u128,
     rooms: u32,
     lru_size: usize,
-    by_name: HashMap<String, IpAddr>,
-    by_ip: HashMap<IpAddr, String>,
-    order: VecDeque<String>,
+    by_name: HashMap<Arc<str>, usize>,
+    by_ip: HashMap<IpAddr, usize>,
+    slots: Vec<Option<Slot>>,
+    free: Vec<usize>,
+    /// The two ends of the recency list: `head` is the name that has gone longest without a hit, so an eviction is one read, and `tail` is where the newest name links.
+    head: Option<usize>,
+    tail: Option<usize>,
 }
 
 impl FakePool {
     fn allocate(&mut self, name: &str) -> Option<IpAddr> {
-        if let Some(ip) = self.by_name.get(name).copied() {
-            self.touch(name);
+        if let Some(&at) = self.by_name.get(name) {
+            let ip = self.slots[at].as_ref()?.ip;
+            self.recency(at);
             return Some(ip);
         }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .ok()?
             .as_millis();
+        self.place(name, now)
+    }
+
+    /// The candidate walk from a given instant: the pool's own clock reads it, and the oracle beside this type is handed the same instant so the two search from one place.
+    fn place(&mut self, name: &str, now: u128) -> Option<IpAddr> {
         let span = 1u128.checked_shl(self.rooms).unwrap_or(u128::MAX);
         let mut candidate = self.base.wrapping_add(now % span);
         for _ in 0..span {
             let ip = self.ip(candidate);
             if !self.by_ip.contains_key(&ip) {
-                if self.order.len() >= self.lru_size {
-                    if let Some(old) = self.order.pop_front() {
-                        if let Some(ip) = self.by_name.remove(&old) {
-                            self.by_ip.remove(&ip);
+                // The oldest name makes room before the new one is linked, so the pool holds exactly `lru_size` names and evicts the one the queue's front would have.
+                if self.by_name.len() >= self.lru_size {
+                    if let Some(old) = self.head {
+                        self.unlink(old);
+                        if let Some(slot) = self.slots[old].take() {
+                            self.by_name.remove(&slot.name);
+                            self.by_ip.remove(&slot.ip);
+                            self.free.push(old);
                         }
                     }
                 }
-                self.by_name.insert(name.to_owned(), ip);
-                self.by_ip.insert(ip, name.to_owned());
-                self.order.push_back(name.to_owned());
+                self.hold(name, ip);
                 return Some(ip);
             }
             candidate = candidate.wrapping_add(1);
@@ -1530,11 +1555,71 @@ impl FakePool {
         }
     }
 
-    fn touch(&mut self, name: &str) {
-        if let Some(at) = self.order.iter().position(|held| held == name) {
-            self.order.remove(at);
+    /// Writes the name and its answer into the slot a freed one left behind, or appends one, and links it at the newest end: the name is one allocation, shared by the map's key and the slot rather than copied into three.
+    fn hold(&mut self, name: &str, ip: IpAddr) {
+        let held: Arc<str> = Arc::from(name);
+        let slot = Slot {
+            name: Arc::clone(&held),
+            ip,
+            prev: None,
+            next: None,
+        };
+        let at = if let Some(at) = self.free.pop() {
+            self.slots[at] = Some(slot);
+            at
+        } else {
+            self.slots.push(Some(slot));
+            self.slots.len() - 1
+        };
+        self.by_name.insert(held, at);
+        self.by_ip.insert(ip, at);
+        self.link(at);
+    }
+
+    /// The hit: unlink and relink at the newest end, which is what the queue's find-then-push did in one walk over every held name.
+    fn recency(&mut self, at: usize) {
+        self.unlink(at);
+        self.link(at);
+    }
+
+    fn unlink(&mut self, at: usize) {
+        let Some(slot) = self.slots[at].as_ref() else {
+            return;
+        };
+        let (prev, next) = (slot.prev, slot.next);
+        match prev {
+            Some(older) => {
+                if let Some(slot) = self.slots[older].as_mut() {
+                    slot.next = next;
+                }
+            }
+            None => self.head = next,
         }
-        self.order.push_back(name.to_owned());
+        match next {
+            Some(newer) => {
+                if let Some(slot) = self.slots[newer].as_mut() {
+                    slot.prev = prev;
+                }
+            }
+            None => self.tail = prev,
+        }
+    }
+
+    fn link(&mut self, at: usize) {
+        let before = self.tail;
+        if let Some(slot) = self.slots[at].as_mut() {
+            slot.prev = before;
+            slot.next = None;
+        }
+        match before {
+            Some(older) => {
+                if let Some(slot) = self.slots[older].as_mut() {
+                    slot.next = Some(at);
+                }
+            }
+            None => self.head = Some(at),
+        }
+        self.tail = Some(at);
     }
 }
 
@@ -1619,7 +1704,10 @@ fn parse_fake(
             lru_size: size,
             by_name: HashMap::new(),
             by_ip: HashMap::new(),
-            order: VecDeque::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            head: None,
+            tail: None,
         }));
     }
     Ok(Some(FakePools { pools }))
@@ -1846,6 +1934,238 @@ mod resolver_tests {
             .lookup_families("example.com", true, true, true)
             .expect("stable");
         assert_eq!(again.0, ips);
+    }
+
+    /// The pool as it stood: three copies of each name and a queue walked on every hit. Kept as the oracle the slot list answers to — the same address for the same name, the same eviction, the same recency order — with the instant handed in so both search from the same place.
+    struct QueuePool {
+        family: Family,
+        base: u128,
+        rooms: u32,
+        lru_size: usize,
+        by_name: std::collections::HashMap<String, IpAddr>,
+        by_ip: std::collections::HashMap<IpAddr, String>,
+        order: std::collections::VecDeque<String>,
+    }
+
+    impl QueuePool {
+        fn new(family: Family, base: u128, rooms: u32, lru_size: usize) -> Self {
+            Self {
+                family,
+                base,
+                rooms,
+                lru_size,
+                by_name: std::collections::HashMap::new(),
+                by_ip: std::collections::HashMap::new(),
+                order: std::collections::VecDeque::new(),
+            }
+        }
+
+        fn allocate(&mut self, name: &str, now: u128) -> Option<IpAddr> {
+            if let Some(ip) = self.by_name.get(name).copied() {
+                self.touch(name);
+                return Some(ip);
+            }
+            self.place(name, now)
+        }
+
+        fn place(&mut self, name: &str, now: u128) -> Option<IpAddr> {
+            let span = 1u128.checked_shl(self.rooms).unwrap_or(u128::MAX);
+            let mut candidate = self.base.wrapping_add(now % span);
+            for _ in 0..span {
+                let ip = self.ip(candidate);
+                if !self.by_ip.contains_key(&ip) {
+                    if self.order.len() >= self.lru_size {
+                        if let Some(old) = self.order.pop_front() {
+                            if let Some(ip) = self.by_name.remove(&old) {
+                                self.by_ip.remove(&ip);
+                            }
+                        }
+                    }
+                    self.by_name.insert(name.to_owned(), ip);
+                    self.by_ip.insert(ip, name.to_owned());
+                    self.order.push_back(name.to_owned());
+                    return Some(ip);
+                }
+                candidate = candidate.wrapping_add(1);
+                if candidate >= self.base.wrapping_add(span) {
+                    candidate = self.base;
+                }
+            }
+            None
+        }
+
+        fn ip(&self, value: u128) -> IpAddr {
+            match self.family {
+                Family::A => IpAddr::V4(Ipv4Addr::from(value as u32)),
+                Family::Aaaa => IpAddr::V6(Ipv6Addr::from(value)),
+            }
+        }
+
+        fn touch(&mut self, name: &str) {
+            if let Some(at) = self.order.iter().position(|held| held == name) {
+                self.order.remove(at);
+            }
+            self.order.push_back(name.to_owned());
+        }
+    }
+
+    fn a_pool(lru_size: usize) -> FakePool {
+        FakePool {
+            family: Family::A,
+            base: u128::from(u32::from(Ipv4Addr::new(198, 18, 0, 0))),
+            rooms: 17,
+            lru_size,
+            by_name: HashMap::new(),
+            by_ip: HashMap::new(),
+            slots: Vec::new(),
+            free: Vec::new(),
+            head: None,
+            tail: None,
+        }
+    }
+
+    /// The same pool's first family, rooms and bound, in the queue form the oracle keeps.
+    fn a_queue(lru_size: usize) -> QueuePool {
+        QueuePool::new(
+            Family::A,
+            u128::from(u32::from(Ipv4Addr::new(198, 18, 0, 0))),
+            17,
+            lru_size,
+        )
+    }
+
+    /// The recency order read out of the slot list, oldest first: the queue's own order, walked from the head.
+    fn recency(pool: &FakePool) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut at = pool.head;
+        while let Some(slot) = at
+            .and_then(|index| pool.slots.get(index))
+            .and_then(Option::as_ref)
+        {
+            out.push(slot.name.to_string());
+            at = slot.next;
+        }
+        out
+    }
+
+    fn fold_ip(ip: IpAddr) -> u32 {
+        match ip {
+            IpAddr::V4(v4) => u32::from(v4),
+            IpAddr::V6(v6) => {
+                let [a, b, c, d, ..] = v6.octets();
+                u32::from_be_bytes([a, b, c, d])
+            }
+        }
+    }
+
+    /// The slot pool is the queue pool at every request: three thousand draws over two hundred names on a pool of sixty-four, every address, every eviction and the whole recency order compared step for step.
+    #[test]
+    fn the_slot_pool_is_the_queue_pool_at_every_request() {
+        let mut word = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut draw = move || {
+            word ^= word << 13;
+            word ^= word >> 7;
+            word ^= word << 17;
+            word
+        };
+        let mut slots = a_pool(64);
+        let mut queue = a_queue(64);
+        for step in 0..3_000u32 {
+            let value = draw();
+            let name = format!("n{}", value % 200);
+            let now = u128::from(value >> 20) % 131_072;
+            let (mine, theirs) = if slots.by_name.contains_key(name.as_str()) {
+                (slots.allocate(&name), queue.allocate(&name, now))
+            } else {
+                (slots.place(&name, now), queue.place(&name, now))
+            };
+            assert_eq!(mine, theirs, "step {step}: {name} at {now}");
+            assert_eq!(slots.by_name.len(), queue.by_name.len(), "step {step}");
+            assert_eq!(
+                recency(&slots),
+                queue.order.iter().cloned().collect::<Vec<_>>(),
+                "step {step}: the recency order"
+            );
+        }
+        assert_eq!(slots.by_name.len(), 64, "the pool filled to its bound");
+        assert_eq!(
+            slots.slots.iter().flatten().count(),
+            64,
+            "one slot per held name, and no more"
+        );
+        assert!(slots.free.is_empty(), "every freed slot taken back");
+    }
+
+    /// The hit the queue made most expensive: the name at the back of a full pool, which its `position` walk reached only after every other name, and which it then copied anew. The slot list unlinks it and links it back, and allocates nothing.
+    #[test]
+    fn a_fake_hit_allocates_nothing() {
+        let names: Vec<String> = (0..4096).map(|i| format!("held{i}")).collect();
+        let mut pool = a_pool(4096);
+        for (step, name) in names.iter().enumerate() {
+            assert!(pool.place(name, step as u128 * 7).is_some(), "{name}");
+        }
+        assert_eq!(pool.by_name.len(), 4096, "every name held");
+        assert_eq!(recency(&pool)[0], names[0], "the first name is the oldest");
+        let last = &names[4095];
+        let (answer, counts) = ferrox_core::alloc_count::measure(|| pool.allocate(last));
+        assert_eq!(answer, Some(IpAddr::V4(Ipv4Addr::new(198, 18, 111, 249))));
+        assert_eq!(counts.allocs, 0, "a hit takes no buffer: {counts:?}");
+        assert_eq!(counts.bytes, 0);
+        assert_eq!(counts.zeroed, 0);
+        assert_eq!(recency(&pool)[0], names[0], "and the order is unmoved");
+        let mut pool = a_pool(4096);
+        for (step, name) in names.iter().enumerate() {
+            assert!(pool.place(name, step as u128 * 7).is_some(), "{name}");
+        }
+        let (_, counts) = ferrox_core::alloc_count::measure(|| pool.allocate(&names[0]));
+        assert_eq!(
+            counts.allocs, 0,
+            "a hit on the oldest takes none either: {counts:?}"
+        );
+        assert_eq!(recency(&pool)[4095], names[0], "and it becomes the newest");
+    }
+
+    /// A name is held once: the allocator says one buffer for it, where the queue form kept a copy in each of its two maps and a third in the queue.
+    #[test]
+    fn a_fake_name_is_held_once() {
+        let mut pool = a_pool(16);
+        for (step, name) in ["a", "b"].iter().enumerate() {
+            assert!(pool.place(name, step as u128).is_some(), "{name}");
+        }
+        let (_, counts) = ferrox_core::alloc_count::measure(|| pool.place("c", 2));
+        assert_eq!(counts.allocs, 1, "the name's own buffer: {counts:?}");
+    }
+
+    /// The queue's hit, and nothing else: sixty-four hits on the name at the back of a four-thousand-name pool — the longest its walk can be — with each answer folded into a pinned `u32` so the walk cannot be folded away.
+    #[test]
+    fn the_queue_hit_costs_the_held_names() {
+        let names: Vec<String> = (0..4096).map(|i| format!("held{i}")).collect();
+        let mut queue = a_queue(4096);
+        for (step, name) in names.iter().enumerate() {
+            assert!(queue.place(name, step as u128 * 7).is_some(), "{name}");
+        }
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            let ip = queue.allocate(&names[4095], 0).expect("a held name");
+            fold = fold.wrapping_mul(31).wrapping_add(fold_ip(ip));
+        }
+        assert_eq!(fold, 0x7824_6400, "sixty-four hits on the back name");
+    }
+
+    /// The same sixty-four hits on the same pool through the slot list: the queue's walk is two index writes, so the fold is the same answer for a constant cost.
+    #[test]
+    fn the_slot_hit_costs_two_index_writes() {
+        let names: Vec<String> = (0..4096).map(|i| format!("held{i}")).collect();
+        let mut pool = a_pool(4096);
+        for (step, name) in names.iter().enumerate() {
+            assert!(pool.place(name, step as u128 * 7).is_some(), "{name}");
+        }
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            let ip = pool.allocate(&names[4095]).expect("a held name");
+            fold = fold.wrapping_mul(31).wrapping_add(fold_ip(ip));
+        }
+        assert_eq!(fold, 0x7824_6400, "the same sixty-four answers");
     }
 
     #[test]

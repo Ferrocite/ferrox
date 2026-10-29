@@ -358,7 +358,7 @@ fn sniff_http(
     bytes: &[u8],
     attrs: Option<&mut Vec<(String, String)>>,
 ) -> Option<(&'static str, String)> {
-    let end = bytes.iter().position(|byte| *byte == b'\n')?;
+    let end = ferrox_core::foxy::octet_in(bytes, 0, b'\n')?;
     let first = &bytes[..end];
     let method = first.split(|byte| *byte == b' ').next()?;
     let known = [
@@ -380,15 +380,15 @@ fn sniff_http(
     let mut host = None;
     let mut at = end + 1;
     while at < bytes.len() {
-        let Some(line_end) = bytes[at..].iter().position(|byte| *byte == b'\n') else {
+        let Some(line_end) = ferrox_core::foxy::octet_in(bytes, at, b'\n') else {
             break;
         };
-        let line = &bytes[at..at + line_end];
+        let line = &bytes[at..line_end];
         let line = line.strip_suffix(b"\r").unwrap_or(line);
         if line.is_empty() {
             break;
         }
-        if let Some(colon) = line.iter().position(|byte| *byte == b':') {
+        if let Some(colon) = ferrox_core::foxy::octet_in(line, 0, b':') {
             let name = line[..colon].trim_ascii();
             let value = std::str::from_utf8(&line[colon + 1..]).ok().map(str::trim);
             if let (Some(attrs), Some(value)) = (attrs.as_deref_mut(), value) {
@@ -403,7 +403,7 @@ fn sniff_http(
                 }
             }
         }
-        at += line_end + 1;
+        at = line_end + 1;
     }
     if let Some(attrs) = attrs {
         let mut parts = first.split(|byte| *byte == b' ');

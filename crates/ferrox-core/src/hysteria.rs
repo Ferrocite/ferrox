@@ -911,6 +911,8 @@ pub fn parse_h3_request(block: &[u8]) -> Option<H3Request> {
 }
 
 /// An HTTP/3 response on a request stream: a `HEADERS` frame carrying `:status` ahead of the caller's fields, then a `DATA` frame only when the body is not empty, each length-prefixed the way the auth answer frames its headers. The caller sends the stream FIN.
+///
+/// The block's length is its fields' lengths summed before a byte of it is written, so the frame prefix goes into the caller's own buffer ahead of the block and the block is written there once — the temporary it used to be assembled in, and the copy that lifted it into the answer, are both gone.
 pub fn encode_h3_response(status: u16, headers: &[(&str, &str)], body: &[u8], out: &mut Vec<u8>) {
     // The code's digits go into the end of a stack buffer: `to_string` is one allocation per answer, and a `fields` list to prepend them to is another.
     let mut code = [0u8; 5];
@@ -924,21 +926,27 @@ pub fn encode_h3_response(status: u16, headers: &[(&str, &str)], body: &[u8], ou
             break;
         }
     }
-    let mut block = Vec::with_capacity(
-        2 + hpack::qpack_field_len(7, code.len() - at)
-            + headers
-                .iter()
-                .map(|(name, value)| hpack::qpack_field_len(name.len(), value.len()))
-                .sum::<usize>(),
-    );
-    hpack::qpack_open(&mut block);
-    hpack::qpack_field(&mut block, ":status", &code[at..]);
-    for (name, value) in headers {
-        hpack::qpack_field(&mut block, name, value.as_bytes());
-    }
+    // `qpack_open` writes the block's two prefix bytes, then one `qpack_field_len` per field is its exact byte count.
+    let block_len = 2
+        + hpack::qpack_field_len(7, code.len() - at)
+        + headers
+            .iter()
+            .map(|(name, value)| hpack::qpack_field_len(name.len(), value.len()))
+            .sum::<usize>();
     frames::quic_varint(out, frames::H3_HEADERS);
-    frames::quic_varint(out, block.len() as u64);
-    out.extend_from_slice(&block);
+    frames::quic_varint(out, block_len as u64);
+    let opened = out.len();
+    hpack::qpack_open(out);
+    hpack::qpack_field(out, ":status", &code[at..]);
+    for (name, value) in headers {
+        hpack::qpack_field(out, name, value.as_bytes());
+    }
+    // The sum the prefix names and the bytes just written are one count, so the frame's block is exactly the fields it opened.
+    debug_assert_eq!(
+        out.len() - opened,
+        block_len,
+        "the block's sum is its bytes"
+    );
     if !body.is_empty() {
         frames::quic_varint(out, frames::H3_DATA);
         frames::quic_varint(out, body.len() as u64);
@@ -946,32 +954,80 @@ pub fn encode_h3_response(status: u16, headers: &[(&str, &str)], body: &[u8], ou
     }
 }
 
+const OCTET: &str = "application/octet-stream";
+
+/// An extension is at most five bytes, so eight bytes padded with spaces hold it whole and `| 0x20` folds it to lower case: a byte that ORs into a lower-case letter is that letter in either case, and no other byte ORs into one, so the fold cannot turn an unknown extension into a known one.
+const fn extension_key(name: &str) -> u64 {
+    let mut padded = [b' '; 8];
+    let mut at = 0;
+    while at < name.len() {
+        padded[at] = name.as_bytes()[at];
+        at += 1;
+    }
+    u64::from_le_bytes(padded) | 0x2020_2020_2020_2020
+}
+
+const HTML: u64 = extension_key("html");
+const HTM: u64 = extension_key("htm");
+const CSS: u64 = extension_key("css");
+const JS: u64 = extension_key("js");
+const MJS: u64 = extension_key("mjs");
+const JSON: u64 = extension_key("json");
+const TXT: u64 = extension_key("txt");
+const XML: u64 = extension_key("xml");
+const SVG: u64 = extension_key("svg");
+const PNG: u64 = extension_key("png");
+const JPG: u64 = extension_key("jpg");
+const JPEG: u64 = extension_key("jpeg");
+const GIF: u64 = extension_key("gif");
+const WEBP: u64 = extension_key("webp");
+const ICO: u64 = extension_key("ico");
+const WOFF: u64 = extension_key("woff");
+const WOFF2: u64 = extension_key("woff2");
+const PDF: u64 = extension_key("pdf");
+const ZIP: u64 = extension_key("zip");
+
 /// The `content-type` a static masquerade file answers with, guessed from the extension of the last path segment and falling back to the octet stream; a cover page is only convincing if a browser reads it as the kind of file it is.
 #[must_use]
 pub fn content_type(path: &str) -> &'static str {
     let name = path.rsplit('/').next().unwrap_or(path);
     let tail = match name.rfind('.') {
         Some(dot) => name[dot + 1..].split(['?', '#']).next().unwrap_or_default(),
-        None => return "application/octet-stream",
+        None => return OCTET,
     };
-    match tail.to_ascii_lowercase().as_str() {
-        "html" | "htm" => "text/html; charset=utf-8",
-        "css" => "text/css; charset=utf-8",
-        "js" | "mjs" => "text/javascript; charset=utf-8",
-        "json" => "application/json",
-        "txt" => "text/plain; charset=utf-8",
-        "xml" => "application/xml",
-        "svg" => "image/svg+xml",
-        "png" => "image/png",
-        "jpg" | "jpeg" => "image/jpeg",
-        "gif" => "image/gif",
-        "webp" => "image/webp",
-        "ico" => "image/x-icon",
-        "woff" => "font/woff",
-        "woff2" => "font/woff2",
-        "pdf" => "application/pdf",
-        "zip" => "application/zip",
-        _ => "application/octet-stream",
+    let bytes = tail.as_bytes();
+    // No name is longer than five bytes, so a longer extension is the octet stream on its length alone, and the length then picks the one group of names a word is compared against.
+    if bytes.len() > 5 {
+        return OCTET;
+    }
+    let key = extension_key(tail);
+    match bytes.len() {
+        2 if key == JS => "text/javascript; charset=utf-8",
+        3 => match key {
+            HTM => "text/html; charset=utf-8",
+            CSS => "text/css; charset=utf-8",
+            MJS => "text/javascript; charset=utf-8",
+            TXT => "text/plain; charset=utf-8",
+            XML => "application/xml",
+            SVG => "image/svg+xml",
+            PNG => "image/png",
+            JPG => "image/jpeg",
+            GIF => "image/gif",
+            ICO => "image/x-icon",
+            PDF => "application/pdf",
+            ZIP => "application/zip",
+            _ => OCTET,
+        },
+        4 => match key {
+            HTML => "text/html; charset=utf-8",
+            JSON => "application/json",
+            JPEG => "image/jpeg",
+            WEBP => "image/webp",
+            WOFF => "font/woff",
+            _ => OCTET,
+        },
+        5 if key == WOFF2 => "font/woff2",
+        _ => OCTET,
     }
 }
 
@@ -1003,7 +1059,10 @@ pub fn parse_origin_response(raw: &[u8]) -> Option<OriginResponse> {
         let name = String::from_utf8_lossy(name).into_owned();
         let value = String::from_utf8_lossy(value).into_owned();
         if name.eq_ignore_ascii_case("transfer-encoding")
-            && value.to_ascii_lowercase().contains("chunked")
+            && value
+                .as_bytes()
+                .windows(7)
+                .any(|window| window.eq_ignore_ascii_case(b"chunked"))
         {
             chunked = true;
         } else if name.eq_ignore_ascii_case("content-length") {
@@ -1038,7 +1097,8 @@ pub struct OriginResponse {
 
 /// Strip the chunked transfer framing: each `hex-length\r\n data \r\n` run yields its data until a zero-length chunk closes the body. A short or malformed run is not a complete response.
 fn dechunk(mut body: &[u8]) -> Option<Vec<u8>> {
-    let mut out = Vec::new();
+    // The framing is longer than the data it wraps, so the framed input bounds the answer and one buffer of its size replaces the doubling series a fresh `Vec` grows through.
+    let mut out = Vec::with_capacity(body.len());
     loop {
         let line_end = body.windows(2).position(|window| window == b"\r\n")?;
         let header = std::str::from_utf8(&body[..line_end]).ok()?;
@@ -1667,23 +1727,77 @@ mod tests {
         assert_eq!(&out[at..at + 2], b"hi");
     }
 
-    /// One block buffer per answer, sized to the bytes it holds: the code's digits go on the wire from a stack array, no field list is joined ahead of them, and the caller's buffer is never grown by the answer.
+    /// The two-pass form the direct answer replaced, kept as the bytes every answer has to still equal: the block assembled in a buffer of its own, then copied into the frame.
+    fn the_block_answer(status: u16, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let code = status.to_string();
+        let mut block = Vec::with_capacity(
+            2 + hpack::qpack_field_len(7, code.len())
+                + headers
+                    .iter()
+                    .map(|(name, value)| hpack::qpack_field_len(name.len(), value.len()))
+                    .sum::<usize>(),
+        );
+        hpack::qpack_open(&mut block);
+        hpack::qpack_field(&mut block, ":status", code.as_bytes());
+        for (name, value) in headers {
+            hpack::qpack_field(&mut block, name, value.as_bytes());
+        }
+        frames::quic_varint(&mut out, frames::H3_HEADERS);
+        frames::quic_varint(&mut out, block.len() as u64);
+        out.extend_from_slice(&block);
+        if !body.is_empty() {
+            frames::quic_varint(&mut out, frames::H3_DATA);
+            frames::quic_varint(&mut out, body.len() as u64);
+            out.extend_from_slice(body);
+        }
+        out
+    }
+
+    /// Every answer is the bytes the two-pass form assembled, and its prefix names exactly the block its fields wrote: the codes whose digits a five-byte stack buffer has to hold, no field beside a full head, and an empty body beside a long one.
     #[test]
-    fn an_h3_answer_allocates_only_its_field_block() {
+    fn every_answer_is_the_bytes_the_block_assembled() {
+        let heads: &[&[(&str, &str)]] = &[
+            &[],
+            &[("content-type", "text/plain")],
+            &[
+                ("content-type", "text/html; charset=utf-8"),
+                ("server", "nginx"),
+                ("cache-control", "no-store"),
+            ],
+        ];
+        let long = [0xffu8; 300];
+        for status in [0u16, 9, 99, 100, 200, 404, 1034, 65535] {
+            for head in heads {
+                for body in [b"".as_slice(), b"hi".as_slice(), long.as_slice()] {
+                    let mut out = Vec::new();
+                    encode_h3_response(status, head, body, &mut out);
+                    assert_eq!(
+                        out,
+                        the_block_answer(status, head, body),
+                        "status {status}, {} field(s), {} body byte(s)",
+                        head.len(),
+                        body.len()
+                    );
+                    let mut at = 0usize;
+                    let frame = frames::h3_frame(&out, &mut at).expect("a headers frame");
+                    hpack::qpack_fields(&out[at..at + frame.length as usize])
+                        .expect("the length names the block the fields wrote");
+                }
+            }
+        }
+    }
+
+    /// One block buffer per answer, sized to the bytes it holds, is gone: the sum of the field lengths opens the frame in the caller's own buffer, so 4096 answers allocate nothing at all, and the buffer's base and capacity hold across every one.
+    #[test]
+    fn an_h3_answer_writes_its_block_straight_into_the_callers_buffer() {
         let headers = [
             ("content-type", "text/html; charset=utf-8"),
             ("server", "nginx"),
         ];
-        let need = 2
-            + hpack::qpack_field_len(":status".len(), 3)
-            + headers
-                .iter()
-                .map(|(name, value)| hpack::qpack_field_len(name.len(), value.len()))
-                .sum::<usize>();
-        let mut out = Vec::with_capacity(need + 16);
+        let mut out = Vec::with_capacity(256);
         encode_h3_response(200, &headers, b"cover", &mut out);
-        let block = out.as_ptr();
-        let capacity = out.capacity();
+        let (block, capacity) = (out.as_ptr(), out.capacity());
         let ((), counts) = crate::alloc_count::measure(|| {
             for _ in 0..4096 {
                 out.clear();
@@ -1692,14 +1806,61 @@ mod tests {
         });
         assert_eq!(
             (counts.allocs, counts.bytes, counts.zeroed),
-            (4096, 4096 * need, 0),
-            "one block of {need} bytes per answer, and nothing joined or grown on the way"
+            (0, 0, 0),
+            "the answer opened nothing of its own"
         );
         assert_eq!(
             (out.as_ptr(), out.capacity()),
             (block, capacity),
-            "the answer never moved or grew the caller's own buffer"
+            "and never moved or grew the caller's own buffer"
         );
+    }
+
+    /// The temporary's own frame: 512 answers to one three-field head, each block assembled in a buffer of its own and copied into the answer.
+    #[test]
+    fn the_block_answer_costs_the_bytes_it_copies() {
+        let headers = [
+            ("content-type", "text/html; charset=utf-8"),
+            ("server", "nginx"),
+            ("cache-control", "no-store"),
+        ];
+        let want = the_block_answer(200, &headers, b"cover").len() as u32 * 512;
+        let mut fold: u32 = 0;
+        for _ in 0..512 {
+            fold = fold.wrapping_add(
+                the_block_answer(
+                    std::hint::black_box(200),
+                    std::hint::black_box(&headers),
+                    std::hint::black_box(b"cover".as_slice()),
+                )
+                .len() as u32,
+            );
+        }
+        assert_eq!(fold, want, "the same 512 answers, one block each");
+    }
+
+    /// The same 512 answers written straight into the caller's buffer, so one ops job reports both frames and only their difference is a claim about the temporary.
+    #[test]
+    fn the_direct_answer_costs_the_same_bytes_once() {
+        let headers = [
+            ("content-type", "text/html; charset=utf-8"),
+            ("server", "nginx"),
+            ("cache-control", "no-store"),
+        ];
+        let want = the_block_answer(200, &headers, b"cover").len() as u32 * 512;
+        let mut out = Vec::with_capacity(512);
+        let mut fold: u32 = 0;
+        for _ in 0..512 {
+            out.clear();
+            encode_h3_response(
+                std::hint::black_box(200),
+                std::hint::black_box(&headers),
+                std::hint::black_box(b"cover".as_slice()),
+                &mut out,
+            );
+            fold = fold.wrapping_add(out.len() as u32);
+        }
+        assert_eq!(fold, want, "the same 512 answers, no block to copy");
     }
 
     #[test]
@@ -1765,6 +1926,104 @@ mod tests {
         );
     }
 
+    /// The doubling form `dechunk` grew through, kept as the byte oracle the one buffer has to equal.
+    fn the_doubling_answer(mut body: &[u8]) -> Option<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            let line_end = body.windows(2).position(|window| window == b"\r\n")?;
+            let header = std::str::from_utf8(&body[..line_end]).ok()?;
+            let size = usize::from_str_radix(header.split(';').next()?.trim(), 16).ok()?;
+            if size == 0 {
+                return Some(out);
+            }
+            let start = line_end + 2;
+            out.extend_from_slice(body.get(start..start + size)?);
+            body = body.get(start + size + 2..)?;
+        }
+    }
+
+    /// One buffer sized to the framing that bounds it, rather than the doubling series a fresh `Vec` grows through: one allocation of exactly the input's length, the capacity held at it, and the same bytes the growing loop wrote for every width and every malformed shape a body arrives in.
+    #[test]
+    fn a_chunked_body_deframes_into_one_buffer() {
+        let payload: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
+        for width in [1usize, 97, 4096] {
+            let mut framed = Vec::new();
+            for piece in payload.chunks(width) {
+                framed.extend_from_slice(format!("{:x}\r\n", piece.len()).as_bytes());
+                framed.extend_from_slice(piece);
+                framed.extend_from_slice(b"\r\n");
+            }
+            framed.extend_from_slice(b"0\r\n\r\n");
+            let (answer, counts) = crate::alloc_count::measure(|| dechunk(&framed));
+            let answer = answer.expect("a chunked stream");
+            assert_eq!(answer, payload, "the de-framed bytes at width {width}");
+            assert_eq!(
+                answer,
+                the_doubling_answer(&framed).expect("the oracle"),
+                "the same bytes the growing loop wrote at width {width}"
+            );
+            assert_eq!(counts.allocs, 1, "one buffer at width {width}");
+            assert_eq!(
+                counts.bytes,
+                framed.len(),
+                "sized to the framing at width {width}"
+            );
+            assert_eq!(
+                answer.capacity(),
+                framed.len(),
+                "and never grown at width {width}"
+            );
+        }
+        let shapes: [&[u8]; 5] = [
+            b"5\r\nhello\r\n0\r\n\r\n",
+            b"5;ext=1\r\nhello\r\n0\r\n\r\n",
+            b"0\r\n\r\n",
+            b"5\r\nhello\r\n",
+            b"z\r\nhello\r\n0\r\n\r\n",
+        ];
+        for shape in shapes {
+            assert_eq!(
+                dechunk(shape),
+                the_doubling_answer(shape),
+                "shape {shape:?}"
+            );
+        }
+    }
+
+    /// The chunked check reads seven bytes at a time in either case rather than lowering a `String` first, and every spelling the lowercase `contains` found is still found, including the ones a browser sends and the ones that only start with the word: the body is not chunked framing, so a spelling read as chunked leaves no response at all.
+    #[test]
+    fn the_chunked_check_reads_every_spelling_the_lowercase_one_read() {
+        for value in [
+            "chunked",
+            "Chunked",
+            "CHUNKED",
+            "gzip, chunked",
+            "GZip, ChUnKeD",
+            "chunkedx",
+            "x-chunked",
+            "chunked;q=1",
+            "chunke",
+            "chu nked",
+            "",
+            "identity",
+            "chunk",
+        ] {
+            let raw = format!(
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: {value}\r\nContent-Length: 5\r\n\r\nhello"
+            );
+            let response = parse_origin_response(raw.as_bytes());
+            if value.to_ascii_lowercase().contains("chunked") {
+                assert!(
+                    response.is_none(),
+                    "{value:?} names chunked, so the plain body is refused"
+                );
+            } else {
+                let response = response.expect("a plain response");
+                assert_eq!(response.body, b"hello", "{value:?} is not chunked");
+            }
+        }
+    }
+
     #[test]
     fn content_type_maps_the_common_extensions() {
         assert_eq!(content_type("/index.html"), "text/html; charset=utf-8");
@@ -1773,6 +2032,174 @@ mod tests {
         assert_eq!(content_type("page.html?v=2"), "text/html; charset=utf-8");
         assert_eq!(content_type("/noextension"), "application/octet-stream");
         assert_eq!(content_type("/file.unknown"), "application/octet-stream");
+    }
+
+    /// The lowercase match the key replaced, kept verbatim as the answer every path has to still get.
+    fn the_lowercase_answer(path: &str) -> &'static str {
+        let name = path.rsplit('/').next().unwrap_or(path);
+        let tail = match name.rfind('.') {
+            Some(dot) => name[dot + 1..].split(['?', '#']).next().unwrap_or_default(),
+            None => return "application/octet-stream",
+        };
+        match tail.to_ascii_lowercase().as_str() {
+            "html" | "htm" => "text/html; charset=utf-8",
+            "css" => "text/css; charset=utf-8",
+            "js" | "mjs" => "text/javascript; charset=utf-8",
+            "json" => "application/json",
+            "txt" => "text/plain; charset=utf-8",
+            "xml" => "application/xml",
+            "svg" => "image/svg+xml",
+            "png" => "image/png",
+            "jpg" | "jpeg" => "image/jpeg",
+            "gif" => "image/gif",
+            "webp" => "image/webp",
+            "ico" => "image/x-icon",
+            "woff" => "font/woff",
+            "woff2" => "font/woff2",
+            "pdf" => "application/pdf",
+            "zip" => "application/zip",
+            _ => "application/octet-stream",
+        }
+    }
+
+    /// The twenty names the map knows, a path that reaches each, and the paths that must not reach one — among them the length traps a five-byte key has to refuse and the non-ASCII one a fold on bytes could invent a letter from.
+    const EXTENSION_PATHS: &[&str] = &[
+        "/index.html",
+        "/a.htm",
+        "/s.css",
+        "/a.js",
+        "/m.mjs",
+        "/d.json",
+        "/r.txt",
+        "/f.xml",
+        "/i.svg",
+        "/p.png",
+        "/p.jpg",
+        "/p.jpeg",
+        "/a.gif",
+        "/p.webp",
+        "/f.ico",
+        "/w.woff",
+        "/w.woff2",
+        "/d.pdf",
+        "/a.zip",
+        "/noextension",
+        "/",
+        "",
+        ".",
+        "..",
+        "/.html",
+        "/file.",
+        "/a.html?v=2",
+        "/a.html#top",
+        "/x.htm?",
+        "/file.unknown",
+        "/file.markdown",
+        "/a.woff2x",
+        "/a.woff2 x",
+        "/a.woff2\t",
+        "/a.é",
+        "/é.html",
+        "/a.\u{ff48}\u{ff54}\u{ff4d}\u{ff4c}",
+        "/a.ht ml",
+        "/a.h\u{74}ml",
+    ];
+
+    fn lowercase_walk_fold() -> u32 {
+        let mut fold: u32 = 0;
+        for path in EXTENSION_PATHS {
+            fold = fold.wrapping_add(the_lowercase_answer(path).len() as u32);
+        }
+        fold
+    }
+
+    /// Every path answers what the lowercase match answered, in any case and under any tail: the fold is `| 0x20` on one padded word, so the only way it could differ is a byte that ORs into a lower-case letter without being that letter in either case, and the sweep carries mixed case beside the non-ASCII traps.
+    #[test]
+    fn every_extension_answers_as_the_lowercase_match_did() {
+        for path in EXTENSION_PATHS {
+            assert_eq!(
+                content_type(path),
+                the_lowercase_answer(path),
+                "path {path:?}"
+            );
+        }
+        for name in [
+            "html", "htm", "css", "js", "mjs", "json", "txt", "xml", "svg", "png", "jpg", "jpeg",
+            "gif", "webp", "ico", "woff", "woff2", "pdf", "zip",
+        ] {
+            let mixed: String = name
+                .bytes()
+                .enumerate()
+                .map(|(at, byte)| {
+                    if at % 2 == 0 {
+                        byte.to_ascii_uppercase()
+                    } else {
+                        byte
+                    }
+                })
+                .map(char::from)
+                .collect();
+            for variant in [name.to_string(), name.to_ascii_uppercase(), mixed] {
+                for path in [
+                    format!("/x.{variant}"),
+                    format!("/x.{variant}?v=2"),
+                    format!("/x.{variant}#f"),
+                    format!("/x.{variant}/y"),
+                ] {
+                    assert_eq!(
+                        content_type(&path),
+                        the_lowercase_answer(&path),
+                        "path {path:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A type is one padded word compared against one group, so the answer costs no heap: 4096 asks over the whole table allocate nothing, where the lowercase match took a `String` a path.
+    #[test]
+    fn a_static_files_type_is_decided_without_an_allocation() {
+        let ((), counts) = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                for path in EXTENSION_PATHS {
+                    std::hint::black_box(content_type(std::hint::black_box(path)));
+                }
+            }
+        });
+        assert_eq!(counts.allocs, 0, "the whole table answered from the stack");
+    }
+
+    /// The key, and nothing else: the whole table asked 64 times, the answer folded after each, and the paths handed over opaquely so no round is answered from the literal.
+    #[test]
+    fn the_word_extension_key_costs_the_word_and_nothing_else() {
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            for path in EXTENSION_PATHS {
+                fold = fold.wrapping_add(content_type(std::hint::black_box(path)).len() as u32);
+            }
+        }
+        assert_eq!(
+            fold,
+            lowercase_walk_fold() * 64,
+            "the same 64 walks, one word a path"
+        );
+    }
+
+    /// The same 64 walks with the lowercase match, so one ops job reports both frames and only their difference is a claim about the key.
+    #[test]
+    fn the_lowercase_extension_key_costs_the_same_answer() {
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            for path in EXTENSION_PATHS {
+                fold = fold
+                    .wrapping_add(the_lowercase_answer(std::hint::black_box(path)).len() as u32);
+            }
+        }
+        assert_eq!(
+            fold,
+            lowercase_walk_fold() * 64,
+            "the same 64 walks, one `String` a path"
+        );
     }
 
     #[test]
