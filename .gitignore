@@ -45,4 +45,3 @@ __pycache__/
 !/dist/USAGE.md
 /lane.json
 /pass.json
-scripts/check-identity-leak.sh

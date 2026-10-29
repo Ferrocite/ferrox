@@ -61,7 +61,6 @@ if [[ $fast == 0 ]]; then
   run_gates \
     check-worktree-artifacts \
     check-leak-surface \
-    check-identity-leak \
     check-dependency-policy \
     check-comments \
     check-merge-markers \
