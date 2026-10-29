@@ -157,6 +157,11 @@ socks  socks::tests::the_client_writes_the_bytes_the_pinned_go_writes  ferrox_co
 socks  socks::tests::the_socks4_request_is_the_bytes_the_pinned_writer_writes  ferrox_core::socks::request4
 socks  socks::tests::the_socks4_reply_is_the_bytes_the_pinned_server_writes  ferrox_core::socks::grant4
 dns-outbound  dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else  ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else
+# The queue hit and the slot hit, on the same full pool and after the same fill:
+# one ops job reports both frames, and only their difference is a claim about
+# the walk the slot list removed.
+engine-dns  dnsapp::resolver_tests::the_queue_hit_costs_the_held_names  ferrox_app::dnsapp::resolver_tests::the_queue_hit_costs_the_held_names
+engine-dns  dnsapp::resolver_tests::the_slot_hit_costs_two_index_writes  ferrox_app::dnsapp::resolver_tests::the_slot_hit_costs_two_index_writes
 security-ech  tls::shaped::hello::tests::an_aes_256_only_config_seals_the_inner_hello  ferrox_core::tls::hpke::Context::seal
 security-ech  tls::shaped::hello::tests::an_aes_256_only_config_seals_the_inner_hello  ferrox_core::tls::hpke::Context::open
 engine-observatory  observatory::tests::a_probe_through_freedom_reads_the_headers_and_gives_the_delay  ferrox_app::observatory::probe

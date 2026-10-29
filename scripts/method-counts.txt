@@ -731,6 +731,8 @@ dns-outbound datagram-answer-bytes-per-datagram 58 ferrox-app-proxy::dns_lane_te
 engine-dns ops-retired-instructions UNBLESSED scripts/count-ops.sh
 engine-dns syscalls-per-udp-exchange UNBLESSED scripts/count-ops.sh
 engine-dns allocations-per-cached-lookup 4 ferrox-app-dnsapp::resolver_tests::a_cache_hit_copies_only_the_answer_vector
+engine-dns fake-hit-allocations 0 ferrox-app-dnsapp::resolver_tests::a_fake_hit_allocates_nothing
+engine-dns fake-name-allocations 1 ferrox-app-dnsapp::resolver_tests::a_fake_name_is_held_once
 engine-dns seconds-per-lookup UNBLESSED CI bench.yml (no cell yet)
 
 # --- the reverse tunnel -----------------------------------------------------
