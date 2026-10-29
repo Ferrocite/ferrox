@@ -2392,7 +2392,7 @@ mod tests {
             writer.try_send(&data),
             crate::proxy::Push::Took(64)
         ));
-        assert!(!peer.lock().unwrap().writes.is_empty());
+        assert_ne!(peer.lock().unwrap().writes.len(), 0);
     }
 
     /// The gathered batch reaches the peer before its own credit parks the writer: a peer grants for
