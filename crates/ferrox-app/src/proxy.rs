@@ -16391,13 +16391,14 @@ fn decoded_path(path: &str) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(String::from_utf8_lossy(&out).into_owned())
 }
 
-/// Every header the reference's hop-by-hop removal leaves, by the name it was sent with; `host` is
-/// absent because the reference promotes it off the header map.
+/// Every header the reference's hop-by-hop removal leaves, by the name it was sent with, plus the
+/// empty `User-Agent` it inserts when the client sent none; `host` is promoted off the header map.
 fn forward_headers<'a>(head: &'a [u8], attrs: &mut crate::router::Attributes<'a>) {
     let Some(line_end) = head.iter().position(|byte| *byte == b'\n') else {
         return;
     };
     let named = connection_named(head, line_end + 1);
+    let mut user_agent = false;
     let mut at = line_end + 1;
     while at < head.len() {
         let Some(end) = head[at..].iter().position(|byte| *byte == b'\n') else {
@@ -16415,11 +16416,15 @@ fn forward_headers<'a>(head: &'a [u8], attrs: &mut crate::router::Attributes<'a>
                     std::str::from_utf8(name),
                     std::str::from_utf8(&line[colon + 1..]),
                 ) {
+                    user_agent |= name.eq_ignore_ascii_case("user-agent");
                     attrs.push(name, std::borrow::Cow::Borrowed(value.trim()));
                 }
             }
         }
         at += end + 1;
+    }
+    if !user_agent {
+        attrs.push("user-agent", std::borrow::Cow::Borrowed(""));
     }
 }
 
@@ -47542,6 +47547,56 @@ end
         assert_eq!(
             head,
             format!("GET /ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n").into_bytes()
+        );
+    }
+
+    /// The reference sets an empty `User-Agent` before it collects attributes, so a head that sent
+    /// none still holds the `^$` pattern a rule names.
+    #[test]
+    fn an_attrs_rule_reads_the_empty_user_agent_the_front_inserts() {
+        let echo = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","attrs":{"user-agent":"^$"},"outboundTag":"block"}]}}"#;
+        let blocked_front = http_front_with(route_outbound(config, Some("in"), true));
+        let mut blocked = Connection::connect(("127.0.0.1", blocked_front)).expect("connects");
+        blocked
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        blocked
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{echo}/ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            blocked.read(&mut buf).expect("closes"),
+            0,
+            "the empty user agent names the block"
+        );
+
+        let allowed_front = http_front_with(route_outbound(config, Some("in"), true));
+        let mut allowed = Connection::connect(("127.0.0.1", allowed_front)).expect("connects");
+        allowed
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        allowed
+            .write_all(
+                format!(
+                    "GET http://127.0.0.1:{echo}/ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\n\
+                     User-Agent: probe\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("gets");
+        let head =
+            read_http_head(&mut allowed, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("echoes the head");
+        assert_eq!(
+            head,
+            format!("GET /ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nUser-Agent: probe\r\n\r\n")
+                .into_bytes()
         );
     }
 
