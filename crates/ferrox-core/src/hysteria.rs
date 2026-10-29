@@ -781,9 +781,25 @@ impl Gecko {
     }
 }
 
+/// A rate hint written as decimal from the back of the stack buffer, so an auth block names it without a heap string.
+fn rate_hint(value: u64, buf: &mut [u8; 20]) -> &str {
+    let mut at = buf.len();
+    let mut rest = value;
+    loop {
+        at -= 1;
+        buf[at] = b'0' + (rest % 10) as u8;
+        rest /= 10;
+        if rest == 0 {
+            break;
+        }
+    }
+    std::str::from_utf8(&buf[at..]).expect("decimal digits")
+}
+
 /// `cc_rx` is the receiving side's `brutalDown`, the rate hint the peer reads before choosing Brutal; 0 is "no cap".
 pub fn build_auth_request(auth: &str, cc_rx: u64, out: &mut Vec<u8>) {
-    let cc_rx = cc_rx.to_string();
+    let mut digits = [0u8; 20];
+    let cc_rx = rate_hint(cc_rx, &mut digits);
     hpack::qpack_literal_many(
         &[
             (":method", "POST"),
@@ -791,7 +807,7 @@ pub fn build_auth_request(auth: &str, cc_rx: u64, out: &mut Vec<u8>) {
             (":authority", AUTH_AUTHORITY),
             (":path", AUTH_PATH),
             (AUTH_HEADER, auth),
-            (CC_RX_HEADER, &cc_rx),
+            (CC_RX_HEADER, cc_rx),
         ],
         out,
     );
@@ -799,12 +815,13 @@ pub fn build_auth_request(auth: &str, cc_rx: u64, out: &mut Vec<u8>) {
 
 /// `cc_rx` is this server's `brutalDown`, the rate hint the client reads before choosing Brutal; 0 is "no cap".
 pub fn build_auth_response(udp: bool, cc_rx: u64, out: &mut Vec<u8>) {
-    let cc_rx = cc_rx.to_string();
+    let mut digits = [0u8; 20];
+    let cc_rx = rate_hint(cc_rx, &mut digits);
     hpack::qpack_literal_many(
         &[
             (":status", "233"),
             (UDP_HEADER, if udp { "true" } else { "false" }),
-            (CC_RX_HEADER, &cc_rx),
+            (CC_RX_HEADER, cc_rx),
         ],
         out,
     );
@@ -1347,6 +1364,26 @@ mod tests {
         build_auth_request("s3cret", 1_310_720, &mut hinted);
         let fields = hpack::qpack_fields(&hinted).expect("reads");
         assert_eq!(find(&fields, CC_RX_HEADER), Some(b"1310720".as_slice()));
+        // The digits land in a stack buffer, so a block built into a roomy buffer costs the heap nothing.
+        let mut out = Vec::with_capacity(256);
+        let capacity = out.capacity();
+        let counts = crate::alloc_count::measure(|| {
+            for _ in 0..4096 {
+                out.clear();
+                build_auth_request("s3cret", 1_310_720, &mut out);
+            }
+        })
+        .1;
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "the hint costs no heap"
+        );
+        assert_eq!(
+            out.capacity(),
+            capacity,
+            "the block stays inside the caller's buffer"
+        );
     }
 
     #[test]

@@ -1774,8 +1774,7 @@ pub(crate) fn hysteria_quic_params(
     }
     let congestion_text = named("congestion")?;
     let cc = match congestion_text.as_str() {
-        "" => None,
-        "brutal" => Some(Congestion::Brutal),
+        "" | "brutal" => Some(Congestion::Brutal),
         "reno" => Some(Congestion::Reno),
         "bbr" => Some(Congestion::Bbr),
         "force-brutal" => {
@@ -2488,17 +2487,17 @@ mod tests {
         assert_eq!(plain.udp_idle, 60);
         assert_eq!(plain.quic, None);
 
-        // A block that names a congestion overrides the stream's own spelling; one that names none leaves it alone.
+        // A present block owns the congestion the way xray's does, its own default included; the stream's extra spelling applies only when no block names one.
         let cc_of = |text: &str| match carrier(text) {
             Carrier::Hysteria(config) => config.cc,
             other => panic!("a hysteria carrier, not {other:?}"),
         };
         assert_eq!(
             cc_of(
-                r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "congestion": "reno"}, "finalmask": {"quicParams": {"initStreamReceiveWindow": 32768}}}}"#
+                r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2, "congestion": "reno"}, "finalmask": {"quicParams": {}}}}"#
             ),
-            Congestion::Reno,
-            "an unnamed congestion is not a default"
+            Congestion::Brutal,
+            "an empty block is xray's default, not the stream's spelling"
         );
         assert_eq!(
             cc_of(
@@ -2506,6 +2505,19 @@ mod tests {
             ),
             Congestion::Bbr,
             "the block's name wins"
+        );
+        let Carrier::Hysteria(empty) = carrier(
+            r#"{"streamSettings": {"network": "hysteria", "hysteriaSettings": {"version": 2}, "finalmask": {"quicParams": {}}}}"#,
+        ) else {
+            panic!("an empty block is carried");
+        };
+        assert_eq!(
+            empty.quic.expect("the empty block still reaches the lane"),
+            QuicParams {
+                cc: Some(Congestion::Brutal),
+                ..QuicParams::default()
+            },
+            "every unset field waits for the reference's default"
         );
 
         // The reference's bounds and names refuse the carrier rather than silently applying a default.

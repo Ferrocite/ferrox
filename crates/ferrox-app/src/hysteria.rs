@@ -2413,6 +2413,65 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_datagram_association_reaps_on_the_configured_idle() {
+        // The reaper's bound is the stream's `udpIdleTimeout`, not the fixed default: a six-second-old association dies at five seconds and lives at sixty.
+        let reaps = |udp_idle: Duration| {
+            let auths: Vec<String> = Vec::new();
+            let handler: Serve = Arc::new(|_| {});
+            let session = idle_session();
+            let stop = Arc::new(AtomicBool::new(false));
+            let target = std::net::UdpSocket::bind("127.0.0.1:0").expect("binds");
+            let mut udp = HashMap::new();
+            udp.insert(
+                1,
+                UdpFlow {
+                    target: Arc::new(target),
+                    defrag: Defrag::new(),
+                    last: Instant::now()
+                        .checked_sub(Duration::from_secs(6))
+                        .expect("six seconds ago"),
+                    stop: Arc::clone(&stop),
+                },
+            );
+            let mut by_scid = HashMap::new();
+            by_scid.insert(
+                vec![1u8; SCID_LEN],
+                Inbound {
+                    conn: Arc::clone(&session.shared),
+                    client_cid: vec![2u8; 8],
+                    initial_dcid: vec![3u8; 8],
+                    authed: true,
+                    settings_sent: true,
+                    settings_done: true,
+                    auth_buf: Vec::new(),
+                    served: HashSet::new(),
+                    wakes: Driver::new(),
+                    udp,
+                    cc_rx: 0,
+                },
+            );
+            let mut router = Router {
+                sock: Arc::clone(&session.sock),
+                local: session.local,
+                out: Unfilled::new(),
+                auths: &auths,
+                serve: &handler,
+                masq: Arc::new(Masquerade::NotFound),
+                udp_idle,
+                cc_rx: 0,
+                routes: by_scid,
+            };
+            router.idle();
+            stop.load(Ordering::Relaxed)
+        };
+        assert!(
+            reaps(Duration::from_secs(5)),
+            "five seconds reaps a six-second-old association"
+        );
+        assert!(!reaps(Duration::from_secs(60)), "sixty seconds keeps it");
+    }
+
     fn idle_session() -> Session {
         let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
         config

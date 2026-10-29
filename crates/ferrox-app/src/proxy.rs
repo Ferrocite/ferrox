@@ -8326,26 +8326,19 @@ fn serve_hysteria_v1_inbound(address: &str, inbound: &Json, freedom: bool, path:
         return false;
     };
     let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
-    let obfs_password = stream
-        .get("tlsSettings")
-        .and_then(|tls| tls.get("obfs"))
-        .and_then(Json::as_str)
-        .unwrap_or("")
-        .to_owned();
+    let config = match crate::config::hysteria_v1_config(Some(stream)) {
+        Ok(config) => config,
+        Err(why) => {
+            eprintln!("hysteria inbound in {path}: {why}; serves nothing");
+            return false;
+        }
+    };
     let owned = address.to_owned();
     let serve: crate::hysteria_v1::Serve = Arc::new(move |flow, host, port| {
         serve_hysteria_v1_flow(flow, &host, port, freedom);
     });
     thread::spawn(move || {
-        crate::hysteria_v1::serve_loop(
-            &owned,
-            &auths,
-            ferrox_core::hysteria::Congestion::Bbr,
-            &cert_path,
-            &key_path,
-            &obfs_password,
-            &serve,
-        );
+        crate::hysteria_v1::serve_loop(&owned, &auths, &cert_path, &key_path, &serve, &config);
     });
     true
 }
