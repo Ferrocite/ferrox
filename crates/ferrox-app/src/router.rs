@@ -5804,6 +5804,36 @@ mod tests {
     }
 
     #[test]
+    fn a_rule_naming_a_webhook_still_routes() {
+        let root = crate::json::parse(
+            r#"{"routing":{"rules":[{"domain":["example.test"],"outboundTag":"direct",
+                "webhook":{"url":"http://127.0.0.1:9/hook"}}]}}"#,
+        )
+        .expect("parses");
+        let flow = Flow {
+            network: Network::Tcp,
+            domain: Some("example.test"),
+            ip: None,
+            port: Some(80),
+            source: None,
+            local: None,
+            inbound_tag: None,
+            protocol: None,
+            user: None,
+            attrs: None,
+            process: None,
+        };
+        let parsed = Routing::parse_in(&root, vec![dir()])
+            .expect("parses")
+            .expect("routing");
+        assert_eq!(
+            parsed.route(&flow),
+            Some("direct"),
+            "the rule must keep routing the flow it matches"
+        );
+    }
+
+    #[test]
     fn a_webhook_action_rides_the_rule_that_names_it() {
         let routing = |webhook: &str| {
             crate::json::parse(&format!(
