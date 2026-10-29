@@ -165,6 +165,11 @@ engine-dns  dnsapp::resolver_tests::the_slot_hit_costs_two_index_writes  ferrox_
 security-ech  tls::shaped::hello::tests::an_aes_256_only_config_seals_the_inner_hello  ferrox_core::tls::hpke::Context::seal
 security-ech  tls::shaped::hello::tests::an_aes_256_only_config_seals_the_inner_hello  ferrox_core::tls::hpke::Context::open
 engine-observatory  observatory::tests::a_probe_through_freedom_reads_the_headers_and_gives_the_delay  ferrox_app::observatory::probe
+# The same eight-kilobyte answer head through the front-to-back rescan and
+# through the resumed walk: one ops job reports both frames, and only their
+# difference is a claim about the rescan.
+engine-observatory  observatory::tests::the_front_scan_costs_every_window_it_has_already_walked  ferrox_app::observatory::tests::the_front_scan_costs_every_window_it_has_already_walked
+engine-observatory  observatory::tests::the_seam_scan_costs_the_octets_it_has_not_walked  ferrox_app::observatory::tests::the_seam_scan_costs_the_octets_it_has_not_walked
 front-healthcheck  proxy::hc_tests::an_hc_get_answers_the_configured_body_after_the_exact_path  ferrox_app::proxy::HcHandler::answer
 # The head that arrives in sixteen windows, walked once and walked again per
 # round: one ops job reports both frames, and only their difference is a claim

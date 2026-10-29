@@ -108,7 +108,7 @@ pub fn connect_request<'a>(
 
 /// Where the head ends: the offset of the empty line that closes an HTTP/1.1 answer, or `None` while it has not arrived. The lane walks a window at a time and asks this before it reads again, so the delimiter rule lives in one place.
 ///
-/// One word at a time: a SWAR pass marks the `\n` lanes of each eight-byte block and only the byte after a marked `\n` is checked against the whole terminator. Bit-identical to `head.windows(4).position(|w| w == b"\r\n\r\n")` — which compares four bytes at every offset — but this reads eight bytes per load and skips the ~255/256 of offsets that hold no `\n`, doing the four-byte verify only at a real candidate. Portable integer code: no target feature, no unsafe. It is the tree's one terminator scan, and every reader that ends a head at `\r\n\r\n` — this lane's window walk, the `httpUpgrade` and xHTTP head readers — reaches it rather than reopening the byte loop.
+/// One word at a time: a SWAR pass marks the `\n` lanes of each eight-byte block and only the byte after a marked `\n` is checked against the whole terminator. Bit-identical to `head.windows(4).position(|w| w == b"\r\n\r\n")` — which compares four bytes at every offset — but this reads eight bytes per load and skips the ~255/256 of offsets that hold no `\n`, doing the four-byte verify only at a real candidate. Portable integer code: no target feature, no unsafe. It is the tree's one terminator scan, and every reader that ends a head at `\r\n\r\n` — this lane's window walk, the `httpUpgrade` and xHTTP head readers, the observatory's probe head and the `hc` front's head reader — reaches it rather than reopening the byte loop.
 #[must_use]
 pub fn head_end(head: &[u8]) -> Option<usize> {
     const CR: u8 = b'\r';

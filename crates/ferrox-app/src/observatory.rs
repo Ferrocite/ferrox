@@ -674,6 +674,31 @@ fn round_trip(
     io.write_all(request.as_bytes())
         .map_err(|error| error.to_string())?;
     io.flush().map_err(|error| error.to_string())?;
+    let (head, end) = read_head(io)?;
+    if !read_body || method != "GET" {
+        return Ok(());
+    }
+    let content = content_length(&head[..end]);
+    let mut left = content.saturating_sub(head.len() - end);
+    let mut buf = [0u8; 4096];
+    while left > 0 {
+        let want = left.min(buf.len());
+        let read = io
+            .read(&mut buf[..want])
+            .map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Err("the peer closed inside the body".to_owned());
+        }
+        left -= read;
+    }
+    if content == 0 {
+        drain(io)?;
+    }
+    Ok(())
+}
+
+/// The answer's head and where it ends, one window at a time: the terminator scan resumes three octets before the octets that just arrived, so a head that drips in is walked once rather than once per window, and it reaches the tree's one `\r\n\r\n` scan rather than a second byte-window loop.
+fn read_head(io: &mut dyn Read) -> Result<(Vec<u8>, usize), String> {
     let mut head = Vec::with_capacity(1024);
     let mut buf = [0u8; 4096];
     loop {
@@ -681,38 +706,16 @@ fn round_trip(
         if read == 0 {
             return Err("the peer closed before a response head".to_owned());
         }
+        // A terminator straddles the seam at most three octets into what was already here.
+        let from = head.len().saturating_sub(3);
         head.extend_from_slice(&buf[..read]);
-        if let Some(end) = find_head_end(&head) {
-            if !read_body || method != "GET" {
-                return Ok(());
-            }
-            let content = content_length(&head[..end]);
-            let mut left = content.saturating_sub(head.len() - end);
-            while left > 0 {
-                let want = left.min(buf.len());
-                let read = io
-                    .read(&mut buf[..want])
-                    .map_err(|error| error.to_string())?;
-                if read == 0 {
-                    return Err("the peer closed inside the body".to_owned());
-                }
-                left -= read;
-            }
-            if content == 0 {
-                drain(io)?;
-            }
-            return Ok(());
+        if let Some(at) = ferrox_core::foxy::head_end(&head[from..]) {
+            return Ok((head, from + at + 4));
         }
         if head.len() > 65_536 {
             return Err("the response head is over 64 KiB".to_owned());
         }
     }
-}
-
-fn find_head_end(head: &[u8]) -> Option<usize> {
-    head.windows(4)
-        .position(|window| window == b"\r\n\r\n")
-        .map(|at| at + 4)
 }
 
 fn content_length(head: &[u8]) -> usize {
@@ -857,6 +860,101 @@ mod tests {
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
         }
+    }
+
+    /// A reader that hands over `window` octets a call, so a head arriving in pieces is the same reader every run.
+    struct Trickle<'a> {
+        bytes: &'a [u8],
+        window: usize,
+    }
+
+    impl Read for Trickle<'_> {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            let take = self.bytes.len().min(out.len()).min(self.window);
+            out[..take].copy_from_slice(&self.bytes[..take]);
+            self.bytes = &self.bytes[take..];
+            Ok(take)
+        }
+    }
+
+    /// The head is found at every arrival pattern: the scan resumes three octets before the seam, so a terminator split across two reads is found where the whole-buffer walk would have found it, and the octets kept are the ones that arrived.
+    #[test]
+    fn an_answer_head_is_found_at_every_split_of_its_arrival() {
+        let answer: &[u8] =
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX-Fill: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\r\n\r\n";
+        let end = answer
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("a terminator")
+            + 4;
+        for window in 1..=answer.len() {
+            let (head, at) = read_head(&mut Trickle {
+                bytes: answer,
+                window,
+            })
+            .unwrap_or_else(|error| panic!("window {window}: {error}"));
+            assert_eq!(at, end, "window {window}");
+            assert_eq!(head.as_slice(), &answer[..head.len()], "window {window}");
+            assert_eq!(&head[end - 4..end], b"\r\n\r\n", "window {window}");
+        }
+    }
+
+    /// An eight-kilobyte answer head that drips in as sixteen 512-octet windows, its terminator in the last four: the shape both scans below are read on.
+    fn sixteen_windows() -> Vec<Vec<u8>> {
+        let mut head = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n".to_vec();
+        let line: &[u8] = b"X-Fill: 0123456789012345678901234567890123456789012\r\n";
+        while head.len() + line.len() <= 8188 {
+            head.extend_from_slice(line);
+        }
+        // Whole lines only, so the filler's own octets hold no terminator.
+        head.resize(8188, b'.');
+        head.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(head.len(), 8192, "a full eight-kilobyte head");
+        head.chunks(512).map(<[u8]>::to_vec).collect()
+    }
+
+    /// The scan as it stood: the whole accumulated head re-walked at four-octet windows after every round.
+    fn scan_from_the_front(rounds: &[Vec<u8>]) -> Option<usize> {
+        let mut head = Vec::new();
+        for round in rounds {
+            head.extend_from_slice(round);
+            if let Some(at) = head.windows(4).position(|window| window == b"\r\n\r\n") {
+                return Some(at + 4);
+            }
+        }
+        None
+    }
+
+    /// The front-to-back rescan and the resumed walk, on the same eight-kilobyte head arriving in sixteen windows: both answer the same end, and only their difference is a claim about the walk. Sixty-four passes each, the ends folded into a pinned `u32` so neither can be folded away.
+    #[test]
+    fn the_front_scan_costs_every_window_it_has_already_walked() {
+        let rounds = sixteen_windows();
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            let end = scan_from_the_front(&rounds).expect("a head");
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(u32::try_from(end).expect("an end"));
+        }
+        assert_eq!(fold, 0x1080_0000, "sixty-four front-to-back walks");
+    }
+
+    #[test]
+    fn the_seam_scan_costs_the_octets_it_has_not_walked() {
+        let joined = sixteen_windows().concat();
+        let mut fold: u32 = 0;
+        for _ in 0..64 {
+            let end = read_head(&mut Trickle {
+                bytes: &joined,
+                window: 512,
+            })
+            .map(|(_, end)| end)
+            .expect("a head");
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(u32::try_from(end).expect("an end"));
+        }
+        assert_eq!(fold, 0x1080_0000, "the same sixty-four heads");
     }
 
     #[test]
