@@ -3,16 +3,19 @@
 const WIDTH: usize = 32;
 const STEP: usize = 16;
 
+/// The sixteen bytes at `at`, little-endian, as one word.
 #[inline]
 fn wide(bytes: &[u8], at: usize) -> u128 {
     u128::from_le_bytes(bytes[at..at + STEP].try_into().unwrap())
 }
 
+/// Write `value` little-endian into the sixteen bytes at `at`.
 #[inline]
 fn store(bytes: &mut [u8], at: usize, value: u128) {
     bytes[at..at + STEP].copy_from_slice(&value.to_le_bytes());
 }
 
+/// The two sixteen-byte phases a step alternates between.
 fn key_words(key: &[u8; WIDTH]) -> [u128; 2] {
     [wide(key, 0), wide(key, STEP)]
 }
