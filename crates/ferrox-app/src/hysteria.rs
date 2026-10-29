@@ -219,6 +219,7 @@ impl Driver {
     }
 }
 
+/// Write a stream's whole buffer under the send budget, releasing the pacer before it parks so a reader can answer.
 pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
     let deadline = Instant::now() + crate::quic::SEND_WAIT;
     let mut paced = false;
@@ -468,6 +469,7 @@ fn post_auth(session: &Session, auth: &str, cc_rx: u64) -> Option<bool> {
 pub(crate) static HANDSHAKES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Dial the configured lane, wrap its socket in the mask or hop it names, and finish the QUIC handshake and auth.
 pub(crate) fn connect(dial: &Dial) -> Option<Session> {
     #[cfg(test)]
     HANDSHAKES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -1092,6 +1094,7 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
     );
 }
 
+/// A serving identity's QUIC config: the lane's transport tuning, its certificate, and its congestion controller.
 pub(crate) fn server_config(
     cert_path: &str,
     key_path: &str,
@@ -2098,6 +2101,7 @@ impl Router<'_> {
         );
     }
 
+    /// Hand one received packet to the route it names, then let every route that took it send once.
     fn drive(&mut self, dcid: &[u8], packet: &mut [u8], from: SocketAddr) {
         let Self {
             routes,

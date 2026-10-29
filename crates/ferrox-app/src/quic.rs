@@ -972,6 +972,7 @@ impl Batch {
         self.data.as_deref()
     }
 
+    /// The slots this batch reads into, taken from the thread's pool on its first read.
     fn data_mut(&mut self) -> &mut BatchData {
         if self.data.is_none() {
             let data = BATCH_POOL
@@ -1048,6 +1049,7 @@ impl Batch {
 
 #[cfg(target_os = "linux")]
 impl Drop for Batch {
+    /// Return the slots to the thread's pool, keeping only the batches a live pump may still ask for.
     fn drop(&mut self) {
         if let Some(data) = self.data.take() {
             let _ = BATCH_POOL.try_with(|pool| {
@@ -1650,6 +1652,7 @@ pub(crate) fn bind_datagram_plain(address: &str) -> std::io::Result<UdpSocket> {
     bind_datagram_gro(address, false)
 }
 
+/// Bind a datagram socket with a lane's buffers, coalescing only when the lane can read a coalesced datagram.
 fn bind_datagram_gro(address: &str, gro: bool) -> std::io::Result<UdpSocket> {
     let sock = UdpSocket::bind(address)?;
     #[cfg(target_os = "linux")]
@@ -2833,6 +2836,7 @@ fn hand_off(
     }
 }
 
+/// Drive one connection's reads and writes until its socket or connection ends, taking a batch of datagrams per turn.
 fn pump(
     shared: &Arc<Mutex<quiche::Connection>>,
     table: &Arc<Mutex<PooledState>>,
