@@ -51,14 +51,14 @@ Nothing here is timed by a local run — every dial through this outbound is a c
 
 ## Gated counts
 
-The decision's retired instructions are the decide probe's frame — `ferrox-core-dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else`, walked 4096 times — read by `scripts/count-ops.sh` under the probe's own filter, the row the count gate now accepts per test. The inline question and rule buffers of #507 moved the frame from 55,544,745 to 60,123,580; two ops runs after that change returned 60,123,580. Folding the name once per question instead of once per domain rule moved it to 47,810,992, the number the ops run on 86e28e9 returned. The vless-encryption module's layout moved `decide` into the probe's own frame under thin LTO, so the five calls each turn now count here: 51,892,686, with the bytes and decisions unchanged. The record-buffer reuse and the b64 one-pass decoder moved the same test binary's inlining up to 51,892,734; the record-header timeout fix moved it back 48 instructions, and `dns.rs` is untouched. The TLS layout from #934 restored the 51,892,734 frame — the bytes and decisions are unchanged — and that is the number the gate files.
+The decision's retired instructions are the decide probe's frame — `ferrox-core-dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_nothing_else`, walked 4096 times — read by `scripts/count-ops.sh` under the probe's own filter, the row the count gate now accepts per test. The inline question and rule buffers of #507 moved the frame from 55,544,745 to 60,123,580; two ops runs after that change returned 60,123,580. Folding the name once per question instead of once per domain rule moved it to 47,810,992, the number the ops run on 86e28e9 returned. The vless-encryption module's layout moved `decide` into the probe's own frame under thin LTO, so the five calls each turn now count here: 51,892,686, with the bytes and decisions unchanged. The record-buffer reuse and the b64 one-pass decoder moved the same test binary's inlining up to 51,892,734; the record-header timeout fix moved it back 48 instructions, and `dns.rs` is untouched. The TLS layout from #934 restored the 51,892,734 frame — the bytes and decisions are unchanged. The sealed-record read side and the head walk's signed cast moved it 40 instructions to 51,892,694, and the arithmetic is what says the decision is untouched: the probe walks its five decisions 4096 times, and 40 is not a multiple of that walk, so the loop that decides is byte for byte the same frame and the 40 is in its setup — the same layout drift this row has recorded at 48 and 54.
 
 ## Measured
 
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 51892734 | scripts/count-ops.sh |
+| ops-retired-instructions | 51892694 | scripts/count-ops.sh |
 | answer-cases-replayed | 21 | ferrox-core-dns::tests::the_answer_is_the_bytes_the_pinned_go_writes |
 | parse-refusals-replayed | 8 | ferrox-core-dns::tests::the_parse_refuses_what_the_reference_refuses |
 | pointer-hop-cap | 10 | ferrox-core-dns::tests::the_pointer_loop_refuses_at_the_cap |
