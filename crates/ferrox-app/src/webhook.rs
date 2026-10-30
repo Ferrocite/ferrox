@@ -4,7 +4,6 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -35,14 +34,19 @@ pub(crate) struct Webhook {
     headers: Vec<(String, String)>,
     deduplication: u32,
     seen: Mutex<Seen>,
-    in_flight: AtomicUsize,
-    saturated: AtomicBool,
+    in_flight: Mutex<InFlight>,
 }
 
 #[derive(Debug)]
 struct Seen {
     emails: HashMap<String, Instant>,
     swept: Instant,
+}
+
+#[derive(Debug)]
+struct InFlight {
+    active: usize,
+    saturated: bool,
 }
 
 /// The facts a matched flow hands the event, as the reference's `buildEvent` reads them. A destination
@@ -103,8 +107,10 @@ pub(crate) fn parse(field: &Json) -> Result<Option<Arc<Webhook>>, String> {
             emails: HashMap::new(),
             swept: Instant::now(),
         }),
-        in_flight: AtomicUsize::new(0),
-        saturated: AtomicBool::new(false),
+        in_flight: Mutex::new(InFlight {
+            active: 0,
+            saturated: false,
+        }),
     })))
 }
 
@@ -127,16 +133,14 @@ impl Webhook {
     /// Send the event one matched flow carries, on its own thread as the reference's goroutine does;
     /// an email inside the window sends nothing.
     pub(crate) fn fire(self: &Arc<Self>, event: &Event<'_>) {
+        if !self.acquire() {
+            return;
+        }
         if self.is_duplicate(event.email.unwrap_or("")) {
+            self.release();
             return;
         }
         let body = event_body(event);
-        if !self.acquire() {
-            if !self.saturated.swap(true, Ordering::Relaxed) {
-                eprintln!("webhook: {MAX_IN_FLIGHT} POSTs in flight; dropping an event");
-            }
-            return;
-        }
         let webhook = Arc::clone(self);
         if let Err(error) = std::thread::Builder::new()
             .name("webhook".to_owned())
@@ -150,18 +154,33 @@ impl Webhook {
         }
     }
 
-    /// Reserve one POST slot, or report that every slot is already held.
+    /// Reserve one POST slot, or report the first drop of a saturated episode.
     fn acquire(&self) -> bool {
-        self.in_flight
-            .try_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
-                (active < MAX_IN_FLIGHT).then_some(active + 1)
-            })
-            .is_ok()
+        let mut state = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active >= MAX_IN_FLIGHT {
+            let first = !state.saturated;
+            state.saturated = true;
+            drop(state);
+            if first {
+                eprintln!("webhook: {MAX_IN_FLIGHT} POSTs in flight; dropping an event");
+            }
+            return false;
+        }
+        state.active += 1;
+        true
     }
 
     fn release(&self) {
-        if self.in_flight.fetch_sub(1, Ordering::AcqRel) == MAX_IN_FLIGHT {
-            self.saturated.store(false, Ordering::Relaxed);
+        let mut state = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active -= 1;
+        if state.active < MAX_IN_FLIGHT {
+            state.saturated = false;
         }
     }
 
@@ -872,20 +891,14 @@ mod tests {
         while accepted.load(Ordering::SeqCst) < CAP && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(
-            accepted.load(Ordering::SeqCst),
-            CAP,
-            "the cap's permits are used"
-        );
+        let started = accepted.load(Ordering::SeqCst);
         std::thread::sleep(Duration::from_millis(500));
-        assert_eq!(
-            accepted.load(Ordering::SeqCst),
-            CAP,
-            "the event over the cap never starts a POST"
-        );
+        let still = accepted.load(Ordering::SeqCst);
         release.store(true, Ordering::SeqCst);
         stop.store(true, Ordering::SeqCst);
         server.join().ok();
+        assert_eq!(started, CAP, "the cap's permits are used");
+        assert_eq!(still, CAP, "the event over the cap never starts a POST");
     }
 
     #[test]
