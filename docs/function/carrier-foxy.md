@@ -17,6 +17,8 @@ UDP rides the same lane as **CONNECT-UDP** (RFC 9298), over `h2` and over `h3`, 
 
 One shape for all of them, and it is the whole design: open a stream, send seven header fields, read one status, relay. The parts that decide rather than move bytes live in `ferrox_core::foxy` (the codecs, the window arithmetic, the UDP path and template), and the app crate owns the socket, the pool and the TLS session. A caller that relays bytes does not know which carrier produced its `Read + Write`. The tunnel a dial returns owns the pooled stream it rides (`FoxyOpen::Tunnel`), so the flow that ends is what hands that stream back.
 
+**The edge can ask for an image captcha.** A suspicious exit gets a `captcha` challenge whose `image_b64` is a data URL. The lane decodes it, answers through an OpenAI-compatible vision endpoint when `VISION_API_BASE_URL`, `VISION_API_KEY` and `VISION_MODEL` are set, and otherwise (on a terminal) writes it to a `0600` temp file, prints the path and reads the characters; with neither it reports `406` instead of replaying the ask. `a_captcha_image_is_read_from_a_data_url_or_its_base64`, `a_captcha_answer_keeps_only_letters_and_digits`, `a_vision_request_names_the_model_and_the_image` and `a_vision_url_is_the_reference_shape` gate the decode, the answer, the request and the endpoint; the live vision call itself is not gated, because it needs a service and a secret.
+
 ## Data path
 
 ```mermaid

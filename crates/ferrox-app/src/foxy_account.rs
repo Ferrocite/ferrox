@@ -4,7 +4,7 @@ use crate::conn::Connection;
 use crate::foxy_challenge::{self, Jar};
 use ferrox_core::foxy::account::{self, Signed};
 use ferrox_core::foxy::{edge_peer, Failure, Pass};
-use ferrox_core::tls::{RustlsProvider, TlsConfig, TlsProvider as _};
+use ferrox_core::tls::{TlsConfig, TlsProvider as _};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
 use std::sync::Mutex;
@@ -469,7 +469,7 @@ impl Endpoint {
     fn tls(&self) -> TlsConfig {
         TlsConfig {
             server_name: self.host.clone(),
-            alpn: Vec::new().into(),
+            alpn: vec![b"http/1.1".to_vec()].into(),
             roots: std::sync::Arc::clone(&self.roots),
             pins: ferrox_core::foxy::pin::Pins::default(),
             cert_pins: std::sync::Arc::from(Vec::new()),
@@ -483,8 +483,27 @@ impl Endpoint {
         }
     }
 
+    /// Mozilla's challenge endpoint only serves its script over HTTP/2, so the edge speaks it.
+    fn tls_h2(&self) -> TlsConfig {
+        let mut cfg = self.tls();
+        cfg.alpn = vec![b"h2".to_vec()].into();
+        cfg.fingerprint = ferrox_core::tls::shaped::Fingerprint::resolve("firefox_148");
+        cfg
+    }
+
     /// Where an account-plane failure keeps its name instead of flattening to an uninformative "io failed".
-    fn connect(&self) -> Result<RustlsProvider<Connection>, String> {
+    fn connect(&self) -> Result<ferrox_core::tls::ClientSession<Connection>, String> {
+        self.connect_with(&self.tls())
+    }
+
+    fn connect_h2(&self) -> Result<ferrox_core::tls::ClientSession<Connection>, String> {
+        self.connect_with(&self.tls_h2())
+    }
+
+    fn connect_with(
+        &self,
+        cfg: &TlsConfig,
+    ) -> Result<ferrox_core::tls::ClientSession<Connection>, String> {
         let peer = match self.address {
             Some(address) => address,
             None => format!("{}:{}", self.host, self.port)
@@ -497,7 +516,7 @@ impl Endpoint {
             .map_err(|why| format!("connect {peer}: {why}"))?;
         let _ = stream.set_read_timeout(Some(IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(IO_TIMEOUT));
-        let mut tls = RustlsProvider::connect(&self.tls(), stream)
+        let mut tls = ferrox_core::tls::connect(cfg, stream)
             .map_err(|why| format!("tls {}: {why}", self.host))?;
         tls.handshake()
             .map_err(|why| format!("handshake {}: {why}", self.host))?;
@@ -507,6 +526,219 @@ impl Endpoint {
 
 use std::net::ToSocketAddrs as _;
 
+/// The challenge host serves its script only over HTTP/2 and binds the page's state to the connection, so one connection carries every stream of a solve.
+struct H2Connection {
+    tls: ferrox_core::tls::ClientSession<Connection>,
+    next: u32,
+    decoder: crate::h2::Decoder,
+}
+
+thread_local! {
+    static H2: std::cell::RefCell<Option<(String, H2Connection)>> = const { std::cell::RefCell::new(None) };
+}
+
+impl H2Connection {
+    fn connect(endpoint: &Endpoint) -> Result<Self, String> {
+        use crate::h2::{frame_head, MAGIC, S_WINDOW, T_SETTINGS, WINDOW};
+        let mut tls = endpoint.connect_h2()?;
+        let mut out = Vec::with_capacity(24 + 9 + 12);
+        out.extend_from_slice(MAGIC);
+        let mut settings = Vec::with_capacity(8);
+        settings.extend_from_slice(&S_WINDOW.to_be_bytes());
+        settings.extend_from_slice(&WINDOW.to_be_bytes());
+        out.extend_from_slice(&frame_head(settings.len(), T_SETTINGS, 0, 0));
+        out.extend_from_slice(&settings);
+        tls.write_all(&out)
+            .and_then(|()| tls.flush())
+            .map_err(|why| format!("writing {} preface: {why}", endpoint.host))?;
+        Ok(Self {
+            tls,
+            next: 1,
+            decoder: crate::h2::Decoder::default(),
+        })
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn request(
+        &mut self,
+        endpoint: &Endpoint,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &[u8],
+    ) -> Result<Reply, String> {
+        use crate::h2::{
+            block_encode, frame_head, read_head_bounded, F_ACK, F_END, F_END_HEADERS, F_PADDED,
+            F_PRIORITY, T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS,
+        };
+        let mut fields: Vec<(String, String)> = Vec::with_capacity(headers.len() + 4);
+        fields.push((":method".to_owned(), method.to_owned()));
+        fields.push((":path".to_owned(), path.to_owned()));
+        fields.push((":scheme".to_owned(), "https".to_owned()));
+        fields.push((":authority".to_owned(), endpoint.host.clone()));
+        for (name, value) in headers {
+            let lower = name.to_ascii_lowercase();
+            if matches!(lower.as_str(), "connection" | "host") {
+                continue;
+            }
+            fields.push((lower, (*value).to_owned()));
+        }
+        let borrowed: Vec<(&str, &str)> = fields
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+            .collect();
+        let block = block_encode(&borrowed);
+        let stream = self.next;
+        self.next += 2;
+        let mut out = Vec::with_capacity(9 + block.len() + 9 + body.len());
+        let flags = if body.is_empty() {
+            F_END_HEADERS | F_END
+        } else {
+            F_END_HEADERS
+        };
+        out.extend_from_slice(&frame_head(block.len(), T_HEADERS, flags, stream));
+        out.extend_from_slice(&block);
+        if !body.is_empty() {
+            out.extend_from_slice(&frame_head(body.len(), T_DATA, F_END, stream));
+            out.extend_from_slice(body);
+        }
+        self.tls
+            .write_all(&out)
+            .and_then(|()| self.tls.flush())
+            .map_err(|why| format!("writing {} {path}: {why}", endpoint.host))?;
+        let mut block = Vec::new();
+        let mut reply = Reply {
+            status: 0,
+            headers: Vec::new(),
+            body: Vec::new(),
+        };
+        let mut ended = false;
+        while !ended {
+            let (len, kind, flags, id) = read_head_bounded(&mut self.tls)
+                .ok_or_else(|| format!("reading {} {path}: frame head", endpoint.host))?;
+            let mut frame = vec![0u8; len];
+            std::io::Read::read_exact(&mut self.tls, &mut frame)
+                .map_err(|why| format!("reading {} {path}: frame body: {why}", endpoint.host))?;
+            match kind {
+                T_SETTINGS if flags & F_ACK == 0 => {
+                    let head = frame_head(0, T_SETTINGS, F_ACK, 0);
+                    self.tls
+                        .write_all(&head)
+                        .and_then(|()| self.tls.flush())
+                        .map_err(|why| format!("acknowledging settings: {why}"))?;
+                }
+                T_PING if flags & F_ACK == 0 => {
+                    let head = frame_head(frame.len(), T_PING, F_ACK, 0);
+                    self.tls
+                        .write_all(&head)
+                        .and_then(|()| self.tls.write_all(&frame))
+                        .and_then(|()| self.tls.flush())
+                        .map_err(|why| format!("answering ping: {why}"))?;
+                }
+                T_HEADERS | T_CONT if id == stream => {
+                    let mut at = 0;
+                    if kind == T_HEADERS {
+                        if flags & F_PADDED != 0 {
+                            at += 1;
+                        }
+                        if flags & F_PRIORITY != 0 {
+                            at += 5;
+                        }
+                    }
+                    let padding = if flags & F_PADDED != 0 {
+                        usize::from(frame.first().copied().unwrap_or(0))
+                    } else {
+                        0
+                    };
+                    let end = frame.len().saturating_sub(padding);
+                    block.extend_from_slice(frame.get(at..end).unwrap_or_default());
+                    if flags & F_END_HEADERS != 0 {
+                        let mut decode_failed = false;
+                        self.decoder
+                            .decode(&block, &mut |name, value| match name {
+                                b":status" => {
+                                    reply.status = std::str::from_utf8(value)
+                                        .ok()
+                                        .and_then(|text| text.parse().ok())
+                                        .unwrap_or(0);
+                                }
+                                _ if !name.starts_with(b":") => reply.headers.push((
+                                    String::from_utf8_lossy(name).into_owned(),
+                                    String::from_utf8_lossy(value).into_owned(),
+                                )),
+                                _ => {}
+                            })
+                            .or_else(|| {
+                                decode_failed = true;
+                                None
+                            });
+                        if decode_failed {
+                            return Err(format!("reading {} {path}: header block", endpoint.host));
+                        }
+                        block.clear();
+                    }
+                    ended = flags & F_END != 0;
+                }
+                T_DATA if id == stream => {
+                    let mut at = 0;
+                    let padding = if flags & F_PADDED != 0 {
+                        at = 1;
+                        usize::from(frame.first().copied().unwrap_or(0))
+                    } else {
+                        0
+                    };
+                    let end = frame.len().saturating_sub(padding);
+                    reply
+                        .body
+                        .extend_from_slice(frame.get(at..end).unwrap_or_default());
+                    ended = flags & F_END != 0;
+                }
+                T_RST => return Err(format!("reading {} {path}: stream reset", endpoint.host)),
+                T_GOAWAY => {
+                    return Err(format!(
+                        "reading {} {path}: connection closed",
+                        endpoint.host
+                    ))
+                }
+                _ => {}
+            }
+        }
+        if reply.status == 0 {
+            return Err(format!("reading {} {path}: no status", endpoint.host));
+        }
+        Ok(reply)
+    }
+}
+
+fn h2_ask(
+    endpoint: &Endpoint,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Result<Reply, String> {
+    let mut retried = false;
+    loop {
+        let result = H2.with(|cached| {
+            let mut cached = cached.borrow_mut();
+            let fresh = !matches!(cached.as_ref(), Some((host, _)) if host == &endpoint.host);
+            if fresh {
+                *cached = Some((endpoint.host.clone(), H2Connection::connect(endpoint)?));
+            }
+            let (_, connection) = cached.as_mut().expect("a connection was just built");
+            connection.request(endpoint, method, path, headers, body)
+        });
+        match result {
+            Ok(reply) => return Ok(reply),
+            Err(why) if retried => return Err(why),
+            Err(_) => {
+                H2.with(|cached| *cached.borrow_mut() = None);
+                retried = true;
+            }
+        }
+    }
+}
+
 /// One request and its answer over TLS, headers exactly as the caller wrote them: the exchange every plane of this app makes, cookie jar or none.
 pub(crate) fn ask(
     endpoint: &Endpoint,
@@ -515,6 +747,10 @@ pub(crate) fn ask(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Reply, String> {
+    // A pinned address is a loopback edge speaking HTTP/1.1; only the real Firefox host needs h2.
+    if endpoint.address.is_none() && endpoint.host.ends_with("firefox.com") {
+        return h2_ask(endpoint, method, url, headers, body);
+    }
     let mut tls = endpoint.connect()?;
     tls.write_all(&request(method, &endpoint.origin(), url, headers, body))
         .and_then(|()| tls.flush())
@@ -1060,6 +1296,15 @@ impl Account {
             return Ok(());
         }
         self.exchange(&session, now)
+    }
+
+    /// Exchanges a session token already minted by the sign-in page, skipping the password and its challenge.
+    pub(crate) fn sign_in_session(&self, session: &str) -> Result<(), Denied> {
+        let session = session.trim().trim_matches('"').to_ascii_lowercase();
+        if session.len() != 64 || !session.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(Denied::Token);
+        }
+        self.exchange(&session, epoch())
     }
 
     /// Continues from the grant a previous launch stored: a live access token is used, a lapsed one is refreshed, and only a rejected grant reaches the password again.
@@ -1761,6 +2006,41 @@ mod loopback {
         assert_eq!(
             seen.last().map(String::as_str),
             Some("GET /api/v1/fpn/token")
+        );
+    }
+
+    /// A browser's session token is already a credential: exchange it without asking `FxA` for a password.
+    #[test]
+    fn a_session_token_mints_a_pass_without_a_sign_in() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        TWO_FACTOR.store(false, std::sync::atomic::Ordering::Relaxed);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots, rx) = edge_with_log();
+        let account = account(address, roots);
+        account
+            .sign_in_session(SESSION)
+            .expect("a browser session token signs in");
+        assert!(account.current().token.starts_with("eyJ"), "and mints");
+        let log = seen(&rx);
+        assert!(
+            !log.iter().any(|line| line == "POST /v1/account/login"),
+            "a session token skips the password sign-in: {log:?}"
+        );
+        assert!(
+            log.iter().any(|line| line == "POST /v1/oauth/token"),
+            "the session token is exchanged: {log:?}"
+        );
+    }
+
+    #[test]
+    fn a_session_token_that_is_not_thirty_two_bytes_of_hex_is_refused() {
+        let (address, roots) = edge();
+        let account = account(address, roots);
+        assert_eq!(
+            account.sign_in_session("not-a-session-token"),
+            Err(Denied::Token)
         );
     }
 
