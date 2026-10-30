@@ -131,6 +131,11 @@ def load_baseline(path):
     return known
 
 
+def filed_gap_bases(path):
+    """The unique scenario bases the baseline files, sorted for a stable replay."""
+    return sorted({base for base, _leg in load_baseline(path)})
+
+
 def filed_basis_ratio(hole, basis):
     """The current ratio on the basis its baseline was filed on, raw when unavailable."""
     raw = hole.get("raw_ratio", hole["ratio"])
@@ -466,7 +471,12 @@ def main():
             return 1
         return 0
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cells", required=True, help="cells/ directory")
+    parser.add_argument("--cells", help="cells/ directory")
+    parser.add_argument(
+        "--bases",
+        action="store_true",
+        help="print the unique scenario bases filed in the baseline and exit",
+    )
     parser.add_argument(
         "--threshold",
         type=float,
@@ -494,6 +504,12 @@ def main():
         "--no-baseline", action="store_true", help="fail on every hole"
     )
     args = parser.parse_args()
+    if args.bases:
+        for base in filed_gap_bases(args.baseline):
+            print(base)
+        return 0
+    if not args.cells:
+        parser.error("--cells is required")
     baseline = {} if args.no_baseline else load_baseline(args.baseline)
 
     grouped = cells_by_scenario(args.cells)

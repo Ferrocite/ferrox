@@ -69,7 +69,10 @@ reads the same list from `scripts/leg-gaps.txt`: a filed gap warns with its issu
 while a new leg or one worse than its filed ratio by more than 0.10 fails the
 matrix. Remove a line only when a run proves the leg fixed, so the fix is a
 visible gate rather than a quiet baseline; a closed issue can still cover an
-open regression. The 2026-10-27 recheck of the vmess, hysteria and gRPC rows
+open regression. `--gaps` (the workflow's `gaps` input) re-measures exactly the
+cells this file names, so a bug-fix slice checks whether any filed hole closed
+without paying for the whole grid; the refresh job never publishes that run.
+The 2026-10-27 recheck of the vmess, hysteria and gRPC rows
 is runs [40523513428](https://github.com/FerroxCo/ferrox/actions/runs/40523513428)
 and [40527294332](https://github.com/FerroxCo/ferrox/actions/runs/40527294332).
 

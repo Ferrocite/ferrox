@@ -10,9 +10,11 @@ repeats=""
 bench_bin="target/release/ferrox-bench"
 only=()
 exclude=()
+gaps=0
 probe_only=0
 build_only=0
 no_build=0
+selftest=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --tier) tier="$2"; shift 2 ;;
@@ -22,9 +24,11 @@ while [[ $# -gt 0 ]]; do
     --bench-bin) bench_bin="$2"; shift 2 ;;
     --only) only+=("$2"); shift 2 ;;
     --exclude) exclude+=("$2"); shift 2 ;;
+    --gaps) gaps=1; shift ;;
     --probe-only) probe_only=1; shift ;;
     --build-only) build_only=1; shift ;;
     --no-build) no_build=1; shift ;;
+    --selftest) selftest=1; shift ;;
     *) echo "::error::unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -38,9 +42,86 @@ engine_dir="target/parity-engines"
 source "$(dirname "$0")/lib-engines.sh"
 source "$(dirname "$0")/lib-matrix.sh"
 
+gap_bases=()
+
+# The tier's scenario ids, once, so --gaps can name a filed gap it cannot reach.
+tier_ids() {
+  scenarios "$tier" | awk '{print $1}'
+}
+
+scenario_kept() {
+  local id="$1" pattern keep
+  if ((gaps)); then
+    keep=0
+    for pattern in ${gap_bases[@]+"${gap_bases[@]}"}; do
+      [[ "$id" == "$pattern" ]] && { keep=1; break; }
+    done
+    ((keep)) || return 1
+  fi
+  for pattern in ${only[@]+"${only[@]}"}; do
+    [[ "$id" == *"$pattern"* ]] || return 1
+  done
+  for pattern in ${exclude[@]+"${exclude[@]}"}; do
+    [[ "$id" == *"$pattern"* ]] && return 1
+  done
+  return 0
+}
+
+load_gap_bases() {
+  local base
+  gap_bases=()
+  while IFS= read -r base; do
+    [[ -n "$base" ]] && gap_bases+=("$base")
+  done < <(filed_gap_bases)
+}
+
+selftest_gaps() {
+  local base ids unreached=0 failed=0
+  load_gap_bases
+  ((${#gap_bases[@]})) || { echo "selftest: scripts/leg-gaps.txt files no scenario bases" >&2; return 1; }
+  ids="$(scenarios full | awk '{print $1}')"
+  for base in "${gap_bases[@]}"; do
+    printf '%s\n' "$ids" | grep -qx "$base" || {
+      echo "selftest: filed gap $base is not a full-tier scenario" >&2
+      unreached=$((unreached + 1))
+    }
+  done
+  ((unreached == 0)) || failed=1
+  only=(); exclude=(); gaps=1
+  scenario_kept "${gap_bases[0]}" || { echo "selftest: --gaps skipped its own first base" >&2; failed=1; }
+  scenario_kept vless-raw-up-1 && { echo "selftest: --gaps kept a base the file does not file" >&2; failed=1; }
+  scenario_kept "${gap_bases[0]}-extra" && { echo "selftest: --gaps matched a neighbour of the base" >&2; failed=1; }
+  gaps=0
+  only=(vless-raw-down-1)
+  scenario_kept vless-raw-down-1 || { echo "selftest: --only stopped matching" >&2; failed=1; }
+  only=()
+  ((failed == 0)) || return 1
+  echo "run-benchmark-matrix selftest: ${#gap_bases[@]} filed gap(s), selection exact"
+}
+
+if ((selftest)); then
+  selftest_gaps
+  exit $?
+fi
+
 main() {
 mkdir -p "$out" "$engine_dir" "$out/cells"
 [[ -f "$pins_file" ]] || fail "$pins_file is missing; refusing to guess a comparator"
+
+if ((gaps)); then
+  load_gap_bases
+  ((${#gap_bases[@]})) || fail "scripts/leg-gaps.txt files no scenario bases; --gaps would run nothing"
+  ids="$(tier_ids)"
+  local base reached=0
+  for base in "${gap_bases[@]}"; do
+    if printf '%s\n' "$ids" | grep -qx "$base"; then
+      reached=$((reached + 1))
+    else
+      echo "::warning::--gaps: $base is filed but not a $tier scenario; it is not measured here" >&2
+    fi
+  done
+  ((reached)) || fail "--gaps: no filed gap is in tier $tier; use --tier full"
+fi
 
 
 if [[ -z "$engines_list" ]]; then
@@ -154,6 +235,7 @@ manifest() {
     ((${#exclude[@]})) && echo "exclude: ${exclude[*]}"
     ((probe_only)) && echo "probe-only: true"
     ((build_only)) && echo "build-only: true"
+    ((gaps)) && echo "gaps: ${gap_bases[*]}"
     echo "commit: $(git rev-parse HEAD 2>/dev/null || echo 'no git metadata')"
     echo "run: ${GITHUB_RUN_ID:-local}"
     echo "attempt: ${GITHUB_RUN_ATTEMPT:-1}"
@@ -241,18 +323,8 @@ fi
   ((${#only[@]})) && echo "# only: ${only[*]}"
   ((${#exclude[@]})) && echo "# exclude: ${exclude[*]}"
   ((probe_only)) && echo "# probe-only: configs written, no traffic moved"
+  ((gaps)) && echo "# gaps: only the cells filed in scripts/leg-gaps.txt"
 } >"$out/commands.sh"
-
-scenario_kept() {
-  local id="$1" pattern
-  for pattern in ${only[@]+"${only[@]}"}; do
-    [[ "$id" == *"$pattern"* ]] || return 1
-  done
-  for pattern in ${exclude[@]+"${exclude[@]}"}; do
-    [[ "$id" == *"$pattern"* ]] && return 1
-  done
-  return 0
-}
 
 engine_path() {
   local have

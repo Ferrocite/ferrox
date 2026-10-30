@@ -74,6 +74,7 @@ if [[ $fast == 0 ]]; then
   python3 scripts/benchstats.py
   python3 scripts/benchmark-delta.py --selftest
   python3 scripts/check-matrix-legs.py --selftest
+  ./scripts/run-benchmark-matrix.sh --selftest
   python3 scripts/workflow-result.py --selftest
   python3 scripts/rewrite-depinfo.py --selftest
 

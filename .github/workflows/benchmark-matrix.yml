@@ -41,6 +41,11 @@ on:
         required: false
         default: ""
         type: string
+      gaps:
+        description: "Only the filed leg gaps in scripts/leg-gaps.txt (for a bug-fix slice)"
+        required: false
+        default: false
+        type: boolean
 
 concurrency:
   group: matrix-${{ github.ref }}
@@ -75,6 +80,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           WANT_TIER: ${{ inputs.tier }}
           WANT_ONLY: ${{ inputs.only }}
+          WANT_GAPS: ${{ inputs.gaps }}
           WANT_REPEATS: ${{ inputs.repeats }}
           WANT_ENGINES: ${{ inputs.engines }}
           WANT_RUNNER: ${{ inputs.runner }}
@@ -113,6 +119,19 @@ jobs:
             done
             ids="$kept"
           fi
+          if [[ "${WANT_GAPS:-false}" == "true" ]]; then
+            filed="$(python3 scripts/check-matrix-legs.py --bases)"
+            kept=""
+            for id in $ids; do
+              for base in $filed; do
+                if [[ "$id" == "$base" ]]; then
+                  kept="$kept $id"
+                  break
+                fi
+              done
+            done
+            ids="$kept"
+          fi
           cells="$(for id in $ids; do printf '"%s",' "$id"; done)"
           cells="[${cells%,}]"
           # No cell is an error: the filter emptied a tier that has scenarios.
@@ -122,6 +141,7 @@ jobs:
           fi
           flags=""
           [[ -n "$WANT_REPEATS" ]] && flags="$flags --repeats $WANT_REPEATS"
+          [[ "${WANT_GAPS:-false}" == "true" ]] && flags="$flags --gaps"
           trees="xray-core,xray-core-rust,sing-box,zeronet,leaf,xray-rust"
           if [[ -n "$WANT_ENGINES" ]]; then
             # A typed list is the caller's own, ferrox included or not.
@@ -175,7 +195,7 @@ jobs:
   refresh:
     name: publish the dated bundles
     needs: run-os
-    if: github.event_name == 'workflow_dispatch' && inputs.tier == 'full'
+    if: github.event_name == 'workflow_dispatch' && inputs.tier == 'full' && inputs.gaps != true
     runs-on: ubuntu-latest
     timeout-minutes: 20
     concurrency:

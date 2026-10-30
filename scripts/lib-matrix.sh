@@ -32,6 +32,11 @@ matrix_udp_carrier() {
   esac
 }
 
+# The scenario bases scripts/leg-gaps.txt files: the cells a bug-fix slice re-measures.
+filed_gap_bases() {
+  python3 "$(dirname "${BASH_SOURCE[0]}")/check-matrix-legs.py" --bases
+}
+
 matrix_server_serves() {
   case "$1:$2" in
     xray-core:hysteria-v1-*) return 1 ;;
