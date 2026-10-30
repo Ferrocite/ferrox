@@ -105,7 +105,7 @@ jobs:
       - name: collect the shard verdicts
         id: verdicts
         run: |
-          verdicts="${{ join(needs.*.results, ' ') }}"
+          verdicts="${{ needs.miri.result }}"
           failed=0
           for result in $verdicts; do
             if [ "$result" != "success" ]; then

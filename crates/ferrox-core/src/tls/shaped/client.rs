@@ -1833,6 +1833,7 @@ mod tests {
 
     /// A close already read with the data is reported as the end, not hidden behind a
     /// socket the peer kept open for more.
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_received_close_is_reported() {
         let suite = Suite::Aes128GcmSha256;
@@ -1847,6 +1848,7 @@ mod tests {
         assert!(session.closed());
     }
 
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_roomy_tls13_chunk_lands_record_by_record_in_the_callers_window() {
         let suite = Suite::Aes128GcmSha256;
@@ -1870,6 +1872,7 @@ mod tests {
 
     /// A TLS 1.3 record read through `Read` lands in the caller's window: the bytes past the
     /// plaintext are the record's own decrypted tail, not the untouched window a staged copy leaves.
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_tls13_record_is_read_where_it_lands() {
         let suite = Suite::Aes128GcmSha256;
@@ -1900,6 +1903,7 @@ mod tests {
     }
 
     /// A window narrower than the record takes what it holds and leaves the rest pending.
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_narrow_window_drains_the_record_from_the_staging_buffer() {
         let suite = Suite::Aes128GcmSha256;
@@ -1966,6 +1970,7 @@ mod tests {
 
     /// A record the transport can hand over whole costs one vectored read, and its body is the
     /// window the caller gets back rather than a copy of a second buffer.
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_pulled_record_lands_in_one_vectored_read() {
         let suite = Suite::Aes128GcmSha256;
@@ -1991,6 +1996,7 @@ mod tests {
         assert_eq!(session.plain_buffer(), []);
     }
 
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_tls13_record_split_across_chunks_is_staged_and_then_lands() {
         let suite = Suite::ChaCha20Sha256;
@@ -2014,6 +2020,7 @@ mod tests {
         assert_eq!(session.plain_buffer(), []);
     }
 
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_roomy_tls12_gcm_chunk_opens_behind_its_explicit_nonce() {
         let suite = Suite::EcdheAes128GcmSha256;
@@ -2036,6 +2043,7 @@ mod tests {
         assert_eq!(session.plain_buffer(), []);
     }
 
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_roomy_tls12_chacha_chunk_opens_without_an_explicit_nonce() {
         let suite = Suite::EcdheChaCha20Sha256;
@@ -2057,6 +2065,7 @@ mod tests {
         assert_eq!(session.plain_buffer(), []);
     }
 
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_roomy_tls12_cbc_chunk_opens_past_its_iv_and_mac() {
         let suite = Suite::EcdheAes128CbcSha;
@@ -2081,6 +2090,7 @@ mod tests {
     /// A handshake flight past the handshake is walked where it lies and takes no heap: a ticket's
     /// body is dropped unread and a `KeyUpdate` reads its one byte, so nothing is copied out to be
     /// looked at.
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_post_handshake_flight_is_read_where_it_lies() {
         let suite = Suite::Aes128GcmSha256;
@@ -2385,6 +2395,7 @@ mod tests {
         assert!(hrr_without_confirmation(&missing).is_err());
     }
 
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_record_split_by_a_timeout_is_resumed_not_lost() {
         let suite = Suite::Aes128GcmSha256;
@@ -2420,6 +2431,7 @@ mod tests {
     /// The roomy path lands the record in the caller's window; a poll that splits its header or
     /// body leaves the bytes already consumed behind it, so the next read resumes rather than
     /// decoding a body as a header.
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_landed_record_split_by_a_timeout_is_resumed_not_lost() {
         let suite = Suite::Aes128GcmSha256;
@@ -2453,6 +2465,7 @@ mod tests {
         }
     }
 
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_handshake_record_split_by_a_timeout_is_resumed_not_lost() {
         let mut wire = vec![HANDSHAKE, 0x03, 0x03, 0x00, 0x04];
@@ -2516,6 +2529,7 @@ mod tests {
 
     /// The record read lands where the record is decrypted from: a stack chunk would have been a second
     /// buffer, zeroed for the full window and then copied into `inbuf`, which only a pointer can see.
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_record_read_fills_the_inbuf_it_decrypts_from() {
         let suite = Suite::Aes128GcmSha256;
@@ -2598,6 +2612,7 @@ mod tests {
 
     /// A relay write hands its record out of the session's own buffer, kept across writes: a fresh
     /// `Vec` per call is one allocation on every write and a different base each time.
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_warm_write_seals_into_the_buffer_it_already_owns() {
         let suite = Suite::Aes128GcmSha256;

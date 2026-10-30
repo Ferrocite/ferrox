@@ -21808,8 +21808,8 @@ pub(crate) fn read_http_head_kept(
     with_head_poll(stream, |stream| kept_head_rounds(stream, limit, budget)).flatten()
 }
 
-/// One round's worth of octets: the peek probe's width, so a head that arrives in pieces costs the same reads it did.
-const HEAD_ROUND: usize = 512;
+/// The kept reader's first round and growth quantum: a common camouflage head fits one allocation, while the 8 KiB limit stays a limit rather than a per-handshake buffer.
+const HEAD_ROUND: usize = 2048;
 
 #[allow(
     clippy::uninit_vec,
@@ -28945,21 +28945,47 @@ mod tests {
     #[test]
     fn a_kept_head_straddling_a_round_is_proved_by_two_reads() {
         let mut wire: Vec<u8> = b"GET /tunnel HTTP/1.1\r\nX-Pad: ".to_vec();
-        while wire.len() < 510 {
+        while wire.len() < HEAD_ROUND - 2 {
             wire.push(b'p');
         }
-        // The delimiter occupies 510..514, so the first 512-byte window ends inside it.
+        // The delimiter occupies HEAD_ROUND-2..HEAD_ROUND+2, so the first round ends inside it.
         wire.extend_from_slice(b"\r\n\r\npayload");
-        assert_eq!(wire[510..], b"\r\n\r\npayload".to_vec());
+        assert_eq!(wire[HEAD_ROUND - 2..], b"\r\n\r\npayload".to_vec());
         let mut source = Counted {
             inner: std::io::Cursor::new(wire),
             reads: 0,
         };
         let (got, at) =
             kept_head_rounds(&mut source, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("straddles");
-        assert_eq!(at, 514, "the head is proved past the seam, not re-windowed");
+        assert_eq!(
+            at,
+            HEAD_ROUND + 2,
+            "the head is proved past the seam, not re-windowed"
+        );
         assert_eq!(&got[at..], b"payload");
         assert_eq!(source.reads, 2, "a round per window: {}", source.reads);
+    }
+
+    /// A common camouflage head is one allocation and a full window is three: the first round covers the head, and the growth rounds stay at the limit's fractions rather than pre-sizing the whole 8 KiB window.
+    #[test]
+    fn a_common_head_is_one_allocation_and_a_full_window_is_three() {
+        for (len, allocs) in [(512usize, 1usize), (700, 1), (8 * 1024, 3)] {
+            let mut head = vec![b'p'; len - 4];
+            head.extend_from_slice(b"\r\n\r\n");
+            for _ in 0..12 {
+                let mut source = std::io::Cursor::new(head.clone());
+                let (read, counts) = ferrox_core::alloc_count::measure(|| {
+                    kept_head_rounds(&mut source, 8 * 1024, HEAD_DEADLINE)
+                });
+                let (got, at) = read.expect("reads a head");
+                assert_eq!(at, len, "the head ends at its delimiter");
+                assert_eq!(&got[..at], &head[..], "the head comes back whole");
+                assert_eq!(
+                    counts.allocs, allocs,
+                    "a {len}-byte head costs {allocs} allocation(s): {counts:?}"
+                );
+            }
+        }
     }
 
     /// The worst input the round loop meets: no delimiter at all. It is refused, and so is a stream that holds nothing.

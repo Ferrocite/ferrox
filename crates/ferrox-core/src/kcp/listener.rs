@@ -364,6 +364,7 @@ mod tests {
         assert_eq!(room.len(), DATAGRAM_MAX, "and it is the whole datagram");
     }
 
+    #[cfg_attr(miri, ignore = "binds a loopback UDP socket")]
     #[test]
     fn close_returns_while_a_session_is_registered() {
         let listener = Listener::bind(([127, 0, 0, 1], 0).into(), Config::default()).expect("bind");
