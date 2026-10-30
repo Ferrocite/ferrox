@@ -49639,6 +49639,65 @@ mod tests {
         )))
     }
 
+    /// The address form an outbound's request carries for a named target: `targetStrategy` resolves it before the protocol builds the request, as the reference's outbound handler does.
+    #[test]
+    fn an_outbound_target_strategy_sends_the_resolved_family() {
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_port = server.local_addr().expect("addr").port();
+        let seen = thread::spawn(move || {
+            let (mut stream, _) = server.accept().expect("accepts");
+            let mut greet = [0u8; 3];
+            stream.read_exact(&mut greet).expect("greets");
+            stream.write_all(&[5, 0]).expect("picks no auth");
+            let mut head = [0u8; 4];
+            stream.read_exact(&mut head).expect("asks");
+            let rest = match head[3] {
+                1 => 6,
+                3 => {
+                    let mut len = [0u8; 1];
+                    stream.read_exact(&mut len).expect("length");
+                    usize::from(len[0]) + 2
+                }
+                4 => 18,
+                _ => 0,
+            };
+            let mut tail = vec![0u8; rest];
+            stream.read_exact(&mut tail).expect("the address");
+            stream
+                .write_all(&[5, 0, 0, 1, 0, 0, 0, 0, 0, 0])
+                .expect("grants");
+            head[3]
+        });
+        let out = route_outbound(
+            &format!(
+                r#"{{"routing":{{}},"outbounds":[{{"protocol":"socks","targetStrategy":"useIPv4","settings":{{"servers":[{{"address":"127.0.0.1","port":{server_port}}}]}}}}]}}"#
+            ),
+            None,
+            false,
+        );
+        let front_port = socks_front_with(out);
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("the method");
+        // The front is asked for the name, so nothing but the lane can resolve it.
+        let mut request = vec![5, 1, 0, 3, 9];
+        request.extend_from_slice(b"localhost");
+        request.extend_from_slice(&80u16.to_be_bytes());
+        client.write_all(&request).expect("asks");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("the front grants");
+        assert_eq!(reply[1], 0);
+        assert_eq!(
+            seen.join().expect("joins"),
+            0x01,
+            "a useIPv4 lane sends the A record, never the name"
+        );
+    }
+
     /// `sendThrough` reads an address and a CIDR, rolls inside the subnet, and refuses a prefix the
     /// reference refuses.
     #[test]
