@@ -3943,9 +3943,9 @@ fn serve_vless_raw_with<D, R>(
             window: &[],
             probe: match decode_request_bounded_gated(
                 &mut stream,
-                |id, _, _, target, port| {
-                    let served = users.iter().any(|user| same_vless_user(&user.id, &id));
-                    if !served {
+                |id, flow, cmd, target, port| {
+                    let user = users.iter().find(|user| same_vless_user(&user.id, &id));
+                    if user.is_none() {
                         crate::accesslog::record(
                             peer,
                             false,
@@ -3955,7 +3955,7 @@ fn serve_vless_raw_with<D, R>(
                             "",
                         );
                     }
-                    served
+                    user.is_some_and(|user| vless_flow_ok(user, flow, cmd, false))
                 },
                 |host, port| (io.resolve)(host, port),
             ) {
