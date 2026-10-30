@@ -3436,18 +3436,21 @@ fn serve_vless_ws(
         );
     }
     // Past the upgrade the frame layer retries timeouts itself, so bound it by wall clock and poll the socket.
-    let Some((got, flow, cmd, target)) = under_handshake(&mut reader, decode_request) else {
+    let Some(request) = under_handshake(&mut reader, decode_request_pending) else {
         return;
     };
-    let ask = reverse_ask(users, &got, flow, cmd);
+    let ask = reverse_ask(users, &request.id, request.flow, request.command);
     if !matches!(ask, ReverseAsk::NotReverse) {
         let closer_writer = writer.clone();
         reverse_carried(ask, reader, writer, Arc::new(move || closer_writer.close()));
         return;
     }
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &request.id, request.flow, request.command, freedom) {
         return;
     }
+    let Some(target) = request.target.resolve() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -3487,18 +3490,21 @@ fn serve_vless_httpupgrade(
     reader.set_poll(Some(RELAY_POLL));
     let decoded = decode_request_bounded(&mut reader);
     reader.set_poll(None);
-    let Some((got, flow, cmd, target)) = decoded else {
+    let Some(request) = decoded else {
         return;
     };
-    let ask = reverse_ask(users, &got, flow, cmd);
+    let ask = reverse_ask(users, &request.id, request.flow, request.command);
     if !matches!(ask, ReverseAsk::NotReverse) {
         let closer = connection_closer(&write);
         reverse_carried(ask, reader, write, closer);
         return;
     }
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &request.id, request.flow, request.command, freedom) {
         return;
     }
+    let Some(target) = request.target.resolve() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -3539,18 +3545,21 @@ fn serve_vless_grpc(
         );
     }
     // Past the preface the reader retries timeouts itself, so the opening request is polled at the relay's grain and bounded by the handshake budget, the way the websocket arm bounds its frames.
-    let Some((got, flow, cmd, target)) = under_handshake(&mut reader, decode_request) else {
+    let Some(request) = under_handshake(&mut reader, decode_request_pending) else {
         return;
     };
-    let ask = reverse_ask(users, &got, flow, cmd);
+    let ask = reverse_ask(users, &request.id, request.flow, request.command);
     if !matches!(ask, ReverseAsk::NotReverse) {
         let closer_writer = writer.clone();
         reverse_carried(ask, reader, writer, Arc::new(move || closer_writer.close()));
         return;
     }
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &request.id, request.flow, request.command, freedom) {
         return;
     }
+    let Some(target) = request.target.resolve() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -3595,18 +3604,21 @@ fn serve_vless_httpheader(
     reader.set_poll(Some(RELAY_POLL));
     let decoded = decode_request_bounded(&mut reader);
     reader.set_poll(None);
-    let Some((got, flow, cmd, target)) = decoded else {
+    let Some(request) = decoded else {
         return;
     };
-    let ask = reverse_ask(users, &got, flow, cmd);
+    let ask = reverse_ask(users, &request.id, request.flow, request.command);
     if !matches!(ask, ReverseAsk::NotReverse) {
         let closer = connection_closer(&write);
         reverse_carried(ask, reader, write, closer);
         return;
     }
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &request.id, request.flow, request.command, freedom) {
         return;
     }
+    let Some(target) = request.target.resolve() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -3762,12 +3774,12 @@ impl ferrox_core::vless_encryption::SplitIo for SealHandshake {
 }
 
 /// The opening request decoded under a wall-clock budget: a peer that upgrades, connects or handshakes and then stays silent costs a thread briefly, not forever.
-fn decode_request_bounded(stream: &mut dyn Read) -> Option<([u8; 16], Flow, u8, SocketAddr)> {
+fn decode_request_bounded(stream: &mut dyn Read) -> Option<VlessRequest> {
     let mut bounded = HandshakeDeadline {
         inner: stream,
         until: Instant::now() + budgets::handshake(),
     };
-    decode_request(&mut bounded)
+    decode_request_pending(&mut bounded)
 }
 
 /// The two arms a carried reader holds for the length of one decode: outside a lane the `ws` and `grpc` readers wait out a timeout, so a head needs the socket's poll quantum and a wall-clock end.
@@ -3894,7 +3906,7 @@ fn serve_vless_raw_with<D, R>(
         }
         None => (
             match decode_request_bounded(&mut stream) {
-                Some(header) => Probe::Decoded(header),
+                Some(request) => Probe::Decoded(request),
                 None => Probe::Dropped,
             },
             Vec::new(),
@@ -3916,20 +3928,29 @@ fn vless_raw_reply<D, R>(
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
     R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
 {
-    let (got, flow, cmd, target) = match probe {
-        Probe::Decoded(header) => header,
+    let request = match probe {
+        Probe::Decoded(request) => request,
         Probe::Refused => {
             let Some(rows) = fallbacks else { return };
             return seize_fallback(stream, rows, window, &carried);
         }
         Probe::Dropped => return,
     };
-    let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
+    let Some(target) = request
+        .target
+        .resolve_with(|host, port| (io.resolve)(host, port))
+    else {
+        return;
+    };
+    let Some(user) = users
+        .iter()
+        .find(|user| same_vless_user(&user.id, &request.id))
+    else {
         let Some(rows) = fallbacks else {
             crate::accesslog::record(
                 stream.peer_addr().ok(),
                 false,
-                &target,
+                &request.target,
                 None,
                 "invalid user",
                 "",
@@ -3938,6 +3959,9 @@ fn vless_raw_reply<D, R>(
         };
         return seize_fallback(stream, rows, window, &carried);
     };
+    if !freedom || !vless_flow_ok(user, request.flow, request.command, false) {
+        return;
+    }
     crate::accesslog::record(
         stream.peer_addr().ok(),
         true,
@@ -3949,7 +3973,7 @@ fn vless_raw_reply<D, R>(
     let mut stream = stream
         .with_meter(crate::stats::user(&user.email, user.level))
         .with_policy(Some(crate::policy::flow(user.level)));
-    match reverse_ask(users, &got, flow, cmd) {
+    match reverse_ask(users, &request.id, request.flow, request.command) {
         ReverseAsk::Allowed(portal) => {
             if stream.write_all(&[0, 0]).is_err() {
                 return;
@@ -3962,19 +3986,16 @@ fn vless_raw_reply<D, R>(
         ReverseAsk::Refused => return,
         ReverseAsk::NotReverse => {}
     }
-    if !freedom || !vless_flow_ok(user, flow, cmd, false) {
-        return;
-    }
-    if cmd == 2 {
+    if request.command == 2 {
         return serve_vless_udp(stream, &target, carried);
     }
-    if cmd == 3 {
+    if request.command == 3 {
         if stream.write_all(&[0, 0]).is_err() {
             return;
         }
         return serve_vless_mux_with(stream, io, &carried);
     }
-    if cmd != 1 {
+    if request.command != 1 {
         // The reference's decoder refuses a command past the id without falling back.
         return;
     }
@@ -4131,18 +4152,24 @@ fn serve_sealed_raw<
     timeout: Option<Connection>,
     _relay: R,
 ) {
-    let Some((got, flow, cmd, target)) = decode_request_bounded(&mut sealed) else {
+    let Some(request) = decode_request_bounded(&mut sealed) else {
         return;
     };
-    let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
-        crate::accesslog::record(peer, false, &target, None, "invalid user", "");
+    let Some(user) = users
+        .iter()
+        .find(|user| same_vless_user(&user.id, &request.id))
+    else {
+        crate::accesslog::record(peer, false, &request.target, None, "invalid user", "");
+        return;
+    };
+    if !freedom || !vless_flow_ok(user, request.flow, request.command, true) {
+        return;
+    }
+    let Some(target) = request.target.resolve() else {
         return;
     };
     crate::accesslog::record(peer, true, &target, None, "", &user.email);
-    if !freedom || !vless_flow_ok(user, flow, cmd, true) {
-        return;
-    }
-    let ask = reverse_ask(users, &got, flow, cmd);
+    let ask = reverse_ask(users, &request.id, request.flow, request.command);
     if !matches!(ask, ReverseAsk::NotReverse) {
         let shared = Arc::new(SealedShared::new(
             sealed,
@@ -4162,7 +4189,7 @@ fn serve_sealed_raw<
         }
         return;
     }
-    match cmd {
+    match request.command {
         2 => {
             if sealed.write_all(&[0, 0]).is_err() {
                 return;
@@ -4200,8 +4227,8 @@ fn serve_sealed_raw<
                 return;
             }
             let close = close_with_uplink(closer, &uplink);
-            if flow == Flow::Vision {
-                let link = crate::vision::Link::sealed(sealed, &got);
+            if request.flow == Flow::Vision {
+                let link = crate::vision::Link::sealed(sealed, &request.id);
                 relay_link(&uplink, link, &close, timeout);
             } else {
                 R::relay(sealed, &uplink, &close);
@@ -4284,18 +4311,24 @@ fn serve_sealed_split_with<R, W, C>(
 {
     let decoded = decode_request_bounded(&mut reader);
     after_decode(reader.get_mut());
-    let Some((got, flow, cmd, target)) = decoded else {
+    let Some(request) = decoded else {
         return;
     };
-    let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
-        crate::accesslog::record(None, false, &target, None, "invalid user", "");
+    let Some(user) = users
+        .iter()
+        .find(|user| same_vless_user(&user.id, &request.id))
+    else {
+        crate::accesslog::record(None, false, &request.target, None, "invalid user", "");
+        return;
+    };
+    if !freedom || !vless_flow_ok(user, request.flow, request.command, true) {
+        return;
+    }
+    let Some(target) = request.target.resolve() else {
         return;
     };
     crate::accesslog::record(None, true, &target, None, "", &user.email);
-    if !freedom || !vless_flow_ok(user, flow, cmd, true) {
-        return;
-    }
-    let ask = reverse_ask(users, &got, flow, cmd);
+    let ask = reverse_ask(users, &request.id, request.flow, request.command);
     if !matches!(ask, ReverseAsk::NotReverse) {
         if let ReverseAsk::Allowed(portal) = ask {
             let meter = crate::stats::user(&user.email, user.level);
@@ -4316,7 +4349,7 @@ fn serve_sealed_split_with<R, W, C>(
         return;
     }
     let meter = crate::stats::user(&user.email, user.level);
-    match cmd {
+    match request.command {
         2 => {
             if writer.write_all(&[0, 0]).is_err() {
                 return;
@@ -4356,7 +4389,7 @@ fn serve_sealed_split_with<R, W, C>(
                 return;
             }
             let close = close_with_uplink(&closer, &uplink);
-            if flow == Flow::Vision {
+            if request.flow == Flow::Vision {
                 eprintln!("vless: vision over a carried encrypted session is not served yet");
                 close();
                 return;
@@ -4656,7 +4689,7 @@ const PROBE_READ: usize = 8192;
 /// What one probe of a table-bearing front lands on: a header the handler owns, a flow the
 /// rows cover, or the reference's own refusal to fall back.
 enum Probe {
-    Decoded(([u8; 16], Flow, u8, SocketAddr)),
+    Decoded(VlessRequest),
     Refused,
     Dropped,
 }
@@ -4693,8 +4726,8 @@ fn probe_front(
             tail: &mut bounded,
             carried: &mut carried,
         };
-        let probe = match decode_request(&mut replay) {
-            Some(header) => Probe::Decoded(header),
+        let probe = match decode_request_pending(&mut replay) {
+            Some(request) => Probe::Decoded(request),
             None => Probe::Dropped,
         };
         (probe, replay.at)
@@ -6432,23 +6465,33 @@ fn serve_vless_quic(
     }
     let mut stream = stream;
     let decoded = decode_request_bounded(&mut stream);
-    let Some((got, flow, cmd, target)) = decoded else {
+    let Some(request) = decoded else {
         stream.close();
         return;
     };
     // Vision framing and reverse accounts ride their own carriers: a QUIC stream carries the reference's three session kinds.
-    let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
+    let Some(user) = users
+        .iter()
+        .find(|user| same_vless_user(&user.id, &request.id))
+    else {
         stream.close();
         return;
     };
-    if !freedom || user.reverse.is_some() || !vless_flow_ok(user, flow, cmd, false) {
+    if !freedom
+        || user.reverse.is_some()
+        || !vless_flow_ok(user, request.flow, request.command, false)
+    {
         stream.close();
         return;
     }
+    let Some(target) = request.target.resolve() else {
+        stream.close();
+        return;
+    };
     let mut stream = stream.with_meter(crate::stats::user(&user.email, user.level));
     let stop = stream.clone();
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || stop.close());
-    match cmd {
+    match request.command {
         1 => serve_vless_quic_tcp(stream, &target),
         2 => {
             if stream.write_all(&[0, 0]).is_err() {
@@ -6475,22 +6518,32 @@ fn serve_vless_quic_sealed(
     stop: crate::quic::QuicStream,
 ) {
     let decoded = decode_request_bounded(&mut sealed);
-    let Some((got, flow, cmd, target)) = decoded else {
+    let Some(request) = decoded else {
         stop.close();
         return;
     };
-    let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
+    let Some(user) = users
+        .iter()
+        .find(|user| same_vless_user(&user.id, &request.id))
+    else {
         stop.close();
         return;
     };
-    if !freedom || user.reverse.is_some() || !vless_flow_ok(user, flow, cmd, false) {
+    if !freedom
+        || user.reverse.is_some()
+        || !vless_flow_ok(user, request.flow, request.command, false)
+    {
         stop.close();
         return;
     }
+    let Some(target) = request.target.resolve() else {
+        stop.close();
+        return;
+    };
     let fin = stop.clone();
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || stop.close());
     let meter = crate::stats::user(&user.email, user.level);
-    match cmd {
+    match request.command {
         1 => {
             let Some(uplink) = dial_or_report(&target) else {
                 close();
@@ -6734,16 +6787,20 @@ fn serve_session_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     }
     let mut creader = creader;
     creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
-    let decoded = decode_request(&mut creader);
+    let decoded = decode_request_pending(&mut creader);
     creader.set_handshake_budget(None);
-    let Some((got, flow, cmd, target)) = decoded else {
+    let Some(request) = decoded else {
         echo_trace("session ws vless decode refused");
         return;
     };
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &request.id, request.flow, request.command, freedom) {
         echo_trace("session ws vless id or cmd refused");
         return;
     }
+    let Some(target) = request.target.resolve() else {
+        echo_trace("session ws uplink refused");
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         echo_trace("session ws uplink refused");
         return;
@@ -6845,16 +6902,21 @@ pub(crate) fn serve_session_xhttp_with(
     freedom: bool,
 ) {
     // Every refusal ends the carrier's stream: a session that answers nothing leaves its reader parked on a reply that will never come.
-    let Some((got, flow, cmd, target)) = decode_request(&mut creader) else {
+    let Some(request) = decode_request_pending(&mut creader) else {
         echo_trace("session xhttp vless decode refused");
         cwriter.finish();
         return;
     };
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &request.id, request.flow, request.command, freedom) {
         echo_trace("session xhttp vless id or cmd refused");
         cwriter.finish();
         return;
     }
+    let Some(target) = request.target.resolve() else {
+        echo_trace("session xhttp uplink refused");
+        cwriter.finish();
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         echo_trace("session xhttp uplink refused");
         cwriter.finish();
@@ -6893,16 +6955,21 @@ fn serve_session_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send +
     }
     let mut creader = creader;
     let decoded = decode_request_bounded(&mut creader);
-    let Some((got, flow, cmd, target)) = decoded else {
+    let Some(request) = decoded else {
         echo_trace("session httpupgrade vless decode refused");
         crate::httpupgrade::quiet(&raw);
         return;
     };
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &request.id, request.flow, request.command, freedom) {
         echo_trace("session httpupgrade vless id or cmd refused");
         crate::httpupgrade::quiet(&raw);
         return;
     }
+    let Some(target) = request.target.resolve() else {
+        echo_trace("session httpupgrade uplink refused");
+        crate::httpupgrade::quiet(&raw);
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         echo_trace("session httpupgrade uplink refused");
         crate::httpupgrade::quiet(&raw);
@@ -6944,14 +7011,18 @@ fn serve_session_httpheader<R: Read + Send + 'static, W: Write + Clone + Send + 
     }
     let mut creader = creader;
     let decoded = decode_request_bounded(&mut creader);
-    let Some((got, flow, cmd, target)) = decoded else {
+    let Some(request) = decoded else {
         echo_trace("session httpheader vless decode refused");
         return;
     };
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &request.id, request.flow, request.command, freedom) {
         echo_trace("session httpheader vless id or cmd refused");
         return;
     }
+    let Some(target) = request.target.resolve() else {
+        echo_trace("session httpheader uplink refused");
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         echo_trace("session httpheader uplink refused");
         return;
@@ -6998,16 +7069,20 @@ fn serve_session_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     let mut creader = creader;
     // The dispatcher already polls the socket behind a session at the relay's grain, so only the request's own clock is armed here: past it a peer that answered the head and then stopped speaking is a refusal, not a thread pinned in `read_exact`'s retry.
     creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
-    let decoded = decode_request(&mut creader);
+    let decoded = decode_request_pending(&mut creader);
     creader.set_handshake_budget(None);
-    let Some((got, flow, cmd, target)) = decoded else {
+    let Some(request) = decoded else {
         echo_trace("session grpc vless decode refused");
         return;
     };
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &request.id, request.flow, request.command, freedom) {
         echo_trace("session grpc vless id or cmd refused");
         return;
     }
+    let Some(target) = request.target.resolve() else {
+        echo_trace("session grpc uplink refused");
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         echo_trace("session grpc uplink refused");
         return;
@@ -7549,11 +7624,12 @@ fn open_vless<S: Read + Write>(
     session: &mut S,
     raw: Option<&Connection>,
     freedom: bool,
-    (_, flow, cmd, target): ([u8; 16], Flow, u8, SocketAddr),
+    request: &VlessRequest,
 ) -> Option<Opened> {
-    if cmd != 1 || !freedom {
+    if request.command != 1 || !freedom {
         return None;
     }
+    let target = request.target.resolve()?;
     let uplink = dial_or_report(&target)?;
     if uplink.set_read_timeout(Some(RELAY_POLL)).is_err() {
         eprintln!("tls: uplink timeout failed");
@@ -7580,7 +7656,7 @@ fn open_vless<S: Read + Write>(
             let _ = raw.shutdown(Shutdown::Both);
         }
     });
-    Some((flow, uplink, close))
+    Some((request.flow, uplink, close))
 }
 
 /// The names a tls front's handshake negotiated, lower-cased the way the reference lowers a
@@ -7641,7 +7717,7 @@ fn relay_vless<S>(
         }
         None => (
             match decode_request_bounded(&mut session) {
-                Some(header) => Probe::Decoded(header),
+                Some(request) => Probe::Decoded(request),
                 None => Probe::Dropped,
             },
             Vec::new(),
@@ -7680,13 +7756,13 @@ fn relay_vless_reply<S>(
         + CipherOpen
         + 'static,
 {
-    let header = match probe {
-        Probe::Decoded(header) => {
-            if !matches!(header.2, 1..=4) {
+    let request = match probe {
+        Probe::Decoded(request) => {
+            if !matches!(request.command, 1..=4) {
                 // The reference's decoder refuses a command past the id without falling back.
                 return;
             }
-            header
+            request
         }
         Probe::Refused => {
             let Some(rows) = fallbacks else { return };
@@ -7697,14 +7773,14 @@ fn relay_vless_reply<S>(
     };
     let Some(user) = users
         .iter()
-        .find(|user| same_vless_user(&user.id, &header.0))
+        .find(|user| same_vless_user(&user.id, &request.id))
     else {
         // The reference's decoder does not know this user: a table front falls back, a bare one drops.
         let Some(rows) = fallbacks else { return };
         let Some(raw) = raw else { return };
         return seize_fallback_tls(session, &raw, rows, window, &carried, front);
     };
-    match reverse_ask(users, &header.0, header.1, header.2) {
+    match reverse_ask(users, &request.id, request.flow, request.command) {
         ReverseAsk::Allowed(portal) => {
             attach_reverse_session(portal, session, raw);
             return;
@@ -7712,11 +7788,11 @@ fn relay_vless_reply<S>(
         ReverseAsk::Refused => return,
         ReverseAsk::NotReverse => {}
     }
-    if !vless_flow_ok(user, header.1, header.2, vision) {
+    if !vless_flow_ok(user, request.flow, request.command, vision) {
         return;
     }
-    let wire_id = header.0;
-    let Some((flow, mut uplink, close)) = open_vless(&mut session, raw.as_ref(), freedom, header)
+    let wire_id = request.id;
+    let Some((flow, mut uplink, close)) = open_vless(&mut session, raw.as_ref(), freedom, &request)
     else {
         let Some(rows) = fallbacks else { return };
         let Some(raw) = raw else { return };
@@ -8958,17 +9034,20 @@ fn serve_vless_kcp(conn: &Arc<ferrox_core::kcp::Connection>, users: &[VlessUser]
     let mut io = KcpIo {
         conn: Arc::clone(conn),
     };
-    let Some((got, flow, cmd, target)) = decode_request_bounded(&mut io) else {
+    let Some(request) = decode_request_bounded(&mut io) else {
         return;
     };
-    if !users
-        .iter()
-        .any(|user| same_vless_user(&user.id, &got) && vless_flow_ok(user, flow, cmd, false))
-        || !freedom
-        || cmd != 1
+    if !users.iter().any(|user| {
+        same_vless_user(&user.id, &request.id)
+            && vless_flow_ok(user, request.flow, request.command, false)
+    }) || !freedom
+        || request.command != 1
     {
         return;
     }
+    let Some(target) = request.target.resolve() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -9194,21 +9273,25 @@ fn serve_hysteria_v1_flow(mut flow: crate::hysteria::Flow, host: &str, port: u16
 }
 
 fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], freedom: bool) {
-    let Some((got, flow, cmd, target)) = decode_request_bounded(&mut io) else {
+    let Some(request) = decode_request_bounded(&mut io) else {
         io.close();
         return;
     };
-    let Some(user) = users
-        .iter()
-        .find(|user| same_vless_user(&user.id, &got) && vless_flow_ok(user, flow, cmd, false))
-    else {
+    let Some(user) = users.iter().find(|user| {
+        same_vless_user(&user.id, &request.id)
+            && vless_flow_ok(user, request.flow, request.command, false)
+    }) else {
         io.close();
         return;
     };
-    if !freedom || cmd != 1 {
+    if !freedom || request.command != 1 {
         io.close();
         return;
     }
+    let Some(target) = request.target.resolve() else {
+        io.close();
+        return;
+    };
     io = io.with_meter(crate::stats::user(&user.email, user.level));
     let Some(uplink) = dial_or_report(&target) else {
         io.close();
@@ -9795,17 +9878,20 @@ fn serve_xdrive_loop(
 }
 
 fn serve_vless_xdrive(mut session: crate::xdrive::Conn, users: &[VlessUser], freedom: bool) {
-    let Some((got, flow, cmd, target)) = decode_request_bounded(&mut session) else {
+    let Some(request) = decode_request_bounded(&mut session) else {
         return;
     };
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &request.id, request.flow, request.command, freedom) {
         return;
     }
     let Some(user) = users.iter().find(|user| {
-        same_vless_user(&user.id, &got)
+        same_vless_user(&user.id, &request.id)
             && user.reverse.is_none()
-            && vless_flow_ok(user, flow, cmd, false)
+            && vless_flow_ok(user, request.flow, request.command, false)
     }) else {
+        return;
+    };
+    let Some(target) = request.target.resolve() else {
         return;
     };
     session = session.with_meter(crate::stats::user(&user.email, user.level));
@@ -22791,15 +22877,71 @@ pub(crate) fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
 const MUX_TARGET: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 666);
 
-pub(crate) fn decode_request(stream: &mut dyn Read) -> Option<([u8; 16], Flow, u8, SocketAddr)> {
+/// A decoded request whose name is still unresolved, so a session validates the account before
+/// it spends resolver capacity on a name the peer chose.
+pub(crate) struct VlessRequest {
+    pub(crate) id: [u8; 16],
+    pub(crate) flow: Flow,
+    pub(crate) command: u8,
+    pub(crate) target: VlessTarget,
+}
+
+pub(crate) enum VlessTarget {
+    Address(SocketAddr),
+    Name(String, u16),
+    Mux,
+}
+
+impl VlessTarget {
+    fn resolve(&self) -> Option<SocketAddr> {
+        self.resolve_with(resolve_endpoint)
+    }
+
+    fn resolve_with(
+        &self,
+        resolve: impl FnOnce(&str, u16) -> Option<SocketAddr>,
+    ) -> Option<SocketAddr> {
+        match self {
+            Self::Address(address) => Some(*address),
+            Self::Name(host, port) => resolve(host, *port),
+            Self::Mux => Some(MUX_TARGET),
+        }
+    }
+}
+
+impl std::fmt::Display for VlessTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Address(address) => write!(f, "{address}"),
+            Self::Name(host, port) => f.write_str(&ferrox_core::foxy::authority(host, *port)),
+            Self::Mux => write!(f, "{MUX_TARGET}"),
+        }
+    }
+}
+
+pub(crate) fn decode_request_pending(stream: &mut dyn Read) -> Option<VlessRequest> {
     // One buffer holds the whole header: the parse borrows the name out of it.
     let mut scratch = [0u8; ferrox_core::vless::REQUEST_MAX];
     let request = ferrox_core::vless::decode_request(stream, &mut scratch)?;
     let target = match request.target {
-        Some(Target::Ip(ip)) => SocketAddr::new(ip, request.port),
-        Some(Target::Name(host)) => resolve_endpoint(host, request.port)?,
-        None => MUX_TARGET,
+        Some(Target::Ip(ip)) => VlessTarget::Address(SocketAddr::new(ip, request.port)),
+        Some(Target::Name(host)) => VlessTarget::Name(host.to_owned(), request.port),
+        None => VlessTarget::Mux,
     };
+    Some(VlessRequest {
+        id: request.id,
+        flow: request.flow,
+        command: request.command,
+        target,
+    })
+}
+
+/// The resolving decoder the probes and tests use; a session decodes pending and resolves only
+/// after it has accepted the account.
+#[cfg(test)]
+pub(crate) fn decode_request(stream: &mut dyn Read) -> Option<([u8; 16], Flow, u8, SocketAddr)> {
+    let request = decode_request_pending(stream)?;
+    let target = request.target.resolve()?;
     Some((request.id, request.flow, request.command, target))
 }
 
@@ -44570,10 +44712,13 @@ mod tests {
                 rest,
                 true,
             );
-            let Some((got, _, cmd, target)) = decode_request_bounded(&mut flow) else {
+            let Some(request) = decode_request_bounded(&mut flow) else {
                 return;
             };
-            assert!(same_vless_user(&got, &id) && cmd == 1);
+            assert!(same_vless_user(&request.id, &id) && request.command == 1);
+            let Some(target) = request.target.resolve() else {
+                return;
+            };
             let Some(uplink) = dial_or_report(&target) else {
                 return;
             };
@@ -52671,7 +52816,15 @@ mod dns_lane_tests {
             &mut window,
         );
         assert!(
-            matches!(verdict, Probe::Decoded((got, _, 1, target)) if got == id && target.port() == 8080 && target.ip().is_loopback()),
+            matches!(
+                verdict,
+                Probe::Decoded(VlessRequest {
+                    id: got,
+                    command: 1,
+                    target: VlessTarget::Address(target),
+                    ..
+                }) if got == id && target.port() == 8080 && target.ip().is_loopback()
+            ),
             "a header this inbound owns is not a probe"
         );
         assert_eq!(
@@ -52741,6 +52894,69 @@ mod dns_lane_tests {
         assert!(matches!(verdict, Probe::Dropped), "a failed read drops");
     }
 
+    /// A name the peer chose is not a resolver job until the account and command are accepted.
+    #[test]
+    fn a_vless_name_waits_for_the_account_before_a_lookup() {
+        fn pair() -> (Connection, thread::JoinHandle<()>) {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+            let addr = listener.local_addr().expect("addr");
+            let client = thread::spawn(move || {
+                let _ = std::net::TcpStream::connect(addr);
+            });
+            let (stream, _) = listener.accept().expect("accepts");
+            (Connection::from(stream), client)
+        }
+        let id = [7u8; 16];
+        let users = one_vless_user(&id);
+        let asked = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&asked);
+        let io = MuxIo {
+            dial: |_: &SocketAddr| -> Option<Connection> { None },
+            resolve: move |_: &str, _: u16| {
+                count.fetch_add(1, Ordering::Relaxed);
+                None
+            },
+        };
+        let request = |id| VlessRequest {
+            id,
+            flow: Flow::None,
+            command: 1,
+            target: VlessTarget::Name("slow.test".to_owned(), 80),
+        };
+        let (stream, client) = pair();
+        vless_raw_reply(
+            stream,
+            &users,
+            true,
+            None,
+            &[],
+            (Probe::Decoded(request([9u8; 16])), Vec::new()),
+            &io,
+        );
+        assert_eq!(
+            asked.load(Ordering::Relaxed),
+            0,
+            "an invalid id never looks up"
+        );
+        client.join().expect("client");
+        let (stream, client) = pair();
+        vless_raw_reply(
+            stream,
+            &users,
+            true,
+            None,
+            &[],
+            (Probe::Decoded(request(id)), Vec::new()),
+            &io,
+        );
+        assert_eq!(
+            asked.load(Ordering::Relaxed),
+            1,
+            "a valid id reaches the resolver"
+        );
+        client.join().expect("client");
+    }
+
     /// A header and its first payload arriving in one read: the handler forwards the payload the
     /// parse left in the window, not just the bytes a later read pulled past it.
     #[test]
@@ -52778,7 +52994,12 @@ mod dns_lane_tests {
             None,
             &[],
             (
-                Probe::Decoded((id, Flow::None, 1, echo_addr)),
+                Probe::Decoded(VlessRequest {
+                    id,
+                    flow: Flow::None,
+                    command: 1,
+                    target: VlessTarget::Address(echo_addr),
+                }),
                 payload.to_vec(),
             ),
             &MuxIo {
