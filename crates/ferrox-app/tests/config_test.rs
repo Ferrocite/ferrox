@@ -88,3 +88,59 @@ fn test_refuses_json_it_cannot_parse() {
     assert!(stdout.contains("Failed to start:"), "{stdout}");
     let _ = std::fs::remove_file(&path);
 }
+
+fn geodata_config(url: &str) -> String {
+    format!(
+        r#"{{"geodata": {{"cron": "0 3 * * *", "outbound": "direct",
+        "assets": [{{"url": "{url}", "file": "Cargo.toml"}}]}},
+        "inbounds": [{{"tag": "in", "listen": "127.0.0.1", "port": 18095, "protocol": "socks",
+        "settings": {{"auth": "noauth"}}}}],
+        "outbounds": [{{"protocol": "freedom", "tag": "direct"}}]}}"#
+    )
+}
+
+/// The reference refuses an asset URL that is not HTTPS while building the config, so `-test` does too.
+#[test]
+fn test_refuses_a_geodata_asset_over_plain_http() {
+    let path = config_path(
+        "geodata-http",
+        &geodata_config("http://example.test/geosite.dat"),
+    );
+    let named = path.to_string_lossy().into_owned();
+    let output = run(&["-test", "-c", &named]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "a plain-http asset is xray's config error: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("invalid geodata asset url") && stdout.contains("scheme must be https"),
+        "the refusal carries the reference's spelling: {stdout}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A schedule this tree does not run is still a config the reference runs, so it starts with one line saying so.
+#[test]
+fn test_accepts_a_geodata_schedule_it_does_not_carry() {
+    let path = config_path(
+        "geodata-cron",
+        &geodata_config("https://example.test/geosite.dat"),
+    );
+    let named = path.to_string_lossy().into_owned();
+    let output = run(&["-test", "-c", &named]);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a valid geodata block is servable: {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("asset downloads are not carried"),
+        "the unscheduled refresh is named instead of silent"
+    );
+    let _ = std::fs::remove_file(&path);
+}

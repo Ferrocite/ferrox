@@ -28,6 +28,7 @@ mod foxy_challenge;
 mod foxy_latency;
 #[cfg(test)]
 mod foxy_live;
+mod geodata;
 mod grpc;
 mod h2;
 mod headers;
