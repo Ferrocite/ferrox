@@ -479,6 +479,7 @@ impl Endpoint {
             fingerprint: None,
             ech_config_list: None,
             websocket: false,
+            master_key_log: None,
         }
     }
 

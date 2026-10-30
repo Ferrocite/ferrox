@@ -4581,6 +4581,7 @@ mod tests {
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
+            master_key_log: None,
         }
     }
 
@@ -4653,6 +4654,7 @@ mod tests {
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
+            master_key_log: None,
         };
         assert!(serve_config(&empty).is_none());
         let mut no_key = minted_identity();

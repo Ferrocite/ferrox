@@ -167,6 +167,7 @@ impl<S: Stream> RealityServer<S> {
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
+            master_key_log: None,
         };
         replay.set_prefix(raw);
         Ok(RealityAccept::Session(Self {
@@ -2424,6 +2425,7 @@ mod tests {
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
+            master_key_log: None,
         };
         let plain = super::super::TlsServerConfig {
             send_tickets: true,

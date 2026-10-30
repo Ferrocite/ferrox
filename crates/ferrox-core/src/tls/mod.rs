@@ -47,6 +47,64 @@ pub struct TlsConfig {
     /// Whether the carrier is a WebSocket or `HTTPUpgrade`: xray's parrots then force
     /// the outer ALPN to `http/1.1` so the upgrade reads as an ordinary browser.
     pub websocket: bool,
+    /// The `masterKeyLog` file every handshake of this config appends its traffic secrets to, or
+    /// `None` to log none, the ordinary case.
+    pub master_key_log: Option<std::sync::Arc<MasterKeyLog>>,
+}
+
+/// xray's `masterKeyLog`: the traffic secrets of every handshake on the config, one NSS line each,
+/// appended to one file so a capture of the session decrypts offline.
+#[derive(Debug)]
+pub struct MasterKeyLog {
+    state: std::sync::Mutex<(std::fs::File, Vec<u8>)>,
+}
+
+impl MasterKeyLog {
+    /// xray's `os.OpenFile(path, O_CREATE|O_RDWR|O_APPEND, 0o600)`: `None` when the path cannot be
+    /// opened, which the reference reports and then carries on without.
+    pub fn open(path: &str) -> Option<Self> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create(true).read(true).append(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        // 193 bytes is the longest line: a 30-byte label, a 32-byte random and a 48-byte SHA-384 secret.
+        Some(Self {
+            state: std::sync::Mutex::new((options.open(path).ok()?, Vec::with_capacity(208))),
+        })
+    }
+}
+
+impl rustls::KeyLog for MasterKeyLog {
+    fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
+        use std::io::Write as _;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (file, line) = &mut *state;
+        line.clear();
+        line.extend_from_slice(label.as_bytes());
+        line.push(b' ');
+        push_hex(line, client_random);
+        line.push(b' ');
+        push_hex(line, secret);
+        line.push(b'\n');
+        // Go's key-log writer drops its write error the same way: logging never fails a handshake.
+        let _ = file.write_all(line);
+    }
+}
+
+/// Lowercase hex, two digits per byte, onto a line that already holds the room.
+fn push_hex(line: &mut Vec<u8>, bytes: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    line.reserve(bytes.len() * 2);
+    for byte in bytes {
+        line.push(DIGITS[usize::from(byte >> 4)]);
+        line.push(DIGITS[usize::from(byte & 0x0f)]);
+    }
 }
 
 pub trait TlsProvider: std::io::Read + std::io::Write {
@@ -282,6 +340,8 @@ pub struct TlsServerConfig {
     pub server_config_cache: crate::tls::rustls_backend::ServerConfigCache,
     /// ECH server keys as the xray TLV: `u16 key || u16 config`, repeated.
     pub ech_server_keys: Option<std::sync::Arc<[u8]>>,
+    /// The `masterKeyLog` file this listener's handshakes append to, or `None` to log none.
+    pub master_key_log: Option<std::sync::Arc<MasterKeyLog>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -379,6 +439,7 @@ pub fn parse_pem_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<TlsServerCo
         reject_unknown_sni: false,
         server_config_cache: std::sync::Arc::default(),
         ech_server_keys: None,
+        master_key_log: None,
     })
 }
 
