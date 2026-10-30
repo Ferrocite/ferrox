@@ -60,7 +60,17 @@ enum CustomValue {
     Str(String),
 }
 
+/// The `echSockopt` node the ECH query's own dial reads.
 pub(crate) fn parse(node: Option<&Json>) -> Result<Option<SocketOptions>, String> {
+    parse_with(node, "the ECH query")
+}
+
+/// The node an outbound's `streamSettings.sockopt` carries: the same options on the transport dial.
+pub(crate) fn parse_outbound(node: Option<&Json>) -> Result<Option<SocketOptions>, String> {
+    parse_with(node, "the outbound")
+}
+
+fn parse_with(node: Option<&Json>, dialer: &str) -> Result<Option<SocketOptions>, String> {
     let Some(node) = node else {
         return Ok(None);
     };
@@ -68,7 +78,7 @@ pub(crate) fn parse(node: Option<&Json>) -> Result<Option<SocketOptions>, String
         return Ok(None);
     }
     if !matches!(node, Json::Obj(_)) {
-        return Err("echSockopt is not an object".to_owned());
+        return Err("sockopt is not an object".to_owned());
     }
     let mark = int(node, "mark")?.filter(|value| *value != 0);
     let tfo = match node.get("tcpFastOpen") {
@@ -80,9 +90,7 @@ pub(crate) fn parse(node: Option<&Json>) -> Result<Option<SocketOptions>, String
             value if value < 0 => Some(0),
             _ => Some(1),
         },
-        Some(_) => {
-            return Err("echSockopt.tcpFastOpen is neither a boolean nor an integer".to_owned())
-        }
+        Some(_) => return Err("sockopt.tcpFastOpen is neither a boolean nor an integer".to_owned()),
     };
     let tproxy = matches!(
         node.get("tproxy").and_then(Json::as_str),
@@ -105,7 +113,7 @@ pub(crate) fn parse(node: Option<&Json>) -> Result<Option<SocketOptions>, String
             "forceipv6" => DomainStrategy::ForceIp6,
             "forceipv4v6" => DomainStrategy::ForceIp46,
             "forceipv6v4" => DomainStrategy::ForceIp64,
-            other => return Err(format!("unsupported echSockopt domainStrategy {other}")),
+            other => return Err(format!("unsupported sockopt domainStrategy {other}")),
         },
     };
     let keep_alive = Some(keep_alive(node)?);
@@ -115,7 +123,7 @@ pub(crate) fn parse(node: Option<&Json>) -> Result<Option<SocketOptions>, String
     let max_seg = int(node, "tcpMaxSeg")?.filter(|value| *value > 0);
     let interface = text(node, "interface")?;
     let custom = custom(node.get("customSockopt"))?;
-    warn_unsupported(node);
+    warn_unsupported(node, dialer);
     Ok(Some(SocketOptions {
         mark,
         tfo,
@@ -131,34 +139,32 @@ pub(crate) fn parse(node: Option<&Json>) -> Result<Option<SocketOptions>, String
     }))
 }
 
-fn warn_unsupported(node: &Json) {
+fn warn_unsupported(node: &Json, dialer: &str) {
     if node
         .get("dialerProxy")
         .and_then(Json::as_str)
         .is_some_and(|text| !text.is_empty())
     {
-        eprintln!("ech: echSockopt.dialerProxy is not wired; the ECH query dials directly");
+        eprintln!("sockopt.dialerProxy is not wired; {dialer} dials directly");
     }
     if node
         .get("addressPortStrategy")
         .and_then(Json::as_str)
         .is_some_and(|text| !text.is_empty() && !text.eq_ignore_ascii_case("none"))
     {
-        eprintln!(
-            "ech: echSockopt.addressPortStrategy is not wired; the ECH query dials its own target"
-        );
+        eprintln!("sockopt.addressPortStrategy is not wired; {dialer} dials its own target");
     }
     if node
         .get("happyEyeballs")
         .is_some_and(|value| !matches!(value, Json::Null))
     {
-        eprintln!("ech: echSockopt.happyEyeballs is not wired; the ECH query dials one address");
+        eprintln!("sockopt.happyEyeballs is not wired; {dialer} dials one address");
     }
     if matches!(node.get("penetrate"), Some(Json::Bool(true))) {
-        eprintln!("ech: echSockopt.penetrate is not wired; the ECH query dials directly");
+        eprintln!("sockopt.penetrate is not wired; {dialer} dials directly");
     }
     if matches!(node.get("tcpMptcp"), Some(Json::Bool(true))) {
-        eprintln!("ech: echSockopt.tcpMptcp is not wired; the ECH query dials a plain TCP socket");
+        eprintln!("sockopt.tcpMptcp is not wired; {dialer} dials a plain TCP socket");
     }
 }
 
@@ -167,10 +173,10 @@ fn int(node: &Json, key: &str) -> Result<Option<i32>, String> {
         return Ok(None);
     };
     let Json::Num(number) = value else {
-        return Err(format!("echSockopt.{key} is not a number"));
+        return Err(format!("sockopt.{key} is not a number"));
     };
     if number.fract() != 0.0 || *number < f64::from(i32::MIN) || *number > f64::from(i32::MAX) {
-        return Err(format!("echSockopt.{key} is not an int32"));
+        return Err(format!("sockopt.{key} is not an int32"));
     }
     Ok(Some(*number as i32))
 }
@@ -183,7 +189,7 @@ fn text(node: &Json, key: &str) -> Result<Option<String>, String> {
         Json::Null => Ok(None),
         Json::Str(text) if text.is_empty() => Ok(None),
         Json::Str(text) => Ok(Some(text.clone())),
-        _ => Err(format!("echSockopt.{key} is not a string")),
+        _ => Err(format!("sockopt.{key} is not a string")),
     }
 }
 
@@ -191,7 +197,7 @@ fn keep_alive(node: &Json) -> Result<KeepAlive, String> {
     let idle = int(node, "tcpKeepAliveIdle")?.unwrap_or(0);
     let interval = int(node, "tcpKeepAliveInterval")?.unwrap_or(0);
     if idle.signum() * interval.signum() < 0 {
-        return Err("echSockopt tcpKeepAliveIdle and tcpKeepAliveInterval disagree".to_owned());
+        return Err("sockopt tcpKeepAliveIdle and tcpKeepAliveInterval disagree".to_owned());
     }
     if idle < 0 || interval < 0 {
         return Ok(KeepAlive::Disabled);
@@ -207,7 +213,7 @@ fn custom(node: Option<&Json>) -> Result<Vec<CustomSockopt>, String> {
         return Ok(Vec::new());
     };
     let Some(items) = node.as_arr() else {
-        return Err("echSockopt.customSockopt is not an array".to_owned());
+        return Err("sockopt.customSockopt is not an array".to_owned());
     };
     let mut out = Vec::with_capacity(items.len());
     for item in items {
@@ -230,7 +236,7 @@ fn custom(node: Option<&Json>) -> Result<Vec<CustomSockopt>, String> {
         let opt = item
             .get("opt")
             .and_then(Json::as_str)
-            .ok_or_else(|| "echSockopt.customSockopt has no opt".to_owned())?
+            .ok_or_else(|| "sockopt.customSockopt has no opt".to_owned())?
             .parse::<i32>()
             .unwrap_or(0);
         let value = item
@@ -243,9 +249,9 @@ fn custom(node: Option<&Json>) -> Result<Vec<CustomSockopt>, String> {
             Some("int") => CustomValue::Int(value.parse::<i32>().unwrap_or(0)),
             Some("str") => CustomValue::Str(value),
             Some(other) => {
-                return Err(format!("echSockopt.customSockopt type {other} is unknown"));
+                return Err(format!("sockopt.customSockopt type {other} is unknown"));
             }
-            None => return Err("echSockopt.customSockopt has no type".to_owned()),
+            None => return Err("sockopt.customSockopt has no type".to_owned()),
         };
         out.push(CustomSockopt {
             system,
@@ -321,6 +327,11 @@ impl SocketOptions {
             }
         };
         roll(&set).ok_or_else(|| format!("ech: {host} resolved to nothing this strategy allows"))
+    }
+
+    /// The options a TCP dial's socket takes before it connects, whichever dial owns it.
+    pub(crate) fn apply_to(&self, socket: &Socket, target: SocketAddr) -> io::Result<()> {
+        self.apply(socket, target, true)
     }
 
     fn apply(&self, socket: &Socket, addr: SocketAddr, tcp: bool) -> io::Result<()> {
