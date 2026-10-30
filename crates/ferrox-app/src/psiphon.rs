@@ -102,7 +102,7 @@ impl PsiphonOut {
         }
     }
 
-    /// The handshake a flow pays to the local listener. `SOCKS4a` is one request and one reply, while SOCKS5 needs a greeting round trip before the request, so a loopback listener takes `SOCKS4a` for every destination it can name; an IPv6 destination has no SOCKS4 form and keeps SOCKS5.
+    /// The handshake a flow pays to the local listener. The SOCKS4 request is one write and one reply, while SOCKS5 needs a greeting round trip first, so a loopback listener takes SOCKS4 — its `SOCKS4a` form when the destination is a name — and an IPv6 destination, which has no SOCKS4 form, keeps SOCKS5.
     pub(crate) fn session(&self, target: &Destination<'_>) -> (Version, &Credential) {
         if self.loopback && !matches!(target, Destination::V6(..)) {
             (Version::V4, &NO_CREDENTIAL)
@@ -377,6 +377,15 @@ impl Settings {
         } else {
             explicit.or_else(|| interface_name(listen.ip()))
         };
+        if let Some(address) = http {
+            // One listen address serves both servers, so only an HTTP port is ever honoured.
+            let bound = effective_ip(listen, interface.as_deref());
+            if address.ip() != bound {
+                return Err(format!(
+                    "psiphon: the client binds its HTTP proxy on the SOCKS listener's address, so httpListen {address} would be ignored; name httpListen on {bound} or drop it"
+                ));
+            }
+        }
         let base = text(settings, "baseConfig")
             .or_else(|| env("AETHER_PSIPHON_CONFIG"))
             .map(PathBuf::from);
@@ -2495,6 +2504,37 @@ mod tests {
         )))
         .expect("settings");
         assert_eq!(shared.listen, SocketAddr::from(([0, 0, 0, 0], 1800)));
+    }
+
+    #[test]
+    fn an_http_listener_cannot_be_bound_on_the_socks_listeners_other_side() {
+        for (document, reason) in [
+            (
+                r#""listen":"0.0.0.0:1821","shareProxyOnNetworkHttpPort":1801"#,
+                "httpListen 127.0.0.1:1801 would be ignored",
+            ),
+            (
+                r#""listen":"127.0.0.1:1821","httpListen":"0.0.0.0:1801""#,
+                "httpListen 0.0.0.0:1801 would be ignored",
+            ),
+            (
+                r#""listen":"127.0.0.1:1821","interface":"any","httpListen":"127.0.0.1:1801""#,
+                "httpListen 127.0.0.1:1801 would be ignored",
+            ),
+            (
+                r#""listen":"192.168.1.2:1821","interface":"eth0","httpListen":"127.0.0.1:1801""#,
+                "httpListen 127.0.0.1:1801 would be ignored",
+            ),
+        ] {
+            let refused = Settings::from_json(Some(&settings_json(&format!("{{{document}}}"))))
+                .expect_err(reason);
+            assert!(refused.contains(reason), "{reason} in {refused}");
+        }
+        let shared = Settings::from_json(Some(&settings_json(
+            r#"{"listen":"0.0.0.0:1821","shareProxyOnNetwork":true,"shareProxyOnNetworkHttpPort":1801}"#,
+        )))
+        .expect("sharing on both listeners agrees on one interface");
+        assert_eq!(shared.http.map(|address| address.port()), Some(1801));
     }
 
     #[test]
