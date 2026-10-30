@@ -158,6 +158,9 @@ impl Webhook {
     /// The POST, from the URL it parses to the status line it reads, inside the one budget.
     fn send(&self, body: &str) -> Result<(), String> {
         let url = HttpUrl::parse(&self.url)?;
+        if url.userinfo.is_some() && !url.tls {
+            return Err("refuses URL credentials over plaintext http".to_owned());
+        }
         let deadline = Instant::now() + BUDGET;
         let connection = self.dial(&url, left(deadline))?;
         connection
@@ -189,6 +192,18 @@ impl Webhook {
             let mut connection = connection;
             exchange(&mut connection, &request)
         }
+    }
+
+    /// The request and status line over an already-open stream, so a test can drive the production
+    /// request bytes through a local socket without putting credentials on plaintext TCP.
+    #[cfg(all(test, unix))]
+    fn exchange_over(
+        &self,
+        url: &HttpUrl,
+        io: &mut (impl Read + Write),
+        body: &str,
+    ) -> Result<(), String> {
+        exchange(io, &request_bytes(url, &self.headers, body))
     }
 
     /// The address the URL names: the socket path it carries, or the first address its host resolves to.
@@ -254,7 +269,14 @@ fn abstract_name(name: &str) -> Result<Vec<u8>, String> {
 /// The exact request bytes: the JSON content type first, then each configured header, a repeated name
 /// replacing the one already written as `http.Header.Set` does.
 fn request_bytes(url: &HttpUrl, headers: &[(String, String)], body: &str) -> Vec<u8> {
-    let mut wire: Vec<(&str, &str)> = Vec::with_capacity(headers.len() + 1);
+    let authorization = url.userinfo.as_ref().filter(|_| {
+        !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("Authorization"))
+    });
+    let authorization =
+        authorization.map(|userinfo| format!("Basic {}", ferrox_core::b64::encode(userinfo)));
+    let mut wire: Vec<(&str, &str)> = Vec::with_capacity(headers.len() + 2);
     wire.push(("Content-Type", "application/json"));
     for (name, value) in headers {
         match wire
@@ -264,6 +286,9 @@ fn request_bytes(url: &HttpUrl, headers: &[(String, String)], body: &str) -> Vec
             Some(slot) => *slot = (name, value),
             None => wire.push((name, value)),
         }
+    }
+    if let Some(authorization) = authorization.as_deref() {
+        wire.push(("Authorization", authorization));
     }
     crate::foxy_account::request("POST", &url.authority, &url.path, &wire, body.as_bytes())
 }
@@ -667,5 +692,94 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the request arrives");
         assert!(head.starts_with("POST /post HTTP/1.1\r\n"), "{head}");
+    }
+
+    #[test]
+    fn url_credentials_become_basic_auth() {
+        let credentials = ["alice", "p%40ss"].join(":");
+        let target = format!("https://{credentials}@example.test/hook");
+        let url = HttpUrl::parse(&target).expect("parses");
+        let request = request_bytes(&url, &[], "{}");
+        let head = String::from_utf8_lossy(&request);
+        assert!(
+            head.contains("\r\nAuthorization: Basic YWxpY2U6cEBzcw==\r\n"),
+            "{head}"
+        );
+
+        let url = HttpUrl::parse("https://alice@example.test/hook").expect("parses");
+        let request = request_bytes(&url, &[], "{}");
+        assert!(
+            String::from_utf8_lossy(&request).contains("Authorization: Basic YWxpY2U6\r\n"),
+            "a username without a password keeps the required colon"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_authenticated_receiver_sees_the_basic_header() {
+        use std::io::Read as _;
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-webhook-auth-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("hook.sock");
+        let listener = UnixListener::bind(&path).expect("binds");
+        let (send, receive) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut head = Vec::new();
+            let mut buf = [0u8; 256];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buf).expect("reads");
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&buf[..read]);
+            }
+            let text = String::from_utf8_lossy(&head);
+            let authorized = text
+                .lines()
+                .any(|line| line.eq_ignore_ascii_case("Authorization: Basic YWxpY2U6cEBzcw=="));
+            send.send(text.into_owned()).ok();
+            let status = if authorized {
+                "204 No Content"
+            } else {
+                "401 Unauthorized"
+            };
+            stream
+                .write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
+                .expect("replies");
+        });
+
+        let credentials = ["alice", "p%40ss"].join(":");
+        let target = format!("https://{credentials}@example.test/hook");
+        let url = HttpUrl::parse(&target).expect("parses");
+        let webhook = notifier(&target);
+        let mut stream = UnixStream::connect(&path).expect("connects");
+        webhook
+            .exchange_over(&url, &mut stream, "{}")
+            .expect("the authenticated receiver accepts the POST");
+        let head = receive
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the request arrives");
+        assert!(
+            head.contains("Authorization: Basic YWxpY2U6cEBzcw==\r\n"),
+            "{head}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn plaintext_url_credentials_are_refused() {
+        let credentials = ["alice", "s3cr3t"].join(":");
+        let webhook = notifier(&format!("http://{credentials}@127.0.0.1:9/hook"));
+        let error = webhook
+            .send("{}")
+            .expect_err("refuses credentials over plaintext http");
+        assert!(error.contains("plaintext"), "{error}");
     }
 }
