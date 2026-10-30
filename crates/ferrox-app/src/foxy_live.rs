@@ -48,6 +48,7 @@ fn account() -> Option<Account> {
         guardian: Endpoint::parse(ferrox_core::foxy::account::GUARDIAN_SERVER, roots)?,
         jar: std::sync::Arc::new(Mutex::new(Jar::default())),
         pending: std::sync::Arc::new(Mutex::new(None)),
+        pending_method: std::sync::Arc::new(Mutex::new(None)),
         auth: std::sync::Arc::new(Mutex::new(Auth {
             access_token: String::new(),
             refresh_token: String::new(),
