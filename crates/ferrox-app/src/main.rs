@@ -96,6 +96,10 @@ fn usage() -> ! {
     eprintln!("  ferrox-app run -c <config.json>   serve inbounds until killed");
     eprintln!("  ferrox-app -config=<file|stdin:> [-format=json|pb]   same, xray's own invocation");
     eprintln!(
+        "  ferrox-app -confdir <dir>        merge every config file in the directory, as xray does"
+    );
+    eprintln!("  ferrox-app -dump                 print the merged config and exit");
+    eprintln!(
         "  ferrox-app -test -c <config.json>  build every handler and exit, as xray's -test does"
     );
     eprintln!(
@@ -372,11 +376,13 @@ fn is_serve_flag(arg: &str) -> bool {
     )
 }
 
-/// xray's own invocation (`-config=stdin: -format=pb`) and the `run -c <file>`
-/// spelling this tree shipped first; one config per process either way.
+/// xray's own invocation (`-config=stdin: -format=pb`) and the `run -c <file>` spelling this tree
+/// shipped first; several files, a config dir or several `-c` files, merge before they serve.
 fn serve_from_flags(args: &[String]) -> ! {
     let mut configs: Vec<String> = Vec::new();
+    let mut confdir: Option<String> = None;
     let mut format: Option<String> = None;
+    let mut dump = false;
     let mut i = 0;
     while i < args.len() {
         let arg = &args[i];
@@ -385,36 +391,35 @@ fn serve_from_flags(args: &[String]) -> ! {
             None => (arg.as_str(), None),
         };
         match flag {
-            "-c" | "-config" | "-format" => {
+            "-c" | "-config" | "-format" | "-confdir" => {
                 let value = if let Some(value) = inline {
                     value
                 } else {
                     i += 1;
                     args.get(i).cloned().unwrap_or_else(|| usage())
                 };
-                if flag == "-format" {
-                    format = Some(value);
-                } else {
-                    configs.push(value);
+                match flag {
+                    "-format" => format = Some(value),
+                    "-confdir" => confdir = Some(value),
+                    _ => configs.push(value),
                 }
             }
-            "-confdir" => {
-                proxy::exit("-confdir needs README row 127 (multi-file config layering); refused");
-            }
             "-test" => TEST_ONLY.store(true, std::sync::atomic::Ordering::Relaxed),
-            "-dump" => {
-                eprintln!("ferrox-app: {flag} is not carried; this binary serves");
-                std::process::exit(1);
-            }
+            "-dump" => dump = true,
             _ => usage(),
         }
         i += 1;
     }
+    if let Some(dir) = confdir.as_deref() {
+        read_conf_dir(dir, format.as_deref(), &mut configs);
+    } else if let Some(dir) = conf_dir_env() {
+        read_conf_dir(&dir, format.as_deref(), &mut configs);
+    }
+    if dump {
+        dump_config(&configs);
+    }
     if configs.len() > 1 {
-        proxy::exit(&format!(
-            "{} -config files need README row 127 (multi-file config layering); refused",
-            configs.len()
-        ));
+        serve_files(&configs, format.as_deref());
     }
     let source = configs.pop().unwrap_or_else(discover_config);
     let format = source_format(format.as_deref(), &source);
@@ -428,6 +433,134 @@ fn serve_from_flags(args: &[String]) -> ! {
     let bytes = std::fs::read(&source)
         .unwrap_or_else(|error| proxy::exit(&format!("cannot read {source}: {error}")));
     serve_source(&source, &bytes, format)
+}
+
+/// xray's `readConfDir`: every file the `-format` regex names, in `os.ReadDir`'s sorted order,
+/// appended after the files `-c` named. A path that is not a directory is not an error there.
+fn read_conf_dir(dir: &str, format: Option<&str>, out: &mut Vec<String>) {
+    if !std::path::Path::new(dir).is_dir() {
+        return;
+    }
+    let entries = std::fs::read_dir(dir)
+        .unwrap_or_else(|error| proxy::exit(&format!("cannot read {dir}: {error}")));
+    let suffixes: &[&str] = match format.map(str::to_ascii_lowercase).as_deref() {
+        Some("json" | "jsonc") => &["json", "jsonc"],
+        Some("toml") => &["toml"],
+        Some("yaml" | "yml") => &["yaml", "yml"],
+        _ => &["json", "jsonc", "toml", "yaml", "yml"],
+    };
+    let mut names: Vec<std::path::PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .is_some_and(|extension| {
+                    suffixes
+                        .iter()
+                        .any(|suffix| extension.eq_ignore_ascii_case(suffix))
+                })
+        })
+        .collect();
+    names.sort();
+    out.extend(
+        names
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned()),
+    );
+}
+
+/// `xray.location.confdir`, read only when `-confdir` named no directory.
+fn conf_dir_env() -> Option<String> {
+    std::env::var_os("xray.location.confdir")
+        .or_else(|| std::env::var_os("XRAY_LOCATION_CONFDIR"))
+        .map(|dir| dir.to_string_lossy().into_owned())
+        .filter(|dir| std::path::Path::new(dir).is_dir())
+}
+
+/// xray's `MergeConfig`: every file decoded, then each later config overrides the one before by
+/// its own `Override` rule. Protobuf is one file or none, as the reference's loader insists.
+fn serve_files(files: &[String], format: Option<&str>) -> ! {
+    let mut merged = crate::json::Json::Obj(Vec::new());
+    for (at, file) in files.iter().enumerate() {
+        if matches!(source_format(format, file), SourceFormat::Protobuf) {
+            proxy::exit("Only one protobuf config file is allowed");
+        }
+        let bytes = std::fs::read(file)
+            .unwrap_or_else(|error| proxy::exit(&format!("cannot read {file}: {error}")));
+        let body = std::str::from_utf8(&bytes)
+            .unwrap_or_else(|error| proxy::exit(&format!("bad config {file}: {error}")));
+        let root = crate::json::parse(body)
+            .unwrap_or_else(|error| proxy::exit(&format!("bad config {file}: {error}")));
+        if at == 0 {
+            merged = root;
+        } else {
+            crate::json::merge(&mut merged, &root, file);
+        }
+    }
+    let mut text = String::new();
+    crate::json::write(&merged, &mut text);
+    proxy::serve_json(&files.join(", "), &text, test_only());
+}
+
+/// xray's `-dump`: the merged config on stdout, without building or serving it. A file format the
+/// reference has no decoder for is skipped, and a merge error is its status 23 with the reason on
+/// stdout.
+fn dump_config(configs: &[String]) -> ! {
+    let files = if configs.is_empty() {
+        vec![discover_config()]
+    } else {
+        configs.to_vec()
+    };
+    let mut merged = crate::json::Json::Obj(Vec::new());
+    let mut first = true;
+    for file in &files {
+        let extension = if file == "stdin:" {
+            None
+        } else {
+            std::path::Path::new(file)
+                .extension()
+                .and_then(std::ffi::OsStr::to_str)
+                .map(str::to_ascii_lowercase)
+        };
+        match extension.as_deref() {
+            Some(format @ ("yaml" | "yml" | "toml")) => {
+                dump_fail(&format!("config format `{format}` is not carried; json is"));
+            }
+            Some("json" | "jsonc") => {}
+            None if file == "stdin:" => {}
+            _ => continue,
+        }
+        let bytes = if file == "stdin:" {
+            let mut bytes = Vec::new();
+            if let Err(error) = std::io::stdin().read_to_end(&mut bytes) {
+                dump_fail(&format!("cannot read stdin: {error}"));
+            }
+            bytes
+        } else {
+            std::fs::read(file)
+                .unwrap_or_else(|error| dump_fail(&format!("cannot read {file}: {error}")))
+        };
+        let body = std::str::from_utf8(&bytes)
+            .unwrap_or_else(|error| dump_fail(&format!("bad config {file}: {error}")));
+        let root = crate::json::parse(body)
+            .unwrap_or_else(|error| dump_fail(&format!("bad config {file}: {error}")));
+        if first {
+            merged = root;
+            first = false;
+        } else {
+            crate::json::merge(&mut merged, &root, file);
+        }
+    }
+    let mut text = String::new();
+    crate::json::write(&merged, &mut text);
+    println!("{text}");
+    std::process::exit(0);
+}
+
+fn dump_fail(message: &str) -> ! {
+    println!("{message}");
+    std::process::exit(23);
 }
 
 #[derive(Clone, Copy)]
