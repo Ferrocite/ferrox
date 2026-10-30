@@ -9,6 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static TEMP: AtomicU64 = AtomicU64::new(0);
 
+pub const MAX_PRIVATE_BYTES: u64 = 8 * 1024 * 1024;
+
 #[derive(Clone, Debug)]
 pub struct Paths {
     pub conf_dir: PathBuf,
@@ -185,21 +187,42 @@ pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     ))
 }
 
-/// Read a small private file, capped so a planted multi-gigabyte file cannot
-/// turn a startup check into an allocation.
-pub fn read_trim(path: &Path) -> Option<String> {
+/// Read a small private file, refusing instead of silently truncating when a
+/// planted file is larger than the launcher ever writes.
+pub fn read_trim_checked(path: &Path) -> std::io::Result<String> {
     let mut text = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(8 * 1024 * 1024)
-        .read_to_end(&mut text)
-        .ok()?;
-    Some(String::from_utf8_lossy(&text).trim().to_owned())
+    std::fs::File::open(path)?
+        .take(MAX_PRIVATE_BYTES + 1)
+        .read_to_end(&mut text)?;
+    if text.len() as u64 > MAX_PRIVATE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file is larger than 8 MiB",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&text).trim().to_owned())
+}
+
+pub fn read_trim(path: &Path) -> Option<String> {
+    read_trim_checked(path).ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_oversized_private_read_is_refused_not_truncated() {
+        let serial = TEMP.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-paths-big-{}-{serial}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("oversized");
+        std::fs::write(&path, vec![b'x'; MAX_PRIVATE_BYTES as usize + 1]).expect("write");
+        assert!(read_trim_checked(&path).is_err());
+        assert!(read_trim(&path).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_private_write_replaces_the_file_and_leaves_no_temp() {

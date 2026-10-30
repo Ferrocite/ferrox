@@ -1,6 +1,6 @@
 # Ferrox on macOS and Windows
 
-Windows packages ship `ferrox-cli.exe`, a native launcher with the same commands and flags as the shell CLI below. Replace `./dist/ferrox-cli.sh` with `.\ferrox-cli.exe` (or just `ferrox-cli` on `PATH`); the release package keeps the binary beside it, so no Bash, WSL or Python is needed. The Windows zip also carries `ferrox-cli.sh` as an optional Git Bash fallback, which needs Python 3 and curl on `PATH`. `--vpn` is supported on Windows through the WinINET system proxy; macOS `--vpn` remains in `ferrox-cli.sh`.
+Windows packages ship `ferrox-cli.exe`, a native launcher with the same commands and flags as the shell CLI below. Replace `./dist/ferrox-cli.sh` with `.\ferrox-cli.exe` (or just `ferrox-cli` on `PATH`); the release package keeps the binary beside it, so no Bash, WSL or Python is needed. The Windows zip also carries `ferrox-cli.sh` as an optional Git Bash fallback for ports-only use, which needs Python 3 and curl on `PATH`; `--vpn` is the native launcher's, and it uses the WinINET system proxy on Windows; macOS `--vpn` remains in `ferrox-cli.sh`.
 
 Two things were built here, from the same release binary — a release package from the `release` workflow ships the second and third of these beside the binary, and finds it without cargo:
 

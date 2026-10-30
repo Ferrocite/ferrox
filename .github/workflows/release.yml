@@ -208,7 +208,7 @@ jobs:
             ```
 
             ```bash
-            bash ./ferrox-cli.sh up --foxy --vpn   # optional Bash fallback, from Git Bash
+            bash ./ferrox-cli.sh up --foxy         # optional Bash fallback, ports only; use the native launcher for --vpn
             ```
 
             ### The lanes this build carries
@@ -491,10 +491,25 @@ jobs:
 
             ### Verify what you downloaded
 
-            Every release carries `SHA256SUMS` beside the packages. On macOS or
-            Linux run `sha256sum --check SHA256SUMS`; in PowerShell run
-            `Get-FileHash .\ferrox-*.zip -Algorithm SHA256` and compare the
-            value with the line in `SHA256SUMS`.
+            Every release carries `SHA256SUMS` beside the packages. To check
+            just the package you downloaded, Linux:
+
+            ```bash
+            grep 'ferrox-VERSION_PLACEHOLDER-.*-linux-gnu.tar.gz' SHA256SUMS | sha256sum --check -
+            ```
+
+            macOS:
+
+            ```bash
+            grep 'ferrox-VERSION_PLACEHOLDER-.*-apple-darwin.tar.gz' SHA256SUMS | shasum -a 256 -c -
+            ```
+
+            With every package present, `sha256sum --check --ignore-missing SHA256SUMS`
+            works on Linux. On Windows, compare the zip with its matching line:
+
+            ```powershell
+            Get-FileHash .\ferrox-*-x86_64-pc-windows-msvc.zip -Algorithm SHA256
+            ```
 
             `README.md` in each package is the quickstart, `USAGE.md` the manual.
         run: |

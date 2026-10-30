@@ -163,6 +163,9 @@ fn is_ferrox(pid: u32) -> bool {
 
 pub fn kill(pid: u32) {
     if !is_ferrox(pid) {
+        eprintln!(
+            "ferrox-cli: process {pid} is not ferrox-app; it was not stopped. If the binary was renamed, set FERROX_BIN."
+        );
         return;
     }
     #[cfg(unix)]

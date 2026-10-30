@@ -100,7 +100,7 @@ mod win {
     use std::ptr;
 
     use serde_json::{json, Value};
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
     use windows_sys::Win32::Networking::WinInet::{
         InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
     };
@@ -148,7 +148,7 @@ mod win {
         }
     }
 
-    fn read(key: HKEY, name: &str) -> Option<(u32, Vec<u8>)> {
+    fn read(key: HKEY, name: &str) -> Result<Option<(u32, Vec<u8>)>, String> {
         let name = wide(name);
         let mut kind = 0_u32;
         let mut size = 0_u32;
@@ -162,8 +162,16 @@ mod win {
                 &mut size,
             )
         };
-        if status != ERROR_SUCCESS || size > MAX_VALUE {
-            return None;
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
+        if status != ERROR_SUCCESS {
+            return Err(format!("RegQueryValueEx({name:?}) failed with {status}"));
+        }
+        if size > MAX_VALUE {
+            return Err(format!(
+                "registry value {name:?} is larger than {MAX_VALUE} bytes"
+            ));
         }
         let mut buffer = vec![0_u8; size as usize];
         let status = unsafe {
@@ -177,28 +185,20 @@ mod win {
             )
         };
         if status != ERROR_SUCCESS {
-            return None;
+            return Err(format!("RegQueryValueEx({name:?}) failed with {status}"));
         }
         let size = (size as usize).min(buffer.len());
         buffer.truncate(size);
-        Some((kind, buffer))
+        Ok(Some((kind, buffer)))
     }
 
-    fn value_of(key: HKEY, name: &str) -> Option<Value> {
-        let (kind, bytes) = read(key, name)?;
-        if kind == REG_SZ {
-            let units: Vec<u16> = bytes
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-                .take_while(|unit| *unit != 0)
-                .collect();
-            Some(json!(String::from_utf16_lossy(&units)))
-        } else if kind == REG_DWORD {
-            let bytes: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
-            Some(json!(u32::from_le_bytes(bytes)))
-        } else {
-            None
-        }
+    fn text_of(bytes: &[u8]) -> String {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .take_while(|unit| *unit != 0)
+            .collect();
+        String::from_utf16_lossy(&units)
     }
 
     fn write_raw(key: HKEY, name: &str, kind: u32, data: &[u8]) -> bool {
@@ -235,14 +235,14 @@ mod win {
         }
     }
 
-    fn snapshot(key: HKEY) -> Value {
+    fn snapshot(key: HKEY) -> Result<Value, String> {
         let mut object = serde_json::Map::new();
         for name in NAMES {
-            if let Some((kind, bytes)) = read(key, name) {
+            if let Some((kind, bytes)) = read(key, name)? {
                 object.insert(name.to_owned(), json!({"kind": kind, "bytes": bytes}));
             }
         }
-        Value::Object(object)
+        Ok(Value::Object(object))
     }
 
     fn restore(key: HKEY, snapshot: &Value) {
@@ -309,10 +309,11 @@ mod win {
         parts.join(";")
     }
 
-    fn bypass(key: HKEY) -> String {
-        let prior = value_of(key, "ProxyOverride")
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .unwrap_or_default();
+    fn bypass(key: HKEY) -> Result<String, String> {
+        let prior = match read(key, "ProxyOverride")? {
+            Some((kind, bytes)) if kind == REG_SZ => text_of(&bytes),
+            Some(_) | None => String::new(),
+        };
         let mut entries: Vec<String> = [
             "localhost",
             "127.0.0.1",
@@ -334,16 +335,31 @@ mod win {
             }
             entries.push(entry.to_owned());
         }
-        entries.join(";")
+        Ok(entries.join(";"))
     }
 
     pub fn arm(paths: &Paths, socks: Option<u16>, http: Option<u16>) -> Result<(), String> {
         let key = open().map_err(|error| {
             format!("system proxy: cannot read the current settings ({error}).")
         })?;
+        let bypass = match bypass(key) {
+            Ok(bypass) => bypass,
+            Err(error) => {
+                close(key);
+                return Err(format!(
+                    "system proxy: cannot read the current bypass list: {error}"
+                ));
+            }
+        };
         let fresh = !paths.proxy_state.exists();
         if fresh {
-            let snapshot = snapshot(key);
+            let snapshot = match snapshot(key) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    close(key);
+                    return Err(format!("system proxy: cannot record the snapshot: {error}"));
+                }
+            };
             let text = match serde_json::to_string(&snapshot) {
                 Ok(text) => text,
                 Err(error) => {
@@ -351,6 +367,13 @@ mod win {
                     return Err(format!("system proxy: cannot record the snapshot: {error}"));
                 }
             };
+            if text.len() as u64 > crate::paths::MAX_PRIVATE_BYTES {
+                close(key);
+                return Err(
+                    "system proxy: the current settings are too large to snapshot safely; nothing was armed."
+                        .to_owned(),
+                );
+            }
             if let Err(error) = write_private(&paths.proxy_state, &text) {
                 close(key);
                 return Err(format!("system proxy: cannot record the snapshot: {error}"));
@@ -359,7 +382,7 @@ mod win {
         let server = server(socks, http);
         let ok = write_dword(key, "ProxyEnable", 1)
             && write_sz(key, "ProxyServer", &server)
-            && write_sz(key, "ProxyOverride", &bypass(key))
+            && write_sz(key, "ProxyOverride", &bypass)
             && write_dword(key, "AutoDetect", 0);
         delete(key, "AutoConfigURL");
         unsafe { RegCloseKey(key) };

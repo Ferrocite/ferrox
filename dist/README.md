@@ -32,7 +32,7 @@ cd ferrox-*-x86_64-pc-windows-msvc
 .\ferrox-cli.exe down
 ```
 
-The same zip includes `ferrox-cli.sh`. From Git Bash, with Python 3 and curl on `PATH`, it runs the same commands as the macOS/Linux CLI: `bash ./ferrox-cli.sh up --foxy --vpn`. The native `ferrox-cli.exe` is the recommended path and needs none of those.
+The same zip includes `ferrox-cli.sh`. From Git Bash, with Python 3 and curl on `PATH`, it runs the ports-only commands: `bash ./ferrox-cli.sh up --foxy`. Use the native `ferrox-cli.exe` for `--vpn`, and it needs none of those dependencies.
 
 On Windows the native launcher keeps config and account files under `%APPDATA%\ferrox` and pid/log/system-proxy state under `%LOCALAPPDATA%\ferrox`, owner-only through NTFS ACLs. The `~/.config/ferrox` paths below describe macOS and Linux.
 
@@ -98,7 +98,7 @@ The fronts are loopback-only: SOCKS5 `127.0.0.1:10808`, HTTP+HTTPS `127.0.0.1:80
 
 - **macOS** — `--vpn` arms and clears the system proxy for you.
 - **Linux** — point apps at the fronts by hand: `ALL_PROXY=socks5h://127.0.0.1:10808 <app>`, or set GNOME/KDE network proxy to `127.0.0.1:8080`.
-- **Windows** — `ferrox-cli.exe up --foxy --vpn` arms the system proxy through the WinINET Internet Settings that Chrome, Edge and most desktop apps read, and `ferrox-cli.exe down` restores the previous settings. From Git Bash, `bash ./ferrox-cli.sh up --foxy --vpn` is the fallback. Without `--vpn`, set Settings > Network & Internet > Proxy to `127.0.0.1:8080`, or use the fronts per app.
+- **Windows** — `ferrox-cli.exe up --foxy --vpn` arms the system proxy through the WinINET Internet Settings that Chrome, Edge and most desktop apps read, and `ferrox-cli.exe down` restores the previous settings. From Git Bash, `bash ./ferrox-cli.sh up --foxy` is the ports-only fallback; use the native `ferrox-cli.exe` for `--vpn`. Without `--vpn`, set Settings > Network & Internet > Proxy to `127.0.0.1:8080`, or use the fronts per app.
 
 Use `socks5h://` (the `h`) so names resolve at the exit, not on your machine.
 
@@ -108,10 +108,16 @@ Use `socks5h://` (the `h`) so names resolve at the exit, not on your machine.
 
 ## Verify the download
 
-Every release includes `SHA256SUMS` beside the packages. On macOS or Linux:
+Every release includes `SHA256SUMS` beside the packages. To check just the
+package you downloaded:
 
 ```bash
-sha256sum --check SHA256SUMS
+# Linux
+grep 'ferrox-.*-linux-gnu.tar.gz' SHA256SUMS | sha256sum --check -
+# macOS
+grep 'ferrox-.*-apple-darwin.tar.gz' SHA256SUMS | shasum -a 256 -c -
+# all packages present
+sha256sum --check --ignore-missing SHA256SUMS
 ```
 
 On Windows, compare the zip's hash with the matching line:

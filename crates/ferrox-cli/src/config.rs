@@ -7,7 +7,7 @@ use std::path::Path;
 use serde_json::{json, Map, Value};
 
 use crate::args::{Options, Outbound};
-use crate::paths::{read_trim, write_private, Paths};
+use crate::paths::{read_trim, read_trim_checked, write_private, Paths};
 
 #[derive(Clone, Copy, Debug)]
 pub struct Ports {
@@ -657,7 +657,8 @@ pub fn config_fronts(
     fronts_set: bool,
     asked: &str,
 ) -> Result<String, String> {
-    let text = read_trim(Path::new(path)).ok_or_else(|| format!("cannot read config {path}"))?;
+    let text = read_trim_checked(Path::new(path))
+        .map_err(|error| format!("cannot read config {path}: {error}"))?;
     let document: Value = serde_json::from_str(&text)
         .map_err(|error| format!("cannot read config {path}: {error}"))?;
     let mut order: Vec<String> = Vec::new();
