@@ -329,6 +329,7 @@ fn rsa_key_transport_matches_go() {
 /// Every TLS 1.2 session Go's own record layer put on the wire, replayed through this client:
 /// the CBC suites' MAC, padding and explicit IV, both AEAD families, and the key expansion that
 /// feeds them from the logged master secret.
+#[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
 #[test]
 fn tls12_sessions_match_go() {
     let golden = include_str!("../../../../../scripts/tls12-oracle/expected.txt");
