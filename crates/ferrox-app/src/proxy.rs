@@ -38181,6 +38181,33 @@ mod tests {
             1,
             "a refused request earns no dial"
         );
+
+        let tunnel_port = spawn_raw(one_vless_user(&id), resolve.clone(), dial.clone());
+        let mut unsupported = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
+        unsupported
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        unsupported
+            .write_all(&vless_header(&id, 5, &name))
+            .expect("requests");
+        let mut probe = [0u8; 1];
+        assert_eq!(
+            unsupported
+                .read(&mut probe)
+                .expect("the unsupported session closes"),
+            0,
+            "a command nothing serves is closed unanswered"
+        );
+        assert_eq!(
+            looked.lock().expect("resolver").len(),
+            1,
+            "an unsupported command earns no lookup"
+        );
+        assert_eq!(
+            dialed.lock().expect("dial").len(),
+            1,
+            "an unsupported command earns no dial"
+        );
     }
 
     #[test]
