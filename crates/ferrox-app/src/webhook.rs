@@ -347,9 +347,9 @@ fn event_body(event: &Event<'_>) -> String {
     out.push_str(",\"destination\":");
     push_destination(&mut out, event.destination);
     out.push_str(",\"originalTarget\":");
-    push_destination(&mut out, event.original);
+    push_target(&mut out, event.original, network);
     out.push_str(",\"routeTarget\":");
-    push_destination(&mut out, event.route);
+    push_target(&mut out, event.route, network);
     out.push_str(",\"inboundTag\":");
     push_string(&mut out, event.inbound_tag.unwrap_or(""));
     out.push_str(",\"inboundName\":");
@@ -379,6 +379,14 @@ fn push_optional(out: &mut String, value: Option<&str>) {
 fn push_destination(out: &mut String, value: Option<&crate::proxy::Destination>) {
     match value {
         Some(value) => push_string(out, &value.authority()),
+        None => out.push_str("null"),
+    }
+}
+
+/// A target as the reference's `Destination.String` writes it, with the flow network first.
+fn push_target(out: &mut String, value: Option<&crate::proxy::Destination>, network: &str) {
+    match value {
+        Some(value) => push_string(out, &format!("{network}:{}", value.authority())),
         None => out.push_str("null"),
     }
 }
