@@ -930,6 +930,7 @@ fn tls_settings(bytes: &[u8]) -> Result<(&'static str, Json), String> {
     let mut max_version = String::new();
     let mut cipher_suites = String::new();
     let mut fingerprint = String::new();
+    let mut master_key_log = String::new();
     let mut reject_unknown_sni = false;
     let mut pinned: Vec<&[u8]> = Vec::new();
     while let Some((field, wire)) = reader.field()? {
@@ -956,6 +957,7 @@ fn tls_settings(bytes: &[u8]) -> Result<(&'static str, Json), String> {
             (9, 2) => cipher_suites = account_text(&mut reader)?,
             (11, 2) => fingerprint = account_text(&mut reader)?,
             (12, 0) => reject_unknown_sni = reader.varint()? != 0,
+            (15, 2) => master_key_log = account_text(&mut reader)?,
             (22, 2) => pinned.push(reader.bytes()?),
             _ => return Err(reader.refuse(field, wire)),
         }
@@ -991,6 +993,9 @@ fn tls_settings(bytes: &[u8]) -> Result<(&'static str, Json), String> {
     }
     if reject_unknown_sni {
         pairs.push(("rejectUnknownSni", Json::Bool(true)));
+    }
+    if !master_key_log.is_empty() {
+        pairs.push(("masterKeyLog", Json::Str(master_key_log)));
     }
     Ok(("tlsSettings", object(pairs)))
 }

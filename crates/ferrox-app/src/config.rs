@@ -612,6 +612,7 @@ pub(crate) fn inbound_tls_identity(
         reject_unknown_sni: false,
         server_config_cache: std::sync::Arc::default(),
         ech_server_keys: None,
+        master_key_log: None,
     };
     let tls = settings.get("tlsSettings");
     identity.alpn = tls_alpn(tls);
@@ -623,6 +624,7 @@ pub(crate) fn inbound_tls_identity(
         .and_then(Json::as_bool)
         .unwrap_or(false);
     identity.ech_server_keys = ech;
+    identity.master_key_log = tls_master_key_log(tls);
     let identity = Arc::new(identity);
     start_cert_ticker(&identity);
     Some(identity)
@@ -1102,7 +1104,22 @@ pub(crate) fn outbound_tls(
             settings.get("network").and_then(Json::as_str),
             Some("ws" | "httpupgrade")
         ),
+        master_key_log: tls_master_key_log(tls),
     }))
+}
+
+/// xray's `masterKeyLog`: an empty name or `none` logs nothing, and a path that cannot be opened is
+/// reported and the handshake proceeds without it.
+fn tls_master_key_log(tls: Option<&Json>) -> Option<Arc<ferrox_core::tls::MasterKeyLog>> {
+    let path = tls
+        .and_then(|tls| tls.get("masterKeyLog"))
+        .and_then(Json::as_str)
+        .filter(|path| !path.is_empty() && *path != "none")?;
+    let Some(log) = ferrox_core::tls::MasterKeyLog::open(path) else {
+        eprintln!("masterKeyLog: {path} cannot be opened; the handshake logs nothing");
+        return None;
+    };
+    Some(Arc::new(log))
 }
 
 /// The outbound REALITY identity: the decoy name, the server static key, the short id.
@@ -3178,6 +3195,14 @@ mod tests {
     fn server_identity(
         leaf: &rcgen::CertifiedKey<rcgen::KeyPair>,
     ) -> Arc<ferrox_core::tls::TlsServerConfig> {
+        server_identity_with(leaf, "")
+    }
+
+    /// The same identity with more `tlsSettings` fields, spelled as a JSON fragment that follows the certificates.
+    fn server_identity_with(
+        leaf: &rcgen::CertifiedKey<rcgen::KeyPair>,
+        settings: &str,
+    ) -> Arc<ferrox_core::tls::TlsServerConfig> {
         let string_json = |pem: &str| {
             format!(
                 "\"{}\"",
@@ -3185,7 +3210,7 @@ mod tests {
             )
         };
         let config = crate::json::parse(&format!(
-            r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"certificates": [{{"certificate": {}, "key": {}}}]}}}}}}"#,
+            r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"certificates": [{{"certificate": {}, "key": {}}}] {settings}}}}}}}"#,
             string_json(&leaf.cert.pem()),
             string_json(&leaf.signing_key.serialize_pem())
         ))
@@ -3311,6 +3336,109 @@ mod tests {
             system.len() + 1,
             "the named anchor is appended to the store, not instead of it"
         );
+    }
+
+    /// A client that trusts `ca` by file and logs its secrets to `log`, with `extra` spliced among
+    /// its `tlsSettings` fields.
+    fn key_log_client(ca: &std::path::Path, log: &std::path::Path, extra: &str) -> Json {
+        crate::json::parse(&format!(
+            r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "tls.test", "disableSystemRoot": true, {extra}"certificates": [{{"certificateFile": {}}}], "masterKeyLog": {}}}}}}}"#,
+            json_path(ca),
+            json_path(log)
+        ))
+        .expect("parses")
+    }
+
+    /// Asserts `text` carries a `label` line and that every line is NSS form: the label, the client
+    /// random and the secret, as lowercase hex.
+    fn assert_nss_log(text: &str, label: &str, what: &str) {
+        assert!(
+            text.lines().any(|line| line.starts_with(label)),
+            "{what}: {text}"
+        );
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split(' ').collect();
+            assert_eq!(
+                fields.len(),
+                3,
+                "NSS form is the label, the client random and the secret: {line}"
+            );
+            assert!(
+                fields[1].len() == 64 && fields[2].len() >= 64,
+                "a random is 32 bytes and a secret at least 32, as hex: {line}"
+            );
+            assert!(
+                fields[1..].iter().all(|hex| hex
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))),
+                "the bytes are lowercase hex: {line}"
+            );
+        }
+    }
+
+    /// xray's `masterKeyLog`: the handshake's traffic secrets land in the file the config names, in
+    /// NSS form, so a capture decrypts offline; a path that cannot be opened is logged and the dial
+    /// proceeds without it.
+    #[test]
+    fn a_master_key_log_records_the_secrets_the_config_names() {
+        let (ca_pem, leaf) = ca_and_leaf("tls.test");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-master-key-log-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let ca = dir.join("ca.pem");
+        std::fs::write(&ca, ca_pem).expect("the test ca");
+        let identity = server_identity(&leaf);
+        let dial = |against: &Arc<ferrox_core::tls::TlsServerConfig>, name: &str, extra: &str| {
+            let log = dir.join(name);
+            let config = key_log_client(&ca, &log, extra);
+            assert!(
+                outbound_handshake(against, &config),
+                "the dial completes with a key log"
+            );
+            std::fs::read_to_string(&log).expect("the log the config named")
+        };
+        let one = dial(&identity, "first.log", "");
+        // A second outbound naming another file shares every other input, so a cache keyed without the log would hand it the first dial's logger.
+        let two = dial(&identity, "second.log", "");
+        // A named fingerprint of `unsafe` dials through stock rustls, the other client build a key log reaches.
+        let stock = dial(&identity, "stock.log", r#""fingerprint": "unsafe", "#);
+        let server_log = dir.join("server.log");
+        let listener = server_identity_with(
+            &leaf,
+            &format!(r#", "masterKeyLog": {}"#, json_path(&server_log)),
+        );
+        let _ = dial(&listener, "client-to-listener.log", "");
+        let served = std::fs::read_to_string(&server_log).expect("the listener's log");
+        let unopenable = key_log_client(&ca, &dir.join("no-such-dir").join("third.log"), "");
+        let tolerated = outbound_handshake(&identity, &unopenable);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_nss_log(
+            &one,
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET ",
+            "the client's handshake secret is written",
+        );
+        assert_nss_log(
+            &two,
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET ",
+            "a second config logs to its own file, not the first dial's",
+        );
+        assert_nss_log(
+            &stock,
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET ",
+            "the stock rustls client writes its secrets too",
+        );
+        assert_nss_log(
+            &served,
+            "SERVER_HANDSHAKE_TRAFFIC_SECRET ",
+            "the listener's own secrets are written",
+        );
+        assert!(tolerated, "an unopenable log leaves the dial alone");
     }
 
     #[test]

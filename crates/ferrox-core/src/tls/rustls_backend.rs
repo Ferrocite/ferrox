@@ -500,7 +500,6 @@ fn build_material(cfg: &TlsConfig) -> Result<Material, TlsError> {
 }
 
 /// What selects a cached client config: a material, the `ALPN` list the builder writes into it, and whether the verifier is the unverified one. The server name stays out — it reaches the connection, not the config.
-#[derive(PartialEq, Eq)]
 struct ConfigKey {
     material: MaterialKey,
     /// The `ALPN` list, shared rather than copied: the key is built on every dial, and copying the list into it allocated a vector of vectors per lookup for a list that never changes.
@@ -508,7 +507,25 @@ struct ConfigKey {
     insecure: bool,
     /// The ECH config list, which rustls bakes into the built config rather than reading per connection.
     ech: Option<std::sync::Arc<[u8]>>,
+    /// The `masterKeyLog` handle rustls bakes into the config: two configs naming different files must not share a build, so the handle's identity is what the key holds.
+    master_key_log: Option<Arc<super::MasterKeyLog>>,
 }
+
+impl PartialEq for ConfigKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.material == other.material
+            && self.alpn == other.alpn
+            && self.insecure == other.insecure
+            && self.ech == other.ech
+            && match (&self.master_key_log, &other.master_key_log) {
+                (None, None) => true,
+                (Some(ours), Some(theirs)) => Arc::ptr_eq(ours, theirs),
+                _ => false,
+            }
+    }
+}
+
+impl Eq for ConfigKey {}
 
 type Configs = Vec<(ConfigKey, Arc<rustls::ClientConfig>)>;
 
@@ -545,6 +562,10 @@ fn build_config(cfg: &TlsConfig, built: &Material) -> Result<rustls::ClientConfi
         config
             .dangerous()
             .set_certificate_verifier(Arc::new(Unverified));
+    }
+    if let Some(log) = &cfg.master_key_log {
+        let log: Arc<dyn rustls::KeyLog> = log.clone();
+        config.key_log = log;
     }
     Ok(config)
 }
@@ -618,6 +639,7 @@ fn client_config(cfg: &TlsConfig) -> Result<Arc<rustls::ClientConfig>, TlsError>
         alpn: std::sync::Arc::clone(&cfg.alpn),
         insecure: cfg.insecure,
         ech: cfg.ech_config_list.clone(),
+        master_key_log: cfg.master_key_log.clone(),
     };
     let all = CONFIGS.get_or_init(Default::default);
     let mut kept = all.lock().expect("one build at a time");
@@ -1340,6 +1362,10 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
     // rustls sends two tickets by default; REALITY arrivals carry none.
     config.send_tls13_tickets = if cfg.send_tickets { 2 } else { 0 };
+    if let Some(log) = &cfg.master_key_log {
+        let log: Arc<dyn rustls::KeyLog> = log.clone();
+        config.key_log = log;
+    }
     Ok(config)
 }
 
@@ -1451,6 +1477,10 @@ pub(crate) fn reality_server_config(
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
     // rustls sends two tickets by default; REALITY arrivals carry none.
     config.send_tls13_tickets = if cfg.send_tickets { 2 } else { 0 };
+    if let Some(log) = &cfg.master_key_log {
+        let log: Arc<dyn rustls::KeyLog> = log.clone();
+        config.key_log = log;
+    }
     Ok(config)
 }
 
@@ -1964,6 +1994,7 @@ mod tests {
             fingerprint: None,
             ech_config_list: None,
             websocket: false,
+            master_key_log: None,
         }
     }
 

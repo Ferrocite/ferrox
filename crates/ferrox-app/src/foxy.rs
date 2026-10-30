@@ -332,6 +332,7 @@ fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
         fingerprint: None,
         ech_config_list: None,
         websocket: false,
+        master_key_log: None,
     }
 }
 
@@ -4009,6 +4010,7 @@ pub(crate) mod loopback {
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
+            master_key_log: None,
         };
         (roots, server)
     }

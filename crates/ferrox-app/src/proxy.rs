@@ -31535,6 +31535,7 @@ mod tests {
             reject_unknown_sni: false,
             server_config_cache: std::sync::Arc::default(),
             ech_server_keys: None,
+            master_key_log: None,
         });
         let client = ferrox_core::tls::TlsConfig {
             server_name: "carrier.test".to_owned(),
@@ -31548,6 +31549,7 @@ mod tests {
             fingerprint: None,
             ech_config_list: None,
             websocket: false,
+            master_key_log: None,
         };
         (server, client)
     }
@@ -31573,6 +31575,7 @@ mod tests {
             fingerprint: None,
             ech_config_list: None,
             websocket: false,
+            master_key_log: None,
         };
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();

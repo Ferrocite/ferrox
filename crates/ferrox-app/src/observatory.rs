@@ -649,6 +649,7 @@ fn probe(
             fingerprint: None,
             ech_config_list: None,
             websocket: false,
+            master_key_log: None,
         };
         let mut session = ferrox_core::tls::RustlsProvider::connect(&config, stream)
             .map_err(|error| error.to_string())?;

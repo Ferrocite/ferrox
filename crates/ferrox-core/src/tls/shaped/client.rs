@@ -62,6 +62,7 @@ pub struct Session<S: Stream> {
     in_at: usize,
     reply: Vec<u8>,
     out: Vec<u8>,
+    key_log: Option<Arc<dyn rustls::KeyLog>>,
 }
 
 impl<S: Stream> std::fmt::Debug for Session<S> {
@@ -88,7 +89,12 @@ impl<S: Stream> Session<S> {
             hello.enable_ech(list)?;
         }
         let verifier = crate::tls::rustls_backend::verifier(cfg)?;
-        Self::with_hello(profile, cfg.server_name.clone(), verifier, hello, io)
+        let mut session = Self::with_hello(profile, cfg.server_name.clone(), verifier, hello, io)?;
+        session.key_log = cfg.master_key_log.as_ref().map(|log| {
+            let log: Arc<dyn rustls::KeyLog> = log.clone();
+            log
+        });
+        Ok(session)
     }
 
     /// A session over a hello the caller built and sealed, as REALITY does.
@@ -129,7 +135,18 @@ impl<S: Stream> Session<S> {
             in_at: 0,
             reply: Vec::new(),
             out: Vec::new(),
+            key_log: None,
         })
+    }
+
+    /// Hands each secret this session derives to the config's `masterKeyLog`, as rustls's own dial does.
+    fn log_secrets(&self, secrets: &[(&str, &[u8])]) {
+        let Some(log) = &self.key_log else {
+            return;
+        };
+        for (label, secret) in secrets {
+            log.log(label, &self.client_random, secret);
+        }
     }
 
     pub(crate) fn get_ref(&self) -> &S {
@@ -317,6 +334,10 @@ impl<S: Stream> Session<S> {
         let server_hs = kdf::derive(hash, &handshake_secret, b"s hs traffic", &self.transcript);
         let derived2 = kdf::derive(hash, &handshake_secret, b"derived", &[]);
         let master = kdf::extract(hash, &derived2, &zeros);
+        self.log_secrets(&[
+            ("CLIENT_HANDSHAKE_TRAFFIC_SECRET", &client_hs),
+            ("SERVER_HANDSHAKE_TRAFFIC_SECRET", &server_hs),
+        ]);
         self.read_key = Some(Direction::tls13(suite, &server_hs));
         self.send_ccs()?;
 
@@ -355,6 +376,10 @@ impl<S: Stream> Session<S> {
         // Both application secrets take the transcript only through the server's Finished.
         let server_ap = kdf::derive(hash, &master, b"s ap traffic", &self.transcript);
         let client_ap = kdf::derive(hash, &master, b"c ap traffic", &self.transcript);
+        self.log_secrets(&[
+            ("CLIENT_TRAFFIC_SECRET_0", &client_ap),
+            ("SERVER_TRAFFIC_SECRET_0", &server_ap),
+        ]);
         self.read_key = Some(Direction::tls13(suite, &server_ap));
         self.write_key = Some(Direction::tls13(suite, &client_hs));
 
@@ -449,6 +474,7 @@ impl<S: Stream> Session<S> {
             session_hash.as_deref(),
         );
 
+        self.log_secrets(&[("CLIENT_RANDOM", &master)]);
         self.client12 = Some(directions.client);
         self.server12 = Some(directions.server);
         self.send_ccs()?;
@@ -1794,6 +1820,7 @@ mod tests {
             in_at: 0,
             reply: Vec::new(),
             out: Vec::new(),
+            key_log: None,
         }
     }
 
