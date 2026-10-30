@@ -17,7 +17,8 @@ import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CLI = ROOT / "dist" / "ferrox-cli.sh"
-WATCH = 15
+# The CLI reconciles every service's proxy before it parses, which can outlast 15 s.
+WATCH = 60
 
 CASES = [
     ("up --psiphon-ready with a non-number", ["up", "--psiphon", "--psiphon-ready", "soon"], "--psiphon-ready wants seconds"),
