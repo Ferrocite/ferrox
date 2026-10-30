@@ -608,7 +608,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-app"
-version = "0.0.3"
+version = "0.0.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-bench"
-version = "0.0.3"
+version = "0.0.1"
 dependencies = [
  "aes-gcm",
  "chacha20 0.9.1",
@@ -651,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-cli"
-version = "0.0.3"
+version = "0.0.1"
 dependencies = [
  "ctrlc",
  "getrandom 0.4.3",
@@ -663,7 +663,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-core"
-version = "0.0.3"
+version = "0.0.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -693,7 +693,7 @@ dependencies = [
 
 [[package]]
 name = "ferrox-prompt"
-version = "0.0.3"
+version = "0.0.1"
 
 [[package]]
 name = "fiat-crypto"

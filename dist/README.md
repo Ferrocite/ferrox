@@ -1,12 +1,13 @@
 # Ferrox — release build
 
-No installer: the binary, the one-command CLI, and the full manual (`USAGE.md`). macOS and Linux ship `ferrox-cli.sh`; Windows ships the native `ferrox-cli.exe` and the same `ferrox-cli.sh` as an optional Git Bash fallback. Nothing here needs cargo, a repository, or a config by hand.
+No installer: the binary, the one-command CLI, and the full manual (`USAGE.md`). macOS and Linux ship `ferrox-cli.sh`; Windows ships the native `ferrox-cli.exe`, a `ferrox-cli.cmd` wrapper, and the same `ferrox-cli.sh` for Git Bash only. Nothing here needs cargo, a repository, or a config by hand.
 
 ```
 ferrox-app            the lane engine: serves SOCKS5/HTTP/mixed fronts, dials every implemented lane
 ferrox-cli.sh         login, up, down, status, ports, locations, version — the only command you need
 ferrox-cli.exe        the same CLI built for Windows; no Bash, WSL or Python
-                      (the Windows zip also carries ferrox-cli.sh for Git Bash users)
+ferrox-cli.cmd        cmd.exe wrapper for ferrox-cli.exe
+ferrox-cli.sh         Git Bash fallback only; not used by the native launcher
 USAGE.md              the manual: every lane, every port, what to do when it does not work
 ```
 
@@ -22,7 +23,7 @@ cd ferrox-*-aarch64-apple-darwin
 ./ferrox-cli.sh down               # stop and clear the system proxy
 ```
 
-On Windows, unpack the zip and use `ferrox-cli.exe`; the flags and prompts are identical:
+On Windows, unpack the zip and use the native launcher; the flags and prompts are identical:
 
 ```powershell
 Expand-Archive ferrox-*-x86_64-pc-windows-msvc.zip -DestinationPath .
@@ -32,7 +33,9 @@ cd ferrox-*-x86_64-pc-windows-msvc
 .\ferrox-cli.exe down
 ```
 
-The same zip includes `ferrox-cli.sh`. From Git Bash, with Python 3 and curl on `PATH`, it runs the ports-only commands: `bash ./ferrox-cli.sh up --foxy`. Use the native `ferrox-cli.exe` for `--vpn`, and it needs none of those dependencies.
+`ferrox-cli.cmd` runs the same binary from `cmd.exe`. The zip also includes `ferrox-cli.sh` for Git Bash only, with Python 3 and curl on `PATH`; it runs ports-only commands. Use the native launcher for `--vpn`.
+
+Do not run `bash ./ferrox-cli.sh` from PowerShell: PowerShell may resolve `bash` to WSL, which fails with `execvpe(/bin/bash)` when no WSL distribution is installed. If you see that error, run `.\ferrox-cli.exe` instead; it needs no shell.
 
 On Windows the native launcher keeps config and account files under `%APPDATA%\ferrox` and pid/log/system-proxy state under `%LOCALAPPDATA%\ferrox`, owner-only through NTFS ACLs. The `~/.config/ferrox` paths below describe macOS and Linux.
 
@@ -98,7 +101,7 @@ The fronts are loopback-only: SOCKS5 `127.0.0.1:10808`, HTTP+HTTPS `127.0.0.1:80
 
 - **macOS** — `--vpn` arms and clears the system proxy for you.
 - **Linux** — point apps at the fronts by hand: `ALL_PROXY=socks5h://127.0.0.1:10808 <app>`, or set GNOME/KDE network proxy to `127.0.0.1:8080`.
-- **Windows** — `ferrox-cli.exe up --foxy --vpn` arms the system proxy through the WinINET Internet Settings that Chrome, Edge and most desktop apps read, and `ferrox-cli.exe down` restores the previous settings. From Git Bash, `bash ./ferrox-cli.sh up --foxy` is the ports-only fallback; use the native `ferrox-cli.exe` for `--vpn`. Without `--vpn`, set Settings > Network & Internet > Proxy to `127.0.0.1:8080`, or use the fronts per app.
+- **Windows** — `.\ferrox-cli.exe up --foxy --vpn` arms the system proxy through the WinINET Internet Settings that Chrome, Edge and most desktop apps read, and `.\ferrox-cli.exe down` restores the previous settings. `ferrox-cli.cmd` forwards to the same launcher. From Git Bash only, `./ferrox-cli.sh up --foxy` is the ports-only fallback; use the native launcher for `--vpn`. Without `--vpn`, set Settings > Network & Internet > Proxy to `127.0.0.1:8080`, or use the fronts per app.
 
 Use `socks5h://` (the `h`) so names resolve at the exit, not on your machine.
 
