@@ -136,6 +136,12 @@ jobs:
           rm -rf "$PKG" && mkdir -p "$PKG"
           if [ "$WINDOWS" = 1 ]; then
             cp "$BIN" "$CLI" dist/ferrox-cli.sh dist/README.md dist/USAGE.md "$PKG/"
+            sed -i 's/\r$//' "$PKG/ferrox-cli.sh"
+            if grep -q $'\r' "$PKG/ferrox-cli.sh"; then
+              echo "::error::$PKG.zip has a CRLF ferrox-cli.sh"
+              exit 1
+            fi
+            bash -n "$PKG/ferrox-cli.sh" || { echo "::error::$PKG.zip has an invalid ferrox-cli.sh"; exit 1; }
           else
             cp "$BIN" dist/ferrox-cli.sh dist/README.md dist/USAGE.md "$PKG/"
           fi
