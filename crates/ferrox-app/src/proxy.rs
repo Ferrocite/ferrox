@@ -16622,12 +16622,17 @@ fn forward_headers<'a>(head: &'a [u8], attrs: &mut crate::router::Attributes<'a>
         if let Some(colon) = ferrox_core::foxy::octet_in(line, 0, b':') {
             let name = &line[..colon];
             if !hop_by_hop(name, named) && !name.eq_ignore_ascii_case(b"host") {
-                if let (Ok(name), Ok(value)) = (
-                    std::str::from_utf8(name),
-                    std::str::from_utf8(&line[colon + 1..]),
-                ) {
-                    user_agent |= name.eq_ignore_ascii_case("user-agent");
-                    attrs.push(name, std::borrow::Cow::Borrowed(value.trim()));
+                user_agent |= name.eq_ignore_ascii_case(b"user-agent");
+                if let Ok(name) = std::str::from_utf8(name) {
+                    let value = match std::str::from_utf8(&line[colon + 1..]) {
+                        Ok(value) => std::borrow::Cow::Borrowed(value.trim()),
+                        Err(_) => std::borrow::Cow::Owned(
+                            String::from_utf8_lossy(&line[colon + 1..])
+                                .trim()
+                                .to_owned(),
+                        ),
+                    };
+                    attrs.push(name, value);
                 }
             }
         }
