@@ -119,6 +119,26 @@ test_enabled  = false
 ferrox_binary = ""
 note          = "open-source Rust WARP core (AGPL-3.0): MASQUE over HTTP/3 and HTTP/2, WireGuard, nested gool/mim, Tor x3, upstream chaining; the source PattNG vendors as libaether.so"
 
+[sources.psiphon-tunnel-core]
+repo          = "https://github.com/CluvexStudio/psiphon-tunnel-core"
+rev           = "83aa73b9b982e7421e00117f5b0c5aceb5dda452"
+topics        = "psiphon, tunnel, console client"
+default_branch = "shirokhorshid"
+path          = "ConsoleClient"
+test_enabled  = false
+ferrox_binary = ""
+note          = "the console client the Psiphon lane spawns, at the commit aether's psiphon-build.sh builds; the live workflow builds this pin, no local gate downloads it"
+
+[sources.psiphon-windows]
+repo          = "https://github.com/Psiphon-Inc/psiphon-windows"
+rev           = "d3319c4172bb3a172c02fda75951d8612f4a7977"
+topics        = "psiphon, windows, console engine"
+default_branch = "master"
+path          = "src/3rdParty/psiphon-tunnel-core.exe"
+test_enabled  = false
+ferrox_binary = ""
+note          = "the GPLv3 Windows GUI and its bundled console engine, read only by the live Windows comparison workflow; no source or binary is vendored"
+
 [sources.zeptun]
 repo          = "https://github.com/Noisemux/zeptun"
 rev           = "321766b45eb5028246c0f4835ec0c97aabe1125c"

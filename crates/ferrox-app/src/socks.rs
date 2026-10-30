@@ -25,6 +25,7 @@
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 
+#[cfg(test)]
 use crate::conn::Connection;
 use ferrox_core::socks;
 
@@ -91,6 +92,100 @@ impl<'a> Destination<'a> {
     }
 }
 
+const REQUEST_HEAD: usize = 3;
+const INLINE_ADDRESS: usize = 1 + 16 + 2;
+const MAX_ADDRESS: usize = 1 + 1 + 255 + 2;
+const INLINE_REQUEST: usize = REQUEST_HEAD + INLINE_ADDRESS;
+const MAX_REQUEST: usize = REQUEST_HEAD + MAX_ADDRESS;
+const INLINE_AUTH: usize = 3 + 64;
+const MAX_AUTH: usize = 3 + 255 + 255;
+
+/// The request's octets into the caller's room: the version, the command, the reserved
+/// byte and the destination. The destination's own encoder is the writer the oracle
+/// compares, so this only places it after the head.
+fn encode_request(cmd: u8, destination: &Destination<'_>, out: &mut [u8]) -> Option<usize> {
+    let target = destination.target();
+    let total = REQUEST_HEAD + target.wire_len();
+    if out.len() < total {
+        return None;
+    }
+    out[0] = socks::VERSION;
+    out[1] = cmd;
+    out[2] = 0;
+    target.encode_into(&mut out[REQUEST_HEAD..total]);
+    Some(total)
+}
+
+/// One request on the wire without a heap buffer: a literal or a short name fits the
+/// inline room, and the RFC's longest name takes the block beside it. Both are written
+/// where they are read, so a dial allocates nothing for its request.
+fn write_request<W: Write>(stream: &mut W, cmd: u8, destination: &Destination<'_>) -> Option<()> {
+    let total = REQUEST_HEAD + destination.target().wire_len();
+    if total <= INLINE_REQUEST {
+        let mut inline = [0u8; INLINE_REQUEST];
+        encode_request(cmd, destination, &mut inline)?;
+        stream.write_all(&inline[..total]).ok()?;
+    } else {
+        let mut long = [0u8; MAX_REQUEST];
+        encode_request(cmd, destination, &mut long)?;
+        stream.write_all(&long[..total]).ok()?;
+    }
+    Some(())
+}
+
+fn encode_user_pass(user: &[u8], pass: &[u8], out: &mut [u8]) -> Option<usize> {
+    let total = 3 + user.len() + pass.len();
+    if out.len() < total || user.len() > 255 || pass.len() > 255 {
+        return None;
+    }
+    out[0] = socks::AUTH_VERSION;
+    out[1] = user.len() as u8;
+    out[2..2 + user.len()].copy_from_slice(user);
+    out[2 + user.len()] = pass.len() as u8;
+    out[3 + user.len()..total].copy_from_slice(pass);
+    Some(total)
+}
+
+fn write_user_pass<W: Write>(stream: &mut W, user: &[u8], pass: &[u8]) -> Option<()> {
+    let total = 3 + user.len() + pass.len();
+    if total <= INLINE_AUTH {
+        let mut inline = [0u8; INLINE_AUTH];
+        encode_user_pass(user, pass, &mut inline)?;
+        stream.write_all(&inline[..total]).ok()?;
+    } else {
+        let mut long = [0u8; MAX_AUTH];
+        encode_user_pass(user, pass, &mut long)?;
+        stream.write_all(&long[..total]).ok()?;
+    }
+    Some(())
+}
+
+/// Consume the bound address a granted reply carries, without owning it: a TCP tunnel
+/// uses nothing the server bound, so the bytes are read to put the stream at the first
+/// tunnel octet and no `Vec` or `String` is built for a name that is then dropped.
+fn skip_bound<R: Read>(stream: &mut R, atyp: u8) -> Option<()> {
+    match atyp {
+        socks::ATYP_IPV4 => {
+            let mut body = [0u8; 6];
+            stream.read_exact(&mut body).ok()?;
+        }
+        socks::ATYP_IPV6 => {
+            let mut body = [0u8; 18];
+            stream.read_exact(&mut body).ok()?;
+        }
+        socks::ATYP_DOMAIN => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).ok()?;
+            let mut body = [0u8; 257];
+            stream
+                .read_exact(&mut body[..usize::from(len[0]) + 2])
+                .ok()?;
+        }
+        _ => return None,
+    }
+    Some(())
+}
+
 /// The address a reply's type byte named: one edge the RFC gives the bound address.
 enum Bound {
     /// An IP address and port, read as the server sent them.
@@ -101,18 +196,18 @@ enum Bound {
 }
 
 /// A SOCKS5 client session over one connection.
-pub(crate) struct Session {
-    stream: Connection,
+pub(crate) struct Session<S> {
+    stream: S,
 }
 
-impl Session {
+impl<S: Read + Write> Session<S> {
     /// Open the handshake on an already-connected socket: the greeting, the credential
     /// exchange when the server asks for one, and nothing else. The request comes after,
     /// because the reply to the greeting is what says whether a credential is needed.
     ///
     /// A server that answers a method this session cannot serve is refused: the pinned Go
     /// client refuses it too (`"auth method not supported."`).
-    pub(crate) fn open(mut stream: Connection, credential: &Credential) -> Option<Self> {
+    pub(crate) fn open(mut stream: S, credential: &Credential) -> Option<Self> {
         let offered = credential.method()?;
         stream
             .write_all(&socks::greeting(offered == socks::METHOD_USER))
@@ -123,12 +218,11 @@ impl Session {
             return None;
         }
         if offered == socks::METHOD_USER {
-            stream
-                .write_all(&socks::user_pass(
-                    credential.user.as_bytes(),
-                    credential.pass.as_bytes(),
-                ))
-                .ok()?;
+            write_user_pass(
+                &mut stream,
+                credential.user.as_bytes(),
+                credential.pass.as_bytes(),
+            )?;
             let mut status = [0u8; 2];
             stream.read_exact(&mut status).ok()?;
             if status[0] != socks::AUTH_VERSION || status[1] != 0 {
@@ -145,8 +239,7 @@ impl Session {
     /// carries an address too, but the pinned writer stops at the status
     /// (`"server rejects request: "`).
     fn send(&mut self, cmd: u8, destination: &Destination<'_>) -> Option<u8> {
-        let request = socks::request(cmd, &destination.target());
-        self.stream.write_all(&request).ok()?;
+        write_request(&mut self.stream, cmd, destination)?;
         let mut head = [0u8; 4];
         self.stream.read_exact(&mut head).ok()?;
         if head[0] != socks::VERSION || head[1] != 0 {
@@ -203,9 +296,9 @@ impl Session {
     ///
     /// The address the server bound is not what the caller asked for and is not needed,
     /// but its octets are read so the stream sits where the tunnel begins.
-    pub(crate) fn connect(&mut self, destination: &Destination<'_>) -> Option<()> {
+    fn connect(&mut self, destination: &Destination<'_>) -> Option<()> {
         let atyp = self.send(socks::CMD_CONNECT, destination)?;
-        self.read_bound(atyp)?;
+        skip_bound(&mut self.stream, atyp)?;
         Some(())
     }
 
@@ -221,13 +314,13 @@ impl Session {
     }
 
     /// The socket the session runs on, once the request has been granted.
-    pub(crate) fn into_stream(self) -> Connection {
+    pub(crate) fn into_stream(self) -> S {
         self.stream
     }
 
     /// Open a SOCKS4 session: there is no greeting and no method to negotiate, so the
     /// request is the first thing on the wire.
-    pub(crate) fn open4(stream: Connection) -> Self {
+    pub(crate) fn open4(stream: S) -> Self {
         Self { stream }
     }
 
@@ -247,8 +340,10 @@ impl Session {
         if user.len() > socks::NAME4_MAX || name.is_some_and(|name| name.len() > socks::NAME4_MAX) {
             return None;
         }
-        let request = socks::request4(socks::CMD4_CONNECT, port, address, user, name);
-        self.stream.write_all(&request).ok()?;
+        let mut request = [0u8; 520];
+        let total =
+            socks::request4_into(socks::CMD4_CONNECT, port, address, user, name, &mut request)?;
+        self.stream.write_all(&request[..total]).ok()?;
         let mut reply = [0u8; 8];
         self.stream.read_exact(&mut reply).ok()?;
         if reply[1] != socks::REPLY4_GRANTED {
@@ -260,16 +355,19 @@ impl Session {
 
 /// The relay a UDP association names: the address datagrams go to, and the control
 /// connection that keeps the association alive.
-pub(crate) struct Association {
+pub(crate) struct Association<S> {
     /// The address the datagrams are sent to.
     pub(crate) relay: SocketAddr,
     /// The control connection. It stays open for the association's life: dropping it
     /// ends the association, which is what the reference does too.
-    pub(crate) control: Connection,
+    pub(crate) control: S,
 }
 
 /// Open a UDP association with a SOCKS5 server.
-pub(crate) fn associate(stream: Connection, credential: &Credential) -> Option<Association> {
+pub(crate) fn associate<S: Read + Write>(
+    stream: S,
+    credential: &Credential,
+) -> Option<Association<S>> {
     let mut session = Session::open(stream, credential)?;
     let relay = session.associate()?;
     Some(Association {
@@ -279,12 +377,12 @@ pub(crate) fn associate(stream: Connection, credential: &Credential) -> Option<A
 }
 
 /// Open a TCP tunnel to one destination through a SOCKS5 server.
-pub(crate) fn connect(
-    stream: Connection,
+pub(crate) fn connect<S: Read + Write>(
+    stream: S,
     credential: &Credential,
     destination: &Destination<'_>,
     version: Version,
-) -> Option<Connection> {
+) -> Option<S> {
     match version {
         Version::V5 => {
             let mut session = Session::open(stream, credential)?;
@@ -308,6 +406,50 @@ mod tests {
 
     /// The octets the client wrote, collected by the server end as it reads them.
     type Written = Arc<Mutex<Vec<u8>>>;
+
+    /// An in-memory server end: the reply is already there, and every read and write is
+    /// counted, so a handshake's syscall shape is exact rather than the scheduler's.
+    struct Script {
+        reply: Vec<u8>,
+        at: usize,
+        writes: Vec<u8>,
+        write_calls: usize,
+        read_calls: usize,
+    }
+
+    impl Script {
+        fn new(reply: Vec<u8>) -> Self {
+            Self {
+                reply,
+                at: 0,
+                writes: Vec::with_capacity(512),
+                write_calls: 0,
+                read_calls: 0,
+            }
+        }
+    }
+
+    impl Read for Script {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.read_calls += 1;
+            let take = buf.len().min(self.reply.len() - self.at);
+            buf[..take].copy_from_slice(&self.reply[self.at..self.at + take]);
+            self.at += take;
+            Ok(take)
+        }
+    }
+
+    impl Write for Script {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.write_calls += 1;
+            self.writes.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     /// A socket pair whose server end answers a scripted SOCKS5 handshake. The octets
     /// the client writes land in the slot, so a test can wait for them.
@@ -405,6 +547,84 @@ mod tests {
     }
 
     #[test]
+    fn a_no_auth_connect_writes_the_greeting_then_the_request() {
+        let reply = vec![5, 0, 5, 0, 0, 1, 127, 0, 0, 1, 0, 80];
+        let script = Script::new(reply);
+        let (stream, counts) = ferrox_core::alloc_count::measure(|| {
+            crate::socks::connect(
+                script,
+                &Credential::default(),
+                &Destination::V4([10, 0, 0, 1], 80),
+                Version::V5,
+            )
+        });
+        let stream = stream.expect("a granted tunnel");
+        assert_eq!(stream.write_calls, 2, "the greeting, then the request");
+        assert_eq!(stream.read_calls, 3, "method, reply head, bound address");
+        assert_eq!(stream.writes, vec![5, 1, 0, 5, 1, 0, 1, 10, 0, 0, 1, 0, 80]);
+        assert_eq!(counts.allocs, 0, "the handshake takes no heap buffer");
+    }
+
+    #[test]
+    fn a_credentialed_connect_writes_the_greeting_credential_and_request() {
+        let reply = vec![5, 2, 1, 0, 5, 0, 0, 1, 127, 0, 0, 1, 0, 80];
+        let script = Script::new(reply);
+        let credential = Credential {
+            user: "u".to_owned(),
+            pass: "p".to_owned(),
+        };
+        let (stream, counts) = ferrox_core::alloc_count::measure(|| {
+            crate::socks::connect(
+                script,
+                &credential,
+                &Destination::V4([10, 0, 0, 1], 80),
+                Version::V5,
+            )
+        });
+        let stream = stream.expect("a granted tunnel");
+        assert_eq!(stream.write_calls, 3, "greeting, credential, then request");
+        assert_eq!(
+            stream.read_calls, 4,
+            "method, status, reply head, bound address"
+        );
+        assert_eq!(
+            stream.writes,
+            vec![5, 1, 2, 1, 1, b'u', 1, b'p', 5, 1, 0, 1, 10, 0, 0, 1, 0, 80]
+        );
+        assert_eq!(counts.allocs, 0, "the handshake takes no heap buffer");
+    }
+
+    #[test]
+    fn a_long_destination_and_a_long_bound_name_take_no_heap_buffer() {
+        let name = vec![b'a'; 200];
+        let mut reply = vec![5, 0, 5, 0, 0, 3, 200];
+        reply.extend_from_slice(&name);
+        reply.extend_from_slice(&80u16.to_be_bytes());
+        let script = Script::new(reply);
+        let (stream, counts) = ferrox_core::alloc_count::measure(|| {
+            crate::socks::connect(
+                script,
+                &Credential::default(),
+                &Destination::Name(&name, 443),
+                Version::V5,
+            )
+        });
+        let stream = stream.expect("a granted tunnel");
+        assert_eq!(stream.write_calls, 2);
+        assert_eq!(
+            stream.read_calls, 4,
+            "method, reply head, length, name+port"
+        );
+        assert_eq!(stream.writes[..3], [5, 1, 0]);
+        assert_eq!(stream.writes[3..6], [5, 1, 0]);
+        assert_eq!(stream.writes[6], 3);
+        assert_eq!(stream.writes[7], 200);
+        assert_eq!(&stream.writes[8..8 + 200], name.as_slice());
+        assert_eq!(stream.writes[8 + 200..], [1, 187]);
+        assert_eq!(counts.allocs, 0, "both slow-path rooms are on the stack");
+    }
+
+    #[test]
     fn a_socks4_session_writes_the_request_and_reads_the_reply() {
         let credential = Credential {
             user: "u".to_owned(),
@@ -456,6 +676,45 @@ mod tests {
             ],
             "the name rides the request instead of being resolved here"
         );
+    }
+
+    #[test]
+    fn a_socks4_connect_takes_no_heap_buffer() {
+        let script = Script::new(vec![0, 90, 0, 0, 0, 0, 0, 0]);
+        let (stream, counts) = ferrox_core::alloc_count::measure(|| {
+            crate::socks::connect(
+                script,
+                &Credential::default(),
+                &Destination::V4([10, 0, 0, 1], 80),
+                Version::V4,
+            )
+        });
+        let stream = stream.expect("a granted tunnel");
+        assert_eq!(stream.write_calls, 1);
+        assert_eq!(stream.read_calls, 1);
+        assert_eq!(stream.writes, vec![4, 1, 0, 80, 10, 0, 0, 1, 0]);
+        assert_eq!(counts.allocs, 0, "the request is a stack block");
+    }
+
+    #[test]
+    fn a_socks4a_connect_takes_no_heap_buffer() {
+        let name = vec![b'a'; 200];
+        let script = Script::new(vec![0, 90, 0, 0, 0, 0, 0, 0]);
+        let (stream, counts) = ferrox_core::alloc_count::measure(|| {
+            crate::socks::connect(
+                script,
+                &Credential::default(),
+                &Destination::Name(&name, 443),
+                Version::V4,
+            )
+        });
+        let stream = stream.expect("a granted tunnel");
+        assert_eq!(stream.write_calls, 1);
+        assert_eq!(stream.read_calls, 1);
+        assert_eq!(&stream.writes[..9], [4, 1, 1, 187, 0, 0, 0, 1, 0]);
+        assert_eq!(&stream.writes[9..9 + 200], name.as_slice());
+        assert_eq!(stream.writes[9 + 200], 0);
+        assert_eq!(counts.allocs, 0, "the name rides the stack block");
     }
 
     #[test]

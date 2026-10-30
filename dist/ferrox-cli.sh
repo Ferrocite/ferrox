@@ -4,6 +4,7 @@
 #   ferrox-cli login                           save the foxy account once (0600)
 #   ferrox-cli up --foxy --vpn                 the Foxy lane, whole-device proxy
 #   ferrox-cli up --veepn --vpn                the VeePN lane, no account needed
+#   ferrox-cli up --psiphon --vpn              the Psiphon lane, its own client
 #   ferrox-cli up --vless 'vless://...'        any vless share link
 #   ferrox-cli up --config mine.json           any config the binary serves
 #   ferrox-cli down | status | ports | tun | version
@@ -102,6 +103,37 @@ UPSTREAM=""
 REGION=""
 VEEPN_DOMAINS=""
 VEEPN_UDID=""
+PSIPHON_BIN=""
+PSIPHON_DIR=""
+PSIPHON_LISTEN=""
+PSIPHON_HTTP=""
+PSIPHON_REGION=""
+PSIPHON_SHAPE=""
+PSIPHON_READY=""
+PSIPHON_BASE=""
+PSIPHON_ENTRIES=""
+PSIPHON_SPLIT=0
+PSIPHON_SPLIT_REGIONS=""
+PSIPHON_USER=""
+PSIPHON_PASS=""
+PSIPHON_POOL=""
+PSIPHON_WORKERS=""
+PSIPHON_AGGRESSIVE=0
+PSIPHON_FEATURES=""
+PSIPHON_LATENCY=""
+PSIPHON_CDN_PROFILE=""
+PSIPHON_GEOIP=""
+PSIPHON_REJECT_CENSORED=0
+PSIPHON_REJECT_COUNTRIES=""
+PSIPHON_COMPARTMENT=""
+PSIPHON_DISABLE_TIMEOUTS=0
+PSIPHON_DNS_ALTERNATE=""
+PSIPHON_DEVICE_LOCATION=""
+PSIPHON_DEVICE_REGION=""
+PSIPHON_NETWORK_ID=""
+PSIPHON_ADDITIONAL_PARAMS=""
+PSIPHON_ESTABLISH_TIMEOUT=""
+PSIPHON_EMIT_BYTES=0
 PROBE_TIMEOUT=20
 FRONTS="socks,http,mixed"
 FRONTS_SET=0
@@ -128,7 +160,7 @@ need_value() {
     die "--vless needs a vless:// share link; nothing was started.
   example: ferrox-cli up --vless 'vless://uuid@host:443?type=ws&security=tls&sni=host&path=/ws'
   a config instead: ferrox-cli up --config mine.json
-  no server to name: ferrox-cli up --foxy   or   ferrox-cli up --veepn"
+  no server to name: ferrox-cli up --foxy   or   ferrox-cli up --veepn   or   ferrox-cli up --psiphon"
   fi
   die "$flag needs $hint; nothing was started (see --help)."
 }
@@ -176,6 +208,7 @@ so no password is asked again and FxA sends no new-sign-in mail.
 
 and from the same fresh package, with nothing to type in at all:
   ferrox-cli up --veepn --vpn                   # anonymous, no account, no server
+  ferrox-cli up --psiphon --vpn                 # the Psiphon client, kept beside the binary
 
 several lanes at once
   ferrox-cli up --foxy --instance work --country DE
@@ -191,6 +224,7 @@ several lanes at once
 outbound (choose one)
   --foxy                 Foxy lane; account from \$FOXY_CREDENTIALS
   --veepn                VeePN lane; anonymous, no account and no server
+  --psiphon              Psiphon lane; dials through its own psiphon-tunnel-core
   --vless LINK           a vless:// share link (tcp, ws, grpc, httpupgrade, xhttp)
   --vmess HOST:PORT --uuid ID
   --trojan HOST:PORT --password PW
@@ -222,6 +256,43 @@ locations
   last one fetched is kept in \$CONF_DIR/foxy-locations.jsonl for when the
   catalogue cannot be reached.  --ping adds a TCP-handshake latency per edge,
   sorts the exits fastest first, and marks an edge that did not answer.
+
+psiphon options (the client's own binary, its own tunnel, and the lane's local SOCKS)
+  --psiphon-bin FILE     the psiphon-tunnel-core client, else \$AETHER_PSIPHON_BIN,
+                         else the executable's pt folder, then PATH
+  --psiphon-region CC    two-letter egress region, else the client decides
+  --psiphon-mode NAME    auto|cdn|conduit|direct, default auto (direct keeps every
+                         TCP shape; cdn asks only fronted shapes; conduit asks for
+                         the in-proxy WebRTC relays; a carried lane drops QUIC)
+  --psiphon-listen ADDR  the client's local SOCKS address, default 127.0.0.1:1821
+  --psiphon-http ADDR    the client's local HTTP proxy, or off; default off
+  --psiphon-dir DIR      the client's data root, default \$CONF_DIR/psiphon
+  --psiphon-ready SECS   how long a tunnel may take, default 180
+  --psiphon-base FILE    a client config the lane starts from, comments allowed
+  --psiphon-entries FILE a server-entry list handed to the client at startup
+  --psiphon-split        split-tunnel destinations in the client's own region
+  --psiphon-split-region LIST  split-tunnel these country codes (comma separated)
+  --psiphon-user USER    the local proxy's username (with --psiphon-pass)
+  --psiphon-pass PASS    the local proxy's password
+  --psiphon-pool N       tunnels to keep in parallel
+  --psiphon-workers N    connection attempts to keep in parallel
+  --psiphon-aggressive   try every server/protocol pair in one round
+  --psiphon-feature LIST client features to report (comma separated)
+  --psiphon-latency N    network timeout multiplier, at least 1
+  --psiphon-disable-timeouts  ask the client for a 0.1 latency lambda
+  --psiphon-cdn-profile NAME  shirokhorshid|legacy|android built-in CDN edges and SNI
+  --psiphon-geoip FILE   MaxMind country database for in-proxy country checks
+  --psiphon-reject-censored   reject in-proxy relays in IR, CN, RU, BY, TM, KP
+  --psiphon-reject-country LIST  reject these in-proxy country codes
+  --psiphon-compartment ID  pin the in-proxy client to one personal compartment
+  --psiphon-dns LIST     alternate DNS resolvers for the client (comma separated)
+  --psiphon-device-location HASH  geohash reported to the client
+  --psiphon-device-region CC  two-letter device region reported to the client
+  --psiphon-network-id ID  network identifier reported to the client
+  --psiphon-additional-params B64  base64 AdditionalParameters for the client
+  --psiphon-establish-timeout SECS  give up if no tunnel is up in SECS
+  --psiphon-emit-bytes   emit the client's byte-transfer notices
+  --upstream URL         an http:// or socks5(h):// hop the client reaches its edge through
 
 veepn options (nothing is required: the plane names the region and its edges)
   --region CC            exit region id (lowercase, e.g. nl, us-va), else the plane picks
@@ -750,6 +821,97 @@ if listed:
 if udid:
     settings["udid"] = udid
 print(json.dumps({"protocol": "veepn", "settings": settings}))
+PY
+}
+
+# The Psiphon outbound: the client's own binary, its state, and only the fields
+# that were asked for; the lane reads its local SOCKS port from the client's notices.
+psiphon_outbound() {
+  local state="${PSIPHON_DIR:-${AETHER_PSIPHON_DIR:-$CONF_DIR/psiphon${INSTANCE:+-$INSTANCE}}}"
+  python3 - "$PSIPHON_BIN" "$state" "$PSIPHON_LISTEN" "$PSIPHON_HTTP" "$PSIPHON_REGION" \
+    "$PSIPHON_SHAPE" "$PSIPHON_READY" "$PSIPHON_BASE" "$PSIPHON_ENTRIES" "$UPSTREAM" \
+    "$PSIPHON_SPLIT" "$PSIPHON_SPLIT_REGIONS" "$PSIPHON_USER" "$PSIPHON_PASS" \
+    "$PSIPHON_POOL" "$PSIPHON_WORKERS" "$PSIPHON_AGGRESSIVE" "$PSIPHON_FEATURES" \
+    "$PSIPHON_LATENCY" "$PSIPHON_CDN_PROFILE" "$PSIPHON_GEOIP" "$PSIPHON_REJECT_CENSORED" \
+    "$PSIPHON_REJECT_COUNTRIES" "$PSIPHON_COMPARTMENT" "$PSIPHON_DISABLE_TIMEOUTS" \
+    "$PSIPHON_DNS_ALTERNATE" "$PSIPHON_DEVICE_LOCATION" "$PSIPHON_DEVICE_REGION" \
+    "$PSIPHON_NETWORK_ID" "$PSIPHON_ADDITIONAL_PARAMS" "$PSIPHON_ESTABLISH_TIMEOUT" \
+    "$PSIPHON_EMIT_BYTES" <<'PY'
+import json, sys
+
+(binary, state, listen, http, region, shape, ready, base, entries, upstream,
+ split, split_regions, user, password, pool, workers, aggressive, features,
+ latency, cdn_profile, geoip, reject_censored, reject_countries, compartment,
+ disable_timeouts, dns_alternate, device_location, device_region, network_id,
+ additional_params, establish_timeout, emit_bytes) = sys.argv[1:]
+settings = {"dataRootDirectory": state}
+if binary:
+    settings["binary"] = binary
+if listen:
+    settings["listen"] = listen
+if http:
+    settings["httpListen"] = http
+if region:
+    settings["region"] = region
+if shape:
+    settings["shape"] = shape
+if ready:
+    settings["readySeconds"] = int(ready)
+if base:
+    settings["baseConfig"] = base
+if entries:
+    settings["serverList"] = entries
+if upstream:
+    settings["upstreamProxy"] = upstream
+if split == "1":
+    settings["splitTunnelOwnRegion"] = True
+listed = [value.strip() for value in split_regions.split(",") if value.strip()]
+if listed:
+    settings["splitTunnelRegions"] = listed
+if user:
+    settings["localProxyUsername"] = user
+if password:
+    settings["localProxyPassword"] = password
+if pool.isdigit():
+    settings["tunnelPoolSize"] = int(pool)
+if workers.isdigit():
+    settings["connectionWorkerPoolSize"] = int(workers)
+if aggressive == "1":
+    settings["aggressiveEstablishment"] = True
+listed = [value.strip() for value in features.split(",") if value.strip()]
+if listed:
+    settings["clientFeatures"] = listed
+if latency:
+    settings["networkLatencyMultiplier"] = float(latency)
+if cdn_profile:
+    settings["cdnProfile"] = cdn_profile
+if geoip:
+    settings["geoIp"] = geoip
+if reject_censored == "1":
+    settings["rejectCensoredProxies"] = True
+listed = [value.strip() for value in reject_countries.split(",") if value.strip()]
+if listed:
+    settings["rejectProxyCountries"] = listed
+if compartment:
+    settings["inproxyCompartment"] = compartment
+if disable_timeouts == "1":
+    settings["disableTimeouts"] = True
+listed = [value.strip() for value in dns_alternate.split(",") if value.strip()]
+if listed:
+    settings["dnsResolverAlternateServers"] = listed
+if device_location:
+    settings["deviceLocation"] = device_location
+if device_region:
+    settings["deviceRegion"] = device_region
+if network_id:
+    settings["networkId"] = network_id
+if additional_params:
+    settings["additionalParameters"] = additional_params
+if establish_timeout.isdigit():
+    settings["establishTunnelTimeoutSeconds"] = int(establish_timeout)
+if emit_bytes == "1":
+    settings["emitBytesTransferred"] = True
+print(json.dumps({"protocol": "psiphon", "settings": settings}))
 PY
 }
 
@@ -1610,6 +1772,7 @@ build_config() {
       outbound="$(build_outbound vless)" || exit 1
       ;;
     veepn) outbound="$(build_outbound veepn)" || exit 1 ;;
+    psiphon) outbound="$(build_outbound psiphon)" || exit 1 ;;
     vmess) outbound="$(build_outbound vmess)" || exit 1 ;;
     trojan) outbound="$(build_outbound trojan)" || exit 1 ;;
     ss) outbound="$(build_outbound ss)" || exit 1 ;;
@@ -1623,6 +1786,7 @@ build_config() {
 ferrox-cli: no outbound chosen; nothing was started.
   --foxy                 account only, no server to name (asks once)
   --veepn                anonymous: no account and no server
+  --psiphon              its own psiphon-tunnel-core, kept beside the binary
   --vless 'vless://...'  a share link
   --vmess HOST:PORT --uuid ID
   --trojan HOST:PORT --password PW
@@ -1821,6 +1985,25 @@ diagnose() {
   else
     say "the lane log stayed empty even with the trace on: nothing was dialled,"
     say "so the front refused the request before any carrier was tried."
+    return 0
+  fi
+  # The Psiphon lane owns its client: its refusals are about the binary, its
+  # config, or the wait for a tunnel, and its own lines already name which.
+  if [ "$OUTBOUND" = psiphon ]; then
+    if grep -q "needs the psiphon-tunnel-core" "$LOG"; then
+      say "diagnosis: the client binary was not found. Keep the release archive's pt"
+      say "folder beside ferrox-app, or name one with --psiphon-bin FILE."
+    elif grep -q "did not come up in" "$LOG"; then
+      say "diagnosis: the client started but no tunnel opened in time. That is this"
+      say "network reaching the Psiphon servers, not the account: try --psiphon-mode"
+      say "direct, another --psiphon-region, or --upstream through a proxy that works."
+    elif grep -qE "would not start|config .* could not|could not be saved" "$LOG"; then
+      say "diagnosis: the client or its config was refused before a tunnel was tried;"
+      say "the lines above name the path and the reason."
+    else
+      say "diagnosis: the client answered no tunnel this lane can dial; the lines"
+      say "above are its own notices."
+    fi
     return 0
   fi
   # The VeePN lane has no account and no edge it configures: every refusal it
@@ -2147,6 +2330,43 @@ while [ $# -gt 0 ]; do
       fi ;;
     --foxy) OUTBOUND=foxy; shift ;;
     --veepn) OUTBOUND=veepn; shift ;;
+    --psiphon) OUTBOUND=psiphon; shift ;;
+    --psiphon-bin) need_value --psiphon-bin "the psiphon-tunnel-core path" "$#" "${2:-}"; PSIPHON_BIN="$2"; shift 2 ;;
+    --psiphon-region) need_value --psiphon-region "a two-letter region" "$#" "${2:-}"; PSIPHON_REGION="$2"; shift 2 ;;
+    --psiphon-mode)
+      need_value --psiphon-mode "auto, cdn, conduit or direct" "$#" "${2:-}"
+      case "$2" in
+        auto|cdn|conduit|direct) PSIPHON_SHAPE="$2" ;;
+        *) die "--psiphon-mode wants auto, cdn, conduit or direct, got '$2'; nothing was started." ;;
+      esac; shift 2 ;;
+    --psiphon-listen) need_value --psiphon-listen "an address and port" "$#" "${2:-}"; PSIPHON_LISTEN="$2"; shift 2 ;;
+    --psiphon-http) need_value --psiphon-http "an address and port, or off" "$#" "${2:-}"; PSIPHON_HTTP="$2"; shift 2 ;;
+    --psiphon-dir) need_value --psiphon-dir "a data directory" "$#" "${2:-}"; PSIPHON_DIR="$2"; shift 2 ;;
+    --psiphon-ready) need_value --psiphon-ready "a number of seconds" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*) die "--psiphon-ready wants seconds, got '$2'; nothing was started." ;; esac; PSIPHON_READY="$2"; shift 2 ;;
+    --psiphon-base) need_value --psiphon-base "a JSON config path" "$#" "${2:-}"; PSIPHON_BASE="$2"; shift 2 ;;
+    --psiphon-entries) need_value --psiphon-entries "a server-entry file" "$#" "${2:-}"; PSIPHON_ENTRIES="$2"; shift 2 ;;
+    --psiphon-split) PSIPHON_SPLIT=1; shift ;;
+    --psiphon-split-region) need_value --psiphon-split-region "country codes" "$#" "${2:-}"; PSIPHON_SPLIT_REGIONS="$2"; shift 2 ;;
+    --psiphon-user) need_value --psiphon-user "a username" "$#" "${2:-}"; PSIPHON_USER="$2"; shift 2 ;;
+    --psiphon-pass) need_value --psiphon-pass "a password" "$#" "${2:-}"; PSIPHON_PASS="$2"; shift 2 ;;
+    --psiphon-pool) need_value --psiphon-pool "a tunnel count" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*) die "--psiphon-pool wants a number, got '$2'; nothing was started." ;; esac; PSIPHON_POOL="$2"; shift 2 ;;
+    --psiphon-workers) need_value --psiphon-workers "a worker count" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*) die "--psiphon-workers wants a number, got '$2'; nothing was started." ;; esac; PSIPHON_WORKERS="$2"; shift 2 ;;
+    --psiphon-aggressive) PSIPHON_AGGRESSIVE=1; shift ;;
+    --psiphon-feature) need_value --psiphon-feature "client features" "$#" "${2:-}"; PSIPHON_FEATURES="$2"; shift 2 ;;
+    --psiphon-latency) need_value --psiphon-latency "a multiplier of at least 1" "$#" "${2:-}"; PSIPHON_LATENCY="$2"; shift 2 ;;
+    --psiphon-disable-timeouts) PSIPHON_DISABLE_TIMEOUTS=1; shift ;;
+    --psiphon-cdn-profile) need_value --psiphon-cdn-profile "shirokhorshid, legacy or android" "$#" "${2:-}"; case "$2" in shirokhorshid|legacy|android) PSIPHON_CDN_PROFILE="$2" ;; *) die "--psiphon-cdn-profile wants shirokhorshid, legacy or android, got '$2'; nothing was started." ;; esac; shift 2 ;;
+    --psiphon-geoip) need_value --psiphon-geoip "a MaxMind database" "$#" "${2:-}"; PSIPHON_GEOIP="$2"; shift 2 ;;
+    --psiphon-reject-censored) PSIPHON_REJECT_CENSORED=1; shift ;;
+    --psiphon-reject-country) need_value --psiphon-reject-country "country codes" "$#" "${2:-}"; PSIPHON_REJECT_COUNTRIES="$2"; shift 2 ;;
+    --psiphon-compartment) need_value --psiphon-compartment "a compartment id" "$#" "${2:-}"; PSIPHON_COMPARTMENT="$2"; shift 2 ;;
+    --psiphon-dns) need_value --psiphon-dns "resolver addresses" "$#" "${2:-}"; PSIPHON_DNS_ALTERNATE="$2"; shift 2 ;;
+    --psiphon-device-location) need_value --psiphon-device-location "a geohash" "$#" "${2:-}"; PSIPHON_DEVICE_LOCATION="$2"; shift 2 ;;
+    --psiphon-device-region) need_value --psiphon-device-region "a two-letter region" "$#" "${2:-}"; PSIPHON_DEVICE_REGION="$2"; shift 2 ;;
+    --psiphon-network-id) need_value --psiphon-network-id "a network id" "$#" "${2:-}"; PSIPHON_NETWORK_ID="$2"; shift 2 ;;
+    --psiphon-additional-params) need_value --psiphon-additional-params "base64 parameters" "$#" "${2:-}"; PSIPHON_ADDITIONAL_PARAMS="$2"; shift 2 ;;
+    --psiphon-establish-timeout) need_value --psiphon-establish-timeout "seconds, at least 1" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*|0) die "--psiphon-establish-timeout wants seconds, at least 1, got '$2'; nothing was started." ;; esac; PSIPHON_ESTABLISH_TIMEOUT="$2"; shift 2 ;;
+    --psiphon-emit-bytes) PSIPHON_EMIT_BYTES=1; shift ;;
     --vless) need_value --vless "a vless:// share link" "$#" "${2:-}"; OUTBOUND=vless; VLESS="$2"; shift 2 ;;
     --vmess) need_value --vmess "HOST:PORT" "$#" "${2:-}"; OUTBOUND=vmess; VMESS="$2"; shift 2 ;;
     --uuid) need_value --uuid "the VMess user id" "$#" "${2:-}"; VMESS_ID="$2"; shift 2 ;;
@@ -2246,6 +2466,8 @@ esac
 # A VeePN flow pays a launch and a list before bytes move, so its first probe
 # waits longer than a lane that configures the server it dials.
 [ "$OUTBOUND" = veepn ] && PROBE_TIMEOUT=45
+# Psiphon downloads a server list and opens a tunnel before its local SOCKS answers.
+[ "$OUTBOUND" = psiphon ] && PROBE_TIMEOUT=200
 
 # Only up, serve and version need the binary: down, status and login must
 # still work when it was never fetched.

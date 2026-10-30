@@ -21,6 +21,7 @@ pub(crate) mod keystream;
 pub mod mux;
 pub mod policy;
 pub mod poly1305;
+pub mod psiphon;
 pub mod record;
 pub mod shadowsocks;
 pub mod shadowsocks2022;

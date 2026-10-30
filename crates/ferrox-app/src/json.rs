@@ -107,7 +107,12 @@ pub(crate) fn write(value: &Json, out: &mut String) {
 
 fn write_string(text: &str, out: &mut String) {
     out.push('"');
-    for byte in text.bytes() {
+    let bytes = text.as_bytes();
+    let mut at = 0usize;
+    let mut copy = 0usize;
+    while let Some((offset, byte)) = next_json_special(&bytes[at..]) {
+        at += offset;
+        out.push_str(&text[copy..at]);
         match byte {
             b'"' => out.push_str("\\\""),
             b'\\' => out.push_str("\\\\"),
@@ -116,15 +121,120 @@ fn write_string(text: &str, out: &mut String) {
             b'\n' => out.push_str("\\n"),
             b'\r' => out.push_str("\\r"),
             b'\t' => out.push_str("\\t"),
-            0x00..=0x1f => {
+            _ => {
                 out.push_str("\\u00");
                 out.push(HEX[(byte >> 4) as usize] as char);
                 out.push(HEX[(byte & 0x0f) as usize] as char);
             }
-            _ => out.push(byte as char),
         }
+        at += 1;
+        copy = at;
     }
+    out.push_str(&text[copy..]);
     out.push('"');
+}
+
+/// The first byte a JSON string must escape: a quote, a backslash, or a control byte.
+/// AVX2 walks 32 bytes per turn when the CPU has it; the SWAR tail keeps the same
+/// unsigned-control test. Bytes at or above `0x80` are not special.
+fn next_json_special(bytes: &[u8]) -> Option<(usize, u8)> {
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 32 && std::is_x86_feature_detected!("avx2") {
+        // SAFETY: the runtime feature test above proves AVX2 is available.
+        return unsafe { next_json_special_avx2(bytes) };
+    }
+    next_json_special_swar(bytes)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn next_json_special_avx2(bytes: &[u8]) -> Option<(usize, u8)> {
+    use core::arch::x86_64::{
+        _mm256_and_si256, _mm256_cmpeq_epi8, _mm256_cmpgt_epi8, _mm256_loadu_si256,
+        _mm256_movemask_epi8, _mm256_or_si256, _mm256_set1_epi8,
+    };
+    let quote = _mm256_set1_epi8(b'"'.cast_signed());
+    let slash = _mm256_set1_epi8(b'\\'.cast_signed());
+    let control = _mm256_set1_epi8(0x20);
+    let negative = _mm256_set1_epi8(-1);
+    let mut at = 0usize;
+    while at + 32 <= bytes.len() {
+        // SAFETY: `at + 32` is inside `bytes`, and the load is unaligned.
+        let marked = unsafe {
+            let block = _mm256_loadu_si256(bytes.as_ptr().add(at).cast());
+            let quote_or_slash = _mm256_or_si256(
+                _mm256_cmpeq_epi8(block, quote),
+                _mm256_cmpeq_epi8(block, slash),
+            );
+            let below_control = _mm256_and_si256(
+                _mm256_cmpgt_epi8(control, block),
+                _mm256_cmpgt_epi8(block, negative),
+            );
+            _mm256_movemask_epi8(_mm256_or_si256(quote_or_slash, below_control))
+        };
+        if marked != 0 {
+            let found = at + marked.trailing_zeros() as usize;
+            return Some((found, bytes[found]));
+        }
+        at += 32;
+    }
+    next_json_special_swar(&bytes[at..]).map(|(found, byte)| (at + found, byte))
+}
+
+/// The SWAR tail: two eight-byte blocks at a time, with the same zero-byte test the rest
+/// of the tree uses and the standard "less than n" test for the control range; the
+/// earliest marked lane is always a real one, so a borrow's false mark above it is never
+/// the answer.
+fn next_json_special_swar(bytes: &[u8]) -> Option<(usize, u8)> {
+    const SPREAD: u64 = 0x0101_0101_0101_0101;
+    const HIGH: u64 = 0x8080_8080_8080_8080;
+    const CONTROL: u64 = 0x2020_2020_2020_2020;
+    let quote = u64::from(b'"').wrapping_mul(SPREAD);
+    let slash = u64::from(b'\\').wrapping_mul(SPREAD);
+    let mark = |word: u64| {
+        let q = word ^ quote;
+        let s = word ^ slash;
+        (q.wrapping_sub(SPREAD) & !q & HIGH)
+            | (s.wrapping_sub(SPREAD) & !s & HIGH)
+            | (word.wrapping_sub(CONTROL) & !word & HIGH)
+    };
+    let mut at = 0usize;
+    while at + 16 <= bytes.len() {
+        let low = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("one eight-byte block"));
+        let high = u64::from_le_bytes(
+            bytes[at + 8..at + 16]
+                .try_into()
+                .expect("one eight-byte block"),
+        );
+        let low_mark = mark(low);
+        if low_mark != 0 {
+            let found = at + low_mark.trailing_zeros() as usize / 8;
+            return Some((found, bytes[found]));
+        }
+        let high_mark = mark(high);
+        if high_mark != 0 {
+            let found = at + 8 + high_mark.trailing_zeros() as usize / 8;
+            return Some((found, bytes[found]));
+        }
+        at += 16;
+    }
+    while at + 8 <= bytes.len() {
+        let word = u64::from_le_bytes(bytes[at..at + 8].try_into().expect("one eight-byte block"));
+        let marked = mark(word);
+        if marked != 0 {
+            let found = at + marked.trailing_zeros() as usize / 8;
+            return Some((found, bytes[found]));
+        }
+        at += 8;
+    }
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if byte == b'"' || byte == b'\\' || byte < 0x20 {
+            return Some((at, byte));
+        }
+        at += 1;
+    }
+    None
 }
 
 const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -303,16 +413,30 @@ impl Cursor<'_> {
     fn string(&mut self) -> Result<String, String> {
         self.pos += 1;
         let mut out = String::new();
+        let mut copy = self.pos;
         loop {
-            let Some(&b) = self.bytes.get(self.pos) else {
+            let Some((offset, byte)) = next_json_special(&self.bytes[self.pos..]) else {
                 return Err(format!("unterminated string at offset {}", self.pos));
             };
-            self.pos += 1;
-            match b {
-                b'"' => return Ok(out),
-                b'\\' => out.push(self.escape()?),
-                0x00..=0x1F => return Err(format!("raw control byte at offset {}", self.pos)),
-                _ => out.push(b as char),
+            self.pos += offset;
+            out.push_str(
+                std::str::from_utf8(&self.bytes[copy..self.pos])
+                    .map_err(|_| format!("invalid utf-8 at offset {copy}"))?,
+            );
+            match byte {
+                b'"' => {
+                    self.pos += 1;
+                    return Ok(out);
+                }
+                b'\\' => {
+                    self.pos += 1;
+                    out.push(self.escape()?);
+                    copy = self.pos;
+                }
+                _ => {
+                    self.pos += 1;
+                    return Err(format!("raw control byte at offset {}", self.pos));
+                }
             }
         }
     }
@@ -549,6 +673,118 @@ mod tests {
             let mut out = String::new();
             write(&value, &mut out);
             assert_eq!(parse(&out).expect(&out), value, "{text} -> {out}");
+        }
+    }
+
+    #[test]
+    fn a_written_string_is_the_bytes_the_parser_reads() {
+        for text in [
+            "",
+            "plain",
+            "\u{0}\u{1f}\n\r\t\"\\",
+            "é",
+            "日本語",
+            "😀",
+            "a\u{0}é😀z",
+        ] {
+            let mut out = String::new();
+            write(&Json::Str(text.to_owned()), &mut out);
+            assert_eq!(
+                parse(&out).expect(&out),
+                Json::Str(text.to_owned()),
+                "{text:?} -> {out}"
+            );
+        }
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let mut text = String::new();
+            for _ in 0..(state % 64) {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let ch = match state % 10 {
+                    0 => '"',
+                    1 => '\\',
+                    2 => '\n',
+                    3 => '\r',
+                    4 => '\t',
+                    5 => '\u{0}',
+                    6 => 'é',
+                    7 => '😀',
+                    8 => 'a',
+                    _ => char::from((state >> 8) as u8),
+                };
+                text.push(ch);
+            }
+            let mut out = String::new();
+            write(&Json::Str(text.clone()), &mut out);
+            assert_eq!(
+                parse(&out).expect(&out),
+                Json::Str(text.clone()),
+                "{text:?} -> {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_word_scan_is_the_byte_scan_for_a_json_string() {
+        fn byte_scan(bytes: &[u8]) -> Option<(usize, u8)> {
+            bytes
+                .iter()
+                .position(|byte| *byte == b'"' || *byte == b'\\' || *byte < 0x20)
+                .map(|at| (at, bytes[at]))
+        }
+        let alphabet = [b'a', b'"', b'\\', b'\n', 0x1f, 0x20, 0x7f, 0x80];
+        for len in 0..=4 {
+            for mut case in 0..alphabet.len().pow(len as u32) {
+                let mut bytes = Vec::with_capacity(len);
+                for _ in 0..len {
+                    bytes.push(alphabet[case % alphabet.len()]);
+                    case /= alphabet.len();
+                }
+                assert_eq!(next_json_special(&bytes), byte_scan(&bytes), "{bytes:?}");
+            }
+        }
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        for pad in 0..40 {
+            for len in 0..96 {
+                let mut bytes = vec![b'a'; pad];
+                for _ in 0..len {
+                    state ^= state << 13;
+                    state ^= state >> 7;
+                    state ^= state << 17;
+                    bytes.push(match state % 37 {
+                        0 => b'"',
+                        1 => b'\\',
+                        2 => 0x1f,
+                        3 => 0x7f,
+                        4 => 0x80,
+                        _ => b'x',
+                    });
+                }
+                let tail = &bytes[pad..];
+                assert_eq!(
+                    next_json_special(tail),
+                    byte_scan(tail),
+                    "pad {pad}, len {len}"
+                );
+            }
+        }
+        let mut bytes = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bytes.push((state >> 8) as u8);
+            assert_eq!(
+                next_json_special(&bytes),
+                byte_scan(&bytes),
+                "{:?}",
+                &bytes[bytes.len().saturating_sub(16)..]
+            );
         }
     }
 

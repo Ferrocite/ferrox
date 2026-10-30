@@ -51,7 +51,7 @@ sys.exit(1 if bad else 0)
 EOF
 
 if git grep -I -n -E '(vless|vmess|trojan|ss)://[^@#? ]+@[^/:?# ]+' -- . \
-  | grep -v -E '@(\[::1\]|(127|10)\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}|(192\.0\.2|198\.51\.100|203\.0\.113)\.[0-9]{1,3}|localhost|example\.[a-z]+|[A-Za-z0-9.-]+\.(test|invalid|localhost)|uuid|host|\{host\})([:/?#]|$)' \
+  | grep -v -E '@(\[::1\]|(127|10)\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}|192\.168\.[0-9]{1,3}\.[0-9]{1,3}|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]{1,3}\.[0-9]{1,3}|(192\.0\.2|198\.51\.100|203\.0\.113)\.[0-9]{1,3}|localhost|example\.[a-z]+|[A-Za-z0-9.-]+\.(test|invalid|localhost|example)|uuid|host|\{host\})([:/?#]|$)' \
   | grep -v '^Binary'; then
   echo "::error::share-link with a non-documentation host — working configs arrive as masked CI input only"
   status=1

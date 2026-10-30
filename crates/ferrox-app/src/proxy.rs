@@ -173,6 +173,7 @@ fn dokodemo_networks(inbound: &Json) -> Vec<&str> {
         .unwrap_or_default()
 }
 
+#[allow(clippy::too_many_lines)]
 fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, test: bool) -> ! {
     // Armed before the first inbound opens, so every flow from here reads the budget the operator named.
     crate::budgets::apply(
@@ -192,11 +193,11 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     install_default_outbound_tag(root);
     let freedom = has_protocol(root, "outbounds", "freedom");
-    let outbound =
-        find_outbound(root).unwrap_or_else(|reason| exit(&format!("bad config {label}: {reason}")));
+    let configured = find_outbound_with(root, test)
+        .unwrap_or_else(|reason| exit(&format!("bad config {label}: {reason}")));
     // A loopback outbound names its inbound by tag, so it resolves only when no concrete dial won.
     let loopback = find_loopback_outbound(root);
-    let outbound = match outbound {
+    let outbound = match configured.clone() {
         Some(Outbound::Freedom(_)) | None if loopback.is_some() => {
             let tag = loopback.expect("guarded by is_some");
             Some(
@@ -226,8 +227,15 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         }
     }
     let route = routing.map(|routing| {
-        route_shared_with_api(root, routing, &portals, observatory.clone(), api.as_ref())
-            .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
+        route_shared_with_api(
+            root,
+            routing,
+            &portals,
+            observatory.clone(),
+            api.as_ref(),
+            configured.as_ref(),
+        )
+        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
     });
     if let Some(api) = api.as_ref() {
         wire_api(
@@ -1528,6 +1536,7 @@ pub(crate) enum Outbound {
     Socks(SocksOut),
     Foxy(Box<FoxyOut>),
     Veepn(crate::veepn::VeepnOut),
+    Psiphon(crate::psiphon::PsiphonOut),
     Freedom(Arc<FreedomOut>),
     Http(HttpOut),
     /// The rules choose the outbound per flow; the plan holds the registry and the fallback.
@@ -1568,6 +1577,7 @@ impl Outbound {
             Self::Http(http) => resolve_outbound(&http.address, http.port),
             Self::WireGuard(wireguard) => wireguard.edge(),
             Self::Masque(masque) => masque.edge(),
+            Self::Psiphon(lane) => Some(lane.endpoint()),
             Self::Metrics { address } => Some(*address),
             Self::Foxy(_)
             | Self::Veepn(_)
@@ -2450,7 +2460,7 @@ fn route_shared(
     portals: &crate::reverse::Portals,
     observatory: Option<Arc<crate::observatory::Observatory>>,
 ) -> Result<Arc<RouteShared>, String> {
-    route_shared_with_api(root, routing, portals, observatory, None)
+    route_shared_with_api(root, routing, portals, observatory, None, None)
 }
 
 /// The same table with the commander's tag reachable: a rule naming it hands the flow to the
@@ -2462,6 +2472,7 @@ fn route_shared_with_api(
     portals: &crate::reverse::Portals,
     observatory: Option<Arc<crate::observatory::Observatory>>,
     api: Option<&Arc<crate::commander::Api>>,
+    default: Option<&Outbound>,
 ) -> Result<Arc<RouteShared>, String> {
     let list = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
     let Some(first) = list.first() else {
@@ -2484,7 +2495,10 @@ fn route_shared_with_api(
         .and_then(Json::as_str)
         .filter(|tag| !tag.is_empty())
         .map(str::to_owned);
-    let default = build(first, default_tag.as_deref().unwrap_or("<default>"))?;
+    let default = match default {
+        Some(outbound) => outbound.clone(),
+        None => build(first, default_tag.as_deref().unwrap_or("<default>"))?,
+    };
     let mut configs: HashMap<&str, &Json> = HashMap::new();
     for outbound in list {
         let tag = outbound.get("tag").and_then(Json::as_str).unwrap_or("");
@@ -16578,7 +16592,10 @@ fn dial_socks_outbound(
             dial_http_outbound(client, server, http, target, ladder);
         }
         Outbound::Socks(socks) => {
-            dial_socks_client(client, server, socks, target);
+            dial_socks_client(client, server, &socks.credential, socks.version, target);
+        }
+        Outbound::Psiphon(lane) => {
+            dial_socks_client(client, server, lane.credential(), lane.version(), target);
         }
         Outbound::Foxy(_)
         | Outbound::Veepn(_)
@@ -16603,7 +16620,8 @@ fn dial_socks_outbound(
 fn dial_socks_client(
     client: &Connection,
     server: &SocketAddr,
-    socks: &SocksOut,
+    credential: &crate::socks::Credential,
+    version: crate::socks::Version,
     target: &Destination,
 ) {
     let Some(upstream) = dial_or_report(server) else {
@@ -16620,9 +16638,7 @@ fn dial_socks_client(
         },
         Destination::Name(host, port) => crate::socks::Destination::Name(host.as_bytes(), *port),
     };
-    let Some(tunnel) =
-        crate::socks::connect(upstream, &socks.credential, &destination, socks.version)
-    else {
+    let Some(tunnel) = crate::socks::connect(upstream, credential, &destination, version) else {
         return;
     };
     relay_handoff(client, &tunnel);
@@ -17662,7 +17678,7 @@ fn foxy_exit_country<T: Read + Write>(tunnel: &mut T, foxy: &FoxyOut) -> Option<
 /// lane stops relaying.
 pub(crate) fn udp_association(
     serve: impl FnOnce(Connection) + Send + 'static,
-) -> Option<crate::socks::Association> {
+) -> Option<crate::socks::Association<Connection>> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
     let pair = listener.local_addr().ok()?;
     let client = std::net::TcpStream::connect(pair).ok()?;
@@ -17685,6 +17701,9 @@ pub(crate) fn relay_leg(relay: SocketAddr) -> std::io::Result<UdpSocket> {
     leg.set_read_timeout(Some(budgets::udp_idle()))?;
     Ok(leg)
 }
+
+/// One association per source; the bound keeps distinct sources from pinning threads and sockets for the door's life.
+const MAX_DOKODEMO_LEGS: usize = 1024;
 
 /// The dokodemo UDP door: a datagram a client sends goes to the target the config
 /// names, and the answer comes back to the client that sent it.
@@ -17712,28 +17731,39 @@ fn dokodemo_udp_door(
         eprintln!("dokodemo-door udp: rewrite target unusable, refused");
         return;
     };
-    let outbound = out.clone();
-    let Some(association) =
-        udp_association(move |conn| serve_socks(conn, &outbound, &no_accounts()))
-    else {
-        eprintln!("dokodemo-door udp: the outbound refused the association");
-        return;
-    };
-    let relay = association.relay;
-    // The control leg stays open for the association's life: dropping it ends it.
-    let _control = association.control;
-    let mut legs: HashMap<SocketAddr, UdpSocket> = HashMap::new();
+    // One association per client: the upstream answers the source the request came from, so a shared association cannot route two clients' replies.
+    let mut legs: HashMap<SocketAddr, (UdpSocket, Connection, Arc<AtomicBool>)> = HashMap::new();
     let mut buf = udp_buffer();
     // The door's frame is the door's: the address it rewrites to is the same for every datagram.
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-    while let Ok((n, src)) = socket.recv_from(&mut buf) {
+    let _ = socket.set_read_timeout(Some(budgets::udp_idle()));
+    loop {
+        let (n, src) = match socket.recv_from(&mut buf) {
+            Ok(read) => read,
+            Err(error) if is_timeout(&error) => {
+                legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+                continue;
+            }
+            Err(_) => return,
+        };
         if n == 0 {
+            continue;
+        }
+        legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+        if !legs.contains_key(&src) && legs.len() >= MAX_DOKODEMO_LEGS {
             continue;
         }
         let leg = match legs.entry(src) {
             std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
             std::collections::hash_map::Entry::Vacant(vacant) => {
-                let Ok(leg) = relay_leg(relay) else {
+                let outbound = out.clone();
+                let Some(association) =
+                    udp_association(move |conn| serve_socks(conn, &outbound, &no_accounts()))
+                else {
+                    eprintln!("dokodemo-door udp: the outbound refused the association");
+                    continue;
+                };
+                let Ok(leg) = relay_leg(association.relay) else {
                     continue;
                 };
                 let Ok(writer) = socket.try_clone() else {
@@ -17742,6 +17772,8 @@ fn dokodemo_udp_door(
                 let Ok(reader) = leg.try_clone() else {
                     continue;
                 };
+                let alive = Arc::new(AtomicBool::new(true));
+                let reader_alive = alive.clone();
                 thread::spawn(move || {
                     let mut back = udp_buffer();
                     while let Ok(read) = reader.recv(&mut back) {
@@ -17752,12 +17784,13 @@ fn dokodemo_udp_door(
                             break;
                         }
                     }
+                    reader_alive.store(false, Ordering::Relaxed);
                 });
-                vacant.insert(leg)
+                vacant.insert((leg, association.control, alive))
             }
         };
         let out = socks_udp_frame(&mut frame, None, &target, &buf[..n]);
-        let _ = leg.send(out);
+        let _ = leg.0.send(out);
     }
 }
 
@@ -17893,7 +17926,25 @@ pub(crate) fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Optio
         Outbound::WireGuard(wireguard) => wireguard.serve_udp(relay, associate),
         Outbound::Masque(masque) => masque.serve_udp(relay, associate),
         Outbound::Freedom(out) => serve_socks_udp_freedom(relay, out),
-        Outbound::Socks(socks) => serve_socks_udp_socks(relay, socks),
+        Outbound::Socks(socks) => {
+            if socks.version == crate::socks::Version::V4 {
+                // SOCKS4 has no datagram half: the association is a SOCKS5 request.
+                return;
+            }
+            let Some(server) = resolve_outbound(&socks.address, socks.port) else {
+                return;
+            };
+            serve_socks_udp_client(relay, server, &socks.credential, socks.version, associate);
+        }
+        Outbound::Psiphon(lane) => {
+            serve_socks_udp_client(
+                relay,
+                lane.endpoint(),
+                lane.credential(),
+                lane.version(),
+                associate,
+            );
+        }
         Outbound::Dns(dns) => serve_dns_udp(relay, dns),
         Outbound::ReversePortal(portal) => serve_socks_udp_portal(relay, portal),
         _ => {}
@@ -18070,6 +18121,18 @@ fn serve_socks_udp_split(
     }
 }
 
+/// The upstream socket's family follows the relay's: an IPv4 relay gets an unspecified IPv4 bind, an IPv6 relay an unspecified IPv6 bind.
+fn udp_bind_for(relay: SocketAddr) -> SocketAddr {
+    match relay {
+        SocketAddr::V4(_) => {
+            SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 0)
+        }
+        SocketAddr::V6(_) => {
+            SocketAddr::new(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED), 0)
+        }
+    }
+}
+
 /// A lane's loop ends on its own idle or a refused upstream; the key must not keep writing to the
 /// socket nobody reads, so a later datagram for that tag opens a fresh lane.
 #[allow(clippy::ref_option)] // the map is keyed by the optional tag itself
@@ -18099,32 +18162,44 @@ fn spawn_udp_lane(out: &Outbound, local: std::net::IpAddr) -> Option<UdpLane> {
 ///
 /// The control leg stays open for the association's life: dropping it ends the
 /// association, and the server stops relaying.
-fn serve_socks_udp_socks(relay: &UdpSocket, socks: &SocksOut) {
-    if socks.version == crate::socks::Version::V4 {
-        // SOCKS4 has no datagram half: the association is a SOCKS5 request.
+fn serve_socks_udp_client(
+    relay: &UdpSocket,
+    server: SocketAddr,
+    credential: &crate::socks::Credential,
+    version: crate::socks::Version,
+    associate: Option<&Connection>,
+) {
+    if version == crate::socks::Version::V4 {
         return;
     }
-    let Some(server) = resolve_outbound(&socks.address, socks.port) else {
-        return;
-    };
+    let idle = lane_idle(relay);
     let Some(stream) = dial_or_report(&server) else {
         return;
     };
-    let Some(association) = crate::socks::associate(stream, &socks.credential) else {
+    let read = stream.read_timeout().ok().flatten();
+    let _ = stream.set_read_timeout(Some(budgets::handshake()));
+    let _ = stream.set_write_timeout(Some(budgets::handshake()));
+    let Some(association) = crate::socks::associate(stream, credential) else {
         return;
     };
-    let _control = association.control;
-    let Ok(upstream) = UdpSocket::bind(SocketAddr::new(
-        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-        0,
-    )) else {
+    let control = association.control;
+    let peer = control_peer(associate);
+    let mut pinned = None;
+    let poll = lane_poll(read);
+    let _ = control.set_read_timeout(Some(poll));
+    let _ = control.set_write_timeout(None);
+    if let Some(associate) = associate {
+        let _ = associate.set_read_timeout(Some(budgets::SESSION_POLL));
+    }
+    let Ok(upstream) = UdpSocket::bind(udp_bind_for(association.relay)) else {
         return;
     };
     if upstream.connect(association.relay).is_err() {
         return;
     }
-    // The same idle budget the relay socket carries, so the two legs of the lane end together instead of one waiting on the other for the life of the process.
-    let _ = upstream.set_read_timeout(Some(budgets::udp_idle()));
+    // The poll is the lane's own: the request leg checks the control socket and the idle budget, and the answer leg checks the stop flag.
+    let _ = relay.set_read_timeout(Some(UDP_POLL));
+    let _ = upstream.set_read_timeout(Some(UDP_POLL));
     let Ok(sender) = upstream.try_clone() else {
         return;
     };
@@ -18136,42 +18211,142 @@ fn serve_socks_udp_socks(relay: &UdpSocket, socks: &SocksOut) {
     };
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let reader_source = source.clone();
+    let activity = Arc::new(Mutex::new(Instant::now()));
+    let answer_activity = activity.clone();
+    let done = Arc::new(AtomicBool::new(false));
+    let answer_done = done.clone();
     // The answer leg: the upstream's frames go back to the client that sent them.
     let answer = thread::spawn(move || {
-        let mut buf = udp_buffer();
-        let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-        while let Ok((n, _)) = receiver.recv_from(&mut buf) {
-            let Some((from, payload)) = parse_socks_udp(&buf[..n]) else {
-                continue;
-            };
-            let Some(dest) = reader_source.lock().ok().and_then(|slot| *slot) else {
-                continue;
-            };
-            let out = socks_udp_frame(&mut frame, Some(&buf[..n]), &from, payload);
-            if client.send_to(out, dest).is_err() {
-                break;
-            }
-        }
+        serve_udp_answer(
+            &receiver,
+            &client,
+            &reader_source,
+            &answer_done,
+            &answer_activity,
+        );
     });
     // The request leg: the client's frames go to the relay address the server named.
     let mut buf = udp_buffer();
     let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-    while let Ok((n, src)) = relay.recv_from(&mut buf) {
-        let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
-            continue;
-        };
-        if payload.is_empty() {
-            continue;
-        }
-        if let Ok(mut slot) = source.lock() {
-            *slot = Some(src);
-        }
-        let out = socks_udp_frame(&mut frame, Some(&buf[..n]), &dest, payload);
-        if sender.send(out).is_err() {
-            break;
+    loop {
+        match relay.recv_from(&mut buf) {
+            Ok((n, src)) => {
+                let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+                    continue;
+                };
+                if payload.is_empty() {
+                    continue;
+                }
+                if !source_allowed(peer, &mut pinned, &source, src) {
+                    continue;
+                }
+                touch(&activity);
+                let out = socks_udp_frame(&mut frame, Some(&buf[..n]), &dest, payload);
+                if sender.send(out).is_err() {
+                    break;
+                }
+            }
+            Err(error) if is_timeout(&error) => {
+                if peer_left(&control)
+                    || associate.is_some_and(peer_left)
+                    || idle_for(&activity) >= idle
+                {
+                    break;
+                }
+            }
+            Err(_) => break,
         }
     }
+    done.store(true, Ordering::Relaxed);
     let _ = answer.join();
+}
+
+/// The peer of the association's control socket: a datagram from any other IP is not this client.
+fn control_peer(associate: Option<&Connection>) -> Option<IpAddr> {
+    associate
+        .and_then(|client| client.peer_addr().ok())
+        .map(|address| address.ip().to_canonical())
+}
+
+/// A datagram belongs to the association only if it comes from the control peer and, after the first, from the same UDP source the client pinned.
+fn source_allowed(
+    peer: Option<IpAddr>,
+    pinned: &mut Option<SocketAddr>,
+    source: &Mutex<Option<SocketAddr>>,
+    datagram: SocketAddr,
+) -> bool {
+    if peer.is_some_and(|peer| datagram.ip().to_canonical() != peer) {
+        return false;
+    }
+    if let Some(allowed) = *pinned {
+        return allowed == datagram;
+    }
+    *pinned = Some(datagram);
+    if let Ok(mut slot) = source.lock() {
+        *slot = Some(datagram);
+    }
+    true
+}
+
+/// The lane's idle is measured from the last datagram in either direction.
+fn idle_for(activity: &Mutex<Instant>) -> Duration {
+    activity
+        .lock()
+        .map(|last| last.elapsed())
+        .unwrap_or_default()
+}
+
+/// A datagram in either direction is activity: the lane's idle budget measures silence, not a request without a reply.
+fn touch(activity: &Mutex<Instant>) {
+    if let Ok(mut last) = activity.lock() {
+        *last = Instant::now();
+    }
+}
+
+/// The control socket is polled for closure: the caller's read timeout still bounds the wait, but never beyond one session poll.
+fn lane_poll(read: Option<Duration>) -> Duration {
+    read.map_or(budgets::SESSION_POLL, |limit| {
+        limit.min(budgets::SESSION_POLL)
+    })
+}
+
+/// The lane's idle is the caller's read timeout, capped at the tree's UDP idle: a DNS query's short timeout is not replaced by the long one.
+fn lane_idle(relay: &UdpSocket) -> Duration {
+    relay
+        .read_timeout()
+        .ok()
+        .flatten()
+        .map_or(budgets::udp_idle(), |limit| limit.min(budgets::udp_idle()))
+}
+
+/// The answer leg of a SOCKS client lane: the upstream's frames go back to the client that sent them, and a stop flag ends the read poll.
+fn serve_udp_answer(
+    receiver: &UdpSocket,
+    client: &UdpSocket,
+    source: &Mutex<Option<SocketAddr>>,
+    done: &AtomicBool,
+    activity: &Mutex<Instant>,
+) {
+    let mut buf = udp_buffer();
+    let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+    while !done.load(Ordering::Relaxed) {
+        let (n, _) = match receiver.recv_from(&mut buf) {
+            Ok(read) => read,
+            Err(error) if is_timeout(&error) => continue,
+            Err(_) => break,
+        };
+        let Some((from, payload)) = parse_socks_udp(&buf[..n]) else {
+            continue;
+        };
+        let Some(dest) = source.lock().ok().and_then(|slot| *slot) else {
+            continue;
+        };
+        let out = socks_udp_frame(&mut frame, Some(&buf[..n]), &from, payload);
+        if client.send_to(out, dest).is_err() {
+            break;
+        }
+        touch(activity);
+    }
 }
 
 /// Freedom UDP: the machine's own socket per destination, since a datagram here has no carrier to ride.
@@ -24327,7 +24502,7 @@ fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
             None
         }
         // The chain's own refusals carry their one line already.
-        "foxy" | "veepn" | "masque" => None,
+        "foxy" | "veepn" | "psiphon" | "masque" => None,
         // A lane without an outbound this binary builds: the name is xray's, not a typo to diagnose.
         "hysteria" => hysteria_outbound_refusal(outbound),
         "dokodemo-door" => Some("the `dokodemo-door` outbound is not carried".to_owned()),
@@ -24387,6 +24562,10 @@ fn diagnose_outbounds(root: &Json) -> Vec<String> {
 }
 
 fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
+    find_outbound_with(root, false)
+}
+
+fn find_outbound_with(root: &Json, test: bool) -> Result<Option<Outbound>, String> {
     let Some(first) = root
         .get("outbounds")
         .and_then(Json::as_arr)
@@ -24400,6 +24579,9 @@ fn find_outbound(root: &Json) -> Result<Option<Outbound>, String> {
         Json::Arr(vec![first.clone()]),
     )]);
     let root = &only;
+    if let Some(lane) = crate::psiphon::psiphon_outbound(root, test)? {
+        return Ok(Some(Outbound::Psiphon(lane)));
+    }
     if let Some(foxy) = find_foxy_outbound(root) {
         return Ok(Some(Outbound::Foxy(Box::new(foxy))));
     }
@@ -38063,6 +38245,31 @@ mod tests {
         (associate, peer)
     }
 
+    #[test]
+    fn a_udp_association_answers_only_the_control_peer_and_its_pinned_source() {
+        let peer = Some(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let client = SocketAddr::from(([127, 0, 0, 1], 4000));
+        let slot = Mutex::new(None);
+        let mut pinned = None;
+        assert!(source_allowed(peer, &mut pinned, &slot, client));
+        assert_eq!(pinned, Some(client));
+        assert_eq!(*slot.lock().expect("slot"), Some(client));
+        assert!(!source_allowed(
+            peer,
+            &mut pinned,
+            &slot,
+            SocketAddr::from(([127, 0, 0, 1], 4001))
+        ));
+        assert!(!source_allowed(
+            peer,
+            &mut pinned,
+            &slot,
+            SocketAddr::from(([127, 0, 0, 2], 4000))
+        ));
+        let mut unpinned = None;
+        assert!(source_allowed(None, &mut unpinned, &slot, client));
+    }
+
     /// A lane with one edge in its ladder, so the dial path has something to walk.
     fn foxy_with_one_edge() -> FoxyOut {
         let mut foxy = foxy_without_edges();
@@ -46768,6 +46975,51 @@ mod tests {
         client.send(b"who-is").expect("sends");
         let (n, _) = client.recv_from(&mut back).expect("the door answers");
         assert_eq!(&back[..n], b"who-is", "the answer comes back to the client");
+    }
+
+    #[test]
+    fn a_dokodemo_door_keeps_two_clients_apart_over_a_socks_outbound() {
+        const PATIENCE: Duration = Duration::from_secs(10);
+        let target = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let target_addr = target.local_addr().expect("addr");
+        thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, src)) = target.recv_from(&mut buf) {
+                let _ = target.send_to(&buf[..n], src);
+            }
+        });
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr = server.local_addr().expect("addr");
+        thread::spawn(move || {
+            while let Ok((stream, _)) = server.accept() {
+                thread::spawn(move || serve_socks(stream, &freedom(), &no_accounts()));
+            }
+        });
+        let out = Outbound::Socks(SocksOut::new(
+            "127.0.0.1",
+            server_addr.port(),
+            "",
+            "",
+            crate::socks::Version::V5,
+        ));
+        let door = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = door.local_addr().expect("addr").port();
+        let dest = Destination::Address(target_addr);
+        let port_map: HashMap<u16, Destination> = HashMap::new();
+        thread::spawn(move || dokodemo_udp_door(&door, &dest, &port_map, &out));
+        let door_addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        for (client, payload) in [(&first, &b"one"[..]), (&second, &b"two"[..])] {
+            client.connect(door_addr).expect("connects");
+            client.set_read_timeout(Some(PATIENCE)).expect("timeout");
+            client.send(payload).expect("sends");
+        }
+        for (client, expected) in [(&first, &b"one"[..]), (&second, &b"two"[..])] {
+            let mut back = [0u8; 2048];
+            let (n, _) = client.recv_from(&mut back).expect("the door answers");
+            assert_eq!(&back[..n], expected, "each client gets its own answer");
+        }
     }
 
     /// The transparent redirect is refused by name: the original destination lives in a

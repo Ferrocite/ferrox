@@ -45,6 +45,7 @@ mod observatory;
 mod policy;
 mod process;
 mod proxy;
+mod psiphon;
 mod quic;
 mod reverse;
 mod router;
