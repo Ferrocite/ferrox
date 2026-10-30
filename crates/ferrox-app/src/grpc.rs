@@ -213,6 +213,8 @@ pub(crate) struct GrpcReader<R: Read = Connection> {
     eof: bool,
     /// The peer sent `END_STREAM`: the read half finished normally, so the write half may still be used.
     remote_end: bool,
+    /// The socket answers a poll instead of blocking, so a read past `END_STREAM` can pump control frames and hand the turn back.
+    poll: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -234,6 +236,7 @@ pub(crate) struct GrpcWriter {
 impl GrpcReader<Connection> {
     /// Arm or clear the poll quantum on the socket this reader reads through, so a peer that opens then stalls mid-header cannot pin the serve thread past the header read; as the `ws`, `httpupgrade` and `httpheader` readers do, and a duplicated socket inherits no read timeout on Windows.
     pub(crate) fn set_poll(&mut self, every: Option<std::time::Duration>) {
+        self.poll = every.is_some();
         let _ = self.read.set_read_timeout(every);
     }
 }
@@ -837,7 +840,7 @@ impl<R: Read> Read for GrpcReader<R> {
             // The next message may already be in the buffer behind the one just taken, and reading the socket first would block on it; that holds at END_STREAM too — the flag ends the frames, not the bytes.
             if self.decode().is_none() {
                 self.eof = true;
-                if self.remote_end {
+                if self.remote_end && self.poll {
                     return self.pump_after_end();
                 }
                 return Ok(0);
@@ -846,14 +849,14 @@ impl<R: Read> Read for GrpcReader<R> {
                 continue;
             }
             if self.eof {
-                if self.remote_end {
+                if self.remote_end && self.poll {
                     return self.pump_after_end();
                 }
                 return Ok(0);
             }
             if self.pump()?.is_none() {
                 self.eof = true;
-                if self.remote_end {
+                if self.remote_end && self.poll {
                     return self.pump_after_end();
                 }
                 return Ok(0);
@@ -1568,6 +1571,7 @@ fn new_reader<R: Read>(
         handshake: None,
         eof: false,
         remote_end: false,
+        poll: false,
     }
 }
 
@@ -2590,6 +2594,7 @@ mod tests {
         )
         .expect("dials");
         drop(writer);
+        reader.poll = true;
         let mut got = [0u8; 8];
         assert_eq!(reader.read(&mut got).expect("reads"), 4);
         assert_eq!(reader.read(&mut got).expect("reads"), 0);
