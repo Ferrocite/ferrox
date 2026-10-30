@@ -1778,7 +1778,7 @@ impl Runtime {
             default_direct: matches!(&route.default, Outbound::Freedom(_)),
             direct: &direct,
         };
-        routing.add_rules(rules, append, known, Some(check))
+        routing.add_rules(rules, append, known, Some(&check))
     }
 
     /// Drop every rule carrying `tag`, for `RoutingService.RemoveRule`.

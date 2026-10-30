@@ -1144,7 +1144,7 @@ impl Routing {
         raw: &[Json],
         append: bool,
         known: impl Fn(&str) -> bool,
-        server: Option<ServerRouteCheck<'_>>,
+        server: Option<&ServerRouteCheck<'_>>,
     ) -> Result<(), String> {
         let mut assets = Assets::new(self.asset_dirs.clone());
         let mut tags: HashSet<String> = if append {
@@ -1182,7 +1182,7 @@ impl Routing {
             }
             rules.push(rule);
         }
-        if let Some(check) = &server {
+        if let Some(check) = server {
             let script = self.script.as_deref();
             for inbound in check.inbounds {
                 let inbound = inbound.as_deref();
