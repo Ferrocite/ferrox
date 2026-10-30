@@ -3560,7 +3560,13 @@ fn serve_vless_grpc(
         return;
     }
     reader.set_poll(Some(RELAY_POLL));
-    crate::proxy::relay_sink(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
+    crate::proxy::relay_sink_drained_with(
+        reader,
+        &writer,
+        &uplink,
+        crate::grpc::mark_reader_dead,
+        |reader| crate::grpc::request_ended(reader),
+    );
 }
 
 fn serve_vless_httpheader(
@@ -7006,7 +7012,13 @@ fn serve_session_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
         return;
     }
     echo_trace("session grpc relaying");
-    relay_sink(creader, &cwriter, &uplink, crate::grpc::mark_reader_dead);
+    relay_sink_drained_with(
+        creader,
+        &cwriter,
+        &uplink,
+        crate::grpc::mark_reader_dead,
+        |reader| crate::grpc::request_ended(reader),
+    );
 }
 
 fn accept_tls_session(
@@ -8709,7 +8721,13 @@ fn dial_vless_rung(
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
             reader.set_poll(Some(RELAY_POLL));
-            crate::proxy::relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
+            crate::proxy::relay_sink_drained_with(
+                reader,
+                &writer,
+                client,
+                crate::grpc::mark_reader_dead,
+                |reader| crate::grpc::request_ended(reader),
+            );
             true
         }
         Rung::Xhttp => {
@@ -12408,7 +12426,13 @@ fn dial_trojan_rung(
             }
             note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             reader.set_poll(Some(RELAY_POLL));
-            crate::proxy::relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
+            crate::proxy::relay_sink_drained_with(
+                reader,
+                &writer,
+                client,
+                crate::grpc::mark_reader_dead,
+                |reader| crate::grpc::request_ended(reader),
+            );
             true
         }
         Rung::Xhttp => {
@@ -13586,9 +13610,15 @@ fn ride_carrier<S: Dialed, D: Dialed>(
             if !writer.send(header) {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            relay_sink_drained_with(ReplyReader::new(reader), &writer, client, |reader| {
-                crate::grpc::mark_reader_dead(reader.inner_mut());
-            });
+            relay_sink_drained_with(
+                ReplyReader::new(reader),
+                &writer,
+                client,
+                |reader| {
+                    crate::grpc::mark_reader_dead(reader.inner_mut());
+                },
+                |reader| crate::grpc::request_ended(reader.inner_mut()),
+            );
         }
         Carrier::Xhttp { settings, .. } => {
             let Some((reader, writer)) = tls_xhttp(server, session, second, &vless.host, settings)
@@ -14170,7 +14200,13 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
             if !writer.send(header) {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
+            relay_sink_drained_with(
+                reader,
+                &writer,
+                client,
+                crate::grpc::mark_reader_dead,
+                |reader| crate::grpc::request_ended(reader),
+            );
         }
         Carrier::Xhttp { settings, .. } => {
             let Some((reader, writer)) = tls_xhttp(
@@ -15233,7 +15269,13 @@ fn serve_trojan_grpc(
         return;
     };
     reader.set_poll(Some(RELAY_POLL));
-    crate::proxy::relay_sink(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
+    crate::proxy::relay_sink_drained_with(
+        reader,
+        &writer,
+        &uplink,
+        crate::grpc::mark_reader_dead,
+        |reader| crate::grpc::request_ended(reader),
+    );
 }
 
 fn serve_trojan_xhttp(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bool) {
@@ -15768,7 +15810,13 @@ fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
         return;
     };
     echo_trace("session grpc relaying");
-    relay_sink(creader, &cwriter, &uplink, crate::grpc::mark_reader_dead);
+    relay_sink_drained_with(
+        creader,
+        &cwriter,
+        &uplink,
+        crate::grpc::mark_reader_dead,
+        |reader| crate::grpc::request_ended(reader),
+    );
 }
 
 fn serve_vmess_kcp_tls(
@@ -21690,7 +21738,13 @@ where
     W: CarrierSink,
     F: FnOnce(&mut R) + Send + 'static,
 {
-    relay_ordered::<R, W, F, CLOSE_BEFORE_JOIN>(reader, writer, peer, on_reader_done)
+    relay_ordered::<R, W, F, _, CLOSE_BEFORE_JOIN, false>(
+        reader,
+        writer,
+        peer,
+        on_reader_done,
+        |_| false,
+    )
 }
 
 const CLOSE_BEFORE_JOIN: bool = true;
@@ -21717,6 +21771,23 @@ impl Forward {
             sent: 0,
             spins: 0,
             parked: None,
+        }
+    }
+}
+
+/// Where one upload leg stands: the buffer the peer has not taken, and whether a normal request end already closed its write half.
+struct Upload {
+    buffer: RelayBuf,
+    first: bool,
+    half_closed: bool,
+}
+
+impl Upload {
+    fn new() -> Self {
+        Self {
+            buffer: RelayBuf::new(),
+            first: true,
+            half_closed: false,
         }
     }
 }
@@ -21824,16 +21895,16 @@ fn forward_finished(
 /// when the sibling already did.
 fn upload_finished(
     read: std::io::Result<usize>,
-    buffer: &mut RelayBuf,
+    upload: &mut Upload,
     peer_write: &mut Connection,
     stall: Duration,
-    first: &mut bool,
+    request_ended: bool,
     ended: impl FnOnce() -> bool,
 ) -> Next {
     let _ = stall;
-    match read {
+    let next = match read {
         Ok(n) if n > 0 => {
-            if *first {
+            if upload.first {
                 echo_trace("relay bwd first read");
                 echo_trace("relay bwd forwarding");
             }
@@ -21842,15 +21913,16 @@ fn upload_finished(
                 crate::census::handle(peer_write),
                 Some(stall)
             );
-            if peer_write.write_all(buffer.filled(n)).is_err() {
+            if peer_write.write_all(upload.buffer.filled(n)).is_err() {
                 echo_trace("relay bwd peer write failed");
-                return Next::Done;
+                Next::Done
+            } else {
+                if upload.first {
+                    echo_trace("relay bwd forwarded");
+                    upload.first = false;
+                }
+                Next::More
             }
-            if *first {
-                echo_trace("relay bwd forwarded");
-                *first = false;
-            }
-            Next::More
         }
         // A carrier read that times out is not an idle socket to park: the frame that grants the sibling's window arrives on this read, so the lane takes another turn at once rather than a quantum later.
         Err(error) if is_timeout(&error) => {
@@ -21868,19 +21940,27 @@ fn upload_finished(
             echo_trace("relay bwd eof");
             Next::Done
         }
+    };
+    // A normal request end still needs the target write half closed, even while this lane pumps control frames.
+    if request_ended && !upload.half_closed {
+        let _ = peer_write.shutdown(Shutdown::Write);
+        upload.half_closed = true;
     }
+    next
 }
 
-fn relay_ordered<R, W, F, const CLOSE_FIRST: bool>(
+fn relay_ordered<R, W, F, E, const CLOSE_FIRST: bool, const DRAIN_REQUEST: bool>(
     reader: R,
     writer: &W,
     peer: &Connection,
     on_reader_done: F,
+    mut request_ended: E,
 ) -> Option<Arc<RelayFinish>>
 where
     R: Read + Send + 'static,
     W: CarrierSink,
     F: FnOnce(&mut R) + Send + 'static,
+    E: FnMut(&mut R) -> bool + Send + 'static,
 {
     echo_trace("relay start");
     let Ok(peer_read) = peer.try_clone() else {
@@ -21948,20 +22028,23 @@ where
     let mut peer_write = peer_write;
     let upload_flow = Arc::clone(&flow);
     let upload_writer = writer.clone();
-    let mut buffer = RelayBuf::new();
-    let mut first = true;
+    let mut upload = Upload::new();
     // Every wait of this shape carries the named stall, armed once outside the byte loop.
     let _ = peer_write.set_write_timeout(Some(stall));
     lane_pool::submit(
         Box::new(move || {
-            let read = reader.read(buffer.as_mut());
+            let read = reader.read(upload.buffer.as_mut());
+            let ended_request = DRAIN_REQUEST && request_ended(&mut reader);
             let next = upload_finished(
                 read,
-                &mut buffer,
+                &mut upload,
                 &mut peer_write,
                 stall,
-                &mut first,
-                || upload_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE),
+                ended_request,
+                || {
+                    (!DRAIN_REQUEST || ended_request)
+                        && upload_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
+                },
             );
             if next != Next::Done {
                 return next;
@@ -21989,21 +22072,29 @@ pub(crate) fn relay_sink_drained<R: Read + Send + 'static, W: CarrierSink>(
     writer: &W,
     peer: &Connection,
 ) -> Option<Arc<RelayFinish>> {
-    relay_sink_drained_with(reader, writer, peer, |_| {})
+    relay_ordered::<R, W, _, _, CLOSE_AFTER_JOIN, false>(reader, writer, peer, |_| {}, |_| false)
 }
 
-pub(crate) fn relay_sink_drained_with<R, W, F>(
+pub(crate) fn relay_sink_drained_with<R, W, F, E>(
     reader: R,
     writer: &W,
     peer: &Connection,
     on_reader_done: F,
+    request_ended: E,
 ) -> Option<Arc<RelayFinish>>
 where
     R: Read + Send + 'static,
     W: CarrierSink,
     F: FnOnce(&mut R) + Send + 'static,
+    E: FnMut(&mut R) -> bool + Send + 'static,
 {
-    relay_ordered::<R, W, F, CLOSE_AFTER_JOIN>(reader, writer, peer, on_reader_done)
+    relay_ordered::<R, W, F, E, CLOSE_AFTER_JOIN, true>(
+        reader,
+        writer,
+        peer,
+        on_reader_done,
+        request_ended,
+    )
 }
 
 pub(crate) fn relay_carried<R: Read + Send + 'static>(
@@ -29004,6 +29095,128 @@ mod tests {
             closed_empty || accepted.is_empty(),
             "a sink that closed before the reply must not accept it"
         );
+    }
+
+    /// A gRPC request that ends normally still needs its target write half closed: a target that
+    /// answers only after EOF must not wait out the response lane.
+    #[test]
+    fn a_grpc_request_half_close_reaches_a_target_that_waits_for_eof() {
+        let target = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let target_port = target.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut request = Vec::new();
+            stream.read_to_end(&mut request).expect("reads the request");
+            assert_eq!(request, b"request");
+            stream.write_all(b"reply").expect("writes");
+            let _ = stream.shutdown(Shutdown::Write);
+        });
+
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let carrier = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let (mut reader, writer) =
+                crate::grpc::accept(stream, "/TunnelService/Tun").expect("serves");
+            reader.set_poll(Some(RELAY_POLL));
+            let uplink = Connection::connect(("127.0.0.1", target_port)).expect("dials");
+            let flow = relay_sink_drained_with(
+                reader,
+                &writer,
+                &uplink,
+                crate::grpc::mark_reader_dead,
+                |reader| crate::grpc::request_ended(reader),
+            );
+            if let Some(flow) = flow {
+                flow.wait();
+            }
+            let _ = done_tx.send(());
+        });
+        let client = thread::spawn(move || {
+            let stream = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+            let (mut reader, writer) =
+                crate::grpc::connect(stream, "127.0.0.1", "/TunnelService/Tun").expect("dials");
+            assert!(writer.send(b"request"));
+            writer.close();
+            let mut reply = [0u8; 5];
+            reader.read_exact(&mut reply).expect("reads the reply");
+            assert_eq!(&reply, b"reply");
+            // Keep the client socket open past the request end, so the relay's reader polls for control frames rather than seeing EOF.
+            thread::sleep(Duration::from_millis(300));
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the relay finished: the target saw the request half-close");
+        client.join().expect("joins");
+        server.join().expect("joins");
+        carrier.join().expect("joins");
+    }
+
+    /// A target response half-close must not end the request lane: a client that keeps uploading
+    /// after the reply reaches the target instead of being marked dead.
+    #[test]
+    fn a_target_response_half_close_keeps_the_request_lane_open() {
+        let target = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let target_port = target.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = target.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let mut first = [0u8; 7];
+            stream.read_exact(&mut first).expect("reads the request");
+            assert_eq!(&first, b"request");
+            stream.write_all(b"reply").expect("writes");
+            let _ = stream.shutdown(Shutdown::Write);
+            let mut rest = Vec::new();
+            stream.read_to_end(&mut rest).expect("reads the rest");
+            assert_eq!(rest, b"more", "the request lane stopped after the reply");
+        });
+
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let carrier = thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            let (mut reader, writer) =
+                crate::grpc::accept(stream, "/TunnelService/Tun").expect("serves");
+            reader.set_poll(Some(RELAY_POLL));
+            let uplink = Connection::connect(("127.0.0.1", target_port)).expect("dials");
+            let flow = relay_sink_drained_with(
+                reader,
+                &writer,
+                &uplink,
+                crate::grpc::mark_reader_dead,
+                |reader| crate::grpc::request_ended(reader),
+            );
+            if let Some(flow) = flow {
+                flow.wait();
+            }
+            let _ = done_tx.send(());
+        });
+        let client = thread::spawn(move || {
+            let stream = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+            let (mut reader, writer) =
+                crate::grpc::connect(stream, "127.0.0.1", "/TunnelService/Tun").expect("dials");
+            assert!(writer.send(b"request"));
+            let mut reply = [0u8; 5];
+            reader.read_exact(&mut reply).expect("reads the reply");
+            assert_eq!(&reply, b"reply");
+            // Past the response lane's idle interval, the request lane must still take bytes.
+            thread::sleep(Duration::from_millis(1_500));
+            assert!(writer.send(b"more"), "the request lane was closed early");
+            writer.close();
+        });
+        done_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the relay finished: the request lane stayed open after the reply");
+        client.join().expect("joins");
+        server.join().expect("joins");
+        carrier.join().expect("joins");
     }
 
     /// A carrier that answers `Parked` keeps the window for the next lane turn: the relay must retry those bytes, not end the flow or move on to the next read.
