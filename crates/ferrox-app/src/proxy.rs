@@ -1029,6 +1029,8 @@ impl SendThrough {
 thread_local! {
     /// The source the outbound a flow entered names, read by the one dial seam.
     static SEND_THROUGH: std::cell::Cell<Option<SendThrough>> = const { std::cell::Cell::new(None) };
+    /// The `streamSettings.sockopt` that outbound names, read by the same seam.
+    static DIAL_SOCKOPTS: std::cell::RefCell<Option<Arc<crate::sockopt::SocketOptions>>> = const { std::cell::RefCell::new(None) };
 }
 
 struct SendThroughGuard;
@@ -1043,6 +1045,22 @@ impl SendThroughGuard {
 impl Drop for SendThroughGuard {
     fn drop(&mut self) {
         SEND_THROUGH.with(|cell| cell.set(None));
+    }
+}
+
+/// The options one flow's dial carries, cleared on drop so a pooled lane thread's next flow starts on the bare socket.
+struct DialSockoptsGuard;
+
+impl DialSockoptsGuard {
+    fn enter(sockopts: Option<Arc<crate::sockopt::SocketOptions>>) -> Self {
+        DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
+        Self
+    }
+}
+
+impl Drop for DialSockoptsGuard {
+    fn drop(&mut self) {
+        DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = None);
     }
 }
 
@@ -1083,29 +1101,47 @@ fn parse_send_through(outbound: &Json) -> Result<Option<SendThrough>, String> {
         .map_err(|_| refuse())
 }
 
-/// Whether any outbound names a source, so a config with no `routing` block still builds the plan
-/// that carries it.
-fn send_through_present(root: &Json) -> Result<bool, String> {
+/// Whether any outbound names a dial setting, so a config with no `routing` block still builds the
+/// plan that carries it.
+fn dial_settings_present(root: &Json) -> Result<bool, String> {
     let outbounds = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
     let mut present = false;
     for outbound in outbounds {
         present |= parse_send_through(outbound)?.is_some();
+        present |= parse_outbound_sockopt(outbound)?.is_some();
     }
     Ok(present)
 }
 
+/// The socket options an outbound's `streamSettings.sockopt` names: the mark, interface and TCP
+/// options its transport dial carries.
+fn parse_outbound_sockopt(
+    outbound: &Json,
+) -> Result<Option<crate::sockopt::SocketOptions>, String> {
+    crate::sockopt::parse_outbound(
+        outbound
+            .get("streamSettings")
+            .and_then(|s| s.get("sockopt")),
+    )
+}
+
 /// The routing table a config runs with: its own block, or an empty one when an outbound names a
-/// source the dial must carry.
+/// dial setting the plan must carry.
 fn routing_for(root: &Json) -> Result<Option<crate::router::Routing>, String> {
     match crate::router::Routing::parse(root)? {
         Some(routing) => Ok(Some(routing)),
-        None if send_through_present(root)? => Ok(Some(crate::router::Routing::empty())),
+        None if dial_settings_present(root)? => Ok(Some(crate::router::Routing::empty())),
         None => Ok(None),
     }
 }
 
-/// One dial that leaves from the source `sendThrough` names; the unbound dial stays the same.
-fn dial_from(target: &SocketAddr, source: IpAddr) -> std::io::Result<Connection> {
+/// One dial that leaves from the source `sendThrough` names and carries the options `sockopt`
+/// took; the plain dial stays the same.
+fn dial_from(
+    target: &SocketAddr,
+    source: Option<IpAddr>,
+    sockopts: Option<&crate::sockopt::SocketOptions>,
+) -> std::io::Result<Connection> {
     use socket2::{Domain, Protocol, SockAddr, Socket, Type};
     let domain = if target.is_ipv4() {
         Domain::IPV4
@@ -1113,18 +1149,26 @@ fn dial_from(target: &SocketAddr, source: IpAddr) -> std::io::Result<Connection>
         Domain::IPV6
     };
     let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
-    socket.bind(&SockAddr::from(SocketAddr::new(source, 0)))?;
+    if let Some(sockopts) = sockopts {
+        sockopts.apply_to(&socket, *target)?;
+    }
+    if let Some(source) = source {
+        socket.bind(&SockAddr::from(SocketAddr::new(source, 0)))?;
+    }
     socket.connect_timeout(&SockAddr::from(*target), budgets::dial())?;
     Ok(Connection::Tcp(std::net::TcpStream::from(socket)))
 }
 
 fn dial(target: &SocketAddr) -> Result<Connection, Failure> {
-    // The seam's one dial entry: a named source binds before the same budget, and no source is the TCP dial unchanged.
-    let source = SEND_THROUGH.with(std::cell::Cell::get);
-    let stream = match source.and_then(SendThrough::address) {
-        Some(source) => dial_from(target, source)
+    // The seam's one dial entry: a named source or option builds the socket before the same budget, and neither is the TCP dial unchanged.
+    let source = SEND_THROUGH
+        .with(std::cell::Cell::get)
+        .and_then(SendThrough::address);
+    let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow().clone());
+    let stream = match (source, sockopts) {
+        (None, None) => crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
             .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
-        None => crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
+        (source, sockopts) => dial_from(target, source, sockopts.as_deref())
             .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
     };
     no_delay(&stream);
@@ -1684,7 +1728,10 @@ struct RouteShared {
     /// The source each outbound's `sendThrough` names, and the default outbound's own.
     sources: HashMap<String, SendThrough>,
     default_source: Option<SendThrough>,
-    has_sources: bool,
+    /// The socket options each outbound's `streamSettings.sockopt` names, and the default's own.
+    sockopts: HashMap<String, Arc<crate::sockopt::SocketOptions>>,
+    default_sockopts: Option<Arc<crate::sockopt::SocketOptions>>,
+    has_dial_settings: bool,
     dynamic: Arc<RwLock<Dynamic>>,
     changed: AtomicBool,
     closed: Outbound,
@@ -2187,12 +2234,18 @@ impl RoutePlan {
         facts: FlowFacts<'_>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         let answer = self.lane_with_protocol_untracked(asked, network, client, facts);
-        if self.shared.has_sources {
-            let source = match answer.1.as_deref() {
+        if self.shared.has_dial_settings {
+            let tag = answer.1.as_deref();
+            let source = match tag {
                 Some(tag) => self.shared.sources.get(tag).copied(),
                 None => self.shared.default_source,
             };
             SEND_THROUGH.with(|cell| cell.set(source));
+            let sockopts = match tag {
+                Some(tag) => self.shared.sockopts.get(tag).cloned(),
+                None => self.shared.default_sockopts.clone(),
+            };
+            DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
         }
         answer
     }
@@ -2517,7 +2570,17 @@ fn route_shared_with_api(
             sources.insert((*tag).to_owned(), source);
         }
     }
-    let has_sources = default_source.is_some() || !sources.is_empty();
+    let default_sockopts = parse_outbound_sockopt(first)?.map(Arc::new);
+    let mut sockopts = HashMap::new();
+    for (tag, config) in &configs {
+        if let Some(options) = parse_outbound_sockopt(config)? {
+            sockopts.insert((*tag).to_owned(), Arc::new(options));
+        }
+    }
+    let has_dial_settings = default_source.is_some()
+        || !sources.is_empty()
+        || default_sockopts.is_some()
+        || !sockopts.is_empty();
     let targets: Vec<&str> = if routing.script().is_some() {
         configs.keys().copied().collect()
     } else {
@@ -2645,7 +2708,9 @@ fn route_shared_with_api(
         default_tag,
         sources,
         default_source,
-        has_sources,
+        sockopts,
+        default_sockopts,
+        has_dial_settings,
         dynamic,
         changed: AtomicBool::new(false),
         closed: Outbound::Block(ferrox_core::blackhole::Response::None),
@@ -16444,6 +16509,7 @@ pub(crate) fn serve_connect(
     let tag = tag.map(str::to_owned).or_else(default_outbound_tag);
     let _outbound = OutboundTag::enter(tag.as_deref());
     let _source = SendThroughGuard::enter(SEND_THROUGH.with(std::cell::Cell::take));
+    let _sockopts = DialSockoptsGuard::enter(DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take()));
     if let Outbound::Loopback(loopback) = out {
         let overridden = loopback_asked(loopback, asked, &client);
         let asked = overridden.as_ref().unwrap_or(asked);
@@ -49478,6 +49544,68 @@ mod tests {
             echo.join().expect("echo");
             assert_eq!(peer, "127.0.0.2".parse::<IpAddr>().expect("source"));
         }
+    }
+
+    /// The socket options an outbound's `streamSettings.sockopt` names are the ones the socket its
+    /// dial makes carries, not the OS defaults.
+    #[cfg(unix)]
+    #[test]
+    fn an_outbound_sockopt_reaches_the_dial_socket() {
+        use std::os::fd::AsRawFd as _;
+
+        let root = crate::json::parse(
+            r#"{"routing":{},"outbounds":[{"protocol":"freedom","streamSettings":{"sockopt":{"tcpKeepAliveIdle":11,"tcpKeepAliveInterval":7}}}]}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let asked = Destination::Name("127.0.0.1".to_owned(), 9);
+        let (_lane, _tag) = plan.lane_with_protocol(
+            &asked,
+            crate::router::Network::Tcp,
+            None,
+            FlowFacts::default(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("echo binds");
+        let target: SocketAddr = listener.local_addr().expect("address");
+        let echo = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+        let stream = dial_or_report(&target).expect("the dial reaches the echo");
+        let fd = stream.as_raw_fd();
+        assert_ne!(
+            socket_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+            0,
+            "the outbound's keepalive reaches the socket"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(socket_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPALIVE), 11);
+        #[cfg(target_os = "linux")]
+        assert_eq!(socket_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), 11);
+        assert_eq!(socket_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), 7);
+        echo.join().expect("echo");
+    }
+
+    #[cfg(unix)]
+    fn socket_int(fd: std::os::fd::RawFd, level: libc::c_int, name: libc::c_int) -> i32 {
+        let mut value = 0i32;
+        let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: the descriptor is live and the value buffer is writable.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                name,
+                std::ptr::addr_of_mut!(value).cast(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        value
     }
 
     /// A `WireGuard` server datagram takes the tag its rules pick for UDP, follows that freedom's
