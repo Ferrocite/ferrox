@@ -52604,6 +52604,31 @@ mod webhook_route_tests {
         (port, receive)
     }
 
+    fn route_outbound(json: &str, tag: Option<&str>, source_known: bool) -> Outbound {
+        let root = crate::json::parse(json).expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        Outbound::Route(Arc::new(RoutePlan::new(
+            shared,
+            tag.map(str::to_owned),
+            None,
+            source_known,
+        )))
+    }
+
+    fn socks_front_with(out: Outbound) -> u16 {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        port
+    }
+
     #[test]
     fn a_split_udp_webhook_names_the_datagram_endpoints() {
         let (port, receive) = receiver(1);
