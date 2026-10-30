@@ -1032,7 +1032,52 @@ pub(crate) struct HttpUrl {
     pub(crate) port: u16,
     pub(crate) authority: String,
     pub(crate) path: String,
-    pub(crate) userinfo: Option<String>,
+    pub(crate) userinfo: Option<Vec<u8>>,
+}
+
+/// The `username:password` bytes a URL's userinfo names, percent-decoded per component and with
+/// the colon Go's Basic auth always writes, even when the password is absent.
+fn decode_userinfo(raw: &str) -> Result<Vec<u8>, String> {
+    let (user, password) = raw.split_once(':').unwrap_or((raw, ""));
+    let mut out = decode_userinfo_component(user)?;
+    out.push(b':');
+    out.extend_from_slice(&decode_userinfo_component(password)?);
+    Ok(out)
+}
+
+fn decode_userinfo_component(raw: &str) -> Result<Vec<u8>, String> {
+    let bytes = raw.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' {
+            let high = userinfo_hex(
+                *bytes
+                    .get(at + 1)
+                    .ok_or("URL userinfo has a short percent escape")?,
+            )?;
+            let low = userinfo_hex(
+                *bytes
+                    .get(at + 2)
+                    .ok_or("URL userinfo has a short percent escape")?,
+            )?;
+            out.push(high << 4 | low);
+            at += 3;
+        } else {
+            out.push(bytes[at]);
+            at += 1;
+        }
+    }
+    Ok(out)
+}
+
+fn userinfo_hex(byte: u8) -> Result<u8, String> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err("URL userinfo has an invalid percent escape".to_owned()),
+    }
 }
 
 impl HttpUrl {
@@ -1046,7 +1091,7 @@ impl HttpUrl {
         let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let target = &rest[..split];
         let (userinfo, authority) = match target.rsplit_once('@') {
-            Some((userinfo, authority)) => (Some(userinfo.to_owned()), authority),
+            Some((userinfo, authority)) => (Some(decode_userinfo(userinfo)?), authority),
             None => (None, target),
         };
         if authority.is_empty() {

@@ -158,6 +158,9 @@ impl Webhook {
     /// The POST, from the URL it parses to the status line it reads, inside the one budget.
     fn send(&self, body: &str) -> Result<(), String> {
         let url = HttpUrl::parse(&self.url)?;
+        if url.userinfo.is_some() && !url.tls {
+            return Err("refuses URL credentials over plaintext http".to_owned());
+        }
         let deadline = Instant::now() + BUDGET;
         let connection = self.dial(&url, left(deadline))?;
         connection
@@ -254,13 +257,13 @@ fn abstract_name(name: &str) -> Result<Vec<u8>, String> {
 /// The exact request bytes: the JSON content type first, then each configured header, a repeated name
 /// replacing the one already written as `http.Header.Set` does.
 fn request_bytes(url: &HttpUrl, headers: &[(String, String)], body: &str) -> Vec<u8> {
-    let authorization = url.userinfo.as_deref().filter(|_| {
+    let authorization = url.userinfo.as_ref().filter(|_| {
         !headers
             .iter()
             .any(|(name, _)| name.eq_ignore_ascii_case("Authorization"))
     });
-    let authorization = authorization
-        .map(|userinfo| format!("Basic {}", ferrox_core::b64::encode(userinfo.as_bytes())));
+    let authorization =
+        authorization.map(|userinfo| format!("Basic {}", ferrox_core::b64::encode(userinfo)));
     let mut wire: Vec<(&str, &str)> = Vec::with_capacity(headers.len() + 2);
     wire.push(("Content-Type", "application/json"));
     for (name, value) in headers {
