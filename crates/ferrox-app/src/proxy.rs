@@ -6392,8 +6392,14 @@ fn serve_vless_quic_inbound(
         return false;
     };
     let users = Arc::clone(users);
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
     let serve: crate::quic::Serve = Arc::new(move |stream| {
-        serve_vless_quic(stream, &users, freedom, decryption.as_deref());
+        serve_vless_quic(
+            stream.with_meter(meter.clone()),
+            &users,
+            freedom,
+            decryption.as_deref(),
+        );
     });
     thread::spawn(move || {
         crate::quic::serve_loop(
@@ -6441,6 +6447,7 @@ fn serve_vless_quic(
         stream.close();
         return;
     }
+    let stream = stream.with_meter(crate::stats::user(&user.email, user.level));
     let stop = stream.clone();
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || stop.close());
     match cmd {
@@ -23576,7 +23583,7 @@ fn one_vless_user(id: &[u8; 16]) -> [VlessUser; 1] {
 #[cfg(all(test, unix))]
 fn enable_user_stats() {
     let root = crate::json::parse(
-        r#"{"stats":{},"policy":{"levels":{"1":{"statsUserUplink":true,"statsUserDownlink":true,"statsUserOnline":true}}}}"#,
+        r#"{"stats":{},"policy":{"system":{"statsInboundUplink":true,"statsInboundDownlink":true},"levels":{"1":{"statsUserUplink":true,"statsUserDownlink":true,"statsUserOnline":true}}}}"#,
     )
     .expect("stats config");
     crate::policy::install(&root).expect("policy installs");
@@ -41465,6 +41472,73 @@ mod tests {
                 Some(decryption.as_ref()),
             );
         }))
+    }
+
+    /// The production QUIC inbound counts the bytes it reads and writes for the inbound, and the
+    /// authenticated flow against its user: the same counters the TCP front arms before the header.
+    #[cfg(unix)]
+    #[test]
+    fn a_quic_vless_flow_counts_its_inbound_and_user() {
+        let _serial = quic_serial();
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        crate::policy::clear();
+        enable_user_stats();
+
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tag = format!("ferrox-quic-stats-{}-{stamp}", std::process::id());
+        let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+        let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
+        std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
+        std::fs::write(&key_path, &key_pem).expect("stages key");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let id = uuid_bytes(uuid).expect("id");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","port":{port},"tag":"quic-in","settings":{{"clients":[{{"id":"{uuid}","email":"quic@example","level":1}}]}},"streamSettings":{{"network":"quic","security":"tls","tlsSettings":{{"certificates":[{{"certificateFile":"{}","keyFile":"{}"}}]}}}}}}"#,
+            cert_path.to_str().expect("ascii").replace('\\', "\\\\"),
+            key_path.to_str().expect("ascii").replace('\\', "\\\\")
+        ))
+        .expect("parses");
+        assert!(serve_vless_inbound(
+            &format!("127.0.0.1:{port}"),
+            &inbound,
+            true,
+            "test",
+            &crate::reverse::Portals::default()
+        ));
+        let echo_port = echo_loop();
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let header = vless_header(&id, 1, &Destination::from(target));
+        let back = quic_vless_round_trip(
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            &roots,
+            &header,
+            b"ping",
+        );
+        assert_eq!(&back, b"ping");
+        let snapshot = crate::stats::snapshot();
+        let inbound = snapshot.inbound.get("quic-in").expect("the inbound counts");
+        assert!(
+            inbound.uplink > 0 && inbound.downlink > 0,
+            "both directions moved: {inbound:?}"
+        );
+        let user = snapshot.user.get("quic@example").expect("the user counts");
+        assert!(
+            user.uplink > 0 && user.downlink > 0,
+            "both directions moved: {user:?}"
+        );
+        crate::stats::clear();
+        crate::policy::clear();
     }
 
     /// One VLESS round trip over a direct QUIC stream: the same header and response bytes as TCP.
