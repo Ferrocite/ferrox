@@ -2,7 +2,6 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use super::config::Config;
@@ -121,15 +120,19 @@ fn scheduler() -> &'static Arc<Scheduler> {
             conns: Mutex::new(Vec::new()),
             wake: Notifier::new(),
         });
-        let weak = Arc::downgrade(&scheduler);
-        thread::Builder::new()
-            .name("kcp-flush".to_owned())
-            .spawn(move || scheduler_loop(&weak))
-            .expect("spawns the flush thread");
+        #[cfg(not(miri))]
+        {
+            let weak = Arc::downgrade(&scheduler);
+            std::thread::Builder::new()
+                .name("kcp-flush".to_owned())
+                .spawn(move || scheduler_loop(&weak))
+                .expect("spawns the flush thread");
+        }
         scheduler
     })
 }
 
+#[cfg(not(miri))]
 fn scheduler_loop(weak: &Weak<Scheduler>) {
     let mut seen = 0;
     loop {
@@ -257,7 +260,9 @@ pub struct Connection {
     terminated: AtomicBool,
     started: AtomicBool,
     write_pending: AtomicBool,
+    #[cfg(any(test, not(miri)))]
     last_flush: Mutex<Instant>,
+    #[cfg(any(test, not(miri)))]
     last_uncond: Mutex<Instant>,
     #[cfg(test)]
     flush_calls: AtomicU32,
@@ -322,6 +327,7 @@ impl Connection {
             }),
         });
         let now = Instant::now();
+        #[cfg(any(test, not(miri)))]
         let tick = Duration::from_millis(u64::from(tti));
         Arc::new(Self {
             ctx: Arc::clone(&ctx),
@@ -340,7 +346,9 @@ impl Connection {
             terminated: AtomicBool::new(false),
             started: AtomicBool::new(false),
             write_pending: AtomicBool::new(false),
+            #[cfg(any(test, not(miri)))]
             last_flush: Mutex::new(now.checked_sub(tick).unwrap_or(now)),
+            #[cfg(any(test, not(miri)))]
             last_uncond: Mutex::new(now),
             #[cfg(test)]
             flush_calls: AtomicU32::new(0),
@@ -355,6 +363,7 @@ impl Connection {
         }
     }
 
+    #[cfg(any(test, not(miri)))]
     fn poll(&self, now: Instant) -> Instant {
         let tick = Duration::from_millis(u64::from(self.ctx.config.tti));
         if self.terminated.load(Ordering::SeqCst) {
@@ -809,9 +818,11 @@ mod tests {
     #[test]
     fn a_write_that_never_succeeds_stops_at_the_attempt_limit() {
         let (recorder, conn) = recording_connection(u32::MAX);
+        #[cfg(not(miri))]
         let started = Instant::now();
         conn.ping(1, Command::Ping);
         assert_eq!(recorder.attempts.load(Ordering::SeqCst), WRITE_ATTEMPTS);
+        #[cfg(not(miri))]
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "a dead sink held the flush for {:?}; the scheduler drives every connection",

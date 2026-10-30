@@ -927,6 +927,7 @@ pub(crate) fn open12_into(
 mod tests {
     use super::*;
 
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_tls12_gcm_record_opens_behind_its_explicit_nonce() {
         let suite = Suite::EcdheAes128GcmSha256;
@@ -947,6 +948,7 @@ mod tests {
         assert_eq!(&body[start..start + len], b"ping");
     }
 
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_tls12_cbc_record_pads_to_the_rfc_length_and_open_back() {
         let suite = Suite::EcdheAes128CbcSha;
@@ -982,6 +984,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_tls12_cbc_record_past_one_batch_opens_the_same_both_ways() {
         let suite = Suite::EcdheAes256CbcSha;
@@ -1009,6 +1012,7 @@ mod tests {
         assert_eq!(&body[start..start + same], &plain[..]);
     }
 
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_tls12_3des_record_pads_to_its_own_block_and_open_back() {
         let suite = Suite::Ecdhe3DesCbcSha;
@@ -1057,6 +1061,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     #[test]
     fn a_tls12_rc4_record_carries_its_mac_and_no_iv() {
         let suite = Suite::EcdheRc4Sha;
