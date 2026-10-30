@@ -5107,10 +5107,12 @@ struct ResolvePool {
     next: AtomicUsize,
 }
 
+type ResolveLookup = Box<dyn FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send>;
+
 struct ResolveJob {
     host: String,
     port: u16,
-    lookup: Box<dyn FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send>,
+    lookup: ResolveLookup,
     reply: SyncSender<std::io::Result<Vec<SocketAddr>>>,
 }
 
@@ -5128,7 +5130,7 @@ impl ResolvePool {
             match thread::Builder::new()
                 .name("ferrox-resolve".to_owned())
                 .stack_size(RESOLVE_STACK)
-                .spawn(move || resolve_worker(receiver))
+                .spawn(move || resolve_worker(&receiver))
             {
                 Ok(_) => queues.push(sender),
                 Err(error) => eprintln!("proxy: cannot start a resolver worker: {error}"),
@@ -5159,7 +5161,7 @@ impl ResolvePool {
     }
 }
 
-fn resolve_worker(receiver: Receiver<ResolveJob>) {
+fn resolve_worker(receiver: &Receiver<ResolveJob>) {
     while let Ok(job) = receiver.recv() {
         let ResolveJob {
             host,
