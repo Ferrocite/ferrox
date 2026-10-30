@@ -3916,6 +3916,7 @@ fn serve_vless_raw_with<D, R>(
     vless_raw_reply(stream, users, freedom, fallbacks, &[], (probe, carried), io);
 }
 
+#[allow(clippy::too_many_lines)]
 fn vless_raw_reply<D, R>(
     stream: Connection,
     users: &[VlessUser],
