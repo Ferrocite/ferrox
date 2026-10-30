@@ -118,7 +118,7 @@ PSIPHON_USER=""
 PSIPHON_PASS=""
 PSIPHON_POOL=""
 PSIPHON_WORKERS=""
-PSIPHON_AGGRESSIVE=0
+PSIPHON_AGGRESSIVE=""
 PSIPHON_FEATURES=""
 PSIPHON_LATENCY=""
 PSIPHON_CDN_PROFILE=""
@@ -134,6 +134,13 @@ PSIPHON_NETWORK_ID=""
 PSIPHON_ADDITIONAL_PARAMS=""
 PSIPHON_ESTABLISH_TIMEOUT=""
 PSIPHON_EMIT_BYTES=0
+PSIPHON_CONDUIT_MODE=""
+PSIPHON_CONDUIT_TIMEOUT=""
+PSIPHON_SHARE=0
+PSIPHON_SERVER_LISTS=""
+PSIPHON_OSL=""
+PSIPHON_ENTRY_KEY=""
+PSIPHON_EXCHANGE_KEY=""
 PROBE_TIMEOUT=20
 FRONTS="socks,http,mixed"
 FRONTS_SET=0
@@ -276,11 +283,21 @@ psiphon options (the client's own binary, its own tunnel, and the lane's local S
   --psiphon-pass PASS    the local proxy's password
   --psiphon-pool N       tunnels to keep in parallel
   --psiphon-workers N    connection attempts to keep in parallel
-  --psiphon-aggressive   try every server/protocol pair in one round
+  --psiphon-aggressive   try every server/protocol pair in one round (the default)
+  --psiphon-no-aggressive  do not try every server/protocol pair in one round
+  --psiphon-conduit-mode NAME  auto|shirokhorshid|public, default auto (auto retries
+                         the public network when the personal compartment is late)
+  --psiphon-conduit-timeout SECS  how long the personal conduit gets before a
+                         public retry, default 180
+  --psiphon-share        listen on every interface so the proxy can be shared
+  --psiphon-server-list LIST  remote server-list URLs (comma separated)
+  --psiphon-osl LIST     obfuscated server-list root URLs (comma separated)
+  --psiphon-entry-key KEY  server-entry signature public key
+  --psiphon-exchange-key KEY  exchange obfuscation key
   --psiphon-feature LIST client features to report (comma separated)
   --psiphon-latency N    network timeout multiplier, at least 1
   --psiphon-disable-timeouts  ask the client for a 0.1 latency lambda
-  --psiphon-cdn-profile NAME  shirokhorshid|legacy|android built-in CDN edges and SNI
+  --psiphon-cdn-profile NAME  shirokhorshid|legacy|android|off built-in CDN edges and SNI
   --psiphon-geoip FILE   MaxMind country database for in-proxy country checks
   --psiphon-reject-censored   reject in-proxy relays in IR, CN, RU, BY, TM, KP
   --psiphon-reject-country LIST  reject these in-proxy country codes
@@ -836,14 +853,17 @@ psiphon_outbound() {
     "$PSIPHON_REJECT_COUNTRIES" "$PSIPHON_COMPARTMENT" "$PSIPHON_DISABLE_TIMEOUTS" \
     "$PSIPHON_DNS_ALTERNATE" "$PSIPHON_DEVICE_LOCATION" "$PSIPHON_DEVICE_REGION" \
     "$PSIPHON_NETWORK_ID" "$PSIPHON_ADDITIONAL_PARAMS" "$PSIPHON_ESTABLISH_TIMEOUT" \
-    "$PSIPHON_EMIT_BYTES" <<'PY'
+    "$PSIPHON_EMIT_BYTES" "$PSIPHON_CONDUIT_MODE" "$PSIPHON_CONDUIT_TIMEOUT" \
+    "$PSIPHON_SHARE" "$PSIPHON_SERVER_LISTS" "$PSIPHON_OSL" "$PSIPHON_ENTRY_KEY" \
+    "$PSIPHON_EXCHANGE_KEY" <<'PY'
 import json, sys
 
 (binary, state, listen, http, region, shape, ready, base, entries, upstream,
  split, split_regions, user, password, pool, workers, aggressive, features,
  latency, cdn_profile, geoip, reject_censored, reject_countries, compartment,
  disable_timeouts, dns_alternate, device_location, device_region, network_id,
- additional_params, establish_timeout, emit_bytes) = sys.argv[1:]
+ additional_params, establish_timeout, emit_bytes, conduit_mode, conduit_timeout,
+ share, server_lists, osl, entry_key, exchange_key) = sys.argv[1:]
 settings = {"dataRootDirectory": state}
 if binary:
     settings["binary"] = binary
@@ -876,8 +896,8 @@ if pool.isdigit():
     settings["tunnelPoolSize"] = int(pool)
 if workers.isdigit():
     settings["connectionWorkerPoolSize"] = int(workers)
-if aggressive == "1":
-    settings["aggressiveEstablishment"] = True
+if aggressive:
+    settings["aggressiveEstablishment"] = aggressive == "1"
 listed = [value.strip() for value in features.split(",") if value.strip()]
 if listed:
     settings["clientFeatures"] = listed
@@ -911,6 +931,23 @@ if establish_timeout.isdigit():
     settings["establishTunnelTimeoutSeconds"] = int(establish_timeout)
 if emit_bytes == "1":
     settings["emitBytesTransferred"] = True
+if conduit_mode:
+    settings["conduitMode"] = conduit_mode
+if conduit_timeout.isdigit():
+    settings["conduitTimeoutSeconds"] = int(conduit_timeout)
+if share == "1":
+    settings["shareProxyOnNetwork"] = True
+for key, value in (
+    ("serverListURLs", server_lists),
+    ("obfuscatedServerListRootUrls", osl),
+):
+    listed = [item.strip() for item in value.split(",") if item.strip()]
+    if listed:
+        settings[key] = listed
+if entry_key:
+    settings["serverEntrySignaturePublicKey"] = entry_key
+if exchange_key:
+    settings["exchangeObfuscationKey"] = exchange_key
 print(json.dumps({"protocol": "psiphon", "settings": settings}))
 PY
 }
@@ -2352,10 +2389,23 @@ while [ $# -gt 0 ]; do
     --psiphon-pool) need_value --psiphon-pool "a tunnel count" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*) die "--psiphon-pool wants a number, got '$2'; nothing was started." ;; esac; PSIPHON_POOL="$2"; shift 2 ;;
     --psiphon-workers) need_value --psiphon-workers "a worker count" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*) die "--psiphon-workers wants a number, got '$2'; nothing was started." ;; esac; PSIPHON_WORKERS="$2"; shift 2 ;;
     --psiphon-aggressive) PSIPHON_AGGRESSIVE=1; shift ;;
+    --psiphon-no-aggressive) PSIPHON_AGGRESSIVE=0; shift ;;
+    --psiphon-conduit-mode)
+      need_value --psiphon-conduit-mode "auto, shirokhorshid or public" "$#" "${2:-}"
+      case "$2" in
+        auto|shirokhorshid|public) PSIPHON_CONDUIT_MODE="$2" ;;
+        *) die "--psiphon-conduit-mode wants auto, shirokhorshid or public, got '$2'; nothing was started." ;;
+      esac; shift 2 ;;
+    --psiphon-conduit-timeout) need_value --psiphon-conduit-timeout "seconds, at least 1" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*|0) die "--psiphon-conduit-timeout wants seconds, at least 1, got '$2'; nothing was started." ;; esac; PSIPHON_CONDUIT_TIMEOUT="$2"; shift 2 ;;
+    --psiphon-share) PSIPHON_SHARE=1; shift ;;
+    --psiphon-server-list) need_value --psiphon-server-list "server-list URLs" "$#" "${2:-}"; PSIPHON_SERVER_LISTS="$2"; shift 2 ;;
+    --psiphon-osl) need_value --psiphon-osl "obfuscated server-list root URLs" "$#" "${2:-}"; PSIPHON_OSL="$2"; shift 2 ;;
+    --psiphon-entry-key) need_value --psiphon-entry-key "a server-entry public key" "$#" "${2:-}"; PSIPHON_ENTRY_KEY="$2"; shift 2 ;;
+    --psiphon-exchange-key) need_value --psiphon-exchange-key "an exchange obfuscation key" "$#" "${2:-}"; PSIPHON_EXCHANGE_KEY="$2"; shift 2 ;;
     --psiphon-feature) need_value --psiphon-feature "client features" "$#" "${2:-}"; PSIPHON_FEATURES="$2"; shift 2 ;;
     --psiphon-latency) need_value --psiphon-latency "a multiplier of at least 1" "$#" "${2:-}"; PSIPHON_LATENCY="$2"; shift 2 ;;
     --psiphon-disable-timeouts) PSIPHON_DISABLE_TIMEOUTS=1; shift ;;
-    --psiphon-cdn-profile) need_value --psiphon-cdn-profile "shirokhorshid, legacy or android" "$#" "${2:-}"; case "$2" in shirokhorshid|legacy|android) PSIPHON_CDN_PROFILE="$2" ;; *) die "--psiphon-cdn-profile wants shirokhorshid, legacy or android, got '$2'; nothing was started." ;; esac; shift 2 ;;
+    --psiphon-cdn-profile) need_value --psiphon-cdn-profile "shirokhorshid, legacy, android or off" "$#" "${2:-}"; case "$2" in shirokhorshid|legacy|android|off) PSIPHON_CDN_PROFILE="$2" ;; *) die "--psiphon-cdn-profile wants shirokhorshid, legacy, android or off, got '$2'; nothing was started." ;; esac; shift 2 ;;
     --psiphon-geoip) need_value --psiphon-geoip "a MaxMind database" "$#" "${2:-}"; PSIPHON_GEOIP="$2"; shift 2 ;;
     --psiphon-reject-censored) PSIPHON_REJECT_CENSORED=1; shift ;;
     --psiphon-reject-country) need_value --psiphon-reject-country "country codes" "$#" "${2:-}"; PSIPHON_REJECT_COUNTRIES="$2"; shift 2 ;;
@@ -2466,8 +2516,14 @@ esac
 # A VeePN flow pays a launch and a list before bytes move, so its first probe
 # waits longer than a lane that configures the server it dials.
 [ "$OUTBOUND" = veepn ] && PROBE_TIMEOUT=45
-# Psiphon downloads a server list and opens a tunnel before its local SOCKS answers.
-[ "$OUTBOUND" = psiphon ] && PROBE_TIMEOUT=200
+# Psiphon downloads a server list and opens a tunnel before its local SOCKS answers;
+# a conduit may spend one timeout on the personal compartment and another on public.
+if [ "$OUTBOUND" = psiphon ]; then
+  PROBE_TIMEOUT=200
+  if [ "$PSIPHON_SHAPE" = conduit ] && [ -n "$PSIPHON_COMPARTMENT" ] && [ "$PSIPHON_CONDUIT_MODE" != public ]; then
+    PROBE_TIMEOUT=600
+  fi
+fi
 
 # Only up, serve and version need the binary: down, status and login must
 # still work when it was never fetched.

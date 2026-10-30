@@ -90,6 +90,7 @@ jobs:
           STATE="$RUNNER_TEMP/psiphon-state-$ENGINE"
           mkdir -p "$STATE"
           : > psiphon-legs.tsv
+          : > psiphon-metrics.tsv
           CLIENT="$CLIENT" STATE="$STATE" python3 - <<'PY'
           import json, os
           settings = {
@@ -122,6 +123,21 @@ jobs:
             kill -KILL "$LANE_PID" 2>/dev/null || true
           }
           trap stop_lane EXIT
+          # An MSYS pid is not a Windows pid, so the lane's own pid is converted once; the two
+          # spaces are allocated independently, so a native pid is never converted back.
+          winpid() {
+            local native
+            native=$(cat "/proc/$1/winpid" 2>/dev/null) && [ -n "$native" ] || native="$1"
+            printf '%s' "$native"
+          }
+          sample_native() {
+            local label="$1" native="$2" line rss cpu
+            [ -n "$native" ] || return 0
+            line=$(powershell.exe -NoProfile -Command "\$p = Get-Process -Id $native -ErrorAction Stop; '{0} {1}' -f [math]::Floor(\$p.WorkingSet64/1024), \$p.CPU" 2>/dev/null | tr -d '\r' | xargs) || return 0
+            read -r rss cpu <<< "$line"
+            [ -n "$rss" ] || return 0
+            printf '%s\t%s\t%s\n' "$label" "$rss" "$cpu" >> psiphon-metrics.tsv
+          }
           via() {
             local front="$1" port="$2"
             shift 2
@@ -169,6 +185,12 @@ jobs:
           fi
           fetch_mb mixed 10809 "psiphon-mixed-$ENGINE.bin" mixed
           fetch_mb socks 10808 "psiphon-socks-warm-$ENGINE.bin" "socks warm"
+          NATIVE_LANE=$(winpid "$LANE_PID")
+          sample_native lane "$NATIVE_LANE"
+          # The console client is a native Windows child, which the MSYS process table cannot see.
+          for child in $(powershell.exe -NoProfile -Command "(Get-CimInstance Win32_Process -Filter 'ParentProcessId=$NATIVE_LANE').ProcessId" 2>/dev/null | tr -d '\r'); do
+            sample_native client "$child"
+          done
       - name: Keep the timings and the lane log
         if: always()
         uses: actions/upload-artifact@v4
@@ -176,6 +198,7 @@ jobs:
           name: psiphon-legs-${{ matrix.engine }}
           path: |
             psiphon-legs.tsv
+            psiphon-metrics.tsv
             psiphon-windows-${{ matrix.engine }}.log
           if-no-files-found: warn
 
@@ -223,4 +246,24 @@ jobs:
           if missing:
               print(f"missing legs: {', '.join(missing)}", file=sys.stderr)
               sys.exit(1)
+
+          metrics = []
+          for path in glob.glob("psiphon-legs-*/psiphon-metrics.tsv"):
+              engine = pathlib.Path(path).parent.name.removeprefix("psiphon-legs-")
+              for line in pathlib.Path(path).read_text().splitlines():
+                  fields = line.split("\t")
+                  if len(fields) != 3:
+                      continue
+                  label, rss, cpu = fields
+                  try:
+                      rss, cpu = int(rss), float(cpu)
+                  except ValueError:
+                      continue
+                  metrics.append((engine, label, rss, cpu))
+          if metrics:
+              print()
+              print("| engine | process | RSS KiB | CPU seconds |")
+              print("| --- | --- | ---: | ---: |")
+              for engine, label, rss, cpu in metrics:
+                  print(f"| {engine} | {label} | {rss} | {cpu:.2f} |")
           PY

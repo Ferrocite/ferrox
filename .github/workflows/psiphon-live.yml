@@ -110,6 +110,7 @@ jobs:
           if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
           CLIENT="$GITHUB_WORKSPACE/target/psiphon/psiphon-tunnel-core"
           : > psiphon-live.log
+          : > psiphon-metrics.tsv
           LANE_PID=""
           stop_lane() {
             if [ -n "$LANE_PID" ]; then
@@ -124,6 +125,13 @@ jobs:
             LANE_PID=""
           }
           trap stop_lane EXIT
+          sample_process() {
+            local label="$1" pid="$2" rss cpu
+            [ -n "$pid" ] || return 0
+            read -r rss cpu < <(ps -o rss=,pcpu= -p "$pid" 2>/dev/null) || return 0
+            [ -n "$rss" ] || return 0
+            printf '%s\t%s\t%s\n' "$label" "$rss" "$cpu" >> psiphon-metrics.tsv
+          }
           via() {
             local front="$1" port="$2"
             shift 2
@@ -218,6 +226,10 @@ jobs:
           trace_front mixed 10809 "mixed" || FAILED="$FAILED mixed(trace)"
           fetch_mb mixed 10809 psiphon-mixed.bin "mixed" || FAILED="$FAILED mixed"
           fetch_mb socks 10808 psiphon-socks-warm.bin "socks warm" || FAILED="$FAILED socks(warm)"
+          sample_process lane "$LANE_PID"
+          for child in $(pgrep -P "$LANE_PID" 2>/dev/null); do
+            sample_process client "$child"
+          done
           python3 - <<'PY' || FAILED="$FAILED udp(dns)"
           import random, socket, struct, sys
 
@@ -361,7 +373,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: psiphon-live-log
-          path: psiphon-live.log
+          path: |
+            psiphon-live.log
+            psiphon-metrics.tsv
           if-no-files-found: ignore
           retention-days: 7
       - name: Summarise
@@ -390,6 +404,29 @@ jobs:
               print("| (no leg recorded a transfer) | 0 | 0.00 | 0.00 |")
           PY
           )
+          metrics=$(python3 - <<'PY'
+          rows = []
+          try:
+              with open("psiphon-metrics.tsv") as metrics:
+                  lines = metrics.read().splitlines()
+          except OSError:
+              lines = []
+          for line in lines:
+              parts = line.split("\t")
+              if len(parts) != 3:
+                  continue
+              label, rss, cpu = parts
+              try:
+                  rss, cpu = int(rss), float(cpu)
+              except ValueError:
+                  continue
+              rows.append((label, rss, cpu))
+          for label, rss, cpu in rows:
+              print(f"| {label} | {rss} | {cpu:.1f} |")
+          if not rows:
+              print("| (no process sampled) | 0 | 0.0 |")
+          PY
+          )
           {
             echo "### Psiphon lane, live"
             echo
@@ -401,6 +438,10 @@ jobs:
             echo "| leg | bytes | seconds | MiB/s |"
             echo "| --- | --- | --- | --- |"
             echo "$table"
+            echo
+            echo "| process | RSS KiB | CPU % |"
+            echo "| --- | ---: | ---: |"
+            echo "$metrics"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "Raw legs (label bytes seconds bytes/s):"
           cat psiphon-legs.tsv 2>/dev/null || true

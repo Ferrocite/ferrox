@@ -89,16 +89,8 @@ pub const INPROXY_PROTOCOLS: [&str; 11] = [
     "INPROXY-WEBRTC-SHADOWSOCKS-OSSH",
 ];
 
-/// The unfronted shapes of [`CHAINED_PROTOCOLS`], for a lane that must not look like a CDN.
-pub const CHAINED_DIRECT_PROTOCOLS: [&str; 7] = [
-    "SSH",
-    "OSSH",
-    "TLS-OSSH",
-    "UNFRONTED-MEEK-OSSH",
-    "UNFRONTED-MEEK-HTTPS-OSSH",
-    "UNFRONTED-MEEK-SESSION-TICKET-OSSH",
-    "SHADOWSOCKS-OSSH",
-];
+/// The direct shapes of [`CHAINED_PROTOCOLS`], including the fronted fallbacks the reference keeps when an upstream proxy carries the lane.
+pub const CHAINED_DIRECT_PROTOCOLS: [&str; 11] = CHAINED_PROTOCOLS;
 
 /// Which tunnel shapes the lane is allowed to ask for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -403,14 +395,18 @@ fn string_scan<'a>(bytes: &'a [u8], at: &mut usize) -> Option<(&'a [u8], bool)> 
     }
 }
 
-/// The first of two bytes. AVX2 walks 64 bytes per turn when the CPU has it, then hands the
-/// sub-64-byte tail to a 32-byte block and the same eight-byte SWAR scan.
+/// The first of two bytes. AVX2 walks 128 bytes per turn when the CPU has it and NEON 32 as one
+/// inlined block, then the same 64-, 32- and eight-byte scans finish the tail.
 #[inline]
 fn next_of(bytes: &[u8], first: u8, second: u8) -> Option<(usize, u8)> {
     #[cfg(target_arch = "x86_64")]
     if bytes.len() >= 32 && std::is_x86_feature_detected!("avx2") {
         // SAFETY: the runtime feature test above proves AVX2 is available.
         return unsafe { next_of_avx2(bytes, first, second) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if bytes.len() >= 16 {
+        return next_of_neon(bytes, first, second);
     }
     next_of_swar(bytes, first, second)
 }
@@ -425,20 +421,32 @@ unsafe fn next_of_avx2(bytes: &[u8], first: u8, second: u8) -> Option<(usize, u8
     let a = _mm256_set1_epi8(first.cast_signed());
     let b = _mm256_set1_epi8(second.cast_signed());
     let mut at = 0usize;
-    while at + 64 <= bytes.len() {
-        // SAFETY: `at + 64` is inside `bytes`, and both loads are unaligned.
+    while at + 128 <= bytes.len() {
+        // SAFETY: `at + 128` is inside `bytes`, and every load is unaligned.
         let (low, high) = unsafe {
-            let low = _mm256_loadu_si256(bytes.as_ptr().add(at).cast());
-            let high = _mm256_loadu_si256(bytes.as_ptr().add(at + 32).cast());
+            let low0 = _mm256_loadu_si256(bytes.as_ptr().add(at).cast());
+            let high0 = _mm256_loadu_si256(bytes.as_ptr().add(at + 32).cast());
+            let low1 = _mm256_loadu_si256(bytes.as_ptr().add(at + 64).cast());
+            let high1 = _mm256_loadu_si256(bytes.as_ptr().add(at + 96).cast());
             (
-                _mm256_movemask_epi8(_mm256_or_si256(
-                    _mm256_cmpeq_epi8(low, a),
-                    _mm256_cmpeq_epi8(low, b),
-                )),
-                _mm256_movemask_epi8(_mm256_or_si256(
-                    _mm256_cmpeq_epi8(high, a),
-                    _mm256_cmpeq_epi8(high, b),
-                )),
+                u64::from(_mm256_movemask_epi8(_mm256_or_si256(
+                    _mm256_cmpeq_epi8(low0, a),
+                    _mm256_cmpeq_epi8(low0, b),
+                )) as u32)
+                    | (u64::from(_mm256_movemask_epi8(_mm256_or_si256(
+                        _mm256_cmpeq_epi8(high0, a),
+                        _mm256_cmpeq_epi8(high0, b),
+                    )) as u32)
+                        << 32),
+                u64::from(_mm256_movemask_epi8(_mm256_or_si256(
+                    _mm256_cmpeq_epi8(low1, a),
+                    _mm256_cmpeq_epi8(low1, b),
+                )) as u32)
+                    | (u64::from(_mm256_movemask_epi8(_mm256_or_si256(
+                        _mm256_cmpeq_epi8(high1, a),
+                        _mm256_cmpeq_epi8(high1, b),
+                    )) as u32)
+                        << 32),
             )
         };
         if low != 0 {
@@ -446,7 +454,28 @@ unsafe fn next_of_avx2(bytes: &[u8], first: u8, second: u8) -> Option<(usize, u8
             return Some((found, bytes[found]));
         }
         if high != 0 {
-            let found = at + 32 + high.trailing_zeros() as usize;
+            let found = at + 64 + high.trailing_zeros() as usize;
+            return Some((found, bytes[found]));
+        }
+        at += 128;
+    }
+    while at + 64 <= bytes.len() {
+        // SAFETY: `at + 64` is inside `bytes`, and both loads are unaligned.
+        let mask = unsafe {
+            let low = _mm256_loadu_si256(bytes.as_ptr().add(at).cast());
+            let high = _mm256_loadu_si256(bytes.as_ptr().add(at + 32).cast());
+            u64::from(_mm256_movemask_epi8(_mm256_or_si256(
+                _mm256_cmpeq_epi8(low, a),
+                _mm256_cmpeq_epi8(low, b),
+            )) as u32)
+                | (u64::from(_mm256_movemask_epi8(_mm256_or_si256(
+                    _mm256_cmpeq_epi8(high, a),
+                    _mm256_cmpeq_epi8(high, b),
+                )) as u32)
+                    << 32)
+        };
+        if mask != 0 {
+            let found = at + mask.trailing_zeros() as usize;
             return Some((found, bytes[found]));
         }
         at += 64;
@@ -467,6 +496,87 @@ unsafe fn next_of_avx2(bytes: &[u8], first: u8, second: u8) -> Option<(usize, u8
         at += 32;
     }
     next_of_swar(&bytes[at..], first, second).map(|(found, byte)| (at + found, byte))
+}
+
+/// The first of two bytes, four eight-lane words per turn. NEON has no byte movemask, so a
+/// half is moved to an integer register whole: a matching lane is a byte of ones, so the
+/// first match is that word's trailing zeros over eight, and a word of zeroes is no match.
+/// The compares and the find are one block of assembly with no target-feature boundary, so
+/// this inlines into the field scan instead of costing a call and a returned struct per field.
+#[cfg(target_arch = "aarch64")]
+#[inline]
+fn next_of_neon(bytes: &[u8], first: u8, second: u8) -> Option<(usize, u8)> {
+    let cursor = bytes.as_ptr();
+    let remaining = bytes.len();
+    let mut off = 0usize;
+    let mut found = usize::MAX;
+    // SAFETY: a block loads only while 32 bytes of it are left, no register outlives the block, and NEON is in the aarch64 base.
+    unsafe {
+        core::arch::asm!(
+            "dup     v4.16b, {first:w}",
+            "dup     v5.16b, {second:w}",
+            "2:",
+            "cmp     {remaining}, #32",
+            "b.lo    3f",
+            "ldp     q0, q1, [{cursor}]",
+            "cmeq    v2.16b, v0.16b, v4.16b",
+            "cmeq    v3.16b, v0.16b, v5.16b",
+            "orr     v2.16b, v2.16b, v3.16b",
+            "cmeq    v3.16b, v1.16b, v4.16b",
+            "cmeq    v1.16b, v1.16b, v5.16b",
+            "orr     v3.16b, v3.16b, v1.16b",
+            "fmov    x9, d2",
+            "cbnz    x9, 4f",
+            "ext     v2.16b, v2.16b, v2.16b, #8",
+            "fmov    x9, d2",
+            "cbnz    x9, 5f",
+            "fmov    x9, d3",
+            "cbnz    x9, 6f",
+            "ext     v3.16b, v3.16b, v3.16b, #8",
+            "fmov    x9, d3",
+            "cbnz    x9, 7f",
+            "add     {cursor}, {cursor}, #32",
+            "sub     {remaining}, {remaining}, #32",
+            "add     {off}, {off}, #32",
+            "b       2b",
+            "4:",
+            "mov     x10, #0",
+            "b       8f",
+            "5:",
+            "mov     x10, #8",
+            "b       8f",
+            "6:",
+            "mov     x10, #16",
+            "b       8f",
+            "7:",
+            "mov     x10, #24",
+            "8:",
+            "rbit    x9, x9",
+            "clz     x9, x9",
+            "lsr     x9, x9, #3",
+            "add     x9, x9, x10",
+            "add     {found}, {off}, x9",
+            "3:",
+            first = in(reg) u32::from(first),
+            second = in(reg) u32::from(second),
+            cursor = inout(reg) cursor => _,
+            remaining = inout(reg) remaining => _,
+            off = inout(reg) off,
+            found = inout(reg) found,
+            out("v0") _,
+            out("v1") _,
+            out("v2") _,
+            out("v3") _,
+            out("v4") _,
+            out("v5") _,
+            out("x9") _,
+            out("x10") _,
+        );
+    }
+    if found != usize::MAX {
+        return Some((found, bytes[found]));
+    }
+    next_of_swar(&bytes[off..], first, second).map(|(found, byte)| (off + found, byte))
 }
 
 /// The first of two bytes, two eight-byte blocks at a time. Both lanes are marked with the
@@ -531,15 +641,19 @@ fn next_quote_or_slash(bytes: &[u8]) -> Option<(usize, u8)> {
     next_of(bytes, b'"', b'/')
 }
 
-/// The first `wanted` byte. AVX2 walks 64 bytes per turn when the CPU has it; a 32-byte
-/// block and the SWAR tail keep the last sub-64-byte run on the same eight-byte test, so both
-/// paths return the same offset.
+/// The first `wanted` byte. AVX2 walks 128 bytes per turn when the CPU has it and aarch64
+/// runs the two-byte scan with the same needle in both lanes; the narrower blocks and the
+/// SWAR tail keep the last run on the same eight-byte test, so every path returns one offset.
 #[must_use]
 pub fn find_byte(bytes: &[u8], wanted: u8) -> Option<usize> {
     #[cfg(target_arch = "x86_64")]
     if bytes.len() >= 32 && std::is_x86_feature_detected!("avx2") {
         // SAFETY: the runtime feature test above proves AVX2 is available.
         return unsafe { find_byte_avx2(bytes, wanted) };
+    }
+    #[cfg(target_arch = "aarch64")]
+    if bytes.len() >= 16 {
+        return next_of_neon(bytes, wanted, wanted).map(|(found, _)| found);
     }
     find_byte_swar(bytes, wanted)
 }
@@ -552,21 +666,40 @@ unsafe fn find_byte_avx2(bytes: &[u8], wanted: u8) -> Option<usize> {
     };
     let needle = _mm256_set1_epi8(wanted.cast_signed());
     let mut at = 0usize;
-    while at + 64 <= bytes.len() {
-        // SAFETY: `at + 64` is inside `bytes`, and both loads are unaligned.
+    while at + 128 <= bytes.len() {
+        // SAFETY: `at + 128` is inside `bytes`, and every load is unaligned.
         let (low, high) = unsafe {
-            let low = _mm256_loadu_si256(bytes.as_ptr().add(at).cast());
-            let high = _mm256_loadu_si256(bytes.as_ptr().add(at + 32).cast());
+            let low0 = _mm256_loadu_si256(bytes.as_ptr().add(at).cast());
+            let high0 = _mm256_loadu_si256(bytes.as_ptr().add(at + 32).cast());
+            let low1 = _mm256_loadu_si256(bytes.as_ptr().add(at + 64).cast());
+            let high1 = _mm256_loadu_si256(bytes.as_ptr().add(at + 96).cast());
             (
-                _mm256_movemask_epi8(_mm256_cmpeq_epi8(low, needle)),
-                _mm256_movemask_epi8(_mm256_cmpeq_epi8(high, needle)),
+                u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(low0, needle)) as u32)
+                    | (u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(high0, needle)) as u32)
+                        << 32),
+                u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(low1, needle)) as u32)
+                    | (u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(high1, needle)) as u32)
+                        << 32),
             )
         };
         if low != 0 {
             return Some(at + low.trailing_zeros() as usize);
         }
         if high != 0 {
-            return Some(at + 32 + high.trailing_zeros() as usize);
+            return Some(at + 64 + high.trailing_zeros() as usize);
+        }
+        at += 128;
+    }
+    while at + 64 <= bytes.len() {
+        // SAFETY: `at + 64` is inside `bytes`, and both loads are unaligned.
+        let mask = unsafe {
+            let low = _mm256_loadu_si256(bytes.as_ptr().add(at).cast());
+            let high = _mm256_loadu_si256(bytes.as_ptr().add(at + 32).cast());
+            u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(low, needle)) as u32)
+                | (u64::from(_mm256_movemask_epi8(_mm256_cmpeq_epi8(high, needle)) as u32) << 32)
+        };
+        if mask != 0 {
+            return Some(at + mask.trailing_zeros() as usize);
         }
         at += 64;
     }
@@ -584,9 +717,8 @@ unsafe fn find_byte_avx2(bytes: &[u8], wanted: u8) -> Option<usize> {
     find_byte_swar(&bytes[at..], wanted).map(|found| at + found)
 }
 
-/// The first `wanted` byte, two eight-byte blocks at a time. One lane is enough here, so a
-/// comment's closing `*`, its newline and the notice reader's newline cost half the marks
-/// `next_of` would spend on the same block.
+/// The first `wanted` byte, two eight-byte blocks at a time. One lane is enough here, so this
+/// half-vector tail of the AVX2 scan and of `next_of` costs half the marks of a two-byte one.
 fn find_byte_swar(bytes: &[u8], wanted: u8) -> Option<usize> {
     const SPREAD: u64 = 0x0101_0101_0101_0101;
     const HIGH: u64 = 0x8080_8080_8080_8080;
@@ -829,7 +961,7 @@ mod tests {
         }
         let mut state = 0x6a09_e667_f3bc_c909u64;
         for pad in 0..40 {
-            for len in 0..96 {
+            for len in 0..=160 {
                 let mut bytes = vec![b'a'; pad];
                 for _ in 0..len {
                     state ^= state << 13;
@@ -852,10 +984,36 @@ mod tests {
     }
 
     #[test]
+    fn the_wide_scan_crosses_a_hundred_and_twenty_eight_bytes() {
+        // Every quarter of three turns, so a loop that stopped after one block or mis-ordered the halves fails.
+        let mut offsets = Vec::new();
+        for turn in 0..3 {
+            for quarter in 0..4 {
+                for lane in [0, 1, 7, 15, 16, 23, 31] {
+                    offsets.push(turn * 128 + quarter * 32 + lane);
+                }
+            }
+        }
+        offsets.extend([383, 392, 399]);
+        let mut bytes = vec![b'a'; 400];
+        for at in offsets {
+            bytes.fill(b'a');
+            let byte = if at % 2 == 0 { b'"' } else { b'\\' };
+            bytes[at] = byte;
+            assert_eq!(
+                next_quote_or_backslash(&bytes),
+                Some((at, byte)),
+                "two bytes at {at}"
+            );
+            assert_eq!(find_byte(&bytes, byte), Some(at), "one byte at {at}");
+        }
+    }
+
+    #[test]
     fn the_single_byte_scan_is_the_byte_scan() {
         let mut state = 0x9e37_79b9_7f4a_7c15u64;
         for pad in 0..17 {
-            for len in 0..=64 {
+            for len in 0..=160 {
                 let mut bytes = vec![b'a'; pad];
                 for _ in 0..len {
                     state ^= state << 13;
@@ -1029,10 +1187,14 @@ mod tests {
             .chained()
             .iter()
             .any(|name| name.contains("QUIC")));
-        assert!(!Shape::Direct
+        assert!(Shape::Direct
             .chained()
             .iter()
             .any(|name| name.starts_with("FRONTED")));
+        assert!(!Shape::Direct
+            .chained()
+            .iter()
+            .any(|name| name.contains("QUIC")));
         assert!(!Shape::Auto
             .chained()
             .iter()

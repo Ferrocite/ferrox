@@ -14,6 +14,7 @@ use std::time::Duration;
 
 const PROPAGATION_CHANNEL_ID: &str = "FFFFFFFFFFFFFFFF";
 const SPONSOR_ID: &str = "FFFFFFFFFFFFFFFF";
+const CONDUIT_TIMEOUT_SECS: u64 = 180;
 
 /// The lane's process and the endpoint it announced. The child is behind a mutex because the
 /// readiness reader owns the pipes while the lane owns the process, and a drop has to be able to
@@ -99,6 +100,29 @@ impl PsiphonOut {
     }
 }
 
+/// How a personal conduit gives way to the public network.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConduitMode {
+    Auto,
+    Shirokhorshid,
+    Public,
+}
+
+impl ConduitMode {
+    fn parse(text: &str) -> Option<Self> {
+        match text.trim().to_ascii_lowercase().as_str() {
+            "auto" => Some(Self::Auto),
+            "shirokhorshid" | "personal" | "inproxy" => Some(Self::Shirokhorshid),
+            "public" | "off" | "none" => Some(Self::Public),
+            _ => None,
+        }
+    }
+
+    const fn uses_compartment(self) -> bool {
+        !matches!(self, Self::Public)
+    }
+}
+
 /// Everything the client is started with, resolved once so a flow pays none of it.
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
@@ -114,7 +138,12 @@ struct Settings {
     entries: Option<PathBuf>,
     base: Option<PathBuf>,
     ready: Duration,
-    server_list: String,
+    conduit_mode: ConduitMode,
+    conduit_timeout: Duration,
+    server_lists: Vec<String>,
+    obfuscated_server_lists: Vec<String>,
+    server_entry_key: Option<String>,
+    exchange_key: Option<String>,
     propagation: String,
     sponsor: String,
     client_platform: String,
@@ -149,6 +178,15 @@ struct Settings {
     limit_cpu: bool,
     initial_protocols: Vec<String>,
     initial_count: Option<u64>,
+    proxy_compartment: Option<String>,
+    max_common_clients: Option<u64>,
+    max_personal_clients: Option<u64>,
+    limit_upstream: Option<u64>,
+    limit_downstream: Option<u64>,
+    reject_proxy_cidrs: Vec<String>,
+    emit_proxy_activity: bool,
+    pause_period: Option<u64>,
+    stagger_workers: Option<u64>,
 }
 
 impl Settings {
@@ -187,7 +225,14 @@ impl Settings {
             reject_proxy_countries.sort_unstable();
             reject_proxy_countries.dedup();
         }
+        let shared = flag(settings, "shareProxyOnNetwork", "AETHER_PSIPHON_SHARE");
         let explicit = text(settings, "interface").or_else(|| env("AETHER_PSIPHON_INTERFACE"));
+        if shared && explicit.as_deref().is_some_and(|name| name != "any") {
+            return Err(
+                "psiphon: shareProxyOnNetwork listens on every interface; remove settings.interface"
+                    .to_owned(),
+            );
+        }
         if let Some(name) = explicit.as_deref() {
             if name != "any" && (listen.ip().is_loopback() || listen.ip().is_unspecified()) {
                 return Err(format!(
@@ -195,7 +240,11 @@ impl Settings {
                 ));
             }
         }
-        let interface = explicit.or_else(|| interface_name(listen.ip()));
+        let interface = if shared {
+            Some("any".to_owned())
+        } else {
+            explicit.or_else(|| interface_name(listen.ip()))
+        };
         let base = text(settings, "baseConfig")
             .or_else(|| env("AETHER_PSIPHON_CONFIG"))
             .map(PathBuf::from);
@@ -238,7 +287,49 @@ impl Settings {
             .and_then(|value| value.parse::<u64>().ok())
             .filter(|value| *value > 0)
             .map_or(psiphon::READY_SECS, |value| value.min(86_400));
-        Ok(Self {
+        let conduit_mode = text(settings, "conduitMode")
+            .or_else(|| env("AETHER_PSIPHON_CONDUIT_MODE"))
+            .map_or(Ok(ConduitMode::Auto), |word| {
+                ConduitMode::parse(&word).ok_or_else(|| {
+                    format!("psiphon: conduitMode {word:?} is not auto, shirokhorshid or public")
+                })
+            })?;
+        let conduit_timeout = integer(
+            settings,
+            "conduitTimeoutSeconds",
+            "AETHER_PSIPHON_CONDUIT_TIMEOUT",
+        )
+        .filter(|value| *value > 0)
+        .map_or(Duration::from_secs(CONDUIT_TIMEOUT_SECS), |value| {
+            Duration::from_secs(value.min(86_400))
+        });
+        let mut server_lists = json_list(settings, "serverListURLs");
+        if server_lists.is_empty() {
+            server_lists = json_list(settings, "serverListUrls");
+        }
+        if server_lists.is_empty() {
+            server_lists.extend(text(settings, "serverListURL"));
+        }
+        if server_lists.is_empty() {
+            server_lists = env_list("AETHER_PSIPHON_SERVER_LIST");
+        }
+        if server_lists.is_empty() {
+            server_lists.push(psiphon::SERVER_LIST_URL.to_owned());
+        }
+        let mut obfuscated_server_lists = json_list(settings, "obfuscatedServerListRootUrls");
+        if obfuscated_server_lists.is_empty() {
+            obfuscated_server_lists = json_list(settings, "obfuscatedServerListRootURLs");
+        }
+        if obfuscated_server_lists.is_empty() {
+            obfuscated_server_lists = env_list("AETHER_PSIPHON_OBFUSCATED_SERVER_LISTS");
+        }
+        if flag(settings, "disableTunnels", "AETHER_PSIPHON_DISABLE_TUNNELS") {
+            return Err(
+                "psiphon: disableTunnels is a stand-alone in-proxy client: it opens no tunnel and no local SOCKS listener, so this lane would carry nothing"
+                    .to_owned(),
+            );
+        }
+        let out = Self {
             binary: text(settings, "binary")
                 .or_else(|| env("AETHER_PSIPHON_BIN"))
                 .map(PathBuf::from),
@@ -252,9 +343,14 @@ impl Settings {
             entries: server_entries(settings),
             base,
             ready: Duration::from_secs(ready),
-            server_list: text(settings, "serverListURL")
-                .or_else(|| env("AETHER_PSIPHON_SERVER_LIST"))
-                .unwrap_or_else(|| psiphon::SERVER_LIST_URL.to_owned()),
+            conduit_mode,
+            conduit_timeout,
+            server_lists,
+            obfuscated_server_lists,
+            server_entry_key: text(settings, "serverEntrySignaturePublicKey")
+                .or_else(|| env("AETHER_PSIPHON_SERVER_ENTRY_KEY")),
+            exchange_key: text(settings, "exchangeObfuscationKey")
+                .or_else(|| env("AETHER_PSIPHON_EXCHANGE_KEY")),
             propagation: text(settings, "propagationChannelId")
                 .or_else(|| env("AETHER_PSIPHON_PROPAGATION_CHANNEL_ID"))
                 .unwrap_or_else(|| PROPAGATION_CHANNEL_ID.to_owned()),
@@ -344,10 +440,11 @@ impl Settings {
                 "AETHER_PSIPHON_WORKERS",
             )
             .filter(|value| *value > 0),
-            aggressive: flag(
+            aggressive: flag_or(
                 settings,
                 "aggressiveEstablishment",
                 "AETHER_PSIPHON_AGGRESSIVE",
+                true,
             ),
             limit_meek: flag(
                 settings,
@@ -371,7 +468,74 @@ impl Settings {
                 "AETHER_PSIPHON_INITIAL_COUNT",
             )
             .filter(|value| *value > 0),
-        })
+            proxy_compartment: text(settings, "inproxyProxyCompartmentId")
+                .or_else(|| env("AETHER_PSIPHON_PROXY_COMPARTMENT")),
+            max_common_clients: integer(
+                settings,
+                "inproxyMaxCommonClients",
+                "AETHER_PSIPHON_MAX_COMMON_CLIENTS",
+            )
+            .filter(|value| *value > 0),
+            max_personal_clients: integer(
+                settings,
+                "inproxyMaxPersonalClients",
+                "AETHER_PSIPHON_MAX_PERSONAL_CLIENTS",
+            )
+            .filter(|value| *value > 0),
+            limit_upstream: integer(
+                settings,
+                "inproxyLimitUpstreamBytesPerSecond",
+                "AETHER_PSIPHON_LIMIT_UPSTREAM",
+            )
+            .filter(|value| *value > 0),
+            limit_downstream: integer(
+                settings,
+                "inproxyLimitDownstreamBytesPerSecond",
+                "AETHER_PSIPHON_LIMIT_DOWNSTREAM",
+            )
+            .filter(|value| *value > 0),
+            reject_proxy_cidrs: list(
+                settings,
+                "inproxyRejectProxyCidrs",
+                "AETHER_PSIPHON_REJECT_CIDRS",
+            ),
+            emit_proxy_activity: flag(
+                settings,
+                "emitInproxyProxyActivity",
+                "AETHER_PSIPHON_EMIT_PROXY_ACTIVITY",
+            ),
+            pause_period: integer(
+                settings,
+                "establishTunnelPausePeriodSeconds",
+                "AETHER_PSIPHON_PAUSE_PERIOD",
+            ),
+            stagger_workers: integer(
+                settings,
+                "staggerConnectionWorkersMilliseconds",
+                "AETHER_PSIPHON_STAGGER_WORKERS",
+            ),
+        };
+        if !out.relay_enabled() && out.relay_without_cap() {
+            return Err(
+                "psiphon: an in-proxy relay setting was given without inproxyMaxCommonClients or inproxyMaxPersonalClients, and the client refuses to start its proxy with both caps at zero"
+                    .to_owned(),
+            );
+        }
+        Ok(out)
+    }
+
+    /// Whether the client runs its in-proxy relay, which it gates on a cap being set.
+    fn relay_enabled(&self) -> bool {
+        self.max_common_clients.is_some() || self.max_personal_clients.is_some()
+    }
+
+    /// Whether a setting only the relay acts on was given, so an inert config is refused.
+    fn relay_without_cap(&self) -> bool {
+        self.proxy_compartment.is_some()
+            || self.limit_upstream.is_some()
+            || self.limit_downstream.is_some()
+            || !self.reject_proxy_cidrs.is_empty()
+            || self.emit_proxy_activity
     }
 
     fn credential(&self) -> Credential {
@@ -419,6 +583,17 @@ fn text(settings: Option<&Json>, key: &str) -> Option<String> {
 }
 
 fn list(settings: Option<&Json>, key: &str, environment: &str) -> Vec<String> {
+    let listed = json_list(settings, key);
+    if listed.is_empty() {
+        env_list(environment)
+    } else {
+        listed
+    }
+}
+
+/// The list a config holds under `key`, and nothing else: a setting with more than one spelling
+/// reads every spelling before the environment is consulted once.
+fn json_list(settings: Option<&Json>, key: &str) -> Vec<String> {
     let listed = settings.and_then(|settings| settings.get(key));
     if let Some(items) = listed.and_then(Json::as_arr) {
         return items
@@ -432,6 +607,10 @@ fn list(settings: Option<&Json>, key: &str, environment: &str) -> Vec<String> {
     if let Some(text) = listed.and_then(Json::as_str) {
         return split_list(text);
     }
+    Vec::new()
+}
+
+fn env_list(environment: &str) -> Vec<String> {
     env(environment)
         .map(|text| split_list(&text))
         .unwrap_or_default()
@@ -475,6 +654,21 @@ fn flag(settings: Option<&Json>, key: &str, environment: &str) -> bool {
             })
         })
         .unwrap_or(false)
+}
+
+fn flag_or(settings: Option<&Json>, key: &str, environment: &str, default: bool) -> bool {
+    settings
+        .and_then(|settings| settings.get(key))
+        .and_then(Json::as_bool)
+        .or_else(|| {
+            env(environment).map(|value| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+        })
+        .unwrap_or(default)
 }
 
 fn number(settings: Option<&Json>, key: &str) -> Option<f64> {
@@ -893,8 +1087,29 @@ fn shirokhorshid_dial_overrides(custom_sni: Option<&str>) -> Json {
     Json::Arr(overrides)
 }
 
+fn transfer_urls(urls: &[String]) -> Json {
+    Json::Arr(
+        urls.iter()
+            .map(|url| {
+                Json::Obj(vec![(
+                    "URL".to_owned(),
+                    Json::Str(ferrox_core::b64::encode(url.as_bytes())),
+                )])
+            })
+            .collect(),
+    )
+}
+
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 fn build_config(settings: &Settings) -> Result<String, String> {
+    build_config_with(
+        settings,
+        settings.inproxy_compartment.is_some() && settings.conduit_mode.uses_compartment(),
+    )
+}
+
+#[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
+fn build_config_with(settings: &Settings, personal: bool) -> Result<String, String> {
     let mut fields: Vec<(String, Json)> = Vec::with_capacity(32);
     put(
         &mut fields,
@@ -915,17 +1130,35 @@ fn build_config(settings: &Settings) -> Result<String, String> {
     put(
         &mut fields,
         "RemoteServerListURLs",
-        Json::Arr(vec![Json::Obj(vec![(
-            "URL".to_owned(),
-            Json::Str(ferrox_core::b64::encode(settings.server_list.as_bytes())),
-        )])]),
+        transfer_urls(&settings.server_lists),
     );
+    if !settings.obfuscated_server_lists.is_empty() {
+        put(
+            &mut fields,
+            "ObfuscatedServerListRootURLs",
+            transfer_urls(&settings.obfuscated_server_lists),
+        );
+    }
     put(
         &mut fields,
         "RemoteServerListSignaturePublicKey",
         Json::Str(psiphon::SERVER_LIST_SIGNATURE_KEY.to_owned()),
     );
-    let conduit = settings.shape.is_conduit() || settings.inproxy_compartment.is_some();
+    if let Some(key) = &settings.server_entry_key {
+        put(
+            &mut fields,
+            "ServerEntrySignaturePublicKey",
+            Json::Str(key.clone()),
+        );
+    }
+    if let Some(key) = &settings.exchange_key {
+        put(
+            &mut fields,
+            "ExchangeObfuscationKey",
+            Json::Str(key.clone()),
+        );
+    }
+    let conduit = settings.shape.is_conduit() || personal;
     put(
         &mut fields,
         "InproxyTunnelProtocolPreferProbability",
@@ -936,7 +1169,7 @@ fn build_config(settings: &Settings) -> Result<String, String> {
         "InproxyTunnelProtocolSelectionProbability",
         Json::Num(if conduit { 1.0 } else { 0.0 }),
     );
-    if let Some(compartment) = &settings.inproxy_compartment {
+    if let (true, Some(compartment)) = (personal, &settings.inproxy_compartment) {
         put(
             &mut fields,
             "InproxyClientPersonalCompartmentID",
@@ -963,28 +1196,70 @@ fn build_config(settings: &Settings) -> Result<String, String> {
             Json::Str(path.to_string_lossy().into_owned()),
         );
     }
-    if !settings.cdn_ips.is_empty() {
-        let mut spec = vec![("IPCandidates".to_owned(), strings(&settings.cdn_ips))];
-        if !settings.cdn_sni.is_empty() {
-            spec.push(("SNIServerNames".to_owned(), strings(&settings.cdn_sni)));
-        }
-        put(&mut fields, "FrontedMeekCDNScanSpec", Json::Obj(spec));
+    if let Some(compartment) = &settings.proxy_compartment {
+        put(
+            &mut fields,
+            "InproxyProxyPersonalCompartmentID",
+            Json::Str(compartment.clone()),
+        );
     }
-    if settings.cdn_ips.is_empty() || !settings.cdn_sets.is_empty() {
+    if settings.relay_enabled() {
+        put(&mut fields, "InproxyEnableProxy", Json::Bool(true));
+    }
+    for (key, value) in [
+        ("InproxyMaxCommonClients", settings.max_common_clients),
+        ("InproxyMaxPersonalClients", settings.max_personal_clients),
+        (
+            "InproxyLimitUpstreamBytesPerSecond",
+            settings.limit_upstream,
+        ),
+        (
+            "InproxyLimitDownstreamBytesPerSecond",
+            settings.limit_downstream,
+        ),
+        ("EstablishTunnelPausePeriodSeconds", settings.pause_period),
+        (
+            "StaggerConnectionWorkersMilliseconds",
+            settings.stagger_workers,
+        ),
+    ] {
+        if let Some(value) = value {
+            put(&mut fields, key, Json::Num(value as f64));
+        }
+    }
+    if !settings.reject_proxy_cidrs.is_empty() {
+        put(
+            &mut fields,
+            "InproxyRejectProxyCIDRs",
+            strings(&settings.reject_proxy_cidrs),
+        );
+    }
+    if settings.emit_proxy_activity {
+        put(&mut fields, "EmitInproxyProxyActivity", Json::Bool(true));
+    }
+    let fronting = !settings.shape.is_conduit() || settings.cdn_profile.is_some();
+    let profile = settings.cdn_profile.as_deref().unwrap_or("shirokhorshid");
+    let fronting_enabled = fronting && !matches!(profile, "off" | "none");
+    if fronting_enabled {
+        if !settings.cdn_ips.is_empty() {
+            let mut spec = vec![("IPCandidates".to_owned(), strings(&settings.cdn_ips))];
+            if !settings.cdn_sni.is_empty() {
+                spec.push(("SNIServerNames".to_owned(), strings(&settings.cdn_sni)));
+            }
+            put(&mut fields, "FrontedMeekCDNScanSpec", Json::Obj(spec));
+        }
         put(
             &mut fields,
             "FrontedMeekCDNScanUseBuiltInSpec",
             Json::Bool(true),
         );
-    }
-    if !settings.cdn_sets.is_empty() {
-        put(
-            &mut fields,
-            "FrontedMeekCDNScanBuiltInSets",
-            strings(&settings.cdn_sets),
-        );
-    }
-    if let Some(profile) = settings.cdn_profile.as_deref() {
+        if !settings.cdn_sets.is_empty() {
+            put(
+                &mut fields,
+                "FrontedMeekCDNScanBuiltInSets",
+                strings(&settings.cdn_sets),
+            );
+        }
         if matches!(profile, "shirokhorshid" | "legacy" | "android") {
             put(
                 &mut fields,
@@ -996,29 +1271,25 @@ fn build_config(settings: &Settings) -> Result<String, String> {
                 "FrontedMeekDialOverridesProbability",
                 Json::Num(1.0),
             );
-            put(
-                &mut fields,
-                "FrontedMeekCDNScanUseBuiltInSpec",
-                Json::Bool(true),
-            );
-        } else {
+        } else if settings.cdn_profile.is_some() {
             eprintln!(
-                "psiphon: cdnProfile {profile:?} is not shirokhorshid, legacy or android; ignored"
+                "psiphon: cdnProfile {profile:?} is not shirokhorshid, legacy, android or off; ignored"
             );
         }
     }
     let chained = settings.upstream.is_some();
-    put(
-        &mut fields,
-        "LimitTunnelProtocols",
-        protocols(if conduit {
-            &psiphon::INPROXY_PROTOCOLS
-        } else if chained {
-            settings.shape.chained()
-        } else {
-            settings.shape.protocols()
-        }),
-    );
+    let selected: Option<&[&str]> = if conduit {
+        Some(&psiphon::INPROXY_PROTOCOLS)
+    } else if chained {
+        Some(settings.shape.chained())
+    } else if settings.shape == Shape::Auto {
+        None
+    } else {
+        Some(settings.shape.protocols())
+    };
+    if let Some(selected) = selected {
+        put(&mut fields, "LimitTunnelProtocols", protocols(selected));
+    }
     if settings.shape.disables_tactics() {
         put(&mut fields, "DisableTactics", Json::Bool(true));
     }
@@ -1135,7 +1406,7 @@ fn build_config(settings: &Settings) -> Result<String, String> {
         !matches!(
             key.as_str(),
             "LocalProxyUsername" | "LocalProxyPassword" | "ListenInterface"
-        )
+        ) && (personal || key != "InproxyClientPersonalCompartmentID")
     });
     if let (Some(user), Some(pass)) = (&settings.proxy_user, &settings.proxy_pass) {
         put(&mut fields, "LocalProxyUsername", Json::Str(user.clone()));
@@ -1194,10 +1465,32 @@ enum Startup {
 }
 
 fn start(settings: &Settings) -> Result<(SocketAddr, Child, Arc<AtomicBool>), String> {
+    let personal =
+        settings.inproxy_compartment.is_some() && settings.conduit_mode.uses_compartment();
+    if !personal || settings.conduit_mode != ConduitMode::Auto {
+        return start_once(settings, personal, settings.ready);
+    }
+    match start_once(settings, true, settings.conduit_timeout) {
+        Ok(started) => Ok(started),
+        Err(error) => {
+            eprintln!(
+                "psiphon: the personal conduit did not come up ({error}); retrying public conduits"
+            );
+            start_once(settings, false, settings.ready)
+        }
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+fn start_once(
+    settings: &Settings,
+    personal: bool,
+    ready: Duration,
+) -> Result<(SocketAddr, Child, Arc<AtomicBool>), String> {
     std::fs::create_dir_all(&settings.state)
         .map_err(|error| format!("psiphon state dir {}: {error}", settings.state.display()))?;
     state_is_owned(&settings.state)?;
-    let config = build_config(settings)?;
+    let config = build_config_with(settings, personal)?;
     let config_path = settings
         .state
         .join(format!("ferrox-psiphon-{}.json", settings.listen.port()));
@@ -1273,7 +1566,7 @@ fn start(settings: &Settings) -> Result<(SocketAddr, Child, Arc<AtomicBool>), St
         return Err(format!("psiphon notice reader: {error}"));
     }
 
-    match receiver.recv_timeout(settings.ready) {
+    match receiver.recv_timeout(ready) {
         Ok(Startup::Ready(socks)) => Ok((socks, child, stopping)),
         Ok(Startup::Failed(reason)) => {
             let _ = child.kill();
@@ -1285,7 +1578,7 @@ fn start(settings: &Settings) -> Result<(SocketAddr, Child, Arc<AtomicBool>), St
             let _ = child.wait();
             Err(format!(
                 "psiphon did not come up in {}s; it may be blocked on this network",
-                settings.ready.as_secs()
+                ready.as_secs()
             ))
         }
     }
@@ -1446,6 +1739,7 @@ mod tests {
         }
         assert!(!config.contains("QUIC-OSSH"));
         assert!(config.contains("\"DisableTactics\":true"));
+        assert!(config.contains("\"AggressiveEstablishment\":true"));
     }
 
     #[test]
@@ -1478,6 +1772,80 @@ mod tests {
         ] {
             assert!(config.contains(expected), "{expected} in {config}");
         }
+    }
+
+    #[test]
+    fn the_relay_side_knobs_reach_the_config() {
+        let settings = Settings::from_json(Some(&settings_json(
+            r#"{"listen":"127.0.0.1:1821","shape":"conduit","inproxyProxyCompartmentId":"room","inproxyMaxCommonClients":12,"inproxyMaxPersonalClients":3,"inproxyLimitUpstreamBytesPerSecond":65536,"inproxyLimitDownstreamBytesPerSecond":131072,"inproxyRejectProxyCidrs":["10.0.0.0/8","192.0.2.0/24"],"emitInproxyProxyActivity":true,"establishTunnelPausePeriodSeconds":0,"staggerConnectionWorkersMilliseconds":250}"#,
+        )))
+        .expect("settings");
+        let config = build_config(&settings).expect("a config");
+        for expected in [
+            "\"InproxyEnableProxy\":true",
+            "\"InproxyProxyPersonalCompartmentID\":\"room\"",
+            "\"InproxyMaxCommonClients\":12",
+            "\"InproxyMaxPersonalClients\":3",
+            "\"InproxyLimitUpstreamBytesPerSecond\":65536",
+            "\"InproxyLimitDownstreamBytesPerSecond\":131072",
+            "\"InproxyRejectProxyCIDRs\":[\"10.0.0.0/8\",\"192.0.2.0/24\"]",
+            "\"EmitInproxyProxyActivity\":true",
+            "\"EstablishTunnelPausePeriodSeconds\":0",
+            "\"StaggerConnectionWorkersMilliseconds\":250",
+        ] {
+            assert!(config.contains(expected), "{expected} in {config}");
+        }
+    }
+
+    #[test]
+    fn a_relay_setting_without_a_cap_is_refused() {
+        let refused = Settings::from_json(Some(&settings_json(
+            r#"{"listen":"127.0.0.1:1821","inproxyProxyCompartmentId":"room"}"#,
+        )))
+        .expect_err(
+            "the client runs no proxy with both caps at zero, so the compartment would be inert",
+        );
+        assert!(refused.contains("inproxyMaxCommonClients"), "{refused}");
+    }
+
+    #[test]
+    fn a_lane_that_only_donates_is_refused() {
+        let refused = Settings::from_json(Some(&settings_json(
+            r#"{"listen":"127.0.0.1:1821","disableTunnels":true}"#,
+        )))
+        .expect_err("a client with no tunnel and no listener leaves the lane nothing to carry");
+        assert!(refused.contains("disableTunnels"), "{refused}");
+    }
+
+    #[test]
+    fn every_spelling_of_a_server_list_is_read_before_the_default() {
+        let settings = Settings::from_json(Some(&settings_json(
+            r#"{"listen":"127.0.0.1:1821","serverListUrls":["https://lower.example/list"],"obfuscatedServerListRootURLs":["https://upper.example/obf"]}"#,
+        )))
+        .expect("settings");
+        assert_eq!(settings.server_lists, ["https://lower.example/list"]);
+        assert_eq!(
+            settings.obfuscated_server_lists,
+            ["https://upper.example/obf"]
+        );
+
+        let both = Settings::from_json(Some(&settings_json(
+            r#"{"listen":"127.0.0.1:1821","serverListURLs":["https://first.example/list"],"serverListUrls":["https://second.example/list"]}"#,
+        )))
+        .expect("settings");
+        assert_eq!(both.server_lists, ["https://first.example/list"]);
+    }
+
+    #[test]
+    fn auto_leaves_the_protocol_choice_to_the_client() {
+        let settings = Settings::from_json(Some(&settings_json(r#"{"listen":"127.0.0.1:1821"}"#)))
+            .expect("settings");
+        let config = build_config(&settings).expect("a config");
+        assert!(!config.contains("\"LimitTunnelProtocols\""), "{config}");
+        assert!(
+            config.contains("\"InproxyTunnelProtocolSelectionProbability\":0"),
+            "{config}"
+        );
     }
 
     #[test]
@@ -1565,6 +1933,102 @@ mod tests {
         }
         assert!(config.contains(&format!("\"{}.{}.{}.{}\"", 23, 215, 0, 206)));
         assert!(!config.contains("\"NetworkLatencyMultiplier\":"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shared_proxy_listens_on_every_interface() {
+        let settings = Settings::from_json(Some(&settings_json(
+            r#"{"listen":"127.0.0.1:1821","shareProxyOnNetwork":true}"#,
+        )))
+        .expect("settings");
+        assert_eq!(settings.interface.as_deref(), Some("any"));
+        let config = build_config(&settings).expect("a config");
+        assert!(config.contains("\"ListenInterface\":\"any\""), "{config}");
+        assert!(!config.contains("\"ClientFeatures\""), "{config}");
+        let error = Settings::from_json(Some(&settings_json(
+            r#"{"listen":"127.0.0.1:1821","shareProxyOnNetwork":true,"interface":"eth0"}"#,
+        )))
+        .unwrap_err();
+        assert!(error.contains("shareProxyOnNetwork"), "{error}");
+    }
+
+    #[test]
+    fn a_conduit_mode_decides_whether_the_compartment_is_named() {
+        for (mode, named) in [("auto", true), ("shirokhorshid", true), ("public", false)] {
+            let settings = Settings::from_json(Some(&settings_json(&format!(
+                r#"{{"listen":"127.0.0.1:1821","shape":"conduit","inproxyCompartment":"room","conduitMode":"{mode}","conduitTimeoutSeconds":2}}"#
+            ))))
+            .expect("settings");
+            assert_eq!(settings.conduit_timeout, Duration::from_secs(2));
+            let config = build_config(&settings).expect("a config");
+            assert_eq!(
+                config.contains("\"InproxyClientPersonalCompartmentID\":\"room\""),
+                named,
+                "{mode}: {config}"
+            );
+        }
+    }
+
+    #[test]
+    fn server_list_bootstrap_reaches_the_config() {
+        let settings = Settings::from_json(Some(&settings_json(
+            r#"{"listen":"127.0.0.1:1821","serverListURLs":["https://a.example/list","https://b.example/list"],"obfuscatedServerListRootUrls":["https://o.example/root"],"serverEntrySignaturePublicKey":"entry-key","exchangeObfuscationKey":"exchange-key"}"#,
+        )))
+        .expect("settings");
+        let config = build_config(&settings).expect("a config");
+        for url in [
+            "https://a.example/list",
+            "https://b.example/list",
+            "https://o.example/root",
+        ] {
+            let encoded = ferrox_core::b64::encode(url.as_bytes());
+            assert!(config.contains(&encoded), "{url} in {config}");
+        }
+        assert!(
+            config.contains("\"ServerEntrySignaturePublicKey\":\"entry-key\""),
+            "{config}"
+        );
+        assert!(
+            config.contains("\"ExchangeObfuscationKey\":\"exchange-key\""),
+            "{config}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_conduit_auto_falls_back_to_public() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-psiphon-fallback-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("dir");
+        let port = free_port(IpAddr::V4(Ipv4Addr::LOCALHOST)).expect("a port");
+        let binary = dir.join("psiphon-tunnel-core");
+        std::fs::write(
+            &binary,
+            format!(
+                "#!/bin/sh\nconfig=\"\"\nwhile [ $# -gt 0 ]; do case \"$1\" in -config) config=\"$2\"; shift 2;; *) shift;; esac; done\nif grep -q InproxyClientPersonalCompartmentID \"$config\"; then exec sleep 30; fi\nprintf '%s\\n' '{{\"noticeType\":\"ListeningSocksProxyPort\",\"data\":{{\"port\":{port}}}}}' >&2\nprintf '%s\\n' '{{\"noticeType\":\"Tunnels\",\"data\":{{\"count\":1}}}}' >&2\nexec sleep 30\n"
+            ),
+        )
+        .expect("write");
+        let mut permissions = std::fs::metadata(&binary).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&binary, permissions).expect("chmod");
+        let settings = format!(
+            r#"{{"binary":"{}","listen":"127.0.0.1:{port}","dataRootDirectory":"{}","readySeconds":5,"shape":"conduit","inproxyCompartment":"room","conduitMode":"auto","conduitTimeoutSeconds":1}}"#,
+            binary.display(),
+            dir.display()
+        );
+        let lane = PsiphonOut::new(Some(&settings_json(&settings))).expect("a lane");
+        assert_eq!(lane.endpoint(), SocketAddr::from(([127, 0, 0, 1], port)));
+        let config = dir.join(format!("ferrox-psiphon-{port}.json"));
+        let written = std::fs::read_to_string(&config).expect("config");
+        assert!(
+            !written.contains("InproxyClientPersonalCompartmentID"),
+            "the public retry still named the compartment: {written}"
+        );
+        drop(lane);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
