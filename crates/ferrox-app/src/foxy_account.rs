@@ -847,13 +847,20 @@ fn fxa_attempts(endpoint: &Endpoint) -> Vec<Endpoint> {
     hosts.iter().map(|host| endpoint.with_host(host)).collect()
 }
 
+/// The session a password sign-in produced and what `FxA` says it still wants before the session is fully verified.
+pub(crate) struct Login {
+    session: String,
+    verified: bool,
+    method: Option<String>,
+}
+
 /// The `FxA` login, tried without the two-factor method first: the first attempt's error is the reason to drop it.
 pub(crate) fn login(
     endpoint: &Endpoint,
     jar: &Mutex<Jar>,
     email: &str,
     password: &str,
-) -> Result<(String, bool), Denied> {
+) -> Result<Login, Denied> {
     // An autofilled or pasted identity carries padding FxA rejects and a casing the stretch must not depend on; drop every separator, zero-width mark and BOM wherever it sits and lower-case to the one form the salt and the body must agree on.
     let email = normalize_identity(email);
     let stretched = account::auth_pw(&email, password);
@@ -881,8 +888,8 @@ fn login_on(
     jar: &Mutex<Jar>,
     email: &str,
     stretched: &str,
-) -> Result<(String, bool), Denied> {
-    for method in [Some("email-2fa"), None] {
+) -> Result<Login, Denied> {
+    for method in [None, Some("email-2fa")] {
         let body = account::login_body(email, stretched, method);
         let reply = foxy_challenge::send_with_challenge(
             endpoint,
@@ -893,7 +900,7 @@ fn login_on(
             &body,
         )?;
         if let Some(errno) = errno(&reply) {
-            if errno == 107 && method.is_some() {
+            if errno == 107 && method.is_none() {
                 continue;
             }
             return Err(Denied::Other(reply.status));
@@ -901,8 +908,12 @@ fn login_on(
         if let Some(denied) = reply.denied() {
             return Err(denied);
         }
-        let token = reply.field("sessionToken").ok_or(Denied::Token)?;
-        return Ok((token, reply.field("verified").is_some_and(|v| v == "true")));
+        let session = reply.field("sessionToken").ok_or(Denied::Token)?;
+        return Ok(Login {
+            session,
+            verified: reply.field("verified").is_some_and(|v| v == "true"),
+            method: reply.field("verificationMethod"),
+        });
     }
     Err(Denied::Token)
 }
@@ -1433,8 +1444,13 @@ impl Account {
     /// Signs in, exchanges the session token, and mints the first pass.
     pub(crate) fn sign_in(&self, email: &str, password: &str) -> Result<(), Denied> {
         let now = epoch();
-        let (session, verified) = login(&self.fxa, &self.jar, email, password)?;
-        if !verified {
+        let Login {
+            session,
+            verified,
+            method,
+        } = login(&self.fxa, &self.jar, email, password)?;
+        // A two-factor session needs its code; an email-verification session still exchanges, so the password path does not fall back to a browser.
+        if !verified && method.as_deref() == Some("email-2fa") {
             *self.pending.lock().map_err(|_| Denied::Token)? = Some(session);
             self.persist();
             return Ok(());
@@ -1920,9 +1936,12 @@ mod loopback {
         )
     }
 
-    fn session_answer() -> String {
-        let verified = !TWO_FACTOR.load(std::sync::atomic::Ordering::Relaxed);
-        format!(r#"{{"sessionToken":"{SESSION}","verified":{verified}}}"#)
+    fn session_answer(method: Option<&str>) -> String {
+        let verified = method.is_none();
+        let method = method
+            .map(|method| format!(r#","verificationMethod":"{method}""#))
+            .unwrap_or_default();
+        format!(r#"{{"sessionToken":"{SESSION}","verified":{verified}{method}}}"#)
     }
 
     /// The whole account plane on one loopback port: challenge, sign-in, Hawk-signed exchange, pass.
@@ -2023,10 +2042,22 @@ mod loopback {
                 }
                 let body = String::from_utf8_lossy(&seen.body);
                 assert!(
-                    body.contains(r#""email":"person@example.com""#),
+                    body.contains(r#""email":"person@example.com""#)
+                        || body.contains(r#""email":"verify@example.com""#),
                     "the login must carry the trimmed identity: {body}"
                 );
-                reply(200, &[], &session_answer())
+                let two_factor = body.contains(r#""verificationMethod":"email-2fa""#);
+                if TWO_FACTOR.load(std::sync::atomic::Ordering::Relaxed) && !two_factor {
+                    return reply(400, &[], r#"{"errno":107}"#);
+                }
+                let method = if two_factor {
+                    Some("email-2fa")
+                } else if body.contains(r#""email":"verify@example.com""#) {
+                    Some("email")
+                } else {
+                    None
+                };
+                reply(200, &[], &session_answer(method))
             }
             ("POST", "/v1/oauth/token" | "/v1/token") => token_answer(seen),
             ("POST", "/v1/session/verify_code") => {
@@ -2196,6 +2227,31 @@ mod loopback {
         assert_eq!(
             seen.last().map(String::as_str),
             Some("GET /api/v1/fpn/token")
+        );
+    }
+
+    /// A login that only asks for email verification still exchanges: the password path does not need a browser.
+    #[test]
+    fn an_email_verification_session_mints_without_a_code() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        TWO_FACTOR.store(false, std::sync::atomic::Ordering::Relaxed);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots, rx) = edge_with_log();
+        let account = account(address, roots);
+        account
+            .sign_in("verify@example.com", "hunter2")
+            .expect("an email-verification session signs in");
+        assert!(
+            !account.needs_code(),
+            "email verification is not a two-factor wait"
+        );
+        assert!(account.current().token.starts_with("eyJ"), "and mints");
+        let log = seen(&rx);
+        assert!(
+            log.iter().any(|line| line == "POST /v1/oauth/token"),
+            "the unverified session is exchanged: {log:?}"
         );
     }
 
