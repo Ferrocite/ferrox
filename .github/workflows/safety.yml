@@ -58,6 +58,10 @@ jobs:
             package: ferrox-app
             target: --bin ferrox-app
             filters: "relay_buffer a_promoted_buffer a_read_into_the_tail a_head_dribbled a_body_never_lands a_frame_split_across_reads a_continue_then_end_sequence a_relay_leg_window_keeps"
+          - shard: quic-buffers
+            package: ferrox-app
+            target: --bin ferrox-app
+            filters: "a_returned_datagram_buffer_is_reused_without_an_allocation"
           - shard: parsers
             package: ferrox-core
             target: --test parsers
