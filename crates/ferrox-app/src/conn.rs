@@ -1289,22 +1289,83 @@ impl Listener {
 }
 
 /// Connect to a target, whichever family it names. The IP arm is the TCP dial with its budget
-/// unchanged; the Unix arm connects a socket path. A local `AF_UNIX` connect returns at once
-/// (`ENOENT`/`ECONNREFUSED`) rather than waiting out a retransmission, so it needs no timeout.
+/// unchanged; the Unix arm spends the same budget, because Linux parks `connect` on a socket path
+/// until the listener's backlog has room, where macOS refuses it at once.
 pub(crate) fn connect(target: &Target, timeout: Duration) -> io::Result<Connection> {
     match target {
         Target::Ip(addr) => dial_tcp(addr, timeout),
-        #[cfg(any(unix, windows))]
+        #[cfg(unix)]
+        Target::Unix(path) => unix_connect(path, timeout),
+        #[cfg(windows)]
         Target::Unix(path) => UnixStream::connect(path).map(Connection::Unix),
     }
 }
 
-/// Connect Linux's abstract namespace, whose address is bytes rather than a path.
+/// One nonblocking `connect` waited out with `poll`, so a full backlog costs the budget and not the
+/// flow's thread, and a listener that answers at once still does.
+#[cfg(unix)]
+fn unix_connect(path: &std::path::Path, timeout: Duration) -> io::Result<Connection> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    connect_bounded(&socket, &SockAddr::unix(path)?, timeout)?;
+    Ok(unix_connection(socket))
+}
+
+/// `connect_timeout`, with Linux's full queue named: a nonblocking `AF_UNIX` connect that finds no
+/// room is hung up with no error set, which socket2 reports as `Other` rather than the refusal it is.
+#[cfg(unix)]
+fn connect_bounded(
+    socket: &socket2::Socket,
+    address: &socket2::SockAddr,
+    timeout: Duration,
+) -> io::Result<()> {
+    socket.connect_timeout(address, timeout).map_err(|error| {
+        if error.kind() == io::ErrorKind::Other {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the socket's queue did not take the connection",
+            )
+        } else {
+            error
+        }
+    })
+}
+
+#[cfg(unix)]
+fn unix_connection(socket: socket2::Socket) -> Connection {
+    Connection::Unix(UnixStream::from(std::os::fd::OwnedFd::from(socket)))
+}
+
+/// Connect Linux's abstract namespace, whose address is bytes rather than a path, under the same
+/// budget the named arm spends.
 #[cfg(target_os = "linux")]
-pub(crate) fn connect_abstract(name: &[u8]) -> io::Result<Connection> {
-    use std::os::linux::net::SocketAddrExt;
-    let address = std::os::unix::net::SocketAddr::from_abstract_name(name)?;
-    std::os::unix::net::UnixStream::connect_addr(&address).map(Connection::Unix)
+pub(crate) fn connect_abstract(name: &[u8], timeout: Duration) -> io::Result<Connection> {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    // SAFETY: `try_init` hands over zeroed storage sized for any address, and the family and length written into it describe the `sockaddr_un` filled here.
+    let ((), address) = unsafe {
+        SockAddr::try_init(|storage, length| {
+            let address = storage.cast::<libc::sockaddr_un>();
+            let field = (*address).sun_path.len();
+            if name.is_empty() || name.len() >= field {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "an abstract name does not fit a socket address",
+                ));
+            }
+            (*address).sun_family = libc::AF_UNIX as libc::sa_family_t;
+            let path = std::ptr::addr_of_mut!((*address).sun_path).cast::<u8>();
+            // The leading zero is the abstract namespace's marker, as `from_abstract_name` writes it.
+            for (at, byte) in name.iter().enumerate() {
+                *path.add(at + 1) = *byte;
+            }
+            *length = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + 1 + name.len())
+                as libc::socklen_t;
+            Ok(())
+        })
+    }?;
+    let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    connect_bounded(&socket, &address, timeout)?;
+    Ok(unix_connection(socket))
 }
 
 /// The seam's `AF_UNIX` arm on the host whose `std` keeps `UnixStream` behind the unstable
@@ -1988,6 +2049,66 @@ mod tests {
             Listener::bind(&Target::Unix(long)).is_err(),
             "a path past the socket address field is refused, not truncated and bound"
         );
+    }
+
+    /// Linux parks `connect` on a socket path once the listener's backlog is full, so a dial that
+    /// is not waited out holds its caller past the budget; the seam spends the budget instead.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_full_unix_backlog_ends_the_dial_at_its_budget() {
+        use socket2::{Domain, SockAddr, Socket, Type};
+        use std::sync::mpsc;
+        use std::time::Instant;
+
+        let dir = std::env::temp_dir().join(format!("ferrox-unix-full-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        let path = dir.join("sock");
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).expect("a unix socket");
+        listener
+            .bind(&SockAddr::unix(&path).expect("a unix address"))
+            .expect("binds");
+        listener.listen(1).expect("listens");
+
+        // Queue connections until a blocking dial stops answering: the next dial then has no room.
+        let filler_path = path.clone();
+        let (progress, filled) = mpsc::channel();
+        std::thread::spawn(move || loop {
+            match UnixStream::connect(&filler_path) {
+                // A queued connection keeps its slot; dropping it would free the room the dial needs to find full.
+                Ok(stream) => std::mem::forget(stream),
+                Err(_) => std::thread::sleep(Duration::from_millis(50)),
+            }
+            let _ = progress.send(());
+        });
+        let started = Instant::now();
+        while filled.recv_timeout(Duration::from_millis(150)).is_ok() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the backlog never fills"
+            );
+        }
+
+        let (done, result) = mpsc::channel();
+        let dial_path = path.clone();
+        std::thread::spawn(move || {
+            let _ = done.send(connect(
+                &Target::Unix(dial_path),
+                Duration::from_millis(200),
+            ));
+        });
+        let attempt = result
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a full backlog must not hold the dial past its budget");
+        let error = attempt.expect_err("a dial with no room must end in the budget's error");
+        assert!(
+            matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ),
+            "the budget's error, not another: {:?}",
+            error.kind()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     fn round_trip_unix(sent: &[u8]) -> Vec<u8> {
