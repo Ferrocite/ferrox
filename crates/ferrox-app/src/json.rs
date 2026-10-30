@@ -66,6 +66,90 @@ impl Json {
     }
 }
 
+/// xray's `conf.Config.Override`: a top-level block replaces whole, `inbounds` and `outbounds`
+/// merge by tag (a new outbound prepends unless the file's name says `tail`), `env` merges by
+/// key, and a null block overrides nothing.
+pub(crate) fn merge(base: &mut Json, over: &Json, name: &str) {
+    let (Json::Obj(base), Json::Obj(pairs)) = (base, over) else {
+        return;
+    };
+    let tail = name.to_ascii_lowercase().contains("tail");
+    for (key, value) in pairs {
+        if matches!(value, Json::Null) {
+            continue;
+        }
+        match key.as_str() {
+            "inbounds" => merge_tagged(base, key, value, false),
+            "outbounds" => merge_tagged(base, key, value, tail),
+            "env" => merge_env(base, key, value),
+            _ => upsert(base, key, value.clone()),
+        }
+    }
+}
+
+/// The value a top-level key holds, inserted as null when this is the first config naming it.
+fn slot<'a>(pairs: &'a mut Vec<(String, Json)>, key: &str) -> &'a mut Json {
+    let Some(at) = pairs.iter().position(|(have, _)| have == key) else {
+        let at = pairs.len();
+        pairs.push((key.to_owned(), Json::Null));
+        return &mut pairs[at].1;
+    };
+    &mut pairs[at].1
+}
+
+fn upsert(pairs: &mut Vec<(String, Json)>, key: &str, value: Json) {
+    *slot(pairs, key) = value;
+}
+
+/// `env` is the one block the reference merges key by key instead of replacing whole.
+fn merge_env(base: &mut Vec<(String, Json)>, key: &str, over: &Json) {
+    let Json::Obj(entries) = over else {
+        upsert(base, key, over.clone());
+        return;
+    };
+    let Json::Obj(into) = slot(base, key) else {
+        upsert(base, key, over.clone());
+        return;
+    };
+    for (name, value) in entries {
+        match into.iter().position(|(have, _)| have == name) {
+            Some(at) => into[at].1 = value.clone(),
+            None => into.push((name.clone(), value.clone())),
+        }
+    }
+}
+
+fn merge_tagged(base: &mut Vec<(String, Json)>, key: &str, over: &Json, tail: bool) {
+    let Json::Arr(items) = over else {
+        upsert(base, key, over.clone());
+        return;
+    };
+    if items.is_empty() {
+        return;
+    }
+    let entry = slot(base, key);
+    let Json::Arr(existing) = entry else {
+        *entry = over.clone();
+        return;
+    };
+    let mut added = Vec::new();
+    for item in items {
+        let tag = item.get("tag").and_then(Json::as_str).unwrap_or_default();
+        match existing
+            .iter()
+            .position(|have| have.get("tag").and_then(Json::as_str).unwrap_or_default() == tag)
+        {
+            Some(at) => existing[at] = item.clone(),
+            None => added.push(item.clone()),
+        }
+    }
+    if tail {
+        existing.extend(added);
+    } else {
+        existing.splice(0..0, added);
+    }
+}
+
 /// The one writer for a value, so a built request never hand-writes a string; its output is what `parse` reads.
 pub(crate) fn write(value: &Json, out: &mut String) {
     match value {
@@ -802,5 +886,29 @@ mod tests {
         out.clear();
         write(&Json::Str("\u{1}\n\"".into()), &mut out);
         assert_eq!(out, "\"\\u0001\\n\\\"\"");
+    }
+
+    #[test]
+    fn merge_keeps_a_block_the_later_file_leaves_null_or_empty() {
+        let mut base =
+            parse(r#"{"log":{"loglevel":"warning"},"inbounds":[{"tag":"in"}]}"#).expect("parses");
+        let over = parse(r#"{"log":null,"inbounds":[]}"#).expect("parses");
+        merge(&mut base, &over, "02-extra.json");
+        let mut text = String::new();
+        write(&base, &mut text);
+        assert_eq!(
+            text,
+            r#"{"log":{"loglevel":"warning"},"inbounds":[{"tag":"in"}]}"#
+        );
+    }
+
+    #[test]
+    fn merge_joins_env_by_key() {
+        let mut base = parse(r#"{"env":{"A":"1","B":"2"}}"#).expect("parses");
+        let over = parse(r#"{"env":{"B":"3","C":"4"}}"#).expect("parses");
+        merge(&mut base, &over, "02-extra.json");
+        let mut text = String::new();
+        write(&base, &mut text);
+        assert_eq!(text, r#"{"env":{"A":"1","B":"3","C":"4"}}"#);
     }
 }

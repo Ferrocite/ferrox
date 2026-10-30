@@ -301,7 +301,10 @@ fn test_reads_a_confdir_the_reference_discovers() {
         "confdir",
         &[
             ("01-inbound.json", &held_port_inbound(port)),
-            ("02-outbound.json", r#"{"outbounds":[{"protocol":"freedom"}]}"#),
+            (
+                "02-outbound.json",
+                r#"{"outbounds":[{"protocol":"freedom"}]}"#,
+            ),
         ],
     );
     let named = dir.to_string_lossy().into_owned();
@@ -326,7 +329,10 @@ fn test_merges_a_second_config_file() {
     let held = TcpListener::bind("127.0.0.1:0").expect("hold a port");
     let port = held.local_addr().expect("local address").port();
     let inbound = config_path("merge-inbound", &held_port_inbound(port));
-    let outbound = config_path("merge-outbound", r#"{"outbounds":[{"protocol":"freedom"}]}"#);
+    let outbound = config_path(
+        "merge-outbound",
+        r#"{"outbounds":[{"protocol":"freedom"}]}"#,
+    );
     let output = run(&[
         "-test",
         "-c",
@@ -388,7 +394,9 @@ fn dump_prints_the_config_the_reference_would_merge() {
         "an outbound of the same tag is replaced in place: {stdout}"
     );
     let new = stdout.find(r#""tag":"new""#).expect("the new outbound");
-    let direct = stdout.find(r#""tag":"direct""#).expect("the replaced outbound");
+    let direct = stdout
+        .find(r#""tag":"direct""#)
+        .expect("the replaced outbound");
     assert!(
         new < direct,
         "an outbound no file named yet prepends, so it stays first: {stdout}"
@@ -402,11 +410,11 @@ fn a_config_file_named_tail_appends_its_outbounds() {
     let base = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"}]}"#;
     let over = r#"{"outbounds":[{"tag":"last","protocol":"blackhole"}]}"#;
     let plain = config_dir(
-        "tail-plain",
+        "append-plain",
         &[("01-base.json", base), ("02-extra.json", over)],
     );
     let tail = config_dir(
-        "tail-named",
+        "append-tail",
         &[("01-base.json", base), ("99-tail.json", over)],
     );
     let first = run(&["-dump", "-confdir", &plain.to_string_lossy()]);
@@ -452,8 +460,7 @@ fn a_later_config_file_replaces_an_inbound_the_handler_builds() {
     );
     assert!(
         stdout.contains("no servable inbound")
-            && String::from_utf8_lossy(&output.stderr)
-                .contains("unreadable vless tls identity"),
+            && String::from_utf8_lossy(&output.stderr).contains("unreadable vless tls identity"),
         "the refusal names the certificate the later file's inbound is missing: {stdout}{}",
         String::from_utf8_lossy(&output.stderr)
     );
