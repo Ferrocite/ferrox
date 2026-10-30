@@ -1886,14 +1886,12 @@ impl Runtime {
                         let fallback = routing
                             .balancer(named)
                             .and_then(crate::router::Balancer::fallback);
-                        return candidates
-                            .iter()
-                            .map(String::as_str)
-                            .chain(fallback)
-                            .all(|candidate| {
+                        return candidates.iter().map(String::as_str).chain(fallback).all(
+                            |candidate| {
                                 Some(candidate) == default_tag
                                     || matches!(tagged.get(candidate), Some(Outbound::Freedom(_)))
-                            });
+                            },
+                        );
                     }
                     Some(named) == default_tag
                         || matches!(tagged.get(named), Some(Outbound::Freedom(_)))
