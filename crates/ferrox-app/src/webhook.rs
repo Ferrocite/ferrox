@@ -16,6 +16,9 @@ use crate::router::Network;
 /// The whole request's budget, which is the reference's `http.Client{Timeout: 5s}`.
 const BUDGET: Duration = Duration::from_secs(5);
 
+/// One notifier's POST threads, capped because each is an OS thread held for up to [`BUDGET`].
+const MAX_IN_FLIGHT: usize = 32;
+
 /// What a stage still has to spend, floored at a millisecond because `std` refuses a zero wait.
 fn left(deadline: Instant) -> Duration {
     deadline
@@ -31,12 +34,19 @@ pub(crate) struct Webhook {
     headers: Vec<(String, String)>,
     deduplication: u32,
     seen: Mutex<Seen>,
+    in_flight: Mutex<InFlight>,
 }
 
 #[derive(Debug)]
 struct Seen {
     emails: HashMap<String, Instant>,
     swept: Instant,
+}
+
+#[derive(Debug)]
+struct InFlight {
+    active: usize,
+    saturated: bool,
 }
 
 /// The facts a matched flow hands the event, as the reference's `buildEvent` reads them. A destination
@@ -97,6 +107,10 @@ pub(crate) fn parse(field: &Json) -> Result<Option<Arc<Webhook>>, String> {
             emails: HashMap::new(),
             swept: Instant::now(),
         }),
+        in_flight: Mutex::new(InFlight {
+            active: 0,
+            saturated: false,
+        }),
     })))
 }
 
@@ -119,16 +133,54 @@ impl Webhook {
     /// Send the event one matched flow carries, on its own thread as the reference's goroutine does;
     /// an email inside the window sends nothing.
     pub(crate) fn fire(self: &Arc<Self>, event: &Event<'_>) {
+        if !self.acquire() {
+            return;
+        }
         if self.is_duplicate(event.email.unwrap_or("")) {
+            self.release();
             return;
         }
         let body = event_body(event);
         let webhook = Arc::clone(self);
         if let Err(error) = std::thread::Builder::new()
             .name("webhook".to_owned())
-            .spawn(move || webhook.post(&body))
+            .spawn(move || {
+                webhook.post(&body);
+                webhook.release();
+            })
         {
+            self.release();
             eprintln!("webhook: cannot start the POST: {error}");
+        }
+    }
+
+    /// Reserve one POST slot, or report the first drop of a saturated episode.
+    fn acquire(&self) -> bool {
+        let mut state = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.active >= MAX_IN_FLIGHT {
+            let first = !state.saturated;
+            state.saturated = true;
+            drop(state);
+            if first {
+                eprintln!("webhook: {MAX_IN_FLIGHT} POSTs in flight; dropping an event");
+            }
+            return false;
+        }
+        state.active += 1;
+        true
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.active -= 1;
+        if state.active < MAX_IN_FLIGHT {
+            state.saturated = false;
         }
     }
 
@@ -779,6 +831,74 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the request arrives");
         assert!(head.starts_with("POST /post HTTP/1.1\r\n"), "{head}");
+    }
+
+    #[test]
+    fn more_than_the_cap_of_posts_is_dropped() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const CAP: usize = 32;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let accepted = Arc::clone(&accepted);
+            let release = Arc::clone(&release);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                listener.set_nonblocking(true).expect("nonblocking");
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                            let release = Arc::clone(&release);
+                            handlers.push(std::thread::spawn(move || {
+                                stream
+                                    .set_read_timeout(Some(Duration::from_secs(1)))
+                                    .expect("timeout");
+                                let mut request = [0u8; 512];
+                                let _ = stream.read(&mut request);
+                                while !release.load(Ordering::SeqCst) {
+                                    std::thread::sleep(Duration::from_millis(5));
+                                }
+                                let _ = stream.write_all(
+                                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
+                                );
+                            }));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for handler in handlers {
+                    handler.join().ok();
+                }
+            })
+        };
+
+        let webhook = notifier(&format!("http://127.0.0.1:{port}/hook"));
+        let destination = Destination::Name("example.test".to_owned(), 80);
+        let event = event(&destination);
+        for _ in 0..=CAP {
+            webhook.fire(&event);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while accepted.load(Ordering::SeqCst) < CAP && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let started = accepted.load(Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(500));
+        let still = accepted.load(Ordering::SeqCst);
+        release.store(true, Ordering::SeqCst);
+        stop.store(true, Ordering::SeqCst);
+        server.join().ok();
+        assert_eq!(started, CAP, "the cap's permits are used");
+        assert_eq!(still, CAP, "the event over the cap never starts a POST");
     }
 
     #[test]
