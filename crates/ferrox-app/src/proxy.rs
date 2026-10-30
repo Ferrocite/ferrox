@@ -7989,21 +7989,28 @@ impl<T> Grain<T> {
 impl<T> Half<T> {
     /// The two directions as a reverse tunnel: the reader owns one handle and the writers share
     /// the other, so a flow parked in a read still does not block its sibling's write.
-    fn into_tunnel(self, closer: Arc<dyn Fn() + Send + Sync>) -> crate::reverse::Tunnel
+    fn into_tunnel(
+        self,
+        closer: Arc<dyn Fn() + Send + Sync>,
+        meter: crate::stats::Meter,
+    ) -> crate::reverse::Tunnel
     where
         T: std::io::Read + std::io::Write + Send + 'static,
     {
         match self {
             Self::Split { read, write } => crate::reverse::Tunnel::new(
-                Box::new(
-                    read.into_inner()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                ),
-                Box::new(
-                    write
+                Box::new(MeteredIo {
+                    inner: read
                         .into_inner()
                         .unwrap_or_else(std::sync::PoisonError::into_inner),
-                ),
+                    meter: meter.clone(),
+                }),
+                Box::new(MeteredIo {
+                    inner: write
+                        .into_inner()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    meter,
+                }),
                 closer,
             ),
             Self::Shared { inner, .. } => {
@@ -8013,8 +8020,14 @@ impl<T> Half<T> {
                         .unwrap_or_else(std::sync::PoisonError::into_inner),
                 ));
                 crate::reverse::Tunnel::new(
-                    Box::new(SharedRead(Arc::clone(&shared))),
-                    Box::new(SharedWrite(shared)),
+                    Box::new(MeteredIo {
+                        inner: SharedRead(Arc::clone(&shared)),
+                        meter: meter.clone(),
+                    }),
+                    Box::new(MeteredIo {
+                        inner: SharedWrite(shared),
+                        meter,
+                    }),
                     closer,
                 )
             }
@@ -24177,7 +24190,7 @@ where
         }
     });
     let tunnel = match driven_halves(session, RELAY_POLL) {
-        Ok(half) => half.into_tunnel(closer),
+        Ok(half) => half.into_tunnel(closer, meter),
         Err(session) => {
             let session = MeteredIo {
                 inner: session,
