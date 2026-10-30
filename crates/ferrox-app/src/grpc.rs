@@ -15,6 +15,9 @@ use crate::h2::{
 
 const MSG_CAP: usize = 16 * 1024 * 1024;
 
+/// The control frames a post-`END_STREAM` read pumps before it yields: a peer that never stops sending them must not pin the lane past the half-close the relay owes the target.
+const POST_END_BURST: usize = 16;
+
 /// The bodies one credit pays for, half the window the preface advertises: a peer that has sent this much is owed a credit, and one that has not still has the other half to send into, so no grant is ever the thing a stalled writer waits for.
 const CREDIT_AT: u32 = WINDOW / 2;
 
@@ -722,13 +725,15 @@ impl<R: Read> GrpcReader<R> {
 
     /// After a normal `END_STREAM` the read half is done, but the connection still carries the control frames the write half needs: pump them, and let the lane's poll timeout hand the turn back.
     fn pump_after_end(&mut self) -> std::io::Result<usize> {
-        loop {
+        for _ in 0..POST_END_BURST {
             match self.pump() {
                 Ok(Some(())) => {}
                 Ok(None) => return Ok(0),
                 Err(error) => return Err(error),
             }
         }
+        // A peer that keeps the control frames coming must not pin this read: the timeout hands the lane back so it can close the target write half, and the next turn pumps the rest.
+        Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
     }
 
     /// One complete frame that is not a body: the scratch holds its bytes and the match is the same one `pump` ran inline.
@@ -2681,6 +2686,39 @@ mod tests {
             reader.msg.len() <= before,
             "DATA after END_STREAM grew the read buffer"
         );
+    }
+
+    /// A peer that keeps sending control frames after `END_STREAM` must not pin the read: a burst
+    /// yields so the relay can half-close, and the next turn pumps the rest.
+    #[test]
+    fn post_end_pumping_yields_after_a_burst() {
+        let mut wire = frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[(":status", "200"), ("content-type", "application/grpc")]),
+        );
+        wire.extend_from_slice(&frame(T_DATA, F_END, 1, &message(b"ping")));
+        let total = 64u64;
+        for seq in 1..=total {
+            wire.extend_from_slice(&frame(T_PING, F_ACK, 0, &seq.to_be_bytes()));
+        }
+        let (mut reader, writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        drop(writer);
+        reader.poll = true;
+        let mut got = [0u8; 8];
+        assert_eq!(reader.read(&mut got).expect("reads"), 4);
+        let error = reader.read(&mut got).expect_err("pumping must yield");
+        assert!(crate::proxy::is_timeout(&error), "{error:?}");
+        let pumped = reader.shared.pong.load(Ordering::SeqCst);
+        assert!(pumped > 0 && pumped < total, "pumped {pumped} of {total}");
+        assert!(request_ended(&reader));
     }
 
     /// `END_STREAM` is only a normal request end once the body it closed has been handed out: a
