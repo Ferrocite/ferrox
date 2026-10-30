@@ -750,6 +750,22 @@ mod tests {
     }
 
     #[test]
+    fn a_malformed_authority_never_reaches_a_failure_log() {
+        let webhook = notifier_with(r#"{"url":"http://user:secret/path@127.0.0.1/hook"}"#);
+        assert_eq!(webhook.logged_url(), "the configured URL");
+        let reason = webhook.send("{}").expect_err("the authority is not a host");
+        assert!(!reason.contains("secret"), "{reason}");
+    }
+
+    #[test]
+    fn a_failed_socket_dial_never_names_the_socket_path() {
+        let Err(reason) = dial_socket("@secret-token", Duration::from_secs(1)) else {
+            panic!("the abstract socket does not exist");
+        };
+        assert!(!reason.contains("secret-token"), "{reason}");
+    }
+
+    #[test]
     fn a_duplicate_email_inside_the_window_is_dropped() {
         let webhook = notifier_with(r#"{"url":"http://127.0.0.1:1/x","deduplication":60}"#);
         assert!(!webhook.is_duplicate("a@x"));
