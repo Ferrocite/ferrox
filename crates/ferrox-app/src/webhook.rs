@@ -366,18 +366,18 @@ fn dial_socket(path: &str, budget: Duration) -> Result<Connection, String> {
         #[cfg(target_os = "linux")]
         if let Some(name) = path.strip_prefix('@') {
             return crate::conn::connect_abstract(&abstract_name(name)?)
-                .map_err(|error| format!("{path}: {error}"));
+                .map_err(|error| format!("unix socket: {error}"));
         }
         crate::conn::connect(
             &crate::conn::Target::Unix(std::path::PathBuf::from(path)),
             budget,
         )
-        .map_err(|error| format!("{path}: {error}"))
+        .map_err(|error| format!("unix socket: {error}"))
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = budget;
-        Err(format!("{path}: this host has no unix sockets"))
+        Err("unix socket: this host has no unix sockets".to_owned())
     }
 }
 
@@ -390,9 +390,7 @@ fn abstract_name(name: &str) -> Result<Vec<u8>, String> {
     };
     let bytes = padded.as_bytes();
     if bytes.len() > 107 {
-        return Err(format!(
-            "abstract socket `{name}` is longer than the kernel's field"
-        ));
+        return Err("abstract socket name is longer than the kernel's field".to_owned());
     }
     let mut name = vec![0u8; 107];
     name[..bytes.len()].copy_from_slice(bytes);
@@ -747,6 +745,39 @@ mod tests {
         assert_eq!(webhook.logged_url(), "http://127.0.0.1:1");
         let malformed = notifier_with(r#"{"url":"secret-without-a-scheme"}"#);
         assert_eq!(malformed.logged_url(), "the configured URL");
+    }
+
+    #[test]
+    fn a_malformed_authority_never_reaches_a_failure_log() {
+        let webhook = notifier_with(r#"{"url":"http://user:secret/path@127.0.0.1/hook"}"#);
+        assert_eq!(webhook.logged_url(), "the configured URL");
+        let reason = webhook.send("{}").expect_err("the authority is not a host");
+        assert!(!reason.contains("secret"), "{reason}");
+
+        let bracketed = notifier_with(r#"{"url":"http://[secret:token]/hook"}"#);
+        assert_eq!(bracketed.logged_url(), "the configured URL");
+        let reason = bracketed
+            .send("{}")
+            .expect_err("a bracketed host is not a secret");
+        assert!(!reason.contains("secret"), "{reason}");
+    }
+
+    #[test]
+    fn a_failed_socket_dial_never_names_the_socket_path() {
+        let Err(reason) = dial_socket("@secret-token", Duration::from_secs(1)) else {
+            panic!("the abstract socket does not exist");
+        };
+        assert!(!reason.contains("secret-token"), "{reason}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_overlong_abstract_name_never_names_the_socket_path() {
+        let overlong = format!("@@secret-token{}", "x".repeat(100));
+        let Err(reason) = dial_socket(&overlong, Duration::from_secs(1)) else {
+            panic!("an overlong abstract name is rejected");
+        };
+        assert!(!reason.contains("secret-token"), "{reason}");
     }
 
     #[test]
