@@ -1782,7 +1782,6 @@ pub(crate) struct RoutePlan {
     inbound_tag: Option<String>,
     inbound_name: Option<String>,
     source_known: bool,
-    udp: Association,
 }
 
 /// The one decision a SOCKS association can carry, or `Split` when each datagram names its own.
@@ -1800,22 +1799,29 @@ impl RoutePlan {
         inbound_name: Option<String>,
         source_known: bool,
     ) -> Self {
-        let udp = match shared
-            .routing
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .udp_tag(inbound_tag.as_deref(), shared.default_tag.as_deref())
-        {
-            Ok(None) => Association::Default,
-            Ok(Some(tag)) => Association::Tag(tag.to_owned()),
-            Err(()) => Association::Split,
-        };
         Self {
             shared,
             inbound_tag,
             inbound_name,
             source_known,
-            udp,
+        }
+    }
+
+    /// The lane a SOCKS association picks, read from the live table so a rule the management API
+    /// added or removed after startup reaches the UDP path.
+    fn association(&self) -> Association {
+        match self
+            .shared
+            .routing
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .udp_tag(
+                self.inbound_tag.as_deref(),
+                self.shared.default_tag.as_deref(),
+            ) {
+            Ok(None) => Association::Default,
+            Ok(Some(tag)) => Association::Tag(tag.to_owned()),
+            Err(()) => Association::Split,
         }
     }
 
@@ -2064,12 +2070,8 @@ impl RoutePlan {
         self.default_lane()
     }
 
-    fn split_udp(&self) -> bool {
-        matches!(self.udp, Association::Split)
-    }
-
-    fn udp_out(&self) -> Result<Picked<'_>, ()> {
-        match &self.udp {
+    fn udp_out(&self, association: &Association) -> Result<Picked<'_>, ()> {
+        match association {
             Association::Default => Ok(self.default_lane().0),
             Association::Tag(tag) => Ok(self.target(tag)),
             Association::Split => Err(()),
@@ -17089,10 +17091,13 @@ fn socks_udp_relay(client: &mut Connection) -> Option<UdpSocket> {
 
 fn serve_socks_udp(client: Connection, out: &Outbound, user: Option<&str>, level: Option<u32>) {
     if let Outbound::Route(plan) = out {
-        if plan.split_udp() || crate::sniff::current().is_some_and(|sniffing| sniffing.enabled()) {
+        let association = plan.association();
+        if matches!(association, Association::Split)
+            || crate::sniff::current().is_some_and(|sniffing| sniffing.enabled())
+        {
             return serve_socks_udp_split(client, plan, user, level);
         }
-        if let Ok(target) = plan.udp_out() {
+        if let Ok(target) = plan.udp_out(&association) {
             return serve_socks_udp_lane(client, &target);
         }
     }
@@ -48078,6 +48083,40 @@ end
         let mut back = [0u8; 4];
         after.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
+    }
+
+    /// A rule added after startup changes the lane a SOCKS UDP association picks, not just the TCP
+    /// path: the association decision is read from the live table, never cached at startup.
+    #[test]
+    fn an_added_rule_changes_a_udp_association() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+                "routing":{"rules":[{"type":"field","inboundTag":["other"],"outboundTag":"block"}]}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let shared = Arc::clone(runtime.route.as_ref().expect("route"));
+        let plan = RoutePlan::new(Arc::clone(&shared), Some("in".to_owned()), None, true);
+        assert!(
+            matches!(plan.association(), Association::Default),
+            "no rule names the inbound yet"
+        );
+
+        let rule = crate::json::parse(
+            r#"{"type":"field","ruleTag":"blocked","inboundTag":["in"],"outboundTag":"block"}"#,
+        )
+        .expect("parses");
+        runtime.add_rules(&[rule], true).expect("adds");
+        assert!(
+            matches!(plan.association(), Association::Tag(tag) if tag == "block"),
+            "the added rule changes the association decision"
+        );
+
+        runtime.remove_rules("blocked").expect("removes");
+        assert!(
+            matches!(plan.association(), Association::Default),
+            "removing the rule puts the association back on the default lane"
+        );
     }
 
     /// A `vlessRoute` rule reads the route id a flow carries: a socks flow carries none, so it reads
