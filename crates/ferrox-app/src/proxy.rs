@@ -808,12 +808,7 @@ fn serve_vless_inbound(
     }
     // An xdrive inbound has no socket: its `security` belongs to the store's lanes, so the stream is served as it arrives from the log.
     if let Carrier::Xdrive { settings } = &carrier {
-        let users = Arc::clone(&users);
-        let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
-        let accept: crate::xdrive::Accept = Arc::new(move |session| {
-            serve_vless_xdrive(session.with_meter(meter.clone()), &users, freedom);
-        });
-        serve_xdrive_loop(settings, address, accept);
+        serve_vless_xdrive_inbound(address, inbound, &users, settings, freedom);
         return true;
     }
     match sec {
@@ -9759,6 +9754,21 @@ fn dial_ss_xdrive(client: &Connection, ss: &ShadowsocksOut, target: &Destination
     };
     let close = xdrive_close(&session);
     crate::shadowsocks::pump_relay_carried(client, session, writer, &close, send, recv);
+}
+
+fn serve_vless_xdrive_inbound(
+    address: &str,
+    inbound: &Json,
+    users: &VlessUsers,
+    settings: &crate::xdrive::Settings,
+    freedom: bool,
+) {
+    let users = Arc::clone(users);
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+    let accept: crate::xdrive::Accept = Arc::new(move |session| {
+        serve_vless_xdrive(session.with_meter(meter.clone()), &users, freedom);
+    });
+    serve_xdrive_loop(settings, address, accept);
 }
 
 /// The listener an xdrive inbound is: the store itself polls for announcements, so there is no socket to bind.
