@@ -37,7 +37,7 @@ on:
           - macos
           - windows
       only:
-        description: "Comma-separated scenario substring filter (blank = every scenario in the tier)"
+        description: "Comma-separated scenario rung filter: a whole id or a `-`-separated child (blank = every scenario in the tier)"
         required: false
         default: ""
         type: string
@@ -111,7 +111,7 @@ jobs:
             for id in $ids; do
               for pat in "${pats[@]}"; do
                 [[ -n "$pat" ]] || continue
-                if [[ "$id" == *"$pat"* ]]; then
+                if scenario_matches "$id" "$pat"; then
                   kept="$kept $id"
                   break
                 fi

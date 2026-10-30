@@ -32,6 +32,13 @@ matrix_udp_carrier() {
   esac
 }
 
+# A filter names a whole rung: the id itself or a `-`-separated child of it, so
+# `vless-raw-down-1` never selects `vless-raw-down-16`.
+scenario_matches() {
+  local id="$1" pattern="$2"
+  [[ "$id" == "$pattern" || "$id" == "$pattern"-* ]]
+}
+
 # The scenario bases scripts/leg-gaps.txt files: the cells a bug-fix slice re-measures.
 filed_gap_bases() {
   python3 "$(dirname "${BASH_SOURCE[0]}")/check-matrix-legs.py" --bases
