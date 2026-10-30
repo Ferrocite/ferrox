@@ -1,4 +1,5 @@
 use crate::conn::Connection;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
@@ -176,28 +177,76 @@ const SCID_LEN: usize = 16;
 
 pub(crate) const MAX_DATAGRAM: usize = 1350;
 
-/// A datagram buffer with no zero pass: the call the slice is handed to writes every byte it reports.
-pub(crate) struct Unfilled<const N: usize>([std::mem::MaybeUninit<u8>; N]);
+/// A datagram buffer reused from a thread-local pool: a new size pays one zero pass, a returned buffer pays none, and every slice names initialized bytes.
+pub(crate) struct Unfilled<const N: usize> {
+    bytes: Vec<u8>,
+}
+
+/// The buffers one thread has returned, capped so a burst is reused without the pool becoming a heap of its own.
+const BUFFER_CACHE: usize = 1024 * 1024;
+
+#[derive(Default)]
+struct BufferPool {
+    bytes: Vec<Vec<u8>>,
+    cached: usize,
+}
+
+impl BufferPool {
+    const fn new() -> Self {
+        Self {
+            bytes: Vec::new(),
+            cached: 0,
+        }
+    }
+
+    fn take(&mut self, len: usize) -> Option<Vec<u8>> {
+        let at = self.bytes.iter().rposition(|bytes| bytes.len() == len)?;
+        let bytes = self.bytes.swap_remove(at);
+        self.cached -= bytes.len();
+        Some(bytes)
+    }
+
+    fn put(&mut self, bytes: Vec<u8>) {
+        if self.cached + bytes.len() <= BUFFER_CACHE {
+            self.cached += bytes.len();
+            self.bytes.push(bytes);
+        }
+    }
+}
+
+thread_local! {
+    static BUFFERS: RefCell<BufferPool> = const { RefCell::new(BufferPool::new()) };
+}
 
 impl<const N: usize> Unfilled<N> {
     #[must_use]
     pub(crate) fn new() -> Self {
-        Self([std::mem::MaybeUninit::<u8>::uninit(); N])
+        let bytes = BUFFERS
+            .with(|pool| pool.borrow_mut().take(N))
+            .unwrap_or_else(|| vec![0; N]);
+        Self { bytes }
     }
 
     #[must_use]
     pub(crate) fn as_mut(&mut self) -> &mut [u8] {
-        // SAFETY: every byte read out of here was written by the call this slice was handed to.
-        unsafe { std::slice::from_raw_parts_mut(self.0.as_mut_ptr().cast::<u8>(), N) }
+        &mut self.bytes
     }
 
     /// The first `len` bytes, which the call this buffer was handed wrote before it published `len`.
     #[cfg(target_os = "linux")]
     #[must_use]
     pub(crate) fn written(&self, len: usize) -> &[u8] {
-        let len = len.min(N);
-        // SAFETY: the read that filled this buffer wrote every byte below `len`, and only that far is read here.
-        unsafe { std::slice::from_raw_parts(self.0.as_ptr().cast::<u8>(), len) }
+        &self.bytes[..len.min(N)]
+    }
+}
+
+impl<const N: usize> Drop for Unfilled<N> {
+    fn drop(&mut self) {
+        if self.bytes.len() != N {
+            return;
+        }
+        let bytes = std::mem::take(&mut self.bytes);
+        let _ = BUFFERS.try_with(|pool| pool.borrow_mut().put(bytes));
     }
 }
 
@@ -3967,6 +4016,21 @@ pub(crate) fn server_accept(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A returned buffer is the next one handed out, so the pool never zeroes a datagram twice.
+    #[test]
+    fn a_returned_datagram_buffer_is_reused_without_an_allocation() {
+        let mut first = Unfilled::<256>::new();
+        first.as_mut()[0] = 0xa5;
+        drop(first);
+        let (mut second, counts) = ferrox_core::alloc_count::measure(Unfilled::<256>::new);
+        assert_eq!(counts.allocs, 0, "a returned buffer is reused");
+        assert_eq!(
+            second.as_mut()[0],
+            0xa5,
+            "the reused buffer keeps the bytes it already had"
+        );
+    }
 
     /// Only a refusal that clears is retried: a held datagram is a second chance, and a
     /// path that has ended has no next sweep to take it.
