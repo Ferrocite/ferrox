@@ -21775,6 +21775,23 @@ impl Forward {
     }
 }
 
+/// Where one upload leg stands: the buffer the peer has not taken, and whether a normal request end already closed its write half.
+struct Upload {
+    buffer: RelayBuf,
+    first: bool,
+    half_closed: bool,
+}
+
+impl Upload {
+    fn new() -> Self {
+        Self {
+            buffer: RelayBuf::new(),
+            first: true,
+            half_closed: false,
+        }
+    }
+}
+
 /// A paced carrier may still owe bytes no caller offered again: drain them before a read that would
 /// otherwise park the only lane able to hand the peer the grant the parked write waits for.
 fn settle_lane(uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
@@ -21878,18 +21895,16 @@ fn forward_finished(
 /// when the sibling already did.
 fn upload_finished(
     read: std::io::Result<usize>,
-    buffer: &mut RelayBuf,
+    upload: &mut Upload,
     peer_write: &mut Connection,
     stall: Duration,
-    first: &mut bool,
     request_ended: bool,
-    half_closed: &mut bool,
     ended: impl FnOnce() -> bool,
 ) -> Next {
     let _ = stall;
     let next = match read {
         Ok(n) if n > 0 => {
-            if *first {
+            if upload.first {
                 echo_trace("relay bwd first read");
                 echo_trace("relay bwd forwarding");
             }
@@ -21898,13 +21913,13 @@ fn upload_finished(
                 crate::census::handle(peer_write),
                 Some(stall)
             );
-            if peer_write.write_all(buffer.filled(n)).is_err() {
+            if peer_write.write_all(upload.buffer.filled(n)).is_err() {
                 echo_trace("relay bwd peer write failed");
                 Next::Done
             } else {
-                if *first {
+                if upload.first {
                     echo_trace("relay bwd forwarded");
-                    *first = false;
+                    upload.first = false;
                 }
                 Next::More
             }
@@ -21927,9 +21942,9 @@ fn upload_finished(
         }
     };
     // A normal request end still needs the target write half closed, even while this lane pumps control frames.
-    if request_ended && !*half_closed {
+    if request_ended && !upload.half_closed {
         let _ = peer_write.shutdown(Shutdown::Write);
-        *half_closed = true;
+        upload.half_closed = true;
     }
     next
 }
@@ -22013,23 +22028,19 @@ where
     let mut peer_write = peer_write;
     let upload_flow = Arc::clone(&flow);
     let upload_writer = writer.clone();
-    let mut buffer = RelayBuf::new();
-    let mut first = true;
-    let mut half_closed = false;
+    let mut upload = Upload::new();
     // Every wait of this shape carries the named stall, armed once outside the byte loop.
     let _ = peer_write.set_write_timeout(Some(stall));
     lane_pool::submit(
         Box::new(move || {
-            let read = reader.read(buffer.as_mut());
+            let read = reader.read(upload.buffer.as_mut());
             let ended_request = DRAIN_REQUEST && request_ended(&mut reader);
             let next = upload_finished(
                 read,
-                &mut buffer,
+                &mut upload,
                 &mut peer_write,
                 stall,
-                &mut first,
                 ended_request,
-                &mut half_closed,
                 || {
                     (!DRAIN_REQUEST || ended_request)
                         && upload_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
