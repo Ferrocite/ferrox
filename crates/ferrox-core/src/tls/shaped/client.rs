@@ -279,6 +279,7 @@ impl<S: Stream> Session<S> {
         if derived != confirmation {
             return Err(ech_rejected(hello, None));
         }
+        self.client_random = hello.ech_inner_random().expect("checked");
         let mut transcript = message_hash(suite.hash(), inner);
         transcript.extend_from_slice(msg);
         self.transcript = transcript;
@@ -286,7 +287,7 @@ impl<S: Stream> Session<S> {
     }
 
     fn ech_accepted(
-        &self,
+        &mut self,
         hello: &Hello,
         msg: &[u8],
         suite: Suite,
@@ -305,6 +306,7 @@ impl<S: Stream> Session<S> {
         if derived != msg[30..38] {
             return Err(ech_rejected(hello, retry));
         }
+        self.client_random = hello.ech_inner_random().expect("checked");
         Ok(())
     }
 
@@ -2264,6 +2266,39 @@ mod tests {
             !error.contains("did not accept"),
             "the confirming hello must be accepted: {error}"
         );
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
+    fn an_accepted_offer_logs_the_inner_random() {
+        let (list, _) = crate::tls::ech::generate("public.test", 7).expect("generates");
+        let mut session = ech_session(&list, accepting_server_hello);
+        let (inner, outer) = {
+            let hello = session.hello.as_ref().expect("hello");
+            (hello.ech_inner_random().expect("inner"), hello.random)
+        };
+        assert_ne!(inner, outer, "the inner random is not the outer one");
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-shaped-ech-keylog-{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let named = path.to_string_lossy().into_owned();
+        let log = crate::tls::MasterKeyLog::open(&named).expect("opens");
+        session.set_key_log(Some(Arc::new(log)));
+        let error = session
+            .handshake()
+            .expect_err("the fixture ends after ServerHello");
+        assert_eq!(error, TlsError::Closed);
+        let text = std::fs::read_to_string(&path).expect("the log the session named");
+        let _ = std::fs::remove_file(&path);
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("CLIENT_HANDSHAKE_TRAFFIC_SECRET "))
+            .unwrap_or_else(|| panic!("the handshake secret is written: {text:?}"));
+        let random = line.split(' ').nth(1).expect("a random field");
+        assert_eq!(random, crate::foxy::account::hex_encode(&inner));
+        assert_ne!(random, crate::foxy::account::hex_encode(&outer));
     }
 
     #[cfg_attr(miri, ignore = "uses the OS random source")]
