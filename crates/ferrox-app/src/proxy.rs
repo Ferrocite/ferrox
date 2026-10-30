@@ -52919,11 +52919,12 @@ mod dns_lane_tests {
     /// A name the peer chose is not a resolver job until the account and command are accepted.
     #[test]
     fn a_vless_name_waits_for_the_account_before_a_lookup() {
-        fn pair() -> (Connection, thread::JoinHandle<()>) {
+        fn pair(header: Vec<u8>) -> (Connection, thread::JoinHandle<()>) {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
             let addr = listener.local_addr().expect("addr");
             let client = thread::spawn(move || {
-                let _ = std::net::TcpStream::connect(addr);
+                let mut client = std::net::TcpStream::connect(addr).expect("connects");
+                client.write_all(&header).expect("writes the header");
             });
             let (stream, _) = listener.accept().expect("accepts");
             (Connection::from(stream), client)
@@ -52939,42 +52940,28 @@ mod dns_lane_tests {
                 None
             },
         };
-        let request = |id| VlessRequest {
-            id,
-            flow: Flow::None,
-            command: 1,
-            target: VlessTarget::Name("slow.test".to_owned(), 80),
-        };
-        let (stream, client) = pair();
-        vless_raw_reply(
-            stream,
-            &users,
-            true,
-            None,
-            &[],
-            (Probe::Decoded(request([9u8; 16])), Vec::new()),
-            &io,
-        );
+        let (stream, client) = pair(a_vless_probe(&[9u8; 16], 1));
+        serve_vless_raw_with(stream, &users, true, None, &io);
         assert_eq!(
             asked.load(Ordering::Relaxed),
             0,
             "an invalid id never looks up"
         );
         client.join().expect("client");
-        let (stream, client) = pair();
-        vless_raw_reply(
-            stream,
-            &users,
-            true,
-            None,
-            &[],
-            (Probe::Decoded(request(id)), Vec::new()),
-            &io,
+        let (stream, client) = pair(a_vless_probe(&id, 5));
+        serve_vless_raw_with(stream, &users, true, None, &io);
+        assert_eq!(
+            asked.load(Ordering::Relaxed),
+            0,
+            "an unsupported command never looks up"
         );
+        client.join().expect("client");
+        let (stream, client) = pair(a_vless_probe(&id, 1));
+        serve_vless_raw_with(stream, &users, true, None, &io);
         assert_eq!(
             asked.load(Ordering::Relaxed),
             1,
-            "a valid id reaches the resolver"
+            "a valid id reaches the resolver once"
         );
         client.join().expect("client");
     }
