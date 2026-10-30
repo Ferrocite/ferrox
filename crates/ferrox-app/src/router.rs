@@ -1148,11 +1148,13 @@ impl Routing {
 
     /// Append a decoded `AddRule` rule list, or replace the table with it when `append` is false.
     /// Rule tags stay unique across the whole table, as the reference's `AddRule` refuses a repeat.
+    /// The candidate table is validated before it is published; a refusal restores the old table.
     pub(crate) fn add_rules(
         &mut self,
         raw: &[Json],
         append: bool,
         known: impl Fn(&str) -> bool,
+        validate: impl Fn(&Self) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut assets = Assets::new(self.asset_dirs.clone());
         let mut tags: HashSet<String> = if append {
@@ -1190,12 +1192,28 @@ impl Routing {
             }
             rules.push(rule);
         }
+        let old_len = self.rules.len();
+        let old = (!append).then(|| {
+            // The reference rebuilds its balancer map from the same config, which carries none.
+            (
+                std::mem::take(&mut self.rules),
+                std::mem::take(&mut self.balancers),
+            )
+        });
         if append {
             self.rules.extend(rules);
         } else {
             self.rules = rules;
-            // The reference rebuilds its balancer map from the same config, which carries none.
-            self.balancers.clear();
+        }
+        if let Err(error) = validate(self) {
+            if append {
+                self.rules.truncate(old_len);
+            } else {
+                let (rules, balancers) = old.expect("a replace saved the old table");
+                self.rules = rules;
+                self.balancers = balancers;
+            }
+            return Err(error);
         }
         self.refresh();
         Ok(())

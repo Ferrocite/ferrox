@@ -1656,6 +1656,8 @@ struct Dynamic {
 #[derive(Debug)]
 struct RouteShared {
     routing: Arc<RwLock<crate::router::Routing>>,
+    /// The server inbounds the startup proof ran for, and whether their default dial is direct.
+    server_inbounds: RwLock<Vec<(Option<String>, bool)>>,
     tagged: HashMap<String, Outbound>,
     /// Each balancer's candidate tags, ordered by tag. Built once so a flow picks from a slice.
     balancers: Arc<HashMap<String, Vec<String>>>,
@@ -1865,13 +1867,45 @@ impl Runtime {
         let Some(route) = &self.route else {
             return Err("routing not configured".to_owned());
         };
-        let known =
-            |tag: &str| route.tagged.contains_key(tag) || Some(tag) == route.default_tag.as_deref();
+        let tagged = &route.tagged;
+        let balancers = &route.balancers;
+        let default_tag = route.default_tag.as_deref();
+        let known = |tag: &str| tagged.contains_key(tag) || Some(tag) == default_tag;
+        let server_inbounds = route
+            .server_inbounds
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let validate = |routing: &crate::router::Routing| {
+            for (tag, default_direct) in &server_inbounds {
+                routing.server_routes(tag.as_deref(), *default_direct, |named, balancer| {
+                    if balancer {
+                        let Some(candidates) = balancers.get(named) else {
+                            return false;
+                        };
+                        let fallback = routing
+                            .balancer(named)
+                            .and_then(crate::router::Balancer::fallback);
+                        candidates
+                            .iter()
+                            .map(String::as_str)
+                            .chain(fallback)
+                            .all(|candidate| {
+                                Some(candidate) == default_tag
+                                    || matches!(tagged.get(candidate), Some(Outbound::Freedom(_)))
+                            })
+                    }
+                    Some(named) == default_tag
+                        || matches!(tagged.get(named), Some(Outbound::Freedom(_)))
+                })?;
+            }
+            Ok(())
+        };
         route
             .routing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .add_rules(rules, append, known)
+            .add_rules(rules, append, known, validate)
     }
 
     /// Drop every rule carrying `tag`, for `RoutingService.RemoveRule`.
@@ -2579,6 +2613,7 @@ fn route_shared_with_api(
     };
     Ok(Arc::new(RouteShared {
         routing,
+        server_inbounds: RwLock::new(Vec::new()),
         tagged,
         balancers,
         observatory,
@@ -2667,13 +2702,17 @@ fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
         Some(named) == shared.default_tag.as_deref()
             || matches!(shared.tagged.get(named), Some(Outbound::Freedom(_)))
     };
-    if let Err(error) = routing.server_routes(
-        tag.as_deref(),
-        matches!(&shared.default, Outbound::Freedom(_)),
-        direct,
-    ) {
+    let default_direct = matches!(&shared.default, Outbound::Freedom(_));
+    let checked = routing.server_routes(tag.as_deref(), default_direct, direct);
+    drop(routing);
+    if let Err(error) = checked {
         exit(&format!("bad config {label}: {error}"));
     }
+    shared
+        .server_inbounds
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((tag, default_direct));
 }
 
 /// The Foxy lane: an account's pass over an edge in one pinned country, plus the split-tunnel list.
