@@ -763,6 +763,16 @@ mod tests {
         assert!(!reason.contains("secret-token"), "{reason}");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_overlong_abstract_name_never_names_the_socket_path() {
+        let overlong = format!("@@secret-token{}", "x".repeat(100));
+        let Err(reason) = dial_socket(&overlong, Duration::from_secs(1)) else {
+            panic!("an overlong abstract name is rejected");
+        };
+        assert!(!reason.contains("secret-token"), "{reason}");
+    }
+
     #[test]
     fn a_duplicate_email_inside_the_window_is_dropped() {
         let webhook = notifier_with(r#"{"url":"http://127.0.0.1:1/x","deduplication":60}"#);
