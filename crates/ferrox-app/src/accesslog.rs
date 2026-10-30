@@ -245,6 +245,38 @@ mod tests {
     }
 
     #[test]
+    fn a_destination_from_the_wire_cannot_forge_a_second_line() {
+        let _guard = crate::stats::test_lock();
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-access-wire-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let mut quoted = String::new();
+        crate::json::write(&Json::Str(path.to_string_lossy().into_owned()), &mut quoted);
+        let root =
+            crate::json::parse(&format!(r#"{{"log":{{"access":{quoted}}}}}"#)).expect("parses");
+        install(&root).expect("access log installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        record(
+            Some(source),
+            false,
+            &"bad\nline:443",
+            None,
+            "invalid user",
+            "",
+        );
+        let text = std::fs::read_to_string(&path).expect("reads the line");
+        assert_eq!(text.lines().count(), 1, "one request writes one line");
+        assert!(
+            text.contains(r"bad\nline:443"),
+            "a control byte is escaped: {text:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+    }
+
+    #[test]
     fn a_flow_records_the_fronts_source_and_email() {
         let _guard = crate::stats::test_lock();
         let path = std::env::temp_dir().join(format!(
