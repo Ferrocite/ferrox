@@ -577,6 +577,63 @@ fn key32(text: &str) -> Option<[u8; 32]> {
     (at == 32).then_some(out)
 }
 
+/// The byte count an unpadded urlsafe-base64 string decodes to: the two characters that leave one byte
+/// and the three that leave two, a lone trailing character naming none, and `\r`/`\n` skipped as Go skips them.
+fn b64url_len(text: &str) -> Option<usize> {
+    let mut symbols = 0usize;
+    for byte in text.bytes() {
+        if byte == b'\r' || byte == b'\n' {
+            continue;
+        }
+        if B64URL[byte as usize] == 0xff {
+            return None;
+        }
+        symbols += 1;
+    }
+    match symbols % 4 {
+        0 => Some(symbols / 4 * 3),
+        2 => Some(symbols / 4 * 3 + 1),
+        3 => Some(symbols / 4 * 3 + 2),
+        _ => None,
+    }
+}
+
+/// The ML-DSA-65 field a REALITY side names, checked as the reference's build checks it: the seed must differ
+/// from `privateKey` and decode to 32 bytes, the verify key to 1952. The signature itself is not carried yet.
+pub(crate) fn reality_mldsa(node: &Json, server: bool) -> Result<bool, String> {
+    let Some(reality) = node
+        .get("streamSettings")
+        .filter(|settings| settings.get("security").and_then(Json::as_str) == Some("reality"))
+        .and_then(|settings| settings.get("realitySettings"))
+    else {
+        return Ok(false);
+    };
+    let (field, length) = if server {
+        ("mldsa65Seed", 32)
+    } else {
+        ("mldsa65Verify", 1952)
+    };
+    let Some(text) = reality
+        .get(field)
+        .and_then(Json::as_str)
+        .filter(|text| !text.is_empty())
+    else {
+        return Ok(false);
+    };
+    if server && reality.get("privateKey").and_then(Json::as_str) == Some(text) {
+        return Err(format!(
+            r#""mldsa65Seed" and "privateKey" can not be the same value: {text}"#
+        ));
+    }
+    if b64url_len(text) != Some(length) {
+        return Err(format!(r#"invalid "{field}": {text}"#));
+    }
+    eprintln!(
+        r#"reality: "{field}" is checked, and the ML-DSA-65 binding it names is not carried"#
+    );
+    Ok(true)
+}
+
 fn as_whole(node: &Json) -> Option<u64> {
     match node {
         Json::Num(n) if *n >= 0.0 && n.fract() == 0.0 => Some(*n as u64),
@@ -2652,6 +2709,74 @@ mod tests {
         });
         assert_eq!(key, Some([0u8; 32]));
         assert_eq!(counts.allocs, 0, "the key is decoded into its array");
+    }
+
+    #[test]
+    fn reality_mldsa_checks_the_references_lengths_and_the_seed_alias() {
+        let seed = "A".repeat(43);
+        let private = "B".repeat(43);
+        let server = |field: &str| {
+            crate::json::parse(&format!(
+                r#"{{"streamSettings":{{"security":"reality","realitySettings":{{"privateKey":"{private}"{field}}}}}}}"#
+            ))
+            .expect("a server")
+        };
+        let client = |field: &str| {
+            crate::json::parse(&format!(
+                r#"{{"streamSettings":{{"security":"reality","realitySettings":{{"publicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","shortId":""{field}}}}}}}"#
+            ))
+            .expect("a client")
+        };
+        assert_eq!(
+            reality_mldsa(&server(&format!(r#","mldsa65Seed":"{seed}""#)), true),
+            Ok(true)
+        );
+        assert_eq!(reality_mldsa(&server(""), true), Ok(false));
+        assert_eq!(
+            reality_mldsa(&server(r#","mldsa65Seed":"""#), true),
+            Ok(false)
+        );
+        // Go's decoder skips CR and LF, so a wrapped seed is the same seed.
+        assert_eq!(
+            reality_mldsa(
+                &server(&format!(
+                    r#","mldsa65Seed":"{}\n{}""#,
+                    &seed[..21],
+                    &seed[21..]
+                )),
+                true
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            reality_mldsa(&server(&format!(r#","mldsa65Seed":"{private}""#)), true),
+            Err(format!(
+                r#""mldsa65Seed" and "privateKey" can not be the same value: {private}"#
+            ))
+        );
+        let short = "A".repeat(42);
+        assert_eq!(
+            reality_mldsa(&server(&format!(r#","mldsa65Seed":"{short}""#)), true),
+            Err(format!(r#"invalid "mldsa65Seed": {short}"#))
+        );
+        let verify = "A".repeat(2603);
+        assert_eq!(
+            reality_mldsa(&client(&format!(r#","mldsa65Verify":"{verify}""#)), false),
+            Ok(true)
+        );
+        assert_eq!(
+            reality_mldsa(&client(&format!(r#","mldsa65Verify":"{seed}""#)), false),
+            Err(format!(r#"invalid "mldsa65Verify": {seed}"#))
+        );
+        let tls = crate::json::parse(
+            r#"{"streamSettings":{"security":"tls","tlsSettings":{"mldsa65Seed":"x"}}}"#,
+        )
+        .expect("tls");
+        assert_eq!(reality_mldsa(&tls, true), Ok(false));
+
+        let (decoded, counts) = ferrox_core::alloc_count::measure(|| b64url_len(&verify));
+        assert_eq!(decoded, Some(1952));
+        assert_eq!(counts.allocs, 0, "the length is counted, not the bytes");
     }
 
     #[test]

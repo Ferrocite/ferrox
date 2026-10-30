@@ -144,3 +144,66 @@ fn test_accepts_a_geodata_schedule_it_does_not_carry() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+fn reality_config(seed: &str) -> String {
+    format!(
+        r#"{{"inbounds":[{{"listen":"127.0.0.1","port":18096,"protocol":"vless",
+        "settings":{{"clients":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}}],"decryption":"none"}},
+        "streamSettings":{{"network":"tcp","security":"reality","realitySettings":{{
+        "target":"cover.test:443","serverNames":["www.example.com"],
+        "privateKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA","shortIds":[""],
+        "mldsa65Seed":"{seed}"}}}}}}],"outbounds":[{{"protocol":"freedom"}}]}}"#
+    )
+}
+
+/// The reference refuses a seed that is its own private key while building the config, so `-test` does too.
+#[test]
+fn test_refuses_a_reality_seed_that_names_the_private_key() {
+    let path = config_path(
+        "reality-seed-alias",
+        &reality_config("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    );
+    let named = path.to_string_lossy().into_owned();
+    let output = run(&["-test", "-c", &named]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "an aliased seed is xray's config error: {}{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains(r#""mldsa65Seed" and "privateKey" can not be the same value"#),
+        "the refusal carries the reference's spelling: {stderr}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A seed the reference signs with is still a config this tree runs, so it starts with one line saying the binding is absent.
+#[test]
+fn test_accepts_a_reality_seed_it_does_not_carry_the_binding_for() {
+    let path = config_path(
+        "reality-seed",
+        &reality_config("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"),
+    );
+    let named = path.to_string_lossy().into_owned();
+    let output = run(&["-test", "-c", &named]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a valid seed is servable: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Configuration OK."),
+        "`-test` reports xray's verdict: {stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(
+            r#""mldsa65Seed" is checked, and the ML-DSA-65 binding it names is not carried"#
+        ),
+        "the absent binding is named instead of silent"
+    );
+    let _ = std::fs::remove_file(&path);
+}

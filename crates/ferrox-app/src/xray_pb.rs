@@ -1172,7 +1172,11 @@ impl RealityFields {
                 self.short_ids.push(hex(id));
                 Ok(())
             }
-            (11, 2) => Err(reader.uncarried("the mldsa65 seed")),
+            (11, 2) => {
+                self.pairs
+                    .push(("mldsa65Seed", Json::Str(b64url(reader.bytes()?))));
+                Ok(())
+            }
             (12, 2) => {
                 self.pairs
                     .push(("limitFallbackUpload", limit_fallback(reader.bytes()?)?));
@@ -1227,7 +1231,11 @@ impl RealityFields {
                 self.client = true;
                 Ok(())
             }
-            (25, 2) => Err(reader.uncarried("the mldsa65 verify key")),
+            (25, 2) => {
+                self.pairs
+                    .push(("mldsa65Verify", Json::Str(b64url(reader.bytes()?))));
+                Ok(())
+            }
             // The spider path shapes the hello's steal request, which this tree's reality client writes its own shape for (pinned against the reference).
             (26 | 27, _) => reader.skip(wire),
             (31, 2) => {
@@ -4917,6 +4925,7 @@ mod tests {
             bytes_field(5, b"www.example.com"),
             bytes_field(6, &[0xab; 32]),
             bytes_field(10, &[0x01, 0x02]),
+            bytes_field(11, &[0x9f; 32]),
         ]);
         let inbound = message(&[
             bytes_field(
@@ -4968,6 +4977,10 @@ mod tests {
                 .and_then(|ids| ids.first()),
             Some(&Json::Str("0102".to_owned()))
         );
+        assert_eq!(
+            reality.get("mldsa65Seed").and_then(Json::as_str),
+            Some(b64url(&[0x9f; 32]).as_str())
+        );
     }
 
     #[test]
@@ -4978,6 +4991,7 @@ mod tests {
             bytes_field(22, b"www.example.com"),
             bytes_field(23, &[0xcd; 32]),
             bytes_field(24, &[]),
+            bytes_field(25, &[0x7e; 1952]),
             bytes_field(31, b"/tmp/reality.keys"),
         ]);
         let type_name = "xray.transport.internet.reality.Config";
@@ -5024,6 +5038,10 @@ mod tests {
             Some(b64url(&[0xcd; 32]).as_str())
         );
         assert_eq!(reality.get("shortId").and_then(Json::as_str), Some(""));
+        assert_eq!(
+            reality.get("mldsa65Verify").and_then(Json::as_str),
+            Some(b64url(&[0x7e; 1952]).as_str())
+        );
         assert_eq!(
             reality.get("masterKeyLog").and_then(Json::as_str),
             Some("/tmp/reality.keys"),
