@@ -52064,7 +52064,7 @@ mod webhook_route_tests {
             "\"email\":\"a@x\"",
             "\"network\":\"tcp\"",
             "\"destination\":\"example.test:80\"",
-            "\"originalTarget\":\"example.test:80\"",
+            "\"originalTarget\":\"tcp:example.test:80\"",
             "\"inboundTag\":\"\"",
             "\"inboundName\":null",
             "\"outboundTag\":\"direct\"",

@@ -347,9 +347,9 @@ fn event_body(event: &Event<'_>) -> String {
     out.push_str(",\"destination\":");
     push_destination(&mut out, event.destination);
     out.push_str(",\"originalTarget\":");
-    push_destination(&mut out, event.original);
+    push_target(&mut out, event.original, network);
     out.push_str(",\"routeTarget\":");
-    push_destination(&mut out, event.route);
+    push_target(&mut out, event.route, network);
     out.push_str(",\"inboundTag\":");
     push_string(&mut out, event.inbound_tag.unwrap_or(""));
     out.push_str(",\"inboundName\":");
@@ -379,6 +379,14 @@ fn push_optional(out: &mut String, value: Option<&str>) {
 fn push_destination(out: &mut String, value: Option<&crate::proxy::Destination>) {
     match value {
         Some(value) => push_string(out, &value.authority()),
+        None => out.push_str("null"),
+    }
+}
+
+/// A target as the reference's `Destination.String` writes it, with the flow network first.
+fn push_target(out: &mut String, value: Option<&crate::proxy::Destination>, network: &str) {
+    match value {
+        Some(value) => push_string(out, &format!("{network}:{}", value.authority())),
         None => out.push_str("null"),
     }
 }
@@ -477,7 +485,7 @@ mod tests {
             head,
             "{\"email\":\"a@x\",\"level\":0,\"protocol\":\"http/1.1\",\"network\":\"tcp\",\
              \"source\":\"127.0.0.1:1234\",\"destination\":\"example.test:80\",\
-             \"originalTarget\":\"original.test:80\",\"routeTarget\":\"sniffed.test:80\",\
+             \"originalTarget\":\"tcp:original.test:80\",\"routeTarget\":\"tcp:sniffed.test:80\",\
              \"inboundTag\":\"in\",\"inboundName\":\"http\",\"inboundLocal\":\"127.0.0.1:8080\",\
              \"outboundTag\":\"direct\""
         );
@@ -487,6 +495,31 @@ mod tests {
                 .chars()
                 .all(|ch| ch.is_ascii_digit()),
             "{timestamp}"
+        );
+    }
+
+    #[test]
+    fn a_udp_target_names_its_network() {
+        let destination = Destination::Name("example.test".to_owned(), 80);
+        let full = Event {
+            network: Network::Udp,
+            destination: Some(&destination),
+            original: Some(&destination),
+            route: Some(&destination),
+            ..event(&destination)
+        };
+        let body = event_body(&full);
+        assert!(
+            body.contains("\"destination\":\"example.test:80\""),
+            "the destination stays host:port: {body}"
+        );
+        assert!(
+            body.contains("\"originalTarget\":\"udp:example.test:80\""),
+            "originalTarget names the flow network: {body}"
+        );
+        assert!(
+            body.contains("\"routeTarget\":\"udp:example.test:80\""),
+            "routeTarget names the flow network: {body}"
         );
     }
 
