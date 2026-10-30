@@ -12,42 +12,57 @@ use crate::args::die;
 use crate::config::{fronts, port_of, Ports};
 use crate::paths::{read_trim, read_trim_checked, secure_dir, write_private, Paths};
 
-pub fn require_bin() -> PathBuf {
-    if let Some(path) = std::env::var_os("FERROX_BIN") {
-        return PathBuf::from(path);
-    }
-    let name = if cfg!(windows) {
+fn bin_name() -> &'static str {
+    if cfg!(windows) {
         "ferrox-app.exe"
     } else {
         "ferrox-app"
-    };
-    let beside = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join(name)));
-    if let Some(path) = beside.filter(|path| path.exists()) {
-        return path;
     }
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn project_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .map(Path::to_path_buf)
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn candidate_bin() -> PathBuf {
+    let root = project_root();
     let cargo_target =
         std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from);
-    let built = cargo_target.join("release").join(if cfg!(windows) {
-        "ferrox-app.exe"
-    } else {
-        "ferrox-app"
-    });
-    if built.exists() {
-        return built;
+    cargo_target.join("release").join(bin_name())
+}
+
+fn beside_bin() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(bin_name())))
+}
+
+fn resolve_bin() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("FERROX_BIN") {
+        return Some(PathBuf::from(path));
     }
+    if let Some(path) = beside_bin().filter(|path| path.exists()) {
+        return Some(path);
+    }
+    let built = candidate_bin();
+    built.exists().then_some(built)
+}
+
+pub fn require_bin() -> PathBuf {
+    if let Some(path) = resolve_bin() {
+        return path;
+    }
+    let built = candidate_bin();
     #[cfg(debug_assertions)]
-    if root.join("Cargo.toml").exists() {
+    if project_root().join("Cargo.toml").exists() {
         eprintln!("building ferrox-app (release, one time)...");
         let status = Command::new("cargo")
             .args(["build", "--locked", "--release", "-p", "ferrox-app"])
-            .current_dir(&root)
+            .current_dir(project_root())
             .status();
         if status.is_ok_and(|status| status.success()) && built.exists() {
             return built;
@@ -140,23 +155,24 @@ fn process_exe(pid: u32) -> Option<PathBuf> {
 }
 
 fn expected_bin() -> PathBuf {
-    if let Some(path) = std::env::var_os("FERROX_BIN") {
-        return PathBuf::from(path);
+    resolve_bin().unwrap_or_else(candidate_bin)
+}
+
+fn canonical_exe(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
     }
-    let name = if cfg!(windows) {
-        "ferrox-app.exe"
-    } else {
-        "ferrox-app"
+    let text = path.to_string_lossy();
+    let Some(stripped) = text.strip_suffix(" (deleted)") else {
+        return path.to_path_buf();
     };
-    std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join(name)))
-        .unwrap_or_default()
+    let stripped = PathBuf::from(stripped);
+    std::fs::canonicalize(&stripped).unwrap_or(stripped)
 }
 
 fn same_exe(actual: &Path, expected: &Path) -> bool {
-    let actual = std::fs::canonicalize(actual).unwrap_or_else(|_| actual.to_path_buf());
-    let expected = std::fs::canonicalize(expected).unwrap_or_else(|_| expected.to_path_buf());
+    let actual = canonical_exe(actual);
+    let expected = canonical_exe(expected);
     #[cfg(windows)]
     {
         actual
