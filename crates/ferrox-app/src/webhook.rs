@@ -229,8 +229,7 @@ impl Webhook {
     }
 
     /// The POST over TCP, from the URL it parses to the status line it reads, inside the one
-    /// budget. Host name resolution and a configured Unix-socket connect are the stages `std`
-    /// cannot bound, so they sit outside the deadline.
+    /// budget. Host name resolution is the stage `std` cannot bound, so it sits outside the deadline.
     fn send(&self, body: &str) -> Result<(), String> {
         let url = HttpUrl::parse(&self.url)?;
         if url.userinfo.is_some() && !url.tls {
@@ -365,7 +364,7 @@ fn dial_socket(path: &str, budget: Duration) -> Result<Connection, String> {
     {
         #[cfg(target_os = "linux")]
         if let Some(name) = path.strip_prefix('@') {
-            return crate::conn::connect_abstract(&abstract_name(name)?)
+            return crate::conn::connect_abstract(&abstract_name(name)?, budget)
                 .map_err(|error| format!("unix socket: {error}"));
         }
         crate::conn::connect(
