@@ -29840,7 +29840,7 @@ mod tests {
         log: Option<&str>,
     ) -> String {
         let log = log
-            .map(|path| format!(r#", "masterKeyLog": "{path}""#))
+            .map(|path| format!(r#", "masterKeyLog": "{}""#, path.replace('\\', "\\\\")))
             .unwrap_or_default();
         format!(
             r#"{{"outbounds": [{{"protocol": "vless", "settings": {{"vnext": [{{"address": "127.0.0.1",
