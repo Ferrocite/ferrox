@@ -23842,7 +23842,7 @@ fn inbound_users(inbound: &Json, portals: &crate::reverse::Portals) -> VlessUser
 fn vless_flow_ok(user: &VlessUser, wire: Flow, cmd: u8, vision: bool) -> bool {
     match wire {
         Flow::Vision => vision && cmd == 1 && user.flow == Flow::Vision,
-        Flow::None => !(user.flow == Flow::Vision && cmd == 1),
+        Flow::None => matches!(cmd, 1..=4) && !(user.flow == Flow::Vision && cmd == 1),
         Flow::Other => false,
     }
 }
