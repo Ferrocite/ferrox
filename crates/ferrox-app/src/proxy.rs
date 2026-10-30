@@ -15752,7 +15752,7 @@ pub(crate) fn serve_connect(
     }
     // The rules dropped this flow: the front has granted it, so the sink answers and ends it.
     if let Outbound::Api(api) = out {
-        api.serve_stream(client);
+        api.serve_routed(client);
         return;
     }
     if let Outbound::Block(answer) = out {

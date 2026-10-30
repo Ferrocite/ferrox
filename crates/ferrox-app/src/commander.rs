@@ -177,6 +177,12 @@ const API_IDLE: Duration = Duration::from_secs(30);
 static API_SLOTS: crate::limit::Slots = crate::limit::Slots::new(API_WORKERS);
 static API_REFUSED: AtomicBool = AtomicBool::new(false);
 
+fn refuse_api() {
+    if !API_REFUSED.swap(true, Ordering::Relaxed) {
+        eprintln!("commander: {API_WORKERS} management connections are busy; refusing more");
+    }
+}
+
 impl Api {
     pub(crate) fn new(config: ApiConfig) -> Arc<Self> {
         Arc::new(Self {
@@ -315,9 +321,7 @@ impl Api {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
                 let Some(slot) = API_SLOTS.acquire() else {
-                    if !API_REFUSED.swap(true, Ordering::Relaxed) {
-                        eprintln!("commander: {API_WORKERS} management connections are busy; refusing more");
-                    }
+                    refuse_api();
                     continue;
                 };
                 let api = Arc::clone(&api);
@@ -340,8 +344,18 @@ impl Api {
         self.serve_stream_with_idle(stream, API_IDLE);
     }
 
+    /// A tunnel the rules routed to the API tag, under the same slot cap as the listener.
+    pub(crate) fn serve_routed(&self, stream: Connection) {
+        let Some(_slot) = API_SLOTS.acquire() else {
+            refuse_api();
+            return;
+        };
+        self.serve_stream(stream);
+    }
+
     /// One HTTP/2 connection's worth of calls. The client opens the preface and its SETTINGS, then
-    /// a HEADERS/DATA pair per call; this answers each completed body in arrival order.
+    /// a HEADERS/DATA pair per call; this answers each completed body in arrival order. Every frame
+    /// head waits only for the configured idle bound, not the relay's retry grain.
     fn serve_stream_with_idle(&self, mut stream: Connection, idle: Duration) {
         if stream.set_read_timeout(Some(idle)).is_err()
             || stream.set_write_timeout(Some(idle)).is_err()
@@ -357,7 +371,7 @@ impl Api {
         }
         let mut decoder = h2::Decoder::default();
         let mut calls: HashMap<u32, Call> = HashMap::new();
-        while let Some((len, kind, flags, id)) = h2::read_head(&mut stream) {
+        while let Some((len, kind, flags, id)) = h2::read_head_bounded(&mut stream) {
             let mut body = vec![0u8; len];
             if stream.read_exact(&mut body).is_err() {
                 return;
@@ -1489,8 +1503,7 @@ mod tests {
         (message, trailers)
     }
 
-    #[test]
-    fn an_idle_api_connection_returns_its_worker() {
+    fn zero_sized_api_connection(preface: bool) -> bool {
         let api = Api::new(ApiConfig::default());
         let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
         let address = listener.local_addr().expect("addr");
@@ -1500,10 +1513,26 @@ mod tests {
             api.serve_stream_with_idle(Connection::from(stream), Duration::from_millis(50));
             done.send(()).expect("reports");
         });
-        let _idle = Connection::connect(address).expect("connects");
+        let mut idle = Connection::connect(address).expect("connects");
+        if preface {
+            idle.write_all(h2::MAGIC).expect("writes the preface");
+        }
+        waited.recv_timeout(Duration::from_secs(2)).is_ok()
+    }
+
+    #[test]
+    fn an_idle_api_connection_before_the_preface_returns_its_worker() {
         assert!(
-            waited.recv_timeout(Duration::from_secs(2)).is_ok(),
+            zero_sized_api_connection(false),
             "an idle connection outlived its bound"
+        );
+    }
+
+    #[test]
+    fn an_idle_api_connection_after_the_preface_returns_its_worker() {
+        assert!(
+            zero_sized_api_connection(true),
+            "a preface-only connection outlived its bound"
         );
     }
 
