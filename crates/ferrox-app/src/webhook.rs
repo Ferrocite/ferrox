@@ -473,6 +473,25 @@ mod tests {
     }
 
     #[test]
+    fn a_mistyped_webhook_is_refused() {
+        for text in [
+            r#""http://127.0.0.1/hook""#,
+            r#"{"url":42}"#,
+            r#"{"url":"http://127.0.0.1/hook","deduplication":"60"}"#,
+            r#"{"url":"http://127.0.0.1/hook","deduplication":-1}"#,
+            r#"{"url":"http://127.0.0.1/hook","deduplication":1.5}"#,
+        ] {
+            let field = crate::json::parse(text).expect("json");
+            assert!(parse(&field).is_err(), "{text} was accepted");
+        }
+        let empty = crate::json::parse(r#"{"url":""}"#).expect("json");
+        assert!(
+            parse(&empty).expect("parses").is_none(),
+            "an empty url still means no notifier"
+        );
+    }
+
+    #[test]
     fn the_event_body_is_the_reference_json() {
         let destination = Destination::Name("example.test".to_owned(), 80);
         let original = Destination::Name("original.test".to_owned(), 80);
