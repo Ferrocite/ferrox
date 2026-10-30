@@ -1989,6 +1989,12 @@ fn watch(
     let mut sent = false;
     loop {
         let outcome = read_notice_line(&mut reader, &mut spill, |line| {
+            let Some(kind) = psiphon::notice_kind(line) else {
+                return;
+            };
+            if !acted_on(kind) {
+                return;
+            }
             let Some(notice) = psiphon::notice(line) else {
                 return;
             };
@@ -2081,6 +2087,20 @@ fn read_notice_line<R: BufRead, F: FnMut(&[u8])>(
         let taken = buf.len();
         reader.consume(taken);
     }
+}
+
+fn acted_on(kind: &str) -> bool {
+    matches!(
+        kind,
+        "ListeningSocksProxyPort"
+            | "Tunnels"
+            | "ConnectedServer"
+            | "AvailableEgressRegions"
+            | "Warning"
+            | "Alert"
+            | "Error"
+            | "InternalError"
+    )
 }
 
 fn note(kind: &str, notice: &Notice<'_>) {

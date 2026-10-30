@@ -297,6 +297,42 @@ pub fn notice(line: &[u8]) -> Option<Notice<'_>> {
     (at == line.len()).then_some(out)
 }
 
+/// The `noticeType` a line names, without walking the object behind it. The client writes
+/// `noticeType` first, so a line whose kind the lane does not act on costs one string read
+/// rather than a parse of its whole data payload.
+#[must_use]
+pub fn notice_kind(line: &[u8]) -> Option<&str> {
+    let mut at = 0usize;
+    space(line, &mut at);
+    if !eat(line, &mut at, b'{') {
+        return None;
+    }
+    space(line, &mut at);
+    if eat(line, &mut at, b'}') {
+        return None;
+    }
+    loop {
+        let key = string(line, &mut at)?;
+        space(line, &mut at);
+        if !eat(line, &mut at, b':') {
+            return None;
+        }
+        space(line, &mut at);
+        if key == b"noticeType" {
+            return string_text(line, &mut at);
+        }
+        skip(line, &mut at, 0)?;
+        space(line, &mut at);
+        match line.get(at) {
+            Some(b',') => {
+                at += 1;
+                space(line, &mut at);
+            }
+            _ => return None,
+        }
+    }
+}
+
 #[inline]
 fn data<'a>(line: &'a [u8], at: &mut usize, out: &mut Notice<'a>) -> Option<()> {
     if !eat(line, at, b'{') {
@@ -405,6 +441,11 @@ fn next_of(bytes: &[u8], first: u8, second: u8) -> Option<(usize, u8)> {
         // SAFETY: the runtime feature test above proves AVX2 is available.
         return unsafe { next_of_avx2(bytes, first, second) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 16 {
+        // SAFETY: SSE2 is part of the x86-64 baseline.
+        return unsafe { next_of_sse2(bytes, first, second) };
+    }
     #[cfg(target_arch = "aarch64")]
     if bytes.len() >= 16 {
         return next_of_neon(bytes, first, second);
@@ -495,6 +536,57 @@ unsafe fn next_of_avx2(bytes: &[u8], first: u8, second: u8) -> Option<(usize, u8
             return Some((found, bytes[found]));
         }
         at += 32;
+    }
+    next_of_swar(&bytes[at..], first, second).map(|(found, byte)| (at + found, byte))
+}
+
+/// The first of two bytes, two 16-byte blocks per turn. This is the x86-64 baseline path:
+/// a field shorter than an AVX2 block, or a CPU without AVX2, still compares sixteen
+/// bytes per instruction rather than falling back to eight-byte words.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn next_of_sse2(bytes: &[u8], first: u8, second: u8) -> Option<(usize, u8)> {
+    use core::arch::x86_64::{
+        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128, _mm_set1_epi8,
+    };
+    let a = unsafe { _mm_set1_epi8(first.cast_signed()) };
+    let b = unsafe { _mm_set1_epi8(second.cast_signed()) };
+    let mut at = 0usize;
+    while at + 32 <= bytes.len() {
+        // SAFETY: `at + 32` is inside `bytes`, and both loads are unaligned.
+        let mask = unsafe {
+            let low = _mm_loadu_si128(bytes.as_ptr().add(at).cast());
+            let high = _mm_loadu_si128(bytes.as_ptr().add(at + 16).cast());
+            u32::from(_mm_movemask_epi8(_mm_or_si128(
+                _mm_cmpeq_epi8(low, a),
+                _mm_cmpeq_epi8(low, b),
+            )) as u16)
+                | (u32::from(_mm_movemask_epi8(_mm_or_si128(
+                    _mm_cmpeq_epi8(high, a),
+                    _mm_cmpeq_epi8(high, b),
+                )) as u16)
+                    << 16)
+        };
+        if mask != 0 {
+            let found = at + mask.trailing_zeros() as usize;
+            return Some((found, bytes[found]));
+        }
+        at += 32;
+    }
+    if at + 16 <= bytes.len() {
+        // SAFETY: `at + 16` is inside `bytes`, and the load is unaligned.
+        let mask = unsafe {
+            let block = _mm_loadu_si128(bytes.as_ptr().add(at).cast());
+            _mm_movemask_epi8(_mm_or_si128(
+                _mm_cmpeq_epi8(block, a),
+                _mm_cmpeq_epi8(block, b),
+            )) as u16
+        };
+        if mask != 0 {
+            let found = at + mask.trailing_zeros() as usize;
+            return Some((found, bytes[found]));
+        }
+        at += 16;
     }
     next_of_swar(&bytes[at..], first, second).map(|(found, byte)| (at + found, byte))
 }
@@ -653,6 +745,11 @@ pub fn find_byte(bytes: &[u8], wanted: u8) -> Option<usize> {
         // SAFETY: the runtime feature test above proves AVX2 is available.
         return unsafe { find_byte_avx2(bytes, wanted) };
     }
+    #[cfg(target_arch = "x86_64")]
+    if bytes.len() >= 16 {
+        // SAFETY: SSE2 is part of the x86-64 baseline.
+        return unsafe { find_byte_sse2(bytes, wanted) };
+    }
     #[cfg(target_arch = "aarch64")]
     if bytes.len() >= 16 {
         return next_of_neon(bytes, wanted, wanted).map(|(found, _)| found);
@@ -715,6 +812,41 @@ unsafe fn find_byte_avx2(bytes: &[u8], wanted: u8) -> Option<usize> {
             return Some(at + marked.trailing_zeros() as usize);
         }
         at += 32;
+    }
+    find_byte_swar(&bytes[at..], wanted).map(|found| at + found)
+}
+
+/// The first `wanted` byte, two 16-byte blocks per turn. It is the baseline path for a
+/// short line, and the fallback where AVX2 is not available.
+#[cfg(target_arch = "x86_64")]
+#[inline]
+unsafe fn find_byte_sse2(bytes: &[u8], wanted: u8) -> Option<usize> {
+    use core::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
+    let needle = unsafe { _mm_set1_epi8(wanted.cast_signed()) };
+    let mut at = 0usize;
+    while at + 32 <= bytes.len() {
+        // SAFETY: `at + 32` is inside `bytes`, and both loads are unaligned.
+        let mask = unsafe {
+            let low = _mm_loadu_si128(bytes.as_ptr().add(at).cast());
+            let high = _mm_loadu_si128(bytes.as_ptr().add(at + 16).cast());
+            u32::from(_mm_movemask_epi8(_mm_cmpeq_epi8(low, needle)) as u16)
+                | (u32::from(_mm_movemask_epi8(_mm_cmpeq_epi8(high, needle)) as u16) << 16)
+        };
+        if mask != 0 {
+            return Some(at + mask.trailing_zeros() as usize);
+        }
+        at += 32;
+    }
+    if at + 16 <= bytes.len() {
+        // SAFETY: `at + 16` is inside `bytes`, and the load is unaligned.
+        let mask = unsafe {
+            let block = _mm_loadu_si128(bytes.as_ptr().add(at).cast());
+            _mm_movemask_epi8(_mm_cmpeq_epi8(block, needle)) as u16
+        };
+        if mask != 0 {
+            return Some(at + mask.trailing_zeros() as usize);
+        }
+        at += 16;
     }
     find_byte_swar(&bytes[at..], wanted).map(|found| at + found)
 }
@@ -1047,6 +1179,23 @@ mod tests {
             assert_eq!(notice(line).and_then(|notice| notice.count), Some(1));
         }
         assert!(notice(b"{\"noticeType\":\"Tunnels\",\"data\":{\"count\":1}} x").is_none());
+    }
+
+    #[test]
+    fn the_kind_is_read_before_the_data_is_parsed() {
+        for line in [SOCKS, TUNNELS] {
+            assert_eq!(
+                notice_kind(line),
+                notice(line).map(|notice| notice.kind),
+                "{}",
+                String::from_utf8_lossy(line)
+            );
+        }
+        let kind_last =
+            br#"{"data":{"message":"x","nested":[1,{"a":null}]},"noticeType":"Warning"}"#;
+        assert_eq!(notice_kind(kind_last), Some("Warning"));
+        assert_eq!(notice_kind(b"{}"), None);
+        assert_eq!(notice_kind(b"[]"), None);
     }
 
     #[test]

@@ -23516,19 +23516,44 @@ fn socks_udp_head(out: &mut Vec<u8>, dest: &SocketAddr) {
 /// Otherwise the frame is rebuilt around the payload, which is the only copy there is.
 ///
 /// The caller's buffer is the only buffer: the frame never allocates.
+fn socks_udp_head_len(frame: &[u8], dest: &SocketAddr) -> Option<usize> {
+    if frame.len() < 4 || frame[..3] != [0, 0, 0] {
+        return None;
+    }
+    match dest {
+        SocketAddr::V4(dest) => {
+            let head = 3 + 1 + 4 + 2;
+            (frame.len() >= head
+                && frame[3] == 1
+                && frame[4..8] == dest.ip().octets()
+                && frame[8..10] == dest.port().to_be_bytes())
+            .then_some(head)
+        }
+        SocketAddr::V6(dest) => {
+            let head = 3 + 1 + 16 + 2;
+            (frame.len() >= head
+                && frame[3] == 4
+                && frame[4..20] == dest.ip().octets()
+                && frame[20..22] == dest.port().to_be_bytes())
+            .then_some(head)
+        }
+    }
+}
+
 pub(crate) fn socks_udp_frame<'a>(
     out: &'a mut Vec<u8>,
     client: Option<&'a [u8]>,
     dest: &SocketAddr,
     payload: &'a [u8],
 ) -> &'a [u8] {
-    socks_udp_head(out, dest);
-    let head = out.len();
     if let Some(client) = client {
-        if client.len() == head + payload.len() && client[..head] == out[..head] {
-            return client;
+        if let Some(head) = socks_udp_head_len(client, dest) {
+            if client.len() == head + payload.len() {
+                return client;
+            }
         }
     }
+    socks_udp_head(out, dest);
     out.extend_from_slice(payload);
     out
 }
@@ -47747,6 +47772,26 @@ mod tests {
             &rebuilt[..],
             "the bytes on the wire are the tree's own"
         );
+    }
+
+    /// The IPv6 header has its own length, and a matching frame is still handed back by
+    /// pointer rather than rebuilt into the caller's buffer.
+    #[test]
+    fn an_ipv6_datagram_that_matches_goes_on_by_pointer() {
+        let dest: SocketAddr = "[2001:db8::7]:443".parse().expect("addr");
+        let payload = b"the payload the client sent";
+        let mut client = vec![0, 0, 0];
+        push_socks_addr(&mut client, &dest);
+        client.extend_from_slice(payload);
+
+        let mut out = Vec::with_capacity(HEAD + UDP_BUF);
+        let sent = socks_udp_frame(&mut out, Some(&client), &dest, payload);
+        assert_eq!(
+            sent.as_ptr() as usize,
+            client.as_ptr() as usize,
+            "the datagram is sent as the client framed it"
+        );
+        assert!(out.is_empty(), "the rebuild buffer was not touched");
     }
 
     /// A datagram the client framed with a name is not the frame this tree builds —
