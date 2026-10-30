@@ -21882,10 +21882,12 @@ fn upload_finished(
     peer_write: &mut Connection,
     stall: Duration,
     first: &mut bool,
+    request_ended: bool,
+    half_closed: &mut bool,
     ended: impl FnOnce() -> bool,
 ) -> Next {
     let _ = stall;
-    match read {
+    let next = match read {
         Ok(n) if n > 0 => {
             if *first {
                 echo_trace("relay bwd first read");
@@ -21898,13 +21900,14 @@ fn upload_finished(
             );
             if peer_write.write_all(buffer.filled(n)).is_err() {
                 echo_trace("relay bwd peer write failed");
-                return Next::Done;
+                Next::Done
+            } else {
+                if *first {
+                    echo_trace("relay bwd forwarded");
+                    *first = false;
+                }
+                Next::More
             }
-            if *first {
-                echo_trace("relay bwd forwarded");
-                *first = false;
-            }
-            Next::More
         }
         // A carrier read that times out is not an idle socket to park: the frame that grants the sibling's window arrives on this read, so the lane takes another turn at once rather than a quantum later.
         Err(error) if is_timeout(&error) => {
@@ -21922,7 +21925,13 @@ fn upload_finished(
             echo_trace("relay bwd eof");
             Next::Done
         }
+    };
+    // A normal request end still needs the target write half closed, even while this lane pumps control frames.
+    if request_ended && !*half_closed {
+        let _ = peer_write.shutdown(Shutdown::Write);
+        *half_closed = true;
     }
+    next
 }
 
 fn relay_ordered<R, W, F, E, const CLOSE_FIRST: bool, const DRAIN_REQUEST: bool>(
@@ -22019,17 +22028,13 @@ where
                 &mut peer_write,
                 stall,
                 &mut first,
+                ended_request,
+                &mut half_closed,
                 || {
                     (!DRAIN_REQUEST || ended_request)
                         && upload_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
                 },
             );
-            // A gRPC request that ended normally still needs its target write half closed: the
-            // answer may be gated on that EOF, while this lane keeps pumping control frames.
-            if ended_request && !half_closed {
-                let _ = peer_write.shutdown(Shutdown::Write);
-                half_closed = true;
-            }
             if next != Next::Done {
                 return next;
             }
@@ -29129,8 +29134,7 @@ mod tests {
             let mut reply = [0u8; 5];
             reader.read_exact(&mut reply).expect("reads the reply");
             assert_eq!(&reply, b"reply");
-            // Keep the client socket open past the request end: the relay's reader must poll for
-            // control frames, not see EOF, while the target waits for the half-close.
+            // Keep the client socket open past the request end, so the relay's reader polls for control frames rather than seeing EOF.
             thread::sleep(Duration::from_millis(300));
         });
         done_rx
