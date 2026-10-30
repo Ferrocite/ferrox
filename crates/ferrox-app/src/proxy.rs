@@ -1594,6 +1594,8 @@ impl Outbound {
         };
         let owner = plan.process_owner(network, client);
         let facts = FlowFacts {
+            source: None,
+            local: None,
             process: owner.as_ref(),
             ..facts
         };
@@ -2000,6 +2002,9 @@ struct FlowFacts<'a> {
     /// by but does not dial.
     original: Option<&'a Destination>,
     route: Option<&'a Destination>,
+    /// The UDP datagram's own endpoints, which replace the TCP control connection's for a split association.
+    source: Option<SocketAddr>,
+    local: Option<SocketAddr>,
 }
 
 /// One inbound's view of the routes: its tag decides which rules may see a flow, and whether the
@@ -2093,6 +2098,8 @@ impl RoutePlan {
         user: Option<&str>,
     ) -> Picked<'_> {
         let facts = FlowFacts {
+            source: None,
+            local: None,
             user,
             ..FlowFacts::default()
         };
@@ -2108,6 +2115,8 @@ impl RoutePlan {
     ) -> Picked<'_> {
         let owner = self.process_owner(network, client);
         let facts = FlowFacts {
+            source: None,
+            local: None,
             process: owner.as_ref(),
             ..facts
         };
@@ -2125,6 +2134,8 @@ impl RoutePlan {
         user: Option<&str>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         let facts = FlowFacts {
+            source: None,
+            local: None,
             user,
             ..FlowFacts::default()
         };
@@ -2188,19 +2199,20 @@ impl RoutePlan {
             Destination::Name(host, _) => (Some(host.as_str()), None),
             Destination::Address(address) => (None, Some(address.ip())),
         };
-        let (source, source_port, local, local_port) = match (self.source_known, client) {
-            (true, Some(client)) => {
-                let source = client.peer_addr().ok();
-                let local = client.local_addr().ok();
-                (
-                    source.map(|addr| addr.ip()),
-                    source.map_or(0, |addr| addr.port()),
-                    local.map(|addr| addr.ip()),
-                    local.map_or(0, |addr| addr.port()),
-                )
-            }
-            _ => (None, 0, None, 0),
+        let (source, local) = if self.source_known {
+            (
+                facts
+                    .source
+                    .or_else(|| client.and_then(|client| client.peer_addr().ok())),
+                facts
+                    .local
+                    .or_else(|| client.and_then(|client| client.local_addr().ok())),
+            )
+        } else {
+            (facts.source, facts.local)
         };
+        let (source, source_port) = source.map_or((None, 0), |addr| (Some(addr.ip()), addr.port()));
+        let (local, local_port) = local.map_or((None, 0), |addr| (Some(addr.ip()), addr.port()));
         let flow = crate::router::Flow {
             network,
             domain,
@@ -15720,6 +15732,8 @@ fn serve_socks_connected(mut client: Connection, out: &Outbound, handshake: &Han
             crate::router::Network::Tcp,
             Some(&client),
             FlowFacts {
+                source: None,
+                local: None,
                 user,
                 level,
                 ..FlowFacts::default()
@@ -15942,6 +15956,8 @@ fn sniff_lane<'a>(
 ) {
     let Some(sniffing) = crate::sniff::current() else {
         let facts = FlowFacts {
+            source: None,
+            local: None,
             user,
             level,
             ..FlowFacts::default()
@@ -15962,6 +15978,8 @@ fn sniff_lane<'a>(
     );
     let attrs = (!pairs.is_empty()).then(|| crate::router::Attributes::from_pairs(&pairs));
     let facts = FlowFacts {
+        source: None,
+        local: None,
         user,
         level,
         attrs: attrs.as_ref(),
@@ -15986,6 +16004,8 @@ fn sniff_lane<'a>(
         None
     };
     let facts = FlowFacts {
+        source: None,
+        local: None,
         protocol: Some(found.protocol),
         original: Some(asked),
         route: if dial.is_none() { route.as_ref() } else { None },
@@ -17163,6 +17183,8 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                     crate::router::Network::Tcp,
                     Some(&client),
                     FlowFacts {
+                        source: None,
+                        local: None,
                         user,
                         level,
                         ..FlowFacts::default()
@@ -17198,6 +17220,8 @@ fn serve_http(mut client: Connection, out: &Outbound, accounts: &SocksAccounts) 
                 crate::router::Network::Tcp,
                 Some(&client),
                 FlowFacts {
+                    source: None,
+                    local: None,
                     protocol: Some("http/1.1"),
                     user,
                     level,
@@ -17582,6 +17606,7 @@ fn serve_socks_udp_split(
     let Some(relay) = socks_udp_relay(&mut client) else {
         return;
     };
+    let relay_local = relay.local_addr().ok();
     let local = relay
         .local_addr()
         .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
@@ -17631,6 +17656,8 @@ fn serve_socks_udp_split(
             crate::router::Network::Udp,
             Some(&client),
             FlowFacts {
+                source: Some(src),
+                local: relay_local,
                 protocol,
                 user,
                 level,
@@ -52603,6 +52630,83 @@ mod webhook_route_tests {
             }
         });
         (port, receive)
+    }
+
+    fn route_outbound(json: &str, tag: Option<&str>, source_known: bool) -> Outbound {
+        let root = crate::json::parse(json).expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        Outbound::Route(Arc::new(RoutePlan::new(
+            shared,
+            tag.map(str::to_owned),
+            None,
+            source_known,
+        )))
+    }
+
+    fn socks_front_with(out: Outbound) -> u16 {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        port
+    }
+
+    #[test]
+    fn a_split_udp_webhook_names_the_datagram_endpoints() {
+        let (port, receive) = receiver(1);
+        let out = route_outbound(
+            &format!(
+                r#"{{"outbounds":[{{"protocol":"freedom","tag":"direct"}}],
+                    "routing":{{"rules":[{{"network":"udp","outboundTag":"direct",
+                        "webhook":{{"url":"http://127.0.0.1:{port}/hook"}}}}]}}}}"#
+            ),
+            Some("in"),
+            true,
+        );
+        let front = socks_front_with(out);
+        let mut control = Connection::connect(("127.0.0.1", front)).expect("connects");
+        control
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        control.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        control.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        control
+            .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        control.read_exact(&mut reply).expect("replies");
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let source = udp.local_addr().expect("addr");
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, relay).expect("sends");
+
+        let body = receive
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the POST");
+        assert!(
+            body.contains(&format!("\"source\":\"{source}\"")),
+            "the UDP client is the source: {body}"
+        );
+        assert!(
+            body.contains(&format!("\"inboundLocal\":\"{relay}\"")),
+            "the UDP relay is the inbound local: {body}"
+        );
     }
 
     #[test]
