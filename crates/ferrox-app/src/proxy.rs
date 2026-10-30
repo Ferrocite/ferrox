@@ -1659,6 +1659,10 @@ struct RouteShared {
     tagged: HashMap<String, Outbound>,
     /// Each balancer's candidate tags, ordered by tag. Built once so a flow picks from a slice.
     balancers: Arc<HashMap<String, Vec<String>>>,
+    /// Each balancer's fallback, so the server-route proof resolves every tag it can pick without the table's lock.
+    balancer_fallbacks: HashMap<String, String>,
+    /// Every server inbound's tag, so an `AddRule` proves the same direct dial the start did.
+    server_inbounds: Vec<Option<String>>,
     observatory: Option<Arc<crate::observatory::Observatory>>,
     /// The script router, kept outside the routing lock: a script callback re-enters the table.
     script_router: Option<Arc<crate::router_script::ScriptRouter>>,
@@ -1856,7 +1860,8 @@ impl Runtime {
     }
 
     /// Append or replace the rule table, for `RoutingService.AddRule`; a table-less config has
-    /// nowhere to put a rule and answers the reference's "routing not configured".
+    /// nowhere to put a rule and answers the reference's "routing not configured". Every server
+    /// inbound proves the candidate table first, so a rule it would silently never evaluate is refused.
     pub(crate) fn add_rules(
         &self,
         rules: &[crate::json::Json],
@@ -1867,11 +1872,17 @@ impl Runtime {
         };
         let known =
             |tag: &str| route.tagged.contains_key(tag) || Some(tag) == route.default_tag.as_deref();
+        let direct = |named: &str| direct_tag(route, named);
+        let proofs: Vec<crate::router::ServerProof<'_>> = route
+            .server_inbounds
+            .iter()
+            .map(|inbound| server_proof(route, inbound.as_deref(), &direct))
+            .collect();
         route
             .routing
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .add_rules(rules, append, known)
+            .add_rules(rules, append, known, &proofs)
     }
 
     /// Drop every rule carrying `tag`, for `RoutingService.RemoveRule`.
@@ -2446,6 +2457,16 @@ fn route_shared_with_api(
     };
     let freedom = has_protocol(root, "outbounds", "freedom");
     let build = |config: &Json, tag: &str| routed_outbound(root, config, tag, freedom);
+    let server_inbounds: Vec<Option<String>> = root
+        .get("inbounds")
+        .and_then(Json::as_arr)
+        .unwrap_or(&[])
+        .iter()
+        .filter(|inbound| {
+            dials_direct_inbound(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""))
+        })
+        .map(inbound_tag)
+        .collect();
     let default_tag = first
         .get("tag")
         .and_then(Json::as_str)
@@ -2551,6 +2572,14 @@ fn route_shared_with_api(
         }
         balancers.insert(balancer.tag().to_owned(), candidates);
     }
+    let balancer_fallbacks: HashMap<String, String> = routing
+        .balancers()
+        .filter_map(|balancer| {
+            balancer
+                .fallback()
+                .map(|fallback| (balancer.tag().to_owned(), fallback.to_owned()))
+        })
+        .collect();
     let script_router = routing.script_shared();
     let routing = Arc::new(RwLock::new(routing));
     let balancers = Arc::new(balancers);
@@ -2581,6 +2610,8 @@ fn route_shared_with_api(
         routing,
         tagged,
         balancers,
+        balancer_fallbacks,
+        server_inbounds,
         observatory,
         script_router,
         script,
@@ -2632,48 +2663,51 @@ fn pick_script_outbound(
     }
 }
 
+/// Whether this inbound serves a flow by dialing the rule's target itself, so every rule that can
+/// reach it must agree with a direct dial.
+fn dials_direct_inbound(protocol: &str) -> bool {
+    matches!(
+        canonical_protocol(protocol),
+        "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria"
+    )
+}
+
 /// A server inbound dials direct, so every rule that can reach it must name a freedom outbound and
 /// the fallback must be one too; anything else refuses the start rather than serving the wrong lane.
 fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
-    // A server inbound dials direct, so every rule that can reach it must agree with that at startup.
-    if !matches!(
-        canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or("")),
-        "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria"
-    ) {
+    if !dials_direct_inbound(inbound.get("protocol").and_then(Json::as_str).unwrap_or("")) {
         return;
     }
     let tag = inbound_tag(inbound);
+    let direct = |named: &str| direct_tag(shared, named);
     let routing = shared
         .routing
         .read()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let direct = |named: &str, balancer: bool| {
-        if balancer {
-            let Some(candidates) = shared.balancers.get(named) else {
-                return false;
-            };
-            let fallback = routing
-                .balancer(named)
-                .and_then(crate::router::Balancer::fallback);
-            return candidates
-                .iter()
-                .map(String::as_str)
-                .chain(fallback)
-                .all(|candidate| {
-                    Some(candidate) == shared.default_tag.as_deref()
-                        || matches!(shared.tagged.get(candidate), Some(Outbound::Freedom(_)))
-                });
-        }
-        Some(named) == shared.default_tag.as_deref()
-            || matches!(shared.tagged.get(named), Some(Outbound::Freedom(_)))
-    };
-    if let Err(error) = routing.server_routes(
-        tag.as_deref(),
-        matches!(&shared.default, Outbound::Freedom(_)),
-        direct,
-    ) {
+    if let Err(error) = routing.server_routes(&server_proof(shared, tag.as_deref(), &direct)) {
         exit(&format!("bad config {label}: {error}"));
     }
+}
+
+/// A server inbound's fixed direct dial, as the rules that reach it must see it.
+fn server_proof<'a>(
+    shared: &'a RouteShared,
+    inbound: Option<&'a str>,
+    direct: &'a dyn Fn(&str) -> bool,
+) -> crate::router::ServerProof<'a> {
+    crate::router::ServerProof {
+        inbound,
+        default_direct: matches!(&shared.default, Outbound::Freedom(_)),
+        direct,
+        candidates: &shared.balancers,
+        fallbacks: &shared.balancer_fallbacks,
+    }
+}
+
+/// Whether an outbound tag dials direct: the default tag or a freedom outbound.
+fn direct_tag(shared: &RouteShared, tag: &str) -> bool {
+    Some(tag) == shared.default_tag.as_deref()
+        || matches!(shared.tagged.get(tag), Some(Outbound::Freedom(_)))
 }
 
 /// The Foxy lane: an account's pass over an edge in one pinned country, plus the split-tunnel list.
@@ -48520,6 +48554,47 @@ end
             matches!(plan.association(), Association::Default),
             "removing the rule puts the association back on the default lane"
         );
+    }
+
+    /// A server inbound never evaluates a rule, so a rule the API adds for one must agree with its
+    /// direct dial; a blocking target would be stored and silently ignored, so the call refuses it.
+    #[test]
+    fn a_rule_that_cannot_reach_a_server_inbound_is_refused_by_add_rule() {
+        let root = crate::json::parse(
+            r#"{"inbounds":[{"tag":"served","protocol":"vless","listen":"127.0.0.1","port":12345,
+                "settings":{"clients":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}},
+                {"tag":"client","protocol":"socks","listen":"127.0.0.1","port":12346,"settings":{"auth":"noauth"}}],
+                "outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+                "routing":{"rules":[{"type":"field","inboundTag":["client"],"domain":["full:other.test"],"outboundTag":"block"}]}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let before = runtime.listed_rules().len();
+        let blocked = crate::json::parse(
+            r#"{"type":"field","ruleTag":"blocked","inboundTag":["served"],"outboundTag":"block"}"#,
+        )
+        .expect("parses");
+        let error = runtime
+            .add_rules(&[blocked], true)
+            .expect_err("the server inbound dials direct");
+        assert!(
+            error.contains("served") && error.contains("block"),
+            "{error}"
+        );
+        assert_eq!(
+            runtime.listed_rules().len(),
+            before,
+            "the refused rule never entered the table"
+        );
+
+        let allowed = crate::json::parse(
+            r#"{"type":"field","ruleTag":"served-direct","inboundTag":["served"],"outboundTag":"direct"}"#,
+        )
+        .expect("parses");
+        runtime
+            .add_rules(&[allowed], true)
+            .expect("a direct rule for the server inbound is added");
+        assert_eq!(runtime.listed_rules().len(), before + 1);
     }
 
     /// A `vlessRoute` rule reads the route id a flow carries: a socks flow carries none, so it reads

@@ -348,6 +348,19 @@ pub(crate) struct Routing {
     wants_process: bool,
 }
 
+/// One server inbound's fixed direct dial, checked against the rules that can reach it — at startup,
+/// and against a candidate table before `AddRule` writes it.
+#[derive(Clone, Copy)]
+pub(crate) struct ServerProof<'a> {
+    pub inbound: Option<&'a str>,
+    pub default_direct: bool,
+    /// Whether a plain outbound tag dials direct: the default tag or a freedom outbound.
+    pub direct: &'a dyn Fn(&str) -> bool,
+    /// Each balancer's resolved candidate tags, so every tag it can pick is checked too.
+    pub candidates: &'a HashMap<String, Vec<String>>,
+    pub fallbacks: &'a HashMap<String, String>,
+}
+
 /// One `balancers` entry: a tag a rule may name, the outbound-tag prefixes it draws from, and the
 /// strategy that picks one per flow. Xray selects candidates with `strings.HasPrefix`, not a regex.
 #[derive(Debug)]
@@ -1147,12 +1160,15 @@ impl Routing {
     }
 
     /// Append a decoded `AddRule` rule list, or replace the table with it when `append` is false.
-    /// Rule tags stay unique across the whole table, as the reference's `AddRule` refuses a repeat.
+    /// Rule tags stay unique across the whole table, as the reference's `AddRule` refuses a repeat,
+    /// and every server inbound proves the candidate table before the write so a rule the inbound
+    /// would never evaluate is refused instead of stored as a no-op.
     pub(crate) fn add_rules(
         &mut self,
         raw: &[Json],
         append: bool,
         known: impl Fn(&str) -> bool,
+        proofs: &[ServerProof<'_>],
     ) -> Result<(), String> {
         let mut assets = Assets::new(self.asset_dirs.clone());
         let mut tags: HashSet<String> = if append {
@@ -1189,6 +1205,17 @@ impl Routing {
                 ));
             }
             rules.push(rule);
+        }
+        for proof in proofs {
+            if append {
+                Self::server_routes_over(
+                    self.script.is_some(),
+                    self.rules.iter().chain(rules.iter()),
+                    proof,
+                )?;
+            } else {
+                Self::server_routes_over(self.script.is_some(), rules.iter(), proof)?;
+            }
         }
         if append {
             self.rules.extend(rules);
@@ -1449,19 +1476,29 @@ impl Routing {
 
     /// Proves a server inbound's fixed direct dial is what the rules would pick anyway. A rule that
     /// could match and points elsewhere refuses the start, because this tree serves that inbound direct.
-    pub(crate) fn server_routes(
-        &self,
-        inbound: Option<&str>,
-        default_direct: bool,
-        direct: impl Fn(&str, bool) -> bool,
+    pub(crate) fn server_routes(&self, proof: &ServerProof<'_>) -> Result<(), String> {
+        Self::server_routes_over(self.script.is_some(), self.rules.iter(), proof)
+    }
+
+    fn server_routes_over<'r>(
+        script: bool,
+        rules: impl Iterator<Item = &'r Rule>,
+        proof: &ServerProof<'_>,
     ) -> Result<(), String> {
-        if self.script.is_some() {
+        let ServerProof {
+            inbound,
+            default_direct,
+            direct,
+            candidates,
+            fallbacks,
+        } = *proof;
+        if script {
             return Err(format!(
                 "inbound {} names a routing script, which the server inbound cannot evaluate",
                 inbound.unwrap_or("<untagged>")
             ));
         }
-        for rule in &self.rules {
+        for rule in rules {
             if !rule.reachable(inbound, Network::Tcp) || !rule.local_os_matches() {
                 continue;
             }
@@ -1473,7 +1510,17 @@ impl Routing {
             {
                 continue;
             }
-            if !direct(&rule.target, rule.balancer) {
+            let dials_direct = if rule.balancer {
+                candidates.get(&rule.target).is_some_and(|list| {
+                    list.iter()
+                        .map(String::as_str)
+                        .chain(fallbacks.get(&rule.target).map(String::as_str))
+                        .all(direct)
+                })
+            } else {
+                direct(&rule.target)
+            };
+            if !dials_direct {
                 return Err(format!(
                     "a rule for inbound {} targets `{}`, which the server inbound serves direct",
                     inbound.unwrap_or("<untagged>"),
@@ -5372,7 +5419,16 @@ mod tests {
 
     #[test]
     fn a_server_inbound_is_refused_when_routing_could_change_its_direct_dial() {
-        let direct = |tag: &str, _balancer: bool| tag == "direct";
+        let direct = |tag: &str| tag == "direct";
+        let candidates = HashMap::new();
+        let fallbacks = HashMap::new();
+        let proof = |inbound: Option<&'static str>, default_direct| ServerProof {
+            inbound,
+            default_direct,
+            direct: &direct,
+            candidates: &candidates,
+            fallbacks: &fallbacks,
+        };
         let root = |rules| object(vec![("routing", routing(rules))]);
         let pinned = root(vec![rule(
             "direct",
@@ -5382,7 +5438,7 @@ mod tests {
             .expect("parses")
             .expect("routing");
         routing
-            .server_routes(Some("server"), false, direct)
+            .server_routes(&proof(Some("server"), false))
             .expect("the tag's rule pins every flow to direct");
         let by_user = root(vec![rule(
             "proxy",
@@ -5392,14 +5448,14 @@ mod tests {
             .expect("parses")
             .expect("routing");
         routing
-            .server_routes(Some("server"), true, direct)
+            .server_routes(&proof(Some("server"), true))
             .expect("a server flow carries no account email for the rule to read");
         let proxy = root(vec![rule("proxy", vec![("port", number(443))])]);
         let routing = Routing::parse_in(&proxy, vec![dir()])
             .expect("parses")
             .expect("routing");
         let error = routing
-            .server_routes(Some("server"), true, direct)
+            .server_routes(&proof(Some("server"), true))
             .expect_err("a per-flow rule can reach the server");
         assert!(error.contains("proxy"), "{error}");
         let default_proxy = root(Vec::new());
@@ -5407,7 +5463,7 @@ mod tests {
             .expect("parses")
             .expect("routing");
         let error = routing
-            .server_routes(Some("server"), false, direct)
+            .server_routes(&proof(Some("server"), false))
             .expect_err("the default is not direct");
         assert!(error.contains("default"), "{error}");
     }
@@ -5603,8 +5659,15 @@ mod tests {
             .expect("parses")
             .expect("routing");
         assert_eq!(routing.source_refusal(Some("tun")), None);
+        let proof = ServerProof {
+            inbound: Some("server"),
+            default_direct: true,
+            direct: &|_| true,
+            candidates: &HashMap::new(),
+            fallbacks: &HashMap::new(),
+        };
         let error = routing
-            .server_routes(Some("server"), true, |_, _| true)
+            .server_routes(&proof)
             .expect_err("a server inbound cannot evaluate a script");
         assert!(error.contains("script"), "{error}");
     }
