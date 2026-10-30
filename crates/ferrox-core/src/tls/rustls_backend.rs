@@ -3049,6 +3049,44 @@ mod tests {
         server.join().expect("joins");
     }
 
+    /// A config that names no resumption keeps no ticket even against a listener that hands one out, which is the reference's default.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_config_that_names_no_resumption_keeps_no_ticket() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let identity = plain_identity();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut served = crate::tls::accept(&identity, stream).expect("serves");
+                served.handshake().expect("served handshake");
+                let mut buf = [0u8; 4];
+                if served.read_exact(&mut buf).is_ok() {
+                    let _ = served.write_all(&buf);
+                }
+            }
+        });
+        // Both dials ride one cached config: rustls gates resumption on the store a config holds, so a cache miss here would sink the witness.
+        let cfg = client("localhost", &[b"test-only"]);
+        let kept = client_config(&cfg).expect("first config builds");
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("a dns name");
+        let a = dial(&kept, &name, port);
+        assert!(a.tls13_tickets() >= 1, "the listener offered a ticket");
+        drop(a);
+        let b = dial(&kept, &name, port);
+        assert_eq!(
+            b.handshake_kind(),
+            Some(rustls::HandshakeKind::Full),
+            "a config that names no resumption carries no ticket"
+        );
+        drop(b);
+        server.join().expect("joins");
+    }
+
     #[cfg_attr(
         miri,
         ignore = "needs a loopback socket, and ring's assembly behind it"
