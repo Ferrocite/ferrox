@@ -75,6 +75,13 @@ use std::io::Read as _;
 use std::io::Write as _;
 use std::time::Duration;
 
+/// Set by `-test`, so the startup exits answer xray's way: `Failed to start:` and status 23.
+static TEST_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn test_only() -> bool {
+    TEST_ONLY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn usage() -> ! {
     eprintln!("usage:");
     eprintln!("  ferrox-app check <vless://...|trojan://...> [--allow-unsafe-fp] [--allow-plaintext-public]");
@@ -84,6 +91,9 @@ fn usage() -> ! {
     eprintln!("  ferrox-app x25519                 print a fresh X25519 keypair");
     eprintln!("  ferrox-app run -c <config.json>   serve inbounds until killed");
     eprintln!("  ferrox-app -config=<file|stdin:> [-format=json|pb]   same, xray's own invocation");
+    eprintln!(
+        "  ferrox-app -test -c <config.json>  build every handler and exit, as xray's -test does"
+    );
     eprintln!(
         "  ferrox-app [no arguments]         serve a discovered config.json, or stdin, as xray does"
     );
@@ -355,10 +365,10 @@ fn serve_from_flags(args: &[String]) -> ! {
                 }
             }
             "-confdir" => {
-                eprintln!("ferrox-app: -confdir needs README row 127 (multi-file config layering); refused");
-                std::process::exit(1);
+                proxy::exit("-confdir needs README row 127 (multi-file config layering); refused");
             }
-            "-test" | "-dump" => {
+            "-test" => TEST_ONLY.store(true, std::sync::atomic::Ordering::Relaxed),
+            "-dump" => {
                 eprintln!("ferrox-app: {flag} is not carried; this binary serves");
                 std::process::exit(1);
             }
@@ -367,26 +377,22 @@ fn serve_from_flags(args: &[String]) -> ! {
         i += 1;
     }
     if configs.len() > 1 {
-        eprintln!(
-            "ferrox-app: {} -config files need README row 127 (multi-file config layering); refused",
+        proxy::exit(&format!(
+            "{} -config files need README row 127 (multi-file config layering); refused",
             configs.len()
-        );
-        std::process::exit(1);
+        ));
     }
     let source = configs.pop().unwrap_or_else(discover_config);
     let format = source_format(format.as_deref(), &source);
     if source == "stdin" || source == "stdin:" {
         let mut bytes = Vec::new();
         if let Err(error) = std::io::stdin().read_to_end(&mut bytes) {
-            eprintln!("ferrox-app: cannot read stdin: {error}");
-            std::process::exit(1);
+            proxy::exit(&format!("cannot read stdin: {error}"));
         }
         serve_source("stdin:", &bytes, format);
     }
-    let bytes = std::fs::read(&source).unwrap_or_else(|error| {
-        eprintln!("cannot read {source}: {error}");
-        std::process::exit(1);
-    });
+    let bytes = std::fs::read(&source)
+        .unwrap_or_else(|error| proxy::exit(&format!("cannot read {source}: {error}")));
     serve_source(&source, &bytes, format)
 }
 
@@ -447,25 +453,21 @@ fn source_format(named: Option<&str>, source: &str) -> SourceFormat {
             }
         }
         Some(other @ ("toml" | "yaml" | "yml")) => {
-            eprintln!("ferrox-app: config format `{other}` is not carried; json and protobuf are");
-            std::process::exit(1);
+            proxy::exit(&format!(
+                "config format `{other}` is not carried; json and protobuf are"
+            ));
         }
-        Some(other) => {
-            eprintln!("ferrox-app: unknown config format `{other}`");
-            std::process::exit(1);
-        }
+        Some(other) => proxy::exit(&format!("unknown config format `{other}`")),
     }
 }
 
 fn serve_source(label: &str, bytes: &[u8], format: SourceFormat) -> ! {
     match format {
-        SourceFormat::Protobuf => proxy::serve_protobuf(label, bytes),
+        SourceFormat::Protobuf => proxy::serve_protobuf(label, bytes, test_only()),
         SourceFormat::Json => {
-            let text = std::str::from_utf8(bytes).unwrap_or_else(|error| {
-                eprintln!("bad config {label}: {error}");
-                std::process::exit(1);
-            });
-            proxy::serve_json(label, text)
+            let body = std::str::from_utf8(bytes)
+                .unwrap_or_else(|error| proxy::exit(&format!("bad config {label}: {error}")));
+            proxy::serve_json(label, body, test_only())
         }
     }
 }

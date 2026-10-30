@@ -61,6 +61,25 @@ impl Observatory {
 /// reference's first-of-type feature lookup does, but both are parsed so neither can hide a
 /// malformed block.
 pub(crate) fn start(root: &Json) -> Result<Option<Arc<Observatory>>, String> {
+    let Some(mode) = parse(root)? else {
+        return Ok(None);
+    };
+    let observatory = Arc::new(Observatory {
+        snapshot: Mutex::new(Arc::from(Vec::new())),
+    });
+    match mode {
+        Mode::Legacy(config) => spawn_legacy(&observatory, root, config),
+        Mode::Burst(config) => spawn_burst(&observatory, root, config),
+    }
+    Ok(Some(observatory))
+}
+
+/// `-test` proves both blocks parse without starting either probe loop.
+pub(crate) fn validate(root: &Json) -> Result<(), String> {
+    parse(root).map(|_| ())
+}
+
+fn parse(root: &Json) -> Result<Option<Mode>, String> {
     let legacy = root
         .get("observatory")
         .filter(|value| !matches!(value, Json::Null))
@@ -71,22 +90,14 @@ pub(crate) fn start(root: &Json) -> Result<Option<Arc<Observatory>>, String> {
         .filter(|value| !matches!(value, Json::Null))
         .map(Burst::parse)
         .transpose()?;
-    let mode = match (legacy, burst) {
+    Ok(match (legacy, burst) {
         (Some(legacy), burst) => {
             drop(burst);
-            Mode::Legacy(legacy)
+            Some(Mode::Legacy(legacy))
         }
-        (None, Some(burst)) => Mode::Burst(burst),
-        (None, None) => return Ok(None),
-    };
-    let observatory = Arc::new(Observatory {
-        snapshot: Mutex::new(Arc::from(Vec::new())),
-    });
-    match mode {
-        Mode::Legacy(config) => spawn_legacy(&observatory, root, config),
-        Mode::Burst(config) => spawn_burst(&observatory, root, config),
-    }
-    Ok(Some(observatory))
+        (None, Some(burst)) => Some(Mode::Burst(burst)),
+        (None, None) => None,
+    })
 }
 
 enum Mode {
