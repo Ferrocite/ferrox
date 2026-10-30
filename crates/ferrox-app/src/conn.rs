@@ -1032,6 +1032,7 @@ pub(crate) struct HttpUrl {
     pub(crate) port: u16,
     pub(crate) authority: String,
     pub(crate) path: String,
+    pub(crate) userinfo: Option<String>,
 }
 
 impl HttpUrl {
@@ -1043,8 +1044,11 @@ impl HttpUrl {
             None => return Err(format!("URL {text:?} names no scheme")),
         };
         let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-        let authority = &rest[..split];
-        let authority = authority.rsplit('@').next().unwrap_or(authority);
+        let target = &rest[..split];
+        let (userinfo, authority) = match target.rsplit_once('@') {
+            Some((userinfo, authority)) => (Some(userinfo.to_owned()), authority),
+            None => (None, target),
+        };
         if authority.is_empty() {
             return Err(format!("URL {text:?} names no host"));
         }
@@ -1090,6 +1094,7 @@ impl HttpUrl {
             port,
             authority: authority.to_owned(),
             path,
+            userinfo,
         })
     }
 }

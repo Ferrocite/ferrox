@@ -254,7 +254,14 @@ fn abstract_name(name: &str) -> Result<Vec<u8>, String> {
 /// The exact request bytes: the JSON content type first, then each configured header, a repeated name
 /// replacing the one already written as `http.Header.Set` does.
 fn request_bytes(url: &HttpUrl, headers: &[(String, String)], body: &str) -> Vec<u8> {
-    let mut wire: Vec<(&str, &str)> = Vec::with_capacity(headers.len() + 1);
+    let authorization = url.userinfo.as_deref().filter(|_| {
+        !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("Authorization"))
+    });
+    let authorization = authorization
+        .map(|userinfo| format!("Basic {}", ferrox_core::b64::encode(userinfo.as_bytes())));
+    let mut wire: Vec<(&str, &str)> = Vec::with_capacity(headers.len() + 2);
     wire.push(("Content-Type", "application/json"));
     for (name, value) in headers {
         match wire
@@ -264,6 +271,9 @@ fn request_bytes(url: &HttpUrl, headers: &[(String, String)], body: &str) -> Vec
             Some(slot) => *slot = (name, value),
             None => wire.push((name, value)),
         }
+    }
+    if let Some(authorization) = authorization.as_deref() {
+        wire.push(("Authorization", authorization));
     }
     crate::foxy_account::request("POST", &url.authority, &url.path, &wire, body.as_bytes())
 }
