@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::io::{Read, Write};
+use std::io::{self, Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,7 +13,8 @@ use crate::conn::{Connection, HttpUrl, Target};
 use crate::json::Json;
 use crate::router::Network;
 
-/// The whole request's budget, which is the reference's `http.Client{Timeout: 5s}`.
+/// One deadline for every dial attempt, the TLS handshake and the reply, matching the reference's
+/// `http.Client{Timeout: 5s}`; only name resolution is outside it, where `std` has no bounded resolver.
 const BUDGET: Duration = Duration::from_secs(5);
 
 /// One notifier's POST threads, capped because each is an OS thread held for up to [`BUDGET`].
@@ -24,6 +25,42 @@ fn left(deadline: Instant) -> Duration {
     deadline
         .saturating_duration_since(Instant::now())
         .max(Duration::from_millis(1))
+}
+
+/// A connection whose every read and write spends what is left of one deadline, not a fresh bound.
+struct DeadlineIo {
+    inner: Connection,
+    deadline: Instant,
+}
+
+impl Read for DeadlineIo {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "webhook budget expired",
+            ));
+        }
+        self.inner.set_read_timeout(Some(left(self.deadline)))?;
+        self.inner.read(buf)
+    }
+}
+
+impl Write for DeadlineIo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if Instant::now() >= self.deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "webhook budget expired",
+            ));
+        }
+        self.inner.set_write_timeout(Some(left(self.deadline)))?;
+        self.inner.write(buf)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
 }
 
 /// One rule's callback: the URL, the headers it adds, and the window in which one email fires once.
@@ -235,13 +272,10 @@ impl Webhook {
             return Err("refuses URL credentials over plaintext http".to_owned());
         }
         let deadline = Instant::now() + BUDGET;
-        let connection = self.dial(&url, left(deadline))?;
-        connection
-            .set_read_timeout(Some(left(deadline)))
-            .map_err(|error| error.to_string())?;
-        connection
-            .set_write_timeout(Some(left(deadline)))
-            .map_err(|error| error.to_string())?;
+        let connection = DeadlineIo {
+            inner: self.dial(&url, deadline)?,
+            deadline,
+        };
         let request = request_bytes(&url, &self.headers, body);
         if url.tls {
             let config = ferrox_core::tls::TlsConfig {
@@ -261,10 +295,10 @@ impl Webhook {
             let mut session = ferrox_core::tls::RustlsProvider::connect(&config, connection)
                 .map_err(|error| error.to_string())?;
             session.handshake().map_err(|error| error.to_string())?;
-            exchange(&mut session, &request)
+            exchange(&mut session, &request, deadline)
         } else {
             let mut connection = connection;
-            exchange(&mut connection, &request)
+            exchange(&mut connection, &request, deadline)
         }
     }
 
@@ -277,20 +311,27 @@ impl Webhook {
         io: &mut (impl Read + Write),
         body: &str,
     ) -> Result<(), String> {
-        exchange(io, &request_bytes(url, &self.headers, body))
+        exchange(
+            io,
+            &request_bytes(url, &self.headers, body),
+            Instant::now() + BUDGET,
+        )
     }
 
     /// The address the URL names: the socket path it carries, or the first address its host resolves to.
-    fn dial(&self, url: &HttpUrl, budget: Duration) -> Result<Connection, String> {
+    fn dial(&self, url: &HttpUrl, deadline: Instant) -> Result<Connection, String> {
         if let Some(path) = &self.socket {
-            return dial_socket(path, budget);
+            return dial_socket(path, left(deadline));
         }
         let mut last = format!("{} resolved to no address", url.host);
         for address in (url.host.as_str(), url.port)
             .to_socket_addrs()
             .map_err(|error| format!("{}: {error}", url.host))?
         {
-            match crate::conn::connect(&Target::Ip(address), budget) {
+            if Instant::now() >= deadline {
+                return Err("the webhook budget expired before dialling".to_owned());
+            }
+            match crate::conn::connect(&Target::Ip(address), left(deadline)) {
                 Ok(connection) => return Ok(connection),
                 Err(error) => last = format!("{address}: {error}"),
             }
@@ -369,12 +410,18 @@ fn request_bytes(url: &HttpUrl, headers: &[(String, String)], body: &str) -> Vec
 
 /// Write the request and read only the status line back: the body is discarded, and dropping the
 /// connection is what ends it, so nothing pays to drain what the peer sends.
-fn exchange(io: &mut (impl Read + Write), request: &[u8]) -> Result<(), String> {
+fn exchange(io: &mut (impl Read + Write), request: &[u8], deadline: Instant) -> Result<(), String> {
+    if Instant::now() >= deadline {
+        return Err("the webhook budget expired before the request".to_owned());
+    }
     io.write_all(request).map_err(|error| error.to_string())?;
     io.flush().map_err(|error| error.to_string())?;
     let mut head = [0u8; 128];
     let mut len = 0;
     while len < head.len() {
+        if Instant::now() >= deadline {
+            return Err("the webhook budget expired before the status".to_owned());
+        }
         let read = io
             .read(&mut head[len..])
             .map_err(|error| error.to_string())?;
