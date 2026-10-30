@@ -1307,8 +1307,28 @@ pub(crate) fn connect(target: &Target, timeout: Duration) -> io::Result<Connecti
 fn unix_connect(path: &std::path::Path, timeout: Duration) -> io::Result<Connection> {
     use socket2::{Domain, SockAddr, Socket, Type};
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-    socket.connect_timeout(&SockAddr::unix(path)?, timeout)?;
+    connect_bounded(&socket, &SockAddr::unix(path)?, timeout)?;
     Ok(unix_connection(socket))
+}
+
+/// `connect_timeout`, with Linux's full queue named: a nonblocking `AF_UNIX` connect that finds no
+/// room is hung up with no error set, which socket2 reports as `Other` rather than the refusal it is.
+#[cfg(unix)]
+fn connect_bounded(
+    socket: &socket2::Socket,
+    address: &socket2::SockAddr,
+    timeout: Duration,
+) -> io::Result<()> {
+    socket.connect_timeout(address, timeout).map_err(|error| {
+        if error.kind() == io::ErrorKind::Other {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the socket's queue did not take the connection",
+            )
+        } else {
+            error
+        }
+    })
 }
 
 #[cfg(unix)]
@@ -1344,7 +1364,7 @@ pub(crate) fn connect_abstract(name: &[u8], timeout: Duration) -> io::Result<Con
         })
     }?;
     let socket = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-    socket.connect_timeout(&address, timeout)?;
+    connect_bounded(&socket, &address, timeout)?;
     Ok(unix_connection(socket))
 }
 
