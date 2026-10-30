@@ -48066,6 +48066,33 @@ end
         );
     }
 
+    /// A non-UTF-8 value is still a value: the empty pattern must not match it.
+    #[test]
+    fn an_attrs_rule_does_not_read_an_invalid_user_agent_as_empty() {
+        let echo = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","attrs":{"user-agent":"^$"},"outboundTag":"block"}]}}"#;
+        let front = http_front_with(route_outbound(config, Some("in"), true));
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut request = format!(
+            "GET http://127.0.0.1:{echo}/ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nUser-Agent: "
+        )
+        .into_bytes();
+        request.push(0xff);
+        request.extend_from_slice(b"\r\n\r\n");
+        client.write_all(&request).expect("gets");
+        let head =
+            read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE).expect("echoes the head");
+        let mut want =
+            format!("GET /ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nUser-Agent: ").into_bytes();
+        want.push(0xff);
+        want.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(head, want, "a non-UTF-8 value is not empty");
+    }
+
     /// What the origin sees after the removal is the head minus the credential line, in place; what the rules see is that head minus every field the hop-by-hop list owns. Both are asserted on one request, so a walk that kept a line or lost one shows up as bytes.
     #[test]
     fn the_forwarded_head_is_what_the_removal_left() {
