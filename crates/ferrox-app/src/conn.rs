@@ -1119,6 +1119,13 @@ impl HttpUrl {
         } else {
             (authority.to_owned(), if tls { 443 } else { 80 })
         };
+        if authority.starts_with('[') {
+            if host.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err("URL host is not valid".to_owned());
+            }
+        } else if host.contains(':') {
+            return Err("URL host is not valid".to_owned());
+        }
         if host.is_empty() {
             return Err("URL names no host".to_owned());
         }
