@@ -25743,9 +25743,11 @@ mod tests {
     #[test]
     fn a_script_pick_sees_an_outbound_added_after_startup() {
         let root = crate::json::parse(r#"{"routing":{}}"#).expect("parses");
-        let routing = crate::router::Routing::parse_in(&root, Vec::new())
-            .expect("parses")
-            .expect("routing");
+        let routing = RwLock::new(
+            crate::router::Routing::parse_in(&root, Vec::new())
+                .expect("parses")
+                .expect("routing"),
+        );
         let dynamic = RwLock::new(Dynamic::default());
         dynamic
             .write()
