@@ -76,7 +76,7 @@ load_gap_bases() {
 }
 
 selftest_gaps() {
-  local base ids unreached=0 failed=0
+  local base ids unfiled filed unreached=0 failed=0
   load_gap_bases
   ((${#gap_bases[@]})) || { echo "selftest: scripts/leg-gaps.txt files no scenario bases" >&2; return 1; }
   ids="$(scenarios full | awk '{print $1}')"
@@ -89,7 +89,16 @@ selftest_gaps() {
   ((unreached == 0)) || failed=1
   only=(); exclude=(); gaps=1
   scenario_kept "${gap_bases[0]}" || { echo "selftest: --gaps skipped its own first base" >&2; failed=1; }
-  scenario_kept vless-raw-up-1 && { echo "selftest: --gaps kept a base the file does not file" >&2; failed=1; }
+  unfiled=""
+  for id in $ids; do
+    filed=0
+    for base in "${gap_bases[@]}"; do
+      [[ "$id" == "$base" ]] && filed=1
+    done
+    ((filed)) || { unfiled="$id"; break; }
+  done
+  [[ -n "$unfiled" ]] || { echo "selftest: every full-tier base is filed" >&2; failed=1; }
+  scenario_kept "$unfiled" && { echo "selftest: --gaps kept $unfiled, a base the file does not file" >&2; failed=1; }
   scenario_kept "${gap_bases[0]}-extra" && { echo "selftest: --gaps matched a neighbour of the base" >&2; failed=1; }
   gaps=0
   only=(vless-raw-down-1)
