@@ -803,7 +803,19 @@ mod tests {
         let server = {
             let stop = Arc::clone(&stop);
             std::thread::spawn(move || {
-                let (mut stream, _) = listener.accept().expect("accepts");
+                listener.set_nonblocking(true).expect("nonblocking");
+                let mut stream = loop {
+                    if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                        return;
+                    }
+                    match listener.accept() {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => return,
+                    }
+                };
                 while !stop.load(std::sync::atomic::Ordering::Relaxed) {
                     if stream.write_all(b"x").is_err() {
                         return;
