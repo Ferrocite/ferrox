@@ -151,8 +151,19 @@ impl Webhook {
     /// The sending thread's body: one failure reports itself and ends the thread.
     fn post(&self, body: &str) {
         if let Err(reason) = self.send(body) {
-            eprintln!("webhook: POST {} failed: {reason}", self.url);
+            eprintln!("webhook: POST {} failed: {reason}", self.logged_url());
         }
+    }
+
+    /// The URL a failure may name: its scheme, host and port, never the userinfo, path or query that can carry a credential.
+    fn logged_url(&self) -> String {
+        HttpUrl::parse(&self.url).map_or_else(
+            |_| "the configured URL".to_owned(),
+            |url| {
+                let scheme = if url.tls { "https" } else { "http" };
+                format!("{scheme}://{}:{}", url.host, url.port)
+            },
+        )
     }
 
     /// The POST, from the URL it parses to the status line it reads, inside the one budget.
@@ -583,6 +594,14 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn a_failure_names_the_host_and_never_the_credential() {
+        let webhook = notifier_with(r#"{"url":"http://user:secret@127.0.0.1:1/hook?token=abc"}"#);
+        assert_eq!(webhook.logged_url(), "http://127.0.0.1:1");
+        let malformed = notifier_with(r#"{"url":"secret-without-a-scheme"}"#);
+        assert_eq!(malformed.logged_url(), "the configured URL");
     }
 
     #[test]
