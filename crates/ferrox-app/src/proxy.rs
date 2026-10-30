@@ -1,7 +1,7 @@
 use crate::conn::{parse_target, Connection, Listener};
 use std::collections::{HashMap, HashSet};
 use std::io::{IoSlice, Read, Write};
-use std::net::{Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
@@ -209,8 +209,8 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
     // Named only when no outbound was built, so the reason behind an exit that names nothing is on its own line first.
     let refused = outbound.is_none().then(|| diagnose_outbounds(root));
     let portals = reverse_portals(root);
-    let routing = crate::router::Routing::parse(root)
-        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
+    let routing =
+        routing_for(root).unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     let observatory = start_observatory(root, test)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     let api_config = match seed.and_then(|seed| seed.api.clone()) {
@@ -973,10 +973,152 @@ impl Drop for OutboundTag {
     }
 }
 
+/// xray's `sendThrough`: the source a flow leaves from, one address or a fresh host in a CIDR.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SendThrough {
+    Address(IpAddr),
+    Cidr { base: IpAddr, prefix: u8 },
+}
+
+impl SendThrough {
+    /// The source one dial binds; a CIDR rolls a host in its subnet as `ParseRandomIP` does.
+    fn address(self) -> Option<IpAddr> {
+        let (base, prefix) = match self {
+            Self::Address(address) => return Some(address),
+            Self::Cidr { base, prefix } => (base, prefix),
+        };
+        let bits = if base.is_ipv4() { 32 } else { 128 };
+        if prefix == bits {
+            return Some(base);
+        }
+        let mut raw = [0u8; 16];
+        getrandom::fill(&mut raw).ok()?;
+        Some(match base {
+            IpAddr::V4(base) => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - u32::from(prefix))
+                };
+                let base = u32::from(base) & mask;
+                let roll = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]) & !mask;
+                IpAddr::V4(std::net::Ipv4Addr::from(base | roll))
+            }
+            IpAddr::V6(base) => {
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - u32::from(prefix))
+                };
+                let base = u128::from(base) & mask;
+                let roll = u128::from_le_bytes(raw) & !mask;
+                IpAddr::V6(std::net::Ipv6Addr::from(base | roll))
+            }
+        })
+    }
+}
+
+thread_local! {
+    /// The source the outbound a flow entered names, read by the one dial seam.
+    static SEND_THROUGH: std::cell::Cell<Option<SendThrough>> = const { std::cell::Cell::new(None) };
+}
+
+struct SendThroughGuard;
+
+impl SendThroughGuard {
+    fn enter(source: Option<SendThrough>) -> Self {
+        SEND_THROUGH.with(|cell| cell.set(source));
+        Self
+    }
+}
+
+impl Drop for SendThroughGuard {
+    fn drop(&mut self) {
+        SEND_THROUGH.with(|cell| cell.set(None));
+    }
+}
+
+/// The outbound-level `sendThrough`: an address or a CIDR, while xray's two names for the inbound's
+/// own addresses warn and leave the dial unbound.
+fn parse_send_through(outbound: &Json) -> Result<Option<SendThrough>, String> {
+    let Some(value) = outbound.get("sendThrough") else {
+        return Ok(None);
+    };
+    if matches!(value, Json::Null) {
+        return Ok(None);
+    }
+    let Some(text) = value.as_str() else {
+        return Err("sendThrough is not a string".to_owned());
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let refuse = || format!("unable to send through: {text}");
+    if let Some((address, prefix)) = text.split_once('/') {
+        let base = address.parse::<IpAddr>().map_err(|_| refuse())?;
+        let prefix = prefix.parse::<u8>().map_err(|_| refuse())?;
+        let bits = if base.is_ipv4() { 32 } else { 128 };
+        if prefix > bits {
+            return Err(refuse());
+        }
+        return Ok(Some(SendThrough::Cidr { base, prefix }));
+    }
+    if text.eq_ignore_ascii_case("origin") || text.eq_ignore_ascii_case("srcip") {
+        eprintln!(
+            "outbound sendThrough `{text}` is not wired; the dial uses the OS source address"
+        );
+        return Ok(None);
+    }
+    text.parse::<IpAddr>()
+        .map(|address| Some(SendThrough::Address(address)))
+        .map_err(|_| refuse())
+}
+
+/// Whether any outbound names a source, so a config with no `routing` block still builds the plan
+/// that carries it.
+fn send_through_present(root: &Json) -> Result<bool, String> {
+    let outbounds = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
+    let mut present = false;
+    for outbound in outbounds {
+        present |= parse_send_through(outbound)?.is_some();
+    }
+    Ok(present)
+}
+
+/// The routing table a config runs with: its own block, or an empty one when an outbound names a
+/// source the dial must carry.
+fn routing_for(root: &Json) -> Result<Option<crate::router::Routing>, String> {
+    match crate::router::Routing::parse(root)? {
+        Some(routing) => Ok(Some(routing)),
+        None if send_through_present(root)? => Ok(Some(crate::router::Routing::empty())),
+        None => Ok(None),
+    }
+}
+
+/// One dial that leaves from the source `sendThrough` names; the unbound dial stays the same.
+fn dial_from(target: &SocketAddr, source: IpAddr) -> std::io::Result<Connection> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    let domain = if target.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    socket.bind(&SockAddr::from(SocketAddr::new(source, 0)))?;
+    socket.connect_timeout(&SockAddr::from(*target), budgets::dial())?;
+    Ok(Connection::Tcp(std::net::TcpStream::from(socket)))
+}
+
 fn dial(target: &SocketAddr) -> Result<Connection, Failure> {
-    // The seam's one dial entry; an IP target is the TCP dial with its budget unchanged, so bytes and calls are identical.
-    let stream = crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
-        .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?;
+    // The seam's one dial entry: a named source binds before the same budget, and no source is the TCP dial unchanged.
+    let source = SEND_THROUGH.with(std::cell::Cell::get);
+    let stream = match source.and_then(SendThrough::address) {
+        Some(source) => dial_from(target, source)
+            .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
+        None => crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
+            .map_err(|e| Failure::new(Stage::SocketConnected, Kind::of(&e)))?,
+    };
     no_delay(&stream);
     let meter = OUTBOUND_TAG.with(|cell| {
         cell.borrow()
@@ -1523,6 +1665,10 @@ struct RouteShared {
     script: Option<crate::router_script::ScriptCallbacks>,
     default: Outbound,
     default_tag: Option<String>,
+    /// The source each outbound's `sendThrough` names, and the default outbound's own.
+    sources: HashMap<String, SendThrough>,
+    default_source: Option<SendThrough>,
+    has_sources: bool,
     dynamic: Arc<RwLock<Dynamic>>,
     changed: AtomicBool,
     closed: Outbound,
@@ -2008,6 +2154,24 @@ impl RoutePlan {
         client: Option<&Connection>,
         facts: FlowFacts<'_>,
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
+        let answer = self.lane_with_protocol_untracked(asked, network, client, facts);
+        if self.shared.has_sources {
+            let source = match answer.1.as_deref() {
+                Some(tag) => self.shared.sources.get(tag).copied(),
+                None => self.shared.default_source,
+            };
+            SEND_THROUGH.with(|cell| cell.set(source));
+        }
+        answer
+    }
+
+    fn lane_with_protocol_untracked(
+        &self,
+        asked: &Destination,
+        network: crate::router::Network,
+        client: Option<&Connection>,
+        facts: FlowFacts<'_>,
+    ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         let (domain, ip) = match asked {
             Destination::Name(host, _) => (Some(host.as_str()), None),
             Destination::Address(address) => (None, Some(address.ip())),
@@ -2299,6 +2463,14 @@ fn route_shared_with_api(
         }
     }
     let mut tagged = HashMap::new();
+    let default_source = parse_send_through(first)?;
+    let mut sources = HashMap::new();
+    for (tag, config) in &configs {
+        if let Some(source) = parse_send_through(config)? {
+            sources.insert((*tag).to_owned(), source);
+        }
+    }
+    let has_sources = default_source.is_some() || !sources.is_empty();
     let targets: Vec<&str> = if routing.script().is_some() {
         configs.keys().copied().collect()
     } else {
@@ -2414,6 +2586,9 @@ fn route_shared_with_api(
         script,
         default,
         default_tag,
+        sources,
+        default_source,
+        has_sources,
         dynamic,
         changed: AtomicBool::new(false),
         closed: Outbound::Block(ferrox_core::blackhole::Response::None),
@@ -15817,6 +15992,7 @@ pub(crate) fn serve_connect(
 ) {
     let tag = tag.map(str::to_owned).or_else(default_outbound_tag);
     let _outbound = OutboundTag::enter(tag.as_deref());
+    let _source = SendThroughGuard::enter(SEND_THROUGH.with(std::cell::Cell::take));
     if let Outbound::Loopback(loopback) = out {
         let overridden = loopback_asked(loopback, asked, &client);
         let asked = overridden.as_ref().unwrap_or(asked);
@@ -47862,6 +48038,110 @@ mod tests {
             None,
             source_known,
         )))
+    }
+
+    /// `sendThrough` reads an address and a CIDR, rolls inside the subnet, and refuses a prefix the
+    /// reference refuses.
+    #[test]
+    fn send_through_reads_an_address_and_a_cidr() {
+        let address = crate::json::parse(r#"{"sendThrough":"127.0.0.2"}"#).expect("parses");
+        assert_eq!(
+            parse_send_through(&address).expect("parses"),
+            Some(SendThrough::Address("127.0.0.2".parse().expect("ip")))
+        );
+        let cidr = crate::json::parse(r#"{"sendThrough":"198.18.0.0/15"}"#).expect("parses");
+        assert_eq!(
+            parse_send_through(&cidr).expect("parses"),
+            Some(SendThrough::Cidr {
+                base: "198.18.0.0".parse().expect("ip"),
+                prefix: 15,
+            })
+        );
+        let rolled = parse_send_through(&cidr)
+            .expect("parses")
+            .expect("a source")
+            .address()
+            .expect("an address");
+        let IpAddr::V4(rolled) = rolled else {
+            panic!("an IPv4 CIDR rolls an IPv4 source");
+        };
+        let base: std::net::Ipv4Addr = "198.18.0.0".parse().expect("ip");
+        assert_eq!(
+            u32::from(rolled) & (u32::MAX << 17),
+            u32::from(base),
+            "the roll stays inside the /15"
+        );
+        let bad = crate::json::parse(r#"{"sendThrough":"198.18.0.0/33"}"#).expect("parses");
+        assert_eq!(
+            parse_send_through(&bad),
+            Err("unable to send through: 198.18.0.0/33".to_owned())
+        );
+    }
+
+    /// A config with no `routing` block still builds the plan that carries `sendThrough`, and one
+    /// without a source stays on the static outbound path.
+    #[test]
+    fn a_config_without_routing_still_carries_send_through() {
+        let named = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","sendThrough":"127.0.0.2"}]}"#,
+        )
+        .expect("parses");
+        assert!(routing_for(&named).expect("parses").is_some());
+        let plain =
+            crate::json::parse(r#"{"outbounds":[{"protocol":"freedom"}]}"#).expect("parses");
+        assert!(routing_for(&plain).expect("parses").is_none());
+    }
+
+    /// The source a freedom flow leaves from is the one its outbound named, not the OS default.
+    #[test]
+    fn an_outbound_send_through_binds_the_source_the_config_names() {
+        let root = crate::json::parse(
+            r#"{"routing":{},"outbounds":[{"protocol":"freedom","sendThrough":"127.0.0.2"}]}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let asked = Destination::Name("127.0.0.1".to_owned(), 9);
+        let (lane, _tag) = plan.lane_with_protocol(
+            &asked,
+            crate::router::Network::Tcp,
+            None,
+            FlowFacts::default(),
+        );
+        assert!(
+            matches!(&*lane, Outbound::Freedom(_)),
+            "the default freedom lane"
+        );
+        let source = SEND_THROUGH
+            .with(std::cell::Cell::get)
+            .expect("the lane carries a source");
+        assert_eq!(source.address(), Some("127.0.0.2".parse().expect("ip")));
+        let _guard = SendThroughGuard::enter(SEND_THROUGH.with(std::cell::Cell::take));
+        // Linux owns all of 127/8 on loopback, so the bind is witnessed where a 127.0.0.2 source routes.
+        #[cfg(target_os = "linux")]
+        {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("echo binds");
+            let port = listener.local_addr().expect("address").port();
+            let (peers, seen) = std::sync::mpsc::channel();
+            let echo = std::thread::spawn(move || {
+                if let Ok((stream, peer)) = listener.accept() {
+                    let _ = peers.send(peer.ip());
+                    drop(stream);
+                }
+            });
+            let target: SocketAddr = format!("127.0.0.1:{port}").parse().expect("target");
+            assert!(
+                dial_or_report(&target).is_some(),
+                "the dial reaches the echo"
+            );
+            let peer = seen
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the echo saw the peer");
+            echo.join().expect("echo");
+            assert_eq!(peer, "127.0.0.2".parse::<IpAddr>().expect("source"));
+        }
     }
 
     /// A `WireGuard` server datagram takes the tag its rules pick for UDP, follows that freedom's
