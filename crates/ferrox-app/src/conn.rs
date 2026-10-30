@@ -1039,19 +1039,19 @@ impl HttpUrl {
         let (tls, rest) = match text.split_once("://") {
             Some(("http", rest)) => (false, rest),
             Some(("https", rest)) => (true, rest),
-            Some((scheme, _)) => return Err(format!("URL scheme `{scheme}` is not http or https")),
-            None => return Err(format!("URL {text:?} names no scheme")),
+            Some(_) => return Err("URL scheme is not http or https".to_owned()),
+            None => return Err("URL names no scheme".to_owned()),
         };
         let split = rest.find(['/', '?', '#']).unwrap_or(rest.len());
         let authority = &rest[..split];
         let authority = authority.rsplit('@').next().unwrap_or(authority);
         if authority.is_empty() {
-            return Err(format!("URL {text:?} names no host"));
+            return Err("URL names no host".to_owned());
         }
         let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
             let (host, tail) = bracketed
                 .split_once(']')
-                .ok_or_else(|| format!("URL {text:?} has an unclosed IPv6 host"))?;
+                .ok_or_else(|| "URL has an unclosed IPv6 host".to_owned())?;
             let port = tail
                 .strip_prefix(':')
                 .and_then(|port| port.parse().ok())
@@ -1062,7 +1062,7 @@ impl HttpUrl {
                 (
                     host.to_owned(),
                     port.parse()
-                        .map_err(|_| format!("URL {text:?} has an invalid port"))?,
+                        .map_err(|_| "URL has an invalid port".to_owned())?,
                 )
             } else {
                 (authority.to_owned(), if tls { 443 } else { 80 })
@@ -1071,7 +1071,7 @@ impl HttpUrl {
             (authority.to_owned(), if tls { 443 } else { 80 })
         };
         if host.is_empty() {
-            return Err(format!("URL {text:?} names no host"));
+            return Err("URL names no host".to_owned());
         }
         let mut path = &rest[split..];
         if let Some(fragment) = path.find('#') {
@@ -1789,6 +1789,18 @@ mod tests {
         assert_eq!(url.path, "/check?q=1");
         let bare = HttpUrl::parse("http://example.test?q=1").expect("parses");
         assert_eq!(bare.path, "/?q=1");
+    }
+
+    #[test]
+    fn a_url_error_does_not_echo_the_credential() {
+        for raw in [
+            "user:secret@host/hook",
+            "ftp://user:secret@host/hook",
+            "http://[user:secret",
+        ] {
+            let error = HttpUrl::parse(raw).expect_err("refused");
+            assert!(!error.contains("secret"), "{raw}: {error}");
+        }
     }
 
     #[test]
