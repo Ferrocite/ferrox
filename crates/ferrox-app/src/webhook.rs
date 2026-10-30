@@ -748,6 +748,36 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_dripping_reply_ends_at_the_one_total_deadline() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("receiver");
+        let port = listener.local_addr().expect("address").port();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    if stream.write_all(b"x").is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            })
+        };
+        let webhook = notifier(&format!("http://127.0.0.1:{port}/hook"));
+        let started = Instant::now();
+        let result = webhook.send("{}");
+        let waited = started.elapsed();
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        server.join().ok();
+        assert!(result.is_err(), "the reply never has a status line");
+        assert!(
+            waited < Duration::from_secs(7),
+            "one total budget ends the drip: {waited:?}"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_socket_url_reaches_the_unix_listener() {
