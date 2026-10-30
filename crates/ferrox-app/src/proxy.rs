@@ -418,9 +418,12 @@ fn serve_inbounds_counted(
                 refuse_inbound(protocol, label, inbound);
                 continue;
             }
-            if prove {
+            if server_protocol(protocol) {
                 if let Some(shared) = route {
-                    prove_server_route(shared, inbound, label);
+                    shared.note_server_inbound(inbound_tag(inbound));
+                    if prove {
+                        prove_server_route(shared, inbound, label);
+                    }
                 }
             }
             register_inbound_sniffing(inbound, label, &addresses);
@@ -1517,6 +1520,8 @@ struct RouteShared {
     tagged: HashMap<String, Outbound>,
     /// Each balancer's candidate tags, ordered by tag. Built once so a flow picks from a slice.
     balancers: Arc<HashMap<String, Vec<String>>>,
+    /// The server inbounds whose fixed direct dial an added rule must not change.
+    server_inbounds: std::sync::Mutex<Vec<Option<String>>>,
     observatory: Option<Arc<crate::observatory::Observatory>>,
     /// The script router, kept outside the routing lock: a script callback re-enters the table.
     script_router: Option<Arc<crate::router_script::ScriptRouter>>,
@@ -1529,6 +1534,17 @@ struct RouteShared {
 }
 
 impl RouteShared {
+    /// Remember a server inbound so a later `AddRule` is judged against its fixed direct dial.
+    fn note_server_inbound(&self, tag: Option<String>) {
+        let mut tags = self
+            .server_inbounds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+
     /// Register an outbound the management API added. A tag a rule already names, or the default,
     /// is a duplicate until it was removed; a removed tag can be added again, as in the reference.
     fn add_outbound(&self, tag: &str, out: Outbound) -> Result<(), String> {
@@ -1721,11 +1737,48 @@ impl Runtime {
         };
         let known =
             |tag: &str| route.tagged.contains_key(tag) || Some(tag) == route.default_tag.as_deref();
-        route
+        let mut routing = route
             .routing
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .add_rules(rules, append, known)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let fallbacks: HashMap<String, Option<String>> = routing
+            .balancers()
+            .map(|balancer| {
+                (
+                    balancer.tag().to_owned(),
+                    balancer.fallback().map(str::to_owned),
+                )
+            })
+            .collect();
+        let direct =
+            |named: &str, balancer: bool| {
+                if balancer {
+                    let Some(candidates) = route.balancers.get(named) else {
+                        return false;
+                    };
+                    let fallback = fallbacks
+                        .get(named)
+                        .and_then(|fallback| fallback.as_deref());
+                    return candidates.iter().map(String::as_str).chain(fallback).all(
+                        |candidate| {
+                            Some(candidate) == route.default_tag.as_deref()
+                                || matches!(route.tagged.get(candidate), Some(Outbound::Freedom(_)))
+                        },
+                    );
+                }
+                Some(named) == route.default_tag.as_deref()
+                    || matches!(route.tagged.get(named), Some(Outbound::Freedom(_)))
+            };
+        let inbounds = route
+            .server_inbounds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let check = crate::router::ServerRouteCheck {
+            inbounds: inbounds.as_slice(),
+            default_direct: matches!(&route.default, Outbound::Freedom(_)),
+            direct: &direct,
+        };
+        routing.add_rules(rules, append, known, Some(check))
     }
 
     /// Drop every rule carrying `tag`, for `RoutingService.RemoveRule`.
@@ -2149,6 +2202,31 @@ impl RoutePlan {
     }
 }
 
+/// The protocols whose inbound always dials its configured lane directly.
+fn server_protocol(protocol: &str) -> bool {
+    matches!(
+        protocol,
+        "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria"
+    )
+}
+
+/// Every server inbound at startup, tagged or not, as its rules must stay direct.
+fn server_inbounds(root: &Json) -> Vec<Option<String>> {
+    let mut tags = Vec::new();
+    for inbound in root.get("inbounds").and_then(Json::as_arr).unwrap_or(&[]) {
+        let protocol =
+            canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or(""));
+        if !server_protocol(protocol) {
+            continue;
+        }
+        let tag = inbound_tag(inbound);
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+    tags
+}
+
 /// The tag an inbound answers to, or nothing when the config leaves it unnamed.
 fn inbound_tag(inbound: &Json) -> Option<String> {
     inbound
@@ -2409,6 +2487,7 @@ fn route_shared_with_api(
         routing,
         tagged,
         balancers,
+        server_inbounds: std::sync::Mutex::new(server_inbounds(root)),
         observatory,
         script_router,
         script,
@@ -2461,10 +2540,9 @@ fn pick_script_outbound(
 /// the fallback must be one too; anything else refuses the start rather than serving the wrong lane.
 fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
     // A server inbound dials direct, so every rule that can reach it must agree with that at startup.
-    if !matches!(
-        canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or("")),
-        "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria"
-    ) {
+    if !server_protocol(canonical_protocol(
+        inbound.get("protocol").and_then(Json::as_str).unwrap_or(""),
+    )) {
         return;
     }
     let tag = inbound_tag(inbound);
@@ -48239,6 +48317,37 @@ end
         assert!(
             matches!(plan.association(), Association::Default),
             "removing the rule puts the association back on the default lane"
+        );
+    }
+
+    /// A rule the management API adds for a server inbound cannot point it at a lane the inbound
+    /// never dials, even when that lane was built for another inbound.
+    #[test]
+    fn an_added_rule_cannot_change_a_server_inbounds_direct_dial() {
+        let config = r#"{"outbounds":[
+            {"tag":"direct","protocol":"freedom"},
+            {"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[
+                {"type":"field","inboundTag":["other"],"outboundTag":"block"}]},
+            "inbounds":[
+                {"tag":"server","protocol":"vless","port":0,"settings":{"clients":[],"decryption":"none"}},
+                {"tag":"other","protocol":"socks","port":0}]}"#;
+        let root = crate::json::parse(config).expect("parses");
+        let runtime = test_runtime(&root);
+        let rule = crate::json::parse(
+            r#"{"type":"field","ruleTag":"blocked","inboundTag":["server"],"outboundTag":"block"}"#,
+        )
+        .expect("parses");
+        let error = runtime
+            .add_rules(&[rule], true)
+            .expect_err("the server inbound serves direct");
+        assert!(error.contains("server"), "{error}");
+        assert!(
+            !runtime
+                .listed_rules()
+                .iter()
+                .any(|rule| rule.tag.as_deref() == Some("blocked")),
+            "the refused rule left the table unchanged"
         );
     }
 

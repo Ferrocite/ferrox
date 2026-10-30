@@ -335,6 +335,13 @@ pub(crate) struct ListedRule {
     pub(crate) tag: Option<String>,
 }
 
+/// The inbounds a runtime `AddRule` must keep dialing direct, and the outbound verdict that says so.
+pub(crate) struct ServerRouteCheck<'a> {
+    pub(crate) inbounds: &'a [Option<String>],
+    pub(crate) default_direct: bool,
+    pub(crate) direct: &'a dyn Fn(&str, bool) -> bool,
+}
+
 #[derive(Debug)]
 pub(crate) struct Routing {
     strategy: DomainStrategy,
@@ -1137,6 +1144,7 @@ impl Routing {
         raw: &[Json],
         append: bool,
         known: impl Fn(&str) -> bool,
+        server: Option<ServerRouteCheck<'_>>,
     ) -> Result<(), String> {
         let mut assets = Assets::new(self.asset_dirs.clone());
         let mut tags: HashSet<String> = if append {
@@ -1173,6 +1181,29 @@ impl Routing {
                 ));
             }
             rules.push(rule);
+        }
+        if let Some(check) = &server {
+            let script = self.script.as_deref();
+            for inbound in check.inbounds {
+                let inbound = inbound.as_deref();
+                if append {
+                    Self::server_routes_in(
+                        script,
+                        self.rules.iter().chain(rules.iter()),
+                        inbound,
+                        check.default_direct,
+                        check.direct,
+                    )?;
+                } else {
+                    Self::server_routes_in(
+                        script,
+                        rules.iter(),
+                        inbound,
+                        check.default_direct,
+                        check.direct,
+                    )?;
+                }
+            }
         }
         if append {
             self.rules.extend(rules);
@@ -1439,13 +1470,29 @@ impl Routing {
         default_direct: bool,
         direct: impl Fn(&str, bool) -> bool,
     ) -> Result<(), String> {
-        if self.script.is_some() {
+        Self::server_routes_in(
+            self.script.as_deref(),
+            self.rules.iter(),
+            inbound,
+            default_direct,
+            direct,
+        )
+    }
+
+    fn server_routes_in<'a>(
+        script: Option<&ScriptRouter>,
+        rules: impl Iterator<Item = &'a Rule>,
+        inbound: Option<&str>,
+        default_direct: bool,
+        direct: impl Fn(&str, bool) -> bool,
+    ) -> Result<(), String> {
+        if script.is_some() {
             return Err(format!(
                 "inbound {} names a routing script, which the server inbound cannot evaluate",
                 inbound.unwrap_or("<untagged>")
             ));
         }
-        for rule in &self.rules {
+        for rule in rules {
             if !rule.reachable(inbound, Network::Tcp) || !rule.local_os_matches() {
                 continue;
             }
