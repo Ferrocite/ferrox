@@ -4,7 +4,8 @@ use std::io::{IoSlice, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -5100,21 +5101,90 @@ fn remember_lookup(host: &str, port: u16, addrs: &[SocketAddr]) -> Arc<[SocketAd
     stored
 }
 
-/// A resolver has no deadline, so the flow waits its dial budget and a detached thread carries the lookup.
+/// A resolver has no deadline, so the flow waits its dial budget and a fixed pool carries the lookup.
+struct ResolvePool {
+    queues: Vec<SyncSender<ResolveJob>>,
+    next: AtomicUsize,
+}
+
+struct ResolveJob {
+    host: String,
+    port: u16,
+    lookup: Box<dyn FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send>,
+    reply: SyncSender<std::io::Result<Vec<SocketAddr>>>,
+}
+
+const RESOLVE_WORKERS: usize = 8;
+const RESOLVE_QUEUE: usize = 64;
+const RESOLVE_STACK: usize = 256 * 1024;
+static RESOLVE_POOL: OnceLock<ResolvePool> = OnceLock::new();
+
+impl ResolvePool {
+    /// Start one set of long-lived workers; a resolver that hangs parks a worker, not a flow's thread.
+    fn new() -> Self {
+        let mut queues = Vec::with_capacity(RESOLVE_WORKERS);
+        for _ in 0..RESOLVE_WORKERS {
+            let (sender, receiver) = sync_channel(RESOLVE_QUEUE);
+            match thread::Builder::new()
+                .name("ferrox-resolve".to_owned())
+                .stack_size(RESOLVE_STACK)
+                .spawn(move || resolve_worker(receiver))
+            {
+                Ok(_) => queues.push(sender),
+                Err(error) => eprintln!("proxy: cannot start a resolver worker: {error}"),
+            }
+        }
+        Self {
+            queues,
+            next: AtomicUsize::new(0),
+        }
+    }
+
+    /// Hand the job to the next queue with room, so one stuck worker cannot park the others.
+    fn submit(&self, mut job: ResolveJob) -> bool {
+        let len = self.queues.len();
+        if len == 0 {
+            return false;
+        }
+        let start = self.next.fetch_add(1, Ordering::Relaxed) % len;
+        for offset in 0..len {
+            match self.queues[(start + offset) % len].try_send(job) {
+                Ok(()) => return true,
+                Err(TrySendError::Full(returned) | TrySendError::Disconnected(returned)) => {
+                    job = returned;
+                }
+            }
+        }
+        false
+    }
+}
+
+fn resolve_worker(receiver: Receiver<ResolveJob>) {
+    while let Ok(job) = receiver.recv() {
+        let ResolveJob {
+            host,
+            port,
+            lookup,
+            reply,
+        } = job;
+        let _ = reply.send(lookup(&host, port));
+    }
+}
+
 fn resolve_bounded<F>(host: &str, port: u16, budget: Duration, lookup: F) -> Vec<SocketAddr>
 where
     F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
 {
-    let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-    let owned = host.to_owned();
-    let Ok(_worker) = thread::Builder::new()
-        .name("ferrox-resolve".to_owned())
-        .spawn(move || {
-            let _ = sender.send(lookup(&owned, port));
-        })
-    else {
-        return Vec::new();
+    let (sender, receiver) = sync_channel(1);
+    let job = ResolveJob {
+        host: host.to_owned(),
+        port,
+        lookup: Box::new(lookup),
+        reply: sender,
     };
+    if !RESOLVE_POOL.get_or_init(ResolvePool::new).submit(job) {
+        return Vec::new();
+    }
     match receiver.recv_timeout(budget) {
         Ok(Ok(addrs)) => addrs,
         Ok(Err(_)) | Err(_) => Vec::new(),
@@ -51508,16 +51578,45 @@ mod resolve_tests {
     /// flow thread that asked, so the lookup is bounded by the dial budget and times out empty.
     #[test]
     fn a_name_lookup_that_never_answers_does_not_park_its_flow() {
+        let (release, wait) = std::sync::mpsc::channel();
         let started = Instant::now();
-        let addrs = resolve_bounded("stalled.invalid", 443, Duration::from_millis(50), |_, _| {
-            std::thread::sleep(Duration::from_secs(3));
-            Ok(Vec::new())
-        });
+        let addrs = resolve_bounded(
+            "stalled.invalid",
+            443,
+            Duration::from_millis(50),
+            move |_, _| {
+                let _ = wait.recv();
+                Ok(Vec::new())
+            },
+        );
         assert!(addrs.is_empty(), "a timed-out lookup has no address");
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "the lookup waited out the stuck resolver instead of its budget: {}ms",
             started.elapsed().as_millis()
+        );
+        release.send(()).expect("releases the stalled worker");
+    }
+
+    /// A flow pays a queue send, not a thread start: repeated lookups reuse the same bounded set.
+    #[test]
+    fn repeated_lookups_reuse_the_bounded_workers() {
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
+        for _ in 0..super::RESOLVE_WORKERS * 2 {
+            let seen = std::sync::Arc::clone(&seen);
+            let addrs = resolve_bounded("localhost", 80, Duration::from_secs(5), move |_, _| {
+                seen.lock()
+                    .expect("seen")
+                    .insert(std::thread::current().id());
+                Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], 80))])
+            });
+            assert_eq!(addrs.len(), 1, "the pooled lookup answered");
+        }
+        let workers = seen.lock().expect("seen").len();
+        assert!(
+            workers <= super::RESOLVE_WORKERS,
+            "spawned {workers} resolver threads for {} lookups",
+            super::RESOLVE_WORKERS * 2
         );
     }
 }
