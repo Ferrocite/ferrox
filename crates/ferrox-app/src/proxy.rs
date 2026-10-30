@@ -21827,7 +21827,11 @@ fn kept_head_rounds(
             return None;
         }
         let base = head.len();
-        let want = HEAD_ROUND.min(limit - base);
+        let mut want = HEAD_ROUND.min(limit - base);
+        let room = head.capacity() - base;
+        if room > 0 {
+            want = want.min(room);
+        }
         head.reserve(want);
         // SAFETY: `read` initialises the bytes it reports, and `set_len` is rolled back on every path that does not.
         unsafe { head.set_len(base + want) };
@@ -28985,6 +28989,29 @@ mod tests {
                     "a {len}-byte head costs {allocs} allocation(s): {counts:?}"
                 );
             }
+        }
+    }
+
+    /// A head that arrives in fragments still fits the first round: a short read must spend the room it already has, not grow the buffer.
+    #[test]
+    fn a_fragmented_head_inside_the_first_round_does_not_grow() {
+        let mut wire = vec![b'p'; 696];
+        wire.extend_from_slice(b"\r\n\r\n");
+        for take in [1usize, 7, 64, 333, 400] {
+            let mut source = Chunked {
+                inner: std::io::Cursor::new(wire.clone()),
+                take,
+            };
+            let (read, counts) = ferrox_core::alloc_count::measure(|| {
+                kept_head_rounds(&mut source, 8 * 1024, HEAD_DEADLINE)
+            });
+            let (got, at) = read.expect("reads a fragmented head");
+            assert_eq!(at, wire.len(), "the head ends at its delimiter");
+            assert_eq!(&got[..at], &wire[..], "the head comes back whole");
+            assert_eq!(
+                counts.allocs, 1,
+                "{take}-byte fragments grow the first round: {counts:?}"
+            );
         }
     }
 
@@ -48271,6 +48298,18 @@ mod tests {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             self.reads += 1;
             self.inner.read(buf)
+        }
+    }
+
+    struct Chunked<R> {
+        inner: R,
+        take: usize,
+    }
+
+    impl<R: Read> Read for Chunked<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = buf.len().min(self.take);
+            self.inner.read(&mut buf[..n])
         }
     }
 

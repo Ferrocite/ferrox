@@ -809,13 +809,14 @@ mod tests {
         assert_eq!(seen[0].len(), CmdOnlySegment::byte_size());
     }
 
-    #[cfg_attr(miri, ignore = "measures a 100ms wall-clock retry deadline")]
     #[test]
     fn a_write_that_never_succeeds_stops_at_the_attempt_limit() {
         let (recorder, conn) = recording_connection(u32::MAX);
+        #[cfg(not(miri))]
         let started = Instant::now();
         conn.ping(1, Command::Ping);
         assert_eq!(recorder.attempts.load(Ordering::SeqCst), WRITE_ATTEMPTS);
+        #[cfg(not(miri))]
         assert!(
             started.elapsed() < Duration::from_millis(100),
             "a dead sink held the flush for {:?}; the scheduler drives every connection",
