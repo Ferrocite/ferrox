@@ -52919,6 +52919,17 @@ mod dns_lane_tests {
     /// A name the peer chose is not a resolver job until the account and command are accepted.
     #[test]
     fn a_vless_name_waits_for_the_account_before_a_lookup() {
+        fn named(id: &[u8; 16], cmd: u8) -> Vec<u8> {
+            let mut out = vec![0u8];
+            out.extend_from_slice(id);
+            out.push(0);
+            out.push(cmd);
+            out.extend_from_slice(&8080u16.to_be_bytes());
+            out.push(ferrox_core::addr::DOMAIN);
+            out.push(10);
+            out.extend_from_slice(b"slow.test.");
+            out
+        }
         fn pair(header: Vec<u8>) -> (Connection, thread::JoinHandle<()>) {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
             let addr = listener.local_addr().expect("addr");
@@ -52940,7 +52951,7 @@ mod dns_lane_tests {
                 None
             },
         };
-        let (stream, client) = pair(a_vless_probe(&[9u8; 16], 1));
+        let (stream, client) = pair(named(&[9u8; 16], 1));
         serve_vless_raw_with(stream, &users, true, None, &io);
         assert_eq!(
             asked.load(Ordering::Relaxed),
@@ -52948,7 +52959,7 @@ mod dns_lane_tests {
             "an invalid id never looks up"
         );
         client.join().expect("client");
-        let (stream, client) = pair(a_vless_probe(&id, 5));
+        let (stream, client) = pair(named(&id, 5));
         serve_vless_raw_with(stream, &users, true, None, &io);
         assert_eq!(
             asked.load(Ordering::Relaxed),
@@ -52956,7 +52967,7 @@ mod dns_lane_tests {
             "an unsupported command never looks up"
         );
         client.join().expect("client");
-        let (stream, client) = pair(a_vless_probe(&id, 1));
+        let (stream, client) = pair(named(&id, 1));
         serve_vless_raw_with(stream, &users, true, None, &io);
         assert_eq!(
             asked.load(Ordering::Relaxed),
