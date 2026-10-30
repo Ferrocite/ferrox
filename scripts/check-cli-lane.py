@@ -384,6 +384,7 @@ def reset_fake_net(state: pathlib.Path) -> None:
         "lanes",
         "system-proxy.owner",
         "system-proxy.supervisor",
+        "system-proxy.supervisor.pid",
         "fake-vpn-lane.pids",
         "fake-exiting-lane.pids",
         "lane.pid",
@@ -1194,6 +1195,30 @@ def config_lane(
 
 
 def check_config_fronts(state: pathlib.Path) -> int:
+    def down() -> int:
+        run = subprocess.run(
+            [str(CLI), "down"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            env=env_for(state),
+        )
+        if run.returncode != 0:
+            print(
+                f"check-cli-lane: a config lane's down exited {run.returncode}:"
+                f"\n{run.stdout + run.stderr}",
+                file=sys.stderr,
+            )
+            return 1
+        if (state / "system-proxy.supervisor").exists():
+            print(
+                "check-cli-lane: a config lane's down left its supervisor behind",
+                file=sys.stderr,
+            )
+            return 1
+        return 0
+
     http_port = free_port()
     http = state / "config-http.json"
     http.write_text(
@@ -1232,14 +1257,8 @@ def check_config_fronts(state: pathlib.Path) -> int:
             file=sys.stderr,
         )
         return 1
-    subprocess.run(
-        [str(CLI), "down"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=WATCH,
-        env=env_for(state),
-    )
+    if down():
+        return 1
 
     mixed_port = free_port()
     mixed = state / "config-mixed.json"
@@ -1274,14 +1293,8 @@ def check_config_fronts(state: pathlib.Path) -> int:
             file=sys.stderr,
         )
         return 1
-    subprocess.run(
-        [str(CLI), "down"],
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=WATCH,
-        env=env_for(state),
-    )
+    if down():
+        return 1
 
     exposed = state / "config-exposed.json"
     exposed.write_text(

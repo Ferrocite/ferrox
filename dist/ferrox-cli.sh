@@ -60,6 +60,7 @@ LOG="$CONF_DIR/lane.log"
 PROXY_PORTS="$STATE_DIR/system-proxy.ports"
 PROXY_STATE="$STATE_DIR/system-proxy.state"
 SUPERVISOR_FILE="$STATE_DIR/system-proxy.supervisor"
+SUPERVISOR_PID_FILE="$STATE_DIR/system-proxy.supervisor.pid"
 
 ACTION="up"
 SUPERVISE_PID=""
@@ -1485,6 +1486,7 @@ apply_instance() {
   PROXY_PORTS="$STATE_DIR/system-proxy$suffix.ports"
   PROXY_STATE="$STATE_DIR/system-proxy$suffix.state"
   SUPERVISOR_FILE="$STATE_DIR/system-proxy$suffix.supervisor"
+  SUPERVISOR_PID_FILE="$STATE_DIR/system-proxy$suffix.supervisor.pid"
   LOCATION_FILE="$CONF_DIR/foxy-location$suffix"
 }
 
@@ -1505,7 +1507,9 @@ supervise_clear() {
     system_proxy_off >/dev/null 2>&1 || true
     if [ "$(lane_pid)" = "$watched" ]; then rm -f "$PID_FILE"; fi
   fi
-  if [ "$(cat "$SUPERVISOR_FILE" 2>/dev/null)" = "$$" ]; then rm -f "$SUPERVISOR_FILE"; fi
+  if [ "$(cat "$SUPERVISOR_FILE" 2>/dev/null)" = "$$" ]; then
+    rm -f "$SUPERVISOR_FILE" "$SUPERVISOR_PID_FILE"
+  fi
   return 0
 }
 
@@ -1521,8 +1525,8 @@ supervise_terminate() {
 action_supervise() {
   local watched="$SUPERVISE_PID"
   [ -n "$watched" ] || exit 0
-  printf '%s\n' "$$" > "$SUPERVISOR_FILE" 2>/dev/null || true
   trap 'supervise_terminate "$watched"; exit 0' HUP INT TERM
+  printf '%s\n' "$$" > "$SUPERVISOR_FILE" 2>/dev/null || true
   while kill -0 "$watched" 2>/dev/null; do sleep 1; done
   supervise_clear "$watched"
   exit 0
@@ -1678,14 +1682,26 @@ supervise_lane() {
   local -a sup=("${BASH:-/bin/bash}" "$SELF" __supervise "$pid")
   [ -n "$INSTANCE" ] && sup+=(--instance "$INSTANCE")
   "${sup[@]}" </dev/null >/dev/null 2>&1 &
+  printf '%s\n' "$!" > "$SUPERVISOR_PID_FILE" 2>/dev/null || true
 }
 
 stop_lane() {
-  local clear="${1:-1}"
+  local clear="${1:-1}" supervisor waited=0
   if lane_running; then
     kill "$(lane_pid)" 2>/dev/null || true
     sleep 1
     lane_running && kill -9 "$(lane_pid)" 2>/dev/null || true
+  fi
+  if [ "$clear" = 1 ]; then
+    supervisor="$(cat "$SUPERVISOR_PID_FILE" 2>/dev/null || true)"
+    [ -n "$supervisor" ] || supervisor="$(cat "$SUPERVISOR_FILE" 2>/dev/null || true)"
+    if [ -n "$supervisor" ]; then
+      while kill -0 "$supervisor" 2>/dev/null && [ "$waited" -lt 100 ]; do
+        sleep 0.05
+        waited=$((waited + 1))
+      done
+      rm -f "$SUPERVISOR_FILE" "$SUPERVISOR_PID_FILE"
+    fi
   fi
   rm -f "$PID_FILE"
   local rc=0
