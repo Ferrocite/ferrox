@@ -437,6 +437,11 @@ impl<R: Read> GrpcReader<R> {
             self.msg.truncate(from);
             return Some(());
         }
+        // DATA after END_STREAM is a protocol violation: discard it rather than buffer a body the read half can no longer consume.
+        if self.remote_end {
+            self.msg.truncate(from);
+            return None;
+        }
         let (first, pad) = if flags & F_PADDED != 0 {
             let Some(&one) = self.msg.get(from) else {
                 self.msg.truncate(from);
@@ -1180,14 +1185,15 @@ impl GrpcWriter {
         let total = plen + data.len();
         let max = max.max(1);
         // The empty end marker is retried by `close` if this wait fails: take its whole window first, so a retry never replays a prefix already on the wire.
-        if end && data.is_empty() && !self.credit(batch, total as u64) {
+        let reserved = end && data.is_empty();
+        if reserved && !self.credit(batch, total as u64) {
             return false;
         }
         let mut at = 0;
         while at < total {
             let n = (total - at).min(max);
             let last = at + n == total;
-            if !self.credit(batch, n as u64) {
+            if !reserved && !self.credit(batch, n as u64) {
                 return false;
             }
             if batch.full() && !batch.flush_blocking(&self.shared) {
@@ -1837,6 +1843,10 @@ pub(crate) fn mark_reader_dead<R: Read>(reader: &mut GrpcReader<R>) {
     }
     reader.shared.dead.store(true, Ordering::SeqCst);
     reader.shared.wake.notify_all();
+}
+
+pub(crate) fn request_ended<R: Read>(reader: &GrpcReader<R>) -> bool {
+    reader.remote_end
 }
 
 #[cfg(test)]
@@ -2636,6 +2646,78 @@ mod tests {
             peer.lock().unwrap().writes.concat(),
             want,
             "a stalled end marker was replayed from the start"
+        );
+    }
+
+    /// DATA after a normal `END_STREAM` is refused rather than buffered: the read half cannot consume
+    /// it, so keeping it would grow the reader without a bound.
+    #[test]
+    fn data_after_end_stream_is_not_buffered() {
+        let mut wire = frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[(":status", "200"), ("content-type", "application/grpc")]),
+        );
+        wire.extend_from_slice(&frame(T_DATA, F_END, 1, &message(b"ping")));
+        for _ in 0..3 {
+            wire.extend_from_slice(&frame(T_DATA, 0, 1, &message(b"pong")));
+        }
+        let (mut reader, writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        drop(writer);
+        reader.poll = true;
+        let mut got = [0u8; 8];
+        assert_eq!(reader.read(&mut got).expect("reads"), 4);
+        assert_eq!(&got[..4], b"ping");
+        let before = reader.msg.len();
+        assert_eq!(reader.read(&mut got).expect("reads"), 0);
+        assert!(
+            reader.msg.len() <= before,
+            "DATA after END_STREAM grew the read buffer"
+        );
+    }
+
+    /// An empty end marker reserves its whole window once: the per-frame loop must not charge it again,
+    /// or a marker that fits the window exactly is refused and leaks the reservation.
+    #[test]
+    fn an_empty_end_marker_charges_its_window_once() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(100)),
+            ..Default::default()
+        });
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), 1, 7);
+        let shared = Arc::clone(&writer.shared);
+        writer.upload_done();
+        {
+            let send = shared.send.lock().unwrap();
+            assert_eq!(
+                send.conn, 0,
+                "the end marker charged the connection window twice"
+            );
+            assert_eq!(
+                send.stream, 0,
+                "the end marker charged the stream window twice"
+            );
+        }
+        let prefix = message(b"");
+        let mut want = Vec::new();
+        for (i, byte) in prefix.iter().enumerate() {
+            let flags = if i + 1 == prefix.len() { F_END } else { 0 };
+            want.extend_from_slice(&frame(T_DATA, flags, 1, &[*byte]));
+        }
+        crate::budgets::clear();
+        assert_eq!(
+            peer.lock().unwrap().writes.concat(),
+            want,
+            "the end marker did not reach the peer"
         );
     }
 
