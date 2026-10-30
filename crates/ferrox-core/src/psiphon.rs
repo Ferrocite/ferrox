@@ -328,7 +328,6 @@ pub fn notice_kind(line: &[u8]) -> Option<&str> {
                 at += 1;
                 space(line, &mut at);
             }
-            Some(b'}') => return None,
             _ => return None,
         }
     }
@@ -550,8 +549,8 @@ unsafe fn next_of_sse2(bytes: &[u8], first: u8, second: u8) -> Option<(usize, u8
     use core::arch::x86_64::{
         _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_or_si128, _mm_set1_epi8,
     };
-    let a = _mm_set1_epi8(first.cast_signed());
-    let b = _mm_set1_epi8(second.cast_signed());
+    let a = unsafe { _mm_set1_epi8(first.cast_signed()) };
+    let b = unsafe { _mm_set1_epi8(second.cast_signed()) };
     let mut at = 0usize;
     while at + 32 <= bytes.len() {
         // SAFETY: `at + 32` is inside `bytes`, and both loads are unaligned.
@@ -823,7 +822,7 @@ unsafe fn find_byte_avx2(bytes: &[u8], wanted: u8) -> Option<usize> {
 #[inline]
 unsafe fn find_byte_sse2(bytes: &[u8], wanted: u8) -> Option<usize> {
     use core::arch::x86_64::{_mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_set1_epi8};
-    let needle = _mm_set1_epi8(wanted.cast_signed());
+    let needle = unsafe { _mm_set1_epi8(wanted.cast_signed()) };
     let mut at = 0usize;
     while at + 32 <= bytes.len() {
         // SAFETY: `at + 32` is inside `bytes`, and both loads are unaligned.
