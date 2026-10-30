@@ -3936,12 +3936,6 @@ fn vless_raw_reply<D, R>(
         }
         Probe::Dropped => return,
     };
-    let Some(target) = request
-        .target
-        .resolve_with(|host, port| (io.resolve)(host, port))
-    else {
-        return;
-    };
     let Some(user) = users
         .iter()
         .find(|user| same_vless_user(&user.id, &request.id))
@@ -3962,6 +3956,12 @@ fn vless_raw_reply<D, R>(
     if !freedom || !vless_flow_ok(user, request.flow, request.command, false) {
         return;
     }
+    let Some(target) = request
+        .target
+        .resolve_with(|host, port| (io.resolve)(host, port))
+    else {
+        return;
+    };
     crate::accesslog::record(
         stream.peer_addr().ok(),
         true,
