@@ -43,7 +43,8 @@ import traceback
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 CLI = ROOT / "dist" / "ferrox-cli.sh"
-WATCH = 15
+# The CLI's own probe may spend 20 s (45 s for VeePN); the watchdog must outlast it.
+WATCH = 60
 
 
 _PORT_LOCK = threading.Lock()
