@@ -23524,7 +23524,7 @@ fn socks_udp_head_len(frame: &[u8], dest: &SocketAddr) -> Option<usize> {
         SocketAddr::V4(dest) => {
             let head = 3 + 1 + 4 + 2;
             (frame.len() >= head
-                && frame[3] == 4
+                && frame[3] == 1
                 && frame[4..8] == dest.ip().octets()
                 && frame[8..10] == dest.port().to_be_bytes())
             .then_some(head)
@@ -23532,7 +23532,7 @@ fn socks_udp_head_len(frame: &[u8], dest: &SocketAddr) -> Option<usize> {
         SocketAddr::V6(dest) => {
             let head = 3 + 1 + 16 + 2;
             (frame.len() >= head
-                && frame[3] == 6
+                && frame[3] == 4
                 && frame[4..20] == dest.ip().octets()
                 && frame[20..22] == dest.port().to_be_bytes())
             .then_some(head)
