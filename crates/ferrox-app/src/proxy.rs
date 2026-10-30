@@ -4,7 +4,7 @@ use std::io::{IoSlice, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
 #[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 use std::thread;
@@ -5103,8 +5103,7 @@ fn remember_lookup(host: &str, port: u16, addrs: &[SocketAddr]) -> Arc<[SocketAd
 
 /// A resolver has no deadline, so the flow waits its dial budget and a fixed pool carries the lookup.
 struct ResolvePool {
-    queues: Vec<SyncSender<ResolveJob>>,
-    next: AtomicUsize,
+    queue: SyncSender<ResolveJob>,
 }
 
 type ResolveLookup = Box<dyn FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send>;
@@ -5112,68 +5111,78 @@ type ResolveLookup = Box<dyn FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr
 struct ResolveJob {
     host: String,
     port: u16,
+    deadline: Instant,
     lookup: ResolveLookup,
     reply: SyncSender<std::io::Result<Vec<SocketAddr>>>,
 }
 
+enum SubmitError {
+    Full,
+    Closed,
+}
+
 const RESOLVE_WORKERS: usize = 8;
-const RESOLVE_QUEUE: usize = 64;
+const RESOLVE_QUEUE: usize = 512;
 const RESOLVE_STACK: usize = 256 * 1024;
-static RESOLVE_POOL: OnceLock<ResolvePool> = OnceLock::new();
+static RESOLVE_POOL: Mutex<Option<ResolvePool>> = Mutex::new(None);
 
 impl ResolvePool {
     /// Start one set of long-lived workers; a resolver that hangs parks a worker, not a flow's thread.
-    fn new() -> Self {
-        let mut queues = Vec::with_capacity(RESOLVE_WORKERS);
+    fn new() -> Option<Self> {
+        let (queue, receiver) = sync_channel(RESOLVE_QUEUE);
+        let receiver = Arc::new(Mutex::new(receiver));
+        let mut workers = 0;
         for _ in 0..RESOLVE_WORKERS {
-            let (sender, receiver) = sync_channel(RESOLVE_QUEUE);
+            let receiver = Arc::clone(&receiver);
             match thread::Builder::new()
                 .name("ferrox-resolve".to_owned())
                 .stack_size(RESOLVE_STACK)
-                .spawn(move || resolve_worker(&receiver))
+                .spawn(move || resolve_worker(receiver.as_ref()))
             {
-                Ok(_) => queues.push(sender),
+                Ok(_) => workers += 1,
                 Err(error) => eprintln!("proxy: cannot start a resolver worker: {error}"),
             }
         }
-        Self {
-            queues,
-            next: AtomicUsize::new(0),
-        }
+        (workers > 0).then_some(Self { queue })
     }
 
-    /// Hand the job to the next queue with room, so one stuck worker cannot park the others.
-    fn submit(&self, mut job: ResolveJob) -> bool {
-        let len = self.queues.len();
-        if len == 0 {
-            return false;
+    /// A shared queue lets an idle worker take the next job; a stalled worker holds no queue.
+    fn submit(&self, job: ResolveJob) -> Result<(), SubmitError> {
+        match self.queue.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(_)) => Err(SubmitError::Full),
+            Err(TrySendError::Disconnected(_)) => Err(SubmitError::Closed),
         }
-        let start = self.next.fetch_add(1, Ordering::Relaxed) % len;
-        for offset in 0..len {
-            match self.queues[(start + offset) % len].try_send(job) {
-                Ok(()) => return true,
-                Err(TrySendError::Full(returned) | TrySendError::Disconnected(returned)) => {
-                    job = returned;
-                }
-            }
-        }
-        false
     }
 }
 
-fn resolve_worker(receiver: &Receiver<ResolveJob>) {
-    while let Ok(job) = receiver.recv() {
+fn resolve_worker(receiver: &Mutex<Receiver<ResolveJob>>) {
+    loop {
+        let job = {
+            let receiver = receiver
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match receiver.recv() {
+                Ok(job) => job,
+                Err(_) => return,
+            }
+        };
         let ResolveJob {
             host,
             port,
+            deadline,
             lookup,
             reply,
         } = job;
+        if Instant::now() >= deadline {
+            continue;
+        }
         let _ = reply.send(lookup(&host, port));
     }
 }
 
-fn resolve_bounded<F>(host: &str, port: u16, budget: Duration, lookup: F) -> Vec<SocketAddr>
+/// `None` is no answer (timeout, resolver error, or a saturated pool); `Some(empty)` is an answer.
+fn resolve_bounded<F>(host: &str, port: u16, budget: Duration, lookup: F) -> Option<Vec<SocketAddr>>
 where
     F: FnOnce(&str, u16) -> std::io::Result<Vec<SocketAddr>> + Send + 'static,
 {
@@ -5181,15 +5190,30 @@ where
     let job = ResolveJob {
         host: host.to_owned(),
         port,
+        deadline: Instant::now()
+            .checked_add(budget)
+            .unwrap_or_else(Instant::now),
         lookup: Box::new(lookup),
         reply: sender,
     };
-    if !RESOLVE_POOL.get_or_init(ResolvePool::new).submit(job) {
-        return Vec::new();
+    let mut pool = RESOLVE_POOL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let result = if let Some(active) = pool.as_ref() {
+        active.submit(job)
+    } else {
+        *pool = ResolvePool::new();
+        let active = pool.as_ref()?;
+        active.submit(job)
+    };
+    if matches!(result, Err(SubmitError::Closed)) {
+        *pool = None;
     }
+    result.ok()?;
+    drop(pool);
     match receiver.recv_timeout(budget) {
-        Ok(Ok(addrs)) => addrs,
-        Ok(Err(_)) | Err(_) => Vec::new(),
+        Ok(Ok(addrs)) => Some(addrs),
+        Ok(Err(_)) | Err(_) => None,
     }
 }
 
@@ -5388,15 +5412,17 @@ fn resolve_name(host: &str, port: u16, local: bool) -> Option<SocketAddr> {
         };
         return ips.first().map(|ip| SocketAddr::new(*ip, port));
     }
-    let addrs = cached_lookup(host, port).unwrap_or_else(|| {
+    let addrs = if let Some(addrs) = cached_lookup(host, port) {
+        addrs
+    } else {
+        // The tuple asks the resolver for host and port directly: no `host:port` re-serialisation, no String, no port re-scan.
         let addrs = resolve_bounded(host, port, budgets::dial(), |host, port| {
-            // The tuple asks the resolver for host and port directly: no `host:port` re-serialisation, no String, no port re-scan.
             (host, port)
                 .to_socket_addrs()
                 .map(std::iter::Iterator::collect)
-        });
+        })?;
         remember_lookup(host, port, &addrs)
-    });
+    };
     addrs.first().copied()
 }
 
@@ -15970,14 +15996,18 @@ fn freedom_lookup(host: &str, port: u16) -> Vec<std::net::IpAddr> {
     if let Some(resolver) = crate::dnsapp::installed() {
         return resolver.lookup(host).map_or_else(Vec::new, |(ips, _)| ips);
     }
-    let addrs = cached_lookup(host, port).unwrap_or_else(|| {
-        let addrs = resolve_bounded(host, port, budgets::dial(), |host, port| {
+    let addrs = if let Some(addrs) = cached_lookup(host, port) {
+        addrs
+    } else {
+        let Some(addrs) = resolve_bounded(host, port, budgets::dial(), |host, port| {
             (host, port)
                 .to_socket_addrs()
                 .map(std::iter::Iterator::collect)
-        });
+        }) else {
+            return Vec::new();
+        };
         remember_lookup(host, port, &addrs)
-    });
+    };
     addrs.iter().map(std::net::SocketAddr::ip).collect()
 }
 
@@ -17998,14 +18028,18 @@ fn dns_lookup(name: &[u8]) -> ferrox_core::dns::Resolve {
             crate::dnsapp::Lookup::Failed => ferrox_core::dns::Resolve::ErrHard,
         };
     }
-    let addrs = cached_lookup(host, 0).unwrap_or_else(|| {
-        let addrs = resolve_bounded(host, 0, budgets::dial(), |host, port| {
+    let addrs = if let Some(addrs) = cached_lookup(host, 0) {
+        addrs
+    } else {
+        let Some(addrs) = resolve_bounded(host, 0, budgets::dial(), |host, port| {
             (host, port)
                 .to_socket_addrs()
                 .map(std::iter::Iterator::collect)
-        });
+        }) else {
+            return ferrox_core::dns::Resolve::ErrHard;
+        };
         remember_lookup(host, 0, &addrs)
-    });
+    };
     if addrs.is_empty() {
         return ferrox_core::dns::Resolve::AnsweredEmpty;
     }
@@ -51591,7 +51625,7 @@ mod resolve_tests {
                 Ok(Vec::new())
             },
         );
-        assert!(addrs.is_empty(), "a timed-out lookup has no address");
+        assert!(addrs.is_none(), "a timed-out lookup has no answer");
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "the lookup waited out the stuck resolver instead of its budget: {}ms",
@@ -51611,8 +51645,9 @@ mod resolve_tests {
                     .expect("seen")
                     .insert(std::thread::current().id());
                 Ok(vec![std::net::SocketAddr::from(([127, 0, 0, 1], 80))])
-            });
-            assert_eq!(addrs.len(), 1, "the pooled lookup answered");
+            })
+            .expect("the pooled lookup answered");
+            assert_eq!(addrs.len(), 1);
         }
         let workers = seen.lock().expect("seen").len();
         assert!(
@@ -51620,6 +51655,83 @@ mod resolve_tests {
             "spawned {workers} resolver threads for {} lookups",
             super::RESOLVE_WORKERS * 2
         );
+    }
+
+    /// A timeout or a resolver error has no answer; a genuine empty answer is still an answer the
+    /// caller may cache.
+    #[test]
+    fn a_failed_lookup_is_not_an_empty_answer() {
+        let failed = resolve_bounded("failed.invalid", 443, Duration::from_secs(1), |_, _| {
+            Err(std::io::Error::other("no answer"))
+        });
+        assert!(failed.is_none(), "a failed lookup has no answer to cache");
+        let empty = resolve_bounded("empty.invalid", 443, Duration::from_secs(1), |_, _| {
+            Ok(Vec::new())
+        });
+        assert_eq!(
+            empty,
+            Some(Vec::new()),
+            "an empty answer is still an answer"
+        );
+    }
+
+    /// A job whose caller already gave up is dropped before the resolver is asked.
+    #[test]
+    fn an_expired_queued_lookup_is_skipped() {
+        let (queue, receiver) = std::sync::mpsc::sync_channel(1);
+        let (reply, _answer) = std::sync::mpsc::sync_channel(1);
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = std::sync::Arc::clone(&ran);
+        queue
+            .send(super::ResolveJob {
+                host: "expired.invalid".to_owned(),
+                port: 443,
+                deadline: Instant::now(),
+                lookup: Box::new(move |_, _| {
+                    seen.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(Vec::new())
+                }),
+                reply,
+            })
+            .expect("queues the expired job");
+        drop(queue);
+        super::resolve_worker(&std::sync::Mutex::new(receiver));
+        assert!(
+            !ran.load(std::sync::atomic::Ordering::Relaxed),
+            "expired work still ran"
+        );
+    }
+
+    /// A worker parked in a resolver does not own the queue: another worker takes the next job.
+    #[test]
+    fn a_stalled_worker_does_not_hold_the_next_lookup() {
+        let (started, began) = std::sync::mpsc::channel();
+        let (release, wait) = std::sync::mpsc::channel();
+        let stalled = std::thread::spawn(move || {
+            resolve_bounded(
+                "stalled.invalid",
+                443,
+                Duration::from_secs(5),
+                move |_, _| {
+                    let _ = started.send(());
+                    let _ = wait.recv();
+                    Ok(Vec::new())
+                },
+            )
+        });
+        began
+            .recv_timeout(Duration::from_secs(1))
+            .expect("the stalled lookup reached a worker");
+        let fresh = resolve_bounded("fresh.invalid", 443, Duration::from_secs(1), |_, _| {
+            Ok(vec![std::net::SocketAddr::from(([192, 0, 2, 7], 443))])
+        });
+        assert_eq!(
+            fresh,
+            Some(vec![std::net::SocketAddr::from(([192, 0, 2, 7], 443))]),
+            "a stalled worker held the next lookup"
+        );
+        release.send(()).expect("releases the stalled worker");
+        let _answer = stalled.join().expect("joins the stalled lookup");
     }
 }
 
