@@ -806,6 +806,7 @@ mod tests {
         assert_eq!(seen[0].len(), CmdOnlySegment::byte_size());
     }
 
+    #[cfg_attr(miri, ignore = "measures a 100ms wall-clock retry deadline")]
     #[test]
     fn a_write_that_never_succeeds_stops_at_the_attempt_limit() {
         let (recorder, conn) = recording_connection(u32::MAX);

@@ -3637,6 +3637,10 @@ mod tests {
 
     /// A served session stops on the peer's close the same way a dialled one does: the
     /// `close_notify` carries no plaintext, so the EOF has to be the session's own state.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
     #[test]
     fn a_server_session_reports_the_peers_close_notify() {
         use crate::tls::TlsProvider as _;
