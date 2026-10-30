@@ -6,6 +6,8 @@ REALITY dials raw TCP and every carried carrier, and serves the same set. The cl
 
 What the handshake does: read the ClientHello, find the X25519 key share, do one group operation, derive the shared secret, HKDF it into an authentication key, and check that the certificate the peer presented is the certificate this session's key can account for — plus an eight-byte `shortId` compared against what the client sent. The certificate is minted per authentication key, so two sessions never present the same bytes.
 
+`mldsa65Seed` and `mldsa65Verify` are read from JSON and from the protobuf config and checked the way the reference's build checks them — a seed that differs from `privateKey` and decodes to 32 bytes, a verify key that decodes to 1952 (`\r`/`\n` skipped, as Go's decoder skips them) — with its `invalid "mldsa65Seed"` and `invalid "mldsa65Verify"` refusals; the length is counted over the symbols, so the check allocates nothing. The signature those fields name is not generated or checked yet, so the handshake runs and says so in one line.
+
 ## Data path
 
 ```mermaid

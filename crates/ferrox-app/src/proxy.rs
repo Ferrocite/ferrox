@@ -6629,6 +6629,10 @@ fn serve_vless_reality_inbound(
         eprintln!("unreadable vless reality settings in {path}: serves nothing");
         return false;
     };
+    if let Err(error) = crate::config::reality_mldsa(inbound, true) {
+        eprintln!("{error} in {path}: inbound refused");
+        return false;
+    }
     let fallbacks = match server_fallbacks(inbound) {
         Ok(fallbacks) => fallbacks.map(Arc::from),
         Err(error) => {
@@ -25814,6 +25818,10 @@ fn vless_outbound(outbound: &Json, server: VlessServer<'_>) -> Option<VlessOut> 
             return None;
         }
         let reality = outbound_reality(outbound, &address)?;
+        if let Err(error) = crate::config::reality_mldsa(outbound, false) {
+            eprintln!("vless: {error}; outbound refused");
+            return None;
+        }
         return Some(VlessOut {
             address,
             port,
