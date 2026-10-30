@@ -3639,6 +3639,95 @@ mod tests {
         );
     }
 
+    /// The `supported_groups` ids of a dial's `ClientHello`, read off the socket before the peer
+    /// hangs up: the handshake ends in an error, but its first record is already on the wire.
+    fn hello_groups(outbound: &Json) -> Vec<u16> {
+        use std::io::Read as _;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("addr");
+        let captured = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().expect("accepts");
+            let mut head = [0u8; 5];
+            peer.read_exact(&mut head).expect("record head");
+            let mut record = head.to_vec();
+            record.resize(5 + usize::from(u16::from_be_bytes([head[3], head[4]])), 0);
+            peer.read_exact(&mut record[5..]).expect("record body");
+            record
+        });
+        let config = outbound_tls(outbound, "127.0.0.1").expect("builds");
+        let stream = std::net::TcpStream::connect(address).expect("connects");
+        use ferrox_core::tls::TlsProvider as _;
+        let _ = ferrox_core::tls::connect(&config, stream)
+            .and_then(|mut client| client.handshake());
+        let record = captured.join().expect("capture thread");
+        let body = &record[9..];
+        let mut at = 2 + 32 + 1 + usize::from(body[2 + 32]);
+        at += 2 + (usize::from(body[at]) << 8 | usize::from(body[at + 1]));
+        at += 1 + usize::from(body[at]);
+        let end = at + 2 + (usize::from(body[at]) << 8 | usize::from(body[at + 1]));
+        at += 2;
+        while at + 4 <= end {
+            let kind = u16::from_be_bytes([body[at], body[at + 1]]);
+            let len = usize::from(body[at + 2]) << 8 | usize::from(body[at + 3]);
+            at += 4;
+            if kind == 0x000a {
+                return body[at + 2..at + len]
+                    .chunks_exact(2)
+                    .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                    .collect();
+            }
+            at += len;
+        }
+        panic!("the hello offers no supported groups");
+    }
+
+    /// xray's `curvePreferences`: the hello offers the named groups, in the order named, on the
+    /// shaped client and on the stock one, under either spelling of the list.
+    #[test]
+    fn a_configured_curve_list_shapes_the_hello_the_dial_sends() {
+        let dial = |extra: &str| {
+            let outbound = crate::json::parse(&format!(
+                r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "tls.test", "allowInsecure": true, {extra}}}}}}}"#
+            ))
+            .expect("parses");
+            hello_groups(&outbound)
+        };
+        assert_eq!(
+            dial(r#""curvePreferences": ["curvep384", "x25519"]"#),
+            vec![0x0018, 0x001d],
+            "the shaped hello offers the named curves in the named order"
+        );
+        assert_eq!(
+            dial(r#""fingerprint": "unsafe", "curvePreferences": "curvep256,x25519""#),
+            vec![0x0017, 0x001d],
+            "the stock client names the same list to rustls, from the comma spelling"
+        );
+        assert_eq!(
+            dial(r#""fingerprint": "unsafe", "curvePreferences": ["x25519mlkem768", "x25519"]"#),
+            vec![0x001d],
+            "a group ring cannot carry is dropped, not replaced by a stock one"
+        );
+    }
+
+    /// A group this build cannot carry is named in a warning and dropped, so the hello keeps the
+    /// list the build would have offered anyway rather than an empty one no handshake survives.
+    #[test]
+    fn an_unwired_curve_name_leaves_the_build_its_own_groups() {
+        let outbound = crate::json::parse(
+            r#"{"streamSettings": {"security": "tls", "tlsSettings": {"serverName": "tls.test", "allowInsecure": true, "curvePreferences": ["curvep521"]}}}"#,
+        )
+        .expect("parses");
+        let groups = hello_groups(&outbound);
+        assert!(
+            groups.contains(&0x001d),
+            "an unwired name leaves the shaped hello its own groups: {groups:?}"
+        );
+        assert!(
+            !groups.contains(&0x0019),
+            "and never claims a group the hello carries no share for: {groups:?}"
+        );
+    }
+
     #[test]
     fn a_certificate_list_serves_the_name_its_sni_asks_for() {
         let first = rcgen::generate_simple_self_signed(vec!["a.test".to_owned()]).expect("mints");
