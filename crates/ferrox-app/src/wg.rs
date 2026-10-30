@@ -1731,7 +1731,14 @@ mod tests {
                 let address = udp.local_addr().expect("dns address");
                 match TcpListener::bind(address) {
                     Ok(tcp) => Some((tcp, udp, address)),
-                    Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => None,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                        ) =>
+                    {
+                        None
+                    }
                     Err(error) => panic!("dns tcp: {error}"),
                 }
             })
