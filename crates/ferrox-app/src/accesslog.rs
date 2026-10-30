@@ -159,25 +159,42 @@ pub(crate) fn record(
         |source| address(source, config.mask_address),
     );
     let mut line = format!(
-        "from {source} {} {destination}",
-        if accepted { "accepted" } else { "rejected" }
+        "from {source} {} {}",
+        if accepted { "accepted" } else { "rejected" },
+        escaped(&format!("{destination}"))
     );
     if let Some(detour) = detour.filter(|detour| !detour.is_empty()) {
         line.push_str(" [");
-        line.push_str(detour);
+        line.push_str(&escaped(detour));
         line.push(']');
     }
     if !reason.is_empty() {
         line.push(' ');
-        line.push_str(reason);
+        line.push_str(&escaped(reason));
     }
     if !email.is_empty() {
         line.push_str(" email: ");
-        line.push_str(email);
+        line.push_str(&escaped(email));
     }
     line.push('\n');
     let _ = writer.write_all(line.as_bytes());
     let _ = writer.flush();
+}
+
+/// A line holds one entry: a path, tag or account that carries a control byte is escaped, not
+/// written through, so nothing a peer names can start a second record.
+fn escaped(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch == '\\' {
+            out.push_str("\\\\");
+        } else if ch.is_control() {
+            out.extend(ch.escape_default());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn address(address: SocketAddr, masked: bool) -> String {

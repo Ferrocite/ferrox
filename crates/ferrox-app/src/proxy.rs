@@ -3953,6 +3953,40 @@ fn vless_raw_reply<D, R>(
         };
         return seize_fallback(stream, rows, window, &carried);
     };
+    match reverse_ask(users, &request.id, request.flow, request.command) {
+        ReverseAsk::Allowed(portal) => {
+            crate::accesslog::record(
+                stream.peer_addr().ok(),
+                true,
+                &request.target,
+                None,
+                "",
+                &user.email,
+            );
+            let mut stream = stream
+                .with_meter(crate::stats::user(&user.email, user.level))
+                .with_policy(Some(crate::policy::flow(user.level)));
+            if stream.write_all(&[0, 0]).is_err() {
+                return;
+            }
+            if let Some(tunnel) = crate::reverse::Tunnel::from_connection(&stream) {
+                portal.attach(tunnel);
+            }
+            return;
+        }
+        ReverseAsk::Refused => {
+            crate::accesslog::record(
+                stream.peer_addr().ok(),
+                true,
+                &request.target,
+                None,
+                "",
+                &user.email,
+            );
+            return;
+        }
+        ReverseAsk::NotReverse => {}
+    }
     if !freedom || !vless_flow_ok(user, request.flow, request.command, false) {
         return;
     }
@@ -3973,19 +4007,6 @@ fn vless_raw_reply<D, R>(
     let mut stream = stream
         .with_meter(crate::stats::user(&user.email, user.level))
         .with_policy(Some(crate::policy::flow(user.level)));
-    match reverse_ask(users, &request.id, request.flow, request.command) {
-        ReverseAsk::Allowed(portal) => {
-            if stream.write_all(&[0, 0]).is_err() {
-                return;
-            }
-            if let Some(tunnel) = crate::reverse::Tunnel::from_connection(&stream) {
-                portal.attach(tunnel);
-            }
-            return;
-        }
-        ReverseAsk::Refused => return,
-        ReverseAsk::NotReverse => {}
-    }
     if request.command == 2 {
         return serve_vless_udp(stream, &target, carried);
     }
