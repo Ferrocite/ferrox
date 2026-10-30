@@ -2350,6 +2350,7 @@ mod tests {
         );
     }
 
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the transcript hash")]
     #[test]
     fn the_ech_confirmation_matches_the_reference_schedule() {
         let random = [0x11u8; 32];

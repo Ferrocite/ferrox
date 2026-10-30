@@ -2,7 +2,6 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock, Weak};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use super::config::Config;
@@ -121,15 +120,19 @@ fn scheduler() -> &'static Arc<Scheduler> {
             conns: Mutex::new(Vec::new()),
             wake: Notifier::new(),
         });
-        let weak = Arc::downgrade(&scheduler);
-        thread::Builder::new()
-            .name("kcp-flush".to_owned())
-            .spawn(move || scheduler_loop(&weak))
-            .expect("spawns the flush thread");
+        #[cfg(not(miri))]
+        {
+            let weak = Arc::downgrade(&scheduler);
+            std::thread::Builder::new()
+                .name("kcp-flush".to_owned())
+                .spawn(move || scheduler_loop(&weak))
+                .expect("spawns the flush thread");
+        }
         scheduler
     })
 }
 
+#[cfg(not(miri))]
 fn scheduler_loop(weak: &Weak<Scheduler>) {
     let mut seen = 0;
     loop {
