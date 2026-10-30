@@ -2449,6 +2449,12 @@ fn header_line(line: &str) -> Option<(String, String)> {
 pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, String) {
     let settings = outbound.get("streamSettings");
     let carrier = stream_carrier(settings);
+    // The reference dials a stream-up session out of an `xmux` pool; this tree keeps none, so the bounds are read and named rather than applied.
+    if let Carrier::Xhttp { settings } = &carrier {
+        if settings.xmux.is_some() {
+            eprintln!("xhttp: \"xmux\" bounds are checked, and this tree keeps no connection pool, so they are not applied");
+        }
+    }
     let key = match &carrier {
         Carrier::Ws { .. } => "wsSettings",
         Carrier::HttpUpgrade { .. } => "httpupgradeSettings",
