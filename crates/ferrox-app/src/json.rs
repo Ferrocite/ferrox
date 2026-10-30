@@ -38,6 +38,19 @@ impl Json {
         self.as_u32().and_then(|n| u16::try_from(n).ok())
     }
 
+    /// The `i64` a JSON integer holds, which is the type a Go `int64` field unmarshals; a float is not one.
+    pub(crate) fn as_i64(&self) -> Option<i64> {
+        match self {
+            Self::Num(n)
+                if n.fract() == 0.0
+                    && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(n) =>
+            {
+                Some(*n as i64)
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn as_bool(&self) -> Option<bool> {
         match self {
             Self::Bool(b) => Some(*b),
