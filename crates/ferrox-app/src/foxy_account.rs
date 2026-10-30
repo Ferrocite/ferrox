@@ -918,7 +918,6 @@ pub(crate) fn token(
     jar: &Mutex<Jar>,
     session_token: Option<&str>,
     refresh_token: Option<&str>,
-    nonce: &str,
     timestamp: u64,
 ) -> Result<Auth, Denied> {
     let body = match (session_token, refresh_token) {
@@ -934,6 +933,7 @@ pub(crate) fn token(
         {
             let authorization = session_token.and_then(|session| {
                 let (id, mac) = account::hawk_credentials(session)?;
+                let nonce = nonce();
                 Some(
                     Signed {
                         method: "POST",
@@ -942,7 +942,7 @@ pub(crate) fn token(
                         port: endpoint.port,
                         body: &body,
                         timestamp,
-                        nonce,
+                        nonce: &nonce,
                     }
                     .header(&id, &mac),
                 )
@@ -1513,16 +1513,8 @@ impl Account {
         if base.valid_at(epoch()) && (!forced || base.access_token != stale.access_token) {
             return Ok(self.adopt(base));
         }
-        let nonce = nonce();
         let now = epoch();
-        let fresh = match token(
-            &self.fxa,
-            &self.jar,
-            None,
-            Some(&base.refresh_token),
-            &nonce,
-            now,
-        ) {
+        let fresh = match token(&self.fxa, &self.jar, None, Some(&base.refresh_token), now) {
             Ok(fresh) => fresh,
             Err(Denied::Token) => {
                 // A refusal can mean another lane spent this rotating grant first: give its write a second before asking for a password.
@@ -1567,8 +1559,7 @@ impl Account {
 
     /// Turns a session token into an access token and mints the first pass.
     fn exchange(&self, session: &str, now: u64) -> Result<(), Denied> {
-        let nonce = nonce();
-        let auth = token(&self.fxa, &self.jar, Some(session), None, &nonce, now)?;
+        let auth = token(&self.fxa, &self.jar, Some(session), None, now)?;
         *self.auth.lock().map_err(|_| Denied::Token)? = auth.clone();
         *self.pending.lock().map_err(|_| Denied::Token)? = None;
         self.persist();
@@ -1591,17 +1582,40 @@ impl Account {
         // The code arrives from the same autofill that pads the identity; strip its padding, keep its case, before it is sent.
         let code = sanitize_code(code);
         let body = account::code_body(&code);
-        foxy_challenge::send_with_challenge(
-            &self.fxa,
-            &self.jar,
-            "POST",
-            "/session/verify_code",
-            &[("Content-Type", JSON_ACCEPT)],
-            &body,
-        )?;
-        let now = epoch();
-        *self.pending.lock().map_err(|_| Denied::Token)? = None;
-        self.exchange(&session, now)
+        let mut last = Denied::Unreachable("no Firefox Accounts host".to_owned());
+        for endpoint in fxa_attempts(&self.fxa) {
+            let reply = match foxy_challenge::send_with_challenge(
+                &endpoint,
+                &self.jar,
+                "POST",
+                "/session/verify_code",
+                &[("Content-Type", JSON_ACCEPT)],
+                &body,
+            ) {
+                Ok(reply) => reply,
+                Err(denied) if host_may_fallback(&denied) => {
+                    last = denied;
+                    continue;
+                }
+                Err(denied) => return Err(denied),
+            };
+            // A refused code is the account's answer; a host that does not publish the route is not.
+            if let Some(denied) = reply.denied() {
+                return Err(denied);
+            }
+            if !(200..300).contains(&reply.status) {
+                let denied = Denied::Other(reply.status);
+                if host_may_fallback(&denied) {
+                    last = denied;
+                    continue;
+                }
+                return Err(denied);
+            }
+            let now = epoch();
+            *self.pending.lock().map_err(|_| Denied::Token)? = None;
+            return self.exchange(&session, now);
+        }
+        Err(last)
     }
 
     pub(crate) fn mint(&self, access_token: &str) -> Result<(), Denied> {
