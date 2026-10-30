@@ -3436,7 +3436,13 @@ fn serve_vless_ws(
         );
     }
     // Past the upgrade the frame layer retries timeouts itself, so bound it by wall clock and poll the socket.
-    let Some((got, flow, cmd, target)) = under_handshake(&mut reader, decode_request) else {
+    let Some((got, flow, cmd, target)) = under_handshake(&mut reader, |read| {
+        decode_request_gated(
+            read,
+            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+            resolve_endpoint,
+        )
+    }) else {
         return;
     };
     let ask = reverse_ask(users, &got, flow, cmd);
@@ -3485,7 +3491,11 @@ fn serve_vless_httpupgrade(
         );
     }
     reader.set_poll(Some(RELAY_POLL));
-    let decoded = decode_request_bounded(&mut reader);
+    let decoded = decode_request_bounded_gated(
+        &mut reader,
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        resolve_endpoint,
+    );
     reader.set_poll(None);
     let Some((got, flow, cmd, target)) = decoded else {
         return;
@@ -3539,7 +3549,13 @@ fn serve_vless_grpc(
         );
     }
     // Past the preface the reader retries timeouts itself, so the opening request is polled at the relay's grain and bounded by the handshake budget, the way the websocket arm bounds its frames.
-    let Some((got, flow, cmd, target)) = under_handshake(&mut reader, decode_request) else {
+    let Some((got, flow, cmd, target)) = under_handshake(&mut reader, |read| {
+        decode_request_gated(
+            read,
+            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+            resolve_endpoint,
+        )
+    }) else {
         return;
     };
     let ask = reverse_ask(users, &got, flow, cmd);
@@ -3593,7 +3609,11 @@ fn serve_vless_httpheader(
         );
     }
     reader.set_poll(Some(RELAY_POLL));
-    let decoded = decode_request_bounded(&mut reader);
+    let decoded = decode_request_bounded_gated(
+        &mut reader,
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        resolve_endpoint,
+    );
     reader.set_poll(None);
     let Some((got, flow, cmd, target)) = decoded else {
         return;
@@ -3762,12 +3782,20 @@ impl ferrox_core::vless_encryption::SplitIo for SealHandshake {
 }
 
 /// The opening request decoded under a wall-clock budget: a peer that upgrades, connects or handshakes and then stays silent costs a thread briefly, not forever.
-fn decode_request_bounded(stream: &mut dyn Read) -> Option<([u8; 16], Flow, u8, SocketAddr)> {
+fn decode_request_bounded_gated<A, F>(
+    stream: &mut dyn Read,
+    accept: A,
+    resolve: F,
+) -> Option<([u8; 16], Flow, u8, SocketAddr)>
+where
+    A: FnOnce([u8; 16], Flow, u8, &Target<'_>, u16) -> bool,
+    F: FnOnce(&str, u16) -> Option<SocketAddr>,
+{
     let mut bounded = HandshakeDeadline {
         inner: stream,
         until: Instant::now() + budgets::handshake(),
     };
-    decode_request(&mut bounded)
+    decode_request_gated(&mut bounded, accept, resolve)
 }
 
 /// The two arms a carried reader holds for the length of one decode: outside a lane the `ws` and `grpc` readers wait out a timeout, so a head needs the socket's poll quantum and a wall-clock end.
@@ -3876,7 +3904,8 @@ fn serve_vless_raw_with<D, R>(
         .and_then(|flow| flow.handshake())
         .unwrap_or_else(budgets::handshake);
     let _ = stream.set_read_timeout(Some(handshake));
-    let (probe, carried) = match fallbacks {
+    let peer = stream.peer_addr().ok();
+    let opening = match fallbacks {
         // With a table on, the reference's first read and its verdict name the flow as a header or a probe.
         Some(_) => {
             let mut window = [0u8; PROBE_READ];
@@ -3884,38 +3913,84 @@ fn serve_vless_raw_with<D, R>(
             let _ = stream.set_read_timeout(None);
             return vless_raw_reply(
                 stream,
+                peer,
                 users,
                 freedom,
                 fallbacks,
-                &window[..consumed],
-                (probe, carried),
+                Opening {
+                    window: &window[..consumed],
+                    probe,
+                    carried,
+                },
                 io,
             );
         }
-        None => (
-            match decode_request_bounded(&mut stream) {
+        None => Opening {
+            window: &[],
+            probe: match decode_request_bounded_gated(
+                &mut stream,
+                |id, _, _, target, port| {
+                    let served = users.iter().any(|user| same_vless_user(&user.id, &id));
+                    if !served {
+                        crate::accesslog::record(
+                            peer,
+                            false,
+                            &NamedTarget(target, port),
+                            None,
+                            "invalid user",
+                            "",
+                        );
+                    }
+                    served
+                },
+                |host, port| (io.resolve)(host, port),
+            ) {
                 Some(header) => Probe::Decoded(header),
                 None => Probe::Dropped,
             },
-            Vec::new(),
-        ),
+            carried: Vec::new(),
+        },
     };
     let _ = stream.set_read_timeout(None);
-    vless_raw_reply(stream, users, freedom, fallbacks, &[], (probe, carried), io);
+    vless_raw_reply(stream, peer, users, freedom, fallbacks, opening, io);
+}
+
+/// What the opening read left behind: the probe window, its verdict, and the bytes past the header.
+struct Opening<'a> {
+    window: &'a [u8],
+    probe: Probe,
+    carried: Vec<u8>,
+}
+
+/// The destination a request named, as the access log writes it: the address it carried, or the name a refused request asked for.
+struct NamedTarget<'a>(&'a Target<'a>, u16);
+
+impl std::fmt::Display for NamedTarget<'_> {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Target::Ip(ip) => write!(out, "{}", SocketAddr::new(*ip, self.1)),
+            Target::Name(host) => write!(out, "{host}:{}", self.1),
+        }
+    }
 }
 
 fn vless_raw_reply<D, R>(
     stream: Connection,
+    peer: Option<SocketAddr>,
     users: &[VlessUser],
     freedom: bool,
     fallbacks: Option<&[Fallback]>,
-    window: &[u8],
-    (probe, carried): (Probe, Vec<u8>),
+    opening: Opening<'_>,
     io: &MuxIo<D, R>,
 ) where
     D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
     R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
 {
+    let Opening {
+        window,
+        probe,
+        carried,
+    } = opening;
     let (got, flow, cmd, target) = match probe {
         Probe::Decoded(header) => header,
         Probe::Refused => {
@@ -3926,26 +4001,12 @@ fn vless_raw_reply<D, R>(
     };
     let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
         let Some(rows) = fallbacks else {
-            crate::accesslog::record(
-                stream.peer_addr().ok(),
-                false,
-                &target,
-                None,
-                "invalid user",
-                "",
-            );
+            crate::accesslog::record(peer, false, &target, None, "invalid user", "");
             return;
         };
         return seize_fallback(stream, rows, window, &carried);
     };
-    crate::accesslog::record(
-        stream.peer_addr().ok(),
-        true,
-        &target,
-        None,
-        "",
-        &user.email,
-    );
+    crate::accesslog::record(peer, true, &target, None, "", &user.email);
     let mut stream = stream
         .with_meter(crate::stats::user(&user.email, user.level))
         .with_policy(Some(crate::policy::flow(user.level)));
@@ -4131,7 +4192,24 @@ fn serve_sealed_raw<
     timeout: Option<Connection>,
     _relay: R,
 ) {
-    let Some((got, flow, cmd, target)) = decode_request_bounded(&mut sealed) else {
+    let Some((got, flow, cmd, target)) = decode_request_bounded_gated(
+        &mut sealed,
+        |id, _, _, target, port| {
+            let served = users.iter().any(|user| same_vless_user(&user.id, &id));
+            if !served {
+                crate::accesslog::record(
+                    peer,
+                    false,
+                    &NamedTarget(target, port),
+                    None,
+                    "invalid user",
+                    "",
+                );
+            }
+            served
+        },
+        resolve_endpoint,
+    ) else {
         return;
     };
     let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
@@ -4282,7 +4360,24 @@ fn serve_sealed_split_with<R, W, C>(
     W: Write + Send + 'static,
     C: FnOnce(&mut R),
 {
-    let decoded = decode_request_bounded(&mut reader);
+    let decoded = decode_request_bounded_gated(
+        &mut reader,
+        |id, _, _, target, port| {
+            let served = users.iter().any(|user| same_vless_user(&user.id, &id));
+            if !served {
+                crate::accesslog::record(
+                    None,
+                    false,
+                    &NamedTarget(target, port),
+                    None,
+                    "invalid user",
+                    "",
+                );
+            }
+            served
+        },
+        resolve_endpoint,
+    );
     after_decode(reader.get_mut());
     let Some((got, flow, cmd, target)) = decoded else {
         return;
@@ -6431,7 +6526,18 @@ fn serve_vless_quic(
         return;
     }
     let mut stream = stream;
-    let decoded = decode_request_bounded(&mut stream);
+    let decoded = decode_request_bounded_gated(
+        &mut stream,
+        |id, flow, cmd, _, _| {
+            freedom
+                && users.iter().any(|user| {
+                    same_vless_user(&user.id, &id)
+                        && user.reverse.is_none()
+                        && vless_flow_ok(user, flow, cmd, false)
+                })
+        },
+        resolve_endpoint,
+    );
     let Some((got, flow, cmd, target)) = decoded else {
         stream.close();
         return;
@@ -6474,7 +6580,18 @@ fn serve_vless_quic_sealed(
     freedom: bool,
     stop: crate::quic::QuicStream,
 ) {
-    let decoded = decode_request_bounded(&mut sealed);
+    let decoded = decode_request_bounded_gated(
+        &mut sealed,
+        |id, flow, cmd, _, _| {
+            freedom
+                && users.iter().any(|user| {
+                    same_vless_user(&user.id, &id)
+                        && user.reverse.is_none()
+                        && vless_flow_ok(user, flow, cmd, false)
+                })
+        },
+        resolve_endpoint,
+    );
     let Some((got, flow, cmd, target)) = decoded else {
         stop.close();
         return;
@@ -6734,7 +6851,11 @@ fn serve_session_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     }
     let mut creader = creader;
     creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
-    let decoded = decode_request(&mut creader);
+    let decoded = decode_request_gated(
+        &mut creader,
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        resolve_endpoint,
+    );
     creader.set_handshake_budget(None);
     let Some((got, flow, cmd, target)) = decoded else {
         echo_trace("session ws vless decode refused");
@@ -6845,7 +6966,11 @@ pub(crate) fn serve_session_xhttp_with(
     freedom: bool,
 ) {
     // Every refusal ends the carrier's stream: a session that answers nothing leaves its reader parked on a reply that will never come.
-    let Some((got, flow, cmd, target)) = decode_request(&mut creader) else {
+    let Some((got, flow, cmd, target)) = decode_request_gated(
+        &mut creader,
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        resolve_endpoint,
+    ) else {
         echo_trace("session xhttp vless decode refused");
         cwriter.finish();
         return;
@@ -6892,7 +7017,11 @@ fn serve_session_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send +
         return serve_sealed_carried(creader, cwriter, users, freedom, decryption, close);
     }
     let mut creader = creader;
-    let decoded = decode_request_bounded(&mut creader);
+    let decoded = decode_request_bounded_gated(
+        &mut creader,
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        resolve_endpoint,
+    );
     let Some((got, flow, cmd, target)) = decoded else {
         echo_trace("session httpupgrade vless decode refused");
         crate::httpupgrade::quiet(&raw);
@@ -6943,7 +7072,11 @@ fn serve_session_httpheader<R: Read + Send + 'static, W: Write + Clone + Send + 
         return serve_sealed_carried(creader, cwriter, users, freedom, decryption, close);
     }
     let mut creader = creader;
-    let decoded = decode_request_bounded(&mut creader);
+    let decoded = decode_request_bounded_gated(
+        &mut creader,
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        resolve_endpoint,
+    );
     let Some((got, flow, cmd, target)) = decoded else {
         echo_trace("session httpheader vless decode refused");
         return;
@@ -6998,7 +7131,11 @@ fn serve_session_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     let mut creader = creader;
     // The dispatcher already polls the socket behind a session at the relay's grain, so only the request's own clock is armed here: past it a peer that answered the head and then stopped speaking is a refusal, not a thread pinned in `read_exact`'s retry.
     creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
-    let decoded = decode_request(&mut creader);
+    let decoded = decode_request_gated(
+        &mut creader,
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        resolve_endpoint,
+    );
     creader.set_handshake_budget(None);
     let Some((got, flow, cmd, target)) = decoded else {
         echo_trace("session grpc vless decode refused");
@@ -7640,7 +7777,11 @@ fn relay_vless<S>(
             );
         }
         None => (
-            match decode_request_bounded(&mut session) {
+            match decode_request_bounded_gated(
+                &mut session,
+                |id, _, _, _, _| users.iter().any(|user| same_vless_user(&user.id, &id)),
+                resolve_endpoint,
+            ) {
                 Some(header) => Probe::Decoded(header),
                 None => Probe::Dropped,
             },
@@ -8958,15 +9099,22 @@ fn serve_vless_kcp(conn: &Arc<ferrox_core::kcp::Connection>, users: &[VlessUser]
     let mut io = KcpIo {
         conn: Arc::clone(conn),
     };
-    let Some((got, flow, cmd, target)) = decode_request_bounded(&mut io) else {
+    let allows = |id: &[u8; 16], flow: Flow, cmd: u8| {
+        freedom
+            && cmd == 1
+            && users
+                .iter()
+                .any(|user| same_vless_user(&user.id, id) && vless_flow_ok(user, flow, cmd, false))
+    };
+    let Some((got, flow, cmd, target)) = decode_request_bounded_gated(
+        &mut io,
+        |id, flow, cmd, _, _| allows(&id, flow, cmd),
+        resolve_endpoint,
+    ) else {
         return;
     };
-    if !users
-        .iter()
-        .any(|user| same_vless_user(&user.id, &got) && vless_flow_ok(user, flow, cmd, false))
-        || !freedom
-        || cmd != 1
-    {
+    // A mux or reverse header names no destination, so the gate above never saw it.
+    if !allows(&got, flow, cmd) {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -9194,7 +9342,18 @@ fn serve_hysteria_v1_flow(mut flow: crate::hysteria::Flow, host: &str, port: u16
 }
 
 fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], freedom: bool) {
-    let Some((got, flow, cmd, target)) = decode_request_bounded(&mut io) else {
+    let allows = |id: &[u8; 16], flow: Flow, cmd: u8| {
+        freedom
+            && cmd == 1
+            && users
+                .iter()
+                .any(|user| same_vless_user(&user.id, id) && vless_flow_ok(user, flow, cmd, false))
+    };
+    let Some((got, flow, cmd, target)) = decode_request_bounded_gated(
+        &mut io,
+        |id, flow, cmd, _, _| allows(&id, flow, cmd),
+        resolve_endpoint,
+    ) else {
         io.close();
         return;
     };
@@ -9205,7 +9364,8 @@ fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], free
         io.close();
         return;
     };
-    if !freedom || cmd != 1 {
+    // A mux or reverse header names no destination, so the gate above never saw it.
+    if !allows(&got, flow, cmd) {
         io.close();
         return;
     }
@@ -9795,9 +9955,14 @@ fn serve_xdrive_loop(
 }
 
 fn serve_vless_xdrive(mut session: crate::xdrive::Conn, users: &[VlessUser], freedom: bool) {
-    let Some((got, flow, cmd, target)) = decode_request_bounded(&mut session) else {
+    let Some((got, flow, cmd, target)) = decode_request_bounded_gated(
+        &mut session,
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        resolve_endpoint,
+    ) else {
         return;
     };
+    // A mux or reverse header names no destination, so the gate above never saw it.
     if !vless_user_allows(users, &got, flow, cmd, freedom) {
         return;
     }
@@ -22791,16 +22956,43 @@ pub(crate) fn read_vless_response(stream: &mut dyn Read) -> Option<()> {
 const MUX_TARGET: SocketAddr =
     SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 666);
 
-pub(crate) fn decode_request(stream: &mut dyn Read) -> Option<([u8; 16], Flow, u8, SocketAddr)> {
+/// The request a front reads, with `accept` asked before the resolver, so a name no served user names is never looked up.
+pub(crate) fn decode_request_gated<A, F>(
+    stream: &mut dyn Read,
+    accept: A,
+    resolve: F,
+) -> Option<([u8; 16], Flow, u8, SocketAddr)>
+where
+    A: FnOnce([u8; 16], Flow, u8, &Target<'_>, u16) -> bool,
+    F: FnOnce(&str, u16) -> Option<SocketAddr>,
+{
     // One buffer holds the whole header: the parse borrows the name out of it.
     let mut scratch = [0u8; ferrox_core::vless::REQUEST_MAX];
     let request = ferrox_core::vless::decode_request(stream, &mut scratch)?;
     let target = match request.target {
-        Some(Target::Ip(ip)) => SocketAddr::new(ip, request.port),
-        Some(Target::Name(host)) => resolve_endpoint(host, request.port)?,
+        Some(target) => {
+            if !accept(
+                request.id,
+                request.flow,
+                request.command,
+                &target,
+                request.port,
+            ) {
+                return None;
+            }
+            match target {
+                Target::Ip(ip) => SocketAddr::new(ip, request.port),
+                Target::Name(host) => resolve(host, request.port)?,
+            }
+        }
         None => MUX_TARGET,
     };
     Some((request.id, request.flow, request.command, target))
+}
+
+/// The same read where the caller has already accepted the header — a probe's own id check — so nothing is withheld from the resolver.
+pub(crate) fn decode_request(stream: &mut dyn Read) -> Option<([u8; 16], Flow, u8, SocketAddr)> {
+    decode_request_gated(stream, |_, _, _, _, _| true, resolve_endpoint)
 }
 
 /// The longest trojan header: key, CRLF, command, a 255-byte domain with its port, and CRLF.
@@ -37628,6 +37820,95 @@ mod tests {
     }
 
     #[test]
+    fn a_request_no_served_user_names_earns_no_lookup() {
+        fn spawn_raw<R, D>(users: [VlessUser; 1], resolve: R, dial: D) -> u16
+        where
+            R: Fn(&str, u16) -> Option<SocketAddr> + Send + Sync + Clone + 'static,
+            D: Fn(&SocketAddr) -> Option<Connection> + Send + Sync + Clone + 'static,
+        {
+            let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let port = tunnel.local_addr().expect("addr").port();
+            thread::spawn(move || {
+                let (stream, _) = tunnel.accept().expect("accepts");
+                serve_vless_raw_with(stream, &users, true, None, &MuxIo { dial, resolve });
+            });
+            port
+        }
+
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = echo.accept() {
+                let _ = stream.write_all(b"ok");
+            }
+        });
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let looked = Arc::new(Mutex::new(Vec::new()));
+        let dialed = Arc::new(Mutex::new(Vec::new()));
+        let seen = Arc::clone(&looked);
+        let touched = Arc::clone(&dialed);
+        let resolve = move |host: &str, port: u16| {
+            seen.lock().expect("resolver").push((host.to_owned(), port));
+            Some(SocketAddr::from(([127, 0, 0, 1], port)))
+        };
+        let dial = move |target: &SocketAddr| {
+            touched.lock().expect("dial").push(*target);
+            Connection::connect(("127.0.0.1", target.port())).ok()
+        };
+        let name = Destination::Name("localhost".to_owned(), echo_addr.port());
+        let tunnel_port = spawn_raw(one_vless_user(&id), resolve.clone(), dial.clone());
+        let mut stream = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        stream
+            .write_all(&vless_header(&id, 1, &name))
+            .expect("requests");
+        assert!(read_vless_response(&mut stream).is_some());
+        let mut back = [0u8; 2];
+        stream.read_exact(&mut back).expect("reads");
+        assert_eq!(&back, b"ok");
+        assert_eq!(
+            looked.lock().expect("resolver").as_slice(),
+            [("localhost".to_owned(), echo_addr.port())],
+            "a served request hands its name to the session's own resolver once"
+        );
+        assert_eq!(
+            dialed.lock().expect("dial").as_slice(),
+            [SocketAddr::from(([127, 0, 0, 1], echo_addr.port()))],
+            "the dial takes the address that resolver answered"
+        );
+
+        let stranger = uuid_bytes("ffffffff-1111-2222-3333-444444444444").expect("id");
+        let tunnel_port = spawn_raw(one_vless_user(&id), resolve.clone(), dial.clone());
+        let mut refused = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
+        refused
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        refused
+            .write_all(&vless_header(&stranger, 1, &name))
+            .expect("requests");
+        let mut probe = [0u8; 1];
+        assert_eq!(
+            refused
+                .read(&mut probe)
+                .expect("the refused session closes"),
+            0,
+            "a request no served user names is dropped, never answered"
+        );
+        assert_eq!(
+            looked.lock().expect("resolver").len(),
+            1,
+            "a refused request earns no lookup"
+        );
+        assert_eq!(
+            dialed.lock().expect("dial").len(),
+            1,
+            "a refused request earns no dial"
+        );
+    }
+
+    #[test]
     fn every_client_entry_is_served_and_keyed_like_the_validator() {
         let inbound = crate::json::parse(
             r#"{"settings":{"clients":[
@@ -44570,7 +44851,9 @@ mod tests {
                 rest,
                 true,
             );
-            let Some((got, _, cmd, target)) = decode_request_bounded(&mut flow) else {
+            let Some((got, _, cmd, target)) =
+                decode_request_bounded_gated(&mut flow, |_, _, _, _, _| true, resolve_endpoint)
+            else {
                 return;
             };
             assert!(same_vless_user(&got, &id) && cmd == 1);
@@ -52771,16 +53054,18 @@ mod dns_lane_tests {
         let (server, _) = front.accept().expect("accept front");
         let id = [7u8; 16];
         let dial = move |target: &SocketAddr| Connection::connect(*target).ok();
+        let peer = server.peer_addr().ok();
         vless_raw_reply(
             Connection::from(server),
+            peer,
             &one_vless_user(&id),
             true,
             None,
-            &[],
-            (
-                Probe::Decoded((id, Flow::None, 1, echo_addr)),
-                payload.to_vec(),
-            ),
+            Opening {
+                window: &[],
+                probe: Probe::Decoded((id, Flow::None, 1, echo_addr)),
+                carried: payload.to_vec(),
+            },
             &MuxIo {
                 dial,
                 resolve: resolve_endpoint,
