@@ -34,6 +34,8 @@ pub struct TlsConfig {
     /// because verifying is the ordinary case, and an unchecked chain is a deliberate,
     /// bounded exception rather than a mode.
     pub insecure: bool,
+    /// Ride the ticket a server hands out on the next dial: xray's `enableSessionResumption`, off by default as the reference leaves it.
+    pub resumption: bool,
     /// SHA-256 digests over whole certificates (`pinnedPeerCertSha256`): a digest matching
     /// the leaf's DER accepts the handshake on the pin alone, one matching an intermediate's
     /// verifies the chain with that certificate as the only root and the server name alongside.

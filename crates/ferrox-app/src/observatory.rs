@@ -658,6 +658,7 @@ fn probe(
             cipher_suites: std::sync::Arc::default(),
             curves: std::sync::Arc::default(),
             insecure: false,
+            resumption: true,
             fingerprint: None,
             ech_config_list: None,
             websocket: false,

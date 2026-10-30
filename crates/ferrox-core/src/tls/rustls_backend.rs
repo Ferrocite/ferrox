@@ -531,6 +531,8 @@ struct ConfigKey {
     /// The `ALPN` list, shared rather than copied: the key is built on every dial, and copying the list into it allocated a vector of vectors per lookup for a list that never changes.
     alpn: std::sync::Arc<[Vec<u8>]>,
     insecure: bool,
+    /// The resumption mode is baked into the built config as its session store, so two configs that differ only here must not share one.
+    resumption: bool,
     /// The ECH config list, which rustls bakes into the built config rather than reading per connection.
     ech: Option<std::sync::Arc<[u8]>>,
     /// The `masterKeyLog` handle rustls bakes into the config: two configs naming different files must not share a build, so the handle's identity is what the key holds.
@@ -542,6 +544,7 @@ impl PartialEq for ConfigKey {
         self.material == other.material
             && self.alpn == other.alpn
             && self.insecure == other.insecure
+            && self.resumption == other.resumption
             && self.ech == other.ech
             && match (&self.master_key_log, &other.master_key_log) {
                 (None, None) => true,
@@ -580,6 +583,12 @@ fn build_config(cfg: &TlsConfig, built: &Material) -> Result<rustls::ClientConfi
         .with_no_client_auth();
     config.alpn_protocols.clear();
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
+    // xray hands Go an empty session cache unless the config names one, so a stock dial keeps no ticket by default.
+    config.resumption = if cfg.resumption {
+        rustls::client::Resumption::in_memory_sessions(256)
+    } else {
+        rustls::client::Resumption::disabled()
+    };
     if let Some(verifier) = &built.verifier {
         config
             .dangerous()
@@ -664,6 +673,7 @@ fn client_config(cfg: &TlsConfig) -> Result<Arc<rustls::ClientConfig>, TlsError>
         material: MaterialKey::of(cfg),
         alpn: std::sync::Arc::clone(&cfg.alpn),
         insecure: cfg.insecure,
+        resumption: cfg.resumption,
         ech: cfg.ech_config_list.clone(),
         master_key_log: cfg.master_key_log.clone(),
     };
@@ -1340,6 +1350,13 @@ fn key_of(entry: &super::CertEntry) -> rustls::pki_types::PrivateKeyDer<'static>
     }
 }
 
+/// One ticket key per process, rotating on ring's six-hour schedule: a ticket carries its session sealed under this key, so a listener keeps no per-session state and a certificate reload does not strand the tickets it handed out before it.
+fn ticket_key() -> Option<Arc<dyn rustls::server::ProducesTickets>> {
+    static KEY: OnceLock<Option<Arc<dyn rustls::server::ProducesTickets>>> = OnceLock::new();
+    KEY.get_or_init(|| rustls::crypto::ring::Ticketer::new().ok())
+        .clone()
+}
+
 pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::ServerConfig, TlsError> {
     let crypto_provider = provider();
     let mut ordered = (*crypto_provider).clone();
@@ -1388,6 +1405,11 @@ pub(crate) fn server_config(cfg: super::TlsServerConfig) -> Result<rustls::Serve
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
     // rustls sends two tickets by default; REALITY arrivals carry none.
     config.send_tls13_tickets = if cfg.send_tickets { 2 } else { 0 };
+    if cfg.send_tickets {
+        if let Some(key) = ticket_key() {
+            config.ticketer = key;
+        }
+    }
     if let Some(log) = &cfg.master_key_log {
         let log: Arc<dyn rustls::KeyLog> = log.clone();
         config.key_log = log;
@@ -1503,6 +1525,11 @@ pub(crate) fn reality_server_config(
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
     // rustls sends two tickets by default; REALITY arrivals carry none.
     config.send_tls13_tickets = if cfg.send_tickets { 2 } else { 0 };
+    if cfg.send_tickets {
+        if let Some(key) = ticket_key() {
+            config.ticketer = key;
+        }
+    }
     if let Some(log) = &cfg.master_key_log {
         let log: Arc<dyn rustls::KeyLog> = log.clone();
         config.key_log = log;
@@ -2021,6 +2048,7 @@ mod tests {
             cipher_suites: std::sync::Arc::default(),
             curves: std::sync::Arc::default(),
             insecure: false,
+            resumption: false,
             fingerprint: None,
             ech_config_list: None,
             websocket: false,
@@ -3013,7 +3041,9 @@ mod tests {
             }
         });
         // "localhost" rather than the shared "tls.test": the session store keys on the name, and a ticket a parallel test's listener left would be handed to this second dial.
-        let cfg = client("localhost", &[b"test-only"]);
+        let mut cfg = client("localhost", &[b"test-only"]);
+        // A config that names no store keeps no ticket, so this witness has to name one.
+        cfg.resumption = true;
         // Both dials ride one cached config: rustls gates resumption on the verifier and store a config holds, so a cache miss here sinks the whole witness.
         let kept = client_config(&cfg).expect("first config builds");
         let name = rustls::pki_types::ServerName::try_from("localhost").expect("a dns name");
@@ -3044,6 +3074,87 @@ mod tests {
         assert!(
             b.peer_leaf().is_some(),
             "a resumed session keeps the chain it cached"
+        );
+        drop(b);
+        server.join().expect("joins");
+    }
+
+    /// A client that names a store rides the ticket a served stream hands out: the reference's Go server tickets by default, so a served edge here must hand one out too.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_served_stream_hands_a_ticket_the_next_dial_rides() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            // One identity behind both accepts: a listener rebuilds nothing between streams, so the ticket the first hands out must open on the second.
+            let identity = plain_identity();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut served = crate::tls::accept(&identity, stream).expect("serves");
+                served.handshake().expect("served handshake");
+                let mut buf = [0u8; 4];
+                if served.read_exact(&mut buf).is_ok() {
+                    let _ = served.write_all(&buf);
+                }
+            }
+        });
+        let mut cfg = client("localhost", &[b"test-only"]);
+        cfg.resumption = true;
+        let kept = client_config(&cfg).expect("first config builds");
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("a dns name");
+        let a = dial(&kept, &name, port);
+        assert_eq!(
+            a.handshake_kind(),
+            Some(rustls::HandshakeKind::Full),
+            "the first dial had no ticket to offer"
+        );
+        assert!(a.tls13_tickets() >= 1, "the served stream handed a ticket");
+        drop(a);
+        let b = dial(&kept, &name, port);
+        assert_eq!(
+            b.handshake_kind(),
+            Some(rustls::HandshakeKind::Resumed),
+            "the listener's ticket let the second dial skip the chain"
+        );
+        drop(b);
+        server.join().expect("joins");
+    }
+
+    /// A config that names no resumption keeps no ticket even against a listener that hands one out, which is the reference's default.
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_config_that_names_no_resumption_keeps_no_ticket() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let identity = plain_identity();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut served = crate::tls::accept(&identity, stream).expect("serves");
+                served.handshake().expect("served handshake");
+                let mut buf = [0u8; 4];
+                if served.read_exact(&mut buf).is_ok() {
+                    let _ = served.write_all(&buf);
+                }
+            }
+        });
+        let cfg = client("localhost", &[b"test-only"]);
+        let kept = client_config(&cfg).expect("first config builds");
+        let name = rustls::pki_types::ServerName::try_from("localhost").expect("a dns name");
+        let a = dial(&kept, &name, port);
+        assert!(a.tls13_tickets() >= 1, "the listener offered a ticket");
+        drop(a);
+        let b = dial(&kept, &name, port);
+        assert_eq!(
+            b.handshake_kind(),
+            Some(rustls::HandshakeKind::Full),
+            "a config that names no resumption carries no ticket"
         );
         drop(b);
         server.join().expect("joins");

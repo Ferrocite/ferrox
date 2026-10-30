@@ -1200,6 +1200,16 @@ pub(crate) fn outbound_tls(
         })
         .unwrap_or_default();
     let curves = tls_curves(tls, fingerprint.is_shaped())?;
+    // xray leaves Go's session cache empty unless the config names one, so an unnamed store keeps no ticket.
+    let resumption = matches!(
+        tls.and_then(|s| s.get("enableSessionResumption")),
+        Some(Json::Bool(true))
+    );
+    if resumption && fingerprint.is_shaped() {
+        eprintln!(
+            "enableSessionResumption: the shaped hello carries no ticket, so this dial keeps none"
+        );
+    }
     Ok(Arc::new(ferrox_core::tls::TlsConfig {
         server_name,
         alpn: alpn.into(),
@@ -1210,6 +1220,7 @@ pub(crate) fn outbound_tls(
         cipher_suites: tls_cipher_suites(tls).into(),
         curves,
         insecure,
+        resumption,
         fingerprint: Some(fingerprint),
         ech_config_list,
         websocket: matches!(
@@ -3787,6 +3798,29 @@ mod tests {
         assert!(
             !groups.contains(&0x0019),
             "and never claims a group the hello carries no share for: {groups:?}"
+        );
+    }
+
+    /// xray's `enableSessionResumption`: the store a dial keeps is the config's say-so, and an unnamed one keeps no ticket, which is the reference's default.
+    #[test]
+    fn a_config_carries_the_session_resumption_it_names() {
+        let config = |extra: &str| {
+            let outbound = crate::json::parse(&format!(
+                r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "tls.test", "allowInsecure": true {extra}}}}}}}"#
+            ))
+            .expect("parses");
+            outbound_tls(&outbound, "127.0.0.1")
+                .expect("builds")
+                .resumption
+        };
+        assert!(!config(""), "an unnamed store keeps no ticket");
+        assert!(
+            config(r#", "enableSessionResumption": true"#),
+            "a named store rides the next dial"
+        );
+        assert!(
+            !config(r#", "enableSessionResumption": false"#),
+            "a false names no store"
         );
     }
 
