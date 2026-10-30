@@ -753,6 +753,13 @@ mod tests {
         assert_eq!(webhook.logged_url(), "the configured URL");
         let reason = webhook.send("{}").expect_err("the authority is not a host");
         assert!(!reason.contains("secret"), "{reason}");
+
+        let bracketed = notifier_with(r#"{"url":"http://[secret:token]/hook"}"#);
+        assert_eq!(bracketed.logged_url(), "the configured URL");
+        let reason = bracketed
+            .send("{}")
+            .expect_err("a bracketed host is not a secret");
+        assert!(!reason.contains("secret"), "{reason}");
     }
 
     #[test]
