@@ -90,11 +90,16 @@ impl<S: Stream> Session<S> {
         }
         let verifier = crate::tls::rustls_backend::verifier(cfg)?;
         let mut session = Self::with_hello(profile, cfg.server_name.clone(), verifier, hello, io)?;
-        session.key_log = cfg.master_key_log.as_ref().map(|log| {
-            let log: Arc<dyn rustls::KeyLog> = log.clone();
+        session.set_key_log(cfg.master_key_log.clone());
+        Ok(session)
+    }
+
+    /// The `masterKeyLog` this session hands its secrets to, set after a caller-built hello as REALITY sets it.
+    pub(crate) fn set_key_log(&mut self, log: Option<Arc<crate::tls::MasterKeyLog>>) {
+        self.key_log = log.map(|log| {
+            let log: Arc<dyn rustls::KeyLog> = log;
             log
         });
-        Ok(session)
     }
 
     /// A session over a hello the caller built and sealed, as REALITY does.

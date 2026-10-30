@@ -29653,13 +29653,26 @@ mod tests {
         flow: &str,
         network: &str,
     ) -> String {
+        reality_network_json_with_log(server_port, public_b64, flow, network, None)
+    }
+
+    fn reality_network_json_with_log(
+        server_port: u16,
+        public_b64: &str,
+        flow: &str,
+        network: &str,
+        log: Option<&str>,
+    ) -> String {
+        let log = log
+            .map(|path| format!(r#", "masterKeyLog": "{path}""#))
+            .unwrap_or_default();
         format!(
             r#"{{"outbounds": [{{"protocol": "vless", "settings": {{"vnext": [{{"address": "127.0.0.1",
             "port": {server_port}, "users": [{{"id": "{REALITY_TEST_ID}", "flow": "{flow}"}}]}}]}},
             "streamSettings": {{"network": "{network}", "security": "reality",
             "realitySettings": {{"serverName": "{REALITY_TEST_SNI}",
             "publicKey": "{public_b64}", "shortId": "{REALITY_TEST_SHORT}",
-            "fingerprint": "chrome"}}}}}}]}}"#,
+            "fingerprint": "chrome"{log}}}}}}}]}}"#,
         )
     }
 
@@ -29915,6 +29928,15 @@ mod tests {
     }
 
     fn reality_pair_with(flow: &str, network: &str, carrier: Carrier) -> RealityPair {
+        reality_pair_logged(flow, network, carrier, None)
+    }
+
+    fn reality_pair_logged(
+        flow: &str,
+        network: &str,
+        carrier: Carrier,
+        log: Option<&str>,
+    ) -> RealityPair {
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_addr = echo.local_addr().expect("addr");
         let echo = thread::spawn(move || {
@@ -29960,11 +29982,12 @@ mod tests {
         });
         let public =
             x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
-        let root = crate::json::parse(&reality_network_json(
+        let root = crate::json::parse(&reality_network_json_with_log(
             server_addr.port(),
             &b64url(&public),
             flow,
             network,
+            log,
         ))
         .expect("parses");
         let outbound = find_outbound(&root)
@@ -30056,6 +30079,36 @@ mod tests {
         dialled.join().expect("joins");
         pair.echo.join().expect("joins");
         pair.front.join().expect("joins");
+    }
+
+    /// The reference opens `realitySettings.masterKeyLog` separately from `tlsSettings`, so a REALITY
+    /// dial's secrets reach the file its own block names.
+    #[test]
+    fn a_reality_master_key_log_records_the_sealed_handshake() {
+        let path =
+            std::env::temp_dir().join(format!("ferrox-reality-keylog-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let named = path.to_string_lossy().into_owned();
+        let pair = reality_pair_logged("", "tcp", Carrier::Raw(Chain::default()), Some(&named));
+        let (mut user, dialled) = dial_pair(&pair);
+        assert_eq!(echo_bulk(&mut user, b"sealed"), b"sealed");
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+        let log = std::fs::read_to_string(&path).expect("the log the config named");
+        let _ = std::fs::remove_file(&path);
+        for label in [
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+            "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+            "CLIENT_TRAFFIC_SECRET_0",
+            "SERVER_TRAFFIC_SECRET_0",
+        ] {
+            assert!(
+                log.lines().any(|line| line.starts_with(label)),
+                "{label} in {log:?}"
+            );
+        }
     }
 
     #[test]

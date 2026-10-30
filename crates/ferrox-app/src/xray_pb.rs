@@ -1230,6 +1230,13 @@ impl RealityFields {
             (25, 2) => Err(reader.uncarried("the mldsa65 verify key")),
             // The spider path shapes the hello's steal request, which this tree's reality client writes its own shape for (pinned against the reference).
             (26 | 27, _) => reader.skip(wire),
+            (31, 2) => {
+                let path = account_text(reader)?;
+                if !path.is_empty() {
+                    self.pairs.push(("masterKeyLog", Json::Str(path)));
+                }
+                Ok(())
+            }
             _ => Err(reader.refuse(field, wire)),
         }
     }
@@ -4971,6 +4978,7 @@ mod tests {
             bytes_field(22, b"www.example.com"),
             bytes_field(23, &[0xcd; 32]),
             bytes_field(24, &[]),
+            bytes_field(31, b"/tmp/reality.keys"),
         ]);
         let type_name = "xray.transport.internet.reality.Config";
         let endpoint = message(&[
@@ -5016,6 +5024,11 @@ mod tests {
             Some(b64url(&[0xcd; 32]).as_str())
         );
         assert_eq!(reality.get("shortId").and_then(Json::as_str), Some(""));
+        assert_eq!(
+            reality.get("masterKeyLog").and_then(Json::as_str),
+            Some("/tmp/reality.keys"),
+            "the reality config's own key log rides field 31"
+        );
         assert!(
             reality.get("dest").is_none()
                 && reality.get("privateKey").is_none()
