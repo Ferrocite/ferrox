@@ -35689,6 +35689,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A VLESS front over the store moves the inbound and the authenticated user's counters, with no socket between them.
+    #[test]
+    fn a_vless_xdrive_front_counts_the_flow_it_relays() {
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        enable_user_stats();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-xdrive-vless-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let folder = dir.to_str().expect("utf-8 folder").replace('\\', "\\\\");
+        let settings = format!(
+            r#""network": "xdrive", "security": "tls",
+                "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
+                    "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
+                "tlsSettings": {{"allowInsecure": true}}"#
+        );
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vless", "tag": "xdrive-in",
+                "settings": {{"clients": [{{"id": "{uuid}", "email": "xdrive@example", "level": 1}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(
+            serve_vless_inbound(
+                "127.0.0.1:9",
+                &inbound,
+                true,
+                "test",
+                &crate::reverse::Portals::default()
+            ),
+            "the store listener arms"
+        );
+        let Outbound::Vless(vless) = find_outbound(&vnext_tls_root("vless", &settings))
+            .expect("parses")
+            .expect("the config names a vless outbound")
+        else {
+            panic!("the outbound dials vless");
+        };
+        let echo_port = echo_loop();
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_vless_xdrive(&socket, &vless, &target);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "the store's session relays");
+        let snapshot = crate::stats::snapshot();
+        let inbound = &snapshot.inbound["xdrive-in"];
+        assert!(
+            inbound.uplink > 0,
+            "the request reached the inbound counter"
+        );
+        assert!(inbound.downlink > 0, "the reply left it");
+        let user = &snapshot.user["xdrive@example"];
+        assert!(user.uplink > 0, "the authenticated user's uplink moved");
+        assert!(user.downlink > 0, "and the downlink too");
+        drop(sock);
+        join_thread_within(relay, Duration::from_secs(30), "the store's session");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A target that answers only after the upload ends still reaches the app: the response wait is a relay budget, not the store's poll linger.
     #[test]
     fn an_xdrive_relay_reads_a_response_after_the_upload_ends() {
