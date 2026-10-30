@@ -2,8 +2,9 @@ name: release
 
 # Ships the lanes. On a version tag (or on demand) this builds `ferrox-app`
 # for every platform a user can run it on and attaches one package per platform
-# to the GitHub Release: the binary, the launcher beside it (`ferrox-cli.exe` and
-# the `ferrox-cli.sh` fallback on Windows, `ferrox-cli.sh` elsewhere), and the two
+# to the GitHub Release: the binary, the launcher beside it (`ferrox-cli.exe`,
+# `ferrox-cli.cmd`, and the `ferrox-cli.sh` fallback on Windows, `ferrox-cli.sh`
+# elsewhere), and the two
 # pages that make trying a lane three commands — `login`, `up --foxy --vpn` (or
 # `up --veepn --vpn` with no account), `down` — with no toolchain, no repository
 # and no config by hand.
@@ -135,13 +136,14 @@ jobs:
           PKG="ferrox-${VERSION#v}-${NAME}"
           rm -rf "$PKG" && mkdir -p "$PKG"
           if [ "$WINDOWS" = 1 ]; then
-            cp "$BIN" "$CLI" dist/ferrox-cli.sh dist/README.md dist/USAGE.md "$PKG/"
+            cp "$BIN" "$CLI" dist/ferrox-cli.sh dist/ferrox-cli.cmd dist/README.md dist/USAGE.md "$PKG/"
             sed -i 's/\r$//' "$PKG/ferrox-cli.sh"
             if grep -q $'\r' "$PKG/ferrox-cli.sh"; then
               echo "::error::$PKG.zip has a CRLF ferrox-cli.sh"
               exit 1
             fi
             bash -n "$PKG/ferrox-cli.sh" || { echo "::error::$PKG.zip has an invalid ferrox-cli.sh"; exit 1; }
+            grep -q 'ferrox-cli.exe' "$PKG/ferrox-cli.cmd" || { echo "::error::$PKG.zip has an invalid ferrox-cli.cmd"; exit 1; }
           else
             cp "$BIN" dist/ferrox-cli.sh dist/README.md dist/USAGE.md "$PKG/"
           fi
@@ -153,6 +155,7 @@ jobs:
               7z a -tzip "$PKG.zip" "$PKG" >/dev/null
               if [ "$WINDOWS" = 1 ]; then
                 7z l "$PKG.zip" | grep -q 'ferrox-cli.exe' || { echo "::error::$PKG.zip has no ferrox-cli.exe"; exit 1; }
+                7z l "$PKG.zip" | grep -q 'ferrox-cli.cmd' || { echo "::error::$PKG.zip has no ferrox-cli.cmd"; exit 1; }
                 7z l "$PKG.zip" | grep -q 'ferrox-cli.sh' || { echo "::error::$PKG.zip has no ferrox-cli.sh"; exit 1; }
               fi ;;
           esac
@@ -188,317 +191,63 @@ jobs:
         env:
           VERSION: ${{ needs.plan.outputs.version }}
           BODY: |-
-            ## Ferrox VERSION_PLACEHOLDER — your allowance buys the bytes that reach you
+            ## Ferrox VERSION_PLACEHOLDER
 
-            Unpack your platform's package and run the CLI beside the binary — no cargo, no repository:
+            Unpack the package for your platform and run the launcher beside the engine. No cargo, repository, or hand-written config is needed.
 
-            ```bash
-            tar xzf ferrox-VERSION_PLACEHOLDER-aarch64-apple-darwin.tar.gz
-            cd ferrox-VERSION_PLACEHOLDER-aarch64-apple-darwin
-            ./ferrox-cli.sh up --foxy --vpn        # asks for email, password and carrier, then connects
-            ./ferrox-cli.sh up --foxy --carrier h3 --vpn   # names the carrier and skips the question
-            ./ferrox-cli.sh status                 # uptime, the carrier it chose, quota left, exit IP and country
-            ./ferrox-cli.sh down
-            ```
+            ### Windows
 
-            Windows ships a native launcher that needs no Bash, WSL or Python.
-            The same zip also carries `ferrox-cli.sh` for anyone who prefers the
-            Bash CLI from Git Bash, with Python 3 and curl on `PATH`.
+            Use `ferrox-cli.exe`. It needs no Bash, WSL, or Python.
 
             ```powershell
             Expand-Archive ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip -DestinationPath .
             cd ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc
-            .\ferrox-cli.exe up --foxy --vpn      # same flags, same prompts; asks once, then resumes
+            .\ferrox-cli.exe up --foxy --vpn
             .\ferrox-cli.exe status
             .\ferrox-cli.exe down
             ```
 
+            The first `up --foxy` asks for the Firefox email and password, then connects. `status` shows the carrier and remaining allowance. `down` stops the lane and restores the Windows proxy.
+
+            If PowerShell says `execvpe(/bin/bash) failed`, it opened WSL instead of Git Bash. That is not this launcher: use `.\ferrox-cli.exe` as shown above. `ferrox-cli.cmd` forwards to the same native launcher for `cmd.exe`. The zip's `ferrox-cli.sh` is only for Git Bash and is ports-only; `--vpn` is the native launcher's.
+
+            ### macOS and Linux
+
             ```bash
-            bash ./ferrox-cli.sh up --foxy         # optional Bash fallback, ports only; use the native launcher for --vpn
+            tar xzf ferrox-VERSION_PLACEHOLDER-x86_64-apple-darwin.tar.gz   # choose your package
+            cd ferrox-VERSION_PLACEHOLDER-x86_64-apple-darwin
+            ./ferrox-cli.sh up --foxy --vpn
+            ./ferrox-cli.sh status
+            ./ferrox-cli.sh down
             ```
 
-            ### The lanes this build carries
+            On Windows, replace `ferrox-cli` with `.\ferrox-cli.exe` in the lane commands below.
 
-            On Windows, use `.\ferrox-cli.exe` wherever this table says
-            `./ferrox-cli.sh` (or `bash ./ferrox-cli.sh` for the fallback).
-
-            | lane | what you supply | start it |
+            | lane | what it needs | start it |
             | --- | --- | --- |
-            | **Foxy** | a Firefox account, email + password, a carrier; **no server** | `./ferrox-cli.sh up --foxy --vpn` |
-            | **VeePN** | **nothing**: anonymous, no account, no server | `./ferrox-cli.sh up --veepn --vpn` |
-            | **VLESS** | a `vless://` link: tcp, ws, grpc, httpupgrade or xhttp; TLS or REALITY | `./ferrox-cli.sh up --vless 'vless://...'` |
-            | **VMess** | `HOST:PORT` and the user id | `./ferrox-cli.sh up --vmess host:443 --uuid ID` |
-            | **Trojan** | `HOST:PORT` and the password | `./ferrox-cli.sh up --trojan host:443 --password PW` |
-            | **Shadowsocks** | `HOST:PORT`, method and password | `./ferrox-cli.sh up --ss host:8388 --method aes-256-gcm --password PW` |
-            | **SOCKS outbound** | a JSON config naming `socks` as the protocol | `--config`: the client role dials out SOCKS5, and `version: "4"` speaks SOCKS4 and SOCKS4a |
-            | **Any served config** | a JSON config | `./ferrox-cli.sh up --config mine.json` |
+            | Foxy | a Firefox account: email and password; no server | `ferrox-cli up --foxy --vpn` |
+            | VeePN | nothing: anonymous, no account, no server | `ferrox-cli up --veepn --vpn` |
+            | VLESS | a `vless://` link | `ferrox-cli up --vless 'vless://...'` |
+            | VMess | `HOST:PORT` and a user id | `ferrox-cli up --vmess host:443 --uuid ID` |
+            | Trojan | `HOST:PORT` and a password | `ferrox-cli up --trojan host:443 --password PW` |
+            | Shadowsocks | `HOST:PORT`, method, and password | `ferrox-cli up --ss host:8388 --method aes-256-gcm --password PW` |
+            | Any config | a JSON config the binary serves | `ferrox-cli up --config mine.json` |
 
-            ### Your allowance buys the bytes that reach you (new in this release)
+            All lanes serve the same loopback fronts: SOCKS5 `127.0.0.1:10808`, HTTP and HTTPS `127.0.0.1:8080`, and mixed `127.0.0.1:10809`.
 
-            A flow the browser hangs up on used to leave its stream open at the
-            edge: the edge kept pulling the rest of the response into a
-            flow-control window nobody drained, and every one of those bytes was
-            charged to the account. A download canceled after its first
-            megabytes cost 1.95x what was read. The lane now ends the half its
-            carrier has and resets what the edge is still filling —
-            `RST_STREAM`/`CANCEL` over `h2`, a stop and a reset over `h3` — from
-            the settle, and from the tunnel's own `Drop` when a flow vanished
-            before it could settle. Measured against the plane's own
-            `X-Quota-Remaining` on a clean account (`foxy-live.yml`, runs
-            39896658437 and 39904632827):
-
-            | what the lane did | bytes carried | allowance charged |
-            | --- | --- | --- |
-            | an idle window, no flow at all | 0 | 0 |
-            | a `HEAD` of a 10 MB body | 240 | 0 |
-            | a 1 MB GET, read to the end | 1,048,815 | 1,049,249 (1.000x) |
-            | a 10 MB GET, read to the end | 10,486,000 | 10,486,097 (1.000x) |
-            | the whole session, one flow canceled mid-body | 12,061,503 | 12,178,099 (**1.0097x**) |
-
-            The plane writes its counter in lagging batches, so the four single
-            rows are the before-fix run and only the last row is a session
-            total; a per-bracket `0 charged` after the fix is the batch, not a
-            free download.
-
-            A flow costs nothing per flow, and what is left on a cancel — at
-            most 1.22x the bytes read, against 1.95x before — is data already in
-            flight when the reset leaves, which no reset can recall.
-            `a_flow_abandoned_mid_response_resets_its_stream` gates the reset
-            against a loopback edge that never ends its body.
-
-            `status` now names why an allowance line is missing instead of
-            printing nothing: either the plane sent no quota header for the pass
-            this lane carries, which is silence rather than zero, or the running
-            lane is a binary that writes neither line, and `down` then `up`
-            restarts it on the one this script runs. A lane that has no
-            allowance to report — a `--vless` lane, say — stays quiet.
-
-            ### Refusals that became behaviour
-
-            Three rows where this tree said no now do what the reference does: a
-            **dokodemo-door `portMap`** is a table the flow's own port indexes
-            (#434), a **SOCKS5** reply that binds a *name* grants the tunnel
-            instead of stalling at the reply (#432), and an **outbound that
-            cannot build the names it needs** is refused by name before the
-            inbounds rule on the flow (#424). The transparent redirect stays
-            refused — that one is the kernel's to give.
-
-            ### Lanes that could not connect, and now can
-
-            - **Trojan over TLS** armed the plaintext role, so its first 56
-              bytes were read as a key and every trojan-over-tls dial died at
-              the handshake; the listener answers with the session its config
-              names, on each carrier the dial uses, and a **UDP association
-              crosses that arm** too (#435, #441).
-            - **VLESS over KCP** carries TLS (#444).
-            - **VMess** reads an authenticated length as the second AEAD over
-              the size field that it is (#439).
-            - An **HTTP/3** response that names its status and then `date` was
-              reported as a broken frame: an indexed field line the lane never
-              reads walks on instead of aborting the block (#436).
-            - A **Foxy** pass the plane refused spent the password; it spends
-              the grant now, and a grant another lane rotated in is adopted
-              rather than re-spent (#438, #431). An interrupted connect leaves
-              no lane behind — no child, no pid file, no config, and the system
-              proxy untouched (#433).
-
-            ### Choosing the carrier on the Foxy lane
-
-            A **carrier** is how the lane sends its flows to the edge. `--carrier`
-            names one, and on a terminal `up --foxy` asks once — an empty answer
-            or a pipe takes `auto`:
-
-            | carrier | what it is | when to pick it |
-            | --- | --- | --- |
-            | `auto` | the ladder h2 → h1 → h3, the fastest that answers | the default, and what a non-terminal gets |
-            | `h2` | HTTP/2 CONNECT; one session is reused across flows | almost always — it outran `h3` in every CI relay run, on every runner |
-            | `h1` | HTTP/1.1 CONNECT; one TLS connection per flow | a network or middlebox that mishandles HTTP/2 |
-            | `h3` | HTTP/3 over QUIC | **the only carrier that carries UDP** — the datagram lane rides it |
-
-            A named `h3` is a preference, not a pin: it leads the ladder, and a
-            path that drops QUIC — silence, not a refusal — is abandoned five
-            seconds into the handshake, so the TCP rungs follow and the lane
-            carries anyway. An `h3` flow reads its own socket now: the lane used
-            to start a pump for any lease that landed on an idle lane, and for a
-            flow's lease that thread could only be a second reader of the same
-            file description — taking datagrams as they landed and re-arming the
-            read timeout the flow had just set, per packet. It asks first now,
-            so a session lease starts one pump and a flow's lease starts none
-            (`pump-threads-started-by-an-app-driven-lease 0`), and what that
-            second reader cost the live `h3` rows is written up on the QUIC and
-            Foxy carrier pages. A signed-in account renews the edge pass on its own
-            clock (a lane left running overnight keeps working), `--country DE`
-            moves the exit, `--city` pins a city tier, two-factor sign-in passes
-            `--code 123456` once, and `--upstream socks5://127.0.0.1:1080` dials
-            the edge through a hop this network allows. A `foxy://` share link —
-            the same settings, carrier included — is read from a config with
-            `--config`.
-
-            `status` reads the lane back: how long it has been up, the
-            carrier it was given, the allowance the plane last named (bytes left
-            of the plan and when they reset), and the exit IP and country.
-
-            ### One sign-in, then every launch resumes the session
-
-            The first `up --foxy` signs in — password, and the browser challenge
-            solved locally — and saves the FxA grant to
-            `~/.config/ferrox/foxy-token.json` (0600, outside every repository).
-            Every launch after it resumes that grant instead of signing in
-            again, so Mozilla sends one new-sign-in mail, not one per connect.
-            The password is asked for again only when the plane refuses the
-            grant. `login` saves the account up front (a hidden prompt, or
-            `--password` for a script), and `logout` stops the lane, forgets the
-            account and removes the stored session:
-
-            ```bash
-            ./ferrox-cli.sh login --email you@example.com
-            ./ferrox-cli.sh logout
-            ```
-
-            ### Choose your exit
-
-            `locations` lists every country and its cities from Mozilla's
-            catalogue — public, so it needs no account. `locations --ping`
-            measures one handshake per edge and orders the nearest first; a
-            silent edge reads `no answer`, and the readings are not cached.
-            `location DE` remembers an exit for every later `up`, `location US
-            SFO` pins a city, and `--country`/`--city` override it once. The
-            list is kept in `foxy-locations.jsonl`, so it still answers when
-            Mozilla is unreachable:
-
-            ```bash
-            ./ferrox-cli.sh locations           # countries and cities, the remembered one marked *
-            ./ferrox-cli.sh locations --ping    # nearest exit first: one handshake per edge, in ms
-            ./ferrox-cli.sh locations US        # one country in detail
-            ./ferrox-cli.sh location DE         # remember Germany for every up
-            ./ferrox-cli.sh location US SFO     # remember a country and a city
-            ```
-
-            ### Targets that should not ride the lane
-
-            `--exclude-domains` and `--exclude-ports` take a comma-separated
-            list out of the Foxy lane for that launch: those targets dial
-            directly, unencrypted. The lists reach the lane normalized, and a
-            port outside 1-65535 is refused before a lane is started:
-
-            ```bash
-            ./ferrox-cli.sh up --foxy --exclude-ports 22 --exclude-domains printer.lan,*.internal
-            ```
-
-            ### A lane that carries nothing stops itself
-
-            `up` proves one real flow through a front before it routes anything.
-            When the fronts open but no flow gets through, it prints the lane's
-            own log and the fix to run, then stops the lane it started — pid
-            file, generated config and proxy marker removed, its port free — and
-            exits 3, so nothing is left running and no `down` is needed. A
-            `--config` file you supplied is never deleted.
-
-            ### More than one lane at once
-
-            `--instance NAME` gives a lane its own config, pid, log, proxy
-            marker, ports and remembered exit, while the account and catalogue
-            stay shared, so two exits can run side by side. Fronts left unnamed
-            in a named lane take the first free ports near the defaults;
-            `--socks`, `--http` and `--mixed` still choose them. `--vpn` stays
-            with the unnamed lane, because the system proxy points at one lane.
-            `down --all` stops every lane, and `logout` does too before
-            forgetting the account:
-
-            ```bash
-            ./ferrox-cli.sh up --foxy --instance work --country DE
-            ./ferrox-cli.sh status --instance work
-            ./ferrox-cli.sh ports --instance work
-            ./ferrox-cli.sh down --all
-            ```
-
-            ### Leaner where it counts
-
-            Between v0.0.2 and v0.0.3 the Foxy lane lost a handshake per
-            flow — an ended flow lends its HTTP/2 session to the next — a
-            buffer per datagram and a `recvfrom` per packet, and the lock its
-            shared lane's idle poll held while it slept. The same grind reached
-            the other lanes: xhttp and Shadowsocks allocate twice less per frame
-            and per datagram and xhttp stages its dial head once per thread, the
-            WebSocket keys are stack arrays and a VLESS request header is parsed
-            without a byte of its own, the buffers a flow fills are no longer
-            zeroed first (VLESS, SOCKS, KCP), an HTTP/2 header block is opened
-            once at its own length instead of grown four times, a datagram
-            leaves in the frame its client framed, a relay socket's two
-            directions no longer share a lock, and a forwarded HTTP head is
-            rewritten inside the buffer it was read into — the absolute-form
-            rewrite used to build a second buffer and copy every header byte
-            before the uplink saw it, and the gate that replaced it holds the
-            head the caller gets to the head that was read, which a copy cannot
-            do. What did **not** change: a ChaCha20 record's remainder. The
-            vector pass was tried on the tail — eight blocks a pass where the
-            ladder managed six, sixteen with `avx512f` — and this tree's own
-            bench gate said no: `0.754x`, `0.879x` and `0.854x` of the
-            reference at 256, 257 and 319 bytes, because the pass's setup is
-            only amortised over a whole pass and a tail is by definition
-            shorter than one. The pass stands where it was and the ladder still
-            closes a record; both readings are on the record-layer page.
-
-            ### Fixed in v0.0.3: a padded frame credits its whole wire length
-
-            RFC 7540 §6.9 puts a DATA frame's whole payload into the flow-control
-            window, the `Pad Length` octet and the padding included. Both HTTP/2
-            lanes — gRPC and Foxy — credited what the parser's trim left, so a
-            padded frame handed the peer back `1 + pad` octets fewer than it had
-            sent: a peer that keeps a strict window lost that much every frame,
-            and a long flow lost its window and stalled. The credit is the
-            frame's wire length now, and `a_padded_frame_credits_its_whole_wire_payload`
-            holds the granted increment at the frames' wire length on each lane.
-            The bytes on the wire did not move. One defect the same slice found
-            is still open and is named rather than claimed away: the Foxy lane's
-            direct delivery hands a padded frame's payload back with its pad
-            still on it, so what a caller gets depends on how much room it had.
-
-            ### Under the hood
-
-            **Routing rules** ride `--config` now: AND selectors over domain,
-            ip, port, source and inbound tag, matched against `geosite.dat`
-            and `geoip.dat` decoded at startup; a lane the transport cannot
-            carry is refused by name, and a flow can be sent to the
-            **blackhole** sink, whose answers are octet-for-octet the
-            reference's. **SOCKS serves and dials** in both roles — SOCKS5,
-            SOCKS4 and SOCKS4a — so an upstream hop can be a SOCKS front.
-            **QUIC** carries a whole datagram per packet with a receive window
-            that grows, and **dokodemo-door** has its UDP door. The CI relay
-            gate now splits each leg's seconds four ways — proxy open, TLS
-            through the lane, first byte, transfer tail — and carries each
-            leg's real curl exit and byte count, so a stalled leg names itself
-            instead of passing green.
-
-            **VeePN** is the lane with nothing to type in. The plane launches this device
-            anonymously, names the fastest region — `--region us-va` pins one — and lists
-            the upstreams that answer for the pair it printed. Its live byte path is gated
-            in CI by `veepn-relay.yml`: exactly 1,000,000 B through the named SOCKS, HTTP
-            and mixed fronts on Ubuntu and macOS, and through `us-va`, `us-or`, `gb-lnd`,
-            `fr-prs`, `sg` and `ru-spb`.
-
-            **VLESS, VMess, Trojan and Shadowsocks** dial the server their link or
-            `HOST:PORT` names. The VLESS converter writes tcp, ws, grpc, httpupgrade and
-            xhttp with `security=none|tls|reality`; anything else the binary serves —
-            kcp, quic, hysteria, httpheader, masque, xdrive — rides `--config` verbatim.
-
-            All lanes serve the same loopback fronts: SOCKS5 `127.0.0.1:10808`, HTTP+HTTPS
-            `127.0.0.1:8080`, mixed `127.0.0.1:10809`. `--vpn` points the system proxy at
-            them only after a real flow answers (macOS for `ferrox-cli.sh`, Windows for
-            `ferrox-cli.exe`); `down` stops the lane and clears the proxy.
+            `--vpn` points the system proxy at those fronts only after a real flow answers. It is supported on macOS by `ferrox-cli.sh` and on Windows by `ferrox-cli.exe`. Without `--vpn`, point apps at a front directly. This build does not create a TUN device, so apps that ignore proxies and raw UDP are not captured.
 
             | package | platform |
             | --- | --- |
             | `ferrox-VERSION_PLACEHOLDER-aarch64-apple-darwin.tar.gz` | macOS on Apple Silicon |
             | `ferrox-VERSION_PLACEHOLDER-x86_64-apple-darwin.tar.gz` | macOS on Intel |
-            | `ferrox-VERSION_PLACEHOLDER-aarch64-linux-gnu.tar.gz` | Linux on aarch64, built on Ubuntu 26.04 |
-            | `ferrox-VERSION_PLACEHOLDER-x86_64-linux-gnu.tar.gz` | Linux on x86_64, built on Ubuntu 26.04 |
-            | `ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip` | Windows x86_64 (native `ferrox-cli.exe` and `ferrox-cli.sh` fallback) |
+            | `ferrox-VERSION_PLACEHOLDER-aarch64-linux-gnu.tar.gz` | Linux on aarch64 |
+            | `ferrox-VERSION_PLACEHOLDER-x86_64-linux-gnu.tar.gz` | Linux on x86_64 |
+            | `ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip` | Windows x86_64: native launcher, `ferrox-cli.cmd`, and Git Bash fallback |
 
-            ### Verify what you downloaded
+            ### Verify the download
 
-            Every release carries `SHA256SUMS` beside the packages. To check
-            just the package you downloaded, Linux:
+            `SHA256SUMS` lists every package. To check only the one you downloaded, Linux:
 
             ```bash
             grep 'ferrox-VERSION_PLACEHOLDER-.*-linux-gnu.tar.gz' SHA256SUMS | sha256sum --check -
@@ -510,14 +259,13 @@ jobs:
             grep 'ferrox-VERSION_PLACEHOLDER-.*-apple-darwin.tar.gz' SHA256SUMS | shasum -a 256 -c -
             ```
 
-            With every package present, `sha256sum --check --ignore-missing SHA256SUMS`
-            works on Linux. On Windows, compare the zip with its matching line:
+            Windows:
 
             ```powershell
             Get-FileHash .\ferrox-*-x86_64-pc-windows-msvc.zip -Algorithm SHA256
             ```
 
-            `README.md` in each package is the quickstart, `USAGE.md` the manual.
+            Compare the result with the matching line in `SHA256SUMS`. `README.md` in each package is the quickstart; `USAGE.md` is the full manual.
         run: |
           printf '%s\n\nBuilt by `release.yml` from commit `%s`.\n' "$BODY" "${GITHUB_SHA::8}" \
             | sed "s/VERSION_PLACEHOLDER/${VERSION#v}/g" >RELEASE-BODY.md

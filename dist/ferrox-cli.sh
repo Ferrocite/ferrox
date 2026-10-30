@@ -16,6 +16,11 @@
 # mode is refused by name, and `ferrox-cli tun` says what that costs.
 set -uo pipefail
 
+if [ "$(uname -s 2>/dev/null)" = Linux ] && grep -qi microsoft /proc/version 2>/dev/null; then
+  echo "ferrox-cli.sh: WSL detected; run ferrox-cli.exe from Windows instead." >&2
+  exit 1
+fi
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SELF="$SCRIPT_DIR/$(basename "$0")"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

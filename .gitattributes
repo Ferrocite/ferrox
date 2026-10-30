@@ -28,3 +28,4 @@ upstream/pins.toml -text
 # Shell entrypoints run under Git Bash and WSL on Windows; a CRLF checkout
 # breaks both with a syntax error at the first function body.
 *.sh text eol=lf
+*.cmd text eol=crlf

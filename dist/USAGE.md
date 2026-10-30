@@ -1,6 +1,6 @@
 # Ferrox on macOS and Windows
 
-Windows packages ship `ferrox-cli.exe`, a native launcher with the same commands and flags as the shell CLI below. Replace `./dist/ferrox-cli.sh` with `.\ferrox-cli.exe` (or just `ferrox-cli` on `PATH`); the release package keeps the binary beside it, so no Bash, WSL or Python is needed. The Windows zip also carries `ferrox-cli.sh` as an optional Git Bash fallback for ports-only use, which needs Python 3 and curl on `PATH`; `--vpn` is the native launcher's, and it uses the WinINET system proxy on Windows; macOS `--vpn` remains in `ferrox-cli.sh`.
+Windows packages ship `ferrox-cli.exe`, a native launcher with the same commands and flags as the shell CLI below. Replace `./dist/ferrox-cli.sh` with `.\ferrox-cli.exe` (or `ferrox-cli.cmd` from `cmd.exe`); the release package keeps the binary beside it, so no Bash, WSL or Python is needed. Do not run `bash ./ferrox-cli.sh` from PowerShell: it may open WSL and fail with `execvpe(/bin/bash)`. Use `.\ferrox-cli.exe` instead. The Windows zip also carries `ferrox-cli.sh` for Git Bash only, as a ports-only fallback that needs Python 3 and curl on `PATH`; `--vpn` is the native launcher's, and it uses the WinINET system proxy on Windows. macOS `--vpn` remains in `ferrox-cli.sh`.
 
 Two things were built here, from the same release binary — a release package from the `release` workflow ships the second and third of these beside the binary, and finds it without cargo:
 
@@ -9,7 +9,8 @@ Two things were built here, from the same release binary — a release package f
 | the binary | `target/release/ferrox-app` (arm64, `ferrox-app 0.0.1`) |
 | the CLI | `dist/ferrox-cli.sh` — every lane, every front, ports, system proxy |
 | the Windows CLI | `ferrox-cli.exe` — the same commands natively; `--vpn` uses the Windows system proxy |
-| the Windows fallback | `ferrox-cli.sh` — the same shell CLI for Git Bash, with Python 3 and curl on `PATH` |
+| the Windows wrapper | `ferrox-cli.cmd` — forwards `cmd.exe` arguments to `ferrox-cli.exe` |
+| the Windows fallback | `ferrox-cli.sh` — Git Bash only, with Python 3 and curl on `PATH` |
 | the app | `dist/Ferrox.app` — the same CLI behind a double-click |
 
 On Windows the native launcher keeps config and account files under `%APPDATA%\ferrox` and pid/log/system-proxy state under `%LOCALAPPDATA%\ferrox`, owner-only through NTFS ACLs. Every `~/.config/ferrox` path on this page describes macOS and Linux.
