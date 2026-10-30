@@ -983,6 +983,22 @@ impl Routing {
         Self::parse_in(root, asset_dirs())
     }
 
+    /// A table with no rule, so a config that names no `routing` block still has a plan to carry
+    /// the outbound fields a dial reads.
+    pub(crate) fn empty() -> Self {
+        Self {
+            strategy: DomainStrategy::AsIs,
+            rules: Vec::new(),
+            balancers: Vec::new(),
+            rule_sets: Vec::new(),
+            asset_dirs: Vec::new(),
+            script: None,
+            has_domains: false,
+            wants_attrs: false,
+            wants_process: false,
+        }
+    }
+
     #[allow(clippy::too_many_lines)]
     pub(crate) fn parse_in(root: &Json, dirs: Vec<PathBuf>) -> Result<Option<Self>, String> {
         let Some(block) = root.get("routing") else {
