@@ -334,6 +334,11 @@ impl SocketOptions {
         self.apply(socket, target, true)
     }
 
+    /// The options a datagram dial's socket takes before it binds and connects.
+    pub(crate) fn apply_to_datagram(&self, socket: &Socket, target: SocketAddr) -> io::Result<()> {
+        self.apply(socket, target, false)
+    }
+
     fn apply(&self, socket: &Socket, addr: SocketAddr, tcp: bool) -> io::Result<()> {
         if tcp {
             match self.keep_alive {
