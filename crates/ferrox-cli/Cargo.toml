@@ -1,0 +1,29 @@
+[package]
+name = "ferrox-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+description = "The release launcher: one command that starts, inspects and stops a lane"
+
+[[bin]]
+name = "ferrox-cli"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+ctrlc = "3"
+getrandom = "0.4"
+rpassword = "7"
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinInet",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+] }

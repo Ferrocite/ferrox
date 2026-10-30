@@ -2,10 +2,10 @@ name: release
 
 # Ships the lanes. On a version tag (or on demand) this builds `ferrox-app`
 # for every platform a user can run it on and attaches one package per platform
-# to the GitHub Release: the binary, `ferrox-cli.sh` beside it, and the two
-# pages that make trying a lane three commands — `login`, `up --foxy --vpn`
-# (or `up --veepn --vpn` with no account), `down` — with no toolchain, no
-# repository and no config by hand.
+# to the GitHub Release: the binary, the launcher beside it (`ferrox-cli.exe` on
+# Windows, `ferrox-cli.sh` elsewhere), and the two pages that make trying a lane
+# three commands — `login`, `up --foxy --vpn` (or `up --veepn --vpn` with no
+# account), `down` — with no toolchain, no repository and no config by hand.
 #
 # Nothing here dials a connection: the job compiles, smoke-runs the binary's
 # own version line, and packages. Whether a lane carries bytes is gated by
@@ -109,13 +109,15 @@ jobs:
           # aarch64 consults them, x86_64 consults neither, so every package
           # holds the runtime-dispatching build the local gates measured.
           RUSTFLAGS: --cfg aes_armv8 --cfg polyval_armv8
-        run: cargo build --locked --release -p ferrox-app --target "${{ matrix.target }}"
-      - name: prove the binary runs
+        run: cargo build --locked --release -p ferrox-app -p ferrox-cli --target "${{ matrix.target }}"
+      - name: prove the binaries run
         shell: bash
         run: |
           BIN="target/${{ matrix.target }}/release/ferrox-app"
-          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          CLI="target/${{ matrix.target }}/release/ferrox-cli"
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; CLI="$CLI.exe"; fi
           "$BIN" version
+          "$CLI" --help >/dev/null
       - name: package the lane kit
         shell: bash
         env:
@@ -123,11 +125,17 @@ jobs:
           NAME: ${{ matrix.pkg || matrix.target }}
         run: |
           BIN="target/${{ matrix.target }}/release/ferrox-app"
-          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          CLI="target/${{ matrix.target }}/release/ferrox-cli"
+          WINDOWS=0
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; CLI="$CLI.exe"; WINDOWS=1; fi
           PKG="ferrox-${VERSION#v}-${NAME}"
           rm -rf "$PKG" && mkdir -p "$PKG"
-          cp "$BIN" dist/ferrox-cli.sh dist/README.md dist/USAGE.md "$PKG/"
-          chmod +x "$PKG/$(basename "$BIN")" "$PKG/ferrox-cli.sh" 2>/dev/null || true
+          if [ "$WINDOWS" = 1 ]; then
+            cp "$BIN" "$CLI" dist/README.md dist/USAGE.md "$PKG/"
+          else
+            cp "$BIN" dist/ferrox-cli.sh dist/README.md dist/USAGE.md "$PKG/"
+          fi
+          chmod +x "$PKG"/* 2>/dev/null || true
           case "$(uname -s)" in
             Darwin|Linux)
               COPYFILE_DISABLE=1 tar --no-xattrs -czf "$PKG.tar.gz" "$PKG" ;;
@@ -169,6 +177,16 @@ jobs:
             ./ferrox-cli.sh up --foxy --carrier h3 --vpn   # names the carrier and skips the question
             ./ferrox-cli.sh status                 # uptime, the carrier it chose, quota left, exit IP and country
             ./ferrox-cli.sh down
+            ```
+
+            Windows ships a native launcher: no Bash, no WSL and no Python.
+
+            ```powershell
+            Expand-Archive ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip -DestinationPath .
+            cd ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc
+            .\ferrox-cli.exe up --foxy --vpn      # same flags, same prompts; asks once, then resumes
+            .\ferrox-cli.exe status
+            .\ferrox-cli.exe down
             ```
 
             ### The lanes this build carries
@@ -434,9 +452,9 @@ jobs:
             kcp, quic, hysteria, httpheader, masque, xdrive — rides `--config` verbatim.
 
             All lanes serve the same loopback fronts: SOCKS5 `127.0.0.1:10808`, HTTP+HTTPS
-            `127.0.0.1:8080`, mixed `127.0.0.1:10809`. `--vpn` points the macOS system proxy
-            at them only after a real flow answers; `down` stops the lane and clears the
-            proxy.
+            `127.0.0.1:8080`, mixed `127.0.0.1:10809`. `--vpn` points the system proxy at
+            them only after a real flow answers (macOS for `ferrox-cli.sh`, Windows for
+            `ferrox-cli.exe`); `down` stops the lane and clears the proxy.
 
             | package | platform |
             | --- | --- |
@@ -444,7 +462,7 @@ jobs:
             | `ferrox-VERSION_PLACEHOLDER-x86_64-apple-darwin.tar.gz` | macOS on Intel |
             | `ferrox-VERSION_PLACEHOLDER-aarch64-linux-gnu.tar.gz` | Linux on aarch64, built on Ubuntu 26.04 |
             | `ferrox-VERSION_PLACEHOLDER-x86_64-linux-gnu.tar.gz` | Linux on x86_64, built on Ubuntu 26.04 |
-            | `ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip` | Windows x86_64 (CLI runs in Git Bash) |
+            | `ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip` | Windows x86_64 (native `ferrox-cli.exe`; no Bash, WSL or Python) |
 
             `README.md` in each package is the quickstart, `USAGE.md` the manual.
         run: |
@@ -491,7 +509,7 @@ jobs:
               echo "- [$n](https://github.com/$GITHUB_REPOSITORY/releases/download/$VERSION/$n)"
             done
             echo
-            echo "Three commands from any of them: unpack, \`./ferrox-cli.sh up --foxy --vpn\` (or \`--veepn\` for no account), done — the CLI asks for the account the first time."
+            echo "Three commands from any of them: unpack, \`./ferrox-cli.sh up --foxy --vpn\` on macOS/Linux or \`.\\ferrox-cli.exe up --foxy --vpn\` on Windows (or \`--veepn\` for no account), done — the CLI asks for the account the first time."
           } >> "$GITHUB_STEP_SUMMARY"
 
   result:

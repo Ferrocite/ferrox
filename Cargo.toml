@@ -5,6 +5,7 @@ members = [
   "crates/ferrox-bench",
   "crates/ferrox-prompt",
   "crates/ferrox-app",
+  "crates/ferrox-cli",
 ]
 
 [workspace.package]

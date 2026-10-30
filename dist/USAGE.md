@@ -1,4 +1,6 @@
-# Ferrox on macOS
+# Ferrox on macOS and Windows
+
+Windows packages ship `ferrox-cli.exe`, a native launcher with the same commands and flags as the shell CLI below. Replace `./dist/ferrox-cli.sh` with `.\ferrox-cli.exe` (or just `ferrox-cli` on `PATH`); the release package keeps the binary beside it, so no Bash, WSL or Python is needed. `--vpn` is supported on Windows through the WinINET system proxy; macOS `--vpn` remains in `ferrox-cli.sh`.
 
 Two things were built here, from the same release binary — a release package from the `release` workflow ships the second and third of these beside the binary, and finds it without cargo:
 
@@ -6,6 +8,7 @@ Two things were built here, from the same release binary — a release package f
 | --- | --- |
 | the binary | `target/release/ferrox-app` (arm64, `ferrox-app 0.0.1`) |
 | the CLI | `dist/ferrox-cli.sh` — every lane, every front, ports, system proxy |
+| the Windows CLI | `ferrox-cli.exe` — the same commands natively; `--vpn` uses the Windows system proxy |
 | the app | `dist/Ferrox.app` — the same CLI behind a double-click |
 
 `ferrox-cli.sh`, this page and `README.md` are tracked so the release job can ship them; everything else under `dist/` — the bundle, its build script, any lane config — stays git-ignored, and so does every file that carries an account.

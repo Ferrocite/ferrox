@@ -1,10 +1,11 @@
 # Ferrox — release build
 
-Three files, no installer: the binary, the one-command CLI (`ferrox-cli.sh`), and the full manual (`USAGE.md`). Nothing here needs cargo, a repository, or a config by hand.
+Three files, no installer: the binary, the one-command CLI (`ferrox-cli.sh` on macOS/Linux, `ferrox-cli.exe` on Windows), and the full manual (`USAGE.md`). Nothing here needs cargo, a repository, or a config by hand.
 
 ```
 ferrox-app            the lane engine: serves SOCKS5/HTTP/mixed fronts, dials every implemented lane
 ferrox-cli.sh         login, up, down, status, ports, locations, version — the only command you need
+ferrox-cli.exe        the same CLI built for Windows; no Bash, WSL or Python
 USAGE.md              the manual: every lane, every port, what to do when it does not work
 ```
 
@@ -18,6 +19,16 @@ cd ferrox-*-aarch64-apple-darwin
 ./ferrox-cli.sh up --foxy --vpn    # asks email + password and the carrier, then connects
 ./ferrox-cli.sh status             # uptime, carrier, quota left, exit IP and country
 ./ferrox-cli.sh down               # stop and clear the system proxy
+```
+
+On Windows, unpack the zip and use `ferrox-cli.exe`; the flags and prompts are identical:
+
+```powershell
+Expand-Archive ferrox-*-x86_64-pc-windows-msvc.zip -DestinationPath .
+cd ferrox-*-x86_64-pc-windows-msvc
+.\ferrox-cli.exe up --foxy --vpn
+.\ferrox-cli.exe status
+.\ferrox-cli.exe down
 ```
 
 The answer is stored once, in `~/.config/ferrox/credentials`, mode 0600, outside every repository; a copy inside a git repository is refused on purpose. Later runs read it silently and never ask again. The first launch also saves the FxA session it signed in with — access token, refresh token, account — to `~/.config/ferrox/foxy-token.json` (0600), so every launch after it resumes that grant instead of calling `/account/login`: Mozilla sends one new-sign-in mail, not one per connect, and the password is only asked for again when the plane refuses the grant. The browser challenge is solved locally. Prefer to save the account up front, or pass it non-interactively:
@@ -82,7 +93,7 @@ The fronts are loopback-only: SOCKS5 `127.0.0.1:10808`, HTTP+HTTPS `127.0.0.1:80
 
 - **macOS** — `--vpn` arms and clears the system proxy for you.
 - **Linux** — point apps at the fronts by hand: `ALL_PROXY=socks5h://127.0.0.1:10808 <app>`, or set GNOME/KDE network proxy to `127.0.0.1:8080`.
-- **Windows** — run `ferrox-cli.sh` from Git Bash; set Settings > Network > Proxy to `127.0.0.1:8080`, or use the fronts per app.
+- **Windows** — `ferrox-cli.exe up --foxy --vpn` arms the system proxy through the WinINET Internet Settings that Chrome, Edge and most desktop apps read, and `ferrox-cli.exe down` restores the previous settings. Without `--vpn`, set Settings > Network & Internet > Proxy to `127.0.0.1:8080`, or use the fronts per app.
 
 Use `socks5h://` (the `h`) so names resolve at the exit, not on your machine.
 
