@@ -84,6 +84,9 @@ fn usage() -> ! {
     eprintln!("  ferrox-app x25519                 print a fresh X25519 keypair");
     eprintln!("  ferrox-app run -c <config.json>   serve inbounds until killed");
     eprintln!("  ferrox-app -config=<file|stdin:> [-format=json|pb]   same, xray's own invocation");
+    eprintln!(
+        "  ferrox-app [no arguments]         serve a discovered config.json, or stdin, as xray does"
+    );
     eprintln!("  ferrox-app mint-foxy-pass -c <config.json> -o <pass.json>");
     eprintln!("                                sign in once, store the proxy pass (0600)");
     eprintln!(
@@ -250,7 +253,9 @@ fn cmd_run(link_str: &str, opt_in: UnsafeOptIn) {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let cmd = args.next().unwrap_or_else(|| usage());
+    let Some(cmd) = args.next() else {
+        serve_from_flags(&[]);
+    };
     match cmd.as_str() {
         "check" => {
             let (link, opt_in) = link_and_opt_in(&mut args);
@@ -258,7 +263,7 @@ fn main() {
         }
         "run" => {
             let rest: Vec<String> = args.collect();
-            if rest.first().is_some_and(|arg| is_serve_flag(arg)) {
+            if rest.is_empty() || rest.first().is_some_and(|arg| is_serve_flag(arg)) {
                 serve_from_flags(&rest);
             }
             let mut iter = rest.into_iter();
@@ -368,7 +373,7 @@ fn serve_from_flags(args: &[String]) -> ! {
         );
         std::process::exit(1);
     }
-    let Some(source) = configs.pop() else { usage() };
+    let source = configs.pop().unwrap_or_else(discover_config);
     let format = source_format(format.as_deref(), &source);
     if source == "stdin" || source == "stdin:" {
         let mut bytes = Vec::new();
@@ -389,6 +394,39 @@ fn serve_from_flags(args: &[String]) -> ! {
 enum SourceFormat {
     Json,
     Protobuf,
+}
+
+/// xray's search when no `-config` is given: a `config.*` in the working directory, then
+/// `xray.location.config`'s `config.json` (the executable's directory when unset), then stdin.
+fn discover_config() -> String {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(dir) = std::env::current_dir() {
+        for name in [
+            "config.json",
+            "config.jsonc",
+            "config.toml",
+            "config.yaml",
+            "config.yml",
+        ] {
+            candidates.push(dir.join(name));
+        }
+    }
+    let installed = std::env::var_os("xray.location.config")
+        .or_else(|| std::env::var_os("XRAY_LOCATION_CONFIG"))
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+        });
+    candidates.extend(installed.map(|dir| dir.join("config.json")));
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .map_or_else(
+            || "stdin:".to_owned(),
+            |path| path.to_string_lossy().into_owned(),
+        )
 }
 
 /// xray infers the format from the extension when `-format` is absent; a stream
