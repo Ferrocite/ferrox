@@ -122,6 +122,13 @@ PSIPHON_AGGRESSIVE=""
 PSIPHON_FEATURES=""
 PSIPHON_LATENCY=""
 PSIPHON_CDN_PROFILE=""
+PSIPHON_CDN_IPS=""
+PSIPHON_CDN_SNI=""
+PSIPHON_CDN_SETS=""
+PSIPHON_UNSAFE_ALERTS=0
+PSIPHON_LOCATION_PRECISION=""
+PSIPHON_SHARE_PORT=""
+PSIPHON_SHARE_HTTP=""
 PSIPHON_GEOIP=""
 PSIPHON_REJECT_CENSORED=0
 PSIPHON_REJECT_COUNTRIES=""
@@ -298,6 +305,13 @@ psiphon options (the client's own binary, its own tunnel, and the lane's local S
   --psiphon-latency N    network timeout multiplier, at least 1
   --psiphon-disable-timeouts  ask the client for a 0.1 latency lambda
   --psiphon-cdn-profile NAME  shirokhorshid|legacy|android|off built-in CDN edges and SNI
+  --psiphon-cdn-ip LIST  CDN edge IPs the client scans (comma separated)
+  --psiphon-cdn-sni LIST CDN edge SNI names the client scans (comma separated)
+  --psiphon-cdn-set LIST built-in CDN edge sets to keep (comma separated)
+  --psiphon-unsafe-alerts  ask the client for unsafe-traffic alerts
+  --psiphon-location-precision N  report coarse location when N is above zero
+  --psiphon-share-port PORT  the shared SOCKS port on every interface
+  --psiphon-share-http PORT  the shared HTTP proxy port on every interface
   --psiphon-geoip FILE   MaxMind country database for in-proxy country checks
   --psiphon-reject-censored   reject in-proxy relays in IR, CN, RU, BY, TM, KP
   --psiphon-reject-country LIST  reject these in-proxy country codes
@@ -855,7 +869,9 @@ psiphon_outbound() {
     "$PSIPHON_NETWORK_ID" "$PSIPHON_ADDITIONAL_PARAMS" "$PSIPHON_ESTABLISH_TIMEOUT" \
     "$PSIPHON_EMIT_BYTES" "$PSIPHON_CONDUIT_MODE" "$PSIPHON_CONDUIT_TIMEOUT" \
     "$PSIPHON_SHARE" "$PSIPHON_SERVER_LISTS" "$PSIPHON_OSL" "$PSIPHON_ENTRY_KEY" \
-    "$PSIPHON_EXCHANGE_KEY" <<'PY'
+    "$PSIPHON_EXCHANGE_KEY" "$PSIPHON_CDN_IPS" "$PSIPHON_CDN_SNI" "$PSIPHON_CDN_SETS" \
+    "$PSIPHON_UNSAFE_ALERTS" "$PSIPHON_LOCATION_PRECISION" "$PSIPHON_SHARE_PORT" \
+    "$PSIPHON_SHARE_HTTP" <<'PY'
 import json, sys
 
 (binary, state, listen, http, region, shape, ready, base, entries, upstream,
@@ -863,7 +879,8 @@ import json, sys
  latency, cdn_profile, geoip, reject_censored, reject_countries, compartment,
  disable_timeouts, dns_alternate, device_location, device_region, network_id,
  additional_params, establish_timeout, emit_bytes, conduit_mode, conduit_timeout,
- share, server_lists, osl, entry_key, exchange_key) = sys.argv[1:]
+ share, server_lists, osl, entry_key, exchange_key, cdn_ips, cdn_sni,
+ cdn_sets, unsafe_alerts, location_precision, share_port, share_http) = sys.argv[1:]
 settings = {"dataRootDirectory": state}
 if binary:
     settings["binary"] = binary
@@ -905,6 +922,22 @@ if latency:
     settings["networkLatencyMultiplier"] = float(latency)
 if cdn_profile:
     settings["cdnProfile"] = cdn_profile
+for key, value in (
+    ("cdnIps", cdn_ips),
+    ("cdnSni", cdn_sni),
+    ("cdnSets", cdn_sets),
+):
+    listed = [item.strip() for item in value.split(",") if item.strip()]
+    if listed:
+        settings[key] = listed
+if unsafe_alerts == "1":
+    settings["unsafeTrafficAlerts"] = True
+if location_precision.isdigit():
+    settings["deviceLocationPrecision"] = int(location_precision)
+if share_port.isdigit():
+    settings["shareProxyOnNetworkSocksPort"] = int(share_port)
+if share_http.isdigit():
+    settings["shareProxyOnNetworkHttpPort"] = int(share_http)
 if geoip:
     settings["geoIp"] = geoip
 if reject_censored == "1":
@@ -2406,6 +2439,13 @@ while [ $# -gt 0 ]; do
     --psiphon-latency) need_value --psiphon-latency "a multiplier of at least 1" "$#" "${2:-}"; PSIPHON_LATENCY="$2"; shift 2 ;;
     --psiphon-disable-timeouts) PSIPHON_DISABLE_TIMEOUTS=1; shift ;;
     --psiphon-cdn-profile) need_value --psiphon-cdn-profile "shirokhorshid, legacy, android or off" "$#" "${2:-}"; case "$2" in shirokhorshid|legacy|android|off) PSIPHON_CDN_PROFILE="$2" ;; *) die "--psiphon-cdn-profile wants shirokhorshid, legacy, android or off, got '$2'; nothing was started." ;; esac; shift 2 ;;
+    --psiphon-cdn-ip) need_value --psiphon-cdn-ip "CDN edge addresses" "$#" "${2:-}"; PSIPHON_CDN_IPS="$2"; shift 2 ;;
+    --psiphon-cdn-sni) need_value --psiphon-cdn-sni "CDN edge names" "$#" "${2:-}"; PSIPHON_CDN_SNI="$2"; shift 2 ;;
+    --psiphon-cdn-set) need_value --psiphon-cdn-set "built-in CDN set names" "$#" "${2:-}"; PSIPHON_CDN_SETS="$2"; shift 2 ;;
+    --psiphon-unsafe-alerts) PSIPHON_UNSAFE_ALERTS=1; shift ;;
+    --psiphon-location-precision) need_value --psiphon-location-precision "a precision above zero" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*) die "--psiphon-location-precision wants a number above zero, got '$2'; nothing was started." ;; esac; PSIPHON_LOCATION_PRECISION="$2"; shift 2 ;;
+    --psiphon-share-port) need_value --psiphon-share-port "a port" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*|0) die "--psiphon-share-port wants a port, got '$2'; nothing was started." ;; esac; PSIPHON_SHARE_PORT="$2"; PSIPHON_SHARE=1; shift 2 ;;
+    --psiphon-share-http) need_value --psiphon-share-http "a port" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*|0) die "--psiphon-share-http wants a port, got '$2'; nothing was started." ;; esac; PSIPHON_SHARE_HTTP="$2"; PSIPHON_SHARE=1; shift 2 ;;
     --psiphon-geoip) need_value --psiphon-geoip "a MaxMind database" "$#" "${2:-}"; PSIPHON_GEOIP="$2"; shift 2 ;;
     --psiphon-reject-censored) PSIPHON_REJECT_CENSORED=1; shift ;;
     --psiphon-reject-country) need_value --psiphon-reject-country "country codes" "$#" "${2:-}"; PSIPHON_REJECT_COUNTRIES="$2"; shift 2 ;;

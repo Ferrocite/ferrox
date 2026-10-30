@@ -16678,10 +16678,19 @@ fn dial_socks_outbound(
             dial_http_outbound(client, server, http, target, ladder);
         }
         Outbound::Socks(socks) => {
-            dial_socks_client(client, server, &socks.credential, socks.version, target);
+            let destination = socks_destination(target);
+            dial_socks_client(
+                client,
+                server,
+                &socks.credential,
+                socks.version,
+                &destination,
+            );
         }
         Outbound::Psiphon(lane) => {
-            dial_socks_client(client, server, lane.credential(), lane.version(), target);
+            let destination = socks_destination(target);
+            let (version, credential) = lane.session(&destination);
+            dial_socks_client(client, server, credential, version, &destination);
         }
         Outbound::Foxy(_)
         | Outbound::Veepn(_)
@@ -16703,17 +16712,8 @@ fn dial_socks_outbound(
 ///
 /// The destination keeps its shape on the wire: a name the caller asked for is a name in
 /// the request, so the server resolves it and this tree's resolver never sees it.
-fn dial_socks_client(
-    client: &Connection,
-    server: &SocketAddr,
-    credential: &crate::socks::Credential,
-    version: crate::socks::Version,
-    target: &Destination,
-) {
-    let Some(upstream) = dial_or_report(server) else {
-        return;
-    };
-    let destination = match target {
+fn socks_destination(target: &Destination) -> crate::socks::Destination<'_> {
+    match target {
         Destination::Address(address) => match address.ip() {
             std::net::IpAddr::V4(octets) => {
                 crate::socks::Destination::V4(octets.octets(), address.port())
@@ -16723,8 +16723,20 @@ fn dial_socks_client(
             }
         },
         Destination::Name(host, port) => crate::socks::Destination::Name(host.as_bytes(), *port),
+    }
+}
+
+fn dial_socks_client(
+    client: &Connection,
+    server: &SocketAddr,
+    credential: &crate::socks::Credential,
+    version: crate::socks::Version,
+    destination: &crate::socks::Destination<'_>,
+) {
+    let Some(upstream) = dial_or_report(server) else {
+        return;
     };
-    let Some(tunnel) = crate::socks::connect(upstream, credential, &destination, version) else {
+    let Some(tunnel) = crate::socks::connect(upstream, credential, destination, version) else {
         return;
     };
     relay_handoff(client, &tunnel);
@@ -20657,7 +20669,7 @@ pub(crate) const RELAY_BUFFER: usize = 64 * 1024;
 
 pub(crate) const RELAY_SMALL_BUFFER: usize = 16 * 1024;
 
-/// `read` takes the whole buffer and only the reported prefix escapes; no `Debug`, which would read uninit bytes.
+/// `read` takes the whole buffer and only the reported prefix escapes.
 pub(crate) struct RelayBuf {
     bytes: Vec<u8>,
     moved: usize,
@@ -20672,16 +20684,9 @@ impl RelayBuf {
 
     /// The same shape at a caller-chosen read window, for a staging buffer whose headroom and tailroom must sit outside the window rather than shrink it.
     #[must_use]
-    #[allow(
-        clippy::uninit_vec,
-        reason = "the length is handed straight to `read`, and only the prefix it reports is ever read back"
-    )]
     pub fn with_len(len: usize) -> Self {
-        let mut bytes = Vec::with_capacity(len);
-        // SAFETY: only the prefix a read reports is ever read back, so the uninitialised tail is unreachable.
-        unsafe { bytes.set_len(len) };
         Self {
-            bytes,
+            bytes: vec![0; len],
             moved: 0,
             promote_to: RELAY_BUFFER,
         }
@@ -20700,7 +20705,7 @@ impl RelayBuf {
         &mut self.bytes
     }
 
-    /// The buffer leaves the type; every later read must be prefix-bounded like `open_chunk`'s or `poll_copy`'s, so the uninitialised tail is never read.
+    /// The buffer leaves the type; every later read is prefix-bounded like `open_chunk`'s or `poll_copy`'s, so bytes a read did not report are never sent.
     #[must_use]
     pub fn into_vec(self) -> Vec<u8> {
         self.bytes
@@ -20708,18 +20713,12 @@ impl RelayBuf {
 
     /// A read that filled the window promotes at once, and a leg whose reads are all short promotes once it has moved a whole window: `recv` returns what is queued rather than what was asked, so a busy leg would otherwise stay at 16 KiB for the life of the flow.
     #[must_use]
-    #[allow(
-        clippy::uninit_vec,
-        reason = "the room a promotion adds lies past the bytes the read reported, and the next read starts at index 0"
-    )]
     pub fn filled(&mut self, n: usize) -> &[u8] {
         self.moved = self.moved.saturating_add(n);
         if self.bytes.len() < self.promote_to
             && (n == self.bytes.len() || self.moved >= self.promote_to)
         {
-            self.bytes.reserve(self.promote_to - self.bytes.len());
-            // SAFETY: added room sits past the prefix and the next read overwrites it from index 0.
-            unsafe { self.bytes.set_len(self.promote_to) };
+            self.bytes.resize(self.promote_to, 0);
         }
         &self.bytes[..n]
     }
