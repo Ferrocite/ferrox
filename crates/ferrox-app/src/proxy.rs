@@ -7882,7 +7882,9 @@ fn relay_vless_reply<S>(
         let Some(raw) = raw else { return };
         return seize_fallback_tls(session, &raw, rows, window, &carried, front);
     };
-    let mut uplink = uplink.with_meter(crate::stats::user(&user.email, user.level).reversed());
+    let user_meter = crate::stats::user(&user.email, user.level);
+    user_meter.write(2);
+    let mut uplink = uplink.with_meter(user_meter.reversed());
     if !carried.is_empty() && uplink.write_all(&carried).is_err() {
         close();
         return;
