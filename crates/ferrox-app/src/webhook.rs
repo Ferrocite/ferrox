@@ -58,7 +58,15 @@ pub(crate) struct Event<'a> {
 
 /// The rule's notifier, or `None` for an entry that names no URL: the reference builds none either.
 pub(crate) fn parse(field: &Json) -> Result<Option<Arc<Webhook>>, String> {
-    let url = field.get("url").and_then(Json::as_str).unwrap_or("");
+    if matches!(field, Json::Null) {
+        return Ok(None);
+    }
+    crate::router::object(field, "webhook")?;
+    let url = match field.get("url") {
+        None => return Ok(None),
+        Some(Json::Str(url)) => url,
+        Some(_) => return Err("webhook url is not a string".to_owned()),
+    };
     if url.is_empty() {
         return Ok(None);
     }
@@ -74,10 +82,12 @@ pub(crate) fn parse(field: &Json) -> Result<Option<Arc<Webhook>>, String> {
             }
         }
     }
-    let deduplication = field
-        .get("deduplication")
-        .and_then(Json::as_u32)
-        .unwrap_or(0);
+    let deduplication = match field.get("deduplication") {
+        None | Some(Json::Null) => 0,
+        Some(value) => value
+            .as_u32()
+            .ok_or_else(|| "webhook deduplication is not a non-negative integer".to_owned())?,
+    };
     Ok(Some(Arc::new(Webhook {
         url,
         socket,
