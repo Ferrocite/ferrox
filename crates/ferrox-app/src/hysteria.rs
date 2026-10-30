@@ -220,7 +220,18 @@ impl Driver {
 }
 
 /// Write a stream's whole buffer under the send budget, releasing the pacer before it parks so a reader can answer.
-pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
+pub(crate) fn send_all(session: &Session, stream: u64, buf: &[u8], fin: bool) -> bool {
+    send_all_metered(session, stream, buf, fin, None)
+}
+
+/// Sends under the budget and counts each slice the connection accepts as it leaves.
+fn send_all_metered(
+    session: &Session,
+    stream: u64,
+    mut buf: &[u8],
+    fin: bool,
+    meter: Option<&crate::stats::Meter>,
+) -> bool {
     let deadline = Instant::now() + crate::quic::SEND_WAIT;
     let mut paced = false;
     loop {
@@ -234,6 +245,9 @@ pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool
         };
         match conn.stream_send(stream, buf, fin && last) {
             Ok(written) => {
+                if let Some(meter) = meter {
+                    meter.write(written);
+                }
                 buf = &buf[written..];
                 crate::quic::flush_egress(&mut conn, &session.sock);
                 if buf.is_empty() && (!fin || last) {
@@ -581,6 +595,7 @@ pub(crate) struct Flow {
 }
 
 impl Flow {
+    /// Adds counters to the flow while keeping the ones it already carries.
     pub(crate) fn with_meter(mut self, meter: crate::stats::Meter) -> Self {
         self.meter = self.meter.merged(meter);
         self
@@ -789,8 +804,7 @@ impl Write for Flow {
         if buf.is_empty() {
             return Ok(0);
         }
-        if send_all(&self.session, self.stream, buf, false) {
-            self.meter.write(buf.len());
+        if send_all_metered(&self.session, self.stream, buf, false, Some(&self.meter)) {
             Ok(buf.len())
         } else {
             Err(broken())

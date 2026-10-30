@@ -3524,6 +3524,7 @@ impl crate::proxy::Duplicate for QuicStream {
 
 impl QuicStream {
     /// Counts both directions against the caller's meters, keeping any an earlier layer already set.
+    /// Adds counters to the stream while keeping the ones it already carries.
     pub(crate) fn with_meter(mut self, meter: crate::stats::Meter) -> Self {
         self.meter = self.meter.merged(meter);
         self

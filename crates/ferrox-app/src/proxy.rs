@@ -9756,6 +9756,7 @@ fn dial_ss_xdrive(client: &Connection, ss: &ShadowsocksOut, target: &Destination
     crate::shadowsocks::pump_relay_carried(client, session, writer, &close, send, recv);
 }
 
+/// Arms the xdrive front's inbound meter before the store serves a session.
 fn serve_vless_xdrive_inbound(
     address: &str,
     inbound: &Json,
@@ -44620,6 +44621,7 @@ mod tests {
     }
 
     #[test]
+    /// The hysteria front serves its own TLS handshake and meters the VLESS flow it accepts.
     fn hysteria_inbound_takes_tls_as_its_own_handshake() {
         let _serial = quic_serial();
         let _stats = crate::stats::test_lock();

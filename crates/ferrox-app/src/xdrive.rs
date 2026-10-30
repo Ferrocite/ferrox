@@ -1325,6 +1325,7 @@ impl Conn {
         }
     }
 
+    /// Adds counters to the session while keeping the ones it already carries.
     pub(crate) fn with_meter(mut self, meter: crate::stats::Meter) -> Self {
         self.meter = self.meter.merged(meter);
         self
