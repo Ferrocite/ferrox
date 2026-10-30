@@ -863,8 +863,9 @@ fn serve_vless_inbound(
             let owned = address.to_owned();
             if let Carrier::Kcp(config) = carrier {
                 let users = Arc::clone(&users);
+                let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
                 let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
-                    serve_vless_kcp(conn, &users, freedom);
+                    serve_vless_kcp(conn, &users, freedom, meter.clone());
                 });
                 return serve_kcp_bound(&owned, config, &serve);
             }
@@ -6755,8 +6756,9 @@ fn serve_vless_tls_inbound(
     if let Carrier::Kcp(config) = carrier {
         let config = config.clone();
         let users = Arc::clone(users);
+        let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
         let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
-            serve_vless_kcp_tls(conn, &users, freedom, &server);
+            serve_vless_kcp_tls(conn, &users, freedom, &server, meter.clone());
         });
         return serve_kcp_bound(&owned, config, &serve);
     }
@@ -6816,8 +6818,9 @@ fn serve_vless_reality_inbound(
         let config = config.clone();
         let users = Arc::clone(users);
         let server = Arc::new(server);
+        let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
         let serve: KcpServe = Arc::new(move |conn: &Arc<ferrox_core::kcp::Connection>| {
-            serve_vless_kcp_reality(conn, &users, freedom, &server);
+            serve_vless_kcp_reality(conn, &users, freedom, &server, meter.clone());
         });
         return serve_kcp_bound(&owned, config, &serve);
     }
@@ -7287,13 +7290,10 @@ fn serve_vless_kcp_tls(
     users: &[VlessUser],
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
+    meter: crate::stats::Meter,
 ) {
-    let Ok(mut tls) = ferrox_core::tls::accept(
-        server,
-        KcpIo {
-            conn: Arc::clone(conn),
-        },
-    ) else {
+    let Ok(mut tls) = ferrox_core::tls::accept(server, KcpIo::with_meter(Arc::clone(conn), meter))
+    else {
         return;
     };
     if !shake_tls(&mut tls) {
@@ -7861,7 +7861,12 @@ fn relay_vless_reply<S>(
     };
     match reverse_ask(users, &header.0, header.1, header.2) {
         ReverseAsk::Allowed(portal) => {
-            attach_reverse_session(portal, session, raw);
+            attach_reverse_session(
+                portal,
+                session,
+                raw,
+                crate::stats::user(&user.email, user.level),
+            );
             return;
         }
         ReverseAsk::Refused => return,
@@ -7871,12 +7876,15 @@ fn relay_vless_reply<S>(
         return;
     }
     let wire_id = header.0;
-    let Some((flow, mut uplink, close)) = open_vless(&mut session, raw.as_ref(), freedom, header)
+    let Some((flow, uplink, close)) = open_vless(&mut session, raw.as_ref(), freedom, header)
     else {
         let Some(rows) = fallbacks else { return };
         let Some(raw) = raw else { return };
         return seize_fallback_tls(session, &raw, rows, window, &carried, front);
     };
+    let user_meter = crate::stats::user(&user.email, user.level);
+    user_meter.write(2);
+    let mut uplink = uplink.with_meter(user_meter.reversed());
     if !carried.is_empty() && uplink.write_all(&carried).is_err() {
         close();
         return;
@@ -7983,21 +7991,28 @@ impl<T> Grain<T> {
 impl<T> Half<T> {
     /// The two directions as a reverse tunnel: the reader owns one handle and the writers share
     /// the other, so a flow parked in a read still does not block its sibling's write.
-    fn into_tunnel(self, closer: Arc<dyn Fn() + Send + Sync>) -> crate::reverse::Tunnel
+    fn into_tunnel(
+        self,
+        closer: Arc<dyn Fn() + Send + Sync>,
+        meter: crate::stats::Meter,
+    ) -> crate::reverse::Tunnel
     where
         T: std::io::Read + std::io::Write + Send + 'static,
     {
         match self {
             Self::Split { read, write } => crate::reverse::Tunnel::new(
-                Box::new(
-                    read.into_inner()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner),
-                ),
-                Box::new(
-                    write
+                Box::new(MeteredIo {
+                    inner: read
                         .into_inner()
                         .unwrap_or_else(std::sync::PoisonError::into_inner),
-                ),
+                    meter: meter.clone(),
+                }),
+                Box::new(MeteredIo {
+                    inner: write
+                        .into_inner()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    meter,
+                }),
                 closer,
             ),
             Self::Shared { inner, .. } => {
@@ -8007,8 +8022,14 @@ impl<T> Half<T> {
                         .unwrap_or_else(std::sync::PoisonError::into_inner),
                 ));
                 crate::reverse::Tunnel::new(
-                    Box::new(SharedRead(Arc::clone(&shared))),
-                    Box::new(SharedWrite(shared)),
+                    Box::new(MeteredIo {
+                        inner: SharedRead(Arc::clone(&shared)),
+                        meter: meter.clone(),
+                    }),
+                    Box::new(MeteredIo {
+                        inner: SharedWrite(shared),
+                        meter,
+                    }),
                     closer,
                 )
             }
@@ -8946,9 +8967,21 @@ fn dial_vless_rung(
 #[derive(Clone)]
 struct KcpIo {
     conn: Arc<ferrox_core::kcp::Connection>,
+    meter: crate::stats::Meter,
 }
 
 impl KcpIo {
+    fn new(conn: Arc<ferrox_core::kcp::Connection>) -> Self {
+        Self {
+            conn,
+            meter: crate::stats::Meter::default(),
+        }
+    }
+
+    fn with_meter(conn: Arc<ferrox_core::kcp::Connection>, meter: crate::stats::Meter) -> Self {
+        Self { conn, meter }
+    }
+
     fn close(&self) {
         self.conn.close();
     }
@@ -8986,7 +9019,10 @@ impl Read for KcpIo {
         };
         self.conn.set_read_deadline(Instant::now() + quantum);
         match self.conn.read(buf) {
-            Ok(n) => Ok(n),
+            Ok(n) => {
+                self.meter.read(n);
+                Ok(n)
+            }
             Err(ferrox_core::kcp::ConnError::IoTimeout) => {
                 Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
             }
@@ -9000,9 +9036,12 @@ impl Write for KcpIo {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.conn
+        let n = self
+            .conn
             .write(buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
+        self.meter.write(n);
+        Ok(n)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
@@ -9012,6 +9051,14 @@ impl Write for KcpIo {
 }
 
 fn kcp_relay(tcp: &Connection, conn: &Arc<ferrox_core::kcp::Connection>) {
+    kcp_relay_metered(tcp, conn, crate::stats::Meter::default());
+}
+
+fn kcp_relay_metered(
+    tcp: &Connection,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    meter: crate::stats::Meter,
+) {
     let Ok(mut tcp_read) = tcp.try_clone() else {
         return;
     };
@@ -9034,18 +9081,19 @@ fn kcp_relay(tcp: &Connection, conn: &Arc<ferrox_core::kcp::Connection>) {
     );
     let up = Arc::clone(conn);
     let forward = Arc::clone(&finish);
+    let downlink = meter.clone();
     let mut buffer = RelayBuf::new();
     lane_pool::submit(
         Box::new(move || {
             let next = match tcp_read.read(buffer.as_mut()) {
                 Ok(0) => Next::Done,
-                Ok(n) => {
-                    if up.write(buffer.filled(n)).is_ok() {
+                Ok(n) => match up.write(buffer.filled(n)) {
+                    Ok(written) => {
+                        downlink.write(written);
                         Next::More
-                    } else {
-                        Next::Done
                     }
-                }
+                    Err(_) => Next::Done,
+                },
                 Err(error) if is_timeout(&error) => {
                     if forward.ended() {
                         Next::Done
@@ -9069,9 +9117,7 @@ fn kcp_relay(tcp: &Connection, conn: &Arc<ferrox_core::kcp::Connection>) {
         }),
     );
     // The handshake's `KcpIo` leaves a 20 ms read deadline: a raw `conn.read` would answer an empty window with a terminal `IoTimeout` and half-close the client before the reply lands, so poll-retry the same quantum here.
-    let mut download = KcpIo {
-        conn: Arc::clone(conn),
-    };
+    let mut download = KcpIo::with_meter(Arc::clone(conn), meter);
     let backward = Arc::clone(&finish);
     let mut buffer = RelayBuf::new();
     lane_pool::submit(
@@ -9109,10 +9155,13 @@ fn kcp_relay(tcp: &Connection, conn: &Arc<ferrox_core::kcp::Connection>) {
     );
 }
 
-fn serve_vless_kcp(conn: &Arc<ferrox_core::kcp::Connection>, users: &[VlessUser], freedom: bool) {
-    let mut io = KcpIo {
-        conn: Arc::clone(conn),
-    };
+fn serve_vless_kcp(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    users: &[VlessUser],
+    freedom: bool,
+    meter: crate::stats::Meter,
+) {
+    let mut io = KcpIo::with_meter(Arc::clone(conn), meter.clone());
     let allows = |id: &[u8; 16], flow: Flow, cmd: u8| {
         freedom
             && cmd == 1
@@ -9131,13 +9180,21 @@ fn serve_vless_kcp(conn: &Arc<ferrox_core::kcp::Connection>, users: &[VlessUser]
     if !allows(&got, flow, cmd) {
         return;
     }
+    let Some(user) = users
+        .iter()
+        .find(|user| same_vless_user(&user.id, &got) && vless_flow_ok(user, flow, cmd, false))
+    else {
+        return;
+    };
+    let meter = meter.merged(crate::stats::user(&user.email, user.level));
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
-    if conn.write(&[0, 0]).is_err() {
+    let mut ack = KcpIo::with_meter(Arc::clone(conn), meter.clone());
+    if ack.write_all(&[0, 0]).is_err() {
         return;
     }
-    kcp_relay(&uplink, conn);
+    kcp_relay_metered(&uplink, conn, meter);
 }
 
 /// Hysteria v2 flow: acknowledge before dialing, so a refused dial reads as EOF rather than as a refusal.
@@ -9412,12 +9469,7 @@ fn kcp_tls_connect(
     conn: &Arc<ferrox_core::kcp::Connection>,
     cfg: &ferrox_core::tls::TlsConfig,
 ) -> Option<ferrox_core::tls::ClientSession<KcpIo>> {
-    let Ok(mut session) = ferrox_core::tls::connect(
-        cfg,
-        KcpIo {
-            conn: Arc::clone(conn),
-        },
-    ) else {
+    let Ok(mut session) = ferrox_core::tls::connect(cfg, KcpIo::new(Arc::clone(conn))) else {
         return None;
     };
     shake_tls(&mut session).then_some(session)
@@ -9453,12 +9505,7 @@ fn relay_kcp_under_tls(
             }
         })
     };
-    let (reader, writer) = session_halves(
-        session,
-        KcpIo {
-            conn: Arc::clone(conn),
-        },
-    );
+    let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(conn)));
     relay_shared(
         Half::socket(downstream),
         Half::split(reader, writer),
@@ -9482,9 +9529,7 @@ fn dial_vless_kcp(
     if conn.write(&header).is_err() {
         return;
     }
-    let mut io = KcpIo {
-        conn: Arc::clone(conn),
-    };
+    let mut io = KcpIo::new(Arc::clone(conn));
     let pump = Pump::over(client, {
         let conn = Arc::clone(conn);
         move |bytes| conn.write(bytes).is_ok()
@@ -9502,13 +9547,12 @@ fn serve_vless_kcp_reality(
     users: &[VlessUser],
     freedom: bool,
     server: &ferrox_core::tls::RealityServerConfig,
+    meter: crate::stats::Meter,
 ) {
     let accepted = ferrox_core::tls::RealityServer::accept(
         server,
         unix_millis(),
-        KcpIo {
-            conn: Arc::clone(conn),
-        },
+        KcpIo::with_meter(Arc::clone(conn), meter),
         Edges::default(),
     );
     let Ok(accepted) = accepted else {
@@ -9525,10 +9569,13 @@ fn serve_vless_kcp_reality(
     }
 }
 
-fn serve_trojan_kcp(conn: &Arc<ferrox_core::kcp::Connection>, key: &[[u8; 56]], freedom: bool) {
-    let mut io = KcpIo {
-        conn: Arc::clone(conn),
-    };
+fn serve_trojan_kcp(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    key: &[[u8; 56]],
+    freedom: bool,
+    meter: crate::stats::Meter,
+) {
+    let mut io = KcpIo::with_meter(Arc::clone(conn), meter.clone());
     let Some((cmd, target)) = decode_trojan_request(&mut io, key) else {
         return;
     };
@@ -9537,7 +9584,7 @@ fn serve_trojan_kcp(conn: &Arc<ferrox_core::kcp::Connection>, key: &[[u8; 56]], 
     }
     crate::accesslog::record_current(&target);
     if cmd == 3 {
-        let (reader, writer, close) = kcp_parts(conn);
+        let (reader, writer, close) = kcp_parts_metered(conn, meter);
         return serve_trojan_udp_halves(reader, writer, move || close());
     }
     if cmd != 1 {
@@ -9546,7 +9593,7 @@ fn serve_trojan_kcp(conn: &Arc<ferrox_core::kcp::Connection>, key: &[[u8; 56]], 
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
-    kcp_relay(&uplink, conn);
+    kcp_relay_metered(&uplink, conn, meter);
 }
 
 fn serve_trojan_kcp_tls(
@@ -9554,19 +9601,17 @@ fn serve_trojan_kcp_tls(
     key: &[[u8; 56]],
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
+    meter: crate::stats::Meter,
 ) {
-    let Ok(mut tls) = ferrox_core::tls::accept(
-        server,
-        KcpIo {
-            conn: Arc::clone(conn),
-        },
-    ) else {
+    let Ok(mut tls) =
+        ferrox_core::tls::accept(server, KcpIo::with_meter(Arc::clone(conn), meter.clone()))
+    else {
         return;
     };
     if !shake_tls(&mut tls) {
         return;
     }
-    relay_trojan(tls, None, Some(Arc::clone(conn)), key, freedom);
+    relay_trojan(tls, None, Some(Arc::clone(conn)), key, freedom, meter);
 }
 
 fn kcp_dial_session(
@@ -9623,12 +9668,7 @@ fn dial_vmess_kcp(
         {
             return;
         }
-        let (reader, writer) = session_halves(
-            session,
-            KcpIo {
-                conn: Arc::clone(conn),
-            },
-        );
+        let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(conn)));
         let close = kcp_close(conn);
         crate::vmess::pump_relay_carried(client, reader, writer, &close, send, recv, None);
         return;
@@ -9636,9 +9676,7 @@ fn dial_vmess_kcp(
     if conn.write(&request).is_err() {
         return;
     }
-    let mut reader = KcpIo {
-        conn: Arc::clone(conn),
-    };
+    let mut reader = KcpIo::new(Arc::clone(conn));
     if !crate::vmess::read_response(&mut reader, &response_key, &response_iv, auth) {
         return;
     }
@@ -9670,12 +9708,7 @@ fn dial_ss_kcp(
             ) else {
                 return;
             };
-            let (reader, writer) = session_halves(
-                session,
-                KcpIo {
-                    conn: Arc::clone(conn),
-                },
-            );
+            let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(conn)));
             let close = kcp_close(conn);
             crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
             return;
@@ -9688,19 +9721,12 @@ fn dial_ss_kcp(
         ) else {
             return;
         };
-        let (reader, writer) = session_halves(
-            session,
-            KcpIo {
-                conn: Arc::clone(conn),
-            },
-        );
+        let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(conn)));
         let close = kcp_close(conn);
         crate::shadowsocks::pump_relay_carried(client, reader, writer, &close, send, recv);
         return;
     }
-    let mut writer = KcpIo {
-        conn: Arc::clone(conn),
-    };
+    let mut writer = KcpIo::new(Arc::clone(conn));
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
         let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
             &mut writer,
@@ -9728,24 +9754,17 @@ fn serve_ss_kcp_tls(
     accounts: &crate::shadowsocks::SsAccounts,
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
+    meter: crate::stats::Meter,
 ) {
-    let Ok(mut tls) = ferrox_core::tls::accept(
-        server,
-        KcpIo {
-            conn: Arc::clone(conn),
-        },
-    ) else {
+    let Ok(mut tls) =
+        ferrox_core::tls::accept(server, KcpIo::with_meter(Arc::clone(conn), meter.clone()))
+    else {
         return;
     };
     if !shake_tls(&mut tls) {
         return;
     }
-    let (reader, writer) = session_halves(
-        tls,
-        KcpIo {
-            conn: Arc::clone(conn),
-        },
-    );
+    let (reader, writer) = session_halves(tls, KcpIo::with_meter(Arc::clone(conn), meter));
     let close = kcp_close(conn);
     if accounts.is_2022 {
         crate::shadowsocks2022::serve_kcp(
@@ -10064,15 +10083,16 @@ type KcpServe = Arc<dyn Fn(&Arc<ferrox_core::kcp::Connection>) + Send + Sync>;
 type KcpClose = Arc<dyn Fn() + Send + Sync>;
 
 fn kcp_parts(conn: &Arc<ferrox_core::kcp::Connection>) -> (KcpIo, KcpIo, KcpClose) {
-    let reader = KcpIo {
-        conn: Arc::clone(conn),
-    };
-    let writer = KcpIo {
-        conn: Arc::clone(conn),
-    };
-    let closer = KcpIo {
-        conn: Arc::clone(conn),
-    };
+    kcp_parts_metered(conn, crate::stats::Meter::default())
+}
+
+fn kcp_parts_metered(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    meter: crate::stats::Meter,
+) -> (KcpIo, KcpIo, KcpClose) {
+    let reader = KcpIo::with_meter(Arc::clone(conn), meter.clone());
+    let writer = KcpIo::with_meter(Arc::clone(conn), meter);
+    let closer = KcpIo::new(Arc::clone(conn));
     let close: KcpClose = Arc::new(move || closer.close());
     (reader, writer, close)
 }
@@ -10250,6 +10270,7 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
         Carrier::Kcp(config) => {
             let email = account.email.clone();
             let level = account.level;
+            let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
             let serve: KcpServe = if sec == "tls" {
                 let Some(server) = inbound_tls_identity(inbound) else {
                     eprintln!("unreadable trojan tls identity on {address}: refused, not served");
@@ -10257,12 +10278,12 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
                 };
                 Arc::new(move |conn| {
                     let _flow = crate::accesslog::flow(None, &email, level);
-                    serve_trojan_kcp_tls(conn, &key, freedom, &server);
+                    serve_trojan_kcp_tls(conn, &key, freedom, &server, meter.clone());
                 })
             } else {
                 Arc::new(move |conn| {
                     let _flow = crate::accesslog::flow(None, &email, level);
-                    serve_trojan_kcp(conn, &key, freedom);
+                    serve_trojan_kcp(conn, &key, freedom, meter.clone());
                 })
             };
             serve_kcp_bound(address, config, &serve)
@@ -10346,6 +10367,7 @@ fn serve_vmess_inbound_users(
         Carrier::Kcp(config) => {
             let email = account.email.clone();
             let level = account.level;
+            let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
             let serve: KcpServe = if sec == "tls" {
                 let Some(server) = inbound_tls_identity(inbound) else {
                     eprintln!("unreadable vmess tls identity on {address}: refused, not served");
@@ -10354,13 +10376,13 @@ fn serve_vmess_inbound_users(
                 let kcp_users = std::sync::Arc::clone(users);
                 Arc::new(move |conn| {
                     let _flow = crate::accesslog::flow(None, &email, level);
-                    serve_vmess_kcp_tls(conn, &kcp_users, freedom, &server);
+                    serve_vmess_kcp_tls(conn, &kcp_users, freedom, &server, meter.clone());
                 })
             } else {
                 let owned_users = std::sync::Arc::clone(users);
                 Arc::new(move |conn| {
                     let _flow = crate::accesslog::flow(None, &email, level);
-                    let (reader, writer, close) = kcp_parts(conn);
+                    let (reader, writer, close) = kcp_parts_metered(conn, meter.clone());
                     crate::vmess::serve_kcp(reader, writer, &owned_users, freedom, &close);
                 })
             };
@@ -10628,6 +10650,7 @@ fn serve_ss_kcp_listener(
 ) -> bool {
     let accounts = Arc::clone(accounts);
     let email = email.to_owned();
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
     let serve: KcpServe = if stream_security(inbound) == "tls" {
         let Some(server) = inbound_tls_identity(inbound) else {
             eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
@@ -10637,12 +10660,12 @@ fn serve_ss_kcp_listener(
         let accounts = Arc::clone(&accounts);
         Arc::new(move |conn| {
             let _flow = crate::accesslog::flow(None, &email, level);
-            serve_ss_kcp_tls(conn, &accounts, freedom, &server);
+            serve_ss_kcp_tls(conn, &accounts, freedom, &server, meter.clone());
         })
     } else {
         Arc::new(move |conn| {
             let _flow = crate::accesslog::flow(None, &email, level);
-            let (reader, writer, close) = kcp_parts(conn);
+            let (reader, writer, close) = kcp_parts_metered(conn, meter.clone());
             if accounts.is_2022 {
                 crate::shadowsocks2022::serve_kcp(
                     reader,
@@ -11136,12 +11159,7 @@ fn open_vmess_udp_kcp(
                 return None;
             }
         }
-        let (reader, writer) = session_halves(
-            session,
-            KcpIo {
-                conn: Arc::clone(&conn),
-            },
-        );
+        let (reader, writer) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
         return Some(CarriedVmess {
             reader: Box::new(reader),
             writer: Box::new(writer),
@@ -11153,9 +11171,7 @@ fn open_vmess_udp_kcp(
     if conn.write(&request).is_err() {
         return None;
     }
-    let mut reader = KcpIo {
-        conn: Arc::clone(&conn),
-    };
+    let mut reader = KcpIo::new(Arc::clone(&conn));
     {
         let mut bounded = HandshakeDeadline {
             inner: &mut reader,
@@ -11165,9 +11181,7 @@ fn open_vmess_udp_kcp(
             return None;
         }
     }
-    let writer = KcpIo {
-        conn: Arc::clone(&conn),
-    };
+    let writer = KcpIo::new(Arc::clone(&conn));
     Some(CarriedVmess {
         reader: Box::new(reader),
         writer: Box::new(writer),
@@ -11628,22 +11642,11 @@ fn dial_trojan_udp_uplink(
         }
         (Carrier::Kcp(_), Some(cfg)) => {
             let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
-            let mut session = ferrox_core::tls::connect(
-                cfg,
-                KcpIo {
-                    conn: Arc::clone(&conn),
-                },
-            )
-            .ok()?;
+            let mut session = ferrox_core::tls::connect(cfg, KcpIo::new(Arc::clone(&conn))).ok()?;
             if !shake_tls(&mut session) || session.write_all(&header).is_err() {
                 return None;
             }
-            let (read, write) = session_halves(
-                session,
-                KcpIo {
-                    conn: Arc::clone(&conn),
-                },
-            );
+            let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
             let close = move || conn.close();
             (Box::new(read), Box::new(write), Box::new(close))
         }
@@ -15623,6 +15626,7 @@ fn relay_trojan<S>(
     kcp: Option<Arc<ferrox_core::kcp::Connection>>,
     key: &[[u8; 56]],
     freedom: bool,
+    meter: crate::stats::Meter,
 ) where
     S: std::io::Read
         + std::io::Write
@@ -15643,7 +15647,7 @@ fn relay_trojan<S>(
     let Some(header) = bounded else {
         return;
     };
-    relay_trojan_request(session, raw, kcp, header, freedom, &[]);
+    relay_trojan_request(session, raw, kcp, header, freedom, &[], meter);
 }
 
 /// A trojan front with fallbacks: the first read names the inbound or routes to the cover site.
@@ -15666,7 +15670,14 @@ fn relay_trojan_with_fallbacks<S>(
         + 'static,
 {
     let Some(rows) = fallbacks else {
-        return relay_trojan(session, raw, kcp, key, freedom);
+        return relay_trojan(
+            session,
+            raw,
+            kcp,
+            key,
+            freedom,
+            crate::stats::Meter::default(),
+        );
     };
     let mut window = [0u8; PROBE_READ];
     let n = {
@@ -15699,7 +15710,15 @@ fn relay_trojan_with_fallbacks<S>(
     let Some(header) = header else {
         return;
     };
-    relay_trojan_request(session, raw, kcp, header, freedom, &window[consumed..n]);
+    relay_trojan_request(
+        session,
+        raw,
+        kcp,
+        header,
+        freedom,
+        &window[consumed..n],
+        crate::stats::Meter::default(),
+    );
 }
 
 fn relay_trojan_request<S>(
@@ -15709,6 +15728,7 @@ fn relay_trojan_request<S>(
     (cmd, target): (u8, SocketAddr),
     freedom: bool,
     carried: &[u8],
+    meter: crate::stats::Meter,
 ) where
     S: std::io::Read
         + std::io::Write
@@ -15740,12 +15760,8 @@ fn relay_trojan_request<S>(
             return;
         }
         if let Some(kcp) = kcp {
-            let (reader, writer) = session_halves(
-                session,
-                KcpIo {
-                    conn: Arc::clone(&kcp),
-                },
-            );
+            let (reader, writer) =
+                session_halves(session, KcpIo::with_meter(Arc::clone(&kcp), meter));
             serve_trojan_udp_halves(
                 CarriedReader::new(carried.to_vec(), reader),
                 writer,
@@ -16038,24 +16054,17 @@ fn serve_vmess_kcp_tls(
     users: &crate::vmess::Users,
     freedom: bool,
     server: &ferrox_core::tls::TlsServerConfig,
+    meter: crate::stats::Meter,
 ) {
-    let Ok(mut tls) = ferrox_core::tls::accept(
-        server,
-        KcpIo {
-            conn: Arc::clone(conn),
-        },
-    ) else {
+    let Ok(mut tls) =
+        ferrox_core::tls::accept(server, KcpIo::with_meter(Arc::clone(conn), meter.clone()))
+    else {
         return;
     };
     if !shake_tls(&mut tls) {
         return;
     }
-    let (reader, writer) = session_halves(
-        tls,
-        KcpIo {
-            conn: Arc::clone(conn),
-        },
-    );
+    let (reader, writer) = session_halves(tls, KcpIo::with_meter(Arc::clone(conn), meter));
     let closer = Arc::clone(conn);
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.close());
     crate::vmess::serve_kcp(reader, writer, users, freedom, &close);
@@ -24162,6 +24171,7 @@ fn attach_reverse_session<S>(
     portal: &Arc<crate::reverse::Portal>,
     mut session: S,
     raw: Option<Connection>,
+    meter: crate::stats::Meter,
 ) -> bool
 where
     S: std::io::Read
@@ -24182,8 +24192,12 @@ where
         }
     });
     let tunnel = match driven_halves(session, RELAY_POLL) {
-        Ok(half) => half.into_tunnel(closer),
+        Ok(half) => half.into_tunnel(closer, meter),
         Err(session) => {
+            let session = MeteredIo {
+                inner: session,
+                meter,
+            };
             let shared = Arc::new(Mutex::new(session));
             crate::reverse::Tunnel::new(
                 Box::new(SharedRead(Arc::clone(&shared))),
@@ -33412,7 +33426,12 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let serving = thread::spawn(move || {
             let conn = listener.accept().expect("accepts");
-            serve_vless_kcp(&conn, &one_vless_user(&id), true);
+            serve_vless_kcp(
+                &conn,
+                &one_vless_user(&id),
+                true,
+                crate::stats::Meter::default(),
+            );
             let _ = done_tx.send(());
         });
         let server_addr: SocketAddr = format!("127.0.0.1:{kcp_port}").parse().expect("addr");
@@ -35725,13 +35744,9 @@ mod tests {
             ferrox_core::kcp::fresh_conversation(),
         )
         .expect("dials");
-        let mut tls = ferrox_core::tls::RustlsProvider::connect(
-            &client,
-            KcpIo {
-                conn: Arc::clone(&conn),
-            },
-        )
-        .expect("opens");
+        let mut tls =
+            ferrox_core::tls::RustlsProvider::connect(&client, KcpIo::new(Arc::clone(&conn)))
+                .expect("opens");
         assert!(shake_tls(&mut tls), "handshakes");
         let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         tls.write_all(&trojan_header(
@@ -35761,13 +35776,8 @@ mod tests {
         let kcp_port = listener.local_addr().port();
         let server = thread::spawn(move || {
             let conn = listener.accept().expect("accepts");
-            let mut tls = ferrox_core::tls::accept(
-                &server_config,
-                KcpIo {
-                    conn: Arc::clone(&conn),
-                },
-            )
-            .expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, KcpIo::new(Arc::clone(&conn)))
+                .expect("accepts");
             assert!(shake_tls(&mut tls), "handshakes");
             let (cmd, _asked) = decode_trojan_request(&mut tls, &[key]).expect("reads the header");
             assert_eq!(cmd, 1);
@@ -35841,13 +35851,9 @@ mod tests {
             ferrox_core::kcp::fresh_conversation(),
         )
         .expect("dials");
-        let mut tls = ferrox_core::tls::RustlsProvider::connect(
-            &client,
-            KcpIo {
-                conn: Arc::clone(&conn),
-            },
-        )
-        .expect("opens");
+        let mut tls =
+            ferrox_core::tls::RustlsProvider::connect(&client, KcpIo::new(Arc::clone(&conn)))
+                .expect("opens");
         assert!(shake_tls(&mut tls), "handshakes");
         let target = Destination::from(
             format!("127.0.0.1:{echo_port}")
@@ -35861,12 +35867,7 @@ mod tests {
             &target,
         )
         .expect("writes the header");
-        let (reader, writer) = session_halves(
-            tls,
-            KcpIo {
-                conn: Arc::clone(&conn),
-            },
-        );
+        let (reader, writer) = session_halves(tls, KcpIo::new(Arc::clone(&conn)));
         let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let dport = downstream.local_addr().expect("addr").port();
         let closer = Arc::clone(&conn);
@@ -36541,7 +36542,7 @@ mod tests {
             let users = crate::vmess::Users::single(id);
             let conn = listener.accept().expect("accepts");
             if let Some(server) = server {
-                serve_vmess_kcp_tls(&conn, &users, true, &server);
+                serve_vmess_kcp_tls(&conn, &users, true, &server, crate::stats::Meter::default());
                 return;
             }
             let (reader, writer, close) = kcp_parts(&conn);
@@ -36822,7 +36823,7 @@ mod tests {
         let port = listener.local_addr().port();
         let session = thread::spawn(move || {
             let conn = listener.accept().expect("accepts");
-            serve_vmess_kcp_tls(&conn, &users, true, &server);
+            serve_vmess_kcp_tls(&conn, &users, true, &server, crate::stats::Meter::default());
         });
         let outbound = crate::json::parse(&format!(
             r#"{{"outbounds": [{{"protocol": "vmess",
@@ -44461,7 +44462,12 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
             let conn = listener.accept().expect("accepts");
-            serve_vless_kcp(&conn, &one_vless_user(&id), true);
+            serve_vless_kcp(
+                &conn,
+                &one_vless_user(&id),
+                true,
+                crate::stats::Meter::default(),
+            );
             // The relay hands off, so the session outlives this call: keep the listener's feed alive.
             let _ = done_rx.recv();
         });
@@ -44475,9 +44481,7 @@ mod tests {
         )
         .expect("dials");
         conn.write(&header).expect("writes");
-        let mut io = KcpIo {
-            conn: Arc::clone(&conn),
-        };
+        let mut io = KcpIo::new(Arc::clone(&conn));
         read_vless_response(&mut io).expect("replies");
         conn.write(b"ping").expect("writes");
         conn.set_read_deadline(std::time::Instant::now() + std::time::Duration::from_secs(10));
@@ -44494,6 +44498,90 @@ mod tests {
         conn.close();
         let _ = done_tx.send(());
         server.join().expect("joins");
+    }
+
+    /// A production KCP listener moves both the inbound and the authenticated user's counters.
+    #[test]
+    fn a_vless_kcp_front_counts_the_flow_it_relays() {
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        enable_user_stats();
+        let echo_port = echo_loop();
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let kcp_port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let inbound = crate::json::parse(
+            r#"{"protocol": "vless", "tag": "kcp-in",
+                "settings": {"clients": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "email": "kcp@example", "level": 1}]},
+                "streamSettings": {"network": "kcp"}}"#,
+        )
+        .expect("parses");
+        let address = format!("127.0.0.1:{kcp_port}");
+        assert!(
+            serve_vless_inbound(
+                &address,
+                &inbound,
+                true,
+                "test",
+                &crate::reverse::Portals::default()
+            ),
+            "the kcp listener arms"
+        );
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let conn = ferrox_core::kcp::dial(
+            address.parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        conn.write(&vless_header(&id, 1, &target)).expect("writes");
+        let mut io = KcpIo::new(Arc::clone(&conn));
+        read_vless_response(&mut io).expect("replies");
+        let baseline = crate::stats::snapshot();
+        let before_inbound = baseline.inbound.get("kcp-in").copied().unwrap_or_default();
+        let before_user = baseline
+            .user
+            .get("kcp@example")
+            .copied()
+            .unwrap_or_default();
+        conn.write(b"ping").expect("writes");
+        conn.set_read_deadline(std::time::Instant::now() + Duration::from_secs(10));
+        let mut back = [0u8; 4];
+        let mut at = 0;
+        while at < back.len() {
+            let n = conn.read(&mut back[at..]).expect("echoes");
+            if n == 0 {
+                break;
+            }
+            at += n;
+        }
+        assert_eq!(&back, b"ping");
+        let snapshot = crate::stats::snapshot();
+        let inbound = &snapshot.inbound["kcp-in"];
+        assert!(
+            inbound.uplink > before_inbound.uplink,
+            "the relayed request moved the inbound uplink counter"
+        );
+        assert!(
+            inbound.downlink > before_inbound.downlink,
+            "the relayed reply moved the inbound downlink counter"
+        );
+        let user = &snapshot.user["kcp@example"];
+        assert!(
+            user.uplink > before_user.uplink,
+            "the relayed request moved the user uplink counter"
+        );
+        assert!(
+            user.downlink > before_user.downlink,
+            "the relayed reply moved the user downlink counter"
+        );
+        conn.close();
     }
 
     /// The security sits above KCP, as it does upstream: a VLESS session that declares tls is served and dialled through the raw connection.
@@ -44534,7 +44622,13 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
             let conn = listener.accept().expect("accepts");
-            serve_vless_kcp_tls(&conn, &one_vless_user(&id), true, &server_cfg);
+            serve_vless_kcp_tls(
+                &conn,
+                &one_vless_user(&id),
+                true,
+                &server_cfg,
+                crate::stats::Meter::default(),
+            );
             // The relay hands off, so the session outlives this call: keep the listener's feed alive.
             let _ = done_rx.recv();
         });
@@ -44703,9 +44797,7 @@ mod tests {
             ferrox_core::kcp::fresh_conversation(),
         )
         .expect("dials");
-        let mut io = KcpIo {
-            conn: Arc::clone(&conn),
-        };
+        let mut io = KcpIo::new(Arc::clone(&conn));
         let started = std::time::Instant::now();
         let mut buf = [0u8; 16];
         let error = io
@@ -49265,8 +49357,14 @@ mod tests {
     fn socks_dials_vless_over_kcp_to_echo() {
         let echo_port = echo_loop();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let serve: KcpServe =
-            Arc::new(move |conn| serve_vless_kcp(conn, &one_vless_user(&id), true));
+        let serve: KcpServe = Arc::new(move |conn| {
+            serve_vless_kcp(
+                conn,
+                &one_vless_user(&id),
+                true,
+                crate::stats::Meter::default(),
+            );
+        });
         let kcp_port = kcp_loop_with(serve);
         let front_port = socks_front_with(Outbound::Vless(VlessOut {
             address: "127.0.0.1".to_owned(),
@@ -49305,7 +49403,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let server = thread::spawn(move || {
             let conn = listener.accept().expect("accepts");
-            serve_trojan_kcp(&conn, &[key], true);
+            serve_trojan_kcp(&conn, &[key], true, crate::stats::Meter::default());
             // The relay hands off, so the session outlives this call: keep the listener's feed alive.
             let _ = done_rx.recv();
         });
@@ -49340,7 +49438,9 @@ mod tests {
     fn socks_dials_trojan_over_kcp_to_echo() {
         let echo_port = echo_loop();
         let key = trojan_key("secret");
-        let serve: KcpServe = Arc::new(move |conn| serve_trojan_kcp(conn, &[key], true));
+        let serve: KcpServe = Arc::new(move |conn| {
+            serve_trojan_kcp(conn, &[key], true, crate::stats::Meter::default());
+        });
         let kcp_port = kcp_loop_with(serve);
         let front_port = socks_front_with(Outbound::Trojan(TrojanOut {
             address: "127.0.0.1".to_owned(),
