@@ -187,6 +187,8 @@ pub(crate) struct GrpcReader<R: Read = Connection> {
     answered: bool,
     head: Vec<u8>,
     head_id: u32,
+    /// The flags of the `HEADERS` frame that opened an incomplete block: `END_STREAM` arrives there, not on the final `CONTINUATION`.
+    head_flags: u8,
     /// The one buffer a body uses: DATA frames are read onto its end and decoded there.
     msg: Vec<u8>,
     msg_at: usize,
@@ -788,6 +790,7 @@ impl<R: Read> GrpcReader<R> {
             body = &body[5..];
         }
         if flags & F_END_HEADERS != 0 {
+            self.head_flags = 0;
             return self.headers(id, flags, body);
         }
         if self.head.len() + body.len() > HEAD_CAP {
@@ -795,6 +798,7 @@ impl<R: Read> GrpcReader<R> {
         }
         self.head.extend_from_slice(body);
         self.head_id = id;
+        self.head_flags = flags;
         Some(())
     }
 
@@ -805,6 +809,8 @@ impl<R: Read> GrpcReader<R> {
         if flags & F_END_HEADERS != 0 {
             let mut block = std::mem::take(&mut self.head);
             block.extend_from_slice(body);
+            let flags = flags | (self.head_flags & F_END);
+            self.head_flags = 0;
             return self.headers(id, flags, &block);
         }
         self.head.extend_from_slice(body);
@@ -1567,6 +1573,7 @@ fn new_reader<R: Read>(
         answered: false,
         head: Vec::new(),
         head_id: 0,
+        head_flags: 0,
         msg: Vec::new(),
         msg_at: 0,
         msg_end: 0,
@@ -2538,6 +2545,30 @@ mod tests {
         assert!(
             !reader.shared.dead.load(Ordering::SeqCst),
             "a normal END_STREAM was treated as a dead connection"
+        );
+    }
+
+    /// An end-marked `HEADERS` that needs a continuation still ends the read half: the final
+    /// `CONTINUATION` does not carry the flag, so the opening frame's `END_STREAM` must survive.
+    #[test]
+    fn an_end_stream_survives_a_continuation() {
+        let block = block_encode(&[(":status", "200"), ("content-type", "application/grpc")]);
+        let cut = block.len() / 2;
+        let mut wire = frame(T_HEADERS, F_END, 1, &block[..cut]);
+        wire.extend_from_slice(&frame(T_CONT, F_END_HEADERS, 1, &block[cut..]));
+        let (mut reader, writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        drop(writer);
+        let mut got = [0u8; 8];
+        assert_eq!(reader.read(&mut got).expect("reads"), 0);
+        assert!(
+            reader.remote_end && reader.eof,
+            "END_STREAM was lost across the continuation"
         );
     }
 
