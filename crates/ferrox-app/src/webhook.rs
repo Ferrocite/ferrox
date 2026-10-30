@@ -228,8 +228,9 @@ impl Webhook {
         )
     }
 
-    /// The POST, from the URL it parses to the status line it reads, inside the one budget. Host
-    /// name resolution is the one stage `std` cannot bound, so it sits outside the deadline.
+    /// The POST over TCP, from the URL it parses to the status line it reads, inside the one
+    /// budget. Host name resolution and a configured Unix-socket connect are the stages `std`
+    /// cannot bound, so they sit outside the deadline.
     fn send(&self, body: &str) -> Result<(), String> {
         let url = HttpUrl::parse(&self.url)?;
         if url.userinfo.is_some() && !url.tls {
@@ -309,10 +310,12 @@ struct DeadlineConnection {
 }
 
 impl DeadlineConnection {
+    /// Wrap the stream without arming anything yet; every read and write arms its own wait.
     fn new(io: Connection, deadline: Instant) -> Self {
         Self { io, deadline }
     }
 
+    /// The time the budget still has, or the timeout the next socket operation must fail with.
     fn remaining(&self) -> std::io::Result<Duration> {
         if Instant::now() >= self.deadline {
             return Err(std::io::Error::new(
@@ -804,6 +807,7 @@ mod tests {
         );
     }
 
+    /// A receiver that answers one byte per second cannot buy a fresh budget for every read.
     #[test]
     fn a_dripping_receiver_cannot_stretch_the_budget() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("receiver");
