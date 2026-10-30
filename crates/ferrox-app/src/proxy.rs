@@ -49851,6 +49851,135 @@ mod tests {
         assert_eq!(payload, b"two");
     }
 
+    /// A freedom datagram leaves from the source its outbound named, as a TCP flow from it does.
+    #[test]
+    fn a_freedom_datagram_lane_binds_the_source_the_config_names() {
+        let root = crate::json::parse(
+            r#"{"routing":{},"outbounds":[{"protocol":"freedom","sendThrough":"127.0.0.2"}]}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let lane = plan.udp_out(&Association::Default).expect("a lane");
+        assert!(
+            matches!(&*lane, Outbound::Freedom(_)),
+            "the default freedom lane"
+        );
+        let source = SEND_THROUGH
+            .with(std::cell::Cell::get)
+            .expect("the datagram lane carries a source");
+        assert_eq!(source.address(), Some("127.0.0.2".parse().expect("ip")));
+        // Linux owns all of 127/8 on loopback, so the bind is witnessed where a 127.0.0.2 source routes.
+        #[cfg(target_os = "linux")]
+        {
+            let echo = std::net::UdpSocket::bind("127.0.0.1:0").expect("echo");
+            let echo_addr = echo.local_addr().expect("address");
+            echo.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let (peers, seen) = std::sync::mpsc::channel();
+            let replied = std::thread::spawn(move || {
+                let mut buf = [0u8; 1500];
+                if let Ok((n, peer)) = echo.recv_from(&mut buf) {
+                    let _ = peers.send(peer.ip());
+                    let _ = echo.send_to(&buf[..n], peer);
+                }
+            });
+            let out = Outbound::clone(&lane);
+            let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip")).expect("a lane");
+            let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut frame = Vec::new();
+            let request = socks_udp_frame(&mut frame, None, &echo_addr, b"one");
+            client.send_to(request, lane.address).expect("send");
+            let mut back = vec![0u8; UDP_BUF];
+            let (n, _) = client.recv_from(&mut back).expect("reply");
+            let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
+            assert_eq!(payload, b"one");
+            let peer = seen
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the echo saw the peer");
+            replied.join().expect("echo");
+            assert_eq!(peer, "127.0.0.2".parse::<IpAddr>().expect("source"));
+        }
+    }
+
+    /// A direct datagram's uplink follows its destination's family, so an IPv6 target is reached.
+    #[test]
+    fn a_freedom_datagram_lane_reaches_an_ipv6_destination() {
+        let echo = std::net::UdpSocket::bind("[::1]:0").expect("echo");
+        let echo_addr = echo.local_addr().expect("address");
+        echo.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let replied = std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            if let Ok((n, peer)) = echo.recv_from(&mut buf) {
+                let _ = echo.send_to(&buf[..n], peer);
+            }
+        });
+        let out = Outbound::Freedom(Arc::new(FreedomOut::default()));
+        let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip")).expect("a lane");
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut frame = Vec::new();
+        let request = socks_udp_frame(&mut frame, None, &echo_addr, b"six");
+        client.send_to(request, lane.address).expect("send");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = client.recv_from(&mut back).expect("reply");
+        let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
+        replied.join().expect("echo");
+        assert_eq!(payload, b"six");
+    }
+
+    /// The outbound's `sockopt` reaches the datagram socket: an option the OS refuses stops that
+    /// uplink instead of being dropped, while the same lane without it answers.
+    #[test]
+    fn a_refused_datagram_sockopt_stops_the_uplink() {
+        fn answers(config: &str) -> bool {
+            let root = crate::json::parse(config).expect("parses");
+            let routing = routing_for(&root).expect("parses").expect("a plan");
+            let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+                .expect("builds");
+            let plan = RoutePlan::new(shared, None, None, false);
+            let out = Outbound::clone(&plan.udp_out(&Association::Default).expect("a lane"));
+            let echo = std::net::UdpSocket::bind("127.0.0.1:0").expect("echo");
+            let echo_addr = echo.local_addr().expect("address");
+            echo.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1500];
+                if let Ok((n, peer)) = echo.recv_from(&mut buf) {
+                    let _ = echo.send_to(&buf[..n], peer);
+                }
+            });
+            let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip")).expect("a lane");
+            let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("timeout");
+            let mut frame = Vec::new();
+            let request = socks_udp_frame(&mut frame, None, &echo_addr, b"one");
+            client.send_to(request, lane.address).expect("send");
+            let mut back = vec![0u8; UDP_BUF];
+            client.recv_from(&mut back).is_ok()
+        }
+        assert!(
+            answers(r#"{"routing":{},"outbounds":[{"protocol":"freedom"}]}"#),
+            "the plain lane answers"
+        );
+        assert!(
+            !answers(
+                r#"{"routing":{},"outbounds":[{"protocol":"freedom","streamSettings":{"sockopt":{"customSockopt":[{"type":"int","level":"999","opt":"999","value":"1"}]}}}]}"#
+            ),
+            "a refused option stops the datagram"
+        );
+    }
+
     /// A routing script picks the lane before the (empty) rule table, and its error closes the
     /// flow instead of falling back to the default handler.
     #[test]
