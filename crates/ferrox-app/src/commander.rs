@@ -1965,12 +1965,11 @@ mod tests {
     /// One `xray.app.router.RoutingRule` a typed router Config carries: an outbound, a ruleTag and
     /// one `domain:` entry.
     fn router_rule(outbound: &str, rule_tag: &str, domain: &str) -> Vec<u8> {
+        let domain = message(&[varint_field(1, 2), bytes_field(2, domain.as_bytes())]);
+        let rule = message(&[bytes_field(2, &domain)]);
         message(&[
             bytes_field(1, outbound.as_bytes()),
-            bytes_field(
-                2,
-                &message(&[varint_field(1, 2), bytes_field(2, domain.as_bytes())]),
-            ),
+            bytes_field(2, &rule),
             bytes_field(19, rule_tag.as_bytes()),
         ])
     }

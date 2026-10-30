@@ -1981,7 +1981,7 @@ impl RoutePlan {
                 }
             };
         }
-        let (target, webhook) = {
+        let (lane, tag, webhook) = {
             let routing = self
                 .shared
                 .routing
@@ -1990,15 +1990,15 @@ impl RoutePlan {
             let Some(hit) = routing.route_target(&flow) else {
                 return self.default_lane();
             };
-            let target = match hit.target {
-                crate::router::RouteTarget::Outbound(tag) => Ok(tag.to_owned()),
-                crate::router::RouteTarget::Balancer(tag) => Err(tag.to_owned()),
+            let webhook = hit.webhook.cloned();
+            let (lane, tag) = match hit.target {
+                crate::router::RouteTarget::Outbound(tag) => {
+                    let lane = self.target(tag);
+                    (lane, self.stable_tag(tag).map(std::borrow::Cow::Borrowed))
+                }
+                crate::router::RouteTarget::Balancer(tag) => self.pick_balanced(&routing, tag),
             };
-            (target, hit.webhook.cloned())
-        };
-        let (lane, tag) = match target {
-            Ok(tag) => (self.target(&tag), Some(std::borrow::Cow::Owned(tag))),
-            Err(tag) => self.pick_balanced(&tag),
+            (lane, tag, webhook)
         };
         if let Some(webhook) = webhook {
             webhook.fire(&crate::webhook::Event {
@@ -2019,14 +2019,24 @@ impl RoutePlan {
         (lane, tag)
     }
 
+    /// The tag's own key in the startup table, so a decision names it without copying.
+    fn stable_tag(&self, tag: &str) -> Option<&str> {
+        if let Some((key, _)) = self.shared.tagged.get_key_value(tag) {
+            return Some(key);
+        }
+        self.shared
+            .default_tag
+            .as_deref()
+            .filter(|default| *default == tag)
+    }
+
     /// The lane a balancer picks for one flow; the event names the picked tag, as the reference's
     /// `GetTag` resolves a balancer before it fires.
-    fn pick_balanced(&self, tag: &str) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
-        let routing = self
-            .shared
-            .routing
-            .read()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    fn pick_balanced(
+        &self,
+        routing: &crate::router::Routing,
+        tag: &str,
+    ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         let Some(balancer) = routing.balancer(tag) else {
             return self.default_lane();
         };
@@ -2046,7 +2056,10 @@ impl RoutePlan {
         }
         if let Some(fallback) = balancer.fallback() {
             let out = self.target(fallback);
-            return (out, Some(std::borrow::Cow::Owned(fallback.to_owned())));
+            return (
+                out,
+                self.stable_tag(fallback).map(std::borrow::Cow::Borrowed),
+            );
         }
         self.default_lane()
     }
