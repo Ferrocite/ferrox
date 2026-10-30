@@ -155,7 +155,9 @@ fn solve_reply(
     if let Some(reply) = reply {
         let page = String::from_utf8_lossy(&reply.body);
         if looks_like_challenge(&page) {
-            let origin = origin_of(&page).unwrap_or_else(|| format!("https://{}", endpoint.host));
+            let origin = origin_of(&page)
+                .filter(|origin| trusted_origin(origin, &endpoint.host))
+                .unwrap_or_else(|| format!("https://{}", endpoint.host));
             if let Some(challenged) = Endpoint::parse(&origin, endpoint.roots.clone()) {
                 match solve_page(&challenged, jar, &page) {
                     Ok(()) => return Ok(()),
@@ -189,6 +191,13 @@ fn looks_like_challenge(page: &str) -> bool {
         && (page.contains("Client Challenge")
             || page.contains("script.js")
             || page.contains("fst-post-back"))
+}
+
+/// A challenge body may only send the solver to the caller's own host or a Firefox host, never an arbitrary origin or an explicit port.
+fn trusted_origin(origin: &str, own: &str) -> bool {
+    let host = origin.strip_prefix("https://").unwrap_or(origin);
+    !host.contains(':')
+        && (host.eq_ignore_ascii_case(own) || host.to_ascii_lowercase().ends_with(".firefox.com"))
 }
 
 /// The origin a challenged body names, absolute when it carries one and the caller's own host otherwise.
@@ -828,6 +837,20 @@ mod tests {
         );
         assert_eq!(origin_of("nothing here"), None);
         assert!(!looks_like_challenge("<html>welcome</html>"));
+    }
+
+    #[test]
+    fn a_challenge_origin_is_the_callers_host_or_a_firefox_host() {
+        let own = "oauth.accounts.firefox.com";
+        assert!(trusted_origin("https://oauth.accounts.firefox.com", own));
+        assert!(trusted_origin("https://api.accounts.firefox.com", own));
+        assert!(trusted_origin("https://API.ACCOUNTS.FIREFOX.COM", own));
+        assert!(!trusted_origin(
+            "https://api.accounts.firefox.com:8443",
+            own
+        ));
+        assert!(!trusted_origin("https://evil.example", own));
+        assert!(!trusted_origin("https://firefox.com.evil", own));
     }
 
     #[test]
