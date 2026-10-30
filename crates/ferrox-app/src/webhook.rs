@@ -366,18 +366,18 @@ fn dial_socket(path: &str, budget: Duration) -> Result<Connection, String> {
         #[cfg(target_os = "linux")]
         if let Some(name) = path.strip_prefix('@') {
             return crate::conn::connect_abstract(&abstract_name(name)?)
-                .map_err(|error| format!("{path}: {error}"));
+                .map_err(|error| format!("unix socket: {error}"));
         }
         crate::conn::connect(
             &crate::conn::Target::Unix(std::path::PathBuf::from(path)),
             budget,
         )
-        .map_err(|error| format!("{path}: {error}"))
+        .map_err(|error| format!("unix socket: {error}"))
     }
     #[cfg(not(any(unix, windows)))]
     {
         let _ = budget;
-        Err(format!("{path}: this host has no unix sockets"))
+        Err("unix socket: this host has no unix sockets".to_owned())
     }
 }
 
@@ -390,9 +390,7 @@ fn abstract_name(name: &str) -> Result<Vec<u8>, String> {
     };
     let bytes = padded.as_bytes();
     if bytes.len() > 107 {
-        return Err(format!(
-            "abstract socket `{name}` is longer than the kernel's field"
-        ));
+        return Err("abstract socket name is longer than the kernel's field".to_owned());
     }
     let mut name = vec![0u8; 107];
     name[..bytes.len()].copy_from_slice(bytes);
