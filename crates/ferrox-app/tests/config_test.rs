@@ -274,3 +274,188 @@ fn test_accepts_xhttp_xmux_bounds_it_does_not_apply() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+fn config_dir(name: &str, files: &[(&str, &str)]) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("ferrox-test-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("create config dir");
+    for (file, text) in files {
+        std::fs::write(dir.join(file), text).expect("write config");
+    }
+    dir
+}
+
+fn held_port_inbound(port: u16) -> String {
+    format!(
+        r#"{{"inbounds":[{{"listen":"127.0.0.1","port":{port},"protocol":"vless",
+        "settings":{{"clients":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}}],"decryption":"none"}}}}]}}"#
+    )
+}
+
+/// xray's `-confdir` loads every `*.json` in the directory and merges them; here the flag was refused.
+#[test]
+fn test_reads_a_confdir_the_reference_discovers() {
+    let held = TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let port = held.local_addr().expect("local address").port();
+    let dir = config_dir(
+        "confdir",
+        &[
+            ("01-inbound.json", &held_port_inbound(port)),
+            ("02-outbound.json", r#"{"outbounds":[{"protocol":"freedom"}]}"#),
+        ],
+    );
+    let named = dir.to_string_lossy().into_owned();
+    let output = run(&["-test", "-confdir", &named]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a config dir the reference reads is servable: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Configuration OK."),
+        "`-test` reports xray's verdict: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Two `-c` files merge into one config, as the reference's `MergeConfig` does.
+#[test]
+fn test_merges_a_second_config_file() {
+    let held = TcpListener::bind("127.0.0.1:0").expect("hold a port");
+    let port = held.local_addr().expect("local address").port();
+    let inbound = config_path("merge-inbound", &held_port_inbound(port));
+    let outbound = config_path("merge-outbound", r#"{"outbounds":[{"protocol":"freedom"}]}"#);
+    let output = run(&[
+        "-test",
+        "-c",
+        &inbound.to_string_lossy(),
+        "-c",
+        &outbound.to_string_lossy(),
+    ]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "two files the reference merges are servable: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Configuration OK."),
+        "`-test` reports xray's verdict: {stdout}"
+    );
+    let _ = std::fs::remove_file(&inbound);
+    let _ = std::fs::remove_file(&outbound);
+}
+
+/// The reference's `Override` replaces a block whole, replaces an inbound or outbound of the same
+/// tag in place, and prepends one no config named yet; `-dump` prints what the merge built.
+#[test]
+fn dump_prints_the_config_the_reference_would_merge() {
+    let base = r#"{"log":{"loglevel":"warning"},
+        "inbounds":[{"tag":"in","listen":"127.0.0.1","port":18099,"protocol":"socks",
+        "settings":{"auth":"noauth"}}],
+        "outbounds":[{"tag":"direct","protocol":"freedom"}]}"#;
+    let over = r#"{"log":{"loglevel":"debug"},
+        "inbounds":[{"tag":"in","listen":"127.0.0.1","port":18100,"protocol":"http"},
+        {"tag":"extra","listen":"127.0.0.1","port":18101,"protocol":"socks","settings":{"auth":"noauth"}}],
+        "outbounds":[{"tag":"direct","protocol":"blackhole"},{"tag":"new","protocol":"blackhole"}]}"#;
+    let dir = config_dir("dump", &[("01-base.json", base), ("02-over.json", over)]);
+    let named = dir.to_string_lossy().into_owned();
+    let output = run(&["-dump", "-confdir", &named]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "`-dump` prints and exits: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains(r#""port":18100"#) && !stdout.contains(r#""port":18099"#),
+        "an inbound of the same tag is replaced in place: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""port":18101"#),
+        "an inbound of a tag no file named yet is appended: {stdout}"
+    );
+    assert!(
+        stdout.contains(r#""loglevel":"debug""#) && !stdout.contains("warning"),
+        "a block the later file names is replaced whole: {stdout}"
+    );
+    assert!(
+        stdout.contains("blackhole") && !stdout.contains("freedom"),
+        "an outbound of the same tag is replaced in place: {stdout}"
+    );
+    let new = stdout.find(r#""tag":"new""#).expect("the new outbound");
+    let direct = stdout.find(r#""tag":"direct""#).expect("the replaced outbound");
+    assert!(
+        new < direct,
+        "an outbound no file named yet prepends, so it stays first: {stdout}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A file whose name contains `tail` appends its new outbounds instead of prepending them.
+#[test]
+fn a_config_file_named_tail_appends_its_outbounds() {
+    let base = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"}]}"#;
+    let over = r#"{"outbounds":[{"tag":"last","protocol":"blackhole"}]}"#;
+    let plain = config_dir(
+        "tail-plain",
+        &[("01-base.json", base), ("02-extra.json", over)],
+    );
+    let tail = config_dir(
+        "tail-named",
+        &[("01-base.json", base), ("99-tail.json", over)],
+    );
+    let first = run(&["-dump", "-confdir", &plain.to_string_lossy()]);
+    let second = run(&["-dump", "-confdir", &tail.to_string_lossy()]);
+    let first = String::from_utf8_lossy(&first.stdout);
+    let second = String::from_utf8_lossy(&second.stdout);
+    assert!(
+        first.find(r#""tag":"last""#).expect("the new outbound")
+            < first.find(r#""tag":"direct""#).expect("the base outbound"),
+        "an ordinary file prepends its outbounds: {first}"
+    );
+    assert!(
+        second.find(r#""tag":"direct""#).expect("the base outbound")
+            < second.find(r#""tag":"last""#).expect("the new outbound"),
+        "a file named tail appends them: {second}"
+    );
+    let _ = std::fs::remove_dir_all(&plain);
+    let _ = std::fs::remove_dir_all(&tail);
+}
+
+/// The merged config is what the handlers are built from: a later file's inbound of the same tag
+/// is the one built, so its missing certificate is the refusal `-test` reports.
+#[test]
+fn a_later_config_file_replaces_an_inbound_the_handler_builds() {
+    let base = r#"{"inbounds":[{"tag":"in","listen":"127.0.0.1","port":18102,"protocol":"socks",
+        "settings":{"auth":"noauth"}}]}"#;
+    let over = r#"{"inbounds":[{"tag":"in","listen":"127.0.0.1","port":443,"protocol":"vless",
+        "settings":{"clients":[{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}],"decryption":"none"},
+        "streamSettings":{"security":"tls","tlsSettings":{"certificates":[
+        {"certificateFile":"/nonexistent/ferrox-test-cert.pem","keyFile":"/nonexistent/ferrox-test-key.pem"}]}}}]}"#;
+    let dir = config_dir(
+        "merged-inbound",
+        &[("01-base.json", base), ("02-over.json", over)],
+    );
+    let named = dir.to_string_lossy().into_owned();
+    let output = run(&["-test", "-confdir", &named]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "the later file's inbound is the one built: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("no servable inbound")
+            && String::from_utf8_lossy(&output.stderr)
+                .contains("unreadable vless tls identity"),
+        "the refusal names the certificate the later file's inbound is missing: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
