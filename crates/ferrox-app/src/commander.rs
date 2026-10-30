@@ -7,8 +7,10 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
 
 use crate::conn::Connection;
 use crate::h2;
@@ -168,6 +170,13 @@ impl std::fmt::Debug for Api {
     }
 }
 
+/// The management API answers from a fixed worker count; a peer that opens more sockets than this is refused rather than given a thread.
+const API_WORKERS: usize = 8;
+const API_STACK: usize = 256 * 1024;
+const API_IDLE: Duration = Duration::from_secs(30);
+static API_SLOTS: crate::limit::Slots = crate::limit::Slots::new(API_WORKERS);
+static API_REFUSED: AtomicBool = AtomicBool::new(false);
+
 impl Api {
     pub(crate) fn new(config: ApiConfig) -> Arc<Self> {
         Arc::new(Self {
@@ -282,7 +291,7 @@ impl Api {
         }
     }
 
-    /// Bind the configured listen address and answer every accepted connection in its own thread.
+    /// Bind the configured listen address and answer accepted connections from a bounded set of workers.
     pub(crate) fn serve_listen(self: &Arc<Self>) {
         let Some(address) = self.config.listen.clone() else {
             return;
@@ -305,15 +314,40 @@ impl Api {
             };
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { continue };
+                let Some(slot) = API_SLOTS.acquire() else {
+                    if !API_REFUSED.swap(true, Ordering::Relaxed) {
+                        eprintln!("commander: {API_WORKERS} management connections are busy; refusing more");
+                    }
+                    continue;
+                };
                 let api = Arc::clone(&api);
-                thread::spawn(move || api.serve_stream(stream));
+                let worker = thread::Builder::new()
+                    .name("ferrox-api".to_owned())
+                    .stack_size(API_STACK)
+                    .spawn(move || {
+                        let _slot = slot;
+                        api.serve_stream(stream);
+                    });
+                if let Err(error) = worker {
+                    eprintln!("commander: cannot start a management worker: {error}");
+                }
             }
         });
     }
 
+    /// One HTTP/2 connection's worth of calls under the configured idle bound.
+    pub(crate) fn serve_stream(&self, stream: Connection) {
+        self.serve_stream_with_idle(stream, API_IDLE);
+    }
+
     /// One HTTP/2 connection's worth of calls. The client opens the preface and its SETTINGS, then
     /// a HEADERS/DATA pair per call; this answers each completed body in arrival order.
-    pub(crate) fn serve_stream(&self, mut stream: Connection) {
+    fn serve_stream_with_idle(&self, mut stream: Connection, idle: Duration) {
+        if stream.set_read_timeout(Some(idle)).is_err()
+            || stream.set_write_timeout(Some(idle)).is_err()
+        {
+            return;
+        }
         let mut preface = [0u8; 24];
         if stream.read_exact(&mut preface).is_err() || &preface != h2::MAGIC {
             return;
@@ -1453,6 +1487,24 @@ mod tests {
             }
         }
         (message, trailers)
+    }
+
+    #[test]
+    fn an_idle_api_connection_returns_its_worker() {
+        let api = Api::new(ApiConfig::default());
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("addr");
+        let (done, waited) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            api.serve_stream_with_idle(Connection::from(stream), Duration::from_millis(50));
+            done.send(()).expect("reports");
+        });
+        let _idle = Connection::connect(address).expect("connects");
+        assert!(
+            waited.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "an idle connection outlived its bound"
+        );
     }
 
     #[test]

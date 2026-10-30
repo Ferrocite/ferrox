@@ -3,8 +3,10 @@ use crate::stats;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::thread;
+use std::time::Duration;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Config {
@@ -111,15 +113,41 @@ fn bind(listen: &str) -> Result<TcpListener, String> {
         .map_err(|error| format!("cannot listen for metrics on `{listen}`: {error}"))
 }
 
+/// A scrape is short and bounded; a peer past this many concurrent sockets is refused rather than given another thread.
+const METRICS_WORKERS: usize = 8;
+const METRICS_STACK: usize = 128 * 1024;
+const METRICS_IDLE: Duration = Duration::from_secs(5);
+static METRICS_SLOTS: crate::limit::Slots = crate::limit::Slots::new(METRICS_WORKERS);
+static METRICS_REFUSED: AtomicBool = AtomicBool::new(false);
+
 fn serve(listener: &TcpListener) {
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
-        thread::spawn(move || answer(stream));
+        let Some(slot) = METRICS_SLOTS.acquire() else {
+            if !METRICS_REFUSED.swap(true, Ordering::Relaxed) {
+                eprintln!("metrics: {METRICS_WORKERS} scrapes are busy; refusing more");
+            }
+            continue;
+        };
+        let worker = thread::Builder::new()
+            .name("ferrox-metrics-scrape".to_owned())
+            .stack_size(METRICS_STACK)
+            .spawn(move || {
+                let _slot = slot;
+                answer(stream);
+            });
+        if let Err(error) = worker {
+            eprintln!("metrics: cannot start a scrape worker: {error}");
+        }
     }
 }
 
 fn answer(mut stream: TcpStream) {
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+    if stream.set_read_timeout(Some(METRICS_IDLE)).is_err()
+        || stream.set_write_timeout(Some(METRICS_IDLE)).is_err()
+    {
+        return;
+    }
     let mut request = [0u8; 4096];
     let read = match stream.read(&mut request) {
         Ok(0) | Err(_) => return,
