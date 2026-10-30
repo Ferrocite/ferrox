@@ -1862,6 +1862,9 @@ fn server_identity_builder(
     if !cfg.send_tickets {
         builder.set_options(boring::ssl::SslOptions::NO_TICKET);
     }
+    if let Some(log) = cfg.master_key_log.clone() {
+        builder.set_keylog_callback(move |_, line| log.log_line(line));
+    }
     Ok(builder)
 }
 

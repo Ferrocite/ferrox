@@ -77,6 +77,21 @@ impl MasterKeyLog {
     }
 }
 
+impl MasterKeyLog {
+    pub(crate) fn log_line(&self, line: &str) {
+        use std::io::Write as _;
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (file, buffer) = &mut *state;
+        buffer.clear();
+        buffer.extend_from_slice(line.as_bytes());
+        buffer.push(b'\n');
+        let _ = file.write_all(buffer);
+    }
+}
+
 impl rustls::KeyLog for MasterKeyLog {
     fn log(&self, label: &str, client_random: &[u8], secret: &[u8]) {
         use std::io::Write as _;

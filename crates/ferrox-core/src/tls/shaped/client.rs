@@ -279,6 +279,7 @@ impl<S: Stream> Session<S> {
         if derived != confirmation {
             return Err(ech_rejected(hello, None));
         }
+        self.client_random = hello.ech_inner_random().expect("checked");
         let mut transcript = message_hash(suite.hash(), inner);
         transcript.extend_from_slice(msg);
         self.transcript = transcript;
@@ -286,7 +287,7 @@ impl<S: Stream> Session<S> {
     }
 
     fn ech_accepted(
-        &self,
+        &mut self,
         hello: &Hello,
         msg: &[u8],
         suite: Suite,
@@ -305,6 +306,7 @@ impl<S: Stream> Session<S> {
         if derived != msg[30..38] {
             return Err(ech_rejected(hello, retry));
         }
+        self.client_random = hello.ech_inner_random().expect("checked");
         Ok(())
     }
 
