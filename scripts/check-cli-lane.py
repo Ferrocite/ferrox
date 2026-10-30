@@ -2880,6 +2880,10 @@ def check_stale_proxy_reconciled(state: pathlib.Path) -> int:
     return 0
 
 
+# The gates job allows ten minutes and check-cli-args runs first: stop a wedged
+# suite early enough that CI kills the job after the failure is already named.
+SUITE = 240
+
 CHECKS = (
     ("picker", check_picker),
     ("status", check_status),
@@ -2910,19 +2914,41 @@ def main() -> int:
     # fake tools rather than twenty checks one after another.
     workers = min(8, max(4, os.cpu_count() or 4))
     failed = []
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        running = {}
+    running = {}
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=workers)
+    try:
         for name, check in CHECKS:
             state = pathlib.Path(tempfile.mkdtemp(prefix=f"ferrox-cli-{check.__name__}-"))
             running[pool.submit(check, state)] = name
-        for job in concurrent.futures.as_completed(running):
-            name = running[job]
-            try:
-                if job.result() != 0:
+        deadline = time.monotonic() + SUITE
+        while running:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            done, _ = concurrent.futures.wait(
+                running,
+                timeout=remaining,
+                return_when=concurrent.futures.FIRST_COMPLETED,
+            )
+            if not done:
+                break
+            for job in done:
+                name = running.pop(job)
+                try:
+                    if job.result() != 0:
+                        failed.append(name)
+                except Exception:
+                    traceback.print_exc()
                     failed.append(name)
-            except Exception:
-                traceback.print_exc()
-                failed.append(name)
+    finally:
+        unfinished = list(running.values())
+        pool.shutdown(wait=False, cancel_futures=True)
+    if unfinished:
+        failed.extend(unfinished)
+        print(
+            f"check-cli-lane: unfinished after {SUITE} s: {', '.join(unfinished)}",
+            file=sys.stderr,
+        )
     if failed:
         print(f"check-cli-lane: failed: {', '.join(failed)}", file=sys.stderr)
         return 1
