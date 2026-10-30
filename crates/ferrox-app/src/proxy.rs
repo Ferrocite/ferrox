@@ -16622,12 +16622,20 @@ fn forward_headers<'a>(head: &'a [u8], attrs: &mut crate::router::Attributes<'a>
         if let Some(colon) = ferrox_core::foxy::octet_in(line, 0, b':') {
             let name = &line[..colon];
             if !hop_by_hop(name, named) && !name.eq_ignore_ascii_case(b"host") {
-                if let (Ok(name), Ok(value)) = (
-                    std::str::from_utf8(name),
-                    std::str::from_utf8(&line[colon + 1..]),
-                ) {
-                    user_agent |= name.eq_ignore_ascii_case("user-agent");
-                    attrs.push(name, std::borrow::Cow::Borrowed(value.trim()));
+                if let Ok(name) = std::str::from_utf8(name) {
+                    let user_agent_header = name.eq_ignore_ascii_case("user-agent");
+                    user_agent |= user_agent_header;
+                    let value = &line[colon + 1..];
+                    match std::str::from_utf8(value) {
+                        Ok(value) => attrs.push(name, std::borrow::Cow::Borrowed(value.trim())),
+                        Err(_) if user_agent_header => attrs.push(
+                            name,
+                            std::borrow::Cow::Owned(
+                                String::from_utf8_lossy(value).trim().to_owned(),
+                            ),
+                        ),
+                        Err(_) => {}
+                    }
                 }
             }
         }
@@ -48064,6 +48072,34 @@ end
             format!("GET /ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nUser-Agent: probe\r\n\r\n")
                 .into_bytes()
         );
+    }
+
+    /// A `User-Agent` whose value is not UTF-8 still holds a value for the rules: the empty
+    /// pattern must not match it, so the request is forwarded.
+    #[test]
+    fn a_non_utf8_user_agent_is_not_the_empty_one() {
+        let echo = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","attrs":{"user-agent":"^$"},"outboundTag":"block"}]}}"#;
+        let front = http_front_with(route_outbound(config, Some("in"), true));
+        let mut client = Connection::connect(("127.0.0.1", front)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        let mut head = format!(
+            "GET http://127.0.0.1:{echo}/ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nUser-Agent: "
+        )
+        .into_bytes();
+        head.push(0xff);
+        head.extend_from_slice(b"\r\n\r\n");
+        client.write_all(&head).expect("gets");
+        let seen = read_http_head(&mut client, HEAD_LIMIT_TEST, HEAD_DEADLINE)
+            .expect("the request is forwarded, not blocked");
+        let mut left =
+            format!("GET /ok HTTP/1.1\r\nHost: 127.0.0.1:{echo}\r\nUser-Agent: ").into_bytes();
+        left.push(0xff);
+        left.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(seen, left);
     }
 
     /// What the origin sees after the removal is the head minus the credential line, in place; what the rules see is that head minus every field the hop-by-hop list owns. Both are asserted on one request, so a walk that kept a line or lost one shows up as bytes.
