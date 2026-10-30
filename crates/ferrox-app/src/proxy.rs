@@ -44490,6 +44490,13 @@ mod tests {
         conn.write(&vless_header(&id, 1, &target)).expect("writes");
         let mut io = KcpIo::new(Arc::clone(&conn));
         read_vless_response(&mut io).expect("replies");
+        let baseline = crate::stats::snapshot();
+        let before_inbound = baseline.inbound.get("kcp-in").copied().unwrap_or_default();
+        let before_user = baseline
+            .user
+            .get("kcp@example")
+            .copied()
+            .unwrap_or_default();
         conn.write(b"ping").expect("writes");
         conn.set_read_deadline(std::time::Instant::now() + Duration::from_secs(10));
         let mut back = [0u8; 4];
@@ -44505,13 +44512,22 @@ mod tests {
         let snapshot = crate::stats::snapshot();
         let inbound = &snapshot.inbound["kcp-in"];
         assert!(
-            inbound.uplink > 0,
-            "the request reached the inbound counter"
+            inbound.uplink > before_inbound.uplink,
+            "the relayed request moved the inbound uplink counter"
         );
-        assert!(inbound.downlink > 0, "the reply left it");
+        assert!(
+            inbound.downlink > before_inbound.downlink,
+            "the relayed reply moved the inbound downlink counter"
+        );
         let user = &snapshot.user["kcp@example"];
-        assert!(user.uplink > 0, "the request reached the user counter");
-        assert!(user.downlink > 0, "the reply left the user counter");
+        assert!(
+            user.uplink > before_user.uplink,
+            "the relayed request moved the user uplink counter"
+        );
+        assert!(
+            user.downlink > before_user.downlink,
+            "the relayed reply moved the user downlink counter"
+        );
         conn.close();
     }
 
