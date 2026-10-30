@@ -48,15 +48,19 @@ cell bundles by `scripts/render-benchmark-charts.py`; CI commits the dated
 results and the latest charts here and opens a review PR. Do not edit between
 the markers by hand: a refresh replaces one runner block at a time.
 
-Each bundle carries one image per test, never one image that merges every test:
-the panel shows throughput, CPU per GiB, peak RSS, peak threads, cold start and
-kernel asks per MiB from the same cell, so a reader never matches one test's
-bar against another test's. The coverage grid is a markdown table, so a missing
-cell and its reason survive both text review and the artifact browser. The
-README block and the bundle's `README.md` are generated from the same
-`matrix-results.json`. A scheduled refresh compares the new medians with the
-last published run and leaves the committed markdown and charts alone when no
-cell moved by more than 10%, the top of the shared runner's noise band.
+Each bundle carries one image per test, with every server for that test side by
+side; it never merges two tests. The panel shows throughput, CPU per GiB, peak
+RSS, peak threads, cold start, kernel asks per MiB, the throughput repeats and
+their spread, from the same cells, so a reader never matches one test's bar
+against another test's. The spread panel names a `split` when one repeat
+separated from the others, which is what a median alone hides. The coverage
+grid is a markdown table, so a missing cell and its reason survive both text
+review and the artifact browser. The README block and the bundle's `README.md`
+are generated from the same `matrix-results.json`; `distribution.csv` carries
+the repeat spread in tidy form beside `table.csv`. A scheduled refresh compares
+the new medians with the last published run and leaves the committed markdown
+and charts alone when no cell moved by more than 10%, the top of the shared
+runner's noise band.
 
 ## Known holes (2026-10-25, rechecked 2026-10-27, standard / ubuntu-latest)
 

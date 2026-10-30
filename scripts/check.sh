@@ -71,6 +71,7 @@ if [[ $fast == 0 ]]; then
     check-method-superset
 
   step "benchmark and matrix selftests"
+  python3 scripts/benchstats.py
   python3 scripts/benchmark-delta.py --selftest
   python3 scripts/check-matrix-legs.py --selftest
   python3 scripts/workflow-result.py --selftest

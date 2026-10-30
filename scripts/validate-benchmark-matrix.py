@@ -145,6 +145,34 @@ def check_repeat_digests(path, doc):
             )
 
 
+def check_spread(results):
+    """Every reported repeat spread re-derived from its cell runs."""
+    for scenario in results.get("scenarios", []):
+        cell_path = Path(args.cells) / scenario["id"] / "cell.json"
+        cell = load_json(cell_path)
+        if cell is None:
+            continue
+        for engine, reported in scenario.get("spread", {}).items():
+            samples = []
+            for entry in cell.get("engines", []):
+                if entry.get("name") != engine:
+                    continue
+                samples = [
+                    run["throughput_mib_s"]
+                    for run in entry.get("runs", [])
+                    if isinstance(run.get("throughput_mib_s"), (int, float))
+                ]
+            expected = benchstats.spread(samples) if samples else None
+            if not expected:
+                continue
+            for key in ("n", "median", "min", "max", "state"):
+                check(
+                    reported.get(key) == expected.get(key),
+                    f"{scenario['id']}/{engine}/spread {key} {reported.get(key)} "
+                    f"re-derives to {expected.get(key)}",
+                )
+
+
 def check_medians(results):
     """Every plotted median re-derived from its repeats."""
     for scenario in results.get("scenarios", []):
@@ -204,8 +232,8 @@ def check_charts(charts_dir, results):
         check(path.is_file(), f"missing chart {path}")
         if path.is_file():
             check(path.stat().st_size > 0, f"empty chart {path}")
-    for scenario in results.get("scenarios", []):
-        path = Path(charts_dir) / "scenarios" / f"{scenario['id']}.png"
+    for base in {scenario.get("base", scenario["id"]) for scenario in results.get("scenarios", [])}:
+        path = Path(charts_dir) / "scenarios" / f"{base}.png"
         check(path.is_file(), f"missing per-test scenario chart {path}")
         if path.is_file():
             check(path.stat().st_size > 0, f"empty chart {path}")
@@ -233,9 +261,10 @@ def check_readme(readme_path, charts_dir, results):
         name for name in THROUGHPUT_ENGINES
         if any(name in scenario.get("medians", {}) for scenario in results.get("scenarios", []))
     ]
+    for base in {scenario.get("base", scenario["id"]) for scenario in results.get("scenarios", [])}:
+        image = f"scenarios/{base}.png"
+        check(image in section, f"README has no per-test chart for {base}")
     for scenario in results.get("scenarios", []):
-        image = f"scenarios/{scenario['id']}.png"
-        check(image in section, f"README has no per-test chart for {scenario['id']}")
         if "setup" in scenario.get("id", ""):
             continue
         medians = scenario.get("medians", {})
@@ -264,10 +293,10 @@ def check_bundle_readme(path, results):
         return
     check("## Coverage" in text, "bundle document has no coverage table")
     check("| scenario | server |" in text, "bundle document has no coverage header")
-    for scenario in results.get("scenarios", []):
+    for base in {scenario.get("base", scenario["id"]) for scenario in results.get("scenarios", [])}:
         check(
-            f"scenarios/{scenario['id']}.png" in text,
-            f"bundle document has no chart for {scenario['id']}",
+            f"scenarios/{base}.png" in text,
+            f"bundle document has no chart for {base}",
         )
 
 
@@ -303,6 +332,7 @@ def main(argv=None):
                 not ran or cell.get("harness_ceilings_mib_s"),
                 f"{scenario['id']}: engines ran but no harness ceiling was recorded",
             )
+    check_spread(results_doc)
     check_medians(results_doc)
     check_manifest(Path(args.cells).parent, results_doc)
     check_charts(args.charts, results_doc)

@@ -13,6 +13,7 @@ threshold; the default is the top of that noise band, 10%.
 """
 
 import statistics
+from itertools import pairwise
 
 TOLERANCE = 0.05
 CHANGE_THRESHOLD = 0.10
@@ -180,3 +181,57 @@ def format_metric(value, unit):
     if unit == "s":
         return f"{value:.2f}"
     return f"{value:.1f}"
+
+
+def spread(values):
+    """Repeat spread for one cell: a split when one repeat left the others.
+
+    Three repeats cannot prove a distribution, so the stronger word is
+    reserved for a visible gap: at least a 1.25x min-to-max range and a
+    largest gap of at least half that range. Anything else with a sample
+    deviation over 10% is `wide`; the rest is `stable`.
+    """
+    ordered = sorted(values)
+    count = len(ordered)
+    if count < 2 or ordered[-1] <= 0:
+        return None
+    mean = statistics.fmean(ordered)
+    deviation = statistics.stdev(ordered)
+    ratio = ordered[-1] / ordered[0] if ordered[0] > 0 else None
+    gaps = [b - a for a, b in pairwise(ordered)]
+    gap = max(gaps)
+    span = ordered[-1] - ordered[0]
+    split = count >= 3 and (ratio is None or ratio >= 1.25) and gap >= span / 2.0
+    state = "split" if split else "wide" if deviation / mean >= 0.10 else "stable"
+    return {
+        "n": count,
+        "min": ordered[0],
+        "median": statistics.median(ordered),
+        "max": ordered[-1],
+        "mean": mean,
+        "stdev": deviation,
+        "cv": deviation / mean,
+        "ratio": ratio,
+        "gap_ratio": gap / span if span else 0.0,
+        "state": state,
+    }
+
+
+def selftest():
+    """The split rule and the two calmer states."""
+    split = spread([2055.9, 2608.5, 2880.3])
+    assert split["state"] == "split" and split["ratio"] > 1.25
+    wide = spread([90.0, 100.0, 111.0])
+    assert wide["state"] == "wide"
+    stable = spread([100.0, 101.0, 102.0])
+    assert stable["state"] == "stable"
+    stalled = spread([0.0, 500.0, 520.0])
+    assert stalled["state"] == "split" and stalled["ratio"] is None
+    assert spread([0.0, 0.0]) is None
+    assert spread([100.0]) is None
+    print("benchstats: selftest ok")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(selftest())

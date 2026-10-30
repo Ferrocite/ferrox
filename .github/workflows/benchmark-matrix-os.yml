@@ -71,7 +71,7 @@ jobs:
           ./scripts/run-benchmark-matrix.sh
           --tier "${{ inputs.tier }}"
           --out target/benchmark-matrix
-          --probe-only
+          --build-only
           ${{ inputs.flags }}
       - uses: actions/upload-artifact@v4
         with:
@@ -208,7 +208,7 @@ jobs:
             if [[ -f target/benchmark-matrix/table.md ]]; then
               cat target/benchmark-matrix/table.md
               echo
-              echo "The text-only table is the \`benchmark-matrix-table-${{ inputs.tier }}-${{ inputs.os }}\` artifact; the bundle below is the charts and images."
+              echo "The text-only tables and repeat spread are the \`benchmark-matrix-table-${{ inputs.tier }}-${{ inputs.os }}\` artifact; the bundle below is the charts and images."
             else
               echo "no text table written"
             fi
@@ -220,6 +220,7 @@ jobs:
           path: |
             target/benchmark-matrix/table.md
             target/benchmark-matrix/table.csv
+            target/benchmark-matrix/distribution.csv
             target/benchmark-matrix/matrix-results.json
             target/benchmark-matrix/manifest.txt
           retention-days: 90
