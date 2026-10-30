@@ -1032,6 +1032,8 @@ thread_local! {
     static SEND_THROUGH: std::cell::Cell<Option<SendThrough>> = const { std::cell::Cell::new(None) };
     /// The `streamSettings.sockopt` that outbound names, read by the same seam.
     static DIAL_SOCKOPTS: std::cell::RefCell<Option<Arc<crate::sockopt::SocketOptions>>> = const { std::cell::RefCell::new(None) };
+    /// The family the outbound a flow entered resolves a named target to before the request carries it.
+    static TARGET_STRATEGY: std::cell::Cell<Option<FreedomDomain>> = const { std::cell::Cell::new(None) };
 }
 
 struct SendThroughGuard;
@@ -1062,6 +1064,23 @@ impl DialSockoptsGuard {
 impl Drop for DialSockoptsGuard {
     fn drop(&mut self) {
         DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = None);
+    }
+}
+
+/// The `targetStrategy` one flow's outbound names, cleared on drop so a lane that answers before the
+/// request is built cannot leave it for the next flow on the thread.
+struct TargetStrategyGuard;
+
+impl TargetStrategyGuard {
+    fn enter(strategy: Option<FreedomDomain>) -> Self {
+        TARGET_STRATEGY.with(|cell| cell.set(strategy));
+        Self
+    }
+}
+
+impl Drop for TargetStrategyGuard {
+    fn drop(&mut self) {
+        TARGET_STRATEGY.with(|cell| cell.set(None));
     }
 }
 
@@ -1110,8 +1129,20 @@ fn dial_settings_present(root: &Json) -> Result<bool, String> {
     for outbound in outbounds {
         present |= parse_send_through(outbound)?.is_some();
         present |= parse_outbound_sockopt(outbound)?.is_some();
+        present |= parse_target_strategy(outbound)?.is_some();
     }
     Ok(present)
+}
+
+/// The outbound-level `targetStrategy`: the family the handler resolves a named target to before
+/// the protocol sends it, and the reference's own refusal for a name it does not know.
+fn parse_target_strategy(outbound: &Json) -> Result<Option<FreedomDomain>, String> {
+    let Some(text) = outbound.get("targetStrategy").and_then(Json::as_str) else {
+        return Ok(None);
+    };
+    let strategy = FreedomDomain::parse(text)
+        .ok_or_else(|| format!("unsupported target domain strategy: {text}"))?;
+    Ok((strategy != FreedomDomain::AsIs).then_some(strategy))
 }
 
 /// The socket options an outbound's `streamSettings.sockopt` names: the mark, interface and TCP
@@ -1732,6 +1763,9 @@ struct RouteShared {
     /// The socket options each outbound's `streamSettings.sockopt` names, and the default's own.
     sockopts: HashMap<String, Arc<crate::sockopt::SocketOptions>>,
     default_sockopts: Option<Arc<crate::sockopt::SocketOptions>>,
+    /// The `targetStrategy` each outbound names, and the default's own.
+    strategies: HashMap<String, FreedomDomain>,
+    default_strategy: Option<FreedomDomain>,
     has_dial_settings: bool,
     dynamic: Arc<RwLock<Dynamic>>,
     changed: AtomicBool,
@@ -2253,6 +2287,11 @@ impl RoutePlan {
             None => self.shared.default_sockopts.clone(),
         };
         DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
+        let strategy = match tag {
+            Some(tag) => self.shared.strategies.get(tag).copied(),
+            None => self.shared.default_strategy,
+        };
+        TARGET_STRATEGY.with(|cell| cell.set(strategy));
     }
 
     fn lane_with_protocol_untracked(
@@ -2589,10 +2628,19 @@ fn route_shared_with_api(
             sockopts.insert((*tag).to_owned(), Arc::new(options));
         }
     }
+    let default_strategy = parse_target_strategy(first)?;
+    let mut strategies = HashMap::new();
+    for (tag, config) in &configs {
+        if let Some(strategy) = parse_target_strategy(config)? {
+            strategies.insert((*tag).to_owned(), strategy);
+        }
+    }
     let has_dial_settings = default_source.is_some()
         || !sources.is_empty()
         || default_sockopts.is_some()
-        || !sockopts.is_empty();
+        || !sockopts.is_empty()
+        || default_strategy.is_some()
+        || !strategies.is_empty();
     let targets: Vec<&str> = if routing.script().is_some() {
         configs.keys().copied().collect()
     } else {
@@ -2722,6 +2770,8 @@ fn route_shared_with_api(
         default_source,
         sockopts,
         default_sockopts,
+        strategies,
+        default_strategy,
         has_dial_settings,
         dynamic,
         changed: AtomicBool::new(false),
@@ -16421,6 +16471,33 @@ fn strategy_name(domain: FreedomDomain) -> &'static str {
     }
 }
 
+/// What `targetStrategy` takes a named target to before the protocol builds its request.
+enum TargetPick {
+    Keep,
+    Address(Destination),
+    Refuse,
+}
+
+/// The address the reference's outbound handler sends instead of a name, or the refusal a forced
+/// strategy owes a name that answered no address of its family.
+fn resolve_target(asked: &Destination, strategy: FreedomDomain) -> TargetPick {
+    let Destination::Name(host, port) = asked else {
+        return TargetPick::Keep;
+    };
+    let picked = freedom_lookup(host, *port).and_then(|ips| strategy.pick(&ips));
+    match picked {
+        Some(ip) => TargetPick::Address(Destination::Address(SocketAddr::new(ip, *port))),
+        None if strategy.forces() => {
+            eprintln!(
+                "targetStrategy: {host} did not resolve, and {} forces an address",
+                strategy_name(strategy)
+            );
+            TargetPick::Refuse
+        }
+        None => TargetPick::Keep,
+    }
+}
+
 /// Sniff the client's first bytes, then pick the lane the reference would: the sniffed name is the
 /// route target, and the original address stays the dial target under `routeOnly`. A sniffed HTTP
 /// head also carries the attributes an `attrs` rule reads, whether or not it named a host.
@@ -16530,6 +16607,7 @@ pub(crate) fn serve_connect(
     let _outbound = OutboundTag::enter(tag.as_deref());
     let _source = SendThroughGuard::enter(SEND_THROUGH.with(std::cell::Cell::take));
     let _sockopts = DialSockoptsGuard::enter(DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take()));
+    let _target = TargetStrategyGuard::enter(TARGET_STRATEGY.with(std::cell::Cell::take));
     if let Outbound::Loopback(loopback) = out {
         let overridden = loopback_asked(loopback, asked, &client);
         let asked = overridden.as_ref().unwrap_or(asked);
@@ -16583,6 +16661,14 @@ pub(crate) fn serve_connect(
         relay_handoff(&client, &upstream);
         return;
     }
+    // xray's outbound handler resolves a named target before the request, so `targetStrategy` decides which answer goes out.
+    let targeted = TARGET_STRATEGY.with(std::cell::Cell::get);
+    let resolved = targeted.map(|strategy| resolve_target(asked, strategy));
+    let asked = match &resolved {
+        Some(TargetPick::Address(address)) => address,
+        Some(TargetPick::Refuse) => return,
+        _ => asked,
+    };
     if let Outbound::Vless(vless) = out {
         if matches!(vless.carrier, Carrier::Quic) {
             if vless.mux {
@@ -24866,6 +24952,16 @@ pub(crate) fn find_freedom_outbound(root: &Json) -> Result<Option<FreedomOut>, S
             .unwrap_or("");
         freedom.domain = FreedomDomain::parse(strategy)
             .ok_or_else(|| format!("unsupported domain strategy: {strategy}"))?;
+        // The reference migrates an outbound-level `targetStrategy` into the freedom lane's own, and it wins over the settings' name.
+        if let Some(strategy) = parse_target_strategy(outbound)? {
+            if freedom.domain != FreedomDomain::AsIs && freedom.domain != strategy {
+                eprintln!(
+                    "freedom: outbound targetStrategy overrides the lane's {}",
+                    strategy_name(freedom.domain)
+                );
+            }
+            freedom.domain = strategy;
+        }
         if let Some(version) = settings
             .and_then(|s| s.get("proxyProtocol"))
             .and_then(Json::as_u32)
@@ -49696,6 +49792,74 @@ mod tests {
             0x01,
             "a useIPv4 lane sends the A record, never the name"
         );
+    }
+
+    /// `targetStrategy` is read at the outbound level, an unknown name refuses at start as the
+    /// reference does, and a config naming only it still builds the plan that carries it.
+    #[test]
+    fn a_target_strategy_is_read_and_an_unknown_one_refuses() {
+        let named = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"socks","targetStrategy":"useIPv4"}]}"#,
+        )
+        .expect("parses");
+        assert!(routing_for(&named).expect("parses").is_some());
+        let refused = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"socks","targetStrategy":"preferIp"}]}"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            routing_for(&refused).expect_err("refuses"),
+            "unsupported target domain strategy: preferIp"
+        );
+    }
+
+    /// The reference migrates an outbound-level `targetStrategy` onto a freedom lane, and it wins
+    /// over the name the lane's settings carries.
+    #[test]
+    fn a_freedom_outbound_prefers_the_outbound_target_strategy() {
+        let both = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","targetStrategy":"useIPv4","settings":{"domainStrategy":"useIPv6"}}]}"#,
+        )
+        .expect("parses");
+        let freedom = find_freedom_outbound(&both)
+            .expect("parses")
+            .expect("a lane");
+        assert_eq!(freedom.domain, FreedomDomain::UseIp4);
+        let settings_only = crate::json::parse(
+            r#"{"outbounds":[{"protocol":"freedom","settings":{"domainStrategy":"useIPv6"}}]}"#,
+        )
+        .expect("parses");
+        let freedom = find_freedom_outbound(&settings_only)
+            .expect("parses")
+            .expect("a lane");
+        assert_eq!(freedom.domain, FreedomDomain::UseIp6);
+    }
+
+    /// A strategy resolves a name to the family it names, leaves an address target alone, and a
+    /// forced one refuses a name no answer of its family reaches.
+    #[test]
+    fn a_target_strategy_picks_the_family_it_names() {
+        let name = Destination::Name("localhost".to_owned(), 443);
+        let TargetPick::Address(Destination::Address(address)) =
+            resolve_target(&name, FreedomDomain::UseIp4)
+        else {
+            panic!("a useIPv4 lane resolves a name the host answers");
+        };
+        assert!(address.is_ipv4());
+        let address = Destination::Address("127.0.0.1:443".parse().expect("addr"));
+        assert!(matches!(
+            resolve_target(&address, FreedomDomain::ForceIp4),
+            TargetPick::Keep
+        ));
+        let unresolvable = Destination::Name("no-such-host.invalid".to_owned(), 80);
+        assert!(matches!(
+            resolve_target(&unresolvable, FreedomDomain::ForceIp4),
+            TargetPick::Refuse
+        ));
+        assert!(matches!(
+            resolve_target(&unresolvable, FreedomDomain::UseIp4),
+            TargetPick::Keep
+        ));
     }
 
     /// `sendThrough` reads an address and a CIDR, rolls inside the subnet, and refuses a prefix the
