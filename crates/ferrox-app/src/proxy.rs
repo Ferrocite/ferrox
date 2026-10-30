@@ -4308,9 +4308,6 @@ fn serve_sealed_raw<
         return;
     };
     crate::accesslog::record(peer, true, &target, None, "", &user.email);
-    if !freedom || !vless_flow_ok(user, flow, cmd, true) {
-        return;
-    }
     let ask = reverse_ask(users, &got, flow, cmd);
     if !matches!(ask, ReverseAsk::NotReverse) {
         let shared = Arc::new(SealedShared::new(
@@ -4329,6 +4326,9 @@ fn serve_sealed_raw<
         if !attached {
             return;
         }
+        return;
+    }
+    if !freedom || !vless_flow_ok(user, flow, cmd, true) {
         return;
     }
     match cmd {
@@ -4478,9 +4478,6 @@ fn serve_sealed_split_with<R, W, C>(
         return;
     };
     crate::accesslog::record(None, true, &target, None, "", &user.email);
-    if !freedom || !vless_flow_ok(user, flow, cmd, true) {
-        return;
-    }
     let ask = reverse_ask(users, &got, flow, cmd);
     if !matches!(ask, ReverseAsk::NotReverse) {
         if let ReverseAsk::Allowed(portal) = ask {
@@ -4499,6 +4496,9 @@ fn serve_sealed_split_with<R, W, C>(
         } else {
             closer();
         }
+        return;
+    }
+    if !freedom || !vless_flow_ok(user, flow, cmd, true) {
         return;
     }
     let meter = crate::stats::user(&user.email, user.level);
@@ -54141,6 +54141,16 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
 mod reverse_tests {
     use super::*;
 
+    fn reverse_user(portal: &Arc<crate::reverse::Portal>, id: [u8; 16]) -> [VlessUser; 1] {
+        [VlessUser {
+            id,
+            flow: Flow::None,
+            email: String::new(),
+            level: 0,
+            reverse: Some(Arc::clone(portal)),
+        }]
+    }
+
     #[test]
     fn a_reverse_request_names_no_target_and_a_forward_one_never_uses_a_reverse_user() {
         let id = [7u8; 16];
@@ -54149,13 +54159,7 @@ mod reverse_tests {
             [&[0u8][..], &id[..], &[0, 4][..]].concat()
         );
         let portal = crate::reverse::Portal::new("portal");
-        let reverse = [VlessUser {
-            id,
-            flow: Flow::None,
-            email: String::new(),
-            level: 0,
-            reverse: Some(Arc::clone(&portal)),
-        }];
+        let reverse = reverse_user(&portal, id);
         let forward = one_vless_user(&id);
         assert!(matches!(
             reverse_ask(&reverse, &id, Flow::None, 4),
@@ -54179,6 +54183,84 @@ mod reverse_tests {
         ));
         assert!(!vless_user_allows(&reverse, &id, Flow::None, 4, true));
         assert!(vless_user_allows(&forward, &id, Flow::None, 1, true));
+    }
+
+    /// A reverse account's command 4 attaches on a sealed raw session with no Freedom outbound:
+    /// the session forwards nothing, so it cannot depend on one.
+    #[test]
+    fn a_sealed_reverse_request_attaches_without_freedom() {
+        use ferrox_core::vless_encryption::{
+            generate_pair, Client, ClientConfig, Server, ServerConfig,
+        };
+        let id = [7u8; 16];
+        let portal = crate::reverse::Portal::new("portal");
+        let users = reverse_user(&portal, id);
+        let (encryption, decryption) = generate_pair(false, "native", "1rtt", "600s");
+        let server = Server::new(ServerConfig::parse(&decryption).expect("server config"));
+        let (client_side, server_side) = crate::reverse::loopback_pair().expect("pair");
+        client_side
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let closer: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let lane = thread::spawn(move || {
+            let sealed = server.handshake(server_side).expect("sealed session");
+            serve_sealed_raw(sealed, None, &users, false, &closer, None, SplitRelay);
+        });
+        let client = Client::new(ClientConfig::parse(&encryption).expect("client config"));
+        let mut stream = client.handshake(client_side).expect("client handshake");
+        stream
+            .write_all(&vless_reverse_header(&id))
+            .expect("reverse request");
+        stream.flush().expect("flush");
+        let mut reply = [1u8; 2];
+        stream
+            .read_exact(&mut reply)
+            .expect("the portal answers a reverse request even with no freedom outbound");
+        assert_eq!(reply, [0, 0]);
+        lane.join().expect("lane");
+        assert!(
+            portal.pick().is_some(),
+            "the portal attached the reverse session"
+        );
+    }
+
+    /// The same request over the split halves a carried carrier yields: the sealed arm reads the
+    /// reverse account before the Freedom gate, the way the plaintext arms do.
+    #[test]
+    fn a_carried_sealed_reverse_request_attaches_without_freedom() {
+        use ferrox_core::vless_encryption::{
+            generate_pair, Client, ClientConfig, Server, ServerConfig,
+        };
+        let id = [7u8; 16];
+        let portal = crate::reverse::Portal::new("portal");
+        let users = reverse_user(&portal, id);
+        let (encryption, decryption) = generate_pair(false, "native", "1rtt", "600s");
+        let server = Server::new(ServerConfig::parse(&decryption).expect("server config"));
+        let (client_side, server_side) = crate::reverse::loopback_pair().expect("pair");
+        let writer = server_side.try_clone().expect("split");
+        client_side
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let closer: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let lane = thread::spawn(move || {
+            serve_sealed_carried(server_side, writer, &users, false, &server, closer);
+        });
+        let client = Client::new(ClientConfig::parse(&encryption).expect("client config"));
+        let mut stream = client.handshake(client_side).expect("client handshake");
+        stream
+            .write_all(&vless_reverse_header(&id))
+            .expect("reverse request");
+        stream.flush().expect("flush");
+        let mut reply = [1u8; 2];
+        stream
+            .read_exact(&mut reply)
+            .expect("the portal answers a reverse request even with no freedom outbound");
+        assert_eq!(reply, [0, 0]);
+        lane.join().expect("lane");
+        assert!(
+            portal.pick().is_some(),
+            "the portal attached the reverse session"
+        );
     }
 
     fn portal_echo(payload: &[u8]) {
