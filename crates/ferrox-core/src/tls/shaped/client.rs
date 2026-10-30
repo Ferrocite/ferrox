@@ -1803,6 +1803,7 @@ mod tests {
     ) -> Session<S> {
         let cfg = TlsConfig {
             insecure: true,
+            resumption: true,
             ..TlsConfig::default()
         };
         Session {

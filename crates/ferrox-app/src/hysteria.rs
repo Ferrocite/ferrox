@@ -1597,6 +1597,7 @@ fn origin_tls_config(host: &str, insecure: bool) -> ferrox_core::tls::TlsConfig 
             crate::quic::system_roots()
         },
         insecure,
+        resumption: true,
         ..Default::default()
     }
 }

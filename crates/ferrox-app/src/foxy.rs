@@ -330,6 +330,7 @@ fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
         cipher_suites: std::sync::Arc::default(),
         curves: std::sync::Arc::default(),
         insecure: false,
+        resumption: true,
         fingerprint: None,
         ech_config_list: None,
         websocket: false,
