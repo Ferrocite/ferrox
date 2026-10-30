@@ -132,7 +132,7 @@ fn merge_tagged(base: &mut Vec<(String, Json)>, key: &str, over: &Json, tail: bo
         *entry = over.clone();
         return;
     };
-    let mut added = Vec::new();
+    let base = existing.len();
     for item in items {
         let tag = item.get("tag").and_then(Json::as_str).unwrap_or_default();
         match existing
@@ -140,13 +140,12 @@ fn merge_tagged(base: &mut Vec<(String, Json)>, key: &str, over: &Json, tail: bo
             .position(|have| have.get("tag").and_then(Json::as_str).unwrap_or_default() == tag)
         {
             Some(at) => existing[at] = item.clone(),
-            None => added.push(item.clone()),
+            None => existing.push(item.clone()),
         }
     }
-    if tail {
-        existing.extend(added);
-    } else {
-        existing.splice(0..0, added);
+    if !tail {
+        let appended = existing.split_off(base);
+        existing.splice(0..0, appended);
     }
 }
 
@@ -910,5 +909,16 @@ mod tests {
         let mut text = String::new();
         write(&base, &mut text);
         assert_eq!(text, r#"{"env":{"A":"1","B":"3","C":"4"}}"#);
+    }
+
+    #[test]
+    fn merge_replaces_a_tag_the_same_file_repeats() {
+        let mut base = parse(r#"{"inbounds":[{"tag":"a","port":1}]}"#).expect("parses");
+        let over =
+            parse(r#"{"inbounds":[{"tag":"a","port":2},{"tag":"a","port":3}]}"#).expect("parses");
+        merge(&mut base, &over, "02-extra.json");
+        let mut text = String::new();
+        write(&base, &mut text);
+        assert_eq!(text, r#"{"inbounds":[{"tag":"a","port":3}]}"#);
     }
 }
