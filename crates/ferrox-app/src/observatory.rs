@@ -656,6 +656,7 @@ fn probe(
             verify_names: std::sync::Arc::default(),
             pins: ferrox_core::foxy::pin::Pins::default(),
             cipher_suites: std::sync::Arc::default(),
+            curves: std::sync::Arc::default(),
             insecure: false,
             fingerprint: None,
             ech_config_list: None,

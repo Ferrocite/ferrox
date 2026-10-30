@@ -24,6 +24,10 @@ pub struct TlsConfig {
     /// Empty means the config named none, so the backend keeps its stock ordering; see
     /// `cipher_suites` for how a non-empty list is built.
     pub cipher_suites: std::sync::Arc<[u16]>,
+    /// The key-exchange groups a hello offers, in the order xray's `tlsSettings.curvePreferences`
+    /// names them, behind one allocation like the suite list. Empty keeps the build's own order:
+    /// the shaped hello's profile shares, or ring's three curves.
+    pub curves: std::sync::Arc<[u16]>,
     /// Accept the peer chain as presented, keeping only the handshake signature that binds
     /// it to the key exchange: xray's `allowInsecure`, read by a masquerade cover's
     /// `masq_url_insecure` origin and by an outbound that names it. `false` is the default
@@ -50,6 +54,13 @@ pub struct TlsConfig {
     /// The `masterKeyLog` file every handshake of this config appends its traffic secrets to, or
     /// `None` to log none, the ordinary case.
     pub master_key_log: Option<std::sync::Arc<MasterKeyLog>>,
+}
+
+/// Whether a client build can offer a group a config named: the shaped hello draws its own key
+/// shares, including the ML-KEM hybrid, while the stock rustls provider is ring's three curves.
+pub fn curve_supported(group: u16, shaped: bool) -> bool {
+    let stock = [shaped::keys::P256, shaped::keys::P384, shaped::keys::X25519];
+    stock.contains(&group) || (shaped && group == shaped::keys::X25519_MLKEM768)
 }
 
 /// xray's `masterKeyLog`: the traffic secrets of every handshake on the config, one NSS line each,

@@ -942,6 +942,59 @@ fn tls_verify_names(settings: Option<&Json>) -> std::sync::Arc<[String]> {
         .into()
 }
 
+/// xray's `curvePreferences`: the groups a hello offers, in the order named, under either spelling
+/// of a `StringList` (a list, or one comma-separated string). A name the reference does not know
+/// warns and drops, as its `ParseCurveName` does; one this build cannot carry warns and drops too,
+/// leaving the build's own order when nothing is left rather than a hello with no groups.
+fn tls_curves(tls: Option<&Json>, shaped: bool) -> Result<std::sync::Arc<[u16]>, String> {
+    let Some(list) = tls.and_then(|s| s.get("curvePreferences")) else {
+        return Ok(std::sync::Arc::default());
+    };
+    let names: Vec<&str> = match list {
+        Json::Str(text) => text.split(',').map(str::trim).collect(),
+        Json::Arr(items) => {
+            let mut names = Vec::with_capacity(items.len());
+            for item in items {
+                names.push(
+                    item.as_str()
+                        .ok_or_else(|| "curvePreferences is not a list of strings".to_owned())?,
+                );
+            }
+            names
+        }
+        _ => return Err("curvePreferences is not a list of strings".to_owned()),
+    };
+    let mut groups: Vec<u16> = Vec::with_capacity(names.len());
+    for name in names.into_iter().filter(|name| !name.is_empty()) {
+        let Some(group) = curve_id(name) else {
+            eprintln!("unsupported curve name: {name}");
+            continue;
+        };
+        if !ferrox_core::tls::curve_supported(group, shaped) {
+            eprintln!("curvePreferences: {name} is not wired; the hello keeps its own groups");
+            continue;
+        }
+        if !groups.contains(&group) {
+            groups.push(group);
+        }
+    }
+    Ok(groups.into())
+}
+
+/// The TLS group id an xray curve name stands for, lowercased as `ParseCurveName` compares them.
+fn curve_id(name: &str) -> Option<u16> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "curvep256" => 0x0017,
+        "curvep384" => 0x0018,
+        "curvep521" => 0x0019,
+        "x25519" => 0x001d,
+        "x25519mlkem768" => 0x11ec,
+        "secp256r1mlkem768" => 0x11eb,
+        "secp384r1mlkem1024" => 0x11ed,
+        _ => return None,
+    })
+}
+
 /// The anchors a client verifies with: the platform store, plus every certificate the config
 /// names. A config that names none keeps the store's one allocation, which is the ordinary case.
 fn tls_client_roots(
@@ -1146,6 +1199,7 @@ pub(crate) fn outbound_tls(
                 .unwrap_or_else(ferrox_core::tls::Fingerprint::stock)
         })
         .unwrap_or_default();
+    let curves = tls_curves(tls, fingerprint.is_shaped())?;
     Ok(Arc::new(ferrox_core::tls::TlsConfig {
         server_name,
         alpn: alpn.into(),
@@ -1154,6 +1208,7 @@ pub(crate) fn outbound_tls(
         cert_pins: std::sync::Arc::from(cert_pins),
         verify_names: tls_verify_names(tls),
         cipher_suites: tls_cipher_suites(tls).into(),
+        curves,
         insecure,
         fingerprint: Some(fingerprint),
         ech_config_list,
@@ -3642,6 +3697,7 @@ mod tests {
     /// The `supported_groups` ids of a dial's `ClientHello`, read off the socket before the peer
     /// hangs up: the handshake ends in an error, but its first record is already on the wire.
     fn hello_groups(outbound: &Json) -> Vec<u16> {
+        use ferrox_core::tls::TlsProvider as _;
         use std::io::Read as _;
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
         let address = listener.local_addr().expect("addr");
@@ -3656,9 +3712,8 @@ mod tests {
         });
         let config = outbound_tls(outbound, "127.0.0.1").expect("builds");
         let stream = std::net::TcpStream::connect(address).expect("connects");
-        use ferrox_core::tls::TlsProvider as _;
-        let _ = ferrox_core::tls::connect(&config, stream)
-            .and_then(|mut client| client.handshake());
+        let _ =
+            ferrox_core::tls::connect(&config, stream).and_then(|mut client| client.handshake());
         let record = captured.join().expect("capture thread");
         let body = &record[9..];
         let mut at = 2 + 32 + 1 + usize::from(body[2 + 32]);
@@ -3672,8 +3727,10 @@ mod tests {
             at += 4;
             if kind == 0x000a {
                 return body[at + 2..at + len]
-                    .chunks_exact(2)
-                    .map(|pair| u16::from_be_bytes([pair[0], pair[1]]))
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
+                    .map(|pair| u16::from_be_bytes(*pair))
                     .collect();
             }
             at += len;
@@ -3701,6 +3758,11 @@ mod tests {
             dial(r#""fingerprint": "unsafe", "curvePreferences": "curvep256,x25519""#),
             vec![0x0017, 0x001d],
             "the stock client names the same list to rustls, from the comma spelling"
+        );
+        assert_eq!(
+            dial(r#""curvePreferences": ["x25519mlkem768", "x25519"]"#),
+            vec![0x11ec, 0x001d],
+            "the shaped hello draws a share for the ML-KEM hybrid it can carry"
         );
         assert_eq!(
             dial(r#""fingerprint": "unsafe", "curvePreferences": ["x25519mlkem768", "x25519"]"#),
