@@ -112,6 +112,7 @@ mod win {
     use crate::paths::{read_trim, write_private, Paths};
 
     const SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    const MAX_VALUE: u32 = 1024 * 1024;
     const NAMES: [&str; 5] = [
         "ProxyEnable",
         "ProxyServer",
@@ -161,7 +162,7 @@ mod win {
                 &mut size,
             )
         };
-        if status != ERROR_SUCCESS {
+        if status != ERROR_SUCCESS || size > MAX_VALUE {
             return None;
         }
         let mut buffer = vec![0_u8; size as usize];
@@ -178,7 +179,8 @@ mod win {
         if status != ERROR_SUCCESS {
             return None;
         }
-        buffer.truncate(size as usize);
+        let size = (size as usize).min(buffer.len());
+        buffer.truncate(size);
         Some((kind, buffer))
     }
 
@@ -199,35 +201,31 @@ mod win {
         }
     }
 
-    fn write_sz(key: HKEY, name: &str, value: &str) -> bool {
+    fn write_raw(key: HKEY, name: &str, kind: u32, data: &[u8]) -> bool {
         let name = wide(name);
-        let data = wide(value);
-        let bytes = data.len() * 2;
         unsafe {
             RegSetValueExW(
                 key,
                 name.as_ptr(),
                 0,
-                REG_SZ,
-                data.as_ptr().cast::<u8>(),
-                bytes as u32,
-            ) == ERROR_SUCCESS
-        }
-    }
-
-    fn write_dword(key: HKEY, name: &str, value: u32) -> bool {
-        let name = wide(name);
-        let data = value.to_le_bytes();
-        unsafe {
-            RegSetValueExW(
-                key,
-                name.as_ptr(),
-                0,
-                REG_DWORD,
+                kind,
                 data.as_ptr(),
                 data.len() as u32,
             ) == ERROR_SUCCESS
         }
+    }
+
+    fn write_sz(key: HKEY, name: &str, value: &str) -> bool {
+        let bytes: Vec<u8> = value
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        write_raw(key, name, REG_SZ, &bytes)
+    }
+
+    fn write_dword(key: HKEY, name: &str, value: u32) -> bool {
+        write_raw(key, name, REG_DWORD, &value.to_le_bytes())
     }
 
     fn delete(key: HKEY, name: &str) {
@@ -240,8 +238,8 @@ mod win {
     fn snapshot(key: HKEY) -> Value {
         let mut object = serde_json::Map::new();
         for name in NAMES {
-            if let Some(value) = value_of(key, name) {
-                object.insert(name.to_owned(), value);
+            if let Some((kind, bytes)) = read(key, name) {
+                object.insert(name.to_owned(), json!({"kind": kind, "bytes": bytes}));
             }
         }
         Value::Object(object)
@@ -250,6 +248,25 @@ mod win {
     fn restore(key: HKEY, snapshot: &Value) {
         for name in NAMES {
             match snapshot.get(name) {
+                Some(Value::Object(value)) => {
+                    let kind = value
+                        .get("kind")
+                        .and_then(Value::as_u64)
+                        .and_then(|kind| u32::try_from(kind).ok());
+                    let bytes: Option<Vec<u8>> =
+                        value.get("bytes").and_then(Value::as_array).map(|rows| {
+                            rows.iter()
+                                .filter_map(Value::as_u64)
+                                .filter_map(|byte| u8::try_from(byte).ok())
+                                .collect()
+                        });
+                    match (kind, bytes) {
+                        (Some(kind), Some(bytes)) => {
+                            write_raw(key, name, kind, &bytes);
+                        }
+                        _ => delete(key, name),
+                    }
+                }
                 Some(Value::String(text)) => {
                     write_sz(key, name, text);
                 }
@@ -327,10 +344,17 @@ mod win {
         let fresh = !paths.proxy_state.exists();
         if fresh {
             let snapshot = snapshot(key);
-            let text = serde_json::to_string(&snapshot)
-                .map_err(|error| format!("system proxy: cannot record the snapshot: {error}"))?;
-            write_private(&paths.proxy_state, &text)
-                .map_err(|error| format!("system proxy: cannot record the snapshot: {error}"))?;
+            let text = match serde_json::to_string(&snapshot) {
+                Ok(text) => text,
+                Err(error) => {
+                    close(key);
+                    return Err(format!("system proxy: cannot record the snapshot: {error}"));
+                }
+            };
+            if let Err(error) = write_private(&paths.proxy_state, &text) {
+                close(key);
+                return Err(format!("system proxy: cannot record the snapshot: {error}"));
+            }
         }
         let server = server(socks, http);
         let ok = write_dword(key, "ProxyEnable", 1)

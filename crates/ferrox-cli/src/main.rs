@@ -17,7 +17,8 @@ mod paths;
 mod probe;
 mod proxy;
 
-use std::io::{IsTerminal as _, Write as _};
+use std::fs::File;
+use std::io::{IsTerminal as _, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -349,7 +350,7 @@ fn verify_flow(options: &Options, ports: Ports, paths: &Paths) -> bool {
 }
 
 fn diagnose(options: &Options, paths: &Paths) {
-    let log = std::fs::read_to_string(&paths.log).unwrap_or_default();
+    let log = read_tail(&paths.log, 64 * 1024);
     if log.trim().is_empty() {
         println!(
             "the lane log is empty: it refused the flow without saying why. Re-run with --debug for the dial trace."
@@ -426,7 +427,7 @@ fn forget_config(paths: &Paths) {
 fn stop_all_lanes(paths: &Paths) -> i32 {
     let mut rc = 0;
     let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(text) = std::fs::read_to_string(&paths.lanes_file) {
+    if let Some(text) = read_trim(&paths.lanes_file) {
         for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
             dirs.push(PathBuf::from(line));
         }
@@ -494,7 +495,7 @@ fn status(options: &Options, paths: &Paths) -> i32 {
     if let Some(uptime) = lane::uptime(paths) {
         println!("up for {uptime}");
     }
-    let log = std::fs::read_to_string(&paths.log).unwrap_or_default();
+    let log = read_tail(&paths.log, 64 * 1024);
     if let Some(carrier) = log
         .lines()
         .filter_map(|line| line.strip_prefix("foxy: carrier "))
@@ -655,10 +656,26 @@ fn supervise(options: &Options, paths: &Paths) -> i32 {
     0
 }
 
-fn tail(path: &Path, lines: usize) {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return;
+fn read_tail(path: &Path, max_bytes: u64) -> String {
+    let Ok(mut file) = File::open(path) else {
+        return String::new();
     };
+    let Ok(metadata) = file.metadata() else {
+        return String::new();
+    };
+    let start = metadata.len().saturating_sub(max_bytes);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    if file.take(max_bytes).read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+fn tail(path: &Path, lines: usize) {
+    let text = read_tail(path, 64 * 1024);
     let all: Vec<&str> = text.lines().collect();
     let start = all.len().saturating_sub(lines);
     for line in &all[start..] {

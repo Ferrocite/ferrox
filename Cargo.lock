@@ -655,6 +655,7 @@ version = "0.0.1"
 dependencies = [
  "ctrlc",
  "getrandom 0.4.3",
+ "libc",
  "rpassword",
  "serde_json",
  "windows-sys 0.61.2",

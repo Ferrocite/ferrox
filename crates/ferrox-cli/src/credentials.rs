@@ -8,22 +8,18 @@ use crate::args::Options;
 use crate::config::FoxyAccount;
 use crate::paths::{read_trim, write_private, Paths};
 
-fn unquote(raw: &str) -> String {
+fn unquote(raw: &str) -> Option<String> {
     let mut out = String::new();
-    let mut chars = raw.chars().peekable();
+    let mut chars = raw.chars();
     let mut quoted = false;
     while let Some(ch) = chars.next() {
         match ch {
             '\'' => quoted = !quoted,
-            '\\' if !quoted => {
-                if let Some(next) = chars.next() {
-                    out.push(next);
-                }
-            }
+            '\\' if !quoted => out.push(chars.next()?),
             _ => out.push(ch),
         }
     }
-    out
+    (!quoted).then_some(out)
 }
 
 fn read(path: &Path) -> (String, String) {
@@ -34,9 +30,9 @@ fn read(path: &Path) -> (String, String) {
     let mut password = String::new();
     for line in text.lines() {
         if let Some(value) = line.strip_prefix("FOXY_EMAIL=") {
-            email = unquote(value);
+            email = unquote(value).unwrap_or_default();
         } else if let Some(value) = line.strip_prefix("FOXY_PASS=") {
-            password = unquote(value);
+            password = unquote(value).unwrap_or_default();
         }
     }
     (email, password)
@@ -160,4 +156,18 @@ pub fn login(options: &Options, paths: &Paths) -> Result<(), String> {
         return Err("an account is an email and a password".to_owned());
     }
     save(&email, &password, paths)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{quote, unquote};
+
+    #[test]
+    fn the_stored_quoting_round_trips_and_a_broken_line_is_refused() {
+        for value in ["plain", "two words", "it's", r"back\slash", r"both ' and \"] {
+            assert_eq!(unquote(&quote(value)).as_deref(), Some(value));
+        }
+        assert_eq!(unquote("'unterminated"), None);
+        assert_eq!(unquote(r"trailing\"), None);
+    }
 }

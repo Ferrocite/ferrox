@@ -561,7 +561,7 @@ pub fn write_config(
 }
 
 fn adopted_ports(path: &Path, fronts: &[String], fixed: &mut [bool], ports: &mut Ports) {
-    let Ok(text) = std::fs::read_to_string(path) else {
+    let Some(text) = read_trim(path) else {
         return;
     };
     let Ok(document) = serde_json::from_str::<Value>(&text) else {
@@ -657,8 +657,7 @@ pub fn config_fronts(
     fronts_set: bool,
     asked: &str,
 ) -> Result<String, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|error| format!("cannot read config {path}: {error}"))?;
+    let text = read_trim(Path::new(path)).ok_or_else(|| format!("cannot read config {path}"))?;
     let document: Value = serde_json::from_str(&text)
         .map_err(|error| format!("cannot read config {path}: {error}"))?;
     let mut order: Vec<String> = Vec::new();

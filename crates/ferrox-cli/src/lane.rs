@@ -42,8 +42,8 @@ pub fn require_bin() -> PathBuf {
     if built.exists() {
         return built;
     }
-    let manifest = root.join("Cargo.toml");
-    if manifest.exists() {
+    #[cfg(debug_assertions)]
+    if root.join("Cargo.toml").exists() {
         eprintln!("building ferrox-app (release, one time)...");
         let status = Command::new("cargo")
             .args(["build", "--locked", "--release", "-p", "ferrox-app"])
@@ -66,10 +66,10 @@ pub fn pid(paths: &Paths) -> Option<u32> {
 pub fn alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .is_ok_and(|status| status.success())
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        unsafe { libc::kill(pid, 0) == 0 }
     }
     #[cfg(windows)]
     {
@@ -92,24 +92,103 @@ pub fn running(paths: &Paths) -> bool {
     pid(paths).is_some_and(alive)
 }
 
+fn process_command(pid: u32) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
+        if raw.is_empty() {
+            return None;
+        }
+        Some(
+            raw.split(|byte| *byte == 0)
+                .filter(|part| !part.is_empty())
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+                .collect::<Vec<_>>()
+                .join(" "),
+        )
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "command="])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        let mut buffer = vec![0_u16; 32_768];
+        let mut length = buffer.len() as u32;
+        let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) };
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            return None;
+        }
+        Some(String::from_utf16_lossy(&buffer[..length as usize]))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn is_ferrox(pid: u32) -> bool {
+    let Some(command) = process_command(pid) else {
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        return true;
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        return false;
+    };
+    if let Some(expected) = std::env::var_os("FERROX_BIN") {
+        if command.contains(&*expected.to_string_lossy()) {
+            return true;
+        }
+    }
+    command.contains("ferrox-app")
+}
+
 pub fn kill(pid: u32) {
+    if !is_ferrox(pid) {
+        return;
+    }
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
+        let Ok(pid) = i32::try_from(pid) else {
+            return;
+        };
+        unsafe { libc::kill(pid, libc::SIGTERM) };
         std::thread::sleep(Duration::from_secs(1));
-        if alive(pid) {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
         }
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if !handle.is_null() {
+            unsafe {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
     }
 }
 
@@ -216,8 +295,8 @@ pub fn uptime(paths: &Paths) -> Option<String> {
 }
 
 pub fn foxy_configured(paths: &Paths) -> bool {
-    std::fs::read_to_string(&paths.cfg)
-        .is_ok_and(|text| text.contains("\"protocol\"") && text.contains("\"foxy\""))
+    read_trim(&paths.cfg)
+        .is_some_and(|text| text.contains("\"protocol\"") && text.contains("\"foxy\""))
 }
 
 pub fn other_lanes(paths: &Paths) -> Vec<(String, u32)> {
