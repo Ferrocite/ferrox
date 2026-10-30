@@ -153,7 +153,7 @@ impl Webhook {
     /// Reserve one POST slot, or report that every slot is already held.
     fn acquire(&self) -> bool {
         self.in_flight
-            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
+            .try_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
                 (active < MAX_IN_FLIGHT).then_some(active + 1)
             })
             .is_ok()
