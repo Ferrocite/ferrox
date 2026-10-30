@@ -7861,7 +7861,12 @@ fn relay_vless_reply<S>(
     };
     match reverse_ask(users, &header.0, header.1, header.2) {
         ReverseAsk::Allowed(portal) => {
-            attach_reverse_session(portal, session, raw);
+            attach_reverse_session(
+                portal,
+                session,
+                raw,
+                crate::stats::user(&user.email, user.level),
+            );
             return;
         }
         ReverseAsk::Refused => return,
@@ -24151,6 +24156,7 @@ fn attach_reverse_session<S>(
     portal: &Arc<crate::reverse::Portal>,
     mut session: S,
     raw: Option<Connection>,
+    meter: crate::stats::Meter,
 ) -> bool
 where
     S: std::io::Read
@@ -24173,6 +24179,10 @@ where
     let tunnel = match driven_halves(session, RELAY_POLL) {
         Ok(half) => half.into_tunnel(closer),
         Err(session) => {
+            let session = MeteredIo {
+                inner: session,
+                meter,
+            };
             let shared = Arc::new(Mutex::new(session));
             crate::reverse::Tunnel::new(
                 Box::new(SharedRead(Arc::clone(&shared))),
