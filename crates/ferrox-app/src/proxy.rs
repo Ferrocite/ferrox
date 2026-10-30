@@ -3560,7 +3560,7 @@ fn serve_vless_grpc(
         return;
     }
     reader.set_poll(Some(RELAY_POLL));
-    crate::proxy::relay_sink(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
+    crate::proxy::relay_sink_drained_with(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
 }
 
 fn serve_vless_httpheader(
@@ -7006,7 +7006,7 @@ fn serve_session_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
         return;
     }
     echo_trace("session grpc relaying");
-    relay_sink(creader, &cwriter, &uplink, crate::grpc::mark_reader_dead);
+    relay_sink_drained_with(creader, &cwriter, &uplink, crate::grpc::mark_reader_dead);
 }
 
 fn accept_tls_session(
@@ -8709,7 +8709,12 @@ fn dial_vless_rung(
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
             reader.set_poll(Some(RELAY_POLL));
-            crate::proxy::relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
+            crate::proxy::relay_sink_drained_with(
+                reader,
+                &writer,
+                client,
+                crate::grpc::mark_reader_dead,
+            );
             true
         }
         Rung::Xhttp => {
@@ -12408,7 +12413,12 @@ fn dial_trojan_rung(
             }
             note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             reader.set_poll(Some(RELAY_POLL));
-            crate::proxy::relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
+            crate::proxy::relay_sink_drained_with(
+                reader,
+                &writer,
+                client,
+                crate::grpc::mark_reader_dead,
+            );
             true
         }
         Rung::Xhttp => {
@@ -14170,7 +14180,7 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
             if !writer.send(header) {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            relay_sink(reader, &writer, client, crate::grpc::mark_reader_dead);
+            relay_sink_drained_with(reader, &writer, client, crate::grpc::mark_reader_dead);
         }
         Carrier::Xhttp { settings, .. } => {
             let Some((reader, writer)) = tls_xhttp(
@@ -15233,7 +15243,7 @@ fn serve_trojan_grpc(
         return;
     };
     reader.set_poll(Some(RELAY_POLL));
-    crate::proxy::relay_sink(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
+    crate::proxy::relay_sink_drained_with(reader, &writer, &uplink, crate::grpc::mark_reader_dead);
 }
 
 fn serve_trojan_xhttp(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bool) {
@@ -15768,7 +15778,7 @@ fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
         return;
     };
     echo_trace("session grpc relaying");
-    relay_sink(creader, &cwriter, &uplink, crate::grpc::mark_reader_dead);
+    relay_sink_drained_with(creader, &cwriter, &uplink, crate::grpc::mark_reader_dead);
 }
 
 fn serve_vmess_kcp_tls(

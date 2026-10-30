@@ -69,6 +69,7 @@ struct Shared {
     init: Mutex<u64>,
     ended: AtomicBool,
     upload_ended: AtomicBool,
+    upload_gate: Mutex<()>,
     dead: AtomicBool,
     pong: AtomicU64,
 }
@@ -469,7 +470,9 @@ impl<R: Read> GrpcReader<R> {
                 return None;
             }
             self.eof = true;
-            self.remote_end = true;
+            if out.is_some() {
+                self.remote_end = true;
+            }
         }
         out
     }
@@ -709,6 +712,17 @@ impl<R: Read> GrpcReader<R> {
         })
     }
 
+    /// After a normal `END_STREAM` the read half is done, but the connection still carries the control frames the write half needs: pump them, and let the lane's poll timeout hand the turn back.
+    fn pump_after_end(&mut self) -> std::io::Result<usize> {
+        loop {
+            match self.pump() {
+                Ok(Some(())) => {}
+                Ok(None) => return Ok(0),
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     /// One complete frame that is not a body: the scratch holds its bytes and the match is the same one `pump` ran inline.
     fn dispatch(&mut self, kind: u8, flags: u8, id: u32, len: usize) -> Option<()> {
         let mut frame = std::mem::take(&mut self.frame);
@@ -823,16 +837,25 @@ impl<R: Read> Read for GrpcReader<R> {
             // The next message may already be in the buffer behind the one just taken, and reading the socket first would block on it; that holds at END_STREAM too — the flag ends the frames, not the bytes.
             if self.decode().is_none() {
                 self.eof = true;
+                if self.remote_end {
+                    return self.pump_after_end();
+                }
                 return Ok(0);
             }
             if self.msg_at < self.pay_end {
                 continue;
             }
             if self.eof {
+                if self.remote_end {
+                    return self.pump_after_end();
+                }
                 return Ok(0);
             }
             if self.pump()?.is_none() {
                 self.eof = true;
+                if self.remote_end {
+                    return self.pump_after_end();
+                }
                 return Ok(0);
             }
         }
@@ -1083,17 +1106,18 @@ impl GrpcWriter {
     }
 
     pub(crate) fn upload_done(&self) {
-        if self.shared.dead.load(Ordering::SeqCst) || self.shared.ended.load(Ordering::SeqCst) {
-            return;
-        }
-        if self
+        let _gate = self
             .shared
-            .upload_ended
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
+            .upload_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.shared.dead.load(Ordering::SeqCst)
+            || self.shared.ended.load(Ordering::SeqCst)
+            || self.shared.upload_ended.load(Ordering::SeqCst)
         {
             return;
         }
+        self.shared.upload_ended.store(true, Ordering::SeqCst);
         let mut batch = Gather::new();
         if !self.message(&[], self.max_frame(), true, &mut batch)
             || !batch.flush_blocking(&self.shared)
@@ -1105,6 +1129,11 @@ impl GrpcWriter {
     }
 
     pub(crate) fn close(&self) {
+        let _gate = self
+            .shared
+            .upload_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if self.shared.ended.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -1112,10 +1141,14 @@ impl GrpcWriter {
             return;
         }
         let mut batch = Gather::new();
-        self.message(&[], self.max_frame(), true, &mut batch);
-        if batch.flush_blocking(&self.shared) {
-            let _ = Gather::settle_blocking(&self.shared);
+        if !self.message(&[], self.max_frame(), true, &mut batch)
+            || !batch.flush_blocking(&self.shared)
+        {
+            self.shared.ended.store(false, Ordering::SeqCst);
+            return;
         }
+        self.shared.upload_ended.store(true, Ordering::SeqCst);
+        let _ = Gather::settle_blocking(&self.shared);
     }
 
     fn max_frame(&self) -> usize {
@@ -1143,6 +1176,10 @@ impl GrpcWriter {
         let plen = frame_prefix(data.len(), &mut prefix);
         let total = plen + data.len();
         let max = max.max(1);
+        // The empty end marker is retried by `close` if this wait fails: take its whole window first, so a retry never replays a prefix already on the wire.
+        if end && data.is_empty() && !self.credit(batch, total as u64) {
+            return false;
+        }
         let mut at = 0;
         while at < total {
             let n = (total - at).min(max);
@@ -1490,6 +1527,7 @@ fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
         init: Mutex::new(65_535),
         ended: AtomicBool::new(false),
         upload_ended: AtomicBool::new(false),
+        upload_gate: Mutex::new(()),
         dead: AtomicBool::new(false),
         pong: AtomicU64::new(0),
     })
@@ -2485,7 +2523,7 @@ mod tests {
     }
 
     /// A half-close that cannot take the end marker leaves the completion retryable: the full close
-    /// sends `F_END` once the peer grants the five bytes the empty message needs.
+    /// sends `F_END` once the peer grants the seven bytes the empty message needs.
     #[test]
     fn a_half_close_that_cannot_send_the_end_marker_is_retried() {
         let _guard = crate::budgets::lock();
@@ -2510,6 +2548,89 @@ mod tests {
             peer.writes.concat(),
             frame(T_DATA, F_END, 1, &message(b"")),
             "the end marker was lost after a stalled half-close"
+        );
+    }
+
+    /// A message that fails to decode is not a normal end: the read half is closed, but the writer must
+    /// still see the failure and wake.
+    #[test]
+    fn an_undecodable_end_stream_is_not_a_normal_end() {
+        let mut body = vec![0u8];
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.push(0xFF);
+        let mut reader = dial(&[(F_END, body)]);
+        let mut got = [0u8; 8];
+        assert_eq!(reader.read(&mut got).expect("reads"), 0);
+        assert!(reader.eof);
+        mark_reader_dead(&mut reader);
+        assert!(
+            reader.shared.dead.load(Ordering::SeqCst),
+            "an undecodable END_STREAM was recorded as a normal end"
+        );
+    }
+
+    /// The control frames the write half needs still arrive after the read half ends: a `WINDOW_UPDATE`
+    /// behind `END_STREAM` raises the writer's window instead of waiting on a reader that returned.
+    #[test]
+    fn a_window_update_after_end_stream_still_reaches_the_writer() {
+        let mut wire = frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[(":status", "200"), ("content-type", "application/grpc")]),
+        );
+        wire.extend_from_slice(&frame(T_DATA, F_END, 1, &message(b"ping")));
+        let inc = 100u32.to_be_bytes();
+        wire.extend_from_slice(&frame(T_WINDOW, 0, 0, &inc));
+        let (mut reader, writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        drop(writer);
+        let mut got = [0u8; 8];
+        assert_eq!(reader.read(&mut got).expect("reads"), 4);
+        assert_eq!(reader.read(&mut got).expect("reads"), 0);
+        assert_eq!(
+            reader.shared.send.lock().unwrap().conn,
+            65_535 + 100,
+            "a WINDOW_UPDATE after END_STREAM did not reach the writer"
+        );
+    }
+
+    /// A stalled end marker takes its whole window before the first byte, so the retry in `close` cannot
+    /// replay a prefix the peer already saw.
+    #[test]
+    fn a_stalled_end_marker_is_not_replayed() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(100)),
+            ..Default::default()
+        });
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), 1, 5);
+        let shared = Arc::clone(&writer.shared);
+        writer.upload_done();
+        {
+            let mut send = shared.send.lock().unwrap();
+            send.conn = u64::MAX;
+            send.stream = u64::MAX;
+        }
+        shared.wake.notify_all();
+        writer.close();
+        crate::budgets::clear();
+        let prefix = message(b"");
+        let mut want = Vec::new();
+        for (i, byte) in prefix.iter().enumerate() {
+            let flags = if i + 1 == prefix.len() { F_END } else { 0 };
+            want.extend_from_slice(&frame(T_DATA, flags, 1, &[*byte]));
+        }
+        assert_eq!(
+            peer.lock().unwrap().writes.concat(),
+            want,
+            "a stalled end marker was replayed from the start"
         );
     }
 
@@ -2848,6 +2969,7 @@ mod tests {
                         init: Mutex::new(u64::from(WINDOW)),
                         ended: AtomicBool::new(false),
                         upload_ended: AtomicBool::new(false),
+                        upload_gate: Mutex::new(()),
                         dead: AtomicBool::new(false),
                         pong: AtomicU64::new(0),
                     });
