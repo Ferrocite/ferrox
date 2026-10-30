@@ -260,7 +260,9 @@ pub struct Connection {
     terminated: AtomicBool,
     started: AtomicBool,
     write_pending: AtomicBool,
+    #[cfg(any(test, not(miri)))]
     last_flush: Mutex<Instant>,
+    #[cfg(any(test, not(miri)))]
     last_uncond: Mutex<Instant>,
     #[cfg(test)]
     flush_calls: AtomicU32,
@@ -325,6 +327,7 @@ impl Connection {
             }),
         });
         let now = Instant::now();
+        #[cfg(any(test, not(miri)))]
         let tick = Duration::from_millis(u64::from(tti));
         Arc::new(Self {
             ctx: Arc::clone(&ctx),
@@ -343,7 +346,9 @@ impl Connection {
             terminated: AtomicBool::new(false),
             started: AtomicBool::new(false),
             write_pending: AtomicBool::new(false),
+            #[cfg(any(test, not(miri)))]
             last_flush: Mutex::new(now.checked_sub(tick).unwrap_or(now)),
+            #[cfg(any(test, not(miri)))]
             last_uncond: Mutex::new(now),
             #[cfg(test)]
             flush_calls: AtomicU32::new(0),
@@ -358,6 +363,7 @@ impl Connection {
         }
     }
 
+    #[cfg(any(test, not(miri)))]
     fn poll(&self, now: Instant) -> Instant {
         let tick = Duration::from_millis(u64::from(self.ctx.config.tti));
         if self.terminated.load(Ordering::SeqCst) {
