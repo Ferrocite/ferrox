@@ -701,7 +701,7 @@ mod tests {
             let text = String::from_utf8_lossy(&head);
             let authorized = text
                 .lines()
-                .any(|line| line.eq_ignore_ascii_case("Authorization: Basic YWxpY2U6czNjcjN0\r"));
+                .any(|line| line.eq_ignore_ascii_case("Authorization: Basic YWxpY2U6czNjcjN0"));
             send.send(text.into_owned()).ok();
             let status = if authorized {
                 "204 No Content"
