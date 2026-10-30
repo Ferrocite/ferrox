@@ -16,12 +16,15 @@
 //! - [`Entry::Aes`] — AES-128-GCM under a password-derived key
 //!   (`SHA256(password)[0..16]`), the wire frame `nonce(12) ‖ ct ‖ tag(16)`.
 //!   A bad tag drops the datagram, which is what keeps sessions apart.
+//! - [`Entry::Salamander`] — `salt(8 random bytes) ‖ payload ^ BLAKE2b-256(password ‖ salt)`,
+//!   the Hysteria v2 mask the reference also accepts as a `finalmask.udp` entry.
 //!
 //! Entries chain in wire order, outermost first: decode strips them left to
 //! right, encode applies them right to left, each entry treating everything
 //! to its right as its own payload — the composition the reference's header
 //! manager performs with its per-connection buffer.
 
+use crate::hysteria::{Salamander, SALAMANDER_SALT};
 use aes_gcm::aead::{AeadInPlace, KeyInit};
 use aes_gcm::{Aes128Gcm, Nonce, Tag};
 use sha2::{Digest as _, Sha256};
@@ -50,6 +53,9 @@ pub enum Spec {
         domain: String,
     },
     Aes {
+        password: String,
+    },
+    Salamander {
         password: String,
     },
 }
@@ -102,6 +108,7 @@ enum Entry {
     Original,
     Header { template: Box<[u8]>, fill: Fill },
     Aes(std::sync::Arc<AesEntry>),
+    Salamander(std::sync::Arc<Salamander>),
 }
 
 impl Entry {
@@ -116,6 +123,7 @@ impl Entry {
             Self::Header { template, .. } => template.len(),
             // Only the nonce is reserved; the tag grows the frame on seal, as the reference's AEAD `Seal` overruns its buffer.
             Self::Aes(_) => 12,
+            Self::Salamander(_) => SALAMANDER_SALT,
         }
     }
 }
@@ -138,9 +146,8 @@ impl std::fmt::Debug for Mask {
 
 impl Mask {
     /// Builds the wire form of a configured chain: derives keys and header
-    /// templates once instead of per datagram. The JSON list order is
-    /// outer-first after the reference's single reversal, so the app hands
-    /// the parsed entries here in the order they appear on the wire.
+    /// templates once instead of per datagram. The app hands the parsed
+    /// entries here in wire order, outermost first.
     ///
     /// # Errors
     ///
@@ -166,6 +173,9 @@ impl Mask {
                     let cipher = Aes128Gcm::new_from_slice(&key).map_err(|_| SpecError)?; // a 16-byte key never fails; the map keeps the `?` off panics
                     Entry::Aes(std::sync::Arc::new(AesEntry { key, cipher }))
                 }
+                Spec::Salamander { password } => Entry::Salamander(std::sync::Arc::new(
+                    Salamander::new(password).ok_or(SpecError)?,
+                )),
             });
         }
         Ok(Self {
@@ -188,6 +198,16 @@ impl Mask {
             rest = match entry {
                 Entry::Original => decode_original(rest)?,
                 Entry::Aes(aes) => decode_aes(rest, &aes.cipher)?,
+                Entry::Salamander(salamander) => {
+                    if rest.len() <= SALAMANDER_SALT {
+                        return None;
+                    }
+                    let mut salt = [0u8; SALAMANDER_SALT];
+                    salt.copy_from_slice(&rest[..SALAMANDER_SALT]);
+                    let (_, body) = rest.split_at_mut(SALAMANDER_SALT);
+                    salamander.mask_in_place(salt, body);
+                    body
+                }
                 Entry::Header { template, .. } => {
                     if rest.len() < template.len() {
                         return None;
@@ -220,6 +240,9 @@ impl PartialEq for Mask {
                         },
                     ) => t1 == t2 && f1 == f2,
                     (Entry::Aes(a), Entry::Aes(b)) => std::sync::Arc::ptr_eq(a, b) || **a == **b,
+                    (Entry::Salamander(a), Entry::Salamander(b)) => {
+                        std::sync::Arc::ptr_eq(a, b) || **a == **b
+                    }
                     _ => false,
                 })
     }
@@ -331,6 +354,15 @@ impl Encoder {
                     let hash = fnv32a(&self.scratch[base + 4..total]);
                     self.scratch[base..base + 4].copy_from_slice(&hash.to_be_bytes());
                     cascade_fwd(&mut self.scratch[base..total]);
+                }
+                Entry::Salamander(salamander) => {
+                    let mut salt = [0u8; SALAMANDER_SALT];
+                    if getrandom::fill(&mut salt).is_err() {
+                        return None; // no entropy: drop the frame, never reuse a salt
+                    }
+                    self.scratch[base..base + SALAMANDER_SALT].copy_from_slice(&salt);
+                    salamander
+                        .mask_in_place(salt, &mut self.scratch[base + SALAMANDER_SALT..total]);
                 }
                 Entry::Aes(aes) => {
                     let nonce_at = base;
@@ -768,8 +800,84 @@ mod tests {
     }
 
     #[test]
+    fn salamander_carries_a_fresh_salt_and_round_trips() {
+        let mask = Mask::from_spec(&[Spec::Salamander {
+            password: "hunter2".to_owned(),
+        }])
+        .expect("builds");
+        let mut enc = Encoder::new(&mask);
+        let plain = b"hello salamander";
+        let first = enc.encode(plain).expect("encodes").to_vec();
+        let second = enc.encode(plain).expect("encodes").to_vec();
+        assert_eq!(first.len(), SALAMANDER_SALT + plain.len());
+        assert_ne!(
+            &first[..SALAMANDER_SALT],
+            &second[..SALAMANDER_SALT],
+            "a fresh salt per datagram"
+        );
+        assert_ne!(&first[SALAMANDER_SALT..], plain, "the body is masked");
+        // The body is the reference's construction under the salt the wire carries.
+        let mut salt = [0u8; SALAMANDER_SALT];
+        salt.copy_from_slice(&first[..SALAMANDER_SALT]);
+        let mut expected = plain.to_vec();
+        Salamander::new("hunter2")
+            .expect("password")
+            .mask_in_place(salt, &mut expected);
+        assert_eq!(&first[SALAMANDER_SALT..], expected.as_slice());
+        // Decode strips the salt and unmasks in place, inside the caller's own buffer.
+        let mut wire = first.clone();
+        let base = wire.as_ptr() as usize;
+        let got = mask.decode_in_place(&mut wire).expect("decodes");
+        assert_eq!(got, plain.as_slice());
+        assert_eq!(
+            got.as_ptr() as usize - base,
+            SALAMANDER_SALT,
+            "the payload must sit inside the datagram"
+        );
+        // A datagram that is only a salt is dropped, and a wrong password unmasks to noise.
+        assert_eq!(
+            mask.decode_in_place(&mut [0u8; SALAMANDER_SALT]),
+            None,
+            "a salt with no payload is not a frame"
+        );
+        let other = Mask::from_spec(&[Spec::Salamander {
+            password: "wrong-pass".to_owned(),
+        }])
+        .expect("builds");
+        assert_ne!(
+            other.decode_in_place(&mut first.clone()).expect("unmasks"),
+            plain,
+            "a different password must not recover the frame"
+        );
+        // The reference's four-byte floor is this mask's build error too.
+        assert_eq!(
+            Mask::from_spec(&[Spec::Salamander {
+                password: "abc".to_owned(),
+            }])
+            .err(),
+            Some(SpecError)
+        );
+    }
+
+    #[test]
+    fn a_salamander_wrapper_sits_outside_the_header_it_wraps() {
+        let mask = Mask::from_spec(&[
+            Spec::Salamander {
+                password: "hunter2".to_owned(),
+            },
+            Spec::Header(HeaderKind::Srtp),
+        ])
+        .expect("builds");
+        let mut enc = Encoder::new(&mask);
+        let wire = enc.encode(b"k").expect("encodes").to_vec();
+        assert_eq!(wire.len(), SALAMANDER_SALT + 4 + 1);
+        let mut copy = wire.clone();
+        assert_eq!(mask.decode_in_place(&mut copy).expect("decodes"), b"k");
+    }
+
+    #[test]
     fn a_stacked_chain_encodes_outer_first_and_strips_in_order() {
-        // The order the reference leaves a `[aes, srtp]` JSON list in after its single reversal: srtp outermost.
+        // Wire order, outermost first: srtp's header then the AES frame around the payload.
         let mask = Mask::from_spec(&[
             Spec::Header(HeaderKind::Srtp),
             Spec::Aes {

@@ -497,6 +497,15 @@ impl core::fmt::Debug for Salamander {
     }
 }
 
+/// Two masks name the same key exactly when their passwords do; the comparison is the config's, never a log line.
+impl PartialEq for Salamander {
+    fn eq(&self, other: &Self) -> bool {
+        self.password == other.password
+    }
+}
+
+impl Eq for Salamander {}
+
 /// Bytes of random salt in front of every obfuscated datagram.
 pub const SALAMANDER_SALT: usize = 8;
 
@@ -586,6 +595,12 @@ impl Salamander {
         salt.copy_from_slice(&datagram[..SALAMANDER_SALT]);
         let key = self.keystream(salt);
         Some(crate::keystream::unshift(datagram, SALAMANDER_SALT, &key))
+    }
+
+    /// XOR `body` in place against the keystream `salt` derives, for a caller that already put the salt in front and keeps the payload where it is.
+    pub(crate) fn mask_in_place(&self, salt: [u8; SALAMANDER_SALT], body: &mut [u8]) {
+        let key = self.keystream(salt);
+        crate::keystream::apply(body, &key);
     }
 }
 

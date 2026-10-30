@@ -40733,6 +40733,63 @@ mod tests {
         assert!(matches!(stream_carrier(None), Carrier::Raw(_)));
     }
 
+    /// A KCP carrier carries the reference's `salamander` wrapper and keeps the order its header
+    /// manager produces: a run of `mkcp-legacy` entries is written front-to-back from the reversed
+    /// list, while a wrapper keeps its place around whatever is inside it.
+    #[test]
+    fn a_kcp_carrier_takes_salamander_and_the_reference_chain_order() {
+        let settings = crate::json::parse(
+            r#"{"network":"kcp","finalmask":{"udp":[
+                {"type":"salamander","settings":{"password":"hunter2"}},
+                {"type":"mkcp-legacy","settings":{"header":"srtp"}}
+            ]}}"#,
+        )
+        .expect("parses");
+        let Carrier::Kcp(config) = stream_carrier(Some(&settings)) else {
+            panic!("the reference accepts this kcp chain");
+        };
+        let expected = ferrox_core::kcp::Mask::from_spec(&[
+            ferrox_core::kcp::Spec::Salamander {
+                password: "hunter2".to_owned(),
+            },
+            ferrox_core::kcp::Spec::Header(ferrox_core::kcp::HeaderKind::Srtp),
+        ])
+        .expect("builds");
+        assert_eq!(
+            config.mask, expected,
+            "the wrapper stays outside the header"
+        );
+
+        let settings = crate::json::parse(
+            r#"{"network":"kcp","finalmask":{"udp":[
+                {"type":"mkcp-legacy","settings":{"header":"srtp"}},
+                {"type":"mkcp-legacy","settings":{"header":"dtls"}}
+            ]}}"#,
+        )
+        .expect("parses");
+        let Carrier::Kcp(config) = stream_carrier(Some(&settings)) else {
+            panic!("accepts");
+        };
+        let expected = ferrox_core::kcp::Mask::from_spec(&[
+            ferrox_core::kcp::Spec::Header(ferrox_core::kcp::HeaderKind::Dtls),
+            ferrox_core::kcp::Spec::Header(ferrox_core::kcp::HeaderKind::Srtp),
+        ])
+        .expect("builds");
+        assert_eq!(config.mask, expected, "a header run is written in reverse");
+
+        for refused in [
+            r#"{"network":"kcp","finalmask":{"udp":[{"type":"sudoku","settings":{"password":"x"}}]}}"#,
+            r#"{"network":"kcp","finalmask":{"udp":[{"type":"salamander","settings":{"password":"hunter2","packetSize":1200}}]}}"#,
+            r#"{"network":"kcp","finalmask":{"udp":[{"type":"salamander","settings":{"password":"abc"}}]}}"#,
+        ] {
+            let settings = crate::json::parse(refused).expect("parses");
+            assert!(
+                matches!(stream_carrier(Some(&settings)), Carrier::Unknown { .. }),
+                "{refused} must be refused by name"
+            );
+        }
+    }
+
     /// The `streamSettings` the two pinned interop rows write, in both number and string spellings.
     const FRAGMENT: &str = r#"{"network":"tcp","finalmask":{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":[11,37],"delays":[0],"maxSplit":24}}]}}"#;
     const FRAGMENT_STRINGS: &str = r#"{"network":"tcp","finalmask":{"tcp":[{"type":"fragment","settings":{"packets":"tlshello","lengths":["11","37"],"delays":["0"],"maxSplit":"24"}}]}}"#;

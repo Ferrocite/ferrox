@@ -433,13 +433,16 @@ mod tests {
     #[cfg_attr(miri, ignore = "binds loopback UDP sockets")]
     #[test]
     fn every_mask_family_echoes_over_loopback() {
-        let families: [&[Spec]; 9] = [
+        let families: [&[Spec]; 10] = [
             &[Spec::Original],
             &[Spec::Header(HeaderKind::Srtp)],
             &[Spec::Header(HeaderKind::Wechat)],
             &[Spec::Header(HeaderKind::Dtls)],
             &[Spec::Header(HeaderKind::Utp)],
             &[Spec::Header(HeaderKind::WireGuard)],
+            &[Spec::Salamander {
+                password: "salamander-pass".to_owned(),
+            }],
             &[Spec::HeaderDns {
                 domain: "www.baidu.com".to_owned(),
             }],

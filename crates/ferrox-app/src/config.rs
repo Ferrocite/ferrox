@@ -1597,12 +1597,9 @@ fn resolve_kcp(settings: Option<&Json>, network: &str) -> Carrier {
     Carrier::Kcp(config)
 }
 
-/// The `finalmask.udp` `mkcp-legacy` chain for a KCP carrier, already in
-/// wire order (outermost first): the reference reverses the JSON list once
-/// when it builds its mask manager, so the last configured entry is the
-/// outermost on the wire. `Some(default)` means no finalmask at all; `None`
-/// refuses the carrier — an unknown udp mask type, a bad header name or an
-/// unpackable dns domain must never silently dial unmasked.
+/// The `finalmask.udp` chain for a KCP carrier, in wire order (outermost first). `Some(default)`
+/// means no finalmask at all; `None` refuses the carrier — an unknown udp mask type, a gecko packet
+/// size, a bad header name or an unpackable dns domain must never silently dial unmasked.
 fn kcp_mask(settings: Option<&Json>) -> Option<ferrox_core::kcp::Mask> {
     use ferrox_core::kcp::{HeaderKind, Mask, Spec};
     let Some(udp) = settings
@@ -1613,52 +1610,87 @@ fn kcp_mask(settings: Option<&Json>) -> Option<ferrox_core::kcp::Mask> {
         return Some(Mask::default());
     };
     let mut specs = Vec::with_capacity(udp.len());
+    let mut headers = Vec::with_capacity(udp.len());
     for entry in udp {
-        if entry
+        let conf = entry.get("settings");
+        match entry
             .get("type")
             .and_then(Json::as_str)
             .map(str::to_lowercase)
-            != Some("mkcp-legacy".to_owned())
+            .as_deref()
         {
-            return None;
-        }
-        let conf = entry.get("settings");
-        let header = conf
-            .and_then(|c| c.get("header"))
-            .and_then(Json::as_str)
-            .unwrap_or("");
-        let value = conf
-            .and_then(|c| c.get("value"))
-            .and_then(Json::as_str)
-            .unwrap_or("");
-        specs.push(if header.is_empty() {
-            if value.is_empty() {
-                Spec::Original
-            } else {
-                Spec::Aes {
-                    password: value.to_owned(),
+            Some("salamander") => {
+                // A positive `packetSize` selects the reference's gecko lane, a fragmenting layer this mask is not.
+                let gecko = match conf.and_then(|c| c.get("packetSize")) {
+                    None | Some(Json::Null) => false,
+                    Some(value) => int32_range(value).is_none_or(|range| range.high > 0),
+                };
+                if gecko {
+                    return None;
                 }
+                let password = conf
+                    .and_then(|c| c.get("password"))
+                    .and_then(Json::as_str)
+                    .unwrap_or("");
+                specs.push(Spec::Salamander {
+                    password: password.to_owned(),
+                });
+                headers.push(false);
             }
-        } else {
-            match header.to_lowercase().as_str() {
-                "dns" => Spec::HeaderDns {
-                    domain: (if value.is_empty() {
-                        "www.baidu.com"
+            Some("mkcp-legacy") => {
+                let header = conf
+                    .and_then(|c| c.get("header"))
+                    .and_then(Json::as_str)
+                    .unwrap_or("");
+                let value = conf
+                    .and_then(|c| c.get("value"))
+                    .and_then(Json::as_str)
+                    .unwrap_or("");
+                specs.push(if header.is_empty() {
+                    if value.is_empty() {
+                        Spec::Original
                     } else {
-                        value
-                    })
-                    .to_owned(),
-                },
-                "dtls" => Spec::Header(HeaderKind::Dtls),
-                "srtp" => Spec::Header(HeaderKind::Srtp),
-                "utp" => Spec::Header(HeaderKind::Utp),
-                "wechat" => Spec::Header(HeaderKind::Wechat),
-                "wireguard" => Spec::Header(HeaderKind::WireGuard),
-                _ => return None,
+                        Spec::Aes {
+                            password: value.to_owned(),
+                        }
+                    }
+                } else {
+                    match header.to_lowercase().as_str() {
+                        "dns" => Spec::HeaderDns {
+                            domain: (if value.is_empty() {
+                                "www.baidu.com"
+                            } else {
+                                value
+                            })
+                            .to_owned(),
+                        },
+                        "dtls" => Spec::Header(HeaderKind::Dtls),
+                        "srtp" => Spec::Header(HeaderKind::Srtp),
+                        "utp" => Spec::Header(HeaderKind::Utp),
+                        "wechat" => Spec::Header(HeaderKind::Wechat),
+                        "wireguard" => Spec::Header(HeaderKind::WireGuard),
+                        _ => return None,
+                    }
+                });
+                headers.push(true);
             }
-        });
+            _ => return None,
+        }
     }
-    specs.reverse();
+    // A run of `mkcp-legacy` entries is written front-to-back from the reversed list, so its wire order is the reverse of its config order; a wrapper keeps its place.
+    let mut at = 0;
+    while at < specs.len() {
+        if !headers[at] {
+            at += 1;
+            continue;
+        }
+        let mut end = at;
+        while end < specs.len() && headers[end] {
+            end += 1;
+        }
+        specs[at..end].reverse();
+        at = end;
+    }
     Mask::from_spec(&specs).ok()
 }
 
