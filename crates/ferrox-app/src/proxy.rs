@@ -64,17 +64,17 @@ fn foxy_edge_row(edge: &ferrox_core::foxy::Candidate, reading: Option<u64>) -> S
     )
 }
 
-pub(crate) fn serve_json(label: &str, text: &str) -> ! {
-    let root = crate::json::parse(text)
+pub(crate) fn serve_json(label: &str, body: &str, test: bool) -> ! {
+    let root = crate::json::parse(body)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
-    serve_root(label, &root, None)
+    serve_root(label, &root, None, test)
 }
 
 /// Xray's own wire form; the pinned scenario suite spawns this binary with `-config=stdin: -format=pb`.
-pub(crate) fn serve_protobuf(label: &str, bytes: &[u8]) -> ! {
+pub(crate) fn serve_protobuf(label: &str, bytes: &[u8], test: bool) -> ! {
     let (root, seed) = crate::xray_pb::to_json_seeded(bytes)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
-    serve_root(label, &root, Some(&seed))
+    serve_root(label, &root, Some(&seed), test)
 }
 
 /// The listen addresses an inbound names: every port its `port` field expands, on the
@@ -172,7 +172,7 @@ fn dokodemo_networks(inbound: &Json) -> Vec<&str> {
         .unwrap_or_default()
 }
 
-fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>) -> ! {
+fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, test: bool) -> ! {
     // Armed before the first inbound opens, so every flow from here reads the budget the operator named.
     crate::budgets::apply(
         &crate::config::budgets(root)
@@ -187,9 +187,7 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>) -> 
     }
     crate::stats::install(root)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
-    crate::metrics::install(root)
-        .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
-    crate::accesslog::install(root)
+    install_file_apps(root, test)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     install_default_outbound_tag(root);
     let freedom = has_protocol(root, "outbounds", "freedom");
@@ -213,7 +211,7 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>) -> 
     let portals = reverse_portals(root);
     let routing = crate::router::Routing::parse(root)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
-    let observatory = crate::observatory::start(root)
+    let observatory = start_observatory(root, test)
         .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")));
     let api_config = match seed.and_then(|seed| seed.api.clone()) {
         Some(config) => Some(config),
@@ -231,17 +229,22 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>) -> 
             .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}")))
     });
     if let Some(api) = api.as_ref() {
-        api.set_observatory(observatory);
-        api.set_runtime(Arc::new(Runtime::new(
-            outbound.clone(),
-            route.clone(),
-            freedom,
-            Arc::clone(&portals),
-        )));
-        api.serve_listen();
+        wire_api(
+            api,
+            observatory,
+            Runtime::new(
+                outbound.clone(),
+                route.clone(),
+                freedom,
+                Arc::clone(&portals),
+            ),
+            test,
+        );
     }
-    install_dns_route(route.clone(), outbound.as_ref());
-    start_bridges(root, outbound.as_ref(), route.as_ref());
+    if !test {
+        install_dns_route(route.clone(), outbound.as_ref());
+        start_bridges(root, outbound.as_ref(), route.as_ref());
+    }
     let (inbounds, hysteria_served) = serve_inbounds_counted(
         label,
         root,
@@ -252,12 +255,17 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>) -> 
         &portals,
         api.as_deref(),
         seed,
+        test,
     );
     if inbounds == 0 {
         match refused.as_deref().unwrap_or(&[]).first() {
             Some(reason) => exit(&format!("bad config {label}: {reason}")),
             None => exit(&format!("no servable inbound in {label}")),
         }
+    }
+    if test {
+        println!("Configuration OK.");
+        std::process::exit(0);
     }
     if hysteria_served {
         // The readiness token the pinned interop harness scans the server log for; not this binary's name.
@@ -266,6 +274,44 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>) -> 
     loop {
         thread::park();
         report_dial_failures();
+    }
+}
+
+/// The observatory a config names; `-test` proves both blocks parse without starting either probe loop.
+fn start_observatory(
+    root: &Json,
+    test: bool,
+) -> Result<Option<Arc<crate::observatory::Observatory>>, String> {
+    if test {
+        crate::observatory::validate(root).map(|()| None)
+    } else {
+        crate::observatory::start(root)
+    }
+}
+
+/// The two file-backed apps: `-test` parses them without opening or creating anything the reference also leaves alone.
+fn install_file_apps(root: &Json, test: bool) -> Result<(), String> {
+    if test {
+        crate::metrics::parse(root)?;
+        crate::accesslog::parse(root)?;
+    } else {
+        crate::metrics::install(root)?;
+        crate::accesslog::install(root)?;
+    }
+    Ok(())
+}
+
+/// Attach the runtime a management call drives, then listen for it; `-test` skips the listener.
+fn wire_api(
+    api: &Arc<crate::commander::Api>,
+    observatory: Option<Arc<crate::observatory::Observatory>>,
+    runtime: Runtime,
+    test: bool,
+) {
+    api.set_observatory(observatory);
+    api.set_runtime(Arc::new(runtime));
+    if !test {
+        api.serve_listen();
     }
 }
 
@@ -340,6 +386,7 @@ fn serve_inbounds_counted(
     portals: &crate::reverse::Portals,
     api: Option<&crate::commander::Api>,
     seed: Option<&crate::xray_pb::Seed>,
+    test: bool,
 ) -> (usize, bool) {
     let routed =
         |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
@@ -353,6 +400,20 @@ fn serve_inbounds_counted(
             let Some(addresses) = serve_addresses(inbound, protocol) else {
                 continue;
             };
+            // `-test` takes an ephemeral loopback port so the one a running instance holds is never touched.
+            let listening = test.then(|| {
+                addresses
+                    .iter()
+                    .map(|address| {
+                        if address.is_empty() {
+                            String::new()
+                        } else {
+                            "127.0.0.1:0".to_owned()
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let bind = listening.as_ref().unwrap_or(&addresses);
             if !inbound_served(protocol) {
                 refuse_inbound(protocol, label, inbound);
                 continue;
@@ -387,7 +448,7 @@ fn serve_inbounds_counted(
                 users
             });
             let before = inbounds;
-            for address in &addresses {
+            for address in bind {
                 match protocol {
                     "vless" => {
                         if serve_vless_inbound(address, inbound, freedom, label, portals) {
@@ -484,7 +545,8 @@ fn serve_inbounds_counted(
                         let Some(out) = routed(inbound, false) else {
                             continue;
                         };
-                        if serve_tun_inbound(inbound, &out, address) {
+                        // `-test` proves the device spec without opening an interface the reference also leaves closed.
+                        if test || serve_tun_inbound(inbound, &out, address) {
                             inbounds += 1;
                         }
                     }
@@ -564,6 +626,7 @@ fn serve_inbounds(
         portals,
         api.map(std::sync::Arc::as_ref),
         seed,
+        false,
     )
 }
 
@@ -1056,7 +1119,13 @@ fn no_delay(stream: &Connection) {
     let _ = stream.set_nodelay(true);
 }
 
-fn exit(message: &str) -> ! {
+/// Startup ends here: xray answers a config error with `Failed to start:` on stdout and status 23,
+/// so a `-test` run reports the same verdict systemd's restart policy keys on.
+pub(crate) fn exit(message: &str) -> ! {
+    if crate::test_only() {
+        println!("Failed to start: {message}");
+        std::process::exit(23);
+    }
     eprintln!("{message}");
     std::process::exit(1);
 }
@@ -1756,6 +1825,7 @@ pub(crate) fn serve_dynamic_inbounds(
         &runtime.portals,
         Some(api),
         Some(seed),
+        false,
     )
 }
 
