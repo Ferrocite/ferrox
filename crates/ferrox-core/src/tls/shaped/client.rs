@@ -2268,6 +2268,36 @@ mod tests {
 
     #[cfg_attr(miri, ignore = "uses the OS random source")]
     #[test]
+    fn an_accepted_offer_logs_the_inner_random() {
+        let (list, _) = crate::tls::ech::generate("public.test", 7).expect("generates");
+        let mut session = ech_session(&list, accepting_server_hello);
+        let (inner, outer) = {
+            let hello = session.hello.as_ref().expect("hello");
+            (hello.ech_inner_random().expect("inner"), hello.random)
+        };
+        assert_ne!(inner, outer, "the inner random is not the outer one");
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-shaped-ech-keylog-{}.log",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let named = path.to_string_lossy().into_owned();
+        let log = crate::tls::MasterKeyLog::open(&named).expect("opens");
+        session.set_key_log(Some(Arc::new(log)));
+        let _ = session.handshake();
+        let text = std::fs::read_to_string(&path).expect("the log the session named");
+        let _ = std::fs::remove_file(&path);
+        let line = text
+            .lines()
+            .find(|line| line.starts_with("CLIENT_HANDSHAKE_TRAFFIC_SECRET "))
+            .unwrap_or_else(|| panic!("the handshake secret is written: {text:?}"));
+        let random = line.split(' ').nth(1).expect("a random field");
+        assert_eq!(random, crate::foxy::account::hex_encode(&inner));
+        assert_ne!(random, crate::foxy::account::hex_encode(&outer));
+    }
+
+    #[cfg_attr(miri, ignore = "uses the OS random source")]
+    #[test]
     fn a_non_confirming_offer_is_refused() {
         let (list, _) = crate::tls::ech::generate("public.test", 7).expect("generates");
         let mut session = ech_session(&list, |hello| {

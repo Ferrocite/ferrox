@@ -3284,6 +3284,56 @@ mod tests {
         ignore = "needs a loopback socket, and ring's assembly behind it"
     )]
     #[test]
+    fn ech_server_records_the_master_key_log() {
+        let (list, keys) = crate::tls::ech::generate("public.test", 3).expect("generates");
+        let cert_pem = anchor_pem("CERTIFICATE", ANCHOR);
+        let key_pem = anchor_pem("PRIVATE KEY", ANCHOR_KEY);
+        let mut identity = crate::tls::parse_pem_identity(&cert_pem, &key_pem).expect("parses");
+        identity.ech_server_keys = Some(keys.into());
+        let path =
+            std::env::temp_dir().join(format!("ferrox-ech-keylog-{}.log", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let named = path.to_string_lossy().into_owned();
+        identity.master_key_log = Some(Arc::new(
+            crate::tls::MasterKeyLog::open(&named).expect("opens"),
+        ));
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                let (stream, _) = listener.accept().expect("accepts");
+                let mut server = crate::tls::accept(&identity, stream).expect("accepts");
+                server.handshake().expect("handshakes");
+                assert!(server.ech_accepted(), "the offer was accepted");
+                let mut buf = [0u8; 4];
+                server.read_exact(&mut buf).expect("reads");
+                server.write_all(&buf).expect("writes");
+                server.flush().expect("flushes");
+            });
+            let mut cfg = client("tls.test", &[b"h2", b"http/1.1"]);
+            cfg.ech_config_list = Some(list.into());
+            let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+            let mut client = crate::tls::connect(&cfg, stream).expect("configures");
+            client.handshake().expect("handshakes");
+            client.write_all(b"ping").expect("writes");
+            client.flush().expect("flushes");
+            let mut buf = [0u8; 4];
+            client.read_exact(&mut buf).expect("reads");
+        });
+        let log = std::fs::read_to_string(&path).expect("the log the config named");
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            log.lines()
+                .any(|line| line.starts_with("SERVER_HANDSHAKE_TRAFFIC_SECRET ")),
+            "the ECH listener's secrets are written: {log:?}"
+        );
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
     fn ech_server_accepts_an_aes_256_only_offer() {
         let (list, keys) = crate::tls::ech::generate_with_suites(
             "public.test",
