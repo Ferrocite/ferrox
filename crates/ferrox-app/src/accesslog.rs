@@ -159,25 +159,42 @@ pub(crate) fn record(
         |source| address(source, config.mask_address),
     );
     let mut line = format!(
-        "from {source} {} {destination}",
-        if accepted { "accepted" } else { "rejected" }
+        "from {source} {} {}",
+        if accepted { "accepted" } else { "rejected" },
+        escaped(&format!("{destination}"))
     );
     if let Some(detour) = detour.filter(|detour| !detour.is_empty()) {
         line.push_str(" [");
-        line.push_str(detour);
+        line.push_str(&escaped(detour));
         line.push(']');
     }
     if !reason.is_empty() {
         line.push(' ');
-        line.push_str(reason);
+        line.push_str(&escaped(reason));
     }
     if !email.is_empty() {
         line.push_str(" email: ");
-        line.push_str(email);
+        line.push_str(&escaped(email));
     }
     line.push('\n');
     let _ = writer.write_all(line.as_bytes());
     let _ = writer.flush();
+}
+
+/// A line holds one entry: a path, tag or account that carries a control byte is escaped, not
+/// written through, so nothing a peer names can start a second record.
+fn escaped(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch == '\\' {
+            out.push_str("\\\\");
+        } else if ch.is_control() {
+            out.extend(ch.escape_default());
+        } else {
+            out.push(ch);
+        }
+    }
+    out
 }
 
 fn address(address: SocketAddr, masked: bool) -> String {
@@ -240,6 +257,37 @@ mod tests {
             text,
             "from 192.0.2.10:1234 accepted example.com:443 [proxy] accept email: a@b.c\n"
         );
+        let _ = std::fs::remove_file(&path);
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+    }
+
+    #[test]
+    fn a_destination_from_the_wire_cannot_forge_a_second_line() {
+        let _guard = crate::stats::test_lock();
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-access-wire-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let mut quoted = String::new();
+        crate::json::write(&Json::Str(path.to_string_lossy().into_owned()), &mut quoted);
+        let root =
+            crate::json::parse(&format!(r#"{{"log":{{"access":{quoted}}}}}"#)).expect("parses");
+        install(&root).expect("access log installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        record(
+            Some(source),
+            false,
+            &"bad\nline:443",
+            Some("tag\nx"),
+            "why\ny",
+            "a@b.c\nz",
+        );
+        let text = std::fs::read_to_string(&path).expect("reads the line");
+        assert_eq!(text.lines().count(), 1, "one request writes one line");
+        for field in ["bad\\nline:443", "[tag\\nx]", "why\\ny", "email: a@b.c\\nz"] {
+            assert!(text.contains(field), "{field:?} is escaped: {text:?}");
+        }
         let _ = std::fs::remove_file(&path);
         install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
     }
