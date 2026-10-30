@@ -1815,8 +1815,10 @@ impl RoutePlan {
             .routing
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .udp_tag(self.inbound_tag.as_deref(), self.shared.default_tag.as_deref())
-        {
+            .udp_tag(
+                self.inbound_tag.as_deref(),
+                self.shared.default_tag.as_deref(),
+            ) {
             Ok(None) => Association::Default,
             Ok(Some(tag)) => Association::Tag(tag.to_owned()),
             Err(()) => Association::Split,
