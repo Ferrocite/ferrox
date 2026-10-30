@@ -1,6 +1,7 @@
 //! A `406` from a Fastly host is a challenge ending in a cookie: without it the plane answers `406` forever.
 
 use std::collections::BTreeMap;
+use std::io::{IsTerminal as _, Write as _};
 use std::sync::Mutex;
 
 use sha2::Digest as _;
@@ -38,7 +39,9 @@ impl Agent {
     }
 }
 
-const BROWSER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36";
+const BROWSER_AGENT: &str =
+    "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0";
+const BROWSER_LANGUAGE: &str = "en-US,en;q=0.5";
 const HTML_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
 
 /// Rounds of post-back before the edge is taken at its word.
@@ -159,16 +162,18 @@ pub(crate) fn solve(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challen
 }
 
 fn solve_on(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challenge> {
-    let page = get(endpoint, jar, "/", HTML_ACCEPT)?;
+    let page = get(endpoint, jar, "/", HTML_ACCEPT, None)?;
     if !page.contains("/_fs-ch-") || !page.contains("Client Challenge") {
         return Err(Challenge::Absent);
     }
     let prefix = prefix_of(&page).ok_or(Challenge::Absent)?;
+    let referer = format!("https://{}/", endpoint.host);
     let script = get(
         endpoint,
         jar,
         &format!("{prefix}/script.js?reload=true"),
         HTML_ACCEPT,
+        Some(&referer),
     )?;
     let (mut challenges, mut token) = parse_init(&script).ok_or(Challenge::Absent)?;
     for _ in 0..MAX_ROUNDS {
@@ -188,16 +193,18 @@ fn solve_on(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challenge> {
         post.push_str("]}");
         let mut body = Vec::new();
         body.extend_from_slice(post.as_bytes());
+        let origin = format!("https://{}", endpoint.host);
+        let referer = format!("{origin}/");
+        let mut headers: Vec<(&str, &str)> =
+            vec![("Content-Type", "application/json"), ("Origin", &origin)];
+        headers.extend(cors_headers(&referer));
         let reply = crate::foxy_account::send(
             endpoint,
             jar,
             Agent::Page,
             "POST",
             &format!("{prefix}/fst-post-back"),
-            &[
-                ("Content-Type", "application/json"),
-                ("Origin", &endpoint.origin()),
-            ],
+            &headers,
             &body,
         )
         .map_err(|_| Challenge::Absent)?;
@@ -226,10 +233,36 @@ fn solve_on(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challenge> {
 
 /// The page must no longer be a challenge for the cookie to be worth keeping.
 fn confirm(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challenge> {
-    let page = get(endpoint, jar, "/", HTML_ACCEPT)?;
+    let page = get(endpoint, jar, "/", HTML_ACCEPT, None)?;
     (!page.contains("/_fs-ch-"))
         .then_some(())
         .ok_or(Challenge::Unsolved)
+}
+
+fn page_headers<'a>(referer: Option<&'a str>) -> Vec<(&'static str, &'a str)> {
+    let mut headers: Vec<(&'static str, &'a str)> = vec![("Accept-Language", BROWSER_LANGUAGE)];
+    if let Some(referer) = referer {
+        headers.push(("Referer", referer));
+        headers.push(("Sec-Fetch-Dest", "script"));
+        headers.push(("Sec-Fetch-Mode", "no-cors"));
+        headers.push(("Sec-Fetch-Site", "same-origin"));
+    } else {
+        headers.push(("Sec-Fetch-Dest", "document"));
+        headers.push(("Sec-Fetch-Mode", "navigate"));
+        headers.push(("Sec-Fetch-Site", "none"));
+        headers.push(("Upgrade-Insecure-Requests", "1"));
+    }
+    headers
+}
+
+fn cors_headers(referer: &str) -> [(&'static str, &str); 5] {
+    [
+        ("Accept-Language", BROWSER_LANGUAGE),
+        ("Referer", referer),
+        ("Sec-Fetch-Dest", "empty"),
+        ("Sec-Fetch-Mode", "cors"),
+        ("Sec-Fetch-Site", "same-origin"),
+    ]
 }
 
 fn get(
@@ -237,14 +270,23 @@ fn get(
     jar: &Mutex<Jar>,
     path: &str,
     accept: &str,
+    referer: Option<&str>,
 ) -> Result<String, Challenge> {
     let agent = if accept == HTML_ACCEPT {
         Agent::Page
     } else {
         Agent::Text
     };
-    let reply = crate::foxy_account::send(endpoint, jar, agent, "GET", path, &[], b"")
-        .map_err(|_| Challenge::Absent)?;
+    let reply = crate::foxy_account::send(
+        endpoint,
+        jar,
+        agent,
+        "GET",
+        path,
+        &page_headers(referer),
+        b"",
+    )
+    .map_err(|_| Challenge::Absent)?;
     if reply.status / 100 != 2 {
         return Err(Challenge::Absent);
     }
@@ -362,9 +404,171 @@ fn answer(
             ("detector_results".to_owned(), Json::Obj(Vec::new())),
             ("v".to_owned(), Json::Num(2.0)),
         ])),
-        "captcha" => Err(Challenge::Unsupported("captcha")),
+        "captcha" => captcha_answer(endpoint, &text("image_b64")),
         _ => Err(Challenge::Unsupported("")),
     }
+}
+
+/// The edge's image captcha: decoded and answered by a vision endpoint when one is configured, else typed at a terminal.
+fn captcha_answer(endpoint: &Endpoint, image: &str) -> Result<Json, Challenge> {
+    let bytes = captcha_image(image).ok_or(Challenge::Absent)?;
+    let answer = vision_from_env()
+        .and_then(|vision| ask_vision(&vision, image, &endpoint.roots))
+        .or_else(|| ask_human(&bytes, captcha_extension(image)))
+        .ok_or(Challenge::Unsupported("captcha"))?;
+    Ok(Json::Obj(vec![
+        ("ty".to_owned(), Json::Str("captcha".to_owned())),
+        ("answer".to_owned(), Json::Str(answer)),
+    ]))
+}
+
+/// The captcha's image is a data URL or its bare base64; the raw bytes are what the model or the person reads.
+fn captcha_image(data: &str) -> Option<Vec<u8>> {
+    let coded = data
+        .split_once("base64,")
+        .map_or(data, |(_, tail)| tail)
+        .trim();
+    let bytes = ferrox_core::b64::decode(coded.as_bytes())?;
+    (!bytes.is_empty()).then_some(bytes)
+}
+
+fn captcha_extension(data: &str) -> &'static str {
+    if data.starts_with("data:image/png") {
+        "png"
+    } else {
+        "jpg"
+    }
+}
+
+fn sanitize_captcha(text: &str) -> Option<String> {
+    let answer: String = text.chars().filter(char::is_ascii_alphanumeric).collect();
+    (!answer.is_empty()).then_some(answer)
+}
+
+struct Vision {
+    url: String,
+    key: String,
+    model: String,
+}
+
+fn vision_from_env() -> Option<Vision> {
+    let base = std::env::var("VISION_API_BASE_URL").ok()?;
+    let key = std::env::var("VISION_API_KEY").ok()?;
+    let model = std::env::var("VISION_MODEL").ok()?;
+    let base = base.trim_end_matches('/');
+    if base.is_empty() || key.is_empty() || model.is_empty() {
+        return None;
+    }
+    Some(Vision {
+        url: vision_url(base),
+        key,
+        model,
+    })
+}
+
+fn vision_url(base: &str) -> String {
+    if base.ends_with("/v1") {
+        format!("{base}/chat/completions")
+    } else {
+        format!("{base}/v1/chat/completions")
+    }
+}
+
+fn vision_body(model: &str, image: &str) -> String {
+    let message = Json::Obj(vec![
+        ("role".to_owned(), Json::Str("user".to_owned())),
+        (
+            "content".to_owned(),
+            Json::Arr(vec![
+                Json::Obj(vec![
+                    ("type".to_owned(), Json::Str("text".to_owned())),
+                    (
+                        "text".to_owned(),
+                        Json::Str(
+                            "Read CAPTCHA characters exactly. Return only characters, no spaces."
+                                .to_owned(),
+                        ),
+                    ),
+                ]),
+                Json::Obj(vec![
+                    ("type".to_owned(), Json::Str("image_url".to_owned())),
+                    (
+                        "image_url".to_owned(),
+                        Json::Obj(vec![("url".to_owned(), Json::Str(image.to_owned()))]),
+                    ),
+                ]),
+            ]),
+        ),
+    ]);
+    let body = Json::Obj(vec![
+        ("model".to_owned(), Json::Str(model.to_owned())),
+        ("temperature".to_owned(), Json::Num(0.0)),
+        ("max_tokens".to_owned(), Json::Num(32.0)),
+        ("messages".to_owned(), Json::Arr(vec![message])),
+    ]);
+    let mut out = String::new();
+    json::write(&body, &mut out);
+    out
+}
+
+fn ask_vision(vision: &Vision, image: &str, roots: &ferrox_core::tls::Anchors) -> Option<String> {
+    let endpoint = Endpoint::parse(&vision.url, roots.clone())?;
+    if endpoint.port != 443 {
+        return None;
+    }
+    let auth = format!("Bearer {}", vision.key);
+    let body = vision_body(&vision.model, image);
+    let reply = crate::foxy_account::ask(
+        &endpoint,
+        "POST",
+        &endpoint.base,
+        &[
+            ("Authorization", auth.as_str()),
+            ("Content-Type", crate::foxy_account::JSON_ACCEPT),
+        ],
+        body.as_bytes(),
+    )
+    .ok()?;
+    if reply.status / 100 != 2 {
+        return None;
+    }
+    let answer = json::parse(&String::from_utf8_lossy(&reply.body)).ok()?;
+    let content = answer
+        .get("choices")?
+        .as_arr()?
+        .first()?
+        .get("message")?
+        .get("content")?
+        .as_str()?;
+    sanitize_captcha(content)
+}
+
+/// A saved temp file is the only way to show the image to the person at the terminal; it is removed after the answer.
+fn ask_human(image: &[u8], extension: &str) -> Option<String> {
+    if !std::io::stdin().is_terminal() {
+        return None;
+    }
+    let mut nonce = [0u8; 6];
+    getrandom::fill(&mut nonce).ok()?;
+    let name = ferrox_core::foxy::account::hex_encode(&nonce);
+    let path = std::env::temp_dir().join(format!("ferrox-captcha-{name}.{extension}"));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let mut file = options.open(&path).ok()?;
+    file.write_all(image).ok()?;
+    drop(file);
+    println!("the edge asks for a captcha: open {}", path.display());
+    print!("captcha characters: ");
+    std::io::stdout().flush().ok()?;
+    let mut line = String::new();
+    std::io::stdin().read_line(&mut line).ok()?;
+    let _ = std::fs::remove_file(&path);
+    sanitize_captcha(&line)
 }
 
 /// The edge's private-access token; with no browser to ask it is empty, which the edge reads as no answer.
@@ -374,16 +578,19 @@ fn fetch_pat(
     prefix: &str,
     token: &str,
 ) -> Result<String, Challenge> {
+    let origin = format!("https://{}", endpoint.host);
+    let headers: Vec<(&str, &str)> = vec![
+        ("Content-Type", crate::foxy_account::JSON_ACCEPT),
+        ("Origin", &origin),
+        ("Content-Length", "0"),
+    ];
     let reply = crate::foxy_account::send(
         endpoint,
         jar,
         Agent::Text,
         "POST",
         &format!("{prefix}/pat?token={}", encode(token)),
-        &[
-            ("Content-Type", crate::foxy_account::JSON_ACCEPT),
-            ("Origin", &endpoint.origin()),
-        ],
+        &headers,
         b"",
     )
     .map_err(|_| Challenge::Absent)?;
@@ -421,7 +628,7 @@ fn solve_pow(base: &str, target: &str) -> Option<[u8; 2]> {
     None
 }
 
-fn encode(text: &str) -> String {
+pub(crate) fn encode(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for byte in text.bytes() {
         match byte {
@@ -517,6 +724,20 @@ mod tests {
         assert_eq!(Agent::Text.accept(), "text/plain");
         assert_eq!(Agent::Page.user_agent(), Agent::Text.user_agent());
         assert_ne!(Agent::Api.user_agent(), Agent::Page.user_agent());
+        assert!(Agent::Page.user_agent().contains("Firefox"));
+    }
+
+    #[test]
+    fn a_browser_request_carries_the_headers_a_navigation_does() {
+        let root = page_headers(None);
+        assert!(root.contains(&("Sec-Fetch-Mode", "navigate")));
+        assert!(root.contains(&("Upgrade-Insecure-Requests", "1")));
+        let script = page_headers(Some("https://accounts.firefox.com/"));
+        assert!(script.contains(&("Sec-Fetch-Dest", "script")));
+        assert!(script.contains(&("Referer", "https://accounts.firefox.com/")));
+        let cors = cors_headers("https://accounts.firefox.com/");
+        assert!(cors.contains(&("Sec-Fetch-Mode", "cors")));
+        assert!(cors.contains(&("Sec-Fetch-Dest", "empty")));
     }
 
     #[test]
@@ -577,5 +798,46 @@ mod tests {
         assert_eq!(encode("a+b/c=d"), "a%2Bb%2Fc%3Dd");
         assert_eq!(encode("abcXYZ019-_.~"), "abcXYZ019-_.~");
         assert_eq!(encode("a b"), "a%20b");
+    }
+
+    #[test]
+    fn a_captcha_image_is_read_from_a_data_url_or_its_base64() {
+        let raw = [0xde, 0xad, 0xbe, 0xef];
+        let coded = ferrox_core::b64::encode(&raw);
+        let data = format!("data:image/png;base64,{coded}");
+        assert_eq!(captcha_image(&data).as_deref(), Some(&raw[..]));
+        assert_eq!(captcha_image(&coded).as_deref(), Some(&raw[..]));
+        assert_eq!(captcha_extension(&data), "png");
+        assert_eq!(captcha_extension(&coded), "jpg");
+        assert_eq!(captcha_image("!!!"), None);
+    }
+
+    #[test]
+    fn a_captcha_answer_keeps_only_letters_and_digits() {
+        assert_eq!(sanitize_captcha("  Ab3-x\n").as_deref(), Some("Ab3x"));
+        assert_eq!(sanitize_captcha("---"), None);
+    }
+
+    #[test]
+    fn a_vision_request_names_the_model_and_the_image() {
+        let body = vision_body("m1", "data:image/png;base64,AA");
+        assert!(body.contains(r#""model":"m1""#), "{body}");
+        assert!(
+            body.contains(r#""url":"data:image/png;base64,AA""#),
+            "{body}"
+        );
+        assert!(body.contains("Read CAPTCHA characters exactly"), "{body}");
+    }
+
+    #[test]
+    fn a_vision_url_is_the_reference_shape() {
+        assert_eq!(
+            vision_url("https://api.example/v1"),
+            "https://api.example/v1/chat/completions"
+        );
+        assert_eq!(
+            vision_url("https://api.example"),
+            "https://api.example/v1/chat/completions"
+        );
     }
 }

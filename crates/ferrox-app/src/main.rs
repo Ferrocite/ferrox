@@ -23,6 +23,7 @@ mod dnsnet;
 mod ech_dns;
 mod foxy;
 mod foxy_account;
+mod foxy_browser;
 mod foxy_catalog;
 mod foxy_challenge;
 mod foxy_latency;
@@ -102,6 +103,10 @@ fn usage() -> ! {
     );
     eprintln!("  ferrox-app mint-foxy-pass -c <config.json> -o <pass.json>");
     eprintln!("                                sign in once, store the proxy pass (0600)");
+    eprintln!(
+        "  ferrox-app browser-login --email ADDR --token-file PATH [--code CODE] [--no-open]"
+    );
+    eprintln!("                                finish the Firefox sign-in in a real browser");
     eprintln!(
         "  ferrox-app edges [--ping]         list the catalogue's edges as JSON rows; --ping adds a handshake ms (null when silent)"
     );
@@ -304,6 +309,32 @@ fn main() {
                 usage();
             }
             proxy::mint_foxy_pass(&config, &out);
+        }
+        "browser-login" => {
+            let mut email = String::new();
+            let mut token_file = String::new();
+            let mut code = String::new();
+            let mut no_open = false;
+            while let Some(arg) = args.next() {
+                match arg.as_str() {
+                    "--email" | "-e" => email = args.next().unwrap_or_else(|| usage()),
+                    "--token-file" | "-t" => {
+                        token_file = args.next().unwrap_or_else(|| usage());
+                    }
+                    "--code" => code = args.next().unwrap_or_else(|| usage()),
+                    "--no-open" => no_open = true,
+                    _ => usage(),
+                }
+            }
+            if email.is_empty() || token_file.is_empty() {
+                usage();
+            }
+            foxy_browser::login(
+                &email,
+                &token_file,
+                (!code.is_empty()).then_some(code.as_str()),
+                no_open,
+            );
         }
         "edges" => {
             let mut ping = false;

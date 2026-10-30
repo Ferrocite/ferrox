@@ -3,6 +3,7 @@
 
 use std::io::{IsTerminal as _, Write as _};
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::args::Options;
 use crate::config::FoxyAccount;
@@ -57,6 +58,31 @@ pub fn stored_email(paths: &Paths) -> String {
         .unwrap_or_default()
 }
 
+/// A grant the browser sign-in stored: a token file with an access token that has not lapsed.
+fn stored_grant(paths: &Paths) -> bool {
+    let Some(text) = read_trim(&paths.token_file) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return false;
+    };
+    if value
+        .get("access_token")
+        .and_then(serde_json::Value::as_str)
+        .is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    let expires = value
+        .get("expires_at")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    expires == 0 || expires > now + 60
+}
+
 fn same_account(stored: &str, email: &str) -> bool {
     !stored.is_empty()
         && stored.trim().to_lowercase()
@@ -83,24 +109,34 @@ pub fn resolve(options: &Options, paths: &Paths) -> Result<FoxyAccount, String> 
     } else {
         options.password.clone()
     };
-    if email.is_empty() || (password.is_empty() && !same_account(&stored_email(paths), &email)) {
+    let has_grant = |email: &str| same_account(&stored_email(paths), email) && stored_grant(paths);
+    if email.is_empty() || (password.is_empty() && !has_grant(&email)) {
         if !std::io::stdin().is_terminal() {
             return Err(
-                "no account: run 'ferrox-cli login' first, or pass --email and --password"
+                "no account: run 'ferrox-cli login --browser' first, or pass --email and --password"
                     .to_owned(),
             );
         }
-        println!("Foxy needs a Firefox account — an email and a password, no server to name.");
+        println!(
+            "Foxy needs a Firefox account — a password, or --browser to sign in through Firefox."
+        );
         if email.is_empty() {
             email = prompt("firefox account email: ", false)?;
         }
-        if password.is_empty() {
+        if password.is_empty() && !has_grant(&email) {
             password = prompt("password (hidden, not echoed): ", true)?;
         }
-        save(&email, &password, paths)?;
+        if !password.is_empty() {
+            save(&email, &password, paths)?;
+        }
     }
-    if email.is_empty() || password.is_empty() {
-        return Err("an account is an email and a password".to_owned());
+    if email.is_empty() {
+        return Err("an account is a firefox email".to_owned());
+    }
+    if password.is_empty() && !has_grant(&email) {
+        return Err(
+            "the stored browser session expired: run 'ferrox-cli login --browser' again".to_owned(),
+        );
     }
     Ok(FoxyAccount { email, password })
 }
@@ -143,7 +179,44 @@ fn save(email: &str, password: &str, paths: &Paths) -> Result<(), String> {
     Ok(())
 }
 
+fn save_email(email: &str, paths: &Paths) -> Result<(), String> {
+    let body = format!("FOXY_EMAIL={}\n", quote(email));
+    write_private(&paths.creds, &body)
+        .map_err(|error| format!("cannot save the account: {error}"))?;
+    println!(
+        "account saved to {}: the browser grant is in {}.",
+        paths.creds.display(),
+        paths.token_file.display()
+    );
+    Ok(())
+}
+
+fn browser_login(options: &Options, paths: &Paths) -> Result<(), String> {
+    let mut email = options.email.clone();
+    if email.is_empty() {
+        email = prompt("firefox account email: ", false)?;
+    }
+    if email.is_empty() {
+        return Err("an account is a firefox email".to_owned());
+    }
+    let status = std::process::Command::new(crate::lane::require_bin())
+        .arg("browser-login")
+        .arg("--email")
+        .arg(&email)
+        .arg("--token-file")
+        .arg(&paths.token_file)
+        .status()
+        .map_err(|error| format!("cannot start the browser sign-in: {error}"))?;
+    if !status.success() {
+        return Err("the browser sign-in did not finish".to_owned());
+    }
+    save_email(&email, paths)
+}
+
 pub fn login(options: &Options, paths: &Paths) -> Result<(), String> {
+    if options.browser {
+        return browser_login(options, paths);
+    }
     let mut email = options.email.clone();
     let mut password = options.password.clone();
     if email.is_empty() {

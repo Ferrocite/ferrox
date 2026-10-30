@@ -69,6 +69,7 @@ pub struct Options {
     pub instance: Option<String>,
     pub all: bool,
     pub vpn: bool,
+    pub browser: bool,
     pub debug: bool,
     pub ping: bool,
     pub loc_filter: String,
@@ -119,6 +120,7 @@ impl Default for Options {
             instance: None,
             all: false,
             vpn: false,
+            browser: false,
             debug: false,
             ping: false,
             loc_filter: String::new(),
@@ -284,6 +286,10 @@ pub fn parse() -> Options {
                 options.email = need(&args, index, "email", "an email address").to_owned();
                 index += 2;
             }
+            "--browser" => {
+                options.browser = true;
+                index += 1;
+            }
             "--password" => {
                 options.password = need(&args, index, "password", "a password").to_owned();
                 index += 2;
@@ -448,7 +454,8 @@ pub fn usage() -> ! {
         "usage: ferrox-cli <command> [options]
 
 commands
-  login      save the foxy account once (prompts for the password)
+  login      save the foxy account once (prompts for the password; --browser
+             signs in through a real browser instead)
   logout     stop the lane, then forget the account and its stored session
   locations  list the countries and cities the catalogue publishes
              (--ping measures the handshake to each edge, fastest first)
@@ -478,6 +485,7 @@ outbound (choose one)
 foxy options
   --email ADDR           Firefox account, else FOXY_EMAIL, else the credentials file
   --password PW          password, else FOXY_PASS
+  --browser              sign in through the system browser (no password sent here)
   --code CODE            two-factor code
   --country CC           exit country; default is the remembered one, else US
   --city CODE            city tier inside the country

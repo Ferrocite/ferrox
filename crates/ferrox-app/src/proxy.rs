@@ -25210,9 +25210,11 @@ fn retry_plane(
 }
 
 /// A `foxy` outbound's account, sign-in or pasted pass, as one `Account` whose pass the renewal thread owns.
+#[allow(clippy::too_many_arguments)]
 fn foxy_account(
     email: &str,
     password: &str,
+    session_token: &str,
     code: &str,
     pasted: &ferrox_core::foxy::Pass,
     guardian: &str,
@@ -25260,30 +25262,47 @@ fn foxy_account(
             }
         }
         if !resumed {
-            if password.is_empty() {
-                eprintln!(
-                    "foxy: no stored session and no settings.password: the sign-in needs one"
-                );
-                return None;
-            }
-            let mut signed_in = false;
-            let sign_in = || {
-                // A retry resumes the grant the first attempt stored before minting: one sign-in, however many attempts the plane's mood costs.
-                if signed_in {
-                    if let Some(session) = account
-                        .tokens
-                        .as_ref()
-                        .and_then(crate::foxy_account::TokenFile::load)
-                    {
-                        return account.resume(session);
+            let mut session_signed_in = false;
+            if !session_token.is_empty() {
+                match retry_plane("session token", || account.sign_in_session(session_token)) {
+                    Ok(()) => session_signed_in = true,
+                    Err(denied) if password.is_empty() => {
+                        eprintln!("foxy: the session token did not sign in: {denied}");
+                        return None;
+                    }
+                    Err(denied) => {
+                        eprintln!(
+                            "foxy: the session token did not sign in: {denied}, trying settings.password"
+                        );
                     }
                 }
-                signed_in = true;
-                account.sign_in(email, password)
-            };
-            if let Err(denied) = retry_plane("sign-in", sign_in) {
-                eprintln!("foxy: the account did not sign in: {denied}");
-                return None;
+            }
+            if !session_signed_in {
+                if password.is_empty() {
+                    eprintln!(
+                        "foxy: no stored session and no settings.password: the sign-in needs one"
+                    );
+                    return None;
+                }
+                let mut signed_in = false;
+                let sign_in = || {
+                    // A retry resumes the grant the first attempt stored before minting: one sign-in, however many attempts the plane's mood costs.
+                    if signed_in {
+                        if let Some(session) = account
+                            .tokens
+                            .as_ref()
+                            .and_then(crate::foxy_account::TokenFile::load)
+                        {
+                            return account.resume(session);
+                        }
+                    }
+                    signed_in = true;
+                    account.sign_in(email, password)
+                };
+                if let Err(denied) = retry_plane("sign-in", sign_in) {
+                    eprintln!("foxy: the account did not sign in: {denied}");
+                    return None;
+                }
             }
         }
         if account.needs_code() {
@@ -25346,6 +25365,25 @@ fn foxy_text_or(
         link.param(key).to_owned()
     } else {
         inline
+    }
+}
+
+/// A sign-in token already minted by the browser: inline wins, else the file it names, read once at boot.
+fn foxy_session_token(link: &ferrox_core::foxy::link::FoxyLink, settings: Option<&Json>) -> String {
+    let inline = foxy_text_or(link, settings, "sessionToken");
+    if !inline.is_empty() {
+        return inline;
+    }
+    let path = foxy_text_or(link, settings, "sessionTokenFile");
+    if path.is_empty() {
+        return String::new();
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(token) => token.trim().to_owned(),
+        Err(error) => {
+            eprintln!("foxy: cannot read sessionTokenFile {path:?}: {error}");
+            String::new()
+        }
     }
 }
 
@@ -25429,6 +25467,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
         let configured = foxy_text_or(&link, settings, "pass");
         let email = foxy_text_or(&link, settings, "email");
         let password = foxy_text_or(&link, settings, "password");
+        let session_token = foxy_session_token(&link, settings);
         let code = foxy_text_or(&link, settings, "code");
         let token_file = foxy_text_or(&link, settings, "tokenFile");
         if configured.is_empty() && email.is_empty() {
@@ -25463,6 +25502,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
         let account = foxy_account(
             &email,
             &password,
+            &session_token,
             &code,
             &pasted,
             link.guardian(),
@@ -48417,6 +48457,24 @@ mod tests {
         )
         .expect("parses");
         assert!(find_foxy_outbound(&root).is_none());
+    }
+
+    #[test]
+    fn a_session_token_is_read_inline_or_from_a_file() {
+        let link =
+            ferrox_core::foxy::link::FoxyLink::parse("foxy://edge.example").expect("a link parses");
+        let inline = crate::json::parse(r#"{"sessionToken":"inline-token"}"#).expect("parses");
+        assert_eq!(foxy_session_token(&link, Some(&inline)), "inline-token");
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-foxy-session-token-{}.txt",
+            std::process::id()
+        ));
+        std::fs::write(&path, "  file-token\n").expect("writes");
+        let escaped = path.display().to_string().replace('\\', "\\\\");
+        let from_file =
+            crate::json::parse(&format!(r#"{{"sessionTokenFile":"{escaped}"}}"#)).expect("parses");
+        assert_eq!(foxy_session_token(&link, Some(&from_file)), "file-token");
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A pasted pass nobody can replace stops carrying at its exp: refuse the lane at start, not at the first flow.
