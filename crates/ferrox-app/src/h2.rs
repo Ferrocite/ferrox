@@ -295,6 +295,19 @@ impl Decoder {
 pub(crate) fn read_head(stream: &mut dyn Read) -> Option<(usize, u8, u8, u32)> {
     let mut head = [0u8; 9];
     crate::proxy::read_exact(stream, &mut head).ok()?;
+    frame_from_head(head)
+}
+
+/// The same frame head for a caller that arms its own socket timeout: one timeout ends the read
+/// instead of retrying the relay's poll grain.
+pub(crate) fn read_head_bounded(stream: &mut dyn Read) -> Option<(usize, u8, u8, u32)> {
+    let mut head = [0u8; 9];
+    stream.read_exact(&mut head).ok()?;
+    frame_from_head(head)
+}
+
+/// Parse one nine-byte frame head, refusing a length past the frame cap.
+fn frame_from_head(head: [u8; 9]) -> Option<(usize, u8, u8, u32)> {
     let len = usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
     if len > FRAME_CAP {
         return None;
