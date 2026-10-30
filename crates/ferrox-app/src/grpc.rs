@@ -209,6 +209,8 @@ pub(crate) struct GrpcReader<R: Read = Connection> {
     /// The clock this head must be decoded by, armed only while the preface, the request headers and the opening request arrive: past it a silence is an error rather than a wait, so a peer that stops speaking releases the thread.
     handshake: Option<std::time::Instant>,
     eof: bool,
+    /// The peer sent `END_STREAM`: the read half finished normally, so the write half may still be used.
+    remote_end: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -363,6 +365,7 @@ impl<R: Read> GrpcReader<R> {
         }
         if flags & F_END != 0 {
             self.eof = true;
+            self.remote_end = true;
         }
         Some(())
     }
@@ -371,6 +374,7 @@ impl<R: Read> GrpcReader<R> {
         if self.answered {
             if flags & F_END != 0 {
                 self.eof = true;
+                self.remote_end = true;
             }
             return Some(());
         }
@@ -395,6 +399,7 @@ impl<R: Read> GrpcReader<R> {
         self.answered = true;
         if flags & F_END != 0 {
             self.eof = true;
+            self.remote_end = true;
         }
         Some(())
     }
@@ -463,6 +468,7 @@ impl<R: Read> GrpcReader<R> {
                 return None;
             }
             self.eof = true;
+            self.remote_end = true;
         }
         out
     }
@@ -1076,17 +1082,25 @@ impl GrpcWriter {
     }
 
     pub(crate) fn upload_done(&self) {
-        if self.shared.dead.load(Ordering::SeqCst)
-            || self.shared.ended.load(Ordering::SeqCst)
-            || self.shared.upload_ended.swap(true, Ordering::SeqCst)
+        if self.shared.dead.load(Ordering::SeqCst) || self.shared.ended.load(Ordering::SeqCst) {
+            return;
+        }
+        if self
+            .shared
+            .upload_ended
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
         {
             return;
         }
         let mut batch = Gather::new();
-        self.message(&[], self.max_frame(), true, &mut batch);
-        if batch.flush_blocking(&self.shared) {
-            let _ = Gather::settle_blocking(&self.shared);
+        if !self.message(&[], self.max_frame(), true, &mut batch)
+            || !batch.flush_blocking(&self.shared)
+        {
+            self.shared.upload_ended.store(false, Ordering::SeqCst);
+            return;
         }
+        let _ = Gather::settle_blocking(&self.shared);
     }
 
     pub(crate) fn close(&self) {
@@ -1514,6 +1528,7 @@ fn new_reader<R: Read>(
         owed_id: 0,
         handshake: None,
         eof: false,
+        remote_end: false,
     }
 }
 
@@ -1774,6 +1789,9 @@ impl crate::proxy::CarrierSink for GrpcWriter {
 }
 
 pub(crate) fn mark_reader_dead<R: Read>(reader: &mut GrpcReader<R>) {
+    if reader.remote_end {
+        return;
+    }
     reader.shared.dead.store(true, Ordering::SeqCst);
     reader.shared.wake.notify_all();
 }
