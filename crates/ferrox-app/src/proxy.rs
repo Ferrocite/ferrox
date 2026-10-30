@@ -52605,6 +52605,58 @@ mod webhook_route_tests {
     }
 
     #[test]
+    fn a_split_udp_webhook_names_the_datagram_endpoints() {
+        let (port, receive) = receiver(1);
+        let out = route_outbound(
+            &format!(
+                r#"{{"outbounds":[{{"protocol":"freedom","tag":"direct"}}],
+                    "routing":{{"rules":[{{"network":"udp","outboundTag":"direct",
+                        "webhook":{{"url":"http://127.0.0.1:{port}/hook"}}}}]}}}}"#
+            ),
+            Some("in"),
+            true,
+        );
+        let front = socks_front_with(out);
+        let mut control = Connection::connect(("127.0.0.1", front)).expect("connects");
+        control
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        control.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        control.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        control
+            .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        control.read_exact(&mut reply).expect("replies");
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let source = udp.local_addr().expect("addr");
+        let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"ping");
+        udp.send_to(&datagram, relay).expect("sends");
+
+        let body = receive
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the POST");
+        assert!(
+            body.contains(&format!("\"source\":\"{source}\"")),
+            "the UDP client is the source: {body}"
+        );
+        assert!(
+            body.contains(&format!("\"inboundLocal\":\"{relay}\"")),
+            "the UDP relay is the inbound local: {body}"
+        );
+    }
+
+    #[test]
     fn a_webhook_rule_posts_the_event_and_drops_a_duplicate_email_inside_the_window() {
         let (port, receive) = receiver(2);
         let root = crate::json::parse(&format!(
