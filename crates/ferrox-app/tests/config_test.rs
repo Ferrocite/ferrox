@@ -207,3 +207,70 @@ fn test_accepts_a_reality_seed_it_does_not_carry_the_binding_for() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+fn xmux_inbound(xmux: &str) -> String {
+    format!(
+        r#"{{"inbounds":[{{"listen":"127.0.0.1","port":18097,"protocol":"vless",
+        "settings":{{"clients":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}}],"decryption":"none"}},
+        "streamSettings":{{"network":"xhttp","xhttpSettings":{{
+        "path":"/share","mode":"stream-up","xmux":{xmux}}}}}}}],"outbounds":[{{"protocol":"freedom"}}]}}"#
+    )
+}
+
+/// The reference refuses both pool bounds at once while building the config, so `-test` does too.
+#[test]
+fn test_refuses_xhttp_xmux_with_both_bounds() {
+    let path = config_path(
+        "xmux-both",
+        &xmux_inbound(r#"{"maxConnections":3,"maxConcurrency":2}"#),
+    );
+    let named = path.to_string_lossy().into_owned();
+    let output = run(&["-test", "-c", &named]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(23),
+        "two exclusive bounds are xray's config error: {}{stderr}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        stderr.contains("maxConnections cannot be specified together with maxConcurrency"),
+        "the refusal carries the reference's spelling: {stderr}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+fn xmux_outbound(xmux: &str) -> String {
+    format!(
+        r#"{{"inbounds":[{{"listen":"127.0.0.1","port":18098,"protocol":"vless",
+        "settings":{{"clients":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811"}}],"decryption":"none"}}}}],
+        "outbounds":[{{"protocol":"vless","settings":{{"vnext":[{{"address":"192.0.2.1","port":443,
+        "users":[{{"id":"b831381d-6324-4d53-ad4f-8cda48b30811","encryption":"none"}}]}}]}},
+        "streamSettings":{{"network":"xhttp","xhttpSettings":{{
+        "path":"/share","mode":"stream-up","xmux":{xmux}}}}}}}]}}"#
+    )
+}
+
+/// A pool bound the reference dials out of is still a config this tree runs, so it starts with one line saying the bound is not applied.
+#[test]
+fn test_accepts_xhttp_xmux_bounds_it_does_not_apply() {
+    let path = config_path("xmux-one", &xmux_outbound(r#"{"maxConnections":3}"#));
+    let named = path.to_string_lossy().into_owned();
+    let output = run(&["-test", "-c", &named]);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "a valid xmux block is servable: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        stdout.contains("Configuration OK."),
+        "`-test` reports xray's verdict: {stdout}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(r#"xhttp: "xmux" bounds are checked"#),
+        "the unapplied pool is named instead of silent"
+    );
+    let _ = std::fs::remove_file(&path);
+}

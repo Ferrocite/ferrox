@@ -15,6 +15,9 @@ use crate::h2::{
 
 const MSG_CAP: usize = 16 * 1024 * 1024;
 
+/// The control frames a post-`END_STREAM` read pumps before it yields: a peer that never stops sending them must not pin the lane past the half-close the relay owes the target.
+const POST_END_BURST: usize = 16;
+
 /// The bodies one credit pays for, half the window the preface advertises: a peer that has sent this much is owed a credit, and one that has not still has the other half to send into, so no grant is ever the thing a stalled writer waits for.
 const CREDIT_AT: u32 = WINDOW / 2;
 
@@ -69,6 +72,7 @@ struct Shared {
     init: Mutex<u64>,
     ended: AtomicBool,
     upload_ended: AtomicBool,
+    upload_gate: Mutex<()>,
     dead: AtomicBool,
     pong: AtomicU64,
 }
@@ -167,6 +171,7 @@ impl Gate {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub(crate) struct GrpcReader<R: Read = Connection> {
     read: R,
@@ -182,6 +187,8 @@ pub(crate) struct GrpcReader<R: Read = Connection> {
     answered: bool,
     head: Vec<u8>,
     head_id: u32,
+    /// The flags of the `HEADERS` frame that opened an incomplete block: `END_STREAM` arrives there, not on the final `CONTINUATION`.
+    head_flags: u8,
     /// The one buffer a body uses: DATA frames are read onto its end and decoded there.
     msg: Vec<u8>,
     msg_at: usize,
@@ -209,6 +216,10 @@ pub(crate) struct GrpcReader<R: Read = Connection> {
     /// The clock this head must be decoded by, armed only while the preface, the request headers and the opening request arrive: past it a silence is an error rather than a wait, so a peer that stops speaking releases the thread.
     handshake: Option<std::time::Instant>,
     eof: bool,
+    /// The peer sent `END_STREAM`: the read half finished normally, so the write half may still be used.
+    remote_end: bool,
+    /// The socket answers a poll instead of blocking, so a read past `END_STREAM` can pump control frames and hand the turn back.
+    poll: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -230,6 +241,7 @@ pub(crate) struct GrpcWriter {
 impl GrpcReader<Connection> {
     /// Arm or clear the poll quantum on the socket this reader reads through, so a peer that opens then stalls mid-header cannot pin the serve thread past the header read; as the `ws`, `httpupgrade` and `httpheader` readers do, and a duplicated socket inherits no read timeout on Windows.
     pub(crate) fn set_poll(&mut self, every: Option<std::time::Duration>) {
+        self.poll = every.is_some();
         let _ = self.read.set_read_timeout(every);
     }
 }
@@ -363,6 +375,7 @@ impl<R: Read> GrpcReader<R> {
         }
         if flags & F_END != 0 {
             self.eof = true;
+            self.remote_end = true;
         }
         Some(())
     }
@@ -371,6 +384,7 @@ impl<R: Read> GrpcReader<R> {
         if self.answered {
             if flags & F_END != 0 {
                 self.eof = true;
+                self.remote_end = true;
             }
             return Some(());
         }
@@ -395,6 +409,7 @@ impl<R: Read> GrpcReader<R> {
         self.answered = true;
         if flags & F_END != 0 {
             self.eof = true;
+            self.remote_end = true;
         }
         Some(())
     }
@@ -426,6 +441,11 @@ impl<R: Read> GrpcReader<R> {
         if id != self.stream || !self.answered {
             self.msg.truncate(from);
             return Some(());
+        }
+        // DATA after END_STREAM is a protocol violation: discard it rather than buffer a body the read half can no longer consume.
+        if self.remote_end {
+            self.msg.truncate(from);
+            return None;
         }
         let (first, pad) = if flags & F_PADDED != 0 {
             let Some(&one) = self.msg.get(from) else {
@@ -463,6 +483,9 @@ impl<R: Read> GrpcReader<R> {
                 return None;
             }
             self.eof = true;
+            if out.is_some() {
+                self.remote_end = true;
+            }
         }
         out
     }
@@ -702,6 +725,19 @@ impl<R: Read> GrpcReader<R> {
         })
     }
 
+    /// After a normal `END_STREAM` the read half is done, but the connection still carries the control frames the write half needs: pump them, and let the lane's poll timeout hand the turn back.
+    fn pump_after_end(&mut self) -> std::io::Result<usize> {
+        for _ in 0..POST_END_BURST {
+            match self.pump() {
+                Ok(Some(())) => {}
+                Ok(None) => return Ok(0),
+                Err(error) => return Err(error),
+            }
+        }
+        // A peer that keeps the control frames coming must not pin this read: the timeout hands the lane back so it can close the target write half, and the next turn pumps the rest.
+        Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+    }
+
     /// One complete frame that is not a body: the scratch holds its bytes and the match is the same one `pump` ran inline.
     fn dispatch(&mut self, kind: u8, flags: u8, id: u32, len: usize) -> Option<()> {
         let mut frame = std::mem::take(&mut self.frame);
@@ -754,6 +790,7 @@ impl<R: Read> GrpcReader<R> {
             body = &body[5..];
         }
         if flags & F_END_HEADERS != 0 {
+            self.head_flags = 0;
             return self.headers(id, flags, body);
         }
         if self.head.len() + body.len() > HEAD_CAP {
@@ -761,6 +798,7 @@ impl<R: Read> GrpcReader<R> {
         }
         self.head.extend_from_slice(body);
         self.head_id = id;
+        self.head_flags = flags;
         Some(())
     }
 
@@ -771,6 +809,8 @@ impl<R: Read> GrpcReader<R> {
         if flags & F_END_HEADERS != 0 {
             let mut block = std::mem::take(&mut self.head);
             block.extend_from_slice(body);
+            let flags = flags | (self.head_flags & F_END);
+            self.head_flags = 0;
             return self.headers(id, flags, &block);
         }
         self.head.extend_from_slice(body);
@@ -816,16 +856,25 @@ impl<R: Read> Read for GrpcReader<R> {
             // The next message may already be in the buffer behind the one just taken, and reading the socket first would block on it; that holds at END_STREAM too — the flag ends the frames, not the bytes.
             if self.decode().is_none() {
                 self.eof = true;
+                if self.remote_end && self.poll {
+                    return self.pump_after_end();
+                }
                 return Ok(0);
             }
             if self.msg_at < self.pay_end {
                 continue;
             }
             if self.eof {
+                if self.remote_end && self.poll {
+                    return self.pump_after_end();
+                }
                 return Ok(0);
             }
             if self.pump()?.is_none() {
                 self.eof = true;
+                if self.remote_end && self.poll {
+                    return self.pump_after_end();
+                }
                 return Ok(0);
             }
         }
@@ -1076,20 +1125,34 @@ impl GrpcWriter {
     }
 
     pub(crate) fn upload_done(&self) {
+        let _gate = self
+            .shared
+            .upload_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if self.shared.dead.load(Ordering::SeqCst)
             || self.shared.ended.load(Ordering::SeqCst)
-            || self.shared.upload_ended.swap(true, Ordering::SeqCst)
+            || self.shared.upload_ended.load(Ordering::SeqCst)
         {
             return;
         }
+        self.shared.upload_ended.store(true, Ordering::SeqCst);
         let mut batch = Gather::new();
-        self.message(&[], self.max_frame(), true, &mut batch);
-        if batch.flush_blocking(&self.shared) {
-            let _ = Gather::settle_blocking(&self.shared);
+        if !self.message(&[], self.max_frame(), true, &mut batch)
+            || !batch.flush_blocking(&self.shared)
+        {
+            self.shared.upload_ended.store(false, Ordering::SeqCst);
+            return;
         }
+        let _ = Gather::settle_blocking(&self.shared);
     }
 
     pub(crate) fn close(&self) {
+        let _gate = self
+            .shared
+            .upload_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if self.shared.ended.swap(true, Ordering::SeqCst) {
             return;
         }
@@ -1097,10 +1160,14 @@ impl GrpcWriter {
             return;
         }
         let mut batch = Gather::new();
-        self.message(&[], self.max_frame(), true, &mut batch);
-        if batch.flush_blocking(&self.shared) {
-            let _ = Gather::settle_blocking(&self.shared);
+        if !self.message(&[], self.max_frame(), true, &mut batch)
+            || !batch.flush_blocking(&self.shared)
+        {
+            self.shared.ended.store(false, Ordering::SeqCst);
+            return;
         }
+        self.shared.upload_ended.store(true, Ordering::SeqCst);
+        let _ = Gather::settle_blocking(&self.shared);
     }
 
     fn max_frame(&self) -> usize {
@@ -1128,11 +1195,16 @@ impl GrpcWriter {
         let plen = frame_prefix(data.len(), &mut prefix);
         let total = plen + data.len();
         let max = max.max(1);
+        // The empty end marker is retried by `close` if this wait fails: take its whole window first, so a retry never replays a prefix already on the wire.
+        let reserved = end && data.is_empty();
+        if reserved && !self.credit(batch, total as u64) {
+            return false;
+        }
         let mut at = 0;
         while at < total {
             let n = (total - at).min(max);
             let last = at + n == total;
-            if !self.credit(batch, n as u64) {
+            if !reserved && !self.credit(batch, n as u64) {
                 return false;
             }
             if batch.full() && !batch.flush_blocking(&self.shared) {
@@ -1475,6 +1547,7 @@ fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
         init: Mutex::new(65_535),
         ended: AtomicBool::new(false),
         upload_ended: AtomicBool::new(false),
+        upload_gate: Mutex::new(()),
         dead: AtomicBool::new(false),
         pong: AtomicU64::new(0),
     })
@@ -1500,6 +1573,7 @@ fn new_reader<R: Read>(
         answered: false,
         head: Vec::new(),
         head_id: 0,
+        head_flags: 0,
         msg: Vec::new(),
         msg_at: 0,
         msg_end: 0,
@@ -1514,6 +1588,8 @@ fn new_reader<R: Read>(
         owed_id: 0,
         handshake: None,
         eof: false,
+        remote_end: false,
+        poll: false,
     }
 }
 
@@ -1774,8 +1850,15 @@ impl crate::proxy::CarrierSink for GrpcWriter {
 }
 
 pub(crate) fn mark_reader_dead<R: Read>(reader: &mut GrpcReader<R>) {
+    if reader.remote_end {
+        return;
+    }
     reader.shared.dead.store(true, Ordering::SeqCst);
     reader.shared.wake.notify_all();
+}
+
+pub(crate) fn request_ended<R: Read>(reader: &GrpcReader<R>) -> bool {
+    reader.remote_end && reader.msg_at >= reader.pay_end
 }
 
 #[cfg(test)]
@@ -2449,6 +2532,281 @@ mod tests {
         assert_eq!(peer.writes.concat(), frame(T_DATA, F_END, 1, &message(b"")));
     }
 
+    /// A response that ends at `END_STREAM` closes the read half, not the connection: the upload
+    /// lane can still send bytes the peer has not taken.
+    #[test]
+    fn a_normal_end_stream_keeps_the_writer_alive() {
+        let mut reader = dial(&[(F_END, message(b"ping"))]);
+        let mut got = [0u8; 8];
+        assert_eq!(reader.read(&mut got).expect("reads"), 4);
+        assert_eq!(reader.read(&mut got).expect("reads"), 0);
+        assert!(reader.eof);
+        mark_reader_dead(&mut reader);
+        assert!(
+            !reader.shared.dead.load(Ordering::SeqCst),
+            "a normal END_STREAM was treated as a dead connection"
+        );
+    }
+
+    /// An end-marked `HEADERS` that needs a continuation still ends the read half: the final
+    /// `CONTINUATION` does not carry the flag, so the opening frame's `END_STREAM` must survive.
+    #[test]
+    fn an_end_stream_survives_a_continuation() {
+        let block = block_encode(&[(":status", "200"), ("content-type", "application/grpc")]);
+        let cut = block.len() / 2;
+        let mut wire = frame(T_HEADERS, F_END, 1, &block[..cut]);
+        wire.extend_from_slice(&frame(T_CONT, F_END_HEADERS, 1, &block[cut..]));
+        let (mut reader, writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        drop(writer);
+        let mut got = [0u8; 8];
+        assert_eq!(reader.read(&mut got).expect("reads"), 0);
+        assert!(
+            reader.remote_end && reader.eof,
+            "END_STREAM was lost across the continuation"
+        );
+    }
+
+    /// A half-close that cannot take the end marker leaves the completion retryable: the full close
+    /// sends `F_END` once the peer grants the seven bytes the empty message needs.
+    #[test]
+    fn a_half_close_that_cannot_send_the_end_marker_is_retried() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(100)),
+            ..Default::default()
+        });
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, 0);
+        let shared = Arc::clone(&writer.shared);
+        writer.upload_done();
+        {
+            let mut send = shared.send.lock().unwrap();
+            send.conn = u64::MAX;
+            send.stream = u64::MAX;
+        }
+        shared.wake.notify_all();
+        writer.close();
+        crate::budgets::clear();
+        let peer = peer.lock().unwrap();
+        assert_eq!(
+            peer.writes.concat(),
+            frame(T_DATA, F_END, 1, &message(b"")),
+            "the end marker was lost after a stalled half-close"
+        );
+    }
+
+    /// A message that fails to decode is not a normal end: the read half is closed, but the writer must
+    /// still see the failure and wake.
+    #[test]
+    fn an_undecodable_end_stream_is_not_a_normal_end() {
+        let mut body = vec![0u8];
+        body.extend_from_slice(&1u32.to_be_bytes());
+        body.push(0xFF);
+        let mut reader = dial(&[(F_END, body)]);
+        let mut got = [0u8; 8];
+        assert_eq!(reader.read(&mut got).expect("reads"), 0);
+        assert!(reader.eof);
+        mark_reader_dead(&mut reader);
+        assert!(
+            reader.shared.dead.load(Ordering::SeqCst),
+            "an undecodable END_STREAM was recorded as a normal end"
+        );
+    }
+
+    /// The control frames the write half needs still arrive after the read half ends: a `WINDOW_UPDATE`
+    /// behind `END_STREAM` raises the writer's window instead of waiting on a reader that returned.
+    #[test]
+    fn a_window_update_after_end_stream_still_reaches_the_writer() {
+        let mut wire = frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[(":status", "200"), ("content-type", "application/grpc")]),
+        );
+        wire.extend_from_slice(&frame(T_DATA, F_END, 1, &message(b"ping")));
+        let inc = 100u32.to_be_bytes();
+        wire.extend_from_slice(&frame(T_WINDOW, 0, 0, &inc));
+        let (mut reader, writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        drop(writer);
+        reader.poll = true;
+        let mut got = [0u8; 8];
+        assert_eq!(reader.read(&mut got).expect("reads"), 4);
+        assert_eq!(reader.read(&mut got).expect("reads"), 0);
+        assert_eq!(
+            reader.shared.send.lock().unwrap().conn,
+            65_535 + 100,
+            "a WINDOW_UPDATE after END_STREAM did not reach the writer"
+        );
+    }
+
+    /// A stalled end marker takes its whole window before the first byte, so the retry in `close` cannot
+    /// replay a prefix the peer already saw.
+    #[test]
+    fn a_stalled_end_marker_is_not_replayed() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(100)),
+            ..Default::default()
+        });
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), 1, 5);
+        let shared = Arc::clone(&writer.shared);
+        writer.upload_done();
+        {
+            let mut send = shared.send.lock().unwrap();
+            send.conn = u64::MAX;
+            send.stream = u64::MAX;
+        }
+        shared.wake.notify_all();
+        writer.close();
+        crate::budgets::clear();
+        let prefix = message(b"");
+        let mut want = Vec::new();
+        for (i, byte) in prefix.iter().enumerate() {
+            let flags = if i + 1 == prefix.len() { F_END } else { 0 };
+            want.extend_from_slice(&frame(T_DATA, flags, 1, &[*byte]));
+        }
+        assert_eq!(
+            peer.lock().unwrap().writes.concat(),
+            want,
+            "a stalled end marker was replayed from the start"
+        );
+    }
+
+    /// DATA after a normal `END_STREAM` is refused rather than buffered: the read half cannot consume
+    /// it, so keeping it would grow the reader without a bound.
+    #[test]
+    fn data_after_end_stream_is_not_buffered() {
+        let mut wire = frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[(":status", "200"), ("content-type", "application/grpc")]),
+        );
+        wire.extend_from_slice(&frame(T_DATA, F_END, 1, &message(b"ping")));
+        for _ in 0..3 {
+            wire.extend_from_slice(&frame(T_DATA, 0, 1, &message(b"pong")));
+        }
+        let (mut reader, writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        drop(writer);
+        reader.poll = true;
+        let mut got = [0u8; 8];
+        assert_eq!(reader.read(&mut got).expect("reads"), 4);
+        assert_eq!(&got[..4], b"ping");
+        let before = reader.msg.len();
+        assert_eq!(reader.read(&mut got).expect("reads"), 0);
+        assert!(
+            reader.msg.len() <= before,
+            "DATA after END_STREAM grew the read buffer"
+        );
+    }
+
+    /// A peer that keeps sending control frames after `END_STREAM` must not pin the read: a burst
+    /// yields so the relay can half-close, and the next turn pumps the rest.
+    #[test]
+    fn post_end_pumping_yields_after_a_burst() {
+        let mut wire = frame(
+            T_HEADERS,
+            F_END_HEADERS,
+            1,
+            &block_encode(&[(":status", "200"), ("content-type", "application/grpc")]),
+        );
+        wire.extend_from_slice(&frame(T_DATA, F_END, 1, &message(b"ping")));
+        let total = 64u64;
+        for seq in 1..=total {
+            wire.extend_from_slice(&frame(T_PING, F_ACK, 0, &seq.to_be_bytes()));
+        }
+        let (mut reader, writer) = connect_split(
+            std::io::Cursor::new(wire),
+            Sink::default(),
+            "127.0.0.1",
+            "/x",
+        )
+        .expect("dials");
+        drop(writer);
+        reader.poll = true;
+        let mut got = [0u8; 8];
+        assert_eq!(reader.read(&mut got).expect("reads"), 4);
+        let error = reader.read(&mut got).expect_err("pumping must yield");
+        assert!(crate::proxy::is_timeout(&error), "{error:?}");
+        let pumped = reader.shared.pong.load(Ordering::SeqCst);
+        assert!(pumped > 0 && pumped < total, "pumped {pumped} of {total}");
+        assert!(request_ended(&reader));
+    }
+
+    /// `END_STREAM` is only a normal request end once the body it closed has been handed out: a
+    /// half-close on the flag alone would cut off bytes still buffered behind the last read.
+    #[test]
+    fn request_ended_waits_for_the_buffered_body() {
+        let body = vec![7u8; 64];
+        let mut reader = dial(&[(F_END, message(&body))]);
+        let mut one = [0u8; 1];
+        assert_eq!(reader.read(&mut one).expect("reads"), 1);
+        assert!(
+            !request_ended(&reader),
+            "reported the request ended with the body still buffered"
+        );
+        let mut rest = vec![0u8; body.len() - 1];
+        assert_eq!(reader.read(&mut rest).expect("reads"), rest.len());
+        assert!(request_ended(&reader));
+    }
+
+    /// An empty end marker reserves its whole window once: the per-frame loop must not charge it again,
+    /// or a marker that fits the window exactly is refused and leaks the reservation.
+    #[test]
+    fn an_empty_end_marker_charges_its_window_once() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(100)),
+            ..Default::default()
+        });
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), 1, 7);
+        let shared = Arc::clone(&writer.shared);
+        writer.upload_done();
+        {
+            let send = shared.send.lock().unwrap();
+            assert_eq!(
+                send.conn, 0,
+                "the end marker charged the connection window twice"
+            );
+            assert_eq!(
+                send.stream, 0,
+                "the end marker charged the stream window twice"
+            );
+        }
+        let prefix = message(b"");
+        let mut want = Vec::new();
+        for (i, byte) in prefix.iter().enumerate() {
+            let flags = if i + 1 == prefix.len() { F_END } else { 0 };
+            want.extend_from_slice(&frame(T_DATA, flags, 1, &[*byte]));
+        }
+        crate::budgets::clear();
+        assert_eq!(
+            peer.lock().unwrap().writes.concat(),
+            want,
+            "the end marker did not reach the peer"
+        );
+    }
+
     /// The gathered batch reaches the peer before its own credit parks the writer: a peer grants for
     /// bytes it has seen, so frames held in a batch cannot wait behind the window they are the thing
     /// that would raise. The witness is a write seen while the thread is still inside `send` — with the
@@ -2784,6 +3142,7 @@ mod tests {
                         init: Mutex::new(u64::from(WINDOW)),
                         ended: AtomicBool::new(false),
                         upload_ended: AtomicBool::new(false),
+                        upload_gate: Mutex::new(()),
                         dead: AtomicBool::new(false),
                         pong: AtomicU64::new(0),
                     });

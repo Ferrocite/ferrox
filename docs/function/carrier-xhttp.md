@@ -1,6 +1,6 @@
 # The xHTTP carrier
 
-The modes the hub serves are `stream-one`, `stream-up` and `packet-up`, on the padding and placement rules the reference ships: `x_padding` in the `Referer` by default, or in the configured header, cookie or query parameter once `xPaddingObfsMode` is on, with the session id and sequence number in a path segment, header, cookie or query parameter as configured. `multi` is not, and neither is the `xmux` connection pool under it.
+The modes the hub serves are `stream-one`, `stream-up` and `packet-up`, on the padding and placement rules the reference ships: `x_padding` in the `Referer` by default, or in the configured header, cookie or query parameter once `xPaddingObfsMode` is on, with the session id and sequence number in a path segment, header, cookie or query parameter as configured. `multi` is not, and neither is the `xmux` connection pool: its bounds are read and checked, and the pool a `stream-up` session would be dialled out of is not.
 
 The framing is the chunked encoding and nothing else: a hex length, CRLF, the payload, CRLF, and a zero-length terminator. There is no envelope, no type byte and no session header beyond the request head.
 
@@ -53,7 +53,7 @@ What the dial does to counts: the reader and the sink dial write for `packet-up`
 
 What is *not* sent yet, and named rather than rounded off:
 
-- `xmux`, the multi-connection pool the reference grows a stream-up session out of, and `serverMaxHeaderBytes`, which bounds the head a reference hub reads. Neither changes a byte the modes above put on the wire.
+- The `xmux` pool the reference grows a `stream-up` session out of, and `serverMaxHeaderBytes`, which bounds the head a reference hub reads. Neither changes a byte the modes above put on the wire. The block itself is read with the reference's `Int32Range` spelling and pool defaults, a config that sets both `maxConnections` and `maxConcurrency` is refused with the reference's sentence, and a stated block gets one stderr line because no pool here applies it.
 - The keep-alive padding the reference hub injects down an open stream-up response: once `scStreamUpServerSecs` is above zero, `hub.go:219` writes a random `xPaddingBytes`-sized run of `X` down the response every that many seconds until the request context ends. Our `sse_ok` answers `200` without the filler — a reference dialer that pads against such a stream waits on content that does not arrive on this side, so until that lands a served stream-up session is a quiet answer instead of a padded one.
 
 ## Connection reuse
@@ -229,7 +229,7 @@ What did not move: the body is still one allocation of exactly `n`, the head-tai
 
 - The stream-up padding filler above (`scStreamUpServerSecs`, `hub.go:219`) is not carried: a served stream-up response is a quiet answer instead of a padded one, which a padding-hungry reference client reads as a hung downlink.
 
-- Three knobs in the reference's `Config` are still not parsed here: `xmux` (the multi-connection pool a stream-up session is dialled out of) and the two caps `serverMaxHeaderBytes` and `scStreamUpServerSecs`. None of them changes a byte the dial puts on the wire, so they are rows for the slice that carries the shapes they govern, not gaps the mode dial leaves behind it.
+- Two knobs in the reference's `Config` are still not parsed here, the caps `serverMaxHeaderBytes` and `scStreamUpServerSecs`; `xmux` is parsed and checked, and only the pool it bounds is missing. None of them changes a byte the dial puts on the wire, so they are rows for the slice that carries the shapes they govern, not gaps the mode dial leaves behind it.
 - The pinned conformance row `rust_socks_client_reaches_target_through_remote_xhttp_profile` panics unless `XRAY_REMOTE_XHTTP_CONFIG` names an owner-only file. The mode assertion in the pinned tree must not be weakened to make it pass; that is stated in the roadmap and repeated here so the row is not quietly rounded off.
 
 ## Pins

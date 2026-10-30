@@ -817,6 +817,59 @@ pub(crate) enum PadMethod {
     Tokenish,
 }
 
+/// The `xmux` bounds a `stream-up` session is dialled out of (`transport_method.go:299`): the reference
+/// grows a connection pool from them, and this tree reads and checks them but keeps no pool.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct Xmux {
+    pub max_concurrency: (i32, i32),
+    pub max_connections: (i32, i32),
+    pub c_max_reuse_times: (i32, i32),
+    pub h_max_request_times: (i32, i32),
+    pub h_max_reusable_secs: (i32, i32),
+    pub h_keep_alive_period: i64,
+}
+
+impl Xmux {
+    /// `SplitHTTPConfig.Build` (`transport_method.go:458`): the two bounds exclude each other, and a block
+    /// that names none of its six fields takes the reference's pool defaults. The flag says whether the
+    /// config wrote the block at all, which is what the one-line notice keys on.
+    fn from_json(node: Option<&crate::json::Json>) -> Option<(Self, bool)> {
+        let mut out = Self::default();
+        let stated = match node {
+            None | Some(crate::json::Json::Null) => false,
+            Some(node @ crate::json::Json::Obj(_)) => {
+                let field = |name: &str| -> Option<(i32, i32)> {
+                    match node.get(name) {
+                        Some(value) => i32_range(value),
+                        None => Some((0, 0)),
+                    }
+                };
+                out.max_concurrency = field("maxConcurrency")?;
+                out.max_connections = field("maxConnections")?;
+                out.c_max_reuse_times = field("cMaxReuseTimes")?;
+                out.h_max_request_times = field("hMaxRequestTimes")?;
+                out.h_max_reusable_secs = field("hMaxReusableSecs")?;
+                out.h_keep_alive_period = match node.get("hKeepAlivePeriod") {
+                    None | Some(crate::json::Json::Null) => 0,
+                    Some(value) => value.as_i64()?,
+                };
+                true
+            }
+            Some(_) => return None,
+        };
+        if out.max_connections.1 > 0 && out.max_concurrency.1 > 0 {
+            eprintln!("maxConnections cannot be specified together with maxConcurrency");
+            return None;
+        }
+        if out == Self::default() {
+            out.max_connections = (3, 3);
+            out.h_max_request_times = (600, 900);
+            out.h_max_reusable_secs = (1800, 3000);
+        }
+        Some((out, stated))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct XhttpSettings {
     pub path: String,
@@ -845,6 +898,8 @@ pub(crate) struct XhttpSettings {
     pub sc_min_posts_interval_ms: (u64, u64),
     pub no_sse: bool,
     pub no_grpc_header: bool,
+    /// The bounds a written `xmux` block states with the reference's defaults filled in; `None` when it wrote none.
+    pub xmux: Option<Xmux>,
 }
 
 impl XhttpSettings {
@@ -901,6 +956,7 @@ impl XhttpSettings {
             sc_min_posts_interval_ms: (30, 30),
             no_sse: false,
             no_grpc_header: false,
+            xmux: None,
         }
     }
 
@@ -1127,6 +1183,8 @@ impl XhttpSettings {
         if out.sc_min_posts_interval_ms.1 == 0 {
             out.sc_min_posts_interval_ms = (30, 30);
         }
+        let (xmux, stated) = Xmux::from_json(xhttp.get("xmux"))?;
+        out.xmux = stated.then_some(xmux);
         Some(out)
     }
 }
@@ -1166,6 +1224,43 @@ fn parse_range(node: &crate::json::Json) -> Option<(u32, u32)> {
     let (a, b) = node.as_str()?.split_once('-')?;
     let (a, b) = (a.parse::<u32>().ok()?, b.parse::<u32>().ok()?);
     Some((a.min(b), a.max(b)))
+}
+
+/// `Int32Range` (`common.go:295`): an integer, or a string holding one, `a-b`, an empty string, or the
+/// signed forms `-a-b` and `-a--b`, ordered so the low bound is first. `null` is the zero range.
+fn i32_range(node: &crate::json::Json) -> Option<(i32, i32)> {
+    let (left, right) = match node {
+        crate::json::Json::Null => (0, 0),
+        crate::json::Json::Num(n)
+            if n.fract() == 0.0 && (-2_147_483_648.0..=2_147_483_647.0).contains(n) =>
+        {
+            (*n as i32, *n as i32)
+        }
+        crate::json::Json::Str(text) => i32_range_string(text)?,
+        _ => return None,
+    };
+    Some((left.min(right), left.max(right)))
+}
+
+/// `ParseRangeString` (`common.go:364`): the reference's `Atoi` on each half, and its `int32(...)` cast,
+/// which wraps rather than refusing a half that outgrew an `i32`.
+fn i32_range_string(text: &str) -> Option<(i32, i32)> {
+    let narrow = |part: &str| part.parse::<i64>().ok().map(|value| value as i32);
+    if let Some(value) = narrow(text) {
+        return Some((value, value));
+    }
+    if text.is_empty() {
+        return Some((0, 0));
+    }
+    // `splitFromSecondDash` splits on the dash that separates the bounds, not on the sign.
+    let (left, right) = match text.strip_prefix('-') {
+        Some(body) => {
+            let at = body.find('-')?;
+            (&text[..=at], &body[at + 1..])
+        }
+        None => text.split_once('-')?,
+    };
+    Some((narrow(left)?, narrow(right)?))
 }
 
 const HUFFMAN_CODE_LEN: [u8; 256] = [
@@ -3446,6 +3541,81 @@ mod tests {
             1,
             "the fixed Host line is the only one"
         );
+    }
+
+    fn xmux_settings(body: &str) -> Option<XhttpSettings> {
+        let node = crate::json::parse(&format!(
+            r#"{{"xhttpSettings": {{"mode": "stream-up", "xmux": {body}}}}}"#
+        ))
+        .expect("parses");
+        XhttpSettings::from_json(Some(&node))
+    }
+
+    /// `xmux` is the reference's `Int32Range` spelling and its own defaults, and the two bounds exclude
+    /// each other exactly as its `Build` refuses them.
+    #[test]
+    fn xmux_reads_the_references_ranges_and_defaults() {
+        let block = |body: &str| {
+            xmux_settings(body)
+                .expect("a valid block")
+                .xmux
+                .expect("a stated block")
+        };
+
+        let empty = block("{}");
+        assert_eq!(
+            (
+                empty.max_connections,
+                empty.h_max_request_times,
+                empty.h_max_reusable_secs
+            ),
+            ((3, 3), (600, 900), (1800, 3000)),
+            "an empty block takes the reference's pool defaults"
+        );
+
+        let one = block(r#"{"maxConnections": 2}"#);
+        assert_eq!(one.max_connections, (2, 2));
+        assert_eq!(
+            one.h_max_request_times,
+            (0, 0),
+            "one named field skips the defaults"
+        );
+
+        let span = block(r#"{"maxConnections": "9-4", "hKeepAlivePeriod": 30}"#);
+        assert_eq!(span.max_connections, (4, 9), "the bounds are ordered");
+        assert_eq!(span.h_keep_alive_period, 30);
+
+        let signed = block(r#"{"cMaxReuseTimes": "-1--3", "maxConcurrency": "-7"}"#);
+        assert_eq!(signed.c_max_reuse_times, (-3, -1));
+        assert_eq!(
+            signed.max_concurrency,
+            (-7, -7),
+            "a negative bound is a sentinel"
+        );
+
+        let none = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/"}}}"#,
+        );
+        assert!(none.xmux.is_none(), "an absent block states nothing");
+
+        assert!(
+            xmux_settings(r#"{"maxConnections": 3, "maxConcurrency": 2}"#).is_none(),
+            "both bounds at once are refused"
+        );
+        let negative = block(r#"{"maxConnections": 3, "maxConcurrency": "-2"}"#);
+        assert_eq!(
+            negative.max_concurrency,
+            (-2, -2),
+            "a negative bound is a sentinel, so only one bound is set"
+        );
+
+        for (body, why) in [
+            (r#"{"maxConnections": "3-"}"#, "a truncated range"),
+            (r#"{"maxConnections": []}"#, "an array is not a range"),
+            (r#"{"hKeepAlivePeriod": "30"}"#, "the period is an integer"),
+        ] {
+            assert!(xmux_settings(body).is_none(), "{why}: {body}");
+        }
     }
 
     /// The answer head is opened once for the bytes it will hold: a padded answer used to start as
