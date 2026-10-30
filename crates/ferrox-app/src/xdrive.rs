@@ -1301,6 +1301,7 @@ pub(crate) struct Conn {
     writer: Arc<Writer>,
     reader: Arc<Reader>,
     wake: Arc<Wake>,
+    meter: crate::stats::Meter,
 }
 
 impl Conn {
@@ -1320,7 +1321,13 @@ impl Conn {
                 Arc::clone(&wake),
             )),
             wake,
+            meter: crate::stats::Meter::default(),
         }
+    }
+
+    pub(crate) fn with_meter(mut self, meter: crate::stats::Meter) -> Self {
+        self.meter = self.meter.merged(meter);
+        self
     }
 
     /// End only the write log, so a relay whose source went quiet lets the peer read its `.end` while our own reader keeps serving the reply.
@@ -1336,13 +1343,16 @@ impl Conn {
 
 impl Read for Conn {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.reader.read(buf)
+        let n = self.reader.read(buf)?;
+        self.meter.read(n);
+        Ok(n)
     }
 }
 
 impl Write for Conn {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         let n = self.writer.write(buf)?;
+        self.meter.write(n);
         self.wake.ring();
         Ok(n)
     }

@@ -577,9 +577,15 @@ pub(crate) struct Flow {
     wake: Option<Arc<StreamWake>>,
     /// The `[0, 0]` acknowledgement still owed to the stream's first read: two on a client-opened flow, none on the server's, because the server reads the request the client already sent.
     reply: usize,
+    meter: crate::stats::Meter,
 }
 
 impl Flow {
+    pub(crate) fn with_meter(mut self, meter: crate::stats::Meter) -> Self {
+        self.meter = self.meter.merged(meter);
+        self
+    }
+
     pub(crate) fn with_wake(mut self, wake: Option<Arc<StreamWake>>) -> Self {
         self.wake = wake;
         self
@@ -621,6 +627,7 @@ impl Flow {
             drive,
             wake: None,
             reply: 0,
+            meter: crate::stats::Meter::default(),
         }
     }
 
@@ -711,6 +718,7 @@ impl Flow {
             let n = (self.backlog.len() - self.at).min(buf.len());
             buf[..n].copy_from_slice(&self.backlog[self.at..self.at + n]);
             self.at += n;
+            self.meter.read(n);
             return Ok(Some(n));
         }
         loop {
@@ -732,6 +740,7 @@ impl Flow {
                 }
             };
             if let Some(n) = read {
+                self.meter.read(n);
                 return Ok(Some(n));
             }
             if self.drive {
@@ -781,6 +790,7 @@ impl Write for Flow {
             return Ok(0);
         }
         if send_all(&self.session, self.stream, buf, false) {
+            self.meter.write(buf.len());
             Ok(buf.len())
         } else {
             Err(broken())
@@ -811,6 +821,7 @@ pub(crate) fn open_flow(session: &Session, stream: u64, header: &[u8]) -> Option
         drive,
         wake,
         reply: 2,
+        meter: crate::stats::Meter::default(),
     })
 }
 
