@@ -48080,6 +48080,48 @@ end
         assert_eq!(&back, b"ping");
     }
 
+    /// A rule added after startup changes the lane a SOCKS UDP association picks, not just the TCP
+    /// path: the association decision is read from the live table, never cached at startup.
+    #[test]
+    fn an_added_rule_changes_a_udp_association() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = Arc::new(crate::reverse::Portals::default());
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let runtime = Runtime::new(
+            Some(freedom()),
+            Some(Arc::clone(&shared)),
+            false,
+            Arc::clone(&portals),
+        );
+        let plan = RoutePlan::new(Arc::clone(&shared), Some("in".to_owned()), None, true);
+        assert!(
+            matches!(&*plan.udp_out().expect("one lane"), Outbound::Freedom(_)),
+            "no rule names the inbound yet"
+        );
+
+        let rule = crate::json::parse(
+            r#"{"type":"field","ruleTag":"blocked","inboundTag":["in"],"outboundTag":"block"}"#,
+        )
+        .expect("parses");
+        runtime.add_rules(&[rule], true).expect("adds");
+        assert!(
+            matches!(&*plan.udp_out().expect("one lane"), Outbound::Block(_)),
+            "the added rule changes the association decision"
+        );
+
+        runtime.remove_rules("blocked").expect("removes");
+        assert!(
+            matches!(&*plan.udp_out().expect("one lane"), Outbound::Freedom(_)),
+            "removing the rule puts the association back on the default lane"
+        );
+    }
+
     /// A `vlessRoute` rule reads the route id a flow carries: a socks flow carries none, so it reads
     /// 0 and a list holding 0 blocks it, while a list of ids the client never sent leaves it alone.
     #[test]
