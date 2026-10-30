@@ -4,6 +4,9 @@ set -euo pipefail
 mode="${1:?usage: count-ops.sh report|report-file|check ...}"
 command -v valgrind >/dev/null || { echo "count-ops: valgrind not installed (apt-get install valgrind strace / brew install valgrind)" >&2; exit 2; }
 
+# The shipping profile strips symbols for size, and callgrind can only name frames a symbol table carries; a test binary is never shipped.
+export CARGO_PROFILE_RELEASE_STRIP=none
+
 outdir="$(mktemp -d)"
 trap 'rm -rf "$outdir"' EXIT
 
