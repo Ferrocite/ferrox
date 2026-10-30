@@ -327,20 +327,32 @@ impl DeadlineConnection {
 impl Read for DeadlineConnection {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.io.set_read_timeout(Some(self.remaining()?))?;
-        self.io.read(buf)
+        self.io.read(buf).map_err(budget_ended)
     }
 }
 
 impl Write for DeadlineConnection {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.io.set_write_timeout(Some(self.remaining()?))?;
-        self.io.write(buf)
+        self.io.write(buf).map_err(budget_ended)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.io.set_write_timeout(Some(self.remaining()?))?;
-        self.io.flush()
+        self.io.flush().map_err(budget_ended)
     }
+}
+
+/// The one timeout spelling across kernels: macOS answers a socket timeout with `WouldBlock`, Linux
+/// with `TimedOut`.
+fn budget_ended(error: std::io::Error) -> std::io::Error {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) {
+        return std::io::Error::new(std::io::ErrorKind::TimedOut, "the webhook budget ended");
+    }
+    error
 }
 
 /// A socket URL dials the path it named: one `@` is the kernel's abstract namespace, two the padded
