@@ -196,6 +196,7 @@ impl Webhook {
 
     /// The request and status line over an already-open stream, so a test can drive the production
     /// request bytes through a local socket without putting credentials on plaintext TCP.
+    #[cfg(all(test, unix))]
     fn exchange_over(
         &self,
         url: &HttpUrl,
