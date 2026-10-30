@@ -1846,7 +1846,7 @@ pub(crate) fn mark_reader_dead<R: Read>(reader: &mut GrpcReader<R>) {
 }
 
 pub(crate) fn request_ended<R: Read>(reader: &GrpcReader<R>) -> bool {
-    reader.remote_end
+    reader.remote_end && reader.msg_at >= reader.pay_end
 }
 
 #[cfg(test)]
@@ -2681,6 +2681,23 @@ mod tests {
             reader.msg.len() <= before,
             "DATA after END_STREAM grew the read buffer"
         );
+    }
+
+    /// `END_STREAM` is only a normal request end once the body it closed has been handed out: a
+    /// half-close on the flag alone would cut off bytes still buffered behind the last read.
+    #[test]
+    fn request_ended_waits_for_the_buffered_body() {
+        let body = vec![7u8; 64];
+        let mut reader = dial(&[(F_END, message(&body))]);
+        let mut one = [0u8; 1];
+        assert_eq!(reader.read(&mut one).expect("reads"), 1);
+        assert!(
+            !request_ended(&reader),
+            "reported the request ended with the body still buffered"
+        );
+        let mut rest = vec![0u8; body.len() - 1];
+        assert_eq!(reader.read(&mut rest).expect("reads"), rest.len());
+        assert!(request_ended(&reader));
     }
 
     /// An empty end marker reserves its whole window once: the per-frame loop must not charge it again,
