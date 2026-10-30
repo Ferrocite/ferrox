@@ -2236,19 +2236,23 @@ impl RoutePlan {
     ) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
         let answer = self.lane_with_protocol_untracked(asked, network, client, facts);
         if self.shared.has_dial_settings {
-            let tag = answer.1.as_deref();
-            let source = match tag {
-                Some(tag) => self.shared.sources.get(tag).copied(),
-                None => self.shared.default_source,
-            };
-            SEND_THROUGH.with(|cell| cell.set(source));
-            let sockopts = match tag {
-                Some(tag) => self.shared.sockopts.get(tag).cloned(),
-                None => self.shared.default_sockopts.clone(),
-            };
-            DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
+            self.carry_dial_settings(answer.1.as_deref());
         }
         answer
+    }
+
+    /// The source and options the picked lane's tag names, left for the one dial seam.
+    fn carry_dial_settings(&self, tag: Option<&str>) {
+        let source = match tag {
+            Some(tag) => self.shared.sources.get(tag).copied(),
+            None => self.shared.default_source,
+        };
+        SEND_THROUGH.with(|cell| cell.set(source));
+        let sockopts = match tag {
+            Some(tag) => self.shared.sockopts.get(tag).cloned(),
+            None => self.shared.default_sockopts.clone(),
+        };
+        DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
     }
 
     fn lane_with_protocol_untracked(
@@ -2392,11 +2396,18 @@ impl RoutePlan {
     }
 
     fn udp_out(&self, association: &Association) -> Result<Picked<'_>, ()> {
-        match association {
-            Association::Default => Ok(self.default_lane().0),
-            Association::Tag(tag) => Ok(self.target(tag)),
-            Association::Split => Err(()),
+        let (lane, tag) = match association {
+            Association::Default => self.default_lane(),
+            Association::Tag(tag) => {
+                let lane = self.target(tag);
+                (lane, self.stable_tag(tag).map(std::borrow::Cow::Borrowed))
+            }
+            Association::Split => return Err(()),
+        };
+        if self.shared.has_dial_settings {
+            self.carry_dial_settings(tag.as_deref());
         }
+        Ok(lane)
     }
 }
 
@@ -17964,9 +17975,23 @@ fn serve_socks_udp_lane(mut client: Connection, out: &Outbound) {
 /// One outbound's datagram lane over a relay socket. The association is `None` when the lane is
 /// itself an inner relay of a split association, whose control socket the splitter owns.
 pub(crate) fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Option<&Connection>) {
+    let source = SEND_THROUGH.with(std::cell::Cell::take);
+    let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
+    serve_udp_lane_with(relay, out, associate, source, sockopts.as_deref());
+}
+
+fn serve_udp_lane_with(
+    relay: &UdpSocket,
+    out: &Outbound,
+    associate: Option<&Connection>,
+    source: Option<SendThrough>,
+    sockopts: Option<&crate::sockopt::SocketOptions>,
+) {
     match out {
         // The reference's loopback handler is TCP-only, so a datagram keeps the named dial's lane.
-        Outbound::Loopback(loopback) => serve_udp_lane(relay, &loopback.dial, associate),
+        Outbound::Loopback(loopback) => {
+            serve_udp_lane_with(relay, &loopback.dial, associate, None, None);
+        }
         Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Quic) => {
             serve_socks_udp_vless(relay, vless);
         }
@@ -18000,7 +18025,7 @@ pub(crate) fn serve_udp_lane(relay: &UdpSocket, out: &Outbound, associate: Optio
         },
         Outbound::WireGuard(wireguard) => wireguard.serve_udp(relay, associate),
         Outbound::Masque(masque) => masque.serve_udp(relay, associate),
-        Outbound::Freedom(out) => serve_socks_udp_freedom(relay, out),
+        Outbound::Freedom(out) => serve_socks_udp_freedom(relay, out, source, sockopts),
         Outbound::Socks(socks) => {
             if socks.version == crate::socks::Version::V4 {
                 // SOCKS4 has no datagram half: the association is a SOCKS5 request.
@@ -18227,8 +18252,15 @@ fn spawn_udp_lane(out: &Outbound, local: std::net::IpAddr) -> Option<UdpLane> {
     let socket = UdpSocket::bind(SocketAddr::new(local, 0)).ok()?;
     let address = socket.local_addr().ok()?;
     let _ = socket.set_read_timeout(Some(budgets::udp_idle()));
+    let source = SEND_THROUGH.with(std::cell::Cell::take);
+    let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow_mut().take());
     let out = out.clone();
-    let handle = thread::spawn(move || serve_udp_lane(&socket, &out, None));
+    let handle = thread::spawn(move || {
+        // The lane's own thread starts with the settings the pick left on this one.
+        SEND_THROUGH.with(|cell| cell.set(source));
+        DIAL_SOCKOPTS.with(|cell| *cell.borrow_mut() = sockopts);
+        serve_udp_lane(&socket, &out, None);
+    });
     Some(UdpLane { address, handle })
 }
 
@@ -18424,8 +18456,47 @@ fn serve_udp_answer(
     }
 }
 
+/// One datagram socket for a direct destination: the family it dials, the source the outbound
+/// names, and the options the outbound took, all before the first packet.
+fn datagram_uplink(
+    dest: SocketAddr,
+    source: Option<IpAddr>,
+    sockopts: Option<&crate::sockopt::SocketOptions>,
+) -> Option<UdpSocket> {
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    let domain = if dest.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)).ok()?;
+    if let Some(sockopts) = sockopts {
+        sockopts.apply_to_datagram(&socket, dest).ok()?;
+    }
+    let bind = source.map_or_else(
+        || {
+            let any = if dest.is_ipv4() {
+                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+            } else {
+                IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)
+            };
+            SocketAddr::new(any, 0)
+        },
+        |source| SocketAddr::new(source, 0),
+    );
+    socket.bind(&SockAddr::from(bind)).ok()?;
+    socket.set_read_timeout(Some(budgets::udp_idle())).ok()?;
+    socket.connect(&SockAddr::from(dest)).ok()?;
+    Some(UdpSocket::from(socket))
+}
+
 /// Freedom UDP: the machine's own socket per destination, since a datagram here has no carrier to ride.
-fn serve_socks_udp_freedom(relay: &UdpSocket, freedom: &FreedomOut) {
+fn serve_socks_udp_freedom(
+    relay: &UdpSocket,
+    freedom: &FreedomOut,
+    send_through: Option<SendThrough>,
+    sockopts: Option<&crate::sockopt::SocketOptions>,
+) {
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let replies = Arc::new(AtomicU64::new(0));
     let mut uplinks: HashMap<SocketAddr, (UdpSocket, thread::JoinHandle<()>)> = HashMap::new();
@@ -18466,13 +18537,8 @@ fn serve_socks_udp_freedom(relay: &UdpSocket, freedom: &FreedomOut) {
             let _ = uplinks[&dest].0.send(payload);
             continue;
         }
-        let Ok(up) = UdpSocket::bind(SocketAddr::new(
-            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            0,
-        )) else {
-            continue;
-        };
-        let Ok(()) = up.connect(dest) else {
+        let Some(up) = datagram_uplink(dest, send_through.and_then(SendThrough::address), sockopts)
+        else {
             continue;
         };
         let Ok(writer) = up.try_clone() else {
@@ -18483,7 +18549,6 @@ fn serve_socks_udp_freedom(relay: &UdpSocket, freedom: &FreedomOut) {
         let Ok(relay_write) = relay.try_clone() else {
             continue;
         };
-        let _ = up.set_read_timeout(Some(budgets::udp_idle()));
         let done = thread::spawn(move || {
             let mut back = udp_buffer();
             let writer = up;
@@ -49821,8 +49886,9 @@ mod tests {
         relay
             .set_read_timeout(Some(Duration::from_millis(300)))
             .expect("timeout");
-        let _serving =
-            std::thread::spawn(move || serve_socks_udp_freedom(&relay, &FreedomOut::default()));
+        let _serving = std::thread::spawn(move || {
+            serve_socks_udp_freedom(&relay, &FreedomOut::default(), None, None);
+        });
         let client = UdpSocket::bind("127.0.0.1:0").expect("client");
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -49849,6 +49915,135 @@ mod tests {
         let (n, _) = client.recv_from(&mut back).expect("reply");
         let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
         assert_eq!(payload, b"two");
+    }
+
+    /// A freedom datagram leaves from the source its outbound named, as a TCP flow from it does.
+    #[test]
+    fn a_freedom_datagram_lane_binds_the_source_the_config_names() {
+        let root = crate::json::parse(
+            r#"{"routing":{},"outbounds":[{"protocol":"freedom","sendThrough":"127.0.0.2"}]}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let lane = plan.udp_out(&Association::Default).expect("a lane");
+        assert!(
+            matches!(&*lane, Outbound::Freedom(_)),
+            "the default freedom lane"
+        );
+        let source = SEND_THROUGH
+            .with(std::cell::Cell::get)
+            .expect("the datagram lane carries a source");
+        assert_eq!(source.address(), Some("127.0.0.2".parse().expect("ip")));
+        // Linux owns all of 127/8 on loopback, so the bind is witnessed where a 127.0.0.2 source routes.
+        #[cfg(target_os = "linux")]
+        {
+            let echo = std::net::UdpSocket::bind("127.0.0.1:0").expect("echo");
+            let echo_addr = echo.local_addr().expect("address");
+            echo.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let (peers, seen) = std::sync::mpsc::channel();
+            let replied = std::thread::spawn(move || {
+                let mut buf = [0u8; 1500];
+                if let Ok((n, peer)) = echo.recv_from(&mut buf) {
+                    let _ = peers.send(peer.ip());
+                    let _ = echo.send_to(&buf[..n], peer);
+                }
+            });
+            let out = Outbound::clone(&lane);
+            let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip")).expect("a lane");
+            let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut frame = Vec::new();
+            let request = socks_udp_frame(&mut frame, None, &echo_addr, b"one");
+            client.send_to(request, lane.address).expect("send");
+            let mut back = vec![0u8; UDP_BUF];
+            let (n, _) = client.recv_from(&mut back).expect("reply");
+            let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
+            assert_eq!(payload, b"one");
+            let peer = seen
+                .recv_timeout(Duration::from_secs(5))
+                .expect("the echo saw the peer");
+            replied.join().expect("echo");
+            assert_eq!(peer, "127.0.0.2".parse::<IpAddr>().expect("source"));
+        }
+    }
+
+    /// A direct datagram's uplink follows its destination's family, so an IPv6 target is reached.
+    #[test]
+    fn a_freedom_datagram_lane_reaches_an_ipv6_destination() {
+        let echo = std::net::UdpSocket::bind("[::1]:0").expect("echo");
+        let echo_addr = echo.local_addr().expect("address");
+        echo.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let replied = std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            if let Ok((n, peer)) = echo.recv_from(&mut buf) {
+                let _ = echo.send_to(&buf[..n], peer);
+            }
+        });
+        let out = Outbound::Freedom(Arc::new(FreedomOut::default()));
+        let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip")).expect("a lane");
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut frame = Vec::new();
+        let request = socks_udp_frame(&mut frame, None, &echo_addr, b"six");
+        client.send_to(request, lane.address).expect("send");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = client.recv_from(&mut back).expect("reply");
+        let (_, payload) = parse_socks_udp(&back[..n]).expect("frame");
+        replied.join().expect("echo");
+        assert_eq!(payload, b"six");
+    }
+
+    /// The outbound's `sockopt` reaches the datagram socket: an option the OS refuses stops that
+    /// uplink instead of being dropped, while the same lane without it answers.
+    #[test]
+    fn a_refused_datagram_sockopt_stops_the_uplink() {
+        fn answers(config: &str) -> bool {
+            let root = crate::json::parse(config).expect("parses");
+            let routing = routing_for(&root).expect("parses").expect("a plan");
+            let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+                .expect("builds");
+            let plan = RoutePlan::new(shared, None, None, false);
+            let out = Outbound::clone(&plan.udp_out(&Association::Default).expect("a lane"));
+            let echo = std::net::UdpSocket::bind("127.0.0.1:0").expect("echo");
+            let echo_addr = echo.local_addr().expect("address");
+            echo.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 1500];
+                if let Ok((n, peer)) = echo.recv_from(&mut buf) {
+                    let _ = echo.send_to(&buf[..n], peer);
+                }
+            });
+            let lane = spawn_udp_lane(&out, "127.0.0.1".parse().expect("ip")).expect("a lane");
+            let client = std::net::UdpSocket::bind("127.0.0.1:0").expect("client");
+            client
+                .set_read_timeout(Some(Duration::from_secs(1)))
+                .expect("timeout");
+            let mut frame = Vec::new();
+            let request = socks_udp_frame(&mut frame, None, &echo_addr, b"one");
+            client.send_to(request, lane.address).expect("send");
+            let mut back = vec![0u8; UDP_BUF];
+            client.recv_from(&mut back).is_ok()
+        }
+        assert!(
+            answers(r#"{"routing":{},"outbounds":[{"protocol":"freedom"}]}"#),
+            "the plain lane answers"
+        );
+        assert!(
+            !answers(
+                r#"{"routing":{},"outbounds":[{"protocol":"freedom","streamSettings":{"sockopt":{"customSockopt":[{"type":"int","level":"999","opt":"999","value":"1"}]}}}]}"#
+            ),
+            "a refused option stops the datagram"
+        );
     }
 
     /// A routing script picks the lane before the (empty) rule table, and its error closes the
