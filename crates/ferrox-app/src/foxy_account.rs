@@ -1582,14 +1582,30 @@ impl Account {
         // The code arrives from the same autofill that pads the identity; strip its padding, keep its case, before it is sent.
         let code = sanitize_code(code);
         let body = account::code_body(&code);
+        let (id, mac) = account::hawk_credentials(&session).ok_or(Denied::Token)?;
         let mut last = Denied::Unreachable("no Firefox Accounts host".to_owned());
         for endpoint in fxa_attempts(&self.fxa) {
+            let now = epoch();
+            let nonce = nonce();
+            let authorization = Signed {
+                method: "POST",
+                path: &endpoint.url("/session/verify_code"),
+                host: &endpoint.origin(),
+                port: endpoint.port,
+                body: &body,
+                timestamp: now,
+                nonce: &nonce,
+            }
+            .header(&id, &mac);
             let reply = match foxy_challenge::send_with_challenge(
                 &endpoint,
                 &self.jar,
                 "POST",
                 "/session/verify_code",
-                &[("Content-Type", JSON_ACCEPT)],
+                &[
+                    ("Content-Type", JSON_ACCEPT),
+                    ("Authorization", &authorization),
+                ],
                 &body,
             ) {
                 Ok(reply) => reply,
@@ -2013,6 +2029,13 @@ mod loopback {
             }
             ("POST", "/v1/oauth/token" | "/v1/token") => token_answer(seen),
             ("POST", "/v1/session/verify_code") => {
+                assert!(
+                    seen.authorization
+                        .as_deref()
+                        .is_some_and(|header| header.starts_with("Hawk ")),
+                    "the code is signed with the pending session: {:?}",
+                    seen.authorization
+                );
                 assert_eq!(
                     seen.body,
                     br#"{"code":"424242"}"#.to_vec(),
