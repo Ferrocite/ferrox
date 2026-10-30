@@ -289,8 +289,9 @@ fn start_observatory(
     }
 }
 
-/// The two file-backed apps: `-test` parses them without opening or creating anything the reference also leaves alone.
+/// The file-backed apps and the `geodata` block: `-test` parses them without opening or creating anything the reference also leaves alone.
 fn install_file_apps(root: &Json, test: bool) -> Result<(), String> {
+    crate::geodata::parse(root, &crate::router::asset_dirs())?;
     if test {
         crate::metrics::parse(root)?;
         crate::accesslog::parse(root)?;

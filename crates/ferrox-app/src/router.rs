@@ -3024,7 +3024,7 @@ fn has_domain_prefix(value: &str) -> bool {
     .any(|prefix| value.starts_with(prefix))
 }
 
-fn resolve_asset_path(path: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
+pub(crate) fn resolve_asset_path(path: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     let direct = PathBuf::from(path);
     if direct.is_file() {
         return Some(direct);
@@ -3452,7 +3452,7 @@ impl Assets {
     }
 }
 
-fn is_local_asset(file: &str) -> bool {
+pub(crate) fn is_local_asset(file: &str) -> bool {
     if file.is_empty() || file == "." {
         return false;
     }
