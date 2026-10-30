@@ -340,10 +340,17 @@ impl<S: Read + Write> Session<S> {
         if user.len() > socks::NAME4_MAX || name.is_some_and(|name| name.len() > socks::NAME4_MAX) {
             return None;
         }
-        let mut request = [0u8; 520];
-        let total =
-            socks::request4_into(socks::CMD4_CONNECT, port, address, user, name, &mut request)?;
-        self.stream.write_all(&request[..total]).ok()?;
+        if user.is_empty() && name.is_none() {
+            let mut request = [0u8; 9];
+            let total =
+                socks::request4_into(socks::CMD4_CONNECT, port, address, user, name, &mut request)?;
+            self.stream.write_all(&request[..total]).ok()?;
+        } else {
+            let mut request = [0u8; 520];
+            let total =
+                socks::request4_into(socks::CMD4_CONNECT, port, address, user, name, &mut request)?;
+            self.stream.write_all(&request[..total]).ok()?;
+        }
         let mut reply = [0u8; 8];
         self.stream.read_exact(&mut reply).ok()?;
         if reply[1] != socks::REPLY4_GRANTED {
