@@ -418,9 +418,11 @@ fn serve_inbounds_counted(
                 refuse_inbound(protocol, label, inbound);
                 continue;
             }
-            if prove {
-                if let Some(shared) = route {
+            if let Some(shared) = route {
+                if prove {
                     prove_server_route(shared, inbound, label);
+                } else {
+                    register_server_inbound(shared, inbound);
                 }
             }
             register_inbound_sniffing(inbound, label, &addresses);
@@ -1656,8 +1658,8 @@ struct Dynamic {
 #[derive(Debug)]
 struct RouteShared {
     routing: Arc<RwLock<crate::router::Routing>>,
-    /// The server inbounds the startup proof ran for, and whether their default dial is direct.
-    server_inbounds: RwLock<Vec<(Option<String>, bool)>>,
+    /// The server inbounds a rule must not send through a blocking lane.
+    server_inbounds: RwLock<Vec<Option<String>>>,
     tagged: HashMap<String, Outbound>,
     /// Each balancer's candidate tags, ordered by tag. Built once so a flow picks from a slice.
     balancers: Arc<HashMap<String, Vec<String>>>,
@@ -1711,6 +1713,38 @@ impl RouteShared {
         if was_added || was_static {
             self.changed.store(true, Ordering::Relaxed);
         }
+    }
+
+    /// Whether a rule may name this tag: the startup table, the default, or an outbound the
+    /// management API added, unless it was removed again.
+    fn known_tag(&self, tag: &str) -> bool {
+        let dynamic = self
+            .dynamic
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !dynamic.removed.contains(tag)
+            && (dynamic.added.contains_key(tag)
+                || self.tagged.contains_key(tag)
+                || Some(tag) == self.default_tag.as_deref())
+    }
+
+    /// Whether the live lane this tag names is a freedom outbound, the only lane a server inbound
+    /// can dial; a removed tag is the closed lane, and an added one shadows the startup entry.
+    fn effective_freedom(&self, tag: &str) -> bool {
+        let dynamic = self
+            .dynamic
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if dynamic.removed.contains(tag) {
+            return false;
+        }
+        if let Some(out) = dynamic.added.get(tag) {
+            return matches!(out.as_ref(), Outbound::Freedom(_));
+        }
+        if Some(tag) == self.default_tag.as_deref() {
+            return matches!(&self.default, Outbound::Freedom(_));
+        }
+        matches!(self.tagged.get(tag), Some(Outbound::Freedom(_)))
     }
 
     /// The tag a tested context routes to: the same table, the same balancer pick and the same
@@ -1867,34 +1901,38 @@ impl Runtime {
         let Some(route) = &self.route else {
             return Err("routing not configured".to_owned());
         };
-        let tagged = &route.tagged;
-        let balancers = &route.balancers;
-        let default_tag = route.default_tag.as_deref();
-        let known = |tag: &str| tagged.contains_key(tag) || Some(tag) == default_tag;
+        let known = |tag: &str| route.known_tag(tag);
         let server_inbounds = route
             .server_inbounds
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
         let validate = |routing: &crate::router::Routing| {
-            for (tag, default_direct) in &server_inbounds {
-                routing.server_routes(tag.as_deref(), *default_direct, |named, balancer| {
+            let default_direct = match route.default_tag.as_deref() {
+                Some(tag) => route.effective_freedom(tag),
+                None => matches!(&route.default, Outbound::Freedom(_)),
+            };
+            for tag in &server_inbounds {
+                routing.server_routes(tag.as_deref(), default_direct, |named, balancer| {
                     if balancer {
-                        let Some(candidates) = balancers.get(named) else {
+                        let Some(candidates) = route.balancers.get(named) else {
                             return false;
                         };
+                        let forced = routing
+                            .balancer(named)
+                            .map(crate::router::Balancer::forced)
+                            .unwrap_or_default();
                         let fallback = routing
                             .balancer(named)
                             .and_then(crate::router::Balancer::fallback);
-                        return candidates.iter().map(String::as_str).chain(fallback).all(
-                            |candidate| {
-                                Some(candidate) == default_tag
-                                    || matches!(tagged.get(candidate), Some(Outbound::Freedom(_)))
-                            },
-                        );
+                        return candidates
+                            .iter()
+                            .map(String::as_str)
+                            .chain(fallback)
+                            .chain((!forced.is_empty()).then_some(forced.as_str()))
+                            .all(|candidate| route.effective_freedom(candidate));
                     }
-                    Some(named) == default_tag
-                        || matches!(tagged.get(named), Some(Outbound::Freedom(_)))
+                    route.effective_freedom(named)
                 })?;
             }
             Ok(())
@@ -2665,14 +2703,30 @@ fn pick_script_outbound(
     }
 }
 
+/// Whether this inbound serves a protocol whose dial is fixed direct, so rules may not move it.
+fn is_server_inbound(inbound: &Json) -> bool {
+    matches!(
+        canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or("")),
+        "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria"
+    )
+}
+
+/// Record a server inbound so a later `AddRule` checks the lane it would name.
+fn register_server_inbound(shared: &RouteShared, inbound: &Json) {
+    if !is_server_inbound(inbound) {
+        return;
+    }
+    shared
+        .server_inbounds
+        .write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(inbound_tag(inbound));
+}
+
 /// A server inbound dials direct, so every rule that can reach it must name a freedom outbound and
 /// the fallback must be one too; anything else refuses the start rather than serving the wrong lane.
 fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
-    // A server inbound dials direct, so every rule that can reach it must agree with that at startup.
-    if !matches!(
-        canonical_protocol(inbound.get("protocol").and_then(Json::as_str).unwrap_or("")),
-        "vless" | "trojan" | "vmess" | "shadowsocks" | "hysteria"
-    ) {
+    if !is_server_inbound(inbound) {
         return;
     }
     let tag = inbound_tag(inbound);
@@ -2685,6 +2739,10 @@ fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
             let Some(candidates) = shared.balancers.get(named) else {
                 return false;
             };
+            let forced = routing
+                .balancer(named)
+                .map(crate::router::Balancer::forced)
+                .unwrap_or_default();
             let fallback = routing
                 .balancer(named)
                 .and_then(crate::router::Balancer::fallback);
@@ -2692,15 +2750,15 @@ fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
                 .iter()
                 .map(String::as_str)
                 .chain(fallback)
-                .all(|candidate| {
-                    Some(candidate) == shared.default_tag.as_deref()
-                        || matches!(shared.tagged.get(candidate), Some(Outbound::Freedom(_)))
-                });
+                .chain((!forced.is_empty()).then_some(forced.as_str()))
+                .all(|candidate| shared.effective_freedom(candidate));
         }
-        Some(named) == shared.default_tag.as_deref()
-            || matches!(shared.tagged.get(named), Some(Outbound::Freedom(_)))
+        shared.effective_freedom(named)
     };
-    let default_direct = matches!(&shared.default, Outbound::Freedom(_));
+    let default_direct = match shared.default_tag.as_deref() {
+        Some(tag) => shared.effective_freedom(tag),
+        None => matches!(&shared.default, Outbound::Freedom(_)),
+    };
     let checked = routing.server_routes(tag.as_deref(), default_direct, direct);
     drop(routing);
     if let Err(error) = checked {
@@ -2710,7 +2768,7 @@ fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
         .server_inbounds
         .write()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .push((tag, default_direct));
+        .push(tag);
 }
 
 /// The Foxy lane: an account's pass over an edge in one pinned country, plus the split-tunnel list.
@@ -48572,6 +48630,11 @@ end
         let shared = runtime.route.as_ref().expect("route");
         let inbound = crate::json::parse(r#"{"tag":"server","protocol":"vless"}"#).expect("parses");
         prove_server_route(shared, &inbound, "test");
+        let before: Vec<_> = runtime
+            .listed_rules()
+            .into_iter()
+            .map(|rule| (rule.target, rule.balancer, rule.tag))
+            .collect();
 
         let rule = crate::json::parse(
             r#"{"type":"field","ruleTag":"blocked","inboundTag":["server"],"outboundTag":"block"}"#,
@@ -48581,13 +48644,121 @@ end
             .add_rules(&[rule], true)
             .expect_err("the server inbound cannot dial a blocking lane");
         assert!(error.contains("server"), "{error}");
-        assert!(
-            !runtime
-                .listed_rules()
-                .iter()
-                .any(|rule| rule.tag.as_deref() == Some("blocked")),
-            "the refused rule must not reach the table"
+        let after: Vec<_> = runtime
+            .listed_rules()
+            .into_iter()
+            .map(|rule| (rule.target, rule.balancer, rule.tag))
+            .collect();
+        assert_eq!(
+            after, before,
+            "the refused rule must leave the table unchanged"
         );
+        assert!(!before
+            .iter()
+            .any(|(_, _, tag)| tag.as_deref() == Some("blocked")));
+    }
+
+    /// A balancer forced to a blocking lane is not a direct route even when its candidates are.
+    #[test]
+    fn a_forced_balancer_to_a_block_lane_is_refused_for_a_server_inbound() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"lane-a","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+                "routing":{"balancers":[{"tag":"pool","selector":["lane-"],"strategy":"roundRobin"}],"rules":[]}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let shared = runtime.route.as_ref().expect("route");
+        let inbound = crate::json::parse(r#"{"tag":"server","protocol":"vless"}"#).expect("parses");
+        prove_server_route(shared, &inbound, "test");
+        runtime
+            .override_balancer("pool", "block")
+            .expect("forces the balancer");
+        let rule = crate::json::parse(
+            r#"{"type":"field","ruleTag":"blocked","inboundTag":["server"],"balancerTag":"pool"}"#,
+        )
+        .expect("parses");
+        let error = runtime
+            .add_rules(&[rule], true)
+            .expect_err("the forced balancer cannot send the server inbound to a block lane");
+        assert!(error.contains("server"), "{error}");
+    }
+
+    /// A tag removed and re-added as a block outbound is not the freedom lane the startup table saw.
+    #[test]
+    fn a_removed_freedom_tag_readded_as_a_block_is_refused_for_a_server_inbound() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"lane","protocol":"freedom"}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let shared = runtime.route.as_ref().expect("route");
+        let inbound = crate::json::parse(r#"{"tag":"server","protocol":"vless"}"#).expect("parses");
+        prove_server_route(shared, &inbound, "test");
+        shared.remove_outbound("lane");
+        shared
+            .add_outbound(
+                "lane",
+                Outbound::Block(ferrox_core::blackhole::Response::None),
+            )
+            .expect("readds the tag");
+        let rule = crate::json::parse(
+            r#"{"type":"field","ruleTag":"blocked","inboundTag":["server"],"outboundTag":"lane"}"#,
+        )
+        .expect("parses");
+        let error = runtime
+            .add_rules(&[rule], true)
+            .expect_err("the tag now names a block lane");
+        assert!(error.contains("server"), "{error}");
+    }
+
+    /// The default outbound tag is direct only when the outbound it names is freedom.
+    #[test]
+    fn a_blocking_default_tag_is_refused_for_a_server_inbound() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"block","protocol":"blackhole"},{"tag":"direct","protocol":"freedom"}],
+                "routing":{"rules":[{"type":"field","inboundTag":["server"],"outboundTag":"direct"}]}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let shared = runtime.route.as_ref().expect("route");
+        let inbound = crate::json::parse(r#"{"tag":"server","protocol":"vless"}"#).expect("parses");
+        prove_server_route(shared, &inbound, "test");
+        let rule = crate::json::parse(
+            r#"{"type":"field","ruleTag":"blocked","inboundTag":["server"],"outboundTag":"block"}"#,
+        )
+        .expect("parses");
+        let error = runtime
+            .add_rules(&[rule], false)
+            .expect_err("the default tag names a block lane");
+        assert!(error.contains("server"), "{error}");
+    }
+
+    /// A server inbound added through the management API is registered, so a later rule cannot
+    /// send it through a block lane either.
+    #[test]
+    fn a_dynamic_server_inbound_is_registered_for_route_validation() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let port = free_port();
+        let dynamic = crate::json::parse(&format!(
+            r#"{{"inbounds":[{{"tag":"dyn","protocol":"vless","listen":"127.0.0.1","port":{port},"settings":{{"clients":[{{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}}}}]}}"#
+        ))
+        .expect("parses");
+        let api = crate::commander::Api::new(crate::commander::ApiConfig::default());
+        let seed = crate::xray_pb::Seed::default();
+        let (served, _) = serve_dynamic_inbounds(&runtime, &dynamic, &seed, &api);
+        assert_eq!(served, 1, "the dynamic inbound is served");
+        let rule = crate::json::parse(
+            r#"{"type":"field","ruleTag":"blocked","inboundTag":["dyn"],"outboundTag":"block"}"#,
+        )
+        .expect("parses");
+        let error = runtime
+            .add_rules(&[rule], true)
+            .expect_err("the dynamic server inbound cannot dial a block lane");
+        assert!(error.contains("dyn"), "{error}");
     }
 
     /// A `vlessRoute` rule reads the route id a flow carries: a socks flow carries none, so it reads
