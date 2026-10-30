@@ -167,6 +167,7 @@ impl Gate {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 pub(crate) struct GrpcReader<R: Read = Connection> {
     read: R,
