@@ -514,7 +514,10 @@ fn status(options: &Options, paths: &Paths) -> i32 {
     {
         println!("carrier: {carrier}");
     } else if tail.truncated && lane::foxy_configured(paths) {
-        println!("carrier: the last carrier was logged before the retained 64 KiB window; run 'ferrox-cli tail' for the older lines.");
+        println!(
+            "carrier: not in the retained 64 KiB window; older entries are in {}.",
+            paths.log.display()
+        );
     }
     if let Some(quota) = log
         .lines()
@@ -523,7 +526,10 @@ fn status(options: &Options, paths: &Paths) -> i32 {
     {
         println!("quota left: {quota}");
     } else if tail.truncated && lane::foxy_configured(paths) {
-        println!("quota: the last allowance was logged before the retained 64 KiB window; run 'ferrox-cli tail' for the older lines.");
+        println!(
+            "quota: not in the retained 64 KiB window; older entries are in {}.",
+            paths.log.display()
+        );
     } else if lane::foxy_configured(paths) {
         println!("quota: the plane named no allowance for the pass this lane carries: that is silence, not zero.");
     }

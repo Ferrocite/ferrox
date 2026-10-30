@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use crate::args::die;
 use crate::config::{fronts, port_of, Ports};
-use crate::paths::{read_trim, secure_dir, write_private, Paths};
+use crate::paths::{read_trim, read_trim_checked, secure_dir, write_private, Paths};
 
 pub fn require_bin() -> PathBuf {
     if let Some(path) = std::env::var_os("FERROX_BIN") {
@@ -92,25 +92,15 @@ pub fn running(paths: &Paths) -> bool {
     pid(paths).is_some_and(alive)
 }
 
-fn process_command(pid: u32) -> Option<String> {
+fn process_exe(pid: u32) -> Option<PathBuf> {
     #[cfg(target_os = "linux")]
     {
-        let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-        if raw.is_empty() {
-            return None;
-        }
-        Some(
-            raw.split(|byte| *byte == 0)
-                .filter(|part| !part.is_empty())
-                .map(|part| String::from_utf8_lossy(part).into_owned())
-                .collect::<Vec<_>>()
-                .join(" "),
-        )
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
     }
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("/bin/ps")
-            .args(["-p", &pid.to_string(), "-o", "command="])
+            .args(["-p", &pid.to_string(), "-o", "comm="])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
@@ -118,7 +108,8 @@ fn process_command(pid: u32) -> Option<String> {
         if !output.status.success() {
             return None;
         }
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!path.is_empty()).then(|| PathBuf::from(path))
     }
     #[cfg(windows)]
     {
@@ -137,7 +128,9 @@ fn process_command(pid: u32) -> Option<String> {
         if ok == 0 {
             return None;
         }
-        Some(String::from_utf16_lossy(&buffer[..length as usize]))
+        Some(PathBuf::from(String::from_utf16_lossy(
+            &buffer[..length as usize],
+        )))
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
@@ -146,19 +139,44 @@ fn process_command(pid: u32) -> Option<String> {
     }
 }
 
+fn expected_bin() -> PathBuf {
+    if let Some(path) = std::env::var_os("FERROX_BIN") {
+        return PathBuf::from(path);
+    }
+    let name = if cfg!(windows) {
+        "ferrox-app.exe"
+    } else {
+        "ferrox-app"
+    };
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(name)))
+        .unwrap_or_default()
+}
+
+fn same_exe(actual: &Path, expected: &Path) -> bool {
+    let actual = std::fs::canonicalize(actual).unwrap_or_else(|_| actual.to_path_buf());
+    let expected = std::fs::canonicalize(expected).unwrap_or_else(|_| expected.to_path_buf());
+    #[cfg(windows)]
+    {
+        actual
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&expected.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        actual == expected
+    }
+}
+
 fn is_ferrox(pid: u32) -> bool {
-    let Some(command) = process_command(pid) else {
+    let Some(actual) = process_exe(pid) else {
         #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
         return true;
         #[cfg(any(target_os = "linux", target_os = "macos", windows))]
         return false;
     };
-    if let Some(expected) = std::env::var_os("FERROX_BIN") {
-        if command.contains(&*expected.to_string_lossy()) {
-            return true;
-        }
-    }
-    command.contains("ferrox-app")
+    same_exe(&actual, &expected_bin())
 }
 
 pub fn kill(pid: u32) {
@@ -195,17 +213,48 @@ pub fn kill(pid: u32) {
     }
 }
 
-fn register(paths: &Paths) {
-    let _ = secure_dir(&paths.state_dir);
-    let text = read_trim(&paths.lanes_file).unwrap_or_default();
+fn register(paths: &Paths) -> Result<(), String> {
+    secure_dir(&paths.state_dir)
+        .map_err(|error| format!("cannot create the state dir: {error}"))?;
+    let text = match read_trim_checked(&paths.lanes_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(format!(
+                "cannot read {}: {error}",
+                paths.lanes_file.display()
+            ));
+        }
+    };
     let conf = paths.conf_dir.to_string_lossy();
-    if !text.lines().any(|line| line == conf) {
-        let _ = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&paths.lanes_file)
-            .and_then(|mut file| writeln!(file, "{conf}"));
+    if text.lines().any(|line| line == conf) {
+        return Ok(());
     }
+    let current = std::fs::metadata(&paths.lanes_file).map_or(0, |meta| meta.len());
+    let addition = conf.len() as u64 + 1;
+    if current.saturating_add(addition) > crate::paths::MAX_PRIVATE_BYTES {
+        return Err(format!(
+            "the lane registry {} would exceed {} bytes; nothing was started.",
+            paths.lanes_file.display(),
+            crate::paths::MAX_PRIVATE_BYTES
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.lanes_file)
+        .map_err(|error| format!("cannot append to {}: {error}", paths.lanes_file.display()))?;
+    writeln!(file, "{conf}")
+        .map_err(|error| format!("cannot append to {}: {error}", paths.lanes_file.display()))?;
+    if file.metadata().map_or(current, |meta| meta.len()) > crate::paths::MAX_PRIVATE_BYTES {
+        let _ = file.set_len(current);
+        return Err(format!(
+            "the lane registry {} exceeded {} bytes; the entry was rolled back.",
+            paths.lanes_file.display(),
+            crate::paths::MAX_PRIVATE_BYTES
+        ));
+    }
+    Ok(())
 }
 
 pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
@@ -213,7 +262,7 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
         .map_err(|error| format!("cannot create the config dir: {error}"))?;
     secure_dir(&paths.state_dir)
         .map_err(|error| format!("cannot create the state dir: {error}"))?;
-    register(paths);
+    register(paths)?;
     let out = OpenOptions::new()
         .create(true)
         .write(true)
