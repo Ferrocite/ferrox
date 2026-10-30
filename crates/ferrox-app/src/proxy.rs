@@ -15990,7 +15990,7 @@ fn freedom_socket(freedom: &FreedomOut, asked: &Destination) -> Option<SocketAdd
             if freedom.domain == FreedomDomain::AsIs {
                 return resolve_endpoint(&host, port);
             }
-            let ips = freedom_lookup(&host, port);
+            let ips = freedom_lookup(&host, port)?;
             if let Some(ip) = freedom.domain.pick(&ips) {
                 return Some(SocketAddr::new(ip, port));
             }
@@ -16006,23 +16006,21 @@ fn freedom_socket(freedom: &FreedomOut, asked: &Destination) -> Option<SocketAdd
     }
 }
 
-fn freedom_lookup(host: &str, port: u16) -> Vec<std::net::IpAddr> {
+fn freedom_lookup(host: &str, port: u16) -> Option<Vec<std::net::IpAddr>> {
     if let Some(resolver) = crate::dnsapp::installed() {
-        return resolver.lookup(host).map_or_else(Vec::new, |(ips, _)| ips);
+        return resolver.lookup(host).map(|(ips, _)| ips);
     }
     let addrs = if let Some(addrs) = cached_lookup(host, port) {
         addrs
     } else {
-        let Some(addrs) = resolve_bounded(host, port, budgets::dial(), |host, port| {
+        let addrs = resolve_bounded(host, port, budgets::dial(), |host, port| {
             (host, port)
                 .to_socket_addrs()
                 .map(std::iter::Iterator::collect)
-        }) else {
-            return Vec::new();
-        };
+        })?;
         remember_lookup(host, port, &addrs)
     };
-    addrs.iter().map(std::net::SocketAddr::ip).collect()
+    Some(addrs.iter().map(std::net::SocketAddr::ip).collect())
 }
 
 fn strategy_name(domain: FreedomDomain) -> &'static str {
