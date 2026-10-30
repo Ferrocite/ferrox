@@ -48522,6 +48522,37 @@ end
         );
     }
 
+    /// A rule added after startup cannot send a server inbound through a lane that inbound never
+    /// evaluates: the startup route proof runs again over the candidate table before it is published.
+    #[test]
+    fn an_added_rule_cannot_send_a_server_inbound_through_a_block_lane() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+                "routing":{"rules":[{"type":"field","inboundTag":["other"],"outboundTag":"block"}]}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let shared = runtime.route.as_ref().expect("route");
+        let inbound = crate::json::parse(r#"{"tag":"server","protocol":"vless"}"#).expect("parses");
+        prove_server_route(shared, &inbound, "test");
+
+        let rule = crate::json::parse(
+            r#"{"type":"field","ruleTag":"blocked","inboundTag":["server"],"outboundTag":"block"}"#,
+        )
+        .expect("parses");
+        let error = runtime
+            .add_rules(&[rule], true)
+            .expect_err("the server inbound cannot dial a blocking lane");
+        assert!(error.contains("server"), "{error}");
+        assert!(
+            !runtime
+                .listed_rules()
+                .iter()
+                .any(|rule| rule.tag.as_deref() == Some("blocked")),
+            "the refused rule must not reach the table"
+        );
+    }
+
     /// A `vlessRoute` rule reads the route id a flow carries: a socks flow carries none, so it reads
     /// 0 and a list holding 0 blocks it, while a list of ids the client never sent leaves it alone.
     #[test]
