@@ -48085,20 +48085,12 @@ end
     #[test]
     fn an_added_rule_changes_a_udp_association() {
         let root = crate::json::parse(
-            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],"routing":{}}"#,
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+                "routing":{"rules":[{"type":"field","inboundTag":["other"],"outboundTag":"block"}]}}"#,
         )
         .expect("parses");
-        let routing = crate::router::Routing::parse_in(&root, Vec::new())
-            .expect("parses")
-            .expect("routing");
-        let portals = Arc::new(crate::reverse::Portals::default());
-        let shared = route_shared(&root, routing, &portals, None).expect("shared");
-        let runtime = Runtime::new(
-            Some(freedom()),
-            Some(Arc::clone(&shared)),
-            false,
-            Arc::clone(&portals),
-        );
+        let runtime = test_runtime(&root);
+        let shared = Arc::clone(runtime.route.as_ref().expect("route"));
         let plan = RoutePlan::new(Arc::clone(&shared), Some("in".to_owned()), None, true);
         assert!(
             matches!(&*plan.udp_out().expect("one lane"), Outbound::Freedom(_)),
