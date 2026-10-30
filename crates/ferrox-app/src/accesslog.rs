@@ -279,16 +279,15 @@ mod tests {
             Some(source),
             false,
             &"bad\nline:443",
-            None,
-            "invalid user",
-            "",
+            Some("tag\nx"),
+            "why\ny",
+            "a@b.c\nz",
         );
         let text = std::fs::read_to_string(&path).expect("reads the line");
         assert_eq!(text.lines().count(), 1, "one request writes one line");
-        assert!(
-            text.contains(r"bad\nline:443"),
-            "a control byte is escaped: {text:?}"
-        );
+        for field in ["bad\\nline:443", "[tag\\nx]", "why\\ny", "email: a@b.c\\nz"] {
+            assert!(text.contains(field), "{field:?} is escaped: {text:?}");
+        }
         let _ = std::fs::remove_file(&path);
         install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
     }
