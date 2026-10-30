@@ -49480,6 +49480,68 @@ mod tests {
         }
     }
 
+    /// The socket options an outbound's `streamSettings.sockopt` names are the ones the socket its
+    /// dial makes carries, not the OS defaults.
+    #[cfg(unix)]
+    #[test]
+    fn an_outbound_sockopt_reaches_the_dial_socket() {
+        use std::os::fd::AsRawFd as _;
+
+        let root = crate::json::parse(
+            r#"{"routing":{},"outbounds":[{"protocol":"freedom","streamSettings":{"sockopt":{"tcpKeepAliveIdle":11,"tcpKeepAliveInterval":7}}}]}"#,
+        )
+        .expect("parses");
+        let routing = routing_for(&root).expect("parses").expect("a plan");
+        let shared = route_shared(&root, routing, &crate::reverse::Portals::default(), None)
+            .expect("builds");
+        let plan = RoutePlan::new(shared, None, None, false);
+        let asked = Destination::Name("127.0.0.1".to_owned(), 9);
+        let (_lane, _tag) = plan.lane_with_protocol(
+            &asked,
+            crate::router::Network::Tcp,
+            None,
+            FlowFacts::default(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("echo binds");
+        let target: SocketAddr = listener.local_addr().expect("address");
+        let echo = std::thread::spawn(move || {
+            if let Ok((stream, _)) = listener.accept() {
+                drop(stream);
+            }
+        });
+        let stream = dial_or_report(&target).expect("the dial reaches the echo");
+        let fd = stream.as_raw_fd();
+        assert_ne!(
+            socket_int(fd, libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+            0,
+            "the outbound's keepalive reaches the socket"
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(socket_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPALIVE), 11);
+        #[cfg(target_os = "linux")]
+        assert_eq!(socket_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPIDLE), 11);
+        assert_eq!(socket_int(fd, libc::IPPROTO_TCP, libc::TCP_KEEPINTVL), 7);
+        echo.join().expect("echo");
+    }
+
+    #[cfg(unix)]
+    fn socket_int(fd: std::os::fd::RawFd, level: libc::c_int, name: libc::c_int) -> i32 {
+        let mut value = 0i32;
+        let mut len = std::mem::size_of_val(&value) as libc::socklen_t;
+        // SAFETY: the descriptor is live and the value buffer is writable.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd,
+                level,
+                name,
+                std::ptr::addr_of_mut!(value).cast(),
+                &raw mut len,
+            )
+        };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+        value
+    }
+
     /// A `WireGuard` server datagram takes the tag its rules pick for UDP, follows that freedom's
     /// redirect, and reports the reply as the original target the inner packet named.
     #[test]
