@@ -782,6 +782,80 @@ mod tests {
     }
 
     #[test]
+    fn more_than_the_cap_of_posts_is_dropped() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        const CAP: usize = 32;
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let accepted = Arc::clone(&accepted);
+            let release = Arc::clone(&release);
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                listener.set_nonblocking(true).expect("nonblocking");
+                let mut handlers = Vec::new();
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                            let release = Arc::clone(&release);
+                            handlers.push(std::thread::spawn(move || {
+                                stream
+                                    .set_read_timeout(Some(Duration::from_secs(1)))
+                                    .expect("timeout");
+                                let mut request = [0u8; 512];
+                                let _ = stream.read(&mut request);
+                                while !release.load(Ordering::SeqCst) {
+                                    std::thread::sleep(Duration::from_millis(5));
+                                }
+                                let _ = stream.write_all(
+                                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n",
+                                );
+                            }));
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                for handler in handlers {
+                    handler.join().ok();
+                }
+            })
+        };
+
+        let webhook = notifier(&format!("http://127.0.0.1:{port}/hook"));
+        let destination = Destination::Name("example.test".to_owned(), 80);
+        let event = event(&destination);
+        for _ in 0..=CAP {
+            webhook.fire(&event);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while accepted.load(Ordering::SeqCst) < CAP && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            CAP,
+            "the cap's permits are used"
+        );
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            CAP,
+            "the event over the cap never starts a POST"
+        );
+        release.store(true, Ordering::SeqCst);
+        stop.store(true, Ordering::SeqCst);
+        server.join().ok();
+    }
+
+    #[test]
     fn url_credentials_become_basic_auth() {
         let credentials = ["alice", "p%40ss"].join(":");
         let target = format!("https://{credentials}@example.test/hook");
