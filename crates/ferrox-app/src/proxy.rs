@@ -17419,7 +17419,6 @@ fn serve_socks_udp_sniffed(mut client: Connection, out: &Outbound) {
     let Some(relay) = socks_udp_relay(&mut client) else {
         return;
     };
-    let relay_local = relay.local_addr().ok();
     let local = relay
         .local_addr()
         .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
@@ -17606,6 +17605,7 @@ fn serve_socks_udp_split(
     let Some(relay) = socks_udp_relay(&mut client) else {
         return;
     };
+    let relay_local = relay.local_addr().ok();
     let local = relay
         .local_addr()
         .map_or(std::net::IpAddr::V4([127, 0, 0, 1].into()), |addr| {
