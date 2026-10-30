@@ -100,7 +100,7 @@ mod win {
     use std::ptr;
 
     use serde_json::{json, Value};
-    use windows_sys::Win32::Foundation::ERROR_SUCCESS;
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
     use windows_sys::Win32::Networking::WinInet::{
         InternetSetOptionW, INTERNET_OPTION_REFRESH, INTERNET_OPTION_SETTINGS_CHANGED,
     };
@@ -112,6 +112,7 @@ mod win {
     use crate::paths::{read_trim, write_private, Paths};
 
     const SETTINGS: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    const MAX_VALUE: u32 = 1024 * 1024;
     const NAMES: [&str; 5] = [
         "ProxyEnable",
         "ProxyServer",
@@ -147,7 +148,7 @@ mod win {
         }
     }
 
-    fn read(key: HKEY, name: &str) -> Option<(u32, Vec<u8>)> {
+    fn read(key: HKEY, name: &str) -> Result<Option<(u32, Vec<u8>)>, String> {
         let name = wide(name);
         let mut kind = 0_u32;
         let mut size = 0_u32;
@@ -161,8 +162,16 @@ mod win {
                 &mut size,
             )
         };
+        if status == ERROR_FILE_NOT_FOUND {
+            return Ok(None);
+        }
         if status != ERROR_SUCCESS {
-            return None;
+            return Err(format!("RegQueryValueEx({name:?}) failed with {status}"));
+        }
+        if size > MAX_VALUE {
+            return Err(format!(
+                "registry value {name:?} is larger than {MAX_VALUE} bytes"
+            ));
         }
         let mut buffer = vec![0_u8; size as usize];
         let status = unsafe {
@@ -176,58 +185,47 @@ mod win {
             )
         };
         if status != ERROR_SUCCESS {
-            return None;
+            return Err(format!("RegQueryValueEx({name:?}) failed with {status}"));
         }
-        buffer.truncate(size as usize);
-        Some((kind, buffer))
+        let size = (size as usize).min(buffer.len());
+        buffer.truncate(size);
+        Ok(Some((kind, buffer)))
     }
 
-    fn value_of(key: HKEY, name: &str) -> Option<Value> {
-        let (kind, bytes) = read(key, name)?;
-        if kind == REG_SZ {
-            let units: Vec<u16> = bytes
-                .chunks_exact(2)
-                .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-                .take_while(|unit| *unit != 0)
-                .collect();
-            Some(json!(String::from_utf16_lossy(&units)))
-        } else if kind == REG_DWORD {
-            let bytes: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
-            Some(json!(u32::from_le_bytes(bytes)))
-        } else {
-            None
-        }
+    fn text_of(bytes: &[u8]) -> String {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .take_while(|unit| *unit != 0)
+            .collect();
+        String::from_utf16_lossy(&units)
     }
 
-    fn write_sz(key: HKEY, name: &str, value: &str) -> bool {
+    fn write_raw(key: HKEY, name: &str, kind: u32, data: &[u8]) -> bool {
         let name = wide(name);
-        let data = wide(value);
-        let bytes = data.len() * 2;
         unsafe {
             RegSetValueExW(
                 key,
                 name.as_ptr(),
                 0,
-                REG_SZ,
-                data.as_ptr().cast::<u8>(),
-                bytes as u32,
-            ) == ERROR_SUCCESS
-        }
-    }
-
-    fn write_dword(key: HKEY, name: &str, value: u32) -> bool {
-        let name = wide(name);
-        let data = value.to_le_bytes();
-        unsafe {
-            RegSetValueExW(
-                key,
-                name.as_ptr(),
-                0,
-                REG_DWORD,
+                kind,
                 data.as_ptr(),
                 data.len() as u32,
             ) == ERROR_SUCCESS
         }
+    }
+
+    fn write_sz(key: HKEY, name: &str, value: &str) -> bool {
+        let bytes: Vec<u8> = value
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        write_raw(key, name, REG_SZ, &bytes)
+    }
+
+    fn write_dword(key: HKEY, name: &str, value: u32) -> bool {
+        write_raw(key, name, REG_DWORD, &value.to_le_bytes())
     }
 
     fn delete(key: HKEY, name: &str) {
@@ -237,19 +235,38 @@ mod win {
         }
     }
 
-    fn snapshot(key: HKEY) -> Value {
+    fn snapshot(key: HKEY) -> Result<Value, String> {
         let mut object = serde_json::Map::new();
         for name in NAMES {
-            if let Some(value) = value_of(key, name) {
-                object.insert(name.to_owned(), value);
+            if let Some((kind, bytes)) = read(key, name)? {
+                object.insert(name.to_owned(), json!({"kind": kind, "bytes": bytes}));
             }
         }
-        Value::Object(object)
+        Ok(Value::Object(object))
     }
 
     fn restore(key: HKEY, snapshot: &Value) {
         for name in NAMES {
             match snapshot.get(name) {
+                Some(Value::Object(value)) => {
+                    let kind = value
+                        .get("kind")
+                        .and_then(Value::as_u64)
+                        .and_then(|kind| u32::try_from(kind).ok());
+                    let bytes: Option<Vec<u8>> =
+                        value.get("bytes").and_then(Value::as_array).map(|rows| {
+                            rows.iter()
+                                .filter_map(Value::as_u64)
+                                .filter_map(|byte| u8::try_from(byte).ok())
+                                .collect()
+                        });
+                    match (kind, bytes) {
+                        (Some(kind), Some(bytes)) => {
+                            write_raw(key, name, kind, &bytes);
+                        }
+                        _ => delete(key, name),
+                    }
+                }
                 Some(Value::String(text)) => {
                     write_sz(key, name, text);
                 }
@@ -292,10 +309,11 @@ mod win {
         parts.join(";")
     }
 
-    fn bypass(key: HKEY) -> String {
-        let prior = value_of(key, "ProxyOverride")
-            .and_then(|value| value.as_str().map(str::to_owned))
-            .unwrap_or_default();
+    fn bypass(key: HKEY) -> Result<String, String> {
+        let prior = match read(key, "ProxyOverride")? {
+            Some((kind, bytes)) if kind == REG_SZ => text_of(&bytes),
+            Some(_) | None => String::new(),
+        };
         let mut entries: Vec<String> = [
             "localhost",
             "127.0.0.1",
@@ -317,25 +335,54 @@ mod win {
             }
             entries.push(entry.to_owned());
         }
-        entries.join(";")
+        Ok(entries.join(";"))
     }
 
     pub fn arm(paths: &Paths, socks: Option<u16>, http: Option<u16>) -> Result<(), String> {
         let key = open().map_err(|error| {
             format!("system proxy: cannot read the current settings ({error}).")
         })?;
+        let bypass = match bypass(key) {
+            Ok(bypass) => bypass,
+            Err(error) => {
+                close(key);
+                return Err(format!(
+                    "system proxy: cannot read the current bypass list: {error}"
+                ));
+            }
+        };
         let fresh = !paths.proxy_state.exists();
         if fresh {
-            let snapshot = snapshot(key);
-            let text = serde_json::to_string(&snapshot)
-                .map_err(|error| format!("system proxy: cannot record the snapshot: {error}"))?;
-            write_private(&paths.proxy_state, &text)
-                .map_err(|error| format!("system proxy: cannot record the snapshot: {error}"))?;
+            let snapshot = match snapshot(key) {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    close(key);
+                    return Err(format!("system proxy: cannot record the snapshot: {error}"));
+                }
+            };
+            let text = match serde_json::to_string(&snapshot) {
+                Ok(text) => text,
+                Err(error) => {
+                    close(key);
+                    return Err(format!("system proxy: cannot record the snapshot: {error}"));
+                }
+            };
+            if text.len() as u64 > crate::paths::MAX_PRIVATE_BYTES {
+                close(key);
+                return Err(
+                    "system proxy: the current settings are too large to snapshot safely; nothing was armed."
+                        .to_owned(),
+                );
+            }
+            if let Err(error) = write_private(&paths.proxy_state, &text) {
+                close(key);
+                return Err(format!("system proxy: cannot record the snapshot: {error}"));
+            }
         }
         let server = server(socks, http);
         let ok = write_dword(key, "ProxyEnable", 1)
             && write_sz(key, "ProxyServer", &server)
-            && write_sz(key, "ProxyOverride", &bypass(key))
+            && write_sz(key, "ProxyOverride", &bypass)
             && write_dword(key, "AutoDetect", 0);
         delete(key, "AutoConfigURL");
         unsafe { RegCloseKey(key) };

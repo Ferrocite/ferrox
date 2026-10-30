@@ -2,7 +2,14 @@
 //! package owns no repository, so the paths are the platform's own per-user
 //! directories, and `FERROX_CONF_DIR`/`FERROX_STATE_DIR` can move them.
 
+use std::fs::OpenOptions;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static TEMP: AtomicU64 = AtomicU64::new(0);
+
+pub const MAX_PRIVATE_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct Paths {
@@ -86,6 +93,27 @@ impl Paths {
     }
 }
 
+#[cfg(windows)]
+fn icacls(path: &Path, grant: &str) -> std::io::Result<()> {
+    let output = std::process::Command::new("icacls")
+        .arg(path)
+        .args(["/inheritance:r", "/grant:r"])
+        .arg(grant)
+        .output()?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "icacls {} failed: {}",
+                path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
+            ),
+        ))
+    }
+}
+
 pub fn secure_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
     #[cfg(unix)]
@@ -95,49 +123,130 @@ pub fn secure_dir(path: &Path) -> std::io::Result<()> {
     }
     #[cfg(windows)]
     {
-        let _ = std::process::Command::new("icacls")
-            .arg(path)
-            .args(["/inheritance:r", "/grant:r"])
-            .arg(format!(
-                "{}:(OI)(CI)F",
-                std::env::var("USERNAME").unwrap_or_else(|_| "user".to_owned())
-            ))
-            .output();
+        let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".to_owned());
+        icacls(path, &format!("{user}:(OI)(CI)F"))?;
     }
     Ok(())
 }
 
-#[allow(clippy::unnecessary_wraps)]
+#[cfg(windows)]
 pub fn secure_file(path: &Path) -> std::io::Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-    }
-    #[cfg(windows)]
-    {
-        let _ = std::process::Command::new("icacls")
-            .arg(path)
-            .args(["/inheritance:r", "/grant:r"])
-            .arg(format!(
-                "{}:F",
-                std::env::var("USERNAME").unwrap_or_else(|_| "user".to_owned())
-            ))
-            .output();
-    }
+    let user = std::env::var("USERNAME").unwrap_or_else(|_| "user".to_owned());
+    icacls(path, &format!("{user}:F"))?;
     Ok(())
 }
 
+/// Replace a private file atomically: a reader never sees a half-written
+/// credential, and the new inode is owner-only before a byte lands in it.
 pub fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
-    if let Some(parent) = path.parent() {
-        secure_dir(parent)?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    secure_dir(parent)?;
+    let name = path
+        .file_name()
+        .map_or_else(|| "ferrox".into(), |name| name.to_string_lossy());
+    for _ in 0..32 {
+        let serial = TEMP.fetch_add(1, Ordering::Relaxed);
+        let temp = parent.join(format!(".{name}.tmp.{}.{serial}", std::process::id()));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.mode(0o600);
+        }
+        let mut file = match options.open(&temp) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        };
+        #[cfg(windows)]
+        if let Err(error) = secure_file(&temp) {
+            drop(file);
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+        let written = file
+            .write_all(contents.as_bytes())
+            .and_then(|()| file.flush());
+        drop(file);
+        if let Err(error) = written {
+            let _ = std::fs::remove_file(&temp);
+            return Err(error);
+        }
+        match std::fs::rename(&temp, path) {
+            Ok(()) => return Ok(()),
+            Err(error) => {
+                let _ = std::fs::remove_file(&temp);
+                return Err(error);
+            }
+        }
     }
-    std::fs::write(path, contents)?;
-    secure_file(path)
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "cannot create a private temporary file",
+    ))
+}
+
+/// Read a small private file, refusing instead of silently truncating when a
+/// planted file is larger than the launcher ever writes.
+pub fn read_trim_checked(path: &Path) -> std::io::Result<String> {
+    let mut text = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_PRIVATE_BYTES + 1)
+        .read_to_end(&mut text)?;
+    if text.len() as u64 > MAX_PRIVATE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "file is larger than 8 MiB",
+        ));
+    }
+    Ok(String::from_utf8_lossy(&text).trim().to_owned())
 }
 
 pub fn read_trim(path: &Path) -> Option<String> {
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|text| text.trim().to_owned())
+    read_trim_checked(path).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_oversized_private_read_is_refused_not_truncated() {
+        let serial = TEMP.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-paths-big-{}-{serial}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("dir");
+        let path = dir.join("oversized");
+        std::fs::write(&path, vec![b'x'; MAX_PRIVATE_BYTES as usize + 1]).expect("write");
+        assert!(read_trim_checked(&path).is_err());
+        assert!(read_trim(&path).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_private_write_replaces_the_file_and_leaves_no_temp() {
+        let serial = TEMP.fetch_add(1, Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-paths-{}-{serial}", std::process::id()));
+        let path = dir.join("credentials");
+        write_private(&path, "first\n").expect("write");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let file = std::fs::metadata(&path).expect("file");
+            let parent = std::fs::metadata(&dir).expect("dir");
+            assert_eq!(file.permissions().mode() & 0o777, 0o600);
+            assert_eq!(parent.permissions().mode() & 0o777, 0o700);
+        }
+        write_private(&path, "second\n").expect("replace");
+        assert_eq!(read_trim(&path).as_deref(), Some("second"));
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .expect("dir")
+            .flatten()
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, ["credentials"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

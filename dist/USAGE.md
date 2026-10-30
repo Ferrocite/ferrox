@@ -1,6 +1,6 @@
 # Ferrox on macOS and Windows
 
-Windows packages ship `ferrox-cli.exe`, a native launcher with the same commands and flags as the shell CLI below. Replace `./dist/ferrox-cli.sh` with `.\ferrox-cli.exe` (or just `ferrox-cli` on `PATH`); the release package keeps the binary beside it, so no Bash, WSL or Python is needed. `--vpn` is supported on Windows through the WinINET system proxy; macOS `--vpn` remains in `ferrox-cli.sh`.
+Windows packages ship `ferrox-cli.exe`, a native launcher with the same commands and flags as the shell CLI below. Replace `./dist/ferrox-cli.sh` with `.\ferrox-cli.exe` (or just `ferrox-cli` on `PATH`); the release package keeps the binary beside it, so no Bash, WSL or Python is needed. The Windows zip also carries `ferrox-cli.sh` as an optional Git Bash fallback for ports-only use, which needs Python 3 and curl on `PATH`; `--vpn` is the native launcher's, and it uses the WinINET system proxy on Windows; macOS `--vpn` remains in `ferrox-cli.sh`.
 
 Two things were built here, from the same release binary — a release package from the `release` workflow ships the second and third of these beside the binary, and finds it without cargo:
 
@@ -9,7 +9,10 @@ Two things were built here, from the same release binary — a release package f
 | the binary | `target/release/ferrox-app` (arm64, `ferrox-app 0.0.1`) |
 | the CLI | `dist/ferrox-cli.sh` — every lane, every front, ports, system proxy |
 | the Windows CLI | `ferrox-cli.exe` — the same commands natively; `--vpn` uses the Windows system proxy |
+| the Windows fallback | `ferrox-cli.sh` — the same shell CLI for Git Bash, with Python 3 and curl on `PATH` |
 | the app | `dist/Ferrox.app` — the same CLI behind a double-click |
+
+On Windows the native launcher keeps config and account files under `%APPDATA%\ferrox` and pid/log/system-proxy state under `%LOCALAPPDATA%\ferrox`, owner-only through NTFS ACLs. Every `~/.config/ferrox` path on this page describes macOS and Linux.
 
 `ferrox-cli.sh`, this page and `README.md` are tracked so the release job can ship them; everything else under `dist/` — the bundle, its build script, any lane config — stays git-ignored, and so does every file that carries an account.
 
@@ -126,7 +129,7 @@ Use `socks5h://` (not `socks5://`) so the name is resolved at the exit instead o
 
 **Ports mode** (`up --foxy`): the three fronts, nothing else touched. One app at a time, or a browser profile pointed at a port.
 
-**VPN mode** (`up --vpn`): the same fronts plus the macOS system proxy. This covers TCP apps that honour the system proxy — browsers, most Electron apps. It is not a tunnel: apps that ignore the system proxy, and UDP, are not captured.
+**VPN mode** (`up --vpn`): the same fronts plus the macOS system proxy (or the Windows WinINET proxy through `ferrox-cli.exe`). This covers TCP apps that honour the system proxy — browsers, most Electron apps. It is not a tunnel: apps that ignore the system proxy, and UDP, are not captured.
 
 **TUN mode** (`--tun`): refused by name. This binary has no `tun`/`utun` inbound and no tun2socks engine (README rows 29 and 58), so there is no device-wide capture. `ferrox-cli tun` prints the same explanation. A config that names a device inbound is refused with its reason rather than served as silence.
 

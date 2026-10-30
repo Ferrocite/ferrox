@@ -2,10 +2,11 @@ name: release
 
 # Ships the lanes. On a version tag (or on demand) this builds `ferrox-app`
 # for every platform a user can run it on and attaches one package per platform
-# to the GitHub Release: the binary, the launcher beside it (`ferrox-cli.exe` on
-# Windows, `ferrox-cli.sh` elsewhere), and the two pages that make trying a lane
-# three commands — `login`, `up --foxy --vpn` (or `up --veepn --vpn` with no
-# account), `down` — with no toolchain, no repository and no config by hand.
+# to the GitHub Release: the binary, the launcher beside it (`ferrox-cli.exe` and
+# the `ferrox-cli.sh` fallback on Windows, `ferrox-cli.sh` elsewhere), and the two
+# pages that make trying a lane three commands — `login`, `up --foxy --vpn` (or
+# `up --veepn --vpn` with no account), `down` — with no toolchain, no repository
+# and no config by hand.
 #
 # Nothing here dials a connection: the job compiles, smoke-runs the binary's
 # own version line, and packages. Whether a lane carries bytes is gated by
@@ -53,19 +54,21 @@ jobs:
           REF_NAME: ${{ github.ref_name }}
           WANT: ${{ github.event.inputs.tag }}
         run: |
+          valid_version() {
+            printf '%s' "$1" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+          }
           if [ "$EVENT" = push ]; then
+            valid_version "$REF_NAME" || { echo "::error::the pushed tag must be vX.Y.Z, got: $REF_NAME"; exit 1; }
             echo "version=$REF_NAME" >> "$GITHUB_OUTPUT"
           elif [ -n "$WANT" ]; then
-            case "$WANT" in
-              v[0-9]*.[0-9]*.[0-9]*) ;;
-              *) echo "::error::the tag input must name an existing vX.Y.Z tag, got: $WANT"; exit 1 ;;
-            esac
+            valid_version "$WANT" || { echo "::error::the tag input must name an existing vX.Y.Z tag, got: $WANT"; exit 1; }
             echo "version=$WANT" >> "$GITHUB_OUTPUT"
           else
             # Nothing typed: the version this workspace declares is the version
             # to ship, so pressing the button once is the whole interaction.
             DECLARED="$(sed -n 's/^version = "\([^"]*\)".*/\1/p' Cargo.toml | head -1)"
             [ -n "$DECLARED" ] || { echo "::error::cannot read the workspace version from Cargo.toml"; exit 1; }
+            valid_version "v$DECLARED" || { echo "::error::Cargo.toml declares a non-vX.Y.Z version: $DECLARED"; exit 1; }
             echo "version=v$DECLARED" >> "$GITHUB_OUTPUT"
           fi
 
@@ -128,10 +131,11 @@ jobs:
           CLI="target/${{ matrix.target }}/release/ferrox-cli"
           WINDOWS=0
           if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; CLI="$CLI.exe"; WINDOWS=1; fi
+          if [ "$WINDOWS" = 1 ]; then bash dist/ferrox-cli.sh --help >/dev/null; fi
           PKG="ferrox-${VERSION#v}-${NAME}"
           rm -rf "$PKG" && mkdir -p "$PKG"
           if [ "$WINDOWS" = 1 ]; then
-            cp "$BIN" "$CLI" dist/README.md dist/USAGE.md "$PKG/"
+            cp "$BIN" "$CLI" dist/ferrox-cli.sh dist/README.md dist/USAGE.md "$PKG/"
           else
             cp "$BIN" dist/ferrox-cli.sh dist/README.md dist/USAGE.md "$PKG/"
           fi
@@ -140,7 +144,11 @@ jobs:
             Darwin|Linux)
               COPYFILE_DISABLE=1 tar --no-xattrs -czf "$PKG.tar.gz" "$PKG" ;;
             *)
-              7z a -tzip "$PKG.zip" "$PKG" >/dev/null ;;
+              7z a -tzip "$PKG.zip" "$PKG" >/dev/null
+              if [ "$WINDOWS" = 1 ]; then
+                7z l "$PKG.zip" | grep -q 'ferrox-cli.exe' || { echo "::error::$PKG.zip has no ferrox-cli.exe"; exit 1; }
+                7z l "$PKG.zip" | grep -q 'ferrox-cli.sh' || { echo "::error::$PKG.zip has no ferrox-cli.sh"; exit 1; }
+              fi ;;
           esac
           rm -rf "$PKG"
           ls -l ferrox-*
@@ -161,6 +169,14 @@ jobs:
           pattern: pkg-*
           path: packages
           merge-multiple: true
+      - name: write the checksums
+        shell: bash
+        run: |
+          cd packages
+          rm -f SHA256SUMS
+          sha256sum ./*.tar.gz ./*.zip >SHA256SUMS
+          sha256sum --check SHA256SUMS
+          cat SHA256SUMS
       - name: the handout
         shell: bash
         env:
@@ -179,7 +195,9 @@ jobs:
             ./ferrox-cli.sh down
             ```
 
-            Windows ships a native launcher: no Bash, no WSL and no Python.
+            Windows ships a native launcher that needs no Bash, WSL or Python.
+            The same zip also carries `ferrox-cli.sh` for anyone who prefers the
+            Bash CLI from Git Bash, with Python 3 and curl on `PATH`.
 
             ```powershell
             Expand-Archive ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip -DestinationPath .
@@ -189,7 +207,14 @@ jobs:
             .\ferrox-cli.exe down
             ```
 
+            ```bash
+            bash ./ferrox-cli.sh up --foxy         # optional Bash fallback, ports only; use the native launcher for --vpn
+            ```
+
             ### The lanes this build carries
+
+            On Windows, use `.\ferrox-cli.exe` wherever this table says
+            `./ferrox-cli.sh` (or `bash ./ferrox-cli.sh` for the fallback).
 
             | lane | what you supply | start it |
             | --- | --- | --- |
@@ -462,7 +487,29 @@ jobs:
             | `ferrox-VERSION_PLACEHOLDER-x86_64-apple-darwin.tar.gz` | macOS on Intel |
             | `ferrox-VERSION_PLACEHOLDER-aarch64-linux-gnu.tar.gz` | Linux on aarch64, built on Ubuntu 26.04 |
             | `ferrox-VERSION_PLACEHOLDER-x86_64-linux-gnu.tar.gz` | Linux on x86_64, built on Ubuntu 26.04 |
-            | `ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip` | Windows x86_64 (native `ferrox-cli.exe`; no Bash, WSL or Python) |
+            | `ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip` | Windows x86_64 (native `ferrox-cli.exe` and `ferrox-cli.sh` fallback) |
+
+            ### Verify what you downloaded
+
+            Every release carries `SHA256SUMS` beside the packages. To check
+            just the package you downloaded, Linux:
+
+            ```bash
+            grep 'ferrox-VERSION_PLACEHOLDER-.*-linux-gnu.tar.gz' SHA256SUMS | sha256sum --check -
+            ```
+
+            macOS:
+
+            ```bash
+            grep 'ferrox-VERSION_PLACEHOLDER-.*-apple-darwin.tar.gz' SHA256SUMS | shasum -a 256 -c -
+            ```
+
+            With every package present, `sha256sum --check --ignore-missing SHA256SUMS`
+            works on Linux. On Windows, compare the zip with its matching line:
+
+            ```powershell
+            Get-FileHash .\ferrox-*-x86_64-pc-windows-msvc.zip -Algorithm SHA256
+            ```
 
             `README.md` in each package is the quickstart, `USAGE.md` the manual.
         run: |

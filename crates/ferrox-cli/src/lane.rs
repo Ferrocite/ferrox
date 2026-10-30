@@ -10,44 +10,59 @@ use std::time::Duration;
 
 use crate::args::die;
 use crate::config::{fronts, port_of, Ports};
-use crate::paths::{read_trim, secure_dir, write_private, Paths};
+use crate::paths::{read_trim, read_trim_checked, secure_dir, write_private, Paths};
 
-pub fn require_bin() -> PathBuf {
-    if let Some(path) = std::env::var_os("FERROX_BIN") {
-        return PathBuf::from(path);
-    }
-    let name = if cfg!(windows) {
+fn bin_name() -> &'static str {
+    if cfg!(windows) {
         "ferrox-app.exe"
     } else {
         "ferrox-app"
-    };
-    let beside = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(|parent| parent.join(name)));
-    if let Some(path) = beside.filter(|path| path.exists()) {
-        return path;
     }
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+fn project_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(Path::parent)
         .map(Path::to_path_buf)
-        .unwrap_or_default();
+        .unwrap_or_default()
+}
+
+fn candidate_bin() -> PathBuf {
+    let root = project_root();
     let cargo_target =
         std::env::var_os("CARGO_TARGET_DIR").map_or_else(|| root.join("target"), PathBuf::from);
-    let built = cargo_target.join("release").join(if cfg!(windows) {
-        "ferrox-app.exe"
-    } else {
-        "ferrox-app"
-    });
-    if built.exists() {
-        return built;
+    cargo_target.join("release").join(bin_name())
+}
+
+fn beside_bin() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.parent().map(|parent| parent.join(bin_name())))
+}
+
+fn resolve_bin() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("FERROX_BIN") {
+        return Some(PathBuf::from(path));
     }
-    let manifest = root.join("Cargo.toml");
-    if manifest.exists() {
+    if let Some(path) = beside_bin().filter(|path| path.exists()) {
+        return Some(path);
+    }
+    let built = candidate_bin();
+    built.exists().then_some(built)
+}
+
+pub fn require_bin() -> PathBuf {
+    if let Some(path) = resolve_bin() {
+        return path;
+    }
+    let built = candidate_bin();
+    #[cfg(debug_assertions)]
+    if project_root().join("Cargo.toml").exists() {
         eprintln!("building ferrox-app (release, one time)...");
         let status = Command::new("cargo")
             .args(["build", "--locked", "--release", "-p", "ferrox-app"])
-            .current_dir(&root)
+            .current_dir(project_root())
             .status();
         if status.is_ok_and(|status| status.success()) && built.exists() {
             return built;
@@ -66,10 +81,10 @@ pub fn pid(paths: &Paths) -> Option<u32> {
 pub fn alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .status()
-            .is_ok_and(|status| status.success())
+        let Ok(pid) = i32::try_from(pid) else {
+            return false;
+        };
+        unsafe { libc::kill(pid, 0) == 0 }
     }
     #[cfg(windows)]
     {
@@ -92,38 +107,170 @@ pub fn running(paths: &Paths) -> bool {
     pid(paths).is_some_and(alive)
 }
 
+fn process_exe(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/exe")).ok()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/bin/ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+        (!path.is_empty()).then(|| PathBuf::from(path))
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+        if handle.is_null() {
+            return None;
+        }
+        let mut buffer = vec![0_u16; 32_768];
+        let mut length = buffer.len() as u32;
+        let ok = unsafe { QueryFullProcessImageNameW(handle, 0, buffer.as_mut_ptr(), &mut length) };
+        unsafe { CloseHandle(handle) };
+        if ok == 0 {
+            return None;
+        }
+        Some(PathBuf::from(String::from_utf16_lossy(
+            &buffer[..length as usize],
+        )))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+fn expected_bin() -> PathBuf {
+    resolve_bin().unwrap_or_else(candidate_bin)
+}
+
+fn canonical_exe(path: &Path) -> PathBuf {
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        return canonical;
+    }
+    let text = path.to_string_lossy();
+    let Some(stripped) = text.strip_suffix(" (deleted)") else {
+        return path.to_path_buf();
+    };
+    let stripped = PathBuf::from(stripped);
+    std::fs::canonicalize(&stripped).unwrap_or(stripped)
+}
+
+fn same_exe(actual: &Path, expected: &Path) -> bool {
+    let actual = canonical_exe(actual);
+    let expected = canonical_exe(expected);
+    #[cfg(windows)]
+    {
+        actual
+            .to_string_lossy()
+            .eq_ignore_ascii_case(&expected.to_string_lossy())
+    }
+    #[cfg(not(windows))]
+    {
+        actual == expected
+    }
+}
+
+fn is_ferrox(pid: u32) -> bool {
+    let Some(actual) = process_exe(pid) else {
+        #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+        return true;
+        #[cfg(any(target_os = "linux", target_os = "macos", windows))]
+        return false;
+    };
+    same_exe(&actual, &expected_bin())
+}
+
 pub fn kill(pid: u32) {
+    if !is_ferrox(pid) {
+        eprintln!(
+            "ferrox-cli: process {pid} is not ferrox-app; it was not stopped. If the binary was renamed, set FERROX_BIN."
+        );
+        return;
+    }
     #[cfg(unix)]
     {
-        let _ = Command::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
+        let Ok(pid) = i32::try_from(pid) else {
+            return;
+        };
+        unsafe { libc::kill(pid, libc::SIGTERM) };
         std::thread::sleep(Duration::from_secs(1));
-        if alive(pid) {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        if unsafe { libc::kill(pid, 0) } == 0 {
+            unsafe { libc::kill(pid, libc::SIGKILL) };
         }
     }
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
-            .args(["/PID", &pid.to_string(), "/T", "/F"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
+        if !handle.is_null() {
+            unsafe {
+                TerminateProcess(handle, 1);
+                CloseHandle(handle);
+            }
+        }
     }
 }
 
-fn register(paths: &Paths) {
-    let _ = secure_dir(&paths.state_dir);
-    let text = read_trim(&paths.lanes_file).unwrap_or_default();
+fn register(paths: &Paths) -> Result<(), String> {
+    secure_dir(&paths.state_dir)
+        .map_err(|error| format!("cannot create the state dir: {error}"))?;
+    let text = match read_trim_checked(&paths.lanes_file) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => {
+            return Err(format!(
+                "cannot read {}: {error}",
+                paths.lanes_file.display()
+            ));
+        }
+    };
     let conf = paths.conf_dir.to_string_lossy();
-    if !text.lines().any(|line| line == conf) {
-        let _ = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&paths.lanes_file)
-            .and_then(|mut file| writeln!(file, "{conf}"));
+    if text.lines().any(|line| line == conf) {
+        return Ok(());
     }
+    let current = std::fs::metadata(&paths.lanes_file).map_or(0, |meta| meta.len());
+    let addition = conf.len() as u64 + 1;
+    if current.saturating_add(addition) > crate::paths::MAX_PRIVATE_BYTES {
+        return Err(format!(
+            "the lane registry {} would exceed {} bytes; nothing was started.",
+            paths.lanes_file.display(),
+            crate::paths::MAX_PRIVATE_BYTES
+        ));
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&paths.lanes_file)
+        .map_err(|error| format!("cannot append to {}: {error}", paths.lanes_file.display()))?;
+    writeln!(file, "{conf}")
+        .map_err(|error| format!("cannot append to {}: {error}", paths.lanes_file.display()))?;
+    if file.metadata().map_or(current, |meta| meta.len()) > crate::paths::MAX_PRIVATE_BYTES {
+        let _ = file.set_len(current);
+        return Err(format!(
+            "the lane registry {} exceeded {} bytes; the entry was rolled back.",
+            paths.lanes_file.display(),
+            crate::paths::MAX_PRIVATE_BYTES
+        ));
+    }
+    Ok(())
 }
 
 pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
@@ -131,7 +278,7 @@ pub fn start(bin: &Path, paths: &Paths, debug: bool) -> Result<u32, String> {
         .map_err(|error| format!("cannot create the config dir: {error}"))?;
     secure_dir(&paths.state_dir)
         .map_err(|error| format!("cannot create the state dir: {error}"))?;
-    register(paths);
+    register(paths)?;
     let out = OpenOptions::new()
         .create(true)
         .write(true)
@@ -216,8 +363,8 @@ pub fn uptime(paths: &Paths) -> Option<String> {
 }
 
 pub fn foxy_configured(paths: &Paths) -> bool {
-    std::fs::read_to_string(&paths.cfg)
-        .is_ok_and(|text| text.contains("\"protocol\"") && text.contains("\"foxy\""))
+    read_trim(&paths.cfg)
+        .is_some_and(|text| text.contains("\"protocol\"") && text.contains("\"foxy\""))
 }
 
 pub fn other_lanes(paths: &Paths) -> Vec<(String, u32)> {

@@ -17,7 +17,8 @@ mod paths;
 mod probe;
 mod proxy;
 
-use std::io::{IsTerminal as _, Write as _};
+use std::fs::File;
+use std::io::{IsTerminal as _, Read as _, Seek as _, SeekFrom, Write as _};
 use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -26,7 +27,7 @@ use std::time::Duration;
 
 use args::{Action, Options, Outbound};
 use config::{fronts, port_of, FoxyAccount, Ports};
-use paths::{read_trim, Paths};
+use paths::{read_trim, read_trim_checked, Paths};
 
 fn main() {
     let mut options = args::parse();
@@ -349,7 +350,7 @@ fn verify_flow(options: &Options, ports: Ports, paths: &Paths) -> bool {
 }
 
 fn diagnose(options: &Options, paths: &Paths) {
-    let log = std::fs::read_to_string(&paths.log).unwrap_or_default();
+    let log = read_tail(&paths.log, 64 * 1024).text;
     if log.trim().is_empty() {
         println!(
             "the lane log is empty: it refused the flow without saying why. Re-run with --debug for the dial trace."
@@ -426,9 +427,19 @@ fn forget_config(paths: &Paths) {
 fn stop_all_lanes(paths: &Paths) -> i32 {
     let mut rc = 0;
     let mut dirs: Vec<PathBuf> = Vec::new();
-    if let Ok(text) = std::fs::read_to_string(&paths.lanes_file) {
-        for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-            dirs.push(PathBuf::from(line));
+    match read_trim_checked(&paths.lanes_file) {
+        Ok(text) => {
+            for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+                dirs.push(PathBuf::from(line));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            eprintln!(
+                "ferrox-cli: cannot read {}: {error}; no lane was stopped.",
+                paths.lanes_file.display()
+            );
+            return 1;
         }
     }
     if !dirs.iter().any(|dir| dir == &paths.conf_dir) {
@@ -494,13 +505,19 @@ fn status(options: &Options, paths: &Paths) -> i32 {
     if let Some(uptime) = lane::uptime(paths) {
         println!("up for {uptime}");
     }
-    let log = std::fs::read_to_string(&paths.log).unwrap_or_default();
+    let tail = read_tail(&paths.log, 64 * 1024);
+    let log = &tail.text;
     if let Some(carrier) = log
         .lines()
         .filter_map(|line| line.strip_prefix("foxy: carrier "))
         .next_back()
     {
         println!("carrier: {carrier}");
+    } else if tail.truncated && lane::foxy_configured(paths) {
+        println!(
+            "carrier: not in the retained 64 KiB window; older entries are in {}.",
+            paths.log.display()
+        );
     }
     if let Some(quota) = log
         .lines()
@@ -508,6 +525,11 @@ fn status(options: &Options, paths: &Paths) -> i32 {
         .next_back()
     {
         println!("quota left: {quota}");
+    } else if tail.truncated && lane::foxy_configured(paths) {
+        println!(
+            "quota: not in the retained 64 KiB window; older entries are in {}.",
+            paths.log.display()
+        );
     } else if lane::foxy_configured(paths) {
         println!("quota: the plane named no allowance for the pass this lane carries: that is silence, not zero.");
     }
@@ -655,10 +677,47 @@ fn supervise(options: &Options, paths: &Paths) -> i32 {
     0
 }
 
-fn tail(path: &Path, lines: usize) {
-    let Ok(text) = std::fs::read_to_string(path) else {
-        return;
+struct Tail {
+    text: String,
+    truncated: bool,
+}
+
+fn read_tail(path: &Path, max_bytes: u64) -> Tail {
+    let Ok(mut file) = File::open(path) else {
+        return Tail {
+            text: String::new(),
+            truncated: false,
+        };
     };
+    let Ok(metadata) = file.metadata() else {
+        return Tail {
+            text: String::new(),
+            truncated: false,
+        };
+    };
+    let truncated = metadata.len() > max_bytes;
+    let start = metadata.len().saturating_sub(max_bytes);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Tail {
+            text: String::new(),
+            truncated,
+        };
+    }
+    let mut bytes = Vec::new();
+    if file.take(max_bytes).read_to_end(&mut bytes).is_err() {
+        return Tail {
+            text: String::new(),
+            truncated,
+        };
+    }
+    Tail {
+        text: String::from_utf8_lossy(&bytes).into_owned(),
+        truncated,
+    }
+}
+
+fn tail(path: &Path, lines: usize) {
+    let text = read_tail(path, 64 * 1024).text;
     let all: Vec<&str> = text.lines().collect();
     let start = all.len().saturating_sub(lines);
     for line in &all[start..] {

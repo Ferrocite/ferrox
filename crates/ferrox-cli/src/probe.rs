@@ -1,24 +1,64 @@
 //! One trace through a front proves a lane carries bytes. The probe is curl on
 //! every platform: Windows ships it, and the two proxy spellings are the same.
 
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 pub fn trace_timeout() -> u64 {
     20
 }
 
-fn curl(binary: &str, args: &[String], timeout: u64) -> String {
-    let output = Command::new(binary)
-        .args(args)
-        .args(["--noproxy", "", "--max-time", &timeout.to_string()])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output();
-    output
-        .ok()
-        .filter(|output| output.status.success())
-        .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-        .unwrap_or_default()
+fn candidates() -> Vec<PathBuf> {
+    #[cfg(windows)]
+    {
+        let mut paths = Vec::new();
+        if let Some(root) = std::env::var_os("SystemRoot") {
+            paths.push(PathBuf::from(root).join("System32").join("curl.exe"));
+        }
+        paths.push(PathBuf::from(r"C:\Windows\System32\curl.exe"));
+        paths.push(PathBuf::from("curl.exe"));
+        paths.push(PathBuf::from("curl"));
+        paths
+    }
+    #[cfg(not(windows))]
+    {
+        vec![
+            PathBuf::from("/usr/bin/curl"),
+            PathBuf::from("/usr/local/bin/curl"),
+            PathBuf::from("curl"),
+        ]
+    }
+}
+
+fn curl(args: &[String], timeout: u64) -> String {
+    for binary in candidates() {
+        if binary.is_absolute() && !binary.exists() {
+            continue;
+        }
+        let output = Command::new(&binary)
+            .args(args)
+            .args([
+                "--noproxy",
+                "",
+                "--fail",
+                "--max-filesize",
+                "65536",
+                "--max-time",
+                &timeout.to_string(),
+            ])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        match output {
+            Ok(output) if output.status.success() => {
+                return String::from_utf8_lossy(&output.stdout).into_owned();
+            }
+            Ok(_) => return String::new(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return String::new(),
+        }
+    }
+    String::new()
 }
 
 fn through_proxy(front: &str, port: u16, url: &str, timeout: u64) -> String {
@@ -31,12 +71,7 @@ fn through_proxy(front: &str, port: u16, url: &str, timeout: u64) -> String {
         args.push(format!("http://127.0.0.1:{port}"));
     }
     args.push(url.to_owned());
-    let first = curl("curl.exe", &args, timeout);
-    if first.is_empty() {
-        curl("curl", &args, timeout)
-    } else {
-        first
-    }
+    curl(&args, timeout)
 }
 
 pub fn probe_front(front: &str, port: u16, timeout: u64) -> String {

@@ -1,11 +1,12 @@
 # Ferrox — release build
 
-Three files, no installer: the binary, the one-command CLI (`ferrox-cli.sh` on macOS/Linux, `ferrox-cli.exe` on Windows), and the full manual (`USAGE.md`). Nothing here needs cargo, a repository, or a config by hand.
+No installer: the binary, the one-command CLI, and the full manual (`USAGE.md`). macOS and Linux ship `ferrox-cli.sh`; Windows ships the native `ferrox-cli.exe` and the same `ferrox-cli.sh` as an optional Git Bash fallback. Nothing here needs cargo, a repository, or a config by hand.
 
 ```
 ferrox-app            the lane engine: serves SOCKS5/HTTP/mixed fronts, dials every implemented lane
 ferrox-cli.sh         login, up, down, status, ports, locations, version — the only command you need
 ferrox-cli.exe        the same CLI built for Windows; no Bash, WSL or Python
+                      (the Windows zip also carries ferrox-cli.sh for Git Bash users)
 USAGE.md              the manual: every lane, every port, what to do when it does not work
 ```
 
@@ -30,6 +31,10 @@ cd ferrox-*-x86_64-pc-windows-msvc
 .\ferrox-cli.exe status
 .\ferrox-cli.exe down
 ```
+
+The same zip includes `ferrox-cli.sh`. From Git Bash, with Python 3 and curl on `PATH`, it runs the ports-only commands: `bash ./ferrox-cli.sh up --foxy`. Use the native `ferrox-cli.exe` for `--vpn`, and it needs none of those dependencies.
+
+On Windows the native launcher keeps config and account files under `%APPDATA%\ferrox` and pid/log/system-proxy state under `%LOCALAPPDATA%\ferrox`, owner-only through NTFS ACLs. The `~/.config/ferrox` paths below describe macOS and Linux.
 
 The answer is stored once, in `~/.config/ferrox/credentials`, mode 0600, outside every repository; a copy inside a git repository is refused on purpose. Later runs read it silently and never ask again. The first launch also saves the FxA session it signed in with — access token, refresh token, account — to `~/.config/ferrox/foxy-token.json` (0600), so every launch after it resumes that grant instead of calling `/account/login`: Mozilla sends one new-sign-in mail, not one per connect, and the password is only asked for again when the plane refuses the grant. The browser challenge is solved locally. Prefer to save the account up front, or pass it non-interactively:
 
@@ -93,13 +98,33 @@ The fronts are loopback-only: SOCKS5 `127.0.0.1:10808`, HTTP+HTTPS `127.0.0.1:80
 
 - **macOS** — `--vpn` arms and clears the system proxy for you.
 - **Linux** — point apps at the fronts by hand: `ALL_PROXY=socks5h://127.0.0.1:10808 <app>`, or set GNOME/KDE network proxy to `127.0.0.1:8080`.
-- **Windows** — `ferrox-cli.exe up --foxy --vpn` arms the system proxy through the WinINET Internet Settings that Chrome, Edge and most desktop apps read, and `ferrox-cli.exe down` restores the previous settings. Without `--vpn`, set Settings > Network & Internet > Proxy to `127.0.0.1:8080`, or use the fronts per app.
+- **Windows** — `ferrox-cli.exe up --foxy --vpn` arms the system proxy through the WinINET Internet Settings that Chrome, Edge and most desktop apps read, and `ferrox-cli.exe down` restores the previous settings. From Git Bash, `bash ./ferrox-cli.sh up --foxy` is the ports-only fallback; use the native `ferrox-cli.exe` for `--vpn`. Without `--vpn`, set Settings > Network & Internet > Proxy to `127.0.0.1:8080`, or use the fronts per app.
 
 Use `socks5h://` (the `h`) so names resolve at the exit, not on your machine.
 
 ## What VPN mode is, and is not
 
 `--vpn` routes every app that honours the system proxy (browsers, most Electron apps) over the lane. It is not a device-wide tunnel: this build carries no TUN device, so apps that ignore proxies and raw UDP are not captured — `./ferrox-cli.sh tun` prints the full reason and what to use instead (SOCKS5 UDP rides the lane for apps that speak it).
+
+## Verify the download
+
+Every release includes `SHA256SUMS` beside the packages. To check just the
+package you downloaded:
+
+```bash
+# Linux
+grep 'ferrox-.*-linux-gnu.tar.gz' SHA256SUMS | sha256sum --check -
+# macOS
+grep 'ferrox-.*-apple-darwin.tar.gz' SHA256SUMS | shasum -a 256 -c -
+# all packages present
+sha256sum --check --ignore-missing SHA256SUMS
+```
+
+On Windows, compare the zip's hash with the matching line:
+
+```powershell
+Get-FileHash .\ferrox-*-x86_64-pc-windows-msvc.zip -Algorithm SHA256
+```
 
 ## When it does not work
 
