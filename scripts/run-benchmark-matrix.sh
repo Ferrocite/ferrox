@@ -59,10 +59,10 @@ scenario_kept() {
     ((keep)) || return 1
   fi
   for pattern in ${only[@]+"${only[@]}"}; do
-    [[ "$id" == *"$pattern"* ]] || return 1
+    scenario_matches "$id" "$pattern" || return 1
   done
   for pattern in ${exclude[@]+"${exclude[@]}"}; do
-    [[ "$id" == *"$pattern"* ]] && return 1
+    scenario_matches "$id" "$pattern" && return 1
   done
   return 0
 }
@@ -94,7 +94,13 @@ selftest_gaps() {
   gaps=0
   only=(vless-raw-down-1)
   scenario_kept vless-raw-down-1 || { echo "selftest: --only stopped matching" >&2; failed=1; }
-  only=()
+  scenario_kept vless-raw-down-16 && { echo "selftest: --only matched the down-16 neighbour" >&2; failed=1; }
+  only=(vless-raw)
+  scenario_kept vless-raw-down-16 || { echo "selftest: --only stopped matching a family" >&2; failed=1; }
+  exclude=(vless-raw-down-1)
+  scenario_kept vless-raw-down-16 || { echo "selftest: --exclude took the down-16 neighbour" >&2; failed=1; }
+  scenario_kept vless-raw-down-1 && { echo "selftest: --exclude kept its own rung" >&2; failed=1; }
+  only=(); exclude=()
   ((failed == 0)) || return 1
   echo "run-benchmark-matrix selftest: ${#gap_bases[@]} filed gap(s), selection exact"
 }
