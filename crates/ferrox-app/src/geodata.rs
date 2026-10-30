@@ -358,7 +358,7 @@ mod tests {
             let root = config(&format!(
                 r#"{{"assets": [{{"url": "{url}", "file": "geosite.dat"}}]}}"#
             ));
-            parse(&root, &[dir.clone()])
+            parse(&root, std::slice::from_ref(&dir))
                 .expect("Go's URL parser lowercases the scheme, so the reference accepts it");
         }
         let root =
