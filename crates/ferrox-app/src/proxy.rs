@@ -6447,7 +6447,7 @@ fn serve_vless_quic(
         stream.close();
         return;
     }
-    let stream = stream.with_meter(crate::stats::user(&user.email, user.level));
+    let mut stream = stream.with_meter(crate::stats::user(&user.email, user.level));
     let stop = stream.clone();
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || stop.close());
     match cmd {
