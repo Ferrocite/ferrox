@@ -2163,6 +2163,33 @@ fn router_settings(bytes: &[u8]) -> Result<Json, String> {
     Ok(object(pairs))
 }
 
+/// `RoutingService.AddRule`'s request: the router Config a call carries and whether its rules
+/// append to the live table or replace it. The reference reads only `Rule` from that config.
+pub(crate) fn add_rule_request(bytes: &[u8]) -> Result<(Vec<Json>, bool), String> {
+    let mut reader = Reader::new(bytes, "xray.app.router.command.AddRuleRequest");
+    let mut config = None;
+    let mut append = false;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => {
+                let (name, value) = typed_message(reader.bytes()?)?;
+                if name != "xray.app.router.Config" {
+                    return Err("AddRule: config type error".to_owned());
+                }
+                config = Some(router_settings(value)?);
+            }
+            (2, 0) => append = reader.varint()? != 0,
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let config = config.ok_or_else(|| "AddRule: config type error".to_owned())?;
+    let rules = match config.get("rules") {
+        Some(Json::Arr(rules)) => rules.clone(),
+        _ => Vec::new(),
+    };
+    Ok((rules, append))
+}
+
 /// `xray.app.router.RoutingRule`: the outbound a flow goes to and every selector
 /// this tree's router reads. The selectors it does not read stay refused by name.
 fn router_rule(bytes: &[u8]) -> Result<Json, String> {

@@ -309,7 +309,12 @@ fn refuse_source(
         return false;
     };
     let tag = inbound_tag(inbound);
-    let Some(selector) = shared.routing.source_refusal(tag.as_deref()) else {
+    let Some(selector) = shared
+        .routing
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .source_refusal(tag.as_deref())
+    else {
         return false;
     };
     let message = format!(
@@ -1385,7 +1390,16 @@ impl Outbound {
 
     /// Whether any rule reads the HTTP attributes a front would have to parse off the request head.
     fn wants_attrs(&self) -> bool {
-        matches!(self, Self::Route(plan) if plan.shared.routing.wants_attrs())
+        matches!(
+            self,
+            Self::Route(plan)
+                if plan
+                    .shared
+                    .routing
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .wants_attrs()
+        )
     }
 }
 
@@ -1430,11 +1444,13 @@ struct Dynamic {
 /// configured outbound as the fallback the reference calls its default handler.
 #[derive(Debug)]
 struct RouteShared {
-    routing: Arc<crate::router::Routing>,
+    routing: Arc<RwLock<crate::router::Routing>>,
     tagged: HashMap<String, Outbound>,
     /// Each balancer's candidate tags, ordered by tag. Built once so a flow picks from a slice.
     balancers: Arc<HashMap<String, Vec<String>>>,
     observatory: Option<Arc<crate::observatory::Observatory>>,
+    /// The script router, kept outside the routing lock: a script callback re-enters the table.
+    script_router: Option<Arc<crate::router_script::ScriptRouter>>,
     script: Option<crate::router_script::ScriptCallbacks>,
     default: Outbound,
     default_tag: Option<String>,
@@ -1484,25 +1500,40 @@ impl RouteShared {
     /// script a live flow would get, without the default outbound the reference leaves to the caller.
     /// A matched rule's webhook fires here too, as the reference's `PickRoute` fires it.
     fn routed_tag(&self, probe: &crate::router::Probe<'_>) -> Result<Option<String>, String> {
-        if let Some(script) = self.routing.script() {
+        if let Some(script) = self.script_router.as_deref() {
             let Some(callbacks) = self.script.as_ref() else {
                 return Ok(None);
             };
             let first = probe.flow(probe.targets[0], probe.sources[0], probe.locals[0]);
             return script.route(&first, callbacks);
         }
-        let Some(hit) = self.routing.probe_rule(probe) else {
-            return Ok(None);
+        let (target, webhook) = {
+            let routing = self
+                .routing
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(hit) = routing.probe_rule(probe) else {
+                return Ok(None);
+            };
+            let target = match hit.target {
+                crate::router::RouteTarget::Outbound(tag) => Ok(tag.to_owned()),
+                crate::router::RouteTarget::Balancer(tag) => Err(tag.to_owned()),
+            };
+            (target, hit.webhook.cloned())
         };
-        let tag = match hit.target {
-            crate::router::RouteTarget::Outbound(tag) => tag.to_owned(),
-            crate::router::RouteTarget::Balancer(tag) => {
-                let Some(balancer) = self.routing.balancer(tag) else {
+        let tag = match target {
+            Ok(tag) => tag,
+            Err(tag) => {
+                let routing = self
+                    .routing
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let Some(balancer) = routing.balancer(&tag) else {
                     return Ok(None);
                 };
                 let candidates = self
                     .balancers
-                    .get(tag)
+                    .get(&tag)
                     .expect("startup built every balancer's candidates");
                 let observed = self
                     .observatory
@@ -1517,7 +1548,7 @@ impl RouteShared {
                 }
             }
         };
-        if let Some(webhook) = hit.webhook {
+        if let Some(webhook) = webhook {
             let destination = destination_of(probe);
             webhook.fire(&crate::webhook::Event {
                 email: probe.user,
@@ -1597,10 +1628,48 @@ impl Runtime {
     }
 
     /// Every rule in table order, for `RoutingService.ListRule`; an unconfigured table lists none.
-    pub(crate) fn listed_rules(&self) -> impl Iterator<Item = crate::router::ListedRule<'_>> {
-        self.route
-            .iter()
-            .flat_map(|route| route.routing.listed_rules())
+    pub(crate) fn listed_rules(&self) -> Vec<crate::router::ListedRule> {
+        let Some(route) = &self.route else {
+            return Vec::new();
+        };
+        route
+            .routing
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .listed_rules()
+            .collect()
+    }
+
+    /// Append or replace the rule table, for `RoutingService.AddRule`; a table-less config has
+    /// nowhere to put a rule and answers the reference's "routing not configured".
+    pub(crate) fn add_rules(
+        &self,
+        rules: &[crate::json::Json],
+        append: bool,
+    ) -> Result<(), String> {
+        let Some(route) = &self.route else {
+            return Err("routing not configured".to_owned());
+        };
+        let known =
+            |tag: &str| route.tagged.contains_key(tag) || Some(tag) == route.default_tag.as_deref();
+        route
+            .routing
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .add_rules(rules, append, known)
+    }
+
+    /// Drop every rule carrying `tag`, for `RoutingService.RemoveRule`.
+    pub(crate) fn remove_rules(&self, tag: &str) -> Result<(), String> {
+        let Some(route) = &self.route else {
+            return Err("routing not configured".to_owned());
+        };
+        route
+            .routing
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove_rules(tag);
+        Ok(())
     }
 
     /// The tag a `RoutingService.TestRoute` context routes to, or `None` for xray's no-clue.
@@ -1616,11 +1685,15 @@ impl Runtime {
 
     /// A balancer's forced tag and its strategy's principle target; an unknown tag is the
     /// reference's `cannot find tag`.
-    pub(crate) fn balancer_info(&self, tag: &str) -> Result<(String, Vec<&str>), &'static str> {
+    pub(crate) fn balancer_info(&self, tag: &str) -> Result<(String, Vec<String>), &'static str> {
         let Some(route) = &self.route else {
             return Err("cannot find tag");
         };
-        let Some(balancer) = route.routing.balancer(tag) else {
+        let routing = route
+            .routing
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(balancer) = routing.balancer(tag) else {
             return Err("cannot find tag");
         };
         let candidates = route.balancers.get(tag).map_or(&[][..], Vec::as_slice);
@@ -1630,7 +1703,11 @@ impl Runtime {
             .map(crate::observatory::Observatory::snapshot);
         Ok((
             balancer.forced(),
-            balancer.principle(candidates, observed.as_deref()),
+            balancer
+                .principle(candidates, observed.as_deref())
+                .into_iter()
+                .map(str::to_owned)
+                .collect(),
         ))
     }
 
@@ -1639,7 +1716,11 @@ impl Runtime {
         let Some(route) = &self.route else {
             return Err("cannot find tag");
         };
-        let Some(balancer) = route.routing.balancer(tag) else {
+        let routing = route
+            .routing
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(balancer) = routing.balancer(tag) else {
             return Err("cannot find tag");
         };
         balancer.force(target);
@@ -1721,6 +1802,8 @@ impl RoutePlan {
     ) -> Self {
         let udp = match shared
             .routing
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .udp_tag(inbound_tag.as_deref(), shared.default_tag.as_deref())
         {
             Ok(None) => Association::Default,
@@ -1829,7 +1912,14 @@ impl RoutePlan {
         network: crate::router::Network,
         source: SocketAddr,
     ) -> Option<crate::process::Owner> {
-        if !self.source_known || !self.shared.routing.wants_process() {
+        if !self.source_known
+            || !self
+                .shared
+                .routing
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .wants_process()
+        {
             return None;
         }
         crate::process::owner(network, source)
@@ -1875,7 +1965,7 @@ impl RoutePlan {
             attrs: facts.attrs,
             process: facts.process,
         };
-        if let Some(script) = self.shared.routing.script() {
+        if let Some(script) = self.shared.script_router.as_deref() {
             let Some(callbacks) = self.shared.script.as_ref() else {
                 return self.default_lane();
             };
@@ -1891,16 +1981,26 @@ impl RoutePlan {
                 }
             };
         }
-        let Some(hit) = self.shared.routing.route_target(&flow) else {
-            return self.default_lane();
+        let (target, webhook) = {
+            let routing = self
+                .shared
+                .routing
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(hit) = routing.route_target(&flow) else {
+                return self.default_lane();
+            };
+            let target = match hit.target {
+                crate::router::RouteTarget::Outbound(tag) => Ok(tag.to_owned()),
+                crate::router::RouteTarget::Balancer(tag) => Err(tag.to_owned()),
+            };
+            (target, hit.webhook.cloned())
         };
-        let (lane, tag) = match hit.target {
-            crate::router::RouteTarget::Outbound(tag) => {
-                (self.target(tag), Some(std::borrow::Cow::Borrowed(tag)))
-            }
-            crate::router::RouteTarget::Balancer(tag) => self.pick_balanced(tag),
+        let (lane, tag) = match target {
+            Ok(tag) => (self.target(&tag), Some(std::borrow::Cow::Owned(tag))),
+            Err(tag) => self.pick_balanced(&tag),
         };
-        if let Some(webhook) = hit.webhook {
+        if let Some(webhook) = webhook {
             webhook.fire(&crate::webhook::Event {
                 email: flow.user,
                 level: facts.level,
@@ -1922,7 +2022,12 @@ impl RoutePlan {
     /// The lane a balancer picks for one flow; the event names the picked tag, as the reference's
     /// `GetTag` resolves a balancer before it fires.
     fn pick_balanced(&self, tag: &str) -> (Picked<'_>, Option<std::borrow::Cow<'_, str>>) {
-        let Some(balancer) = self.shared.routing.balancer(tag) else {
+        let routing = self
+            .shared
+            .routing
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(balancer) = routing.balancer(tag) else {
             return self.default_lane();
         };
         let candidates = self
@@ -1936,13 +2041,12 @@ impl RoutePlan {
             .as_deref()
             .map(crate::observatory::Observatory::snapshot);
         if let Some(picked) = balancer.pick(candidates, observed.as_deref()) {
-            return (self.target(&picked), Some(picked));
+            let out = self.target(&picked);
+            return (out, Some(picked));
         }
         if let Some(fallback) = balancer.fallback() {
-            return (
-                self.target(fallback),
-                Some(std::borrow::Cow::Borrowed(fallback)),
-            );
+            let out = self.target(fallback);
+            return (out, Some(std::borrow::Cow::Owned(fallback.to_owned())));
         }
         self.default_lane()
     }
@@ -2190,10 +2294,11 @@ fn route_shared_with_api(
         }
         balancers.insert(balancer.tag().to_owned(), candidates);
     }
-    let routing = Arc::new(routing);
+    let script_router = routing.script_shared();
+    let routing = Arc::new(RwLock::new(routing));
     let balancers = Arc::new(balancers);
     let dynamic = Arc::new(RwLock::new(Dynamic::default()));
-    let script = if routing.script().is_some() {
+    let script = if script_router.is_some() {
         let routing = Arc::clone(&routing);
         let balancers = Arc::clone(&balancers);
         let tags: Arc<HashSet<String>> = Arc::new(tagged.keys().cloned().collect());
@@ -2220,6 +2325,7 @@ fn route_shared_with_api(
         tagged,
         balancers,
         observatory,
+        script_router,
         script,
         default,
         default_tag,
@@ -2232,13 +2338,16 @@ fn route_shared_with_api(
 /// `xray.router.PickOutbound`: a balancer tag picks one candidate (its fallback when a strategy
 /// names none), any other tag has to be an outbound this table built.
 fn pick_script_outbound(
-    routing: &crate::router::Routing,
+    routing: &RwLock<crate::router::Routing>,
     balancers: &HashMap<String, Vec<String>>,
     tags: &HashSet<String>,
     dynamic: &RwLock<Dynamic>,
     observatory: Option<&crate::observatory::Observatory>,
     tag: &str,
 ) -> Result<String, String> {
+    let routing = routing
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(balancer) = routing.balancer(tag) {
         let candidates = balancers.get(tag).map_or(&[][..], Vec::as_slice);
         let observed = observatory.map(crate::observatory::Observatory::snapshot);
@@ -2274,13 +2383,16 @@ fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
         return;
     }
     let tag = inbound_tag(inbound);
+    let routing = shared
+        .routing
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let direct = |named: &str, balancer: bool| {
         if balancer {
             let Some(candidates) = shared.balancers.get(named) else {
                 return false;
             };
-            let fallback = shared
-                .routing
+            let fallback = routing
                 .balancer(named)
                 .and_then(crate::router::Balancer::fallback);
             return candidates
@@ -2295,7 +2407,7 @@ fn prove_server_route(shared: &RouteShared, inbound: &Json, label: &str) {
         Some(named) == shared.default_tag.as_deref()
             || matches!(shared.tagged.get(named), Some(Outbound::Freedom(_)))
     };
-    if let Err(error) = shared.routing.server_routes(
+    if let Err(error) = routing.server_routes(
         tag.as_deref(),
         matches!(&shared.default, Outbound::Freedom(_)),
         direct,
@@ -47901,6 +48013,52 @@ end
         allowed.write_all(b"ping").expect("writes");
         let mut back = [0u8; 4];
         allowed.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    /// A rule the management API adds after startup routes a flow that arrives after the call, and
+    /// removing it puts the next flow back on the default lane.
+    #[test]
+    fn an_added_rule_routes_a_flow_that_arrives_after_the_call() {
+        let echo_port = echo_loop();
+        let config = r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"block","protocol":"blackhole"}],
+            "routing":{"rules":[{"type":"field","domain":["full:other.test"],"outboundTag":"block"}]}}"#;
+        let root = crate::json::parse(config).expect("parses");
+        let runtime = test_runtime(&root);
+        let shared = Arc::clone(runtime.route.as_ref().expect("route"));
+        let front = |shared: &Arc<RouteShared>| {
+            socks_front_with(Outbound::Route(Arc::new(RoutePlan::new(
+                Arc::clone(shared),
+                Some("in".to_owned()),
+                None,
+                true,
+            ))))
+        };
+
+        let mut before = socks_tcp_client(front(&shared), echo_port);
+        before.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        before.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+
+        let rule = crate::json::parse(
+            r#"{"type":"field","ruleTag":"blocked","ip":["127.0.0.1"],"outboundTag":"block"}"#,
+        )
+        .expect("parses");
+        runtime.add_rules(&[rule], true).expect("adds");
+        let mut blocked = socks_tcp_client(front(&shared), echo_port);
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            blocked.read(&mut buf).expect("closes"),
+            0,
+            "the rule the call added blocks a flow that starts after it"
+        );
+
+        runtime.remove_rules("blocked").expect("removes");
+        let mut after = socks_tcp_client(front(&shared), echo_port);
+        after.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        after.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
     }
 
