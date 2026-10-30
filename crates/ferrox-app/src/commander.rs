@@ -2287,6 +2287,29 @@ mod tests {
     }
 
     #[test]
+    fn test_route_rejects_an_unbounded_address_cross_product() {
+        let root = crate::json::parse(ROUTED).expect("parses");
+        let api = routing_api(&root);
+        let mut context = Vec::new();
+        for _ in 0..33 {
+            field_bytes(&mut context, 3, &[198, 51, 100, 1]);
+            field_bytes(&mut context, 4, &[203, 0, 113, 5]);
+            field_bytes(&mut context, 13, &[192, 0, 2, 1]);
+        }
+        assert_eq!(
+            api.dispatch(
+                "/xray.app.router.command.RoutingService/TestRoute",
+                &test_route_request(&context, &["outbound"]),
+            ),
+            Err((
+                3,
+                "routing context: a tested context names more than 1024 address combinations"
+                    .to_owned()
+            ))
+        );
+    }
+
+    #[test]
     fn test_route_reads_a_source_port_named_without_an_address() {
         let root = crate::json::parse(
             r#"{
