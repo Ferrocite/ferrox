@@ -5078,6 +5078,20 @@ pub(crate) fn lookup_is_remembered(host: &str, port: u16) -> bool {
         .is_some()
 }
 
+#[cfg(test)]
+pub(crate) fn forget_lookup(host: &str, port: u16) {
+    let Ok(mut cache) = RESOLVED.lock() else {
+        return;
+    };
+    let Some(entries) = cache.as_mut() else {
+        return;
+    };
+    let Some(per_port) = entries.get_mut(&port) else {
+        return;
+    };
+    per_port.remove(host);
+}
+
 fn remember_lookup(host: &str, port: u16, addrs: &[SocketAddr]) -> Arc<[SocketAddr]> {
     let stored: Arc<[SocketAddr]> = Arc::from(addrs);
     let Ok(mut cache) = RESOLVED.lock() else {

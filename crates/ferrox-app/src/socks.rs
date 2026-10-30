@@ -576,25 +576,24 @@ mod tests {
     /// A server may name the relay a UDP association uses; that name must take the bounded resolver, not a lookup that can park the flow forever.
     #[test]
     fn an_association_reply_name_takes_the_bounded_resolver() {
+        crate::proxy::forget_lookup("localhost", 53);
         let (client, _written) = pair(|server, _seen| {
             let mut greeting = [0u8; 3];
             server.read_exact(&mut greeting).expect("the greeting");
             server.write_all(&[5, 0]).expect("the method reply");
             let mut request = [0u8; 10];
             server.read_exact(&mut request).expect("the request");
-            let name = b"associate-cache.invalid";
+            let name = b"localhost";
             let mut reply = vec![5, 0, 0, 3, name.len() as u8];
             reply.extend_from_slice(name);
             reply.extend_from_slice(&53u16.to_be_bytes());
             server.write_all(&reply).expect("the reply");
         });
         let mut session = Session::open(client, &Credential::default()).expect("a session");
+        let relay = session.associate().expect("localhost has a relay");
+        assert_eq!(relay.port(), 53, "the reply's port rides the lookup");
         assert!(
-            session.associate().is_none(),
-            "the invalid name has no relay"
-        );
-        assert!(
-            crate::proxy::lookup_is_remembered("associate-cache.invalid", 53),
+            crate::proxy::lookup_is_remembered("localhost", 53),
             "the association took the bounded resolver"
         );
     }
