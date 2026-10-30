@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,6 +16,9 @@ use crate::router::Network;
 
 /// The whole request's budget, which is the reference's `http.Client{Timeout: 5s}`.
 const BUDGET: Duration = Duration::from_secs(5);
+
+/// One notifier's POST threads, capped because each is an OS thread held for up to [`BUDGET`].
+const MAX_IN_FLIGHT: usize = 32;
 
 /// What a stage still has to spend, floored at a millisecond because `std` refuses a zero wait.
 fn left(deadline: Instant) -> Duration {
@@ -31,6 +35,8 @@ pub(crate) struct Webhook {
     headers: Vec<(String, String)>,
     deduplication: u32,
     seen: Mutex<Seen>,
+    in_flight: AtomicUsize,
+    saturated: AtomicBool,
 }
 
 #[derive(Debug)]
@@ -97,6 +103,8 @@ pub(crate) fn parse(field: &Json) -> Result<Option<Arc<Webhook>>, String> {
             emails: HashMap::new(),
             swept: Instant::now(),
         }),
+        in_flight: AtomicUsize::new(0),
+        saturated: AtomicBool::new(false),
     })))
 }
 
@@ -123,12 +131,37 @@ impl Webhook {
             return;
         }
         let body = event_body(event);
+        if !self.acquire() {
+            if !self.saturated.swap(true, Ordering::Relaxed) {
+                eprintln!("webhook: {MAX_IN_FLIGHT} POSTs in flight; dropping an event");
+            }
+            return;
+        }
         let webhook = Arc::clone(self);
         if let Err(error) = std::thread::Builder::new()
             .name("webhook".to_owned())
-            .spawn(move || webhook.post(&body))
+            .spawn(move || {
+                webhook.post(&body);
+                webhook.release();
+            })
         {
+            self.release();
             eprintln!("webhook: cannot start the POST: {error}");
+        }
+    }
+
+    /// Reserve one POST slot, or report that every slot is already held.
+    fn acquire(&self) -> bool {
+        self.in_flight
+            .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |active| {
+                (active < MAX_IN_FLIGHT).then_some(active + 1)
+            })
+            .is_ok()
+    }
+
+    fn release(&self) {
+        if self.in_flight.fetch_sub(1, Ordering::AcqRel) == MAX_IN_FLIGHT {
+            self.saturated.store(false, Ordering::Relaxed);
         }
     }
 
