@@ -2449,6 +2449,51 @@ mod tests {
         assert_eq!(peer.writes.concat(), frame(T_DATA, F_END, 1, &message(b"")));
     }
 
+    /// A response that ends at `END_STREAM` closes the read half, not the connection: the upload
+    /// lane can still send bytes the peer has not taken.
+    #[test]
+    fn a_normal_end_stream_keeps_the_writer_alive() {
+        let mut reader = dial(&[(F_END, message(b"ping"))]);
+        let mut got = [0u8; 8];
+        assert_eq!(reader.read(&mut got).expect("reads"), 4);
+        assert_eq!(reader.read(&mut got).expect("reads"), 0);
+        assert!(reader.eof);
+        mark_reader_dead(&mut reader);
+        assert!(
+            !reader.shared.dead.load(Ordering::SeqCst),
+            "a normal END_STREAM was treated as a dead connection"
+        );
+    }
+
+    /// A half-close that cannot take the end marker leaves the completion retryable: the full close
+    /// sends `F_END` once the peer grants the five bytes the empty message needs.
+    #[test]
+    fn a_half_close_that_cannot_send_the_end_marker_is_retried() {
+        let _guard = crate::budgets::lock();
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(100)),
+            ..Default::default()
+        });
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = writer_over(Recorder(Arc::clone(&peer)), HUNK, 0);
+        let shared = Arc::clone(&writer.shared);
+        writer.upload_done();
+        {
+            let mut send = shared.send.lock().unwrap();
+            send.conn = u64::MAX;
+            send.stream = u64::MAX;
+        }
+        shared.wake.notify_all();
+        writer.close();
+        crate::budgets::clear();
+        let peer = peer.lock().unwrap();
+        assert_eq!(
+            peer.writes.concat(),
+            frame(T_DATA, F_END, 1, &message(b"")),
+            "the end marker was lost after a stalled half-close"
+        );
+    }
+
     /// The gathered batch reaches the peer before its own credit parks the writer: a peer grants for
     /// bytes it has seen, so frames held in a batch cannot wait behind the window they are the thing
     /// that would raise. The witness is a write seen while the thread is still inside `send` — with the
