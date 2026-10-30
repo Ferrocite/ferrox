@@ -681,47 +681,28 @@ mod tests {
 
     #[test]
     fn url_credentials_become_basic_auth() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
-        let port = listener.local_addr().expect("addr").port();
-        let (send, receive) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accepts");
-            stream
-                .set_read_timeout(Some(Duration::from_secs(10)))
-                .expect("arms");
-            let mut head = Vec::new();
-            let mut buf = [0u8; 256];
-            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
-                let read = stream.read(&mut buf).expect("reads");
-                if read == 0 {
-                    break;
-                }
-                head.extend_from_slice(&buf[..read]);
-            }
-            let text = String::from_utf8_lossy(&head);
-            let authorized = text
-                .lines()
-                .any(|line| line.eq_ignore_ascii_case("Authorization: Basic YWxpY2U6czNjcjN0"));
-            send.send(text.into_owned()).ok();
-            let status = if authorized {
-                "204 No Content"
-            } else {
-                "401 Unauthorized"
-            };
-            stream
-                .write_all(format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes())
-                .expect("replies");
-        });
-        let webhook = notifier(&format!("http://alice:s3cr3t@127.0.0.1:{port}/hook"));
-        webhook
-            .send("{}")
-            .expect("the authenticated receiver accepts the POST");
-        let head = receive
-            .recv_timeout(Duration::from_secs(10))
-            .expect("the request arrives");
+        let url = HttpUrl::parse("https://alice:p%40ss@example.test/hook").expect("parses");
+        let request = request_bytes(&url, &[], "{}");
+        let head = String::from_utf8_lossy(&request);
         assert!(
-            head.contains("Authorization: Basic YWxpY2U6czNjcjN0\r\n"),
+            head.contains("\r\nAuthorization: Basic YWxpY2U6cEBzcw==\r\n"),
             "{head}"
         );
+
+        let url = HttpUrl::parse("https://alice@example.test/hook").expect("parses");
+        let request = request_bytes(&url, &[], "{}");
+        assert!(
+            String::from_utf8_lossy(&request).contains("Authorization: Basic YWxpY2U6\r\n"),
+            "a username without a password keeps the required colon"
+        );
+    }
+
+    #[test]
+    fn plaintext_url_credentials_are_refused() {
+        let webhook = notifier("http://alice:s3cr3t@127.0.0.1:9/hook");
+        let error = webhook
+            .send("{}")
+            .expect_err("refuses credentials over plaintext http");
+        assert!(error.contains("plaintext"), "{error}");
     }
 }
