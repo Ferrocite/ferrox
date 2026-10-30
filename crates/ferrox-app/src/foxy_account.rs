@@ -104,6 +104,7 @@ pub(crate) struct Session {
     pub(crate) email: String,
     pub(crate) auth: Option<Auth>,
     pub(crate) pending: Option<String>,
+    pub(crate) pending_method: Option<String>,
 }
 
 /// The one file that spares a launch `FxA`'s sign-in: the email it belongs to is stored with the grant, so a different account never resumes the last one's session.
@@ -151,15 +152,26 @@ impl TokenFile {
                 .map_or(0, u64::from),
         });
         let pending = field("pending_session").filter(|session| !session.is_empty());
+        let pending_method = field("pending_method").filter(|method| !method.is_empty());
         (auth.is_some() || pending.is_some()).then_some(Session {
             email,
             auth,
             pending,
+            pending_method,
         })
     }
 
     /// Best-effort and owner-only: a session that cannot be written costs the next launch a sign-in, which is a line, not a failed lane.
     pub(crate) fn save(&self, auth: Option<&Auth>, pending: Option<&str>) {
+        self.save_pending(auth, pending, None);
+    }
+
+    fn save_pending(
+        &self,
+        auth: Option<&Auth>,
+        pending: Option<&str>,
+        pending_method: Option<&str>,
+    ) {
         use crate::json::{self, Json};
         if let Some(dir) = self.path.parent() {
             let _ = std::fs::create_dir_all(dir);
@@ -179,6 +191,9 @@ impl TokenFile {
         }
         if let Some(pending) = pending {
             pairs.push(("pending_session".to_owned(), Json::Str(pending.to_owned())));
+            if let Some(method) = pending_method {
+                pairs.push(("pending_method".to_owned(), Json::Str(method.to_owned())));
+            }
         }
         let mut text = String::new();
         json::write(&Json::Obj(pairs), &mut text);
@@ -1420,6 +1435,8 @@ pub(crate) struct Account {
     pub(crate) guardian: Endpoint,
     /// A sign-in stopped at two-factor, holding the session token the code must be submitted against.
     pub(crate) pending: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// The method that stopped the sign-in, so an authenticator code goes to its own route.
+    pub(crate) pending_method: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// One jar for both hosts, so a challenge solved on one is not solved twice.
     pub(crate) jar: std::sync::Arc<Mutex<Jar>>,
     pub(crate) auth: std::sync::Arc<std::sync::Mutex<Auth>>,
@@ -1450,8 +1467,13 @@ impl Account {
             method,
         } = login(&self.fxa, &self.jar, email, password)?;
         // A two-factor session needs its code; an email-verification session still exchanges, so the password path does not fall back to a browser.
-        if !verified && method.as_deref() == Some("email-2fa") {
+        if !verified
+            && method
+                .as_deref()
+                .is_some_and(|method| method.ends_with("-2fa"))
+        {
             *self.pending.lock().map_err(|_| Denied::Token)? = Some(session);
+            *self.pending_method.lock().map_err(|_| Denied::Token)? = method;
             self.persist();
             return Ok(());
         }
@@ -1471,6 +1493,7 @@ impl Account {
     pub(crate) fn resume(&self, session: Session) -> Result<(), Denied> {
         if let Some(pending) = session.pending {
             *self.pending.lock().map_err(|_| Denied::Token)? = Some(pending);
+            *self.pending_method.lock().map_err(|_| Denied::Token)? = session.pending_method;
             return Ok(());
         }
         let auth = session.auth.ok_or(Denied::Token)?;
@@ -1571,7 +1594,12 @@ impl Account {
         };
         let auth = self.auth.lock().ok().map(|auth| auth.clone());
         let pending = self.pending.lock().ok().and_then(|pending| pending.clone());
-        tokens.save(auth.as_ref(), pending.as_deref());
+        let method = self
+            .pending_method
+            .lock()
+            .ok()
+            .and_then(|method| method.clone());
+        tokens.save_pending(auth.as_ref(), pending.as_deref(), method.as_deref());
     }
 
     /// Turns a session token into an access token and mints the first pass.
@@ -1579,6 +1607,7 @@ impl Account {
         let auth = token(&self.fxa, &self.jar, Some(session), None, now)?;
         *self.auth.lock().map_err(|_| Denied::Token)? = auth.clone();
         *self.pending.lock().map_err(|_| Denied::Token)? = None;
+        *self.pending_method.lock().map_err(|_| Denied::Token)? = None;
         self.persist();
         self.mint(&auth.access_token)
     }
@@ -1599,6 +1628,17 @@ impl Account {
         // The code arrives from the same autofill that pads the identity; strip its padding, keep its case, before it is sent.
         let code = sanitize_code(code);
         let body = account::code_body(&code);
+        let method = self
+            .pending_method
+            .lock()
+            .map_err(|_| Denied::Token)?
+            .clone();
+        let totp = method.as_deref() == Some("totp-2fa");
+        let path = if totp {
+            "/session/verify/totp"
+        } else {
+            "/session/verify_code"
+        };
         let (id, mac) = account::hawk_credentials(&session).ok_or(Denied::Token)?;
         let mut last = Denied::Unreachable("no Firefox Accounts host".to_owned());
         for endpoint in fxa_attempts(&self.fxa) {
@@ -1606,7 +1646,7 @@ impl Account {
             let nonce = nonce();
             let authorization = Signed {
                 method: "POST",
-                path: &endpoint.url("/session/verify_code"),
+                path: &endpoint.url(path),
                 host: &endpoint.origin(),
                 port: endpoint.port,
                 body: &body,
@@ -1618,7 +1658,7 @@ impl Account {
                 &endpoint,
                 &self.jar,
                 "POST",
-                "/session/verify_code",
+                path,
                 &[
                     ("Content-Type", JSON_ACCEPT),
                     ("Authorization", &authorization),
@@ -1643,6 +1683,9 @@ impl Account {
                     continue;
                 }
                 return Err(denied);
+            }
+            if totp && reply.field("success").as_deref() != Some("true") {
+                return Err(Denied::Token);
             }
             let now = epoch();
             *self.pending.lock().map_err(|_| Denied::Token)? = None;
@@ -1772,6 +1815,7 @@ mod renewal {
                 .expect("parses"),
             jar: std::sync::Arc::new(Mutex::new(Jar::default())),
             pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            pending_method: std::sync::Arc::new(std::sync::Mutex::new(None)),
             auth: std::sync::Arc::new(std::sync::Mutex::new(Auth {
                 access_token: "a".to_owned(),
                 refresh_token: "r".to_owned(),
@@ -1996,6 +2040,30 @@ mod loopback {
         )
     }
 
+    fn code_answer(seen: &Seen, totp: bool) -> Vec<u8> {
+        assert!(
+            seen.authorization
+                .as_deref()
+                .is_some_and(|header| header.starts_with("Hawk ")),
+            "the code is signed with the pending session: {:?}",
+            seen.authorization
+        );
+        if totp && seen.body == br#"{"code":"000000"}"# {
+            return reply(200, &[], r#"{"success":false}"#);
+        }
+        assert_eq!(
+            seen.body,
+            br#"{"code":"424242"}"#.to_vec(),
+            "{:?}",
+            seen.body
+        );
+        if totp {
+            reply(200, &[], r#"{"success":true}"#)
+        } else {
+            reply(200, &[], "{}")
+        }
+    }
+
     fn answer(seen: &Seen, tx: &mpsc::Sender<Seen>) -> Vec<u8> {
         let _ = tx.send(seen.clone());
         let cleared = seen
@@ -2043,7 +2111,8 @@ mod loopback {
                 let body = String::from_utf8_lossy(&seen.body);
                 assert!(
                     body.contains(r#""email":"person@example.com""#)
-                        || body.contains(r#""email":"verify@example.com""#),
+                        || body.contains(r#""email":"verify@example.com""#)
+                        || body.contains(r#""email":"totp@example.com""#),
                     "the login must carry the trimmed identity: {body}"
                 );
                 let two_factor = body.contains(r#""verificationMethod":"email-2fa""#);
@@ -2052,6 +2121,8 @@ mod loopback {
                 }
                 let method = if two_factor {
                     Some("email-2fa")
+                } else if body.contains(r#""email":"totp@example.com""#) {
+                    Some("totp-2fa")
                 } else if body.contains(r#""email":"verify@example.com""#) {
                     Some("email")
                 } else {
@@ -2060,22 +2131,8 @@ mod loopback {
                 reply(200, &[], &session_answer(method))
             }
             ("POST", "/v1/oauth/token" | "/v1/token") => token_answer(seen),
-            ("POST", "/v1/session/verify_code") => {
-                assert!(
-                    seen.authorization
-                        .as_deref()
-                        .is_some_and(|header| header.starts_with("Hawk ")),
-                    "the code is signed with the pending session: {:?}",
-                    seen.authorization
-                );
-                assert_eq!(
-                    seen.body,
-                    br#"{"code":"424242"}"#.to_vec(),
-                    "{:?}",
-                    seen.body
-                );
-                reply(200, &[], "{}")
-            }
+            ("POST", "/v1/session/verify_code") => code_answer(seen, false),
+            ("POST", "/v1/session/verify/totp") => code_answer(seen, true),
             ("POST", "/api/v1/fpn/activate") => {
                 ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
                 reply(200, &[], r#"{"subscribed":true,"maxBytes":5368709120}"#)
@@ -2116,6 +2173,7 @@ mod loopback {
             },
             jar: std::sync::Arc::new(Mutex::new(Jar::default())),
             pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
+            pending_method: std::sync::Arc::new(std::sync::Mutex::new(None)),
             auth: std::sync::Arc::new(std::sync::Mutex::new(Auth {
                 access_token: String::new(),
                 refresh_token: String::new(),
@@ -2253,6 +2311,62 @@ mod loopback {
             log.iter().any(|line| line == "POST /v1/oauth/token"),
             "the unverified session is exchanged: {log:?}"
         );
+    }
+
+    /// An authenticator code is submitted to its own route, signed with the same pending session.
+    #[test]
+    fn a_totp_session_verifies_at_the_authenticator_route() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        TWO_FACTOR.store(false, std::sync::atomic::Ordering::Relaxed);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let (address, roots, rx) = edge_with_log();
+        let path = token_path("totp");
+        let tokens =
+            TokenFile::new(path.to_str().expect("utf-8"), "totp@example.com").expect("bound");
+        let mut account = account(address, roots);
+        account.tokens = Some(tokens);
+        account
+            .sign_in("totp@example.com", "hunter2")
+            .expect("a TOTP session signs in");
+        assert!(account.needs_code(), "the authenticator code is required");
+        assert!(
+            account.current().token.is_empty(),
+            "no pass before the code"
+        );
+        let stored = account
+            .tokens
+            .as_ref()
+            .expect("the file rides the account")
+            .load()
+            .expect("the pending sign-in is written");
+        assert_eq!(
+            stored.pending_method.as_deref(),
+            Some("totp-2fa"),
+            "the method survives a restart"
+        );
+        assert_eq!(
+            account.verify_code("000000"),
+            Err(Denied::Token),
+            "a refused authenticator code does not exchange"
+        );
+        assert!(account.needs_code(), "the refused code keeps the wait");
+        account.verify_code("424242").expect("verifies");
+        assert!(!account.needs_code(), "the code clears the wait");
+        assert!(account.current().token.starts_with("eyJ"), "and mints");
+        let log = seen(&rx);
+        assert!(
+            log.iter()
+                .any(|line| line == "POST /v1/session/verify/totp"),
+            "the authenticator route is used: {log:?}"
+        );
+        assert!(
+            !log.iter()
+                .any(|line| line == "POST /v1/session/verify_code"),
+            "the email route is not used for an authenticator: {log:?}"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// A browser's session token is already a credential: exchange it without asking `FxA` for a password.

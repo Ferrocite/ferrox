@@ -25382,6 +25382,7 @@ fn foxy_account(
         guardian: crate::foxy_account::Endpoint::parse(guardian, std::sync::Arc::clone(roots))?,
         jar: std::sync::Arc::new(std::sync::Mutex::new(crate::foxy_challenge::Jar::default())),
         pending: std::sync::Arc::new(std::sync::Mutex::new(None)),
+        pending_method: std::sync::Arc::new(std::sync::Mutex::new(None)),
         auth: std::sync::Arc::new(std::sync::Mutex::new(crate::foxy_account::Auth {
             access_token: String::new(),
             refresh_token: String::new(),
