@@ -328,11 +328,11 @@ fn rule_hit(rule: &Rule) -> RuleHit<'_> {
 
 /// One rule as `RoutingService.ListRule` lists it: the tag the rule names (empty when it names a
 /// balancer, as the reference's one-of leaves `Tag` empty) and the rule's own tag.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct ListedRule<'a> {
-    pub(crate) target: &'a str,
+#[derive(Debug, Clone)]
+pub(crate) struct ListedRule {
+    pub(crate) target: String,
     pub(crate) balancer: bool,
-    pub(crate) tag: Option<&'a str>,
+    pub(crate) tag: Option<String>,
 }
 
 #[derive(Debug)]
@@ -340,7 +340,9 @@ pub(crate) struct Routing {
     strategy: DomainStrategy,
     rules: Vec<Rule>,
     balancers: Vec<Balancer>,
-    script: Option<ScriptRouter>,
+    rule_sets: Vec<Arc<RuleSet>>,
+    asset_dirs: Vec<PathBuf>,
+    script: Option<Arc<ScriptRouter>>,
     has_domains: bool,
     wants_attrs: bool,
     wants_process: bool,
@@ -1061,7 +1063,7 @@ impl Routing {
                 if strategy_seen || rules_present {
                     return Err("routing script cannot be used with domainStrategy or rules".into());
                 }
-                Some(ScriptRouter::parse_in(path, dirs)?)
+                Some(Arc::new(ScriptRouter::parse_in(path, dirs.clone())?))
             }
             _ => None,
         };
@@ -1119,11 +1121,88 @@ impl Routing {
             strategy,
             rules,
             balancers,
+            rule_sets,
+            asset_dirs: dirs,
             script,
             has_domains,
             wants_attrs,
             wants_process,
         }))
+    }
+
+    /// Append a decoded `AddRule` rule list, or replace the table with it when `append` is false.
+    /// Rule tags stay unique across the whole table, as the reference's `AddRule` refuses a repeat.
+    pub(crate) fn add_rules(
+        &mut self,
+        raw: &[Json],
+        append: bool,
+        known: impl Fn(&str) -> bool,
+    ) -> Result<(), String> {
+        let mut assets = Assets::new(self.asset_dirs.clone());
+        let mut tags: HashSet<String> = if append {
+            self.rules
+                .iter()
+                .filter_map(|rule| rule.tag.clone())
+                .collect()
+        } else {
+            HashSet::new()
+        };
+        let mut rules = Vec::with_capacity(raw.len());
+        for item in raw {
+            let Some(rule) = Rule::parse(item, &mut assets, &self.rule_sets)? else {
+                continue;
+            };
+            if let Some(tag) = &rule.tag {
+                if !tags.insert(tag.clone()) {
+                    return Err(format!("duplicate ruleTag `{tag}`"));
+                }
+            }
+            if rule.balancer {
+                if !(append
+                    && self
+                        .balancers
+                        .iter()
+                        .any(|balancer| balancer.tag == rule.target))
+                {
+                    return Err(format!("balancer `{}` not found", rule.target));
+                }
+            } else if !known(&rule.target) {
+                return Err(format!(
+                    "routing targets `{}`, which no outbound names",
+                    rule.target
+                ));
+            }
+            rules.push(rule);
+        }
+        if append {
+            self.rules.extend(rules);
+        } else {
+            self.rules = rules;
+            // The reference rebuilds its balancer map from the same config, which carries none.
+            self.balancers.clear();
+        }
+        self.refresh();
+        Ok(())
+    }
+
+    /// Drop every rule carrying `tag`, the reference's `RemoveRule`; a tag no rule carries is not
+    /// an error there, and the table is unchanged.
+    pub(crate) fn remove_rules(&mut self, tag: &str) {
+        self.rules.retain(|rule| rule.tag.as_deref() != Some(tag));
+        self.refresh();
+    }
+
+    /// Recompute the three flags a front reads before it parses attributes or looks up a process.
+    fn refresh(&mut self) {
+        self.has_domains = self.rules.iter().any(|rule| {
+            rule.domains.is_some()
+                || rule
+                    .sets
+                    .as_ref()
+                    .is_some_and(|sets| sets.iter().any(|set| set.has_domains()))
+        });
+        self.wants_attrs = self.rules.iter().any(|rule| rule.attrs.is_some());
+        self.wants_process = self.rules.iter().any(|rule| rule.process.is_some());
     }
 
     /// Whether any rule reads the flow's HTTP attributes, which is the only reason a front pays to parse them.
@@ -1149,11 +1228,11 @@ impl Routing {
     }
 
     /// Every rule in table order, for the management API's listing.
-    pub(crate) fn listed_rules(&self) -> impl Iterator<Item = ListedRule<'_>> {
+    pub(crate) fn listed_rules(&self) -> impl Iterator<Item = ListedRule> + '_ {
         self.rules.iter().map(|rule| ListedRule {
-            target: rule.target.as_str(),
+            target: rule.target.clone(),
             balancer: rule.balancer,
-            tag: rule.tag.as_deref(),
+            tag: rule.tag.clone(),
         })
     }
 
@@ -1166,7 +1245,12 @@ impl Routing {
     }
 
     pub(crate) fn script(&self) -> Option<&ScriptRouter> {
-        self.script.as_ref()
+        self.script.as_deref()
+    }
+
+    /// The script router as a handle a front can keep outside the table's lock.
+    pub(crate) fn script_shared(&self) -> Option<Arc<ScriptRouter>> {
+        self.script.clone()
     }
 
     /// The first matching rule's target; `None` leaves the caller's default in place.

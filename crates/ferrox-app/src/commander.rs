@@ -487,6 +487,8 @@ impl Api {
     ) -> Result<Vec<u8>, (u32, String)> {
         match method {
             "ListRule" => self.list_rules(),
+            "AddRule" => self.add_rule(request),
+            "RemoveRule" => self.remove_rule(request),
             "TestRoute" => self.test_route(request),
             "GetBalancerInfo" => self.get_balancer_info(request),
             "OverrideBalancerTarget" => self.override_balancer_target(request),
@@ -501,14 +503,36 @@ impl Api {
         for rule in self.runtime()?.listed_rules() {
             let mut item = Vec::new();
             if !rule.balancer {
-                field_str(&mut item, 1, rule.target);
+                field_str(&mut item, 1, &rule.target);
             }
-            if let Some(tag) = rule.tag {
+            if let Some(tag) = &rule.tag {
                 field_str(&mut item, 2, tag);
             }
             field_bytes(&mut out, 1, &item);
         }
         Ok(out)
+    }
+
+    /// Append or replace the live rule table; the reference answers a bare status, so does this.
+    fn add_rule(&self, request: &[u8]) -> Result<Vec<u8>, (u32, String)> {
+        let (rules, append) =
+            crate::xray_pb::add_rule_request(request).map_err(|reason| (2, reason))?;
+        self.runtime()?
+            .add_rules(&rules, append)
+            .map_err(|reason| (2, reason))?;
+        Ok(Vec::new())
+    }
+
+    /// Drop every rule carrying the request's ruleTag.
+    fn remove_rule(&self, request: &[u8]) -> Result<Vec<u8>, (u32, String)> {
+        let tag = request_str(request, 1).unwrap_or_default();
+        if tag.is_empty() {
+            return Err((2, "empty tag name!".to_owned()));
+        }
+        self.runtime()?
+            .remove_rules(&tag)
+            .map_err(|reason| (2, reason))?;
+        Ok(Vec::new())
     }
 
     fn test_route(&self, request: &[u8]) -> Result<Vec<u8>, (u32, String)> {
@@ -1938,6 +1962,55 @@ mod tests {
         api
     }
 
+    /// One `xray.app.router.RoutingRule` a typed router Config carries: an outbound, a ruleTag and
+    /// one `domain:` entry.
+    fn router_rule(outbound: &str, rule_tag: &str, domain: &str) -> Vec<u8> {
+        let domain = message(&[varint_field(1, 2), bytes_field(2, domain.as_bytes())]);
+        let rule = message(&[bytes_field(2, &domain)]);
+        message(&[
+            bytes_field(1, outbound.as_bytes()),
+            bytes_field(2, &rule),
+            bytes_field(19, rule_tag.as_bytes()),
+        ])
+    }
+
+    fn add_rule_request(rules: &[Vec<u8>], append: bool) -> Vec<u8> {
+        let mut config = Vec::new();
+        for rule in rules {
+            config.extend(bytes_field(2, rule));
+        }
+        let mut request = bytes_field(1, &typed("xray.app.router.Config", &config));
+        if append {
+            request.extend(varint_field(2, 1));
+        }
+        request
+    }
+
+    fn remove_rule_request(rule_tag: &str) -> Vec<u8> {
+        let mut request = Vec::new();
+        field_str(&mut request, 1, rule_tag);
+        request
+    }
+
+    fn listed(api: &Api) -> Vec<(Option<String>, Option<String>)> {
+        let answer = api
+            .dispatch("/xray.app.router.command.RoutingService/ListRule", &[])
+            .expect("lists");
+        all_bytes(&answer, 1)
+            .map(|item| (request_str(item, 1), request_str(item, 2)))
+            .collect()
+    }
+
+    fn routed_tag(api: &Api, domain: &str) -> Option<String> {
+        let request = test_route_request(&routed_context(2, domain), &["outbound"]);
+        api.dispatch(
+            "/xray.app.router.command.RoutingService/TestRoute",
+            &request,
+        )
+        .ok()
+        .and_then(|answer| request_str(&answer, 12))
+    }
+
     fn test_route_request(context: &[u8], selectors: &[&str]) -> Vec<u8> {
         let mut request = Vec::new();
         field_bytes(&mut request, 1, context);
@@ -2025,6 +2098,115 @@ mod tests {
         assert_eq!(request_str(items[1], 2).as_deref(), Some("pool"));
         assert_eq!(request_str(items[2], 1).as_deref(), Some("direct"));
         assert_eq!(request_str(items[2], 2).as_deref(), Some("udp"));
+    }
+
+    /// A table whose rules reach both outbounds and no network or port selector shadows the
+    /// appended rule, which is then the first match for the domain the test asks about.
+    const ADDABLE: &str = r#"{
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "edge-b", "protocol": "freedom"}
+        ],
+        "routing": {"rules": [
+            {"type": "field", "ruleTag": "web", "domain": ["full:example.com"], "outboundTag": "direct"},
+            {"type": "field", "ruleTag": "seed", "domain": ["full:seed.test"], "outboundTag": "edge-b"}
+        ]}
+    }"#;
+
+    #[test]
+    fn add_rule_appends_a_rule_the_live_table_answers_with() {
+        let root = crate::json::parse(ADDABLE).expect("parses");
+        let api = routing_api(&root);
+        let path = "/xray.app.router.command.RoutingService/AddRule";
+        api.dispatch(
+            path,
+            &add_rule_request(&[router_rule("edge-b", "added", "blocked.test")], true),
+        )
+        .expect("appends");
+
+        let rules = listed(&api);
+        assert_eq!(
+            rules.len(),
+            3,
+            "the appended rule joins the two configured ones"
+        );
+        assert_eq!(
+            rules[2],
+            (Some("edge-b".to_owned()), Some("added".to_owned()))
+        );
+        assert_eq!(
+            routed_tag(&api, "blocked.test").as_deref(),
+            Some("edge-b"),
+            "a flow reaches the rule the call added"
+        );
+
+        api.dispatch(
+            "/xray.app.router.command.RoutingService/RemoveRule",
+            &remove_rule_request("added"),
+        )
+        .expect("removes");
+        assert_eq!(listed(&api).len(), 2);
+        assert_eq!(
+            routed_tag(&api, "blocked.test"),
+            None,
+            "the removed rule no longer answers"
+        );
+    }
+
+    #[test]
+    fn add_rule_without_append_replaces_the_whole_table() {
+        let root = crate::json::parse(ADDABLE).expect("parses");
+        let api = routing_api(&root);
+        api.dispatch(
+            "/xray.app.router.command.RoutingService/AddRule",
+            &add_rule_request(&[router_rule("edge-b", "only", "blocked.test")], false),
+        )
+        .expect("replaces");
+
+        assert_eq!(
+            listed(&api),
+            vec![(Some("edge-b".to_owned()), Some("only".to_owned()))],
+            "the reference's shouldAppend=false drops every old rule"
+        );
+        assert_eq!(routed_tag(&api, "example.com"), None);
+        assert_eq!(routed_tag(&api, "blocked.test").as_deref(), Some("edge-b"));
+    }
+
+    #[test]
+    fn add_rule_refuses_a_rule_tag_the_table_already_carries() {
+        let root = crate::json::parse(ADDABLE).expect("parses");
+        let api = routing_api(&root);
+        assert_eq!(
+            api.dispatch(
+                "/xray.app.router.command.RoutingService/AddRule",
+                &add_rule_request(&[router_rule("edge-b", "web", "blocked.test")], true),
+            ),
+            Err((2, "duplicate ruleTag `web`".to_owned()))
+        );
+    }
+
+    #[test]
+    fn add_rule_refuses_a_config_that_is_not_a_router() {
+        let root = crate::json::parse(ROUTED).expect("parses");
+        let api = routing_api(&root);
+        let request = bytes_field(1, &typed("xray.app.dns.Config", &[]));
+        assert_eq!(
+            api.dispatch("/xray.app.router.command.RoutingService/AddRule", &request),
+            Err((2, "AddRule: config type error".to_owned()))
+        );
+    }
+
+    #[test]
+    fn remove_rule_refuses_an_empty_tag() {
+        let root = crate::json::parse(ROUTED).expect("parses");
+        let api = routing_api(&root);
+        assert_eq!(
+            api.dispatch(
+                "/xray.app.router.command.RoutingService/RemoveRule",
+                &remove_rule_request(""),
+            ),
+            Err((2, "empty tag name!".to_owned()))
+        );
     }
 
     #[test]
