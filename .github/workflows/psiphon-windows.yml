@@ -1,0 +1,226 @@
+name: Psiphon Windows engine (live comparison)
+
+# Compares the pinned console client with the console engine Psiphon-Windows ships,
+# on the same Windows runner, through the same ferrox lane and the same 1 MB legs.
+# The Windows GUI has no headless mode, so this reads its bundled engine rather
+# than its UI. Nothing from the GPLv3 repository is committed; the workflow fetches
+# the pin at run time and uploads only its own timings.
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: two-letter egress region; blank lets the client choose
+        required: false
+        default: ""
+
+concurrency:
+  group: psiphon-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NO_PROXY: 127.0.0.1,localhost
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  lane:
+    name: Psiphon lane (${{ matrix.engine }} engine)
+    runs-on: windows-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        engine: [pinned, windows]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        if: matrix.engine == 'pinned'
+        with:
+          go-version: "1.26.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: psiphon-windows-${{ matrix.engine }}
+      - uses: actions/cache@v4
+        if: matrix.engine == 'pinned'
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: psiphon-go-${{ runner.os }}-${{ hashFiles('upstream/pins.toml') }}
+      - name: Fetch the pinned Psiphon source
+        run: |
+          if [ "${{ matrix.engine }}" = pinned ]; then
+            ./scripts/fetch-upstream.sh --only psiphon-tunnel-core
+          else
+            ./scripts/fetch-upstream.sh --only psiphon-windows
+          fi
+      - name: Build or locate the engine
+        run: |
+          if [ "${{ matrix.engine }}" = pinned ]; then
+            mkdir -p target/psiphon
+            CLIENT="$GITHUB_WORKSPACE/target/psiphon/psiphon-tunnel-core.exe"
+            (
+              cd upstream/psiphon-tunnel-core
+              if [ -d vendor ]; then export GOFLAGS=-mod=vendor; else export GOFLAGS=-mod=mod; fi
+              CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$CLIENT" ./ConsoleClient
+            )
+          else
+            CLIENT="$GITHUB_WORKSPACE/upstream/psiphon-windows/src/3rdParty/psiphon-tunnel-core.exe"
+          fi
+          test -s "$CLIENT"
+          echo "CLIENT=$CLIENT" >> "$GITHUB_ENV"
+          ls -l "$CLIENT"
+      - name: Build ferrox-app
+        run: cargo build --locked -p ferrox-app
+      - name: Carry a megabyte through the lane
+        env:
+          ENGINE: ${{ matrix.engine }}
+          PSIPHON_REGION: ${{ inputs.region }}
+        run: |
+          set -euo pipefail
+          BIN=target/debug/ferrox-app.exe
+          test -s "$BIN"
+          STATE="$RUNNER_TEMP/psiphon-state-$ENGINE"
+          mkdir -p "$STATE"
+          : > psiphon-legs.tsv
+          CLIENT="$CLIENT" STATE="$STATE" python3 - <<'PY'
+          import json, os
+          settings = {
+              "binary": os.environ["CLIENT"],
+              "listen": "127.0.0.1:1821",
+              "dataRootDirectory": os.environ["STATE"],
+              "readySeconds": 300,
+              "shape": "auto",
+          }
+          if os.environ.get("PSIPHON_REGION"):
+              settings["region"] = os.environ["PSIPHON_REGION"]
+          document = {
+              "inbounds": [
+                  {"protocol": "socks", "listen": "127.0.0.1", "port": 10808},
+                  {"protocol": "mixed", "listen": "127.0.0.1", "port": 10809},
+              ],
+              "outbounds": [{"protocol": "psiphon", "settings": settings}],
+          }
+          with open("psiphon-windows.json", "w") as handle:
+              json.dump(document, handle)
+          PY
+          "$BIN" run -c psiphon-windows.json > "psiphon-windows-$ENGINE.log" 2>&1 &
+          LANE_PID=$!
+          stop_lane() {
+            kill -TERM "$LANE_PID" 2>/dev/null || true
+            for _ in $(seq 1 20); do
+              kill -0 "$LANE_PID" 2>/dev/null || return 0
+              sleep 0.5
+            done
+            kill -KILL "$LANE_PID" 2>/dev/null || true
+          }
+          trap stop_lane EXIT
+          via() {
+            local front="$1" port="$2"
+            shift 2
+            if [ "$front" = mixed ]; then
+              curl -sS "$@" -x "http://127.0.0.1:$port"
+            else
+              curl -sS "$@" --socks5-hostname "127.0.0.1:$port"
+            fi
+          }
+          wait_front() {
+            local front="$1" port="$2" stop_at=$((SECONDS + 360))
+            while ((SECONDS < stop_at)); do
+              kill -0 "$LANE_PID" 2>/dev/null || return 1
+              if via "$front" "$port" --max-time 30 https://www.cloudflare.com/cdn-cgi/trace -o trace.txt 2>/dev/null && grep -q '^loc=' trace.txt; then
+                return 0
+              fi
+              sleep 2
+            done
+            return 1
+          }
+          fetch_mb() {
+            local front="$1" port="$2" file="$3" label="$4" code=0 timing got
+            timing=$(via "$front" "$port" --max-time 300 \
+              -w '%{size_download} %{time_total} %{speed_download}' \
+              'https://speed.cloudflare.com/__down?bytes=1000000' -o "$file") || code=$?
+            echo "$label ${timing:-0 0 0}" >> psiphon-legs.tsv
+            got=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+            got="${got:-0}"
+            if test "$code" = 0 && test "$got" = 1000000; then
+              return 0
+            fi
+            echo "$label FAILED: curl exit $code after $got of 1000000 B" >&2
+            return 1
+          }
+          if ! wait_front socks 10808; then
+            echo "the socks front carried no trace in 360s" >&2
+            tail -n 100 "psiphon-windows-$ENGINE.log" >&2
+            exit 1
+          fi
+          fetch_mb socks 10808 "psiphon-socks-$ENGINE.bin" socks
+          if ! wait_front mixed 10809; then
+            echo "the mixed front carried no trace in 360s" >&2
+            tail -n 100 "psiphon-windows-$ENGINE.log" >&2
+            exit 1
+          fi
+          fetch_mb mixed 10809 "psiphon-mixed-$ENGINE.bin" mixed
+          fetch_mb socks 10808 "psiphon-socks-warm-$ENGINE.bin" "socks warm"
+      - name: Keep the timings and the lane log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: psiphon-legs-${{ matrix.engine }}
+          path: |
+            psiphon-legs.tsv
+            psiphon-windows-${{ matrix.engine }}.log
+          if-no-files-found: warn
+
+  compare:
+    name: Compare the two engines
+    needs: lane
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: psiphon-legs-*
+      - name: Ratios, pinned over Windows
+        run: |
+          python3 - <<'PY'
+          import glob, pathlib, sys
+
+          rows = {}
+          for path in glob.glob("psiphon-legs-*/psiphon-legs.tsv"):
+              engine = pathlib.Path(path).parent.name.removeprefix("psiphon-legs-")
+              for line in pathlib.Path(path).read_text().splitlines():
+                  fields = line.split()
+                  if len(fields) < 4:
+                      continue
+                  label = " ".join(fields[:-3])
+                  size, seconds, speed = fields[-3:]
+                  rows.setdefault(engine, {})[label] = (int(size), float(seconds), float(speed))
+
+          labels = ["socks", "mixed", "socks warm"]
+          missing = []
+          print("| leg | engine | bytes | seconds | bytes/s | pinned/windows time | pinned/windows speed |")
+          print("| --- | --- | ---: | ---: | ---: | ---: | ---: |")
+          for label in labels:
+              got = {}
+              for engine in ("pinned", "windows"):
+                  value = rows.get(engine, {}).get(label)
+                  if value is None:
+                      missing.append(f"{engine}:{label}")
+                      continue
+                  got[engine] = value
+                  size, seconds, speed = value
+                  print(f"| {label} | {engine} | {size} | {seconds:.6f} | {speed:.0f} | | |")
+              if len(got) == 2:
+                  pinned, windows = got["pinned"], got["windows"]
+                  print(f"| {label} | ratio | | | | {pinned[1] / windows[1]:.3f} | {pinned[2] / windows[2]:.3f} |")
+          if missing:
+              print(f"missing legs: {', '.join(missing)}", file=sys.stderr)
+              sys.exit(1)
+          PY

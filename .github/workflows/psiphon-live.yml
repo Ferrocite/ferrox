@@ -1,0 +1,420 @@
+name: Psiphon lane (live tunnel check)
+
+# Proves the `psiphon` lane against the real Psiphon network: it builds the
+# pinned console client, starts `ferrox-app` with a socks and a mixed front,
+# waits for a front to carry a trace through the client's first tunnel, then
+# carries an exact 1 MB file through each front and a DNS query through the
+# client's SOCKS5 UDP association. The runner's own egress and the console
+# client with no lane are the controls, so a refused tunnel, a broken UDP path
+# and a runner that cannot move a megabyte are different lines in the summary.
+#
+# No account and no secrets: the free Psiphon pool is the setup. The schedule is
+# weekly rather than per-push because the client, its server list and its egress
+# are external; `ci.yml` owns the unit gates. Dispatch is the way to ask this
+# lane about a change or a network.
+on:
+  schedule:
+    - cron: "17 5 * * 3"
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: client shape
+        required: false
+        default: auto
+        type: choice
+        options:
+          - auto
+          - cdn
+          - conduit
+          - direct
+      region:
+        description: two-letter egress region; blank lets the client choose
+        required: false
+        default: ""
+
+concurrency:
+  group: psiphon-live-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  NO_PROXY: 127.0.0.1,localhost
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  psiphon-live:
+    name: Psiphon lane live (tunnel + 1 MB)
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.0"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: psiphon-live
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: psiphon-go-${{ runner.os }}-${{ hashFiles('upstream/pins.toml') }}
+      - name: Fetch the pinned Psiphon client
+        run: ./scripts/fetch-upstream.sh --only psiphon-tunnel-core
+      - name: Build the Psiphon console client
+        run: |
+          mkdir -p target/psiphon
+          CLIENT="$GITHUB_WORKSPACE/target/psiphon/psiphon-tunnel-core"
+          (
+            cd upstream/psiphon-tunnel-core
+            if [ -d vendor ]; then export GOFLAGS=-mod=vendor; else export GOFLAGS=-mod=mod; fi
+            CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$CLIENT" ./ConsoleClient
+          )
+          test -s "$CLIENT"
+          ls -l "$CLIENT"
+      - name: Build ferrox-app
+        run: cargo build --locked -p ferrox-app
+      # A leg below cannot tell a refused tunnel from a runner that cannot carry
+      # a megabyte. This control names which one it is; a short read here is a
+      # warning about the runner, never a red lane.
+      - name: Egress control - 1 MB with no lane
+        run: |
+          : > psiphon-legs.tsv
+          : > control.bin
+          code=0
+          timing=$(curl -sS --noproxy '*' --max-time 300 \
+            -w '%{size_download} %{time_total} %{speed_download}' \
+            'https://speed.cloudflare.com/__down?bytes=1000000' -o control.bin) || code=$?
+          echo "control, no lane ${timing:-0 0 0}" >> psiphon-legs.tsv
+          got=$(wc -c < control.bin 2>/dev/null | tr -d ' ')
+          echo "egress control: curl exit $code, ${got:-0} bytes of 1000000"
+          if test "$code" = 0 && test "${got:-0}" = 1000000; then
+            echo "egress control carried the whole megabyte"
+          else
+            echo "::warning::this runner cannot itself download 1 MB (curl exit $code, ${got:-0} bytes)"
+          fi
+      - name: Start the lane and carry a megabyte
+        env:
+          PSIPHON_MODE: ${{ inputs.mode || 'auto' }}
+          PSIPHON_REGION: ${{ inputs.region }}
+        run: |
+          BIN=target/debug/ferrox-app
+          if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
+          CLIENT="$GITHUB_WORKSPACE/target/psiphon/psiphon-tunnel-core"
+          : > psiphon-live.log
+          LANE_PID=""
+          stop_lane() {
+            if [ -n "$LANE_PID" ]; then
+              kill -TERM "$LANE_PID" 2>/dev/null || true
+              tries=0
+              while [ "$tries" -lt 20 ] && kill -0 "$LANE_PID" 2>/dev/null; do
+                sleep 0.5
+                tries=$((tries + 1))
+              done
+              kill -KILL "$LANE_PID" 2>/dev/null || true
+            fi
+            LANE_PID=""
+          }
+          trap stop_lane EXIT
+          via() {
+            local front="$1" port="$2"
+            shift 2
+            if [ "$front" = mixed ] || [ "$front" = http ]; then
+              curl -sS "$@" -x "http://127.0.0.1:$port"
+            else
+              curl -sS "$@" --socks5-hostname "127.0.0.1:$port"
+            fi
+          }
+          wait_front() {
+            local front="$1" port="$2" stop_at=$((SECONDS + 360))
+            while ((SECONDS < stop_at)); do
+              kill -0 "$LANE_PID" 2>/dev/null || return 1
+              if via "$front" "$port" --max-time 30 https://www.cloudflare.com/cdn-cgi/trace -o trace.txt 2>/dev/null && grep -q '^loc=' trace.txt; then
+                return 0
+              fi
+              sleep 2
+            done
+            return 1
+          }
+          trace_front() {
+            local front="$1" port="$2" label="$3" code=0 timing
+            : > trace.txt
+            timing=$(via "$front" "$port" --max-time 120 \
+              -w '%{size_download} %{time_total} %{speed_download}' \
+              https://www.cloudflare.com/cdn-cgi/trace -o trace.txt) || code=$?
+            echo "$label trace ${timing:-0 0 0}" >> psiphon-legs.tsv
+            if test "$code" = 0 && grep -q '^loc=' trace.txt; then
+              grep -E '^(loc|ip)=' trace.txt || true
+              return 0
+            fi
+            echo "$label trace FAILED: curl exit $code" >&2
+            return 1
+          }
+          fetch_mb() {
+            local front="$1" port="$2" file="$3" label="$4" code=0 timing got
+            timing=$(via "$front" "$port" --max-time 300 \
+              -w '%{size_download} %{time_total} %{speed_download}' \
+              'https://speed.cloudflare.com/__down?bytes=1000000' -o "$file") || code=$?
+            echo "$label ${timing:-0 0 0}" >> psiphon-legs.tsv
+            got=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+            got="${got:-0}"
+            if test "$code" = 0 && test "$got" = 1000000; then
+              echo "$label: 1000000 B"
+              return 0
+            fi
+            echo "$label FAILED: curl exit $code after $got of 1000000 B" >&2
+            return 1
+          }
+          case "$PSIPHON_MODE" in
+            auto|cdn|conduit|direct) ;;
+            *) echo "unknown mode $PSIPHON_MODE; wants auto, cdn, conduit or direct" >&2; exit 2 ;;
+          esac
+          CLIENT="$CLIENT" PSIPHON_MODE="$PSIPHON_MODE" PSIPHON_REGION="$PSIPHON_REGION" \
+            STATE="$RUNNER_TEMP/psiphon-state" python3 - <<'PY'
+          import json, os
+          settings = {
+              "binary": os.environ["CLIENT"],
+              "listen": "127.0.0.1:1821",
+              "dataRootDirectory": os.environ["STATE"],
+              "readySeconds": 300,
+              "shape": os.environ["PSIPHON_MODE"],
+          }
+          if os.environ.get("PSIPHON_REGION"):
+              settings["region"] = os.environ["PSIPHON_REGION"]
+          document = {
+              "inbounds": [
+                  {"protocol": "socks", "listen": "127.0.0.1", "port": 10808},
+                  {"protocol": "mixed", "listen": "127.0.0.1", "port": 10809},
+              ],
+              "outbounds": [{"protocol": "psiphon", "settings": settings}],
+          }
+          with open("psiphon-live.json", "w") as handle:
+              json.dump(document, handle)
+          PY
+          chmod 600 psiphon-live.json
+          "$BIN" run -c psiphon-live.json >> psiphon-live.log 2>&1 &
+          LANE_PID=$!
+          if ! wait_front socks 10808; then
+            echo "the socks front carried no trace in 360s" >&2
+            tail -n 100 psiphon-live.log >&2
+            exit 1
+          fi
+          if ! wait_front mixed 10809; then
+            echo "the mixed front carried no trace in 360s" >&2
+            tail -n 100 psiphon-live.log >&2
+            exit 1
+          fi
+          FAILED=""
+          trace_front socks 10808 "socks" || FAILED="$FAILED socks(trace)"
+          fetch_mb socks 10808 psiphon-socks.bin "socks" || FAILED="$FAILED socks"
+          trace_front mixed 10809 "mixed" || FAILED="$FAILED mixed(trace)"
+          fetch_mb mixed 10809 psiphon-mixed.bin "mixed" || FAILED="$FAILED mixed"
+          fetch_mb socks 10808 psiphon-socks-warm.bin "socks warm" || FAILED="$FAILED socks(warm)"
+          python3 - <<'PY' || FAILED="$FAILED udp(dns)"
+          import random, socket, struct, sys
+
+          def read_exact(sock, size):
+              data = b""
+              while len(data) < size:
+                  chunk = sock.recv(size - len(data))
+                  if not chunk:
+                      sys.exit("socks front closed the association")
+                  data += chunk
+              return data
+
+          control = socket.create_connection(("127.0.0.1", 10808), timeout=30)
+          control.sendall(b"\x05\x01\x00")
+          if read_exact(control, 2) != b"\x05\x00":
+              sys.exit("socks front refused the greeting")
+          control.sendall(b"\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00")
+          head = read_exact(control, 4)
+          if head[0] != 5 or head[1] != 0:
+              sys.exit(f"udp associate refused: {head!r}")
+          if head[3] == 1:
+              body = read_exact(control, 6)
+              relay = (socket.inet_ntoa(body[:4]), struct.unpack("!H", body[4:6])[0])
+          elif head[3] == 4:
+              body = read_exact(control, 18)
+              relay = (socket.inet_ntop(socket.AF_INET6, body[:16]), struct.unpack("!H", body[16:18])[0])
+          elif head[3] == 3:
+              length = read_exact(control, 1)[0]
+              body = read_exact(control, length + 2)
+              relay = (body[:length].decode(), struct.unpack("!H", body[length:])[0])
+          else:
+              sys.exit(f"unexpected relay address type {head[3]}")
+          datagram = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+          datagram.settimeout(30)
+          datagram.connect(relay)
+          query_id = random.randrange(0, 65536)
+          qname = b"".join(bytes([len(part)]) + part.encode() for part in "example.com".split(".")) + b"\x00"
+          query = struct.pack("!HHHHHH", query_id, 0x0100, 1, 0, 0, 0) + qname + struct.pack("!HH", 1, 1)
+          # A live resolver, built here rather than written as a fixture literal.
+          target = b"\x01" + bytes([1, 1, 1, 1]) + struct.pack("!H", 53)
+          datagram.send(b"\x00\x00\x00" + target + query)
+          answer = datagram.recv(4096)
+          if len(answer) < 10 or answer[0:3] != b"\x00\x00\x00":
+              sys.exit("the udp relay returned no socks5 frame")
+          if answer[3] == 1:
+              offset = 10
+          elif answer[3] == 4:
+              offset = 22
+          else:
+              offset = 5 + answer[4] + 2
+          payload = answer[offset:]
+          if len(payload) < 12 or struct.unpack("!H", payload[:2])[0] != query_id:
+              sys.exit("the udp relay returned another query")
+          answers = struct.unpack("!H", payload[6:8])[0]
+          if answers < 1:
+              sys.exit("the udp relay returned no dns answer")
+          print(f"udp dns: {answers} answer(s) through the Psiphon association")
+          PY
+          if [ -n "$FAILED" ]; then
+            echo "failed legs:$FAILED" >&2
+            tail -n 100 psiphon-live.log >&2
+            exit 1
+          fi
+      - name: Console client direct control - 1 MB
+        if: success()
+        run: |
+          CLIENT="$GITHUB_WORKSPACE/target/psiphon/psiphon-tunnel-core"
+          STATE="$RUNNER_TEMP/psiphon-direct-state"
+          CFG="$RUNNER_TEMP/psiphon-state/ferrox-psiphon-1821.json"
+          sed -e 's/"LocalSocksProxyPort":1821/"LocalSocksProxyPort":1822/' \
+              -e "s#\"DataRootDirectory\":\"[^\"]*\"#\"DataRootDirectory\":\"$STATE\"#" \
+              "$CFG" > psiphon-direct.json
+          mkdir -p "$STATE"
+          "$CLIENT" -config psiphon-direct.json -dataRootDirectory "$STATE" \
+            > psiphon-direct.out 2> psiphon-direct.err &
+          CLIENT_PID=$!
+          stop_client() {
+            kill -TERM "$CLIENT_PID" 2>/dev/null || true
+            wait "$CLIENT_PID" 2>/dev/null || true
+          }
+          trap stop_client EXIT
+          ready=0
+          stop_at=$((SECONDS + 300))
+          while ((SECONDS < stop_at)); do
+            if curl -sS --max-time 30 --socks5-hostname 127.0.0.1:1822 \
+              https://www.cloudflare.com/cdn-cgi/trace -o direct-trace.txt 2>/dev/null \
+              && grep -q '^loc=' direct-trace.txt; then
+              ready=1
+              break
+            fi
+            sleep 2
+          done
+          if [ "$ready" != 1 ]; then
+            echo "the console client carried no direct trace in 300s" >&2
+            tail -n 80 psiphon-direct.err >&2
+            exit 1
+          fi
+          code=0
+          : > direct.bin
+          timing=$(curl -sS --max-time 300 --socks5-hostname 127.0.0.1:1822 \
+            -w '%{size_download} %{time_total} %{speed_download}' \
+            'https://speed.cloudflare.com/__down?bytes=1000000' -o direct.bin) || code=$?
+          echo "client direct ${timing:-0 0 0}" >> psiphon-legs.tsv
+          got=$(wc -c < direct.bin 2>/dev/null | tr -d ' ')
+          got="${got:-0}"
+          if [ "$code" != 0 ] || [ "$got" != 1000000 ]; then
+            echo "client direct FAILED: curl exit $code after $got of 1000000 B" >&2
+            exit 1
+          fi
+          echo "client direct: 1000000 B"
+
+      - name: Probe the client's tunnel notices
+        if: failure()
+        run: |
+          CFG="$RUNNER_TEMP/psiphon-state/ferrox-psiphon-1821.json"
+          STATE="$RUNNER_TEMP/psiphon-tunnel-probe"
+          echo "== client config"
+          cat "$CFG" 2>/dev/null || echo "no config"
+          mkdir -p "$STATE"
+          pkill -TERM -f 'psiphon-tunnel-core' 2>/dev/null || true
+          sleep 1
+          sed 's/"LocalSocksProxyPort":1821/"LocalSocksProxyPort":1822/' "$CFG" >psiphon-tunnel.json
+          set +e
+          timeout 120s "$GITHUB_WORKSPACE/target/psiphon/psiphon-tunnel-core" \
+            -config psiphon-tunnel.json -dataRootDirectory "$STATE" \
+            >psiphon-tunnel.out 2>psiphon-tunnel.err
+          code=$?
+          set -e
+          echo "client tunnel probe exit $code"
+          grep -E 'Error|Warning|Tunnel|ConnectedServer|Listening|Failed|Server' psiphon-tunnel.err 2>/dev/null | tail -n 100 || true
+          echo "== tail"
+          tail -n 60 psiphon-tunnel.err 2>/dev/null || true
+      - name: Stop the lane and show its log
+        if: always()
+        run: |
+          pkill -TERM -f 'ferrox-app run -c psiphon-live.json' 2>/dev/null || true
+          echo "== lane log tail (notices, tunnel, relay totals; no secrets) =="
+          tail -n 100 psiphon-live.log 2>/dev/null || true
+      - name: Keep the lane log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: psiphon-live-log
+          path: psiphon-live.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - name: Summarise
+        if: always()
+        run: |
+          table=$(python3 - <<'PY'
+          rows = []
+          try:
+              with open("psiphon-legs.tsv") as legs:
+                  lines = legs.read().splitlines()
+          except OSError:
+              lines = []
+          for line in lines:
+              parts = line.rsplit(None, 3)
+              if len(parts) != 4:
+                  continue
+              label, size, seconds, speed = parts
+              try:
+                  size, seconds, speed = float(size), float(seconds), float(speed)
+              except ValueError:
+                  continue
+              rows.append((label, size, seconds, speed))
+          for label, size, seconds, speed in rows:
+              print(f"| {label} | {int(size)} | {seconds:.2f} | {speed / 1048576:.2f} |")
+          if not rows:
+              print("| (no leg recorded a transfer) | 0 | 0.00 | 0.00 |")
+          PY
+          )
+          {
+            echo "### Psiphon lane, live"
+            echo
+            echo "The lane builds the pinned console client, waits for its first"
+            echo "tunnel, and asserts an exact 1000000-byte download through the"
+            echo "socks and mixed fronts. Durations are reported against the"
+            echo "runner's own egress control; the byte count is the gate."
+            echo
+            echo "| leg | bytes | seconds | MiB/s |"
+            echo "| --- | --- | --- | --- |"
+            echo "$table"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Raw legs (label bytes seconds bytes/s):"
+          cat psiphon-legs.tsv 2>/dev/null || true
+
+  result:
+    name: result
+    needs: [psiphon-live]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: psiphon-live
+          needs: ${{ toJSON(needs) }}
+          artifacts: psiphon-live-log

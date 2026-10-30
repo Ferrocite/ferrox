@@ -683,8 +683,16 @@ socks pb-scenario-sides-decoded 2 ferrox-app-xray_pb::tests::a_socks_scenario_de
 socks socks4-handshake-allocations 0 ferrox-app-proxy::tests::a_socks4_handshake_costs_no_heap_buffer
 socks socks4a-handshake-allocations 1 ferrox-app-proxy::tests::a_socks4a_handshake_costs_one_heap_buffer
 socks socks4-reply-bytes 8 ferrox-core-socks::tests::the_socks4_reply_is_the_bytes_the_pinned_server_writes
-socks socks4-client-request-buffers 1 ferrox-app-socks::tests::a_socks4_session_writes_the_request_and_reads_the_reply
-socks socks4a-client-request-buffers 1 ferrox-app-socks::tests::a_socks4a_session_names_its_destination
+socks socks4-client-request-buffers 0 ferrox-app-socks::tests::a_socks4_connect_takes_no_heap_buffer
+socks socks4a-client-request-buffers 0 ferrox-app-socks::tests::a_socks4a_connect_takes_no_heap_buffer
+socks socks5-connect-write-calls 2 ferrox-app-socks::tests::a_no_auth_connect_writes_the_greeting_then_the_request
+socks socks5-connect-read-calls 3 ferrox-app-socks::tests::a_no_auth_connect_writes_the_greeting_then_the_request
+socks socks5-connect-allocations 0 ferrox-app-socks::tests::a_no_auth_connect_writes_the_greeting_then_the_request
+socks socks5-credentialed-connect-write-calls 3 ferrox-app-socks::tests::a_credentialed_connect_writes_the_greeting_credential_and_request
+socks socks5-credentialed-connect-read-calls 4 ferrox-app-socks::tests::a_credentialed_connect_writes_the_greeting_credential_and_request
+socks socks5-credentialed-connect-allocations 0 ferrox-app-socks::tests::a_credentialed_connect_writes_the_greeting_credential_and_request
+socks socks5-long-connect-allocations 0 ferrox-app-socks::tests::a_long_destination_and_a_long_bound_name_take_no_heap_buffer
+socks socks5-long-connect-read-calls 4 ferrox-app-socks::tests::a_long_destination_and_a_long_bound_name_take_no_heap_buffer
 socks socks4-requests-a-credential-front-refuses 1 ferrox-app-proxy::tests::a_front_that_asks_for_a_credential_refuses_a_socks4_request
 socks socks4-xray-scenario-tests-passing 1 scripts/run-upstream-suite.sh
 
@@ -807,3 +815,10 @@ carrier-masque h2-frame-body-allocations 0 ferrox-app-masque-h2::tests::a_frame_
 carrier-masque h2-capsule-staging-allocations 0 ferrox-app-masque-h2::tests::a_whole_capsule_is_read_where_it_landed
 carrier-masque h2-datagram-packet-queue-copies 0 ferrox-app-masque-h2::tests::a_datagram_capsule_goes_straight_to_its_lane
 carrier-masque h2-queued-capsule-cap 64 ferrox-app-masque-h2::tests::a_stalled_send_window_bounds_the_queued_capsules
+carrier-psiphon ops-retired-instructions UNBLESSED scripts/count-ops.sh
+carrier-psiphon syscalls-per-notice-line UNBLESSED scripts/count-ops.sh
+carrier-psiphon notice-scan-allocations-per-line 0 ferrox-core-psiphon::tests::a_notice_scan_takes_no_buffer_of_its_own
+carrier-psiphon notice-line-copies-when-it-fits 0 ferrox-app-psiphon::tests::a_notice_line_is_visited_where_the_reader_holds_it
+carrier-psiphon notice-line-allocations-when-it-fits 0 ferrox-app-psiphon::tests::a_notice_line_that_fits_the_reader_takes_no_buffer
+carrier-psiphon flow-clone-allocations 0 ferrox-app-psiphon::tests::a_flow_clone_shares_the_credential_words
+carrier-psiphon seconds-per-live-transfer UNBLESSED .github/workflows/psiphon-live.yml

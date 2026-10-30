@@ -20,6 +20,13 @@ CLI = ROOT / "dist" / "ferrox-cli.sh"
 WATCH = 15
 
 CASES = [
+    ("up --psiphon-ready with a non-number", ["up", "--psiphon", "--psiphon-ready", "soon"], "--psiphon-ready wants seconds"),
+    ("up --psiphon-mode with a bad mode", ["up", "--psiphon", "--psiphon-mode", "turbo"], "--psiphon-mode wants auto, cdn, conduit or direct"),
+    ("up --psiphon-pool with a non-number", ["up", "--psiphon", "--psiphon-pool", "many"], "--psiphon-pool wants a number"),
+    ("up --psiphon-workers with a non-number", ["up", "--psiphon", "--psiphon-workers", "many"], "--psiphon-workers wants a number"),
+    ("up --psiphon-establish-timeout with a non-number", ["up", "--psiphon", "--psiphon-establish-timeout", "soon"], "--psiphon-establish-timeout wants seconds"),
+    ("up --psiphon-establish-timeout with zero", ["up", "--psiphon", "--psiphon-establish-timeout", "0"], "--psiphon-establish-timeout wants seconds"),
+    ("up --psiphon-cdn-profile with a bad profile", ["up", "--psiphon", "--psiphon-cdn-profile", "turbo"], "--psiphon-cdn-profile wants shirokhorshid"),
     ("up --vless with no link", ["up", "--vless"], "vless://"),
     ("up --vless with a non-link", ["up", "--vless", "notalink"], "vless://"),
     ("up --vmess without --uuid", ["up", "--vmess", "host:443"], "--uuid"),

@@ -244,18 +244,40 @@ pub fn refuse4() -> &'static [u8] {
 /// what tells the server a name follows. One buffer carries the whole request.
 #[must_use]
 pub fn request4(cmd: u8, port: u16, address: [u8; 4], user: &[u8], name: Option<&[u8]>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(9 + user.len() + name.map_or(0, <[u8]>::len));
-    out.push(VERSION4);
-    out.push(cmd);
-    out.extend_from_slice(&port.to_be_bytes());
-    out.extend_from_slice(&address);
-    out.extend_from_slice(user);
-    out.push(0);
-    if let Some(name) = name {
-        out.extend_from_slice(name);
-        out.push(0);
-    }
+    let total = 9 + user.len() + name.map_or(0, |name| name.len() + 1);
+    let mut out = vec![0u8; total];
+    request4_into(cmd, port, address, user, name, &mut out).expect("the counted room");
     out
+}
+
+/// Write the SOCKS4 request into `out` and return its length, so a dial can use one
+/// stack block instead of a heap `Vec`.
+pub fn request4_into(
+    cmd: u8,
+    port: u16,
+    address: [u8; 4],
+    user: &[u8],
+    name: Option<&[u8]>,
+    out: &mut [u8],
+) -> Option<usize> {
+    let total = 9 + user.len() + name.map_or(0, |name| name.len() + 1);
+    if out.len() < total {
+        return None;
+    }
+    out[0] = VERSION4;
+    out[1] = cmd;
+    out[2..4].copy_from_slice(&port.to_be_bytes());
+    out[4..8].copy_from_slice(&address);
+    out[8..8 + user.len()].copy_from_slice(user);
+    out[8 + user.len()] = 0;
+    let mut at = 9 + user.len();
+    if let Some(name) = name {
+        out[at..at + name.len()].copy_from_slice(name);
+        at += name.len();
+        out[at] = 0;
+        at += 1;
+    }
+    Some(at)
 }
 
 /// The RFC 1928 reply: the version, the status, the reserved byte, and the bound address.
