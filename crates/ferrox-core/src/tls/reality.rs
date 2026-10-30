@@ -1075,6 +1075,8 @@ pub struct RealityClientConfig {
     pub short_id: [u8; 8],
     /// The parrot whose hello carries the seal, as `tlsSettings.fingerprint` names it.
     pub fingerprint: String,
+    /// The `realitySettings.masterKeyLog` file this dial appends its traffic secrets to, or `None`.
+    pub key_log: Option<std::sync::Arc<crate::tls::MasterKeyLog>>,
 }
 
 /// The version reported in the sealed session id, the pinned Xray-core release.
@@ -1143,6 +1145,7 @@ impl<S: Stream> RealityClientSession<S> {
                 io,
             )?,
         };
+        session.inner.set_key_log(cfg.key_log.clone());
         session.handshake()?;
         Ok(session)
     }
@@ -2608,6 +2611,7 @@ mod tests {
             public_key: public,
             short_id: SHORT_ID,
             fingerprint: "chrome".to_owned(),
+            key_log: None,
         }
     }
 

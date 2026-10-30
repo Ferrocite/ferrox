@@ -1158,6 +1158,7 @@ pub(crate) fn outbound_reality(
             .and_then(Json::as_str)
             .unwrap_or("chrome")
             .to_owned(),
+        key_log: tls_master_key_log(Some(reality)),
     }))
 }
 
