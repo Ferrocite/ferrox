@@ -20700,7 +20700,7 @@ impl RelayBuf {
         &mut self.bytes
     }
 
-    /// The buffer leaves the type; the read that owned every byte already happened, so the `Vec` is only safe to hand out when every later read is prefix-bounded like `open_chunk`'s.
+    /// The buffer leaves the type; every later read must be prefix-bounded like `open_chunk`'s or `poll_copy`'s, so the uninitialised tail is never read.
     #[must_use]
     pub fn into_vec(self) -> Vec<u8> {
         self.bytes
@@ -51116,7 +51116,7 @@ end
 /// worker that has work, not one per direction.
 #[cfg(not(target_os = "linux"))]
 mod poll_copy {
-    use super::{Connection, RelayEnd, Shutdown};
+    use super::{Connection, RelayBuf, RelayEnd, Shutdown};
     use std::io::{self, Read, Write};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -51345,7 +51345,7 @@ mod poll_copy {
     struct Direction {
         src: Connection,
         dst: Connection,
-        bytes: Box<[u8]>,
+        bytes: Vec<u8>,
         filled: usize,
         off: usize,
         src_at_eof: bool,
@@ -51361,7 +51361,7 @@ mod poll_copy {
             Self {
                 src,
                 dst,
-                bytes: vec![0u8; WINDOW].into_boxed_slice(),
+                bytes: RelayBuf::with_len(WINDOW).into_vec(),
                 filled: 0,
                 off: 0,
                 src_at_eof: false,
