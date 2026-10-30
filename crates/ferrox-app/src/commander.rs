@@ -553,7 +553,9 @@ impl Api {
             })
             .collect();
         let attributes = (!pairs.is_empty()).then(|| crate::router::Attributes::from_pairs(&pairs));
-        let probe = context.probe(attributes.as_ref());
+        let probe = context
+            .probe(attributes.as_ref())
+            .map_err(|reason| (3, format!("routing context: {reason}")))?;
         let Some(tag) = self
             .runtime()?
             .tested_route(&probe)
@@ -1055,6 +1057,9 @@ fn uuid_string(id: [u8; 16]) -> String {
 
 // ---- RoutingService ----
 
+/// The most source x local x target address choices a `TestRoute` context may name.
+const MAX_TESTED_FLOWS: usize = 1024;
+
 /// One `TestRoute` context as it arrived. The bytes are kept as they came so the answer echoes
 /// exactly what the request carried, and the flows a rule table reads are built from them.
 #[derive(Default)]
@@ -1108,7 +1113,7 @@ impl RoutingContext {
     fn probe<'a>(
         &'a self,
         attrs: Option<&'a crate::router::Attributes<'a>>,
-    ) -> crate::router::Probe<'a> {
+    ) -> Result<crate::router::Probe<'a>, String> {
         let text =
             |raw: &'a Option<Vec<u8>>| raw.as_deref().and_then(|raw| std::str::from_utf8(raw).ok());
         let addresses = |raw: &[Vec<u8>]| {
@@ -1119,7 +1124,19 @@ impl RoutingContext {
             }
             out
         };
-        crate::router::Probe {
+        let targets = addresses(&self.target_ips);
+        let sources = addresses(&self.source_ips);
+        let locals = addresses(&self.local_ips);
+        let combinations = sources
+            .len()
+            .checked_mul(locals.len())
+            .and_then(|count| count.checked_mul(targets.len()));
+        if combinations.is_none_or(|count| count > MAX_TESTED_FLOWS) {
+            return Err(format!(
+                "a tested context names more than {MAX_TESTED_FLOWS} address combinations"
+            ));
+        }
+        Ok(crate::router::Probe {
             network: match self.network {
                 2 => crate::router::Network::Tcp,
                 3 => crate::router::Network::Udp,
@@ -1131,13 +1148,13 @@ impl RoutingContext {
             protocol: text(&self.protocol),
             user: text(&self.user),
             attrs,
-            targets: addresses(&self.target_ips),
-            sources: addresses(&self.source_ips),
+            targets,
+            sources,
             source_port: self.source_port as u16,
-            locals: addresses(&self.local_ips),
+            locals,
             local_port: self.local_port as u16,
             vless_route: self.vless_route as u16,
-        }
+        })
     }
 
     /// The answer, echoing the fields the request's selectors name plus the picked outbound. The
@@ -2283,6 +2300,42 @@ mod tests {
             request_str(&answer, 12).as_deref(),
             Some("edge"),
             "the address list is any-of, so the second target reaches the ip rule"
+        );
+    }
+
+    #[test]
+    fn test_route_rejects_an_unbounded_address_cross_product() {
+        let root = crate::json::parse(ROUTED).expect("parses");
+        let api = routing_api(&root);
+        let mut context = Vec::new();
+        for _ in 0..33 {
+            field_bytes(&mut context, 3, &[198, 51, 100, 1]);
+            field_bytes(&mut context, 4, &[203, 0, 113, 5]);
+            field_bytes(&mut context, 13, &[192, 0, 2, 1]);
+        }
+        assert_eq!(
+            api.dispatch(
+                "/xray.app.router.command.RoutingService/TestRoute",
+                &test_route_request(&context, &["outbound"]),
+            ),
+            Err((
+                3,
+                "routing context: a tested context names more than 1024 address combinations"
+                    .to_owned()
+            ))
+        );
+        let mut at_cap = Vec::new();
+        for _ in 0..32 {
+            field_bytes(&mut at_cap, 3, &[198, 51, 100, 1]);
+            field_bytes(&mut at_cap, 13, &[192, 0, 2, 1]);
+        }
+        assert_eq!(
+            api.dispatch(
+                "/xray.app.router.command.RoutingService/TestRoute",
+                &test_route_request(&at_cap, &["outbound"]),
+            ),
+            Err((2, "no clue".to_owned())),
+            "1024 combinations is the cap, not one past it"
         );
     }
 
