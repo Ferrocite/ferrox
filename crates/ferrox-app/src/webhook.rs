@@ -228,20 +228,17 @@ impl Webhook {
         )
     }
 
-    /// The POST, from the URL it parses to the status line it reads, inside the one budget.
+    /// The POST over TCP, from the URL it parses to the status line it reads, inside the one
+    /// budget. Host name resolution and a configured Unix-socket connect are the stages `std`
+    /// cannot bound, so they sit outside the deadline.
     fn send(&self, body: &str) -> Result<(), String> {
         let url = HttpUrl::parse(&self.url)?;
         if url.userinfo.is_some() && !url.tls {
             return Err("refuses URL credentials over plaintext http".to_owned());
         }
         let deadline = Instant::now() + BUDGET;
-        let connection = self.dial(&url, left(deadline))?;
-        connection
-            .set_read_timeout(Some(left(deadline)))
-            .map_err(|error| error.to_string())?;
-        connection
-            .set_write_timeout(Some(left(deadline)))
-            .map_err(|error| error.to_string())?;
+        let connection = self.dial(&url, deadline)?;
+        let mut connection = DeadlineConnection::new(connection, deadline);
         let request = request_bytes(&url, &self.headers, body);
         if url.tls {
             let config = ferrox_core::tls::TlsConfig {
@@ -263,7 +260,6 @@ impl Webhook {
             session.handshake().map_err(|error| error.to_string())?;
             exchange(&mut session, &request)
         } else {
-            let mut connection = connection;
             exchange(&mut connection, &request)
         }
     }
@@ -280,23 +276,86 @@ impl Webhook {
         exchange(io, &request_bytes(url, &self.headers, body))
     }
 
-    /// The address the URL names: the socket path it carries, or the first address its host resolves to.
-    fn dial(&self, url: &HttpUrl, budget: Duration) -> Result<Connection, String> {
+    /// The address the URL names: the socket path it carries, or the first address its host resolves
+    /// to. Each attempt spends only what the one deadline has left, and resolution is untimed.
+    fn dial(&self, url: &HttpUrl, deadline: Instant) -> Result<Connection, String> {
+        if Instant::now() >= deadline {
+            return Err("the webhook budget ended before a dial".to_owned());
+        }
         if let Some(path) = &self.socket {
-            return dial_socket(path, budget);
+            return dial_socket(path, left(deadline));
         }
         let mut last = format!("{} resolved to no address", url.host);
         for address in (url.host.as_str(), url.port)
             .to_socket_addrs()
             .map_err(|error| format!("{}: {error}", url.host))?
         {
-            match crate::conn::connect(&Target::Ip(address), budget) {
+            if Instant::now() >= deadline {
+                break;
+            }
+            match crate::conn::connect(&Target::Ip(address), left(deadline)) {
                 Ok(connection) => return Ok(connection),
                 Err(error) => last = format!("{address}: {error}"),
             }
         }
         Err(last)
     }
+}
+
+/// A stream that spends the POST's one deadline before every socket read and write, so a peer that
+/// drips cannot re-arm a fresh budget on each call.
+struct DeadlineConnection {
+    io: Connection,
+    deadline: Instant,
+}
+
+impl DeadlineConnection {
+    /// Wrap the stream without arming anything yet; every read and write arms its own wait.
+    fn new(io: Connection, deadline: Instant) -> Self {
+        Self { io, deadline }
+    }
+
+    /// The time the budget still has, or the timeout the next socket operation must fail with.
+    fn remaining(&self) -> std::io::Result<Duration> {
+        if Instant::now() >= self.deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the webhook budget ended",
+            ));
+        }
+        Ok(left(self.deadline))
+    }
+}
+
+impl Read for DeadlineConnection {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.io.set_read_timeout(Some(self.remaining()?))?;
+        self.io.read(buf).map_err(budget_ended)
+    }
+}
+
+impl Write for DeadlineConnection {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.io.set_write_timeout(Some(self.remaining()?))?;
+        self.io.write(buf).map_err(budget_ended)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.io.set_write_timeout(Some(self.remaining()?))?;
+        self.io.flush().map_err(budget_ended)
+    }
+}
+
+/// The one timeout spelling across kernels: macOS answers a socket timeout with `WouldBlock`, Linux
+/// with `TimedOut`.
+fn budget_ended(error: std::io::Error) -> std::io::Error {
+    if matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ) {
+        return std::io::Error::new(std::io::ErrorKind::TimedOut, "the webhook budget ended");
+    }
+    error
 }
 
 /// A socket URL dials the path it named: one `@` is the kernel's abstract namespace, two the padded
@@ -745,6 +804,38 @@ mod tests {
         assert!(
             waited < Duration::from_secs(15),
             "the budget ends the wait: {waited:?}"
+        );
+    }
+
+    /// A receiver that answers one byte per second cannot buy a fresh budget for every read.
+    #[test]
+    fn a_dripping_receiver_cannot_stretch_the_budget() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("receiver");
+        let port = listener.local_addr().expect("address").port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            for byte in b"HTTP/1.1" {
+                std::thread::sleep(Duration::from_secs(1));
+                if stream.write_all(&[*byte]).is_err() {
+                    return;
+                }
+            }
+        });
+        let webhook = notifier(&format!("http://127.0.0.1:{port}/hook"));
+        let started = Instant::now();
+        let error = webhook
+            .send("{}")
+            .expect_err("the one deadline ends the read");
+        let waited = started.elapsed();
+        assert!(
+            error.contains("budget") || error.contains("timed out"),
+            "{error}"
+        );
+        assert!(
+            waited < Duration::from_secs(7),
+            "a drip cannot re-arm the budget on every read: {waited:?}"
         );
     }
 
