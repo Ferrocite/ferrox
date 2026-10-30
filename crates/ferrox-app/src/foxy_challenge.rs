@@ -16,6 +16,8 @@ pub(crate) enum Agent {
     Api,
     /// The challenge page and its script.
     Page,
+    /// The challenge page asked for with the account client's own agent: an edge may serve the wall to one and not the other.
+    PageApi,
     /// The private-access token call, which wants plain text back.
     Text,
 }
@@ -24,7 +26,7 @@ impl Agent {
     #[must_use]
     pub(crate) fn user_agent(self) -> &'static str {
         match self {
-            Self::Api => crate::foxy_account::USER_AGENT,
+            Self::Api | Self::PageApi => crate::foxy_account::USER_AGENT,
             Self::Page | Self::Text => BROWSER_AGENT,
         }
     }
@@ -33,7 +35,7 @@ impl Agent {
     pub(crate) fn accept(self) -> &'static str {
         match self {
             Self::Api => crate::foxy_account::JSON_ACCEPT,
-            Self::Page => HTML_ACCEPT,
+            Self::Page | Self::PageApi => HTML_ACCEPT,
             Self::Text => "text/plain",
         }
     }
@@ -51,7 +53,11 @@ pub(crate) const MAX_ATTEMPTS: usize = 5;
 /// The two characters a proof of work is asked to find, over this alphabet.
 const ALPHABET: &[u8; 62] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 /// The hosts to try when the one that answered will not serve the page itself.
-const FALLBACKS: [&str; 2] = ["api.accounts.firefox.com", "accounts.firefox.com"];
+const FALLBACKS: [&str; 3] = [
+    "accounts.firefox.com",
+    "oauth.accounts.firefox.com",
+    "api.accounts.firefox.com",
+];
 
 /// Cookies kept by domain, so a challenge solved on one host does not travel to another.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -133,14 +139,31 @@ pub(crate) fn send_with_challenge(
         if attempt == MAX_ATTEMPTS {
             break;
         }
-        solve(endpoint, jar).map_err(|_| Denied::Challenged(406))?;
+        solve_reply(endpoint, jar, Some(&reply)).map_err(|_| Denied::Challenged(406))?;
     }
     Err(Denied::Challenged(406))
 }
 
-/// Solves the challenge on whichever host serves it and installs the cookies the plane needs.
-pub(crate) fn solve(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challenge> {
+/// A challenged body may already be the page, so solve it before spending a GET; an empty one falls back to the host's own root.
+fn solve_reply(
+    endpoint: &Endpoint,
+    jar: &Mutex<Jar>,
+    reply: Option<&Reply>,
+) -> Result<(), Challenge> {
     let mut asked = Vec::new();
+    let mut last = Challenge::Absent;
+    if let Some(reply) = reply {
+        let page = String::from_utf8_lossy(&reply.body);
+        if looks_like_challenge(&page) {
+            let origin = origin_of(&page).unwrap_or_else(|| format!("https://{}", endpoint.host));
+            if let Some(challenged) = Endpoint::parse(&origin, endpoint.roots.clone()) {
+                match solve_page(&challenged, jar, &page) {
+                    Ok(()) => return Ok(()),
+                    Err(other) => last = other,
+                }
+            }
+        }
+    }
     asked.push(endpoint.clone());
     for host in FALLBACKS {
         if host != endpoint.host {
@@ -150,7 +173,6 @@ pub(crate) fn solve(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challen
             );
         }
     }
-    let mut last = Challenge::Absent;
     for host in &asked {
         match solve_on(host, jar) {
             Ok(()) => return Ok(()),
@@ -161,18 +183,57 @@ pub(crate) fn solve(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challen
     Err(last)
 }
 
-fn solve_on(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challenge> {
-    let page = get(endpoint, jar, "/", HTML_ACCEPT, None)?;
-    if !page.contains("/_fs-ch-") || !page.contains("Client Challenge") {
-        return Err(Challenge::Absent);
+fn looks_like_challenge(page: &str) -> bool {
+    page.len() <= 2_000_000
+        && page.contains("/_fs-ch-")
+        && (page.contains("Client Challenge")
+            || page.contains("script.js")
+            || page.contains("fst-post-back"))
+}
+
+/// The origin a challenged body names, absolute when it carries one and the caller's own host otherwise.
+fn origin_of(page: &str) -> Option<String> {
+    for (at, _) in page.match_indices("https://") {
+        let rest = &page[at + "https://".len()..];
+        let end = rest
+            .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':')))
+            .unwrap_or(rest.len());
+        let host = &rest[..end];
+        if !host.is_empty() && rest[end..].starts_with("/_fs-ch-") {
+            return Some(format!("https://{host}"));
+        }
     }
-    let prefix = prefix_of(&page).ok_or(Challenge::Absent)?;
+    None
+}
+
+fn solve_on(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challenge> {
+    let mut last = Challenge::Absent;
+    for agent in [Agent::Page, Agent::PageApi] {
+        let page = match get_as(endpoint, jar, "/", agent, None) {
+            Ok(page) => page,
+            Err(Challenge::Absent) => continue,
+            Err(other) => return Err(other),
+        };
+        if !looks_like_challenge(&page) {
+            continue;
+        }
+        match solve_page(endpoint, jar, &page) {
+            Ok(()) => return Ok(()),
+            Err(Challenge::Absent) => last = Challenge::Absent,
+            Err(other) => last = other,
+        }
+    }
+    Err(last)
+}
+
+fn solve_page(endpoint: &Endpoint, jar: &Mutex<Jar>, page: &str) -> Result<(), Challenge> {
+    let prefix = prefix_of(page).ok_or(Challenge::Absent)?;
     let referer = format!("https://{}/", endpoint.host);
-    let script = get(
+    let script = get_as(
         endpoint,
         jar,
         &format!("{prefix}/script.js?reload=true"),
-        HTML_ACCEPT,
+        Agent::Page,
         Some(&referer),
     )?;
     let (mut challenges, mut token) = parse_init(&script).ok_or(Challenge::Absent)?;
@@ -233,8 +294,8 @@ fn solve_on(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challenge> {
 
 /// The page must no longer be a challenge for the cookie to be worth keeping.
 fn confirm(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challenge> {
-    let page = get(endpoint, jar, "/", HTML_ACCEPT, None)?;
-    (!page.contains("/_fs-ch-"))
+    let page = get_as(endpoint, jar, "/", Agent::Page, None)?;
+    (!looks_like_challenge(&page))
         .then_some(())
         .ok_or(Challenge::Unsolved)
 }
@@ -265,18 +326,13 @@ fn cors_headers(referer: &str) -> [(&'static str, &str); 5] {
     ]
 }
 
-fn get(
+fn get_as(
     endpoint: &Endpoint,
     jar: &Mutex<Jar>,
     path: &str,
-    accept: &str,
+    agent: Agent,
     referer: Option<&str>,
 ) -> Result<String, Challenge> {
-    let agent = if accept == HTML_ACCEPT {
-        Agent::Page
-    } else {
-        Agent::Text
-    };
     let reply = crate::foxy_account::send(
         endpoint,
         jar,
@@ -401,8 +457,6 @@ fn answer(
                     ("error_trace".to_owned(), Json::Null),
                 ]),
             ),
-            ("detector_results".to_owned(), Json::Obj(Vec::new())),
-            ("v".to_owned(), Json::Num(2.0)),
         ])),
         "captcha" => captcha_answer(endpoint, &text("image_b64")),
         _ => Err(Challenge::Unsupported("")),
@@ -757,6 +811,30 @@ mod tests {
             |bytes: &[u8]| ferrox_core::foxy::account::hex_encode(&sha2::Sha256::digest(bytes));
         assert_eq!(&solve_pow(base, &want(b"basea0")).expect("solved"), b"a0");
         assert!(solve_pow(base, &want(b"othera0")).is_none());
+    }
+
+    #[test]
+    fn a_challenged_body_names_the_page_and_the_origin_it_came_from() {
+        let page = "<html>Client Challenge <script src=\"https://api.accounts.firefox.com/_fs-ch-abc/script.js\"></script></html>";
+        assert!(looks_like_challenge(page));
+        assert_eq!(
+            origin_of(page).as_deref(),
+            Some("https://api.accounts.firefox.com")
+        );
+        let unrelated = "<a href=\"https://www.mozilla.org/privacy\">x</a><script src=\"https://oauth.accounts.firefox.com/_fs-ch-def/script.js\"></script>";
+        assert_eq!(
+            origin_of(unrelated).as_deref(),
+            Some("https://oauth.accounts.firefox.com")
+        );
+        assert_eq!(origin_of("nothing here"), None);
+        assert!(!looks_like_challenge("<html>welcome</html>"));
+    }
+
+    #[test]
+    fn the_account_client_can_ask_for_the_same_page() {
+        assert_eq!(Agent::PageApi.user_agent(), crate::foxy_account::USER_AGENT);
+        assert_eq!(Agent::PageApi.accept(), HTML_ACCEPT);
+        assert_ne!(Agent::PageApi.user_agent(), Agent::Page.user_agent());
     }
 
     #[test]

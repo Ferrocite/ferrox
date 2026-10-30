@@ -466,6 +466,17 @@ impl Endpoint {
         format!("{}{path}", self.base)
     }
 
+    /// The same origin under another Firefox Accounts host: a pinned loopback keeps its address, a real host resolves the new name.
+    #[must_use]
+    fn with_host(&self, host: &str) -> Self {
+        let mut endpoint = self.clone();
+        host.clone_into(&mut endpoint.host);
+        if self.address.is_none() {
+            endpoint.address = edge_peer(host, self.port);
+        }
+        endpoint
+    }
+
     fn tls(&self) -> TlsConfig {
         TlsConfig {
             server_name: self.host.clone(),
@@ -740,7 +751,7 @@ fn h2_ask(
     }
 }
 
-/// One request and its answer over TLS, headers exactly as the caller wrote them: the exchange every plane of this app makes, cookie jar or none.
+/// One request and its answer over HTTP/1.1, headers exactly as the caller wrote them: the exchange every plane of this app makes, cookie jar or none.
 pub(crate) fn ask(
     endpoint: &Endpoint,
     method: &str,
@@ -748,15 +759,18 @@ pub(crate) fn ask(
     headers: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Reply, String> {
-    // A pinned address is a loopback edge speaking HTTP/1.1; only the real Firefox host needs h2.
-    if endpoint.address.is_none() && endpoint.host.ends_with("firefox.com") {
-        return h2_ask(endpoint, method, url, headers, body);
-    }
     let mut tls = endpoint.connect()?;
     tls.write_all(&request(method, &endpoint.origin(), url, headers, body))
         .and_then(|()| tls.flush())
         .map_err(|why| format!("writing {} {url}: {why}", endpoint.host))?;
     read_reply(&mut tls).map_err(|why| format!("reading {} {url}: {why}", endpoint.host))
+}
+
+/// The browser plane's challenge only exists over HTTP/2 on the real Firefox host; every other host, and every pinned loopback edge, stays HTTP/1.1.
+fn wants_h2(endpoint: &Endpoint, agent: crate::foxy_challenge::Agent) -> bool {
+    agent != crate::foxy_challenge::Agent::Api
+        && endpoint.address.is_none()
+        && endpoint.host.ends_with("firefox.com")
 }
 
 /// One request and answer through the jar; the agent and accept are the caller's because API and challenge differ.
@@ -783,7 +797,13 @@ pub(crate) fn send(
     if let Some(cookie) = cookie.as_deref() {
         headers.push(("Cookie", cookie));
     }
-    let reply = ask(endpoint, method, &url, &headers, body).map_err(Denied::Unreachable)?;
+    // The account API answers the same bytes over HTTP/1.1; only the browser challenge needs h2.
+    let reply = if wants_h2(endpoint, agent) {
+        h2_ask(endpoint, method, &url, &headers, body)
+    } else {
+        ask(endpoint, method, &url, &headers, body)
+    }
+    .map_err(Denied::Unreachable)?;
     if let Ok(mut jar) = jar.lock() {
         jar.absorb(&endpoint.host, &reply);
     }
@@ -812,6 +832,20 @@ fn sanitize_code(code: &str) -> String {
     code.chars().filter(|c| !is_padding(*c)).collect()
 }
 
+/// The Firefox Accounts hosts a password may be sent to: the OAuth origin today, the API origin the older client used, and each as the other's fallback.
+const FXA_HOSTS: [&str; 2] = ["oauth.accounts.firefox.com", "api.accounts.firefox.com"];
+
+/// Every origin worth asking, the caller's own first: a host that answers a challenge or a 404 is not a dead account.
+fn fxa_attempts(endpoint: &Endpoint) -> Vec<Endpoint> {
+    let mut hosts = vec![endpoint.host.clone()];
+    for host in FXA_HOSTS {
+        if host != endpoint.host && !hosts.iter().any(|seen| seen == host) {
+            hosts.push(host.to_owned());
+        }
+    }
+    hosts.iter().map(|host| endpoint.with_host(host)).collect()
+}
+
 /// The `FxA` login, tried without the two-factor method first: the first attempt's error is the reason to drop it.
 pub(crate) fn login(
     endpoint: &Endpoint,
@@ -822,8 +856,33 @@ pub(crate) fn login(
     // An autofilled or pasted identity carries padding FxA rejects and a casing the stretch must not depend on; drop every separator, zero-width mark and BOM wherever it sits and lower-case to the one form the salt and the body must agree on.
     let email = normalize_identity(email);
     let stretched = account::auth_pw(&email, password);
+    let mut last = Denied::Unreachable("no Firefox Accounts host".to_owned());
+    for endpoint in fxa_attempts(endpoint) {
+        match login_on(&endpoint, jar, &email, &stretched) {
+            Ok(signed) => return Ok(signed),
+            Err(denied) if host_may_fallback(&denied) => last = denied,
+            Err(denied) => return Err(denied),
+        }
+    }
+    Err(last)
+}
+
+/// A refusal about the credential itself is the account's answer, not a reason to ask another origin; a challenge, a missing route and an unreachable plane are.
+fn host_may_fallback(denied: &Denied) -> bool {
+    matches!(
+        denied,
+        Denied::Unreachable(_) | Denied::Challenged(_) | Denied::Other(0 | 404 | 405 | 406)
+    ) || matches!(denied, Denied::Other(status) if *status >= 500)
+}
+
+fn login_on(
+    endpoint: &Endpoint,
+    jar: &Mutex<Jar>,
+    email: &str,
+    stretched: &str,
+) -> Result<(String, bool), Denied> {
     for method in [Some("email-2fa"), None] {
-        let body = account::login_body(&email, &stretched, method);
+        let body = account::login_body(email, stretched, method);
         let reply = foxy_challenge::send_with_challenge(
             endpoint,
             jar,
@@ -867,38 +926,72 @@ pub(crate) fn token(
         (None, Some(refresh)) => account::token_body("refresh_token", Some(refresh)),
         (None, None) => return Err(Denied::Token),
     };
-    let authorization = session_token.and_then(|session| {
-        let (id, mac) = account::hawk_credentials(session)?;
-        Some(
-            Signed {
-                method: "POST",
-                path: &endpoint.url("/oauth/token"),
-                host: &endpoint.origin(),
-                port: endpoint.port,
-                body: &body,
-                timestamp,
-                nonce,
+    let mut last = Denied::Token;
+    for endpoint in fxa_attempts(endpoint) {
+        for (at, path) in token_paths(&endpoint, session_token.is_some())
+            .into_iter()
+            .enumerate()
+        {
+            let authorization = session_token.and_then(|session| {
+                let (id, mac) = account::hawk_credentials(session)?;
+                Some(
+                    Signed {
+                        method: "POST",
+                        path: &endpoint.url(path),
+                        host: &endpoint.origin(),
+                        port: endpoint.port,
+                        body: &body,
+                        timestamp,
+                        nonce,
+                    }
+                    .header(&id, &mac),
+                )
+            });
+            let mut headers: Vec<(&str, &str)> = vec![("Content-Type", JSON_ACCEPT)];
+            if let Some(authorization) = authorization.as_deref() {
+                headers.push(("Authorization", authorization));
             }
-            .header(&id, &mac),
-        )
-    });
-    let mut headers: Vec<(&str, &str)> = vec![("Content-Type", JSON_ACCEPT)];
-    if let Some(authorization) = authorization.as_deref() {
-        headers.push(("Authorization", authorization));
+            let reply = match foxy_challenge::send_with_challenge(
+                &endpoint, jar, "POST", path, &headers, &body,
+            ) {
+                Ok(reply) => reply,
+                Err(denied) if host_may_fallback(&denied) => {
+                    last = denied;
+                    continue;
+                }
+                Err(denied) => return Err(denied),
+            };
+            match token_reply(&reply, refresh_token, timestamp, session_token.is_some()) {
+                Ok(auth) => return Ok(auth),
+                // A credential refusal on the origin's own route is the account's answer; the other spelling was only a probe, so ask the other host.
+                Err(denied @ (Denied::Token | Denied::Quota(_))) if at == 0 => return Err(denied),
+                Err(denied) => last = denied,
+            }
+        }
     }
-    let reply = foxy_challenge::send_with_challenge(
-        endpoint,
-        jar,
-        "POST",
-        "/oauth/token",
-        &headers,
-        &body,
-    )?;
+    Err(last)
+}
+
+/// The token route each origin publishes: the OAuth origin renews at `/token`, the auth origin at `/oauth/token`, and the other spelling is tried before the other host.
+fn token_paths(endpoint: &Endpoint, session_token: bool) -> [&'static str; 2] {
+    if !session_token && endpoint.host.starts_with("oauth.") {
+        ["/token", "/oauth/token"]
+    } else {
+        ["/oauth/token", "/token"]
+    }
+}
+
+fn token_reply(
+    reply: &Reply,
+    refresh_token: Option<&str>,
+    timestamp: u64,
+    session_token: bool,
+) -> Result<Auth, Denied> {
     if let Some(denied) = reply.denied() {
         return Err(denied);
     }
     // A refresh grant FxA refuses outright is dead, not a plane to ask again: 400 joins the 401/403s that mean sign-in.
-    if session_token.is_none() && reply.status == 400 {
+    if !session_token && reply.status == 400 {
         return Err(Denied::Token);
     }
     if reply.status != 200 {
@@ -989,6 +1082,55 @@ mod tests {
         assert!(text.contains("\r\nAccept: application/json\r\n"));
         assert!(text.contains("\r\nX-A: 1\r\n"));
         assert!(text.ends_with("\r\nContent-Length: 2\r\n\r\n{}"));
+    }
+
+    #[test]
+    fn the_account_hosts_fall_back_both_ways() {
+        let roots: ferrox_core::tls::Anchors = Vec::new().into();
+        let oauth = Endpoint::parse("https://oauth.accounts.firefox.com/v1", roots.clone())
+            .expect("parses");
+        let hosts: Vec<String> = fxa_attempts(&oauth)
+            .into_iter()
+            .map(|endpoint| endpoint.host)
+            .collect();
+        assert_eq!(
+            hosts,
+            ["oauth.accounts.firefox.com", "api.accounts.firefox.com"]
+        );
+        let api = Endpoint::parse("https://api.accounts.firefox.com/v1", roots).expect("parses");
+        let hosts: Vec<String> = fxa_attempts(&api)
+            .into_iter()
+            .map(|endpoint| endpoint.host)
+            .collect();
+        assert_eq!(
+            hosts,
+            ["api.accounts.firefox.com", "oauth.accounts.firefox.com"]
+        );
+    }
+
+    #[test]
+    fn a_token_route_is_the_one_each_origin_publishes() {
+        let roots: ferrox_core::tls::Anchors = Vec::new().into();
+        let oauth = Endpoint::parse("https://oauth.accounts.firefox.com/v1", roots.clone())
+            .expect("parses");
+        assert_eq!(token_paths(&oauth, false), ["/token", "/oauth/token"]);
+        assert_eq!(token_paths(&oauth, true), ["/oauth/token", "/token"]);
+        let api = Endpoint::parse("https://api.accounts.firefox.com/v1", roots).expect("parses");
+        assert_eq!(token_paths(&api, false), ["/oauth/token", "/token"]);
+    }
+
+    #[test]
+    fn only_the_browser_plane_on_the_real_firefox_host_speaks_h2() {
+        let roots = Vec::new().into();
+        let fxa = Endpoint::parse("https://oauth.accounts.firefox.com/v1", roots).expect("parses");
+        assert!(!wants_h2(&fxa, crate::foxy_challenge::Agent::Api));
+        assert!(wants_h2(&fxa, crate::foxy_challenge::Agent::Page));
+        assert!(wants_h2(&fxa, crate::foxy_challenge::Agent::Text));
+        let pinned = Endpoint {
+            address: Some("127.0.0.1:1".parse().expect("addr")),
+            ..fxa
+        };
+        assert!(!wants_h2(&pinned, crate::foxy_challenge::Agent::Page));
     }
 
     #[test]
@@ -1371,13 +1513,15 @@ impl Account {
         if base.valid_at(epoch()) && (!forced || base.access_token != stale.access_token) {
             return Ok(self.adopt(base));
         }
+        let nonce = nonce();
+        let now = epoch();
         let fresh = match token(
             &self.fxa,
             &self.jar,
             None,
             Some(&base.refresh_token),
-            &nonce(),
-            epoch(),
+            &nonce,
+            now,
         ) {
             Ok(fresh) => fresh,
             Err(Denied::Token) => {
@@ -1423,7 +1567,8 @@ impl Account {
 
     /// Turns a session token into an access token and mints the first pass.
     fn exchange(&self, session: &str, now: u64) -> Result<(), Denied> {
-        let auth = token(&self.fxa, &self.jar, Some(session), None, &nonce(), now)?;
+        let nonce = nonce();
+        let auth = token(&self.fxa, &self.jar, Some(session), None, &nonce, now)?;
         *self.auth.lock().map_err(|_| Denied::Token)? = auth.clone();
         *self.pending.lock().map_err(|_| Denied::Token)? = None;
         self.persist();
@@ -1574,7 +1719,7 @@ mod renewal {
 
     fn account_with(pass: Pass) -> Account {
         Account {
-            fxa: Endpoint::parse("https://api.accounts.firefox.com/v1", Vec::new().into())
+            fxa: Endpoint::parse(ferrox_core::foxy::account::FXA_SERVER, Vec::new().into())
                 .expect("parses"),
             guardian: Endpoint::parse("https://vpn.mozilla.org", Vec::new().into())
                 .expect("parses"),
@@ -1645,7 +1790,11 @@ mod loopback {
     use crate::conn::Listener;
     use std::sync::mpsc;
 
-    pub(crate) const HOSTS: [&str; 2] = ["api.accounts.firefox.com", "vpn.mozilla.org"];
+    pub(crate) const HOSTS: [&str; 3] = [
+        "api.accounts.firefox.com",
+        "oauth.accounts.firefox.com",
+        "vpn.mozilla.org",
+    ];
     use sha2::Digest as _;
     const PREFIX: &str = "/_fs-ch-loopback";
     pub(crate) const SESSION: &str =
@@ -1825,6 +1974,8 @@ mod loopback {
                 assert!(body.contains("\"answer\":\"a1\""), "{body}");
                 assert!(body.contains("\"auth\":\"pat-answer\""), "{body}");
                 assert!(body.contains("\"bot_detected\":false"), "{body}");
+                assert!(!body.contains("detector_results"), "{body}");
+                assert!(!body.contains("\"v\":"), "{body}");
                 reply(
                     200,
                     &[("Set-Cookie", "_fs_chl=cleared; Path=/; Domain=firefox.com")],
@@ -1846,7 +1997,7 @@ mod loopback {
                 );
                 reply(200, &[], &session_answer())
             }
-            ("POST", "/v1/oauth/token") => token_answer(seen),
+            ("POST", "/v1/oauth/token" | "/v1/token") => token_answer(seen),
             ("POST", "/v1/session/verify_code") => {
                 assert_eq!(
                     seen.body,
@@ -2130,7 +2281,7 @@ mod loopback {
             "a refresh is not a sign-in: {log:?}"
         );
         assert!(
-            log.iter().any(|line| line == "POST /v1/oauth/token"),
+            log.iter().any(|line| line == "POST /v1/token"),
             "the lapsed access token is renewed: {log:?}"
         );
         let stored = account
@@ -2185,7 +2336,7 @@ mod loopback {
         );
         let log = seen(&rx);
         assert!(
-            !log.iter().any(|line| line == "POST /v1/oauth/token"),
+            !log.iter().any(|line| line == "POST /v1/token"),
             "an adopted grant is not spent again: {log:?}"
         );
         let _ = std::fs::remove_file(&path);
@@ -2253,7 +2404,7 @@ mod loopback {
             let request = rx
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .expect("the refresh arrives");
-            assert_eq!(request.path, "/v1/oauth/token");
+            assert_eq!(request.path, "/v1/token");
             writer.save(
                 Some(&Auth {
                     access_token: "access-9".to_owned(),
@@ -2306,7 +2457,7 @@ mod loopback {
         );
         let log = seen(&rx);
         assert!(
-            log.iter().any(|line| line == "POST /v1/oauth/token"),
+            log.iter().any(|line| line == "POST /v1/token"),
             "a refused clock-valid token is refreshed, not replayed: {log:?}"
         );
         assert!(
@@ -2361,7 +2512,7 @@ mod loopback {
         assert!(account.can_renew(), "the stored grant stays");
         let log = seen(&rx);
         assert!(
-            log.iter().any(|line| line == "POST /v1/oauth/token"),
+            log.iter().any(|line| line == "POST /v1/token"),
             "the refusal was reached after a refresh: {log:?}"
         );
         assert!(
@@ -2413,7 +2564,7 @@ mod loopback {
         );
         let log = seen(&rx);
         assert!(
-            log.iter().any(|line| line == "POST /v1/oauth/token"),
+            log.iter().any(|line| line == "POST /v1/token"),
             "the dead grant is spent before it is called dead: {log:?}"
         );
         assert!(

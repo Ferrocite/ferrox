@@ -3,7 +3,8 @@
 use crate::b64;
 use ring::{digest, hmac, pbkdf2};
 
-pub const FXA_SERVER: &str = "https://api.accounts.firefox.com/v1";
+/// The OAuth origin serves the same account routes without the Fastly pat wall the API origin now answers with a bare 406.
+pub const FXA_SERVER: &str = "https://oauth.accounts.firefox.com/v1";
 pub const GUARDIAN_SERVER: &str = "https://vpn.mozilla.org";
 pub const FXA_CLIENT_ID: &str = "5882386c6d801776";
 pub const OAUTH_SCOPE: &str = "profile https://identity.mozilla.com/apps/vpn";
