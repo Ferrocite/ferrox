@@ -17,6 +17,9 @@ pub(crate) struct Hello {
     pub session_id: [u8; 32],
     pub shares: Vec<Share>,
     profile: &'static Profile,
+    /// The groups a config's `curvePreferences` names, in its order: `None` keeps the profile's
+    /// own list and shares, the hello a browser would send.
+    groups: Option<Vec<u16>>,
     grease: [u16; 5],
     alpn: Option<&'static [&'static [u8]]>,
     sni: Option<String>,
@@ -54,6 +57,7 @@ impl Hello {
         server_name: &str,
         alpn: &[Vec<u8>],
         websocket: bool,
+        curves: &[u16],
     ) -> Result<Self, TlsError> {
         // One draw for the whole hello: its random, its session id, five GREASE pairs.
         let mut seed = [0u8; 74];
@@ -65,7 +69,12 @@ impl Hello {
             *slot = u16::from_le_bytes(*pair);
         }
         let grease = distinct_grease(grease);
-        let (groups, reuse) = share_spec(profile);
+        // A config that names curves offers those and no profile group beside them, drawing a share for each in its order.
+        let (groups, reuse) = if curves.is_empty() {
+            share_spec(profile)
+        } else {
+            (curves, false)
+        };
         let shares = keys::generate(groups, reuse).map_err(TlsError::Other)?;
         let mut hello = Self {
             msg: Vec::new(),
@@ -73,6 +82,7 @@ impl Hello {
             session_id,
             shares,
             profile,
+            groups: (!curves.is_empty()).then(|| curves.to_vec()),
             grease,
             alpn: alpn_override(alpn, websocket),
             sni: sni_name(server_name).map(str::to_owned),
@@ -255,6 +265,7 @@ impl Hello {
             session_id: self.session_id,
             shares,
             profile: self.profile,
+            groups: self.groups.clone(),
             grease: self.grease,
             alpn: self.alpn,
             sni: self.sni.clone(),
@@ -299,11 +310,13 @@ impl Hello {
         group: u16,
         peer: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
-        let advertised = self
-            .profile
-            .exts
-            .iter()
-            .any(|ext| matches!(&ext.body, Body::Groups(groups) if groups.contains(&group)));
+        let advertised =
+            match &self.groups {
+                Some(groups) => groups.contains(&group),
+                None => self.profile.exts.iter().any(
+                    |ext| matches!(&ext.body, Body::Groups(groups) if groups.contains(&group)),
+                ),
+            };
         if !advertised {
             return Err(TlsError::NoSharedCipher);
         }
@@ -529,7 +542,11 @@ impl Hello {
             }
             Body::Sni => (0x0000, false, Source::Name(sni?)),
             Body::Pad => (PAD, true, Source::Zeros(0)),
-            Body::Groups(groups) => (0x000a, false, Source::Groups(groups)),
+            Body::Groups(groups) => (
+                0x000a,
+                false,
+                Source::Groups(self.groups.as_deref().unwrap_or(groups)),
+            ),
             Body::Sigalgs(values) => (0x000d, false, Source::Sigalgs(values)),
             Body::Alpn(table) => (
                 ALPN,
@@ -616,6 +633,7 @@ impl Hello {
             session_id: [0u8; 32],
             shares: keys::canonical(groups),
             profile,
+            groups: None,
             grease: distinct_grease([0; 5]),
             alpn: None,
             sni: sni_name(server_name).map(str::to_owned),
@@ -1038,7 +1056,7 @@ mod tests {
         )
         .expect("generates");
         let profile = Fingerprint::default().profile().expect("profile");
-        let mut hello = Hello::build(profile, "hidden.test", &[], false).expect("builds");
+        let mut hello = Hello::build(profile, "hidden.test", &[], false, &[]).expect("builds");
         hello.enable_ech(&list).expect("ech");
 
         let body = &hello.msg[4..];
@@ -1061,7 +1079,7 @@ mod tests {
     fn a_real_ech_offer_hides_the_inner_name_under_the_public_one() {
         let (list, keys) = crate::tls::ech::generate("public.test", 7).expect("generates");
         let profile = Fingerprint::default().profile().expect("profile");
-        let mut hello = Hello::build(profile, "hidden.test", &[], false).expect("builds");
+        let mut hello = Hello::build(profile, "hidden.test", &[], false, &[]).expect("builds");
         hello.enable_ech(&list).expect("ech");
 
         let body = &hello.msg[4..];
@@ -1286,7 +1304,7 @@ mod tests {
         assert!(offered, "the preset's table names the protocol");
         assert!(!hello.offers_alpn(b"h2"), "and not one it omits");
         assert_eq!(counts.allocs, 0, "the table is walked in place: {counts:?}");
-        let dial = Hello::build(profile, "example.com", &[b"h2".to_vec()], true)
+        let dial = Hello::build(profile, "example.com", &[b"h2".to_vec()], true, &[])
             .expect("a shaped dial hello");
         let (offered, counts) = crate::alloc_count::measure(|| dial.offers_alpn(b"http/1.1"));
         assert!(offered, "the carrier's forced list names the protocol");
@@ -1308,7 +1326,7 @@ mod tests {
             .expect("a preset name resolves")
             .profile()
             .expect("a shaped profile");
-        let mut hello = Hello::build(profile, "example.com", &[b"http/1.1".to_vec()], true)
+        let mut hello = Hello::build(profile, "example.com", &[b"http/1.1".to_vec()], true, &[])
             .expect("a shaped dial hello");
         let retry = hello
             .retry(keys::X25519, Some(&[7, 6, 5]))

@@ -154,6 +154,11 @@ impl Fingerprint {
     pub(crate) fn profile(self) -> Option<&'static Profile> {
         self.0
     }
+
+    /// Whether this fingerprint shapes its hello; the stock one dials rustls's own.
+    pub fn is_shaped(self) -> bool {
+        self.0.is_some()
+    }
 }
 
 /// The eleven browser shapes xray draws `random` from once per process.

@@ -28,6 +28,26 @@ fn order_cipher_suites(provider: &mut rustls::crypto::CryptoProvider, order: &[u
     });
 }
 
+/// A config that names curves offers only those, in its order; one the provider cannot carry is
+/// absent rather than replaced by a stock group, the same rule the suite order follows. A list the
+/// provider carries none of leaves the stock order, since a hello with no group handshakes with
+/// nobody.
+fn order_kx_groups(provider: &mut rustls::crypto::CryptoProvider, order: &[u16]) {
+    let named: Vec<&'static dyn rustls::crypto::SupportedKxGroup> = order
+        .iter()
+        .filter_map(|&want| {
+            provider
+                .kx_groups
+                .iter()
+                .copied()
+                .find(|group| u16::from(group.name()) == want)
+        })
+        .collect();
+    if !named.is_empty() {
+        provider.kx_groups = named;
+    }
+}
+
 pub struct RustlsProvider<S: Stream> {
     conn: rustls::ClientConnection,
     io: S,
@@ -397,6 +417,7 @@ struct MaterialKey {
     cert_pins: Arc<[[u8; 32]]>,
     verify_names: Arc<[String]>,
     cipher_suites: std::sync::Arc<[u16]>,
+    curves: Arc<[u16]>,
     /// The mode decides whether a named verifier exists, so it belongs to the material it selects.
     insecure: bool,
 }
@@ -413,6 +434,7 @@ impl PartialEq for MaterialKey {
             && self.cert_pins.as_ref() == other.cert_pins.as_ref()
             && self.verify_names == other.verify_names
             && self.cipher_suites == other.cipher_suites
+            && self.curves == other.curves
             && self.insecure == other.insecure
     }
 }
@@ -425,6 +447,7 @@ impl MaterialKey {
             cert_pins: Arc::clone(&cfg.cert_pins),
             verify_names: Arc::clone(&cfg.verify_names),
             cipher_suites: Arc::clone(&cfg.cipher_suites),
+            curves: Arc::clone(&cfg.curves),
             insecure: cfg.insecure,
         }
     }
@@ -452,6 +475,9 @@ fn build_material(cfg: &TlsConfig) -> Result<Material, TlsError> {
     if !cfg.cipher_suites.is_empty() {
         // The ring backend's set is a subset of `crypto/tls`'s, so a named suite it cannot reach is absent rather than replaced by a stock one.
         order_cipher_suites(&mut provider, &cfg.cipher_suites);
+    }
+    if !cfg.curves.is_empty() {
+        order_kx_groups(&mut provider, &cfg.curves);
     }
     let provider = Arc::new(provider);
 
@@ -1993,6 +2019,7 @@ mod tests {
             cert_pins: std::sync::Arc::default(),
             verify_names: std::sync::Arc::default(),
             cipher_suites: std::sync::Arc::default(),
+            curves: std::sync::Arc::default(),
             insecure: false,
             fingerprint: None,
             ech_config_list: None,

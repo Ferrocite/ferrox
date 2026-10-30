@@ -244,6 +244,7 @@ fn transport_tls(stream: &Json, security: &str) -> Option<Arc<TlsConfig>> {
             cert_pins: std::sync::Arc::from(Vec::new()),
             verify_names: std::sync::Arc::default(),
             cipher_suites: std::sync::Arc::default(),
+            curves: std::sync::Arc::default(),
             insecure: tls.get("allowInsecure").and_then(Json::as_bool) == Some(true),
             fingerprint: None,
             ech_config_list: None,
