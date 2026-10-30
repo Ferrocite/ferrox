@@ -2286,7 +2286,10 @@ mod tests {
         let named = path.to_string_lossy().into_owned();
         let log = crate::tls::MasterKeyLog::open(&named).expect("opens");
         session.set_key_log(Some(Arc::new(log)));
-        let _ = session.handshake();
+        let error = session
+            .handshake()
+            .expect_err("the fixture ends after ServerHello");
+        assert_eq!(error, TlsError::Closed);
         let text = std::fs::read_to_string(&path).expect("the log the session named");
         let _ = std::fs::remove_file(&path);
         let line = text
