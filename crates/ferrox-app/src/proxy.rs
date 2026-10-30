@@ -2711,16 +2711,32 @@ fn server_proof<'a>(
 ) -> crate::router::ServerProof<'a> {
     crate::router::ServerProof {
         inbound,
-        default_direct: matches!(&shared.default, Outbound::Freedom(_)),
+        default_direct: match shared.default_tag.as_deref() {
+            Some(tag) => direct(tag),
+            None => matches!(&shared.default, Outbound::Freedom(_)),
+        },
         direct,
         candidates: &shared.balancers,
         fallbacks: &shared.balancer_fallbacks,
     }
 }
 
-/// Whether an outbound tag dials direct: the default tag or a freedom outbound.
+/// Whether an outbound tag dials direct: a freedom outbound, or the default tag when the default
+/// outbound is freedom. The dynamic table wins, so a removed or replaced tag reads its live lane.
 fn direct_tag(shared: &RouteShared, tag: &str) -> bool {
-    Some(tag) == shared.default_tag.as_deref()
+    if shared.changed.load(Ordering::Relaxed) {
+        let dynamic = shared
+            .dynamic
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if dynamic.removed.contains(tag) {
+            return false;
+        }
+        if let Some(out) = dynamic.added.get(tag) {
+            return matches!(out.as_ref(), Outbound::Freedom(_));
+        }
+    }
+    (Some(tag) == shared.default_tag.as_deref() && matches!(&shared.default, Outbound::Freedom(_)))
         || matches!(shared.tagged.get(tag), Some(Outbound::Freedom(_)))
 }
 
@@ -48806,6 +48822,74 @@ end
             .add_rules(&[allowed], true)
             .expect("a direct rule for the server inbound is added");
         assert_eq!(runtime.listed_rules().len(), before + 1);
+    }
+
+    /// A default outbound that is not freedom is not the direct dial a server inbound serves, even
+    /// though its tag is the default: a rule naming it would be stored and never evaluated.
+    #[test]
+    fn a_server_rule_naming_a_non_freedom_default_is_refused() {
+        let root = crate::json::parse(
+            r#"{"inbounds":[{"tag":"served","protocol":"vless","listen":"127.0.0.1","port":12345,
+                "settings":{"clients":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}}],
+                "outbounds":[{"tag":"default","protocol":"blackhole"}],"routing":{}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let rule = crate::json::parse(
+            r#"{"type":"field","ruleTag":"served-default","inboundTag":["served"],"outboundTag":"default"}"#,
+        )
+        .expect("parses");
+        let error = runtime
+            .add_rules(&[rule], true)
+            .expect_err("the default outbound is not freedom");
+        assert!(error.contains("default"), "{error}");
+    }
+
+    /// `direct_tag` reads the live outbound table: a tag removed and re-added as a non-freedom lane
+    /// is no longer direct, and a removed default tag is no longer the direct dial.
+    #[test]
+    fn a_server_rule_reads_the_live_directness_of_its_target() {
+        let root = crate::json::parse(
+            r#"{"inbounds":[{"tag":"served","protocol":"vless","listen":"127.0.0.1","port":12345,
+                "settings":{"clients":[{"id":"8b2f3c1e-6a3e-4a56-9b8c-7f0b2a1d4c5e"}]}}],
+                "outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"alt","protocol":"freedom"}],
+                "routing":{"rules":[{"type":"field","inboundTag":["client"],"outboundTag":"alt"}]}}"#,
+        )
+        .expect("parses");
+        let runtime = test_runtime(&root);
+        let shared = Arc::clone(runtime.route.as_ref().expect("route"));
+        let rule = |tag: &str| {
+            crate::json::parse(&format!(
+                r#"{{"type":"field","ruleTag":"served-{tag}","inboundTag":["served"],"outboundTag":"{tag}"}}"#
+            ))
+            .expect("parses")
+        };
+
+        shared.remove_outbound("alt");
+        shared
+            .add_outbound(
+                "alt",
+                Outbound::Block(ferrox_core::blackhole::Response::None),
+            )
+            .expect("re-adds alt as a block");
+        let error = runtime
+            .add_rules(&[rule("alt")], true)
+            .expect_err("alt now blocks, so the server cannot dial it direct");
+        assert!(error.contains("alt"), "{error}");
+
+        shared.remove_outbound("direct");
+        let error = runtime
+            .add_rules(&[rule("direct")], true)
+            .expect_err("the default tag was removed, so it no longer dials direct");
+        assert!(error.contains("direct"), "{error}");
+
+        shared.remove_outbound("alt");
+        shared
+            .add_outbound("alt", freedom())
+            .expect("re-adds alt as freedom");
+        runtime
+            .add_rules(&[rule("alt")], true)
+            .expect("a live freedom tag is still a direct dial");
     }
 
     /// A `vlessRoute` rule reads the route id a flow carries: a socks flow carries none, so it reads
