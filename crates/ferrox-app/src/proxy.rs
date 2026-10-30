@@ -808,10 +808,7 @@ fn serve_vless_inbound(
     }
     // An xdrive inbound has no socket: its `security` belongs to the store's lanes, so the stream is served as it arrives from the log.
     if let Carrier::Xdrive { settings } = &carrier {
-        let users = Arc::clone(&users);
-        let accept: crate::xdrive::Accept =
-            Arc::new(move |session| serve_vless_xdrive(session, &users, freedom));
-        serve_xdrive_loop(settings, address, accept);
+        serve_vless_xdrive_inbound(address, inbound, &users, settings, freedom);
         return true;
     }
     match sec {
@@ -839,8 +836,9 @@ fn serve_vless_inbound(
             let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
             let masq = crate::config::masquerade_from_stream(Some(settings));
             let users = Arc::clone(&users);
+            let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
             let serve: crate::hysteria::Serve = Arc::new(move |flow| {
-                serve_vless_hysteria(flow, &users, freedom);
+                serve_vless_hysteria(flow.with_meter(meter.clone()), &users, freedom);
             });
             thread::spawn(move || {
                 serve_hysteria_thread(&owned, &config, &cert_path, &key_path, &masq, &serve);
@@ -6392,8 +6390,14 @@ fn serve_vless_quic_inbound(
         return false;
     };
     let users = Arc::clone(users);
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
     let serve: crate::quic::Serve = Arc::new(move |stream| {
-        serve_vless_quic(stream, &users, freedom, decryption.as_deref());
+        serve_vless_quic(
+            stream.with_meter(meter.clone()),
+            &users,
+            freedom,
+            decryption.as_deref(),
+        );
     });
     thread::spawn(move || {
         crate::quic::serve_loop(
@@ -6441,6 +6445,7 @@ fn serve_vless_quic(
         stream.close();
         return;
     }
+    let mut stream = stream.with_meter(crate::stats::user(&user.email, user.level));
     let stop = stream.clone();
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || stop.close());
     match cmd {
@@ -9193,15 +9198,18 @@ fn serve_vless_hysteria(mut io: crate::hysteria::Flow, users: &[VlessUser], free
         io.close();
         return;
     };
-    if !users
+    let Some(user) = users
         .iter()
-        .any(|user| same_vless_user(&user.id, &got) && vless_flow_ok(user, flow, cmd, false))
-        || !freedom
-        || cmd != 1
-    {
+        .find(|user| same_vless_user(&user.id, &got) && vless_flow_ok(user, flow, cmd, false))
+    else {
+        io.close();
+        return;
+    };
+    if !freedom || cmd != 1 {
         io.close();
         return;
     }
+    io = io.with_meter(crate::stats::user(&user.email, user.level));
     let Some(uplink) = dial_or_report(&target) else {
         io.close();
         return;
@@ -9748,6 +9756,22 @@ fn dial_ss_xdrive(client: &Connection, ss: &ShadowsocksOut, target: &Destination
     crate::shadowsocks::pump_relay_carried(client, session, writer, &close, send, recv);
 }
 
+/// Arms the xdrive front's inbound meter before the store serves a session.
+fn serve_vless_xdrive_inbound(
+    address: &str,
+    inbound: &Json,
+    users: &VlessUsers,
+    settings: &crate::xdrive::Settings,
+    freedom: bool,
+) {
+    let users = Arc::clone(users);
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+    let accept: crate::xdrive::Accept = Arc::new(move |session| {
+        serve_vless_xdrive(session.with_meter(meter.clone()), &users, freedom);
+    });
+    serve_xdrive_loop(settings, address, accept);
+}
+
 /// The listener an xdrive inbound is: the store itself polls for announcements, so there is no socket to bind.
 fn serve_xdrive_loop(
     settings: &crate::xdrive::Settings,
@@ -9777,6 +9801,14 @@ fn serve_vless_xdrive(mut session: crate::xdrive::Conn, users: &[VlessUser], fre
     if !vless_user_allows(users, &got, flow, cmd, freedom) {
         return;
     }
+    let Some(user) = users.iter().find(|user| {
+        same_vless_user(&user.id, &got)
+            && user.reverse.is_none()
+            && vless_flow_ok(user, flow, cmd, false)
+    }) else {
+        return;
+    };
+    session = session.with_meter(crate::stats::user(&user.email, user.level));
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -10059,9 +10091,10 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
         Carrier::Xdrive { settings } => {
             let email = account.email.clone();
             let level = account.level;
+            let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
             let accept: crate::xdrive::Accept = Arc::new(move |session| {
                 let _flow = crate::accesslog::flow(None, &email, level);
-                serve_trojan_xdrive(session, &key, freedom);
+                serve_trojan_xdrive(session.with_meter(meter.clone()), &key, freedom);
             });
             serve_xdrive_loop(&settings, address, accept);
             true
@@ -10159,9 +10192,10 @@ fn serve_vmess_inbound_users(
             let email = account.email.clone();
             let level = account.level;
             let xdrive_users = std::sync::Arc::clone(users);
+            let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
             let accept: crate::xdrive::Accept = Arc::new(move |session| {
                 let _flow = crate::accesslog::flow(None, &email, level);
-                serve_vmess_xdrive(session, &xdrive_users, freedom);
+                serve_vmess_xdrive(session.with_meter(meter.clone()), &xdrive_users, freedom);
             });
             serve_xdrive_loop(&settings, address, accept);
             true
@@ -10518,9 +10552,10 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
             let accounts = Arc::clone(&accounts);
             let email = account.email.clone();
             let level = account.level;
+            let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
             let accept: crate::xdrive::Accept = Arc::new(move |session| {
                 let _flow = crate::accesslog::flow(None, &email, level);
-                serve_ss_xdrive(session, &accounts, freedom);
+                serve_ss_xdrive(session.with_meter(meter.clone()), &accounts, freedom);
             });
             serve_xdrive_loop(&settings, address, accept);
         }
@@ -23573,10 +23608,10 @@ fn one_vless_user(id: &[u8; 16]) -> [VlessUser; 1] {
     }]
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 fn enable_user_stats() {
     let root = crate::json::parse(
-        r#"{"stats":{},"policy":{"levels":{"1":{"statsUserUplink":true,"statsUserDownlink":true,"statsUserOnline":true}}}}"#,
+        r#"{"stats":{},"policy":{"system":{"statsInboundUplink":true,"statsInboundDownlink":true},"levels":{"1":{"statsUserUplink":true,"statsUserDownlink":true,"statsUserOnline":true}}}}"#,
     )
     .expect("stats config");
     crate::policy::install(&root).expect("policy installs");
@@ -35592,6 +35627,9 @@ mod tests {
     /// The store is the transport, so an xdrive row that declares tls parses and dials: both roles read the folder the config names.
     #[test]
     fn a_trojan_xdrive_dial_under_tls_reaches_the_store() {
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        enable_user_stats();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock")
@@ -35609,7 +35647,7 @@ mod tests {
                 "tlsSettings": {{"allowInsecure": true}}"#
         );
         let inbound = crate::json::parse(&format!(
-            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+            r#"{{"protocol": "trojan", "tag": "xdrive-in", "settings": {{"clients": [{{"password": "secret"}}]}},
                 "streamSettings": {{{settings}}}}}"#
         ))
         .expect("parses");
@@ -35640,6 +35678,91 @@ mod tests {
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
         assert_eq!(&read_echo(&mut sock), b"ping", "the store's session relays");
+        let snapshot = crate::stats::snapshot();
+        let inbound = &snapshot.inbound["xdrive-in"];
+        assert!(
+            inbound.uplink > 0,
+            "the request reached the inbound counter"
+        );
+        assert!(inbound.downlink > 0, "the reply left it");
+        drop(sock);
+        join_thread_within(relay, Duration::from_secs(30), "the store's session");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A VLESS front over the store moves the inbound and the authenticated user's counters, with no socket between them.
+    #[test]
+    fn a_vless_xdrive_front_counts_the_flow_it_relays() {
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        enable_user_stats();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "ferrox-xdrive-vless-{}-{stamp}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let folder = dir.to_str().expect("utf-8 folder").replace('\\', "\\\\");
+        let settings = format!(
+            r#""network": "xdrive", "security": "tls",
+                "xdriveSettings": {{"service": "local", "remoteFolder": "{folder}",
+                    "segmentBytes": 512, "flushIntervalMs": 2, "pollIntervalMs": 2,
+                    "maxPollIntervalMs": 8, "sessionTtlSeconds": 60}},
+                "tlsSettings": {{"allowInsecure": true}}"#
+        );
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "vless", "tag": "xdrive-in",
+                "settings": {{"clients": [{{"id": "{uuid}", "email": "xdrive@example", "level": 1}}]}},
+                "streamSettings": {{{settings}}}}}"#
+        ))
+        .expect("parses");
+        assert!(
+            serve_vless_inbound(
+                "127.0.0.1:9",
+                &inbound,
+                true,
+                "test",
+                &crate::reverse::Portals::default()
+            ),
+            "the store listener arms"
+        );
+        let Outbound::Vless(vless) = find_outbound(&vnext_tls_root("vless", &settings))
+            .expect("parses")
+            .expect("the config names a vless outbound")
+        else {
+            panic!("the outbound dials vless");
+        };
+        let echo_port = echo_loop();
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let relay = thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_vless_xdrive(&socket, &vless, &target);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "the store's session relays");
+        let snapshot = crate::stats::snapshot();
+        let inbound = &snapshot.inbound["xdrive-in"];
+        assert!(
+            inbound.uplink > 0,
+            "the request reached the inbound counter"
+        );
+        assert!(inbound.downlink > 0, "the reply left it");
+        let user = &snapshot.user["xdrive@example"];
+        assert!(user.uplink > 0, "the authenticated user's uplink moved");
+        assert!(user.downlink > 0, "and the downlink too");
         drop(sock);
         join_thread_within(relay, Duration::from_secs(30), "the store's session");
         let _ = std::fs::remove_dir_all(&dir);
@@ -41467,6 +41590,73 @@ mod tests {
         }))
     }
 
+    /// The production QUIC inbound counts the bytes it reads and writes for the inbound, and the
+    /// authenticated flow against its user: the same counters the TCP front arms before the header.
+    #[cfg(unix)]
+    #[test]
+    fn a_quic_vless_flow_counts_its_inbound_and_user() {
+        let _serial = quic_serial();
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        crate::policy::clear();
+        enable_user_stats();
+
+        let minted =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
+        let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let tag = format!("ferrox-quic-stats-{}-{stamp}", std::process::id());
+        let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
+        let key_path = std::env::temp_dir().join(format!("{tag}.key"));
+        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
+        std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
+        std::fs::write(&key_path, &key_pem).expect("stages key");
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let id = uuid_bytes(uuid).expect("id");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","port":{port},"tag":"quic-in","settings":{{"clients":[{{"id":"{uuid}","email":"quic@example","level":1}}]}},"streamSettings":{{"network":"quic","security":"tls","tlsSettings":{{"certificates":[{{"certificateFile":"{}","keyFile":"{}"}}]}}}}}}"#,
+            cert_path.to_str().expect("ascii").replace('\\', "\\\\"),
+            key_path.to_str().expect("ascii").replace('\\', "\\\\")
+        ))
+        .expect("parses");
+        assert!(serve_vless_inbound(
+            &format!("127.0.0.1:{port}"),
+            &inbound,
+            true,
+            "test",
+            &crate::reverse::Portals::default()
+        ));
+        let echo_port = echo_loop();
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let header = vless_header(&id, 1, &Destination::from(target));
+        let back = quic_vless_round_trip(
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            &roots,
+            &header,
+            b"ping",
+        );
+        assert_eq!(&back, b"ping");
+        let snapshot = crate::stats::snapshot();
+        let inbound = snapshot.inbound.get("quic-in").expect("the inbound counts");
+        assert!(
+            inbound.uplink > 0 && inbound.downlink > 0,
+            "both directions moved: {inbound:?}"
+        );
+        let user = snapshot.user.get("quic@example").expect("the user counts");
+        assert!(
+            user.uplink > 0 && user.downlink > 0,
+            "both directions moved: {user:?}"
+        );
+        crate::stats::clear();
+        crate::policy::clear();
+    }
+
     /// One VLESS round trip over a direct QUIC stream: the same header and response bytes as TCP.
     fn quic_vless_round_trip(
         addr: SocketAddr,
@@ -44431,8 +44621,12 @@ mod tests {
     }
 
     #[test]
+    /// The hysteria front serves its own TLS handshake and meters the VLESS flow it accepts.
     fn hysteria_inbound_takes_tls_as_its_own_handshake() {
         let _serial = quic_serial();
+        let _stats = crate::stats::test_lock();
+        crate::stats::clear();
+        enable_user_stats();
         let echo_port = echo_loop();
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let id = uuid_bytes(uuid).expect("id");
@@ -44452,7 +44646,7 @@ mod tests {
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
         let inbound = crate::json::parse(&format!(
-            r#"{{"protocol": "vless", "port": {port}, "settings": {{"clients": [{{"id": "{uuid}"}}]}}, "streamSettings": {{"network": "hysteria", "security": "tls", "hysteriaSettings": {{"version": 2, "auth": "inbound-auth"}}, "tlsSettings": {{"alpn": ["h3"], "certificates": [{{"certificateFile": "{}", "keyFile": "{}"}}]}}}}}}"#,
+            r#"{{"protocol": "vless", "port": {port}, "tag": "hysteria-in", "settings": {{"clients": [{{"id": "{uuid}", "email": "hysteria@example", "level": 1}}]}}, "streamSettings": {{"network": "hysteria", "security": "tls", "hysteriaSettings": {{"version": 2, "auth": "inbound-auth"}}, "tlsSettings": {{"alpn": ["h3"], "certificates": [{{"certificateFile": "{}", "keyFile": "{}"}}]}}}}}}"#,
             cert_path.to_str().expect("ascii").replace('\\', "\\\\"),
             key_path.to_str().expect("ascii").replace('\\', "\\\\")
         ))
@@ -44471,6 +44665,16 @@ mod tests {
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
+        let snapshot = crate::stats::snapshot();
+        let inbound = &snapshot.inbound["hysteria-in"];
+        assert!(
+            inbound.uplink > 0,
+            "the request reached the inbound counter"
+        );
+        assert!(inbound.downlink > 0, "the reply left it");
+        let user = &snapshot.user["hysteria@example"];
+        assert!(user.uplink > 0, "the authenticated user's uplink moved");
+        assert!(user.downlink > 0, "and the downlink too");
     }
 
     #[test]

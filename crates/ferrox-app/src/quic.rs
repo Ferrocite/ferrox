@@ -100,6 +100,7 @@ impl PooledStream {
             conn: Arc::clone(&self.conn),
             sock: Arc::clone(&self.sock),
             id: self.id,
+            meter: crate::stats::Meter::default(),
         }
     }
 }
@@ -3427,6 +3428,7 @@ pub(crate) struct QuicStream {
     conn: Arc<Mutex<quiche::Connection>>,
     sock: Arc<Datagram>,
     id: u64,
+    meter: crate::stats::Meter,
 }
 
 /// How long one stream read polls quiche before idling: FIN and close land inside the next quantum.
@@ -3458,6 +3460,7 @@ impl Read for QuicStream {
                     };
                     if n > 0 {
                         flush_egress(&mut conn, &self.sock);
+                        self.meter.read(n);
                         return Ok(n);
                     }
                     if fin {
@@ -3492,7 +3495,10 @@ impl Write for QuicStream {
                     }
                     std::thread::sleep(STREAM_POLL);
                 }
-                Ok(n) => rest = &rest[n..],
+                Ok(n) => {
+                    self.meter.write(n);
+                    rest = &rest[n..];
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -3517,6 +3523,13 @@ impl crate::proxy::Duplicate for QuicStream {
 }
 
 impl QuicStream {
+    /// Counts both directions against the caller's meters, keeping any an earlier layer already set.
+    /// Adds counters to the stream while keeping the ones it already carries.
+    pub(crate) fn with_meter(mut self, meter: crate::stats::Meter) -> Self {
+        self.meter = self.meter.merged(meter);
+        self
+    }
+
     /// One send flight without holding the lock across the wait behind it.
     fn send_once(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let Ok(mut conn) = self.conn.lock() else {
@@ -3901,6 +3914,7 @@ fn reap(
             conn,
             sock: Arc::clone(sock),
             id: stream,
+            meter: crate::stats::Meter::default(),
         };
         let serve = Arc::clone(serve);
         std::thread::spawn(move || serve(session));

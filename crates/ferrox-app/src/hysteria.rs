@@ -220,7 +220,18 @@ impl Driver {
 }
 
 /// Write a stream's whole buffer under the send budget, releasing the pacer before it parks so a reader can answer.
-pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool) -> bool {
+pub(crate) fn send_all(session: &Session, stream: u64, buf: &[u8], fin: bool) -> bool {
+    send_all_metered(session, stream, buf, fin, None)
+}
+
+/// Sends under the budget and counts each slice the connection accepts as it leaves.
+fn send_all_metered(
+    session: &Session,
+    stream: u64,
+    mut buf: &[u8],
+    fin: bool,
+    meter: Option<&crate::stats::Meter>,
+) -> bool {
     let deadline = Instant::now() + crate::quic::SEND_WAIT;
     let mut paced = false;
     loop {
@@ -234,6 +245,9 @@ pub(crate) fn send_all(session: &Session, stream: u64, mut buf: &[u8], fin: bool
         };
         match conn.stream_send(stream, buf, fin && last) {
             Ok(written) => {
+                if let Some(meter) = meter {
+                    meter.write(written);
+                }
                 buf = &buf[written..];
                 crate::quic::flush_egress(&mut conn, &session.sock);
                 if buf.is_empty() && (!fin || last) {
@@ -577,9 +591,16 @@ pub(crate) struct Flow {
     wake: Option<Arc<StreamWake>>,
     /// The `[0, 0]` acknowledgement still owed to the stream's first read: two on a client-opened flow, none on the server's, because the server reads the request the client already sent.
     reply: usize,
+    meter: crate::stats::Meter,
 }
 
 impl Flow {
+    /// Adds counters to the flow while keeping the ones it already carries.
+    pub(crate) fn with_meter(mut self, meter: crate::stats::Meter) -> Self {
+        self.meter = self.meter.merged(meter);
+        self
+    }
+
     pub(crate) fn with_wake(mut self, wake: Option<Arc<StreamWake>>) -> Self {
         self.wake = wake;
         self
@@ -621,6 +642,7 @@ impl Flow {
             drive,
             wake: None,
             reply: 0,
+            meter: crate::stats::Meter::default(),
         }
     }
 
@@ -711,6 +733,7 @@ impl Flow {
             let n = (self.backlog.len() - self.at).min(buf.len());
             buf[..n].copy_from_slice(&self.backlog[self.at..self.at + n]);
             self.at += n;
+            self.meter.read(n);
             return Ok(Some(n));
         }
         loop {
@@ -732,6 +755,7 @@ impl Flow {
                 }
             };
             if let Some(n) = read {
+                self.meter.read(n);
                 return Ok(Some(n));
             }
             if self.drive {
@@ -780,7 +804,7 @@ impl Write for Flow {
         if buf.is_empty() {
             return Ok(0);
         }
-        if send_all(&self.session, self.stream, buf, false) {
+        if send_all_metered(&self.session, self.stream, buf, false, Some(&self.meter)) {
             Ok(buf.len())
         } else {
             Err(broken())
@@ -811,6 +835,7 @@ pub(crate) fn open_flow(session: &Session, stream: u64, header: &[u8]) -> Option
         drive,
         wake,
         reply: 2,
+        meter: crate::stats::Meter::default(),
     })
 }
 
