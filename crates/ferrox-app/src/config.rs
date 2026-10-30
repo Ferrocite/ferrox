@@ -1623,7 +1623,7 @@ fn kcp_mask(settings: Option<&Json>) -> Option<ferrox_core::kcp::Mask> {
                 // A positive `packetSize` selects the reference's gecko lane, a fragmenting layer this mask is not.
                 let gecko = match conf.and_then(|c| c.get("packetSize")) {
                     None | Some(Json::Null) => false,
-                    Some(value) => int32_range(value).map_or(true, |range| range.high > 0),
+                    Some(value) => int32_range(value).is_none_or(|range| range.high > 0),
                 };
                 if gecko {
                     return None;

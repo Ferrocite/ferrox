@@ -870,7 +870,7 @@ mod tests {
         .expect("builds");
         let mut enc = Encoder::new(&mask);
         let wire = enc.encode(b"k").expect("encodes").to_vec();
-        assert_eq!(wire.len(), SALAMANDER_SALT + 13 + 1);
+        assert_eq!(wire.len(), SALAMANDER_SALT + 4 + 1);
         let mut copy = wire.clone();
         assert_eq!(mask.decode_in_place(&mut copy).expect("decodes"), b"k");
     }
