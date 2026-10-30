@@ -803,11 +803,11 @@ mod tests {
     #[test]
     fn vless_ws_tls_matches_the_reference_shape() {
         let outbound = vless_outbound(
-            "vless://uuid@host.example:443?type=ws&security=tls&sni=edge.example&host=cdn.example&path=%2Fws#name",
+            "vless://uuid@host.test:443?type=ws&security=tls&sni=edge.example&host=cdn.example&path=%2Fws#name",
         )
         .unwrap();
         assert_eq!(outbound["protocol"], "vless");
-        assert_eq!(outbound["settings"]["vnext"][0]["address"], "host.example");
+        assert_eq!(outbound["settings"]["vnext"][0]["address"], "host.test");
         assert_eq!(outbound["settings"]["vnext"][0]["port"], 443);
         assert_eq!(outbound["settings"]["vnext"][0]["users"][0]["id"], "uuid");
         assert_eq!(outbound["streamSettings"]["network"], "ws");
