@@ -3943,9 +3943,9 @@ fn serve_vless_raw_with<D, R>(
             window: &[],
             probe: match decode_request_bounded_gated(
                 &mut stream,
-                |id, _, _, target, port| {
-                    let served = users.iter().any(|user| same_vless_user(&user.id, &id));
-                    if !served {
+                |id, flow, cmd, target, port| {
+                    let user = users.iter().find(|user| same_vless_user(&user.id, &id));
+                    if user.is_none() {
                         crate::accesslog::record(
                             peer,
                             false,
@@ -3955,7 +3955,7 @@ fn serve_vless_raw_with<D, R>(
                             "",
                         );
                     }
-                    served
+                    user.is_some_and(|user| vless_flow_ok(user, flow, cmd, false))
                 },
                 |host, port| (io.resolve)(host, port),
             ) {
@@ -24049,7 +24049,7 @@ fn inbound_users(inbound: &Json, portals: &crate::reverse::Portals) -> VlessUser
 fn vless_flow_ok(user: &VlessUser, wire: Flow, cmd: u8, vision: bool) -> bool {
     match wire {
         Flow::Vision => vision && cmd == 1 && user.flow == Flow::Vision,
-        Flow::None => !(user.flow == Flow::Vision && cmd == 1),
+        Flow::None => matches!(cmd, 1..=4) && !(user.flow == Flow::Vision && cmd == 1),
         Flow::Other => false,
     }
 }
@@ -38095,6 +38095,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn a_request_no_served_user_names_earns_no_lookup() {
         fn spawn_raw<R, D>(users: [VlessUser; 1], resolve: R, dial: D) -> u16
         where
@@ -38180,6 +38181,33 @@ mod tests {
             dialed.lock().expect("dial").len(),
             1,
             "a refused request earns no dial"
+        );
+
+        let tunnel_port = spawn_raw(one_vless_user(&id), resolve.clone(), dial.clone());
+        let mut unsupported = Connection::connect(("127.0.0.1", tunnel_port)).expect("connects");
+        unsupported
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        unsupported
+            .write_all(&vless_header(&id, 5, &name))
+            .expect("requests");
+        let mut probe = [0u8; 1];
+        assert_eq!(
+            unsupported
+                .read(&mut probe)
+                .expect("the unsupported session closes"),
+            0,
+            "a command nothing serves is closed unanswered"
+        );
+        assert_eq!(
+            looked.lock().expect("resolver").len(),
+            1,
+            "an unsupported command earns no lookup"
+        );
+        assert_eq!(
+            dialed.lock().expect("dial").len(),
+            1,
+            "an unsupported command earns no dial"
         );
     }
 
