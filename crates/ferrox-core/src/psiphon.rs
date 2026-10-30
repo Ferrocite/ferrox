@@ -372,6 +372,7 @@ fn string_text<'a>(bytes: &'a [u8], at: &mut usize) -> Option<&'a str> {
 
 /// The string's contents and whether a backslash stood anywhere in it, so a message that
 /// needs no unescaping is known without a second walk over the bytes.
+#[inline]
 fn string_scan<'a>(bytes: &'a [u8], at: &mut usize) -> Option<(&'a [u8], bool)> {
     space(bytes, at);
     if !eat(bytes, at, b'"') {
@@ -582,6 +583,7 @@ fn next_of_neon(bytes: &[u8], first: u8, second: u8) -> Option<(usize, u8)> {
 /// The first of two bytes, two eight-byte blocks at a time. Both lanes are marked with the
 /// same zero-byte test the terminator scan uses, so a long run is walked sixteen bytes per
 /// turn and the byte loop only finishes a tail shorter than two words.
+#[inline]
 fn next_of_swar(bytes: &[u8], first: u8, second: u8) -> Option<(usize, u8)> {
     const SPREAD: u64 = 0x0101_0101_0101_0101;
     const HIGH: u64 = 0x8080_8080_8080_8080;

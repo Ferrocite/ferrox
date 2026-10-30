@@ -1,7 +1,7 @@
 //! The `Psiphon` lane: the psiphon-tunnel-core console client as its own program, its local SOCKS listener read from the notices it writes, and every flow dialled through that listener by the tree's SOCKS client. The client owns the tunnel, its shaping and its server list; this lane owns only the config it is started with and the wait for its first tunnel.
 
 use crate::json::{self, Json};
-use crate::socks::{Credential, Version};
+use crate::socks::{Credential, Destination, Version};
 use ferrox_core::psiphon::{self, Notice, Shape};
 use std::io::{BufRead, BufReader};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
@@ -15,6 +15,12 @@ use std::time::Duration;
 const PROPAGATION_CHANNEL_ID: &str = "FFFFFFFFFFFFFFFF";
 const SPONSOR_ID: &str = "FFFFFFFFFFFFFFFF";
 const CONDUIT_TIMEOUT_SECS: u64 = 180;
+
+/// A loopback Psiphon listener never asks for RFC 1929 credentials: the client exempts a loopback peer, so the empty pair is the one its `SOCKS4a` and no-auth SOCKS5 paths both carry.
+static NO_CREDENTIAL: Credential = Credential {
+    user: String::new(),
+    pass: String::new(),
+};
 
 /// The lane's process and the endpoint it announced. The child is behind a mutex because the
 /// readiness reader owns the pipes while the lane owns the process, and a drop has to be able to
@@ -44,6 +50,7 @@ pub(crate) struct PsiphonOut {
     endpoint: SocketAddr,
     credential: Arc<Credential>,
     version: Version,
+    loopback: bool,
 }
 
 impl PsiphonOut {
@@ -61,6 +68,7 @@ impl PsiphonOut {
             endpoint,
             credential: Arc::new(credential),
             version: Version::V5,
+            loopback: endpoint.ip().is_loopback(),
         })
     }
 
@@ -81,12 +89,26 @@ impl PsiphonOut {
             endpoint,
             credential: Arc::new(credential),
             version: Version::V5,
+            loopback: endpoint.ip().is_loopback(),
         })
     }
 
-    /// The local SOCKS server's credential, empty unless the config named a pair.
+    /// The local SOCKS server's credential: a loopback peer is exempt from the client's RFC 1929 check, so the lane sends none.
     pub(crate) fn credential(&self) -> &Credential {
-        &self.credential
+        if self.loopback {
+            &NO_CREDENTIAL
+        } else {
+            &self.credential
+        }
+    }
+
+    /// The handshake a flow pays to the local listener. `SOCKS4a` is one request and one reply, while SOCKS5 needs a greeting round trip before the request, so a loopback listener takes `SOCKS4a` for every destination it can name; an IPv6 destination has no SOCKS4 form and keeps SOCKS5.
+    pub(crate) fn session(&self, target: &Destination<'_>) -> (Version, &Credential) {
+        if self.loopback && !matches!(target, Destination::V6(..)) {
+            (Version::V4, &NO_CREDENTIAL)
+        } else {
+            (self.version, self.credential())
+        }
     }
 
     /// The SOCKS version the client's listener speaks.
@@ -187,6 +209,105 @@ struct Settings {
     emit_proxy_activity: bool,
     pause_period: Option<u64>,
     stagger_workers: Option<u64>,
+    reduced_relay: Option<ReducedRelay>,
+    disable_port_mapping: Option<bool>,
+    disable_stun: Option<bool>,
+    disable_ipv6_ice: Option<bool>,
+    disable_mobile_inbound: Option<bool>,
+    activity_notice_period: Option<u64>,
+    stun_servers: Vec<String>,
+    stun_servers_rfc5780: Vec<String>,
+    announce_delay: Option<u64>,
+    announce_jitter: Option<f64>,
+    destination_dial_timeout: Option<u64>,
+    webrtc_debug: bool,
+}
+
+/// The hours a device sponsors bandwidth, as minutes past midnight: the client refuses a reduced
+/// window whose two ends match or whose cap is above the cap it reduces.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReducedRelay {
+    start: u16,
+    end: u16,
+    max_common_clients: u64,
+    limit_upstream: Option<u64>,
+    limit_downstream: Option<u64>,
+}
+
+impl ReducedRelay {
+    /// The two ends in the client's own `HH:MM`, so what is sent is what it parsed.
+    fn times(&self) -> (String, String) {
+        (clock(self.start), clock(self.end))
+    }
+}
+
+fn clock(minutes: u16) -> String {
+    format!("{:02}:{:02}", minutes / 60, minutes % 60)
+}
+
+/// Minutes past midnight from the client's own `HH:MM`, which is the form it parses; one digit is
+/// accepted in either field because it reads the same, and the emitted form is always two.
+fn time_of_day(text: &str) -> Option<u16> {
+    let (hour, minute) = text.split_once(':')?;
+    let hour = clock_part(hour)?;
+    let minute = clock_part(minute)?;
+    (hour < 24 && minute < 60).then_some(hour * 60 + minute)
+}
+
+fn clock_part(text: &str) -> Option<u16> {
+    (!text.is_empty() && text.len() <= 2 && text.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| text.parse().ok())
+        .flatten()
+}
+
+/// The reduced window, read only when one of its three required parts is present so an absent
+/// schedule stays absent instead of being invented.
+fn reduced_relay(settings: Option<&Json>) -> Result<Option<ReducedRelay>, String> {
+    let start =
+        text(settings, "inproxyReducedStartTime").or_else(|| env("AETHER_PSIPHON_REDUCED_START"));
+    let end = text(settings, "inproxyReducedEndTime").or_else(|| env("AETHER_PSIPHON_REDUCED_END"));
+    let cap = integer(
+        settings,
+        "inproxyReducedMaxCommonClients",
+        "AETHER_PSIPHON_REDUCED_MAX_COMMON_CLIENTS",
+    )
+    .filter(|value| *value > 0)
+    .or_else(|| json_integer(settings, "inproxyReducedMaxClients").filter(|value| *value > 0));
+    if start.is_none() && end.is_none() && cap.is_none() {
+        return Ok(None);
+    }
+    let (Some(start), Some(end), Some(max_common_clients)) = (start, end, cap) else {
+        return Err(
+            "psiphon: a reduced relay needs inproxyReducedStartTime, inproxyReducedEndTime and inproxyReducedMaxCommonClients together"
+                .to_owned(),
+        );
+    };
+    let start = time_of_day(&start).ok_or_else(|| {
+        format!("psiphon: inproxyReducedStartTime {start:?} is not a time of day like 23:30")
+    })?;
+    let end = time_of_day(&end).ok_or_else(|| {
+        format!("psiphon: inproxyReducedEndTime {end:?} is not a time of day like 06:00")
+    })?;
+    if start == end {
+        return Err("psiphon: a reduced relay needs two ends that differ".to_owned());
+    }
+    Ok(Some(ReducedRelay {
+        start,
+        end,
+        max_common_clients,
+        limit_upstream: integer(
+            settings,
+            "inproxyReducedLimitUpstreamBytesPerSecond",
+            "AETHER_PSIPHON_REDUCED_LIMIT_UPSTREAM",
+        )
+        .filter(|value| *value > 0),
+        limit_downstream: integer(
+            settings,
+            "inproxyReducedLimitDownstreamBytesPerSecond",
+            "AETHER_PSIPHON_REDUCED_LIMIT_DOWNSTREAM",
+        )
+        .filter(|value| *value > 0),
+    }))
 }
 
 impl Settings {
@@ -194,15 +315,26 @@ impl Settings {
     fn from_json(settings: Option<&Json>) -> Result<Self, String> {
         let listen = listen_address(settings)?;
         let http = http_address(settings)?;
-        let region = match text(settings, "region").or_else(|| env("AETHER_PSIPHON_REGION")) {
+        let region = match text(settings, "region")
+            .or_else(|| text(settings, "egressRegion"))
+            .or_else(|| env("AETHER_PSIPHON_REGION"))
+        {
             Some(code) => Some(psiphon::region(&code).ok_or_else(|| {
                 format!("psiphon: region {code:?} is not a two-letter country code")
             })?),
             None => None,
         };
         let shape = text(settings, "shape")
+            .or_else(|| text(settings, "protocolSelection"))
             .or_else(|| env("AETHER_PSIPHON_MODE"))
-            .map_or(Shape::Auto, |word| Shape::parse(&word));
+            .map_or(Shape::Auto, |word| {
+                match word.trim().to_ascii_lowercase().as_str() {
+                    "conduit" => Shape::Conduit,
+                    "cdn_fronting" | "cdn" | "fronted" => Shape::Cdn,
+                    "direct" => Shape::Direct,
+                    _ => Shape::parse(&word),
+                }
+            });
         let device_region =
             match text(settings, "deviceRegion").or_else(|| env("AETHER_PSIPHON_DEVICE_REGION")) {
                 Some(code) => Some(psiphon::region(&code).ok_or_else(|| {
@@ -258,10 +390,12 @@ impl Settings {
                 },
                 PathBuf::from,
             );
-        let proxy_user =
-            text(settings, "localProxyUsername").or_else(|| env("AETHER_PSIPHON_PROXY_USER"));
-        let proxy_pass =
-            text(settings, "localProxyPassword").or_else(|| env("AETHER_PSIPHON_PROXY_PASS"));
+        let proxy_user = text(settings, "localProxyUsername")
+            .or_else(|| text(settings, "shareProxyOnNetworkUsername"))
+            .or_else(|| env("AETHER_PSIPHON_PROXY_USER"));
+        let proxy_pass = text(settings, "localProxyPassword")
+            .or_else(|| text(settings, "shareProxyOnNetworkPassword"))
+            .or_else(|| env("AETHER_PSIPHON_PROXY_PASS"));
         if proxy_user.is_some() != proxy_pass.is_some() {
             return Err(
                 "psiphon: localProxyUsername and localProxyPassword must be named together"
@@ -294,16 +428,20 @@ impl Settings {
                     format!("psiphon: conduitMode {word:?} is not auto, shirokhorshid or public")
                 })
             })?;
-        let conduit_timeout = integer(
-            settings,
-            "conduitTimeoutSeconds",
-            "AETHER_PSIPHON_CONDUIT_TIMEOUT",
-        )
-        .filter(|value| *value > 0)
-        .map_or(Duration::from_secs(CONDUIT_TIMEOUT_SECS), |value| {
-            Duration::from_secs(value.min(86_400))
-        });
+        let conduit_timeout = json_integer(settings, "conduitTimeoutSeconds")
+            .or_else(|| json_integer(settings, "conduitTimeout"))
+            .or_else(|| env_integer("AETHER_PSIPHON_CONDUIT_TIMEOUT"))
+            .filter(|value| *value > 0)
+            .map_or(Duration::from_secs(CONDUIT_TIMEOUT_SECS), |value| {
+                Duration::from_secs(value.min(86_400))
+            });
         let mut server_lists = json_list(settings, "serverListURLs");
+        if server_lists.is_empty() {
+            server_lists = json_list(settings, "remoteServerListURLs");
+        }
+        if server_lists.is_empty() {
+            server_lists = json_list(settings, "RemoteServerListURLs");
+        }
         if server_lists.is_empty() {
             server_lists = json_list(settings, "serverListUrls");
         }
@@ -329,6 +467,55 @@ impl Settings {
                     .to_owned(),
             );
         }
+        let mut cdn_ips = json_list(settings, "cdnIps");
+        if cdn_ips.is_empty() {
+            cdn_ips = json_list(settings, "cdnFrontingCustomIpList");
+        }
+        if cdn_ips.is_empty() {
+            cdn_ips = env_list("AETHER_PSIPHON_CDN_IPS");
+        }
+        let mut cdn_sni = json_list(settings, "cdnSni");
+        if cdn_sni.is_empty() {
+            cdn_sni = json_list(settings, "cdnFrontingCustomSni");
+        }
+        if cdn_sni.is_empty() {
+            cdn_sni = env_list("AETHER_PSIPHON_CDN_SNI");
+        }
+        let mut client_features = list(settings, "clientFeatures", "AETHER_PSIPHON_FEATURES");
+        if flag(
+            settings,
+            "unsafeTrafficAlerts",
+            "AETHER_PSIPHON_UNSAFE_ALERTS",
+        ) && !client_features
+            .iter()
+            .any(|feature| feature == "unsafe-traffic-alerts")
+        {
+            client_features.push("unsafe-traffic-alerts".to_owned());
+        }
+        if integer(
+            settings,
+            "deviceLocationPrecision",
+            "AETHER_PSIPHON_LOCATION_PRECISION",
+        )
+        .is_some_and(|precision| precision > 0)
+            && !client_features
+                .iter()
+                .any(|feature| feature == "coarse-location")
+        {
+            client_features.push("coarse-location".to_owned());
+        }
+        let aggressive = if text(settings, "aggressiveEstablishment").is_some()
+            || env("AETHER_PSIPHON_AGGRESSIVE").is_some()
+        {
+            flag_or(
+                settings,
+                "aggressiveEstablishment",
+                "AETHER_PSIPHON_AGGRESSIVE",
+                true,
+            )
+        } else {
+            flag_or(settings, "beastMode", "AETHER_PSIPHON_BEAST", true)
+        };
         let out = Self {
             binary: text(settings, "binary")
                 .or_else(|| env("AETHER_PSIPHON_BIN"))
@@ -360,8 +547,8 @@ impl Settings {
             client_platform: text(settings, "clientPlatform")
                 .or_else(|| env("AETHER_PSIPHON_CLIENT_PLATFORM"))
                 .unwrap_or_else(client_platform),
-            cdn_ips: list(settings, "cdnIps", "AETHER_PSIPHON_CDN_IPS"),
-            cdn_sni: list(settings, "cdnSni", "AETHER_PSIPHON_CDN_SNI"),
+            cdn_ips,
+            cdn_sni,
             cdn_sets: list(settings, "cdnSets", "AETHER_PSIPHON_CDN_SETS"),
             cdn_profile: text(settings, "cdnProfile")
                 .or_else(|| env("AETHER_PSIPHON_CDN_PROFILE"))
@@ -378,6 +565,7 @@ impl Settings {
                     }
                 }),
             inproxy_compartment: text(settings, "inproxyCompartment")
+                .or_else(|| text(settings, "inproxyClientPersonalCompartmentId"))
                 .or_else(|| env("AETHER_PSIPHON_COMPARTMENT")),
             reject_proxy_countries,
             disable_timeouts: flag(
@@ -419,7 +607,7 @@ impl Settings {
             )?,
             proxy_user,
             proxy_pass,
-            client_features: list(settings, "clientFeatures", "AETHER_PSIPHON_FEATURES"),
+            client_features,
             latency: decimal(
                 settings,
                 "networkLatencyMultiplier",
@@ -440,12 +628,7 @@ impl Settings {
                 "AETHER_PSIPHON_WORKERS",
             )
             .filter(|value| *value > 0),
-            aggressive: flag_or(
-                settings,
-                "aggressiveEstablishment",
-                "AETHER_PSIPHON_AGGRESSIVE",
-                true,
-            ),
+            aggressive,
             limit_meek: flag(
                 settings,
                 "limitMeekBufferSizes",
@@ -514,12 +697,84 @@ impl Settings {
                 "staggerConnectionWorkersMilliseconds",
                 "AETHER_PSIPHON_STAGGER_WORKERS",
             ),
+            reduced_relay: reduced_relay(settings)?,
+            disable_port_mapping: tri(
+                settings,
+                "inproxyDisablePortMapping",
+                "AETHER_PSIPHON_DISABLE_PORT_MAPPING",
+            ),
+            disable_stun: tri(
+                settings,
+                "inproxyDisableSTUN",
+                "AETHER_PSIPHON_DISABLE_STUN",
+            ),
+            disable_ipv6_ice: tri(
+                settings,
+                "inproxyDisableIPv6ICECandidates",
+                "AETHER_PSIPHON_DISABLE_IPV6_ICE",
+            ),
+            disable_mobile_inbound: tri(
+                settings,
+                "inproxyDisableInboundForMobileNetworks",
+                "AETHER_PSIPHON_DISABLE_MOBILE_INBOUND",
+            ),
+            activity_notice_period: integer(
+                settings,
+                "inproxyProxyTotalActivityNoticePeriodMilliseconds",
+                "AETHER_PSIPHON_ACTIVITY_NOTICE_PERIOD",
+            )
+            .filter(|value| *value > 0),
+            stun_servers: list(
+                settings,
+                "inproxySTUNServerAddresses",
+                "AETHER_PSIPHON_STUN_SERVERS",
+            ),
+            stun_servers_rfc5780: list(
+                settings,
+                "inproxySTUNServerAddressesRFC5780",
+                "AETHER_PSIPHON_STUN_SERVERS_RFC5780",
+            ),
+            announce_delay: integer(
+                settings,
+                "inproxyProxyAnnounceDelayMilliseconds",
+                "AETHER_PSIPHON_ANNOUNCE_DELAY",
+            ),
+            announce_jitter: decimal(
+                settings,
+                "inproxyProxyAnnounceDelayJitter",
+                "AETHER_PSIPHON_ANNOUNCE_JITTER",
+            ),
+            destination_dial_timeout: integer(
+                settings,
+                "inproxyProxyDestinationDialTimeoutMilliseconds",
+                "AETHER_PSIPHON_DESTINATION_DIAL_TIMEOUT",
+            )
+            .filter(|value| *value > 0),
+            webrtc_debug: flag(
+                settings,
+                "inproxyEnableWebRTCDebugLogging",
+                "AETHER_PSIPHON_WEBRTC_DEBUG",
+            ),
         };
         if !out.relay_enabled() && out.relay_without_cap() {
             return Err(
                 "psiphon: an in-proxy relay setting was given without inproxyMaxCommonClients or inproxyMaxPersonalClients, and the client refuses to start its proxy with both caps at zero"
                     .to_owned(),
             );
+        }
+        if let Some(reduced) = out.reduced_relay {
+            let Some(common) = out.max_common_clients else {
+                return Err(
+                    "psiphon: a reduced relay needs inproxyMaxCommonClients, which is the cap it reduces"
+                        .to_owned(),
+                );
+            };
+            if reduced.max_common_clients > common {
+                return Err(format!(
+                    "psiphon: inproxyReducedMaxCommonClients {} is above inproxyMaxCommonClients {common}",
+                    reduced.max_common_clients
+                ));
+            }
         }
         Ok(out)
     }
@@ -536,6 +791,18 @@ impl Settings {
             || self.limit_downstream.is_some()
             || !self.reject_proxy_cidrs.is_empty()
             || self.emit_proxy_activity
+            || self.reduced_relay.is_some()
+            || self.disable_port_mapping == Some(true)
+            || self.disable_stun == Some(true)
+            || self.disable_ipv6_ice == Some(true)
+            || self.disable_mobile_inbound == Some(true)
+            || self.activity_notice_period.is_some()
+            || !self.stun_servers.is_empty()
+            || !self.stun_servers_rfc5780.is_empty()
+            || self.announce_delay.is_some()
+            || self.announce_jitter.is_some()
+            || self.destination_dial_timeout.is_some()
+            || self.webrtc_debug
     }
 
     fn credential(&self) -> Credential {
@@ -641,34 +908,27 @@ fn split_list(text: &str) -> Vec<String> {
         .collect()
 }
 
-fn flag(settings: Option<&Json>, key: &str, environment: &str) -> bool {
+/// A setting the config may leave out, so the client's own default stands when it is absent.
+fn tri(settings: Option<&Json>, key: &str, environment: &str) -> Option<bool> {
     settings
         .and_then(|settings| settings.get(key))
         .and_then(Json::as_bool)
-        .or_else(|| {
-            env(environment).map(|value| {
-                matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-        })
-        .unwrap_or(false)
+        .or_else(|| env(environment).map(|value| text_flag(&value)))
+}
+
+fn flag(settings: Option<&Json>, key: &str, environment: &str) -> bool {
+    tri(settings, key, environment).unwrap_or(false)
 }
 
 fn flag_or(settings: Option<&Json>, key: &str, environment: &str, default: bool) -> bool {
-    settings
-        .and_then(|settings| settings.get(key))
-        .and_then(Json::as_bool)
-        .or_else(|| {
-            env(environment).map(|value| {
-                matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "1" | "true" | "yes" | "on"
-                )
-            })
-        })
-        .unwrap_or(default)
+    tri(settings, key, environment).unwrap_or(default)
+}
+
+fn text_flag(value: &str) -> bool {
+    matches!(
+        value.to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on"
+    )
 }
 
 fn number(settings: Option<&Json>, key: &str) -> Option<f64> {
@@ -682,8 +942,18 @@ fn number(settings: Option<&Json>, key: &str) -> Option<f64> {
 }
 
 fn integer(settings: Option<&Json>, key: &str, environment: &str) -> Option<u64> {
+    json_integer(settings, key).or_else(|| env_integer(environment))
+}
+
+fn json_integer(settings: Option<&Json>, key: &str) -> Option<u64> {
     number(settings, key)
-        .or_else(|| env(environment).and_then(|value| value.parse::<f64>().ok()))
+        .filter(|value| value.is_finite() && *value >= 0.0 && value.fract() == 0.0)
+        .map(|value| value as u64)
+}
+
+fn env_integer(environment: &str) -> Option<u64> {
+    env(environment)
+        .and_then(|value| value.parse::<f64>().ok())
         .filter(|value| value.is_finite() && *value >= 0.0 && value.fract() == 0.0)
         .map(|value| value as u64)
 }
@@ -749,6 +1019,14 @@ fn default_state() -> PathBuf {
 fn listen_address(settings: Option<&Json>) -> Result<SocketAddr, String> {
     let text = text(settings, "listen")
         .or_else(|| env("AETHER_PSIPHON_BIND"))
+        .or_else(|| {
+            integer(
+                settings,
+                "shareProxyOnNetworkSocksPort",
+                "AETHER_PSIPHON_SHARE_PORT",
+            )
+            .map(|port| shared_bind(settings, port))
+        })
         .unwrap_or_else(|| psiphon::DEFAULT_BIND.to_owned());
     let address = text
         .parse::<SocketAddr>()
@@ -761,7 +1039,17 @@ fn listen_address(settings: Option<&Json>) -> Result<SocketAddr, String> {
 }
 
 fn http_address(settings: Option<&Json>) -> Result<Option<SocketAddr>, String> {
-    let Some(text) = text(settings, "httpListen").or_else(|| env("AETHER_PSIPHON_HTTP")) else {
+    let Some(text) = text(settings, "httpListen")
+        .or_else(|| env("AETHER_PSIPHON_HTTP"))
+        .or_else(|| {
+            integer(
+                settings,
+                "shareProxyOnNetworkHttpPort",
+                "AETHER_PSIPHON_SHARE_HTTP",
+            )
+            .map(|port| shared_bind(settings, port))
+        })
+    else {
         return Ok(None);
     };
     if text == "off" {
@@ -775,6 +1063,17 @@ fn http_address(settings: Option<&Json>) -> Result<Option<SocketAddr>, String> {
     } else {
         address
     }))
+}
+
+/// A shared port names only a port, so it binds every interface only when sharing was asked for;
+/// otherwise it stays on loopback, where the client's unauthenticated listener belongs.
+fn shared_bind(settings: Option<&Json>, port: u64) -> String {
+    let ip = if flag(settings, "shareProxyOnNetwork", "AETHER_PSIPHON_SHARE") {
+        "0.0.0.0"
+    } else {
+        "127.0.0.1"
+    };
+    format!("{ip}:{port}")
 }
 
 fn free_port(ip: IpAddr) -> Result<u16, String> {
@@ -1232,6 +1531,89 @@ fn build_config_with(settings: &Settings, personal: bool) -> Result<String, Stri
             &mut fields,
             "InproxyRejectProxyCIDRs",
             strings(&settings.reject_proxy_cidrs),
+        );
+    }
+    if let Some(reduced) = &settings.reduced_relay {
+        let (start, end) = reduced.times();
+        put(&mut fields, "InproxyReducedStartTime", Json::Str(start));
+        put(&mut fields, "InproxyReducedEndTime", Json::Str(end));
+        put(
+            &mut fields,
+            "InproxyReducedMaxCommonClients",
+            Json::Num(reduced.max_common_clients as f64),
+        );
+        for (key, value) in [
+            (
+                "InproxyReducedLimitUpstreamBytesPerSecond",
+                reduced.limit_upstream,
+            ),
+            (
+                "InproxyReducedLimitDownstreamBytesPerSecond",
+                reduced.limit_downstream,
+            ),
+        ] {
+            if let Some(value) = value {
+                put(&mut fields, key, Json::Num(value as f64));
+            }
+        }
+    }
+    for (key, value) in [
+        ("InproxyDisablePortMapping", settings.disable_port_mapping),
+        ("InproxyDisableSTUN", settings.disable_stun),
+        ("InproxyDisableIPv6ICECandidates", settings.disable_ipv6_ice),
+        (
+            "InproxyDisableInboundForMobileNetworks",
+            settings.disable_mobile_inbound,
+        ),
+    ] {
+        if let Some(value) = value {
+            put(&mut fields, key, Json::Bool(value));
+        }
+    }
+    for (key, value) in [
+        (
+            "InproxyProxyTotalActivityNoticePeriodMilliseconds",
+            settings.activity_notice_period,
+        ),
+        (
+            "InproxyProxyAnnounceDelayMilliseconds",
+            settings.announce_delay,
+        ),
+        (
+            "InproxyProxyDestinationDialTimeoutMilliseconds",
+            settings.destination_dial_timeout,
+        ),
+    ] {
+        if let Some(value) = value {
+            put(&mut fields, key, Json::Num(value as f64));
+        }
+    }
+    if let Some(jitter) = settings.announce_jitter {
+        put(
+            &mut fields,
+            "InproxyProxyAnnounceDelayJitter",
+            Json::Num(jitter),
+        );
+    }
+    if !settings.stun_servers.is_empty() {
+        put(
+            &mut fields,
+            "InproxySTUNServerAddresses",
+            strings(&settings.stun_servers),
+        );
+    }
+    if !settings.stun_servers_rfc5780.is_empty() {
+        put(
+            &mut fields,
+            "InproxySTUNServerAddressesRFC5780",
+            strings(&settings.stun_servers_rfc5780),
+        );
+    }
+    if settings.webrtc_debug {
+        put(
+            &mut fields,
+            "InproxyEnableWebRTCDebugLogging",
+            Json::Bool(true),
         );
     }
     if settings.emit_proxy_activity {
@@ -1743,6 +2125,47 @@ mod tests {
     }
 
     #[test]
+    fn shirokhorshid_preference_names_reach_the_same_settings() {
+        let settings = Settings::from_json(Some(&settings_json(
+            r#"{"shareProxyOnNetwork":true,"shareProxyOnNetworkSocksPort":1900,"shareProxyOnNetworkHttpPort":1901,"protocolSelection":"cdn_fronting","egressRegion":"ir","beastMode":false,"cdnFrontingCustomIpList":["192.0.2.1"],"cdnFrontingCustomSni":"edge.example","unsafeTrafficAlerts":true,"deviceLocationPrecision":2,"inproxyClientPersonalCompartmentId":"room"}"#,
+        )))
+        .expect("settings");
+        assert_eq!(settings.listen.port(), 1900);
+        assert_eq!(settings.http.map(|address| address.port()), Some(1901));
+        assert_eq!(settings.region.as_deref(), Some("IR"));
+        assert_eq!(settings.shape, Shape::Cdn);
+        assert!(!settings.aggressive, "beastMode is the same switch");
+        assert_eq!(settings.cdn_ips, ["192.0.2.1"]);
+        assert_eq!(settings.cdn_sni, ["edge.example"]);
+        assert_eq!(settings.inproxy_compartment.as_deref(), Some("room"));
+        assert!(settings
+            .client_features
+            .contains(&"unsafe-traffic-alerts".to_owned()));
+        assert!(settings
+            .client_features
+            .contains(&"coarse-location".to_owned()));
+        let config = build_config(&settings).expect("a config");
+        assert!(config.contains("\"LocalSocksProxyPort\":1900"));
+        assert!(config.contains("\"LocalHttpProxyPort\":1901"));
+        assert!(config.contains("\"EgressRegion\":\"IR\""));
+        assert!(!config.contains("\"AggressiveEstablishment\":true"));
+        assert!(config.contains("\"FrontedMeekCDNScanSpec\""));
+        assert!(config.contains("edge.example"));
+    }
+
+    #[test]
+    fn the_clients_own_key_outranks_its_android_alias() {
+        let settings = Settings::from_json(Some(&settings_json(
+            r#"{"listen":"127.0.0.1:1821","shape":"direct","protocolSelection":"conduit","conduitTimeoutSeconds":7,"conduitTimeout":3,"cdnIps":["192.0.2.9"],"cdnFrontingCustomIpList":["192.0.2.1"],"cdnSni":["a.example"],"cdnFrontingCustomSni":"b.example"}"#,
+        )))
+        .expect("settings");
+        assert_eq!(settings.shape, Shape::Direct);
+        assert_eq!(settings.conduit_timeout, Duration::from_secs(7));
+        assert_eq!(settings.cdn_ips, ["192.0.2.9"]);
+        assert_eq!(settings.cdn_sni, ["a.example"]);
+    }
+
+    #[test]
     fn split_tunnel_credentials_and_client_knobs_reach_the_config() {
         let settings = Settings::from_json(Some(&settings_json(
             r#"{"listen":"127.0.0.1:1821","localProxyUsername":"u","localProxyPassword":"p","splitTunnelOwnRegion":true,"splitTunnelRegions":["ir","de"],"clientFeatures":["VPN"],"networkLatencyMultiplier":1.5,"tunnelPoolSize":2,"connectionWorkerPoolSize":4,"aggressiveEstablishment":true,"limitCpuThreads":true,"limitMeekBufferSizes":true,"limitRelayBufferSizes":true,"limitTlsProfiles":["Chrome"],"limitQuicVersions":["v1"],"initialLimitTunnelProtocols":["SSH"],"initialLimitTunnelProtocolsCandidateCount":3}"#,
@@ -1806,6 +2229,110 @@ mod tests {
             "the client runs no proxy with both caps at zero, so the compartment would be inert",
         );
         assert!(refused.contains("inproxyMaxCommonClients"), "{refused}");
+    }
+
+    #[test]
+    fn a_reduced_relay_reaches_the_config_in_the_clients_own_clock() {
+        let settings = Settings::from_json(Some(&settings_json(
+            r#"{"listen":"127.0.0.1:1821","inproxyMaxCommonClients":12,"inproxyReducedStartTime":"23:30","inproxyReducedEndTime":"6:00","inproxyReducedMaxCommonClients":4,"inproxyReducedLimitUpstreamBytesPerSecond":32768,"inproxyReducedLimitDownstreamBytesPerSecond":65536}"#,
+        )))
+        .expect("settings");
+        let config = build_config(&settings).expect("a config");
+        for expected in [
+            "\"InproxyEnableProxy\":true",
+            "\"InproxyReducedStartTime\":\"23:30\"",
+            "\"InproxyReducedEndTime\":\"06:00\"",
+            "\"InproxyReducedMaxCommonClients\":4",
+            "\"InproxyReducedLimitUpstreamBytesPerSecond\":32768",
+            "\"InproxyReducedLimitDownstreamBytesPerSecond\":65536",
+        ] {
+            assert!(config.contains(expected), "{expected} in {config}");
+        }
+    }
+
+    #[test]
+    fn the_clients_deprecated_reduced_cap_is_read_as_the_modern_one() {
+        let settings = Settings::from_json(Some(&settings_json(
+            r#"{"listen":"127.0.0.1:1821","inproxyMaxCommonClients":12,"inproxyReducedStartTime":"01:00","inproxyReducedEndTime":"02:00","inproxyReducedMaxClients":3}"#,
+        )))
+        .expect("the client promotes InproxyReducedMaxClients into the modern field");
+        let config = build_config(&settings).expect("a config");
+        assert!(
+            config.contains("\"InproxyReducedMaxCommonClients\":3"),
+            "{config}"
+        );
+    }
+
+    #[test]
+    fn a_reduced_relay_needs_a_whole_window_inside_the_cap() {
+        for (document, reason) in [
+            (
+                r#""inproxyMaxCommonClients":12,"inproxyReducedStartTime":"23:30","inproxyReducedEndTime":"06:00""#,
+                "together",
+            ),
+            (
+                r#""inproxyMaxCommonClients":12,"inproxyReducedStartTime":"23:30","inproxyReducedMaxCommonClients":4"#,
+                "together",
+            ),
+            (
+                r#""inproxyMaxCommonClients":12,"inproxyReducedStartTime":"23:30","inproxyReducedEndTime":"23:30","inproxyReducedMaxCommonClients":4"#,
+                "differ",
+            ),
+            (
+                r#""inproxyMaxCommonClients":12,"inproxyReducedStartTime":"24:00","inproxyReducedEndTime":"06:00","inproxyReducedMaxCommonClients":4"#,
+                "not a time of day",
+            ),
+            (
+                r#""inproxyMaxCommonClients":12,"inproxyReducedStartTime":"23:30","inproxyReducedEndTime":"06:00","inproxyReducedMaxCommonClients":13"#,
+                "is above inproxyMaxCommonClients",
+            ),
+            (
+                r#""inproxyMaxPersonalClients":3,"inproxyReducedStartTime":"23:30","inproxyReducedEndTime":"06:00","inproxyReducedMaxCommonClients":1"#,
+                "which is the cap it reduces",
+            ),
+        ] {
+            let refused = Settings::from_json(Some(&settings_json(&format!(
+                "{{\"listen\":\"127.0.0.1:1821\",{document}}}"
+            ))))
+            .expect_err(reason);
+            assert!(refused.contains(reason), "{reason} in {refused}");
+        }
+    }
+
+    #[test]
+    fn the_reachability_knobs_reach_the_config() {
+        let settings = Settings::from_json(Some(&settings_json(
+            r#"{"listen":"127.0.0.1:1821","inproxyMaxCommonClients":8,"inproxyDisablePortMapping":true,"inproxyDisableSTUN":true,"inproxyDisableIPv6ICECandidates":true,"inproxyDisableInboundForMobileNetworks":true,"inproxyProxyTotalActivityNoticePeriodMilliseconds":1500,"inproxySTUNServerAddresses":["stun.example:3478"],"inproxySTUNServerAddressesRFC5780":["stun.example:3479"],"inproxyProxyAnnounceDelayMilliseconds":200,"inproxyProxyAnnounceDelayJitter":0.25,"inproxyProxyDestinationDialTimeoutMilliseconds":9000,"inproxyEnableWebRTCDebugLogging":true}"#,
+        )))
+        .expect("settings");
+        let config = build_config(&settings).expect("a config");
+        for expected in [
+            "\"InproxyDisablePortMapping\":true",
+            "\"InproxyDisableSTUN\":true",
+            "\"InproxyDisableIPv6ICECandidates\":true",
+            "\"InproxyDisableInboundForMobileNetworks\":true",
+            "\"InproxyProxyTotalActivityNoticePeriodMilliseconds\":1500",
+            "\"InproxySTUNServerAddresses\":[\"stun.example:3478\"]",
+            "\"InproxySTUNServerAddressesRFC5780\":[\"stun.example:3479\"]",
+            "\"InproxyProxyAnnounceDelayMilliseconds\":200",
+            "\"InproxyProxyAnnounceDelayJitter\":0.25",
+            "\"InproxyProxyDestinationDialTimeoutMilliseconds\":9000",
+            "\"InproxyEnableWebRTCDebugLogging\":true",
+        ] {
+            assert!(config.contains(expected), "{expected} in {config}");
+        }
+    }
+
+    #[test]
+    fn a_time_of_day_is_the_clients_own_clock() {
+        for (text, minutes) in [("00:00", 0u16), ("23:59", 1439), ("6:00", 360), ("0:0", 0)] {
+            assert_eq!(time_of_day(text), Some(minutes), "{text}");
+        }
+        for refused in ["24:00", "23:60", "2330", "", ":", "1:2:3", "23:30 "] {
+            assert_eq!(time_of_day(refused), None, "{refused}");
+        }
+        assert_eq!(clock(1439), "23:59");
+        assert_eq!(clock(0), "00:00");
     }
 
     #[test]
@@ -1954,6 +2481,23 @@ mod tests {
     }
 
     #[test]
+    fn a_shared_port_without_sharing_stays_on_loopback() {
+        let settings = Settings::from_json(Some(&settings_json(
+            r#"{"shareProxyOnNetworkSocksPort":1800,"shareProxyOnNetworkHttpPort":1801}"#,
+        )))
+        .expect("settings");
+        assert!(settings.listen.ip().is_loopback(), "{}", settings.listen);
+        assert!(settings.http.is_some_and(|http| http.ip().is_loopback()));
+        let config = build_config(&settings).expect("a config");
+        assert!(!config.contains("\"ListenInterface\""), "{config}");
+        let shared = Settings::from_json(Some(&settings_json(
+            r#"{"shareProxyOnNetwork":true,"shareProxyOnNetworkSocksPort":1800}"#,
+        )))
+        .expect("settings");
+        assert_eq!(shared.listen, SocketAddr::from(([0, 0, 0, 0], 1800)));
+    }
+
+    #[test]
     fn a_conduit_mode_decides_whether_the_compartment_is_named() {
         for (mode, named) in [("auto", true), ("shirokhorshid", true), ("public", false)] {
             let settings = Settings::from_json(Some(&settings_json(&format!(
@@ -2045,6 +2589,7 @@ mod tests {
                 pass: "p".to_owned(),
             }),
             version: Version::V5,
+            loopback: true,
         };
         let (flow, counts) = ferrox_core::alloc_count::measure(|| lane.clone());
         assert_eq!(counts.allocs, 0);
@@ -2081,6 +2626,48 @@ mod tests {
         )))
         .unwrap_err();
         assert!(error.contains("two-letter country code"), "{error}");
+    }
+
+    fn lane_at(address: SocketAddr, user: &str, pass: &str) -> PsiphonOut {
+        PsiphonOut {
+            _process: Arc::new(Process {
+                child: Mutex::new(None),
+                stopping: Arc::new(AtomicBool::new(false)),
+            }),
+            endpoint: address,
+            credential: Arc::new(Credential {
+                user: user.to_owned(),
+                pass: pass.to_owned(),
+            }),
+            version: Version::V5,
+            loopback: address.ip().is_loopback(),
+        }
+    }
+
+    #[test]
+    fn a_loopback_listener_takes_socks4a_without_the_credential() {
+        let lane = lane_at(SocketAddr::from(([127, 0, 0, 1], 1821)), "u", "p");
+        for target in [
+            Destination::V4([192, 0, 2, 1], 443),
+            Destination::Name(b"example.com", 443),
+        ] {
+            let (version, credential) = lane.session(&target);
+            assert_eq!(version, Version::V4);
+            assert!(credential.user.is_empty() && credential.pass.is_empty());
+            assert!(std::ptr::eq(credential, &raw const NO_CREDENTIAL));
+        }
+        let (version, credential) = lane.session(&Destination::V6([0; 16], 443));
+        assert_eq!(version, Version::V5, "SOCKS4 has no IPv6 form");
+        assert!(credential.user.is_empty() && credential.pass.is_empty());
+    }
+
+    #[test]
+    fn a_non_loopback_listener_keeps_socks5_and_its_credential() {
+        let lane = lane_at(SocketAddr::from(([192, 0, 2, 1], 1821)), "u", "p");
+        let (version, credential) = lane.session(&Destination::V4([192, 0, 2, 2], 443));
+        assert_eq!(version, Version::V5);
+        assert_eq!(credential.user, "u");
+        assert_eq!(credential.pass, "p");
     }
 
     #[test]
