@@ -499,6 +499,11 @@ mod tests {
             parse(&empty).expect("parses").is_none(),
             "an empty url still means no notifier"
         );
+        let absent = crate::json::parse(r#"{"deduplication":60}"#).expect("json");
+        assert!(
+            parse(&absent).expect("parses").is_none(),
+            "a missing url is the reference's nil notifier"
+        );
     }
 
     #[test]
