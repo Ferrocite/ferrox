@@ -58,7 +58,15 @@ pub(crate) struct Event<'a> {
 
 /// The rule's notifier, or `None` for an entry that names no URL: the reference builds none either.
 pub(crate) fn parse(field: &Json) -> Result<Option<Arc<Webhook>>, String> {
-    let url = field.get("url").and_then(Json::as_str).unwrap_or("");
+    if matches!(field, Json::Null) {
+        return Ok(None);
+    }
+    crate::router::object(field, "webhook")?;
+    let url = match field.get("url") {
+        None => return Ok(None),
+        Some(Json::Str(url)) => url,
+        Some(_) => return Err("webhook url is not a string".to_owned()),
+    };
     if url.is_empty() {
         return Ok(None);
     }
@@ -74,10 +82,12 @@ pub(crate) fn parse(field: &Json) -> Result<Option<Arc<Webhook>>, String> {
             }
         }
     }
-    let deduplication = field
-        .get("deduplication")
-        .and_then(Json::as_u32)
-        .unwrap_or(0);
+    let deduplication = match field.get("deduplication") {
+        None | Some(Json::Null) => 0,
+        Some(value) => value
+            .as_u32()
+            .ok_or_else(|| "webhook deduplication is not a non-negative integer".to_owned())?,
+    };
     Ok(Some(Arc::new(Webhook {
         url,
         socket,
@@ -470,6 +480,30 @@ mod tests {
     fn notifier(url: &str) -> Arc<Webhook> {
         let field = crate::json::parse(&format!(r#"{{"url":"{url}"}}"#)).expect("json");
         parse(&field).expect("parses").expect("a notifier")
+    }
+
+    #[test]
+    fn a_mistyped_webhook_is_refused() {
+        for text in [
+            r#""http://127.0.0.1/hook""#,
+            r#"{"url":42}"#,
+            r#"{"url":"http://127.0.0.1/hook","deduplication":"60"}"#,
+            r#"{"url":"http://127.0.0.1/hook","deduplication":-1}"#,
+            r#"{"url":"http://127.0.0.1/hook","deduplication":1.5}"#,
+        ] {
+            let field = crate::json::parse(text).expect("json");
+            assert!(parse(&field).is_err(), "{text} was accepted");
+        }
+        let empty = crate::json::parse(r#"{"url":""}"#).expect("json");
+        assert!(
+            parse(&empty).expect("parses").is_none(),
+            "an empty url still means no notifier"
+        );
+        let absent = crate::json::parse(r#"{"deduplication":60}"#).expect("json");
+        assert!(
+            parse(&absent).expect("parses").is_none(),
+            "a missing url is the reference's nil notifier"
+        );
     }
 
     #[test]
