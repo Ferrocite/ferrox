@@ -5173,10 +5173,7 @@ mod tests {
         let outbound = message(&[
             bytes_field(
                 2,
-                &typed(
-                    "xray.app.proxyman.SenderConfig",
-                    &bytes_field(4, &mux),
-                ),
+                &typed("xray.app.proxyman.SenderConfig", &bytes_field(4, &mux)),
             ),
             bytes_field(
                 3,
@@ -5186,9 +5183,8 @@ mod tests {
                 ),
             ),
         ]);
-        let json =
-            to_json(&config(&dokodemo(5000, &[varint_field(7, 2)]), &outbound))
-                .expect("the sender's mux decodes");
+        let json = to_json(&config(&dokodemo(5000, &[varint_field(7, 2)]), &outbound))
+            .expect("the sender's mux decodes");
         let enabled = json
             .get("outbounds")
             .and_then(Json::as_arr)
