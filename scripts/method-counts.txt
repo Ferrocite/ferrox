@@ -480,6 +480,7 @@ trojan header-reads-numeric-address 2 ferrox-app-proxy::tests::the_trojan_header
 trojan header-reads-domain-address 3 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
 trojan header-bytes-copied-out-of-the-buffer 0 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
 trojan key-bytes-compared-early-exit 0 ferrox-app-proxy::tests::the_key_compare_reads_every_byte
+trojan numeric-domain-header-allocations 0 ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven
 carrier-hysteria ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-hysteria tcp-flows-per-handshake 2 ferrox-app-proxy::tests::hysteria_shares_one_connection_between_two_flows
 carrier-hysteria closed-connections-reused 0 ferrox-app-proxy::tests::hysteria_redials_when_a_pooled_connection_closes

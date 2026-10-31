@@ -5683,9 +5683,9 @@ pub(crate) fn resolve_endpoint(host: &str, port: u16) -> Option<SocketAddr> {
 }
 
 fn resolve_name(host: &str, port: u16, local: bool) -> Option<SocketAddr> {
-    // An address literal takes the resolver's numeric path, with no cache key of its own.
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return (host, port).to_socket_addrs().ok()?.next();
+    // An address literal parses straight to an address: no cache key and no resolver iterator.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, port));
     }
     if let Some(resolver) = crate::dnsapp::installed() {
         let (ips, _) = if local {
@@ -23404,11 +23404,13 @@ const TROJAN_HEAD_MAX: usize = 56 + 2 + 1 + 1 + 1 + 255 + 2 + 2;
 
 /// Compares every byte, so timing hides how much of the key was right and a short read never agrees.
 fn key_agrees(got: &[u8], key: &[u8; 56]) -> bool {
-    if got.len() != key.len() {
+    let Ok(got) = <&[u8; 56]>::try_from(got) else {
         return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in got.iter().zip(key) {
+    };
+    let mut diff = 0u64;
+    for at in (0..56).step_by(8) {
+        let a = u64::from_ne_bytes(got[at..at + 8].try_into().expect("a full key word"));
+        let b = u64::from_ne_bytes(key[at..at + 8].try_into().expect("a full key word"));
         diff |= a ^ b;
     }
     diff == 0
@@ -30572,7 +30574,7 @@ mod tests {
                     .collect::<Vec<u8>>(),
                 2,
             ),
-            (b"\x03\x09localhost\x1f\x90".to_vec(), 3),
+            (b"\x03\x09127.0.0.1\x1f\x90".to_vec(), 3),
         ] {
             let mut wire = key.to_vec();
             wire.extend_from_slice(b"\r\n\x01");
@@ -30588,6 +30590,20 @@ mod tests {
             assert_eq!(cmd, 1, "{addr:?}");
             assert_eq!(reader.reads, reads, "{addr:?}");
         }
+
+        let numeric = b"\x03\x09127.0.0.1\x1f\x90";
+        let mut wire = key.to_vec();
+        wire.extend_from_slice(b"\r\n\x01");
+        wire.extend_from_slice(numeric);
+        wire.extend_from_slice(b"\r\n");
+        let (decoded, counts) = ferrox_core::alloc_count::measure(|| {
+            decode_trojan_request(&mut std::io::Cursor::new(wire), &[key])
+        });
+        assert!(decoded.is_some(), "the numeric domain header decodes");
+        assert_eq!(
+            counts.allocs, 0,
+            "a numeric domain is parsed, not walked through an allocating resolver iterator"
+        );
     }
 
     /// The server read is four for every address family and two for mux, down from five for an IP and six for a domain: the add-ons ride in with the command byte, and the port, family and the body's first byte share one read.
