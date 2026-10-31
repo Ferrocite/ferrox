@@ -36506,7 +36506,6 @@ mod tests {
                 r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
             ),
         ];
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
         for (tag, stream) in cases {
             let inbound = crate::json::parse(&format!(
                 r#"{{"protocol": "vmess", "settings": {{"clients": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},
@@ -36547,7 +36546,7 @@ mod tests {
             let vmess = VmessOut {
                 address: "127.0.0.1".to_owned(),
                 port,
-                id,
+                id: uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id"),
                 cipher: crate::vmess::Cipher::Auto,
                 auth_len: false,
                 no_termination: false,
