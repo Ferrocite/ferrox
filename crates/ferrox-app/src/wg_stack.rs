@@ -2443,7 +2443,7 @@ mod client_tests {
         let thread_config = config();
         let routes: UdpRoutes = Arc::default();
         let thread_routes = Arc::clone(&routes);
-        std::thread::spawn(move || {
+        crate::budgets::spawn(move || {
             let (to_tunnel, _) = std::sync::mpsc::channel();
             client_udp(
                 &thread_relay,
@@ -2651,7 +2651,7 @@ mod client_tests {
             "192.0.2.8:53".parse().unwrap(),
         ];
         let wanted = targets.clone();
-        std::thread::spawn(move || {
+        crate::budgets::spawn(move || {
             client_udp(
                 &thread_relay,
                 &thread_config,

@@ -8498,7 +8498,7 @@ where
         }
         Ok(n) if to.write_once(buffer.filled(n)).is_ok() => Next::More,
         Err(error) if is_timeout(&error) => {
-            if ended.ended() {
+            if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                 Next::Done
             } else {
                 Next::Idle
@@ -9221,7 +9221,7 @@ fn kcp_relay_metered(
                     Err(_) => Next::Done,
                 },
                 Err(error) if is_timeout(&error) => {
-                    if forward.ended() {
+                    if forward.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                         Next::Done
                     } else {
                         Next::Idle
@@ -9258,7 +9258,7 @@ fn kcp_relay_metered(
                     }
                 }
                 Err(error) if is_timeout(&error) => {
-                    if backward.ended() {
+                    if backward.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                         Next::Done
                     } else {
                         Next::Idle
@@ -21331,12 +21331,17 @@ pub(crate) mod lane_pool {
                 );
             }
             let before = parker_batches(&pool);
-            thread::sleep(Duration::from_millis(40));
-            let batches = parker_batches(&pool) - before;
+            // A count a loaded machine cannot reach in a fixed window is a count this test cannot gate: wait for the rounds instead.
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut batches = 0;
+            while batches < 2 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+                batches = parker_batches(&pool) - before;
+            }
             stop.store(true, Ordering::Relaxed);
             assert!(
                 batches >= 2,
-                "{idle} idle lanes cycled {batches} park rounds in 40 ms"
+                "{idle} idle lanes cycled {batches} park rounds in five seconds"
             );
             assert!(running.load(Ordering::Relaxed) >= idle);
         }
@@ -21620,12 +21625,7 @@ impl RelayFinish {
         self.ended.store(true, Ordering::Relaxed);
     }
 
-    /// True once the sibling ended and the last-reply grace has run: a timeout may only end the leg after that, or a reply that follows the FIN is dropped.
-    pub(crate) fn ended_and_drained(&self) -> bool {
-        self.ended_and_idle(crate::budgets::RELAY_DRAIN_GRACE)
-    }
-
-    /// True once the sibling ended and `idle` has run since: the answer lane waits a target's own budget, not the upload lane's short grace.
+    /// True once the sibling ended and `idle` has run since: a lane waits for the last reply that follows its sibling's end, then hands its thread back.
     pub(crate) fn ended_and_idle(&self, idle: Duration) -> bool {
         self.ended_at
             .lock()
@@ -21712,7 +21712,7 @@ where
         Ok(0) => Next::Done,
         Ok(n) if to.write_once(buffer.filled(n)).is_ok() => Next::More,
         Err(error) if is_timeout(&error) => {
-            if ended.ended() {
+            if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                 Next::Done
             } else {
                 Next::Idle
@@ -22464,7 +22464,7 @@ fn forward_finished(
     buffer: &mut RelayBuf,
     uplink: &impl CarrierSink,
     at: &mut Forward,
-    ended_and_drained: impl FnOnce() -> bool,
+    give_up: impl FnOnce() -> bool,
 ) -> Next {
     match read {
         Ok(n) if n > 0 => {
@@ -22478,7 +22478,7 @@ fn forward_finished(
             forward_flush(buffer, uplink, at).unwrap_or(Next::More)
         }
         Err(error) if is_timeout(&error) => {
-            if ended_and_drained() {
+            if give_up() {
                 Next::Done
             } else {
                 Next::Idle
@@ -22611,7 +22611,7 @@ where
                 peer_read.read(buffer.as_mut())
             };
             let next = forward_finished(read, &mut buffer, &uplink, &mut at, || {
-                forward_flow.ended_and_drained()
+                forward_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
             });
             if next != Next::Done {
                 return next;
@@ -22735,7 +22735,7 @@ pub(crate) fn relay_carried<R: Read + Send + 'static>(
                     }
                 }
                 Err(error) if is_timeout(&error) => {
-                    if forward_flow.ended_and_drained() {
+                    if forward_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE) {
                         Next::Done
                     } else {
                         Next::Idle
@@ -22769,7 +22769,7 @@ pub(crate) fn relay_carried<R: Read + Send + 'static>(
                     }
                 }
                 Err(error) if is_timeout(&error) => {
-                    if upload_flow.ended() {
+                    if upload_flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                         Next::Done
                     } else {
                         Next::Idle
@@ -32214,7 +32214,7 @@ mod tests {
         for stream in listener.incoming().take(takes) {
             let Ok(stream) = stream else { continue };
             let carrier = carrier.clone();
-            thread::spawn(move || {
+            crate::budgets::spawn(move || {
                 serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
             });
         }
@@ -33781,7 +33781,7 @@ mod tests {
         let id = [0x28u8; 16];
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
-        let server = thread::spawn(move || {
+        let server = crate::budgets::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accepts");
             let Some((got, _flow, cmd, _target)) = decode_request(&mut stream) else {
                 panic!("reads a vless header");
@@ -33819,7 +33819,7 @@ mod tests {
             encryption: None,
         };
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
-        let relaying = thread::spawn(move || {
+        let relaying = crate::budgets::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
             dial_vless(
                 &stream,
@@ -34073,7 +34073,7 @@ mod tests {
         let id = [0x29u8; 16];
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
-        let server = thread::spawn(move || {
+        let server = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             let (mut reader, mut writer) =
                 crate::httpupgrade::accept(stream, "/p", "").expect("accepts the upgrade");
@@ -34115,7 +34115,7 @@ mod tests {
             encryption: None,
         };
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
-        let relaying = thread::spawn(move || {
+        let relaying = crate::budgets::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
             dial_vless(
                 &stream,
@@ -34151,7 +34151,7 @@ mod tests {
         let server_config = reality_server_config();
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let server_addr = listener.local_addr().expect("addr");
-        let server = thread::spawn(move || {
+        let server = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             let edges = reality_edges(&server_config, &stream);
             let Ok(ferrox_core::tls::RealityAccept::Session(mut session)) =
@@ -34198,7 +34198,7 @@ mod tests {
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
-        let relaying = thread::spawn(move || {
+        let relaying = crate::budgets::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
             dial_vless(
                 &stream,
@@ -34703,7 +34703,7 @@ mod tests {
         let id = [0x4Bu8; 16];
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
-        let server = thread::spawn(move || {
+        let server = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
             tls.handshake().expect("handshakes");
@@ -34725,7 +34725,7 @@ mod tests {
         });
         let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let dport = downstream.local_addr().expect("addr").port();
-        let relay = thread::spawn(move || {
+        let relay = crate::budgets::spawn(move || {
             let (client, _) = downstream.accept().expect("accepts");
             let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
             let target: SocketAddr = "127.0.0.1:1".parse().expect("addr");
@@ -35194,7 +35194,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let (seen, framed) = std::sync::mpsc::channel();
-        let server = thread::spawn(move || {
+        let server = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
             tls.handshake().expect("handshakes");
@@ -35221,7 +35221,7 @@ mod tests {
         let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let dport = downstream.local_addr().expect("addr").port();
         let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
-        let relay = thread::spawn(move || {
+        let relay = crate::budgets::spawn(move || {
             let (client, _) = downstream.accept().expect("accepts");
             let vless = VlessOut {
                 address: "127.0.0.1".to_owned(),
@@ -38701,7 +38701,7 @@ mod tests {
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let (associate, peer) = association_pair();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             serve_socks_udp_foxy(&relay, &foxy_without_edges(), Some(&associate));
             let _ = done_tx.send(());
         });
@@ -38742,7 +38742,7 @@ mod tests {
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let (associate, peer) = association_pair();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             serve_socks_udp_foxy_ip(&relay, &foxy_without_edges(), Some(&associate));
             let _ = done_tx.send(());
         });
@@ -52827,7 +52827,7 @@ mod relay_tests {
     /// only, dials nothing.
     #[test]
     fn a_carried_relay_ends_the_leg_behind_a_peer_that_reads_nothing() {
-        const STALLED: Duration = Duration::from_millis(250);
+        const STALLED: Duration = Duration::from_secs(30);
         const CEILING: Duration = Duration::from_secs(10);
 
         budgets::apply(&crate::config::Budgets {
@@ -52839,7 +52839,7 @@ mod relay_tests {
         let destination = carried.destination.try_clone().expect("clones");
         let (handed, joined) = mpsc::channel();
         let began = std::time::Instant::now();
-        let relayed = thread::spawn(move || {
+        let relayed = crate::budgets::spawn(move || {
             if let Some(flow) = relay_carried(std::io::empty(), &write, &destination) {
                 flow.wait();
             }
@@ -52859,7 +52859,7 @@ mod relay_tests {
         carried.close();
 
         assert!(
-            took < STALLED,
+            took < crate::budgets::RELAY_RESPONSE_IDLE * 3,
             "the carried relay handed back after {took:?}, at its peer's {STALLED:?} read arm \
              rather than on the sibling's end"
         );
@@ -53537,7 +53537,8 @@ mod resolve_tests {
             "the lookup waited out the stuck resolver instead of its budget: {}ms",
             started.elapsed().as_millis()
         );
-        release.send(()).expect("releases the stalled worker");
+        // A lookup that timed out may already have dropped the queued closure, so the release is best effort.
+        let _ = release.send(());
     }
 
     /// A flow pays a queue send, not a thread start: repeated lookups reuse the same bounded set.

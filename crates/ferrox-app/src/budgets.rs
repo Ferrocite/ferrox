@@ -10,10 +10,7 @@ pub(crate) const HANDSHAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) const RELAY_POLL: Duration = Duration::from_millis(1);
 
-/// A lane whose sibling already ended still waits this long for the last reply before giving the flow up, so a peer that answers after the FIN reaches the sink.
-pub(crate) const RELAY_DRAIN_GRACE: Duration = Duration::from_millis(20);
-
-/// How long the answer lane keeps reading after the upload lane ended: a target may answer after the client's half-close, and xray-core's own `UplinkOnly` default is one second.
+/// How long a lane keeps reading after its sibling ended: a peer may answer after the FIN, and xray-core's own `UplinkOnly` default is one second. Past it the lane hands its thread back, so a peer that never answers cannot park it.
 pub(crate) const RELAY_RESPONSE_IDLE: Duration = Duration::from_secs(1);
 
 /// How long a connection we refused stays open after its GOAWAY: closing with the peer's bytes still unread makes the stack abort with RST, and that can swallow the refusal itself.

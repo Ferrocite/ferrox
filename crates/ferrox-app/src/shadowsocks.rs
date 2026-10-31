@@ -589,7 +589,10 @@ fn uplink_step(
     match read {
         Ok(0) => crate::proxy::lane_pool::Next::Done,
         Ok(n) if seal_all(send, buf, n, writer).is_ok() => crate::proxy::lane_pool::Next::More,
-        Err(error) if crate::proxy::is_timeout(&error) && !flow.ended() => {
+        Err(error)
+            if crate::proxy::is_timeout(&error)
+                && !flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) =>
+        {
             crate::proxy::lane_pool::Next::Idle
         }
         Ok(_) | Err(_) => crate::proxy::lane_pool::Next::Done,

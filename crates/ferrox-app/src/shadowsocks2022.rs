@@ -810,7 +810,10 @@ fn uplink_step(
                 }
             }
         },
-        Err(error) if crate::proxy::is_timeout(&error) && !flow.ended() => {
+        Err(error)
+            if crate::proxy::is_timeout(&error)
+                && !flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) =>
+        {
             return crate::proxy::lane_pool::Next::Idle;
         }
         Err(_) => return crate::proxy::lane_pool::Next::Done,

@@ -1065,7 +1065,7 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
                     }
                 }
                 Err(error) if crate::proxy::is_timeout(&error) => {
-                    if forward.ended() {
+                    if forward.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                         Next::Done
                     } else {
                         Next::Idle
@@ -1102,7 +1102,7 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
                     }
                 }
                 Ok(None) => {
-                    if backward.ended() {
+                    if backward.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                         Next::Done
                     } else {
                         Next::Idle

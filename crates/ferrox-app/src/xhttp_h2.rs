@@ -2205,7 +2205,7 @@ mod tests {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let sender = Arc::clone(&conn);
-        let running = thread::spawn(move || sender.send_data(1, b"ping"));
+        let running = crate::budgets::spawn(move || sender.send_data(1, b"ping"));
         let until = std::time::Instant::now() + Duration::from_secs(2);
         while conn.send_conn.try_lock().is_ok() {
             assert!(
@@ -2268,7 +2268,7 @@ mod tests {
             .unwrap_or_else(PoisonError::into_inner);
         let (sent, got) = std::sync::mpsc::channel();
         let sender = Arc::clone(&conn);
-        let running = thread::spawn(move || {
+        let running = crate::budgets::spawn(move || {
             let _ = sent.send(sender.send_data(1, b"ping"));
         });
         let until = std::time::Instant::now() + Duration::from_secs(2);

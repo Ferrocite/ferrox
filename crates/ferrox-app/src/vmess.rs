@@ -1637,7 +1637,7 @@ fn forward_step(
             }
         }
         Err(ref error) if crate::proxy::is_timeout(error) => {
-            if flow.ended_and_drained() {
+            if flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                 (Next::Done, false)
             } else {
                 (Next::Idle, false)
@@ -1674,7 +1674,7 @@ fn backward_step<R: Read>(
     }
     match reader.step(recv) {
         Opened::Idle => {
-            if flow.ended() {
+            if flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                 Next::Done
             } else {
                 Next::Idle

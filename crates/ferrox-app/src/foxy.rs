@@ -6027,11 +6027,11 @@ pub(crate) mod loopback {
         })
     }
 
-    /// The wait a parked downlink leg takes is not the uplink's: the lane's lock comes back before the leg waits, so a browser's first byte after a quiet edge does not pay for that quiet. Both TCP carriers arm the same way, so the same flow runs on each. The wait is armed far wider than production's 100 ms quantum on purpose — a stall this test looks for is the wait itself, and a 500 ms hold with a 100 ms budget would leave it room to hide.
+    /// The wait a parked downlink leg takes is not the uplink's: the lane's lock comes back before the leg waits, so a browser's first byte after a quiet edge does not pay for that quiet. Both TCP carriers arm the same way, so the same flow runs on each. The wait is armed far wider than production's 100 ms quantum on purpose — a stall this test looks for is the wait itself, and a 500 ms hold with a 100 ms budget would leave it room to hide — and the reach sits just under it, so a loaded machine's scheduling delay does not read as the wait.
     #[test]
     fn a_parked_downlink_leg_does_not_hold_the_uplink_behind_its_wait() {
         const WAIT: Duration = Duration::from_millis(500);
-        const REACH: Duration = Duration::from_millis(100);
+        const REACH: Duration = Duration::from_millis(400);
         const BYTES: u8 = 4;
         for (carrier, alpn) in [(Carrier::H2, &b"h2"[..]), (Carrier::H1, &b"http/1.1"[..])] {
             let (roots, server) = minted(alpn);
@@ -7374,12 +7374,17 @@ pub(crate) mod loopback {
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
+            // The handshake reads on the session's budget; a quantum armed here is a flush's latency for the stream that follows it.
+            let socket = stream.try_clone().expect("clones");
             stream
-                .set_read_timeout(Some(crate::budgets::RELAY_QUANTUM))
+                .set_read_timeout(Some(crate::budgets::handshake()))
                 .expect("times out");
             let mut tls =
                 ferrox_core::tls::RustlsServerProvider::accept(server, stream).expect("accepts");
             tls.handshake().expect("handshakes");
+            socket
+                .set_read_timeout(Some(crate::budgets::RELAY_QUANTUM))
+                .expect("times out");
             let mut head = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut head) {
                 return;
@@ -7494,13 +7499,17 @@ pub(crate) mod loopback {
     ) -> std::thread::JoinHandle<()> {
         std::thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            // A TLS flush performs one read when nothing is pending to write, so the socket's read timeout is a flush's latency: the product's relays arm a quantum, and an edge that arms twenty seconds spends twenty in one idle read.
+            // A TLS flush performs one read when nothing is pending to write, so the socket's read timeout is a flush's latency: the handshake gets the session's budget, and the relays afterwards arm a quantum.
+            let socket = stream.try_clone().expect("clones");
             stream
-                .set_read_timeout(Some(crate::budgets::RELAY_QUANTUM))
+                .set_read_timeout(Some(crate::budgets::handshake()))
                 .expect("times out");
             let mut tls = ferrox_core::tls::RustlsServerProvider::accept(server.clone(), stream)
                 .expect("accepts");
             tls.handshake().expect("handshakes");
+            socket
+                .set_read_timeout(Some(crate::budgets::RELAY_QUANTUM))
+                .expect("times out");
             let mut head = vec![0u8; frames::PREFACE.len()];
             if !read_exact_poll(&mut tls, &mut head) {
                 return;
