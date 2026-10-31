@@ -37,7 +37,7 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 1315 | scripts/count-ops.sh |
+| ops-retired-instructions | 1167 | scripts/count-ops.sh |
 | password-bytes-on-the-wire | 56 | ferrox-app-proxy::tests::trojan_key_is_sha224_hex |
 | framing-bytes-added-after-the-header | 0 | ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers |
 | udp-framing-bytes-per-datagram | 2 | ferrox-app-proxy::tests::trojan_udp_frames_carry |
@@ -56,7 +56,7 @@ graph TD
   proxy::tests::the_trojan_header_costs_two_reads_not_seven 'proxy::decode_trojan_request'
 ```
 
-The frame is `decode_trojan_request` over three fixed in-memory headers. The domain form carries the literal `127.0.0.1`, so the parser takes `resolve_name`'s literal arm and never enters `getaddrinfo`; the count is the header parse alone and reproduces across runs. It is **1315** retired instructions, blessed in `scripts/expected-ops.txt`; before the literal arm and the word fold the same frame read `80397` then `80812` across two runs of one binary because the resolver was inside it. The wire bytes and the three-read domain parse are unchanged.
+The frame is `decode_trojan_request` over three fixed in-memory headers. The domain form carries the literal `127.0.0.1`, so the byte-level IPv4 reader returns the address directly and neither `resolve_name` nor `getaddrinfo` is entered; the count is the header parse alone and reproduces across runs. It is **1167** retired instructions, blessed in `scripts/expected-ops.txt`; before the literal arm and the word fold the same frame read `80397` then `80812` across two runs of one binary because the resolver was inside it, and before the byte-level IPv4 reader it read `1315`. The wire bytes and the three-read domain parse are unchanged.
 
 ## Time
 
@@ -77,6 +77,8 @@ Read from one CI run of one `benchmark-matrix.yml` cell, `trojan-tls-raw-down-8`
 - **A key compare that returned on the first wrong byte, then walked it a byte at a time.** `got != *key` short-circuits, so the time it took said how much of the key was right. `key_agrees` folds the 56 bytes as seven `u64` words into one accumulator — seven XOR/OR pairs instead of fifty-six byte folds, every byte still read — and refuses a short read outright. `the_key_compare_reads_every_byte` is the gate.
 - **An MD5 or SHA-1 chain per connection.** The password arrives as its SHA-224 hex, so there is nothing to derive: 56 bytes on the wire, 56 bytes compared. Contrast Shadowsocks, where the MD5 chain and HKDF are real work and are named in [that page](shadowsocks.md).
 - **The `host:port` `String` a domain header serialised for the resolver.** `resolve_endpoint` did `format!("{host}:{port}").to_socket_addrs()`: it built one owned `String` and the `str` form then re-scanned it for the last `:` to split host and port back apart. The `(&str, u16)` tuple hands the resolver both as separate arguments — no serialisation, no `String`, no port re-scan — and a bracketless IPv6 host is no longer mangled by that split. The tuple still carries a real name to the resolver; see the literal arm below for the numeric form.
+
+- **The UTF-8 check and generic address parser a numeric domain paid for.** The domain form's bytes are already a slice, but the parser turned them into `&str` and then asked `IpAddr::from_str` to try IPv4 and IPv6 before `resolve_name`'s own literal arm. A byte-level IPv4 reader now consumes the same digits with the same leading-zero and three-digit rules, so a numeric host never crosses into UTF-8 validation or the generic parser. `the_trojan_ipv4_reader_matches_the_standard_parser` holds a table of valid and malformed literals against `Ipv4Addr::from_str`; the frame drops 148 instructions, and the reads, wire bytes and resolver path for a real name are unchanged.
 
 - **The resolver iterator a numeric domain paid for.** `resolve_name` parsed the literal to decide the address was numeric, then handed the same `(host, port)` to `to_socket_addrs`, which parses it again and allocates a one-element `Vec` for the iterator. The literal arm now returns `SocketAddr::new(ip, port)` directly, with no second parse, no `Vec` and no resolver entry. `the_trojan_numeric_domain_header_allocates_nothing` measures a Trojan domain-form header carrying `127.0.0.1` through the counting allocator and asserts zero allocations; `a_datagram_target_is_resolved_without_a_host_port_string` holds the same zero on the Shadowsocks datagram path. Both the answer and the wire bytes are unchanged; a real name still takes the resolver tuple.
 
