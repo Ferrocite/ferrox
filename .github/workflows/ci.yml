@@ -69,6 +69,10 @@ jobs:
         run: |
           python3 scripts/check-cli-args.py
           python3 scripts/check-cli-lane.py
+      - name: the Firefox pin
+        run: |
+          python3 scripts/update-firefox-version.py --selftest
+          python3 scripts/update-firefox-version.py --check
       - name: the gates that do not need a toolchain
         env:
           GATES: check-leak-surface check-comments check-merge-markers check-fixture-safety check-dependency-policy check-windows-binary-paths check-method-docs check-ci-scope

@@ -1138,14 +1138,13 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
     );
 }
 
-/// A serving identity's QUIC config: the lane's transport tuning, its certificate, and its congestion controller.
+/// A serving identity's QUIC config: the lane's transport tuning, its certificate list, and its congestion controller.
 pub(crate) fn server_config(
-    cert_path: &str,
-    key_path: &str,
+    identity: &ferrox_core::tls::TlsServerConfig,
     cc: hysteria::Congestion,
     quic: Option<&hysteria::QuicParams>,
 ) -> Option<quiche::Config> {
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
+    let mut config = crate::quic::tls_config(identity)?;
     config.set_application_protos(&[crate::quic::ALPN]).ok()?;
     config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
     // A served connection always carries an auth validator, and the reference enables the datagram lane exactly when one is present, so the lane is on unconditionally here; the depths are the peer's unsent-datagram queue, matching `udpMessageChanSize`.
@@ -1159,8 +1158,6 @@ pub(crate) fn server_config(
         // The served side carries the same ceilings as the dial: without them quiche's autotuner has no room above the initial window, and a peer's upload is paced by `window / rtt` for its whole life.
         None => crate::quic::tune_transport(&mut config),
     }
-    config.load_cert_chain_from_pem_file(cert_path).ok()?;
-    config.load_priv_key_from_pem_file(key_path).ok()?;
     Some(config)
 }
 
@@ -2355,9 +2352,8 @@ fn route_packet(
 pub(crate) fn serve_loop(
     address: &str,
     auths: &[String],
+    identity: &ferrox_core::tls::TlsServerConfig,
     cc: hysteria::Congestion,
-    cert_path: &str,
-    key_path: &str,
     obfs_password: &str,
     masq: &Masquerade,
     serve: &Serve,
@@ -2371,7 +2367,7 @@ pub(crate) fn serve_loop(
         return;
     };
     let local = sock.local_addr().unwrap_or(bound);
-    let Some(mut template) = server_config(cert_path, key_path, cc, quic) else {
+    let Some(mut template) = server_config(identity, cc, quic) else {
         return;
     };
     let sock = match hysteria::Salamander::new(obfs_password) {
@@ -2559,7 +2555,14 @@ mod tests {
     #[test]
     fn server_config_refuses_without_a_chain_it_can_read() {
         let cc = hysteria::Congestion::Bbr;
-        assert!(server_config("/nonexistent.crt", "/nonexistent.key", cc, None).is_none());
+        let empty = ferrox_core::tls::TlsServerConfig {
+            certs: Vec::new(),
+            ..minted_identity()
+        };
+        assert!(server_config(&empty, cc, None).is_none());
+        let mut double = minted_identity();
+        double.certs[0].key_der = vec![0u8; 16];
+        assert!(server_config(&double, cc, None).is_none());
     }
 
     #[test]
@@ -2568,11 +2571,9 @@ mod tests {
             quic: Some(hysteria::QuicParams::default()),
             ..hysteria::Config::default()
         };
-        let (mut server, cert_path, key_path) = server_template(&config);
+        let mut server = server_template(&config);
         let first = peer_params_with(&mut server, true);
         let second = peer_params_with(&mut server, true);
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
         assert!(
             first.stateless_reset_token.is_some(),
             "an enabled reset sends a token"
@@ -2586,43 +2587,39 @@ mod tests {
     #[test]
     fn a_disabled_stateless_reset_sends_no_token() {
         let config = hysteria::Config::default();
-        let (mut server, cert_path, key_path) = server_template(&config);
+        let mut server = server_template(&config);
         let params = peer_params_with(&mut server, false);
-        let _ = std::fs::remove_file(&cert_path);
-        let _ = std::fs::remove_file(&key_path);
         assert!(
             params.stateless_reset_token.is_none(),
             "a disabled reset advertises nothing"
         );
     }
 
-    /// A server template over a freshly minted certificate; the caller removes both files.
-    fn server_template(
-        config: &hysteria::Config,
-    ) -> (quiche::Config, std::path::PathBuf, std::path::PathBuf) {
+    fn minted_identity() -> ferrox_core::tls::TlsServerConfig {
         let minted = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()])
             .expect("mints a certificate");
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let tag = format!("ferrox-hysteria-reset-{}-{stamp}", std::process::id());
-        let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
-        let key_path = std::env::temp_dir().join(format!("{tag}.key"));
-        std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
-        std::fs::write(
-            &key_path,
-            crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY"),
-        )
-        .expect("stages key");
-        let server = server_config(
-            cert_path.to_str().expect("ascii"),
-            key_path.to_str().expect("ascii"),
-            config.cc,
-            config.quic.as_ref(),
-        )
-        .expect("a server config");
-        (server, cert_path, key_path)
+        ferrox_core::tls::TlsServerConfig {
+            certs: vec![ferrox_core::tls::CertEntry {
+                cert_chain: crate::quic::parse_ca_pem(minted.cert.pem().as_bytes()),
+                key_der: minted.signing_key.serialize_der(),
+                key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+                reload: None,
+            }],
+            alpn: Vec::new(),
+            min_version: None,
+            max_version: None,
+            cipher_suites: Vec::new(),
+            send_tickets: true,
+            reject_unknown_sni: false,
+            server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
+            master_key_log: None,
+        }
+    }
+
+    /// A server template over a freshly minted certificate.
+    fn server_template(config: &hysteria::Config) -> quiche::Config {
+        server_config(&minted_identity(), config.cc, config.quic.as_ref()).expect("a server config")
     }
 
     /// One accept off the shared template, then a client handshake to read what it sent.

@@ -1,0 +1,56 @@
+name: update-firefox-version
+
+# The Foxy lane carries one desktop Firefox identity; the binary never fetches
+# it. This moves the pin when Mozilla ships a major and leaves a PR for review.
+
+on:
+  schedule:
+    - cron: "17 3 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: update-firefox-version
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Check the committed pin
+        run: |
+          python3 scripts/update-firefox-version.py --selftest
+          python3 scripts/update-firefox-version.py --check
+      - name: Move the pin to stable
+        run: python3 scripts/update-firefox-version.py
+      - name: Verify the moved pin
+        run: python3 scripts/update-firefox-version.py --check
+      - name: Open or refresh the pull request
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if git diff --quiet -- crates/ferrox-app/src/foxy_challenge.rs; then
+            echo "the pin is already current"
+            exit 0
+          fi
+          version="$(python3 scripts/update-firefox-version.py --check --print-version)"
+          branch="chore/firefox-version-${version%%.*}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$branch"
+          git add crates/ferrox-app/src/foxy_challenge.rs
+          git commit -m "foxy: pin Firefox ${version}"
+          git push --force origin "$branch"
+          body="Mozilla stable moved the desktop Firefox identity to ${version}. \`scripts/update-firefox-version.py\` moved \`FIREFOX_VERSION\` and \`BROWSER_AGENT\` together; the pin check gates the pair."
+          if gh pr view "$branch" >/dev/null 2>&1; then
+            gh pr edit "$branch" --title "foxy: pin Firefox ${version}" --body "$body"
+          else
+            gh pr create --title "foxy: pin Firefox ${version}" --body "$body" --head "$branch" --base main
+          fi

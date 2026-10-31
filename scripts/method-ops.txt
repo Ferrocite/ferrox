@@ -190,3 +190,4 @@ front-healthcheck  proxy::hc_tests::the_front_scan_costs_every_window_it_has_alr
 front-healthcheck  proxy::hc_tests::the_seam_scan_costs_the_bytes_it_has_not_walked  ferrox_app::proxy::hc_tests::the_seam_scan_costs_the_bytes_it_has_not_walked
 carrier-quic  proxy::tests::quic_serves_vless_echo_over_loopback  quic::serve_loop
 wireguard  wireguard::device::tests::a_replayed_transport_counter_is_refused  wireguard::device::Tunnel::send
+carrier-quic  quic::tests::a_two_entry_identity_builds_every_context  quic::tls_config

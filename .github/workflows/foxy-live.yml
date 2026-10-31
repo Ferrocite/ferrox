@@ -88,6 +88,15 @@ jobs:
               echo "$bundle: $(grep -c 'BEGIN CERTIFICATE' "$bundle") certificates"
             fi
           done
+      # No account: a dummy credential must reach FxA, so a 406 here is the UA
+      # class and not the credential. This is the first gate the pinned Firefox
+      # identity has to clear before the real sign-in spends the account.
+      - name: The UA class, without an account
+        if: steps.secrets.outputs.present == 'true'
+        run: |
+          ./scripts/watch-test.sh --quiet 300 --out target/ci/foxy-ua.log -- \
+            cargo test -p ferrox-app --locked -- --ignored --nocapture --test-threads=1 \
+              foxy_live::a_dummy_account_clears_the_edge_without_a_browser
       # Signs in for real, mints for real, reads the catalogue, and reports which
       # carriers answered. Every output line is metadata; the pass is never
       # printed. This is the only check that can say whether QUIC works.

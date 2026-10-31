@@ -22,8 +22,9 @@ fi
 
 if git grep -I -n -E 'Instant::now|SystemTime::now' -- crates/ferrox-core/src \
     ':!crates/ferrox-core/src/kcp/**' \
-    ':!crates/ferrox-core/src/chacha/calibrate.rs'; then
-  echo "::error::ferrox-core must stay deterministic — wall-clock reads live in ferrox-bench (two named exceptions: kcp/ is retransmission-timed by definition, chacha/calibrate.rs picks between two byte-identical one-block cores)"
+    ':!crates/ferrox-core/src/chacha/calibrate.rs' \
+    ':!crates/ferrox-core/src/tls/shaped/client.rs'; then
+  echo "::error::ferrox-core must stay deterministic — wall-clock reads live in ferrox-bench (three named exceptions: kcp/ is retransmission-timed by definition, chacha/calibrate.rs picks between two byte-identical one-block cores, tls/shaped/client.rs bounds a handshake by one absolute deadline)"
   status=1
 fi
 

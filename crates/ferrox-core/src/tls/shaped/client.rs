@@ -8,6 +8,7 @@ use rustls::client::danger::ServerCertVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use std::io::{Read, Write};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 const HANDSHAKE: u8 = 22;
 const ALERT: u8 = 21;
@@ -17,8 +18,11 @@ const MAX_RECORD: usize = 16384 + 256;
 const RECORD_READ: usize = 16384;
 const MAX_HANDSHAKE: usize = 1 << 20;
 const MAX_PLAINTEXT: usize = 16384;
-/// How many poll quanta a handshake record may spend waiting for the socket: at KCP's 20 ms read that is 30 s, and a retry cannot re-enter a shaped hello already on the wire.
-const HANDSHAKE_POLLS: u32 = 1_500;
+/// How long a shaped handshake may spend waiting for its peer, matching the KCP path's read deadline.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long an immediate `WouldBlock` waits before the handshake asks again; a transport with a read timeout has already waited, a nonblocking one has not.
+const WOULD_BLOCK_RETRY: Duration = Duration::from_millis(1);
 
 /// The `HelloRetryRequest` random, which names the message without a new type.
 const HRR_RANDOM: [u8; 32] = [
@@ -40,7 +44,7 @@ pub struct Session<S: Stream> {
     server_name: ServerName<'static>,
     profile: &'static Profile,
     hello: Option<Hello>,
-    handshake_polls: Option<u32>,
+    handshake_deadline: Option<Instant>,
     client_random: [u8; 32],
     transcript: Vec<u8>,
     version: Option<Version>,
@@ -124,7 +128,7 @@ impl<S: Stream> Session<S> {
             server_name,
             profile,
             hello: Some(hello),
-            handshake_polls: None,
+            handshake_deadline: None,
             client_random: [0u8; 32],
             transcript: Vec::new(),
             version: None,
@@ -180,12 +184,19 @@ impl<S: Stream> Session<S> {
         self.plain.capacity()
     }
 
+    /// Runs the shaped handshake, reading against one absolute deadline from the first call.
     fn run(&mut self) -> Result<(), TlsError> {
         if self.done {
             return Ok(());
         }
-        if self.handshake_polls.is_none() {
-            self.handshake_polls = Some(HANDSHAKE_POLLS);
+        if self.handshake_deadline.is_none() {
+            self.handshake_deadline = Some(Instant::now() + HANDSHAKE_TIMEOUT);
+        }
+        if self
+            .handshake_deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(TlsError::Timeout);
         }
         let mut hello = self
             .hello
@@ -256,7 +267,7 @@ impl<S: Stream> Session<S> {
         }?;
         self.check_alpn(&hello, &mut sh)?;
         self.done = true;
-        self.handshake_polls = None;
+        self.handshake_deadline = None;
         Ok(())
     }
 
@@ -558,13 +569,9 @@ impl<S: Stream> Session<S> {
 
     /// Reads one record's body into `plain`, decrypts it in place, and leaves its content pending there.
     fn read_record(&mut self) -> Result<u8, TlsError> {
-        let mut polls = self.handshake_polls.unwrap_or(0);
+        let deadline = self.handshake_deadline;
         let mut header = [0u8; 5];
-        let exact = exact_until(&mut self.io, &mut header, &mut polls);
-        if self.handshake_polls.is_some() {
-            self.handshake_polls = Some(polls);
-        }
-        exact?;
+        exact_until(&mut self.io, &mut header, deadline)?;
         let len = usize::from(u16::from_be_bytes([header[3], header[4]]));
         if len > MAX_RECORD {
             return Err(TlsError::Other(
@@ -576,11 +583,7 @@ impl<S: Stream> Session<S> {
         if self.plain.len() < len {
             self.plain.resize(len, 0);
         }
-        let exact = exact_until(&mut self.io, &mut self.plain[..len], &mut polls);
-        if self.handshake_polls.is_some() {
-            self.handshake_polls = Some(polls);
-        }
-        exact?;
+        exact_until(&mut self.io, &mut self.plain[..len], deadline)?;
         let Self {
             read_key,
             server12,
@@ -1632,17 +1635,26 @@ fn exact_before<S: Read>(io: &mut S, buf: &mut [u8]) -> (usize, Result<(), TlsEr
     (filled, Ok(()))
 }
 
-/// Fills `buf` from the transport; a non-zero `polls` is a handshake's budget, so a poll-quantum expiry waits for the peer instead of failing a hello that is already on the wire.
-fn exact_until<S: Read>(io: &mut S, mut buf: &mut [u8], polls: &mut u32) -> Result<(), TlsError> {
+/// Fills `buf` from the transport; a handshake's deadline lets a poll-quantum expiry wait for the peer instead of failing a hello that is already on the wire.
+fn exact_until<S: Read>(
+    io: &mut S,
+    mut buf: &mut [u8],
+    deadline: Option<Instant>,
+) -> Result<(), TlsError> {
     while !buf.is_empty() {
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            return Err(TlsError::Timeout);
+        }
         match io.read(buf) {
             Ok(0) => return Err(TlsError::Closed),
             Ok(n) => buf = &mut buf[n..],
             Err(error) if TlsError::is_timeout(&error) => {
-                if *polls == 0 {
+                if deadline.is_none() {
                     return Err(TlsError::Timeout);
                 }
-                *polls -= 1;
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    std::thread::sleep(WOULD_BLOCK_RETRY);
+                }
             }
             Err(error) => return Err(TlsError::from(error)),
         }
@@ -1812,7 +1824,7 @@ mod tests {
             server_name: ServerName::try_from("tls.test".to_owned()).expect("name"),
             profile: profiles::profile("chrome").expect("chrome profile"),
             hello: None,
-            handshake_polls: None,
+            handshake_deadline: None,
             client_random: [0; 32],
             transcript: Vec::new(),
             version: Some(version),
@@ -2492,12 +2504,74 @@ mod tests {
         );
         subject.read_key = None;
         subject.done = false;
-        subject.handshake_polls = Some(HANDSHAKE_POLLS);
+        subject.handshake_deadline = Some(Instant::now() + HANDSHAKE_TIMEOUT);
         assert_eq!(
             subject.read_record().expect("the handshake record resumes"),
             HANDSHAKE
         );
         assert_eq!(subject.pending(), &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_handshake_past_its_deadline_stops_at_the_next_timeout() {
+        let mut wire = vec![HANDSHAKE, 0x03, 0x03, 0x00, 0x04];
+        wire.extend_from_slice(&[1, 2, 3, 4]);
+        let mut subject = session_on(
+            SplitRead {
+                wire,
+                at: 0,
+                stall_at: 7,
+                stalled: false,
+            },
+            Version::Tls13,
+            Suite::Aes128GcmSha256,
+            Direction::tls13(Suite::Aes128GcmSha256, &[0u8; 32]),
+            Direction::tls13(Suite::Aes128GcmSha256, &[0u8; 32]),
+        );
+        subject.read_key = None;
+        subject.done = false;
+        subject.handshake_deadline = Some(
+            Instant::now()
+                .checked_sub(Duration::from_secs(1))
+                .expect("one second before now"),
+        );
+        let error = subject
+            .read_record()
+            .expect_err("a handshake past its deadline refuses");
+        assert_eq!(
+            error,
+            TlsError::Timeout,
+            "the refusal is the handshake's timeout"
+        );
+    }
+
+    #[test]
+    fn a_would_block_waits_before_asking_again() {
+        struct AlwaysWouldBlock {
+            reads: usize,
+        }
+
+        impl Read for AlwaysWouldBlock {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+
+        let mut stream = AlwaysWouldBlock { reads: 0 };
+        let mut buf = [0u8; 1];
+        let error = exact_until(
+            &mut stream,
+            &mut buf,
+            Some(Instant::now() + Duration::from_millis(20)),
+        )
+        .expect_err("the deadline expires");
+        assert_eq!(error, TlsError::Timeout);
+        assert!(
+            stream.reads < 100,
+            "{} reads in 20 ms is a spin",
+            stream.reads
+        );
     }
 
     struct SplitRead {

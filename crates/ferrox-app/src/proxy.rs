@@ -18,9 +18,8 @@ use crate::budgets::{
 };
 use crate::config::{
     inbound_carrier, inbound_reality_config, inbound_tls_identity, outbound_carrier,
-    outbound_reality, outbound_tls, server_fallbacks, stream_security, tls_ca_roots,
-    tls_cert_paths, trojan_key, uuid_bytes, vless_security_supported, Carrier, Fallback,
-    FallbackNetwork,
+    outbound_reality, outbound_tls, server_fallbacks, stream_security, tls_ca_roots, trojan_key,
+    uuid_bytes, vless_security_supported, Carrier, Fallback, FallbackNetwork,
 };
 use crate::json::Json;
 use ferrox_core::failure::{Failure, Kind, Ladder, Rung, Stage};
@@ -837,11 +836,10 @@ fn serve_vless_inbound(
                 eprintln!("unreadable hysteria identity in {path}: serves nothing");
                 return false;
             };
-            let Some((cert_path, key_path)) = tls_cert_paths(settings) else {
+            let Some(identity) = crate::config::tls_identity_from_settings(settings) else {
                 eprintln!("unreadable hysteria identity in {path}: serves nothing");
                 return false;
             };
-            let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
             let masq = crate::config::masquerade_from_stream(Some(settings));
             let users = Arc::clone(&users);
             let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
@@ -849,7 +847,7 @@ fn serve_vless_inbound(
                 serve_vless_hysteria(flow.with_meter(meter.clone()), &users, freedom);
             });
             thread::spawn(move || {
-                serve_hysteria_thread(&owned, &config, &cert_path, &key_path, &masq, &serve);
+                serve_hysteria_thread(&owned, &config, &identity, &masq, &serve);
             });
             true
         }
@@ -909,17 +907,15 @@ fn serve_vless_inbound(
 fn serve_hysteria_thread(
     address: &str,
     config: &ferrox_core::hysteria::Config,
-    cert_path: &str,
-    key_path: &str,
+    identity: &ferrox_core::tls::TlsServerConfig,
     masq: &ferrox_core::hysteria::Masquerade,
     serve: &crate::hysteria::Serve,
 ) {
     crate::hysteria::serve_loop(
         address,
         std::slice::from_ref(&config.auth),
+        identity,
         config.cc,
-        cert_path,
-        key_path,
         &config.obfs_password,
         masq,
         serve,
@@ -9384,11 +9380,10 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
         eprintln!("hysteria inbound in {path} is not on the hysteria transport: serves nothing");
         return false;
     }
-    let Some((cert_path, key_path)) = tls_cert_paths(stream) else {
+    let Some(identity) = crate::config::tls_identity_from_settings(stream) else {
         eprintln!("unreadable hysteria identity in {path}: serves nothing");
         return false;
     };
-    let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
     let owned = address.to_owned();
     let mut obfs_password = String::new();
     // A named obfuscation this build cannot honour is refused rather than served in the clear.
@@ -9430,9 +9425,8 @@ fn serve_hysteria_inbound(address: &str, inbound: &Json, freedom: bool, path: &s
         crate::hysteria::serve_loop(
             &owned,
             &auths,
+            &identity,
             cc,
-            &cert_path,
-            &key_path,
             &obfs_password,
             &masq,
             &serve,
@@ -9468,11 +9462,10 @@ fn serve_hysteria_v1_inbound(address: &str, inbound: &Json, freedom: bool, path:
         eprintln!("hysteria inbound in {path} is not on the hysteria transport: serves nothing");
         return false;
     }
-    let Some((cert_path, key_path)) = tls_cert_paths(stream) else {
+    let Some(identity) = crate::config::tls_identity_from_settings(stream) else {
         eprintln!("unreadable hysteria identity in {path}: serves nothing");
         return false;
     };
-    let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
     let config = match crate::config::hysteria_v1_config(Some(stream)) {
         Ok(config) => config,
         Err(why) => {
@@ -9485,7 +9478,7 @@ fn serve_hysteria_v1_inbound(address: &str, inbound: &Json, freedom: bool, path:
         serve_hysteria_v1_flow(flow, &host, port, freedom);
     });
     thread::spawn(move || {
-        crate::hysteria_v1::serve_loop(&owned, &auths, &cert_path, &key_path, &serve, &config);
+        crate::hysteria_v1::serve_loop(&owned, &auths, &identity, &serve, &config);
     });
     true
 }
@@ -10500,11 +10493,10 @@ fn serve_trojan_transport_inbound(
         eprintln!("unreadable hysteria identity in trojan: serves nothing");
         return Some(false);
     };
-    let Some((cert_path, key_path)) = tls_cert_paths(settings) else {
+    let Some(identity) = crate::config::tls_identity_from_settings(settings) else {
         eprintln!("unreadable hysteria identity in trojan: serves nothing");
         return Some(false);
     };
-    let (cert_path, key_path) = (cert_path.to_owned(), key_path.to_owned());
     let masq = crate::config::masquerade_from_stream(Some(settings));
     let config = config.clone();
     let owned = address.to_owned();
@@ -10514,7 +10506,7 @@ fn serve_trojan_transport_inbound(
         serve_trojan_hysteria(flow.with_meter(meter.clone()), &key, freedom);
     });
     thread::spawn(move || {
-        serve_hysteria_thread(&owned, &config, &cert_path, &key_path, &masq, &serve);
+        serve_hysteria_thread(&owned, &config, &identity, &masq, &serve);
     });
     Some(true)
 }
@@ -25715,6 +25707,24 @@ fn foxy_ports(value: Option<&Json>) -> Vec<u16> {
         .collect()
 }
 
+fn foxy_exit_probe(
+    link: &ferrox_core::foxy::link::FoxyLink,
+    settings: Option<&Json>,
+) -> Option<String> {
+    let probe = foxy_text_or(link, settings, "exitProbe");
+    (!probe.is_empty()).then_some(probe)
+}
+
+fn foxy_pasted_pass(token: &str) -> ferrox_core::foxy::Pass {
+    ferrox_core::foxy::Pass {
+        token: std::sync::Arc::from(token),
+        expires_at: ferrox_core::foxy::account::jwt_expiry(token),
+        quota_remaining: None,
+        quota_reset: None,
+        quota_limit: None,
+    }
+}
+
 /// One plane refusal's pace: a retryable one is asked again after the gap it named, a final one is handed back at once.
 fn retry_plane(
     what: &str,
@@ -25981,6 +25991,14 @@ fn foxy_h3_over_http(
     upstream.is_some_and(crate::foxy::UpstreamProxy::http) && carrier == crate::foxy::Carrier::H3
 }
 
+/// A config's explicit `FxA` identity is process-wide; empty restores the pin and an invalid one warns.
+fn apply_fxa_user_agent(settings: Option<&Json>) {
+    let value = foxy_text(settings, "fxaUserAgent");
+    if let Err(why) = crate::foxy_challenge::set_fxa_user_agent(&value) {
+        eprintln!("foxy: fxaUserAgent {why}: keeping the current identity");
+    }
+}
+
 fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
     let empty = Vec::new();
     for outbound in root
@@ -26022,13 +26040,8 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             eprintln!("foxy: carrier h3 cannot ride an http upstreamProxy: use socks5(h)://, h1, h2 or auto");
             continue;
         }
-        let pasted = ferrox_core::foxy::Pass {
-            token: std::sync::Arc::from(configured.clone()),
-            expires_at: ferrox_core::foxy::account::jwt_expiry(&configured),
-            quota_remaining: None,
-            quota_reset: None,
-            quota_limit: None,
-        };
+        apply_fxa_user_agent(settings);
+        let pasted = foxy_pasted_pass(&configured);
         let account = foxy_account(
             &email,
             &password,
@@ -26072,10 +26085,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             edge_address,
             direct_ports: foxy_ports(settings.and_then(|s| s.get("directPorts"))),
             direct_suffixes: foxy_list_or(&link, settings, "directDomains"),
-            exit_probe: match foxy_text_or(&link, settings, "exitProbe") {
-                probe if probe.is_empty() => None,
-                probe => Some(probe),
-            },
+            exit_probe: foxy_exit_probe(&link, settings),
             verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
             probe_unavailable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             exit_probe_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -45827,6 +45837,31 @@ mod tests {
         hysteria_loop_masq(auth, id, obfs, ferrox_core::hysteria::Masquerade::NotFound)
     }
 
+    /// A certificate and the roots that trust it, minted for a loopback server.
+    fn minted_tls_identity(name: &str) -> (Arc<ferrox_core::tls::TlsServerConfig>, Vec<Vec<u8>>) {
+        let minted = rcgen::generate_simple_self_signed(vec![name.to_owned()]).expect("mints");
+        let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
+        assert_ne!(roots, Vec::<Vec<u8>>::new());
+        let identity = Arc::new(ferrox_core::tls::TlsServerConfig {
+            certs: vec![ferrox_core::tls::CertEntry {
+                cert_chain: roots.clone(),
+                key_der: minted.signing_key.serialize_der(),
+                key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+                reload: None,
+            }],
+            alpn: Vec::new(),
+            min_version: None,
+            max_version: None,
+            cipher_suites: Vec::new(),
+            send_tickets: true,
+            reject_unknown_sni: false,
+            server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
+            master_key_log: None,
+        });
+        (identity, roots)
+    }
+
     /// Brings up a hysteria inbound on a free port with the given masquerade cover, so a test can point a browser at it and read what the cover answers.
     fn hysteria_loop_masq(
         auth: &str,
@@ -45846,37 +45881,45 @@ mod tests {
         masq: ferrox_core::hysteria::Masquerade,
         serve: crate::hysteria::Serve,
     ) -> (u16, Vec<Vec<u8>>) {
-        let minted =
-            rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let tag = format!("ferrox-hysteria-test-{}-{stamp}", std::process::id());
-        let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
-        let key_path = std::env::temp_dir().join(format!("{tag}.key"));
-        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
-        std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
-        std::fs::write(&key_path, &key_pem).expect("stages key");
+        let (identity, roots) = minted_tls_identity("localhost");
+        hysteria_loop_with_identity(auth, obfs, masq, identity, roots, serve)
+    }
+
+    fn hysteria_loop_identity(
+        auth: &str,
+        id: [u8; 16],
+        obfs: &str,
+        masq: ferrox_core::hysteria::Masquerade,
+        identity: Arc<ferrox_core::tls::TlsServerConfig>,
+        roots: Vec<Vec<u8>>,
+    ) -> (u16, Vec<Vec<u8>>) {
+        let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+            serve_vless_hysteria(flow, &one_vless_user(&id), true);
+        });
+        hysteria_loop_with_identity(auth, obfs, masq, identity, roots, serve)
+    }
+
+    fn hysteria_loop_with_identity(
+        auth: &str,
+        obfs: &str,
+        masq: ferrox_core::hysteria::Masquerade,
+        identity: Arc<ferrox_core::tls::TlsServerConfig>,
+        roots: Vec<Vec<u8>>,
+        serve: crate::hysteria::Serve,
+    ) -> (u16, Vec<Vec<u8>>) {
         let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
-        let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
-        assert_ne!(roots, Vec::<Vec<u8>>::new());
         let address = format!("127.0.0.1:{port}");
         let auths = vec![auth.to_owned()];
         let obfs = obfs.to_owned();
-        let (cert_path, key_path) = (
-            cert_path.to_str().expect("ascii").to_owned(),
-            key_path.to_str().expect("ascii").to_owned(),
-        );
+
         thread::spawn(move || {
             crate::hysteria::serve_loop(
                 &address,
                 &auths,
+                &identity,
                 ferrox_core::hysteria::Congestion::Bbr,
-                &cert_path,
-                &key_path,
                 &obfs,
                 &masq,
                 &serve,
@@ -46043,10 +46086,23 @@ mod tests {
         target: SocketAddr,
         obfs: &str,
     ) -> Connection {
+        hysteria_tcp_pair_host(port, roots, auth, id, target, obfs, "localhost")
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn hysteria_tcp_pair_host(
+        port: u16,
+        roots: Vec<Vec<u8>>,
+        auth: &str,
+        id: [u8; 16],
+        target: SocketAddr,
+        obfs: &str,
+        host: &str,
+    ) -> Connection {
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let front_port = front.local_addr().expect("addr").port();
         let dial = crate::hysteria::Dial {
-            host: "localhost".to_owned(),
+            host: host.to_owned(),
             address: "127.0.0.1".to_owned(),
             port,
             config: ferrox_core::hysteria::Config {
@@ -47153,6 +47209,32 @@ mod tests {
     }
 
     #[test]
+    fn hysteria_serves_the_certificate_the_sni_names() {
+        let _serial = quic_serial();
+        let echo_port = echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (first, _) = minted_tls_identity("first.test");
+        let (second, roots) = minted_tls_identity("second.test");
+        let mut identity = (*first).clone();
+        identity.certs.push(second.certs[0].clone());
+        let (port, roots) = hysteria_loop_identity(
+            "test-auth",
+            id,
+            "",
+            ferrox_core::hysteria::Masquerade::NotFound,
+            Arc::new(identity),
+            roots,
+        );
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut client =
+            hysteria_tcp_pair_host(port, roots, "test-auth", id, target, "", "second.test");
+        client.write_all(b"ping").expect("writes");
+        let mut back = [0u8; 4];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+    }
+
+    #[test]
     fn hysteria_v1_carries_a_tcp_echo_over_loopback() {
         let _serial = quic_serial();
         let echo_port = echo_loop();
@@ -47164,6 +47246,82 @@ mod tests {
             address: "127.0.0.1".to_owned(),
             port,
             host: "localhost".to_owned(),
+            config: ferrox_core::hysteria::Config {
+                version: 1,
+                auth: "v1-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: String::new(),
+                hop: None,
+                gecko: None,
+                ..ferrox_core::hysteria::Config::default()
+            },
+            roots: Some(roots.into()),
+        };
+        let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            dial_socks_outbound(
+                &stream,
+                &Outbound::Hysteria(Box::new(out)),
+                &server,
+                &Destination::from(target),
+            );
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(b"v1").expect("writes");
+        let mut back = [0u8; 2];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"v1");
+    }
+
+    fn hysteria_v1_loop_identity(
+        identity: Arc<ferrox_core::tls::TlsServerConfig>,
+        auth: &str,
+    ) -> u16 {
+        let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        let auth = auth.to_owned();
+        let serve: crate::hysteria_v1::Serve = Arc::new(move |flow, host, port| {
+            serve_hysteria_v1_flow(flow, &host, port, true);
+        });
+        thread::spawn(move || {
+            crate::hysteria_v1::serve_loop(
+                &address,
+                std::slice::from_ref(&auth),
+                &identity,
+                &serve,
+                &ferrox_core::hysteria::Config {
+                    version: 1,
+                    cc: ferrox_core::hysteria::Congestion::Bbr,
+                    udp_idle: 60,
+                    ..ferrox_core::hysteria::Config::default()
+                },
+            );
+        });
+        port
+    }
+
+    #[test]
+    fn hysteria_v1_serves_the_certificate_the_sni_names() {
+        let _serial = quic_serial();
+        let echo_port = echo_loop();
+        let (first, _) = minted_tls_identity("first.test");
+        let (second, roots) = minted_tls_identity("second.test");
+        let mut identity = (*first).clone();
+        identity.certs.push(second.certs[0].clone());
+        let port = hysteria_v1_loop_identity(Arc::new(identity), "v1-auth");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = HysteriaOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            host: "second.test".to_owned(),
             config: ferrox_core::hysteria::Config {
                 version: 1,
                 auth: "v1-auth".to_owned(),

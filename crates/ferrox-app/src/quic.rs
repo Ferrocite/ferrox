@@ -428,6 +428,7 @@ fn pem_capacity(der_len: usize, label_len: usize) -> usize {
     (11 + label_len + 6) + (full * 64 + rem.div_ceil(3) * 4) + lines + (9 + label_len + 6)
 }
 
+#[cfg(test)]
 pub(crate) fn der_to_pem(der: &[u8], label: &str) -> Vec<u8> {
     let mut pem = Vec::with_capacity(pem_capacity(der.len(), label.len()));
     append_pem(&mut pem, der, label);
@@ -561,47 +562,21 @@ pub(crate) fn tune(config: &mut quiche::Config, alpn: &[u8]) -> bool {
 
 /// A serving identity: the lane's own tuning plus the certificate chain quiche reads at load time.
 pub(crate) fn serve_config(identity: &ferrox_core::tls::TlsServerConfig) -> Option<quiche::Config> {
-    let mut config = if identity.ech_server_keys.is_some() {
-        let builder = identity.ech_server_context_builder().ok()?;
-        quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder).ok()?
-    } else if identity.reject_unknown_sni {
-        let builder = ferrox_core::tls::quic_server_context_builder(identity).ok()?;
-        quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder).ok()?
-    } else {
-        quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?
-    };
+    let mut config = tls_config(identity)?;
     if !tune(&mut config, ALPN) {
         return None;
     }
-    if identity.ech_server_keys.is_some() || identity.reject_unknown_sni {
-        return Some(config);
-    }
-    let entry = identity.certs.first()?;
-    let label = match entry.key_kind {
-        ferrox_core::tls::ServerKeyKind::Pkcs8 => "PRIVATE KEY",
-        ferrox_core::tls::ServerKeyKind::Sec1 => "EC PRIVATE KEY",
-        ferrox_core::tls::ServerKeyKind::Pkcs1 => "RSA PRIVATE KEY",
+    Some(config)
+}
+
+/// The TLS half of a serving identity, before a carrier adds its own ALPN and tuning.
+pub(crate) fn tls_config(identity: &ferrox_core::tls::TlsServerConfig) -> Option<quiche::Config> {
+    let builder = if identity.ech_server_keys.is_some() {
+        identity.ech_server_context_builder().ok()?
+    } else {
+        ferrox_core::tls::quic_server_context_builder(identity).ok()?
     };
-    let mut chain = Vec::with_capacity(
-        entry
-            .cert_chain
-            .iter()
-            .map(|der| pem_capacity(der.len(), "CERTIFICATE".len()))
-            .sum(),
-    );
-    for der in &entry.cert_chain {
-        append_pem(&mut chain, der, "CERTIFICATE");
-    }
-    let key = der_to_pem(&entry.key_der, label);
-    let (cert_path, cert_text) = stage_trust_file(&chain)?;
-    let (key_path, key_text) = stage_trust_file(&key)?;
-    let loaded = config
-        .load_cert_chain_from_pem_file(&cert_text)
-        .and(config.load_priv_key_from_pem_file(&key_text))
-        .is_ok();
-    let _ = std::fs::remove_file(&cert_path);
-    let _ = std::fs::remove_file(&key_path);
-    loaded.then_some(config)
+    quiche::Config::with_boring_ssl_ctx_builder(quiche::PROTOCOL_VERSION, builder).ok()
 }
 
 pub(crate) fn quiche_config(roots: &[Vec<u8>], cc: Option<&str>) -> Option<quiche::Config> {
@@ -4651,8 +4626,11 @@ mod tests {
     }
 
     fn minted_identity() -> ferrox_core::tls::TlsServerConfig {
-        let minted =
-            rcgen::generate_simple_self_signed(vec!["quic.test".to_owned()]).expect("mints");
+        minted_identity_for("quic.test")
+    }
+
+    fn minted_identity_for(name: &str) -> ferrox_core::tls::TlsServerConfig {
+        let minted = rcgen::generate_simple_self_signed(vec![name.to_owned()]).expect("mints");
         let roots = parse_ca_pem(minted.cert.pem().as_bytes());
         assert_ne!(roots, Vec::<Vec<u8>>::new());
         ferrox_core::tls::TlsServerConfig {
@@ -4713,6 +4691,18 @@ mod tests {
     }
 
     #[test]
+    fn a_two_entry_identity_builds_every_context() {
+        let mut identity = minted_identity_for("first.test");
+        identity
+            .certs
+            .push(minted_identity_for("second.test").certs.remove(0));
+        assert!(
+            tls_config(&identity).is_some(),
+            "both entries build on the serving context"
+        );
+    }
+
+    #[test]
     fn serve_config_loads_a_minted_identity() {
         assert!(serve_config(&minted_identity()).is_some());
         let mut rejecting = minted_identity();
@@ -4720,6 +4710,67 @@ mod tests {
         assert!(
             serve_config(&rejecting).is_some(),
             "the SNI rule builds on the QUIC context"
+        );
+    }
+
+    #[test]
+    fn the_certificate_the_sni_names_is_the_one_served() {
+        let mut identity = minted_identity_for("first.test");
+        identity
+            .certs
+            .push(minted_identity_for("second.test").certs.remove(0));
+        let (client, server) = lane_pair_of_name(
+            &identity,
+            Some("second.test"),
+            &identity.certs[1].cert_chain,
+            None,
+        );
+        assert!(client.conn.is_established() && server.conn.is_established());
+    }
+
+    #[test]
+    fn a_hello_without_a_name_answers_the_first_certificate() {
+        let mut identity = minted_identity_for("first.test");
+        identity
+            .certs
+            .push(minted_identity_for("second.test").certs.remove(0));
+        let (client, server) =
+            lane_pair_of_name(&identity, None, &identity.certs[0].cert_chain, None);
+        assert!(client.conn.is_established() && server.conn.is_established());
+    }
+
+    #[test]
+    fn a_hello_without_a_name_is_refused_when_the_list_rejects_it() {
+        let mut identity = minted_identity_for("first.test");
+        identity
+            .certs
+            .push(minted_identity_for("second.test").certs.remove(0));
+        identity.reject_unknown_sni = true;
+        let (client, server) =
+            lane_pair_raw(&identity, None, &identity.certs[0].cert_chain, None, false);
+        assert!(
+            !client.conn.is_established() && !server.conn.is_established(),
+            "an unnamed hello is refused when the list rejects unknown names"
+        );
+    }
+
+    #[test]
+    fn an_unknown_name_is_refused_when_the_list_rejects_it() {
+        let mut identity = minted_identity_for("first.test");
+        identity
+            .certs
+            .push(minted_identity_for("second.test").certs.remove(0));
+        identity.reject_unknown_sni = true;
+        let (client, server) = lane_pair_raw(
+            &identity,
+            Some("other.test"),
+            &identity.certs[0].cert_chain,
+            None,
+            false,
+        );
+        assert!(
+            !client.conn.is_established() && !server.conn.is_established(),
+            "the unmatched hello is refused before a certificate"
         );
     }
 
@@ -5048,9 +5099,45 @@ mod tests {
         identity: &ferrox_core::tls::TlsServerConfig,
         offer: Option<&[u8]>,
     ) -> (Lane, Lane) {
+        lane_pair_of_name(
+            identity,
+            Some("quic.test"),
+            &identity.certs[0].cert_chain,
+            offer,
+        )
+    }
+
+    fn lane_pair_of_name(
+        identity: &ferrox_core::tls::TlsServerConfig,
+        name: Option<&str>,
+        roots: &[Vec<u8>],
+        offer: Option<&[u8]>,
+    ) -> (Lane, Lane) {
+        let (client, server) = lane_pair_raw(identity, name, roots, offer, true);
+        assert!(
+            client.conn.is_established() && server.conn.is_established(),
+            "the lane handshook over the very sweep under test"
+        );
+        (client, server)
+    }
+
+    fn lane_pair_raw(
+        identity: &ferrox_core::tls::TlsServerConfig,
+        name: Option<&str>,
+        roots: &[Vec<u8>],
+        offer: Option<&[u8]>,
+        verify: bool,
+    ) -> (Lane, Lane) {
         let mut server_config = serve_config(identity).expect("serves");
         server_config.set_active_connection_id_limit(4);
-        let mut client_config = quiche_config(&identity.certs[0].cert_chain, None).expect("trusts");
+        let mut client_config = if verify {
+            quiche_config(roots, None).expect("trusts")
+        } else {
+            let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).expect("configures");
+            config.verify_peer(false);
+            config.set_application_protos(&[ALPN]).expect("negotiates");
+            config
+        };
         client_config.set_active_connection_id_limit(4);
         let server_sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
         let server_addr = server_sock.local_addr().expect("addr");
@@ -5070,7 +5157,7 @@ mod tests {
         getrandom::fill(&mut bytes).expect("random");
         let client_id = quiche::ConnectionId::from_ref(&bytes);
         let mut client = quiche::connect(
-            Some("quic.test"),
+            name,
             &client_id,
             client_addr,
             server_addr,
@@ -5112,10 +5199,6 @@ mod tests {
                 break;
             }
         }
-        assert!(
-            client.conn.is_established() && server.conn.is_established(),
-            "the lane handshook over the very sweep under test"
-        );
         (client, server)
     }
 
