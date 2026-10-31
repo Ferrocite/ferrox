@@ -19670,6 +19670,13 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
     None
 }
 
+/// One local source's UDP association: its own connected uplink to the server, and the reply cipher that source seals with.
+struct SsUdpClientSource {
+    uplink: UdpSocket,
+    hop: Option<ferrox_core::shadowsocks::Cipher>,
+    last: Instant,
+}
+
 fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
     if let Some(method2022) = ferrox_core::shadowsocks2022::Method::parse(&ss.method) {
         serve_socks_udp_shadowsocks2022(relay, ss, method2022);
@@ -19687,34 +19694,16 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
         Some(server) => server,
         None => return,
     };
-    let bound = if server.is_ipv6() {
-        UdpSocket::bind("[::]:0")
-    } else {
-        UdpSocket::bind("0.0.0.0:0")
-    };
-    let Ok(uplink) = bound else {
-        return;
-    };
-    if uplink.connect(server).is_err()
-        || uplink.set_read_timeout(Some(budgets::udp_idle())).is_err()
-    {
-        return;
-    }
-    let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    // One uplink per local source: a reply can only name the source whose socket carried it.
+    let sources: Arc<Mutex<HashMap<SocketAddr, SsUdpClientSource>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     let done = Arc::new(AtomicBool::new(false));
-    let Some(reader) = spawn_ss_udp_reader(
-        &uplink,
-        relay,
-        &master,
-        method,
-        Arc::clone(&source),
-        Arc::clone(&done),
-    ) else {
+    let Some(reader) = spawn_ss_udp_sources(&sources, relay, &master, method, Arc::clone(&done))
+    else {
         return;
     };
     let mut buf = Vec::new();
     resize_scratch(&mut buf, crate::shadowsocks::DATAGRAM_MAX);
-    let mut hop: Option<ferrox_core::shadowsocks::Cipher> = None;
     while let Ok((n, src)) = relay
         .recv_from(&mut buf[crate::shadowsocks::SEAL_ROOM..crate::shadowsocks::SEAL_ROOM + UDP_BUF])
     {
@@ -19726,21 +19715,116 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
         if payload.is_empty() {
             continue;
         }
-        if let Ok(mut slot) = source.lock() {
-            *slot = Some(src);
-        }
         let (at, len) = (
             payload.as_ptr() as usize - buf.as_ptr() as usize,
             payload.len(),
         );
-        if let Some(packet) =
-            crate::shadowsocks::seal_datagram(&master, method, &dest, &mut buf, at, len, &mut hop)
-        {
-            let _ = uplink.send(packet);
+        let Ok(mut guard) = sources.lock() else {
+            break;
+        };
+        if !guard.contains_key(&src) {
+            if guard.len() >= crate::shadowsocks::SS_UDP_SOURCES {
+                let now = Instant::now();
+                let idle = budgets::udp_idle();
+                guard.retain(|_, source| now.duration_since(source.last) < idle);
+                if guard.len() >= crate::shadowsocks::SS_UDP_SOURCES {
+                    continue;
+                }
+            }
+            let bound = if server.is_ipv6() {
+                UdpSocket::bind("[::]:0")
+            } else {
+                UdpSocket::bind("0.0.0.0:0")
+            };
+            let Ok(uplink) = bound else {
+                continue;
+            };
+            if uplink.connect(server).is_err() || uplink.set_nonblocking(true).is_err() {
+                continue;
+            }
+            guard.insert(
+                src,
+                SsUdpClientSource {
+                    uplink,
+                    hop: None,
+                    last: Instant::now(),
+                },
+            );
+        }
+        let Some(source) = guard.get_mut(&src) else {
+            continue;
+        };
+        source.last = Instant::now();
+        if let Some(packet) = crate::shadowsocks::seal_datagram(
+            &master,
+            method,
+            &dest,
+            &mut buf,
+            at,
+            len,
+            &mut source.hop,
+        ) {
+            let _ = source.uplink.send(packet);
         }
     }
     done.store(true, Ordering::Relaxed);
     join(&reader);
+}
+
+fn spawn_ss_udp_sources(
+    sources: &Arc<Mutex<HashMap<SocketAddr, SsUdpClientSource>>>,
+    relay: &UdpSocket,
+    master: &ferrox_core::shadowsocks::MasterKey,
+    method: ferrox_core::shadowsocks::Method,
+    done: Arc<AtomicBool>,
+) -> Option<RelayEnd> {
+    let send = relay.try_clone().ok()?;
+    let sources = Arc::clone(sources);
+    let master = master.clone();
+    Some(RelayPool::global().run(move || {
+        let mut buf = Vec::new();
+        resize_scratch(&mut buf, crate::shadowsocks::DATAGRAM_MAX);
+        let room = crate::shadowsocks::SEAL_ROOM;
+        let base = buf.as_ptr() as usize;
+        loop {
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
+            let now = Instant::now();
+            let idle = budgets::udp_idle();
+            let Ok(mut guard) = sources.lock() else {
+                break;
+            };
+            guard.retain(|_, source| now.duration_since(source.last) < idle);
+            for (src, source) in guard.iter_mut() {
+                loop {
+                    match source.uplink.recv(&mut buf[room..room + UDP_BUF]) {
+                        Ok(n) => {
+                            source.last = Instant::now();
+                            let Some((target, payload)) = crate::shadowsocks::open_datagram(
+                                &master,
+                                method,
+                                &mut buf[room..room + n],
+                                &mut source.hop,
+                            ) else {
+                                continue;
+                            };
+                            let (at, len) = (payload.as_ptr() as usize - base, payload.len());
+                            let head = 3 + if target.is_ipv6() { 19 } else { 7 };
+                            let start = at - head;
+                            buf[start..start + 3].fill(0);
+                            crate::shadowsocks::write_addr(&mut buf[start + 3..at], &target);
+                            let _ = send.send_to(&buf[start..at + len], src);
+                        }
+                        Err(error) if is_timeout(&error) => break,
+                        Err(_) => break,
+                    }
+                }
+            }
+            drop(guard);
+            std::thread::sleep(RELAY_POLL);
+        }
+    }))
 }
 
 fn serve_socks_udp_shadowsocks2022(
@@ -19844,64 +19928,6 @@ fn spawn_ss_udp_reader2022(
                     };
                     let out = socks_udp_frame(&mut reply, None, &target, payload);
                     let _ = send.send_to(out, dest);
-                }
-                Err(error) if is_timeout(&error) => {
-                    if done.load(Ordering::Relaxed) {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    }))
-}
-
-fn spawn_ss_udp_reader(
-    uplink: &UdpSocket,
-    relay: &UdpSocket,
-    master: &ferrox_core::shadowsocks::MasterKey,
-    method: ferrox_core::shadowsocks::Method,
-    source: Arc<Mutex<Option<SocketAddr>>>,
-    done: Arc<AtomicBool>,
-) -> Option<RelayEnd> {
-    let read = uplink.try_clone().ok()?;
-    read.set_read_timeout(Some(RELAY_POLL)).ok()?;
-    let send = relay.try_clone().ok()?;
-    let master = master.clone();
-    Some(RelayPool::global().run(move || {
-        let mut buf = Vec::new();
-        resize_scratch(&mut buf, crate::shadowsocks::DATAGRAM_MAX);
-        let room = crate::shadowsocks::SEAL_ROOM;
-        let base = buf.as_ptr() as usize;
-        let mut hop: Option<ferrox_core::shadowsocks::Cipher> = None;
-        loop {
-            match read.recv(&mut buf[room..room + UDP_BUF]) {
-                Ok(n) => {
-                    let opened = crate::shadowsocks::open_datagram(
-                        &master,
-                        method,
-                        &mut buf[room..room + n],
-                        &mut hop,
-                    );
-                    let Some((target, payload)) = opened else {
-                        continue;
-                    };
-                    let (at, len) = (payload.as_ptr() as usize - base, payload.len());
-                    let dest = match source.lock() {
-                        Ok(guard) => *guard,
-                        Err(_) => None,
-                    };
-                    let Some(dest) = dest else {
-                        continue;
-                    };
-                    let head = 3 + match target {
-                        SocketAddr::V4(_) => 7,
-                        SocketAddr::V6(_) => 19,
-                    };
-                    let start = at - head;
-                    buf[start..start + 3].fill(0);
-                    crate::shadowsocks::write_addr(&mut buf[start + 3..at], &target);
-                    let _ = send.send_to(&buf[start..at + len], dest);
                 }
                 Err(error) if is_timeout(&error) => {
                     if done.load(Ordering::Relaxed) {
@@ -24389,7 +24415,7 @@ fn inbound_account(inbound: &Json) -> InboundAccount {
 fn inbound_first_client(inbound: &Json) -> Option<&Json> {
     inbound
         .get("settings")
-        .and_then(|s| s.get("clients"))
+        .and_then(|s| s.get("clients").or_else(|| s.get("users")))
         .and_then(Json::as_arr)
         .and_then(|clients| clients.first())
 }
@@ -40060,6 +40086,93 @@ mod tests {
         assert_eq!(source.port(), target.port());
         assert_eq!(source.ip().to_canonical(), target.ip().to_canonical());
         assert_eq!(payload, b"ping");
+    }
+
+    /// Two local sources under one account and one target: the reply each gets is the one whose socket carried it, not the last source to speak.
+    #[test]
+    fn socks_associate_keeps_each_udp_source_on_its_own_reply() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            let mut buf = vec![0u8; UDP_BUF];
+            while held.len() < 2 {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                held.push((buf[..n].to_vec(), src));
+            }
+            for (payload, src) in held {
+                if echo.send_to(&payload, src).is_err() {
+                    return;
+                }
+            }
+        });
+        let tunnel = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let users = crate::shadowsocks::account("an-example-shared-password", "aes-256-gcm");
+            crate::shadowsocks::serve_udp_on(&tunnel, &users, true);
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = Outbound::Shadowsocks(ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port: tunnel_port,
+            method: "aes-256-gcm".to_owned(),
+            password: "an-example-shared-password".to_owned(),
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+        });
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        for (udp, word) in [
+            (&first, b"alpha".as_slice()),
+            (&second, b"bravo".as_slice()),
+        ] {
+            udp.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut datagram = vec![0u8, 0, 0];
+            push_socks_addr(&mut datagram, &target);
+            datagram.extend_from_slice(word);
+            udp.send_to(&datagram, relay).expect("sends");
+        }
+        for (udp, word) in [
+            (&first, b"alpha".as_slice()),
+            (&second, b"bravo".as_slice()),
+        ] {
+            let mut back = vec![0u8; UDP_BUF];
+            let (n, _) = udp.recv_from(&mut back).expect("echoes");
+            let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+            assert_eq!(source.port(), target.port());
+            assert_eq!(payload, word);
+        }
     }
 
     fn mux_test_echo() -> u16 {
