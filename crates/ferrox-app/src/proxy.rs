@@ -3208,6 +3208,7 @@ pub(crate) struct VmessOut {
     id: [u8; 16],
     cipher: crate::vmess::Cipher,
     auth_len: bool,
+    no_termination: bool,
     carrier: Carrier,
     host: String,
     headers: Vec<(String, String)>,
@@ -9810,9 +9811,14 @@ fn dial_vmess_kcp(
     vmess: &VmessOut,
     target: &Destination,
 ) {
-    let Some((request, send, recv, response_key, response_iv, auth)) =
-        crate::vmess::client_request(&vmess.id, vmess.cipher, vmess.auth_len, target, 1)
-    else {
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
         return;
     };
     if let Some(cfg) = vmess.tls.as_deref() {
@@ -10062,9 +10068,14 @@ fn dial_vmess_xdrive(client: &Connection, vmess: &VmessOut, target: &Destination
     let Some(session) = xdrive_dial_session(&vmess.carrier, &vmess.address, vmess.port) else {
         return;
     };
-    let Some((request, send, recv, response_key, response_iv, auth)) =
-        crate::vmess::client_request(&vmess.id, vmess.cipher, vmess.auth_len, target, 1)
-    else {
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
         return;
     };
     let mut reader = session.clone();
@@ -11442,6 +11453,7 @@ fn vmess_udp_request(vmess: &VmessOut, dest: &SocketAddr) -> Option<crate::vmess
         &vmess.id,
         vmess.cipher,
         vmess.auth_len,
+        vmess.no_termination,
         &Destination::from(*dest),
         2,
     )
@@ -12635,9 +12647,14 @@ fn dial_vmess_httpupgrade(
     let rung = attempt.rung;
     let path = attempt.path;
     let ed = attempt.ed;
-    let Some((request, send, recv, response_key, response_iv, auth)) =
-        crate::vmess::client_request(&vmess.id, vmess.cipher, vmess.auth_len, target, 1)
-    else {
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
     };
     let Some((reader, write)) =
@@ -12681,9 +12698,14 @@ fn dial_vmess_grpc(
     let Some((reader, writer)) = crate::grpc::connect_with(uplink, &vmess.host, &settings) else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
-    let Some((request, send, recv, response_key, response_iv, auth)) =
-        crate::vmess::client_request(&vmess.id, vmess.cipher, vmess.auth_len, target, 1)
-    else {
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
     };
     if !writer.send(&request) {
@@ -12715,9 +12737,14 @@ fn dial_vmess_ws(
     let rung = attempt.rung;
     let path = attempt.path;
     let ed = attempt.ed;
-    let Some((request, send, recv, response_key, response_iv, auth)) =
-        crate::vmess::client_request(&vmess.id, vmess.cipher, vmess.auth_len, target, 1)
-    else {
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
     };
     let Some((reader, writer)) = crate::ws::connect(
@@ -12815,9 +12842,14 @@ fn dial_vmess_headed(
     else {
         return !Failure::new(Stage::SocketConnected, Kind::Unreachable).worth_retrying();
     };
-    let Some((request, send, recv, response_key, response_iv, auth)) =
-        crate::vmess::client_request(&vmess.id, vmess.cipher, vmess.auth_len, target, 1)
-    else {
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
         return !Failure::new(Stage::SocketConnected, Kind::Local).worth_retrying();
     };
     if write.write_all(&request).is_err() {
@@ -12861,7 +12893,14 @@ fn dial_vmess_rung(
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
             let Some((request, send, recv, response_key, response_iv, auth)) =
-                crate::vmess::client_request(&vmess.id, vmess.cipher, vmess.auth_len, target, 1)
+                crate::vmess::client_request(
+                    &vmess.id,
+                    vmess.cipher,
+                    vmess.auth_len,
+                    vmess.no_termination,
+                    target,
+                    1,
+                )
             else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
             };
@@ -12895,6 +12934,7 @@ fn dial_vmess_rung(
                     &vmess.id,
                     vmess.cipher,
                     vmess.auth_len,
+                    vmess.no_termination,
                     target,
                 )
             else {
@@ -14954,9 +14994,14 @@ fn vmess_tls_raw(
     vmess: &VmessOut,
     target: &Destination,
 ) {
-    let Some((request, send, recv, response_key, response_iv, auth)) =
-        crate::vmess::client_request(&vmess.id, vmess.cipher, vmess.auth_len, target, 1)
-    else {
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
         return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
     };
     if session.write_all(&request).is_err() {
@@ -15018,9 +15063,14 @@ fn vmess_tls_carried(
     vmess: &VmessOut,
     target: &Destination,
 ) {
-    let Some((request, send, recv, response_key, response_iv, auth)) =
-        crate::vmess::client_request(&vmess.id, vmess.cipher, vmess.auth_len, target, 1)
-    else {
+    let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
+        &vmess.id,
+        vmess.cipher,
+        vmess.auth_len,
+        vmess.no_termination,
+        target,
+        1,
+    ) else {
         return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
     };
     match &vmess.carrier {
@@ -24707,12 +24757,22 @@ fn inbound_first_client(inbound: &Json) -> Option<&Json> {
         .and_then(|clients| clients.first())
 }
 
+/// The reference's per-account experiment string: the protobuf field is `tests_enabled`, its
+/// JSON name `testsEnabled`, and a share link spells the same list `experiments`.
+fn account_experiments(client: &Json) -> Option<&str> {
+    ["testsEnabled", "tests_enabled", "experiments"]
+        .into_iter()
+        .find_map(|name| client.get(name).and_then(Json::as_str))
+}
+
 /// Whether an account asks for the reference's authenticated-length experiment.
 fn authenticated_length(client: &Json) -> bool {
-    client
-        .get("experiments")
-        .and_then(Json::as_str)
-        .is_some_and(|text| text.contains("AuthenticatedLength"))
+    account_experiments(client).is_some_and(|text| text.contains("AuthenticatedLength"))
+}
+
+/// Whether an account asks for the reference's suppressed termination signal.
+fn no_termination(client: &Json) -> bool {
+    account_experiments(client).is_some_and(|text| text.contains("NoTerminationSignal"))
 }
 
 /// The reference parses `security: "none"` as `auto`; only the authenticated length keeps that spelling out of the plain flow.
@@ -24758,7 +24818,12 @@ fn inbound_vmess_users(inbound: &Json) -> crate::vmess::UsersRef {
                         .unwrap_or("")
                         .to_owned();
                     let level = client.get("level").and_then(Json::as_u32).unwrap_or(0);
-                    Some(crate::vmess::User { level, email, id })
+                    Some(crate::vmess::User {
+                        level,
+                        email,
+                        id,
+                        no_termination: no_termination(client),
+                    })
                 })
                 .collect::<Vec<_>>()
         })
@@ -25862,6 +25927,7 @@ fn loopback_dial(
                 id: inbound_id(inbound),
                 cipher,
                 auth_len: client.is_some_and(authenticated_length),
+                no_termination: client.is_some_and(no_termination),
                 carrier,
                 host,
                 tls: None,
@@ -27493,6 +27559,7 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
         let id = user.get("id").and_then(Json::as_str).and_then(uuid_bytes)?;
         let cipher = vmess_cipher(user);
         let auth_len = authenticated_length(user);
+        let no_termination = no_termination(user);
         if let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) {
             return Some(VmessOut {
                 address,
@@ -27500,6 +27567,7 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
                 id,
                 cipher,
                 auth_len,
+                no_termination,
                 carrier,
                 host,
                 tls: Some(tls),
@@ -27519,6 +27587,7 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
             id,
             cipher,
             auth_len,
+            no_termination,
             carrier,
             host,
             tls: None,
@@ -36481,6 +36550,7 @@ mod tests {
                 id,
                 cipher: crate::vmess::Cipher::Auto,
                 auth_len: false,
+                no_termination: false,
                 carrier: inbound_carrier(&inbound),
                 host: "127.0.0.1".to_owned(),
                 tls: Some(Arc::clone(&client)),
@@ -37094,6 +37164,7 @@ mod tests {
             id: uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id"),
             cipher: crate::vmess::Cipher::Auto,
             auth_len: false,
+            no_termination: false,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
             tls: Some(client),
@@ -37452,6 +37523,7 @@ mod tests {
             id,
             cipher: crate::vmess::Cipher::Auto,
             auth_len: false,
+            no_termination: false,
             carrier,
             host: "127.0.0.1".to_owned(),
             tls: tls.map(|(_, client)| Arc::new(client.clone())),
@@ -37951,6 +38023,7 @@ mod tests {
                 id,
                 cipher: crate::vmess::Cipher::Auto,
                 auth_len: false,
+                no_termination: false,
                 carrier: Carrier::Raw(Chain::default()),
                 host: String::new(),
                 tls: Some(Arc::new(client_config)),
@@ -38168,6 +38241,7 @@ mod tests {
             id,
             cipher: crate::vmess::Cipher::Auto,
             auth_len: false,
+            no_termination: false,
             carrier,
             host: "127.0.0.1".to_owned(),
             tls: Some(Arc::new(tls)),
@@ -38658,6 +38732,7 @@ mod tests {
             id,
             cipher: crate::vmess::Cipher::Chacha,
             auth_len: false,
+            no_termination: false,
             carrier: Carrier::Xhttp {
                 settings: xhttp_settings("/share"),
             },
@@ -40102,6 +40177,7 @@ mod tests {
                 &id,
                 crate::vmess::Cipher::Chacha,
                 false,
+                false,
                 &Destination::from(target),
                 2,
             )
@@ -40172,6 +40248,7 @@ mod tests {
             id,
             cipher: crate::vmess::Cipher::Chacha,
             auth_len: false,
+            no_termination: false,
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
             tls: None,
@@ -42697,6 +42774,7 @@ mod tests {
             id,
             cipher: crate::vmess::Cipher::Chacha,
             auth_len: false,
+            no_termination: false,
             carrier: Carrier::Ws {
                 path: "/tunnel".to_owned(),
                 ed: 0,
@@ -42767,6 +42845,7 @@ mod tests {
             id,
             cipher: crate::vmess::Cipher::Chacha,
             auth_len: false,
+            no_termination: false,
             carrier: Carrier::HttpUpgrade {
                 path: "/tunnel".to_owned(),
                 host: String::new(),
@@ -42838,6 +42917,7 @@ mod tests {
             id,
             cipher: crate::vmess::Cipher::Chacha,
             auth_len: false,
+            no_termination: false,
             carrier: Carrier::Grpc(crate::config::GrpcSettings::path(
                 "/TunnelService/Tun".to_owned(),
             )),
@@ -42911,6 +42991,7 @@ mod tests {
             id,
             cipher: crate::vmess::Cipher::Chacha,
             auth_len: false,
+            no_termination: false,
             carrier: Carrier::Ws {
                 path: "/tunnel".to_owned(),
                 ed: 0,
@@ -51497,6 +51578,7 @@ mod tests {
             id,
             cipher: crate::vmess::Cipher::Auto,
             auth_len: false,
+            no_termination: false,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
             tls: None,

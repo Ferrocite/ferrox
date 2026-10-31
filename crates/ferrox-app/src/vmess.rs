@@ -578,6 +578,9 @@ pub(crate) struct Flow {
     /// size parser leaves the mask draw for an AEAD of its own (`proxy/vmess/encoding/server.go`),
     /// its key derived `KDF16(key, "auth_len")` and its nonce counting beside the body's.
     len_seal: Option<SizeAead>,
+    /// Whether this direction closes with the zero-length marker. The reference's
+    /// `NoTerminationSignal` account turns it off for that side (`proxy/vmess/{inbound,outbound}`).
+    end_marker: bool,
 }
 
 impl Flow {
@@ -625,6 +628,7 @@ impl Flow {
             counter: 0,
             shake,
             len_seal: None,
+            end_marker: true,
         })
     }
     /// How many octets the next frame's size field takes on the wire.
@@ -1214,6 +1218,7 @@ pub(crate) fn client_request(
     id: &[u8; 16],
     cipher: Cipher,
     auth_len: bool,
+    no_termination: bool,
     target: &crate::proxy::Destination,
     cmd: u8,
 ) -> Option<ClientRequest> {
@@ -1228,6 +1233,7 @@ pub(crate) fn client_request(
         send.len_seal = Some(SizeAead::fresh(&data_key, actual, &data_iv)?);
         recv.len_seal = Some(SizeAead::fresh(&data_key, actual, &data_iv)?);
     }
+    send.end_marker = !no_termination;
     Some((request, send, recv, response_key, response_iv, auth))
 }
 
@@ -1236,10 +1242,11 @@ pub(crate) fn client_handshake(
     id: &[u8; 16],
     cipher: Cipher,
     auth_len: bool,
+    no_termination: bool,
     target: &crate::proxy::Destination,
 ) -> Option<ClientSession> {
     let (request, send, recv, response_key, response_iv, auth) =
-        client_request(id, cipher, auth_len, target, 1)?;
+        client_request(id, cipher, auth_len, no_termination, target, 1)?;
     if uplink.write_all(&request).is_err() {
         return None;
     }
@@ -1476,6 +1483,9 @@ pub(crate) struct User {
     pub(crate) level: u32,
     pub(crate) email: String,
     pub(crate) id: [u8; 16],
+    /// The account's `NoTerminationSignal` experiment: its side of the session ends without
+    /// the zero-length marker (`proxy/vmess/inbound/inbound.go:217`).
+    pub(crate) no_termination: bool,
 }
 
 pub(crate) type UsersRef = std::sync::Arc<Users>;
@@ -1492,6 +1502,7 @@ impl Users {
             level: 0,
             email: String::new(),
             id,
+            no_termination: false,
         }])
     }
 
@@ -1538,7 +1549,8 @@ pub(crate) fn accept_request(stream: &mut dyn Read, users: &Users) -> Option<Acc
     read_exact(stream, &mut auth_id).ok()?;
     let (instruction, user) = users.authenticate(&auth_id)?;
     let header = read_open_header(stream, &instruction, &auth_id)?;
-    let (target, send, recv, prefix, cmd) = decode_header(&header)?;
+    let (target, mut send, recv, prefix, cmd) = decode_header(&header)?;
+    send.end_marker = !user.no_termination;
     let meter = crate::stats::user(&user.email, user.level);
     Some(Accepted {
         target,
@@ -1651,7 +1663,7 @@ fn forward_step(
     match plain_read.read(buf) {
         Ok(0) => {
             // A clean end tells the peer this direction is done; the other direction keeps relaying.
-            let clean = write_frame(writer, send, &[], staging, pad);
+            let clean = !send.end_marker || write_frame(writer, send, &[], staging, pad);
             if !clean {
                 close();
             }
@@ -2197,7 +2209,8 @@ pub(crate) fn pump_relay(
         let mut ended = false;
         while let Ok(read) = plain_read.read(&mut buf) {
             if read == 0 {
-                ended = write_frame(&mut sealed_write, &mut send, &[], &mut staging, &mut pad);
+                ended = !send.end_marker
+                    || write_frame(&mut sealed_write, &mut send, &[], &mut staging, &mut pad);
                 break;
             }
             let mut at = 0;
@@ -2270,6 +2283,7 @@ mod tests {
             &id,
             Cipher::Auto,
             false,
+            false,
             &crate::proxy::Destination::from(target),
             1,
         ) else {
@@ -2313,6 +2327,7 @@ mod tests {
             &second,
             Cipher::Auto,
             false,
+            false,
             &crate::proxy::Destination::from(target),
             1,
         )
@@ -2323,11 +2338,13 @@ mod tests {
                 level: 0,
                 email: "first@example.com".to_owned(),
                 id: first,
+                no_termination: false,
             },
             User {
                 level: 0,
                 email: "second@example.com".to_owned(),
                 id: second,
+                no_termination: false,
             },
         ]);
         let mut cursor = Cursor::new(request);
@@ -3182,6 +3199,7 @@ mod tests {
             &id,
             Cipher::Auto,
             false,
+            false,
             &crate::proxy::Destination::from(target),
         )
         .expect("handshakes");
@@ -3804,16 +3822,22 @@ mod tests {
         let target = crate::proxy::Destination::from(target);
         for cipher in [Cipher::Aes, Cipher::Chacha] {
             for auth_len in [false, true] {
-                let (_, send, recv, _, _, _) =
-                    client_request(&[0x31; 16], cipher, auth_len, &target, 1)
-                        .expect("the client builds the account's framing");
-                let width = if auth_len { SIZE_FIELD } else { HEADER_LEN };
-                assert_eq!(send.size_field(), width, "{cipher:?} {auth_len}");
-                assert_eq!(recv.size_field(), width, "{cipher:?} {auth_len}");
+                for no_termination in [false, true] {
+                    let (_, send, recv, _, _, _) =
+                        client_request(&[0x31; 16], cipher, auth_len, no_termination, &target, 1)
+                            .expect("the client builds the account's framing");
+                    let width = if auth_len { SIZE_FIELD } else { HEADER_LEN };
+                    assert_eq!(send.size_field(), width, "{cipher:?} {auth_len}");
+                    assert_eq!(recv.size_field(), width, "{cipher:?} {auth_len}");
+                    assert_eq!(
+                        send.end_marker, !no_termination,
+                        "the account's termination signal rides the sending flow"
+                    );
+                }
             }
         }
         assert!(
-            client_request(&[0x31; 16], Cipher::None, true, &target, 1).is_none(),
+            client_request(&[0x31; 16], Cipher::None, true, false, &target, 1).is_none(),
             "the authenticated length has no key under none"
         );
     }
@@ -4150,6 +4174,7 @@ mod tests {
         };
         let mut wire = Wire::new(carrier);
         let cap = wire.held.capacity();
+        let base = wire.held.as_ptr() as usize;
         let mut batches = 0;
         let mut got = Vec::new();
         while let Some(batch) = wire.batch(&mut recv) {
@@ -4159,9 +4184,13 @@ mod tests {
             let (front, len) = (batch.as_ptr() as usize, batch.len());
             got.extend_from_slice(batch);
             assert_eq!(
-                front,
-                wire.held.as_ptr() as usize,
+                front, base,
                 "a batch is not the pump's own bytes gathered at its front"
+            );
+            assert_eq!(
+                wire.held.as_ptr() as usize,
+                base,
+                "the pump moved its buffer"
             );
             assert_eq!(wire.held.capacity(), cap, "the pump grew its buffer");
             assert_eq!(got.len(), len, "and the whole batch was handed over");
@@ -4497,6 +4526,68 @@ mod tests {
             .read_exact(&mut got)
             .expect("the upload survives the target's clean end");
         assert_eq!(&got, b"ping");
+    }
+
+    #[test]
+    fn an_account_without_the_termination_signal_ends_without_the_marker() {
+        let key = [0x55u8; 16];
+        let iv = [0x66u8; 16];
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        for no_termination in [false, true] {
+            let (mut plain, mut target) = socket_pair();
+            plain
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("arms");
+            target.write_all(b"x").expect("writes the download");
+            target.shutdown(Shutdown::Write).expect("ends the download");
+
+            let out = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(|| {});
+            let flow = crate::proxy::RelayFinish::new(false, std::sync::Arc::clone(&close), None);
+            let mut send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+            send.end_marker = !no_termination;
+            let mut buf = relay_window();
+            let mut staging = Vec::new();
+            let mut pad = PadSource::fresh().expect("entropy");
+            let mut writer = Collected(std::sync::Arc::clone(&out));
+            let mut done = false;
+            for _ in 0..4 {
+                let (next, _) = forward_step(
+                    &mut plain,
+                    &mut buf,
+                    &mut writer,
+                    &mut send,
+                    &mut staging,
+                    &mut pad,
+                    &close,
+                    &flow,
+                );
+                if next == Next::Done {
+                    done = true;
+                    break;
+                }
+            }
+            assert!(done, "the clean end is a Done step");
+
+            let held = out.lock().expect("lock").clone();
+            let mut peer = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
+            let mut wire = Wire::new(Sealed {
+                held,
+                at: 0,
+                grain: usize::MAX,
+                reads: 0,
+            });
+            let mut got = Vec::new();
+            while let Some(batch) = wire.batch(&mut peer) {
+                got.extend_from_slice(batch);
+            }
+            assert_eq!(got, b"x", "the payload arrives either way");
+            assert_eq!(
+                wire.ended_by_marker(),
+                !no_termination,
+                "only an account that keeps the signal closes with the marker"
+            );
+        }
     }
 
     #[test]
