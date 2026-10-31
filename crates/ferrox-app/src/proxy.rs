@@ -10518,6 +10518,7 @@ fn hc_content_length(head: &str) -> Option<usize> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
     let key = inbound_trojan_keys(inbound);
     let account = inbound_account(inbound);
@@ -27643,6 +27644,7 @@ fn outbound_mux(outbound: &Json) -> Mux {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
     let empty = Vec::new();
     let outbounds = root
@@ -37491,6 +37493,11 @@ mod tests {
         22000 + (std::process::id() as u16 % 256) * 32
     }
 
+    fn trojan_mux_probe_port() -> u16 {
+        static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+        trojan_probe_base() + 100 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// A trojan client that pipelines its first payload with the request header keeps it: the
     /// probe's first read stops at the header and the relay forwards what rode behind it.
     #[test]
@@ -37958,7 +37965,7 @@ mod tests {
         ];
         for (index, (tag, stream)) in carriers.into_iter().enumerate() {
             let inbound = trojan_reality_inbound(stream);
-            let port = trojan_probe_base() + index as u16;
+            let port = trojan_probe_base() + 32 + index as u16;
             let address = format!("127.0.0.1:{port}");
             assert!(serve_trojan_inbound(&address, &inbound, true), "{tag}");
             let waited = Instant::now();
@@ -37997,7 +38004,7 @@ mod tests {
     #[test]
     fn a_trojan_reality_kcp_inbound_answers_the_session() {
         let inbound = trojan_reality_inbound(r#""network": "kcp""#);
-        let port = trojan_probe_base() + 16;
+        let port = trojan_probe_base() + 17;
         let address = format!("127.0.0.1:{port}");
         assert!(serve_trojan_inbound(&address, &inbound, true));
         let echo_port = echo_loop();
@@ -38073,9 +38080,7 @@ mod tests {
         mut trojan: TrojanOut,
         wait_for_tcp: bool,
     ) {
-        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
+        let port = trojan_mux_probe_port();
         let address = format!("127.0.0.1:{port}");
         assert!(serve_trojan_inbound(&address, inbound, true), "{tag}");
         if wait_for_tcp {
@@ -38303,16 +38308,13 @@ mod tests {
             udp: true,
             udp443: Udp443::Reject,
         };
-        for (index, (tag, inbound, reality, tls)) in [
+        for (tag, inbound, reality, tls) in [
             ("raw", plain, None, None),
             ("reality", reality, Some(trojan_reality_client()), None),
             ("ws", ws, None, None),
             ("ws-tls", ws_tls, None, Some(client)),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let port = trojan_probe_base() + 20 + index as u16;
+        ] {
+            let port = trojan_mux_probe_port();
             let address = format!("127.0.0.1:{port}");
             assert!(serve_trojan_inbound(&address, &inbound, true), "{tag}");
             let waited = Instant::now();
