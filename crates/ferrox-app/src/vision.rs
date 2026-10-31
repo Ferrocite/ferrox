@@ -586,13 +586,16 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             _ => self.session.read(buf)?,
         };
         if n > 0 && !raw && active {
-            let tls = self.filter_update(|tls| {
-                if tls.budget > 0 {
+            let (tls, observed) = self.filter_update(|tls| {
+                let observed = tls.budget > 0;
+                if observed {
                     tls.observe(&buf[..n]);
                 }
-                *tls
+                (*tls, observed)
             });
-            self.engage(&tls);
+            if observed {
+                self.engage(&tls);
+            }
         }
         Ok(n)
     }
@@ -864,13 +867,16 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
             self.write_out(buf)?;
             return Ok(buf.len());
         }
-        let tls = self.filter_update(|tls| {
-            if tls.budget > 0 {
+        let (tls, observed) = self.filter_update(|tls| {
+            let observed = tls.budget > 0;
+            if observed {
                 tls.observe(buf);
             }
-            *tls
+            (*tls, observed)
         });
-        self.engage(&tls);
+        if observed {
+            self.engage(&tls);
+        }
         // The relay hands one buffer of up to 256 KiB: it frames as blocks of one Xray buffer, and the filter budget and the switch are counted per caller buffer as the reference counts them per `MultiBuffer`.
         let complete =
             tls.present && buf.len() >= 6 && buf[..3] == TLS_APPLICATION_DATA && is_record_run(buf);
@@ -1379,13 +1385,31 @@ mod tests {
         writer
             .tls_accesses
             .store(0, std::sync::atomic::Ordering::Relaxed);
-        writer.write_all(b"hello").expect("writes");
+        let payload = vec![0x17; MAX_FRAME_CONTENT + 1];
+        writer.write_all(&payload).expect("writes");
         assert_eq!(
             writer
                 .tls_accesses
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
             "the framed write takes the shared state once"
+        );
+    }
+
+    /// A write after the filter is spent observes nothing, so it must not take the
+    /// session to rearm an alignment the exhausted filter already decided.
+    #[test]
+    fn a_spent_write_does_not_rearm_the_limiter() {
+        let (_reader, mut writer) = Link::split(Fake::new(&[]), Fake::new(&[]), None, None, &UUID);
+        writer.tls.update(|tls| {
+            tls.budget = 0;
+            tls.enable_xtls = true;
+        });
+        let before = writer.session.engaged;
+        writer.write_all(b"hello").expect("writes");
+        assert_eq!(
+            writer.session.engaged, before,
+            "a spent budget does not rearm the limiter"
         );
     }
 
