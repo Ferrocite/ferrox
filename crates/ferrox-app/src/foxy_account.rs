@@ -483,7 +483,7 @@ impl Endpoint {
 
     /// The same origin under another Firefox Accounts host: a pinned loopback keeps its address, a real host resolves the new name.
     #[must_use]
-    fn with_host(&self, host: &str) -> Self {
+    pub(crate) fn with_host(&self, host: &str) -> Self {
         let mut endpoint = self.clone();
         host.clone_into(&mut endpoint.host);
         if self.address.is_none() {

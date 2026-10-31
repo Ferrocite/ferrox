@@ -98,20 +98,27 @@ def main() -> int:
             )
             return 1
         print(f"check-cli-args: {label} refused")
-    reset = ["version", "--foxy", "--fxa-user-agent", "   "]
-    run = subprocess.run(
-        [CLI, *reset],
-        capture_output=True,
-        text=True,
-        timeout=WATCH,
-        stdin=subprocess.DEVNULL,
-        env=env,
+    accepted = [
+        ("a printable fxa user agent", ["version", "--foxy", "--fxa-user-agent", "Firefox/1.0"]),
+        ("a blank fxa user agent resetting the pin", ["version", "--foxy", "--fxa-user-agent", "   "]),
+    ]
+    for label, args in accepted:
+        run = subprocess.run(
+            [CLI, *args],
+            capture_output=True,
+            text=True,
+            timeout=WATCH,
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
+        if run.returncode != 0 or "printable ASCII" in run.stdout + run.stderr:
+            print(f"check-cli-args: {label} must be accepted", file=sys.stderr)
+            print(run.stdout + run.stderr, file=sys.stderr)
+            return 1
+    print(
+        f"check-cli-args: {len(CASES)} refusal(s),"
+        f" {len(accepted)} accepted, no hang"
     )
-    if run.returncode != 0 or "printable ASCII" in run.stdout + run.stderr:
-        print("check-cli-args: a blank fxa user agent must restore the pin", file=sys.stderr)
-        print(run.stdout + run.stderr, file=sys.stderr)
-        return 1
-    print(f"check-cli-args: {len(CASES)} refusal(s), one blank reset accepted, no hang")
     return 0
 
 

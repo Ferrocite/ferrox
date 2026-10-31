@@ -262,10 +262,7 @@ fn solve_reply(
     asked.push(endpoint.clone());
     for host in FALLBACKS {
         if host != endpoint.host {
-            asked.push(
-                Endpoint::parse(&format!("https://{host}"), endpoint.roots.clone())
-                    .ok_or(Challenge::Absent)?,
-            );
+            asked.push(endpoint.with_host(host));
         }
     }
     for host in &asked {

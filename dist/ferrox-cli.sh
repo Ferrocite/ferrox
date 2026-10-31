@@ -184,9 +184,6 @@ need_value() {
 printable_ascii() {
   local LC_ALL=C value="$1"
   case "$value" in *[![:print:]]*) return 1 ;; esac
-  value="${value#"${value%%[![:space:]]*}"}"
-  value="${value%"${value##*[![:space:]]}"}"
-  [ -z "$value" ] && return 0
 }
 
 need_port() {
