@@ -296,23 +296,6 @@ impl Read for Connection {
             Connection::Unix(stream) => stream.read_vectored(bufs),
         }
     }
-
-    fn read_buf(&mut self, mut buf: io::BorrowedCursor<'_>) -> io::Result<()> {
-        match self {
-            Connection::Tcp(stream) => stream.read_buf(buf),
-            Connection::Masked(masked) => masked.stream.read_buf(buf),
-            Connection::Metered(metered) => {
-                metered.inner.read_buf(buf.reborrow())?;
-                metered.meter.read(buf.written());
-                Ok(())
-            }
-            Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
-                inner.read_buf(buf)
-            }
-            #[cfg(any(unix, windows))]
-            Connection::Unix(stream) => stream.read_buf(buf),
-        }
-    }
 }
 
 impl Write for Connection {
