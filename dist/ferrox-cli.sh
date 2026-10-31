@@ -183,10 +183,10 @@ need_value() {
 # A header value has to fit on one line and carry no control byte; trim the padding the binary trims.
 printable_ascii() {
   local LC_ALL=C value="$1"
+  case "$value" in *[![:print:]]*) return 1 ;; esac
   value="${value#"${value%%[![:space:]]*}"}"
   value="${value%"${value##*[![:space:]]}"}"
-  [ -z "$value" ] && return 1
-  case "$value" in *[![:print:]]*) return 1 ;; esac
+  [ -z "$value" ] && return 0
 }
 
 need_port() {
@@ -761,9 +761,9 @@ def split_ports(raw):
         sys.exit("--exclude-ports wants at least one port; nothing was started.")
     return numbers
 
-fxa_user_agent = fxa_user_agent.strip()
-if fxa_user_agent and any(not 32 <= ord(ch) <= 126 for ch in fxa_user_agent):
+if any(not 32 <= ord(ch) <= 126 for ch in fxa_user_agent):
     sys.exit("--fxa-user-agent wants printable ASCII only; nothing was started.")
+fxa_user_agent = fxa_user_agent.strip()
 
 # The account, not a minted pass: the pass the edge accepts lives 600 seconds,
 # so a lane handed a bare token cannot renew it and dies when it expires.

@@ -42,7 +42,6 @@ CASES = [
     ("up --config without a path", ["up", "--config"], "JSON config path"),
     ("up with an unknown carrier", ["up", "--carrier", "banana"], "h1, h2 or h3"),
     ("an fxa user agent that is not printable ASCII", ["up", "--foxy", "--fxa-user-agent", "Firefox\nInjected: x"], "printable ASCII"),
-    ("an fxa user agent that is blank", ["up", "--foxy", "--fxa-user-agent", "   "], "printable ASCII"),
     ("up with no lane", ["up"], "no outbound chosen"),
     ("ping outside locations", ["up", "--ping"], "--ping"),
     ("exclusions outside foxy", ["up", "--exclude-ports", "22"], "--exclude-ports"),
@@ -99,7 +98,20 @@ def main() -> int:
             )
             return 1
         print(f"check-cli-args: {label} refused")
-    print(f"check-cli-args: {len(CASES)} refusal(s), no hang")
+    reset = ["version", "--foxy", "--fxa-user-agent", "   "]
+    run = subprocess.run(
+        [CLI, *reset],
+        capture_output=True,
+        text=True,
+        timeout=WATCH,
+        stdin=subprocess.DEVNULL,
+        env=env,
+    )
+    if run.returncode != 0 or "printable ASCII" in run.stdout + run.stderr:
+        print("check-cli-args: a blank fxa user agent must restore the pin", file=sys.stderr)
+        print(run.stdout + run.stderr, file=sys.stderr)
+        return 1
+    print(f"check-cli-args: {len(CASES)} refusal(s), one blank reset accepted, no hang")
     return 0
 
 

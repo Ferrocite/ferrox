@@ -21,15 +21,19 @@ pub(crate) enum Agent {
     Page,
     /// The challenge page asked for with the account client's own agent: an edge may serve the wall to one and not the other.
     PageApi,
-    /// The private-access token call, which wants plain text back.
+    /// The private-access token call under the Firefox identity, which wants plain text back.
     Text,
+    /// The same call under the account client's identity, for a solver that earned its cookie as `MozillaVPN`.
+    TextApi,
 }
 
 impl Agent {
     #[must_use]
     pub(crate) fn user_agent(self) -> Cow<'static, str> {
         match self {
-            Self::Api | Self::PageApi => Cow::Borrowed(crate::foxy_account::USER_AGENT),
+            Self::Api | Self::PageApi | Self::TextApi => {
+                Cow::Borrowed(crate::foxy_account::USER_AGENT)
+            }
             Self::Fxa | Self::Page | Self::Text => fxa_user_agent(),
         }
     }
@@ -39,7 +43,7 @@ impl Agent {
         match self {
             Self::Api | Self::Fxa => crate::foxy_account::JSON_ACCEPT,
             Self::Page | Self::PageApi => HTML_ACCEPT,
-            Self::Text => "text/plain",
+            Self::Text | Self::TextApi => "text/plain",
         }
     }
 }
@@ -74,12 +78,12 @@ pub(crate) fn set_fxa_user_agent(value: &str) -> Result<(), String> {
 }
 
 fn validated_user_agent(value: &str) -> Result<Option<String>, String> {
+    if !value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
+        return Err("the FxA User-Agent must contain printable ASCII".to_owned());
+    }
     let value = value.trim();
     if value.is_empty() {
         return Ok(None);
-    }
-    if !value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
-        return Err("the FxA User-Agent must contain printable ASCII".to_owned());
     }
     Ok(Some(value.to_owned()))
 }
@@ -351,7 +355,7 @@ fn solve_page(
     for _ in 0..MAX_ROUNDS {
         let mut answers = Vec::new();
         for challenge in challenges.as_arr().unwrap_or(&[]) {
-            answers.push(answer(endpoint, jar, prefix, &token, challenge)?);
+            answers.push(answer(endpoint, jar, prefix, &token, challenge, agent)?);
         }
         let mut post = String::from("{\"token\":\"");
         ferrox_core::foxy::account::escape_json_into(&token, &mut post);
@@ -519,6 +523,7 @@ fn answer(
     prefix: &str,
     token: &str,
     challenge: &Json,
+    agent: Agent,
 ) -> Result<Json, Challenge> {
     let kind = challenge.get("ty").and_then(Json::as_str).unwrap_or("");
     let data = challenge.get("data");
@@ -548,7 +553,7 @@ fn answer(
             ("ty".to_owned(), Json::Str("pat".to_owned())),
             (
                 "auth".to_owned(),
-                Json::Str(fetch_pat(endpoint, jar, prefix, token)?),
+                Json::Str(fetch_pat(endpoint, jar, prefix, token, agent)?),
             ),
         ])),
         "clientmetrics" => Ok(Json::Obj(vec![
@@ -742,6 +747,7 @@ fn fetch_pat(
     jar: &Mutex<Jar>,
     prefix: &str,
     token: &str,
+    agent: Agent,
 ) -> Result<String, Challenge> {
     let origin = format!("https://{}", endpoint.host);
     let headers: Vec<(&str, &str)> = vec![
@@ -749,10 +755,15 @@ fn fetch_pat(
         ("Origin", &origin),
         ("Content-Length", "0"),
     ];
+    // The PAT call carries the identity that solved the page, so a cookie earned as `MozillaVPN` is not presented as Firefox.
+    let text = match agent {
+        Agent::Page => Agent::Text,
+        _ => Agent::TextApi,
+    };
     let reply = crate::foxy_account::send(
         endpoint,
         jar,
-        Agent::Text,
+        text,
         "POST",
         &format!("{prefix}/pat?token={}", encode(token)),
         &headers,
@@ -890,6 +901,9 @@ mod tests {
         );
         assert_eq!(Agent::Page.accept(), HTML_ACCEPT);
         assert_eq!(Agent::Text.accept(), "text/plain");
+        assert_eq!(Agent::TextApi.accept(), "text/plain");
+        assert_eq!(Agent::TextApi.user_agent(), Agent::Api.user_agent());
+        assert_ne!(Agent::TextApi.user_agent(), Agent::Text.user_agent());
         assert_eq!(Agent::Page.user_agent(), Agent::Text.user_agent());
         assert_ne!(Agent::Api.user_agent(), Agent::Page.user_agent());
         assert!(Agent::Page.user_agent().contains("Firefox"));

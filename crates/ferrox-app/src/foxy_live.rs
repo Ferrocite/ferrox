@@ -65,21 +65,37 @@ fn account() -> Option<Account> {
     })
 }
 
-/// No secrets: a dummy credential reaches `FxA`, so the answer proves the UA class and not the account.
+/// No secrets: a dummy credential reaches `FxA` under the pinned Firefox identity, and the answer is the edge's, not a fallback's.
 #[test]
 #[ignore = "network: a dummy credential proves the pinned identity is not refused as a bot"]
 fn a_dummy_account_clears_the_edge_without_a_browser() {
-    let account = account().expect("the FxA host parses");
-    let denied = account
-        .sign_in("ferrox-dummy@example.com", "not-a-password")
-        .expect_err("a dummy credential must not sign in");
+    let endpoint = Endpoint::parse(
+        ferrox_core::foxy::account::FXA_SERVER,
+        crate::quic::system_roots(),
+    )
+    .expect("the FxA host parses");
+    let jar = Mutex::new(Jar::default());
+    let email = "ferrox-dummy@example.com";
+    let stretched = ferrox_core::foxy::account::auth_pw(email, "not-a-password");
+    let body = ferrox_core::foxy::account::login_body(email, &stretched, None);
+    let reply = crate::foxy_account::send(
+        &endpoint,
+        &jar,
+        crate::foxy_challenge::Agent::Fxa,
+        "POST",
+        "/account/login",
+        &[("Content-Type", crate::foxy_account::JSON_ACCEPT)],
+        &body,
+    )
+    .expect("the edge answers the Firefox identity");
+    assert_ne!(
+        reply.status, 406,
+        "the pinned Firefox identity cleared the UA class"
+    );
     assert!(
-        !matches!(
-            denied,
-            crate::foxy_account::Denied::Challenged(406)
-                | crate::foxy_account::Denied::Unreachable(_)
-        ),
-        "the pinned Firefox identity reached FxA and cleared the UA class: {denied}"
+        matches!(reply.status, 400 | 401 | 403),
+        "the edge read the credential rather than refusing the client: HTTP {}",
+        reply.status
     );
 }
 

@@ -341,10 +341,10 @@ pub fn parse() -> Options {
                     "fxa-user-agent",
                     "a printable ASCII User-Agent",
                 );
-                let value = value.trim();
-                if value.is_empty() || !value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
+                if !value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
                     die("--fxa-user-agent wants printable ASCII only; nothing was started.");
                 }
+                let value = value.trim();
                 value.clone_into(&mut options.fxa_user_agent);
                 index += 2;
             }

@@ -1156,6 +1156,7 @@ mod tests {
         assert!(!wants_h2(&fxa, crate::foxy_challenge::Agent::Fxa));
         assert!(wants_h2(&fxa, crate::foxy_challenge::Agent::Page));
         assert!(wants_h2(&fxa, crate::foxy_challenge::Agent::Text));
+        assert!(wants_h2(&fxa, crate::foxy_challenge::Agent::TextApi));
         let pinned = Endpoint {
             address: Some("127.0.0.1:1".parse().expect("addr")),
             ..fxa
@@ -2159,11 +2160,12 @@ mod loopback {
                 )
             }
             ("POST", "/v1/account/login") => {
-                if !seen
+                let cleared = seen
                     .cookie
                     .as_deref()
-                    .is_some_and(|c| c.contains("_fs_chl=cleared"))
-                {
+                    .is_some_and(|c| c.contains("_fs_chl=cleared"));
+                // The pinned Firefox identity is accepted as a UA class, so it logs in without solving the page.
+                if !cleared && seen.agent != firefox_agent() {
                     return reply(406, &[], "");
                 }
                 let body = String::from_utf8_lossy(&seen.body);
@@ -2283,7 +2285,7 @@ mod loopback {
     }
 
     #[test]
-    fn an_account_signs_in_through_a_challenge_and_mints_a_pass() {
+    fn an_account_signs_in_and_mints_a_pass() {
         let _turn = EDGE
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -2329,17 +2331,10 @@ mod loopback {
             seen.first().map(String::as_str),
             Some("POST /v1/account/login")
         );
-        assert_eq!(
-            seen.iter().filter(|line| *line == "GET /").count(),
-            2,
-            "{seen:?}"
-        );
         assert!(
-            seen.iter()
-                .any(|line| line.ends_with("script.js?reload=true")),
-            "{seen:?}"
+            !seen.iter().any(|line| line == "GET /"),
+            "the Firefox identity needs no challenge page: {seen:?}"
         );
-        assert!(seen.iter().any(|line| line.contains("/pat?")), "{seen:?}");
         assert_eq!(
             seen.last().map(String::as_str),
             Some("GET /api/v1/fpn/token")
@@ -2415,6 +2410,12 @@ mod loopback {
                 |seen| seen.agent == USER_AGENT && seen.path.ends_with("script.js?reload=true")
             ),
             "the solver keeps that identity for its script: {log:?}"
+        );
+        assert!(
+            log.iter().any(|seen| seen.agent == USER_AGENT
+                && seen.path.contains("/pat?")
+                && seen.accept == "text/plain"),
+            "the PAT call keeps the solver identity and its text answer: {log:?}"
         );
         assert!(account.current().token.starts_with("eyJ"), "and mints");
     }
