@@ -21,6 +21,9 @@ const MAX_PLAINTEXT: usize = 16384;
 /// How long a shaped handshake may spend waiting for its peer, matching the KCP path's read deadline.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How long an immediate `WouldBlock` waits before the handshake asks again; a transport with a read timeout has already waited, a nonblocking one has not.
+const WOULD_BLOCK_RETRY: Duration = Duration::from_millis(1);
+
 /// The `HelloRetryRequest` random, which names the message without a new type.
 const HRR_RANDOM: [u8; 32] = [
     0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
@@ -181,6 +184,7 @@ impl<S: Stream> Session<S> {
         self.plain.capacity()
     }
 
+    /// Runs the shaped handshake, reading against one absolute deadline from the first call.
     fn run(&mut self) -> Result<(), TlsError> {
         if self.done {
             return Ok(());
@@ -1648,6 +1652,9 @@ fn exact_until<S: Read>(
                 if deadline.is_none() {
                     return Err(TlsError::Timeout);
                 }
+                if error.kind() != std::io::ErrorKind::TimedOut {
+                    std::thread::sleep(WOULD_BLOCK_RETRY);
+                }
             }
             Err(error) => return Err(TlsError::from(error)),
         }
@@ -2535,6 +2542,35 @@ mod tests {
             error,
             TlsError::Timeout,
             "the refusal is the handshake's timeout"
+        );
+    }
+
+    #[test]
+    fn a_would_block_waits_before_asking_again() {
+        struct AlwaysWouldBlock {
+            reads: usize,
+        }
+
+        impl Read for AlwaysWouldBlock {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
+        }
+
+        let mut stream = AlwaysWouldBlock { reads: 0 };
+        let mut buf = [0u8; 1];
+        let error = exact_until(
+            &mut stream,
+            &mut buf,
+            Some(Instant::now() + Duration::from_millis(20)),
+        )
+        .expect_err("the deadline expires");
+        assert_eq!(error, TlsError::Timeout);
+        assert!(
+            stream.reads < 100,
+            "{} reads in 20 ms is a spin",
+            stream.reads
         );
     }
 
