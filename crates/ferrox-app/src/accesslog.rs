@@ -241,7 +241,7 @@ mod tests {
     #[test]
     fn a_clean_field_is_escaped_without_a_second_buffer() {
         let mut out = String::with_capacity(64);
-        let (_, counts) =
+        let ((), counts) =
             ferrox_core::alloc_count::measure(|| push_escaped(&mut out, "example.com:443"));
         assert_eq!(counts.allocs, 0, "a clean field allocated: {counts:?}");
         assert_eq!(out, "example.com:443");

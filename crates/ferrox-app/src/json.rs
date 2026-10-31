@@ -640,6 +640,14 @@ fn hex(byte: u8, at: usize) -> Result<u32, String> {
 mod tests {
     use super::*;
 
+    fn item_tag(item: &Json) -> &str {
+        item.get("tag").and_then(Json::as_str).expect("tag")
+    }
+
+    fn item_port(item: &Json) -> u32 {
+        item.get("port").and_then(Json::as_u32).expect("port")
+    }
+
     #[derive(Debug, Clone)]
     struct Rng(u64);
 
@@ -953,19 +961,19 @@ mod tests {
 
     #[test]
     fn merge_keeps_the_tag_order_across_a_large_prepend() {
-        let row = |tag: usize, port: usize| {
+        let row = |tag: usize, port: f64| {
             Json::Obj(vec![
                 ("tag".to_owned(), Json::Str(format!("tag{tag}"))),
-                ("port".to_owned(), Json::Num(port as f64)),
+                ("port".to_owned(), Json::Num(port)),
             ])
         };
         let mut base = Json::Obj(vec![(
             "inbounds".to_owned(),
-            Json::Arr((0..4096).map(|tag| row(tag, 0)).collect()),
+            Json::Arr((0..4096).map(|tag| row(tag, 0.0)).collect()),
         )]);
         let over = Json::Obj(vec![(
             "inbounds".to_owned(),
-            Json::Arr((2048..6144).map(|tag| row(tag, 1)).collect()),
+            Json::Arr((2048..6144).map(|tag| row(tag, 1.0)).collect()),
         )]);
         merge(&mut base, &over, "02-extra.json");
         let items = base.get("inbounds").and_then(Json::as_arr).expect("array");
@@ -974,23 +982,21 @@ mod tests {
             6144,
             "replaced tags stay in place, new ones prepend"
         );
-        fn tag(item: &Json) -> &str {
-            item.get("tag").and_then(Json::as_str).expect("tag")
-        }
-        fn port(item: &Json) -> u32 {
-            item.get("port").and_then(Json::as_u32).expect("port")
-        }
-        assert_eq!(tag(&items[0]), "tag4096");
-        assert_eq!(tag(&items[2047]), "tag6143");
-        assert_eq!(tag(&items[2048]), "tag0");
-        assert_eq!(tag(&items[4095]), "tag2047");
-        assert_eq!(tag(&items[4096]), "tag2048");
+        assert_eq!(item_tag(&items[0]), "tag4096");
+        assert_eq!(item_tag(&items[2047]), "tag6143");
+        assert_eq!(item_tag(&items[2048]), "tag0");
+        assert_eq!(item_tag(&items[4095]), "tag2047");
+        assert_eq!(item_tag(&items[4096]), "tag2048");
         assert_eq!(
-            port(&items[4096]),
+            item_port(&items[4096]),
             1,
             "an existing tag is replaced in place"
         );
-        assert_eq!(tag(&items[6143]), "tag4095");
-        assert_eq!(port(&items[6143]), 0, "an untouched tag keeps its value");
+        assert_eq!(item_tag(&items[6143]), "tag4095");
+        assert_eq!(
+            item_port(&items[6143]),
+            0,
+            "an untouched tag keeps its value"
+        );
     }
 }
