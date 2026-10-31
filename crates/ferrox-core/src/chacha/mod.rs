@@ -290,8 +290,30 @@ fn xor_groups_impl<V: Lanes, const NST: usize, const FROM: bool>(
     (NST * V::CHUNKS) as u32
 }
 
+#[inline(always)]
+fn read_le(bytes: &[u8], width: usize) -> u64 {
+    let mut buf = [0u8; 8];
+    buf[..width].copy_from_slice(&bytes[..width]);
+    u64::from_le_bytes(buf)
+}
+
 fn xor_last_bytes_from<const FROM: bool>(dst: &mut [u8], src: &[u8], staged: &[u8; 16]) {
-    for at in 0..dst.len() {
+    let mut at = 0usize;
+    for width in [8usize, 4, 2, 1] {
+        if dst.len() - at >= width {
+            let read = |bytes: &[u8]| read_le(bytes, width);
+            let plain = if FROM {
+                read(&src[at..])
+            } else {
+                read(&dst[at..])
+            };
+            let mixed = plain ^ read(&staged[at..]);
+            let bytes = mixed.to_le_bytes();
+            dst[at..at + width].copy_from_slice(&bytes[..width]);
+            at += width;
+        }
+    }
+    if at < dst.len() {
         dst[at] = if FROM {
             src[at] ^ staged[at]
         } else {
