@@ -193,11 +193,11 @@ jobs:
           BODY: |-
             ## Ferrox VERSION_PLACEHOLDER
 
-            Unpack the package for your platform and run the launcher beside the engine. No cargo, repository, or hand-written config is needed.
+            Unpack the package for your platform. The engine and launcher are side by side; no cargo, repository, or config is needed.
 
-            ### Windows
+            ### Windows: use `ferrox-cli.exe`
 
-            Use `ferrox-cli.exe`. It needs no Bash, WSL, or Python.
+            It is native and needs no Bash, WSL, or Python.
 
             ```powershell
             Expand-Archive ferrox-VERSION_PLACEHOLDER-x86_64-pc-windows-msvc.zip -DestinationPath .
@@ -207,9 +207,7 @@ jobs:
             .\ferrox-cli.exe down
             ```
 
-            The first `up --foxy` asks for the Firefox email and password, then connects. `status` shows the carrier and remaining allowance. `down` stops the lane and restores the Windows proxy.
-
-            If PowerShell says `execvpe(/bin/bash) failed`, it opened WSL instead of Git Bash. That is not this launcher: use `.\ferrox-cli.exe` as shown above. `ferrox-cli.cmd` forwards to the same native launcher for `cmd.exe`. The zip's `ferrox-cli.sh` is only for Git Bash and is ports-only; `--vpn` is the native launcher's.
+            If PowerShell opens WSL and prints `execvpe(/bin/bash) failed`, use `.\ferrox-cli.exe` as shown; do not run `bash ./ferrox-cli.sh`. `ferrox-cli.cmd` forwards to the same binary from `cmd.exe`; the zip's `ferrox-cli.sh` is Git Bash only and ports-only.
 
             ### macOS and Linux
 
@@ -221,17 +219,22 @@ jobs:
             ./ferrox-cli.sh down
             ```
 
-            On Windows, replace `ferrox-cli` with `.\ferrox-cli.exe` in the lane commands below.
+            On Windows, replace `./ferrox-cli.sh` with `.\ferrox-cli.exe` in the lane commands below.
+
+            ### Lanes
 
             | lane | what it needs | start it |
             | --- | --- | --- |
             | Foxy | a Firefox account: email and password; no server | `ferrox-cli up --foxy --vpn` |
             | VeePN | nothing: anonymous, no account, no server | `ferrox-cli up --veepn --vpn` |
+            | Psiphon | `psiphon-tunnel-core` beside `ferrox-app`; no account | `ferrox-cli.sh up --psiphon --vpn` |
             | VLESS | a `vless://` link | `ferrox-cli up --vless 'vless://...'` |
             | VMess | `HOST:PORT` and a user id | `ferrox-cli up --vmess host:443 --uuid ID` |
             | Trojan | `HOST:PORT` and a password | `ferrox-cli up --trojan host:443 --password PW` |
             | Shadowsocks | `HOST:PORT`, method, and password | `ferrox-cli up --ss host:8388 --method aes-256-gcm --password PW` |
             | Any config | a JSON config the binary serves | `ferrox-cli up --config mine.json` |
+
+            Psiphon runs its own client: `--psiphon-conduit-mode shirokhorshid` or `--psiphon-cdn-profile shirokhorshid` selects the Shiroy variants; `auto`/`public` and `legacy`/`android`/`off` keep the built-in paths.
 
             All lanes serve the same loopback fronts: SOCKS5 `127.0.0.1:10808`, HTTP and HTTPS `127.0.0.1:8080`, and mixed `127.0.0.1:10809`.
 
@@ -247,7 +250,7 @@ jobs:
 
             ### Verify the download
 
-            `SHA256SUMS` lists every package. To check only the one you downloaded, Linux:
+            `SHA256SUMS` lists every package; compare it with the matching line. Linux:
 
             ```bash
             grep 'ferrox-VERSION_PLACEHOLDER-.*-linux-gnu.tar.gz' SHA256SUMS | sha256sum --check -
@@ -265,7 +268,7 @@ jobs:
             Get-FileHash .\ferrox-*-x86_64-pc-windows-msvc.zip -Algorithm SHA256
             ```
 
-            Compare the result with the matching line in `SHA256SUMS`. `README.md` in each package is the quickstart; `USAGE.md` is the full manual.
+            `README.md` in each package is the quickstart; `USAGE.md` is the full manual.
         run: |
           printf '%s\n\nBuilt by `release.yml` from commit `%s`.\n' "$BODY" "${GITHUB_SHA::8}" \
             | sed "s/VERSION_PLACEHOLDER/${VERSION#v}/g" >RELEASE-BODY.md

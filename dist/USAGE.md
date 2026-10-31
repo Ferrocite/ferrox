@@ -144,14 +144,17 @@ ferrox-cli up --veepn --region us-va      # anonymous: no account, no server
 ferrox-cli up --vmess host:443 --uuid ID --network tcp
 ferrox-cli up --trojan host:443 --password PW
 ferrox-cli up --ss host:8388 --method aes-256-gcm --password PW
+ferrox-cli up --psiphon                   # its own psiphon-tunnel-core beside ferrox-app
 ferrox-cli up --config mine.json          # served verbatim, any inbound/outbound
 ```
+
+The Psiphon lane needs no account; `--psiphon-bin FILE` names the client when it is not beside `ferrox-app`, `--psiphon-conduit-mode shirokhorshid` or `--psiphon-cdn-profile shirokhorshid` selects the Shiroy variants, and `auto`/`public` with `legacy`/`android`/`off` keeps the built-in paths.
 
 The vless converter writes `tcp`, `ws`, `grpc`, `httpupgrade` and `xhttp`, with `security=none|tls|reality`. Anything else (kcp, quic, hysteria, httpheader, masque, xdrive) goes through `--config`: those are config shapes this binary already serves, and the converter does not guess at them. A share-link lane with no link, a missing `--uuid`, or a missing password is refused before the lane starts, with the example to run.
 
 `--veepn` is the one lane that needs nothing typed in. The plane launches this device anonymously, names the fastest region (or the one `--region` pins, with `--country` as its alias), and lists the upstreams that answer `Basic` for the pair it printed. The region ids are the plane's own, lowercase and from its free pool (`nl`, `us-va`, `us-or`, `gb-lnd`, `fr-prs`, `sg`, `ru-spb` at the time of writing); a typed id is lowered for the ask, and a name the plane does not list is answered `422` and diagnosed as such. The device id the plane sees is kept in `~/.config/ferrox/veepn.udid` (mode 0600), so a restart is the same device; `--domains` replaces the seven API origins this build ships with, and `--udid` names the identity outright.
 
-A config file can carry any inbound the binary serves — `vless`, `vmess`, `trojan`, `shadowsocks`, `hysteria`, `socks`, `http`, `mixed` — and any outbound — those plus `foxy`, `veepn`, `http` and `freedom`.
+A config file can carry any inbound the binary serves — `vless`, `vmess`, `trojan`, `shadowsocks`, `hysteria`, `socks`, `http`, `mixed` — and any outbound — those plus `foxy`, `veepn`, `psiphon`, `http` and `freedom`.
 
 ## 6. The app
 
