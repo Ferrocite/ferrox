@@ -53,6 +53,8 @@
 # `masque::datagram_encode`, `ws::write_frame`, and
 # `ws::tests::mask_chunks_match_the_byte_loop`, whose body is the masking loop
 # with no I/O, so the frame and the method are the same thing.
+# The Trojan row's domain header carries `127.0.0.1`, so its frame is the parse
+# and not the resolver, and the number it publishes reproduces.
 #
 # `doc  test filter  symbol`
 record-layer  record::tests::the_ladder_reports_the_blocks_the_caller_asked_for  ferrox_core::record::fill_exact

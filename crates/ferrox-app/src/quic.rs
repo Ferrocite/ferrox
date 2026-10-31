@@ -3201,6 +3201,17 @@ pub(crate) fn dial_pooled(
     dial: &QuicDial,
     target: &crate::proxy::Destination,
 ) {
+    let header = crate::proxy::vless_header(&dial.id, 1, target);
+    dial_pooled_with(client, dial, &header, true);
+}
+
+/// A pooled stream whose first bytes are the caller's own header, and whose reply the protocol either owes or does not.
+pub(crate) fn dial_pooled_with(
+    client: &Connection,
+    dial: &QuicDial,
+    header: &[u8],
+    expect_reply: bool,
+) {
     let pooled = pool().stream(dial);
     #[cfg(test)]
     qstage(format!(
@@ -3241,10 +3252,10 @@ pub(crate) fn dial_pooled(
         leave_session(&pooled.table, id);
         return;
     };
-    let header = crate::proxy::vless_header(&dial.id, 1, target);
     let deadline = Instant::now() + HANDSHAKE_TIMEOUT;
-    let opened = stream_send_all_parked(&pooled.conn, &flush_sock, id, &header, false, deadline)
-        && stream_recv_exact_parked(&pooled.conn, id, 2, deadline).as_deref() == Some(&[0, 0]);
+    let opened = stream_send_all_parked(&pooled.conn, &flush_sock, id, header, false, deadline)
+        && (!expect_reply
+            || stream_recv_exact_parked(&pooled.conn, id, 2, deadline).as_deref() == Some(&[0, 0]));
     #[cfg(test)]
     qstage(format!("{} t={} header {id} {opened}", dial.port, qms()));
     if !opened {

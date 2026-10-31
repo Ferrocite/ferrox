@@ -172,6 +172,8 @@ impl TrojanLink {
             TransportKind::Grpc => ("trojan-grpc", "trojan-grpc-tls"),
             TransportKind::Xhttp => ("trojan-xhttp", "trojan-xhttp-tls"),
             TransportKind::Kcp => ("trojan-kcp", "trojan-kcp-tls"),
+            TransportKind::Quic => ("trojan-quic", "trojan-quic"),
+            TransportKind::Hysteria => ("trojan-hysteria", "trojan-hysteria"),
             other => {
                 return Support::Planned {
                     reason: planned_reason(other),
@@ -501,6 +503,16 @@ mod tests {
                 "trojan://pw@127.0.0.1:443?headerType=http",
                 "trojan-httpheader",
             ),
+            (
+                "trojan://pw@example.com:443?security=tls&type=quic",
+                "trojan-quic",
+            ),
+            ("trojan://pw@127.0.0.1:443?type=quic", "trojan-quic"),
+            (
+                "trojan://pw@example.com:443?security=tls&type=hysteria",
+                "trojan-hysteria",
+            ),
+            ("trojan://pw@127.0.0.1:443?type=hysteria", "trojan-hysteria"),
         ] {
             assert_eq!(
                 TrojanLink::parse(text).expect(text).support(),
@@ -509,12 +521,6 @@ mod tests {
             );
         }
         for (text, want) in [
-            (
-                "trojan://pw@example.com:443?security=tls&type=quic",
-                Support::Planned {
-                    reason: "trojan-quic: parses, the carrier is not wired for trojan",
-                },
-            ),
             (
                 "trojan://pw@127.0.0.1:443?security=reality",
                 Support::Planned {

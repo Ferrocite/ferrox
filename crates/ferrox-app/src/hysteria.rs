@@ -816,7 +816,17 @@ impl Write for Flow {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn open_flow(session: &Session, stream: u64, header: &[u8]) -> Option<Flow> {
+    open_flow_with_reply(session, stream, header, 2)
+}
+
+fn open_flow_with_reply(
+    session: &Session,
+    stream: u64,
+    header: &[u8],
+    reply: usize,
+) -> Option<Flow> {
     let mut prefix = Vec::with_capacity(2 + header.len());
     hysteria::tcp_prefix(&mut prefix);
     prefix.extend_from_slice(header);
@@ -834,7 +844,7 @@ pub(crate) fn open_flow(session: &Session, stream: u64, header: &[u8]) -> Option
         at: 0,
         drive,
         wake,
-        reply: 2,
+        reply,
         meter: crate::stats::Meter::default(),
     })
 }
@@ -997,9 +1007,9 @@ pub(crate) fn close_pooled() {
 }
 
 /// A flow over the outbound's live connection when a stream opens on it, a fresh handshake otherwise; a pooled connection that stopped opening is dropped where it is found.
-fn open_pooled(dial: &Dial, header: &[u8]) -> Option<Flow> {
+fn open_pooled(dial: &Dial, header: &[u8], reply: usize) -> Option<Flow> {
     for (session, stream) in candidates(dial) {
-        if let Some(flow) = open_flow(&session, stream, header) {
+        if let Some(flow) = open_flow_with_reply(&session, stream, header, reply) {
             return Some(flow);
         }
         if session.shared.lock().is_ok_and(|conn| !usable(&conn)) {
@@ -1009,7 +1019,7 @@ fn open_pooled(dial: &Dial, header: &[u8]) -> Option<Flow> {
     let mut session = connect(dial)?;
     let driver = Driver::new();
     driver.attach(&mut session);
-    let Some(flow) = open_flow(&session, FIRST_FLOW_STREAM, header) else {
+    let Some(flow) = open_flow_with_reply(&session, FIRST_FLOW_STREAM, header, reply) else {
         driver.stop();
         return None;
     };
@@ -1024,7 +1034,11 @@ pub(crate) fn dial_vless(
     target: &crate::proxy::Destination,
 ) {
     let header = crate::proxy::vless_header(id, 1, target);
-    let Some(flow) = open_pooled(dial, &header) else {
+    dial_header(client, dial, &header, 2);
+}
+
+pub(crate) fn dial_header(client: &Connection, dial: &Dial, header: &[u8], reply: usize) {
+    let Some(flow) = open_pooled(dial, header, reply) else {
         return;
     };
     relay(client, &flow);
