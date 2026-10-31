@@ -25,7 +25,7 @@ pub fn table() -> String {
     );
     let _ = writeln!(
         s,
-        "| 2 | VLESS TCP TLS (Vision optional) | {} | raw-carrier dial through `tls::connect` with the header and response on the session (`proxy::tests` loopback echoes and outbound parse gates); vision over TLS stays planned |",
+        "| 2 | VLESS TCP TLS (Vision optional) | {} | raw and carried dials through `tls::connect` with the header and response on the session (`proxy::tests` loopback echoes and outbound parse gates); Vision-over-TLS frames the same dial (`vless_over_tls_vision_carries_an_echo`, `vless_over_tls_vision_direct_switch_carries_inner_tls`) |",
         live_support("security=tls&encryption=none&type=tcp", "192.0.2.1")
     );
     let _ = writeln!(
