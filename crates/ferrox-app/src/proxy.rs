@@ -40560,7 +40560,9 @@ mod tests {
         let mut wire = crate::proxy::unfilled(crate::shadowsocks::DATAGRAM_MAX);
         let mut opened = Vec::new();
         for _ in 0..2 {
-            let (n, uplink) = server.recv_from(&mut wire).expect("the lane seals to the server");
+            let (n, uplink) = server
+                .recv_from(&mut wire)
+                .expect("the lane seals to the server");
             let mut hop = None;
             let (target, body) =
                 crate::shadowsocks::open_datagram(&master, method, &mut wire[..n], &mut hop)
@@ -40576,18 +40578,14 @@ mod tests {
         let mut reply = crate::proxy::unfilled(crate::shadowsocks::DATAGRAM_MAX);
         reply[room..room + 4].copy_from_slice(b"pong");
         let packet = crate::shadowsocks::seal_datagram(
-            &master,
-            method,
-            &first,
-            &mut reply,
-            room,
-            4,
-            &mut None,
+            &master, method, &first, &mut reply, room, 4, &mut None,
         )
         .expect("seals");
         server.send_to(packet, opened[0].0).expect("sends");
         let mut back = vec![0u8; UDP_BUF];
-        let (n, _) = source.recv_from(&mut back).expect("the lane frames the reply");
+        let (n, _) = source
+            .recv_from(&mut back)
+            .expect("the lane frames the reply");
         let (framed_from, body) = parse_socks_udp(&back[..n]).expect("splits");
         assert_eq!(framed_from, first);
         assert_eq!(body, b"pong");
