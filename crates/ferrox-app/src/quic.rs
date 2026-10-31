@@ -4729,6 +4729,21 @@ mod tests {
     }
 
     #[test]
+    fn a_hello_without_a_name_is_refused_when_the_list_rejects_it() {
+        let mut identity = minted_identity_for("first.test");
+        identity
+            .certs
+            .push(minted_identity_for("second.test").certs.remove(0));
+        identity.reject_unknown_sni = true;
+        let (client, server) =
+            lane_pair_raw(&identity, None, &identity.certs[0].cert_chain, None, false);
+        assert!(
+            !client.conn.is_established() && !server.conn.is_established(),
+            "an unnamed hello is refused when the list rejects unknown names"
+        );
+    }
+
+    #[test]
     fn an_unknown_name_is_refused_when_the_list_rejects_it() {
         let mut identity = minted_identity_for("first.test");
         identity
