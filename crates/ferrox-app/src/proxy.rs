@@ -3239,8 +3239,25 @@ pub(crate) struct ShadowsocksOut {
     host: String,
     headers: Vec<(String, String)>,
     heartbeat: u32,
-    mux: bool,
+    mux: Mux,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
+}
+
+/// The session's two lanes and xray's `xudpProxyUDP443` for the datagram one, read only while a mux session is enabled.
+#[derive(Debug, Clone, Copy, Default)]
+struct Mux {
+    tcp: bool,
+    udp: bool,
+    udp443: Udp443,
+}
+
+/// What a UDP datagram to port 443 does under a mux: it is refused, rides the mux, or skips it for the direct dial.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Udp443 {
+    #[default]
+    Reject,
+    Allow,
+    Skip,
 }
 
 fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::sync::Arc<Stop>>) {
@@ -11034,10 +11051,14 @@ fn inbound_ss_networks(inbound: &Json) -> (bool, bool) {
     };
     let mut tcp = false;
     let mut udp = false;
-    let mut take = |name: &str| match name.trim() {
-        "tcp" => tcp = true,
-        "udp" => udp = true,
-        _ => {}
+    let mut take = |name: &str| {
+        for part in name.split(',') {
+            match part.trim() {
+                "tcp" => tcp = true,
+                "udp" => udp = true,
+                _ => {}
+            }
+        }
     };
     match named.as_arr() {
         Some(items) => {
@@ -17095,7 +17116,7 @@ fn dial_socks_outbound(
         Outbound::Vmess(vmess) => dial_vmess(client, server, vmess, target, ladder),
         Outbound::Trojan(trojan) => dial_trojan(client, server, trojan, target, ladder),
         Outbound::Shadowsocks(shadowsocks) => {
-            if !shadowsocks.mux || !dial_ss_mux(client, shadowsocks, target) {
+            if !shadowsocks.mux.tcp || !dial_ss_mux(client, shadowsocks, target) {
                 dial_shadowsocks(client, server, shadowsocks, target, ladder);
             }
         }
@@ -19788,7 +19809,7 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
         serve_socks_udp_shadowsocks2022(relay, ss, method2022);
         return;
     }
-    if ss.mux && serve_socks_udp_ss_mux(relay, ss) {
+    if ss.mux.udp && serve_socks_udp_ss_mux(relay, ss) {
         return;
     }
     let Some(method) = ferrox_core::shadowsocks::Method::parse(&ss.method) else {
@@ -20297,6 +20318,55 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
     join(&done);
 }
 
+/// A UDP/443 datagram whose mux policy skips rides its own direct uplink: one socket per destination, its replies framed back to the association's client.
+fn skip_ss_mux_datagram(
+    uplinks: &mut HashMap<SocketAddr, UdpSocket>,
+    dest: SocketAddr,
+    payload: &[u8],
+    relay: &UdpSocket,
+    source: &Arc<Mutex<Option<SocketAddr>>>,
+) {
+    if let Some(up) = uplinks.get(&dest) {
+        let _ = up.send(payload);
+        return;
+    }
+    let Some(up) = datagram_uplink(dest, None, None) else {
+        return;
+    };
+    let Ok(writer) = up.try_clone() else {
+        return;
+    };
+    let peer = Arc::clone(source);
+    let Ok(relay_write) = relay.try_clone() else {
+        return;
+    };
+    thread::spawn(move || {
+        let mut back = udp_buffer();
+        let mut framed = Vec::with_capacity(HEAD + UDP_BUF);
+        while let Ok(read) = up.recv(&mut back) {
+            let Some(client) = peer.lock().ok().and_then(|slot| *slot) else {
+                continue;
+            };
+            let out = socks_udp_frame(&mut framed, None, &dest, &back[..read]);
+            if relay_write.send_to(out, client).is_err() {
+                break;
+            }
+        }
+    });
+    uplinks.insert(dest, writer);
+    // The datagram that opened the destination is its first payload; a hop must not drop it.
+    let _ = uplinks[&dest].send(payload);
+}
+
+/// The datagram's 443 policy: only a port-443 datagram is affected, and only by reject or skip.
+fn ss_mux_443(policy: Udp443, dest: SocketAddr) -> Udp443 {
+    if dest.port() == 443 {
+        policy
+    } else {
+        Udp443::Allow
+    }
+}
+
 fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
     let Some(mux) = open_ss_mux(ss) else {
         return false;
@@ -20312,6 +20382,7 @@ fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
     let mut ids = ferrox_core::mux::Ids::new(1);
     // One mux flow per destination, opened by the first datagram and named on every later one.
     let mut lanes: Vec<(SocketAddr, u16)> = Vec::new();
+    let mut direct: HashMap<SocketAddr, UdpSocket> = HashMap::new();
     let mut published: Option<SocketAddr> = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
@@ -20325,6 +20396,20 @@ fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
                 *slot = Some(src);
                 published = Some(src);
             }
+        }
+        match ss_mux_443(ss.mux.udp443, dest) {
+            Udp443::Reject => {
+                static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                if SAID.set(()).is_ok() {
+                    eprintln!("shadowsocks: mux rejects udp/443; the datagram is dropped");
+                }
+                continue;
+            }
+            Udp443::Skip => {
+                skip_ss_mux_datagram(&mut direct, dest, payload, relay, &source);
+                continue;
+            }
+            Udp443::Allow => {}
         }
         let (id, first) = if let Some((_, id)) = lanes.iter().find(|(known, _)| *known == dest) {
             (*id, false)
@@ -25767,7 +25852,7 @@ fn loopback_shadowsocks(
         password: inbound_ss_password(inbound),
         carrier,
         host,
-        mux: false,
+        mux: Mux::default(),
         tls: None,
         headers,
         heartbeat,
@@ -26608,7 +26693,7 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
                 password,
                 carrier,
                 host,
-                mux: false,
+                mux: Mux::default(),
                 tls: None,
                 headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
                 heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
@@ -26625,6 +26710,25 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
             }
             _ => continue,
         };
+        // A negative pool size turns that manager off: tcp and udp each read xray's own rule.
+        let mux = outbound.get("mux");
+        let enabled = mux.and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true));
+        let concurrency = mux
+            .and_then(|mux| mux.get("concurrency"))
+            .and_then(Json::as_i64)
+            .unwrap_or(0);
+        let xudp = mux
+            .and_then(|mux| mux.get("xudpConcurrency"))
+            .and_then(Json::as_i64)
+            .unwrap_or(0);
+        let udp443 = match mux
+            .and_then(|mux| mux.get("xudpProxyUDP443"))
+            .and_then(Json::as_str)
+        {
+            Some("skip") => Udp443::Skip,
+            Some("allow") => Udp443::Allow,
+            _ => Udp443::Reject,
+        };
         return Some(ShadowsocksOut {
             address,
             port,
@@ -26632,7 +26736,11 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
             password,
             carrier,
             host,
-            mux: outbound.get("mux").and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true)),
+            mux: Mux {
+                tcp: enabled && concurrency >= 0,
+                udp: enabled && (xudp > 0 || (xudp == 0 && concurrency >= 0)),
+                udp443,
+            },
             tls,
             headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
             heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
@@ -29037,6 +29145,8 @@ mod tests {
         assert_eq!(inbound_ss_networks(&string), (true, false));
         let array = crate::json::parse(r#"{"settings": {"network": ["udp"]}}"#).expect("parses");
         assert_eq!(inbound_ss_networks(&array), (false, true));
+        let joined = crate::json::parse(r#"{"settings": {"network": "tcp,udp"}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&joined), (true, true));
         let unsupported =
             crate::json::parse(r#"{"settings": {"network": "unix"}}"#).expect("parses");
         assert_eq!(inbound_ss_networks(&unsupported), (false, false));
@@ -36729,7 +36839,7 @@ mod tests {
             password: "an-example-shared-password".to_owned(),
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
             tls: Some(client),
             headers: Vec::new(),
             heartbeat: 0,
@@ -36817,7 +36927,7 @@ mod tests {
                 password: "an-example-shared-password".to_owned(),
                 carrier: inbound_carrier(&inbound),
                 host: "127.0.0.1".to_owned(),
-                mux: false,
+                mux: Mux::default(),
                 tls: Some(Arc::clone(&client)),
                 headers: Vec::new(),
                 heartbeat: 0,
@@ -36861,7 +36971,34 @@ mod tests {
         )
         .expect("parses");
         let out = find_shadowsocks_outbound(&root).expect("finds");
-        assert!(out.mux, "the switch is read");
+        assert!(out.mux.tcp, "the switch is read");
+        assert!(out.mux.udp, "a default xudp pool rides the mux too");
+        assert_eq!(
+            out.mux.udp443,
+            Udp443::Reject,
+            "xray's default refuses udp/443"
+        );
+        let direct = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "xudpConcurrency": -1, "xudpProxyUDP443": "skip"}}]}"#,
+        )
+        .expect("parses");
+        let direct = find_shadowsocks_outbound(&direct).expect("finds");
+        assert!(!direct.mux.udp, "a negative xudp pool sends UDP direct");
+        assert_eq!(
+            direct.mux.udp443,
+            Udp443::Skip,
+            "the udp/443 policy is read"
+        );
+        let tcp_off = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "concurrency": -1}}]}"#,
+        )
+        .expect("parses");
+        let tcp_off = find_shadowsocks_outbound(&tcp_off).expect("finds");
+        assert!(
+            !tcp_off.mux.tcp,
+            "a negative tcp pool turns the session off"
+        );
+        assert!(!tcp_off.mux.udp, "udp follows the pool it rides");
     }
 
     /// The vmess dial carries its request in the session too, so a tls kcp row speaks the same bytes both roles.
@@ -38623,7 +38760,7 @@ mod tests {
             password,
             carrier,
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -40271,7 +40408,11 @@ mod tests {
             password: "an-example-shared-password".to_owned(),
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
-            mux: true,
+            mux: Mux {
+                tcp: true,
+                udp: true,
+                udp443: Udp443::Reject,
+            },
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -40327,7 +40468,11 @@ mod tests {
             password: "an-example-shared-password".to_owned(),
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
-            mux: true,
+            mux: Mux {
+                tcp: true,
+                udp: true,
+                udp443: Udp443::Reject,
+            },
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -40347,6 +40492,45 @@ mod tests {
         let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
         assert_eq!(from.port(), echo_port);
         assert_eq!(payload, b"ping", "the mux frame's datagram echoes");
+    }
+
+    /// xray's `xudpProxyUDP443` shapes port 443 alone, and only a reject or a skip changes what happens to it.
+    #[test]
+    fn only_a_reject_or_a_skip_touches_udp443() {
+        let https: SocketAddr = "192.0.2.1:443".parse().expect("addr");
+        let plain: SocketAddr = "192.0.2.1:8443".parse().expect("addr");
+        assert_eq!(ss_mux_443(Udp443::Reject, https), Udp443::Reject);
+        assert_eq!(ss_mux_443(Udp443::Skip, https), Udp443::Skip);
+        assert_eq!(ss_mux_443(Udp443::Reject, plain), Udp443::Allow);
+        assert_eq!(ss_mux_443(Udp443::Allow, https), Udp443::Allow);
+    }
+
+    /// A datagram the mux skips rides a direct uplink, and its reply comes back framed for the association's client.
+    #[test]
+    fn a_skipped_datagram_rides_a_direct_lane() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, src)) = echo.recv_from(&mut buf) {
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let source = Arc::new(Mutex::new(Some(client.local_addr().expect("addr"))));
+        let mut uplinks = HashMap::new();
+        skip_ss_mux_datagram(&mut uplinks, echo_addr, b"ping", &relay, &source);
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = client.recv_from(&mut back).expect("the direct lane echoes");
+        let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(from, echo_addr);
+        assert_eq!(payload, b"ping");
     }
 
     /// A shadowsocks inbound told to carry udp alone opens no stream listener and still answers a datagram, as the reference's udp worker alone would.
@@ -40456,7 +40640,7 @@ mod tests {
             password: "an-example-shared-password".to_owned(),
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -40534,7 +40718,7 @@ mod tests {
             password: "an-example-shared-password".to_owned(),
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -52772,7 +52956,7 @@ end
             password,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
+            mux: Mux::default(),
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,

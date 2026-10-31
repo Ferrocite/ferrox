@@ -675,20 +675,33 @@ struct SenderConfig {
 fn multiplex_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.app.proxyman.MultiplexingConfig");
     let mut enabled = false;
+    let mut concurrency = 0i32;
+    let mut xudp_concurrency = 0i32;
+    let mut udp443 = String::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 0) => enabled = reader.varint()? != 0,
-            // The pool sizes and UDP/443 policy shape a session this tree opens per flow, so they are read and dropped.
-            (2..=3, 0) => {
-                reader.varint()?;
-            }
+            (2, 0) => concurrency = int32(reader.varint()?),
+            (3, 0) => xudp_concurrency = int32(reader.varint()?),
             (4, 2) => {
-                reader.bytes()?;
+                udp443 = String::from_utf8_lossy(reader.bytes()?).into_owned();
             }
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    Ok(object(vec![("enabled", Json::Bool(enabled))]))
+    Ok(object(vec![
+        ("enabled", Json::Bool(enabled)),
+        ("concurrency", Json::Num(f64::from(concurrency))),
+        ("xudpConcurrency", Json::Num(f64::from(xudp_concurrency))),
+        ("xudpProxyUDP443", Json::Str(udp443)),
+    ]))
+}
+
+/// One protobuf `int32` out of its varint: a negative value arrives sign-extended across ten bytes, so the low 32 bits are the number.
+fn int32(raw: u64) -> i32 {
+    u32::try_from(raw & u64::from(u32::MAX))
+        .expect("the mask narrows to 32 bits")
+        .cast_signed()
 }
 
 /// xray's `SocketConfig` as far as a stream's dial reads it: the system dial this tree puts
@@ -5169,7 +5182,12 @@ mod tests {
             varint_field(2, 443),
             bytes_field(3, &ss_user(&ss_account(b"shadowsocks-password", 6), None)),
         ]);
-        let mux = message(&[varint_field(1, 1), varint_field(2, 8)]);
+        let mux = message(&[
+            varint_field(1, 1),
+            varint_field(2, 8),
+            varint_field(3, u64::from(u32::MAX)),
+            bytes_field(4, b"skip"),
+        ]);
         let outbound = message(&[
             bytes_field(
                 2,
@@ -5185,14 +5203,27 @@ mod tests {
         ]);
         let json = to_json(&config(&dokodemo(5000, &[varint_field(7, 2)]), &outbound))
             .expect("the sender's mux decodes");
-        let enabled = json
+        let mux = json
             .get("outbounds")
             .and_then(Json::as_arr)
             .expect("outbounds")[0]
             .get("mux")
-            .and_then(|mux| mux.get("enabled"))
-            .and_then(Json::as_bool);
-        assert_eq!(enabled, Some(true), "the client dials a mux session");
+            .expect("the mux block");
+        assert_eq!(
+            mux.get("enabled").and_then(Json::as_bool),
+            Some(true),
+            "the client dials a mux session"
+        );
+        assert_eq!(
+            mux.get("xudpConcurrency").and_then(Json::as_i64),
+            Some(-1),
+            "a negative xudp pool turns UDP muxing off"
+        );
+        assert_eq!(
+            mux.get("xudpProxyUDP443").and_then(Json::as_str),
+            Some("skip"),
+            "the udp/443 policy reaches the dial"
+        );
     }
 
     #[test]

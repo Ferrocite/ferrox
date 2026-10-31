@@ -1210,6 +1210,79 @@ struct UdpSource {
     last: Instant,
 }
 
+/// One readiness wait over the front's client socket and every association's sockets, so a pass
+/// reads only what has data instead of trying each socket in turn.
+#[cfg(unix)]
+mod poll_set {
+    use std::io;
+    use std::net::UdpSocket;
+    use std::os::fd::AsRawFd;
+
+    pub(crate) type Row = libc::pollfd;
+
+    pub(crate) fn socket_row(socket: &UdpSocket) -> Row {
+        libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }
+    }
+
+    pub(crate) fn wait(rows: &mut [Row], timeout: i32) -> io::Result<usize> {
+        let count = libc::nfds_t::try_from(rows.len()).unwrap_or(libc::nfds_t::MAX);
+        loop {
+            // SAFETY: `rows` is this call's array, `count` its length, and the call writes only `revents`.
+            let answered = unsafe { libc::poll(rows.as_mut_ptr(), count, timeout) };
+            if answered >= 0 {
+                return Ok(usize::try_from(answered).unwrap_or(0));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    pub(crate) fn is_ready(row: Row) -> bool {
+        row.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+    }
+}
+
+/// The Windows spelling of the same wait: `WSAPoll`, whose error code comes from `WSAGetLastError`.
+#[cfg(windows)]
+mod poll_set {
+    use std::io;
+    use std::net::UdpSocket;
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAGetLastError, WSAPoll, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLRDNORM, SOCKET, WSAPOLLFD,
+    };
+
+    pub(crate) type Row = WSAPOLLFD;
+
+    pub(crate) fn socket_row(socket: &UdpSocket) -> Row {
+        WSAPOLLFD {
+            fd: socket.as_raw_socket() as SOCKET,
+            events: POLLIN | POLLRDNORM,
+            revents: 0,
+        }
+    }
+
+    pub(crate) fn wait(rows: &mut [Row], timeout: i32) -> io::Result<usize> {
+        let count = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+        // SAFETY: `rows` is this call's array, `count` its length, and the call writes only `revents`.
+        let answered = unsafe { WSAPoll(rows.as_mut_ptr(), count, timeout) };
+        if answered < 0 {
+            return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        }
+        Ok(usize::try_from(answered).unwrap_or(0))
+    }
+
+    pub(crate) fn is_ready(row: Row) -> bool {
+        row.revents & (POLLIN | POLLRDNORM | POLLERR | POLLHUP | POLLNVAL) != 0
+    }
+}
+
 pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool) {
     if !freedom || users.is_empty() {
         return;
@@ -1287,110 +1360,160 @@ fn serve_udp_stream(clients: &UdpSocket, user: &SsUser) {
     }
 }
 
-/// One association per client source, created only by a datagram whose tag verifies: a reply can only name the source whose socket carried it.
+/// One association per client source, created only by a datagram whose tag verifies: a reply can only name a source the tag proved.
 #[allow(clippy::too_many_lines)]
+/// Serve an AEAD front: one upstream association per client source, each with its own sockets, so a
+/// reply reaches the one account that opened it. The pass parks in `poll` until a socket is ready or
+/// the earliest association goes idle, so a quiet front costs no wakeups.
 fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
+    if clients.set_nonblocking(true).is_err() {
+        return;
+    }
     let mut sources: HashMap<SocketAddr, UdpSource> = HashMap::new();
     let mut probes: Vec<Option<Cipher>> = users.iter().map(|_| None).collect();
     let mut buf = crate::proxy::unfilled(DATAGRAM_MAX);
     let mut reply = crate::proxy::unfilled(DATAGRAM_MAX);
-    let mut last_prune = Instant::now();
+    let mut rows: Vec<poll_set::Row> = Vec::new();
+    let mut owners: Vec<Option<(SocketAddr, bool)>> = Vec::new();
+    let idle = crate::budgets::udp_idle();
     loop {
-        match clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
-            Ok((n, src)) => {
-                let now = Instant::now();
-                let datagram = &mut buf[SEAL_ROOM..SEAL_ROOM + n];
-                let opened = if let Some(source) = sources.get_mut(&src) {
-                    let user = &users[source.user];
-                    open_datagram(&user.master, user.method, datagram, &mut source.hop)
-                        .map(|(dest, payload)| (dest, payload, source))
-                } else {
-                    let Some((which, dest, payload)) =
-                        open_datagram_any(users, datagram, &mut probes)
-                    else {
-                        continue;
-                    };
-                    if sources.len() >= SS_UDP_SOURCES {
-                        let idle = crate::budgets::udp_idle();
-                        sources.retain(|_, source| now.duration_since(source.last) < idle);
-                        if sources.len() >= SS_UDP_SOURCES {
-                            continue;
-                        }
-                    }
-                    let Ok(v4) = UdpSocket::bind("0.0.0.0:0") else {
-                        continue;
-                    };
-                    let v6 = UdpSocket::bind("[::]:0").ok();
-                    if v4.set_nonblocking(true).is_err() {
-                        continue;
-                    }
-                    if v6
-                        .as_ref()
-                        .is_some_and(|sock| sock.set_nonblocking(true).is_err())
-                    {
-                        continue;
-                    }
-                    let hop = probes[which].take();
-                    sources.insert(
-                        src,
-                        UdpSource {
-                            user: which,
-                            v4,
-                            v6,
-                            hop,
-                            last: now,
-                        },
-                    );
-                    let source = sources.get_mut(&src).expect("just inserted");
-                    Some((
-                        dest,
-                        &buf[SEAL_ROOM + payload.start..SEAL_ROOM + payload.end],
-                        source,
-                    ))
-                };
-                let Some((dest, payload, source)) = opened else {
-                    continue;
-                };
-                source.last = now;
-                if dest.is_ipv6() {
-                    if let Some(sock) = source.v6.as_ref() {
-                        let _ = sock.send_to(payload, dest);
-                    }
-                } else {
-                    let _ = source.v4.send_to(payload, dest);
-                }
+        rows.clear();
+        owners.clear();
+        rows.push(poll_set::socket_row(clients));
+        owners.push(None);
+        for (address, source) in &sources {
+            rows.push(poll_set::socket_row(&source.v4));
+            owners.push(Some((*address, false)));
+            if let Some(v6) = source.v6.as_ref() {
+                rows.push(poll_set::socket_row(v6));
+                owners.push(Some((*address, true)));
             }
-            Err(error) if crate::proxy::is_timeout(&error) => {}
-            Err(_) => break,
         }
         let now = Instant::now();
-        for (src, source) in &mut sources {
-            let user = &users[source.user];
-            let v4 = &source.v4;
-            let v6 = source.v6.as_ref();
-            for sock in std::iter::once(v4).chain(v6) {
-                while let Ok((n, from)) = sock.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF])
-                {
-                    source.last = now;
-                    if let Some(packet) = seal_datagram(
-                        &user.master,
-                        user.method,
-                        &from,
-                        &mut reply,
-                        SEAL_ROOM,
-                        n,
-                        &mut source.hop,
-                    ) {
-                        let _ = clients.send_to(packet, src);
+        let timeout = sources
+            .values()
+            .map(|source| (source.last + idle).saturating_duration_since(now))
+            .min()
+            .map_or(-1, |left| {
+                i32::try_from(left.as_millis()).unwrap_or(i32::MAX)
+            });
+        let Ok(ready) = poll_set::wait(&mut rows, timeout) else {
+            break;
+        };
+        if ready > 0 {
+            for (row, owner) in rows.iter().zip(owners.iter()) {
+                if !poll_set::is_ready(*row) {
+                    continue;
+                }
+                let Some((src, is_v6)) = *owner else {
+                    while let Ok((n, src)) =
+                        clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF])
+                    {
+                        let now = Instant::now();
+                        let datagram = &mut buf[SEAL_ROOM..SEAL_ROOM + n];
+                        if let Some(source) = sources.get_mut(&src) {
+                            let user = &users[source.user];
+                            if let Some((dest, payload)) =
+                                open_datagram(&user.master, user.method, datagram, &mut source.hop)
+                            {
+                                source.last = now;
+                                let uplink = if dest.is_ipv6() {
+                                    source.v6.as_ref()
+                                } else {
+                                    Some(&source.v4)
+                                };
+                                if let Some(uplink) = uplink {
+                                    let _ = uplink.send_to(payload, dest);
+                                }
+                            }
+                            continue;
+                        }
+                        let Some((which, dest, payload)) =
+                            open_datagram_any(users, datagram, &mut probes)
+                        else {
+                            continue;
+                        };
+                        if sources.len() >= SS_UDP_SOURCES {
+                            sources.retain(|_, source| now.duration_since(source.last) < idle);
+                            if sources.len() >= SS_UDP_SOURCES {
+                                continue;
+                            }
+                        }
+                        let Ok(v4) = UdpSocket::bind("0.0.0.0:0") else {
+                            continue;
+                        };
+                        if v4.set_nonblocking(true).is_err() {
+                            continue;
+                        }
+                        let v6 = UdpSocket::bind("[::]:0")
+                            .ok()
+                            .filter(|sock| sock.set_nonblocking(true).is_ok());
+                        let payload = &buf[SEAL_ROOM + payload.start..SEAL_ROOM + payload.end];
+                        let uplink = if dest.is_ipv6() {
+                            v6.as_ref()
+                        } else {
+                            Some(&v4)
+                        };
+                        if let Some(uplink) = uplink {
+                            let _ = uplink.send_to(payload, dest);
+                        }
+                        let hop = probes[which].take();
+                        sources.insert(
+                            src,
+                            UdpSource {
+                                user: which,
+                                v4,
+                                v6,
+                                hop,
+                                last: now,
+                            },
+                        );
                     }
+                    continue;
+                };
+                let Some(source) = sources.get_mut(&src) else {
+                    continue;
+                };
+                let socket = if is_v6 {
+                    match source.v6.as_ref() {
+                        Some(socket) => socket,
+                        None => continue,
+                    }
+                } else {
+                    &source.v4
+                };
+                let mut dropped = false;
+                loop {
+                    match socket.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
+                        Ok((n, from)) => {
+                            source.last = Instant::now();
+                            let user = &users[source.user];
+                            if let Some(packet) = seal_datagram(
+                                &user.master,
+                                user.method,
+                                &from,
+                                &mut reply,
+                                SEAL_ROOM,
+                                n,
+                                &mut source.hop,
+                            ) {
+                                let _ = clients.send_to(packet, src);
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            dropped = true;
+                            break;
+                        }
+                    }
+                }
+                if dropped {
+                    sources.remove(&src);
                 }
             }
         }
-        if now.duration_since(last_prune) >= Duration::from_secs(1) {
-            let idle = crate::budgets::udp_idle();
-            sources.retain(|_, source| now.duration_since(source.last) < idle);
-            last_prune = now;
-        }
+        let now = Instant::now();
+        sources.retain(|_, source| now.duration_since(source.last) < idle);
     }
 }
 
@@ -2274,6 +2397,80 @@ mod tests {
         );
         let mut wire = stranger;
         assert!(open_datagram_any(&users, &mut wire, &mut hops).is_none());
+    }
+
+    /// Each source answers on its own association: two clients naming one destination reach the
+    /// destination from two upstream sockets, and each hears only the answer to its own datagram.
+    #[test]
+    fn an_aead_front_answers_each_source_on_its_own_association() {
+        fn echo_and_report() -> (SocketAddr, std::sync::mpsc::Receiver<bool>) {
+            let sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            let addr = sock.local_addr().expect("addr");
+            let (reported, seen) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let mut buf = vec![0u8; UDP_BUF];
+                let mut first = None;
+                let mut shared = true;
+                for _ in 0..2 {
+                    if let Ok((n, from)) = sock.recv_from(&mut buf) {
+                        shared &= first.is_none_or(|source| source == from);
+                        first.get_or_insert(from);
+                        let _ = sock.send_to(&buf[..n], from);
+                    }
+                }
+                let _ = reported.send(shared);
+            });
+            (addr, seen)
+        }
+        let (dest, upstream) = echo_and_report();
+        let users: Vec<SsUser> = [
+            ("first-password", Method::Aes256Gcm),
+            ("second-password", Method::Aes128Gcm),
+        ]
+        .into_iter()
+        .map(|(password, method)| SsUser {
+            method,
+            master: MasterKey::new(password, method.key_len()),
+            email: String::new(),
+            level: 0,
+        })
+        .collect();
+        let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        let serving = users.clone();
+        thread::spawn(move || serve_udp_on(&front, &serving, true));
+        let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut wire = vec![0u8; DATAGRAM_MAX];
+        for (client, user, marker) in [
+            (&first, &users[0], b"first".as_slice()),
+            (&second, &users[1], b"second".as_slice()),
+        ] {
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let packet = seal_to_wire(&user.master, user.method, &dest, marker);
+            client.send_to(&packet, front_addr).expect("sends");
+            let (n, _) = client
+                .recv_from(&mut wire)
+                .expect("the source hears its answer");
+            let (from, payload) = open_from_wire(&user.master, user.method, &wire[..n])
+                .expect("the answer opens under that source's own account");
+            assert_eq!((from, payload.as_slice()), (dest, marker));
+        }
+        assert!(
+            !upstream.recv().expect("the destination reports"),
+            "each client source owns its upstream association"
+        );
+        for client in [&first, &second] {
+            client
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("timeout");
+            assert!(
+                client.recv_from(&mut wire).is_err(),
+                "an answer is never fanned across sources"
+            );
+        }
     }
 
     #[test]
