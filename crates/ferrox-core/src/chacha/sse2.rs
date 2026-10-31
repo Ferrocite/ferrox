@@ -81,4 +81,12 @@ impl Lanes for S4 {
             _mm_storeu_si128(dst.as_mut_ptr().cast(), _mm_xor_si128(cur, self.0));
         }
     }
+
+    #[inline]
+    fn xor_chunk_from(self, _c: usize, src: &[u8; 16], dst: &mut [u8; 16]) {
+        unsafe {
+            let cur = _mm_loadu_si128(src.as_ptr().cast());
+            _mm_storeu_si128(dst.as_mut_ptr().cast(), _mm_xor_si128(cur, self.0));
+        }
+    }
 }

@@ -225,6 +225,17 @@ impl Engine {
     }
 
     #[target_feature(enable = "aes,pclmulqdq,ssse3")]
+    pub(crate) unsafe fn seal_from(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        src: &[u8],
+        dst: &mut [u8],
+    ) -> [u8; 16] {
+        super::seal_impl_from(&self.rk, &self.h, nonce, aad, src, dst)
+    }
+
+    #[target_feature(enable = "aes,pclmulqdq,ssse3")]
     pub(crate) unsafe fn open(
         &self,
         nonce: &[u8; 12],

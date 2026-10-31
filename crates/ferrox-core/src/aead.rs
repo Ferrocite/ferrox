@@ -48,6 +48,27 @@ pub fn chacha20_poly1305_seal_in_place(
 }
 
 #[must_use]
+pub fn chacha20_poly1305_seal_from(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    src: &[u8],
+    dst: &mut [u8],
+) -> [u8; 16] {
+    assert_eq!(
+        src.len(),
+        dst.len(),
+        "the source and the wire are the same message"
+    );
+    let mut one_time = [0u8; 32];
+    crate::record::fill_exact_with_head_from(key, nonce, 0, &mut one_time, src, dst);
+
+    let mut state = Poly1305::new(&one_time);
+    mac(&mut state, aad, dst);
+    state.finish()
+}
+
+#[must_use]
 pub fn chacha20_poly1305_decrypt_in_place(
     key: &[u8; 32],
     nonce: &[u8; 12],
@@ -100,6 +121,26 @@ mod tests {
             (0..=300)
                 .chain([511, 512, 513, 1024, 4095, 4096, 8192])
                 .collect()
+        }
+    }
+
+    #[test]
+    fn sealing_from_a_source_is_the_in_place_seal_and_leaves_the_source_alone() {
+        let key = [0x5bu8; 32];
+        let nonce = [0xa7u8; 12];
+        let aad = b"a header";
+        for &len in &sweep_lengths() {
+            let plain: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(251).wrapping_add(11))
+                .collect();
+            let original = plain.clone();
+            let mut in_place = plain.clone();
+            let want = chacha20_poly1305_seal_in_place(&key, &nonce, aad, &mut in_place);
+            let mut dst = vec![0u8; len];
+            let got = chacha20_poly1305_seal_from(&key, &nonce, aad, &plain, &mut dst);
+            assert_eq!(got, want, "tag at length {len}");
+            assert_eq!(dst, in_place, "ciphertext at length {len}");
+            assert_eq!(plain, original, "source at length {len}");
         }
     }
 

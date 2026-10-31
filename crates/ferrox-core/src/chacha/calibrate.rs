@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Instant;
 
-use super::{base, base_state, portable, xor_groups, Wide};
+use super::{base, base_state, portable, xor_groups_impl, Wide};
 
 const LANES_PREFERRED: u8 = 1;
 
@@ -48,7 +48,7 @@ fn measure() -> bool {
         let start = Instant::now();
         for block in 0..BLOCKS {
             let mut out = [0u8; 64];
-            xor_groups::<Wide, 1>(&base::<Wide>(&state), ctr, &mut out, None);
+            xor_groups_impl::<Wide, 1, false>(&base::<Wide>(&state), ctr, &[], &mut out, None);
             ctr = u32::from_le_bytes(out[..4].try_into().expect("four bytes"));
             lanes[block * 64..block * 64 + 64].copy_from_slice(&out);
         }
@@ -75,10 +75,10 @@ fn measure() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        base, base_state, portable, verdict, xor_groups, Wide, LANES_PREFERRED, ONE_BLOCK,
+        base, base_state, portable, verdict, xor_groups_impl, Wide, LANES_PREFERRED, ONE_BLOCK,
         SCALAR_PREFERRED, UNCALIBRATED,
     };
-    use crate::chacha::one_block;
+    use crate::chacha::one_block_impl;
     use std::sync::atomic::Ordering;
 
     #[test]
@@ -104,7 +104,7 @@ mod tests {
         let nonce = [0x44u8; 12];
         let state = base_state(&key, &nonce);
         let mut chosen = [0u8; 64];
-        assert_eq!(one_block(&state, 9, &mut chosen), 1);
+        assert_eq!(one_block_impl::<false>(&state, 9, &[], &mut chosen), 1);
         let mut scalar = [0u8; 64];
         portable::xor_block(&state, 9, &mut scalar);
         assert_eq!(chosen, scalar, "the chosen core wrote something else");
@@ -118,7 +118,7 @@ mod tests {
         for ctr in [0u32, 1, 3, 7, u32::MAX - 1, u32::MAX] {
             let mut lanes = [0u8; 64];
             let mut scalar = [0u8; 64];
-            xor_groups::<Wide, 1>(&base::<Wide>(&state), ctr, &mut lanes, None);
+            xor_groups_impl::<Wide, 1, false>(&base::<Wide>(&state), ctr, &[], &mut lanes, None);
             portable::xor_block(&state, ctr, &mut scalar);
             assert_eq!(lanes, scalar, "counter {ctr}: the two cores disagree");
         }

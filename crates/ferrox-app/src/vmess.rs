@@ -426,18 +426,20 @@ fn valid_auth_id(key: &AuthKey, auth_id: &[u8; 16]) -> bool {
 struct Shake {
     reader: shake::Shake128Reader,
     padding: bool,
+    masked: bool,
     bytes: [u8; 64],
     at: usize,
 }
 
 impl Shake {
-    fn fresh(iv: &[u8; 16], padding: bool) -> Self {
+    fn fresh(iv: &[u8; 16], padding: bool, masked: bool) -> Self {
         use sha3::digest::{ExtendableOutput as _, Update as _};
         let mut shake = shake::Shake128::default();
         shake.update(iv);
         Self {
             reader: shake.finalize_xof(),
             padding,
+            masked,
             bytes: [0u8; 64],
             at: 64,
         }
@@ -454,7 +456,6 @@ impl Shake {
         self.at += 2;
         u16::from_be_bytes(bytes)
     }
-    #[cfg(test)]
     fn pad_len(&mut self) -> u16 {
         if self.padding {
             self.draw() % 64
@@ -475,6 +476,9 @@ impl Shake {
         } else {
             (0, self.draw() ^ wire)
         }
+    }
+    fn pad_only(&mut self, wire: u16) -> (usize, u16) {
+        (usize::from(self.draw() % 64), wire)
     }
     fn draws(&mut self) -> (u16, u16) {
         if self.padding {
@@ -581,6 +585,13 @@ impl Flow {
     fn unseal_len(&mut self, sealed: &mut [u8; SIZE_FIELD]) -> Option<u16> {
         self.len_seal.as_mut()?.unseal_len(sealed)
     }
+    /// The next frame's padding, drawn before its length the way the reference's
+    /// `NextPaddingLen` runs before the size parser (`common/crypto/auth.go:128`).
+    fn pad_len(&mut self) -> usize {
+        self.shake
+            .as_mut()
+            .map_or(0, |sizes| usize::from(sizes.pad_len()))
+    }
     fn fresh(
         cipher: Cipher,
         key: &[u8; 16],
@@ -588,8 +599,13 @@ impl Flow {
         options: u8,
         mask_seed: &[u8; 16],
     ) -> Option<Self> {
-        let masking = options & OPT_MASK != 0 && options & OPT_AUTH_LEN == 0;
-        let padding = options & OPT_PAD != 0 && options & OPT_AUTH_LEN == 0;
+        let masking = options & OPT_MASK != 0;
+        let padding = options & OPT_PAD != 0;
+        // Padding is drawn from the masking size parser, so a padded request without the mask bit has no generator the reference can build either (`proxy/vmess/encoding/server.go`).
+        if padding && !masking {
+            return None;
+        }
+        let auth_len = options & OPT_AUTH_LEN != 0;
         let actual = cipher.resolve();
         let aead = match actual {
             Cipher::Aes => Aead::Aes(ferrox_core::aesgcm::Aes128Gcm::new(key)),
@@ -597,7 +613,9 @@ impl Flow {
             Cipher::None => Aead::Plain,
             Cipher::Auto => return None,
         };
-        let shake = masking.then(|| Shake::fresh(mask_seed, padding));
+        // A sealed length replaces the mask draw, never the padding draw: the reference keeps its SHAKE generator for padding after it swaps the size parser for the AEAD.
+        let shake = (padding || (masking && !auth_len))
+            .then(|| Shake::fresh(mask_seed, padding, masking && !auth_len));
         let mut nonce = [0u8; 12];
         nonce[2..].copy_from_slice(&iv[2..12]);
         Some(Self {
@@ -623,25 +641,33 @@ impl Flow {
         &self.nonce
     }
     fn seal_onto(&mut self, plain: &[u8], out: &mut Vec<u8>) {
-        let at = out.len();
-        out.extend_from_slice(plain);
         self.nonce[..2].copy_from_slice(&self.counter.to_be_bytes());
         let nonce = &self.nonce;
         match &self.aead {
-            Aead::Aes(aes) => {
-                let tag = aes.seal_in_place(nonce, b"", &mut out[at..]);
-                out.extend_from_slice(&tag);
-            }
-            Aead::Chacha(key) => {
-                let tag = ferrox_core::aead::chacha20_poly1305_seal_in_place(
-                    key,
-                    nonce,
-                    b"",
-                    &mut out[at..],
+            Aead::Plain => out.extend_from_slice(plain),
+            Aead::Aes(_) | Aead::Chacha(_) => {
+                let at = out.len();
+                out.reserve(plain.len() + TAG_LEN);
+                // SAFETY: the reserve is at least `plain.len()` bytes, `seal_from` writes every byte it is handed before anything reads them, and the length is claimed only after the tag is appended.
+                let dst = unsafe {
+                    let spare = out.spare_capacity_mut();
+                    core::slice::from_raw_parts_mut(spare.as_mut_ptr().cast::<u8>(), plain.len())
+                };
+                let (p, d) = (plain.as_ptr() as usize, dst.as_ptr() as usize);
+                debug_assert!(
+                    p + plain.len() <= d || d + plain.len() <= p,
+                    "seal_from reads plaintext and writes the caller's staging; those must not overlap"
                 );
+                let tag = match &self.aead {
+                    Aead::Aes(aes) => aes.seal_from(nonce, b"", plain, dst),
+                    Aead::Chacha(key) => {
+                        ferrox_core::aead::chacha20_poly1305_seal_from(key, nonce, b"", plain, dst)
+                    }
+                    Aead::Plain => unreachable!("the arm above rules the plain leg out"),
+                };
+                unsafe { out.set_len(at + plain.len()) };
                 out.extend_from_slice(&tag);
             }
-            Aead::Plain => {}
         }
         // Wraps past 65535 like the reference's `GenerateChunkNonce`; see the method page.
         self.counter = self.counter.wrapping_add(1);
@@ -704,9 +730,20 @@ fn decode_target(header: &[u8], cursor: &mut usize) -> Option<SocketAddr> {
 
 type RequestParts = (Vec<u8>, [u8; 16], [u8; 16], u8);
 
+/// The framing bits the reference's outbound sets: chunk stream, a masked size, padding, and
+/// the authenticated-length experiment on top when the account asks for it
+/// (`proxy/vmess/outbound/outbound.go:104-119`). The experiment has no key under `none`.
+fn framing_options(cipher: Cipher, auth_len: bool) -> Option<u8> {
+    if auth_len && cipher.resolve() == Cipher::None {
+        return None;
+    }
+    Some(OPT_STREAM | OPT_MASK | OPT_PAD | if auth_len { OPT_AUTH_LEN } else { 0 })
+}
+
 fn request_bytes(
     uuid: &[u8; 16],
     cipher: Cipher,
+    auth_len: bool,
     target: &crate::proxy::Destination,
     cmd: u8,
 ) -> Option<RequestParts> {
@@ -724,7 +761,7 @@ fn request_bytes(
     let mut nonce = [0u8; 8];
     nonce.copy_from_slice(&rand[33..41]);
     let pad_len = usize::from(rand[41] % 16);
-    let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+    let options = framing_options(cipher, auth_len)?;
     let mut clear = Vec::with_capacity(64);
     clear.push(1);
     clear.extend_from_slice(&data_iv);
@@ -777,7 +814,8 @@ fn read_wire_len(stream: &mut dyn Read, recv: &mut Flow) -> Option<(usize, usize
     if recv.len_seal.is_some() {
         let mut sealed = [0u8; SIZE_FIELD];
         read_exact(stream, &mut sealed).ok()?;
-        return Some((usize::from(recv.unseal_len(&mut sealed)?), 0));
+        let padding = recv.pad_len();
+        return Some((usize::from(recv.unseal_len(&mut sealed)?), padding));
     }
     let mut prefix = [0u8; HEADER_LEN];
     read_exact(stream, &mut prefix).ok()?;
@@ -790,7 +828,11 @@ fn masked_len(recv: &mut Flow, wire: u16) -> (usize, usize) {
     match recv.shake.as_mut() {
         None => (usize::from(wire), 0),
         Some(sizes) => {
-            let (padding, total) = sizes.pad_and_mask(wire);
+            let (padding, total) = if sizes.masked {
+                sizes.pad_and_mask(wire)
+            } else {
+                sizes.pad_only(wire)
+            };
             (usize::from(total), padding)
         }
     }
@@ -833,7 +875,7 @@ fn stage_frame(send: &mut Flow, plain: &[u8], staging: &mut Vec<u8>, pad: &mut P
     let (padding, mask_raw, masked) = match send.shake.as_mut() {
         None => (0, 0, false),
         Some(s) => {
-            let (pad_raw, mask_raw) = s.draws();
+            let (pad_raw, mask_raw) = if s.masked { s.draws() } else { (s.draw(), 0) };
             (usize::from(pad_raw % 64), mask_raw, true)
         }
     };
@@ -1121,8 +1163,9 @@ impl<R: Read> Wire<R> {
             let sizes = if width == SIZE_FIELD {
                 let mut sealed = [0u8; SIZE_FIELD];
                 sealed.copy_from_slice(&self.held[self.start..self.start + SIZE_FIELD]);
+                let padding = recv.pad_len();
                 recv.unseal_len(&mut sealed)
-                    .map(|total| (usize::from(total), 0))
+                    .map(|total| (usize::from(total), padding))
             } else {
                 let mut prefix = [0u8; HEADER_LEN];
                 prefix.copy_from_slice(&self.held[self.start..self.start + HEADER_LEN]);
@@ -1170,15 +1213,21 @@ pub(crate) type ClientRequest = (Vec<u8>, Flow, Flow, [u8; 16], [u8; 16], u8);
 pub(crate) fn client_request(
     id: &[u8; 16],
     cipher: Cipher,
+    auth_len: bool,
     target: &crate::proxy::Destination,
     cmd: u8,
 ) -> Option<ClientRequest> {
-    let (request, data_key, data_iv, auth) = request_bytes(id, cipher, target, cmd)?;
+    let (request, data_key, data_iv, auth) = request_bytes(id, cipher, auth_len, target, cmd)?;
     let (response_key, response_iv) = response_material(&data_iv, &data_key);
-    let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+    let options = framing_options(cipher, auth_len)?;
     let actual = cipher.resolve();
-    let send = Flow::fresh(actual, &data_key, &data_iv, options, &data_iv)?;
-    let recv = Flow::fresh(actual, &response_key, &response_iv, options, &response_iv)?;
+    let mut send = Flow::fresh(actual, &data_key, &data_iv, options, &data_iv)?;
+    let mut recv = Flow::fresh(actual, &response_key, &response_iv, options, &response_iv)?;
+    if auth_len {
+        // Both directions seal their size with the request body's pair, the shape the reference's server and client use (`proxy/vmess/encoding/{client,server}.go`).
+        send.len_seal = Some(SizeAead::fresh(&data_key, actual, &data_iv)?);
+        recv.len_seal = Some(SizeAead::fresh(&data_key, actual, &data_iv)?);
+    }
     Some((request, send, recv, response_key, response_iv, auth))
 }
 
@@ -1186,10 +1235,11 @@ pub(crate) fn client_handshake(
     uplink: &mut Connection,
     id: &[u8; 16],
     cipher: Cipher,
+    auth_len: bool,
     target: &crate::proxy::Destination,
 ) -> Option<ClientSession> {
     let (request, send, recv, response_key, response_iv, auth) =
-        client_request(id, cipher, target, 1)?;
+        client_request(id, cipher, auth_len, target, 1)?;
     if uplink.write_all(&request).is_err() {
         return None;
     }
@@ -1378,8 +1428,8 @@ fn decode_header(header: &[u8]) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)>
     }
     let cipher = Cipher::from_code(header[35] & 0x0f)?;
     let options = header[34];
-    // Both together is no encoding the reference accepts: a padded reader needs a mask draw the sealed parser cannot give (`proxy/vmess/encoding/server.go`).
-    if options & OPT_AUTH_LEN != 0 && options & OPT_PAD != 0 {
+    // Padding is drawn from the masking size parser, so the reference cannot build the generator without the mask bit either (`proxy/vmess/encoding/server.go`).
+    if options & OPT_PAD != 0 && options & OPT_MASK == 0 {
         return None;
     }
     // A body without a cipher leaves the sealed size with no key to seal against, and the reference refuses the option there (`proxy/vmess/encoding/server.go`).
@@ -1408,8 +1458,8 @@ fn decode_header(header: &[u8]) -> Option<(SocketAddr, Flow, Flow, Vec<u8>, u8)>
     // The body AEAD rides the response material, the sealed size rides the request's keys (`proxy/vmess/encoding/server.go` `EncodeResponseBody`): both directions derive the size AEAD from the request body key and IV.
     if options & OPT_AUTH_LEN != 0 {
         let actual = cipher.resolve();
-        recv.len_seal = SizeAead::fresh(&data_key, actual, &data_iv);
-        send.len_seal = SizeAead::fresh(&data_key, actual, &data_iv);
+        recv.len_seal = Some(SizeAead::fresh(&data_key, actual, &data_iv)?);
+        send.len_seal = Some(SizeAead::fresh(&data_key, actual, &data_iv)?);
     }
     Some((target, send, recv, prefix, cmd))
 }
@@ -2219,6 +2269,7 @@ mod tests {
         let Some((request, mut send, _recv, _, _, _)) = client_request(
             &id,
             Cipher::Auto,
+            false,
             &crate::proxy::Destination::from(target),
             1,
         ) else {
@@ -2261,6 +2312,7 @@ mod tests {
         let request = client_request(
             &second,
             Cipher::Auto,
+            false,
             &crate::proxy::Destination::from(target),
             1,
         )
@@ -2398,6 +2450,7 @@ mod tests {
         let (request, data_key, data_iv, auth) = request_bytes(
             &id,
             Cipher::Chacha,
+            false,
             &crate::proxy::Destination::from(target),
             1,
         )
@@ -2467,6 +2520,7 @@ mod tests {
         let (request, data_key, data_iv, auth) = request_bytes(
             &id,
             Cipher::Chacha,
+            false,
             &crate::proxy::Destination::from(target),
             1,
         )
@@ -2587,6 +2641,7 @@ mod tests {
         let (request, data_key, data_iv, auth) = request_bytes(
             &id,
             Cipher::Chacha,
+            false,
             &crate::proxy::Destination::from(target),
             1,
         )
@@ -2724,7 +2779,7 @@ mod tests {
                 "run of {run_len}: {frames} frames must cost exactly one write"
             );
 
-            let mut mask = Shake::fresh(&iv, true);
+            let mut mask = Shake::fresh(&iv, true, true);
             let (mut a, mut b) = (0usize, 0usize);
             for (frame, chunk) in chunks.iter().enumerate() {
                 if run_len > READ_PLAIN {
@@ -2907,6 +2962,70 @@ mod tests {
     }
 
     #[test]
+    fn an_aes_batch_is_the_frames_written_one_at_a_time() {
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        let key = [0x3cu8; 16];
+        let iv: [u8; 16] = std::array::from_fn(|i| 0x10u8.wrapping_add(i as u8));
+        for run_len in [
+            1usize,
+            MAX_PLAIN,
+            FRAMES_PER_WRITE * MAX_PLAIN - 1,
+            FRAMES_PER_WRITE * MAX_PLAIN,
+        ] {
+            let body: Vec<u8> = (0..run_len)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
+                .collect();
+            let chunks: Vec<&[u8]> = body.chunks(MAX_PLAIN).take(FRAMES_PER_WRITE).collect();
+            let mut send = Flow::fresh(Cipher::Aes, &key, &iv, options, &iv).expect("sends");
+            let mut staging = Vec::new();
+            let mut pad = PadSource::fresh().expect("entropy");
+            let mut apart = Vec::new();
+            for frame in &chunks {
+                staging.clear();
+                assert!(stage_frame(&mut send, frame, &mut staging, &mut pad));
+                apart.extend_from_slice(&staging);
+            }
+
+            let mut batched = Flow::fresh(Cipher::Aes, &key, &iv, options, &iv).expect("sends");
+            let mut whole = Vec::new();
+            let mut batch_pad = PadSource::fresh().expect("entropy");
+            let mut sink = CountingWriter::default();
+            assert!(
+                stage_frames(&mut sink, &mut batched, &body, &mut whole, &mut batch_pad),
+                "run of {run_len}: staged"
+            );
+            let mut mask = Shake::fresh(&iv, true, true);
+            let (mut a, mut b) = (0usize, 0usize);
+            for chunk in &chunks {
+                let padding = usize::from(mask.pad_len());
+                assert_eq!(
+                    apart[a..a + 2],
+                    whole[b..b + 2],
+                    "run of {run_len}: length prefix"
+                );
+                let wire = u16::from_be_bytes([apart[a], apart[a + 1]]);
+                let masked = usize::from(mask.draw() ^ wire);
+                let sealed = masked - padding;
+                assert_eq!(chunk.len() + TAG_LEN, sealed, "run of {run_len}: sealed");
+                assert_eq!(
+                    apart[a + 2..a + 2 + sealed],
+                    whole[b + 2..b + 2 + sealed],
+                    "run of {run_len}: sealed body"
+                );
+                a += 2 + masked;
+                b += 2 + masked;
+            }
+            assert_eq!(a, apart.len(), "run of {run_len}: frames are the batch");
+            assert_eq!(b, whole.len(), "run of {run_len}: batch is the frames");
+            assert_eq!(
+                sink.writes,
+                usize::from(!chunks.is_empty()),
+                "run of {run_len}: one write"
+            );
+        }
+    }
+
+    #[test]
     fn frames_reuse_the_callers_buffers() {
         let cipher = Cipher::Chacha;
         let key = [0x77u8; 16];
@@ -3062,6 +3181,7 @@ mod tests {
             &mut uplink,
             &id,
             Cipher::Auto,
+            false,
             &crate::proxy::Destination::from(target),
         )
         .expect("handshakes");
@@ -3116,22 +3236,32 @@ mod tests {
     fn batched_draws_keep_the_reference_stream() {
         use sha3::digest::{ExtendableOutput as _, Update as _, XofReader as _};
         let iv = [0x4du8; 16];
-        for padding in [false, true] {
+        for (padding, masked) in [(false, true), (true, true), (true, false)] {
             let mut raw = shake::Shake128::default();
             raw.update(&iv);
             let mut raw = raw.finalize_xof();
-            let mut wrapped = Shake::fresh(&iv, padding);
+            let mut wrapped = Shake::fresh(&iv, padding, masked);
             for _ in 0..200 {
                 if padding {
-                    let mut want = [0u8; 4];
-                    raw.read(&mut want);
-                    assert_eq!(
-                        wrapped.draws(),
-                        (
-                            u16::from_be_bytes([want[0], want[1]]),
-                            u16::from_be_bytes([want[2], want[3]])
-                        )
-                    );
+                    if masked {
+                        let mut want = [0u8; 4];
+                        raw.read(&mut want);
+                        assert_eq!(
+                            wrapped.draws(),
+                            (
+                                u16::from_be_bytes([want[0], want[1]]),
+                                u16::from_be_bytes([want[2], want[3]])
+                            )
+                        );
+                    } else {
+                        let mut want = [0u8; 2];
+                        raw.read(&mut want);
+                        assert_eq!(
+                            wrapped.draw(),
+                            u16::from_be_bytes(want),
+                            "an authenticated length draws only padding"
+                        );
+                    }
                 } else {
                     let mut want = [0u8; 2];
                     raw.read(&mut want);
@@ -3547,14 +3677,22 @@ mod tests {
             header
         };
         // The bit names a framing both directions carry: a frame's size field is the sealed 18 octets, not the two masked ones.
-        let (_, send, recv, _, _) =
-            decode_header(&header(0x04, OPT_STREAM | OPT_AUTH_LEN | OPT_MASK)).expect("decodes");
-        assert_eq!(send.size_field(), SIZE_FIELD);
-        assert_eq!(recv.size_field(), SIZE_FIELD);
-        // Padding needs a mask draw the sealed parser cannot give, and the reference refuses the pair.
+        for options in [
+            OPT_STREAM | OPT_AUTH_LEN | OPT_MASK,
+            OPT_STREAM | OPT_AUTH_LEN | OPT_MASK | OPT_PAD,
+        ] {
+            let (_, send, recv, _, _) = decode_header(&header(0x04, options)).expect("decodes");
+            assert_eq!(send.size_field(), SIZE_FIELD);
+            assert_eq!(recv.size_field(), SIZE_FIELD);
+        }
+        // Padding is drawn from the masking parser, so without the mask bit the reference has no generator to build.
         assert!(
             decode_header(&header(0x04, OPT_STREAM | OPT_AUTH_LEN | OPT_PAD)).is_none(),
-            "padding with an authenticated length"
+            "padding without a mask"
+        );
+        assert!(
+            decode_header(&header(0x04, OPT_STREAM | OPT_PAD)).is_none(),
+            "padding without a mask, authenticated length off"
         );
         // A body without a cipher leaves the sealed size without a key, and the reference refuses the option there too.
         assert!(decode_header(&header(0x05, OPT_STREAM | OPT_AUTH_LEN)).is_none());
@@ -3585,72 +3723,99 @@ mod tests {
         };
         let payload: Vec<u8> = (0..300).map(|k| k as u8).collect();
         for cipher in [Cipher::Aes, Cipher::Chacha] {
-            let options = OPT_STREAM | OPT_AUTH_LEN;
-            let mut send =
-                Flow::fresh(cipher, &[0x02; 16], &[0x01; 16], options, &[0x01; 16]).expect("sends");
-            send.len_seal = SizeAead::fresh(&[0x02; 16], cipher, &[0x01; 16]);
-            let mut sealed = Vec::new();
-            let mut pad = PadSource::fresh().expect("entropy");
-            assert!(
-                stage_frame(&mut send, &payload, &mut sealed, &mut pad),
-                "payload"
-            );
-            assert!(stage_frame(&mut send, &[], &mut sealed, &mut pad), "marker");
-            let mut recv =
-                Flow::fresh(cipher, &[0x02; 16], &[0x01; 16], options, &[0x01; 16]).expect("recvs");
-            recv.len_seal = SizeAead::fresh(&[0x02; 16], cipher, &[0x01; 16]);
-            let mut read = &sealed[..];
-            {
-                let mut scratch = Vec::new();
-                let opened = read_frame(&mut read, &mut recv, &mut scratch).expect("opens");
-                assert_eq!(opened, &payload, "the plain bytes behind the sealed size");
-                let marker = read_frame(&mut read, &mut recv, &mut scratch).expect("ends");
-                assert!(marker.is_empty(), "the zero body is the end");
-            }
-            let carrier = Sealed {
-                held: sealed.clone(),
-                at: 0,
-                grain: usize::MAX,
-                reads: 0,
-            };
-            let (_writes, got) = drain(&mut Wire::new(carrier), &mut {
-                let mut wire_recv =
-                    Flow::fresh(cipher, &[0x02; 16], &[0x01; 16], options, &[0x01; 16])
-                        .expect("recvs");
-                wire_recv.len_seal = SizeAead::fresh(&[0x02; 16], cipher, &[0x01; 16]);
-                wire_recv
-            });
-            assert_eq!(got, payload, "the wire opens the same frames");
+            for options in [
+                OPT_STREAM | OPT_AUTH_LEN,
+                OPT_STREAM | OPT_AUTH_LEN | OPT_MASK,
+                OPT_STREAM | OPT_AUTH_LEN | OPT_MASK | OPT_PAD,
+            ] {
+                let mut send = Flow::fresh(cipher, &[0x02; 16], &[0x01; 16], options, &[0x01; 16])
+                    .expect("sends");
+                send.len_seal = SizeAead::fresh(&[0x02; 16], cipher, &[0x01; 16]);
+                let mut sealed = Vec::new();
+                let mut pad = PadSource::fresh().expect("entropy");
+                assert!(
+                    stage_frame(&mut send, &payload, &mut sealed, &mut pad),
+                    "payload"
+                );
+                assert!(stage_frame(&mut send, &[], &mut sealed, &mut pad), "marker");
+                let mut recv = Flow::fresh(cipher, &[0x02; 16], &[0x01; 16], options, &[0x01; 16])
+                    .expect("recvs");
+                recv.len_seal = SizeAead::fresh(&[0x02; 16], cipher, &[0x01; 16]);
+                let mut read = &sealed[..];
+                {
+                    let mut scratch = Vec::new();
+                    let opened = read_frame(&mut read, &mut recv, &mut scratch).expect("opens");
+                    assert_eq!(opened, &payload, "the plain bytes behind the sealed size");
+                    let marker = read_frame(&mut read, &mut recv, &mut scratch).expect("ends");
+                    assert!(marker.is_empty(), "the zero body is the end");
+                }
+                let carrier = Sealed {
+                    held: sealed.clone(),
+                    at: 0,
+                    grain: usize::MAX,
+                    reads: 0,
+                };
+                let (_writes, got) = drain(&mut Wire::new(carrier), &mut {
+                    let mut wire_recv =
+                        Flow::fresh(cipher, &[0x02; 16], &[0x01; 16], options, &[0x01; 16])
+                            .expect("recvs");
+                    wire_recv.len_seal = SizeAead::fresh(&[0x02; 16], cipher, &[0x01; 16]);
+                    wire_recv
+                });
+                assert_eq!(got, payload, "the wire opens the same frames");
 
-            // The staged framing is a server's response framing here: the body AEAD rides the response material while the sealed size rides the request's keys (`proxy/vmess/encoding/server.go` `EncodeResponseBody`), so a peer sealing the size with the wrong pair cannot open it.
-            let head = header(cipher.code(), options);
-            let (_, mut srv, _, _, _) = decode_header(&head).expect("decodes");
-            let (response_key, response_iv) = response_material(&[0x01; 16], &[0x02; 16]);
-            let mut peer = Flow::fresh(cipher, &response_key, &response_iv, options, &response_iv)
-                .expect("peer");
-            peer.len_seal = SizeAead::fresh(&[0x02; 16], cipher, &[0x01; 16]);
-            let mut staged = Vec::new();
-            let mut pad = PadSource::fresh().expect("entropy");
-            assert!(
-                stage_frame(&mut srv, &payload, &mut staged, &mut pad),
-                "staged"
-            );
-            let mut read = &staged[..];
-            let mut scratch = Vec::new();
-            let opened = read_frame(&mut read, &mut peer, &mut scratch).expect("opens");
-            assert_eq!(
-                opened, &payload,
-                "the request's keys seal the response sizes"
-            );
-            let mut wrong = Flow::fresh(cipher, &response_key, &response_iv, options, &response_iv)
-                .expect("peer");
-            wrong.len_seal = SizeAead::fresh(&response_key, cipher, &response_iv);
-            let mut read = &staged[..];
-            assert!(
-                read_frame(&mut read, &mut wrong, &mut Vec::new()).is_none(),
-                "the size field will not open under the response pair"
-            );
+                // The staged framing is a server's response framing here: the body AEAD rides the response material while the sealed size rides the request's keys (`proxy/vmess/encoding/server.go` `EncodeResponseBody`), so a peer sealing the size with the wrong pair cannot open it.
+                let head = header(cipher.code(), options);
+                let (_, mut srv, _, _, _) = decode_header(&head).expect("decodes");
+                let (response_key, response_iv) = response_material(&[0x01; 16], &[0x02; 16]);
+                let mut peer =
+                    Flow::fresh(cipher, &response_key, &response_iv, options, &response_iv)
+                        .expect("peer");
+                peer.len_seal = SizeAead::fresh(&[0x02; 16], cipher, &[0x01; 16]);
+                let mut staged = Vec::new();
+                let mut pad = PadSource::fresh().expect("entropy");
+                assert!(
+                    stage_frame(&mut srv, &payload, &mut staged, &mut pad),
+                    "staged"
+                );
+                let mut read = &staged[..];
+                let mut scratch = Vec::new();
+                let opened = read_frame(&mut read, &mut peer, &mut scratch).expect("opens");
+                assert_eq!(
+                    opened, &payload,
+                    "the request's keys seal the response sizes"
+                );
+                let mut wrong =
+                    Flow::fresh(cipher, &response_key, &response_iv, options, &response_iv)
+                        .expect("peer");
+                wrong.len_seal = SizeAead::fresh(&response_key, cipher, &response_iv);
+                let mut read = &staged[..];
+                assert!(
+                    read_frame(&mut read, &mut wrong, &mut Vec::new()).is_none(),
+                    "the size field will not open under the response pair"
+                );
+            }
         }
+    }
+
+    #[test]
+    fn the_client_asks_for_the_authenticated_length_experiment() {
+        let target: SocketAddr = "127.0.0.1:8080".parse().expect("addr");
+        let target = crate::proxy::Destination::from(target);
+        for cipher in [Cipher::Aes, Cipher::Chacha] {
+            for auth_len in [false, true] {
+                let (_, send, recv, _, _, _) =
+                    client_request(&[0x31; 16], cipher, auth_len, &target, 1)
+                        .expect("the client builds the account's framing");
+                let width = if auth_len { SIZE_FIELD } else { HEADER_LEN };
+                assert_eq!(send.size_field(), width, "{cipher:?} {auth_len}");
+                assert_eq!(recv.size_field(), width, "{cipher:?} {auth_len}");
+            }
+        }
+        assert!(
+            client_request(&[0x31; 16], Cipher::None, true, &target, 1).is_none(),
+            "the authenticated length has no key under none"
+        );
     }
 
     #[test]
@@ -3662,9 +3827,14 @@ mod tests {
         ];
         for cipher in [Cipher::Auto, Cipher::Aes, Cipher::Chacha, Cipher::None] {
             for target in targets {
-                let (request, _, _, _) =
-                    request_bytes(&uuid, cipher, &crate::proxy::Destination::from(target), 1)
-                        .expect("builds");
+                let (request, _, _, _) = request_bytes(
+                    &uuid,
+                    cipher,
+                    false,
+                    &crate::proxy::Destination::from(target),
+                    1,
+                )
+                .expect("builds");
                 assert!(request.len() > 42 + TAG_LEN);
                 let instruction = instruction_key(&uuid);
                 let auth_id: [u8; AUTH_LEN] = request[..AUTH_LEN].try_into().expect("auth");
@@ -3712,14 +3882,21 @@ mod tests {
             request_bytes(
                 &[0xccu8; 16],
                 Cipher::Auto,
+                false,
                 &"127.0.0.1:1".parse().expect("addr"),
                 1,
             )
             .expect("builds")
             .0,
-            request_bytes(&id, Cipher::Auto, &"127.0.0.1:1".parse().expect("addr"), 1)
-                .expect("builds")
-                .0[..20]
+            request_bytes(
+                &id,
+                Cipher::Auto,
+                false,
+                &"127.0.0.1:1".parse().expect("addr"),
+                1,
+            )
+            .expect("builds")
+            .0[..20]
                 .to_vec(),
         ] {
             let mut stream = Connection::connect(("127.0.0.1", port)).expect("connects");

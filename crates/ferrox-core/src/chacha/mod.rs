@@ -37,6 +37,8 @@ pub(crate) trait Lanes: Copy {
 
     fn xor_chunk(self, c: usize, dst: &mut [u8; 16]);
 
+    fn xor_chunk_from(self, c: usize, src: &[u8; 16], dst: &mut [u8; 16]);
+
     fn with_counters(self, first: u32) -> Self;
 }
 
@@ -181,13 +183,31 @@ fn rounds<V: Lanes, const NST: usize>(regs: &mut [[V; 4]; NST]) {
     }
 }
 
+const ZERO16: [u8; 16] = [0u8; 16];
+
 #[inline(always)]
-pub(crate) fn xor_groups<V: Lanes, const NST: usize>(
+fn store<V: Lanes, const FROM: bool>(reg: V, initial: V, c: usize, src: &[u8], dst: &mut [u8; 16]) {
+    let reg = reg.add(initial);
+    if FROM {
+        reg.xor_chunk_from(c, src.try_into().expect("a chunk is sixteen bytes"), dst);
+    } else {
+        reg.xor_chunk(c, dst);
+    }
+}
+
+#[inline(always)]
+fn xor_groups_impl<V: Lanes, const NST: usize, const FROM: bool>(
     base: &Base<V>,
     start: u32,
+    src: &[u8],
     out: &mut [u8],
     mut head: Option<&mut [u8; 32]>,
 ) -> u32 {
+    debug_assert_eq!(
+        FROM.then_some(src.len()),
+        FROM.then_some(out.len()),
+        "the source and the destination are the same message"
+    );
     debug_assert!(out.len() + 64 * usize::from(head.is_some()) <= NST * V::LANES * 16);
 
     let mut regs = counters::<V, NST>(base, start);
@@ -209,6 +229,7 @@ pub(crate) fn xor_groups<V: Lanes, const NST: usize>(
     }
 
     let (blocks, partial) = out.as_chunks_mut::<64>();
+    let (src_blocks, src_partial) = src.as_chunks::<64>();
     let mut i = 0usize;
     'stores: for (s, state) in regs.iter_mut().enumerate() {
         let ff = [
@@ -223,22 +244,45 @@ pub(crate) fn xor_groups<V: Lanes, const NST: usize>(
             }
             let Some(block) = blocks.get_mut(i) else {
                 let (chunks, tail) = partial.as_chunks_mut::<16>();
-                for (chunk, (reg, initial)) in
-                    chunks.iter_mut().zip(state.iter_mut().zip(ff.iter()))
+                let (sources, src_tail) = src_partial.as_chunks::<16>();
+                for (ci, (chunk, (reg, initial))) in chunks
+                    .iter_mut()
+                    .zip(state.iter().zip(ff.iter()))
+                    .enumerate()
                 {
-                    reg.add(*initial).xor_chunk(c, chunk);
+                    let src = if FROM {
+                        sources
+                            .get(ci)
+                            .expect("the source and the destination split alike")
+                    } else {
+                        &ZERO16
+                    };
+                    store::<V, FROM>(*reg, *initial, c, src, chunk);
                 }
                 if !tail.is_empty() {
                     let mut staged = [0u8; 16];
                     let g = chunks.len();
-                    state[g].add(ff[g]).xor_chunk(c, &mut staged);
-                    xor_last_bytes(tail, &staged);
+                    store::<V, FROM>(state[g], ff[g], c, &ZERO16, &mut staged);
+                    xor_last_bytes_from::<FROM>(tail, src_tail, &staged);
                 }
                 break 'stores;
             };
+            let src_block = if FROM { src_blocks.get(i) } else { None };
             let (chunks, _) = block.as_chunks_mut::<16>();
-            for (chunk, (reg, initial)) in chunks.iter_mut().zip(state.iter_mut().zip(ff.iter())) {
-                reg.add(*initial).xor_chunk(c, chunk);
+            for (ci, (chunk, (reg, initial))) in chunks
+                .iter_mut()
+                .zip(state.iter().zip(ff.iter()))
+                .enumerate()
+            {
+                let src = if FROM {
+                    src_block.expect("the source and the destination split alike")
+                        [ci * 16..ci * 16 + 16]
+                        .try_into()
+                        .expect("a block is four chunks")
+                } else {
+                    &ZERO16
+                };
+                store::<V, FROM>(*reg, *initial, c, src, chunk);
             }
             i += 1;
         }
@@ -246,25 +290,13 @@ pub(crate) fn xor_groups<V: Lanes, const NST: usize>(
     (NST * V::CHUNKS) as u32
 }
 
-#[inline(always)]
-fn read_le(bytes: &[u8], width: usize) -> u64 {
-    let mut buf = [0u8; 8];
-    buf[..width].copy_from_slice(&bytes[..width]);
-    u64::from_le_bytes(buf)
-}
-
-fn xor_last_bytes(dst: &mut [u8], staged: &[u8; 16]) {
-    let mut at = 0usize;
-    for width in [8usize, 4, 2, 1] {
-        if dst.len() - at >= width {
-            let mixed = read_le(&dst[at..], width) ^ read_le(&staged[at..], width);
-            let bytes = mixed.to_le_bytes();
-            dst[at..at + width].copy_from_slice(&bytes[..width]);
-            at += width;
-        }
-    }
-    if at < dst.len() {
-        dst[at] ^= staged[at];
+fn xor_last_bytes_from<const FROM: bool>(dst: &mut [u8], src: &[u8], staged: &[u8; 16]) {
+    for at in 0..dst.len() {
+        dst[at] = if FROM {
+            src[at] ^ staged[at]
+        } else {
+            dst[at] ^ staged[at]
+        };
     }
 }
 
@@ -299,14 +331,16 @@ fn tail_group(len: usize, owed: usize, chunks: usize) -> (usize, usize) {
 
 /// The ladder's last stretch: one group sized to *all* blocks left, since a state's work is cheaper than the single-block dependent chain, with the final block stored partial and only stored bytes reported; `NST * 4 + 4` must stay inside `x86_64`'s sixteen `ymm`, which `GROUP_STATES` spills at a measured +25% (`aarch64` pays the spill, see `TAIL_STATES`).
 #[inline(always)]
-fn xor_tail<V: Lanes>(
+fn xor_tail_impl<V: Lanes, const FROM: bool>(
     state: &[u32; 16],
     base: &Base<V>,
     start: u32,
     mut head: Option<&mut [u8; 32]>,
+    src: &[u8],
     buf: &mut [u8],
 ) -> u32 {
     let mut ctr = start;
+    let mut src = src;
     let mut rest = buf;
     let mut blocks = 0u32;
     let mut owed = 64 * usize::from(head.is_some());
@@ -315,10 +349,15 @@ fn xor_tail<V: Lanes>(
         let (states, take) = tail_group(rest.len(), owed, V::CHUNKS);
         let nominal = states * V::CHUNKS;
         let (chunk, tail) = rest.split_at_mut(take);
+        let (chunk_src, tail_src) = if FROM {
+            src.split_at(take)
+        } else {
+            (&[][..], &[][..])
+        };
         macro_rules! pass {
             ($($n:literal),+ $(,)?) => {
                 match states {
-                    $($n => xor_groups::<V, $n>(base, ctr, chunk, head.take()),)+
+                    $($n => xor_groups_impl::<V, $n, FROM>(base, ctr, chunk_src, chunk, head.take()),)+
                     _ => unreachable!("`states` is clamped to TAIL_STATES"),
                 }
             };
@@ -326,35 +365,69 @@ fn xor_tail<V: Lanes>(
         blocks += pass!(1, 2, 3, 4, 5, 6, 7, 8).min(needed as u32);
         ctr = ctr.wrapping_add(nominal as u32);
         rest = tail;
+        src = tail_src;
         owed = 0;
     }
     if !rest.is_empty() || head.is_some() {
         if let Some(h) = head.take() {
             let mut block = [0u8; 64];
-            blocks += one_block(state, ctr, &mut block);
+            blocks += one_block_impl::<false>(state, ctr, &[], &mut block);
             h.copy_from_slice(&block[..32]);
             ctr = ctr.wrapping_add(1);
         }
         if !rest.is_empty() {
-            blocks += one_block(state, ctr, rest);
+            blocks += one_block_impl::<FROM>(state, ctr, src, rest);
         }
     }
     blocks
 }
 
+#[inline(always)]
+fn xor_tail<V: Lanes>(
+    state: &[u32; 16],
+    base: &Base<V>,
+    start: u32,
+    head: Option<&mut [u8; 32]>,
+    buf: &mut [u8],
+) -> u32 {
+    xor_tail_impl::<V, false>(state, base, start, head, &[], buf)
+}
+
+#[inline(always)]
+fn xor_tail_from<V: Lanes>(
+    state: &[u32; 16],
+    base: &Base<V>,
+    start: u32,
+    head: Option<&mut [u8; 32]>,
+    src: &[u8],
+    dst: &mut [u8],
+) -> u32 {
+    xor_tail_impl::<V, true>(state, base, start, head, src, dst)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn one_block(state: &[u32; 16], ctr: u32, out: &mut [u8]) -> u32 {
-    xor_groups::<sse2::S4, 1>(&base::<sse2::S4>(state), ctr, out, None)
+fn one_block_impl<const FROM: bool>(
+    state: &[u32; 16],
+    ctr: u32,
+    src: &[u8],
+    out: &mut [u8],
+) -> u32 {
+    xor_groups_impl::<sse2::S4, 1, FROM>(&base::<sse2::S4>(state), ctr, src, out, None)
 }
 
 #[cfg(not(target_arch = "x86_64"))]
 #[inline]
-fn one_block(state: &[u32; 16], ctr: u32, out: &mut [u8]) -> u32 {
+fn one_block_impl<const FROM: bool>(
+    state: &[u32; 16],
+    ctr: u32,
+    src: &[u8],
+    out: &mut [u8],
+) -> u32 {
     if calibrate::verdict() {
-        xor_groups::<Wide, 1>(&base::<Wide>(state), ctr, out, None)
+        xor_groups_impl::<Wide, 1, FROM>(&base::<Wide>(state), ctr, src, out, None)
     } else {
-        portable::xor_block(state, ctr, out)
+        portable::xor_block_impl::<FROM>(state, ctr, src, out)
     }
 }
 
@@ -375,6 +448,24 @@ pub(crate) fn xor_blocks(
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn xor_blocks_from(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    start: u32,
+    head: Option<&mut [u8; 32]>,
+    src: &[u8],
+    dst: &mut [u8],
+) -> u32 {
+    if std::is_x86_feature_detected!("avx512f") && std::is_x86_feature_detected!("avx2") {
+        unsafe { avx512::xor_blocks_from(key, nonce, start, head, src, dst) }
+    } else if std::is_x86_feature_detected!("avx2") {
+        unsafe { avx2::xor_blocks_from(key, nonce, start, head, src, dst) }
+    } else {
+        xor_ladder_from::<portable::U4>(key, nonce, start, head, src, dst)
+    }
+}
+
 #[cfg(target_arch = "aarch64")]
 pub(crate) fn xor_blocks(
     key: &[u8; 32],
@@ -384,6 +475,18 @@ pub(crate) fn xor_blocks(
     buf: &mut [u8],
 ) -> u32 {
     soa::xor_blocks(key, nonce, start, head, buf)
+}
+
+#[cfg(target_arch = "aarch64")]
+pub(crate) fn xor_blocks_from(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    start: u32,
+    head: Option<&mut [u8; 32]>,
+    src: &[u8],
+    dst: &mut [u8],
+) -> u32 {
+    soa::xor_blocks_from(key, nonce, start, head, src, dst)
 }
 
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
@@ -397,30 +500,77 @@ pub(crate) fn xor_blocks(
     xor_ladder::<Wide>(key, nonce, start, head, buf)
 }
 
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+pub(crate) fn xor_blocks_from(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    start: u32,
+    head: Option<&mut [u8; 32]>,
+    src: &[u8],
+    dst: &mut [u8],
+) -> u32 {
+    xor_ladder_from::<Wide>(key, nonce, start, head, src, dst)
+}
+
 /// The group loop, then the tail: on `aarch64` the pass always leaves less than `group_bytes`, so only tests reach the group — the independent ladder every pass is read against.
+#[cfg(any(not(target_arch = "aarch64"), test))]
+#[inline(always)]
+fn xor_ladder_impl<V: Lanes, const FROM: bool>(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    start: u32,
+    mut head: Option<&mut [u8; 32]>,
+    src: &[u8],
+    buf: &mut [u8],
+) -> u32 {
+    let state = base_state(key, nonce);
+    let base = base::<V>(&state);
+    let mut ctr = start;
+    let mut src = src;
+    let mut rest = buf;
+    let mut blocks = 0u32;
+    let mut owed = 64 * usize::from(head.is_some());
+    while rest.len() + owed >= group_bytes::<V>() {
+        let take = (group_bytes::<V>() - owed).min(rest.len());
+        let (chunk, tail) = rest.split_at_mut(take);
+        let (chunk_src, tail_src) = if FROM {
+            src.split_at(take)
+        } else {
+            (&[][..], &[][..])
+        };
+        blocks +=
+            xor_groups_impl::<V, GROUP_STATES, FROM>(&base, ctr, chunk_src, chunk, head.take());
+        ctr = ctr.wrapping_add((GROUP_STATES * V::CHUNKS) as u32);
+        rest = tail;
+        src = tail_src;
+        owed = 0;
+    }
+    blocks + xor_tail_impl::<V, FROM>(&state, &base, ctr, head, src, rest)
+}
+
 #[cfg(any(not(target_arch = "aarch64"), test))]
 #[inline(always)]
 fn xor_ladder<V: Lanes>(
     key: &[u8; 32],
     nonce: &[u8; 12],
     start: u32,
-    mut head: Option<&mut [u8; 32]>,
+    head: Option<&mut [u8; 32]>,
     buf: &mut [u8],
 ) -> u32 {
-    let state = base_state(key, nonce);
-    let base = base::<V>(&state);
-    let mut ctr = start;
-    let mut rest = buf;
-    let mut blocks = 0u32;
-    let mut owed = 64 * usize::from(head.is_some());
-    while rest.len() + owed >= group_bytes::<V>() {
-        let (chunk, tail) = rest.split_at_mut((group_bytes::<V>() - owed).min(rest.len()));
-        blocks += xor_groups::<V, GROUP_STATES>(&base, ctr, chunk, head.take());
-        ctr = ctr.wrapping_add((GROUP_STATES * V::CHUNKS) as u32);
-        rest = tail;
-        owed = 0;
-    }
-    blocks + xor_tail::<V>(&state, &base, ctr, head, rest)
+    xor_ladder_impl::<V, false>(key, nonce, start, head, &[], buf)
+}
+
+#[cfg(any(not(target_arch = "aarch64"), test))]
+#[inline(always)]
+fn xor_ladder_from<V: Lanes>(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    start: u32,
+    head: Option<&mut [u8; 32]>,
+    src: &[u8],
+    dst: &mut [u8],
+) -> u32 {
+    xor_ladder_impl::<V, true>(key, nonce, start, head, src, dst)
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -628,7 +778,7 @@ mod sse2_counter_tests {
 
 #[cfg(test)]
 mod tail_store_tests {
-    use super::xor_last_bytes;
+    use super::xor_last_bytes_from;
 
     #[test]
     fn the_wide_tail_xor_is_the_byte_loop_it_replaced() {
@@ -638,7 +788,7 @@ mod tail_store_tests {
                 .map(|i| (i as u8).wrapping_mul(91).wrapping_add(5))
                 .collect();
             let mut wide = original.clone();
-            xor_last_bytes(&mut wide, &staged);
+            xor_last_bytes_from::<false>(&mut wide, &[], &staged);
             let mut bytes = original;
             for (dst, ks) in bytes.iter_mut().zip(staged) {
                 *dst ^= ks;
@@ -652,7 +802,7 @@ mod tail_store_tests {
         let staged: [u8; 16] = [0xFF; 16];
         for len in 1..=15usize {
             let mut buf = vec![0xA5u8; len + 8];
-            xor_last_bytes(&mut buf[..len], &staged);
+            xor_last_bytes_from::<false>(&mut buf[..len], &[], &staged);
             assert!(
                 buf[len..].iter().all(|b| *b == 0xA5),
                 "len {len} wrote past the tail: {buf:?}"
@@ -661,14 +811,76 @@ mod tail_store_tests {
     }
 
     #[test]
+    fn a_tail_from_a_source_reads_it_and_writes_the_destination() {
+        let staged: [u8; 16] = std::array::from_fn(|i| (i as u8).wrapping_mul(29).wrapping_add(7));
+        for len in 1..=16usize {
+            let src: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(53).wrapping_add(3))
+                .collect();
+            let copy = src.clone();
+            let mut dst = vec![0xA5u8; len];
+            xor_last_bytes_from::<true>(&mut dst, &src, &staged);
+            for i in 0..len {
+                assert_eq!(dst[i], copy[i] ^ staged[i], "len {len} byte {i}");
+            }
+            assert_eq!(src, copy, "len {len} left the source alone");
+        }
+    }
+
+    #[test]
     fn a_single_tail_byte_is_xored_and_the_rest_is_not() {
         let staged = [0u8; 16];
         let mut buf = [0x5Au8];
-        xor_last_bytes(&mut buf, &staged);
+        xor_last_bytes_from::<false>(&mut buf, &[], &staged);
         assert_eq!(buf, [0x5Au8]);
         let staged = [0xFFu8; 16];
         let mut buf = [0x5Au8];
-        xor_last_bytes(&mut buf, &staged);
+        xor_last_bytes_from::<false>(&mut buf, &[], &staged);
         assert_eq!(buf, [0xA5u8]);
+    }
+}
+
+#[cfg(test)]
+mod from_tests {
+    use super::portable::U4;
+    use super::{xor_ladder, xor_ladder_from};
+
+    #[test]
+    fn the_from_ladder_is_the_in_place_ladder_and_leaves_the_source_alone() {
+        let key = [0x3cu8; 32];
+        let nonce = [0x91u8; 12];
+        for &len in &[
+            0usize, 1, 15, 16, 63, 64, 65, 255, 256, 511, 512, 513, 1024, 4096,
+        ] {
+            let src: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(197).wrapping_add(13))
+                .collect();
+            for head in [false, true] {
+                let original = src.clone();
+                let mut in_place = src.clone();
+                let mut dst = vec![0u8; len];
+                let mut want_head = [0u8; 32];
+                let mut got_head = [0u8; 32];
+                let want = xor_ladder::<U4>(
+                    &key,
+                    &nonce,
+                    7,
+                    head.then_some(&mut want_head),
+                    &mut in_place,
+                );
+                let got = xor_ladder_from::<U4>(
+                    &key,
+                    &nonce,
+                    7,
+                    head.then_some(&mut got_head),
+                    &src,
+                    &mut dst,
+                );
+                assert_eq!(got, want, "len {len} head {head}: block count");
+                assert_eq!(dst, in_place, "len {len} head {head}: bytes");
+                assert_eq!(got_head, want_head, "len {len} head {head}: one-time key");
+                assert_eq!(src, original, "len {len} head {head}: source moved");
+            }
+        }
     }
 }
