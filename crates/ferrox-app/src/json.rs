@@ -992,9 +992,9 @@ mod tests {
             1,
             "an existing tag is replaced in place"
         );
-        assert_eq!(item_tag(&items[6143]), "tag4095");
+        assert_eq!(item_tag(&items[4095]), "tag2047");
         assert_eq!(
-            item_port(&items[6143]),
+            item_port(&items[4095]),
             0,
             "an untouched tag keeps its value"
         );
