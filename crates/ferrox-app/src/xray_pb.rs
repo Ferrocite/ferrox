@@ -763,15 +763,15 @@ fn stream_settings(bytes: &[u8]) -> Result<Json, String> {
     } else {
         network
     };
-    if network != "tcp" && network != "masque" {
+    if !matches!(network.as_str(), "tcp" | "masque" | "kcp" | "mkcp") {
         return Err(format!("network `{network}` is not carried"));
     }
     let mut pairs = vec![("network", Json::Str(network.clone()))];
     if let Some(settings) = transport_settings {
-        let key = if network == "masque" {
-            "masqueSettings"
-        } else {
-            "tcpSettings"
+        let key = match network.as_str() {
+            "masque" => "masqueSettings",
+            "kcp" | "mkcp" => "kcpSettings",
+            _ => "tcpSettings",
         };
         pairs.push((key, settings));
     }
@@ -837,8 +837,49 @@ fn transport_config(bytes: &[u8]) -> Result<(Option<Json>, String), String> {
             };
             masque_transport(value).map(|json| (Some(json), name))
         }
+        Some((message, value)) if message == "xray.transport.internet.kcp.Config" => {
+            let name = if name.is_empty() || name == "tcp" {
+                "mkcp".to_owned()
+            } else {
+                name
+            };
+            kcp_transport(value).map(|json| (Some(json), name))
+        }
         Some((message, _)) => Err(format!("transport settings `{message}` is not carried")),
     }
+}
+
+/// The KCP tunables the dialect spells in `kcpSettings`; every absent field is the
+/// reference's zero value, which the dialect fills from its own defaults (`config::kcp_config`).
+fn kcp_transport(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.transport.internet.kcp.Config");
+    let mut values = [0u32; 6];
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1..=6, 0) => {
+                values[field as usize - 1] = u32::try_from(reader.varint()?).map_err(|_| {
+                    "xray.transport.internet.kcp.Config: a value is above 4294967295".to_owned()
+                })?;
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let names = [
+        "mtu",
+        "tti",
+        "uplinkCapacity",
+        "downlinkCapacity",
+        "cwndMultiplier",
+        "maxSendingWindow",
+    ];
+    Ok(object(
+        names
+            .into_iter()
+            .zip(values)
+            .filter(|(_, value)| *value != 0)
+            .map(|(name, value)| (name, Json::Num(f64::from(value))))
+            .collect(),
+    ))
 }
 
 fn tcp_transport(bytes: &[u8]) -> Result<(), String> {
@@ -1602,8 +1643,9 @@ fn dokodemo_settings(bytes: &[u8]) -> Result<Json, String> {
     ]))
 }
 
-/// A vmess account: the user's uuid and the cipher it asks for when the config names one.
-type VmessAccount = (String, Option<String>);
+/// A vmess account: the user's uuid, the cipher it asks for when the config names one, and
+/// the experiment string its `tests_enabled` field carries.
+type VmessAccount = (String, Option<String>, Option<String>);
 type VmessUser = (VmessAccount, u32, String);
 
 /// A vmess inbound serves the clients its users name; xray's default level and the detour
@@ -2517,11 +2559,13 @@ fn vmess_user(bytes: &[u8]) -> Result<VmessUser, String> {
 }
 
 /// The account's uuid, and the cipher its client asks for when the config names one.
-/// `tests_enabled` switches on a per-account experiment no scenario writes.
+/// `tests_enabled` names the per-account experiments the reference enables by substring, the
+/// authenticated length and the suppressed termination signal among them (`proxy/vmess/account.go:56`).
 fn vmess_account(bytes: &[u8]) -> Result<VmessAccount, String> {
     let mut reader = Reader::new(bytes, "xray.proxy.vmess.Account");
     let mut id = None;
     let mut security = None;
+    let mut tests_enabled = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => {
@@ -2552,20 +2596,32 @@ fn vmess_account(bytes: &[u8]) -> Result<VmessAccount, String> {
                     }
                 });
             }
-            (4, 2) => return Err(reader.uncarried("tests_enabled")),
+            (4, 2) => {
+                tests_enabled = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.proxy.vmess.Account: tests_enabled is not utf-8".to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
             _ => return Err(reader.refuse(field, wire)),
         }
     }
     Ok((
         id.ok_or("xray.proxy.vmess.Account: no id")?,
         security.map(str::to_owned),
+        tests_enabled,
     ))
 }
 
-fn vmess_client((id, security): VmessAccount, level: u32, email: String) -> Json {
+fn vmess_client((id, security, tests_enabled): VmessAccount, level: u32, email: String) -> Json {
     let mut pairs = vec![("id", Json::Str(id))];
     if let Some(security) = security {
         pairs.push(("security", Json::Str(security)));
+    }
+    if let Some(tests_enabled) = tests_enabled {
+        pairs.push(("testsEnabled", Json::Str(tests_enabled)));
     }
     if level != 0 {
         pairs.push(("level", Json::Num(f64::from(level))));
@@ -3762,10 +3818,13 @@ mod tests {
         dokodemo_inbound(&receiver(port, Some(&[127, 0, 0, 1])), &message(&settings))
     }
 
-    fn vmess_account(id: &[u8], security: Option<u64>) -> Vec<u8> {
+    fn vmess_account(id: &[u8], security: Option<u64>, tests_enabled: Option<&str>) -> Vec<u8> {
         let mut account = vec![bytes_field(1, id)];
         if let Some(value) = security {
             account.push(bytes_field(3, &varint_field(1, value)));
+        }
+        if let Some(text) = tests_enabled {
+            account.push(bytes_field(4, text.as_bytes()));
         }
         typed("xray.proxy.vmess.Account", &message(&account))
     }
@@ -4249,7 +4308,7 @@ mod tests {
 
     #[test]
     fn a_vmess_inbound_decodes_its_clients() {
-        let account = vmess_account(b"bbbb-bbbb", Some(3));
+        let account = vmess_account(b"bbbb-bbbb", Some(3), Some("AuthenticatedLength"));
         let settings = bytes_field(1, &vmess_user(&account));
         let inbound = message(&[
             bytes_field(
@@ -4278,11 +4337,64 @@ mod tests {
             client.get("security").and_then(Json::as_str),
             Some("aes-128-gcm")
         );
+        assert_eq!(
+            client.get("testsEnabled").and_then(Json::as_str),
+            Some("AuthenticatedLength")
+        );
+    }
+
+    #[test]
+    fn a_kcp_stream_carries_its_tunables() {
+        let kcp = message(&[
+            varint_field(1, 1400),
+            varint_field(2, 20),
+            varint_field(3, 10),
+            varint_field(4, 50),
+            varint_field(5, 2),
+            varint_field(6, 1_048_576),
+        ]);
+        let stream = message(&[
+            bytes_field(
+                2,
+                &message(&[
+                    bytes_field(2, &typed("xray.transport.internet.kcp.Config", &kcp)),
+                    bytes_field(3, b"mkcp"),
+                ]),
+            ),
+            bytes_field(5, b"mkcp"),
+        ]);
+        let account = vmess_account(b"bbbb-bbbb", None, None);
+        let settings = bytes_field(1, &vmess_user(&account));
+        let inbound = message(&[
+            bytes_field(
+                2,
+                &typed(
+                    "xray.app.proxyman.ReceiverConfig",
+                    &receiver_stream(5000, &stream),
+                ),
+            ),
+            bytes_field(3, &typed("xray.proxy.vmess.inbound.Config", &settings)),
+        ]);
+        let json = to_json(&config(&inbound, &freedom_outbound())).expect("kcp inbound decodes");
+        let stream = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("streamSettings")
+            .expect("stream settings");
+        assert_eq!(stream.get("network").and_then(Json::as_str), Some("mkcp"));
+        let kcp = stream.get("kcpSettings").expect("kcp settings");
+        assert_eq!(kcp.get("mtu").and_then(Json::as_u32), Some(1400));
+        assert_eq!(kcp.get("uplinkCapacity").and_then(Json::as_u32), Some(10));
+        assert_eq!(
+            kcp.get("maxSendingWindow").and_then(Json::as_u32),
+            Some(1_048_576)
+        );
     }
 
     #[test]
     fn a_vmess_outbound_decodes_its_endpoint() {
-        let account = vmess_account(b"cccc-cccc", None);
+        let account = vmess_account(b"cccc-cccc", None, None);
         let endpoint = message(&[
             bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
             varint_field(2, 443),
@@ -4324,7 +4436,10 @@ mod tests {
 
     #[test]
     fn a_vmess_user_level_rides_into_the_client() {
-        let user = message(&[varint_field(1, 2), vmess_user(&vmess_account(b"d", None))]);
+        let user = message(&[
+            varint_field(1, 2),
+            vmess_user(&vmess_account(b"d", None, None)),
+        ]);
         let settings = bytes_field(1, &user);
         let inbound = message(&[
             bytes_field(
