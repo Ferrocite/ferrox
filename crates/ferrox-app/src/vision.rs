@@ -49,6 +49,9 @@ pub(crate) struct Link<S: Read + Write + RecordAlignment> {
     /// The feed a read built: a steady read spends no scan, so it must build none.
     #[cfg(test)]
     feeds: usize,
+    /// The shared filter state's acquisitions: a framed write takes one, not four.
+    #[cfg(test)]
+    tls_accesses: std::sync::atomic::AtomicUsize,
     read: Reading,
     write: Writing,
     tls: TlsCell,
@@ -265,6 +268,20 @@ struct Tls {
 }
 
 impl<S: Read + Write + RecordAlignment> Link<S> {
+    fn filter(&self) -> Tls {
+        #[cfg(test)]
+        self.tls_accesses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.tls.snapshot()
+    }
+
+    fn filter_update<R>(&mut self, f: impl FnOnce(&mut Tls) -> R) -> R {
+        #[cfg(test)]
+        self.tls_accesses
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.tls.update(f)
+    }
+
     pub(crate) fn new(session: S, raw: Option<Connection>, uuid: &[u8; 16]) -> Self {
         Self {
             session,
@@ -286,6 +303,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             validated: 0,
             #[cfg(test)]
             feeds: 0,
+            #[cfg(test)]
+            tls_accesses: std::sync::atomic::AtomicUsize::new(0),
             read: Reading {
                 padding: true,
                 raw: false,
@@ -335,6 +354,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             validated: 0,
             #[cfg(test)]
             feeds: 0,
+            #[cfg(test)]
+            tls_accesses: std::sync::atomic::AtomicUsize::new(0),
             read: Reading {
                 padding: true,
                 raw: false,
@@ -440,7 +461,7 @@ impl<S: Read + Write + RecordAlignment> Read for Link<S> {
     /// The content the walk hands this caller buffer is one filter unit: it joins the
     /// feeding spread through the run, and the machine spends at the unit's end.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let tls = self.tls.snapshot();
+        let tls = self.filter();
         let active = tls.budget > 0;
         let mut feed = active.then(|| Feeding::new(&tls));
         #[cfg(test)]
@@ -449,7 +470,7 @@ impl<S: Read + Write + RecordAlignment> Read for Link<S> {
         }
         let n = self.drive_read(buf, feed.as_mut(), active)?;
         if let Some(feed) = feed {
-            if feed.run > 0 && self.tls.snapshot().budget > 0 {
+            if feed.run > 0 {
                 self.spend(&feed);
             }
         }
@@ -491,17 +512,17 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                     if self.walk.framed && self.read.padding {
                         return Ok(0);
                     }
-                    return Ok(self.drain_tail(buf, feed.as_deref_mut()));
+                    return Ok(self.drain_tail(buf, feed.as_deref_mut(), active));
                 }
             } else {
                 // the framing is over: what it left in the window is content, then raw
                 if self.dot < self.have.len() && !buf.is_empty() {
-                    return Ok(self.drain_tail(buf, feed.as_deref_mut()));
+                    return Ok(self.drain_tail(buf, feed.as_deref_mut(), active));
                 }
                 if buf.is_empty() {
                     return Ok(0);
                 }
-                return self.read_direct(buf);
+                return self.read_direct(buf, active);
             }
         }
     }
@@ -510,7 +531,10 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     /// hands its confirmed switch or its exhausted window over, and the idle switch
     /// arms the alignment only when its verdict earned it.
     fn spend(&mut self, feed: &Feeding) {
-        self.tls.update(|tls| {
+        let tls = self.filter_update(|tls| {
+            if tls.budget == 0 {
+                return None;
+            }
             tls.budget -= 1;
             // A split writer can observe a hello after this snapshot; its progress outranks ours.
             if tls.server_hello_left == feed.start {
@@ -531,13 +555,16 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             } else if feed.left > 0 && feed.scanned >= feed.left {
                 tls.budget = 0;
             }
+            Some(*tls)
         });
-        self.engage();
+        if let Some(tls) = tls {
+            self.engage(&tls);
+        }
     }
 
-    fn drain_tail(&mut self, buf: &mut [u8], feed: Option<&mut Feeding>) -> usize {
+    fn drain_tail(&mut self, buf: &mut [u8], feed: Option<&mut Feeding>, active: bool) -> usize {
         let n = (self.have.len() - self.dot).min(buf.len());
-        if n > 0 && self.tls.snapshot().budget > 0 {
+        if n > 0 && active {
             if let Some(feed) = feed {
                 feed_extent(&self.have[self.dot..self.dot + n], feed);
             }
@@ -552,21 +579,26 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
     }
 
     /// Past the framing the payload lands in the caller's buffer: no copy, where the staged path needed two.
-    fn read_direct(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn read_direct(&mut self, buf: &mut [u8], active: bool) -> std::io::Result<usize> {
         let raw = self.read.raw;
         let n = match self.raw.as_mut() {
             Some(handle) if raw => handle.read(buf)?,
             _ => self.session.read(buf)?,
         };
-        if n > 0 && !raw && self.tls.snapshot().budget > 0 {
-            self.tls.update(|tls| tls.observe(&buf[..n]));
-            self.engage();
+        if n > 0 && !raw && active {
+            let tls = self.filter_update(|tls| {
+                if tls.budget > 0 {
+                    tls.observe(&buf[..n]);
+                }
+                *tls
+            });
+            self.engage(&tls);
         }
         Ok(n)
     }
 
-    fn engage(&mut self) {
-        if self.read.padding && self.tls.snapshot().enable_xtls {
+    fn engage(&mut self, tls: &Tls) {
+        if self.read.padding && tls.enable_xtls {
             self.session.engage_record_alignment();
         }
     }
@@ -832,11 +864,13 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
             self.write_out(buf)?;
             return Ok(buf.len());
         }
-        if self.tls.snapshot().budget > 0 {
-            self.tls.update(|tls| tls.observe(buf));
-            self.engage();
-        }
-        let tls = self.tls.snapshot();
+        let tls = self.filter_update(|tls| {
+            if tls.budget > 0 {
+                tls.observe(buf);
+            }
+            *tls
+        });
+        self.engage(&tls);
         // The relay hands one buffer of up to 256 KiB: it frames as blocks of one Xray buffer, and the filter budget and the switch are counted per caller buffer as the reference counts them per `MultiBuffer`.
         let complete =
             tls.present && buf.len() >= 6 && buf[..3] == TLS_APPLICATION_DATA && is_record_run(buf);
@@ -1335,6 +1369,48 @@ mod tests {
         let n = link.read(&mut out).expect("reads");
         assert_eq!(&out[..n], b"body");
         assert_eq!(link.feeds, 0, "the scan is over, so no feed is built");
+    }
+
+    /// The framed writer observes the filter and reads it back to frame: one acquisition
+    /// of the state a split link shares, where the first form took up to four.
+    #[test]
+    fn a_framed_write_takes_the_shared_state_once() {
+        let (_reader, mut writer) = Link::split(Fake::new(&[]), Fake::new(&[]), None, None, &UUID);
+        writer
+            .tls_accesses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        writer.write_all(b"hello").expect("writes");
+        assert_eq!(
+            writer
+                .tls_accesses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the framed write takes the shared state once"
+        );
+    }
+
+    /// After the switch a read spends no budget, so it reads the shared state once and
+    /// hands the content through without a second look.
+    #[test]
+    fn a_steady_direct_read_takes_the_shared_state_once() {
+        let (mut reader, _writer) =
+            Link::split(Fake::new(b"tail"), Fake::new(&[]), None, None, &UUID);
+        reader.read.padding = false;
+        reader.walk.framed = true;
+        reader.tls.update(|tls| tls.budget = 0);
+        reader
+            .tls_accesses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        let mut out = [0u8; 8];
+        let n = reader.read(&mut out).expect("reads");
+        assert_eq!(&out[..n], b"tail");
+        assert_eq!(
+            reader
+                .tls_accesses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "a steady direct read takes the shared state once"
+        );
     }
 
     /// The command byte is validated once per frame, and a command the reference does
