@@ -119,12 +119,11 @@ fn merge_env(base: &mut Vec<(String, Json)>, key: &str, over: &Json) {
     let mut added: Vec<(&str, &Json)> = Vec::new();
     let mut replaced: Vec<(usize, &Json)> = Vec::new();
     for (name, value) in entries {
-        match index.get(name.as_str()) {
-            Some(&at) => replaced.push((at, value)),
-            None => {
-                index.insert(name.as_str(), into.len() + added.len());
-                added.push((name, value));
-            }
+        if let Some(&at) = index.get(name.as_str()) {
+            replaced.push((at, value));
+        } else {
+            index.insert(name.as_str(), into.len() + added.len());
+            added.push((name, value));
         }
     }
     drop(index);
@@ -161,12 +160,11 @@ fn merge_tagged(base: &mut Vec<(String, Json)>, key: &str, over: &Json, tail: bo
     let mut replaced: Vec<(usize, &Json)> = Vec::new();
     for item in items {
         let tag = item.get("tag").and_then(Json::as_str).unwrap_or_default();
-        match index.get(tag) {
-            Some(&at) => replaced.push((at, item)),
-            None => {
-                index.insert(tag, base + added.len());
-                added.push(item);
-            }
+        if let Some(&at) = index.get(tag) {
+            replaced.push((at, item));
+        } else {
+            index.insert(tag, base + added.len());
+            added.push(item);
         }
     }
     drop(index);
@@ -976,8 +974,12 @@ mod tests {
             6144,
             "replaced tags stay in place, new ones prepend"
         );
-        let tag = |item: &Json| item.get("tag").and_then(Json::as_str).expect("tag");
-        let port = |item: &Json| item.get("port").and_then(Json::as_u32).expect("port");
+        fn tag(item: &Json) -> &str {
+            item.get("tag").and_then(Json::as_str).expect("tag")
+        }
+        fn port(item: &Json) -> u32 {
+            item.get("port").and_then(Json::as_u32).expect("port")
+        }
         assert_eq!(tag(&items[0]), "tag4096");
         assert_eq!(tag(&items[2047]), "tag6143");
         assert_eq!(tag(&items[2048]), "tag0");
