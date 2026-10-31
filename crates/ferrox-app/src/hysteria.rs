@@ -1134,6 +1134,8 @@ pub(crate) fn server_config(
     let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
     config.set_application_protos(&[crate::quic::ALPN]).ok()?;
     config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
+    // A bulk download starts at 400 packets: quiche's ten leaves the first window smaller than one flow's first read, and BBR then paces every ACK.
+    config.set_initial_congestion_window_packets(400);
     // A served connection always carries an auth validator, and the reference enables the datagram lane exactly when one is present, so the lane is on unconditionally here; the depths are the peer's unsent-datagram queue, matching `udpMessageChanSize`.
     config.enable_dgram(true, 1024, 1024);
     match quic {

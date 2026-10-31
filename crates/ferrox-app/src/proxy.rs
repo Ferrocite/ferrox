@@ -45725,15 +45725,22 @@ mod tests {
         );
     }
 
-    fn hysteria_server_once() {
+    fn hysteria_raw_flow(
+        port: u16,
+        roots: &[Vec<u8>],
+        auth: &str,
+        id: [u8; 16],
+        target: SocketAddr,
+    ) -> (
+        quiche::Connection,
+        crate::quic::Datagram,
+        SocketAddr,
+        std::time::Instant,
+    ) {
         use ferrox_core::foxy::frames as h3;
-        let echo_port = echo_loop();
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let (port, roots) = hysteria_loop_with("bisect2-auth", id, "");
-        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
         let sock = crate::quic::Datagram::plain(sock);
-        let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
+        let mut config = crate::quic::quiche_config(roots, Some("bbr")).expect("configures");
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
@@ -45748,7 +45755,7 @@ mod tests {
             &mut conn, &sock, 2, &settings, true, horizon
         ));
         let mut block = Vec::new();
-        ferrox_core::hysteria::build_auth_request("bisect2-auth", 0, &mut block);
+        ferrox_core::hysteria::build_auth_request(auth, 0, &mut block);
         let mut frame = Vec::new();
         h3::quic_varint(&mut frame, h3::H3_HEADERS);
         h3::quic_varint(&mut frame, block.len() as u64);
@@ -45781,12 +45788,50 @@ mod tests {
         let reply = crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, 2, horizon)
             .expect("replies");
         assert_eq!(reply.as_slice(), &[0, 0]);
+        (conn, sock, local, horizon)
+    }
+
+    fn hysteria_server_once() {
+        let echo_port = echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("bisect2-auth", id, "");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let (mut conn, sock, local, horizon) =
+            hysteria_raw_flow(port, &roots, "bisect2-auth", id, target);
         assert!(crate::quic::stream_send_all(
             &mut conn, &sock, 4, b"ping", false, horizon
         ));
         let back =
             crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, 4, horizon).expect("echoes");
         assert_eq!(back.as_slice(), b"ping");
+    }
+
+    #[test]
+    fn hysteria_server_sends_a_bulk_download_to_a_raw_quic_client() {
+        let _serial = quic_serial();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let sink = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let sink_port = sink.local_addr().expect("addr").port();
+        let body: Vec<u8> = (0..32 * 1024 * 1024).map(|at| at as u8).collect();
+        let expected = body.clone();
+        thread::spawn(move || {
+            let (mut stream, _) = sink.accept().expect("accepts");
+            stream.write_all(&body).expect("sends the download");
+        });
+        let (port, roots) = hysteria_loop_with("bulk-raw-auth", id, "");
+        let target: SocketAddr = format!("127.0.0.1:{sink_port}").parse().expect("addr");
+        let (mut conn, sock, local, horizon) =
+            hysteria_raw_flow(port, &roots, "bulk-raw-auth", id, target);
+        let started = Instant::now();
+        let got =
+            crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, expected.len(), horizon)
+                .expect("reads the whole download");
+        let elapsed = started.elapsed();
+        assert_eq!(got, expected);
+        assert!(
+            elapsed < Duration::from_secs(8),
+            "32 MiB took {elapsed:?}; a ten-packet initial window paces this near 2 MiB/s"
+        );
     }
 
     /// Drives a browser's HTTP/3 `GET` against a masquerade port and reads the cover answer back: it hand-shakes, sends a `HEADERS` request on stream 0 with a FIN, then walks the reply's `HEADERS` and `DATA` frames into a status, its headers, and its body.
