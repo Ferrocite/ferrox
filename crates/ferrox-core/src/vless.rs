@@ -256,6 +256,16 @@ impl VlessLink {
             }
         }
         if security == Security::Tls && matches!(self.flow(), "" | "none") {
+            if matches!(
+                self.transport_kind(),
+                TransportKind::Quic | TransportKind::Hysteria
+            ) && self.wants_unsafe_fingerprint()
+                && !opt_in.unsafe_fingerprint()
+            {
+                return Support::UnsafeRequiresOptIn {
+                    reason: "unsafe fingerprint requested: re-run with explicit opt-in",
+                };
+            }
             let method = match self.transport_kind() {
                 TransportKind::Ws => Some("vless-ws-tls"),
                 TransportKind::Xhttp => Some("vless-xhttp-tls"),
@@ -1365,6 +1375,25 @@ mod tests {
                 method: "vless-tcp-reality-vision"
             },
         );
+    }
+
+    #[test]
+    fn a_quic_or_hysteria_tls_link_still_vetoes_an_unsafe_fingerprint() {
+        for (transport, method) in [("quic", "vless-quic"), ("hysteria", "vless-hysteria")] {
+            let l = VlessLink::parse(&format!(
+                "vless://aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee@example.com:443?security=tls&encryption=none&type={transport}&fp=unsafe-chrome#unsafe"
+            ))
+            .expect("parses");
+            assert!(
+                matches!(l.support(), Support::UnsafeRequiresOptIn { .. }),
+                "{transport}"
+            );
+            assert_eq!(
+                l.support_opted(UnsafeOptIn::none().allow_unsafe_fingerprint()),
+                Support::Implemented { method },
+                "{transport}"
+            );
+        }
     }
 
     #[test]
