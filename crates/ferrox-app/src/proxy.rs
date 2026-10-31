@@ -21294,42 +21294,93 @@ pub(crate) const RELAY_BUFFER: usize = 64 * 1024;
 
 pub(crate) const RELAY_SMALL_BUFFER: usize = 16 * 1024;
 
-// A zeroed buffer a finished relay hands back, so the next flow on this thread keeps the 64 KiB it already paid for.
-thread_local! {
-    static RELAY_SPARE: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
+// One pool per window quantum, so a flow that never promotes keeps paying 16 KiB, not 64 KiB.
+// Thread-local spares drain to the shared pool at thread exit: a short-lived `relay_split` leg
+// that drops its RelayBuf before the thread ends still leaves the window reusable by other threads.
+struct RelaySpare {
+    small: Vec<Vec<u8>>,
+    large: Vec<Vec<u8>>,
 }
+
+impl Drop for RelaySpare {
+    fn drop(&mut self) {
+        for bytes in std::mem::take(&mut self.small) {
+            give_relay_shared(RELAY_SMALL_BUFFER, bytes);
+        }
+        for bytes in std::mem::take(&mut self.large) {
+            give_relay_shared(RELAY_BUFFER, bytes);
+        }
+    }
+}
+
+thread_local! {
+    static RELAY_SPARE: std::cell::RefCell<RelaySpare> =
+        const { std::cell::RefCell::new(RelaySpare { small: Vec::new(), large: Vec::new() }) };
+}
+
+static RELAY_SHARED_SMALL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static RELAY_SHARED_LARGE: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
 
 const RELAY_SPARE_MAX: usize = 4;
-const RELAY_SHARED_MAX: usize = 64;
+const RELAY_SHARED_SMALL_MAX: usize = 128;
+const RELAY_SHARED_LARGE_MAX: usize = 64;
 
-/// The cross-thread fallback: a flow set up on one lane and finished on another still returns its window.
-static RELAY_SHARED: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
-
-fn take_relay_window() -> Option<Vec<u8>> {
-    RELAY_SPARE
-        .with(|spare| spare.borrow_mut().pop())
-        .or_else(|| RELAY_SHARED.lock().ok()?.pop())
-}
-
-fn give_relay_window(mut bytes: Vec<u8>) {
-    if bytes.len() != RELAY_BUFFER {
-        bytes.resize(RELAY_BUFFER, 0);
-    }
-    let mut slot = Some(bytes);
-    RELAY_SPARE.with(|spare| {
+fn take_relay_window(quantum: usize) -> Option<Vec<u8>> {
+    let local = RELAY_SPARE.try_with(|spare| {
         let mut spare = spare.borrow_mut();
-        if spare.len() < RELAY_SPARE_MAX {
-            spare.push(slot.take().expect("the window is offered once"));
+        if quantum == RELAY_SMALL_BUFFER {
+            spare.small.pop()
+        } else {
+            spare.large.pop()
         }
     });
-    let Some(bytes) = slot else {
+    local
+        .ok()
+        .flatten()
+        .or_else(|| shared_relay_pool(quantum).lock().ok()?.pop())
+}
+
+fn give_relay_window(bytes: Vec<u8>) {
+    let len = bytes.len();
+    if len != RELAY_SMALL_BUFFER && len != RELAY_BUFFER {
         return;
+    }
+    let is_small = len == RELAY_SMALL_BUFFER;
+    let mut slot = Some(bytes);
+    let _ = RELAY_SPARE.try_with(|spare| {
+        let mut spare = spare.borrow_mut();
+        let pool = if is_small {
+            &mut spare.small
+        } else {
+            &mut spare.large
+        };
+        if pool.len() < RELAY_SPARE_MAX {
+            pool.push(slot.take().unwrap());
+        }
+    });
+    if let Some(bytes) = slot {
+        give_relay_shared(len, bytes);
+    }
+}
+
+fn give_relay_shared(quantum: usize, bytes: Vec<u8>) {
+    let shared = shared_relay_pool(quantum);
+    let cap = if quantum == RELAY_SMALL_BUFFER {
+        RELAY_SHARED_SMALL_MAX
+    } else {
+        RELAY_SHARED_LARGE_MAX
     };
-    let Ok(mut shared) = RELAY_SHARED.lock() else {
-        return;
-    };
-    if shared.len() < RELAY_SHARED_MAX {
-        shared.push(bytes);
+    let Ok(mut pool) = shared.lock() else { return };
+    if pool.len() < cap {
+        pool.push(bytes);
+    }
+}
+
+fn shared_relay_pool(quantum: usize) -> &'static Mutex<Vec<Vec<u8>>> {
+    if quantum == RELAY_SMALL_BUFFER {
+        &RELAY_SHARED_SMALL
+    } else {
+        &RELAY_SHARED_LARGE
     }
 }
 
@@ -21350,10 +21401,11 @@ impl RelayBuf {
     /// The same shape at a caller-chosen read window, for a staging buffer whose headroom and tailroom must sit outside the window rather than shrink it.
     #[must_use]
     pub fn with_len(len: usize) -> Self {
-        let bytes = if len <= RELAY_BUFFER {
-            take_relay_window().unwrap_or_else(|| vec![0u8; RELAY_BUFFER])
-        } else {
-            vec![0u8; len]
+        let bytes = match len {
+            RELAY_SMALL_BUFFER | RELAY_BUFFER => {
+                take_relay_window(len).unwrap_or_else(|| vec![0u8; len])
+            }
+            _ => vec![0u8; len],
         };
         Self {
             bytes,
@@ -21389,6 +21441,15 @@ impl RelayBuf {
         self.moved = self.moved.saturating_add(n);
         if self.window < self.promote_to && (n == self.window || self.moved >= self.promote_to) {
             self.window = self.promote_to;
+            if self.bytes.len() < self.window {
+                let head = self.bytes.len();
+                let mut promoted =
+                    take_relay_window(self.window).unwrap_or_else(|| vec![0u8; self.window]);
+                promoted[..head].copy_from_slice(&self.bytes[..head]);
+                let mut old = std::mem::replace(&mut self.bytes, promoted);
+                old.truncate(head);
+                give_relay_window(old);
+            }
         }
         &self.bytes[..n]
     }
@@ -21414,7 +21475,7 @@ impl RelayBuf {
 
 impl Drop for RelayBuf {
     fn drop(&mut self) {
-        if self.bytes.len() == RELAY_BUFFER {
+        if self.bytes.len() == RELAY_SMALL_BUFFER || self.bytes.len() == RELAY_BUFFER {
             give_relay_window(std::mem::take(&mut self.bytes));
         }
     }
@@ -23820,7 +23881,7 @@ impl Pump {
                     return;
                 }
                 let _ = reading.set_read_timeout(Some(RELAY_POLL));
-                // The same reused window the relay uses: the pool already paid the 16 KiB memset, so a fresh flow does not.
+                // The same reused window the relay uses: the small pool already paid the 16 KiB memset, so a fresh flow does not.
                 let mut buffer = RelayBuf::new();
                 loop {
                     if !matches!(stop_rx.try_recv(), Err(TryRecvError::Empty)) {
@@ -31167,20 +31228,32 @@ mod tests {
         }
     }
 
-    /// A finished flow hands its window back: the next flow on this thread takes the same zeroed allocation, and its promotion pays no second zeroing pass. The gate is the allocator's own zeroed-allocation count rather than a timing.
+    /// A finished flow hands its window back: the next flow takes the same zeroed allocation from the local pool, and the promotion draws from the large pool rather than paying a fresh zeroing pass. The gate is the allocator's own zeroed-allocation count rather than a timing.
     #[test]
     fn a_reused_relay_window_is_not_zeroed() {
         drop(RelayBuf::with_len(RELAY_SMALL_BUFFER));
+        drop(RelayBuf::with_len(RELAY_SMALL_BUFFER));
         let (_, counts) =
             ferrox_core::alloc_count::measure(|| RelayBuf::with_len(RELAY_SMALL_BUFFER));
-        assert_eq!(counts.zeroed, 0, "the reused window is zeroed: {counts:?}");
+        assert_eq!(
+            counts.zeroed, 0,
+            "the reused small window is zeroed: {counts:?}"
+        );
 
+        drop(RelayBuf::with_len(RELAY_BUFFER));
         let mut buffer = RelayBuf::new();
         let ((), counts) = ferrox_core::alloc_count::measure(|| {
             let _ = buffer.filled(RELAY_SMALL_BUFFER);
         });
         assert_eq!(counts.zeroed, 0, "the promotion is zeroed: {counts:?}");
         assert_eq!(buffer.size(), RELAY_BUFFER, "the promotion kept its window");
+    }
+
+    /// A window between the quanta is exactly what its flow asked for: the pool keeps a 16 KiB flow at 16 KiB rather than handing it a 64 KiB allocation it may never fill.
+    #[test]
+    fn an_unpooled_window_stays_the_size_it_asked_for() {
+        let buffer = RelayBuf::with_len(32 * 1024).into_vec();
+        assert_eq!(buffer.capacity(), 32 * 1024, "the flow paid for 64 KiB");
     }
 
     #[test]
