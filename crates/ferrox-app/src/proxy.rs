@@ -24707,6 +24707,14 @@ fn inbound_first_client(inbound: &Json) -> Option<&Json> {
         .and_then(|clients| clients.first())
 }
 
+/// Whether an account asks for the reference's authenticated-length experiment.
+fn authenticated_length(client: &Json) -> bool {
+    client
+        .get("experiments")
+        .and_then(Json::as_str)
+        .is_some_and(|text| text.contains("AuthenticatedLength"))
+}
+
 fn inbound_id(inbound: &Json) -> [u8; 16] {
     inbound_first_client(inbound)
         .and_then(|client| client.get("id"))
@@ -25831,22 +25839,15 @@ fn loopback_dial(
         }
         "vmess" if matches!(stream_security(inbound), "" | "none") => {
             let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
-            let cipher = crate::vmess::Cipher::parse(
-                inbound_first_client(inbound)
-                    .and_then(|client| client.get("security"))
-                    .and_then(Json::as_str)
-                    .unwrap_or("auto"),
-            );
-            let auth_len = inbound_first_client(inbound)
-                .and_then(|client| client.get("experiments"))
-                .and_then(Json::as_str)
-                .is_some_and(|text| text.contains("AuthenticatedLength"));
+            let security = inbound_first_client(inbound).and_then(|client| client.get("security"));
+            let cipher =
+                crate::vmess::Cipher::parse(security.and_then(Json::as_str).unwrap_or("auto"));
             Ok(Outbound::Vmess(VmessOut {
                 address: address.to_owned(),
                 port,
                 id: inbound_id(inbound),
                 cipher,
-                auth_len,
+                auth_len: inbound_first_client(inbound).is_some_and(authenticated_length),
                 carrier,
                 host,
                 tls: None,
@@ -27481,10 +27482,7 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
                 .and_then(Json::as_str)
                 .unwrap_or("auto"),
         );
-        let auth_len = user
-            .get("experiments")
-            .and_then(Json::as_str)
-            .is_some_and(|text| text.contains("AuthenticatedLength"));
+        let auth_len = authenticated_length(user);
         if let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) {
             return Some(VmessOut {
                 address,

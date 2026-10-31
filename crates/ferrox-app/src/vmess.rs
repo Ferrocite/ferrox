@@ -497,7 +497,7 @@ impl Shake {
                 self.at += 4;
                 draws
             } else {
-                (self.pad_len(), 0)
+                (self.draw(), 0)
             }
         } else if self.masked {
             (0, self.draw())
