@@ -1201,6 +1201,9 @@ pub(crate) const SS_UDP_SOURCES: usize = 4096;
 /// The most destinations one stream-cipher listener routes replies for: that account seals no tag, so a reply goes to the last client whose datagram named it.
 const SS_UDP_DESTS: usize = 4096;
 
+/// Datagrams one ready socket drains in a pass: a flooder cannot keep the front from its other sockets, and a level-triggered `poll` names what is left next pass.
+const UDP_DRAIN: usize = 64;
+
 /// One client source's UDP association: the account its first datagram named, its own upstream sockets, and the reply cipher that account seals with.
 struct UdpSource {
     user: usize,
@@ -1406,11 +1409,15 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
                     continue;
                 }
                 let Some((src, is_v6)) = *owner else {
-                    while let Ok((n, src)) =
-                        clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF])
-                    {
+                    for _ in 0..UDP_DRAIN {
+                        let Ok((n, src)) =
+                            clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF])
+                        else {
+                            break;
+                        };
                         let now = Instant::now();
                         let datagram = &mut buf[SEAL_ROOM..SEAL_ROOM + n];
+                        let mut bound = false;
                         if let Some(source) = sources.get_mut(&src) {
                             let user = &users[source.user];
                             if let Some((dest, payload)) =
@@ -1425,7 +1432,10 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
                                 if let Some(uplink) = uplink {
                                     let _ = uplink.send_to(payload, dest);
                                 }
+                                bound = true;
                             }
+                        }
+                        if bound {
                             continue;
                         }
                         let Some((which, dest, payload)) =
@@ -1483,7 +1493,7 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
                     &source.v4
                 };
                 let mut dropped = false;
-                loop {
+                for _ in 0..UDP_DRAIN {
                     match socket.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
                         Ok((n, from)) => {
                             source.last = Instant::now();
@@ -1501,6 +1511,7 @@ fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
                             }
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
                         Err(_) => {
                             dropped = true;
                             break;
@@ -2471,6 +2482,60 @@ mod tests {
                 "an answer is never fanned across sources"
             );
         }
+    }
+
+    /// A source whose stored account no longer opens its datagram is re-probed across the users, so an address another client now sends from is rebound instead of dropped.
+    #[test]
+    fn a_rebound_source_replaces_its_association() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let dest = echo.local_addr().expect("addr");
+        let (reported, seen) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, from)) = echo.recv_from(&mut buf) {
+                let _ = reported.send(from);
+                if echo.send_to(&buf[..n], from).is_err() {
+                    return;
+                }
+            }
+        });
+        let users: Vec<SsUser> = [
+            ("first-password", Method::Aes256Gcm),
+            ("second-password", Method::Aes128Gcm),
+        ]
+        .into_iter()
+        .map(|(password, method)| SsUser {
+            method,
+            master: MasterKey::new(password, method.key_len()),
+            email: String::new(),
+            level: 0,
+        })
+        .collect();
+        let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        let serving = users.clone();
+        thread::spawn(move || serve_udp_on(&front, &serving, true));
+        let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut wire = vec![0u8; DATAGRAM_MAX];
+        for (user, marker) in [
+            (&users[0], b"first".as_slice()),
+            (&users[1], b"second".as_slice()),
+        ] {
+            let packet = seal_to_wire(&user.master, user.method, &dest, marker);
+            client.send_to(&packet, front_addr).expect("sends");
+            let (n, _) = client
+                .recv_from(&mut wire)
+                .expect("the rebound source hears its answer");
+            let (from, payload) = open_from_wire(&user.master, user.method, &wire[..n])
+                .expect("the answer opens under the account that now proves the source");
+            assert_eq!((from, payload.as_slice()), (dest, marker));
+        }
+        let first = seen.recv().expect("the first association's source");
+        let second = seen.recv().expect("the second association's source");
+        assert_ne!(first, second, "the rebound account owns a new association, not the old one");
     }
 
     #[test]

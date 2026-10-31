@@ -20318,44 +20318,71 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
     join(&done);
 }
 
-/// A UDP/443 datagram whose mux policy skips rides its own direct uplink: one socket per destination, its replies framed back to the association's client.
-fn skip_ss_mux_datagram(
-    uplinks: &mut HashMap<SocketAddr, UdpSocket>,
-    dest: SocketAddr,
-    payload: &[u8],
-    relay: &UdpSocket,
-    source: &Arc<Mutex<Option<SocketAddr>>>,
-) {
-    if let Some(up) = uplinks.get(&dest) {
-        let _ = up.send(payload);
-        return;
-    }
-    let Some(up) = datagram_uplink(dest, None, None) else {
-        return;
-    };
-    let Ok(writer) = up.try_clone() else {
-        return;
-    };
-    let peer = Arc::clone(source);
-    let Ok(relay_write) = relay.try_clone() else {
-        return;
-    };
-    thread::spawn(move || {
-        let mut back = udp_buffer();
-        let mut framed = Vec::with_capacity(HEAD + UDP_BUF);
-        while let Ok(read) = up.recv(&mut back) {
-            let Some(client) = peer.lock().ok().and_then(|slot| *slot) else {
-                continue;
-            };
-            let out = socks_udp_frame(&mut framed, None, &dest, &back[..read]);
-            if relay_write.send_to(out, client).is_err() {
-                break;
+/// The skipped datagrams' own lane: one socket pair for the whole association, so a destination cannot add a descriptor, and each reply is framed by the address it actually came from.
+struct DirectLane {
+    v4: UdpSocket,
+    v6: Option<UdpSocket>,
+    done: Arc<AtomicBool>,
+    reader: RelayEnd,
+}
+
+impl DirectLane {
+    fn open(relay: &UdpSocket, source: &Arc<Mutex<Option<SocketAddr>>>) -> Option<Self> {
+        let v4 = UdpSocket::bind("0.0.0.0:0").ok()?;
+        v4.set_read_timeout(Some(RELAY_POLL)).ok()?;
+        let v6 = UdpSocket::bind("[::]:0")
+            .ok()
+            .filter(|sock| sock.set_read_timeout(Some(RELAY_POLL)).is_ok());
+        let read4 = v4.try_clone().ok()?;
+        let read6 = v6.as_ref().and_then(|sock| sock.try_clone().ok());
+        let answer = relay.try_clone().ok()?;
+        let client = Arc::clone(source);
+        let done = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&done);
+        let reader = RelayPool::global().run(move || {
+            let mut back = udp_buffer();
+            let mut framed = Vec::with_capacity(HEAD + UDP_BUF);
+            while !stop.load(Ordering::Relaxed) {
+                for up in std::iter::once(&read4).chain(read6.as_ref()) {
+                    loop {
+                        if stop.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        match up.recv_from(&mut back) {
+                            Ok((n, from)) => {
+                                let Some(dest) = client.lock().ok().and_then(|slot| *slot) else {
+                                    continue;
+                                };
+                                let out = socks_udp_frame(&mut framed, None, &from, &back[..n]);
+                                if answer.send_to(out, dest).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(error) if is_timeout(&error) => break,
+                            Err(_) => return,
+                        }
+                    }
+                }
             }
+        });
+        Some(Self { v4, v6, done, reader })
+    }
+
+    fn send(&self, dest: SocketAddr, payload: &[u8]) {
+        let uplink = if dest.is_ipv6() {
+            self.v6.as_ref()
+        } else {
+            Some(&self.v4)
+        };
+        if let Some(uplink) = uplink {
+            let _ = uplink.send_to(payload, dest);
         }
-    });
-    uplinks.insert(dest, writer);
-    // The datagram that opened the destination is its first payload; a hop must not drop it.
-    let _ = uplinks[&dest].send(payload);
+    }
+
+    fn close(self) {
+        self.done.store(true, Ordering::Relaxed);
+        join(&self.reader);
+    }
 }
 
 /// The datagram's 443 policy: only a port-443 datagram is affected, and only by reject or skip.
@@ -20382,7 +20409,7 @@ fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
     let mut ids = ferrox_core::mux::Ids::new(1);
     // One mux flow per destination, opened by the first datagram and named on every later one.
     let mut lanes: Vec<(SocketAddr, u16)> = Vec::new();
-    let mut direct: HashMap<SocketAddr, UdpSocket> = HashMap::new();
+    let mut direct: Option<DirectLane> = None;
     let mut published: Option<SocketAddr> = None;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
@@ -20406,7 +20433,15 @@ fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
                 continue;
             }
             Udp443::Skip => {
-                skip_ss_mux_datagram(&mut direct, dest, payload, relay, &source);
+                if direct.is_none() {
+                    let Some(lane) = DirectLane::open(relay, &source) else {
+                        continue;
+                    };
+                    direct = Some(lane);
+                }
+                if let Some(lane) = &direct {
+                    lane.send(dest, payload);
+                }
                 continue;
             }
             Udp443::Allow => {}
@@ -20444,6 +20479,9 @@ fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
     }
     (mux.close)();
     join(&done);
+    if let Some(lane) = direct {
+        lane.close();
+    }
     true
 }
 
@@ -40505,32 +40543,53 @@ mod tests {
         assert_eq!(ss_mux_443(Udp443::Allow, https), Udp443::Allow);
     }
 
-    /// A datagram the mux skips rides a direct uplink, and its reply comes back framed for the association's client.
+    /// A datagram the mux skips rides the association's one direct lane, and each reply is framed by the address it actually came from.
     #[test]
     fn a_skipped_datagram_rides_a_direct_lane() {
-        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
-        let echo_addr = echo.local_addr().expect("addr");
-        thread::spawn(move || {
-            let mut buf = vec![0u8; UDP_BUF];
-            while let Ok((n, src)) = echo.recv_from(&mut buf) {
-                if echo.send_to(&buf[..n], src).is_err() {
-                    return;
+        let echo = |peers: std::sync::mpsc::Sender<SocketAddr>| {
+            let socket = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            let address = socket.local_addr().expect("addr");
+            thread::spawn(move || {
+                let mut buf = vec![0u8; UDP_BUF];
+                while let Ok((n, src)) = socket.recv_from(&mut buf) {
+                    let _ = peers.send(src);
+                    if socket.send_to(&buf[..n], src).is_err() {
+                        return;
+                    }
                 }
-            }
-        });
+            });
+            address
+        };
+        let (peers, seen) = std::sync::mpsc::channel();
+        let first = echo(peers.clone());
+        let second = echo(peers);
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
         client
             .set_read_timeout(Some(Duration::from_secs(10)))
             .expect("timeout");
         let source = Arc::new(Mutex::new(Some(client.local_addr().expect("addr"))));
-        let mut uplinks = HashMap::new();
-        skip_ss_mux_datagram(&mut uplinks, echo_addr, b"ping", &relay, &source);
+        let lane = DirectLane::open(&relay, &source).expect("lane");
+        lane.send(first, b"ping");
+        lane.send(second, b"pong");
         let mut back = vec![0u8; UDP_BUF];
-        let (n, _) = client.recv_from(&mut back).expect("the direct lane echoes");
-        let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
-        assert_eq!(from, echo_addr);
-        assert_eq!(payload, b"ping");
+        let mut answered: Vec<(SocketAddr, Vec<u8>)> = (0..2)
+            .map(|_| {
+                let (n, _) = client.recv_from(&mut back).expect("the direct lane echoes");
+                let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
+                (from, payload.to_vec())
+            })
+            .collect();
+        answered.sort();
+        let mut want = vec![(first, b"ping".to_vec()), (second, b"pong".to_vec())];
+        want.sort();
+        lane.close();
+        assert_eq!(answered, want);
+        assert_eq!(
+            seen.recv().expect("first destination seen"),
+            seen.recv().expect("second destination seen"),
+            "one lane serves every destination"
+        );
     }
 
     /// A shadowsocks inbound told to carry udp alone opens no stream listener and still answers a datagram, as the reference's udp worker alone would.
