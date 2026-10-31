@@ -40,7 +40,7 @@ pub fn table() -> String {
     );
     let _ = writeln!(
         s,
-        "| 5 | `TROJAN` TCP TLS | implemented (`proxy.rs`: password framing, both roles, raw `TCP` + every dialled carrier) | `xray_oracle::trojan_over_raw_tcp_matches_the_oracle` (conformance 37132662374) for the framing |"
+        "| 5 | `TROJAN` TCP TLS | implemented (`proxy.rs`: password framing, both roles, raw `TCP` + every dialled carrier, QUIC and Hysteria TCP/UDP) | `xray_oracle::trojan_over_raw_tcp_matches_the_oracle` (conformance 37132662374) for the framing; `quic_serves_trojan_*` and `hysteria_carries_trojan_*` for the transport carriers |"
     );
     let _ = writeln!(
         s,

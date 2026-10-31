@@ -3225,6 +3225,9 @@ pub(crate) struct TrojanOut {
     headers: Vec<(String, String)>,
     heartbeat: u32,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
+    quic_roots: Option<ferrox_core::tls::Anchors>,
+    quic_ech: Option<Arc<[u8]>>,
+    hysteria_roots: Option<ferrox_core::tls::Anchors>,
 }
 
 #[derive(Debug, Clone)]
@@ -5679,9 +5682,9 @@ pub(crate) fn resolve_endpoint(host: &str, port: u16) -> Option<SocketAddr> {
 }
 
 fn resolve_name(host: &str, port: u16, local: bool) -> Option<SocketAddr> {
-    // An address literal takes the resolver's numeric path, with no cache key of its own.
-    if host.parse::<std::net::IpAddr>().is_ok() {
-        return (host, port).to_socket_addrs().ok()?.next();
+    // An address literal parses straight to an address: no cache key and no resolver iterator.
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, port));
     }
     if let Some(resolver) = crate::dnsapp::installed() {
         let (ips, _) = if local {
@@ -10374,6 +10377,12 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
         eprintln!("trojan reality inbound on {address}: refused, not served as plaintext");
         return false;
     }
+    let carrier = inbound_carrier(inbound);
+    if let Some(served) =
+        serve_trojan_transport_inbound(address, inbound, Arc::clone(&key), &carrier, freedom)
+    {
+        return served;
+    }
     let fallbacks = if sec == "tls" {
         match server_fallbacks(inbound) {
             Ok(fallbacks) => fallbacks.map(Arc::from),
@@ -10385,7 +10394,7 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
     } else {
         None
     };
-    match inbound_carrier(inbound) {
+    match carrier {
         Carrier::Kcp(config) => {
             let email = account.email.clone();
             let level = account.level;
@@ -10457,6 +10466,166 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
             );
             true
         }
+    }
+}
+
+fn serve_trojan_transport_inbound(
+    address: &str,
+    inbound: &Json,
+    key: Arc<[[u8; 56]]>,
+    carrier: &Carrier,
+    freedom: bool,
+) -> Option<bool> {
+    if matches!(carrier, Carrier::Quic) {
+        return Some(serve_trojan_quic_inbound(address, inbound, key, freedom));
+    }
+    let Carrier::Hysteria(config) = carrier else {
+        return None;
+    };
+    if config.version != 2 {
+        eprintln!(
+            "hysteria v{} carrier in trojan is not the v2 serve `hysteria` names: serves nothing",
+            config.version
+        );
+        return Some(false);
+    }
+    let Some(settings) = inbound.get("streamSettings") else {
+        eprintln!("unreadable hysteria identity in trojan: serves nothing");
+        return Some(false);
+    };
+    let Some(identity) = crate::config::tls_identity_from_settings(settings) else {
+        eprintln!("unreadable hysteria identity in trojan: serves nothing");
+        return Some(false);
+    };
+    let masq = crate::config::masquerade_from_stream(Some(settings));
+    let config = config.clone();
+    let owned = address.to_owned();
+    let key = Arc::clone(&key);
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+    let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+        serve_trojan_hysteria(flow.with_meter(meter.clone()), &key, freedom);
+    });
+    thread::spawn(move || {
+        serve_hysteria_thread(&owned, &config, &identity, &masq, &serve);
+    });
+    Some(true)
+}
+
+fn serve_trojan_quic_inbound(
+    address: &str,
+    inbound: &Json,
+    key: Arc<[[u8; 56]]>,
+    freedom: bool,
+) -> bool {
+    let Some(identity) = quic_inbound_identity(inbound) else {
+        eprintln!("trojan quic inbound needs security tls with a certificate: serves nothing");
+        return false;
+    };
+    let Some(config) = crate::quic::serve_config(&identity) else {
+        eprintln!("unreadable trojan quic tls identity: serves nothing");
+        return false;
+    };
+    let Ok(sock) = crate::quic::bind_datagram(address) else {
+        eprintln!("cannot listen on {address}: serves nothing");
+        return false;
+    };
+    let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+    let serve: crate::quic::Serve = Arc::new(move |stream| {
+        serve_trojan_quic(stream.with_meter(meter.clone()), &key, freedom);
+    });
+    thread::spawn(move || {
+        crate::quic::serve_loop(
+            crate::quic::Datagram::plain(sock),
+            &Arc::new(Mutex::new(config)),
+            &serve,
+            &Arc::new(AtomicBool::new(false)),
+        );
+    });
+    true
+}
+
+fn serve_trojan_quic(mut stream: crate::quic::QuicStream, key: &[[u8; 56]], freedom: bool) {
+    if !freedom {
+        stream.close();
+        return;
+    }
+    let Some((cmd, target)) = decode_trojan_request(
+        &mut HandshakeDeadline {
+            inner: &mut stream,
+            until: Instant::now() + budgets::handshake(),
+        },
+        key,
+    ) else {
+        stream.close();
+        return;
+    };
+    crate::accesslog::record_current(&target);
+    match cmd {
+        1 => serve_trojan_quic_tcp(stream, &target),
+        3 => {
+            let close = stream.clone();
+            serve_trojan_udp_halves(stream.clone(), stream, move || close.close());
+        }
+        _ => stream.close(),
+    }
+}
+
+fn serve_trojan_quic_tcp(stream: crate::quic::QuicStream, target: &SocketAddr) {
+    let fin = stream.clone();
+    let Some(uplink) = dial_or_report(target) else {
+        stream.close();
+        return;
+    };
+    if uplink.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        stream.close();
+        return;
+    }
+    let Ok(stop) = uplink.try_clone() else {
+        stream.close();
+        return;
+    };
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = stop.shutdown(Shutdown::Both);
+    });
+    relay_shared_then(
+        Half::socket(stream),
+        Half::socket(uplink),
+        &close,
+        move || {
+            let _ = fin.fin();
+        },
+    );
+}
+
+fn serve_trojan_hysteria(mut io: crate::hysteria::Flow, key: &[[u8; 56]], freedom: bool) {
+    if !freedom {
+        io.close();
+        return;
+    }
+    let Some((cmd, target)) = decode_trojan_request(
+        &mut HandshakeDeadline {
+            inner: &mut io,
+            until: Instant::now() + budgets::handshake(),
+        },
+        key,
+    ) else {
+        io.close();
+        return;
+    };
+    crate::accesslog::record_current(&target);
+    match cmd {
+        1 => {
+            let Some(uplink) = dial_or_report(&target) else {
+                io.close();
+                return;
+            };
+            crate::hysteria::relay(&uplink, &io);
+        }
+        3 => {
+            let close = io.clone();
+            serve_trojan_udp_halves(io.clone(), io, move || close.close());
+        }
+        _ => io.close(),
     }
 }
 
@@ -11712,7 +11881,33 @@ fn trojan_udp_carried(carrier: &Carrier) -> bool {
             | Carrier::Xhttp { .. }
             | Carrier::HttpHeader { .. }
             | Carrier::Kcp(_)
+            | Carrier::Quic
     )
+}
+
+fn trojan_quic_dial(trojan: &TrojanOut) -> crate::quic::QuicDial {
+    crate::quic::QuicDial {
+        id: [0; 16],
+        host: std::sync::Arc::from(trojan.host.as_str()),
+        address: std::sync::Arc::from(trojan.address.as_str()),
+        port: trojan.port,
+        upstream: None,
+        roots: trojan.quic_roots.clone(),
+        ech_config_list: trojan.quic_ech.clone(),
+    }
+}
+
+fn trojan_hysteria_dial(trojan: &TrojanOut) -> Option<crate::hysteria::Dial> {
+    let Carrier::Hysteria(config) = &trojan.carrier else {
+        return None;
+    };
+    Some(crate::hysteria::Dial {
+        host: trojan.host.clone(),
+        address: trojan.address.clone(),
+        port: trojan.port,
+        config: config.clone(),
+        roots: trojan.hysteria_roots.clone(),
+    })
 }
 
 fn dial_trojan_udp_uplink(
@@ -11721,6 +11916,9 @@ fn dial_trojan_udp_uplink(
     relay: &UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
 ) -> Option<TrojanUdpUplink> {
+    if matches!(trojan.carrier, Carrier::Quic) {
+        return dial_trojan_quic_udp_uplink(trojan, dest, relay, source);
+    }
     let server = resolve_outbound(&trojan.address, trojan.port)?;
     let header = trojan_header(&trojan.key, 3, &Destination::from(*dest));
     let udp_send = relay.try_clone().ok()?;
@@ -11780,6 +11978,37 @@ fn dial_trojan_udp_uplink(
     };
     let done = spawn_trojan_uplink_reader(read, udp_send, source);
     Some(TrojanUdpUplink { write, close, done })
+}
+
+fn dial_trojan_quic_udp_uplink(
+    trojan: &TrojanOut,
+    dest: &SocketAddr,
+    relay: &UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+) -> Option<TrojanUdpUplink> {
+    let pooled = crate::quic::pumped_stream_within(&trojan_quic_dial(trojan), budgets::dial())?;
+    let header = trojan_header(&trojan.key, 3, &Destination::from(*dest));
+    let mut stream = pooled.stream_handle();
+    if stream.write_all(&header).is_err() {
+        pooled.cancel();
+        return None;
+    }
+    let Ok(udp_send) = relay.try_clone() else {
+        pooled.cancel();
+        return None;
+    };
+    let done = spawn_trojan_uplink_reader(pooled.stream_handle(), udp_send, source);
+    let close_stream = pooled.stream_handle();
+    let pooled = Mutex::new(Some(pooled));
+    let close: Box<dyn Fn() + Send> = Box::new(move || {
+        close_stream.close();
+        drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
+    });
+    Some(TrojanUdpUplink {
+        write: Box::new(stream),
+        close,
+        done,
+    })
 }
 
 fn trojan_udp_plain(
@@ -16705,6 +16934,18 @@ pub(crate) fn serve_connect(
         }
     }
     if let Outbound::Trojan(trojan) = out {
+        if matches!(trojan.carrier, Carrier::Quic) {
+            let header = trojan_header(&trojan.key, 1, asked);
+            crate::quic::dial_pooled_with(&client, &trojan_quic_dial(trojan), &header, false);
+            return;
+        }
+        if matches!(trojan.carrier, Carrier::Hysteria(_)) {
+            let header = trojan_header(&trojan.key, 1, asked);
+            if let Some(dial) = trojan_hysteria_dial(trojan) {
+                crate::hysteria::dial_header(&client, &dial, &header, 0);
+            }
+            return;
+        }
         if matches!(trojan.carrier, Carrier::Kcp(_)) {
             if let Some(session) = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port) {
                 dial_trojan_kcp(&client, &session, trojan, asked);
@@ -18094,6 +18335,11 @@ fn serve_udp_lane_with(
         Outbound::Vless(vless) if matches!(vless.carrier, Carrier::Hysteria(_)) && !vless.mux => {
             // The datagram lane carries UDP flows the same way it carries TCP ones: one association per destination, ids never reused on the connection.
             if let Some(dial) = hysteria_dial_session(vless) {
+                crate::hysteria::serve_udp(relay, &dial);
+            }
+        }
+        Outbound::Trojan(trojan) if matches!(trojan.carrier, Carrier::Hysteria(_)) => {
+            if let Some(dial) = trojan_hysteria_dial(trojan) {
                 crate::hysteria::serve_udp(relay, &dial);
             }
         }
@@ -23397,11 +23643,13 @@ const TROJAN_HEAD_MAX: usize = 56 + 2 + 1 + 1 + 1 + 255 + 2 + 2;
 
 /// Compares every byte, so timing hides how much of the key was right and a short read never agrees.
 fn key_agrees(got: &[u8], key: &[u8; 56]) -> bool {
-    if got.len() != key.len() {
+    let Ok(got) = <&[u8; 56]>::try_from(got) else {
         return false;
-    }
-    let mut diff = 0u8;
-    for (a, b) in got.iter().zip(key) {
+    };
+    let mut diff = 0u64;
+    for at in (0..56).step_by(8) {
+        let a = u64::from_ne_bytes(got[at..at + 8].try_into().expect("a full key word"));
+        let b = u64::from_ne_bytes(key[at..at + 8].try_into().expect("a full key word"));
         diff |= a ^ b;
     }
     diff == 0
@@ -25204,6 +25452,7 @@ fn loopback_dial(
             "names `{tag}`, whose listener expects a PROXY header no loopback redial sends"
         ));
     }
+    let (headers, heartbeat) = crate::config::carrier_headers(inbound.get("streamSettings"));
     match protocol {
         "vless" if vless_security_supported(stream_security(inbound)) => {
             let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
@@ -25236,8 +25485,8 @@ fn loopback_dial(
                 tls: None,
                 flow: String::new(),
                 reality: None,
-                headers: crate::config::carrier_headers(inbound.get("streamSettings")).0,
-                heartbeat: crate::config::carrier_headers(inbound.get("streamSettings")).1,
+                headers,
+                heartbeat,
                 encryption,
             }))
         }
@@ -25250,8 +25499,11 @@ fn loopback_dial(
                 carrier,
                 host,
                 tls: None,
-                headers: crate::config::carrier_headers(inbound.get("streamSettings")).0,
-                heartbeat: crate::config::carrier_headers(inbound.get("streamSettings")).1,
+                headers,
+                heartbeat,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
             }))
         }
         "vmess" if matches!(stream_security(inbound), "" | "none") => {
@@ -25270,34 +25522,45 @@ fn loopback_dial(
                 carrier,
                 host,
                 tls: None,
-                headers: crate::config::carrier_headers(inbound.get("streamSettings")).0,
-                heartbeat: crate::config::carrier_headers(inbound.get("streamSettings")).1,
+                headers,
+                heartbeat,
             }))
         }
         "shadowsocks" if matches!(stream_security(inbound), "" | "none") => {
-            let method = inbound_method(inbound);
-            if !inbound_ss_destinations(inbound, &method).is_empty() {
-                return Err(format!(
-                    "names `{tag}`, which relays to fixed destinations rather than freedom"
-                ));
-            }
-            let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
-            Ok(Outbound::Shadowsocks(ShadowsocksOut {
-                address: address.to_owned(),
-                port,
-                method,
-                password: inbound_ss_password(inbound),
-                carrier,
-                host,
-                tls: None,
-                headers: crate::config::carrier_headers(inbound.get("streamSettings")).0,
-                heartbeat: crate::config::carrier_headers(inbound.get("streamSettings")).1,
-            }))
+            loopback_shadowsocks(inbound, address, port, tag, headers, heartbeat)
         }
         _ => Err(format!(
             "names `{tag}` speaking `{protocol}`, which no client dial here replays"
         )),
     }
+}
+
+fn loopback_shadowsocks(
+    inbound: &Json,
+    address: &str,
+    port: u16,
+    tag: &str,
+    headers: Vec<(String, String)>,
+    heartbeat: u32,
+) -> Result<Outbound, String> {
+    let method = inbound_method(inbound);
+    if !inbound_ss_destinations(inbound, &method).is_empty() {
+        return Err(format!(
+            "names `{tag}`, which relays to fixed destinations rather than freedom"
+        ));
+    }
+    let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
+    Ok(Outbound::Shadowsocks(ShadowsocksOut {
+        address: address.to_owned(),
+        port,
+        method,
+        password: inbound_ss_password(inbound),
+        carrier,
+        host,
+        tls: None,
+        headers,
+        heartbeat,
+    }))
 }
 
 /// The carrier the redial speaks, or the refusal when it speaks none.
@@ -25893,23 +26156,54 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
         let port = server.get("port").and_then(Json::as_port)?;
         let password = server.get("password").and_then(Json::as_str)?;
         let key = trojan_key(password);
-        if let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) {
-            return Some(TrojanOut {
-                address,
-                port,
-                key,
-                carrier,
-                host,
-                tls: Some(tls),
-                headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
-                heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
-            });
+        let security = stream_security(outbound);
+        let quic_tls = outbound
+            .get("streamSettings")
+            .and_then(|s| s.get("network"))
+            .and_then(Json::as_str)
+            == Some("quic")
+            && security == "tls";
+        let hysteria_tls = hysteria_transport(outbound) && security == "tls";
+        if security == "tls" && !quic_tls && !hysteria_tls {
+            if let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) {
+                return Some(TrojanOut {
+                    address,
+                    port,
+                    key,
+                    carrier,
+                    host,
+                    tls: Some(tls),
+                    headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+                    heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+                    quic_roots: None,
+                    quic_ech: None,
+                    hysteria_roots: None,
+                });
+            }
         }
         let stored = xdrive_carried(outbound, &address);
-        if !matches!(stream_security(outbound), "" | "none") && stored.is_none() {
+        if !matches!(security, "" | "none") && !quic_tls && !hysteria_tls && stored.is_none() {
             continue;
         }
         let (carrier, host) = stored.unwrap_or_else(|| outbound_carrier(outbound, &address));
+        let (quic_roots, quic_ech, hysteria_roots) = match &carrier {
+            Carrier::Quic => {
+                let ech = if quic_tls {
+                    match crate::config::quic_ech_config(outbound, &address) {
+                        Ok(ech) => ech,
+                        Err(why) => {
+                            eprintln!("trojan: {why}; the quic dial will fail");
+                            return None;
+                        }
+                    }
+                } else {
+                    None
+                };
+                (tls_ca_roots(outbound), ech, None)
+            }
+            Carrier::Hysteria(_) => (None, None, tls_ca_roots(outbound)),
+            _ => (None, None, None),
+        };
         return Some(TrojanOut {
             address,
             port,
@@ -25919,6 +26213,9 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
             tls: None,
             headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
             heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+            quic_roots,
+            quic_ech,
+            hysteria_roots,
         });
     }
     None
@@ -30583,7 +30880,7 @@ mod tests {
                     .collect::<Vec<u8>>(),
                 2,
             ),
-            (b"\x03\x09localhost\x1f\x90".to_vec(), 3),
+            (b"\x03\x09127.0.0.1\x1f\x90".to_vec(), 3),
         ] {
             let mut wire = key.to_vec();
             wire.extend_from_slice(b"\r\n\x01");
@@ -30599,6 +30896,24 @@ mod tests {
             assert_eq!(cmd, 1, "{addr:?}");
             assert_eq!(reader.reads, reads, "{addr:?}");
         }
+    }
+
+    #[test]
+    fn the_trojan_numeric_domain_header_allocates_nothing() {
+        let key = trojan_key("an-example-shared-password");
+        let numeric = b"\x03\x09127.0.0.1\x1f\x90";
+        let mut wire = key.to_vec();
+        wire.extend_from_slice(b"\r\n\x01");
+        wire.extend_from_slice(numeric);
+        wire.extend_from_slice(b"\r\n");
+        let (decoded, counts) = ferrox_core::alloc_count::measure(|| {
+            decode_trojan_request(&mut std::io::Cursor::new(wire), &[key])
+        });
+        assert!(decoded.is_some(), "the numeric domain header decodes");
+        assert_eq!(
+            counts.allocs, 0,
+            "a numeric domain is parsed, not walked through an allocating resolver iterator"
+        );
     }
 
     /// The server read is four for every address family and two for mux, down from five for an IP and six for a domain: the add-ons ride in with the command byte, and the port, family and the body's first byte share one read.
@@ -34425,6 +34740,16 @@ mod tests {
                     assert!(matches!(out.carrier, Carrier::Kcp(_)));
                     assert!(out.tls.is_some(), "the kcp session carries tls");
                 }
+                "quic" => {
+                    let out = find_trojan_outbound(&root).expect("quic carries its own tls");
+                    assert!(matches!(out.carrier, Carrier::Quic));
+                    assert!(out.tls.is_none(), "the carrier's tls is not a second layer");
+                }
+                "hysteria" => {
+                    let out = find_trojan_outbound(&root).expect("hysteria carries its own tls");
+                    assert!(matches!(out.carrier, Carrier::Hysteria(_)));
+                    assert!(out.tls.is_none(), "the carrier's tls is not a second layer");
+                }
                 _ => assert!(find_trojan_outbound(&root).is_none(), "{network}"),
             }
         }
@@ -35343,6 +35668,9 @@ mod tests {
                 tls: Some(Arc::new(client_config)),
                 headers: Vec::new(),
                 heartbeat: 0,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
             };
             echo_trace(&format!("cli {port} dialing"));
             dial_trojan(
@@ -35456,6 +35784,9 @@ mod tests {
                 tls: Some(Arc::clone(&client)),
                 headers: Vec::new(),
                 heartbeat: 0,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
             };
             let listener: SocketAddr = address.parse().expect("addr");
             thread::spawn(move || {
@@ -35805,6 +36136,9 @@ mod tests {
             tls: client.cloned(),
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         };
         let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("binds"));
         let relay_addr = relay.local_addr().expect("addr");
@@ -36052,6 +36386,9 @@ mod tests {
             tls: Some(Arc::new(client_config)),
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         };
         let target = Destination::from(
             format!("127.0.0.1:{echo_port}")
@@ -37401,6 +37738,9 @@ mod tests {
             tls: Some(Arc::new(tls)),
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         })
     }
 
@@ -39232,6 +39572,9 @@ mod tests {
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -41808,6 +42151,9 @@ mod tests {
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -41875,6 +42221,9 @@ mod tests {
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -41943,6 +42292,9 @@ mod tests {
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -42008,6 +42360,9 @@ mod tests {
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -42073,6 +42428,9 @@ mod tests {
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -42574,6 +42932,75 @@ mod tests {
         back
     }
 
+    fn quic_trojan_round_trip(
+        addr: SocketAddr,
+        roots: &[Vec<u8>],
+        header: &[u8],
+        payload: &[u8],
+    ) -> Vec<u8> {
+        let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
+            .expect("a socket the server can be addressed from");
+        let sock = crate::quic::Datagram::plain(sock);
+        let mut conn = crate::quic::handshake_within(
+            &sock,
+            peer,
+            local,
+            "localhost",
+            roots,
+            None,
+            QUIC_TEST_TIMEOUT,
+        )
+        .expect("handshakes");
+        assert!(crate::quic::send_h3_opening(&mut conn, &sock));
+        let deadline = Instant::now() + QUIC_TEST_TIMEOUT;
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 0, header, false, deadline
+        ));
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 0, payload, false, deadline
+        ));
+        let back =
+            crate::quic::stream_recv_exact(&mut conn, &sock, local, 0, payload.len(), deadline)
+                .expect("echoes");
+        let _ = conn.close(false, 0, b"done");
+        crate::quic::flush_egress(&mut conn, &sock);
+        back
+    }
+
+    #[test]
+    fn quic_serves_trojan_echo_over_loopback() {
+        let _serial = quic_serial();
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 8192];
+            loop {
+                let Ok(n) = stream.read(&mut buf) else {
+                    return;
+                };
+                if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+        });
+        let key = trojan_key("secret");
+        let serve_key = [key];
+        let (addr, roots, stop, driver) = quic_serve_with(Arc::new(move |stream| {
+            serve_trojan_quic(stream, &serve_key, true);
+        }));
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let header = trojan_header(&key, 1, &Destination::from(target));
+        let payload: Vec<u8> = (0..65536u32).map(|i| (i % 251) as u8).collect();
+        let back = quic_trojan_round_trip(addr, &roots, &header, &payload);
+        assert_eq!(
+            back, payload,
+            "bulk arrives whole over a Trojan QUIC stream"
+        );
+        stop.store(true, Ordering::Relaxed);
+        driver.join().expect("joins");
+    }
+
     #[test]
     fn quic_serves_vless_echo_over_loopback() {
         let _serial = quic_serial();
@@ -42659,6 +43086,74 @@ mod tests {
                 .expect("echoes");
         assert_eq!(&back[..2], &frame[..2]);
         assert_eq!(&back[2..], payload);
+        let _ = conn.close(false, 0, b"done");
+        crate::quic::flush_egress(&mut conn, &sock);
+        stop.store(true, Ordering::Relaxed);
+        driver.join().expect("joins");
+    }
+
+    #[test]
+    fn quic_serves_trojan_udp_over_loopback() {
+        let _serial = quic_serial();
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            loop {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let key = trojan_key("secret");
+        let serve_key = [key];
+        let (addr, roots, stop, driver) = quic_serve_with(Arc::new(move |stream| {
+            serve_trojan_quic(stream, &serve_key, true);
+        }));
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", addr.port())
+            .expect("a socket the server can be addressed from");
+        let sock = crate::quic::Datagram::plain(sock);
+        let mut conn = crate::quic::handshake_within(
+            &sock,
+            peer,
+            local,
+            "localhost",
+            &roots,
+            None,
+            QUIC_TEST_TIMEOUT,
+        )
+        .expect("handshakes");
+        assert!(crate::quic::send_h3_opening(&mut conn, &sock));
+        let deadline = Instant::now() + QUIC_TEST_TIMEOUT;
+        assert!(crate::quic::stream_send_all(
+            &mut conn,
+            &sock,
+            0,
+            &trojan_header(&key, 3, &Destination::from(target)),
+            false,
+            deadline
+        ));
+        let payload = b"ping";
+        let mut frame = Vec::new();
+        push_socks_addr(&mut frame, &target);
+        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        frame.extend_from_slice(b"\r\n");
+        frame.extend_from_slice(payload);
+        assert!(crate::quic::stream_send_all(
+            &mut conn, &sock, 0, &frame, false, deadline
+        ));
+        let back =
+            crate::quic::stream_recv_exact(&mut conn, &sock, local, 0, frame.len(), deadline)
+                .expect("echoes");
+        let mut got = vec![0u8; UDP_BUF];
+        let mut reader = back.as_slice();
+        let (source, n) = read_trojan_datagram(&mut reader, &mut got).expect("the reply frame");
+        assert_eq!(source, target);
+        assert_eq!(&got[..n], payload);
         let _ = conn.close(false, 0, b"done");
         crate::quic::flush_egress(&mut conn, &sock);
         stop.store(true, Ordering::Relaxed);
@@ -45374,8 +45869,20 @@ mod tests {
         obfs: &str,
         masq: ferrox_core::hysteria::Masquerade,
     ) -> (u16, Vec<Vec<u8>>) {
+        let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+            serve_vless_hysteria(flow, &one_vless_user(&id), true);
+        });
+        hysteria_loop_serve(auth, obfs, masq, serve)
+    }
+
+    fn hysteria_loop_serve(
+        auth: &str,
+        obfs: &str,
+        masq: ferrox_core::hysteria::Masquerade,
+        serve: crate::hysteria::Serve,
+    ) -> (u16, Vec<Vec<u8>>) {
         let (identity, roots) = minted_tls_identity("localhost");
-        hysteria_loop_identity(auth, id, obfs, masq, identity, roots)
+        hysteria_loop_with_identity(auth, obfs, masq, identity, roots, serve)
     }
 
     fn hysteria_loop_identity(
@@ -45386,15 +45893,27 @@ mod tests {
         identity: Arc<ferrox_core::tls::TlsServerConfig>,
         roots: Vec<Vec<u8>>,
     ) -> (u16, Vec<Vec<u8>>) {
+        let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+            serve_vless_hysteria(flow, &one_vless_user(&id), true);
+        });
+        hysteria_loop_with_identity(auth, obfs, masq, identity, roots, serve)
+    }
+
+    fn hysteria_loop_with_identity(
+        auth: &str,
+        obfs: &str,
+        masq: ferrox_core::hysteria::Masquerade,
+        identity: Arc<ferrox_core::tls::TlsServerConfig>,
+        roots: Vec<Vec<u8>>,
+        serve: crate::hysteria::Serve,
+    ) -> (u16, Vec<Vec<u8>>) {
         let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
         let address = format!("127.0.0.1:{port}");
         let auths = vec![auth.to_owned()];
         let obfs = obfs.to_owned();
-        let serve: crate::hysteria::Serve = Arc::new(move |flow| {
-            serve_vless_hysteria(flow, &one_vless_user(&id), true);
-        });
+
         thread::spawn(move || {
             crate::hysteria::serve_loop(
                 &address,
@@ -45409,6 +45928,154 @@ mod tests {
             );
         });
         (port, roots)
+    }
+
+    fn hysteria_trojan_loop(auth: &str, key: [u8; 56], obfs: &str) -> (u16, Vec<Vec<u8>>) {
+        let key = [key];
+        let serve: crate::hysteria::Serve = Arc::new(move |flow| {
+            serve_trojan_hysteria(flow, &key, true);
+        });
+        hysteria_loop_serve(
+            auth,
+            obfs,
+            ferrox_core::hysteria::Masquerade::NotFound,
+            serve,
+        )
+    }
+
+    fn hysteria_trojan_dial(
+        port: u16,
+        roots: Vec<Vec<u8>>,
+        auth: &str,
+        obfs: &str,
+    ) -> crate::hysteria::Dial {
+        crate::hysteria::Dial {
+            host: "localhost".to_owned(),
+            address: "127.0.0.1".to_owned(),
+            port,
+            config: ferrox_core::hysteria::Config {
+                version: 2,
+                auth: auth.to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: obfs.to_owned(),
+                hop: None,
+                gecko: None,
+                ..ferrox_core::hysteria::Config::default()
+            },
+            roots: Some(roots.into()),
+        }
+    }
+
+    #[test]
+    fn hysteria_carries_trojan_echo_over_loopback() {
+        let _serial = quic_serial();
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 8192];
+            loop {
+                let Ok(n) = stream.read(&mut buf) else {
+                    return;
+                };
+                if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                    return;
+                }
+            }
+        });
+        let key = trojan_key("hysteria-secret");
+        let (port, roots) = hysteria_trojan_loop("hysteria-auth", key, "");
+        let dial = hysteria_trojan_dial(port, roots, "hysteria-auth", "");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let header = trojan_header(&key, 1, &Destination::from(target));
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            crate::hysteria::dial_header(&stream, &dial, &header, 0);
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        let payload = vec![0x5au8; 65536];
+        client.write_all(&payload).expect("writes");
+        let mut back = vec![0u8; payload.len()];
+        client.read_exact(&mut back).expect("echoes");
+        assert_eq!(back, payload);
+    }
+
+    #[test]
+    fn hysteria_carries_a_trojan_udp_association_over_the_carrier() {
+        let _serial = quic_serial();
+        let echo_port = udp_echo_loop();
+        let key = trojan_key("hysteria-secret");
+        let (port, roots) = hysteria_trojan_loop("association-auth", key, "");
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = Outbound::Trojan(TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            key,
+            carrier: Carrier::Hysteria(ferrox_core::hysteria::Config {
+                version: 2,
+                auth: "association-auth".to_owned(),
+                cc: ferrox_core::hysteria::Congestion::Bbr,
+                obfs_password: String::new(),
+                hop: None,
+                gecko: None,
+                ..ferrox_core::hysteria::Config::default()
+            }),
+            host: "localhost".to_owned(),
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: Some(roots.into()),
+        });
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(QUIC_TEST_TIMEOUT))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        udp.set_read_timeout(Some(Duration::from_millis(250)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"association-ping");
+        let mut back = vec![0u8; UDP_BUF];
+        let deadline = std::time::Instant::now() + QUIC_TEST_TIMEOUT;
+        let answer = loop {
+            let _ = udp.send_to(&datagram, relay);
+            match udp.recv_from(&mut back) {
+                Ok((n, _)) => break n,
+                Err(_) if std::time::Instant::now() < deadline => {}
+                Err(error) => panic!("echo never returns: {error}"),
+            }
+        };
+        let (source, payload) = parse_socks_udp(&back[..answer]).expect("splits");
+        assert_eq!(source, target);
+        assert_eq!(payload, b"association-ping");
     }
 
     fn hysteria_tcp_pair(
@@ -49932,6 +50599,9 @@ mod tests {
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
         client.write_all(b"ping").expect("writes");

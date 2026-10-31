@@ -1335,34 +1335,24 @@ mod tests {
     use std::io::IoSlice;
     use std::thread;
 
-    /// Silence past the budget is death, not scheduling: a peer that opens the connection and never sends must not pin the raw Shadowsocks handshake thread forever.
-    use std::net::ToSocketAddrs as _;
-
-    /// A datagram's target is asked of the resolver as a host and a port, with no
-    /// `host:port` string in between: the counting allocator is the witness, and the name
-    /// is an address literal so the resolver is asked nothing of the network.
+    /// A datagram's address literal parses straight to an address, with no
+    /// `host:port` string and no resolver iterator: the counting allocator is the witness.
     #[test]
     fn a_datagram_target_is_resolved_without_a_host_port_string() {
         let mut header = vec![3u8, 3];
         header.extend_from_slice(b"::1");
         header.extend_from_slice(&443u16.to_be_bytes());
-        let (_, baseline) = ferrox_core::alloc_count::measure(|| {
-            ("::1", 443u16)
-                .to_socket_addrs()
-                .ok()
-                .and_then(|mut addrs| addrs.next())
-        });
-        let baseline = baseline.allocs;
         let ((target, used), counts) =
             ferrox_core::alloc_count::measure(|| parse_addr_header(&header).expect("resolves"));
         assert_eq!(used, header.len(), "the whole header was read");
         assert_eq!(target, SocketAddr::new("::1".parse().expect("ip"), 443));
         assert_eq!(
-            counts.allocs, baseline,
-            "the engine builds no string of its own for the resolver"
+            counts.allocs, 0,
+            "an address literal is parsed, not walked through an allocating resolver iterator"
         );
     }
 
+    /// Silence past the budget is death, not scheduling: a peer that opens the connection and never sends must not pin the raw Shadowsocks handshake thread forever.
     #[test]
     fn a_silent_peer_cannot_pin_a_raw_shadowsocks_handshake() {
         crate::budgets::apply(&crate::config::Budgets {
