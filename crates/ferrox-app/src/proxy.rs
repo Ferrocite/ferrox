@@ -11060,8 +11060,8 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     let (tcp, udp) = inbound_ss_networks(inbound);
     let accounts = ss_accounts(inbound, address, password, method);
     let udp_accounts = (udp && matches!(carrier, Carrier::Raw(_))).then(|| Arc::clone(&accounts));
+    // The 2022 relay serves its own tcp and udp listeners as one unit, so a network list does not split it.
     if matches!(carrier, Carrier::Raw(_))
-        && udp
         && serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method)
     {
         return;
@@ -36851,6 +36851,17 @@ mod tests {
         let out = find_shadowsocks_outbound(&root).expect("finds");
         assert!(matches!(out.carrier, Carrier::Ws { .. }));
         assert!(out.tls.is_some(), "the tls row is kept");
+    }
+
+    /// xray's sender-side multiplex switch reaches the shadowsocks dial, which is what opens the session.
+    #[test]
+    fn a_shadowsocks_outbound_reads_the_mux_switch() {
+        let root = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true}}]}"#,
+        )
+        .expect("parses");
+        let out = find_shadowsocks_outbound(&root).expect("finds");
+        assert!(out.mux, "the switch is read");
     }
 
     /// The vmess dial carries its request in the session too, so a tls kcp row speaks the same bytes both roles.

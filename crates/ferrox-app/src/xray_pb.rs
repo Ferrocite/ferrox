@@ -5163,6 +5163,43 @@ mod tests {
     }
 
     #[test]
+    fn a_sender_multiplex_switch_reaches_the_dial() {
+        let endpoint = message(&[
+            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+            varint_field(2, 443),
+            bytes_field(3, &ss_user(&ss_account(b"shadowsocks-password", 6), None)),
+        ]);
+        let mux = message(&[varint_field(1, 1), varint_field(2, 8)]);
+        let outbound = message(&[
+            bytes_field(
+                2,
+                &typed(
+                    "xray.app.proxyman.SenderConfig",
+                    &bytes_field(4, &mux),
+                ),
+            ),
+            bytes_field(
+                3,
+                &typed(
+                    "xray.proxy.shadowsocks.ClientConfig",
+                    &bytes_field(1, &endpoint),
+                ),
+            ),
+        ]);
+        let json =
+            to_json(&config(&dokodemo(5000, &[varint_field(7, 2)]), &outbound))
+                .expect("the sender's mux decodes");
+        let enabled = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0]
+            .get("mux")
+            .and_then(|mux| mux.get("enabled"))
+            .and_then(Json::as_bool);
+        assert_eq!(enabled, Some(true), "the client dials a mux session");
+    }
+
+    #[test]
     fn a_shadowsocks_scenario_decodes_both_sides() {
         let settings = message(&[
             bytes_field(
