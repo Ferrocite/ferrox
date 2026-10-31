@@ -40285,6 +40285,59 @@ mod tests {
         dial.join().expect("the mux session ends with the client");
     }
 
+    /// A datagram under a mux-enabled shadowsocks outbound names the mux host on its session and the target on the frame, and each reply comes back to its source.
+    #[test]
+    fn shadowsocks_mux_carries_a_datagram_through_one_session() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, src)) = echo.recv_from(&mut buf) {
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let users = crate::shadowsocks::account("an-example-shared-password", "aes-256-gcm");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for stream in tunnel.incoming().flatten() {
+                let users = users.clone();
+                thread::spawn(move || crate::shadowsocks::serve(stream, &users, true));
+            }
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let relay_addr = relay.local_addr().expect("addr");
+        let ss = ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port: tunnel_port,
+            method: "aes-256-gcm".to_owned(),
+            password: "an-example-shared-password".to_owned(),
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: true,
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+        };
+        thread::spawn(move || serve_socks_udp_shadowsocks(&relay, &ss));
+        let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        source
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"ping");
+        source.send_to(&datagram, relay_addr).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = source.recv_from(&mut back).expect("echoes");
+        let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(from.port(), echo_port);
+        assert_eq!(payload, b"ping", "the mux frame's datagram echoes");
+    }
+
     /// A shadowsocks inbound told to carry udp alone opens no stream listener, as the reference's udp worker alone would not.
     #[test]
     fn a_udp_only_shadowsocks_inbound_opens_no_stream_listener() {
