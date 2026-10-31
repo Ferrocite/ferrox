@@ -165,10 +165,10 @@ ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_n
 # the frames, commands and bytes are unchanged.
 vision::Linkferrox_app::vision::tests::Fake::pump 30848 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
 
-# Blessed 1995 by the trojan literal arm and key fold: the probe's domain header
+# Blessed 1315 by the trojan literal arm and key fold: the probe's domain header
 # carries `127.0.0.1`, so `resolve_name` returns `SocketAddr::new` without the
 # one-element `to_socket_addrs` iterator, and `key_agrees` folds the 56 key bytes
 # as seven `u64` words instead of a byte loop. The frame used to carry the
 # resolver and read 80397/80812 across two runs of one binary; the wire bytes,
 # the three-read domain parse and the refusal of a short key are unchanged.
-proxy::decode_trojan_request 1995 proxy::tests::the_trojan_header_costs_two_reads_not_seven
+proxy::decode_trojan_request 1315 proxy::tests::the_trojan_header_costs_two_reads_not_seven
