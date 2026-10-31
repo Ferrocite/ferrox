@@ -3240,6 +3240,7 @@ pub(crate) struct ShadowsocksOut {
     host: String,
     headers: Vec<(String, String)>,
     heartbeat: u32,
+    mux: bool,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
 }
 
@@ -4607,11 +4608,16 @@ where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    let wire = MuxWire::Tunnel(crate::reverse::Tunnel::new(
-        Box::new(reader),
-        Box::new(writer),
-        close,
-    ));
+    serve_mux_tunnel(Box::new(reader), Box::new(writer), close, Vec::new());
+}
+
+pub(crate) fn serve_mux_tunnel(
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    close: Arc<dyn Fn() + Send + Sync>,
+    carried: Vec<u8>,
+) {
+    let wire = MuxWire::Tunnel(crate::reverse::Tunnel::new(reader, writer, close));
     let io = MuxIo {
         dial: dial_or_report,
         resolve: resolve_endpoint,
@@ -4624,7 +4630,7 @@ where
         (io.dial)(&address)
     });
     let udp: MuxUdpOk = Arc::new(|_| true);
-    serve_mux_wire(&wire, &dial, &udp, None, &[]);
+    serve_mux_wire(&wire, &dial, &udp, None, &carried);
 }
 
 struct MeteredIo<T> {
@@ -12380,6 +12386,55 @@ fn open_vless_mux(vless: &VlessOut) -> Option<MuxUplink> {
     })
 }
 
+fn open_ss_mux(ss: &ShadowsocksOut) -> Option<MuxUplink> {
+    // The 2022 rung answers its own reply handshake before a frame, and its mux reader is not wired yet: the caller dials directly.
+    if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+        return None;
+    }
+    let server = resolve_outbound(&ss.address, ss.port)?;
+    let target = Destination::Name(
+        crate::shadowsocks::MUX_HOST.to_owned(),
+        crate::shadowsocks::MUX_PORT,
+    );
+    let (read, write, close): (
+        Box<dyn Read + Send>,
+        Box<dyn Write + Send>,
+        Arc<dyn Fn() + Send + Sync>,
+    ) = match (&ss.carrier, ss.tls.as_deref()) {
+        (Carrier::Raw(_), None) => {
+            let stream = dial_or_report(&server)?.with_mask(ss.carrier.tcp_mask());
+            let read = stream.try_clone().ok()?;
+            let write = stream.try_clone().ok()?;
+            (Box::new(read), Box::new(write), connection_closer(&stream))
+        }
+        (Carrier::Raw(_), Some(cfg)) => {
+            let session = dial_tls_session(&server, cfg, ss.carrier.tcp_mask())?;
+            let (read, write, raw) = session.into_halves()?;
+            let close = connection_closer(&raw);
+            (Box::new(read), Box::new(write), close)
+        }
+        _ => {
+            static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if SAID.set(()).is_ok() {
+                eprintln!("shadowsocks: mux is served on a raw or tls carrier; dialing directly");
+            }
+            return None;
+        }
+    };
+    let mut write = write;
+    let (send, recv) = crate::shadowsocks::client_send_handshake(
+        &mut *write,
+        &ss.password,
+        &ss.method,
+        &target,
+    )?;
+    Some(MuxUplink {
+        read: Box::new(crate::shadowsocks::SsMuxReader::new(read, recv)),
+        write: Box::new(crate::shadowsocks::SsMuxWriter::new(write, send)),
+        close,
+    })
+}
+
 fn open_vless_mux_quic(vless: &VlessOut) -> Option<MuxUplink> {
     let pooled = crate::quic::pumped_stream_within(&vless_quic_dial(vless), budgets::dial())?;
     let header = vless_mux_header(&vless.id);
@@ -12436,9 +12491,21 @@ fn open_vless_mux_quic(vless: &VlessOut) -> Option<MuxUplink> {
 }
 
 fn dial_vless_mux(client: &Connection, vless: &VlessOut, target: &Destination) {
-    let Some(mut mux) = open_vless_mux(vless) else {
+    let Some(mux) = open_vless_mux(vless) else {
         return;
     };
+    dial_mux_stream(client, mux, target);
+}
+
+fn dial_ss_mux(client: &Connection, ss: &ShadowsocksOut, target: &Destination) -> bool {
+    let Some(mux) = open_ss_mux(ss) else {
+        return false;
+    };
+    dial_mux_stream(client, mux, target);
+    true
+}
+
+fn dial_mux_stream(client: &Connection, mut mux: MuxUplink, target: &Destination) {
     let mut ids = ferrox_core::mux::Ids::new(1);
     let Ok(id) = ids.take() else {
         return;
@@ -16991,7 +17058,9 @@ fn dial_socks_outbound(
         Outbound::Vmess(vmess) => dial_vmess(client, server, vmess, target, ladder),
         Outbound::Trojan(trojan) => dial_trojan(client, server, trojan, target, ladder),
         Outbound::Shadowsocks(shadowsocks) => {
-            dial_shadowsocks(client, server, shadowsocks, target, ladder);
+            if !shadowsocks.mux || !dial_ss_mux(client, shadowsocks, target) {
+                dial_shadowsocks(client, server, shadowsocks, target, ladder);
+            }
         }
         Outbound::Hysteria(hy) => crate::hysteria_v1::dial(client, &hy.dial(), target),
         Outbound::Http(http) => {
@@ -19682,6 +19751,9 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
         serve_socks_udp_shadowsocks2022(relay, ss, method2022);
         return;
     }
+    if ss.mux && serve_socks_udp_ss_mux(relay, ss) {
+        return;
+    }
     let Some(method) = ferrox_core::shadowsocks::Method::parse(&ss.method) else {
         return;
     };
@@ -20186,6 +20258,72 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
     let _ = write.write_all(&header[..written]);
     (mux.close)();
     join(&done);
+}
+
+fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
+    let Some(mux) = open_ss_mux(ss) else {
+        return false;
+    };
+    let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let Some(done) = spawn_xudp_reader(mux.read, relay, Arc::clone(&source)) else {
+        (mux.close)();
+        return true;
+    };
+    let mut write = mux.write;
+    let mut buf = udp_buffer();
+    let mut header = Vec::with_capacity(64);
+    let mut ids = ferrox_core::mux::Ids::new(1);
+    // One mux flow per destination, opened by the first datagram and named on every later one.
+    let mut lanes: Vec<(SocketAddr, u16)> = Vec::new();
+    let mut published: Option<SocketAddr> = None;
+    while let Ok((n, src)) = relay.recv_from(&mut buf) {
+        let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
+            continue;
+        };
+        if payload.is_empty() {
+            continue;
+        }
+        if published != Some(src) {
+            if let Ok(mut slot) = source.lock() {
+                *slot = Some(src);
+                published = Some(src);
+            }
+        }
+        let (id, first) = match lanes.iter().find(|(known, _)| *known == dest) {
+            Some((_, id)) => (*id, false),
+            None => {
+                let Ok(id) = ids.take() else { continue };
+                lanes.push((dest, id));
+                (id, true)
+            }
+        };
+        let frame = ferrox_core::mux::Outgoing {
+            id,
+            status: if first {
+                ferrox_core::mux::Status::New
+            } else {
+                ferrox_core::mux::Status::Keep
+            },
+            options: ferrox_core::mux::DATA,
+            target: Some(mux_target_of(dest)),
+            global_id: None,
+        };
+        let (head, body) = xudp_datagram(&frame, &mut header, payload);
+        if write_all_parts::<2>(&mut *write, &[head, body]).is_err() {
+            break;
+        }
+    }
+    for (_, id) in &lanes {
+        let end = ferrox_core::mux::Outgoing::bare(*id, ferrox_core::mux::Status::End, 0);
+        resize_scratch(&mut header, end.frame_len(0));
+        let written = end.encode_into(None, &mut header);
+        if write.write_all(&header[..written]).is_err() {
+            break;
+        }
+    }
+    (mux.close)();
+    join(&done);
+    true
 }
 
 fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
@@ -25587,6 +25725,7 @@ fn loopback_shadowsocks(
         password: inbound_ss_password(inbound),
         carrier,
         host,
+        mux: false,
         tls: None,
         headers,
         heartbeat,
@@ -26427,6 +26566,7 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
                 password,
                 carrier,
                 host,
+                mux: false,
                 tls: None,
                 headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
                 heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
@@ -26450,6 +26590,7 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
             password,
             carrier,
             host,
+            mux: outbound.get("mux").and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true)),
             tls,
             headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
             heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
@@ -36533,6 +36674,7 @@ mod tests {
             password: "an-example-shared-password".to_owned(),
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: Some(client),
             headers: Vec::new(),
             heartbeat: 0,
@@ -36620,6 +36762,7 @@ mod tests {
                 password: "an-example-shared-password".to_owned(),
                 carrier: inbound_carrier(&inbound),
                 host: "127.0.0.1".to_owned(),
+                mux: false,
                 tls: Some(Arc::clone(&client)),
                 headers: Vec::new(),
                 heartbeat: 0,
@@ -36676,6 +36819,7 @@ mod tests {
             cipher: crate::vmess::Cipher::Auto,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: Some(client),
             headers: Vec::new(),
             heartbeat: 0,
@@ -38238,6 +38382,7 @@ mod tests {
                 settings: xhttp_settings("/share"),
             },
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -38414,6 +38559,7 @@ mod tests {
             password,
             carrier,
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -39599,6 +39745,7 @@ mod tests {
             key: trojan_key("secret"),
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -39747,6 +39894,7 @@ mod tests {
             cipher: crate::vmess::Cipher::Chacha,
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -40046,6 +40194,7 @@ mod tests {
             password: "an-example-shared-password".to_owned(),
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -40123,6 +40272,7 @@ mod tests {
             password: "an-example-shared-password".to_owned(),
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -41968,6 +42118,7 @@ mod tests {
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42038,6 +42189,7 @@ mod tests {
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42106,6 +42258,7 @@ mod tests {
                 "/TunnelService/Tun".to_owned(),
             )),
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42179,6 +42332,7 @@ mod tests {
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42265,6 +42419,7 @@ mod tests {
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42335,6 +42490,7 @@ mod tests {
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42406,6 +42562,7 @@ mod tests {
             key: trojan_key("secret"),
             carrier: Carrier::Grpc(crate::config::GrpcSettings::path("/Tun".to_owned())),
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42474,6 +42631,7 @@ mod tests {
                 settings: xhttp_settings("/tunnel"),
             },
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42542,6 +42700,7 @@ mod tests {
                 path: "/tunnel".to_owned(),
             },
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -50713,6 +50872,7 @@ mod tests {
             key,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -50744,6 +50904,7 @@ mod tests {
             cipher: crate::vmess::Cipher::Auto,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -52360,6 +52521,7 @@ end
             password,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
+            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,

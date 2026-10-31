@@ -209,7 +209,7 @@ pub(crate) fn outbound(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.core.OutboundHandlerConfig");
     let mut settings = None;
     let mut tag = None;
-    let mut sender = None;
+    let mut sender = SenderConfig::default();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             // A tag names the handler for the router's rules.
@@ -281,8 +281,11 @@ pub(crate) fn outbound(bytes: &[u8]) -> Result<Json, String> {
         ],
         _ => return Err(format!("outbound protocol `{name}` is not carried")),
     };
-    if let Some(stream) = sender {
+    if let Some(stream) = sender.stream {
         pairs.push(("streamSettings", stream));
+    }
+    if let Some(mux) = sender.mux {
+        pairs.push(("mux", mux));
     }
     if let Some(tag) = tag {
         pairs.push(("tag", Json::Str(tag)));
@@ -642,25 +645,50 @@ fn sniffing_settings(bytes: &[u8]) -> Result<Json, String> {
     ]))
 }
 
-/// A sender's client-side stream policy: only its stream settings are carried, and a multiplex
-/// or via policy names a shape this tree arms from the outbound's own JSON key.
-fn sender_config(bytes: &[u8]) -> Result<Option<Json>, String> {
+/// A sender's client-side stream policy: only its stream settings and multiplex switch are
+/// carried, and a via policy names a shape this tree refuses by number.
+fn sender_config(bytes: &[u8]) -> Result<SenderConfig, String> {
     let mut reader = Reader::new(bytes, "xray.app.proxyman.SenderConfig");
-    let mut stream = None;
+    let mut config = SenderConfig::default();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => return Err(reader.uncarried("the outbound's via address")),
             (2, 2) => {
                 // A sender's stream settings are a bare `internet.StreamConfig`, not a typed wrapper.
-                stream = Some(stream_settings(reader.bytes()?)?);
+                config.stream = Some(stream_settings(reader.bytes()?)?);
             }
-            (4, 2) => return Err(reader.uncarried("multiplex settings")),
+            (4, 2) => config.mux = Some(multiplex_settings(reader.bytes()?)?),
             (5, 2) => return Err(reader.uncarried("the via cidr")),
             (6, 0) => return Err(reader.uncarried("the target domain strategy")),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    Ok(stream)
+    Ok(config)
+}
+
+#[derive(Default)]
+struct SenderConfig {
+    stream: Option<Json>,
+    mux: Option<Json>,
+}
+
+fn multiplex_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.proxyman.MultiplexingConfig");
+    let mut enabled = false;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => enabled = reader.varint()? != 0,
+            // The pool sizes and UDP/443 policy shape a session this tree opens per flow, so they are read and dropped.
+            (2..=3, 0) => {
+                reader.varint()?;
+            }
+            (4, 2) => {
+                reader.bytes()?;
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(object(vec![("enabled", Json::Bool(enabled))]))
 }
 
 /// xray's `SocketConfig` as far as a stream's dial reads it: the system dial this tree puts

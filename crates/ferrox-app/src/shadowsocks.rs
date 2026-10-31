@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::{IoSliceMut, Read, Write};
+use std::io::{IoSlice, IoSliceMut, Read, Write};
 use std::net::{Shutdown, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
@@ -17,6 +17,10 @@ const CHUNKS_PER_BATCH: usize = 4;
 // One relay read of a stream is exactly one chunk: a 16384 B read would seal as 16383 + 1, a second length seal and tag for a single tail byte, and a batch read of CHUNKS_PER_BATCH of them tiles into whole chunks for the same reason. A stream has no chunks to batch, so its granularity — and every carrier frame size that follows from it — is unchanged.
 const READ_CHUNK: usize = MAX_CHUNK;
 const IV_LEN: usize = 16;
+
+/// The mux request's own name and port, which the reference compares by domain alone.
+pub(crate) const MUX_HOST: &str = "v1.mux.cool";
+pub(crate) const MUX_PORT: u16 = 9527;
 
 /// What the uplink thread seals with: the AEAD chunk cipher, or the stream state whose crypt writes into the read buffer itself.
 #[allow(
@@ -100,8 +104,23 @@ pub(crate) fn serve(mut stream: Connection, users: &[SsUser], freedom: bool) {
     let Some((user, recv, chunk)) = opened else {
         return;
     };
-    let Some((target, header_len)) = parse_addr_header(chunk) else {
+    let Some(request) = parse_request(chunk) else {
         return;
+    };
+    let (target, header_len) = match request {
+        Request::Mux(header_len) => {
+            crate::accesslog::record_current(&format_args!("{MUX_HOST}:{MUX_PORT}"));
+            let carried = chunk[header_len..].to_vec();
+            drop(head);
+            let Some(accepted) =
+                mux_after_handshake(user, &mut stream, Recv::Ready(recv), carried)
+            else {
+                return;
+            };
+            serve_mux_connection(stream, accepted);
+            return;
+        }
+        Request::Target(target, header_len) => (target, header_len),
     };
     crate::accesslog::record_current(&target);
     let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
@@ -185,8 +204,8 @@ fn serve_stream(mut stream: Connection, master: &MasterKey) {
                         Ok(n) => {
                             recv.crypt(&mut head[len..len + n]);
                             len += n;
-                            if let Some(found) = parse_addr_header(&head[..len]) {
-                                return Some((recv, found, len));
+                            if let Some(request) = parse_request(&head[..len]) {
+                                return Some((recv, request, len));
                             }
                         }
                         Err(error) if crate::proxy::is_timeout(&error) => {}
@@ -197,8 +216,19 @@ fn serve_stream(mut stream: Connection, master: &MasterKey) {
             })
     };
     let _ = stream.set_read_timeout(None);
-    let Some((recv, (target, used), len)) = opened else {
+    let Some((recv, request, len)) = opened else {
         return;
+    };
+    let (target, used) = match request {
+        Request::Mux(used) => {
+            crate::accesslog::record_current(&format_args!("{MUX_HOST}:{MUX_PORT}"));
+            let Some(accepted) = stream_mux(&mut stream, master, recv, &head[used..len]) else {
+                return;
+            };
+            serve_mux_connection(stream, accepted);
+            return;
+        }
+        Request::Target(target, used) => (target, used),
     };
     crate::accesslog::record_current(&target);
     let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
@@ -232,12 +262,12 @@ pub(crate) fn serve_ws(stream: Connection, users: &[SsUser], path: &str, freedom
     let Some((mut reader, mut writer)) = crate::ws::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, users, freedom) else {
+    let Some(accepted) = accept_on(&mut reader, &mut writer, users, freedom) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    serve_accepted(accepted, reader, writer, close);
 }
 
 pub(crate) fn serve_httpupgrade(
@@ -250,7 +280,7 @@ pub(crate) fn serve_httpupgrade(
     let Some((mut reader, mut writer)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, users, freedom) else {
+    let Some(accepted) = accept_on(&mut reader, &mut writer, users, freedom) else {
         return;
     };
     let Ok(closer) = writer.try_clone() else {
@@ -259,7 +289,7 @@ pub(crate) fn serve_httpupgrade(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(Shutdown::Both);
     });
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    serve_accepted(accepted, reader, writer, close);
 }
 
 /// The carrier's answer held back until a blocking peek finds the first byte of the request packet, so a dial that waits for the `101` before it writes is never answered: only a dial that puts the packet on the wire with the `GET` finishes.
@@ -292,7 +322,7 @@ pub(crate) fn serve_httpupgrade_answering_after_the_request(
     if write.write_all(crate::httpupgrade::SWITCH).is_err() {
         return;
     }
-    let Some((uplink, send, recv)) = accept_on(&mut read, &mut write, users, freedom) else {
+    let Some(accepted) = accept_on(&mut read, &mut write, users, freedom) else {
         return;
     };
     let Ok(closer) = write.try_clone() else {
@@ -301,7 +331,7 @@ pub(crate) fn serve_httpupgrade_answering_after_the_request(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(Shutdown::Both);
     });
-    pump_relay_carried(&uplink, read, write, &close, send, recv);
+    serve_accepted(accepted, read, write, close);
 }
 
 #[cfg(test)]
@@ -323,34 +353,34 @@ pub(crate) fn serve_grpc_with(
     let Some((mut reader, mut writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
-    let Some((uplink, send, recv)) = under_handshake(&mut reader, |read| {
+    let Some(accepted) = under_handshake(&mut reader, |read| {
         accept_on(read, &mut writer, users, freedom)
     }) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    serve_accepted(accepted, reader, writer, close);
 }
 
 pub(crate) fn serve_xhttp(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
     let Some((mut reader, mut writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, users, freedom) else {
+    let Some(accepted) = accept_on(&mut reader, &mut writer, users, freedom) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> =
         std::sync::Arc::new(move || closer.finish());
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    serve_accepted(accepted, reader, writer, close);
 }
 
 pub(crate) fn serve_httpheader(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
     let Some((mut reader, mut writer)) = crate::httpheader::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, users, freedom) else {
+    let Some(accepted) = accept_on(&mut reader, &mut writer, users, freedom) else {
         return;
     };
     let Ok(closer) = writer.try_clone() else {
@@ -359,7 +389,7 @@ pub(crate) fn serve_httpheader(stream: Connection, users: &[SsUser], path: &str,
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(Shutdown::Both);
     });
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    serve_accepted(accepted, reader, writer, close);
 }
 
 pub(crate) fn serve_session<R, W>(
@@ -372,7 +402,7 @@ pub(crate) fn serve_session<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    let Some((uplink, send, recv)) = accept_on(
+    let Some(accepted) = accept_on(
         &mut reader as &mut dyn Read,
         &mut writer as &mut dyn Write,
         users,
@@ -381,7 +411,7 @@ pub(crate) fn serve_session<R, W>(
         close();
         return;
     };
-    pump_relay_carried(&uplink, reader, writer, close, send, recv);
+    serve_accepted(accepted, reader, writer, std::sync::Arc::clone(close));
 }
 
 pub(crate) fn serve_kcp<R, W>(
@@ -394,7 +424,7 @@ pub(crate) fn serve_kcp<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    let Some((uplink, send, recv)) = accept_on(
+    let Some(accepted) = accept_on(
         &mut reader as &mut dyn Read,
         &mut writer as &mut dyn Write,
         users,
@@ -402,21 +432,21 @@ pub(crate) fn serve_kcp<R, W>(
     ) else {
         return;
     };
-    pump_relay_carried(&uplink, reader, writer, close, send, recv);
+    serve_accepted(accepted, reader, writer, std::sync::Arc::clone(close));
 }
 
 fn accept_stream(
     reader: &mut dyn Read,
     writer: &mut dyn Write,
     master: &MasterKey,
-) -> Option<(Connection, Uplink, Recv)> {
+) -> Option<Accepted> {
     let mut iv = [0u8; IV_LEN];
     read_exact(reader, &mut iv).ok()?;
     let key = rc4_md5_key(master.as_bytes(), &iv)?;
     let mut recv = Rc4::new(&key)?;
     let mut head = [0u8; 512];
     let mut len = 0usize;
-    let (target, used) = loop {
+    let request = loop {
         if len >= 512 {
             return None;
         }
@@ -428,19 +458,30 @@ fn accept_stream(
         };
         recv.crypt(&mut head[len..len + n]);
         len += n;
-        if let Some(found) = parse_addr_header(&head[..len]) {
-            break found;
+        if let Some(request) = parse_request(&head[..len]) {
+            break request;
         }
     };
+    let (target, used) = match request {
+        Request::Mux(used) => {
+            crate::accesslog::record_current(&format_args!("{MUX_HOST}:{MUX_PORT}"));
+            return stream_mux(writer, master, recv, &head[used..len]);
+        }
+        Request::Target(target, used) => (target, used),
+    };
     crate::accesslog::record_current(&target);
-    let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
-    uplink.write_all(&head[used..len]).ok()?;
     let mut iv = [0u8; IV_LEN];
     getrandom::fill(&mut iv).ok()?;
     let key = rc4_md5_key(master.as_bytes(), &iv)?;
     let send = Rc4::new(&key)?;
+    let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
+    uplink.write_all(&head[used..len]).ok()?;
     writer.write_all(&iv).ok()?;
-    Some((uplink, Uplink::Stream(send), Recv::StreamReady(recv)))
+    Some(Accepted::Direct {
+        uplink,
+        send: Uplink::Stream(send),
+        recv: Recv::StreamReady(recv),
+    })
 }
 
 fn accept_on(
@@ -448,7 +489,7 @@ fn accept_on(
     writer: &mut dyn Write,
     users: &[SsUser],
     freedom: bool,
-) -> Option<(Connection, Uplink, Recv)> {
+) -> Option<Accepted> {
     if !freedom {
         return None;
     }
@@ -458,7 +499,15 @@ fn accept_on(
     let mut head = wire_buffer();
     let (user, mut recv, size) = accept_cipher(reader, users)?;
     let chunk = open_chunk_after(reader, &mut recv, &mut head, size)?;
-    let (target, header_len) = parse_addr_header(chunk)?;
+    let request = parse_request(chunk)?;
+    let (target, header_len) = match request {
+        Request::Mux(header_len) => {
+            crate::accesslog::record_current(&format_args!("{MUX_HOST}:{MUX_PORT}"));
+            let carried = chunk[header_len..].to_vec();
+            return mux_after_handshake(user, writer, Recv::Ready(recv), carried);
+        }
+        Request::Target(target, header_len) => (target, header_len),
+    };
     crate::accesslog::record_current(&target);
     let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
     uplink.write_all(&chunk[header_len..]).ok()?;
@@ -468,7 +517,244 @@ fn accept_on(
     getrandom::fill(&mut salt[..salt_len]).ok()?;
     let send = Cipher::from_master_key(user.method, &user.master, &salt[..salt_len])?;
     writer.write_all(&salt[..salt_len]).ok()?;
-    Some((uplink, Uplink::Aead(send), Recv::Ready(recv)))
+    Some(Accepted::Direct {
+        uplink,
+        send: Uplink::Aead(send),
+        recv: Recv::Ready(recv),
+    })
+}
+
+/// The first request's destination: the mux name is one no resolver answers, so it is recognised
+/// from the raw header before resolution and never dialed.
+enum Request {
+    Mux(usize),
+    Target(SocketAddr, usize),
+}
+
+fn parse_request(buf: &[u8]) -> Option<Request> {
+    if let Some(used) = mux_header_len(buf) {
+        return Some(Request::Mux(used));
+    }
+    parse_addr_header(buf).map(|(target, used)| Request::Target(target, used))
+}
+
+/// The reference compares the mux domain alone, so the port a client chose never gates the session.
+fn mux_header_len(buf: &[u8]) -> Option<usize> {
+    if buf.first() != Some(&3) {
+        return None;
+    }
+    let (crate::proxy::AddrBody::Domain(host), at) =
+        crate::proxy::parse_addr_body(buf, crate::proxy::AddrKind::Domain)?
+    else {
+        return None;
+    };
+    if host != MUX_HOST || buf.len() < at + 2 {
+        return None;
+    }
+    Some(at + 2)
+}
+
+fn mux_after_handshake(
+    user: &SsUser,
+    writer: &mut dyn Write,
+    recv: Recv,
+    carried: Vec<u8>,
+) -> Option<Accepted> {
+    let salt_len = user.method.key_len();
+    let mut salt = [0u8; SALT_LEN];
+    getrandom::fill(&mut salt[..salt_len]).ok()?;
+    let send = Cipher::from_master_key(user.method, &user.master, &salt[..salt_len])?;
+    writer.write_all(&salt[..salt_len]).ok()?;
+    Some(Accepted::Mux {
+        send: Uplink::Aead(send),
+        recv,
+        carried,
+    })
+}
+
+/// The stream rung's mux answer: the reply IV goes out in the clear and whatever rode the header enters the session.
+fn stream_mux(
+    writer: &mut dyn Write,
+    master: &MasterKey,
+    recv: Rc4,
+    carried: &[u8],
+) -> Option<Accepted> {
+    let mut iv = [0u8; IV_LEN];
+    getrandom::fill(&mut iv).ok()?;
+    let key = rc4_md5_key(master.as_bytes(), &iv)?;
+    let send = Rc4::new(&key)?;
+    writer.write_all(&iv).ok()?;
+    Some(Accepted::Mux {
+        send: Uplink::Stream(send),
+        recv: Recv::StreamReady(recv),
+        carried: carried.to_vec(),
+    })
+}
+
+/// A mux session on a socket this thread owns: the reader, writer and close are the socket's own clones.
+fn serve_mux_connection(stream: Connection, accepted: Accepted) {
+    let Ok(reader) = stream.try_clone() else {
+        return;
+    };
+    let Ok(writer) = stream.try_clone() else {
+        return;
+    };
+    let Ok(closer) = stream.try_clone() else {
+        return;
+    };
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    serve_accepted(accepted, reader, writer, close);
+}
+
+fn serve_accepted<R, W>(
+    accepted: Accepted,
+    reader: R,
+    writer: W,
+    close: std::sync::Arc<dyn Fn() + Send + Sync>,
+) where
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: Write + Send + 'static,
+{
+    match accepted {
+        Accepted::Direct { uplink, send, recv } => {
+            pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+        }
+        Accepted::Mux {
+            send,
+            recv,
+            carried,
+        } => {
+            let mut reader = reader;
+            reader.arm_relay_poll();
+            let reader = SsMuxReader::new(reader, recv);
+            let writer = SsMuxWriter::new(writer, send);
+            crate::proxy::serve_mux_tunnel(Box::new(reader), Box::new(writer), close, carried);
+        }
+    }
+}
+
+pub(crate) struct SsMuxReader<R> {
+    downlink: Downlink<R>,
+    pending: Vec<u8>,
+    at: usize,
+    done: bool,
+}
+
+impl<R: Read> SsMuxReader<R> {
+    pub(crate) fn new(reader: R, recv: Recv) -> Self {
+        Self {
+            downlink: Downlink::new(reader, recv),
+            pending: Vec::new(),
+            at: 0,
+            done: false,
+        }
+    }
+}
+
+impl<R: Read> Read for SsMuxReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.at < self.pending.len() {
+                let n = (self.pending.len() - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&self.pending[self.at..self.at + n]);
+                self.at += n;
+                if self.at == self.pending.len() {
+                    self.pending.clear();
+                    self.at = 0;
+                }
+                return Ok(n);
+            }
+            if self.done {
+                return Ok(0);
+            }
+            let mut sink = VecSink(&mut self.pending);
+            let next = self.downlink.step(&mut sink, None);
+            if self.pending.is_empty() {
+                match next {
+                    crate::proxy::lane_pool::Next::Done => {
+                        self.done = true;
+                        return Ok(0);
+                    }
+                    crate::proxy::lane_pool::Next::Idle => {
+                        return Err(std::io::ErrorKind::WouldBlock.into());
+                    }
+                    crate::proxy::lane_pool::Next::More
+                    | crate::proxy::lane_pool::Next::Retry => {}
+                }
+            } else if matches!(next, crate::proxy::lane_pool::Next::Done) {
+                self.done = true;
+            }
+        }
+    }
+}
+
+pub(crate) struct SsMuxWriter<W> {
+    send: Uplink,
+    writer: W,
+    buf: Vec<u8>,
+}
+
+impl<W: Write> SsMuxWriter<W> {
+    pub(crate) fn new(writer: W, send: Uplink) -> Self {
+        Self {
+            send,
+            writer,
+            buf: crate::proxy::unfilled(BATCH),
+        }
+    }
+}
+
+impl<W: Write> Write for SsMuxWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut offset = 0;
+        while offset < buf.len() {
+            let take = (buf.len() - offset).min(MAX_CHUNK);
+            self.buf[SEAL_HEAD..SEAL_HEAD + take].copy_from_slice(&buf[offset..offset + take]);
+            seal_all(&mut self.send, &mut self.buf, take, &mut self.writer)?;
+            offset += take;
+        }
+        Ok(buf.len())
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        let mut total = 0;
+        for buf in bufs {
+            if buf.is_empty() {
+                continue;
+            }
+            self.write(buf)?;
+            total += buf.len();
+        }
+        Ok(total)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+struct VecSink<'a>(&'a mut Vec<u8>);
+
+impl Write for VecSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        let mut total = 0;
+        for buf in bufs {
+            self.0.extend_from_slice(buf);
+            total += buf.len();
+        }
+        Ok(total)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn client_send_handshake(
@@ -516,6 +802,19 @@ pub(crate) enum Recv {
     Waiting(Method, MasterKey),
     StreamReady(Rc4),
     StreamWaiting(MasterKey),
+}
+
+pub(crate) enum Accepted {
+    Direct {
+        uplink: Connection,
+        send: Uplink,
+        recv: Recv,
+    },
+    Mux {
+        send: Uplink,
+        recv: Recv,
+        carried: Vec<u8>,
+    },
 }
 
 pub(crate) fn pump_relay(plain: &Connection, sealed: &Connection, send: Uplink, recv: Recv) {
