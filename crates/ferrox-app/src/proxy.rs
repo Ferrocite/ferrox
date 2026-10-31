@@ -33293,7 +33293,7 @@ mod tests {
                 match tls.read(&mut buf[at..]) {
                     Ok(0) => break,
                     Ok(n) => at += n,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(error) if is_timeout(&error) => {
                         assert!(Instant::now() < deadline, "the client's ping arrives");
                     }
                     Err(error) => panic!("reads: {error}"),

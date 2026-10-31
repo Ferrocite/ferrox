@@ -2182,18 +2182,24 @@ mod tests {
         (client, listener)
     }
 
-    /// A peer that accepts and closes at once wakes the connect's poll with a hangup and no error set, which socket2 reports as a failure on a socket the kernel has already connected. The dial answers as connected, because the read that follows is what reports a peer that left.
+    /// A socket the kernel already connected answers `connect` with an error and no refusal: the dial reports connected, and the read that follows is what reports a peer that left.
     #[test]
     fn an_error_reported_on_a_connected_socket_is_not_a_refusal() {
         use socket2::{Domain, Protocol, SockAddr, Socket, Type};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
         let address = SockAddr::from(listener.local_addr().expect("addr"));
+        let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
         let accept = crate::budgets::spawn(move || {
             let _ = listener.accept();
+            let _ = accepted_tx.send(());
         });
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("socket");
         connect_bounded(&socket, &address, Duration::from_secs(5)).expect("the dial connects");
+        accepted_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the peer accepts");
+        // The peer has already left, and the kernel answers the second connect with `EISCONN` on the socket it connected: the dial calls that connected.
         connect_bounded(&socket, &address, Duration::from_secs(5)).expect(
             "a second connect reports an error, and the socket it already had is the answer",
         );
