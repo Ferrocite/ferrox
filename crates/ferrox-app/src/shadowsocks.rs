@@ -2535,7 +2535,7 @@ mod tests {
         }
         let first = seen.recv().expect("the first association's source");
         let second = seen.recv().expect("the second association's source");
-        assert_ne!(first, second, "the rebound account opens a new association");
+        assert_ne!(first, second, "the rebound association is new");
     }
 
     #[test]

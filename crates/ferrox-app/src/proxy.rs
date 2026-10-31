@@ -20365,7 +20365,12 @@ impl DirectLane {
                 }
             }
         });
-        Some(Self { v4, v6, done, reader })
+        Some(Self {
+            v4,
+            v6,
+            done,
+            reader,
+        })
     }
 
     fn send(&self, dest: SocketAddr, payload: &[u8]) {
@@ -40633,11 +40638,21 @@ mod tests {
         let dial = UdpSocket::bind("127.0.0.1:0").expect("binds");
         dial.set_read_timeout(Some(Duration::from_secs(5)))
             .expect("timeout");
-        dial.send_to(&packet, &address).expect("sends");
         let mut back = vec![0u8; UDP_BUF];
-        let (n, _) = dial
-            .recv_from(&mut back)
-            .expect("the udp front still answers");
+        // A windows front still binding reads as a reset from a port nothing owns yet, so the retry waits for its bind.
+        let mut attempts = 0;
+        let n = loop {
+            dial.send_to(&packet, &address).expect("sends");
+            match dial.recv_from(&mut back) {
+                Ok((n, _)) => break n,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                    attempts += 1;
+                    assert!(attempts < 200, "the udp front still answers");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("the udp front still answers: {error}"),
+            }
+        };
         let (source, payload) =
             crate::shadowsocks::open_datagram(&master, method, &mut back[..n], &mut hop)
                 .expect("opens");
