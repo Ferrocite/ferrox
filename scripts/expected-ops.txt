@@ -120,8 +120,12 @@
 # are the same concatenation; a_pem_buffer_is_reserved_to_its_exact_length
 # (len == capacity over 12 lengths) and appending_into_a_reserved_buffer_does_not_move_it
 # (pointer identity across two appends) witness it, green on linux, macos and windows.
+# Re-blessed 562 by tls-own-the-list: `der_to_pem` is test-only now, so its
+# test-only instantiation inlines the same `append_pem` body at 562 instead of
+# 591; the bytes, `pem_wraps_at_sixty_four_columns`, and every base64 vector are
+# unchanged.
 
-append_pem 591
+append_pem 562
 
 # Re-blessed 47810992 by the once-per-question fold: the decide probe's frame is
 # 4096 walks of one direct forward, one rule return, two hijacks and one

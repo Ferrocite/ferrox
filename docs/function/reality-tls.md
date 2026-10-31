@@ -118,7 +118,7 @@ What was **not** removed, and is not claimed:
 
 ## Time
 
-**Not measured yet.** `der_to_pem 2653` is the single instruction count this repository has ever blessed, and it is measured by `ops.yml` on `ubuntu-latest` because valgrind does not exist on the other runners. No handshake duration is quoted from a machine without a named runner.
+**Not measured yet.** `append_pem 562` is the single instruction count this repository has ever blessed, and it is measured by `ops.yml` on `ubuntu-latest` because valgrind does not exist on the other runners. No handshake duration is quoted from a machine without a named runner.
 
 The frame seam has no duration either, and it is not a runner problem: the matrix's `TLS` arm is raw, and one scenario frames a carrier onto a session — `vless-tls-ws-down-8` — where no scenario gives `grpc` or `xhttp` a `tlsSettings`, so every other framing cell reaches the wire in the clear and never frames onto a `TLS` session. A throughput row here would measure something else. The seam is gated by the write and send counts above and by the rows that do carry a frame over a session: the workspace's `TLS` carrier loops, `vless-tls-ws-down-8` in `benchmark-matrix.yml`, and CI's `conformance` and upstream suites. Giving `grpc` and `xhttp` the same arm is the open row that would change that, and it is not this page's to settle.
 
