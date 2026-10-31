@@ -465,44 +465,35 @@ impl Shake {
     }
     fn pad_and_mask(&mut self, wire: u16) -> (usize, u16) {
         if self.padding {
-            if self.masked {
-                if self.at + 4 > self.bytes.len() {
-                    self.refill();
-                }
-                let bytes = &self.bytes[self.at..self.at + 4];
-                let pad = usize::from(u16::from_be_bytes([bytes[0], bytes[1]]) % 64);
-                let mask = u16::from_be_bytes([bytes[2], bytes[3]]);
-                self.at += 4;
-                (pad, mask ^ wire)
-            } else {
-                (usize::from(self.pad_len()), wire)
+            if self.at + 4 > self.bytes.len() {
+                self.refill();
             }
-        } else if self.masked {
-            (0, self.draw() ^ wire)
+            let bytes = &self.bytes[self.at..self.at + 4];
+            let pad = usize::from(u16::from_be_bytes([bytes[0], bytes[1]]) % 64);
+            let mask = u16::from_be_bytes([bytes[2], bytes[3]]);
+            self.at += 4;
+            (pad, mask ^ wire)
         } else {
-            (0, wire)
+            (0, self.draw() ^ wire)
         }
+    }
+    fn pad_only(&mut self, wire: u16) -> (usize, u16) {
+        (usize::from(self.draw() % 64), wire)
     }
     fn draws(&mut self) -> (u16, u16) {
         if self.padding {
-            if self.masked {
-                if self.at + 4 > self.bytes.len() {
-                    self.refill();
-                }
-                let bytes = &self.bytes[self.at..self.at + 4];
-                let draws = (
-                    u16::from_be_bytes([bytes[0], bytes[1]]),
-                    u16::from_be_bytes([bytes[2], bytes[3]]),
-                );
-                self.at += 4;
-                draws
-            } else {
-                (self.draw(), 0)
+            if self.at + 4 > self.bytes.len() {
+                self.refill();
             }
-        } else if self.masked {
-            (0, self.draw())
+            let bytes = &self.bytes[self.at..self.at + 4];
+            let draws = (
+                u16::from_be_bytes([bytes[0], bytes[1]]),
+                u16::from_be_bytes([bytes[2], bytes[3]]),
+            );
+            self.at += 4;
+            draws
         } else {
-            (0, 0)
+            (0, self.draw())
         }
     }
 }
@@ -837,7 +828,11 @@ fn masked_len(recv: &mut Flow, wire: u16) -> (usize, usize) {
     match recv.shake.as_mut() {
         None => (usize::from(wire), 0),
         Some(sizes) => {
-            let (padding, total) = sizes.pad_and_mask(wire);
+            let (padding, total) = if sizes.masked {
+                sizes.pad_and_mask(wire)
+            } else {
+                sizes.pad_only(wire)
+            };
             (usize::from(total), padding)
         }
     }
@@ -880,7 +875,7 @@ fn stage_frame(send: &mut Flow, plain: &[u8], staging: &mut Vec<u8>, pad: &mut P
     let (padding, mask_raw, masked) = match send.shake.as_mut() {
         None => (0, 0, false),
         Some(s) => {
-            let (pad_raw, mask_raw) = s.draws();
+            let (pad_raw, mask_raw) = if s.masked { s.draws() } else { (s.draw(), 0) };
             (usize::from(pad_raw % 64), mask_raw, true)
         }
     };
@@ -3262,8 +3257,8 @@ mod tests {
                         let mut want = [0u8; 2];
                         raw.read(&mut want);
                         assert_eq!(
-                            wrapped.draws(),
-                            (u16::from_be_bytes(want), 0),
+                            wrapped.draw(),
+                            u16::from_be_bytes(want),
                             "an authenticated length draws only padding"
                         );
                     }
