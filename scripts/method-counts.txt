@@ -111,7 +111,7 @@ vless sealed-record-buffer-growth 0 ferrox-core-vless::tests::a_record_is_opened
 vless sealed-record-sizes-swept 12 ferrox-core-vless::tests::a_record_of_any_size_reads_back_the_octets_that_were_written
 
 # --- Trojan -----------------------------------------------------------------
-trojan ops-retired-instructions UNBLESSED scripts/count-ops.sh
+trojan ops-retired-instructions 1995 scripts/count-ops.sh
 trojan password-bytes-on-the-wire 56 ferrox-app-proxy::tests::trojan_key_is_sha224_hex
 trojan framing-bytes-added-after-the-header 0 ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers
 trojan udp-framing-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_frames_carry
