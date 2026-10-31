@@ -43,7 +43,7 @@ graph TD
     R2 -->|yes| R2B["open the 18-byte size field,<br/>drawing its padding first"]
     R2A --> R3["open each frame in place, padding stripped"]
     R2B --> R3
-    R3 --> R4["gather the plaintext to the front<br/>of that same buffer, 0 allocations"]
+    R3 --> R4["the first frame stays where it opened;<br/>later frames gather behind it, 0 allocations"]
     R4 --> R5["counter +1 per frame;<br/>whole batch to the target, 1 syscall"]
 ```
 
