@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -111,11 +112,29 @@ fn merge_env(base: &mut Vec<(String, Json)>, key: &str, over: &Json) {
         upsert(base, key, over.clone());
         return;
     };
+    let mut index: HashMap<&str, usize> = HashMap::with_capacity(into.len() + entries.len());
+    for (at, (name, _)) in into.iter().enumerate() {
+        index.entry(name.as_str()).or_insert(at);
+    }
+    let mut added: Vec<(&str, &Json)> = Vec::new();
+    let mut replaced: Vec<(usize, &Json)> = Vec::new();
     for (name, value) in entries {
-        match into.iter().position(|(have, _)| have == name) {
-            Some(at) => into[at].1 = value.clone(),
-            None => into.push((name.clone(), value.clone())),
+        match index.get(name.as_str()) {
+            Some(&at) => replaced.push((at, value)),
+            None => {
+                index.insert(name.as_str(), into.len() + added.len());
+                added.push((name, value));
+            }
         }
+    }
+    drop(index);
+    into.extend(
+        added
+            .into_iter()
+            .map(|(name, value)| (name.to_owned(), value.clone())),
+    );
+    for (at, value) in replaced {
+        into[at].1 = value.clone();
     }
 }
 
@@ -133,15 +152,27 @@ fn merge_tagged(base: &mut Vec<(String, Json)>, key: &str, over: &Json, tail: bo
         return;
     };
     let base = existing.len();
+    let mut index: HashMap<&str, usize> = HashMap::with_capacity(base + items.len());
+    for (at, have) in existing.iter().enumerate() {
+        let tag = have.get("tag").and_then(Json::as_str).unwrap_or_default();
+        index.entry(tag).or_insert(at);
+    }
+    let mut added: Vec<&Json> = Vec::new();
+    let mut replaced: Vec<(usize, &Json)> = Vec::new();
     for item in items {
         let tag = item.get("tag").and_then(Json::as_str).unwrap_or_default();
-        match existing
-            .iter()
-            .position(|have| have.get("tag").and_then(Json::as_str).unwrap_or_default() == tag)
-        {
-            Some(at) => existing[at] = item.clone(),
-            None => existing.push(item.clone()),
+        match index.get(tag) {
+            Some(&at) => replaced.push((at, item)),
+            None => {
+                index.insert(tag, base + added.len());
+                added.push(item);
+            }
         }
+    }
+    drop(index);
+    existing.extend(added.into_iter().cloned());
+    for (at, item) in replaced {
+        existing[at] = item.clone();
     }
     if !tail {
         let appended = existing.split_off(base);
@@ -920,5 +951,44 @@ mod tests {
         let mut text = String::new();
         write(&base, &mut text);
         assert_eq!(text, r#"{"inbounds":[{"tag":"a","port":3}]}"#);
+    }
+
+    #[test]
+    fn merge_keeps_the_tag_order_across_a_large_prepend() {
+        let row = |tag: usize, port: usize| {
+            Json::Obj(vec![
+                ("tag".to_owned(), Json::Str(format!("tag{tag}"))),
+                ("port".to_owned(), Json::Num(port as f64)),
+            ])
+        };
+        let mut base = Json::Obj(vec![(
+            "inbounds".to_owned(),
+            Json::Arr((0..4096).map(|tag| row(tag, 0)).collect()),
+        )]);
+        let over = Json::Obj(vec![(
+            "inbounds".to_owned(),
+            Json::Arr((2048..6144).map(|tag| row(tag, 1)).collect()),
+        )]);
+        merge(&mut base, &over, "02-extra.json");
+        let items = base.get("inbounds").and_then(Json::as_arr).expect("array");
+        assert_eq!(
+            items.len(),
+            6144,
+            "replaced tags stay in place, new ones prepend"
+        );
+        let tag = |item: &Json| item.get("tag").and_then(Json::as_str).expect("tag");
+        let port = |item: &Json| item.get("port").and_then(Json::as_u32).expect("port");
+        assert_eq!(tag(&items[0]), "tag4096");
+        assert_eq!(tag(&items[2047]), "tag6143");
+        assert_eq!(tag(&items[2048]), "tag0");
+        assert_eq!(tag(&items[4095]), "tag2047");
+        assert_eq!(tag(&items[4096]), "tag2048");
+        assert_eq!(
+            port(&items[4096]),
+            1,
+            "an existing tag is replaced in place"
+        );
+        assert_eq!(tag(&items[6143]), "tag4095");
+        assert_eq!(port(&items[6143]), 0, "an untouched tag keeps its value");
     }
 }
