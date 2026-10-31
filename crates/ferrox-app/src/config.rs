@@ -648,6 +648,13 @@ pub(crate) fn inbound_tls_identity(
     if settings.get("security").and_then(Json::as_str) != Some("tls") {
         return None;
     }
+    tls_identity_from_settings(settings)
+}
+
+/// The certificate list and TLS fields a stream's `streamSettings` names, without the security check: a carrier that owns its TLS (QUIC, hysteria) still serves the same list.
+pub(crate) fn tls_identity_from_settings(
+    settings: &Json,
+) -> Option<Arc<ferrox_core::tls::TlsServerConfig>> {
     let ech = match ech_server_keys(settings) {
         Ok(keys) => keys,
         Err(why) => {
@@ -825,18 +832,6 @@ fn inline_pem(entry: &Json, field: &str) -> Option<Vec<u8>> {
             .join("\n")
             .into_bytes(),
     )
-}
-
-pub(crate) fn tls_cert_paths(settings: &Json) -> Option<(&str, &str)> {
-    let first = settings
-        .get("tlsSettings")?
-        .get("certificates")?
-        .as_arr()?
-        .first()?;
-    Some((
-        first.get("certificateFile")?.as_str()?,
-        first.get("keyFile")?.as_str()?,
-    ))
 }
 
 /// The eight hex digits per group of an inbound id or an outbound server uuid, dashes optional.
@@ -3200,21 +3195,6 @@ mod tests {
     }
 
     #[test]
-    fn tls_cert_paths_read_the_first_certificate() {
-        let tls = crate::json::parse(
-            r#"{"streamSettings": {"security": "tls", "tlsSettings": {"certificates": [{"certificateFile": "/tmp/a.crt", "keyFile": "/tmp/a.key"}]}}}"#,
-        )
-        .expect("parses");
-        let settings = tls.get("streamSettings").expect("settings");
-        assert_eq!(tls_cert_paths(settings), Some(("/tmp/a.crt", "/tmp/a.key")));
-        assert!(inbound_tls_identity(&tls).is_none());
-        let plain =
-            crate::json::parse(r#"{"streamSettings": {"network": "tcp"}}"#).expect("parses");
-        let settings = plain.get("streamSettings").expect("settings");
-        assert_eq!(tls_cert_paths(settings), None);
-    }
-
-    #[test]
     fn a_relative_certificate_resolves_under_xray_location_cert() {
         static ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _guard = ENV
@@ -3296,6 +3276,39 @@ mod tests {
             identity.ech_server_keys.as_deref(),
             Some(keys.as_slice()),
             "the inbound carries the parsed ECH keys into its TLS identity"
+        );
+    }
+
+    #[test]
+    fn a_carrier_that_owns_tls_reads_the_same_certificate_list() {
+        let string_json = |pem: &str| -> String {
+            format!(
+                "\"{}\"",
+                pem.trim_end().replace('\r', "").replace('\n', "\\n")
+            )
+        };
+        let first =
+            rcgen::generate_simple_self_signed(vec!["first.test".to_owned()]).expect("mints");
+        let second =
+            rcgen::generate_simple_self_signed(vec!["second.test".to_owned()]).expect("mints");
+        let config = crate::json::parse(&format!(
+            r#"{{"streamSettings": {{"tlsSettings": {{"certificates": [{{"certificate": {}, "key": {}}}, {{"certificate": {}, "key": {}}}]}}}}}}"#,
+            string_json(&first.cert.pem()),
+            string_json(&first.signing_key.serialize_pem()),
+            string_json(&second.cert.pem()),
+            string_json(&second.signing_key.serialize_pem())
+        ))
+        .expect("parses");
+        let settings = config.get("streamSettings").expect("settings");
+        let identity = tls_identity_from_settings(settings).expect("loads");
+        assert_eq!(identity.certs.len(), 2);
+        assert_eq!(
+            identity.certs[0].cert_chain[0].as_slice(),
+            first.cert.der().as_ref()
+        );
+        assert_eq!(
+            identity.certs[1].cert_chain[0].as_slice(),
+            second.cert.der().as_ref()
         );
     }
 

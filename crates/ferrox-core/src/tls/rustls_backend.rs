@@ -1841,11 +1841,58 @@ pub fn quic_server_context_builder(
 fn server_identity_builder(
     cfg: &super::TlsServerConfig,
 ) -> Result<boring::ssl::SslContextBuilder, TlsError> {
-    use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode, SslVersion};
-    let entry = cfg
+    let first = cfg
         .certs
         .first()
         .ok_or_else(|| TlsError::Other("server identity has no certificate".to_owned()))?;
+    let mut builder = identity_builder(first)?;
+    server_settings(&mut builder, cfg)?;
+    if cfg.certs.len() > 1 || cfg.reject_unknown_sni {
+        let mut names = Vec::with_capacity(cfg.certs.len());
+        for entry in &cfg.certs {
+            names.push(certificate_names(entry.cert_chain.first().ok_or_else(
+                || TlsError::Other("server identity has no certificate".to_owned()),
+            )?));
+        }
+        let mut contexts = Vec::with_capacity(cfg.certs.len().saturating_sub(1));
+        for entry in cfg.certs.iter().skip(1) {
+            let mut context = identity_builder(entry)?;
+            server_settings(&mut context, cfg)?;
+            contexts.push(context.build());
+        }
+        let reject = cfg.reject_unknown_sni;
+        builder.set_servername_callback(move |ssl, alert| {
+            use boring::ssl::{NameType, SniError};
+            let sni = ssl.servername(NameType::HOST_NAME).unwrap_or("");
+            if !reject && (names.len() == 1 || sni.is_empty()) {
+                return Ok(());
+            }
+            if let Some((at, _)) = names
+                .iter()
+                .enumerate()
+                .find(|(_, names)| sni_matches(names, sni))
+            {
+                if at == 0 {
+                    return Ok(());
+                }
+                if ssl.set_ssl_context(&contexts[at - 1]).is_err() {
+                    *alert = boring::ssl::SslAlert::INTERNAL_ERROR;
+                    return Err(SniError::ALERT_FATAL);
+                }
+                return Ok(());
+            }
+            if reject {
+                *alert = boring::ssl::SslAlert::UNRECOGNIZED_NAME;
+                return Err(SniError::ALERT_FATAL);
+            }
+            Ok(())
+        });
+    }
+    Ok(builder)
+}
+
+fn identity_builder(entry: &super::CertEntry) -> Result<boring::ssl::SslContextBuilder, TlsError> {
+    use boring::ssl::{SslContextBuilder, SslMethod, SslVerifyMode};
     let mut chain = entry.cert_chain.iter();
     let leaf = chain
         .next()
@@ -1872,24 +1919,14 @@ fn server_identity_builder(
     builder
         .check_private_key()
         .map_err(|error| boring_error(&error))?;
-    if cfg.reject_unknown_sni {
-        let names = certificate_names(
-            entry
-                .cert_chain
-                .first()
-                .ok_or_else(|| TlsError::Other("server identity has no certificate".to_owned()))?,
-        );
-        builder.set_servername_callback(move |ssl, alert| {
-            if ssl
-                .servername(boring::ssl::NameType::HOST_NAME)
-                .is_some_and(|sni| sni_matches(&names, sni))
-            {
-                return Ok(());
-            }
-            *alert = boring::ssl::SslAlert::UNRECOGNIZED_NAME;
-            Err(boring::ssl::SniError::ALERT_FATAL)
-        });
-    }
+    Ok(builder)
+}
+
+fn server_settings(
+    builder: &mut boring::ssl::SslContextBuilder,
+    cfg: &super::TlsServerConfig,
+) -> Result<(), TlsError> {
+    use boring::ssl::SslVersion;
     if !cfg.alpn.is_empty() {
         let wanted = cfg.alpn.clone();
         builder.set_alpn_select_callback(move |_, client| {
@@ -1918,7 +1955,7 @@ fn server_identity_builder(
     if let Some(log) = cfg.master_key_log.clone() {
         builder.set_keylog_callback(move |_, line| log.log_line(line));
     }
-    Ok(builder)
+    Ok(())
 }
 
 /// Whether an error is the socket's poll grain expiring with nothing in it,

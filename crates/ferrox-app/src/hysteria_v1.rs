@@ -522,12 +522,11 @@ fn flush(sock: &crate::quic::Datagram, conn: &mut quiche::Connection, out: &mut 
 }
 
 fn server_config(
-    cert_path: &str,
-    key_path: &str,
+    identity: &ferrox_core::tls::TlsServerConfig,
     cc: ferrox_core::hysteria::Congestion,
     quic: Option<&ferrox_core::hysteria::QuicParams>,
 ) -> Option<quiche::Config> {
-    let mut config = quiche::Config::new(quiche::PROTOCOL_VERSION).ok()?;
+    let mut config = crate::quic::tls_config(identity)?;
     config.set_application_protos(&[wire::ALPN]).ok()?;
     config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
     config.enable_dgram(true, 1024, 1024);
@@ -541,8 +540,6 @@ fn server_config(
     if let Some(params) = quic {
         crate::quic::apply_hysteria_quic(&mut config, params, true);
     }
-    config.load_cert_chain_from_pem_file(cert_path).ok()?;
-    config.load_priv_key_from_pem_file(key_path).ok()?;
     Some(config)
 }
 
@@ -1075,8 +1072,7 @@ fn serve_tcp_or_udp(
 pub(crate) fn serve_loop(
     address: &str,
     auths: &[String],
-    cert_path: &str,
-    key_path: &str,
+    identity: &ferrox_core::tls::TlsServerConfig,
     serve: &Serve,
     config: &ferrox_core::hysteria::Config,
 ) {
@@ -1087,8 +1083,7 @@ pub(crate) fn serve_loop(
         return;
     };
     let local = sock.local_addr().unwrap_or(bound);
-    let Some(mut template) = server_config(cert_path, key_path, config.cc, config.quic.as_ref())
-    else {
+    let Some(mut template) = server_config(identity, config.cc, config.quic.as_ref()) else {
         return;
     };
     let sock = match XPlus::new(&config.obfs_password) {
@@ -1293,30 +1288,34 @@ mod tests {
 
         let minted =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).expect("mints");
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_nanos();
-        let tag = format!("ferrox-hysteria-v1-unknown-{}-{stamp}", std::process::id());
-        let cert_path = std::env::temp_dir().join(format!("{tag}.crt"));
-        let key_path = std::env::temp_dir().join(format!("{tag}.key"));
-        let key_pem = crate::quic::der_to_pem(&minted.signing_key.serialize_der(), "PRIVATE KEY");
-        std::fs::write(&cert_path, minted.cert.pem().as_bytes()).expect("stages cert");
-        std::fs::write(&key_path, &key_pem).expect("stages key");
         let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
         let roots = crate::quic::parse_ca_pem(minted.cert.pem().as_bytes());
-        let cert = cert_path.to_str().expect("ascii").to_owned();
-        let key = key_path.to_str().expect("ascii").to_owned();
+        let identity = ferrox_core::tls::TlsServerConfig {
+            certs: vec![ferrox_core::tls::CertEntry {
+                cert_chain: roots.clone(),
+                key_der: minted.signing_key.serialize_der(),
+                key_kind: ferrox_core::tls::ServerKeyKind::Pkcs8,
+                reload: None,
+            }],
+            alpn: Vec::new(),
+            min_version: None,
+            max_version: None,
+            cipher_suites: Vec::new(),
+            send_tickets: true,
+            reject_unknown_sni: false,
+            server_config_cache: std::sync::Arc::default(),
+            ech_server_keys: None,
+            master_key_log: None,
+        };
         let address = format!("127.0.0.1:{port}");
         let serve: Serve = Arc::new(|_, _, _| {});
         std::thread::spawn(move || {
             serve_loop(
                 &address,
                 &["v1-auth".to_owned()],
-                &cert,
-                &key,
+                &identity,
                 &serve,
                 &ferrox_core::hysteria::Config {
                     version: 1,
