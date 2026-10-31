@@ -45830,38 +45830,6 @@ mod tests {
         assert_eq!(back.as_slice(), b"ping");
     }
 
-    #[test]
-    #[cfg_attr(
-        windows,
-        ignore = "Windows CI's timer resolution masks the five-millisecond poll; the Linux benchmark matrix gates this"
-    )]
-    fn hysteria_server_sends_a_bulk_download_to_a_raw_quic_client() {
-        let _serial = quic_serial();
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let sink = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let sink_port = sink.local_addr().expect("addr").port();
-        let body: Vec<u8> = (0..32 * 1024 * 1024).map(|at| at as u8).collect();
-        let expected = body.clone();
-        thread::spawn(move || {
-            let (mut stream, _) = sink.accept().expect("accepts");
-            stream.write_all(&body).expect("sends the download");
-        });
-        let (port, roots) = hysteria_loop_with("bulk-raw-auth", id, "");
-        let target: SocketAddr = format!("127.0.0.1:{sink_port}").parse().expect("addr");
-        let (mut conn, sock, local, horizon) =
-            hysteria_raw_flow(port, &roots, "bulk-raw-auth", id, target);
-        let started = Instant::now();
-        let got =
-            crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, expected.len(), horizon)
-                .expect("reads the whole download");
-        let elapsed = started.elapsed();
-        assert_eq!(got, expected);
-        assert!(
-            elapsed < Duration::from_secs(8),
-            "32 MiB took {elapsed:?}; a ten-packet initial window paces this near 2 MiB/s"
-        );
-    }
-
     /// Drives a browser's HTTP/3 `GET` against a masquerade port and reads the cover answer back: it hand-shakes, sends a `HEADERS` request on stream 0 with a FIN, then walks the reply's `HEADERS` and `DATA` frames into a status, its headers, and its body.
     fn masq_get(port: u16, roots: &[Vec<u8>], path: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
         use ferrox_core::foxy::frames as h3;

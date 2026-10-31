@@ -2554,6 +2554,83 @@ mod tests {
     }
 
     #[test]
+    fn a_served_lane_starts_with_a_window_wider_than_ten_packets() {
+        let identity = minted_identity();
+        let roots = identity.certs[0].cert_chain.clone();
+        let client_addr = "127.0.0.1:50000".parse().expect("addr");
+        let server_addr = "127.0.0.1:443".parse().expect("addr");
+        let client_cid = [1u8; SCID_LEN];
+        let server_cid = [2u8; SCID_LEN];
+        let mut client_config =
+            crate::quic::quiche_config(&roots, Some("reno")).expect("trusts the lane");
+        let mut server_config =
+            server_config(&identity, hysteria::Congestion::Reno, None).expect("serves");
+        let mut client = quiche::connect(
+            None,
+            &quiche::ConnectionId::from_ref(&client_cid),
+            client_addr,
+            server_addr,
+            &mut client_config,
+        )
+        .expect("connects");
+        let mut server = quiche::accept(
+            &quiche::ConnectionId::from_ref(&server_cid),
+            None,
+            server_addr,
+            client_addr,
+            &mut server_config,
+        )
+        .expect("accepts");
+        let mut up = Unfilled::<MAX_DATAGRAM>::new();
+        let mut down = Unfilled::<MAX_DATAGRAM>::new();
+        for _ in 0..8 {
+            while let Ok((n, _)) = client.send(up.as_mut()) {
+                server
+                    .recv(
+                        &mut up.as_mut()[..n],
+                        quiche::RecvInfo {
+                            from: client_addr,
+                            to: server_addr,
+                        },
+                    )
+                    .expect("drives the server");
+            }
+            while let Ok((n, _)) = server.send(down.as_mut()) {
+                client
+                    .recv(
+                        &mut down.as_mut()[..n],
+                        quiche::RecvInfo {
+                            from: server_addr,
+                            to: client_addr,
+                        },
+                    )
+                    .expect("drives the client");
+            }
+            if client.is_established() && server.is_established() {
+                break;
+            }
+        }
+        assert!(server.is_established(), "the lane handshook");
+        let payload = vec![0u8; 1 << 20];
+        let mut off = 0;
+        while off < payload.len() {
+            match server.stream_send(1, &payload[off..], true) {
+                Ok(n) => off += n,
+                Err(quiche::Error::Done) => break,
+                Err(e) => panic!("stream_send: {e:?}"),
+            }
+        }
+        let mut sent = 0usize;
+        while let Ok((n, _)) = server.send(down.as_mut()) {
+            sent += n;
+        }
+        assert!(
+            sent > 100_000,
+            "the first flight is {sent} bytes; a ten-packet window stops near 12 KiB"
+        );
+    }
+
+    #[test]
     fn a_stateless_reset_token_is_minted_afresh_per_accept() {
         let config = hysteria::Config {
             quic: Some(hysteria::QuicParams::default()),
