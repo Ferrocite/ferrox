@@ -54,6 +54,9 @@ pub(crate) trait Wide16: Copy {
 
     /// Xor sixty-four bytes: one whole block.
     fn xor_store(self, dst: &mut [u8]);
+
+    /// Xor a whole block's keystream with the source and write the destination.
+    fn xor_store_from(self, src: &[u8], dst: &mut [u8]);
 }
 
 #[inline(always)]
@@ -111,6 +114,21 @@ pub(crate) fn pass<V: Wide16>(
     state: &[u32; 16],
     ctr: u32,
     head: Option<&mut [u8; 32]>,
+    out: &mut [u8],
+) {
+    pass_impl::<V, false>(state, ctr, head, &[], out);
+}
+
+#[inline(always)]
+#[allow(
+    clippy::too_many_lines,
+    reason = "the round's sixteen quarter rounds are written out because their register names are the diagonal, and the transpose and the store follow those same names"
+)]
+pub(crate) fn pass_impl<V: Wide16, const FROM: bool>(
+    state: &[u32; 16],
+    ctr: u32,
+    head: Option<&mut [u8; 32]>,
+    src: &[u8],
     out: &mut [u8],
 ) {
     debug_assert_eq!(state[12], 0, "the counter register is only a base at zero");
@@ -177,13 +195,18 @@ pub(crate) fn pass<V: Wide16>(
         m[0].xor_lo32(one_time);
         skip = 1;
     }
-    for (block, word) in out
+    for (i, (block, word)) in out
         .as_chunks_mut::<64>()
         .0
         .iter_mut()
         .zip(m.into_iter().skip(skip))
+        .enumerate()
     {
-        word.xor_store(block);
+        if FROM {
+            word.xor_store_from(&src[i * 64..i * 64 + 64], block);
+        } else {
+            word.xor_store(block);
+        }
     }
 }
 
@@ -220,6 +243,51 @@ pub(crate) fn wide_blocks<V: Wide16>(
     }
 
     blocks + rest(key, nonce, ctr, head, left)
+}
+
+/// The same pass loop reading a source and writing a destination; the remainder handler is the destination's own fused tail.
+#[cfg_attr(
+    not(target_arch = "x86_64"),
+    allow(
+        dead_code,
+        reason = "AVX-512 is the only caller; the portable checker uses it under test"
+    )
+)]
+#[inline(always)]
+pub(crate) fn wide_blocks_from<V: Wide16>(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    start: u32,
+    mut head: Option<&mut [u8; 32]>,
+    src: &[u8],
+    dst: &mut [u8],
+    rest: impl FnOnce(&[u8; 32], &[u8; 12], u32, Option<&mut [u8; 32]>, &[u8], &mut [u8]) -> u32,
+) -> u32 {
+    let state = crate::chacha::base_state(key, nonce);
+    let mut ctr = start;
+    let mut src = src;
+    let mut left = dst;
+    let mut blocks = 0u32;
+
+    loop {
+        let take = if head.is_some() {
+            PASS_BYTES - 64
+        } else {
+            PASS_BYTES
+        };
+        if left.len() < take {
+            break;
+        }
+        let (chunk, tail) = left.split_at_mut(take);
+        let (chunk_src, tail_src) = src.split_at(take);
+        pass_impl::<V, true>(&state, ctr, head.take(), chunk_src, chunk);
+        blocks += PASS_BLOCKS;
+        ctr = ctr.wrapping_add(PASS_BLOCKS);
+        left = tail;
+        src = tail_src;
+    }
+
+    blocks + rest(key, nonce, ctr, head, src, left)
 }
 
 /// Sixteen `u32`: not a fallback — nothing dispatches to it — but the pass's checker, the same body in a form a machine without AVX-512 can execute.
@@ -290,6 +358,20 @@ impl Wide16 for P16 {
         debug_assert_eq!(dst.len(), 64, "a block is sixteen words");
         xor_words(&self.0, dst);
     }
+
+    #[inline]
+    fn xor_store_from(self, src: &[u8], dst: &mut [u8]) {
+        debug_assert_eq!(src.len(), 64, "a block is sixteen words");
+        debug_assert_eq!(dst.len(), 64, "a block is sixteen words");
+        for (word, (src, dst)) in self.0.iter().zip(
+            src.as_chunks::<4>()
+                .0
+                .iter()
+                .zip(dst.as_chunks_mut::<4>().0),
+        ) {
+            *dst = (u32::from_le_bytes(*src) ^ word).to_le_bytes();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -303,8 +385,8 @@ fn xor_words(words: &[u32; 16], dst: &mut [u8]) {
 
 #[cfg(test)]
 mod tests {
-    use super::{wide_blocks, IDX, P16, PASS_BLOCKS, PASS_BYTES};
-    use crate::chacha::{portable::U4, xor_ladder};
+    use super::{wide_blocks, wide_blocks_from, IDX, P16, PASS_BLOCKS, PASS_BYTES};
+    use crate::chacha::{portable::U4, xor_ladder, xor_ladder_from};
 
     /// The index network replayed in scalar code: element `b` of register `j` after four stages must be element `j` of register `b` before them.
     #[test]
@@ -478,5 +560,41 @@ mod tests {
         xor_ladder::<U4>(&key, &nonce, 0, None, &mut want[..PASS_BYTES]);
         xor_ladder::<U4>(&key, &nonce, PASS_BLOCKS, None, &mut want[PASS_BYTES..]);
         assert_eq!(buf, want, "the counter the second pass starts from");
+    }
+    #[test]
+    fn the_from_pass_is_the_ladder_and_leaves_the_source_alone() {
+        let key = [0x6du8; 32];
+        let nonce = [0xc4u8; 12];
+        for &len in &[
+            0usize,
+            1,
+            63,
+            64,
+            65,
+            PASS_BYTES - 1,
+            PASS_BYTES,
+            PASS_BYTES + 1,
+            2 * PASS_BYTES,
+        ] {
+            let plain: Vec<u8> = (0..len)
+                .map(|i| (i as u8).wrapping_mul(181).wrapping_add(17))
+                .collect();
+            let original = plain.clone();
+            let mut in_place = plain.clone();
+            let mut dst = vec![0u8; len];
+            let want = wide_blocks::<P16>(&key, &nonce, 3, None, &mut in_place, xor_ladder::<U4>);
+            let got = wide_blocks_from::<P16>(
+                &key,
+                &nonce,
+                3,
+                None,
+                &plain,
+                &mut dst,
+                xor_ladder_from::<U4>,
+            );
+            assert_eq!(got, want, "len {len}: block count");
+            assert_eq!(dst, in_place, "len {len}: bytes");
+            assert_eq!(plain, original, "len {len}: source moved");
+        }
     }
 }

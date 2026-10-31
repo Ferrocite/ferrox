@@ -1,6 +1,6 @@
 //! Eight blocks per pass, one state word per register with the blocks in the lanes: the pass's sixteen registers are the whole file, so shorter lengths and remainders go to the ladder.
 
-use super::{as_i32_bits, base, base_state, xor_tail, Lanes};
+use super::{as_i32_bits, base, base_state, xor_tail, xor_tail_from, Lanes};
 #[allow(
     clippy::wildcard_imports,
     reason = "arch intrinsics: the module's whole API is register operations"
@@ -135,6 +135,19 @@ impl Lanes for A8 {
             _mm_storeu_si128(dst.as_mut_ptr().cast(), _mm_xor_si128(cur, ours));
         }
     }
+
+    #[inline]
+    fn xor_chunk_from(self, c: usize, src: &[u8; 16], dst: &mut [u8; 16]) {
+        unsafe {
+            let cur = _mm_loadu_si128(src.as_ptr().cast());
+            let ours = if c == 0 {
+                _mm256_castsi256_si128(self.0)
+            } else {
+                _mm256_extracti128_si256::<1>(self.0)
+            };
+            _mm_storeu_si128(dst.as_mut_ptr().cast(), _mm_xor_si128(cur, ours));
+        }
+    }
 }
 
 /// Blocks one pass covers: sixteen registers, one state word in each.
@@ -240,13 +253,29 @@ fn xor_y(dst: &mut [u8], v: __m256i) {
     }
 }
 
+#[inline(always)]
+fn xor_y_from(src: &[u8], dst: &mut [u8], v: __m256i) {
+    debug_assert_eq!(src.len(), 32, "half a block");
+    debug_assert_eq!(dst.len(), 32, "half a block");
+    unsafe {
+        let s = _mm256_loadu_si256(src.as_ptr().cast());
+        _mm256_storeu_si256(dst.as_mut_ptr().cast(), _mm256_xor_si256(s, v));
+    }
+}
+
 /// One eight-block pass, the message xored in place: `out` is `PASS_BYTES` long, or sixty-four less with a `head` whose first thirty-two bytes take the one-time-key block and whose tail is dropped, over a nonce state with a zero counter.
 #[allow(
     clippy::too_many_lines,
     reason = "the round's sixteen quarter rounds are written out because their register names are the diagonal, and the store follows those same names"
 )]
 #[inline(always)]
-fn pass(state: &[u32; 16], ctr: u32, head: Option<&mut [u8; 32]>, out: &mut [u8]) {
+fn pass_impl<const FROM: bool>(
+    state: &[u32; 16],
+    ctr: u32,
+    head: Option<&mut [u8; 32]>,
+    src: &[u8],
+    out: &mut [u8],
+) {
     debug_assert_eq!(state[12], 0, "the counter register is only a base at zero");
     debug_assert_eq!(
         out.len(),
@@ -342,8 +371,13 @@ fn pass(state: &[u32; 16], ctr: u32, head: Option<&mut [u8; 32]>, out: &mut [u8]
                 join_hi(rows[2][pair], rows[3][pair]),
             )
         };
-        xor_y(&mut out[at..at + 32], lo);
-        xor_y(&mut out[at + 32..at + 64], hi);
+        if FROM {
+            xor_y_from(&src[at..at + 32], &mut out[at..at + 32], lo);
+            xor_y_from(&src[at + 32..at + 64], &mut out[at + 32..at + 64], hi);
+        } else {
+            xor_y(&mut out[at..at + 32], lo);
+            xor_y(&mut out[at + 32..at + 64], hi);
+        }
         at += 64;
     }
 }
@@ -381,6 +415,48 @@ pub(crate) unsafe fn xor_blocks(
     }
 
     blocks + xor_tail::<A8>(&state, &rows, ctr, head, rest)
+}
+
+#[inline(always)]
+fn pass(state: &[u32; 16], ctr: u32, head: Option<&mut [u8; 32]>, out: &mut [u8]) {
+    pass_impl::<false>(state, ctr, head, &[], out);
+}
+
+#[target_feature(enable = "avx2")]
+pub(crate) unsafe fn xor_blocks_from(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    start: u32,
+    mut head: Option<&mut [u8; 32]>,
+    src: &[u8],
+    dst: &mut [u8],
+) -> u32 {
+    let state = base_state(key, nonce);
+    let rows = base::<A8>(&state);
+    let mut ctr = start;
+    let mut src = src;
+    let mut rest = dst;
+    let mut blocks = 0u32;
+
+    loop {
+        let take = if head.is_some() {
+            PASS_BYTES - 64
+        } else {
+            PASS_BYTES
+        };
+        if rest.len() < take {
+            break;
+        }
+        let (chunk, tail) = rest.split_at_mut(take);
+        let (chunk_src, tail_src) = src.split_at(take);
+        pass_impl::<true>(&state, ctr, head.take(), chunk_src, chunk);
+        blocks += PASS_BLOCKS;
+        ctr = ctr.wrapping_add(PASS_BLOCKS);
+        rest = tail;
+        src = tail_src;
+    }
+
+    blocks + xor_tail_from::<A8>(&state, &rows, ctr, head, src, rest)
 }
 
 #[cfg(test)]

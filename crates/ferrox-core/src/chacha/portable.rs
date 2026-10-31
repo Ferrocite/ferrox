@@ -87,10 +87,24 @@ impl Lanes for U4 {
             *d = (u32::from_le_bytes(*d) ^ w).to_le_bytes();
         }
     }
+
+    #[inline]
+    fn xor_chunk_from(self, _c: usize, src: &[u8; 16], dst: &mut [u8; 16]) {
+        let (sources, _) = src.as_chunks::<4>();
+        let (words, _) = dst.as_chunks_mut::<4>();
+        for ((src, dst), w) in sources.iter().zip(words.iter_mut()).zip(self.0) {
+            *dst = (u32::from_le_bytes(*src) ^ w).to_le_bytes();
+        }
+    }
 }
 
 #[cfg(not(target_arch = "x86_64"))]
-pub(crate) fn xor_block(state: &[u32; 16], counter: u32, out: &mut [u8]) -> u32 {
+pub(crate) fn xor_block_impl<const FROM: bool>(
+    state: &[u32; 16],
+    counter: u32,
+    src: &[u8],
+    out: &mut [u8],
+) -> u32 {
     let mut state = *state;
     state[12] = counter;
 
@@ -107,8 +121,17 @@ pub(crate) fn xor_block(state: &[u32; 16], counter: u32, out: &mut [u8]) -> u32 
     }
 
     let (chunks, tail) = out.as_chunks_mut::<16>();
-    for (chunk, reg) in chunks.iter_mut().zip(regs[0].iter()) {
-        reg.xor_chunk(0, chunk);
+    let (sources, src_tail) = src.as_chunks::<16>();
+    for ((chunk, source), reg) in chunks
+        .iter_mut()
+        .zip(sources.iter().map(Some).chain(core::iter::repeat(None)))
+        .zip(regs[0].iter())
+    {
+        if FROM {
+            reg.xor_chunk_from(0, source.unwrap_or(&[0u8; 16]), chunk);
+        } else {
+            reg.xor_chunk(0, chunk);
+        }
     }
     let rest = tail.len();
     for (i, word) in regs[0]
@@ -123,11 +146,22 @@ pub(crate) fn xor_block(state: &[u32; 16], counter: u32, out: &mut [u8]) -> u32 
         }
         let ks = word.to_le_bytes();
         let n = 4.min(rest - off);
-        for (dst, k) in tail[off..off + n].iter_mut().zip(ks) {
-            *dst ^= k;
+        for j in 0..n {
+            let k = ks[j];
+            tail[off + j] = if FROM {
+                src_tail[off + j] ^ k
+            } else {
+                tail[off + j] ^ k
+            };
         }
     }
     1
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+#[inline]
+pub(crate) fn xor_block(state: &[u32; 16], counter: u32, out: &mut [u8]) -> u32 {
+    xor_block_impl::<false>(state, counter, &[], out)
 }
 
 #[cfg(test)]

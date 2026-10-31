@@ -285,6 +285,106 @@ pub(crate) fn seal_impl<V: Lanes>(
     )
 }
 
+/// CTR and GHASH reading `src` and writing `dst`, so a caller that holds plaintext in one buffer and the wire in another never copies between them. `src` and `dst` must not overlap; their lengths are equal.
+#[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the cipher state, both directions and the deferred tail are the pass, not a bundle"
+)]
+pub(crate) fn ctr_ghash_from<V: Lanes>(
+    rk: &[V; 11],
+    hp: &[(V, V); 4],
+    template: V,
+    mut state: V,
+    src: &[u8],
+    dst: &mut [u8],
+    tailq: &mut Tail<V>,
+    mut ctr: u32,
+) -> V {
+    debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
+    let (sblocks, stail) = src.as_chunks::<16>();
+    let (dblocks, dtail) = dst.as_chunks_mut::<16>();
+    let (sgroups, srest) = sblocks.as_chunks::<4>();
+    let (dgroups, drest) = dblocks.as_chunks_mut::<4>();
+    debug_assert_eq!(sgroups.len(), dgroups.len(), "equal lengths group alike");
+    for (sq, dq) in sgroups.iter().zip(dgroups.iter_mut()) {
+        let mut ksv = ctr4v(template, ctr);
+        V::encrypt4(rk, &mut ksv);
+        let ct4 = [
+            ksv[0].xor(V::load(&sq[0])),
+            ksv[1].xor(V::load(&sq[1])),
+            ksv[2].xor(V::load(&sq[2])),
+            ksv[3].xor(V::load(&sq[3])),
+        ];
+        ct4[0].store(&mut dq[0]);
+        ct4[1].store(&mut dq[1]);
+        ct4[2].store(&mut dq[2]);
+        ct4[3].store(&mut dq[3]);
+        state = ghash_group(
+            hp,
+            [
+                state.xor(ct4[0].bswap()),
+                ct4[1].bswap(),
+                ct4[2].bswap(),
+                ct4[3].bswap(),
+            ],
+        );
+        ctr += 4;
+    }
+    for (sb, db) in srest.iter().zip(drest.iter_mut()) {
+        let ks1 = V::encrypt1v(rk, template.ctr_add(ctr).ctr_swap());
+        let ct1 = ks1.xor(V::load(sb));
+        ct1.store(db);
+        tailq.push(ct1.bswap());
+        ctr += 1;
+    }
+    if !stail.is_empty() {
+        let ks1 = V::encrypt1v(rk, template.ctr_add(ctr).ctr_swap());
+        let mut ksb = [0u8; 16];
+        ks1.store(&mut ksb);
+        let mut padded = [0u8; 16];
+        for (((xb, kb), pb), db) in stail
+            .iter()
+            .zip(ksb.iter())
+            .zip(padded.iter_mut())
+            .zip(dtail.iter_mut())
+        {
+            let v = *xb ^ kb;
+            *pb = v;
+            *db = v;
+        }
+        tailq.push(V::load(&padded).bswap());
+    }
+    state
+}
+
+#[inline(always)]
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn seal_impl_from<V: Lanes>(
+    rk: &[V; 11],
+    h: &[(V, V); 4],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    src: &[u8],
+    dst: &mut [u8],
+) -> [u8; 16] {
+    debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
+    let template = counter_template::<V>(nonce);
+    let mask = V::encrypt1v(rk, template.ctr_add(1).ctr_swap());
+    let mut tailq = Tail::new();
+    let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
+    let state = flush(h, state, &mut tailq);
+    let state = ctr_ghash_from(rk, h, template, state, src, dst, &mut tailq, 2);
+    finish(
+        h,
+        state,
+        &mut tailq,
+        aad.len() as u64,
+        dst.len() as u64,
+        mask,
+    )
+}
+
 #[inline(always)]
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn open_impl<V: Lanes>(
@@ -462,6 +562,32 @@ impl Aes128Gcm {
                 c.encrypt_in_place_detached(aes_gcm::Nonce::from_slice(nonce), aad, buf)
                     .expect("the length limits above are the crate's own refusal conditions")
                     .into()
+            }
+        }
+    }
+
+    /// Seal `src` into `dst` without a staging copy: the CTR pass reads plaintext and writes ciphertext where the caller wants it, and GHASH authenticates the bytes it just wrote. `src` and `dst` must be equal-length and must not overlap.
+    #[must_use]
+    pub fn seal_from(&self, nonce: &[u8; 12], aad: &[u8], src: &[u8], dst: &mut [u8]) -> [u8; 16] {
+        assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
+        assert!(
+            (dst.len() as u64) <= (u64::from(u32::MAX) - 1) * 16,
+            "GCM plaintext is at most 2^32 - 2 blocks"
+        );
+        assert!(
+            (aad.len() as u64) < (1u64 << 61),
+            "GCM associated data is at most 2^61 - 1 bytes"
+        );
+        match &self.inner {
+            #[cfg(target_arch = "x86_64")]
+            Inner::X86V(e) => unsafe { e.seal_from(nonce, aad, src, dst) },
+            #[cfg(target_arch = "x86_64")]
+            Inner::X86(e) => unsafe { e.seal_from(nonce, aad, src, dst) },
+            #[cfg(target_arch = "aarch64")]
+            Inner::Arm(e) => unsafe { e.seal_from(nonce, aad, src, dst) },
+            Inner::Crate(_) => {
+                dst.copy_from_slice(src);
+                self.seal_in_place(nonce, aad, dst)
             }
         }
     }
@@ -985,6 +1111,44 @@ mod tests {
         }
         if cfg!(not(miri)) {
             assert!(checked > 5_000, "the native sweep is dense, not a sample");
+        }
+    }
+
+    #[test]
+    fn sealing_from_a_source_writes_the_same_bytes_and_leaves_the_source_alone() {
+        let keys: [[u8; 16]; 2] = [
+            std::array::from_fn(|i| (i as u8).wrapping_mul(37).wrapping_add(11)),
+            std::array::from_fn(|i| (i as u8).wrapping_mul(97).wrapping_add(29)),
+        ];
+        let nonce = [0x5au8; 12];
+        let mut checked = 0usize;
+        for key in &keys {
+            let engine = Aes128Gcm::new(key);
+            for aad_len in [0usize, 16] {
+                let aad: Vec<u8> = (0..aad_len).map(|i| i as u8).collect();
+                for len in sweep_lengths() {
+                    let plain: Vec<u8> = (0..len)
+                        .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
+                        .collect();
+                    let mut in_place = plain.clone();
+                    let want = engine.seal_in_place(&nonce, &aad, &mut in_place);
+                    let mut dst = vec![0xa5u8; len];
+                    let tag = engine.seal_from(&nonce, &aad, &plain, &mut dst);
+                    assert_eq!(tag, want, "tag: aad {aad_len} len {len}");
+                    assert_eq!(dst, in_place, "ciphertext: aad {aad_len} len {len}");
+                    assert_eq!(
+                        plain,
+                        (0..len)
+                            .map(|i| (i as u8).wrapping_mul(53).wrapping_add(7))
+                            .collect::<Vec<u8>>(),
+                        "seal_from must not touch the plaintext: aad {aad_len} len {len}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        if cfg!(not(miri)) {
+            assert!(checked > 900, "the native sweep is dense, not a sample");
         }
     }
 

@@ -1,10 +1,12 @@
 # VMess AEAD
 
-VMess is the one method here that pays for a keyed handshake and then gets out of the way. The header is read once per connection and every later frame is an 8 KiB payload, a SHAKE-masked 2-byte length, and a 16-byte tag.
+VMess is the one method here that pays for a keyed handshake and then gets out of the way. The header is read once per connection and every later frame is an 8 KiB payload, a size field — a SHAKE-masked 2-byte length by default, an 18-byte sealed length under `AuthenticatedLengthExperiment` — and a 16-byte tag.
 
 A dial that was handed a name writes it inside the sealed request header as ATYP 2 with its own length, so the edge resolves it and the client's resolver is never asked.
 
-The framing this tree speaks is `OptionChunkStream | OptionChunkMasking | OptionGlobalPadding` with **no** authenticated-length option, which is the shape that costs one AEAD call per frame instead of two. That is not a simplification: a peer negotiates framing options in the clear, so a different set is visible on the wire. Xray's client default is the same three bits, so this matches.
+The default framing this tree speaks is `OptionChunkStream | OptionChunkMasking | OptionGlobalPadding`, the shape that costs one AEAD call per frame. It also carries the reference's `AuthenticatedLengthExperiment`: an account whose `experiments` string contains `AuthenticatedLength` dials with `OptionAuthenticatedLength` added, and every frame's size field becomes two plain octets plus a tag sealed under `KDF16(body_key, "auth_len")` (`proxy/vmess/encoding/server.go`), a second AEAD call per frame. The option is negotiated in the clear, so a peer sees which set it got; xray's default is the same three bits and the experiment is opt-in, which keeps the default wire bytes and cost unchanged. Padding stays on in both sets and is still drawn from the SHAKE stream, before the length, exactly where the reference draws it (`common/crypto/auth.go` `AuthenticationReader::readSize`).
+
+The client's selection is the account's `experiments` string (`proxy/vmess/outbound/outbound.go:117`); `the_client_asks_for_the_authenticated_length_experiment` checks both ciphers' flows switch to the sealed size field and that `none` refuses the experiment. `the_option_byte_has_four_named_bits` holds the four-bit combinations, including the reference's padding-without-masking refusal, and `an_authenticated_length_peer_is_read_like_any_other` drives a padded and an unpadded sealed-length stream through both `read_frame` and `Wire`, with the response size sealed from the request pair. What is **not** removed: the second AEAD per frame when the experiment is on; the default path still pays one.
 
 ## Carriers
 
@@ -25,15 +27,22 @@ The payload cipher follows the reference's `auto` negotiation rather than a fixe
 ```mermaid
 graph TD
     W["plaintext read, 128 KiB"] --> W1["16 frames of 8192 B"]
-    W1 --> W2["one buffered SHAKE draw masks<br/>every length in the batch; seal the payload in place, append the tag"]
-    W2 --> W3["one staging buffer<br/>1 copy per byte, 0 allocations"]
-    W3 --> W4["write_all, 1 syscall"]
-    W4 --> W(("wire"))
+    W1 --> W2["per frame: one buffered SHAKE draw<br/>padding first, then the mask unless the length is sealed"]
+    W2 --> W2A{"authenticated length?"}
+    W2A -->|no| W3["write the 2-byte masked length"]
+    W2A -->|yes| W2B["seal the 18-byte size field<br/>under KDF16(body_key, auth_len)"]
+    W2B --> W3
+    W3 --> W4["seal the payload into staging<br/>hardware AES/ChaCha: 0 copies<br/>crate fallback: 1 copy, 0 allocations"]
+    W4 --> W5["write_all, 1 syscall"]
+    W5 --> W(("wire"))
     R(("wire")) --> R1["fill the pump's own buffer<br/>1 read per refill"]
-    R1 --> R2["unmask the 2-byte length,<br/>open each frame in place"]
-    R2 --> R3["gather the plaintext to the front<br/>of that same buffer, 0 allocations"]
-    R3 --> R4["counter +1 per frame"]
-    R4 --> R5["write the whole batch to the target,<br/>1 syscall"]
+    R1 --> R2{"authenticated length?"}
+    R2 -->|no| R2A["unmask the 2-byte length"]
+    R2 -->|yes| R2B["open the 18-byte size field,<br/>drawing its padding first"]
+    R2A --> R3["open each frame in place, padding stripped"]
+    R2B --> R3
+    R3 --> R4["gather the plaintext to the front<br/>of that same buffer, 0 allocations"]
+    R4 --> R5["counter +1 per frame;<br/>whole batch to the target, 1 syscall"]
 ```
 
 ## Measured
@@ -67,6 +76,8 @@ graph TD
   vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time 'vmess::stage_frame'
 ./scripts/count-ops.sh report \
   vmess::tests::frames_reuse_the_callers_buffers 'vmess::read_frame'
+./scripts/count-ops.sh report \
+  vmess::tests::an_aes_batch_is_the_frames_written_one_at_a_time 'vmess::stage_frame'
 ```
 
 `UNBLESSED` for the gate, as above; the artefact's pair is the claim. On the same twelve-frame test `vmess::stage_frame` read **9 646 837 Ir** before the buffered draw (`p2-vmess-gate`), **9 637 793 Ir** after it, **9 636 923 Ir** after the in-place nonce (`p2-vmess-nonce`), and **9 629 747 Ir** after the length is written once (`p2-vmess-stage`): **−17 090 Ir / −0.177 %**, about 1 424 Ir a frame. `vmess::read_frame` moved 69 533 → 69 284 → 69 072 → **66 201 Ir** after the scratch stops zeroing: **−3 332 Ir / −4.79 %**. The wire bytes are the unchanged side: `frames_seal_to_stable_bytes`, `a_batch_on_the_wire_is_the_frames_written_one_at_a_time`, and the counter tests hold them.
@@ -114,6 +125,7 @@ The tag and the payload are both authenticated over the ciphertext, so this meth
 - **A gather for a one-frame batch.** The pump gathered every frame's plaintext to the front of its buffer, even when the batch held one frame and the opened bytes were already a contiguous slice where they lay. A one-frame batch hands that slice over at its own offset now; a second frame still gathers the pair to the front, so a full batch keeps its one contiguous write. `a_one_frame_batch_is_handed_over_where_it_opened` holds the returned base inside the pump's buffer and past its front, and `the_pump_gathers_into_its_own_buffer_and_never_moves_it` holds the multi-frame path at the front. The bytes are unchanged; the batch tests and `a_dribbled_carrier_still_offers_one_frame_and_loses_nothing` are the gate.
 - **A second copy on read.** Xray's large-chunk read path (`common/crypto/auth.go:188-203`) allocates a pooled buffer, reads into it, opens in place, and then calls `buf.MergeBytes`, which is a second copy plus a whole new `MultiBuffer` of 8 KiB buffers per chunk. The `≤ 8 KiB` path (`:137-151`) is in place and is the cheaper of the two; this tree always takes the in-place shape because its frame size is fixed at 8 KiB.
 - **A staging copy on every relayed byte, and its buffer.** The webSocket carrier wrapped the relay's writer in a `WsSink` that copied each sealed batch into a `Vec::with_capacity(READ_PLAIN + FRAMES_PER_WRITE * (TAG_LEN + 2 + 64))` — 132 384 bytes opened per flow on both sides — before `flush` handed that copy to the frame writer, so every relayed byte crossed user space twice on the way out. The batch buffer the relay already stages into is what the carrier writes now: `web-socket-staging-copies-per-batch 0` is gated by `a_sealed_batch_reaches_a_web_socket_carrier_where_it_lies`, which holds the payload's base at the staging buffer's own base (a copy puts it in another allocation) and that buffer's capacity steady across the write, and `web-socket-carrier-bytes-opened-at-most 1024` by `a_web_socket_carrier_opens_no_batch_buffer`, which holds the carrier's construction under a kilobyte where the removed buffer was 132 384. The frames are unchanged, one webSocket message per batch with the client's mask drawn per message as before: `WsWriter::write` already sends the slice it is handed, and `write_all` hands it a whole batch in one call, which is why nothing between the seal and the socket had to own the bytes. What was *not* removed: the mask copy a client pays for every message (`write_frame` masks into the frame buffer, mask bytes first), the seal copy into `staging`, and the one write per batch.
+- **The staging copy on the AEAD seal.** `seal_onto` appended every plaintext byte to `staging` and then sealed it there, so every relayed byte crossed user space twice on the way out. Both hardware ciphers now seal from the pump's plaintext straight into the staging buffer's spare capacity: `Aes128Gcm::seal_from` (`crates/ferrox-core/src/aesgcm/{mod,x86,x86v,arm}.rs`) and `chacha20_poly1305_seal_from` (`aead.rs` over the fused `xor_blocks_from` in `chacha/{mod,avx2,avx512,wide,soa,neon,sse2,portable}.rs`) read the source and write the destination in one pass, and VMess claims the staged length only after the tag is appended. `sealing_from_a_source_writes_the_same_bytes_and_leaves_the_source_alone` and `sealing_from_a_source_is_the_in_place_seal_and_leaves_the_source_alone` sweep every length against the in-place seal, and `an_aes_batch_is_the_frames_written_one_at_a_time` plus `a_batch_on_the_wire_is_the_frames_written_one_at_a_time` hold both ciphers at the frame stream. The retired-instruction side is `scripts/count-ops.sh report vmess::tests::an_aes_batch_is_the_frames_written_one_at_a_time 'vmess::stage_frame'` and `... a_batch_on_the_wire_is_the_frames_written_one_at_a_time 'vmess::stage_frame'` under CI's `ops.yml`; they are `UNBLESSED` on this page because the slice host has no valgrind. What was **not** removed: the `aes-gcm 0.10` fallback still copies into `staging` before its in-place seal, because it has no kernel to fuse with; `user-space-copies-per-byte-written 1` stays the fallback's figure.
 - **An `auto` that was never automatic.** `Cipher::Auto` used to resolve to ChaCha20-Poly1305 unconditionally, so on a machine with hardware AES this tree sealed every VMess payload with a software stream cipher while the reference pays hardware AES for the same `auto` config. The measured cost was the whole payload path: on the `vmess-raw-down-8` matrix cell ferrox ran ~0.44x of xray-core's throughput and ~2.3x its CPU per GiB, and the gap was the cipher, not the concurrency — `vless-raw-down-8`, which shares the relay model but negotiates no cipher, beats xray on the same runner. `Auto` now resolves the way `GetSecurityType` does, onto the already-gated hardware AES path.
 - **Nested HMAC construction.** The VMess KDF is an explicit HMAC-chain state machine (`vmess::Kdf`) that reuses a precomputed inner/outer pair, where Xray's `proxy/vmess/aead/kdf.go` builds a fresh `hmac.New` per path element and the handshake pays four of them. Zray made the same call for the same reason.
 - **The 512 MiB flow ceiling.** The seal counter used to stop at `u16::MAX`, which ends every flow past 65536 seals while the reference wraps its `uint16` counter and continues. The counter now wraps exactly like `GenerateChunkNonce` (`proxy/vmess/encoding/client.go:302`), so long flows keep the reference's nonces; past the wrap the nonces repeat, which is the reference's wire and is named here rather than hidden. `counter_wrap_matches_the_reference` is the gate.

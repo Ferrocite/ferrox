@@ -90,6 +90,17 @@ impl Wide16 for Z16 {
             _mm512_storeu_si512(p, _mm512_xor_si512(_mm512_loadu_si512(p), self.0));
         }
     }
+
+    #[inline]
+    fn xor_store_from(self, src: &[u8], dst: &mut [u8]) {
+        debug_assert_eq!(src.len(), 64, "a block is sixteen words");
+        debug_assert_eq!(dst.len(), 64, "a block is sixteen words");
+        unsafe {
+            let s = _mm512_loadu_si512(src.as_ptr().cast());
+            let p: *mut __m512i = dst.as_mut_ptr().cast();
+            _mm512_storeu_si512(p, _mm512_xor_si512(s, self.0));
+        }
+    }
 }
 
 /// Whole passes take the sixteen-block pass, the rest the eight-block pass and the ladder; `avx512f` and `avx2` are both required because the head is written with two `ymm` registers.
@@ -108,6 +119,28 @@ pub(crate) unsafe fn xor_blocks(
         head,
         buf,
         |k, n, ctr, head, buf| unsafe { super::avx2::xor_blocks(k, n, ctr, head, buf) },
+    )
+}
+
+#[target_feature(enable = "avx512f,avx2")]
+pub(crate) unsafe fn xor_blocks_from(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    start: u32,
+    head: Option<&mut [u8; 32]>,
+    src: &[u8],
+    dst: &mut [u8],
+) -> u32 {
+    super::wide::wide_blocks_from::<Z16>(
+        key,
+        nonce,
+        start,
+        head,
+        src,
+        dst,
+        |k, n, ctr, head, src, dst| unsafe {
+            super::avx2::xor_blocks_from(k, n, ctr, head, src, dst)
+        },
     )
 }
 
