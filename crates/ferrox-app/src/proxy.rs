@@ -23677,6 +23677,44 @@ fn trojan_take(
     true
 }
 
+/// Reads a decimal IPv4 literal exactly as `Ipv4Addr::from_str` does, without validating UTF-8 first.
+fn trojan_ipv4(bytes: &[u8]) -> Option<std::net::Ipv4Addr> {
+    let digit = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        _ => None,
+    };
+    let mut octets = [0u8; 4];
+    let mut at = 0usize;
+    for (index, octet) in octets.iter_mut().enumerate() {
+        if index > 0 {
+            if bytes.get(at) != Some(&b'.') {
+                return None;
+            }
+            at += 1;
+        }
+        let first = digit(*bytes.get(at)?)?;
+        at += 1;
+        if first == 0 && bytes.get(at).and_then(|byte| digit(*byte)).is_some() {
+            return None;
+        }
+        let mut value = u16::from(first);
+        let mut digits = 1;
+        while digits < 3 {
+            let Some(next) = bytes.get(at).and_then(|byte| digit(*byte)) else {
+                break;
+            };
+            value = value * 10 + u16::from(next);
+            at += 1;
+            digits += 1;
+        }
+        if value > 255 {
+            return None;
+        }
+        *octet = value as u8;
+    }
+    (at == bytes.len()).then_some(octets.into())
+}
+
 /// The whole header in one read, parsed in place: 2-3 reads where the field-at-a-time parse spent 7-8.
 fn decode_trojan_request(stream: &mut dyn Read, key: &[[u8; 56]]) -> Option<(u8, SocketAddr)> {
     let mut head = [0u8; TROJAN_HEAD_MAX];
@@ -23716,9 +23754,13 @@ fn decode_trojan_request(stream: &mut dyn Read, key: &[[u8; 56]]) -> Option<(u8,
             if !trojan_take(stream, &mut head, &mut filled, name_end + 4) {
                 return None;
             }
-            let host = std::str::from_utf8(&head[61..name_end]).ok()?;
+            let host = &head[61..name_end];
             let port = u16::from_be_bytes([head[name_end], head[name_end + 1]]);
-            (resolve_endpoint(host, port)?, name_end + 2)
+            let target = match trojan_ipv4(host) {
+                Some(ip) => SocketAddr::new(IpAddr::V4(ip), port),
+                None => resolve_endpoint(std::str::from_utf8(host).ok()?, port)?,
+            };
+            (target, name_end + 2)
         }
         _ => return None,
     };
@@ -30899,6 +30941,39 @@ mod tests {
                 .unwrap_or_else(|| panic!("decodes {addr:?}"));
             assert_eq!(cmd, 1, "{addr:?}");
             assert_eq!(reader.reads, reads, "{addr:?}");
+        }
+    }
+
+    #[test]
+    fn the_trojan_ipv4_reader_matches_the_standard_parser() {
+        for text in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "255.255.255.255",
+            "192.0.2.1",
+            "10.20.30.40",
+            "192.0.2.256",
+            "192.0.2.1000",
+            "192.0.2.04",
+            "0.0.0.01",
+            "192.0.2",
+            "192.0.2.1.5",
+            "192..0.2",
+            "192.0.2.",
+            ".192.0.2",
+            "",
+            " 192.0.2.1",
+            "192.0.2.1 ",
+            "192.0.2.1\n",
+            "192.0.2.a",
+            "192.0.2.-1",
+            "192.0.2.1a",
+        ] {
+            assert_eq!(
+                trojan_ipv4(text.as_bytes()),
+                text.parse::<std::net::Ipv4Addr>().ok(),
+                "{text:?}"
+            );
         }
     }
 
