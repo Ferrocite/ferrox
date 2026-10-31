@@ -2195,11 +2195,15 @@ mod tests {
             let _ = accepted_tx.send(());
         });
         let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("socket");
-        connect_bounded(&socket, &address, Duration::from_secs(5)).expect("the dial connects");
+        socket.connect(&address).expect("the dial connects");
         accepted_rx
             .recv_timeout(Duration::from_secs(10))
             .expect("the peer accepts");
-        // The peer has already left, and the kernel answers the second connect with `EISCONN` on the socket it connected: the dial calls that connected.
+        // The peer has already left. The repeated connect is the branch's own witness: it has to fail, or the dial below never reaches the recovery.
+        assert!(
+            socket.connect(&address).is_err(),
+            "a repeated connect on a connected socket fails"
+        );
         connect_bounded(&socket, &address, Duration::from_secs(5)).expect(
             "a second connect reports an error, and the socket it already had is the answer",
         );
