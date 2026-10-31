@@ -16,7 +16,7 @@ A UDP association rides every TCP carrier the outbound dials — raw, ws, httpUp
 
 REALITY is carried both roles on every TCP carrier the row names — raw, ws, httpUpgrade, gRPC, xhttp and http header — and above KCP, where the session wraps the connection. xray restricts REALITY to raw, XHTTP and gRPC, so the other carriers are a superset rather than a gap. `a_trojan_reality_inbound_answers_every_tcp_carrier` holds the six pairs, `a_trojan_reality_kcp_inbound_answers_the_session` holds the KCP pair, and an inbound that declares `security: reality` without an identity is refused by name rather than served as plaintext — `a_trojan_reality_inbound_without_identity_is_refused_not_downgraded` is the gate against a silent downgrade.
 
-Mux opens `v1.mux.cool:9527` on a raw carrier both ends, plain, under TLS, and under REALITY, carrying a TCP stream or a UDP association through one session; `a_trojan_mux_carries_a_tcp_stream_over_raw_tls_and_reality` and `a_trojan_mux_carries_a_udp_association_over_raw_and_reality` are the gates. A mux row on a non-raw carrier is dialed directly rather than refused, and the outbound says so once. The `trojan://` share link is parsed by `ferrox_core::trojan::TrojanLink`, which `check`/`run` accept beside `vless://`, and its header probe goes through the same `encode_header` the dial uses. These are capability statements, not performance ones.
+Mux opens `v1.mux.cool:9527` on every carrier xray pairs it with — raw, ws, httpUpgrade, gRPC, xhttp, http header and KCP — plain, under TLS, and under REALITY, carrying a TCP stream or a UDP association through one session; `a_trojan_mux_carries_a_tcp_stream_over_every_carrier` holds the twenty-one TCP pairs and `a_trojan_mux_carries_a_udp_association_over_raw_and_reality` holds the UDP lane, including a non-raw ws pair. A carrier xray does not pair with mux — QUIC, Hysteria — is dialed directly rather than refused, and the outbound says so once. The `trojan://` share link is parsed by `ferrox_core::trojan::TrojanLink`, which `check`/`run` accept beside `vless://`, and its header probe goes through the same `encode_header` the dial uses. These are capability statements, not performance ones.
 
 ## Data path
 
@@ -46,8 +46,8 @@ graph TD
 | udp-carriers-holding-an-association | 7 | ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier |
 | reality-tcp-carriers-holding-an-echo | 6 | ferrox-app-proxy::tests::a_trojan_reality_inbound_answers_every_tcp_carrier |
 | reality-kcp-pairs-holding-an-echo | 1 | ferrox-app-proxy::tests::a_trojan_reality_kcp_inbound_answers_the_session |
-| mux-tcp-carriers-holding-a-stream | 3 | ferrox-app-proxy::tests::a_trojan_mux_carries_a_tcp_stream_over_raw_tls_and_reality |
-| mux-udp-carriers-holding-an-association | 2 | ferrox-app-proxy::tests::a_trojan_mux_carries_a_udp_association_over_raw_and_reality |
+| mux-tcp-carriers-holding-a-stream | 21 | ferrox-app-proxy::tests::a_trojan_mux_carries_a_tcp_stream_over_every_carrier |
+| mux-udp-carriers-holding-an-association | 4 | ferrox-app-proxy::tests::a_trojan_mux_carries_a_udp_association_over_raw_and_reality |
 | header-reads-numeric-address | 2 | ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven |
 | header-reads-domain-address | 3 | ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven |
 | header-bytes-copied-out-of-the-buffer | 0 | ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven |

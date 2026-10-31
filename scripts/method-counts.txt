@@ -118,8 +118,8 @@ trojan udp-framing-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_fram
 trojan udp-carriers-holding-an-association 7 ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier
 trojan reality-tcp-carriers-holding-an-echo 6 ferrox-app-proxy::tests::a_trojan_reality_inbound_answers_every_tcp_carrier
 trojan reality-kcp-pairs-holding-an-echo 1 ferrox-app-proxy::tests::a_trojan_reality_kcp_inbound_answers_the_session
-trojan mux-tcp-carriers-holding-a-stream 3 ferrox-app-proxy::tests::a_trojan_mux_carries_a_tcp_stream_over_raw_tls_and_reality
-trojan mux-udp-carriers-holding-an-association 2 ferrox-app-proxy::tests::a_trojan_mux_carries_a_udp_association_over_raw_and_reality
+trojan mux-tcp-carriers-holding-a-stream 21 ferrox-app-proxy::tests::a_trojan_mux_carries_a_tcp_stream_over_every_carrier
+trojan mux-udp-carriers-holding-an-association 4 ferrox-app-proxy::tests::a_trojan_mux_carries_a_udp_association_over_raw_and_reality
 
 # --- XTLS Vision ------------------------------------------------------------
 xtls-vision ops-retired-instructions 26240 scripts/count-ops.sh
