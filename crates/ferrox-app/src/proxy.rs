@@ -20748,7 +20748,7 @@ pub(crate) const RELAY_BUFFER: usize = 64 * 1024;
 
 pub(crate) const RELAY_SMALL_BUFFER: usize = 16 * 1024;
 
-/// A zeroed buffer a finished relay hands back, so the next flow on this thread keeps the 64 KiB it already paid for.
+// A zeroed buffer a finished relay hands back, so the next flow on this thread keeps the 64 KiB it already paid for.
 thread_local! {
     static RELAY_SPARE: std::cell::RefCell<Vec<Vec<u8>>> = const { std::cell::RefCell::new(Vec::new()) };
 }
