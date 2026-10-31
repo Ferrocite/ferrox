@@ -317,6 +317,61 @@ fn ctr_ghash8(
 }
 
 #[inline(always)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the key schedule, both directions and the deferred tail are the pass, not a bundle"
+)]
+fn ctr_ghash8_from(
+    rk: &[uint8x16_t; 11],
+    ghash: &impl GhashTables,
+    template: uint8x16_t,
+    mut state: uint8x16_t,
+    src: &[u8],
+    dst: &mut [u8],
+    tailq: &mut super::Tail<uint8x16_t>,
+    mut ctr: u32,
+) -> uint8x16_t {
+    let (h, hp) = (ghash.h(), ghash.hp());
+    let (sblocks, _rest_bytes) = src.as_chunks::<16>();
+    let (dblocks, _rest_bytes) = dst.as_chunks_mut::<16>();
+    let (sgroups, _rest_blocks) = sblocks.as_chunks::<8>();
+    let (dgroups, _rest_blocks) = dblocks.as_chunks_mut::<8>();
+    let done = dgroups.len() * 8;
+    for (sg, dg) in sgroups.iter().zip(dgroups.iter_mut()) {
+        let mut ks = ctr8v_p(template, ctr);
+        <uint8x16_t as Lanes>::encrypt4(rk, &mut ks[0]);
+        <uint8x16_t as Lanes>::encrypt4(rk, &mut ks[1]);
+        let mut ct = load_pairs(sg);
+        for (i, pair) in ct.iter_mut().enumerate() {
+            pair.lo = <uint8x16_t as Lanes>::xor(ks[i / 2][i % 2 * 2], pair.lo);
+            pair.hi = <uint8x16_t as Lanes>::xor(ks[i / 2][i % 2 * 2 + 1], pair.hi);
+        }
+        store_pairs(dg, ct);
+        state = ghash_group8(
+            hp,
+            state,
+            [
+                bswap_p(ct[0]),
+                bswap_p(ct[1]),
+                bswap_p(ct[2]),
+                bswap_p(ct[3]),
+            ],
+        );
+        ctr += 8;
+    }
+    super::ctr_ghash_from(
+        rk,
+        h,
+        template,
+        state,
+        &src[done * 16..],
+        &mut dst[done * 16..],
+        tailq,
+        ctr,
+    )
+}
+
+#[inline(always)]
 fn ghash8(
     ghash: &impl GhashTables,
     mut state: uint8x16_t,
@@ -506,6 +561,36 @@ impl Engine {
             &mut tailq,
             aad.len() as u64,
             buf.len() as u64,
+            mask,
+        )
+    }
+
+    #[target_feature(enable = "aes,neon")]
+    pub(crate) unsafe fn seal_from(
+        &self,
+        nonce: &[u8; 12],
+        aad: &[u8],
+        src: &[u8],
+        dst: &mut [u8],
+    ) -> [u8; 16] {
+        debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
+        let template = super::counter_template::<uint8x16_t>(nonce);
+        let mask = <uint8x16_t as Lanes>::encrypt1v(&self.rk, template.ctr_add(1).ctr_swap());
+        let mut tailq = super::Tail::new();
+        let state = super::ghash(
+            &self.h,
+            <uint8x16_t as Lanes>::load(&[0u8; 16]),
+            aad,
+            &mut tailq,
+        );
+        let state = super::flush(&self.h, state, &mut tailq);
+        let state = ctr_ghash8_from(&self.rk, self, template, state, src, dst, &mut tailq, 2);
+        super::finish(
+            &self.h,
+            state,
+            &mut tailq,
+            aad.len() as u64,
+            dst.len() as u64,
             mask,
         )
     }

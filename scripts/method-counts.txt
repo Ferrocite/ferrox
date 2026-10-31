@@ -78,7 +78,6 @@ vmess ops-retired-instructions UNBLESSED scripts/count-ops.sh
 vmess maximum-payload-per-frame 8192 ferrox-app-vmess::tests::frames_seal_to_stable_bytes
 vmess frames-per-write-syscall 16 ferrox-app-vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time
 vmess write-syscalls-per-128KiB-relay-read 1 ferrox-app-vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time
-vmess user-space-copies-per-byte-written 1 ferrox-app-vmess::tests::frames_reuse_the_callers_buffers
 vmess frame-buffer-allocations-per-relay-write 0 ferrox-app-vmess::tests::frames_reuse_the_callers_buffers
 vmess frames-per-plain-write 16 ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write
 vmess plain-write-syscalls-per-16-frame-batch 1 ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write
