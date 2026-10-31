@@ -261,6 +261,8 @@ impl VlessLink {
                 TransportKind::Xhttp => Some("vless-xhttp-tls"),
                 TransportKind::Grpc => Some("vless-grpc-tls"),
                 TransportKind::HttpUpgrade => Some("vless-httpupgrade-tls"),
+                TransportKind::Quic => Some("vless-quic"),
+                TransportKind::Hysteria => Some("vless-hysteria"),
                 _ => None,
             };
             if let Some(method) = method {
