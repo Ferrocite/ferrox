@@ -6,7 +6,7 @@ A dial that was handed a name writes it inside the sealed request header as ATYP
 
 The default framing this tree speaks is `OptionChunkStream | OptionChunkMasking | OptionGlobalPadding`, the shape that costs one AEAD call per frame. It also carries the reference's `AuthenticatedLengthExperiment`: an account whose `experiments` string contains `AuthenticatedLength` dials with `OptionAuthenticatedLength` added, and every frame's size field becomes two plain octets plus a tag sealed under `KDF16(body_key, "auth_len")` (`proxy/vmess/encoding/server.go`), a second AEAD call per frame. The option is negotiated in the clear, so a peer sees which set it got; xray's default is the same three bits and the experiment is opt-in, which keeps the default wire bytes and cost unchanged. Padding stays on in both sets and is still drawn from the SHAKE stream, before the length, exactly where the reference draws it (`common/crypto/auth.go` `AuthenticationReader::readSize`).
 
-The client's selection is the account's experiment string — `experiments` in the reference's JSON, `tests_enabled` in its protobuf (`proxy/vmess/outbound/outbound.go:117`); `the_client_asks_for_the_authenticated_length_experiment` checks both ciphers' flows switch to the sealed size field and that a plain `Cipher::None` flow refuses the experiment, while `vmess_tls_outbound_parses_diallable_carriers` checks a config spelling `security: "none"` with the experiment resolves to the reference's `auto`. `the_option_byte_has_four_named_bits` holds the four-bit combinations, including the reference's padding-without-masking refusal, and `an_authenticated_length_peer_is_read_like_any_other` drives a padded and an unpadded sealed-length stream through both `read_frame` and `Wire`, with the response size sealed from the request pair. The default hot path was measured against `main` at `fe7723d6` in CI's `ops.yml` (`41216189413` baseline, `41216186185` after): `vmess::stage_frame` moved **9 232 947 → 9 262 117 Ir** (+29 170, +0.316%) and `vmess::read_frame` **66 421 → 67 207 Ir** (+786, +1.183%). The added instructions are the per-frame choice between the masked and the authenticated-length SHAKE draw — one branch on the size parser — with the default wire bytes unchanged. What is **not** removed: the second AEAD per frame when the experiment is on; the default path still pays one.
+The client's selection is the account's experiment string — `experiments` in the reference's JSON, `tests_enabled` in its protobuf (`proxy/vmess/outbound/outbound.go:117`); `the_client_asks_for_the_authenticated_length_experiment` checks both ciphers' flows switch to the sealed size field and that a plain `Cipher::None` flow refuses the experiment, while `vmess_tls_outbound_parses_diallable_carriers` checks a config spelling `security: "none"` with the experiment resolves to the reference's `auto`. `the_option_byte_has_four_named_bits` holds the four-bit combinations, including the reference's padding-without-masking refusal, and `an_authenticated_length_peer_is_read_like_any_other` drives a padded and an unpadded sealed-length stream through both `read_frame` and `Wire`, with the response size sealed from the request pair. The default hot path was measured against `main` at `fe7723d6` in CI's `ops.yml` (`41216189413` baseline, `41246668876` after): `vmess::stage_frame` moved **9 232 947 → 9 261 845 Ir** (+28 898, +0.313%) and `vmess::read_frame` **66 421 → 66 434 Ir** (+13, +0.020%). The added instructions are the per-frame choice between the masked and the authenticated-length SHAKE draw — one branch on the size parser — with the default wire bytes unchanged. What is **not** removed: the second AEAD per frame when the experiment is on; the default path still pays one.
 
 An account whose experiment string also names `NoTerminationSignal` ends its side without the zero-length marker (`proxy/vmess/inbound/inbound.go:217`, `proxy/vmess/outbound/outbound.go:180`); both roles still read a peer's marker either way. `an_account_without_the_termination_signal_ends_without_the_marker` drives the same pump with the signal kept and suppressed: the payload arrives both times and only the run that keeps the signal ends on the marker.
 
@@ -92,6 +92,17 @@ graph TD
 | throughput | 1.235 [1.216, 1.269] | better, gating |
 | cpu per GiB | 1.178 [1.169, 1.187] | better, gating |
 | peak rss | 7.122 [7.079, 7.165] | better, gating |
+
+The same cell ran at `standard` tier (3 repeats) on `main`'s `fe7723d6` (EPYC 7763, run `41246681271`) and on this head `184e3a9c` (EPYC 9V74, run `41246678961`); the runners differ, so each run's own ratio to the reference is what reads across them.
+
+| run | server | throughput | cpu per GiB | peak rss |
+| --- | --- | --- | --- | --- |
+| `fe7723d6` | ferrox | 2.649x | 1.818x | 3.082x |
+| `fe7723d6` | xray-core | 2.368x | 1.727x | 3.022x |
+| `184e3a9c` | ferrox | 2.996x | 2.000x | 2.972x |
+| `184e3a9c` | xray-core | 2.708x | 2.000x | 3.005x |
+
+With the default wire bytes unchanged, the throughput and CPU leads widened on both servers and peak RSS held near 3x.
 
 The split those two totals are made of, in ms/GiB medians:
 
