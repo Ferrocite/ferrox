@@ -36362,7 +36362,11 @@ mod tests {
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
         assert_eq!(&read_echo(&mut sock), b"ping", "the store's session relays");
-        let snapshot = crate::stats::snapshot();
+        let snapshot = counted(|now| {
+            now.inbound
+                .get("xdrive-in")
+                .is_some_and(|row| row.uplink > 0 && row.downlink > 0)
+        });
         let inbound = &snapshot.inbound["xdrive-in"];
         assert!(
             inbound.uplink > 0,
@@ -36437,7 +36441,15 @@ mod tests {
             .expect("timeout");
         sock.write_all(b"ping").expect("writes");
         assert_eq!(&read_echo(&mut sock), b"ping", "the store's session relays");
-        let snapshot = crate::stats::snapshot();
+        let snapshot = counted(|now| {
+            now.inbound
+                .get("xdrive-in")
+                .is_some_and(|row| row.uplink > 0 && row.downlink > 0)
+                && now
+                    .user
+                    .get("xdrive@example")
+                    .is_some_and(|row| row.uplink > 0 && row.downlink > 0)
+        });
         let inbound = &snapshot.inbound["xdrive-in"];
         assert!(
             inbound.uplink > 0,
@@ -42464,7 +42476,15 @@ mod tests {
             b"ping",
         );
         assert_eq!(&back, b"ping");
-        let snapshot = crate::stats::snapshot();
+        let snapshot = counted(|now| {
+            now.inbound
+                .get("quic-in")
+                .is_some_and(|row| row.uplink > 0 && row.downlink > 0)
+                && now
+                    .user
+                    .get("quic@example")
+                    .is_some_and(|row| row.uplink > 0 && row.downlink > 0)
+        });
         let inbound = snapshot.inbound.get("quic-in").expect("the inbound counts");
         assert!(
             inbound.uplink > 0 && inbound.downlink > 0,
@@ -44773,7 +44793,15 @@ mod tests {
             at += n;
         }
         assert_eq!(&back, b"ping");
-        let snapshot = crate::stats::snapshot();
+        let snapshot = counted(|now| {
+            now.inbound
+                .get("kcp-in")
+                .is_some_and(|row| row.downlink > before_inbound.downlink)
+                && now
+                    .user
+                    .get("kcp@example")
+                    .is_some_and(|row| row.downlink > before_user.downlink)
+        });
         let inbound = &snapshot.inbound["kcp-in"];
         assert!(
             inbound.uplink > before_inbound.uplink,
@@ -45579,7 +45607,15 @@ mod tests {
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
-        let snapshot = crate::stats::snapshot();
+        let snapshot = counted(|now| {
+            now.inbound
+                .get("hysteria-in")
+                .is_some_and(|row| row.uplink > 0 && row.downlink > 0)
+                && now
+                    .user
+                    .get("hysteria@example")
+                    .is_some_and(|row| row.uplink > 0 && row.downlink > 0)
+        });
         let inbound = &snapshot.inbound["hysteria-in"];
         assert!(
             inbound.uplink > 0,
@@ -46805,6 +46841,19 @@ mod tests {
             }
         });
         port
+    }
+
+    /// A reply reaches the client's socket before the relay's counter for it moves, so a loaded machine reads the registry first: wait for the count the assertion is about.
+    fn counted(ready: impl Fn(&crate::stats::Snapshot) -> bool) -> crate::stats::Snapshot {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = crate::stats::snapshot();
+            if ready(&snapshot) {
+                return snapshot;
+            }
+            assert!(Instant::now() < deadline, "the counters move for the flow");
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     fn delayed_echo_loop(delay: Duration) -> u16 {
