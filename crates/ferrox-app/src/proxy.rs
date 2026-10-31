@@ -21309,9 +21309,16 @@ impl RelayBuf {
 
     /// The same shape at a caller-chosen read window, for a staging buffer whose headroom and tailroom must sit outside the window rather than shrink it.
     #[must_use]
+    #[allow(
+        clippy::uninit_vec,
+        reason = "the length is handed straight to `read`, and only the prefix it reports is ever read back"
+    )]
     pub fn with_len(len: usize) -> Self {
+        let mut bytes = Vec::with_capacity(len);
+        // SAFETY: only the prefix a read reports is ever read back, so the uninitialised tail is unreachable.
+        unsafe { bytes.set_len(len) };
         Self {
-            bytes: vec![0; len],
+            bytes,
             moved: 0,
             promote_to: RELAY_BUFFER,
         }
@@ -21338,12 +21345,18 @@ impl RelayBuf {
 
     /// A read that filled the window promotes at once, and a leg whose reads are all short promotes once it has moved a whole window: `recv` returns what is queued rather than what was asked, so a busy leg would otherwise stay at 16 KiB for the life of the flow.
     #[must_use]
+    #[allow(
+        clippy::uninit_vec,
+        reason = "the room a promotion adds lies past the bytes the read reported, and the next read starts at index 0"
+    )]
     pub fn filled(&mut self, n: usize) -> &[u8] {
         self.moved = self.moved.saturating_add(n);
         if self.bytes.len() < self.promote_to
             && (n == self.bytes.len() || self.moved >= self.promote_to)
         {
-            self.bytes.resize(self.promote_to, 0);
+            self.bytes.reserve(self.promote_to - self.bytes.len());
+            // SAFETY: added room sits past the prefix and the next read overwrites it from index 0.
+            unsafe { self.bytes.set_len(self.promote_to) };
         }
         &self.bytes[..n]
     }
@@ -31112,6 +31125,21 @@ mod tests {
                 "a read did not realloc the window"
             );
         }
+    }
+
+    /// A read window is handed to `read` uninitialised: the window and its promotion pay no zeroing pass, and the gate is the allocator's own zeroed-allocation count rather than a timing.
+    #[test]
+    fn a_relay_window_is_not_zeroed_before_a_read() {
+        let (_, counts) =
+            ferrox_core::alloc_count::measure(|| RelayBuf::with_len(RELAY_SMALL_BUFFER));
+        assert_eq!(counts.zeroed, 0, "the initial window is zeroed: {counts:?}");
+
+        let mut buffer = RelayBuf::new();
+        let (_, counts) = ferrox_core::alloc_count::measure(|| {
+            buffer.filled(RELAY_SMALL_BUFFER);
+        });
+        assert_eq!(counts.zeroed, 0, "the promotion is zeroed: {counts:?}");
+        assert_eq!(buffer.size(), RELAY_BUFFER, "the promotion kept its window");
     }
 
     #[test]
