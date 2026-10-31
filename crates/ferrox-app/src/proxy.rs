@@ -40662,9 +40662,12 @@ mod tests {
             r#"{"protocol": "shadowsocks", "settings": {"password": "pw", "method": "aes-256-gcm", "network": ["unix"]}}"#,
         )
         .expect("parses");
-        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let port = probe.local_addr().expect("addr").port();
-        drop(probe);
+        let port = (18888..18900)
+            .find(|port| {
+                std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok()
+                    && UdpSocket::bind(("127.0.0.1", *port)).is_ok()
+            })
+            .expect("a free registered port");
         let address = format!("127.0.0.1:{port}");
         serve_shadowsocks_inbound(&address, &inbound, true);
         thread::sleep(Duration::from_millis(50));
