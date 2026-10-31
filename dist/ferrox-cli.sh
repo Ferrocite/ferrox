@@ -4,7 +4,7 @@
 #   ferrox-cli login                           save the foxy account once (0600)
 #   ferrox-cli up --foxy --vpn                 the Foxy lane, whole-device proxy
 #   ferrox-cli up --veepn --vpn                the VeePN lane, no account needed
-#   ferrox-cli up --psiphon --vpn              the Psiphon lane, its own client
+#   ferrox-cli up --psiphon --vpn              the Psiphon lane, native OSSH/SSH
 #   ferrox-cli up --vless 'vless://...'        any vless share link
 #   ferrox-cli up --config mine.json           any config the binary serves
 #   ferrox-cli down | status | ports | tun | version
@@ -148,6 +148,7 @@ PSIPHON_SHARE=0
 PSIPHON_SERVER_LISTS=""
 PSIPHON_OSL=""
 PSIPHON_ENTRY_KEY=""
+PSIPHON_LIST_KEY=""
 PSIPHON_EXCHANGE_KEY=""
 PROBE_TIMEOUT=20
 FRONTS="socks,http,mixed"
@@ -229,7 +230,7 @@ so no password is asked again and FxA sends no new-sign-in mail.
 
 and from the same fresh package, with nothing to type in at all:
   ferrox-cli up --veepn --vpn                   # anonymous, no account, no server
-  ferrox-cli up --psiphon --vpn                 # the Psiphon client, kept beside the binary
+  ferrox-cli up --psiphon --vpn                 # native OSSH/SSH, no client binary
 
 several lanes at once
   ferrox-cli up --foxy --instance work --country DE
@@ -245,7 +246,7 @@ several lanes at once
 outbound (choose one)
   --foxy                 Foxy lane; account from \$FOXY_CREDENTIALS
   --veepn                VeePN lane; anonymous, no account and no server
-  --psiphon              Psiphon lane; dials through its own psiphon-tunnel-core
+  --psiphon              Psiphon lane; native OSSH/SSH, no client binary
   --vless LINK           a vless:// share link (tcp, ws, grpc, httpupgrade, xhttp)
   --vmess HOST:PORT --uuid ID
   --trojan HOST:PORT --password PW
@@ -279,59 +280,30 @@ locations
   catalogue cannot be reached.  --ping adds a TCP-handshake latency per edge,
   sorts the exits fastest first, and marks an edge that did not answer.
 
-psiphon options (the client's own binary, its own tunnel, and the lane's local SOCKS)
-  --psiphon-bin FILE     the psiphon-tunnel-core client, else \$AETHER_PSIPHON_BIN,
-                         else the executable's pt folder, then PATH
-  --psiphon-region CC    two-letter egress region, else the client decides
-  --psiphon-mode NAME    auto|cdn|conduit|direct, default auto (direct keeps every
-                         TCP shape; cdn asks only fronted shapes; conduit asks for
-                         the in-proxy WebRTC relays; a carried lane drops QUIC)
-  --psiphon-listen ADDR  the client's local SOCKS address, default 127.0.0.1:1821
-  --psiphon-http ADDR    the client's local HTTP proxy, or off; default off
-  --psiphon-dir DIR      the client's data root, default \$CONF_DIR/psiphon
+psiphon options (native OSSH/SSH transport and the lane's local SOCKS)
+  --psiphon-region CC    two-letter egress region, else any server
+  --psiphon-listen ADDR  the lane's local SOCKS address, default 127.0.0.1:1821
+  --psiphon-dir DIR      the lane's state, default \$CONF_DIR/psiphon
   --psiphon-ready SECS   how long a tunnel may take, default 180
-  --psiphon-base FILE    a client config the lane starts from, comments allowed
-  --psiphon-entries FILE a server-entry list handed to the client at startup
-  --psiphon-split        split-tunnel destinations in the client's own region
-  --psiphon-split-region LIST  split-tunnel these country codes (comma separated)
+  --psiphon-entries FILE a server-entry list read at startup
   --psiphon-user USER    the local proxy's username (with --psiphon-pass)
   --psiphon-pass PASS    the local proxy's password
-  --psiphon-pool N       tunnels to keep in parallel
-  --psiphon-workers N    connection attempts to keep in parallel
-  --psiphon-aggressive   try every server/protocol pair in one round (the default)
-  --psiphon-no-aggressive  do not try every server/protocol pair in one round
-  --psiphon-conduit-mode NAME  auto|shirokhorshid|public, default auto (auto retries
-                         the public network when the personal compartment is late)
-  --psiphon-conduit-timeout SECS  how long the personal conduit gets before a
-                         public retry, default 180
   --psiphon-share        listen on every interface so the proxy can be shared
-  --psiphon-server-list LIST  remote server-list URLs (comma separated)
-  --psiphon-osl LIST     obfuscated server-list root URLs (comma separated)
-  --psiphon-entry-key KEY  server-entry signature public key
-  --psiphon-exchange-key KEY  exchange obfuscation key
-  --psiphon-feature LIST client features to report (comma separated)
-  --psiphon-latency N    network timeout multiplier, at least 1
-  --psiphon-disable-timeouts  ask the client for a 0.1 latency lambda
-  --psiphon-cdn-profile NAME  shirokhorshid|legacy|android|off built-in CDN edges and SNI
-  --psiphon-cdn-ip LIST  CDN edge IPs the client scans (comma separated)
-  --psiphon-cdn-sni LIST CDN edge SNI names the client scans (comma separated)
-  --psiphon-cdn-set LIST built-in CDN edge sets to keep (comma separated)
-  --psiphon-unsafe-alerts  ask the client for unsafe-traffic alerts
-  --psiphon-location-precision N  report coarse location when N is above zero
   --psiphon-share-port PORT  the shared SOCKS port on every interface
-  --psiphon-share-http PORT  the shared HTTP proxy port on every interface
-  --psiphon-geoip FILE   MaxMind country database for in-proxy country checks
-  --psiphon-reject-censored   reject in-proxy relays in IR, CN, RU, BY, TM, KP
-  --psiphon-reject-country LIST  reject these in-proxy country codes
-  --psiphon-compartment ID  pin the in-proxy client to one personal compartment
-  --psiphon-dns LIST     alternate DNS resolvers for the client (comma separated)
-  --psiphon-device-location HASH  geohash reported to the client
-  --psiphon-device-region CC  two-letter device region reported to the client
-  --psiphon-network-id ID  network identifier reported to the client
-  --psiphon-additional-params B64  base64 AdditionalParameters for the client
-  --psiphon-establish-timeout SECS  give up if no tunnel is up in SECS
-  --psiphon-emit-bytes   emit the client's byte-transfer notices
-  --upstream URL         an http:// or socks5(h):// hop the client reaches its edge through
+  --psiphon-server-list LIST  remote server-list URLs (comma separated)
+  --psiphon-list-key KEY  the signed list's RSA publisher key
+  --upstream URL         accepted for compatibility; this lane dials its SSH
+                         servers directly and names the field as ignored
+  The client-tuning flags from earlier releases (--psiphon-bin, --psiphon-mode,
+  --psiphon-http, --psiphon-base, --psiphon-pool, --psiphon-workers,
+  --psiphon-aggressive, --psiphon-no-aggressive, --psiphon-conduit-*,
+  --psiphon-split*, --psiphon-osl, --psiphon-entry-key, --psiphon-exchange-key,
+  --psiphon-feature, --psiphon-latency, --psiphon-disable-timeouts, --psiphon-cdn-*,
+  --psiphon-unsafe-alerts, --psiphon-location-precision, --psiphon-share-http,
+  --psiphon-geoip, --psiphon-reject-*, --psiphon-compartment, --psiphon-dns,
+  --psiphon-device-*, --psiphon-network-id, --psiphon-additional-params,
+  --psiphon-establish-timeout, --psiphon-emit-bytes) are still parsed for script
+  compatibility; the native engine names each one as ignored in one line.
 
 veepn options (nothing is required: the plane names the region and its edges)
   --region CC            exit region id (lowercase, e.g. nl, us-va), else the plane picks
@@ -869,8 +841,8 @@ print(json.dumps({"protocol": "veepn", "settings": settings}))
 PY
 }
 
-# The Psiphon outbound: the client's own binary, its state, and only the fields
-# that were asked for; the lane reads its local SOCKS port from the client's notices.
+# The Psiphon outbound: the native transport, its state, and only the fields
+# that were asked for; unsupported client fields are named as ignored by the lane.
 psiphon_outbound() {
   local state="${PSIPHON_DIR:-${AETHER_PSIPHON_DIR:-$CONF_DIR/psiphon${INSTANCE:+-$INSTANCE}}}"
   python3 - "$PSIPHON_BIN" "$state" "$PSIPHON_LISTEN" "$PSIPHON_HTTP" "$PSIPHON_REGION" \
@@ -883,6 +855,7 @@ psiphon_outbound() {
     "$PSIPHON_NETWORK_ID" "$PSIPHON_ADDITIONAL_PARAMS" "$PSIPHON_ESTABLISH_TIMEOUT" \
     "$PSIPHON_EMIT_BYTES" "$PSIPHON_CONDUIT_MODE" "$PSIPHON_CONDUIT_TIMEOUT" \
     "$PSIPHON_SHARE" "$PSIPHON_SERVER_LISTS" "$PSIPHON_OSL" "$PSIPHON_ENTRY_KEY" \
+    "$PSIPHON_LIST_KEY" \
     "$PSIPHON_EXCHANGE_KEY" "$PSIPHON_CDN_IPS" "$PSIPHON_CDN_SNI" "$PSIPHON_CDN_SETS" \
     "$PSIPHON_UNSAFE_ALERTS" "$PSIPHON_LOCATION_PRECISION" "$PSIPHON_SHARE_PORT" \
     "$PSIPHON_SHARE_HTTP" <<'PY'
@@ -993,6 +966,8 @@ for key, value in (
         settings[key] = listed
 if entry_key:
     settings["serverEntrySignaturePublicKey"] = entry_key
+if list_key:
+    settings["serverListSignaturePublicKey"] = list_key
 if exchange_key:
     settings["exchangeObfuscationKey"] = exchange_key
 print(json.dumps({"protocol": "psiphon", "settings": settings}))
@@ -1870,7 +1845,7 @@ build_config() {
 ferrox-cli: no outbound chosen; nothing was started.
   --foxy                 account only, no server to name (asks once)
   --veepn                anonymous: no account and no server
-  --psiphon              its own psiphon-tunnel-core, kept beside the binary
+  --psiphon              native OSSH/SSH, no client binary
   --vless 'vless://...'  a share link
   --vmess HOST:PORT --uuid ID
   --trojan HOST:PORT --password PW
@@ -2071,22 +2046,25 @@ diagnose() {
     say "so the front refused the request before any carrier was tried."
     return 0
   fi
-  # The Psiphon lane owns its client: its refusals are about the binary, its
-  # config, or the wait for a tunnel, and its own lines already name which.
+  # The Psiphon lane owns its transport: its refusals are about the signed list,
+  # a server entry, or the SSH dial, and its own lines already name which.
   if [ "$OUTBOUND" = psiphon ]; then
-    if grep -q "needs the psiphon-tunnel-core" "$LOG"; then
-      say "diagnosis: the client binary was not found. Keep the release archive's pt"
-      say "folder beside ferrox-app, or name one with --psiphon-bin FILE."
-    elif grep -q "did not come up in" "$LOG"; then
-      say "diagnosis: the client started but no tunnel opened in time. That is this"
-      say "network reaching the Psiphon servers, not the account: try --psiphon-mode"
-      say "direct, another --psiphon-region, or --upstream through a proxy that works."
-    elif grep -qE "would not start|config .* could not|could not be saved" "$LOG"; then
-      say "diagnosis: the client or its config was refused before a tunnel was tried;"
-      say "the lines above name the path and the reason."
+    if grep -qE "signature|key digest|server list key|server list .*HTTP" "$LOG"; then
+      say "diagnosis: the signed server list was refused. Check the network path to"
+      say "--psiphon-server-list, and the publisher key behind --psiphon-list-key."
+    elif grep -qE "no usable server entries|server list holds no SSH entries" "$LOG"; then
+      say "diagnosis: the list yielded no SSH entry. Name a list with --psiphon-entries"
+      say "or --psiphon-server-list; the lines above name the fetch or parse failure."
+    elif grep -qE "no server accepted the tunnel|was not reachable" "$LOG"; then
+      say "diagnosis: entries were found but no SSH server answered. That is this"
+      say "network reaching the Psiphon servers: try another --psiphon-region or a"
+      say "server-entry list from a network where the lane already works."
+    elif grep -qE "listen|is not an address" "$LOG"; then
+      say "diagnosis: the local SOCKS address was refused; --psiphon-listen names the"
+      say "address and port the lane binds."
     else
-      say "diagnosis: the client answered no tunnel this lane can dial; the lines"
-      say "above are its own notices."
+      say "diagnosis: the lane opened no tunnel this flow can use; the lines above"
+      say "are its own notices."
     fi
     return 0
   fi
@@ -2448,6 +2426,7 @@ while [ $# -gt 0 ]; do
     --psiphon-server-list) need_value --psiphon-server-list "server-list URLs" "$#" "${2:-}"; PSIPHON_SERVER_LISTS="$2"; shift 2 ;;
     --psiphon-osl) need_value --psiphon-osl "obfuscated server-list root URLs" "$#" "${2:-}"; PSIPHON_OSL="$2"; shift 2 ;;
     --psiphon-entry-key) need_value --psiphon-entry-key "a server-entry public key" "$#" "${2:-}"; PSIPHON_ENTRY_KEY="$2"; shift 2 ;;
+    --psiphon-list-key) need_value --psiphon-list-key "a list publisher key" "$#" "${2:-}"; PSIPHON_LIST_KEY="$2"; shift 2 ;;
     --psiphon-exchange-key) need_value --psiphon-exchange-key "an exchange obfuscation key" "$#" "${2:-}"; PSIPHON_EXCHANGE_KEY="$2"; shift 2 ;;
     --psiphon-feature) need_value --psiphon-feature "client features" "$#" "${2:-}"; PSIPHON_FEATURES="$2"; shift 2 ;;
     --psiphon-latency) need_value --psiphon-latency "a multiplier of at least 1" "$#" "${2:-}"; PSIPHON_LATENCY="$2"; shift 2 ;;
@@ -2577,12 +2556,12 @@ esac
 # A VeePN flow pays a launch and a list before bytes move, so its first probe
 # waits longer than a lane that configures the server it dials.
 [ "$OUTBOUND" = veepn ] && PROBE_TIMEOUT=45
-# Psiphon downloads a server list and opens a tunnel before its local SOCKS answers;
-# a conduit may spend one timeout on the personal compartment and another on public.
+# Psiphon downloads a signed server list and completes an SSH handshake before its
+# local SOCKS answers, so its first probe waits longer than a configured lane.
 if [ "$OUTBOUND" = psiphon ]; then
   PROBE_TIMEOUT=200
-  if [ "$PSIPHON_SHAPE" = conduit ] && [ -n "$PSIPHON_COMPARTMENT" ] && [ "$PSIPHON_CONDUIT_MODE" != public ]; then
-    PROBE_TIMEOUT=600
+  if [ -n "$PSIPHON_READY" ] && [ "$PSIPHON_READY" -gt 180 ]; then
+    PROBE_TIMEOUT=$((PSIPHON_READY + 20))
   fi
 fi
 

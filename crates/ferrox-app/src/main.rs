@@ -47,6 +47,7 @@ mod policy;
 mod process;
 mod proxy;
 mod psiphon;
+mod psiphon_ssh;
 mod quic;
 mod reverse;
 mod router;

@@ -1,15 +1,24 @@
-name: Psiphon Windows engine (live comparison)
+name: Psiphon Windows lane (live tunnel check)
 
-# Compares the pinned console client with the console engine Psiphon-Windows ships,
-# on the same Windows runner, through the same ferrox lane and the same 1 MB legs.
-# The Windows GUI has no headless mode, so this reads its bundled engine rather
-# than its UI. Nothing from the GPLv3 repository is committed; the workflow fetches
-# the pin at run time and uploads only its own timings.
+# Proves the native `psiphon` lane on Windows and measures it beside the engine
+# the working Windows client ships: `ferrox-app` starts with a socks and a mixed
+# front, waits for a front to carry a trace through the lane's first tunnel, then
+# carries an exact 1 MB file through each front and through the lane's own HTTP
+# edge. The pinned `psiphon-tunnel-core.exe` from Psiphon-Inc/psiphon-windows then
+# runs on the same ports, pinned to the server and SSH/OSSH protocol the native
+# lane selected, so a ratio is not a difference between two carriers. The runner's
+# own egress is
+# the control; the byte count is the gate. No Psiphon GUI is fetched or started,
+# and the engine is checked against the blob hash the pin names.
+#
+# The engine leg is a measurement, not a gate: its carrier set and its tactics
+# are external, and a refusal there is a line in the summary rather than a red
+# lane. The native legs are the gate.
 on:
   workflow_dispatch:
     inputs:
       region:
-        description: two-letter egress region; blank lets the client choose
+        description: two-letter egress region; blank lets each lane choose
         required: false
         default: ""
 
@@ -24,81 +33,160 @@ env:
   NO_PROXY: 127.0.0.1,localhost
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
+  PSIPHON_WINDOWS_REV: d3319c4172bb3a172c02fda75951d8612f4a7977
+  PSIPHON_WINDOWS_BLOB: bf7dd62065f6ea3a353f238f1135ef779a7d862a
 
 jobs:
-  lane:
-    name: Psiphon lane (${{ matrix.engine }} engine)
+  psiphon-windows:
+    name: Psiphon lane (native vs shipped engine, 1 MB)
     runs-on: windows-latest
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        engine: [pinned, windows]
+    timeout-minutes: 45
     defaults:
       run:
         shell: bash
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-go@v5
-        if: matrix.engine == 'pinned'
+      - uses: actions/setup-python@v5
         with:
-          go-version: "1.26.0"
+          python-version: "3.12"
       - uses: Swatinem/rust-cache@v2
         with:
-          key: psiphon-windows-${{ matrix.engine }}
-      - uses: actions/cache@v4
-        if: matrix.engine == 'pinned'
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: psiphon-go-${{ runner.os }}-${{ hashFiles('upstream/pins.toml') }}
-      - name: Fetch the pinned Psiphon source
-        run: |
-          if [ "${{ matrix.engine }}" = pinned ]; then
-            ./scripts/fetch-upstream.sh --only psiphon-tunnel-core
-          else
-            ./scripts/fetch-upstream.sh --only psiphon-windows
-          fi
-      - name: Build or locate the engine
-        run: |
-          if [ "${{ matrix.engine }}" = pinned ]; then
-            mkdir -p target/psiphon
-            CLIENT="$GITHUB_WORKSPACE/target/psiphon/psiphon-tunnel-core.exe"
-            (
-              cd upstream/psiphon-tunnel-core
-              if [ -d vendor ]; then export GOFLAGS=-mod=vendor; else export GOFLAGS=-mod=mod; fi
-              CGO_ENABLED=0 go build -trimpath -ldflags "-s -w" -o "$CLIENT" ./ConsoleClient
-            )
-          else
-            CLIENT="$GITHUB_WORKSPACE/upstream/psiphon-windows/src/3rdParty/psiphon-tunnel-core.exe"
-          fi
-          test -s "$CLIENT"
-          echo "CLIENT=$CLIENT" >> "$GITHUB_ENV"
-          ls -l "$CLIENT"
+          key: psiphon-windows
       - name: Build ferrox-app
-        run: cargo build --locked -p ferrox-app
-      - name: Carry a megabyte through the lane
+        run: cargo build --locked --release -p ferrox-app
+      # The pin names a rev and a blob hash; the hash is the file's git blob id,
+      # so `git hash-object` checks exactly the bytes the pin points at.
+      - name: Fetch the shipped engine
+        run: |
+          curl -fsSL --retry 3 -o psiphon-tunnel-core.exe \
+            "https://raw.githubusercontent.com/Psiphon-Inc/psiphon-windows/$PSIPHON_WINDOWS_REV/src/3rdParty/psiphon-tunnel-core.exe"
+          test -s psiphon-tunnel-core.exe
+          got=$(git hash-object psiphon-tunnel-core.exe)
+          if [ "$got" != "$PSIPHON_WINDOWS_BLOB" ]; then
+            echo "::error::the engine's blob hash is $got, the pin names $PSIPHON_WINDOWS_BLOB"
+            exit 1
+          fi
+          echo "engine blob $got matches the pin"
+      - name: Egress control - 1 MB with no lane
+        run: |
+          : > psiphon-legs.tsv
+          : > control.bin
+          code=0
+          timing=$(curl -sS --noproxy '*' --max-time 300 \
+            -w '%{size_download} %{time_total} %{speed_download}' \
+            'https://speed.cloudflare.com/__down?bytes=1000000' -o control.bin) || code=$?
+          echo "control, no lane ${timing:-0 0 0}" >> psiphon-legs.tsv
+          got=$(wc -c < control.bin 2>/dev/null | tr -d ' ')
+          echo "egress control: curl exit $code, ${got:-0} bytes of 1000000"
+          if test "$code" = 0 && test "${got:-0}" = 1000000; then
+            echo "egress control carried the whole megabyte"
+          else
+            echo "::warning::this runner cannot itself download 1 MB (curl exit $code, ${got:-0} bytes)"
+          fi
+      - name: Carry a megabyte through both implementations
         env:
-          ENGINE: ${{ matrix.engine }}
           PSIPHON_REGION: ${{ inputs.region }}
         run: |
-          set -euo pipefail
-          BIN=target/debug/ferrox-app.exe
+          BIN=target/release/ferrox-app.exe
           test -s "$BIN"
-          STATE="$RUNNER_TEMP/psiphon-state-$ENGINE"
-          mkdir -p "$STATE"
-          : > psiphon-legs.tsv
+          : > psiphon-windows.log
+          : > psiphon-reference.log
           : > psiphon-metrics.tsv
-          CLIENT="$CLIENT" STATE="$STATE" python3 - <<'PY'
+          LANE_PID=""
+          stop_lane() {
+            if [ -n "$LANE_PID" ]; then
+              kill -TERM "$LANE_PID" 2>/dev/null || true
+              tries=0
+              while [ "$tries" -lt 20 ] && kill -0 "$LANE_PID" 2>/dev/null; do
+                sleep 0.5
+                tries=$((tries + 1))
+              done
+              kill -KILL "$LANE_PID" 2>/dev/null || true
+            fi
+            LANE_PID=""
+          }
+          trap stop_lane EXIT
+          # An MSYS pid is not a Windows pid, so a pid is converted once; the two
+          # spaces are allocated independently, so a native pid is never converted back.
+          winpid() {
+            local native
+            native=$(cat "/proc/$1/winpid" 2>/dev/null) && [ -n "$native" ] || native="$1"
+            printf '%s' "$native"
+          }
+          # TotalProcessorTime covers every thread, which is what a lane's CPU is;
+          # the cumulative figure is differenced around the legs in the summary.
+          sample_native() {
+            local label="$1" native="$2" line rss cpu
+            [ -n "$native" ] || return 0
+            line=$(powershell.exe -NoProfile -Command "\$p = Get-Process -Id $native -ErrorAction Stop; '{0} {1}' -f [math]::Floor(\$p.WorkingSet64/1024), \$p.TotalProcessorTime.TotalSeconds" 2>/dev/null | tr -d '\r' | xargs) || return 0
+            read -r rss cpu <<< "$line"
+            [ -n "$rss" ] || return 0
+            printf '%s\t%s\t%s\n' "$label" "$rss" "$cpu" >> psiphon-metrics.tsv
+          }
+          via() {
+            local front="$1" port="$2"
+            shift 2
+            if [ "$front" = mixed ] || [ "$front" = http ]; then
+              curl -sS "$@" -x "http://127.0.0.1:$port"
+            else
+              curl -sS "$@" --socks5-hostname "127.0.0.1:$port"
+            fi
+          }
+          wait_front() {
+            local front="$1" port="$2" limit="${3:-360}"
+            local stop_at=$((SECONDS + limit))
+            while ((SECONDS < stop_at)); do
+              if lane_exited; then
+                lane_report
+                return 1
+              fi
+              if via "$front" "$port" --max-time 30 https://www.cloudflare.com/cdn-cgi/trace -o trace.txt 2>/dev/null && grep -q '^loc=' trace.txt; then
+                return 0
+              fi
+              sleep 2
+            done
+            lane_report
+            return 1
+          }
+          trace_front() {
+            local front="$1" port="$2" label="$3" code=0 timing
+            : > trace.txt
+            timing=$(via "$front" "$port" --max-time 120 \
+              -w '%{size_download} %{time_total} %{speed_download}' \
+              https://www.cloudflare.com/cdn-cgi/trace -o trace.txt) || code=$?
+            echo "$label trace ${timing:-0 0 0}" >> psiphon-legs.tsv
+            if test "$code" = 0 && grep -q '^loc=' trace.txt; then
+              grep -E '^(loc|ip)=' trace.txt || true
+              return 0
+            fi
+            echo "$label trace FAILED: curl exit $code" >&2
+            return 1
+          }
+          fetch_mb() {
+            local front="$1" port="$2" file="$3" label="$4" code=0 timing got
+            timing=$(via "$front" "$port" --max-time 300 \
+              -w '%{size_download} %{time_total} %{speed_download}' \
+              'https://speed.cloudflare.com/__down?bytes=1000000' -o "$file") || code=$?
+            echo "$label ${timing:-0 0 0}" >> psiphon-legs.tsv
+            got=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
+            got="${got:-0}"
+            if test "$code" = 0 && test "$got" = 1000000; then
+              echo "$label: 1000000 B"
+              return 0
+            fi
+            echo "$label FAILED: curl exit $code after $got of 1000000 B" >&2
+            return 1
+          }
+          # The two signature values are read out of the lane's own source, so the
+          # shipped engine verifies the same list with the same key this tree pins.
+          PSIPHON_REGION="$PSIPHON_REGION" STATE="$RUNNER_TEMP/psiphon-state" python - <<'PY'
           import json, os
           settings = {
-              "binary": os.environ["CLIENT"],
               "listen": "127.0.0.1:1821",
               "dataRootDirectory": os.environ["STATE"],
               "readySeconds": 300,
-              "shape": "auto",
+              "LocalHttpProxyPort": 10819,
           }
           if os.environ.get("PSIPHON_REGION"):
               settings["region"] = os.environ["PSIPHON_REGION"]
@@ -112,158 +200,276 @@ jobs:
           with open("psiphon-windows.json", "w") as handle:
               json.dump(document, handle)
           PY
-          "$BIN" run -c psiphon-windows.json > "psiphon-windows-$ENGINE.log" 2>&1 &
+          PSIPHON_REGION="$PSIPHON_REGION" STATE="$RUNNER_TEMP/psiphon-reference-state" python - <<'PY'
+          import base64, json, os, re
+          source = open("crates/ferrox-core/src/psiphon.rs").read()
+          url = re.search(r'SERVER_LIST_URL: &str =\s*"([^"]+)"', source).group(1)
+          block = re.search(r'SERVER_LIST_SIGNATURE_KEY: &str = concat!\((.*?)\);', source, re.S).group(1)
+          key = "".join(re.findall(r'"([^"]*)"', block))
+          config = {
+              "PropagationChannelId": "FFFFFFFFFFFFFFFF",
+              "SponsorId": "FFFFFFFFFFFFFFFF",
+              "ClientPlatform": "Windows",
+              "ClientVersion": "1",
+              "DataRootDirectory": os.environ["STATE"],
+              "LocalSocksProxyPort": 10808,
+              "LocalHttpProxyPort": 10809,
+              "RemoteServerListUrl": url,
+              "RemoteServerListURLs": [{"URL": base64.b64encode(url.encode()).decode()}],
+              "RemoteServerListSignaturePublicKey": key,
+              "EmitDiagnosticNotices": False,
+              "EmitBytesTransferred": False,
+          }
+          if os.environ.get("PSIPHON_REGION"):
+              config["EgressRegion"] = os.environ["PSIPHON_REGION"].upper()
+          with open("psiphon-reference.json", "w") as handle:
+              json.dump(config, handle)
+          PY
+          mkdir -p "$RUNNER_TEMP/psiphon-state" "$RUNNER_TEMP/psiphon-reference-state"
+
+          FAILED=""
+          # `-test` builds every handler and exits, so a config or a settings value
+          # this lane refuses is named before a tunnel is attempted.
+          "$BIN" -test -c psiphon-windows.json
+          # The binary is the job, so its pid is `$!`: a wrapper subshell hides the
+          # pid that died and the status it died with.
+          "$BIN" run -c psiphon-windows.json > psiphon-windows.log 2>&1 &
           LANE_PID=$!
-          stop_lane() {
-            kill -TERM "$LANE_PID" 2>/dev/null || true
-            for _ in $(seq 1 20); do
-              kill -0 "$LANE_PID" 2>/dev/null || return 0
-              sleep 0.5
-            done
-            kill -KILL "$LANE_PID" 2>/dev/null || true
+          LANE_LABEL=native
+          READY_AT=$SECONDS
+          # A dead child's status is still readable once, so it is collected here and
+          # kept in the file the summary and the artifact read.
+          lane_exited() {
+            [ -f lane-status.txt ] && return 0
+            kill -0 "$LANE_PID" 2>/dev/null && return 1
+            wait "$LANE_PID" 2>/dev/null
+            echo "$LANE_LABEL $?" > lane-status.txt
+            return 0
           }
-          trap stop_lane EXIT
-          # An MSYS pid is not a Windows pid, so the lane's own pid is converted once; the two
-          # spaces are allocated independently, so a native pid is never converted back.
-          winpid() {
-            local native
-            native=$(cat "/proc/$1/winpid" 2>/dev/null) && [ -n "$native" ] || native="$1"
-            printf '%s' "$native"
-          }
-          sample_native() {
-            local label="$1" native="$2" line rss cpu
-            [ -n "$native" ] || return 0
-            line=$(powershell.exe -NoProfile -Command "\$p = Get-Process -Id $native -ErrorAction Stop; '{0} {1}' -f [math]::Floor(\$p.WorkingSet64/1024), \$p.CPU" 2>/dev/null | tr -d '\r' | xargs) || return 0
-            read -r rss cpu <<< "$line"
-            [ -n "$rss" ] || return 0
-            printf '%s\t%s\t%s\n' "$label" "$rss" "$cpu" >> psiphon-metrics.tsv
-          }
-          via() {
-            local front="$1" port="$2"
-            shift 2
-            if [ "$front" = mixed ]; then
-              curl -sS "$@" -x "http://127.0.0.1:$port"
-            else
-              curl -sS "$@" --socks5-hostname "127.0.0.1:$port"
+          lane_report() {
+            if [ -f lane-status.txt ]; then
+              echo "lane $(cat lane-status.txt) after $((SECONDS - READY_AT))s" >&2
             fi
+            echo "lane log ($(wc -c < psiphon-windows.log) bytes):" >&2
+            tail -n 60 psiphon-windows.log >&2
+            echo "== application event log ==" >&2
+            powershell.exe -NoProfile -Command "Get-WinEvent -FilterHashtable @{LogName='Application'; StartTime=(Get-Date).AddMinutes(-5)} -MaxEvents 5 -ErrorAction SilentlyContinue | Format-List TimeCreated,ProviderName,Id,Message" 2>/dev/null | tr -d '\r' | tail -n 30 >&2 || true
           }
-          wait_front() {
-            local front="$1" port="$2" stop_at=$((SECONDS + 360))
-            while ((SECONDS < stop_at)); do
-              kill -0 "$LANE_PID" 2>/dev/null || return 1
-              if via "$front" "$port" --max-time 30 https://www.cloudflare.com/cdn-cgi/trace -o trace.txt 2>/dev/null && grep -q '^loc=' trace.txt; then
-                return 0
-              fi
-              sleep 2
-            done
-            return 1
-          }
-          fetch_mb() {
-            local front="$1" port="$2" file="$3" label="$4" code=0 timing got
-            timing=$(via "$front" "$port" --max-time 300 \
-              -w '%{size_download} %{time_total} %{speed_download}' \
-              'https://speed.cloudflare.com/__down?bytes=1000000' -o "$file") || code=$?
-            echo "$label ${timing:-0 0 0}" >> psiphon-legs.tsv
-            got=$(wc -c < "$file" 2>/dev/null | tr -d ' ')
-            got="${got:-0}"
-            if test "$code" = 0 && test "$got" = 1000000; then
-              return 0
-            fi
-            echo "$label FAILED: curl exit $code after $got of 1000000 B" >&2
-            return 1
-          }
-          if ! wait_front socks 10808; then
-            echo "the socks front carried no trace in 360s" >&2
-            tail -n 100 "psiphon-windows-$ENGINE.log" >&2
-            exit 1
+          # A lane that exits during startup and a tunnel the network refused are
+          # different lines, and the shipped engine still runs after either one: it
+          # is what tells a runner that cannot reach Psiphon from a lane that cannot.
+          NATIVE_UP=""
+          if lane_exited; then
+            lane_report
+            FAILED="$FAILED native(exited)"
+          elif ! wait_front socks 10808; then
+            echo "the native lane carried no trace through its socks front in 360s" >&2
+            lane_report
+            FAILED="$FAILED native(socks ready)"
+          elif ! wait_front http 10819; then
+            echo "the native lane's own HTTP edge carried no trace in 360s" >&2
+            lane_report
+            FAILED="$FAILED native(http ready)"
+          else
+            NATIVE_UP=1
           fi
-          fetch_mb socks 10808 "psiphon-socks-$ENGINE.bin" socks
-          if ! wait_front mixed 10809; then
-            echo "the mixed front carried no trace in 360s" >&2
-            tail -n 100 "psiphon-windows-$ENGINE.log" >&2
-            exit 1
-          fi
-          fetch_mb mixed 10809 "psiphon-mixed-$ENGINE.bin" mixed
-          fetch_mb socks 10808 "psiphon-socks-warm-$ENGINE.bin" "socks warm"
+          if [ -z "$NATIVE_UP" ]; then
+            echo "native failed 0 0 0" >> psiphon-legs.tsv
+          else
+          printf 'native ready 0 %s 0\n' "$((SECONDS - READY_AT))" >> psiphon-legs.tsv
           NATIVE_LANE=$(winpid "$LANE_PID")
-          sample_native lane "$NATIVE_LANE"
-          # The console client is a native Windows child, which the MSYS process table cannot see.
-          for child in $(powershell.exe -NoProfile -Command "(Get-CimInstance Win32_Process -Filter 'ParentProcessId=$NATIVE_LANE').ProcessId" 2>/dev/null | tr -d '\r'); do
-            sample_native client "$child"
-          done
-      - name: Keep the timings and the lane log
+          sample_native "native ready" "$NATIVE_LANE"
+          trace_front socks 10808 "native socks" || FAILED="$FAILED native(socks trace)"
+          fetch_mb socks 10808 psiphon-socks.bin "native socks" || FAILED="$FAILED native(socks)"
+          trace_front http 10819 "native http" || FAILED="$FAILED native(http trace)"
+          fetch_mb http 10819 psiphon-http.bin "native http" || FAILED="$FAILED native(http)"
+          fetch_mb socks 10808 psiphon-socks-warm.bin "native socks warm" || FAILED="$FAILED native(socks warm)"
+          # The CPU window matches the reference's three megabytes; the mixed leg
+          # still gates, but it is extra work and stays outside the ratio.
+          sample_native "native done" "$NATIVE_LANE"
+          trace_front mixed 10809 "native mixed" || FAILED="$FAILED native(mixed trace)"
+          fetch_mb mixed 10809 psiphon-mixed.bin "native mixed" || FAILED="$FAILED native(mixed)"
+          fi
+          stop_lane
+
+          if ! python scripts/psiphon-target.py \
+            --log psiphon-windows.log \
+            --state "$RUNNER_TEMP/psiphon-state" \
+            --config psiphon-reference.json; then
+            echo "::warning::the reference could not be pinned to the native server and protocol; skipping the comparison"
+            echo "reference failed 0 0 0" >> psiphon-legs.tsv
+          else
+          rm -f lane-status.txt
+          ./psiphon-tunnel-core.exe --config psiphon-reference.json >> psiphon-reference.log 2>&1 &
+          LANE_PID=$!
+          LANE_LABEL=reference
+          READY_AT=$SECONDS
+          if ! wait_front socks 10808 420; then
+            echo "::warning::the shipped engine carried no trace in 420s"
+            tail -n 60 psiphon-reference.log >&2 || true
+            echo "reference failed 0 0 0" >> psiphon-legs.tsv
+          else
+            printf 'reference ready 0 %s 0\n' "$((SECONDS - READY_AT))" >> psiphon-legs.tsv
+            REFERENCE_ENGINE=$(winpid "$LANE_PID")
+            sample_native "reference ready" "$REFERENCE_ENGINE"
+            REF_FAILED=""
+            trace_front socks 10808 "reference socks" || REF_FAILED="$REF_FAILED socks(trace)"
+            fetch_mb socks 10808 reference-socks.bin "reference socks" || REF_FAILED="$REF_FAILED socks"
+            if wait_front http 10809 120; then
+              trace_front http 10809 "reference http" || REF_FAILED="$REF_FAILED http(trace)"
+              fetch_mb http 10809 reference-http.bin "reference http" || REF_FAILED="$REF_FAILED http"
+            else
+              echo "::warning::the shipped engine's HTTP proxy carried no trace in 120s"
+              REF_FAILED="$REF_FAILED http(unbound)"
+            fi
+            fetch_mb socks 10808 reference-socks-warm.bin "reference socks warm" || REF_FAILED="$REF_FAILED socks(warm)"
+            sample_native "reference done" "$REFERENCE_ENGINE"
+            if [ -n "$REF_FAILED" ]; then
+              echo "::warning::the shipped engine's legs failed:$REF_FAILED"
+              tail -n 60 psiphon-reference.log >&2 || true
+            fi
+          fi
+          stop_lane
+          fi
+          if [ -n "$FAILED" ]; then
+            echo "failed legs:$FAILED" >&2
+            tail -n 100 psiphon-windows.log >&2
+            exit 1
+          fi
+      - name: Stop the lanes and show their logs
+        if: always()
+        run: |
+          pkill -TERM -f 'ferrox-app.exe run -c psiphon-windows.json' 2>/dev/null || true
+          pkill -TERM -f 'psiphon-tunnel-core.exe --config psiphon-reference.json' 2>/dev/null || true
+          echo "== native lane log tail =="
+          tail -n 100 psiphon-windows.log 2>/dev/null || true
+          echo "== shipped engine log tail =="
+          tail -n 40 psiphon-reference.log 2>/dev/null || true
+      - name: Keep the timings and the lane logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: psiphon-legs-${{ matrix.engine }}
+          name: psiphon-windows-log
           path: |
             psiphon-legs.tsv
             psiphon-metrics.tsv
-            psiphon-windows-${{ matrix.engine }}.log
+            psiphon-windows.log
+            psiphon-reference.log
+            lane-status.txt
           if-no-files-found: warn
-
-  compare:
-    name: Compare the two engines
-    needs: lane
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          pattern: psiphon-legs-*
-      - name: Ratios, pinned over Windows
+      - name: Summarise
+        if: always()
         run: |
-          python3 - <<'PY'
-          import glob, pathlib, sys
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          legs = []
+          try:
+              lines = open("psiphon-legs.tsv").read().splitlines()
+          except OSError:
+              lines = []
+          for line in lines:
+              parts = line.rsplit(None, 3)
+              if len(parts) != 4:
+                  continue
+              label, size, seconds, speed = parts
+              try:
+                  size, seconds, speed = float(size), float(seconds), float(speed)
+              except ValueError:
+                  continue
+              legs.append((label, size, seconds, speed))
 
-          rows = {}
-          for path in glob.glob("psiphon-legs-*/psiphon-legs.tsv"):
-              engine = pathlib.Path(path).parent.name.removeprefix("psiphon-legs-")
-              for line in pathlib.Path(path).read_text().splitlines():
-                  fields = line.split()
-                  if len(fields) < 4:
+          metrics = {}
+          try:
+              for line in open("psiphon-metrics.tsv").read().splitlines():
+                  parts = line.split("\t")
+                  if len(parts) != 3:
                       continue
-                  label = " ".join(fields[:-3])
-                  size, seconds, speed = fields[-3:]
-                  rows.setdefault(engine, {})[label] = (int(size), float(seconds), float(speed))
-
-          labels = ["socks", "mixed", "socks warm"]
-          missing = []
-          print("| leg | engine | bytes | seconds | bytes/s | pinned/windows time | pinned/windows speed |")
-          print("| --- | --- | ---: | ---: | ---: | ---: | ---: |")
-          for label in labels:
-              got = {}
-              for engine in ("pinned", "windows"):
-                  value = rows.get(engine, {}).get(label)
-                  if value is None:
-                      missing.append(f"{engine}:{label}")
-                      continue
-                  got[engine] = value
-                  size, seconds, speed = value
-                  print(f"| {label} | {engine} | {size} | {seconds:.6f} | {speed:.0f} | | |")
-              if len(got) == 2:
-                  pinned, windows = got["pinned"], got["windows"]
-                  print(f"| {label} | ratio | | | | {pinned[1] / windows[1]:.3f} | {pinned[2] / windows[2]:.3f} |")
-          if missing:
-              print(f"missing legs: {', '.join(missing)}", file=sys.stderr)
-              sys.exit(1)
-
-          metrics = []
-          for path in glob.glob("psiphon-legs-*/psiphon-metrics.tsv"):
-              engine = pathlib.Path(path).parent.name.removeprefix("psiphon-legs-")
-              for line in pathlib.Path(path).read_text().splitlines():
-                  fields = line.split("\t")
-                  if len(fields) != 3:
-                      continue
-                  label, rss, cpu = fields
+                  label, rss, cpu = parts
                   try:
-                      rss, cpu = int(rss), float(cpu)
+                      metrics[label] = (int(rss), float(cpu))
                   except ValueError:
                       continue
-                  metrics.append((engine, label, rss, cpu))
-          if metrics:
-              print()
-              print("| engine | process | RSS KiB | CPU seconds |")
-              print("| --- | --- | ---: | ---: |")
-              for engine, label, rss, cpu in metrics:
-                  print(f"| {engine} | {label} | {rss} | {cpu:.2f} |")
+          except OSError:
+              pass
+
+          def leg(label):
+              for name, size, seconds, speed in legs:
+                  if name == label:
+                      return size, seconds, speed
+              return None
+
+          def delta(label):
+              ready, done = metrics.get(f"{label} ready"), metrics.get(f"{label} done")
+              if not ready or not done:
+                  return None, None
+              return done[0], done[1] - ready[1]
+
+          print("### Psiphon lane, Windows")
+          print()
+          print("The native lane and the engine `psiphon-windows` ships run back to")
+          print("back on the same runner and the same ports; each carries 1 MB")
+          print("through its socks front, its HTTP front and a warm repeat. The")
+          print("engine is pinned to the server and SSH/OSSH protocol the native lane")
+          print("chose, so the ratio is the implementation and not a different carrier.")
+          print("Both verify the")
+          print("same signed list with the key this tree pins. The runner's own egress")
+          print("is the control; byte counts are the gate.")
+          print()
+          print("| leg | bytes | seconds | MiB/s |")
+          print("| --- | --- | --- | --- |")
+          for label, size, seconds, speed in legs:
+              print(f"| {label} | {int(size)} | {seconds:.2f} | {speed / 1048576:.2f} |")
+          if not legs:
+              print("| (no leg recorded a transfer) | 0 | 0.00 | 0.00 |")
+          print()
+          print("| process | RSS KiB | CPU s |")
+          print("| --- | ---: | ---: |")
+          for label, (rss, cpu) in metrics.items():
+              print(f"| {label} | {rss} | {cpu:.2f} |")
+          if not metrics:
+              print("| (no process sampled) | 0 | 0.00 |")
+          print()
+          print("| measure | native | reference | ratio (higher favours native) |")
+          print("| --- | ---: | ---: | ---: |")
+
+          def rate(row):
+              return f"{row[2] / 1048576:.2f}" if row else "n/a"
+
+          for label in ("socks", "http", "socks warm"):
+              native, reference = leg(f"native {label}"), leg(f"reference {label}")
+              ratio = f"{native[2] / reference[2]:.2f}x" if native and reference and reference[2] > 0 else "n/a"
+              print(f"| {label} MiB/s | {rate(native)} | {rate(reference)} | {ratio} |")
+          native, reference = leg("native ready"), leg("reference ready")
+          ratio = f"{reference[1] / native[1]:.2f}x" if native and reference and native[1] > 0 else "n/a"
+          native_ready = f"{native[1]:.2f}" if native else "n/a"
+          reference_ready = f"{reference[1]:.2f}" if reference else "n/a"
+          print(f"| ready s | {native_ready} | {reference_ready} | {ratio} |")
+          print()
+          print("| measure | native | reference | ratio (higher favours native) |")
+          print("| --- | ---: | ---: | ---: |")
+          rss_native, cpu_native = delta("native")
+          rss_reference, cpu_reference = delta("reference")
+          if rss_native and rss_reference:
+              print(f"| RSS KiB after the legs | {rss_native} | {rss_reference} | {rss_reference / rss_native:.2f}x |")
+          else:
+              print("| RSS KiB after the legs | n/a | n/a | n/a |")
+          if cpu_native is not None and cpu_reference is not None and cpu_native > 0:
+              print(f"| CPU s for 3 MB | {cpu_native:.2f} | {cpu_reference:.2f} | {cpu_reference / cpu_native:.2f}x |")
+          else:
+              print("| CPU s for 3 MB | n/a | n/a | n/a |")
           PY
+          echo "Raw legs (label bytes seconds bytes/s):"
+          cat psiphon-legs.tsv 2>/dev/null || true
+
+  result:
+    name: result
+    needs: [psiphon-windows]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/result
+        with:
+          title: psiphon-windows
+          needs: ${{ toJSON(needs) }}
+          artifacts: psiphon-windows-log
