@@ -176,7 +176,7 @@ fn dokodemo_networks(inbound: &Json) -> Vec<&str> {
 #[allow(clippy::too_many_lines)]
 fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, test: bool) -> ! {
     // Armed before the first inbound opens, so every flow from here reads the budget the operator named.
-    crate::budgets::apply(
+    crate::budgets::apply_config(
         &crate::config::budgets(root)
             .unwrap_or_else(|error| exit(&format!("bad config {label}: {error}"))),
     );
@@ -1187,7 +1187,7 @@ fn dial_from(
     if let Some(source) = source {
         socket.bind(&SockAddr::from(SocketAddr::new(source, 0)))?;
     }
-    socket.connect_timeout(&SockAddr::from(*target), budgets::dial())?;
+    crate::conn::connect_bounded(&socket, &SockAddr::from(*target), budgets::dial())?;
     Ok(Connection::Tcp(std::net::TcpStream::from(socket)))
 }
 
@@ -29691,7 +29691,6 @@ mod tests {
     /// The budget a leg waits on is the one the config named: the hand-back arrives past a named millisecond and inside the two-minute constant, so the verdict says which value the site read.
     #[test]
     fn a_named_join_budget_is_the_bound_a_parked_leg_gives_up_on() {
-        let _guard = budgets::lock();
         let root = crate::json::parse(r#"{"budgets": {"relayJoin": "1ms"}}"#).expect("parses");
         budgets::apply(&crate::config::budgets(&root).expect("a budget the engine acts on"));
         let handed_back_later = || {
@@ -32224,7 +32223,6 @@ mod tests {
     /// A peer that opens the carrier and sends nothing must release its thread at the handshake budget; the magic read cannot sit on a socket that will never answer.
     #[test]
     fn a_silent_xhttp_peer_releases_its_thread() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(200)),
             ..Default::default()
@@ -32235,7 +32233,7 @@ mod tests {
             settings: xhttp_settings("/up/"),
         };
         let (done, waited) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
             serve_vless(
                 stream,
@@ -32261,7 +32259,6 @@ mod tests {
     /// An encrypted xHTTP peer that opens the session and never sends the hello must release its thread at the handshake budget; the chunk body reader retries timeouts forever.
     #[test]
     fn an_encrypted_silent_xhttp_peer_releases_its_thread() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -32281,7 +32278,7 @@ mod tests {
             settings: xhttp_settings("/up/"),
         };
         let (done, waited) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
             serve_vless(
                 stream,
@@ -33289,7 +33286,20 @@ mod tests {
                 panic!("handshakes past the pause");
             };
             let mut buf = [0u8; 4];
-            tls.read_exact(&mut buf).expect("reads");
+            let mut at = 0;
+            // The 1 ms probe is the handshake's claim, not the payload's: a loaded machine's read times out and is asked again.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while at < buf.len() {
+                match tls.read(&mut buf[at..]) {
+                    Ok(0) => break,
+                    Ok(n) => at += n,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "the client's ping arrives");
+                    }
+                    Err(error) => panic!("reads: {error}"),
+                }
+            }
+            assert_eq!(at, buf.len(), "the client's ping arrives");
             tls.write_all(&buf).expect("echoes");
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
@@ -33306,7 +33316,6 @@ mod tests {
     /// Silence past the budget is death, not scheduling: a peer that opens the connection and never sends must not pin the raw VLESS handshake thread forever.
     #[test]
     fn a_silent_peer_cannot_pin_a_raw_vless_handshake() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -33315,7 +33324,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless_raw(stream, &one_vless_user(&id), true, None);
             let _ = done_tx.send(());
@@ -33330,7 +33339,6 @@ mod tests {
     /// Silence past the budget is death, not scheduling: a peer that opens the connection and never sends must not pin the raw Trojan handshake thread forever.
     #[test]
     fn a_silent_peer_cannot_pin_a_raw_trojan_handshake() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -33339,7 +33347,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_trojan_raw(stream, &[key], true);
             let _ = done_tx.send(());
@@ -33354,7 +33362,6 @@ mod tests {
     /// Silence past the budget is death, not scheduling: a peer that opens the socks front and never greets must not pin its handler thread forever.
     #[test]
     fn a_silent_peer_cannot_pin_the_socks_greeting() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -33362,7 +33369,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_socks(stream, &freedom(), &no_accounts());
             let _ = done_tx.send(());
@@ -33377,7 +33384,6 @@ mod tests {
     /// The budget bounds each read the greeting is made of, not only the first: a peer that selects a method and then stalls before naming its target costs the same budget.
     #[test]
     fn a_peer_stalled_mid_greeting_cannot_pin_the_socks_front() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -33385,7 +33391,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_socks(stream, &freedom(), &no_accounts());
             let _ = done_tx.send(());
@@ -33402,7 +33408,6 @@ mod tests {
     /// A peer that finishes the websocket upgrade and then goes quiet costs a handshake budget, not a thread.
     #[test]
     fn a_silent_peer_cannot_pin_a_ws_handshake() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -33415,7 +33420,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
             let _ = done_tx.send(());
@@ -33434,7 +33439,6 @@ mod tests {
     /// A peer that rides the upgrade response then stops speaking releases the handshake thread.
     #[test]
     fn a_silent_peer_cannot_pin_an_httpupgrade_handshake() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -33448,7 +33452,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
             let _ = done_tx.send(());
@@ -33468,7 +33472,6 @@ mod tests {
     /// A peer whose head passes camouflage but whose body never arrives still dies on the budget.
     #[test]
     fn a_silent_peer_cannot_pin_an_httpheader_handshake() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -33478,7 +33481,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
             let _ = done_tx.send(());
@@ -33496,7 +33499,6 @@ mod tests {
     /// Silence before the preface is death, not scheduling: a peer that opens a gRPC connection and never sends must not pin the accept thread past the head's budget.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_preface() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -33506,7 +33508,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
             let _ = done_tx.send(());
@@ -33521,7 +33523,6 @@ mod tests {
     /// A peer that sends the 24-octet preface and then stops speaking dies on the same budget: the request headers are read under the clock the preface started on.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_request_head() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -33531,7 +33532,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
             let _ = done_tx.send(());
@@ -33548,7 +33549,6 @@ mod tests {
     /// A client that completes the gRPC handshake and never sends its first hunk releases the serve thread: the opening request is decoded under the reader's own budget, the way the websocket frames are.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_vless_request() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -33558,7 +33558,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
             let _ = done_tx.send(());
@@ -33574,7 +33574,6 @@ mod tests {
     /// A session inbound whose peer answers the head and then stops speaking releases the serve thread: the dispatcher's poll makes the session read answer, and the request's own clock makes it refuse.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_tls_vless_request() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -33586,7 +33585,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless_tls(
                 stream,
@@ -33613,7 +33612,6 @@ mod tests {
     /// A trojan inbound over gRPC whose peer answers the head and never writes its hash releases the serve thread: the carrier puts its clock away with the head, so the request reads under its own.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_trojan_request() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -33622,7 +33620,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_trojan_grpc(
                 stream,
@@ -33643,7 +33641,6 @@ mod tests {
     /// A KCP session that registers with a prefix and then falls silent dies on the wall-clock budget, not on the poll quantum.
     #[test]
     fn a_silent_peer_cannot_pin_a_kcp_handshake() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -33655,7 +33652,7 @@ mod tests {
                 .expect("binds");
         let kcp_port = listener.local_addr().port();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let conn = listener.accept().expect("accepts");
             serve_vless_kcp(
                 &conn,
@@ -33684,7 +33681,6 @@ mod tests {
     /// A trojan peer that never finishes the password line releases the handshake thread.
     #[test]
     fn a_silent_peer_cannot_pin_a_trojan_handshake() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -33693,7 +33689,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_trojan_raw(stream, &[key], true);
             let _ = done_tx.send(());
@@ -33778,7 +33774,6 @@ mod tests {
     /// The payload grace is a ceiling on a refusal, not a delay before the upload: a raw client that already has bytes must hand them to a response-withholding edge at once, or the first write of every upload waits out the grace while the edge waits for that write.
     #[test]
     fn vless_raw_client_pumps_the_upload_before_the_payload_grace_expires() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             payload_grace: Some(Duration::from_millis(500)),
             ..Default::default()
@@ -34071,7 +34066,6 @@ mod tests {
     /// `HTTPUpgrade` is a carrier too, and its server may hold the `[0, 0]` until the first payload arrives: the pump must start before the payload grace, not after it.
     #[test]
     fn vless_httpupgrade_client_pumps_the_upload_before_the_payload_grace_expires() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             payload_grace: Some(Duration::from_millis(500)),
             ..Default::default()
@@ -34149,7 +34143,6 @@ mod tests {
     /// The pump belongs to the carrier, and REALITY is a carrier: a REALITY server that holds its `[0, 0]` until the first payload record arrives must not deadlock the client either.
     #[test]
     fn vless_reality_client_pumps_the_upload_before_reading_the_response() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             payload_grace: Some(Duration::from_millis(500)),
             ..Default::default()
@@ -34702,7 +34695,6 @@ mod tests {
     fn vless_tls_raw_client_pumps_the_upload_before_the_response() {
         use ferrox_core::tls::TlsProvider as _;
 
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             payload_grace: Some(Duration::from_millis(500)),
             ..Default::default()
@@ -35193,7 +35185,6 @@ mod tests {
     fn vless_vision_pumps_the_upload_before_the_payload_grace_expires() {
         use ferrox_core::tls::TlsProvider as _;
 
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             payload_grace: Some(Duration::from_millis(500)),
             ..Default::default()
@@ -35954,8 +35945,6 @@ mod tests {
     /// A trojan listener that declares tls over KCP answers the session its config names: the request is read off the records, not the plaintext header.
     #[test]
     fn a_trojan_kcp_inbound_that_declares_tls_answers_the_session() {
-        let _guard = budgets::lock();
-
         let (cert, key, client) = tls_cert_json();
         let inbound = crate::json::parse(&format!(
             r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
@@ -36062,7 +36051,6 @@ mod tests {
     /// A shadowsocks listener that declares tls over KCP answers the session its config names: the salt and the request ride the records, not the plaintext datagram.
     #[test]
     fn a_shadowsocks_kcp_inbound_that_declares_tls_answers_the_session() {
-        let _guard = budgets::lock();
         let (cert, key, client) = tls_cert_json();
         let inbound = crate::json::parse(&format!(
             r#"{{"protocol": "shadowsocks", "settings": {{"password": "an-example-shared-password", "method": "aes-256-gcm"}},
@@ -36124,7 +36112,6 @@ mod tests {
     /// The dial half of the same row: a shadowsocks outbound that declares tls writes its request inside the session, not ahead of it.
     #[test]
     fn a_shadowsocks_kcp_dial_under_tls_wraps_the_header_in_the_session() {
-        let _guard = budgets::lock();
         let (cert, key, client) = tls_cert_json();
         let inbound = crate::json::parse(&format!(
             r#"{{"protocol": "shadowsocks", "settings": {{"password": "an-example-shared-password", "method": "aes-256-gcm"}},
@@ -36181,7 +36168,6 @@ mod tests {
     /// A shadowsocks listener and dial that declare tls answer the handshake before any non-KCP carrier.
     #[test]
     fn a_shadowsocks_inbound_that_declares_tls_answers_every_carrier() {
-        let _guard = budgets::lock();
         let (cert, key, client) = tls_cert_json();
         let cases = [
             ("raw", r#""network": "tcp""#),
@@ -36269,7 +36255,6 @@ mod tests {
     /// The vmess dial carries its request in the session too, so a tls kcp row speaks the same bytes both roles.
     #[test]
     fn a_vmess_kcp_dial_under_tls_wraps_the_header_in_the_session() {
-        let _guard = budgets::lock();
         let (cert, key, client) = tls_cert_json();
         let inbound = crate::json::parse(&format!(
             r#"{{"protocol": "vmess", "settings": {{"clients": [{{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},
@@ -38677,7 +38662,6 @@ mod tests {
     /// Silence past the budget is death, not a leak: a stream-per-destination association with no traffic hands its thread back at the idle budget.
     #[test]
     fn a_quiet_foxy_udp_association_hands_its_thread_back() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             udp_idle: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -38685,7 +38669,7 @@ mod tests {
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let (associate, _peer) = association_pair();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             serve_socks_udp_foxy(&relay, &foxy_without_edges(), Some(&associate));
             let _ = done_tx.send(());
         });
@@ -38698,7 +38682,6 @@ mod tests {
     /// The client's goodbye outranks the idle budget: an association whose control socket closed hands its thread back at the next tick.
     #[test]
     fn a_foxy_udp_association_ends_when_its_client_leaves() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             udp_idle: Some(Duration::from_secs(30)),
             ..Default::default()
@@ -38720,7 +38703,6 @@ mod tests {
     /// The shared tunnel obeys the same lifetime as the per-destination streams: silence past the budget hands the thread back.
     #[test]
     fn a_quiet_foxy_connect_ip_association_hands_its_thread_back() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             udp_idle: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -38728,7 +38710,7 @@ mod tests {
         let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let (associate, _peer) = association_pair();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             serve_socks_udp_foxy_ip(&relay, &foxy_without_edges(), Some(&associate));
             let _ = done_tx.send(());
         });
@@ -38741,7 +38723,6 @@ mod tests {
     /// And the goodbye outranks the budget here too: no tunnel is left dialled and parked when the app is gone.
     #[test]
     fn a_foxy_connect_ip_association_ends_when_its_client_leaves() {
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             udp_idle: Some(Duration::from_secs(30)),
             ..Default::default()
@@ -42631,7 +42612,6 @@ mod tests {
     #[test]
     fn a_silent_quic_udp_peer_cannot_pin_the_dial() {
         let _serial = quic_serial();
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             dial: Some(Duration::from_secs(2)),
             ..Default::default()
@@ -48349,7 +48329,6 @@ mod tests {
     /// A client that connects to the `mixed` front and never speaks is a client the greeting's budget ends: the sniff is a read like any other, and an un-armed one held the per-connection thread for as long as the client kept the session.
     #[test]
     fn the_mixed_front_gives_up_a_client_that_never_speaks() {
-        let _guard = budgets::lock();
         let root = crate::json::parse(r#"{"budgets": {"handshake": "200ms"}}"#).expect("parses");
         budgets::apply(&crate::config::budgets(&root).expect("a budget the engine acts on"));
         let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -52537,7 +52516,6 @@ mod relay_tests {
         const ROUNDS: usize = 512;
         const NEIGHBOURS: usize = 16;
 
-        let _guard = budgets::lock();
         let stalled_front = listener();
         let stalled_front_port = port_of(&stalled_front);
         let stalled_back = listener();
@@ -52642,7 +52620,6 @@ mod relay_tests {
         // The front's own write arm: the destination reads nothing, so the write parks, and the arm is this test's.
         const ARMED: Duration = Duration::from_millis(250);
 
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             relay_join: Some(JOINED),
             ..Default::default()
@@ -52695,7 +52672,6 @@ mod relay_tests {
         const STALLED: Duration = Duration::from_millis(250);
         const CEILING: Duration = Duration::from_secs(10);
 
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             relay_stall: Some(STALLED),
             ..Default::default()
@@ -52805,7 +52781,6 @@ mod relay_tests {
         const STALLED: Duration = Duration::from_millis(250);
         const CEILING: Duration = Duration::from_secs(10);
 
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             relay_stall: Some(STALLED),
             ..Default::default()
@@ -52855,7 +52830,6 @@ mod relay_tests {
         const ARMED: Duration = Duration::from_secs(30);
         const CEILING: Duration = Duration::from_secs(10);
 
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             relay_join: Some(JOINED),
             relay_stall: Some(ARMED),
@@ -52983,7 +52957,6 @@ mod relay_tests {
         const ROUNDS: usize = 128;
         const LEN: usize = CHUNK * ROUNDS;
 
-        let _guard = budgets::lock();
         let front = Arc::new(listener());
         let front_port = port_of(&front);
         let back = Arc::new(listener());
@@ -53338,7 +53311,6 @@ mod census_tests {
         const CEILING: Duration = Duration::from_secs(10);
         const UPLOAD: usize = 16 << 20;
 
-        let _guard = budgets::lock();
         budgets::apply(&crate::config::Budgets {
             relay_stall: Some(STALLED),
             ..Default::default()
@@ -53354,7 +53326,7 @@ mod census_tests {
         let _silent_peer = peer.accept().map(|(stream, _)| stream).expect("accepts");
         let (handed, joined) = mpsc::channel();
         let began = Instant::now();
-        let leg = thread::spawn(move || {
+        let leg = crate::budgets::spawn(move || {
             let flow = relay_carried(
                 std::io::Cursor::new(vec![0u8; UPLOAD]),
                 &write,

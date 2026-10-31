@@ -4411,7 +4411,6 @@ mod tests {
     /// A packet-up session whose downlink never arrives holds its packets forever; a later bind must start fresh rather than read a sequence from a flow that already stalled.
     #[test]
     fn a_packet_up_session_with_no_downlink_is_replaced_after_the_stall() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             relay_stall: Some(std::time::Duration::from_millis(200)),
             ..Default::default()
@@ -4437,7 +4436,6 @@ mod tests {
     /// past the budget is still alive and must keep the same sequence.
     #[test]
     fn an_active_packet_up_session_is_not_swept_by_its_age() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             relay_stall: Some(std::time::Duration::from_millis(500)),
             ..Default::default()

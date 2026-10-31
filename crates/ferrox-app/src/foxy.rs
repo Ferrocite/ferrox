@@ -4192,7 +4192,6 @@ pub(crate) mod loopback {
     fn a_silent_edge_costs_the_open_its_head_budget_not_the_flow() {
         use ferrox_core::tls::TlsProvider as _;
 
-        let _guard = crate::budgets::lock();
         for (alpn, carrier, label) in [
             (&b"http/1.1"[..], Carrier::H1, "h1"),
             (&b"h2"[..], Carrier::H2, "h2"),
@@ -4235,7 +4234,6 @@ pub(crate) mod loopback {
     fn a_dripping_head_costs_the_open_its_head_budget_not_its_length() {
         use ferrox_core::tls::TlsProvider as _;
 
-        let guard = crate::budgets::lock();
         let root = crate::json::parse(r#"{"budgets": {"headArrival": "300ms"}}"#).expect("parses");
         crate::budgets::apply(&crate::config::budgets(&root).expect("a name the engine acts on"));
         let (roots, server) = minted(b"http/1.1");
@@ -4263,8 +4261,6 @@ pub(crate) mod loopback {
         let at = Instant::now();
         let opened = Tunnel::open(&dial, "example.com:443", None).err();
         crate::budgets::clear();
-        // The edge's own drip is the fixture's wait, not the budget's: the lock goes back here.
-        drop(guard);
         let failure = opened.expect("the head never lands whole");
         assert_eq!(failure, Failure::Stream, "a drip ends at the wall");
         assert!(

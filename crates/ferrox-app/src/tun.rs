@@ -1998,7 +1998,6 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_quiet_tun_flow_hands_its_threads_back() {
-        let _guard = budgets::lock();
         let idle = std::time::Duration::from_millis(250);
         budgets::apply(&crate::config::Budgets {
             udp_idle: Some(idle),

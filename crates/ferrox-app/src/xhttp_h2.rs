@@ -738,7 +738,7 @@ fn open_stream(
     };
     let settings = settings.clone();
     let users = Arc::clone(users);
-    std::thread::spawn(move || {
+    crate::budgets::spawn(move || {
         match crate::xhttp::accept_core(
             &head,
             Vec::new(),
@@ -1270,14 +1270,14 @@ mod tests {
     ) -> (SocketAddr, thread::JoinHandle<()>) {
         let front = test_bind("127.0.0.1:0").expect("binds");
         let addr = front.local_addr().expect("addr");
-        let handle = thread::spawn(move || {
+        let handle = crate::budgets::spawn(move || {
             for stream in front.incoming().take(takes) {
                 let Ok(stream) = stream else { continue };
                 let Ok(read) = stream.try_clone() else {
                     continue;
                 };
                 let settings = settings.clone();
-                thread::spawn(move || {
+                crate::budgets::spawn(move || {
                     serve_h2(read, stream, &settings, &crate::proxy::one_user(id), true);
                 });
             }
@@ -2141,7 +2141,6 @@ mod tests {
     /// A sender the peer never credits gives up at the relay stall, so a downlink cannot park its thread on a window that never arrives.
     #[test]
     fn a_sender_with_no_credit_gives_up_at_the_stall() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             relay_stall: Some(Duration::from_millis(500)),
             ..Default::default()
@@ -2167,7 +2166,7 @@ mod tests {
             .unwrap_or_else(PoisonError::into_inner) = 0;
         let (sent, got) = std::sync::mpsc::channel();
         let sender = Arc::clone(&conn);
-        let running = thread::spawn(move || {
+        let running = crate::budgets::spawn(move || {
             let _ = sent.send(sender.send_data(1, b"ping"));
         });
         let verdict = got.recv_timeout(Duration::from_secs(3));
@@ -2182,7 +2181,6 @@ mod tests {
     /// read the inbound `END_STREAM` as a dead stream and drop the downlink.
     #[test]
     fn an_ended_request_still_sends_its_response() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             relay_stall: Some(Duration::from_secs(30)),
             ..Default::default()
@@ -2241,7 +2239,6 @@ mod tests {
     /// left to discover the stream is gone when the relay stall expires.
     #[test]
     fn a_reset_stream_wakes_a_sender_waiting_on_its_window() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             relay_stall: Some(Duration::from_secs(30)),
             ..Default::default()
@@ -2309,7 +2306,6 @@ mod tests {
     /// A POST that never sends its body leaves the stream's reader parked on a request no peer will finish; the relay stall ends it, and the stream is reset instead of holding its thread for the life of the connection.
     #[test]
     fn a_post_with_no_body_ends_at_the_stall() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             relay_stall: Some(Duration::from_millis(200)),
             ..Default::default()

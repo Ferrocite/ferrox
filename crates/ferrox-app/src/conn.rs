@@ -1221,7 +1221,15 @@ impl Iterator for Incoming<'_> {
 /// same arguments, so the dial it issues (and its budget) is byte-for-byte what the TCP path
 /// did before the transport seam — the transport type changed, the syscall did not.
 pub(crate) fn dial_tcp(addr: &SocketAddr, timeout: Duration) -> io::Result<Connection> {
-    TcpStream::connect_timeout(addr, timeout).map(Connection::Tcp)
+    use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+    let domain = if addr.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    connect_bounded(&socket, &SockAddr::from(*addr), timeout)?;
+    Ok(Connection::Tcp(TcpStream::from(socket)))
 }
 
 #[cfg(test)]
@@ -1311,16 +1319,18 @@ fn unix_connect(path: &std::path::Path, timeout: Duration) -> io::Result<Connect
     Ok(unix_connection(socket))
 }
 
-/// `connect_timeout`, with Linux's full queue named: a nonblocking `AF_UNIX` connect that finds no
-/// room is hung up with no error set, which socket2 reports as `Other` rather than the refusal it is.
-#[cfg(unix)]
-fn connect_bounded(
+/// `connect_timeout`, with a peer that accepts and closes at once taken as connected: the kernel wakes the connect's poll with a hangup and no error set, which socket2 reports as `Other`. Linux's full `AF_UNIX` queue is named here too — the same hangup with no error set, which is a refusal rather than a connection.
+pub(crate) fn connect_bounded(
     socket: &socket2::Socket,
     address: &socket2::SockAddr,
     timeout: Duration,
 ) -> io::Result<()> {
-    socket.connect_timeout(address, timeout).map_err(|error| {
-        if error.kind() == io::ErrorKind::Other {
+    let bounded = socket.connect_timeout(address, timeout);
+    if bounded.is_err() && socket.peer_addr().is_ok() {
+        return Ok(());
+    }
+    bounded.map_err(|error| {
+        if cfg!(unix) && error.kind() == io::ErrorKind::Other {
             io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "the socket's queue did not take the connection",
@@ -2170,5 +2180,23 @@ mod tests {
         // The socket file lives on by the listener's descriptor; drop the directory entry now so an interrupted run leaves nothing to unlink.
         std::fs::remove_dir_all(&dir).ok();
         (client, listener)
+    }
+
+    /// A peer that accepts and closes at once wakes the connect's poll with a hangup and no error set, which socket2 reports as a failure on a socket the kernel has already connected. The dial answers as connected, because the read that follows is what reports a peer that left.
+    #[test]
+    fn an_error_reported_on_a_connected_socket_is_not_a_refusal() {
+        use socket2::{Domain, Protocol, SockAddr, Socket, Type};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = SockAddr::from(listener.local_addr().expect("addr"));
+        let accept = crate::budgets::spawn(move || {
+            let _ = listener.accept();
+        });
+        let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP)).expect("socket");
+        connect_bounded(&socket, &address, Duration::from_secs(5)).expect("the dial connects");
+        connect_bounded(&socket, &address, Duration::from_secs(5)).expect(
+            "a second connect reports an error, and the socket it already had is the answer",
+        );
+        accept.join().expect("joins");
     }
 }
