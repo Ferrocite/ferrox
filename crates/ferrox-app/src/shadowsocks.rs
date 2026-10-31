@@ -1343,7 +1343,11 @@ fn serve_udp_stream(clients: &UdpSocket, user: &SsUser) {
             Err(_) => break,
         }
         for sock in std::iter::once(&v4).chain(v6.as_ref()) {
-            while let Ok((n, from)) = sock.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
+            for _ in 0..UDP_DRAIN {
+                let Ok((n, from)) = sock.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF])
+                else {
+                    break;
+                };
                 let Some(&client) = by_dest.get(&from) else {
                     continue;
                 };
