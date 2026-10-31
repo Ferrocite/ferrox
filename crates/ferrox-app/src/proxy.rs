@@ -25340,20 +25340,17 @@ fn outbound_refusal(outbound: &Json, protocol: &str) -> Option<String> {
     };
     match protocol {
         "vless" | "vmess" => {
-            let server = lane_server(settings, "vnext")?;
+            let (server, account) = vnext_lane(settings?)?;
             if let Some(field) = dial_fields(server) {
                 return Some(field);
             }
-            if server
-                .get("users")
-                .and_then(Json::as_arr)
-                .and_then(|users| users.first())
-                .and_then(|user| user.get("id"))
+            if account
+                .get("id")
                 .and_then(Json::as_str)
                 .and_then(uuid_bytes)
                 .is_none()
             {
-                return Some("no user id that is a uuid in the first user".to_owned());
+                return Some("no user id that is a uuid in the account".to_owned());
             }
             if stream_security(outbound) == "tls" && !hysteria_transport(outbound) {
                 let address = server
@@ -25427,6 +25424,29 @@ fn lane_server<'a>(settings: Option<&'a Json>, key: &str) -> Option<&'a Json> {
         .and_then(|s| s.get(key))
         .and_then(Json::as_arr)
         .and_then(|servers| servers.first())
+}
+
+/// The dial entry and the account a vless or vmess outbound is read from, in both spellings the
+/// reference builds: `vnext[0]` with its `users[0]`, or the simplified form where the settings
+/// themselves carry address, port and id. `infra/conf/vless.go` and `infra/conf/vmess.go` take
+/// that form whenever `address` is set, so it wins even beside a `vnext`.
+fn vnext_lane(settings: &Json) -> Option<(&Json, &Json)> {
+    if settings
+        .get("address")
+        .and_then(Json::as_str)
+        .is_some_and(|address| !address.is_empty())
+    {
+        return Some((settings, settings));
+    }
+    let server = lane_server(Some(settings), "vnext")?;
+    Some((
+        server,
+        server
+            .get("users")
+            .and_then(Json::as_arr)
+            .and_then(|users| users.first())
+            .unwrap_or(server),
+    ))
 }
 
 /// The dial pair a server entry must carry; the missing one is the refusal's word.
@@ -27236,21 +27256,15 @@ fn find_http_outbound(root: &Json) -> Option<HttpOut> {
     None
 }
 
-fn vnext_servers<'a>(
-    root: &'a Json,
-    protocol: &'a str,
-) -> impl Iterator<Item = (&'a Json, &'a Json)> + 'a {
+/// The outbound, dial entry and account of each vmess entry the tree shows.
+fn vmess_outbounds(root: &Json) -> impl Iterator<Item = (&Json, &Json, &Json)> {
     let outbounds: &[Json] = root.get("outbounds").and_then(Json::as_arr).unwrap_or(&[]);
     outbounds
         .iter()
-        .filter(move |outbound| outbound.get("protocol").and_then(Json::as_str) == Some(protocol))
+        .filter(|outbound| outbound.get("protocol").and_then(Json::as_str) == Some("vmess"))
         .filter_map(|outbound| {
-            let server = outbound
-                .get("settings")
-                .and_then(|s| s.get("vnext"))
-                .and_then(Json::as_arr)
-                .and_then(|servers| servers.first())?;
-            Some((outbound, server))
+            let (server, account) = vnext_lane(outbound.get("settings")?)?;
+            Some((outbound, server, account))
         })
 }
 
@@ -27271,56 +27285,20 @@ fn vless_server(settings: &Json) -> Option<VlessServer<'_>> {
         .get("reverse")
         .and_then(|reverse| reverse.get("tag"))
         .and_then(Json::as_str);
-    if let Some(server) = settings
-        .get("vnext")
-        .and_then(Json::as_arr)
-        .and_then(|servers| servers.first())
-    {
-        let address = server.get("address").and_then(Json::as_str)?;
-        let port = server.get("port").and_then(Json::as_port)?;
-        let user = server
-            .get("users")
-            .and_then(Json::as_arr)
-            .and_then(|users| users.first());
-        let id = user
-            .and_then(|user| user.get("id"))
+    let (server, account) = vnext_lane(settings)?;
+    Some(VlessServer {
+        address: server.get("address").and_then(Json::as_str)?,
+        port: server.get("port").and_then(Json::as_port)?,
+        id: account
+            .get("id")
             .and_then(Json::as_str)
-            .and_then(uuid_bytes)?;
-        let flow = user
-            .and_then(|user| user.get("flow"))
+            .and_then(uuid_bytes)?,
+        flow: account
+            .get("flow")
             .and_then(Json::as_str)
             .unwrap_or("")
-            .to_owned();
-        let encryption = user
-            .and_then(|user| user.get("encryption"))
-            .and_then(Json::as_str);
-        return Some(VlessServer {
-            address,
-            port,
-            id,
-            flow,
-            encryption,
-            reverse,
-        });
-    }
-    let address = settings.get("address").and_then(Json::as_str)?;
-    let port = settings.get("port").and_then(Json::as_port)?;
-    let id = settings
-        .get("id")
-        .and_then(Json::as_str)
-        .and_then(uuid_bytes)?;
-    let flow = settings
-        .get("flow")
-        .and_then(Json::as_str)
-        .unwrap_or("")
-        .to_owned();
-    let encryption = settings.get("encryption").and_then(Json::as_str);
-    Some(VlessServer {
-        address,
-        port,
-        id,
-        flow,
-        encryption,
+            .to_owned(),
+        encryption: account.get("encryption").and_then(Json::as_str),
         reverse,
     })
 }
@@ -27549,13 +27527,9 @@ fn vless_loopback_encryption(
 }
 
 fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
-    if let Some((outbound, server)) = vnext_servers(root, "vmess").next() {
+    if let Some((outbound, server, user)) = vmess_outbounds(root).next() {
         let address = server.get("address").and_then(Json::as_str)?.to_owned();
         let port = server.get("port").and_then(Json::as_port)?;
-        let user = server
-            .get("users")
-            .and_then(Json::as_arr)
-            .and_then(|users| users.first())?;
         let id = user.get("id").and_then(Json::as_str).and_then(uuid_bytes)?;
         let cipher = vmess_cipher(user);
         let auth_len = authenticated_length(user);
@@ -38689,6 +38663,62 @@ mod tests {
         let out = find_vmess_outbound(&plain).expect("finds");
         assert!(matches!(out.carrier, Carrier::Raw(_)));
         assert_eq!(out.host, "192.0.2.1");
+    }
+
+    /// `infra/conf/vmess.go` and `infra/conf/vless.go` synthesize the one-member vnext from the
+    /// settings themselves whenever `address` is set; a config the reference runs cannot fall
+    /// through to a direct dial here.
+    #[test]
+    fn a_simplified_outbound_dials_its_protocol() {
+        let vmess = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vmess", "settings": {
+                "address": "192.0.2.1", "port": 443,
+                "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "security": "chacha20-poly1305",
+                "experiments": "AuthenticatedLength|NoTerminationSignal"}}]}"#,
+        )
+        .expect("parses");
+        let Some(Outbound::Vmess(out)) = find_outbound(&vmess).expect("builds") else {
+            panic!("the flat vmess settings fell through to a direct dial");
+        };
+        assert_eq!(out.address, "192.0.2.1");
+        assert_eq!(out.port, 443);
+        assert_eq!(
+            out.id,
+            uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id")
+        );
+        assert_eq!(out.cipher, crate::vmess::Cipher::Chacha);
+        assert!(out.auth_len, "the settings name the experiment");
+        assert!(out.no_termination);
+        let vless = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vless", "settings": {
+                "address": "192.0.2.1", "port": 443,
+                "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "flow": "xtls-rprx-vision"}}]}"#,
+        )
+        .expect("parses");
+        let Some(Outbound::Vless(out)) = find_outbound(&vless).expect("builds") else {
+            panic!("the flat vless settings fell through to a direct dial");
+        };
+        assert_eq!(out.flow, "xtls-rprx-vision", "the account is the settings");
+        assert_eq!(
+            out.id,
+            uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id")
+        );
+        let no_id = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vmess", "settings": {
+                "address": "192.0.2.1", "port": 443}}]}"#,
+        )
+        .expect("parses");
+        let first = &no_id
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0];
+        assert_eq!(
+            outbound_refusal(first, "vmess").as_deref(),
+            Some("no user id that is a uuid in the account"),
+            "a flat outbound missing its id says so"
+        );
     }
 
     // A ladder walk dials one uplink per rung, so a test server serves the bound rather than one connection.
