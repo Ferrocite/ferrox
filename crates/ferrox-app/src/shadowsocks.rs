@@ -1184,8 +1184,11 @@ pub(crate) fn serve_udp(address: &str, users: &[SsUser], freedom: bool) {
     serve_udp_on(&clients, users, freedom);
 }
 
-/// The most client sources one listener carries: each source owns an upstream socket pair, so a stranger cannot grow the map without bound.
+/// The most client sources one AEAD listener carries: each source owns an upstream socket pair, and only a datagram whose tag verifies creates one.
 pub(crate) const SS_UDP_SOURCES: usize = 4096;
+
+/// The most destinations one stream-cipher listener routes replies for: that account seals no tag, so a reply goes to the last client whose datagram named it.
+const SS_UDP_DESTS: usize = 4096;
 
 /// One client source's UDP association: the account its first datagram named, its own upstream sockets, and the reply cipher that account seals with.
 struct UdpSource {
@@ -1196,7 +1199,6 @@ struct UdpSource {
     last: Instant,
 }
 
-#[allow(clippy::too_many_lines)]
 pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool) {
     if !freedom || users.is_empty() {
         return;
@@ -1204,7 +1206,79 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool)
     if clients.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
-    // One association per client source: a reply can only name the source whose socket carried it.
+    match users.iter().position(|user| user.method.is_stream()) {
+        // Nothing in a stream datagram proves which client sent it, so the first stream account owns the front's udp side.
+        Some(which) => serve_udp_stream(clients, &users[which]),
+        None => serve_udp_aead(clients, users),
+    }
+}
+
+/// One socket pair and one destination table serve a stream account: a reply is addressed to the last client that named its destination, and the table is capped rather than grown, so a stream front admits no descriptor for traffic it cannot prove.
+fn serve_udp_stream(clients: &UdpSocket, user: &SsUser) {
+    let Ok(v4) = UdpSocket::bind("0.0.0.0:0") else {
+        return;
+    };
+    let v6 = UdpSocket::bind("[::]:0").ok();
+    if v4.set_nonblocking(true).is_err() {
+        return;
+    }
+    if v6
+        .as_ref()
+        .is_some_and(|sock| sock.set_nonblocking(true).is_err())
+    {
+        return;
+    }
+    let mut by_dest: HashMap<SocketAddr, SocketAddr> = HashMap::new();
+    let mut hop = None;
+    let mut buf = crate::proxy::unfilled(DATAGRAM_MAX);
+    let mut reply = crate::proxy::unfilled(DATAGRAM_MAX);
+    loop {
+        match clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
+            Ok((n, src)) => {
+                let datagram = &mut buf[SEAL_ROOM..SEAL_ROOM + n];
+                if let Some((dest, payload)) =
+                    open_datagram(&user.master, user.method, datagram, &mut hop)
+                {
+                    if by_dest.len() >= SS_UDP_DESTS {
+                        by_dest.clear();
+                    }
+                    by_dest.insert(dest, src);
+                    if dest.is_ipv6() {
+                        if let Some(sock) = v6.as_ref() {
+                            let _ = sock.send_to(payload, dest);
+                        }
+                    } else {
+                        let _ = v4.send_to(payload, dest);
+                    }
+                }
+            }
+            Err(error) if crate::proxy::is_timeout(&error) => {}
+            Err(_) => break,
+        }
+        for sock in std::iter::once(&v4).chain(v6.as_ref()) {
+            while let Ok((n, from)) = sock.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
+                let Some(&client) = by_dest.get(&from) else {
+                    continue;
+                };
+                if let Some(packet) = seal_datagram(
+                    &user.master,
+                    user.method,
+                    &from,
+                    &mut reply,
+                    SEAL_ROOM,
+                    n,
+                    &mut hop,
+                ) {
+                    let _ = clients.send_to(packet, client);
+                }
+            }
+        }
+    }
+}
+
+/// One association per client source, created only by a datagram whose tag verifies: a reply can only name the source whose socket carried it.
+#[allow(clippy::too_many_lines)]
+fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
     let mut sources: HashMap<SocketAddr, UdpSource> = HashMap::new();
     let mut probes: Vec<Option<Cipher>> = users.iter().map(|_| None).collect();
     let mut buf = crate::proxy::unfilled(DATAGRAM_MAX);
@@ -1672,19 +1746,13 @@ pub(crate) fn open_datagram<'a>(
     Some((target, &body[used..len]))
 }
 
-/// Open one wire datagram against every client: the first whose tag verifies names the flow and seals its replies, and a failed probe leaves the buffer untouched because the tag is checked before the body opens. A stream client has no tag to probe, so it owns the listener the way it owns the tcp side.
+/// Open one wire datagram against every client: the first whose tag verifies names the flow and seals its replies, and a failed probe leaves the buffer untouched because the tag is checked before the body opens.
 pub(crate) fn open_datagram_any(
     users: &[SsUser],
     packet: &mut [u8],
     hops: &mut [Option<Cipher>],
 ) -> Option<(usize, SocketAddr, std::ops::Range<usize>)> {
     let base = packet.as_ptr() as usize;
-    if let Some(which) = users.iter().position(|user| user.method.is_stream()) {
-        let user = &users[which];
-        let (target, payload) = open_datagram(&user.master, user.method, packet, &mut hops[which])?;
-        let start = payload.as_ptr() as usize - base;
-        return Some((which, target, start..start + payload.len()));
-    }
     for (which, user) in users.iter().enumerate() {
         if let Some((target, payload)) =
             open_datagram(&user.master, user.method, &mut *packet, &mut hops[which])
@@ -3005,6 +3073,54 @@ mod tests {
         );
         assert!(open_from_wire(&master, method, &packet[..10]).is_none());
         assert!(open_from_wire(&master, method, &[]).is_none());
+    }
+
+    /// A stream account seals no tag, so each destination's reply goes to the client whose datagram last named it rather than to whichever source spoke last.
+    #[test]
+    fn a_stream_front_routes_each_destination_back_to_its_client() {
+        fn answer(word: u8) -> (SocketAddr, thread::JoinHandle<()>) {
+            let sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            let addr = sock.local_addr().expect("addr");
+            let handle = thread::spawn(move || {
+                let mut buf = vec![0u8; UDP_BUF];
+                while let Ok((n, src)) = sock.recv_from(&mut buf) {
+                    if sock.send_to(&vec![word; n], src).is_err() {
+                        return;
+                    }
+                }
+            });
+            (addr, handle)
+        }
+        let (a_dest, _a) = answer(b'a');
+        let (b_dest, _b) = answer(b'b');
+        let method = Method::Rc4Md5;
+        let master = MasterKey::new("an-example-shared-password", 16);
+        let users = [SsUser {
+            method,
+            master: master.clone(),
+            email: String::new(),
+            level: 0,
+        }];
+        let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        thread::spawn(move || serve_udp_on(&front, &users, true));
+        let (a, b) = (
+            UdpSocket::bind("127.0.0.1:0").expect("binds"),
+            UdpSocket::bind("127.0.0.1:0").expect("binds"),
+        );
+        a.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+        b.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+        a.send_to(&seal_to_wire(&master, method, &a_dest, b"one"), front_addr)
+            .expect("sends");
+        b.send_to(&seal_to_wire(&master, method, &b_dest, b"two"), front_addr)
+            .expect("sends");
+        let mut wire = vec![0u8; DATAGRAM_MAX];
+        let (n, _) = a.recv_from(&mut wire).expect("the first client hears back");
+        let (from, payload) = open_from_wire(&master, method, &wire[..n]).expect("opens");
+        assert_eq!((from, payload.as_slice()), (a_dest, b"aaa".as_slice()));
+        let (n, _) = b.recv_from(&mut wire).expect("the second client hears back");
+        let (from, payload) = open_from_wire(&master, method, &wire[..n]).expect("opens");
+        assert_eq!((from, payload.as_slice()), (b_dest, b"bbb".as_slice()));
     }
 
     /// What a stage between the carrier and the codec asks for: its own capacity.
