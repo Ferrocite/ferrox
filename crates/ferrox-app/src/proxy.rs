@@ -11027,80 +11027,110 @@ fn serve_ss_relay_inbound(address: &str, inbound: &Json, password: &str, method:
     true
 }
 
+/// The networks a shadowsocks inbound opens, from a `tcp,udp` string or an array; naming none opens both, a superset of the reference's TCP default.
+fn inbound_ss_networks(inbound: &Json) -> (bool, bool) {
+    let Some(named) = inbound.get("settings").and_then(|s| s.get("network")) else {
+        return (true, true);
+    };
+    let mut tcp = false;
+    let mut udp = false;
+    let mut take = |name: &str| match name.trim() {
+        "tcp" => tcp = true,
+        "udp" => udp = true,
+        _ => {}
+    };
+    match named.as_arr() {
+        Some(items) => {
+            for item in items {
+                if let Some(name) = item.as_str() {
+                    take(name);
+                }
+            }
+        }
+        None => take(named.as_str().unwrap_or("")),
+    }
+    (tcp, udp)
+}
+
 fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     let password = inbound_ss_password(inbound);
     let account = inbound_account(inbound);
     let method = inbound_method(inbound);
     let carrier = inbound_carrier(inbound);
-    let udp_raw = matches!(carrier, Carrier::Raw(_));
+    let (tcp, udp) = inbound_ss_networks(inbound);
     let accounts = ss_accounts(inbound, address, password, method);
-    let udp_accounts = udp_raw.then(|| Arc::clone(&accounts));
+    let udp_accounts = (udp && matches!(carrier, Carrier::Raw(_))).then(|| Arc::clone(&accounts));
     if matches!(carrier, Carrier::Raw(_))
+        && udp
         && serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method)
     {
         return;
     }
-    match carrier {
-        Carrier::Kcp(config) => {
-            if !serve_ss_kcp_listener(
-                address,
-                inbound,
-                config,
-                &accounts,
-                freedom,
-                &account.email,
-                account.level,
-            ) {
-                return;
+    if tcp {
+        match carrier {
+            Carrier::Kcp(config) => {
+                if !serve_ss_kcp_listener(
+                    address,
+                    inbound,
+                    config,
+                    &accounts,
+                    freedom,
+                    &account.email,
+                    account.level,
+                ) {
+                    return;
+                }
             }
-        }
-        Carrier::Xdrive { settings } => {
-            let accounts = Arc::clone(&accounts);
-            let email = account.email.clone();
-            let level = account.level;
-            let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
-            let accept: crate::xdrive::Accept = Arc::new(move |session| {
-                let _flow = crate::accesslog::flow(None, &email, level);
-                serve_ss_xdrive(session.with_meter(meter.clone()), &accounts, freedom);
-            });
-            serve_xdrive_loop(&settings, address, accept);
-        }
-        carrier if stream_security(inbound) == "tls" => {
-            let Some(server) = inbound_tls_identity(inbound) else {
-                eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
-                return;
-            };
-            spawn_role(
+            Carrier::Xdrive { settings } => {
+                let accounts = Arc::clone(&accounts);
+                let email = account.email.clone();
+                let level = account.level;
+                let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+                let accept: crate::xdrive::Accept = Arc::new(move |session| {
+                    let _flow = crate::accesslog::flow(None, &email, level);
+                    serve_ss_xdrive(session.with_meter(meter.clone()), &accounts, freedom);
+                });
+                serve_xdrive_loop(&settings, address, accept);
+            }
+            carrier if stream_security(inbound) == "tls" => {
+                // A refused identity takes only the stream half: a udp relay this config asked for still opens.
+                match inbound_tls_identity(inbound) {
+                    Some(server) => spawn_role(
+                        address,
+                        inbound_role(
+                            inbound,
+                            Role::Shadowsocks {
+                                accounts,
+                                carrier,
+                                freedom,
+                                tls: Some(server),
+                            },
+                        ),
+                        inbound_tag(inbound),
+                    ),
+                    None => eprintln!(
+                        "unreadable shadowsocks tls identity on {address}: refused, not served"
+                    ),
+                }
+            }
+            _ if !matches!(stream_security(inbound), "" | "none") => {
+                let security = stream_security(inbound);
+                eprintln!("shadowsocks security `{security}` on {address}: refused, not served");
+            }
+            other => spawn_role(
                 address,
                 inbound_role(
                     inbound,
                     Role::Shadowsocks {
                         accounts,
-                        carrier,
+                        carrier: other,
                         freedom,
-                        tls: Some(server),
+                        tls: None,
                     },
                 ),
                 inbound_tag(inbound),
-            );
-        }
-        _ if !matches!(stream_security(inbound), "" | "none") => {
-            let security = stream_security(inbound);
-            eprintln!("shadowsocks security `{security}` on {address}: refused, not served");
-        }
-        other => spawn_role(
-            address,
-            inbound_role(
-                inbound,
-                Role::Shadowsocks {
-                    accounts,
-                    carrier: other,
-                    freedom,
-                    tls: None,
-                },
             ),
-            inbound_tag(inbound),
-        ),
+        }
     }
     if let Some(accounts) = udp_accounts {
         let udp_address = address.to_owned();
@@ -29004,6 +29034,16 @@ mod tests {
     }
 
     #[test]
+    fn shadowsocks_networks_read_as_a_string_or_an_array() {
+        let string = crate::json::parse(r#"{"settings": {"network": "tcp"}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&string), (true, false));
+        let array = crate::json::parse(r#"{"settings": {"network": ["udp"]}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&array), (false, true));
+        let absent = crate::json::parse(r#"{"settings": {"password": "p"}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&absent), (true, true));
+    }
+
+    #[test]
     fn the_seam_split_find_across_agrees_with_the_per_byte_branch_scan() {
         // The contiguous probe scan must yield the identical first position on every seam, interior and absent placement.
         fn before(head: &[u8], probe: &[u8]) -> Option<usize> {
@@ -36833,7 +36873,6 @@ mod tests {
             cipher: crate::vmess::Cipher::Auto,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: Some(client),
             headers: Vec::new(),
             heartbeat: 0,
@@ -38396,7 +38435,6 @@ mod tests {
                 settings: xhttp_settings("/share"),
             },
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -39759,7 +39797,6 @@ mod tests {
             key: trojan_key("secret"),
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -39908,7 +39945,6 @@ mod tests {
             cipher: crate::vmess::Cipher::Chacha,
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -40175,6 +40211,24 @@ mod tests {
             "a password no client lists is refused"
         );
         assert_eq!(listed, 2, "one account per user");
+    }
+
+    /// A shadowsocks inbound told to carry udp alone opens no stream listener, as the reference's udp worker alone would not.
+    #[test]
+    fn a_udp_only_shadowsocks_inbound_opens_no_stream_listener() {
+        let inbound = crate::json::parse(
+            r#"{"protocol": "shadowsocks", "settings": {"password": "pw", "method": "aes-256-gcm", "network": ["udp"]}}"#,
+        )
+        .expect("parses");
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        serve_shadowsocks_inbound(&format!("127.0.0.1:{port}"), &inbound, true);
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "the udp-only front bound no tcp listener"
+        );
     }
 
     #[test]
@@ -42132,7 +42186,6 @@ mod tests {
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42203,7 +42256,6 @@ mod tests {
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42272,7 +42324,6 @@ mod tests {
                 "/TunnelService/Tun".to_owned(),
             )),
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42346,7 +42397,6 @@ mod tests {
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42433,7 +42483,6 @@ mod tests {
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42504,7 +42553,6 @@ mod tests {
                 ed: 0,
             },
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42576,7 +42624,6 @@ mod tests {
             key: trojan_key("secret"),
             carrier: Carrier::Grpc(crate::config::GrpcSettings::path("/Tun".to_owned())),
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42645,7 +42692,6 @@ mod tests {
                 settings: xhttp_settings("/tunnel"),
             },
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -42714,7 +42760,6 @@ mod tests {
                 path: "/tunnel".to_owned(),
             },
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -50886,7 +50931,6 @@ mod tests {
             key,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -50918,7 +50962,6 @@ mod tests {
             cipher: crate::vmess::Cipher::Auto,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
-            mux: false,
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,

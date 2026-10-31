@@ -3023,25 +3023,23 @@ fn ss_user(bytes: &[u8]) -> Result<SsAccount, String> {
     Ok(account)
 }
 
-/// The clients a shadowsocks inbound serves, one account per `users` entry. Its `network` list is
-/// read, not refused: this front serves TCP and UDP on every shadowsocks inbound.
+/// The clients a shadowsocks inbound serves, one account per `users` entry, and the networks its config opened.
 fn ss_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.proxy.shadowsocks.ServerConfig");
     let mut users = Vec::new();
+    let mut networks = Vec::new();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => users.push(ss_user(reader.bytes()?)?),
-            // A repeated enum arrives packed into one field or per field; this front serves both networks either way.
+            // A repeated enum arrives packed into one field or per field.
             (2, 2) => {
                 let mut packed =
                     Reader::new(reader.bytes()?, "xray.proxy.shadowsocks.ServerConfig");
                 while packed.more() {
-                    packed.varint()?;
+                    networks.push(packed.varint()?);
                 }
             }
-            (2, 0) => {
-                reader.varint()?;
-            }
+            (2, 0) => networks.push(reader.varint()?),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
@@ -3061,7 +3059,25 @@ fn ss_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
             object(pairs)
         })
         .collect();
-    Ok(object(vec![("users", Json::Arr(clients))]))
+    let mut settings = vec![("users", Json::Arr(clients))];
+    // Only tcp and udp reach a worker; a network this front does not carry opens nothing, as in the reference.
+    let mut opened: Vec<&str> = Vec::new();
+    if !networks.is_empty() {
+        for network in &networks {
+            let name = match network {
+                2 => "tcp",
+                3 => "udp",
+                _ => continue,
+            };
+            if !opened.contains(&name) {
+                opened.push(name);
+            }
+        }
+        if !opened.is_empty() {
+            settings.push(("network", Json::Str(opened.join(","))));
+        }
+    }
+    Ok(object(settings))
 }
 
 /// A shadowsocks outbound dials the one server its config names.
@@ -6075,8 +6091,38 @@ mod tests {
             bytes_field(1, &ss_user(&ss_account(b"a", 6), None)),
             bytes_field(2, &[4]),
         ]);
-        to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
+        let json = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
             .expect("a unix network decodes");
+        let named = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .and_then(|settings| settings.get("network"))
+            .and_then(Json::as_str);
+        assert_eq!(
+            named, None,
+            "a network this front does not carry narrows nothing, so the inbound still opens both"
+        );
+    }
+
+    #[test]
+    fn a_shadowsocks_network_list_narrows_the_front() {
+        let settings = message(&[
+            bytes_field(1, &ss_user(&ss_account(b"a", 6), None)),
+            bytes_field(2, &[2, 3]),
+            bytes_field(2, &[2]),
+        ]);
+        let json = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
+            .expect("both networks decode");
+        let named = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .and_then(|settings| settings.get("network"))
+            .and_then(Json::as_str);
+        assert_eq!(named, Some("tcp,udp"), "each network named once, in order");
     }
 
     #[test]
