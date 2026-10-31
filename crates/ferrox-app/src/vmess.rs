@@ -3730,6 +3730,7 @@ mod tests {
         for cipher in [Cipher::Aes, Cipher::Chacha] {
             for options in [
                 OPT_STREAM | OPT_AUTH_LEN,
+                OPT_STREAM | OPT_AUTH_LEN | OPT_MASK,
                 OPT_STREAM | OPT_AUTH_LEN | OPT_MASK | OPT_PAD,
             ] {
                 let mut send = Flow::fresh(cipher, &[0x02; 16], &[0x01; 16], options, &[0x01; 16])
