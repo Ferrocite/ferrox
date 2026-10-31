@@ -4747,7 +4747,7 @@ fn relay_split<R, W>(
         let mut sealed_write = sealed_write;
         let mut buf = RelayBuf::with_window(window);
         loop {
-            match plain_read.read(buf.as_mut()) {
+            match buf.read_from(&mut plain_read) {
                 Ok(0) => break,
                 Ok(n) => {
                     if sealed_write.write_all(buf.filled(n)).is_err() {
@@ -4767,7 +4767,7 @@ fn relay_split<R, W>(
     });
     let mut buf = RelayBuf::with_window(window);
     loop {
-        match sealed_read.read(buf.as_mut()) {
+        match buf.read_from(&mut sealed_read) {
             Ok(0) => break,
             Ok(n) => {
                 if plain_write.write_all(buf.filled(n)).is_err() {
@@ -7716,7 +7716,7 @@ fn copy_paced<R: Read, W: Write>(
 ) {
     let mut buffer = RelayBuf::new();
     loop {
-        let n = match from.read_once(buffer.as_mut()) {
+        let n = match from.read_once_buf(buffer) {
             Ok(0) => break,
             Ok(n) => n,
             Err(error) if is_timeout(&error) => {
@@ -8348,10 +8348,28 @@ impl<T: Read> Half<T> {
         result
     }
 
+    fn read_once_buf(&self, buf: &mut RelayBuf) -> std::io::Result<usize> {
+        census!("tunnel-leg-read", crate::census::NO_FD, None);
+        let result = self.read_locked_buf(buf);
+        self.hand_off();
+        result
+    }
+
     fn read_locked(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.read_locked_with(|guard| guard.read(buf))
+    }
+
+    fn read_locked_buf(&self, buf: &mut RelayBuf) -> std::io::Result<usize> {
+        self.read_locked_with(|guard| buf.read_from(guard))
+    }
+
+    fn read_locked_with(
+        &self,
+        fill: impl FnOnce(&mut T) -> std::io::Result<usize>,
+    ) -> std::io::Result<usize> {
         match self {
             Self::Split { read, .. } => match read.lock() {
-                Ok(mut guard) => guard.read(buf),
+                Ok(mut guard) => fill(&mut guard),
                 Err(_) => Err(std::io::Error::other("relay half poisoned")),
             },
             Self::Shared {
@@ -8365,7 +8383,7 @@ impl<T: Read> Half<T> {
                 if let Some(grain) = grain {
                     grain.before_read(&guard, wanted.load(Ordering::Relaxed));
                 }
-                let result = guard.read(buf);
+                let result = fill(&mut guard);
                 if let Some(grain) = grain {
                     match &result {
                         Ok(0) => {}
@@ -8523,7 +8541,7 @@ where
     R: Read,
     W: Write + HalfShut,
 {
-    match from.read_once(buffer.as_mut()) {
+    match from.read_once_buf(buffer) {
         Ok(0) => {
             to.spill_write();
             Next::Done
@@ -8549,7 +8567,7 @@ fn copy_stream<R: Read, W: Write>(
 ) {
     let mut buffer = RelayBuf::new();
     loop {
-        let n = match from.read_once(buffer.as_mut()) {
+        let n = match from.read_once_buf(buffer) {
             Ok(0) => break,
             Ok(n) => n,
             Err(error) if is_timeout(&error) => {
@@ -9243,7 +9261,7 @@ fn kcp_relay_metered(
     let mut buffer = RelayBuf::new();
     lane_pool::submit(
         Box::new(move || {
-            let next = match tcp_read.read(buffer.as_mut()) {
+            let next = match buffer.read_from(&mut tcp_read) {
                 Ok(0) => Next::Done,
                 Ok(n) => match up.write(buffer.filled(n)) {
                     Ok(written) => {
@@ -9280,7 +9298,7 @@ fn kcp_relay_metered(
     let mut buffer = RelayBuf::new();
     lane_pool::submit(
         Box::new(move || {
-            let next = match download.read(buffer.as_mut()) {
+            let next = match buffer.read_from(&mut download) {
                 Ok(0) => Next::Done,
                 Ok(n) => {
                     if tcp_write.write_all(buffer.filled(n)).is_ok() {
@@ -21294,9 +21312,10 @@ pub(crate) const RELAY_BUFFER: usize = 64 * 1024;
 
 pub(crate) const RELAY_SMALL_BUFFER: usize = 16 * 1024;
 
-/// `read` takes the whole buffer and only the reported prefix escapes.
+/// `read` takes the whole buffer and only the reported prefix escapes. The window is capacity, not length: `read_buf` writes into the spare tail and only the bytes it reports are ever marked initialised.
 pub(crate) struct RelayBuf {
     bytes: Vec<u8>,
+    window: usize,
     moved: usize,
     promote_to: usize,
 }
@@ -21309,16 +21328,10 @@ impl RelayBuf {
 
     /// The same shape at a caller-chosen read window, for a staging buffer whose headroom and tailroom must sit outside the window rather than shrink it.
     #[must_use]
-    #[allow(
-        clippy::uninit_vec,
-        reason = "the length is handed straight to `read`, and only the prefix it reports is ever read back"
-    )]
     pub fn with_len(len: usize) -> Self {
-        let mut bytes = Vec::with_capacity(len);
-        // SAFETY: only the prefix a read reports is ever read back, so the uninitialised tail is unreachable.
-        unsafe { bytes.set_len(len) };
         Self {
-            bytes,
+            bytes: Vec::with_capacity(len),
+            window: len,
             moved: 0,
             promote_to: RELAY_BUFFER,
         }
@@ -21332,31 +21345,49 @@ impl RelayBuf {
         buf
     }
 
+    /// Fill the window from `reader` without zeroing it first: `read_buf` may write into uninitialised capacity, and only the prefix it reports is marked initialised.
+    pub fn read_from<R: Read>(&mut self, reader: &mut R) -> std::io::Result<usize> {
+        self.read_with(|cursor| reader.read_buf(cursor))
+    }
+
+    fn read_with(
+        &mut self,
+        fill: impl FnOnce(std::io::BorrowedCursor<'_>) -> std::io::Result<()>,
+    ) -> std::io::Result<usize> {
+        self.bytes.clear();
+        self.bytes.reserve(self.window);
+        let mut buf = std::io::BorrowedBuf::from(self.bytes.spare_capacity_mut());
+        fill(buf.unfilled())?;
+        let n = buf.filled().len();
+        // SAFETY: `fill` initialised the prefix `BorrowedBuf` reports, and `n` is that prefix.
+        unsafe { self.bytes.set_len(n) };
+        Ok(n)
+    }
+
+    /// A caller that writes the whole window itself gets initialised bytes first.
     #[must_use]
     pub fn as_mut(&mut self) -> &mut [u8] {
-        &mut self.bytes
+        if self.bytes.len() < self.window {
+            self.bytes.resize(self.window, 0);
+        }
+        &mut self.bytes[..self.window]
     }
 
     /// The buffer leaves the type; every later read is prefix-bounded like `open_chunk`'s or `poll_copy`'s, so bytes a read did not report are never sent.
     #[must_use]
-    pub fn into_vec(self) -> Vec<u8> {
+    pub fn into_vec(mut self) -> Vec<u8> {
+        self.bytes.resize(self.window, 0);
         self.bytes
     }
 
     /// A read that filled the window promotes at once, and a leg whose reads are all short promotes once it has moved a whole window: `recv` returns what is queued rather than what was asked, so a busy leg would otherwise stay at 16 KiB for the life of the flow.
     #[must_use]
-    #[allow(
-        clippy::uninit_vec,
-        reason = "the room a promotion adds lies past the bytes the read reported, and the next read starts at index 0"
-    )]
     pub fn filled(&mut self, n: usize) -> &[u8] {
         self.moved = self.moved.saturating_add(n);
-        if self.bytes.len() < self.promote_to
-            && (n == self.bytes.len() || self.moved >= self.promote_to)
-        {
-            self.bytes.reserve(self.promote_to - self.bytes.len());
-            // SAFETY: added room sits past the prefix and the next read overwrites it from index 0.
-            unsafe { self.bytes.set_len(self.promote_to) };
+        if self.window < self.promote_to && (n == self.window || self.moved >= self.promote_to) {
+            self.window = self.promote_to;
+            self.bytes
+                .reserve(self.window.saturating_sub(self.bytes.len()));
         }
         &self.bytes[..n]
     }
@@ -21376,7 +21407,7 @@ impl RelayBuf {
     #[cfg(test)]
     #[must_use]
     pub fn size(&self) -> usize {
-        self.bytes.len()
+        self.window
     }
 }
 
@@ -22260,7 +22291,7 @@ where
     R: Read,
     W: Write,
 {
-    match from.read_once(buffer.as_mut()) {
+    match from.read_once_buf(buffer) {
         Ok(0) => Next::Done,
         Ok(n) if to.write_once(buffer.filled(n)).is_ok() => Next::More,
         Err(error) if is_timeout(&error) => {
@@ -22333,7 +22364,7 @@ fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     loop {
         let read = {
             census!("relay-leg-read", crate::census::handle(from), read_arm);
-            from.read(buffer.as_mut())
+            buffer.read_from(from)
         };
         let n = match read {
             Ok(0) => return,
@@ -23164,7 +23195,7 @@ where
             }
             let read = {
                 census!("carrier-read", crate::census::handle(&peer_read), read_arm);
-                peer_read.read(buffer.as_mut())
+                buffer.read_from(&mut peer_read)
             };
             let next = forward_finished(read, &mut buffer, &uplink, &mut at, || {
                 forward_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
@@ -23193,7 +23224,7 @@ where
     let _ = peer_write.set_write_timeout(Some(stall));
     lane_pool::submit(
         Box::new(move || {
-            let read = reader.read(upload.buffer.as_mut());
+            let read = upload.buffer.read_from(&mut reader);
             let ended_request = DRAIN_REQUEST && request_ended(&mut reader);
             let next = upload_finished(
                 read,
@@ -23280,7 +23311,7 @@ pub(crate) fn relay_carried<R: Read + Send + 'static>(
         Box::new(move || {
             let read = {
                 census!("carrier-read", crate::census::handle(&peer_read), read_arm);
-                peer_read.read(buffer.as_mut())
+                buffer.read_from(&mut peer_read)
             };
             let next = match read {
                 Ok(n) if n > 0 => {
@@ -23310,7 +23341,7 @@ pub(crate) fn relay_carried<R: Read + Send + 'static>(
     let mut buffer = RelayBuf::new();
     lane_pool::submit(
         Box::new(move || {
-            let read = reader.read(buffer.as_mut());
+            let read = buffer.read_from(&mut reader);
             let next = match read {
                 Ok(n) if n > 0 => {
                     census!(
@@ -23786,7 +23817,7 @@ impl Pump {
                     if !matches!(stop_rx.try_recv(), Err(TryRecvError::Empty)) {
                         break;
                     }
-                    match reading.read(buffer.as_mut()) {
+                    match buffer.read_from(&mut reading) {
                         Ok(size) if size > 0 => {
                             pumped.store(true, Ordering::Relaxed);
                             if !to_carrier(buffer.filled(size)) {
@@ -30837,6 +30868,7 @@ mod tests {
     #[test]
     fn a_relay_buffer_promotes_once_a_whole_window_has_moved() {
         let mut buffer = RelayBuf::new();
+        let _ = buffer.as_mut();
         let short = RELAY_SMALL_BUFFER - 1;
         let window = (RELAY_BUFFER - 1) / short;
         for _ in 0..window {
@@ -30857,6 +30889,7 @@ mod tests {
         );
 
         let mut small = RelayBuf::new();
+        let _ = small.as_mut();
         assert_eq!(small.filled(1).len(), 1);
         assert_eq!(
             small.size(),
@@ -31135,6 +31168,7 @@ mod tests {
         assert_eq!(counts.zeroed, 0, "the initial window is zeroed: {counts:?}");
 
         let mut buffer = RelayBuf::new();
+        let _ = buffer.as_mut();
         let ((), counts) = ferrox_core::alloc_count::measure(|| {
             let _ = buffer.filled(RELAY_SMALL_BUFFER);
         });
