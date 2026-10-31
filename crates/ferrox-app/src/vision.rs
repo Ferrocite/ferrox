@@ -633,6 +633,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             };
             dot += 16;
         }
+        let cap = buf.as_deref().map_or(usize::MAX, <[u8]>::len);
         let mut held = 0;
         let result = 'frames: loop {
             // the header is read whole when the window offers five bytes; the tail is byte-by-byte
@@ -643,14 +644,11 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 let content = (body >> 16) as usize;
                 let padding = (body & 0xffff) as usize;
                 self.validate();
-                dot += 5;
-                let room = match buf.as_deref() {
-                    Some(slot) => slot.len() - held,
-                    None => usize::MAX,
-                };
-                if end - dot >= content + padding && room >= content {
+                let at = dot + 5;
+                let next = at + content + padding;
+                if next <= end && cap - held >= content {
                     if content > 0 {
-                        let fresh = &self.have[dot..dot + content];
+                        let fresh = &self.have[at..at + content];
                         if active {
                             if let Some(feed) = feed.as_deref_mut() {
                                 feed.run += content;
@@ -662,7 +660,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                         }
                         held += content;
                     }
-                    dot += content + padding;
+                    dot = next;
                     if command == VisionCommand::Continue.byte() {
                         if held == 0 {
                             break 'frames held;
@@ -683,6 +681,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 walk.want_content = content;
                 walk.want_padding = padding;
                 walk.want_header = 0;
+                dot = at;
             } else if walk.want_header > 0 {
                 if dot == end {
                     // parked inside an incomplete header: nothing moves without bytes
@@ -704,10 +703,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 continue 'frames;
             }
             if walk.want_content > 0 {
-                let room = match buf.as_deref() {
-                    Some(slot) => slot.len() - held,
-                    None => usize::MAX,
-                };
+                let room = cap - held;
                 let take = walk.want_content.min(end - dot).min(room);
                 let fresh = &self.have[dot..dot + take];
                 if active {
@@ -722,7 +718,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 dot += take;
                 walk.want_content -= take;
                 held += take;
-                if walk.want_content > 0 || held == buf.as_deref().map_or(0, <[u8]>::len) {
+                if walk.want_content > 0 || held == cap {
                     break 'frames held;
                 }
             }
