@@ -38670,7 +38670,8 @@ mod tests {
     /// through to a direct dial here.
     #[test]
     fn a_simplified_outbound_dials_its_protocol() {
-        let vmess = crate::json::parse(
+        const ID: &str = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        let root = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vmess", "settings": {
                 "address": "192.0.2.1", "port": 443,
                 "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
@@ -38678,39 +38679,33 @@ mod tests {
                 "experiments": "AuthenticatedLength|NoTerminationSignal"}}]}"#,
         )
         .expect("parses");
-        let Some(Outbound::Vmess(out)) = find_outbound(&vmess).expect("builds") else {
+        let Some(Outbound::Vmess(out)) = find_outbound(&root).expect("builds") else {
             panic!("the flat vmess settings fell through to a direct dial");
         };
         assert_eq!(out.address, "192.0.2.1");
         assert_eq!(out.port, 443);
-        assert_eq!(
-            out.id,
-            uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id")
-        );
+        assert_eq!(out.id, uuid_bytes(ID).expect("id"));
         assert_eq!(out.cipher, crate::vmess::Cipher::Chacha);
         assert!(out.auth_len, "the settings name the experiment");
         assert!(out.no_termination);
-        let vless = crate::json::parse(
+        let root = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vless", "settings": {
                 "address": "192.0.2.1", "port": 443,
                 "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
                 "flow": "xtls-rprx-vision"}}]}"#,
         )
         .expect("parses");
-        let Some(Outbound::Vless(out)) = find_outbound(&vless).expect("builds") else {
+        let Some(Outbound::Vless(out)) = find_outbound(&root).expect("builds") else {
             panic!("the flat vless settings fell through to a direct dial");
         };
         assert_eq!(out.flow, "xtls-rprx-vision", "the account is the settings");
-        assert_eq!(
-            out.id,
-            uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id")
-        );
-        let no_id = crate::json::parse(
+        assert_eq!(out.id, uuid_bytes(ID).expect("id"));
+        let root = crate::json::parse(
             r#"{"outbounds": [{"protocol": "vmess", "settings": {
                 "address": "192.0.2.1", "port": 443}}]}"#,
         )
         .expect("parses");
-        let first = &no_id
+        let first = &root
             .get("outbounds")
             .and_then(Json::as_arr)
             .expect("outbounds")[0];
