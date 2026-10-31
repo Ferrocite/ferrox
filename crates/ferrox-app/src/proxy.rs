@@ -45807,6 +45807,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        windows,
+        ignore = "Windows CI's timer resolution masks the five-millisecond poll; the Linux benchmark matrix gates this"
+    )]
     fn hysteria_server_sends_a_bulk_download_to_a_raw_quic_client() {
         let _serial = quic_serial();
         let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
