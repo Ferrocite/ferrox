@@ -26,7 +26,8 @@ vless-reality-grpc-down-8|server-threads|1.67|696
 vless-reality-raw-down-8|server-threads|1.54|696
 vless-reality-xhttp-down-8|server-cpu|0.00|668
 vless-reality-xhttp-down-8|server-threads|0.00|668
-vless-tls-grpc-down-8|server-threads|1.46|696
+vless-tls-grpc-down-8|server-threads|1.67|696
+vless-tls-grpc-up-1|rust|0.53|704
 vless-tls-raw-down-8|server-threads|1.46|696
 vless-tls-ws-down-8|server-threads|1.36|696
 vless-vision-reality-raw-down-8|server-threads|1.54|696

@@ -2406,17 +2406,22 @@ mod tests {
     fn a_window_update_ends_a_parked_room_wait() {
         let writer = writer_over(Recorder(Arc::new(Mutex::new(Peer::default()))), HUNK, 0);
         let shared = Arc::clone(&writer.shared);
+        let done = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&done);
         let grant = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            {
-                let mut send = shared.send.lock().unwrap_or_else(PoisonError::into_inner);
-                send.conn = u64::MAX;
-                send.stream = u64::MAX;
+            while !stop.load(Ordering::SeqCst) {
+                {
+                    let mut send = shared.send.lock().unwrap_or_else(PoisonError::into_inner);
+                    send.conn = u64::MAX;
+                    send.stream = u64::MAX;
+                }
+                shared.wake.notify_all();
+                std::thread::sleep(Duration::from_millis(1));
             }
-            shared.wake.notify_all();
         });
         let began = Instant::now();
         writer.wait_for_room(Duration::from_secs(2));
+        done.store(true, Ordering::SeqCst);
         grant.join().expect("the granter ran");
         assert!(
             began.elapsed() < Duration::from_secs(2),
@@ -2430,25 +2435,30 @@ mod tests {
     fn a_window_update_wakes_a_parked_take() {
         let writer = writer_over(Recorder(Arc::new(Mutex::new(Peer::default()))), HUNK, 0);
         let shared = Arc::clone(&writer.shared);
+        let done = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&done);
         let grant = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(20));
-            {
-                let mut send = shared.send.lock().unwrap_or_else(PoisonError::into_inner);
-                send.conn = u64::MAX;
-                send.stream = u64::MAX;
+            while !stop.load(Ordering::SeqCst) {
+                {
+                    let mut send = shared.send.lock().unwrap_or_else(PoisonError::into_inner);
+                    send.conn = u64::MAX;
+                    send.stream = u64::MAX;
+                }
+                shared.wake.notify_all();
+                std::thread::sleep(Duration::from_millis(1));
             }
-            shared.wake.notify_all();
         });
         let began = Instant::now();
         let took = take_window_until(
             &writer.shared,
             HUNK as u64 - 1,
-            Some(began + Duration::from_secs(10)),
+            Some(began + Duration::from_secs(2)),
         );
+        done.store(true, Ordering::SeqCst);
         grant.join().expect("the granter ran");
         assert!(took, "the parked take saw the window update");
         assert!(
-            began.elapsed() < Duration::from_secs(10),
+            began.elapsed() < Duration::from_secs(2),
             "the update woke the take before its deadline"
         );
     }
