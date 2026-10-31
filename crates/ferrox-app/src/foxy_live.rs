@@ -65,7 +65,7 @@ fn account() -> Option<Account> {
     })
 }
 
-/// No secrets: a dummy credential reaches FxA, so the answer proves the UA class and not the account.
+/// No secrets: a dummy credential reaches `FxA`, so the answer proves the UA class and not the account.
 #[test]
 #[ignore = "network: a dummy credential proves the pinned identity is not refused as a bot"]
 fn a_dummy_account_clears_the_edge_without_a_browser() {

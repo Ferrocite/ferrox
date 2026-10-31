@@ -51,8 +51,9 @@ const BROWSER_LANGUAGE: &str = "en-US,en;q=0.5";
 
 static FXA_USER_AGENT: Mutex<Option<String>> = Mutex::new(None);
 
-/// One identity for both the FxA calls and the challenge solver: a solved cookie is bound to the client that earned it.
+/// One identity for both the `FxA` calls and the challenge solver: a solved cookie is bound to the client that earned it.
 fn fxa_user_agent() -> Cow<'static, str> {
+    debug_assert!(BROWSER_AGENT.contains(FIREFOX_VERSION));
     match FXA_USER_AGENT
         .lock()
         .ok()
@@ -63,7 +64,7 @@ fn fxa_user_agent() -> Cow<'static, str> {
     }
 }
 
-/// Sets the identity both the FxA calls and the solver present; empty restores the pinned Firefox identity.
+/// Sets the identity both the `FxA` calls and the solver present; empty restores the pinned Firefox identity.
 pub(crate) fn set_fxa_user_agent(value: &str) -> Result<(), String> {
     let value = validated_user_agent(value)?;
     *FXA_USER_AGENT
@@ -217,13 +218,13 @@ fn send_as(
     Err(Denied::Challenged(406))
 }
 
-/// The Firefox Accounts hosts whose edge refuses the MozillaVPN agent class; Remote Settings and Guardian are not among them.
+/// The Firefox Accounts hosts whose edge refuses the `MozillaVPN` agent class; Remote Settings and Guardian are not among them.
 fn is_fxa_host(host: &str) -> bool {
     host.eq_ignore_ascii_case("accounts.firefox.com")
         || host.to_ascii_lowercase().ends_with(".accounts.firefox.com")
 }
 
-/// The page identities that may solve a challenge for a caller: the Firefox identity matching an FxA call, or the reference's two-page ladder for the MozillaVPN agent.
+/// The page identities that may solve a challenge for a caller: the Firefox identity matching an `FxA` call, or the reference's two-page ladder for the `MozillaVPN` agent.
 fn solver_agents(agent: Agent) -> &'static [Agent] {
     match agent {
         Agent::Fxa => &[Agent::Page],
@@ -323,7 +324,7 @@ fn solve_on(endpoint: &Endpoint, jar: &Mutex<Jar>, agents: &[Agent]) -> Result<(
     Err(last)
 }
 
-/// The page identity that earned a challenge body: FxA under Firefox, the account client under its own agent.
+/// The page identity that earned a challenge body: `FxA` under Firefox, the account client under its own agent.
 fn solver_page(agent: Agent) -> Agent {
     match agent {
         Agent::Fxa => Agent::Page,

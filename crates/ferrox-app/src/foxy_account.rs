@@ -1901,10 +1901,10 @@ mod loopback {
     /// Whether the plane treats the entitlement as activated, which the activate-and-mint-again path turns on.
     pub(crate) static ACTIVE: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(true);
-    /// Whether the edge refuses the MozillaVPN agent on FxA calls, the UA-class denial the pinned Firefox identity clears.
+    /// Whether the edge refuses the `MozillaVPN` agent on `FxA` calls, the UA-class denial the pinned Firefox identity clears.
     pub(crate) static REFUSE_VPN_AGENT: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
-    /// Whether the edge refuses the Firefox identity everywhere, the revert the old MozillaVPN path still has to clear.
+    /// Whether the edge refuses the Firefox identity everywhere, the revert the old `MozillaVPN` path still has to clear.
     pub(crate) static REFUSE_FIREFOX_AGENT: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
 
@@ -2346,7 +2346,7 @@ mod loopback {
         );
     }
 
-    /// A UA-class `406` on FxA is cleared by the pinned Firefox identity, with no challenge page in the log.
+    /// A UA-class `406` on `FxA` is cleared by the pinned Firefox identity, with no challenge page in the log.
     #[test]
     fn the_firefox_identity_clears_an_agent_class_refusal() {
         let _turn = EDGE
@@ -2384,7 +2384,7 @@ mod loopback {
         );
     }
 
-    /// A revert that refuses the Firefox identity still signs in: the MozillaVPN path earns and presents its own cookie.
+    /// A revert that refuses the Firefox identity still signs in: the `MozillaVPN` path earns and presents its own cookie.
     #[test]
     fn the_old_identity_clears_a_firefox_refusal() {
         let _turn = EDGE
