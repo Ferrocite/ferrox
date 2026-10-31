@@ -103,7 +103,7 @@ Both H1 handshakes â€” the `POST` a server reads and the `200` a dialer reads â€
 
 ## The poll it hands back
 
-A chunked body's reader keeps its place across a poll timeout: the offset into the chunk, the phase (`chunk`: body, the closing CRLF, or the trailer lines), and the read-ahead cursor are fields, so a lane's quantum expiring mid-chunk returns `WouldBlock` and the next step continues at the same byte. The framing stays atomic: the last body bytes are delivered before the CRLF is taken, so a timeout on the pair loses nothing. Syscalls per chunk are unchanged (`xhttp::tests::a_chunk_costs_two_reads_not_three`); the resumed read is the same read. Witnessed by `xhttp::tests::a_crlf_split_across_reads_still_drains`.
+A chunked body's reader keeps its place across a poll timeout: the offset into the chunk, the phase (`chunk`: body, the closing CRLF, or the trailer lines), and the read-ahead cursor are fields, so a lane's quantum expiring mid-chunk returns `WouldBlock` and the next step continues at the same byte. The framing stays atomic: the last body bytes are delivered before the CRLF is taken, so a timeout on the pair loses nothing. A peer chunk as large as the relay window still costs two reads (`xhttp::tests::a_chunk_costs_two_reads_not_three`). xray writes its 8 KiB buffer per chunk, a quarter of that window, so the CRLF fill now takes a whole window instead of 128 bytes and the following bodies are parsed out of it: 16 peer chunks cost 5 reads, not 33 (`xhttp::tests::a_peer_chunk_smaller_than_the_window_amortises_its_framing`). What is not removed: the body bytes that ride in that window are copied out of it, so the download path pays one user-space copy where the direct body read paid none. Witnessed by `xhttp::tests::a_crlf_split_across_reads_still_drains`.
 
 ## Measured
 
@@ -114,6 +114,7 @@ A chunked body's reader keeps its place across a poll timeout: the offset into t
 | framing-size-lines-without-an-allocation | 0 | ferrox-app-xhttp::tests::size_lines_match_format_without_allocating |
 | framing-read-syscalls-per-chunk | 1 | ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three |
 | read-syscalls-per-chunk | 2 | ferrox-app-xhttp::tests::a_chunk_costs_two_reads_not_three |
+| read-syscalls-for-16-peer-chunks | 5 | ferrox-app-xhttp::tests::a_peer_chunk_smaller_than_the_window_amortises_its_framing |
 | write-slices-per-window | 1 | ferrox-app-xhttp::tests::one_window_is_one_chunked_frame |
 | user-space-copies-per-byte-written | 1 | ferrox-app-xhttp::tests::exchange_carries_an_echo_over_loopback |
 | requests-served-per-connection | 2 | ferrox-app-xhttp::tests::one_connection_carries_the_packet_up_uplink |
