@@ -22399,6 +22399,10 @@ pub(crate) trait CarrierSink: Clone + Send + 'static {
     fn settle(&self) -> Settle {
         Settle::Clear
     }
+    /// Sleeps out a parked turn; a carrier whose room arrives on a peer wake returns early instead.
+    fn wait_for_room(&self, turn: std::time::Duration) {
+        std::thread::sleep(turn);
+    }
     fn close(&self);
     /// Ends the request body when the app half-closes, before the carrier's own download ends; only a carrier whose response is gated on that body (xhttp, gRPC) answers here.
     fn upload_done(&self) {}
@@ -22652,7 +22656,7 @@ fn settle_lane(uplink: &impl CarrierSink, at: &mut Forward) -> Option<Next> {
             at.spins += 1;
             if at.spins >= RELAY_SPINS {
                 at.spins = 0;
-                std::thread::sleep(crate::budgets::RELAY_POLL);
+                uplink.wait_for_room(crate::budgets::RELAY_POLL);
             }
             Some(Next::Retry)
         }
@@ -22675,7 +22679,7 @@ fn forward_flush(buffer: &RelayBuf, uplink: &impl CarrierSink, at: &mut Forward)
                     return Some(Next::Retry);
                 }
                 at.spins = 0;
-                std::thread::sleep(crate::budgets::RELAY_POLL);
+                uplink.wait_for_room(crate::budgets::RELAY_POLL);
                 return Some(Next::Retry);
             }
             Push::Lost => {
