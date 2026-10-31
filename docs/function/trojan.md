@@ -14,7 +14,9 @@ A raw TLS listener that names `settings.fallbacks` spends the reference's first 
 
 A UDP association rides every TCP carrier the outbound dials — raw, ws, httpUpgrade, gRPC, xhttp (stream-one), http header and KCP — plain or under a terminated session, on both the client and the listener. The listener parses the association off whatever carrier the dial wrote; the client splits the session into the reader and writer its pump needs and wakes a parked reader by closing the carrier it came from. `a_trojan_udp_association_crosses_every_carrier` runs all fourteen pairs and holds two datagrams through each, 250 ms apart so a pump that gives up on an idle association is caught. QUIC carries the same SOCKS address, length, CRLF and payload frame on its stream, and Hysteria carries the association through its own datagram lane; `quic_serves_trojan_udp_over_loopback` and `hysteria_carries_a_trojan_udp_association_over_the_carrier` hold both ends.
 
-Two things are deliberately not implemented and are named rather than rounded off: mux is VLESS-only on both ends, so a trojan row that asks for it is not carried; and an inbound that declares `security: reality` is refused by name rather than served as plaintext — a silent downgrade of a session the config asked for is the failure mode, and `a_trojan_reality_inbound_is_refused_not_downgraded` is the gate. The `trojan://` share link is parsed by `ferrox_core::trojan::TrojanLink`, which `check`/`run` accept beside `vless://`, and its header probe goes through the same `encode_header` the dial uses. These are capability statements, not performance ones.
+REALITY is carried both roles on every TCP carrier the row names — raw, ws, httpUpgrade, gRPC, xhttp and http header — and above KCP, where the session wraps the connection. xray restricts REALITY to raw, XHTTP and gRPC, so the other carriers are a superset rather than a gap. `a_trojan_reality_inbound_answers_every_tcp_carrier` holds the six pairs, `a_trojan_reality_kcp_inbound_answers_the_session` holds the KCP pair, and an inbound that declares `security: reality` without an identity is refused by name rather than served as plaintext — `a_trojan_reality_inbound_without_identity_is_refused_not_downgraded` is the gate against a silent downgrade.
+
+Mux opens `v1.mux.cool:9527` on a raw carrier both ends, plain, under TLS, and under REALITY, carrying a TCP stream or a UDP association through one session; `a_trojan_mux_carries_a_tcp_stream_over_raw_tls_and_reality` and `a_trojan_mux_carries_a_udp_association_over_raw_and_reality` are the gates. A mux row on a non-raw carrier is dialed directly rather than refused, and the outbound says so once. The `trojan://` share link is parsed by `ferrox_core::trojan::TrojanLink`, which `check`/`run` accept beside `vless://`, and its header probe goes through the same `encode_header` the dial uses. These are capability statements, not performance ones.
 
 ## Data path
 
@@ -42,6 +44,10 @@ graph TD
 | framing-bytes-added-after-the-header | 0 | ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers |
 | udp-framing-bytes-per-datagram | 2 | ferrox-app-proxy::tests::trojan_udp_frames_carry |
 | udp-carriers-holding-an-association | 7 | ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier |
+| reality-tcp-carriers-holding-an-echo | 6 | ferrox-app-proxy::tests::a_trojan_reality_inbound_answers_every_tcp_carrier |
+| reality-kcp-pairs-holding-an-echo | 1 | ferrox-app-proxy::tests::a_trojan_reality_kcp_inbound_answers_the_session |
+| mux-tcp-carriers-holding-a-stream | 3 | ferrox-app-proxy::tests::a_trojan_mux_carries_a_tcp_stream_over_raw_tls_and_reality |
+| mux-udp-carriers-holding-an-association | 2 | ferrox-app-proxy::tests::a_trojan_mux_carries_a_udp_association_over_raw_and_reality |
 | header-reads-numeric-address | 2 | ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven |
 | header-reads-domain-address | 3 | ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven |
 | header-bytes-copied-out-of-the-buffer | 0 | ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven |
