@@ -75,6 +75,7 @@ shadowsocks-2022  shadowsocks2022::tests::udp_server_replies_are_server_typed_an
 shadowsocks-2022  shadowsocks2022::tests::the_session_subkey_probe_costs_the_derive_and_nothing_else  ferrox_core::shadowsocks2022::session_subkey
 vmess  vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time  vmess::stage_frame
 vmess  vmess::tests::frames_reuse_the_callers_buffers  vmess::read_frame
+vmess  vmess::tests::an_aes_batch_is_the_frames_written_one_at_a_time  vmess::stage_frame
 trojan  proxy::tests::the_trojan_header_costs_two_reads_not_seven  proxy::decode_trojan_request
 vless  vless::tests::first_method_header_is_stable  ferrox_core::vless::VlessLink::encode_into
 vless  vless::tests::the_request_parse_probe_costs_the_read_and_nothing_else  ferrox_core::vless::decode_request

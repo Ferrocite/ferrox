@@ -911,7 +911,14 @@ impl Api {
                 .ok_or_else(|| (3, "vmess account id is not a uuid".to_owned()))?;
             let email = request_str(user, 2).unwrap_or_default();
             let level = request_varint(user, 1).unwrap_or(0) as u32;
-            if !users.add(vmess::User { level, email, id }) {
+            let no_termination =
+                request_str(account.1, 4).is_some_and(|text| text.contains("NoTerminationSignal"));
+            if !users.add(vmess::User {
+                level,
+                email,
+                id,
+                no_termination,
+            }) {
                 return Err((2, "user already exists".to_owned()));
             }
             Ok(Vec::new())

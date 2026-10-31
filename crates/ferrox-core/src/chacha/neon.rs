@@ -104,4 +104,15 @@ impl Lanes for N4 {
             );
         }
     }
+
+    #[inline]
+    fn xor_chunk_from(self, _c: usize, src: &[u8; 16], dst: &mut [u8; 16]) {
+        unsafe {
+            let cur = vld1q_u8(src.as_ptr());
+            vst1q_u8(
+                dst.as_mut_ptr(),
+                veorq_u8(cur, vreinterpretq_u8_u32(self.0)),
+            );
+        }
+    }
 }
