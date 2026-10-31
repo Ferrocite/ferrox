@@ -82,6 +82,10 @@ if [[ $fast == 0 ]]; then
   python3 scripts/check-cli-args.py
   python3 scripts/check-cli-lane.py
 
+  step "firefox pin"
+  python3 scripts/update-firefox-version.py --selftest
+  python3 scripts/update-firefox-version.py --check
+
   step "prompt library"
   cargo run --locked --quiet -p ferrox-prompt -- check
 fi

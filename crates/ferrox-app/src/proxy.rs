@@ -25451,6 +25451,24 @@ fn foxy_ports(value: Option<&Json>) -> Vec<u16> {
         .collect()
 }
 
+fn foxy_exit_probe(
+    link: &ferrox_core::foxy::link::FoxyLink,
+    settings: Option<&Json>,
+) -> Option<String> {
+    let probe = foxy_text_or(link, settings, "exitProbe");
+    (!probe.is_empty()).then_some(probe)
+}
+
+fn foxy_pasted_pass(token: &str) -> ferrox_core::foxy::Pass {
+    ferrox_core::foxy::Pass {
+        token: std::sync::Arc::from(token),
+        expires_at: ferrox_core::foxy::account::jwt_expiry(token),
+        quota_remaining: None,
+        quota_reset: None,
+        quota_limit: None,
+    }
+}
+
 /// One plane refusal's pace: a retryable one is asked again after the gap it named, a final one is handed back at once.
 fn retry_plane(
     what: &str,
@@ -25717,6 +25735,14 @@ fn foxy_h3_over_http(
     upstream.is_some_and(crate::foxy::UpstreamProxy::http) && carrier == crate::foxy::Carrier::H3
 }
 
+/// A config's explicit `FxA` identity is process-wide; empty restores the pin and an invalid one warns.
+fn apply_fxa_user_agent(settings: Option<&Json>) {
+    let value = foxy_text(settings, "fxaUserAgent");
+    if let Err(why) = crate::foxy_challenge::set_fxa_user_agent(&value) {
+        eprintln!("foxy: fxaUserAgent {why}: keeping the current identity");
+    }
+}
+
 fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
     let empty = Vec::new();
     for outbound in root
@@ -25758,13 +25784,8 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             eprintln!("foxy: carrier h3 cannot ride an http upstreamProxy: use socks5(h)://, h1, h2 or auto");
             continue;
         }
-        let pasted = ferrox_core::foxy::Pass {
-            token: std::sync::Arc::from(configured.clone()),
-            expires_at: ferrox_core::foxy::account::jwt_expiry(&configured),
-            quota_remaining: None,
-            quota_reset: None,
-            quota_limit: None,
-        };
+        apply_fxa_user_agent(settings);
+        let pasted = foxy_pasted_pass(&configured);
         let account = foxy_account(
             &email,
             &password,
@@ -25808,10 +25829,7 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             edge_address,
             direct_ports: foxy_ports(settings.and_then(|s| s.get("directPorts"))),
             direct_suffixes: foxy_list_or(&link, settings, "directDomains"),
-            exit_probe: match foxy_text_or(&link, settings, "exitProbe") {
-                probe if probe.is_empty() => None,
-                probe => Some(probe),
-            },
+            exit_probe: foxy_exit_probe(&link, settings),
             verified: std::sync::Arc::new(std::sync::Mutex::new(None)),
             probe_unavailable: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             exit_probe_running: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),

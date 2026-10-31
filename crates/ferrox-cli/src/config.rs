@@ -255,6 +255,9 @@ fn foxy_outbound(
     settings.insert("password".to_owned(), json!(account.password));
     settings.insert("country".to_owned(), json!(options.country.to_uppercase()));
     settings.insert("carrier".to_owned(), json!(options.carrier));
+    if !options.fxa_user_agent.is_empty() {
+        settings.insert("fxaUserAgent".to_owned(), json!(options.fxa_user_agent));
+    }
     if !paths.token_file.as_os_str().is_empty() {
         settings.insert(
             "tokenFile".to_owned(),

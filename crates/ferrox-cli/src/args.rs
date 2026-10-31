@@ -52,6 +52,7 @@ pub struct Options {
     pub city_set: bool,
     pub carrier: String,
     pub carrier_set: bool,
+    pub fxa_user_agent: String,
     pub upstream: String,
     pub exclude_domains: String,
     pub exclude_ports: String,
@@ -103,6 +104,7 @@ impl Default for Options {
             city_set: false,
             carrier: "auto".to_owned(),
             carrier_set: false,
+            fxa_user_agent: String::new(),
             upstream: String::new(),
             exclude_domains: String::new(),
             exclude_ports: String::new(),
@@ -332,6 +334,20 @@ pub fn parse() -> Options {
                 options.carrier_set = true;
                 index += 2;
             }
+            "--fxa-user-agent" => {
+                let value = need(
+                    &args,
+                    index,
+                    "fxa-user-agent",
+                    "a printable ASCII User-Agent",
+                );
+                if !value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
+                    die("--fxa-user-agent wants printable ASCII only; nothing was started.");
+                }
+                let value = value.trim();
+                value.clone_into(&mut options.fxa_user_agent);
+                index += 2;
+            }
             "--upstream" => {
                 options.upstream =
                     need(&args, index, "upstream", "an http:// or socks5:// URL").to_owned();
@@ -433,6 +449,9 @@ pub fn parse() -> Options {
     {
         die("--exclude-domains and --exclude-ports belong to the foxy lane; nothing was started.");
     }
+    if !options.fxa_user_agent.is_empty() && options.outbound != Some(Outbound::Foxy) {
+        die("--fxa-user-agent belongs to the foxy lane; nothing was started.");
+    }
     if options.all {
         if options.action != Action::Down {
             die("--all belongs to 'down' (ferrox-cli down --all); nothing was started.");
@@ -490,6 +509,7 @@ foxy options
   --country CC           exit country; default is the remembered one, else US
   --city CODE            city tier inside the country
   --carrier NAME         auto|h1|h2|h3, default auto
+  --fxa-user-agent UA    override the pinned desktop Firefox identity for FxA
   --upstream URL         http:// or socks5(h):// hop to reach the edge through
   --exclude-domains LIST domain suffixes that leave the tunnel
   --exclude-ports LIST   destination ports that leave the tunnel
