@@ -1,15 +1,28 @@
 # Ferrox — release build
 
-No installer: the binary, the one-command CLI, and the full manual (`USAGE.md`). macOS and Linux ship `ferrox-cli.sh`; Windows ships the native `ferrox-cli.exe`, a `ferrox-cli.cmd` wrapper, and the same `ferrox-cli.sh` for Git Bash only. Nothing here needs cargo, a repository, or a config by hand.
+No installer: the binary, the one-command CLI, and the full manual (`USAGE.md`). Nothing here needs cargo, a repository, or a config by hand.
 
 ```
 ferrox-app            the lane engine: serves SOCKS5/HTTP/mixed fronts, dials every implemented lane
-ferrox-cli.sh         login, up, down, status, ports, locations, version — the only command you need
-ferrox-cli.exe        the same CLI built for Windows; no Bash, WSL or Python
+ferrox-cli.exe        Windows launcher; no Bash, WSL or Python
 ferrox-cli.cmd        cmd.exe wrapper for ferrox-cli.exe
-ferrox-cli.sh         Git Bash fallback only; not used by the native launcher
+ferrox-cli.sh         macOS/Linux launcher; Git Bash fallback on Windows
 USAGE.md              the manual: every lane, every port, what to do when it does not work
 ```
+
+## Pick the launcher for your platform
+
+**Windows:** unpack the zip and run `ferrox-cli.exe`. Do not run `bash ./ferrox-cli.sh` from PowerShell: PowerShell may resolve `bash` to WSL, which fails with `execvpe(/bin/bash)` when no WSL distribution is installed. If you see that error, use `.\ferrox-cli.exe`; it needs no shell. `ferrox-cli.cmd` forwards to the same binary from `cmd.exe`; the zip's `ferrox-cli.sh` is for Git Bash only and runs ports-only commands.
+
+```powershell
+Expand-Archive ferrox-*-x86_64-pc-windows-msvc.zip -DestinationPath .
+cd ferrox-*-x86_64-pc-windows-msvc
+.\ferrox-cli.exe up --foxy --vpn
+.\ferrox-cli.exe status
+.\ferrox-cli.exe down
+```
+
+**macOS and Linux:** run `ferrox-cli.sh`, as shown below.
 
 ## 30-second start — the Foxy lane
 
@@ -23,19 +36,7 @@ cd ferrox-*-aarch64-apple-darwin
 ./ferrox-cli.sh down               # stop and clear the system proxy
 ```
 
-On Windows, unpack the zip and use the native launcher; the flags and prompts are identical:
-
-```powershell
-Expand-Archive ferrox-*-x86_64-pc-windows-msvc.zip -DestinationPath .
-cd ferrox-*-x86_64-pc-windows-msvc
-.\ferrox-cli.exe up --foxy --vpn
-.\ferrox-cli.exe status
-.\ferrox-cli.exe down
-```
-
-`ferrox-cli.cmd` runs the same binary from `cmd.exe`. The zip also includes `ferrox-cli.sh` for Git Bash only, with Python 3 and curl on `PATH`; it runs ports-only commands. Use the native launcher for `--vpn`.
-
-Do not run `bash ./ferrox-cli.sh` from PowerShell: PowerShell may resolve `bash` to WSL, which fails with `execvpe(/bin/bash)` when no WSL distribution is installed. If you see that error, run `.\ferrox-cli.exe` instead; it needs no shell.
+The flags and prompts are identical on Windows; use `.\ferrox-cli.exe` in place of `./ferrox-cli.sh`.
 
 On Windows the native launcher keeps config and account files under `%APPDATA%\ferrox` and pid/log/system-proxy state under `%LOCALAPPDATA%\ferrox`, owner-only through NTFS ACLs. The `~/.config/ferrox` paths below describe macOS and Linux.
 
@@ -94,6 +95,8 @@ Every share link this build dials goes through the same one command; anything be
 ```
 
 Here the server is in the link or the `HOST:PORT` — unlike Foxy, these lanes dial the server you name. An invocation that cannot start the lane it names is refused before anything runs: `up --vless` with no link prints the example, `up --vmess` without `--uuid` names the missing id, and a rejected `up` leaves a lane that is already carrying traffic untouched.
+
+The Psiphon lane starts its own `psiphon-tunnel-core`, kept beside `ferrox-app` or named with `--psiphon-bin FILE`: `./ferrox-cli.sh up --psiphon --vpn`. Add `--psiphon-conduit-mode shirokhorshid` or `--psiphon-cdn-profile shirokhorshid` for the Shiroy variants; `auto`/`public` and `legacy`/`android`/`off` keep the built-in paths.
 
 ## Ports, on every platform
 
