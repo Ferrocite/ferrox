@@ -40214,6 +40214,77 @@ mod tests {
         assert_eq!(listed, 2, "one account per user");
     }
 
+    /// The reference's mux over shadowsocks: the client names `v1.mux.cool` on the request domain, the server opens a session, and a stream inside it echoes.
+    #[test]
+    fn shadowsocks_mux_carries_a_stream_through_one_session() {
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        let (dialed_tx, dialed_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for stream in echo.incoming().flatten() {
+                if dialed_tx.send(()).is_err() {
+                    return;
+                }
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = stream.read(&mut buf) {
+                        if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let users = inbound_ss_users(
+            &crate::json::parse(
+                r#"{"protocol": "shadowsocks", "settings": {"password": "an-example-shared-password", "method": "aes-256-gcm"}}"#,
+            )
+            .expect("parses"),
+            "an-example-shared-password",
+            "aes-256-gcm",
+            "test",
+        );
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for stream in tunnel.incoming().flatten() {
+                let users = users.clone();
+                thread::spawn(move || crate::shadowsocks::serve(stream, &users, true));
+            }
+        });
+        let ss = ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port: tunnel_port,
+            method: "aes-256-gcm".to_owned(),
+            password: "an-example-shared-password".to_owned(),
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: true,
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+        };
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let (local, _) = front.accept().expect("accepts");
+        let target = Destination::from(SocketAddr::from(([127, 0, 0, 1], echo_port)));
+        let dial = thread::spawn(move || {
+            assert!(dial_ss_mux(&local, &ss, &target), "the mux session opens");
+        });
+        dialed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the frame's target is dialed");
+        client.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut client), b"ping", "the mux stream echoes");
+        client.shutdown(Shutdown::Both).expect("closes");
+        dial.join().expect("the mux session ends with the client");
+    }
+
     /// A shadowsocks inbound told to carry udp alone opens no stream listener, as the reference's udp worker alone would not.
     #[test]
     fn a_udp_only_shadowsocks_inbound_opens_no_stream_listener() {
