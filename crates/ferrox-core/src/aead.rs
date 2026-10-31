@@ -55,7 +55,7 @@ pub fn chacha20_poly1305_seal_from(
     src: &[u8],
     dst: &mut [u8],
 ) -> [u8; 16] {
-    debug_assert_eq!(
+    assert_eq!(
         src.len(),
         dst.len(),
         "the source and the wire are the same message"
