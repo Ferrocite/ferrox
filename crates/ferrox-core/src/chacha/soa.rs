@@ -1,6 +1,6 @@
 //! Eight blocks per pass as two sets of four, one state word per register with the blocks in the lanes: a diagonal round is a register rename, and the second set supplies the eight chains a half round's barrier needs to fill.
 
-use super::{base, base_state, xor_tail, Wide};
+use super::{base, base_state, xor_tail, xor_tail_from, Wide};
 #[allow(
     clippy::wildcard_imports,
     reason = "arch intrinsics: the module's whole API is register operations"
@@ -123,12 +123,41 @@ fn store_block(dst: &mut [u8], rows: [uint32x4_t; 4]) {
     }
 }
 
+#[inline(always)]
+fn xor_row_from(dst: &mut [u8; 16], src: &[u8; 16], row: uint32x4_t) {
+    unsafe {
+        vst1q_u8(
+            dst.as_mut_ptr(),
+            veorq_u8(vld1q_u8(src.as_ptr()), vreinterpretq_u8_u32(row)),
+        );
+    }
+}
+
+#[inline(always)]
+fn store_block_from(dst: &mut [u8], src: &[u8], rows: [uint32x4_t; 4]) {
+    for ((chunk, src), row) in dst
+        .as_chunks_mut::<16>()
+        .0
+        .iter_mut()
+        .zip(src.as_chunks::<16>().0)
+        .zip(rows)
+    {
+        xor_row_from(chunk, src, row);
+    }
+}
+
 /// One eight-block pass, the message xored in place: `out` is `PASS_BYTES` long, or sixty-four less with a `head` taking the first thirty-two bytes of the one-time-key block and dropping its tail, over a nonce state with a zero counter.
 #[allow(
     clippy::too_many_lines,
     reason = "the round's sixteen quarter rounds are written out because their register names are the diagonal, and the store follows those same names"
 )]
-fn pass(state: &[u32; 16], ctr: u32, head: Option<&mut [u8; 32]>, out: &mut [u8]) {
+fn pass_impl<const FROM: bool>(
+    state: &[u32; 16],
+    ctr: u32,
+    head: Option<&mut [u8; 32]>,
+    src: &[u8],
+    out: &mut [u8],
+) {
     debug_assert_eq!(state[12], 0, "the counter register is only a base at zero");
     debug_assert_eq!(
         out.len(),
@@ -248,14 +277,24 @@ fn pass(state: &[u32; 16], ctr: u32, head: Option<&mut [u8; 32]>, out: &mut [u8]
         xor_row(&mut key_rows[1], slots[0][1]);
         skip = 1;
     }
-    for (block, slot) in out
+    for (i, (block, slot)) in out
         .as_chunks_mut::<64>()
         .0
         .iter_mut()
         .zip(slots.into_iter().chain(later).skip(skip))
+        .enumerate()
     {
-        store_block(block, slot);
+        if FROM {
+            store_block_from(block, &src[i * 64..i * 64 + 64], slot);
+        } else {
+            store_block(block, slot);
+        }
     }
+}
+
+#[inline(always)]
+fn pass(state: &[u32; 16], ctr: u32, head: Option<&mut [u8; 32]>, out: &mut [u8]) {
+    pass_impl::<false>(state, ctr, head, &[], out);
 }
 
 /// The eight-block pass over whole passes, its tail straight to `xor_tail` with this state: a pass leaves fewer than `group_bytes` so the group loop never runs, and as in `chacha::xor_blocks` the head is block `start`'s keystream while the first byte encrypts under `start + 1`.
@@ -290,6 +329,43 @@ pub(crate) fn xor_blocks(
     }
 
     blocks + xor_tail::<Wide>(&state, &rows, ctr, head, rest)
+}
+
+#[inline]
+pub(crate) fn xor_blocks_from(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    start: u32,
+    mut head: Option<&mut [u8; 32]>,
+    src: &[u8],
+    dst: &mut [u8],
+) -> u32 {
+    let state = base_state(key, nonce);
+    let rows = base::<Wide>(&state);
+    let mut ctr = start;
+    let mut src = src;
+    let mut rest = dst;
+    let mut blocks = 0u32;
+
+    loop {
+        let take = if head.is_some() {
+            PASS_BYTES - 64
+        } else {
+            PASS_BYTES
+        };
+        if rest.len() < take {
+            break;
+        }
+        let (chunk, tail) = rest.split_at_mut(take);
+        let (chunk_src, tail_src) = src.split_at(take);
+        pass_impl::<true>(&state, ctr, head.take(), chunk_src, chunk);
+        blocks += PASS_BLOCKS;
+        ctr = ctr.wrapping_add(PASS_BLOCKS);
+        rest = tail;
+        src = tail_src;
+    }
+
+    blocks + xor_tail_from::<Wide>(&state, &rows, ctr, head, src, rest)
 }
 
 #[cfg(test)]

@@ -14,6 +14,29 @@ pub fn fill_exact(key: &[u8; 32], nonce: &[u8; 12], start_block: u32, buf: &mut 
     ))
 }
 
+pub fn fill_exact_from(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    start_block: u32,
+    src: &[u8],
+    dst: &mut [u8],
+) -> u64 {
+    let blocks = blocks_for(dst.len());
+    assert!(
+        blocks <= u64::from(u32::MAX) - u64::from(start_block),
+        "chacha20 block counter would wrap; a nonce's keystream would repeat"
+    );
+
+    u64::from(crate::chacha::xor_blocks_from(
+        key,
+        nonce,
+        start_block,
+        None,
+        src,
+        dst,
+    ))
+}
+
 pub fn fill_exact_with_head(
     key: &[u8; 32],
     nonce: &[u8; 12],
@@ -32,6 +55,29 @@ pub fn fill_exact_with_head(
         start_block,
         Some(head),
         buf,
+    ))
+}
+
+pub fn fill_exact_with_head_from(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    start_block: u32,
+    head: &mut [u8; 32],
+    src: &[u8],
+    dst: &mut [u8],
+) -> u64 {
+    let blocks = blocks_for(dst.len() + 64);
+    assert!(
+        blocks <= u64::from(u32::MAX) - u64::from(start_block),
+        "chacha20 block counter would wrap; a nonce's keystream would repeat"
+    );
+    u64::from(crate::chacha::xor_blocks_from(
+        key,
+        nonce,
+        start_block,
+        Some(head),
+        src,
+        dst,
     ))
 }
 
