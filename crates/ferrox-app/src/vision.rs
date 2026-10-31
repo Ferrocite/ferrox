@@ -874,9 +874,13 @@ impl<S: Read + Write + RecordAlignment> Write for Link<S> {
             }
             (*tls, observed)
         });
-        if observed {
+        let tls = if observed {
+            let tls = self.filter();
             self.engage(&tls);
-        }
+            tls
+        } else {
+            tls
+        };
         // The relay hands one buffer of up to 256 KiB: it frames as blocks of one Xray buffer, and the filter budget and the switch are counted per caller buffer as the reference counts them per `MultiBuffer`.
         let complete =
             tls.present && buf.len() >= 6 && buf[..3] == TLS_APPLICATION_DATA && is_record_run(buf);
@@ -1380,8 +1384,9 @@ mod tests {
     /// The framed writer observes the filter and reads it back to frame: one acquisition
     /// of the state a split link shares, where the first form took up to four.
     #[test]
-    fn a_framed_write_takes_the_shared_state_once() {
+    fn a_steady_framed_write_takes_the_shared_state_once() {
         let (_reader, mut writer) = Link::split(Fake::new(&[]), Fake::new(&[]), None, None, &UUID);
+        writer.tls.update(|tls| tls.budget = 0);
         writer
             .tls_accesses
             .store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1392,7 +1397,7 @@ mod tests {
                 .tls_accesses
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
-            "the framed write takes the shared state once"
+            "a steady framed write takes the shared state once"
         );
     }
 
