@@ -23270,7 +23270,7 @@ impl Pump {
                     return;
                 }
                 let _ = reading.set_read_timeout(Some(RELAY_POLL));
-                // The same reused, uninitialised buffer the relay uses: no 16 KiB memset for bytes the first read overwrites.
+                // The same reused window the relay uses: the pool already paid the 16 KiB memset, so a fresh flow does not.
                 let mut buffer = RelayBuf::new();
                 loop {
                     if !matches!(stop_rx.try_recv(), Err(TryRecvError::Empty)) {
@@ -30376,7 +30376,7 @@ mod tests {
         assert_eq!(read.len(), RELAY_SMALL_BUFFER);
     }
 
-    /// Miri, not a byte test, sees a clip past the reported prefix: that is an uninitialised read.
+    /// A clip past the reported prefix would ship bytes the read did not write; the buffer hands back only what it was told.
     #[test]
     fn the_relay_buffer_hands_back_only_what_its_read_reported() {
         let source: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
@@ -30487,7 +30487,7 @@ mod tests {
         }
     }
 
-    /// The relay legs hand `read` a window that has left the type uninitialised (`RelayBuf::with_len(n).into_vec()`): the claim this witnesses is that leaving did not shrink the quantum — the same `len` and headroom the zero-filled `vec![0u8; n]` carried — so the read still covers the whole window and never reallocs, and only the prefix a read reports escapes. The zeroing is the only thing that changed.
+    /// The relay legs hand `read` a window that has left the type (`RelayBuf::with_len(n).into_vec()`): the claim this witnesses is that leaving did not shrink the quantum — the same `len` and headroom the zero-filled `vec![0u8; n]` carried — so the read still covers the whole window and never reallocs, and only the prefix a read reports escapes.
     #[test]
     fn a_relay_leg_window_keeps_its_quantum_after_leaving_the_buffer() {
         for window in [RELAY_SMALL_BUFFER, 32 * 1024] {
