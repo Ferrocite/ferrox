@@ -11027,7 +11027,7 @@ fn serve_ss_relay_inbound(address: &str, inbound: &Json, password: &str, method:
     true
 }
 
-/// The networks a shadowsocks inbound opens, from a `tcp,udp` string or an array; naming none opens both, a superset of the reference's TCP default.
+/// The networks a shadowsocks inbound opens, from a `tcp,udp` string or an array: a list that names neither opens none, and an absent list opens both, the superset of the reference's tcp default.
 fn inbound_ss_networks(inbound: &Json) -> (bool, bool) {
     let Some(named) = inbound.get("settings").and_then(|s| s.get("network")) else {
         return (true, true);
@@ -29037,6 +29037,9 @@ mod tests {
         assert_eq!(inbound_ss_networks(&string), (true, false));
         let array = crate::json::parse(r#"{"settings": {"network": ["udp"]}}"#).expect("parses");
         assert_eq!(inbound_ss_networks(&array), (false, true));
+        let unsupported =
+            crate::json::parse(r#"{"settings": {"network": "unix"}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&unsupported), (false, false));
         let absent = crate::json::parse(r#"{"settings": {"password": "p"}}"#).expect("parses");
         assert_eq!(inbound_ss_networks(&absent), (true, true));
     }
@@ -40226,6 +40229,29 @@ mod tests {
         assert!(
             std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
             "the udp-only front bound no tcp listener"
+        );
+    }
+
+    /// A list naming only a network this front does not carry opens neither listener, as the reference starts no worker for it.
+    #[test]
+    fn an_unsupported_shadowsocks_network_opens_no_listener() {
+        let inbound = crate::json::parse(
+            r#"{"protocol": "shadowsocks", "settings": {"password": "pw", "method": "aes-256-gcm", "network": ["unix"]}}"#,
+        )
+        .expect("parses");
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        serve_shadowsocks_inbound(&address, &inbound, true);
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "no stream listener"
+        );
+        assert!(
+            UdpSocket::bind(&address).is_ok(),
+            "no datagram listener took the port"
         );
     }
 

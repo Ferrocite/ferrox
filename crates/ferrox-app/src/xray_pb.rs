@@ -3060,7 +3060,7 @@ fn ss_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
         })
         .collect();
     let mut settings = vec![("users", Json::Arr(clients))];
-    // Only tcp and udp reach a worker; a network this front does not carry opens nothing, as in the reference.
+    // Only tcp and udp reach a worker; a list that names neither opens nothing, as the reference's has no worker for it.
     let mut opened: Vec<&str> = Vec::new();
     if !networks.is_empty() {
         for network in &networks {
@@ -3073,9 +3073,7 @@ fn ss_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
                 opened.push(name);
             }
         }
-        if !opened.is_empty() {
-            settings.push(("network", Json::Str(opened.join(","))));
-        }
+        settings.push(("network", Json::Str(opened.join(","))));
     }
     Ok(object(settings))
 }
@@ -6086,7 +6084,7 @@ mod tests {
     }
 
     #[test]
-    fn a_shadowsocks_unix_network_is_accepted() {
+    fn a_shadowsocks_unix_network_opens_no_listener() {
         let settings = message(&[
             bytes_field(1, &ss_user(&ss_account(b"a", 6), None)),
             bytes_field(2, &[4]),
@@ -6101,8 +6099,9 @@ mod tests {
             .and_then(|settings| settings.get("network"))
             .and_then(Json::as_str);
         assert_eq!(
-            named, None,
-            "a network this front does not carry narrows nothing, so the inbound still opens both"
+            named,
+            Some(""),
+            "a unix-only list names no network this front carries, so it opens neither"
         );
     }
 
