@@ -30886,7 +30886,6 @@ mod tests {
             assert_eq!(cmd, 1, "{addr:?}");
             assert_eq!(reader.reads, reads, "{addr:?}");
         }
-
     }
 
     #[test]
