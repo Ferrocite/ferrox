@@ -1652,7 +1652,7 @@ fn exact_until<S: Read>(
                 if deadline.is_none() {
                     return Err(TlsError::Timeout);
                 }
-                if error.kind() != std::io::ErrorKind::TimedOut {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
                     std::thread::sleep(WOULD_BLOCK_RETRY);
                 }
             }
