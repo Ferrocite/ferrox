@@ -40349,9 +40349,19 @@ mod tests {
         assert_eq!(payload, b"ping", "the mux frame's datagram echoes");
     }
 
-    /// A shadowsocks inbound told to carry udp alone opens no stream listener, as the reference's udp worker alone would not.
+    /// A shadowsocks inbound told to carry udp alone opens no stream listener and still answers a datagram, as the reference's udp worker alone would.
     #[test]
     fn a_udp_only_shadowsocks_inbound_opens_no_stream_listener() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, src)) = echo.recv_from(&mut buf) {
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
         let inbound = crate::json::parse(
             r#"{"protocol": "shadowsocks", "settings": {"password": "pw", "method": "aes-256-gcm", "network": ["udp"]}}"#,
         )
@@ -40359,12 +40369,37 @@ mod tests {
         let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
-        serve_shadowsocks_inbound(&format!("127.0.0.1:{port}"), &inbound, true);
-        thread::sleep(Duration::from_millis(50));
+        let address = format!("127.0.0.1:{port}");
+        serve_shadowsocks_inbound(&address, &inbound, true);
+        thread::sleep(Duration::from_millis(100));
         assert!(
             std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
             "the udp-only front bound no tcp listener"
         );
+        let master = ferrox_core::shadowsocks::MasterKey::new("pw", 32);
+        let method = ferrox_core::shadowsocks::Method::Aes256Gcm;
+        let mut wire = vec![0u8; crate::shadowsocks::DATAGRAM_MAX];
+        let at = crate::shadowsocks::SEAL_ROOM;
+        wire[at..at + 4].copy_from_slice(b"ping");
+        let mut hop = None;
+        let packet = crate::shadowsocks::seal_datagram(
+            &master, method, &echo_addr, &mut wire, at, 4, &mut hop,
+        )
+        .expect("seals")
+        .to_vec();
+        let dial = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        dial.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        dial.send_to(&packet, &address).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = dial
+            .recv_from(&mut back)
+            .expect("the udp front still answers");
+        let (source, payload) =
+            crate::shadowsocks::open_datagram(&master, method, &mut back[..n], &mut hop)
+                .expect("opens");
+        assert_eq!(source.port(), echo_addr.port());
+        assert_eq!(payload, b"ping");
     }
 
     /// A list naming only a network this front does not carry opens neither listener, as the reference starts no worker for it.
