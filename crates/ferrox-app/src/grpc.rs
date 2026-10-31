@@ -95,23 +95,34 @@ impl std::fmt::Debug for Shared {
 /// batch flushes before it parks, since a peer grants for bytes it has seen and not for ones still
 /// sitting in the batch.
 fn take_window(shared: &Shared, need: u64, wait: bool) -> bool {
+    let deadline = wait.then(|| Instant::now() + crate::budgets::relay_stall());
+    take_window_until(shared, need, deadline)
+}
+
+/// The same take under a deadline: a relay write waits only the quantum its lane can spare, while a
+/// blocking caller waits the relay stall, and the wake is the peer's `WINDOW_UPDATE` rather than a
+/// poll that has to re-ask for credit it could already have.
+fn take_window_until(shared: &Shared, need: u64, deadline: Option<Instant>) -> bool {
     let mut send = shared.send.lock().unwrap_or_else(PoisonError::into_inner);
-    if wait {
-        while send.conn < need || send.stream < need {
-            if shared.dead.load(Ordering::SeqCst) {
-                return false;
-            }
-            let (guard, waited) = shared
-                .wake
-                .wait_timeout(send, crate::budgets::relay_stall())
-                .unwrap_or_else(PoisonError::into_inner);
-            send = guard;
-            if waited.timed_out() {
-                return false;
-            }
+    while send.conn < need || send.stream < need {
+        if shared.dead.load(Ordering::SeqCst) {
+            return false;
         }
-    } else if send.conn < need || send.stream < need {
-        return false;
+        let Some(deadline) = deadline else {
+            return false;
+        };
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        let (guard, waited) = shared
+            .wake
+            .wait_timeout(send, left)
+            .unwrap_or_else(PoisonError::into_inner);
+        send = guard;
+        if waited.timed_out() {
+            return false;
+        }
     }
     send.conn -= need;
     send.stream -= need;
@@ -1028,10 +1039,10 @@ impl GrpcWriter {
         batch.flush_blocking(&self.shared)
     }
 
-    /// The same frames as `send`, but a window the peer has not granted parks the bytes instead of
-    /// holding the worker the lane that reads the credit needs. A message is the unit a window
-    /// pays for, so it is taken whole: a half-sent one cannot be offered again without duplicating
-    /// the half the peer already has.
+    /// The same frames as `send`, but a window the peer has not granted parks the bytes after one
+    /// bounded turn instead of holding the worker the lane that reads the credit needs. A message
+    /// is the unit a window pays for, so it is taken whole: a half-sent one cannot be offered again
+    /// without duplicating the half the peer already has.
     fn try_send(&self, data: &[u8]) -> crate::proxy::Push {
         if self.shared.dead.load(Ordering::SeqCst) {
             return crate::proxy::Push::Lost;
@@ -1067,7 +1078,9 @@ impl GrpcWriter {
                 {
                     return stop;
                 }
-                if !take_window(&self.shared, total as u64, false) {
+                // Only a flush this call made can earn the update; nothing new on the wire gives the peer no reason to grant.
+                let deadline = Instant::now() + crate::budgets::RELAY_POLL;
+                if flushed == 0 || !take_window_until(&self.shared, total as u64, Some(deadline)) {
                     return Self::took_or_parked(flushed);
                 }
             }
@@ -2373,6 +2386,59 @@ mod tests {
         running.join().expect("writer thread");
         crate::budgets::clear();
         assert_eq!(verdict, Ok(false), "a writer with no credit returned");
+    }
+
+    /// A relay write whose next message has no window spends one poll quantum waiting for the
+    /// update its own flush earns, and only then gives the lane back: a peer that grants nothing
+    /// still costs a turn, but a peer that grants for the bytes it just read wakes the writer
+    /// instead of pacing it at one window per quantum.
+    #[test]
+    fn a_parked_try_send_waits_one_quantum() {
+        let writer = writer_over(
+            Recorder(Arc::new(Mutex::new(Peer::default()))),
+            HUNK,
+            HUNK as u64,
+        );
+        let data = vec![0u8; 2 * HUNK];
+        let began = Instant::now();
+        let pushed = writer.try_send(&data);
+        assert!(
+            matches!(pushed, crate::proxy::Push::Took(n) if n > 0),
+            "the flush that earned the update was not returned"
+        );
+        assert!(
+            began.elapsed() >= crate::budgets::RELAY_POLL,
+            "the parked write gave the lane back without waiting for the update"
+        );
+    }
+
+    /// The update that pays for a parked take wakes it before its deadline, so a relay re-offers
+    /// the same bytes on the notification rather than polling for them.
+    #[test]
+    fn a_window_update_wakes_a_parked_take() {
+        let writer = writer_over(Recorder(Arc::new(Mutex::new(Peer::default()))), HUNK, 0);
+        let shared = Arc::clone(&writer.shared);
+        let grant = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            {
+                let mut send = shared.send.lock().unwrap_or_else(PoisonError::into_inner);
+                send.conn = u64::MAX;
+                send.stream = u64::MAX;
+            }
+            shared.wake.notify_all();
+        });
+        let began = Instant::now();
+        let took = take_window_until(
+            &writer.shared,
+            HUNK as u64 - 1,
+            Some(began + Duration::from_secs(10)),
+        );
+        grant.join().expect("the granter ran");
+        assert!(took, "the parked take saw the window update");
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "the update woke the take before its deadline"
+        );
     }
 
     /// The witnesses for `carrier-grpc writes-per-relay-read 1`, `carrier-grpc segments-per-socket-write 10` and `carrier-grpc payload-runs-per-socket-write 5`: a relay read of four `HUNK`s is five DATA frames, one whole message each, and leaves as one write of ten segments whose bytes are those frames in order, with five of them still runs of the caller's own buffer — a gather holds heads and envelopes apart, it does not stage a byte of payload.

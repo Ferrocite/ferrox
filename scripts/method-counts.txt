@@ -118,7 +118,7 @@ trojan udp-framing-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_fram
 trojan udp-carriers-holding-an-association 7 ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier
 
 # --- XTLS Vision ------------------------------------------------------------
-xtls-vision ops-retired-instructions 30848 scripts/count-ops.sh
+xtls-vision ops-retired-instructions 26240 scripts/count-ops.sh
 xtls-vision syscalls-per-framed-read UNBLESSED scripts/count-ops.sh
 xtls-vision seconds-per-framed-read UNBLESSED CI bench.yml (no cell yet)
 xtls-vision padding-command-bytes 5 ferrox-app-vision::tests::writing_frames_the_payload_and_heads_the_first_with_the_uuid
