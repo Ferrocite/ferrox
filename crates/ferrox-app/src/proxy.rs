@@ -1533,7 +1533,6 @@ enum Role {
         carrier: Carrier,
         freedom: bool,
         tls: Option<Arc<ferrox_core::tls::TlsServerConfig>>,
-        account: InboundAccount,
     },
     Socks {
         out: Outbound,
@@ -1584,11 +1583,11 @@ impl Role {
             Role::Trojan { account, .. }
             | Role::TrojanTls { account, .. }
             | Role::Vmess { account, .. }
-            | Role::VmessTls { account, .. }
-            | Role::Shadowsocks { account, .. } => Some(account),
+            | Role::VmessTls { account, .. } => Some(account),
             Role::Vless { .. }
             | Role::VlessTls { .. }
             | Role::VlessReality { .. }
+            | Role::Shadowsocks { .. }
             | Role::Socks { .. }
             | Role::Http { .. }
             | Role::Mixed { .. }
@@ -4633,9 +4632,20 @@ pub(crate) fn serve_mux_tunnel(
     serve_mux_wire(&wire, &dial, &udp, None, &carried);
 }
 
-struct MeteredIo<T> {
+pub(crate) struct MeteredIo<T> {
     inner: T,
     meter: crate::stats::Meter,
+}
+
+/// A carrier leg whose bytes are counted for the account its handshake named.
+pub(crate) fn metered<T>(inner: T, meter: crate::stats::Meter) -> MeteredIo<T> {
+    MeteredIo { inner, meter }
+}
+
+impl<T: RelayPoll> RelayPoll for MeteredIo<T> {
+    fn arm_relay_poll(&mut self) {
+        self.inner.arm_relay_poll();
+    }
 }
 
 impl<T: Read> Read for MeteredIo<T> {
@@ -11069,7 +11079,6 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
                         carrier,
                         freedom,
                         tls: Some(server),
-                        account,
                     },
                 ),
                 inbound_tag(inbound),
@@ -11088,7 +11097,6 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
                     carrier: other,
                     freedom,
                     tls: None,
-                    account,
                 },
             ),
             inbound_tag(inbound),
@@ -24966,6 +24974,12 @@ fn inbound_ss_users(
                 client_password,
                 client_method.key_len(),
             ),
+            email: client
+                .get("email")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            level: client.get("level").and_then(Json::as_u32).unwrap_or(0),
         });
     }
     std::sync::Arc::from(users)
@@ -55531,7 +55545,6 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             carrier,
             freedom,
             tls,
-            account: _,
         } => serve_shadowsocks(stream, &accounts, &carrier, freedom, tls.as_deref()),
         Role::Socks { out, accounts } => serve_socks(stream, &out, &accounts),
         Role::Http { out, accounts } => serve_http(stream, &out, &accounts),
