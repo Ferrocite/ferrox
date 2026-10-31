@@ -167,23 +167,27 @@ pub(crate) fn record(
         || "unknown".to_owned(),
         |source| address(source, config.mask_address),
     );
-    let mut line = format!(
-        "from {source} {} {}",
-        if accepted { "accepted" } else { "rejected" },
-        escaped(&format!("{destination}"))
+    let mut line = String::with_capacity(64 + source.len());
+    line.push_str("from ");
+    line.push_str(&source);
+    line.push(' ');
+    line.push_str(if accepted { "accepted " } else { "rejected " });
+    let _ = std::fmt::write(
+        &mut Escaper { out: &mut line },
+        format_args!("{destination}"),
     );
     if let Some(detour) = detour.filter(|detour| !detour.is_empty()) {
         line.push_str(" [");
-        line.push_str(&escaped(detour));
+        push_escaped(&mut line, detour);
         line.push(']');
     }
     if !reason.is_empty() {
         line.push(' ');
-        line.push_str(&escaped(reason));
+        push_escaped(&mut line, reason);
     }
     if !email.is_empty() {
         line.push_str(" email: ");
-        line.push_str(&escaped(email));
+        push_escaped(&mut line, email);
     }
     line.push('\n');
     let _ = writer.write_all(line.as_bytes());
@@ -192,18 +196,32 @@ pub(crate) fn record(
 
 /// A line holds one entry: a path, tag or account that carries a control byte is escaped, not
 /// written through, so nothing a peer names can start a second record.
-fn escaped(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for ch in value.chars() {
+fn push_escaped(out: &mut String, value: &str) {
+    let mut start = 0;
+    for (at, ch) in value.char_indices() {
         if ch == '\\' {
+            out.push_str(&value[start..at]);
             out.push_str("\\\\");
+            start = at + 1;
         } else if ch.is_control() {
+            out.push_str(&value[start..at]);
             out.extend(ch.escape_default());
-        } else {
-            out.push(ch);
+            start = at + ch.len_utf8();
         }
     }
-    out
+    out.push_str(&value[start..]);
+}
+
+/// The destination is a `Display`, so its bytes are escaped as they are written rather than materialised into a second string first.
+struct Escaper<'a> {
+    out: &'a mut String,
+}
+
+impl std::fmt::Write for Escaper<'_> {
+    fn write_str(&mut self, text: &str) -> std::fmt::Result {
+        push_escaped(self.out, text);
+        Ok(())
+    }
 }
 
 fn address(address: SocketAddr, masked: bool) -> String {
@@ -219,6 +237,15 @@ fn address(address: SocketAddr, masked: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_clean_field_is_escaped_without_a_second_buffer() {
+        let mut out = String::with_capacity(64);
+        let ((), counts) =
+            ferrox_core::alloc_count::measure(|| push_escaped(&mut out, "example.com:443"));
+        assert_eq!(counts.allocs, 0, "a clean field allocated: {counts:?}");
+        assert_eq!(out, "example.com:443");
+    }
 
     #[test]
     fn the_reference_access_and_mask_are_read() {

@@ -21357,9 +21357,98 @@ pub(crate) const RELAY_BUFFER: usize = 64 * 1024;
 
 pub(crate) const RELAY_SMALL_BUFFER: usize = 16 * 1024;
 
-/// `read` takes the whole buffer and only the reported prefix escapes.
+/// One pool per window quantum; thread-local spares drain to the shared pool at thread exit.
+struct RelaySpare {
+    small: Vec<Vec<u8>>,
+    large: Vec<Vec<u8>>,
+}
+
+impl Drop for RelaySpare {
+    fn drop(&mut self) {
+        for bytes in std::mem::take(&mut self.small) {
+            give_relay_shared(RELAY_SMALL_BUFFER, bytes);
+        }
+        for bytes in std::mem::take(&mut self.large) {
+            give_relay_shared(RELAY_BUFFER, bytes);
+        }
+    }
+}
+
+thread_local! {
+    static RELAY_SPARE: std::cell::RefCell<RelaySpare> =
+        const { std::cell::RefCell::new(RelaySpare { small: Vec::new(), large: Vec::new() }) };
+}
+
+static RELAY_SHARED_SMALL: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+static RELAY_SHARED_LARGE: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+const RELAY_SPARE_MAX: usize = 4;
+const RELAY_SHARED_SMALL_MAX: usize = 128;
+const RELAY_SHARED_LARGE_MAX: usize = 64;
+
+fn take_relay_window(quantum: usize) -> Option<Vec<u8>> {
+    let local = RELAY_SPARE.try_with(|spare| {
+        let mut spare = spare.borrow_mut();
+        if quantum == RELAY_SMALL_BUFFER {
+            spare.small.pop()
+        } else {
+            spare.large.pop()
+        }
+    });
+    local
+        .ok()
+        .flatten()
+        .or_else(|| shared_relay_pool(quantum).lock().ok()?.pop())
+}
+
+fn give_relay_window(bytes: Vec<u8>) {
+    let len = bytes.len();
+    if len != RELAY_SMALL_BUFFER && len != RELAY_BUFFER {
+        return;
+    }
+    let is_small = len == RELAY_SMALL_BUFFER;
+    let mut slot = Some(bytes);
+    let _ = RELAY_SPARE.try_with(|spare| {
+        let mut spare = spare.borrow_mut();
+        let pool = if is_small {
+            &mut spare.small
+        } else {
+            &mut spare.large
+        };
+        if pool.len() < RELAY_SPARE_MAX {
+            pool.push(slot.take().unwrap());
+        }
+    });
+    if let Some(bytes) = slot {
+        give_relay_shared(len, bytes);
+    }
+}
+
+fn give_relay_shared(quantum: usize, bytes: Vec<u8>) {
+    let shared = shared_relay_pool(quantum);
+    let cap = if quantum == RELAY_SMALL_BUFFER {
+        RELAY_SHARED_SMALL_MAX
+    } else {
+        RELAY_SHARED_LARGE_MAX
+    };
+    let Ok(mut pool) = shared.lock() else { return };
+    if pool.len() < cap {
+        pool.push(bytes);
+    }
+}
+
+fn shared_relay_pool(quantum: usize) -> &'static Mutex<Vec<Vec<u8>>> {
+    if quantum == RELAY_SMALL_BUFFER {
+        &RELAY_SHARED_SMALL
+    } else {
+        &RELAY_SHARED_LARGE
+    }
+}
+
+/// `read` takes the whole buffer and only the reported prefix escapes. The window is a length over a fully initialised allocation, so a pool hit pays no zeroing pass.
 pub(crate) struct RelayBuf {
     bytes: Vec<u8>,
+    window: usize,
     moved: usize,
     promote_to: usize,
 }
@@ -21373,8 +21462,15 @@ impl RelayBuf {
     /// The same shape at a caller-chosen read window, for a staging buffer whose headroom and tailroom must sit outside the window rather than shrink it.
     #[must_use]
     pub fn with_len(len: usize) -> Self {
+        let bytes = match len {
+            RELAY_SMALL_BUFFER | RELAY_BUFFER => {
+                take_relay_window(len).unwrap_or_else(|| vec![0u8; len])
+            }
+            _ => vec![0u8; len],
+        };
         Self {
-            bytes: vec![0; len],
+            bytes,
+            window: len,
             moved: 0,
             promote_to: RELAY_BUFFER,
         }
@@ -21390,23 +21486,31 @@ impl RelayBuf {
 
     #[must_use]
     pub fn as_mut(&mut self) -> &mut [u8] {
-        &mut self.bytes
+        &mut self.bytes[..self.window]
     }
 
     /// The buffer leaves the type; every later read is prefix-bounded like `open_chunk`'s or `poll_copy`'s, so bytes a read did not report are never sent.
     #[must_use]
-    pub fn into_vec(self) -> Vec<u8> {
-        self.bytes
+    pub fn into_vec(mut self) -> Vec<u8> {
+        self.bytes.truncate(self.window);
+        std::mem::take(&mut self.bytes)
     }
 
     /// A read that filled the window promotes at once, and a leg whose reads are all short promotes once it has moved a whole window: `recv` returns what is queued rather than what was asked, so a busy leg would otherwise stay at 16 KiB for the life of the flow.
     #[must_use]
     pub fn filled(&mut self, n: usize) -> &[u8] {
         self.moved = self.moved.saturating_add(n);
-        if self.bytes.len() < self.promote_to
-            && (n == self.bytes.len() || self.moved >= self.promote_to)
-        {
-            self.bytes.resize(self.promote_to, 0);
+        if self.window < self.promote_to && (n == self.window || self.moved >= self.promote_to) {
+            self.window = self.promote_to;
+            if self.bytes.len() < self.window {
+                let head = self.bytes.len();
+                let mut promoted =
+                    take_relay_window(self.window).unwrap_or_else(|| vec![0u8; self.window]);
+                promoted[..head].copy_from_slice(&self.bytes[..head]);
+                let mut old = std::mem::replace(&mut self.bytes, promoted);
+                old.truncate(head);
+                give_relay_window(old);
+            }
         }
         &self.bytes[..n]
     }
@@ -21426,7 +21530,15 @@ impl RelayBuf {
     #[cfg(test)]
     #[must_use]
     pub fn size(&self) -> usize {
-        self.bytes.len()
+        self.window
+    }
+}
+
+impl Drop for RelayBuf {
+    fn drop(&mut self) {
+        if self.bytes.len() == RELAY_SMALL_BUFFER || self.bytes.len() == RELAY_BUFFER {
+            give_relay_window(std::mem::take(&mut self.bytes));
+        }
     }
 }
 
@@ -23830,7 +23942,7 @@ impl Pump {
                     return;
                 }
                 let _ = reading.set_read_timeout(Some(RELAY_POLL));
-                // The same reused, uninitialised buffer the relay uses: no 16 KiB memset for bytes the first read overwrites.
+                // The same reused window the relay uses: the small pool already paid the 16 KiB memset, so a fresh flow does not.
                 let mut buffer = RelayBuf::new();
                 loop {
                     if !matches!(stop_rx.try_recv(), Err(TryRecvError::Empty)) {
@@ -31038,7 +31150,7 @@ mod tests {
         assert_eq!(read.len(), RELAY_SMALL_BUFFER);
     }
 
-    /// Miri, not a byte test, sees a clip past the reported prefix: that is an uninitialised read.
+    /// A clip past the reported prefix would ship bytes the read did not write; the buffer hands back only what it was told.
     #[test]
     fn the_relay_buffer_hands_back_only_what_its_read_reported() {
         let source: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
@@ -31149,7 +31261,7 @@ mod tests {
         }
     }
 
-    /// The relay legs hand `read` a window that has left the type uninitialised (`RelayBuf::with_len(n).into_vec()`): the claim this witnesses is that leaving did not shrink the quantum — the same `len` and headroom the zero-filled `vec![0u8; n]` carried — so the read still covers the whole window and never reallocs, and only the prefix a read reports escapes. The zeroing is the only thing that changed.
+    /// The relay legs hand `read` a window that has left the type (`RelayBuf::with_len(n).into_vec()`): the claim this witnesses is that leaving did not shrink the quantum — the same `len` and headroom the zero-filled `vec![0u8; n]` carried — so the read still covers the whole window and never reallocs, and only the prefix a read reports escapes.
     #[test]
     fn a_relay_leg_window_keeps_its_quantum_after_leaving_the_buffer() {
         for window in [RELAY_SMALL_BUFFER, 32 * 1024] {
@@ -31179,6 +31291,34 @@ mod tests {
                 "a read did not realloc the window"
             );
         }
+    }
+
+    /// A finished flow hands its window back: the next flow takes the same zeroed allocation from the local pool, and the promotion draws from the large pool rather than paying a fresh zeroing pass. The gate is the allocator's own zeroed-allocation count rather than a timing.
+    #[test]
+    fn a_reused_relay_window_is_not_zeroed() {
+        drop(RelayBuf::with_len(RELAY_SMALL_BUFFER));
+        drop(RelayBuf::with_len(RELAY_SMALL_BUFFER));
+        let (_, counts) =
+            ferrox_core::alloc_count::measure(|| RelayBuf::with_len(RELAY_SMALL_BUFFER));
+        assert_eq!(
+            counts.zeroed, 0,
+            "the reused small window is zeroed: {counts:?}"
+        );
+
+        drop(RelayBuf::with_len(RELAY_BUFFER));
+        let mut buffer = RelayBuf::new();
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            let _ = buffer.filled(RELAY_SMALL_BUFFER);
+        });
+        assert_eq!(counts.zeroed, 0, "the promotion is zeroed: {counts:?}");
+        assert_eq!(buffer.size(), RELAY_BUFFER, "the promotion kept its window");
+    }
+
+    /// A window between the quanta is exactly what its flow asked for: the pool keeps a 16 KiB flow at 16 KiB rather than handing it a 64 KiB allocation it may never fill.
+    #[test]
+    fn an_unpooled_window_stays_the_size_it_asked_for() {
+        let buffer = RelayBuf::with_len(32 * 1024).into_vec();
+        assert_eq!(buffer.capacity(), 32 * 1024, "the flow paid for 64 KiB");
     }
 
     #[test]

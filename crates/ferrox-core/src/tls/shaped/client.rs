@@ -2513,6 +2513,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "reaches ring's CPUID FFI through the record KDF")]
     fn a_handshake_past_its_deadline_stops_at_the_next_timeout() {
         let mut wire = vec![HANDSHAKE, 0x03, 0x03, 0x00, 0x04];
         wire.extend_from_slice(&[1, 2, 3, 4]);
