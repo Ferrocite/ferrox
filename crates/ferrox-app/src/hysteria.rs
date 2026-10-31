@@ -1147,6 +1147,8 @@ pub(crate) fn server_config(
     let mut config = crate::quic::tls_config(identity)?;
     config.set_application_protos(&[crate::quic::ALPN]).ok()?;
     config.set_cc_algorithm_name(cc.quiche_name()).ok()?;
+    // A bulk download starts at 400 packets: quiche's ten leaves the first window smaller than one flow's first read, and BBR then paces every ACK.
+    config.set_initial_congestion_window_packets(400);
     // A served connection always carries an auth validator, and the reference enables the datagram lane exactly when one is present, so the lane is on unconditionally here; the depths are the peer's unsent-datagram queue, matching `udpMessageChanSize`.
     config.enable_dgram(true, 1024, 1024);
     match quic {
@@ -2563,6 +2565,83 @@ mod tests {
         let mut double = minted_identity();
         double.certs[0].key_der = vec![0u8; 16];
         assert!(server_config(&double, cc, None).is_none());
+    }
+
+    #[test]
+    fn a_served_lane_starts_with_a_window_wider_than_ten_packets() {
+        let identity = minted_identity();
+        let roots = identity.certs[0].cert_chain.clone();
+        let client_addr = "127.0.0.1:50000".parse().expect("addr");
+        let server_addr = "127.0.0.1:443".parse().expect("addr");
+        let client_cid = [1u8; SCID_LEN];
+        let server_cid = [2u8; SCID_LEN];
+        let mut client_config =
+            crate::quic::quiche_config(&roots, Some("reno")).expect("trusts the lane");
+        let mut server_config =
+            server_config(&identity, hysteria::Congestion::Reno, None).expect("serves");
+        let mut client = quiche::connect(
+            None,
+            &quiche::ConnectionId::from_ref(&client_cid),
+            client_addr,
+            server_addr,
+            &mut client_config,
+        )
+        .expect("connects");
+        let mut server = quiche::accept(
+            &quiche::ConnectionId::from_ref(&server_cid),
+            None,
+            server_addr,
+            client_addr,
+            &mut server_config,
+        )
+        .expect("accepts");
+        let mut up = Unfilled::<MAX_DATAGRAM>::new();
+        let mut down = Unfilled::<MAX_DATAGRAM>::new();
+        for _ in 0..8 {
+            while let Ok((n, _)) = client.send(up.as_mut()) {
+                server
+                    .recv(
+                        &mut up.as_mut()[..n],
+                        quiche::RecvInfo {
+                            from: client_addr,
+                            to: server_addr,
+                        },
+                    )
+                    .expect("drives the server");
+            }
+            while let Ok((n, _)) = server.send(down.as_mut()) {
+                client
+                    .recv(
+                        &mut down.as_mut()[..n],
+                        quiche::RecvInfo {
+                            from: server_addr,
+                            to: client_addr,
+                        },
+                    )
+                    .expect("drives the client");
+            }
+            if client.is_established() && server.is_established() {
+                break;
+            }
+        }
+        assert!(server.is_established(), "the lane handshook");
+        let payload = vec![0u8; 1 << 20];
+        let mut off = 0;
+        while off < payload.len() {
+            match server.stream_send(1, &payload[off..], true) {
+                Ok(n) => off += n,
+                Err(quiche::Error::Done) => break,
+                Err(e) => panic!("stream_send: {e:?}"),
+            }
+        }
+        let mut sent = 0usize;
+        while let Ok((n, _)) = server.send(down.as_mut()) {
+            sent += n;
+        }
+        assert!(
+            sent > 100_000,
+            "the first flight is {sent} bytes; a ten-packet window stops near 12 KiB"
+        );
     }
 
     #[test]

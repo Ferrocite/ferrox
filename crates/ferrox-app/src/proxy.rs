@@ -46420,15 +46420,22 @@ mod tests {
         );
     }
 
-    fn hysteria_server_once() {
+    fn hysteria_raw_flow(
+        port: u16,
+        roots: &[Vec<u8>],
+        auth: &str,
+        id: [u8; 16],
+        target: SocketAddr,
+    ) -> (
+        quiche::Connection,
+        crate::quic::Datagram,
+        SocketAddr,
+        std::time::Instant,
+    ) {
         use ferrox_core::foxy::frames as h3;
-        let echo_port = echo_loop();
-        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
-        let (port, roots) = hysteria_loop_with("bisect2-auth", id, "");
-        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
         let (sock, peer, local) = crate::quic::udp_to_server("127.0.0.1", port).expect("udp");
         let sock = crate::quic::Datagram::plain(sock);
-        let mut config = crate::quic::quiche_config(&roots, Some("bbr")).expect("configures");
+        let mut config = crate::quic::quiche_config(roots, Some("bbr")).expect("configures");
         let mut scid = [0u8; 16];
         getrandom::fill(&mut scid).expect("random");
         let cid = quiche::ConnectionId::from_ref(&scid);
@@ -46443,7 +46450,7 @@ mod tests {
             &mut conn, &sock, 2, &settings, true, horizon
         ));
         let mut block = Vec::new();
-        ferrox_core::hysteria::build_auth_request("bisect2-auth", 0, &mut block);
+        ferrox_core::hysteria::build_auth_request(auth, 0, &mut block);
         let mut frame = Vec::new();
         h3::quic_varint(&mut frame, h3::H3_HEADERS);
         h3::quic_varint(&mut frame, block.len() as u64);
@@ -46476,6 +46483,16 @@ mod tests {
         let reply = crate::quic::stream_recv_exact(&mut conn, &sock, local, 4, 2, horizon)
             .expect("replies");
         assert_eq!(reply.as_slice(), &[0, 0]);
+        (conn, sock, local, horizon)
+    }
+
+    fn hysteria_server_once() {
+        let echo_port = echo_loop();
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let (port, roots) = hysteria_loop_with("bisect2-auth", id, "");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let (mut conn, sock, local, horizon) =
+            hysteria_raw_flow(port, &roots, "bisect2-auth", id, target);
         assert!(crate::quic::stream_send_all(
             &mut conn, &sock, 4, b"ping", false, horizon
         ));
