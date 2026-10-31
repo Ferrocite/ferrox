@@ -311,14 +311,6 @@ impl<R: Read> Reader<R> {
         }
         self.take(buf)
     }
-
-    /// A framed line is already in the window, so the next body can be joined to this read without a syscall or a block.
-    fn line_ready(&self) -> bool {
-        let end = self.prefix.len().min(self.at + 130);
-        self.prefix[self.at..end]
-            .windows(2)
-            .any(|pair| pair == b"\r\n")
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -556,37 +548,26 @@ impl<R: Read> Read for Reader<R> {
             return Ok(0);
         }
         self.parse_head()?;
-        let mut filled = 0;
         loop {
             if self.ended {
-                return Ok(filled);
+                return Ok(0);
             }
             if self.left > 0 {
-                let n = self.left.min(buf.len() - filled);
-                if n == 0 {
-                    return Ok(filled);
-                }
-                let got = self.body(&mut buf[filled..filled + n])?;
+                let n = self.left.min(buf.len());
+                let got = self.body(&mut buf[..n])?;
                 if got == 0 {
                     return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
                 }
                 self.left -= got;
-                filled += got;
                 if self.left == 0 {
                     // The pair is taken on the next call, so a poll timeout after these bytes cannot lose them.
                     self.chunk = Chunk::Crlf;
                 }
-                if filled == buf.len() {
-                    return Ok(filled);
-                }
-                continue;
+                return Ok(got);
             }
             if self.chunk == Chunk::Crlf {
                 // Both bytes or neither: a poll timeout inside the CRLF leaves the pair unread, so the next read resumes on the same two bytes.
                 while self.prefix.len() - self.at < 2 {
-                    if filled > 0 {
-                        return Ok(filled);
-                    }
                     self.prefix.drain(..self.at);
                     self.at = 0;
                     // One promoted window instead of a two-byte read: the bytes past the CRLF are the next size lines and bodies.
@@ -602,21 +583,15 @@ impl<R: Read> Read for Reader<R> {
                 self.chunk = Chunk::Body;
             }
             if self.chunk == Chunk::Trailers {
-                if filled > 0 && !self.line_ready() {
-                    return Ok(filled);
-                }
                 let mut trailer = [0u8; 130];
                 let len = read_line_into(self, &mut trailer)?
                     .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
                 if len == 0 {
                     self.chunk = Chunk::Body;
                     self.ended = true;
-                    return Ok(filled);
+                    return Ok(0);
                 }
                 continue;
-            }
-            if filled > 0 && !self.line_ready() {
-                return Ok(filled);
             }
             let mut line = [0u8; 130];
             let len = read_line_into(self, &mut line)?
@@ -631,9 +606,6 @@ impl<R: Read> Read for Reader<R> {
                 return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
             }
             self.left = size;
-            if filled > 0 && self.prefix.len() - self.at < self.left {
-                return Ok(filled);
-            }
         }
     }
 }
@@ -3203,42 +3175,6 @@ mod tests {
             reader.reads(),
             5,
             "{count} peer chunks must not cost a read each"
-        );
-    }
-
-    /// The window already holds several peer chunks, so one caller read hands them all over instead of stopping at the first; the relay then writes the coalesced span, not one chunk at a time.
-    #[test]
-    fn a_read_hands_over_the_chunks_the_window_holds() {
-        const PEER: usize = 8 * 1024;
-        let count = 16;
-        let chunks: Vec<usize> = std::iter::repeat_n(PEER, count).collect();
-        let payload: Vec<u8> = vec![0x5Au8; PEER * count];
-        let mut reader = Reader {
-            read: std::io::Cursor::new(framed(&chunks)),
-            prefix: Vec::new(),
-            at: 0,
-            left: 0,
-            ended: false,
-            reads: 0,
-            pending_head: false,
-            chunk: Chunk::Body,
-        };
-        let mut got = Vec::new();
-        let mut sizes = Vec::new();
-        let mut buf = vec![0u8; CHUNK];
-        loop {
-            let n = reader.read(&mut buf).expect("reads");
-            if n == 0 {
-                break;
-            }
-            sizes.push(n);
-            got.extend_from_slice(&buf[..n]);
-        }
-        assert_eq!(got, payload, "the bytes must be unchanged");
-        assert_eq!(
-            sizes,
-            [PEER, CHUNK - PEER, PEER, CHUNK - PEER],
-            "{count} peer chunks must leave as four reads"
         );
     }
 
