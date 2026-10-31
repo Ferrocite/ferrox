@@ -21294,9 +21294,7 @@ pub(crate) const RELAY_BUFFER: usize = 64 * 1024;
 
 pub(crate) const RELAY_SMALL_BUFFER: usize = 16 * 1024;
 
-// One pool per window quantum, so a flow that never promotes keeps paying 16 KiB, not 64 KiB.
-// Thread-local spares drain to the shared pool at thread exit: a short-lived `relay_split` leg
-// that drops its RelayBuf before the thread ends still leaves the window reusable by other threads.
+/// One pool per window quantum; thread-local spares drain to the shared pool at thread exit.
 struct RelaySpare {
     small: Vec<Vec<u8>>,
     large: Vec<Vec<u8>>,
