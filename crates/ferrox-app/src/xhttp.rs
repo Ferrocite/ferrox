@@ -12,6 +12,8 @@ use ferrox_core::transport::url_decode_parts;
 const HEAD_LIMIT: usize = 64 * 1024;
 /// One chunk per relay window: a promoted read leaves as one chunked frame, not as a 16 KiB chunk per quarter of it.
 const CHUNK: usize = crate::proxy::RELAY_BUFFER;
+/// Four relay windows of framing read-ahead: xray writes 8 KiB per chunk, so one fill covers thirty-two.
+const READ_AHEAD: usize = 4 * CHUNK;
 const HEX: &[u8; 16] = b"0123456789ABCDEF";
 
 fn path_covers(configured: &str, requested: &str) -> bool {
@@ -272,7 +274,7 @@ impl<R: Read> Reader<R> {
         }
     }
 
-    /// The syscall counter, read by `a_chunk_costs_two_reads_not_three` and `a_real_socket_drains_the_same_bytes`.
+    /// The syscall counter, read by `a_chunk_costs_a_read_per_read_ahead_window` and `a_real_socket_drains_the_same_bytes`.
     #[cfg_attr(not(test), expect(dead_code, reason = "only the gate reads it"))]
     #[must_use]
     pub(crate) fn reads(&self) -> usize {
@@ -570,8 +572,8 @@ impl<R: Read> Read for Reader<R> {
                 while self.prefix.len() - self.at < 2 {
                     self.prefix.drain(..self.at);
                     self.at = 0;
-                    // One promoted window instead of a two-byte read: the bytes past the CRLF are the next size lines and bodies.
-                    let n = self.fill(CHUNK)?;
+                    // One read-ahead instead of a two-byte read: the bytes past the CRLF are the next size lines and bodies.
+                    let n = self.fill(READ_AHEAD)?;
                     if n == 0 {
                         return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
                     }
@@ -2878,7 +2880,7 @@ mod tests {
         assert_eq!(counts.zeroed, 0, "the draw fills every byte: {counts:?}");
     }
 
-    /// The same drain over a real socket asserts the *bytes* and nothing else: a socket may segment, so its read count moves with the scheduler and cannot gate a number — that claim belongs to `a_chunk_costs_two_reads_not_three`, on an in-memory stream that answers the whole buffer. The peer paces its sends 2048 bytes at a time, which segments the kernel's delivery the way load alone used to do at random.
+    /// The same drain over a real socket asserts the *bytes* and nothing else: a socket may segment, so its read count moves with the scheduler and cannot gate a number — that claim belongs to `a_chunk_costs_a_read_per_read_ahead_window`, on an in-memory stream that answers the whole buffer. The peer paces its sends 2048 bytes at a time, which segments the kernel's delivery the way load alone used to do at random.
     #[test]
     fn a_real_socket_drains_the_same_bytes() {
         let count = 16usize;
@@ -3111,7 +3113,7 @@ mod tests {
 
     /// Reads are driven with a fixed CHUNK buffer, the way `relay_ordered` drives them, so the count is the reader's and not `read_to_end`'s buffer growth; `reads` is the counter that says so.
     #[test]
-    fn a_chunk_costs_two_reads_not_three() {
+    fn a_chunk_costs_a_read_per_read_ahead_window() {
         for count in [1usize, 2, 4, 8, 16] {
             let chunks: Vec<usize> = std::iter::repeat_n(CHUNK, count).collect();
             let payload: Vec<u8> = vec![0x5Au8; CHUNK * count];
@@ -3135,11 +3137,11 @@ mod tests {
                 got.extend_from_slice(&buf[..n]);
             }
             assert_eq!(got, payload, "{count} chunks: the bytes must be unchanged");
-            // Two reads per chunk amortised -- one framing window, one body -- plus the terminating size line. The old shape read the size line and the two-byte CRLF separately, so it cost three per chunk.
+            // One size line, one body read before the first window lands, and one fill per four chunks. The old shape read the size line and the two-byte CRLF separately, so it cost three per chunk.
             assert_eq!(
                 reader.reads(),
-                count * 2 + 1,
-                "{count} chunks: framing reads must amortise to one per chunk"
+                1 + 2 * count.div_ceil(4),
+                "{count} chunks: fills must cover four chunks each"
             );
         }
     }
@@ -3173,7 +3175,7 @@ mod tests {
         assert_eq!(got, payload, "the bytes must be unchanged");
         assert_eq!(
             reader.reads(),
-            5,
+            3,
             "{count} peer chunks must not cost a read each"
         );
     }
