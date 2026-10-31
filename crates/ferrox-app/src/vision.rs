@@ -249,6 +249,8 @@ struct Walk {
 struct Reading {
     padding: bool,
     raw: bool,
+    /// The budget only falls, so once it reaches zero no later read asks the cell again.
+    spent: bool,
 }
 
 struct Writing {
@@ -308,6 +310,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             read: Reading {
                 padding: true,
                 raw: false,
+                spent: false,
             },
             write: Writing {
                 padding: true,
@@ -359,6 +362,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             read: Reading {
                 padding: true,
                 raw: false,
+                spent: false,
             },
             write: Writing {
                 padding: true,
@@ -461,9 +465,17 @@ impl<S: Read + Write + RecordAlignment> Read for Link<S> {
     /// The content the walk hands this caller buffer is one filter unit: it joins the
     /// feeding spread through the run, and the machine spends at the unit's end.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let tls = self.filter();
-        let active = tls.budget > 0;
-        let mut feed = active.then(|| Feeding::new(&tls));
+        let tls = if self.read.spent {
+            None
+        } else {
+            let tls = self.filter();
+            self.read.spent = tls.budget == 0;
+            Some(tls)
+        };
+        let mut feed = tls
+            .filter(|tls| tls.budget > 0)
+            .map(|tls| Feeding::new(&tls));
+        let active = feed.is_some();
         #[cfg(test)]
         if feed.is_some() {
             self.feeds += 1;
@@ -558,7 +570,10 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
             Some(*tls)
         });
         if let Some(tls) = tls {
+            self.read.spent = tls.budget == 0;
             self.engage(&tls);
+        } else {
+            self.read.spent = true;
         }
     }
 
@@ -593,6 +608,7 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 }
                 (*tls, observed)
             });
+            self.read.spent = tls.budget == 0;
             if observed {
                 self.engage(&tls);
             }
@@ -1418,10 +1434,10 @@ mod tests {
         );
     }
 
-    /// After the switch a read spends no budget, so it reads the shared state once and
-    /// hands the content through without a second look.
+    /// The first read after the switch learns the filter is spent; from then on the
+    /// budget can only stay zero, so no read asks the shared cell again.
     #[test]
-    fn a_steady_direct_read_takes_the_shared_state_once() {
+    fn a_spent_direct_read_takes_no_shared_state() {
         let (mut reader, _writer) =
             Link::split(Fake::new(b"tail"), Fake::new(&[]), None, None, &UUID);
         reader.read.padding = false;
@@ -1438,7 +1454,18 @@ mod tests {
                 .tls_accesses
                 .load(std::sync::atomic::Ordering::Relaxed),
             1,
-            "a steady direct read takes the shared state once"
+            "the read that learns the budget is spent takes it once"
+        );
+        reader
+            .tls_accesses
+            .store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(reader.read(&mut out).expect("reads"), 0);
+        assert_eq!(
+            reader
+                .tls_accesses
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a spent direct read takes no shared state"
         );
     }
 
