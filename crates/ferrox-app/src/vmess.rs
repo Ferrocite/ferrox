@@ -1637,7 +1637,7 @@ fn forward_step(
             }
         }
         Err(ref error) if crate::proxy::is_timeout(error) => {
-            if flow.ended_and_drained() {
+            if flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                 (Next::Done, false)
             } else {
                 (Next::Idle, false)
@@ -1674,7 +1674,7 @@ fn backward_step<R: Read>(
     }
     match reader.step(recv) {
         Opened::Idle => {
-            if flow.ended() {
+            if flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                 Next::Done
             } else {
                 Next::Idle
@@ -2344,7 +2344,6 @@ mod tests {
     /// Silence past the budget is death, not scheduling: a peer that opens the connection and never sends must not pin the raw `VMess` handshake thread forever.
     #[test]
     fn a_silent_peer_cannot_pin_a_raw_vmess_handshake() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -2353,7 +2352,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve(stream, &Users::single(id), true);
             let _ = done_tx.send(());
@@ -2539,7 +2538,6 @@ mod tests {
     /// A vmess inbound over gRPC whose peer answers the head and never sends its first hunk releases the serve thread: the carrier puts its clock away with the head, so the auth id reads under its own.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_vmess_request() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -2548,7 +2546,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_grpc(stream, "/p", &Users::single(id), true);
             let _ = done_tx.send(());

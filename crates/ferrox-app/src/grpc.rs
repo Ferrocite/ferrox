@@ -2357,7 +2357,6 @@ mod tests {
     /// A writer the peer never credits gives up at the relay stall, so a relay leg cannot park its thread on a window that never arrives.
     #[test]
     fn a_writer_with_no_credit_gives_up_at_the_stall() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             relay_stall: Some(Duration::from_millis(500)),
             ..Default::default()
@@ -2365,7 +2364,7 @@ mod tests {
         let writer = writer_over(Recorder(Arc::new(Mutex::new(Peer::default()))), HUNK, 0);
         let shared = Arc::clone(&writer.shared);
         let (sent, got) = std::sync::mpsc::channel();
-        let running = thread::spawn(move || {
+        let running = crate::budgets::spawn(move || {
             let _ = sent.send(writer.send(b"ping"));
         });
         let verdict = got.recv_timeout(Duration::from_secs(3));
@@ -2576,7 +2575,6 @@ mod tests {
     /// sends `F_END` once the peer grants the seven bytes the empty message needs.
     #[test]
     fn a_half_close_that_cannot_send_the_end_marker_is_retried() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             relay_stall: Some(Duration::from_millis(100)),
             ..Default::default()
@@ -2655,7 +2653,6 @@ mod tests {
     /// replay a prefix the peer already saw.
     #[test]
     fn a_stalled_end_marker_is_not_replayed() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             relay_stall: Some(Duration::from_millis(100)),
             ..Default::default()
@@ -2773,7 +2770,6 @@ mod tests {
     /// or a marker that fits the window exactly is refused and leaks the reservation.
     #[test]
     fn an_empty_end_marker_charges_its_window_once() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             relay_stall: Some(Duration::from_millis(100)),
             ..Default::default()

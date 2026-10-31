@@ -810,7 +810,10 @@ fn uplink_step(
                 }
             }
         },
-        Err(error) if crate::proxy::is_timeout(&error) && !flow.ended() => {
+        Err(error)
+            if crate::proxy::is_timeout(&error)
+                && !flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) =>
+        {
             return crate::proxy::lane_pool::Next::Idle;
         }
         Err(_) => return crate::proxy::lane_pool::Next::Done,
@@ -2261,7 +2264,6 @@ mod tests {
 
     #[test]
     fn a_silent_peer_cannot_pin_a_single_psk_shadowsocks2022_handshake() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -2270,7 +2272,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let psk = psk_b64(32);
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve(stream, &psk, "2022-blake3-aes-256-gcm", true);
             let _ = done_tx.send(());
@@ -2285,7 +2287,6 @@ mod tests {
     /// A 2022-blake3 inbound over gRPC whose peer answers the head and never sends its salt releases the serve thread: the carrier puts its clock away with the head, so the handshake reads under its own.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_shadowsocks2022_request() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -2294,7 +2295,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let psk = psk_b64(32);
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_grpc(stream, &psk, "2022-blake3-aes-256-gcm", "/p", true);
             let _ = done_tx.send(());
@@ -2309,7 +2310,6 @@ mod tests {
 
     #[test]
     fn a_silent_peer_cannot_pin_a_multi_psk_shadowsocks2022_handshake() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -2318,7 +2318,7 @@ mod tests {
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let password = format!("{}:{}", psk_b64(32), psk_b64(32));
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve(stream, &password, "2022-blake3-aes-256-gcm", true);
             let _ = done_tx.send(());

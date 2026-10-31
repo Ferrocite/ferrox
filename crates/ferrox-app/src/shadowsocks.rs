@@ -589,7 +589,10 @@ fn uplink_step(
     match read {
         Ok(0) => crate::proxy::lane_pool::Next::Done,
         Ok(n) if seal_all(send, buf, n, writer).is_ok() => crate::proxy::lane_pool::Next::More,
-        Err(error) if crate::proxy::is_timeout(&error) && !flow.ended() => {
+        Err(error)
+            if crate::proxy::is_timeout(&error)
+                && !flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) =>
+        {
             crate::proxy::lane_pool::Next::Idle
         }
         Ok(_) | Err(_) => crate::proxy::lane_pool::Next::Done,
@@ -1362,7 +1365,6 @@ mod tests {
 
     #[test]
     fn a_silent_peer_cannot_pin_a_raw_shadowsocks_handshake() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -1370,7 +1372,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve(
                 stream,
@@ -1389,7 +1391,6 @@ mod tests {
     /// Silence past the budget is death, not scheduling: the stream handshake reads a clear IV then scans the encrypted header, and a peer that opens the connection and never sends must not pin that thread forever either.
     #[test]
     fn a_silent_peer_cannot_pin_a_stream_shadowsocks_handshake() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -1397,7 +1398,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve(
                 stream,
@@ -1858,7 +1859,6 @@ mod tests {
     /// A shadowsocks inbound over gRPC whose peer answers the head and never sends its IV releases the serve thread: the carrier puts its clock away with the head, so the handshake reads under its own.
     #[test]
     fn a_silent_peer_cannot_pin_a_grpc_shadowsocks_request() {
-        let _guard = crate::budgets::lock();
         crate::budgets::apply(&crate::config::Budgets {
             handshake: Some(Duration::from_millis(250)),
             ..Default::default()
@@ -1866,7 +1866,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let addr = listener.local_addr().expect("addr");
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let serving = thread::spawn(move || {
+        let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_grpc(
                 stream,

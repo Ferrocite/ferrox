@@ -10,10 +10,7 @@ pub(crate) const HANDSHAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) const RELAY_POLL: Duration = Duration::from_millis(1);
 
-/// A lane whose sibling already ended still waits this long for the last reply before giving the flow up, so a peer that answers after the FIN reaches the sink.
-pub(crate) const RELAY_DRAIN_GRACE: Duration = Duration::from_millis(20);
-
-/// How long the answer lane keeps reading after the upload lane ended: a target may answer after the client's half-close, and xray-core's own `UplinkOnly` default is one second.
+/// How long a lane keeps reading after its sibling ended: a peer may answer after the FIN, and xray-core's own `UplinkOnly` default is one second. Past it the lane hands its thread back, so a peer that never answers cannot park it.
 pub(crate) const RELAY_RESPONSE_IDLE: Duration = Duration::from_secs(1);
 
 /// How long a connection we refused stays open after its GOAWAY: closing with the peer's bytes still unread makes the stack abort with RST, and that can swallow the refusal itself.
@@ -71,134 +68,200 @@ pub(crate) const UDP_IDLE: Duration = Duration::from_secs(120);
 /// How long a carrier may stay open and silent before the app's payload goes out ahead of the answer: a carrier that refuses inside the window leaves the bytes for the ladder's next rung.
 pub(crate) const PAYLOAD_GRACE: Duration = Duration::from_millis(100);
 
-// The same waits restated by a config, in milliseconds, where zero means the name was never written. Each getter is read once per flow — at a dial, a handshake arm, a relay teardown, an idle arming — and never inside a byte loop, so naming a budget adds no operation to a measured path. Cadences that pace a loop (`RELAY_POLL`, `SESSION_POLL`, `RELAY_IDLE`, the spin and try counts) stay constants on purpose: a runtime cadence is a load per iteration in the hottest loop this file describes.
-static DIAL_MS: AtomicU64 = AtomicU64::new(0);
-static HANDSHAKE_MS: AtomicU64 = AtomicU64::new(0);
-static HEAD_ARRIVAL_MS: AtomicU64 = AtomicU64::new(0);
-static RELAY_JOIN_MS: AtomicU64 = AtomicU64::new(0);
-static RELAY_QUANTUM_MS: AtomicU64 = AtomicU64::new(0);
-static RELAY_STALL_MS: AtomicU64 = AtomicU64::new(0);
-static UDP_IDLE_MS: AtomicU64 = AtomicU64::new(0);
-static PAYLOAD_GRACE_MS: AtomicU64 = AtomicU64::new(0);
-static GOAWAY_GRACE_MS: AtomicU64 = AtomicU64::new(0);
-static SINK_GRACE_MS: AtomicU64 = AtomicU64::new(0);
-static CARRIER_PROBE_MS: AtomicU64 = AtomicU64::new(0);
+/// One wait a config can restate, in the order `CONSTANTS`, `SLOTS` and `as_table` carry it.
+#[derive(Clone, Copy)]
+enum Named {
+    Dial,
+    Handshake,
+    HeadArrival,
+    RelayJoin,
+    RelayQuantum,
+    RelayStall,
+    UdpIdle,
+    PayloadGrace,
+    GoawayGrace,
+    SinkGrace,
+    CarrierProbe,
+}
 
-fn named(set: &AtomicU64, default: Duration) -> Duration {
-    match set.load(Ordering::Relaxed) {
-        0 => default,
+/// The constant beside each name, read when nothing has restated it.
+const CONSTANTS: [Duration; 11] = [
+    DIAL_TIMEOUT,
+    HANDSHAKE_REQUEST_TIMEOUT,
+    HEAD_DEADLINE,
+    RELAY_JOIN,
+    RELAY_QUANTUM,
+    RELAY_STALL,
+    UDP_IDLE,
+    PAYLOAD_GRACE,
+    GOAWAY_GRACE,
+    SINK_GRACE,
+    CARRIER_PROBE,
+];
+
+// The same waits restated by a config, in milliseconds, where zero means the name was never written. Each getter is read once per flow — at a dial, a handshake arm, a relay teardown, an idle arming — and never inside a byte loop, so naming a budget adds no operation to a measured path. Cadences that pace a loop (`RELAY_POLL`, `SESSION_POLL`, `RELAY_IDLE`, the spin and try counts) stay constants on purpose: a runtime cadence is a load per iteration in the hottest loop this file describes.
+static SLOTS: [AtomicU64; 11] = [
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+    AtomicU64::new(0),
+];
+
+/// A config's waits in `Named` order: the one place the eleven names are spelled out.
+fn as_table(overrides: &crate::config::Budgets) -> [Option<Duration>; 11] {
+    [
+        overrides.dial,
+        overrides.handshake,
+        overrides.head_arrival,
+        overrides.relay_join,
+        overrides.relay_quantum,
+        overrides.relay_stall,
+        overrides.udp_idle,
+        overrides.payload_grace,
+        overrides.goaway_grace,
+        overrides.sink_grace,
+        overrides.carrier_probe,
+    ]
+}
+
+/// The wait one site reads: the value a test armed for this thread, else the one the config named, else the constant.
+fn wait(named: Named) -> Duration {
+    #[cfg(test)]
+    if let Some(armed) = MINE.with(|cell| cell.get()[named as usize]) {
+        return armed;
+    }
+    match SLOTS[named as usize].load(Ordering::Relaxed) {
+        0 => CONSTANTS[named as usize],
         millis => Duration::from_millis(millis),
     }
 }
 
 pub(crate) fn dial() -> Duration {
-    named(&DIAL_MS, DIAL_TIMEOUT)
+    wait(Named::Dial)
 }
 
 pub(crate) fn handshake() -> Duration {
-    named(&HANDSHAKE_MS, HANDSHAKE_REQUEST_TIMEOUT)
+    wait(Named::Handshake)
 }
 
 pub(crate) fn head_arrival() -> Duration {
-    named(&HEAD_ARRIVAL_MS, HEAD_DEADLINE)
+    wait(Named::HeadArrival)
 }
 
 pub(crate) fn relay_join() -> Duration {
-    named(&RELAY_JOIN_MS, RELAY_JOIN)
+    wait(Named::RelayJoin)
 }
 
 pub(crate) fn relay_quantum() -> Duration {
-    named(&RELAY_QUANTUM_MS, RELAY_QUANTUM)
+    wait(Named::RelayQuantum)
 }
 
 pub(crate) fn relay_stall() -> Duration {
-    named(&RELAY_STALL_MS, RELAY_STALL)
+    wait(Named::RelayStall)
 }
 
 pub(crate) fn udp_idle() -> Duration {
-    named(&UDP_IDLE_MS, UDP_IDLE)
+    wait(Named::UdpIdle)
 }
 
 pub(crate) fn payload_grace() -> Duration {
-    named(&PAYLOAD_GRACE_MS, PAYLOAD_GRACE)
+    wait(Named::PayloadGrace)
 }
 
 pub(crate) fn goaway_grace() -> Duration {
-    named(&GOAWAY_GRACE_MS, GOAWAY_GRACE)
+    wait(Named::GoawayGrace)
 }
 
 pub(crate) fn sink_grace() -> Duration {
-    named(&SINK_GRACE_MS, SINK_GRACE)
+    wait(Named::SinkGrace)
 }
 
 pub(crate) fn carrier_probe() -> Duration {
-    named(&CARRIER_PROBE_MS, CARRIER_PROBE)
+    wait(Named::CarrierProbe)
 }
 
 /// Write every budget the config named; a name it did not write stays the constant above.
-pub(crate) fn apply(overrides: &crate::config::Budgets) {
-    fn one(set: &AtomicU64, value: Option<Duration>) {
+pub(crate) fn apply_config(overrides: &crate::config::Budgets) {
+    for (slot, value) in SLOTS.iter().zip(as_table(overrides)) {
         if let Some(value) = value {
-            set.store(
+            slot.store(
                 u64::try_from(value.as_millis()).unwrap_or(u64::MAX),
                 Ordering::Relaxed,
             );
         }
     }
-    one(&DIAL_MS, overrides.dial);
-    one(&HANDSHAKE_MS, overrides.handshake);
-    one(&HEAD_ARRIVAL_MS, overrides.head_arrival);
-    one(&RELAY_JOIN_MS, overrides.relay_join);
-    one(&RELAY_QUANTUM_MS, overrides.relay_quantum);
-    one(&RELAY_STALL_MS, overrides.relay_stall);
-    one(&UDP_IDLE_MS, overrides.udp_idle);
-    one(&PAYLOAD_GRACE_MS, overrides.payload_grace);
-    one(&GOAWAY_GRACE_MS, overrides.goaway_grace);
-    one(&SINK_GRACE_MS, overrides.sink_grace);
-    one(&CARRIER_PROBE_MS, overrides.carrier_probe);
 }
 
-/// A named budget is the value a test can restore; nothing else writes the table outside `apply`.
+#[cfg(test)]
+thread_local! {
+    /// The waits a test armed for its own flows: this thread reads them, and every thread it starts carries them. A concurrent test reads the constants, so an arm is measured against the budgets the suite is not racing.
+    static MINE: std::cell::Cell<[Option<Duration>; 11]> = const { std::cell::Cell::new([None; 11]) };
+}
+
+/// Arm the waits this test's own flows read; a name it leaves out keeps the constant.
+#[cfg(test)]
+pub(crate) fn apply(overrides: &crate::config::Budgets) {
+    let named = as_table(overrides);
+    MINE.with(|cell| {
+        let mut armed = cell.get();
+        for (slot, value) in armed.iter_mut().zip(named) {
+            if value.is_some() {
+                *slot = value;
+            }
+        }
+        cell.set(armed);
+    });
+}
+
+/// Hand the table back, so a test that named nothing reads the constants again.
 #[cfg(test)]
 pub(crate) fn clear() {
-    for set in [
-        &DIAL_MS,
-        &HANDSHAKE_MS,
-        &HEAD_ARRIVAL_MS,
-        &RELAY_JOIN_MS,
-        &RELAY_QUANTUM_MS,
-        &RELAY_STALL_MS,
-        &UDP_IDLE_MS,
-        &PAYLOAD_GRACE_MS,
-        &GOAWAY_GRACE_MS,
-        &SINK_GRACE_MS,
-        &CARRIER_PROBE_MS,
-    ] {
-        set.store(0, Ordering::Relaxed);
+    MINE.with(|cell| cell.set([None; 11]));
+    for slot in &SLOTS {
+        slot.store(0, Ordering::Relaxed);
     }
 }
 
+/// A body for a thread this one starts: it reads the waits this thread armed, not the constants.
 #[cfg(test)]
-static ARMED: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) fn carrying<F: FnOnce() -> T + Send, T: Send>(body: F) -> impl FnOnce() -> T + Send {
+    let armed = MINE.with(std::cell::Cell::get);
+    move || {
+        MINE.with(|cell| cell.set(armed));
+        body()
+    }
+}
 
-/// The table is process-global and read by every thread, so a test that arms one takes this lock: two arming tests never overlap, and the values they arm are held for no assertion of their own.
-///
-/// The lock is held until the guard is dropped, so a test hands it back as soon as the code under test is done: a fixture that waits on its own teardown waits outside the window, or every other arming test waits behind it.
+/// A thread a test starts, for the flow the test drives off its own thread: `thread::spawn` drops the arm.
 #[cfg(test)]
-pub(crate) fn lock() -> std::sync::MutexGuard<'static, ()> {
-    ARMED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
+pub(crate) fn spawn<F: FnOnce() -> T + Send + 'static, T: Send + 'static>(
+    body: F,
+) -> std::thread::JoinHandle<T> {
+    std::thread::spawn(carrying(body))
+}
+
+/// The same thread in a shipped binary, where the table is the process's and every thread already reads it.
+#[cfg(not(test))]
+pub(crate) fn spawn<F: FnOnce() -> T + Send + 'static, T: Send + 'static>(
+    body: F,
+) -> std::thread::JoinHandle<T> {
+    std::thread::spawn(body)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Every override here is at least as generous as the constant it replaces, so a table left armed by a failed assertion cannot tighten a wait another test is racing.
+    /// An arm is this thread's, so the constants are read before it and after it by the same test and by every other test at any thread count.
     #[test]
     fn a_budget_the_config_names_is_the_value_a_site_reads() {
-        let _guard = lock();
         // Nothing has armed the table, so each site reads the constant beside its name.
         assert_eq!(dial(), DIAL_TIMEOUT);
         assert_eq!(handshake(), HANDSHAKE_REQUEST_TIMEOUT);
@@ -248,5 +311,18 @@ mod tests {
             CARRIER_PROBE,
             "an unnamed wait is its constant"
         );
+    }
+
+    /// A thread a test starts reads the table it armed, so a flow that runs off the test's own thread is still measured against the named wait.
+    #[test]
+    fn a_spawned_thread_reads_the_table_its_starter_armed() {
+        apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(250)),
+            ..Default::default()
+        });
+        let seen = spawn(handshake).join().expect("joins");
+        clear();
+        assert_eq!(seen, Duration::from_millis(250));
+        assert_eq!(handshake(), HANDSHAKE_REQUEST_TIMEOUT);
     }
 }
