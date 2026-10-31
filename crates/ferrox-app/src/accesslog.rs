@@ -38,6 +38,15 @@ impl Drop for FlowGuard {
     }
 }
 
+/// The account a front authenticates after its flow opened: the source and the lease stay, the identity is the one the client proved.
+pub(crate) fn reidentify(email: &str, level: u32) {
+    FLOW.with(|flow| {
+        let mut flow = flow.borrow_mut();
+        email.clone_into(&mut flow.email);
+        flow.level = level;
+    });
+}
+
 /// One accepted line for the flow the current front is serving, at the destination its request named.
 pub(crate) fn record_current(destination: &dyn std::fmt::Display) {
     let (source, email) = FLOW.with(|flow| {

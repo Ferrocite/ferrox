@@ -1533,7 +1533,6 @@ enum Role {
         carrier: Carrier,
         freedom: bool,
         tls: Option<Arc<ferrox_core::tls::TlsServerConfig>>,
-        account: InboundAccount,
     },
     Socks {
         out: Outbound,
@@ -1584,11 +1583,11 @@ impl Role {
             Role::Trojan { account, .. }
             | Role::TrojanTls { account, .. }
             | Role::Vmess { account, .. }
-            | Role::VmessTls { account, .. }
-            | Role::Shadowsocks { account, .. } => Some(account),
+            | Role::VmessTls { account, .. } => Some(account),
             Role::Vless { .. }
             | Role::VlessTls { .. }
             | Role::VlessReality { .. }
+            | Role::Shadowsocks { .. }
             | Role::Socks { .. }
             | Role::Http { .. }
             | Role::Mixed { .. }
@@ -3240,7 +3239,25 @@ pub(crate) struct ShadowsocksOut {
     host: String,
     headers: Vec<(String, String)>,
     heartbeat: u32,
+    mux: Mux,
     tls: Option<Arc<ferrox_core::tls::TlsConfig>>,
+}
+
+/// The session's two lanes and xray's `xudpProxyUDP443` for the datagram one, read only while a mux session is enabled.
+#[derive(Debug, Clone, Copy, Default)]
+struct Mux {
+    tcp: bool,
+    udp: bool,
+    udp443: Udp443,
+}
+
+/// What a UDP datagram to port 443 does under a mux: it is refused, rides the mux, or skips it for the direct dial.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+enum Udp443 {
+    #[default]
+    Reject,
+    Allow,
+    Skip,
 }
 
 fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::sync::Arc<Stop>>) {
@@ -4607,11 +4624,16 @@ where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    let wire = MuxWire::Tunnel(crate::reverse::Tunnel::new(
-        Box::new(reader),
-        Box::new(writer),
-        close,
-    ));
+    serve_mux_tunnel(Box::new(reader), Box::new(writer), close, &[]);
+}
+
+pub(crate) fn serve_mux_tunnel(
+    reader: Box<dyn Read + Send>,
+    writer: Box<dyn Write + Send>,
+    close: Arc<dyn Fn() + Send + Sync>,
+    carried: &[u8],
+) {
+    let wire = MuxWire::Tunnel(crate::reverse::Tunnel::new(reader, writer, close));
     let io = MuxIo {
         dial: dial_or_report,
         resolve: resolve_endpoint,
@@ -4624,12 +4646,23 @@ where
         (io.dial)(&address)
     });
     let udp: MuxUdpOk = Arc::new(|_| true);
-    serve_mux_wire(&wire, &dial, &udp, None, &[]);
+    serve_mux_wire(&wire, &dial, &udp, None, carried);
 }
 
-struct MeteredIo<T> {
+pub(crate) struct MeteredIo<T> {
     inner: T,
     meter: crate::stats::Meter,
+}
+
+/// A carrier leg whose bytes are counted for the account its handshake named.
+pub(crate) fn metered<T>(inner: T, meter: crate::stats::Meter) -> MeteredIo<T> {
+    MeteredIo { inner, meter }
+}
+
+impl<T: RelayPoll> RelayPoll for MeteredIo<T> {
+    fn arm_relay_poll(&mut self) {
+        self.inner.arm_relay_poll();
+    }
 }
 
 impl<T: Read> Read for MeteredIo<T> {
@@ -11011,82 +11044,114 @@ fn serve_ss_relay_inbound(address: &str, inbound: &Json, password: &str, method:
     true
 }
 
+/// The networks a shadowsocks inbound opens, from a `tcp,udp` string or an array: a list that names neither opens none, and an absent list opens both, the superset of the reference's tcp default.
+fn inbound_ss_networks(inbound: &Json) -> (bool, bool) {
+    let Some(named) = inbound.get("settings").and_then(|s| s.get("network")) else {
+        return (true, true);
+    };
+    let mut tcp = false;
+    let mut udp = false;
+    let mut take = |name: &str| {
+        for part in name.split(',') {
+            match part.trim() {
+                "tcp" => tcp = true,
+                "udp" => udp = true,
+                _ => {}
+            }
+        }
+    };
+    match named.as_arr() {
+        Some(items) => {
+            for item in items {
+                if let Some(name) = item.as_str() {
+                    take(name);
+                }
+            }
+        }
+        None => take(named.as_str().unwrap_or("")),
+    }
+    (tcp, udp)
+}
+
 fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     let password = inbound_ss_password(inbound);
     let account = inbound_account(inbound);
     let method = inbound_method(inbound);
     let carrier = inbound_carrier(inbound);
-    let udp_raw = matches!(carrier, Carrier::Raw(_));
+    let (tcp, udp) = inbound_ss_networks(inbound);
     let accounts = ss_accounts(inbound, address, password, method);
-    let udp_accounts = udp_raw.then(|| Arc::clone(&accounts));
+    let udp_accounts = (udp && matches!(carrier, Carrier::Raw(_))).then(|| Arc::clone(&accounts));
+    // The 2022 relay serves its own tcp and udp listeners as one unit, so a network list does not split it.
     if matches!(carrier, Carrier::Raw(_))
         && serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method)
     {
         return;
     }
-    match carrier {
-        Carrier::Kcp(config) => {
-            if !serve_ss_kcp_listener(
-                address,
-                inbound,
-                config,
-                &accounts,
-                freedom,
-                &account.email,
-                account.level,
-            ) {
-                return;
+    if tcp {
+        match carrier {
+            Carrier::Kcp(config) => {
+                if !serve_ss_kcp_listener(
+                    address,
+                    inbound,
+                    config,
+                    &accounts,
+                    freedom,
+                    &account.email,
+                    account.level,
+                ) {
+                    return;
+                }
             }
-        }
-        Carrier::Xdrive { settings } => {
-            let accounts = Arc::clone(&accounts);
-            let email = account.email.clone();
-            let level = account.level;
-            let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
-            let accept: crate::xdrive::Accept = Arc::new(move |session| {
-                let _flow = crate::accesslog::flow(None, &email, level);
-                serve_ss_xdrive(session.with_meter(meter.clone()), &accounts, freedom);
-            });
-            serve_xdrive_loop(&settings, address, accept);
-        }
-        carrier if stream_security(inbound) == "tls" => {
-            let Some(server) = inbound_tls_identity(inbound) else {
-                eprintln!("unreadable shadowsocks tls identity on {address}: refused, not served");
-                return;
-            };
-            spawn_role(
+            Carrier::Xdrive { settings } => {
+                let accounts = Arc::clone(&accounts);
+                let email = account.email.clone();
+                let level = account.level;
+                let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
+                let accept: crate::xdrive::Accept = Arc::new(move |session| {
+                    let _flow = crate::accesslog::flow(None, &email, level);
+                    serve_ss_xdrive(session.with_meter(meter.clone()), &accounts, freedom);
+                });
+                serve_xdrive_loop(&settings, address, accept);
+            }
+            carrier if stream_security(inbound) == "tls" => {
+                // A refused identity takes only the stream half: a udp relay this config asked for still opens.
+                match inbound_tls_identity(inbound) {
+                    Some(server) => spawn_role(
+                        address,
+                        inbound_role(
+                            inbound,
+                            Role::Shadowsocks {
+                                accounts,
+                                carrier,
+                                freedom,
+                                tls: Some(server),
+                            },
+                        ),
+                        inbound_tag(inbound),
+                    ),
+                    None => eprintln!(
+                        "unreadable shadowsocks tls identity on {address}: refused, not served"
+                    ),
+                }
+            }
+            _ if !matches!(stream_security(inbound), "" | "none") => {
+                let security = stream_security(inbound);
+                eprintln!("shadowsocks security `{security}` on {address}: refused, not served");
+            }
+            other => spawn_role(
                 address,
                 inbound_role(
                     inbound,
                     Role::Shadowsocks {
                         accounts,
-                        carrier,
+                        carrier: other,
                         freedom,
-                        tls: Some(server),
-                        account,
+                        tls: None,
                     },
                 ),
                 inbound_tag(inbound),
-            );
-        }
-        _ if !matches!(stream_security(inbound), "" | "none") => {
-            let security = stream_security(inbound);
-            eprintln!("shadowsocks security `{security}` on {address}: refused, not served");
-        }
-        other => spawn_role(
-            address,
-            inbound_role(
-                inbound,
-                Role::Shadowsocks {
-                    accounts,
-                    carrier: other,
-                    freedom,
-                    tls: None,
-                    account,
-                },
             ),
-            inbound_tag(inbound),
-        ),
+        }
     }
     if let Some(accounts) = udp_accounts {
         let udp_address = address.to_owned();
@@ -12337,6 +12402,13 @@ fn mux_dial_uplink(client: &Connection, uplink: &mut dyn Write, id: u16) {
     let _ = uplink.write_all(&header);
 }
 
+/// The two halves of a mux carrier and the close that tears its socket down.
+type MuxHalves = (
+    Box<dyn Read + Send>,
+    Box<dyn Write + Send>,
+    Arc<dyn Fn() + Send + Sync>,
+);
+
 struct MuxUplink {
     read: Box<dyn Read + Send>,
     write: Box<dyn Write + Send>,
@@ -12376,6 +12448,47 @@ fn open_vless_mux(vless: &VlessOut) -> Option<MuxUplink> {
     Some(MuxUplink {
         read: Box::new(read),
         write: Box::new(uplink),
+        close,
+    })
+}
+
+fn open_ss_mux(ss: &ShadowsocksOut) -> Option<MuxUplink> {
+    // The 2022 rung answers its own reply handshake before a frame, and its mux reader is not wired yet: the caller dials directly.
+    if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
+        return None;
+    }
+    let server = resolve_outbound(&ss.address, ss.port)?;
+    let target = Destination::Name(
+        crate::shadowsocks::MUX_HOST.to_owned(),
+        crate::shadowsocks::MUX_PORT,
+    );
+    let (read, write, close): MuxHalves = match (&ss.carrier, ss.tls.as_deref()) {
+        (Carrier::Raw(_), None) => {
+            let stream = dial_or_report(&server)?.with_mask(ss.carrier.tcp_mask());
+            let read = stream.try_clone().ok()?;
+            let write = stream.try_clone().ok()?;
+            (Box::new(read), Box::new(write), connection_closer(&stream))
+        }
+        (Carrier::Raw(_), Some(cfg)) => {
+            let session = dial_tls_session(&server, cfg, ss.carrier.tcp_mask())?;
+            let (read, write, raw) = session.into_halves()?;
+            let close = connection_closer(&raw);
+            (Box::new(read), Box::new(write), close)
+        }
+        _ => {
+            static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            if SAID.set(()).is_ok() {
+                eprintln!("shadowsocks: mux is served on a raw or tls carrier; dialing directly");
+            }
+            return None;
+        }
+    };
+    let mut write = write;
+    let (send, recv) =
+        crate::shadowsocks::client_send_handshake(&mut *write, &ss.password, &ss.method, &target)?;
+    Some(MuxUplink {
+        read: Box::new(crate::shadowsocks::SsMuxReader::new(read, recv)),
+        write: Box::new(crate::shadowsocks::SsMuxWriter::new(write, send)),
         close,
     })
 }
@@ -12436,9 +12549,21 @@ fn open_vless_mux_quic(vless: &VlessOut) -> Option<MuxUplink> {
 }
 
 fn dial_vless_mux(client: &Connection, vless: &VlessOut, target: &Destination) {
-    let Some(mut mux) = open_vless_mux(vless) else {
+    let Some(mux) = open_vless_mux(vless) else {
         return;
     };
+    dial_mux_stream(client, mux, target);
+}
+
+fn dial_ss_mux(client: &Connection, ss: &ShadowsocksOut, target: &Destination) -> bool {
+    let Some(mux) = open_ss_mux(ss) else {
+        return false;
+    };
+    dial_mux_stream(client, mux, target);
+    true
+}
+
+fn dial_mux_stream(client: &Connection, mut mux: MuxUplink, target: &Destination) {
     let mut ids = ferrox_core::mux::Ids::new(1);
     let Ok(id) = ids.take() else {
         return;
@@ -16991,7 +17116,9 @@ fn dial_socks_outbound(
         Outbound::Vmess(vmess) => dial_vmess(client, server, vmess, target, ladder),
         Outbound::Trojan(trojan) => dial_trojan(client, server, trojan, target, ladder),
         Outbound::Shadowsocks(shadowsocks) => {
-            dial_shadowsocks(client, server, shadowsocks, target, ladder);
+            if !shadowsocks.mux.tcp || !dial_ss_mux(client, shadowsocks, target) {
+                dial_shadowsocks(client, server, shadowsocks, target, ladder);
+            }
         }
         Outbound::Hysteria(hy) => crate::hysteria_v1::dial(client, &hy.dial(), target),
         Outbound::Http(http) => {
@@ -19670,51 +19797,122 @@ fn foxy_udp_dial(foxy: &FoxyOut, dest: &SocketAddr) -> Option<crate::foxy::Datag
     None
 }
 
+/// One local source's UDP association: its own connected uplink to the server, and the reply cipher that source seals with.
+struct SsUdpClientSource {
+    uplink: UdpSocket,
+    hop: Option<ferrox_core::shadowsocks::Cipher>,
+    last: Instant,
+}
+
+/// The outbound's plain Shadowsocks UDP lane: one sealed uplink per source, replies opened under that source's key and framed back to it.
+struct SsUdpLane {
+    master: ferrox_core::shadowsocks::MasterKey,
+    method: ferrox_core::shadowsocks::Method,
+    server: SocketAddr,
+    sources: Arc<Mutex<HashMap<SocketAddr, SsUdpClientSource>>>,
+    done: Arc<AtomicBool>,
+    reader: RelayEnd,
+}
+
+impl SsUdpLane {
+    fn open(relay: &UdpSocket, ss: &ShadowsocksOut) -> Option<Self> {
+        let method = ferrox_core::shadowsocks::Method::parse(&ss.method)?;
+        let master = ferrox_core::shadowsocks::MasterKey::new(&ss.password, method.key_len());
+        let server: SocketAddr = format!("{}:{}", ss.address, ss.port)
+            .to_socket_addrs()
+            .ok()
+            .and_then(|mut it| it.next())?;
+        let sources = Arc::new(Mutex::new(HashMap::new()));
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = spawn_ss_udp_sources(&sources, relay, &master, method, Arc::clone(&done))?;
+        Some(Self {
+            master,
+            method,
+            server,
+            sources,
+            done,
+            reader,
+        })
+    }
+
+    /// Seals one datagram onto its source's uplink, opening the association on the first; false only when the source map is unusable.
+    fn send(
+        &self,
+        src: SocketAddr,
+        dest: SocketAddr,
+        buf: &mut [u8],
+        at: usize,
+        len: usize,
+    ) -> bool {
+        let Ok(mut guard) = self.sources.lock() else {
+            return false;
+        };
+        if !guard.contains_key(&src) {
+            if guard.len() >= crate::shadowsocks::SS_UDP_SOURCES {
+                let now = Instant::now();
+                let idle = budgets::udp_idle();
+                guard.retain(|_, source| now.duration_since(source.last) < idle);
+                if guard.len() >= crate::shadowsocks::SS_UDP_SOURCES {
+                    return true;
+                }
+            }
+            let bound = if self.server.is_ipv6() {
+                UdpSocket::bind("[::]:0")
+            } else {
+                UdpSocket::bind("0.0.0.0:0")
+            };
+            let Ok(uplink) = bound else {
+                return true;
+            };
+            if uplink.connect(self.server).is_err() || uplink.set_nonblocking(true).is_err() {
+                return true;
+            }
+            guard.insert(
+                src,
+                SsUdpClientSource {
+                    uplink,
+                    hop: None,
+                    last: Instant::now(),
+                },
+            );
+        }
+        let Some(source) = guard.get_mut(&src) else {
+            return true;
+        };
+        source.last = Instant::now();
+        if let Some(packet) = crate::shadowsocks::seal_datagram(
+            &self.master,
+            self.method,
+            &dest,
+            buf,
+            at,
+            len,
+            &mut source.hop,
+        ) {
+            let _ = source.uplink.send(packet);
+        }
+        true
+    }
+
+    fn close(self) {
+        self.done.store(true, Ordering::Relaxed);
+        join(&self.reader);
+    }
+}
+
 fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
     if let Some(method2022) = ferrox_core::shadowsocks2022::Method::parse(&ss.method) {
         serve_socks_udp_shadowsocks2022(relay, ss, method2022);
         return;
     }
-    let Some(method) = ferrox_core::shadowsocks::Method::parse(&ss.method) else {
-        return;
-    };
-    let master = ferrox_core::shadowsocks::MasterKey::new(&ss.password, method.key_len());
-    let server: SocketAddr = match format!("{}:{}", ss.address, ss.port)
-        .to_socket_addrs()
-        .ok()
-        .and_then(|mut it| it.next())
-    {
-        Some(server) => server,
-        None => return,
-    };
-    let bound = if server.is_ipv6() {
-        UdpSocket::bind("[::]:0")
-    } else {
-        UdpSocket::bind("0.0.0.0:0")
-    };
-    let Ok(uplink) = bound else {
-        return;
-    };
-    if uplink.connect(server).is_err()
-        || uplink.set_read_timeout(Some(budgets::udp_idle())).is_err()
-    {
+    if ss.mux.udp && serve_socks_udp_ss_mux(relay, ss) {
         return;
     }
-    let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
-    let done = Arc::new(AtomicBool::new(false));
-    let Some(reader) = spawn_ss_udp_reader(
-        &uplink,
-        relay,
-        &master,
-        method,
-        Arc::clone(&source),
-        Arc::clone(&done),
-    ) else {
+    let Some(lane) = SsUdpLane::open(relay, ss) else {
         return;
     };
     let mut buf = Vec::new();
     resize_scratch(&mut buf, crate::shadowsocks::DATAGRAM_MAX);
-    let mut hop: Option<ferrox_core::shadowsocks::Cipher> = None;
     while let Ok((n, src)) = relay
         .recv_from(&mut buf[crate::shadowsocks::SEAL_ROOM..crate::shadowsocks::SEAL_ROOM + UDP_BUF])
     {
@@ -19726,21 +19924,71 @@ fn serve_socks_udp_shadowsocks(relay: &UdpSocket, ss: &ShadowsocksOut) {
         if payload.is_empty() {
             continue;
         }
-        if let Ok(mut slot) = source.lock() {
-            *slot = Some(src);
-        }
         let (at, len) = (
             payload.as_ptr() as usize - buf.as_ptr() as usize,
             payload.len(),
         );
-        if let Some(packet) =
-            crate::shadowsocks::seal_datagram(&master, method, &dest, &mut buf, at, len, &mut hop)
-        {
-            let _ = uplink.send(packet);
+        if !lane.send(src, dest, &mut buf, at, len) {
+            break;
         }
     }
-    done.store(true, Ordering::Relaxed);
-    join(&reader);
+    lane.close();
+}
+
+fn spawn_ss_udp_sources(
+    sources: &Arc<Mutex<HashMap<SocketAddr, SsUdpClientSource>>>,
+    relay: &UdpSocket,
+    master: &ferrox_core::shadowsocks::MasterKey,
+    method: ferrox_core::shadowsocks::Method,
+    done: Arc<AtomicBool>,
+) -> Option<RelayEnd> {
+    let send = relay.try_clone().ok()?;
+    let sources = Arc::clone(sources);
+    let master = master.clone();
+    Some(RelayPool::global().run(move || {
+        let mut buf = Vec::new();
+        resize_scratch(&mut buf, crate::shadowsocks::DATAGRAM_MAX);
+        let room = crate::shadowsocks::SEAL_ROOM;
+        let base = buf.as_ptr() as usize;
+        loop {
+            if done.load(Ordering::Relaxed) {
+                break;
+            }
+            let now = Instant::now();
+            let idle = budgets::udp_idle();
+            let Ok(mut guard) = sources.lock() else {
+                break;
+            };
+            guard.retain(|_, source| now.duration_since(source.last) < idle);
+            for (src, source) in guard.iter_mut() {
+                loop {
+                    match source.uplink.recv(&mut buf[room..room + UDP_BUF]) {
+                        Ok(n) => {
+                            source.last = Instant::now();
+                            let Some((target, payload)) = crate::shadowsocks::open_datagram(
+                                &master,
+                                method,
+                                &mut buf[room..room + n],
+                                &mut source.hop,
+                            ) else {
+                                continue;
+                            };
+                            let (at, len) = (payload.as_ptr() as usize - base, payload.len());
+                            let head = 3 + if target.is_ipv6() { 19 } else { 7 };
+                            let start = at - head;
+                            buf[start..start + 3].fill(0);
+                            crate::shadowsocks::write_addr(&mut buf[start + 3..at], &target);
+                            let _ = send.send_to(&buf[start..at + len], src);
+                        }
+                        Err(error) if is_timeout(&error) => break,
+                        Err(_) => break,
+                    }
+                }
+            }
+            drop(guard);
+            std::thread::sleep(RELAY_POLL);
+        }
+    }))
 }
 
 fn serve_socks_udp_shadowsocks2022(
@@ -19844,64 +20092,6 @@ fn spawn_ss_udp_reader2022(
                     };
                     let out = socks_udp_frame(&mut reply, None, &target, payload);
                     let _ = send.send_to(out, dest);
-                }
-                Err(error) if is_timeout(&error) => {
-                    if done.load(Ordering::Relaxed) {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    }))
-}
-
-fn spawn_ss_udp_reader(
-    uplink: &UdpSocket,
-    relay: &UdpSocket,
-    master: &ferrox_core::shadowsocks::MasterKey,
-    method: ferrox_core::shadowsocks::Method,
-    source: Arc<Mutex<Option<SocketAddr>>>,
-    done: Arc<AtomicBool>,
-) -> Option<RelayEnd> {
-    let read = uplink.try_clone().ok()?;
-    read.set_read_timeout(Some(RELAY_POLL)).ok()?;
-    let send = relay.try_clone().ok()?;
-    let master = master.clone();
-    Some(RelayPool::global().run(move || {
-        let mut buf = Vec::new();
-        resize_scratch(&mut buf, crate::shadowsocks::DATAGRAM_MAX);
-        let room = crate::shadowsocks::SEAL_ROOM;
-        let base = buf.as_ptr() as usize;
-        let mut hop: Option<ferrox_core::shadowsocks::Cipher> = None;
-        loop {
-            match read.recv(&mut buf[room..room + UDP_BUF]) {
-                Ok(n) => {
-                    let opened = crate::shadowsocks::open_datagram(
-                        &master,
-                        method,
-                        &mut buf[room..room + n],
-                        &mut hop,
-                    );
-                    let Some((target, payload)) = opened else {
-                        continue;
-                    };
-                    let (at, len) = (payload.as_ptr() as usize - base, payload.len());
-                    let dest = match source.lock() {
-                        Ok(guard) => *guard,
-                        Err(_) => None,
-                    };
-                    let Some(dest) = dest else {
-                        continue;
-                    };
-                    let head = 3 + match target {
-                        SocketAddr::V4(_) => 7,
-                        SocketAddr::V6(_) => 19,
-                    };
-                    let start = at - head;
-                    buf[start..start + 3].fill(0);
-                    crate::shadowsocks::write_addr(&mut buf[start + 3..at], &target);
-                    let _ = send.send_to(&buf[start..at + len], dest);
                 }
                 Err(error) if is_timeout(&error) => {
                     if done.load(Ordering::Relaxed) {
@@ -20160,6 +20350,116 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
     let _ = write.write_all(&header[..written]);
     (mux.close)();
     join(&done);
+}
+
+/// The datagram's 443 policy: only a port-443 datagram is affected, and only by reject or skip.
+fn ss_mux_443(policy: Udp443, dest: SocketAddr) -> Udp443 {
+    if dest.port() == 443 {
+        policy
+    } else {
+        Udp443::Allow
+    }
+}
+
+fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
+    let Some(mux) = open_ss_mux(ss) else {
+        return false;
+    };
+    let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+    let Some(done) = spawn_xudp_reader(mux.read, relay, Arc::clone(&source)) else {
+        (mux.close)();
+        return true;
+    };
+    let mut write = mux.write;
+    let mut buf = Vec::new();
+    resize_scratch(&mut buf, crate::shadowsocks::DATAGRAM_MAX);
+    let room = crate::shadowsocks::SEAL_ROOM;
+    let mut header = Vec::with_capacity(64);
+    let mut ids = ferrox_core::mux::Ids::new(1);
+    // One mux flow per destination, opened by the first datagram and named on every later one.
+    let mut lanes: Vec<(SocketAddr, u16)> = Vec::new();
+    let mut skip: Option<SsUdpLane> = None;
+    let mut skip_tried = false;
+    let mut published: Option<SocketAddr> = None;
+    while let Ok((n, src)) = relay.recv_from(&mut buf[room..room + UDP_BUF]) {
+        let Some((dest, payload)) = parse_socks_udp(&buf[room..room + n]) else {
+            continue;
+        };
+        if payload.is_empty() {
+            continue;
+        }
+        if published != Some(src) {
+            if let Ok(mut slot) = source.lock() {
+                *slot = Some(src);
+                published = Some(src);
+            }
+        }
+        match ss_mux_443(ss.mux.udp443, dest) {
+            Udp443::Reject => {
+                static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+                if SAID.set(()).is_ok() {
+                    eprintln!("shadowsocks: mux rejects udp/443; the datagram is dropped");
+                }
+                continue;
+            }
+            Udp443::Skip => {
+                if !skip_tried {
+                    skip_tried = true;
+                    skip = SsUdpLane::open(relay, ss);
+                    if skip.is_none() {
+                        eprintln!("shadowsocks: udp/443 skip lane unavailable; dropped");
+                    }
+                }
+                if let Some(lane) = &skip {
+                    let (at, len) = (
+                        payload.as_ptr() as usize - buf.as_ptr() as usize,
+                        payload.len(),
+                    );
+                    if !lane.send(src, dest, &mut buf, at, len) {
+                        break;
+                    }
+                }
+                continue;
+            }
+            Udp443::Allow => {}
+        }
+        let (id, first) = if let Some((_, id)) = lanes.iter().find(|(known, _)| *known == dest) {
+            (*id, false)
+        } else {
+            let Ok(id) = ids.take() else { continue };
+            lanes.push((dest, id));
+            (id, true)
+        };
+        let frame = ferrox_core::mux::Outgoing {
+            id,
+            status: if first {
+                ferrox_core::mux::Status::New
+            } else {
+                ferrox_core::mux::Status::Keep
+            },
+            options: ferrox_core::mux::DATA,
+            target: Some(mux_target_of(dest)),
+            global_id: None,
+        };
+        let (head, body) = xudp_datagram(&frame, &mut header, payload);
+        if write_all_parts::<2>(&mut *write, &[head, body]).is_err() {
+            break;
+        }
+    }
+    for (_, id) in &lanes {
+        let end = ferrox_core::mux::Outgoing::bare(*id, ferrox_core::mux::Status::End, 0);
+        resize_scratch(&mut header, end.frame_len(0));
+        let written = end.encode_into(None, &mut header);
+        if write.write_all(&header[..written]).is_err() {
+            break;
+        }
+    }
+    (mux.close)();
+    join(&done);
+    if let Some(lane) = skip {
+        lane.close();
+    }
+    true
 }
 
 fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
@@ -24389,7 +24689,7 @@ fn inbound_account(inbound: &Json) -> InboundAccount {
 fn inbound_first_client(inbound: &Json) -> Option<&Json> {
     inbound
         .get("settings")
-        .and_then(|s| s.get("clients"))
+        .and_then(|s| s.get("clients").or_else(|| s.get("users")))
         .and_then(Json::as_arr)
         .and_then(|clients| clients.first())
 }
@@ -24802,6 +25102,12 @@ fn inbound_ss_users(
                 client_password,
                 client_method.key_len(),
             ),
+            email: client
+                .get("email")
+                .and_then(Json::as_str)
+                .unwrap_or("")
+                .to_owned(),
+            level: client.get("level").and_then(Json::as_u32).unwrap_or(0),
         });
     }
     std::sync::Arc::from(users)
@@ -25561,6 +25867,7 @@ fn loopback_shadowsocks(
         password: inbound_ss_password(inbound),
         carrier,
         host,
+        mux: Mux::default(),
         tls: None,
         headers,
         heartbeat,
@@ -26401,6 +26708,7 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
                 password,
                 carrier,
                 host,
+                mux: Mux::default(),
                 tls: None,
                 headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
                 heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
@@ -26417,6 +26725,25 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
             }
             _ => continue,
         };
+        // A negative pool size turns that manager off: tcp and udp each read xray's own rule.
+        let mux = outbound.get("mux");
+        let enabled = mux.and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true));
+        let concurrency = mux
+            .and_then(|mux| mux.get("concurrency"))
+            .and_then(Json::as_i64)
+            .unwrap_or(0);
+        let xudp = mux
+            .and_then(|mux| mux.get("xudpConcurrency"))
+            .and_then(Json::as_i64)
+            .unwrap_or(0);
+        let udp443 = match mux
+            .and_then(|mux| mux.get("xudpProxyUDP443"))
+            .and_then(Json::as_str)
+        {
+            Some("skip") => Udp443::Skip,
+            Some("allow") => Udp443::Allow,
+            _ => Udp443::Reject,
+        };
         return Some(ShadowsocksOut {
             address,
             port,
@@ -26424,6 +26751,11 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
             password,
             carrier,
             host,
+            mux: Mux {
+                tcp: enabled && concurrency >= 0,
+                udp: enabled && (xudp > 0 || (xudp == 0 && concurrency >= 0)),
+                udp443,
+            },
             tls,
             headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
             heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
@@ -28820,6 +29152,21 @@ mod tests {
         let inbound = crate::json::parse(r#"{"settings": {"network": "tcp"}}"#).expect("parses");
         assert!(dokodemo_target(&inbound).is_none());
         assert!(dokodemo_networks(&inbound).contains(&"tcp"));
+    }
+
+    #[test]
+    fn shadowsocks_networks_read_as_a_string_or_an_array() {
+        let string = crate::json::parse(r#"{"settings": {"network": "tcp"}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&string), (true, false));
+        let array = crate::json::parse(r#"{"settings": {"network": ["udp"]}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&array), (false, true));
+        let joined = crate::json::parse(r#"{"settings": {"network": "tcp,udp"}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&joined), (true, true));
+        let unsupported =
+            crate::json::parse(r#"{"settings": {"network": "unix"}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&unsupported), (false, false));
+        let absent = crate::json::parse(r#"{"settings": {"password": "p"}}"#).expect("parses");
+        assert_eq!(inbound_ss_networks(&absent), (true, true));
     }
 
     #[test]
@@ -36507,6 +36854,7 @@ mod tests {
             password: "an-example-shared-password".to_owned(),
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
             tls: Some(client),
             headers: Vec::new(),
             heartbeat: 0,
@@ -36594,6 +36942,7 @@ mod tests {
                 password: "an-example-shared-password".to_owned(),
                 carrier: inbound_carrier(&inbound),
                 host: "127.0.0.1".to_owned(),
+                mux: Mux::default(),
                 tls: Some(Arc::clone(&client)),
                 headers: Vec::new(),
                 heartbeat: 0,
@@ -36627,6 +36976,44 @@ mod tests {
         let out = find_shadowsocks_outbound(&root).expect("finds");
         assert!(matches!(out.carrier, Carrier::Ws { .. }));
         assert!(out.tls.is_some(), "the tls row is kept");
+    }
+
+    /// xray's sender-side multiplex switch reaches the shadowsocks dial, which is what opens the session.
+    #[test]
+    fn a_shadowsocks_outbound_reads_the_mux_switch() {
+        let root = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true}}]}"#,
+        )
+        .expect("parses");
+        let out = find_shadowsocks_outbound(&root).expect("finds");
+        assert!(out.mux.tcp, "the switch is read");
+        assert!(out.mux.udp, "a default xudp pool rides the mux too");
+        assert_eq!(
+            out.mux.udp443,
+            Udp443::Reject,
+            "xray's default refuses udp/443"
+        );
+        let direct = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "xudpConcurrency": -1, "xudpProxyUDP443": "skip"}}]}"#,
+        )
+        .expect("parses");
+        let direct = find_shadowsocks_outbound(&direct).expect("finds");
+        assert!(!direct.mux.udp, "a negative xudp pool sends UDP direct");
+        assert_eq!(
+            direct.mux.udp443,
+            Udp443::Skip,
+            "the udp/443 policy is read"
+        );
+        let tcp_off = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "shadowsocks", "settings": {"servers": [{"address": "192.0.2.1", "port": 443, "method": "aes-256-gcm", "password": "secret"}]}, "mux": {"enabled": true, "concurrency": -1}}]}"#,
+        )
+        .expect("parses");
+        let tcp_off = find_shadowsocks_outbound(&tcp_off).expect("finds");
+        assert!(
+            !tcp_off.mux.tcp,
+            "a negative tcp pool turns the session off"
+        );
+        assert!(!tcp_off.mux.udp, "udp follows the pool it rides");
     }
 
     /// The vmess dial carries its request in the session too, so a tls kcp row speaks the same bytes both roles.
@@ -38388,6 +38775,7 @@ mod tests {
             password,
             carrier,
             host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -39989,6 +40377,310 @@ mod tests {
         assert_eq!(listed, 2, "one account per user");
     }
 
+    /// The reference's mux over shadowsocks: the client names `v1.mux.cool` on the request domain, the server opens a session, and a stream inside it echoes.
+    #[test]
+    fn shadowsocks_mux_carries_a_stream_through_one_session() {
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        let (dialed_tx, dialed_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            for stream in echo.incoming().flatten() {
+                if dialed_tx.send(()).is_err() {
+                    return;
+                }
+                thread::spawn(move || {
+                    let mut stream = stream;
+                    let mut buf = [0u8; 1024];
+                    while let Ok(n) = stream.read(&mut buf) {
+                        if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let users = inbound_ss_users(
+            &crate::json::parse(
+                r#"{"protocol": "shadowsocks", "settings": {"password": "an-example-shared-password", "method": "aes-256-gcm"}}"#,
+            )
+            .expect("parses"),
+            "an-example-shared-password",
+            "aes-256-gcm",
+            "test",
+        );
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for stream in tunnel.incoming().flatten() {
+                let users = users.clone();
+                thread::spawn(move || crate::shadowsocks::serve(stream, &users, true));
+            }
+        });
+        let ss = ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port: tunnel_port,
+            method: "aes-256-gcm".to_owned(),
+            password: "an-example-shared-password".to_owned(),
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: Mux {
+                tcp: true,
+                udp: true,
+                udp443: Udp443::Reject,
+            },
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+        };
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let (local, _) = front.accept().expect("accepts");
+        let target = Destination::from(SocketAddr::from(([127, 0, 0, 1], echo_port)));
+        let dial = thread::spawn(move || {
+            assert!(dial_ss_mux(&local, &ss, &target), "the mux session opens");
+        });
+        dialed_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the frame's target is dialed");
+        client.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut client), b"ping", "the mux stream echoes");
+        client.shutdown(Shutdown::Both).expect("closes");
+        dial.join().expect("the mux session ends with the client");
+    }
+
+    /// A datagram under a mux-enabled shadowsocks outbound names the mux host on its session and the target on the frame, and each reply comes back to its source.
+    #[test]
+    fn shadowsocks_mux_carries_a_datagram_through_one_session() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, src)) = echo.recv_from(&mut buf) {
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let users = crate::shadowsocks::account("an-example-shared-password", "aes-256-gcm");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            for stream in tunnel.incoming().flatten() {
+                let users = users.clone();
+                thread::spawn(move || crate::shadowsocks::serve(stream, &users, true));
+            }
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let relay_addr = relay.local_addr().expect("addr");
+        let ss = ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port: tunnel_port,
+            method: "aes-256-gcm".to_owned(),
+            password: "an-example-shared-password".to_owned(),
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: Mux {
+                tcp: true,
+                udp: true,
+                udp443: Udp443::Reject,
+            },
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+        };
+        thread::spawn(move || serve_socks_udp_shadowsocks(&relay, &ss));
+        let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        source
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let mut datagram = vec![0u8, 0, 0];
+        push_socks_addr(&mut datagram, &target);
+        datagram.extend_from_slice(b"ping");
+        source.send_to(&datagram, relay_addr).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = source.recv_from(&mut back).expect("echoes");
+        let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(from.port(), echo_port);
+        assert_eq!(payload, b"ping", "the mux frame's datagram echoes");
+    }
+
+    /// xray's `xudpProxyUDP443` shapes port 443 alone, and only a reject or a skip changes what happens to it.
+    #[test]
+    fn only_a_reject_or_a_skip_touches_udp443() {
+        let https: SocketAddr = "192.0.2.1:443".parse().expect("addr");
+        let plain: SocketAddr = "192.0.2.1:8443".parse().expect("addr");
+        assert_eq!(ss_mux_443(Udp443::Reject, https), Udp443::Reject);
+        assert_eq!(ss_mux_443(Udp443::Skip, https), Udp443::Skip);
+        assert_eq!(ss_mux_443(Udp443::Reject, plain), Udp443::Allow);
+        assert_eq!(ss_mux_443(Udp443::Allow, https), Udp443::Allow);
+    }
+
+    /// A datagram the mux skips takes the outbound's own Shadowsocks UDP lane: sealed to the server, never sent to the destination in the clear, one uplink per source, and its reply framed back by the address it came from.
+    #[test]
+    fn a_skipped_datagram_rides_the_outbound_udp_lane() {
+        let server = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        server
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let server_addr = server.local_addr().expect("addr");
+        let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        source
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let ss = ShadowsocksOut {
+            address: server_addr.ip().to_string(),
+            port: server_addr.port(),
+            method: "aes-256-gcm".to_owned(),
+            password: "a-skipped-datagram-password".to_owned(),
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+        };
+        let lane = SsUdpLane::open(&front, &ss).expect("lane");
+        let from = source.local_addr().expect("addr");
+        let room = crate::shadowsocks::SEAL_ROOM;
+        let first: SocketAddr = "192.0.2.9:443".parse().expect("addr");
+        let second: SocketAddr = "192.0.2.9:8443".parse().expect("addr");
+        let mut buf = crate::proxy::unfilled(crate::shadowsocks::DATAGRAM_MAX);
+        buf[room..room + 5].copy_from_slice(b"first");
+        assert!(lane.send(from, first, &mut buf, room, 5));
+        buf[room..room + 6].copy_from_slice(b"second");
+        assert!(lane.send(from, second, &mut buf, room, 6));
+        let method = ferrox_core::shadowsocks::Method::parse("aes-256-gcm").expect("method");
+        let master = ferrox_core::shadowsocks::MasterKey::new(&ss.password, method.key_len());
+        let mut wire = crate::proxy::unfilled(crate::shadowsocks::DATAGRAM_MAX);
+        let mut opened = Vec::new();
+        for _ in 0..2 {
+            let (n, uplink) = server
+                .recv_from(&mut wire)
+                .expect("the lane seals to the server");
+            let mut hop = None;
+            let (target, body) =
+                crate::shadowsocks::open_datagram(&master, method, &mut wire[..n], &mut hop)
+                    .expect("the server opens the datagram");
+            opened.push((uplink, target, body.to_vec()));
+        }
+        opened.sort_by_key(|(_, target, _)| *target);
+        assert_eq!(opened[0].1, first);
+        assert_eq!(opened[0].2.as_slice(), b"first");
+        assert_eq!(opened[1].1, second);
+        assert_eq!(opened[1].2.as_slice(), b"second");
+        assert_eq!(opened[0].0, opened[1].0, "one uplink per source");
+        let mut reply = crate::proxy::unfilled(crate::shadowsocks::DATAGRAM_MAX);
+        reply[room..room + 4].copy_from_slice(b"pong");
+        let packet = crate::shadowsocks::seal_datagram(
+            &master, method, &first, &mut reply, room, 4, &mut None,
+        )
+        .expect("seals");
+        server.send_to(packet, opened[0].0).expect("sends");
+        let mut back = vec![0u8; UDP_BUF];
+        let (n, _) = source
+            .recv_from(&mut back)
+            .expect("the lane frames the reply");
+        let (framed_from, body) = parse_socks_udp(&back[..n]).expect("splits");
+        assert_eq!(framed_from, first);
+        assert_eq!(body, b"pong");
+        lane.close();
+    }
+
+    /// A shadowsocks inbound told to carry udp alone opens no stream listener and still answers a datagram, as the reference's udp worker alone would.
+    #[test]
+    fn a_udp_only_shadowsocks_inbound_opens_no_stream_listener() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, src)) = echo.recv_from(&mut buf) {
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let inbound = crate::json::parse(
+            r#"{"protocol": "shadowsocks", "settings": {"password": "pw", "method": "aes-256-gcm", "network": ["udp"]}}"#,
+        )
+        .expect("parses");
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        serve_shadowsocks_inbound(&address, &inbound, true);
+        thread::sleep(Duration::from_millis(100));
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "the udp-only front bound no tcp listener"
+        );
+        let master = ferrox_core::shadowsocks::MasterKey::new("pw", 32);
+        let method = ferrox_core::shadowsocks::Method::Aes256Gcm;
+        let mut wire = vec![0u8; crate::shadowsocks::DATAGRAM_MAX];
+        let at = crate::shadowsocks::SEAL_ROOM;
+        wire[at..at + 4].copy_from_slice(b"ping");
+        let mut hop = None;
+        let packet = crate::shadowsocks::seal_datagram(
+            &master, method, &echo_addr, &mut wire, at, 4, &mut hop,
+        )
+        .expect("seals")
+        .to_vec();
+        let dial = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        dial.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let mut back = vec![0u8; UDP_BUF];
+        // A windows front still binding reads as a reset from a port nothing owns yet, so the retry waits for its bind.
+        let mut attempts = 0;
+        let n = loop {
+            dial.send_to(&packet, &address).expect("sends");
+            match dial.recv_from(&mut back) {
+                Ok((n, _)) => break n,
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
+                    attempts += 1;
+                    assert!(attempts < 200, "the udp front still answers");
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("the udp front still answers: {error}"),
+            }
+        };
+        let (source, payload) =
+            crate::shadowsocks::open_datagram(&master, method, &mut back[..n], &mut hop)
+                .expect("opens");
+        assert_eq!(source.port(), echo_addr.port());
+        assert_eq!(payload, b"ping");
+    }
+
+    /// A list naming only a network this front does not carry opens neither listener, as the reference starts no worker for it.
+    #[test]
+    fn an_unsupported_shadowsocks_network_opens_no_listener() {
+        let inbound = crate::json::parse(
+            r#"{"protocol": "shadowsocks", "settings": {"password": "pw", "method": "aes-256-gcm", "network": ["unix"]}}"#,
+        )
+        .expect("parses");
+        let port = (18888..18900)
+            .find(|port| {
+                std::net::TcpListener::bind(("127.0.0.1", *port)).is_ok()
+                    && UdpSocket::bind(("127.0.0.1", *port)).is_ok()
+            })
+            .expect("a free registered port");
+        let address = format!("127.0.0.1:{port}");
+        serve_shadowsocks_inbound(&address, &inbound, true);
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
+            "no stream listener"
+        );
+        assert!(
+            UdpSocket::bind(&address).is_ok(),
+            "no datagram listener took the port"
+        );
+    }
+
     #[test]
     fn socks_associate_reaches_udp_echo_via_shadowsocks() {
         let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
@@ -40020,6 +40712,7 @@ mod tests {
             password: "an-example-shared-password".to_owned(),
             carrier: Carrier::Raw(Chain::default()),
             host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -40060,6 +40753,94 @@ mod tests {
         assert_eq!(source.port(), target.port());
         assert_eq!(source.ip().to_canonical(), target.ip().to_canonical());
         assert_eq!(payload, b"ping");
+    }
+
+    /// Two local sources under one account and one target: the reply each gets is the one whose socket carried it, not the last source to speak.
+    #[test]
+    fn socks_associate_keeps_each_udp_source_on_its_own_reply() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            let mut buf = vec![0u8; UDP_BUF];
+            while held.len() < 2 {
+                let Ok((n, src)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                held.push((buf[..n].to_vec(), src));
+            }
+            for (payload, src) in held {
+                if echo.send_to(&payload, src).is_err() {
+                    return;
+                }
+            }
+        });
+        let tunnel = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let users = crate::shadowsocks::account("an-example-shared-password", "aes-256-gcm");
+            crate::shadowsocks::serve_udp_on(&tunnel, &users, true);
+        });
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let front_port = front.local_addr().expect("addr").port();
+        let out = Outbound::Shadowsocks(ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port: tunnel_port,
+            method: "aes-256-gcm".to_owned(),
+            password: "an-example-shared-password".to_owned(),
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+        });
+        thread::spawn(move || {
+            let (stream, _) = front.accept().expect("accepts");
+            serve_socks(stream, &out, &no_accounts());
+        });
+        let mut client = Connection::connect(("127.0.0.1", front_port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        client.write_all(&[5, 1, 0]).expect("greets");
+        let mut method = [0u8; 2];
+        client.read_exact(&mut method).expect("selects");
+        assert_eq!(method, [5, 0]);
+        client
+            .write_all(&[5, 3, 0, 1, 127, 0, 0, 1, 0, 0])
+            .expect("associates");
+        let mut reply = [0u8; 10];
+        client.read_exact(&mut reply).expect("replies");
+        assert_eq!(&reply[..4], &[5, 0, 0, 1]);
+        let relay: SocketAddr = SocketAddr::new(
+            std::net::IpAddr::V4([127, 0, 0, 1].into()),
+            u16::from_be_bytes(reply[8..10].try_into().expect("port")),
+        );
+        let target: SocketAddr = format!("127.0.0.1:{echo_port}").parse().expect("addr");
+        let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        for (udp, word) in [
+            (&first, b"alpha".as_slice()),
+            (&second, b"bravo".as_slice()),
+        ] {
+            udp.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut datagram = vec![0u8, 0, 0];
+            push_socks_addr(&mut datagram, &target);
+            datagram.extend_from_slice(word);
+            udp.send_to(&datagram, relay).expect("sends");
+        }
+        for (udp, word) in [
+            (&first, b"alpha".as_slice()),
+            (&second, b"bravo".as_slice()),
+        ] {
+            let mut back = vec![0u8; UDP_BUF];
+            let (n, _) = udp.recv_from(&mut back).expect("echoes");
+            let (source, payload) = parse_socks_udp(&back[..n]).expect("splits");
+            assert_eq!(source.port(), target.port());
+            assert_eq!(payload, word);
+        }
     }
 
     fn mux_test_echo() -> u16 {
@@ -52264,6 +53045,7 @@ end
             password,
             carrier: Carrier::Kcp(ferrox_core::kcp::Config::default()),
             host: "127.0.0.1".to_owned(),
+            mux: Mux::default(),
             tls: None,
             headers: Vec::new(),
             heartbeat: 0,
@@ -55273,7 +56055,6 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             carrier,
             freedom,
             tls,
-            account: _,
         } => serve_shadowsocks(stream, &accounts, &carrier, freedom, tls.as_deref()),
         Role::Socks { out, accounts } => serve_socks(stream, &out, &accounts),
         Role::Http { out, accounts } => serve_http(stream, &out, &accounts),

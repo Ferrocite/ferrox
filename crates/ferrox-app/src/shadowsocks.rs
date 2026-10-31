@@ -1,7 +1,7 @@
 use std::collections::HashMap;
-use std::io::{IoSliceMut, Read, Write};
+use std::io::{IoSlice, IoSliceMut, Read, Write};
 use std::net::{Shutdown, SocketAddr, UdpSocket};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ferrox_core::shadowsocks::{
     rc4_md5_key, Cipher, MasterKey, Method, Rc4, LENGTH_LEN, MAX_CHUNK, TAG_LEN,
@@ -9,7 +9,7 @@ use ferrox_core::shadowsocks::{
 
 use crate::budgets::RELAY_POLL;
 use crate::conn::Connection;
-use crate::proxy::{read_exact, under_handshake, write_all_runs, Destination, UDP_BUF};
+use crate::proxy::{read_exact, under_handshake, write_all_runs, Destination, RelayPoll, UDP_BUF};
 
 const SALT_LEN: usize = 32;
 // Chunks one relay read takes and one write carries. A batch never waits for the chunk that has not arrived, so this is a syscall count rather than a latency budget: four costs the same one read and the same one write as one.
@@ -17,6 +17,10 @@ const CHUNKS_PER_BATCH: usize = 4;
 // One relay read of a stream is exactly one chunk: a 16384 B read would seal as 16383 + 1, a second length seal and tag for a single tail byte, and a batch read of CHUNKS_PER_BATCH of them tiles into whole chunks for the same reason. A stream has no chunks to batch, so its granularity — and every carrier frame size that follows from it — is unchanged.
 const READ_CHUNK: usize = MAX_CHUNK;
 const IV_LEN: usize = 16;
+
+/// The mux request's own name and port, which the reference compares by domain alone.
+pub(crate) const MUX_HOST: &str = "v1.mux.cool";
+pub(crate) const MUX_PORT: u16 = 9527;
 
 /// What the uplink thread seals with: the AEAD chunk cipher, or the stream state whose crypt writes into the read buffer itself.
 #[allow(
@@ -33,6 +37,9 @@ pub(crate) enum Uplink {
 pub(crate) struct SsUser {
     pub(crate) method: Method,
     pub(crate) master: MasterKey,
+    /// The account's name and policy level, applied once the cipher names it.
+    pub(crate) email: String,
+    pub(crate) level: u32,
 }
 
 pub(crate) type SsUsers = std::sync::Arc<[SsUser]>;
@@ -66,6 +73,8 @@ pub(crate) fn account(password: &str, method: &str) -> SsUsers {
         Some(method) => std::sync::Arc::from([SsUser {
             method,
             master: MasterKey::new(password, method.key_len()),
+            email: String::new(),
+            level: 0,
         }]),
         None => SsUsers::default(),
     }
@@ -76,8 +85,7 @@ pub(crate) fn serve(mut stream: Connection, users: &[SsUser], freedom: bool) {
         return;
     }
     if let Some(user) = stream_user(users) {
-        let master = user.master.clone();
-        return serve_stream(stream, &master);
+        return serve_stream(stream, user);
     }
     let mut head = wire_buffer();
     // Bound the salt and first-chunk reads to a wall-clock budget, then restore the relay's blocking reads.
@@ -100,8 +108,25 @@ pub(crate) fn serve(mut stream: Connection, users: &[SsUser], freedom: bool) {
     let Some((user, recv, chunk)) = opened else {
         return;
     };
-    let Some((target, header_len)) = parse_addr_header(chunk) else {
+    stream = stream
+        .with_meter(authenticate(user))
+        .with_policy(Some(crate::policy::flow(user.level)));
+    let Some(request) = parse_request(chunk) else {
         return;
+    };
+    let (target, header_len) = match request {
+        Request::Mux(header_len) => {
+            crate::accesslog::record_current(&format_args!("{MUX_HOST}:{MUX_PORT}"));
+            let carried = chunk[header_len..].to_vec();
+            drop(head);
+            let Some(accepted) = mux_after_handshake(user, &mut stream, Recv::Ready(recv), carried)
+            else {
+                return;
+            };
+            serve_mux_connection(&stream, accepted);
+            return;
+        }
+        Request::Target(target, header_len) => (target, header_len),
     };
     crate::accesslog::record_current(&target);
     let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
@@ -161,8 +186,15 @@ fn accept_cipher<'u>(
     None
 }
 
+/// The account whose cipher opened the request: from here its email, level and counters are the flow's.
+fn authenticate(user: &SsUser) -> crate::stats::Meter {
+    crate::accesslog::reidentify(&user.email, user.level);
+    crate::stats::user_traffic(&user.email, user.level)
+}
+
 /// The stream handshake: a 16-byte IV in the clear, then the address header rides the RC4 stream itself, so the first read already carries payload and whatever arrived with the header is forwarded, not re-read.
-fn serve_stream(mut stream: Connection, master: &MasterKey) {
+fn serve_stream(mut stream: Connection, user: &SsUser) {
+    let master = user.master.clone();
     let mut head = [0u8; 512];
     // Bound the IV and address-header reads to a wall-clock budget, then restore the relay's blocking reads.
     let budget = crate::budgets::handshake();
@@ -185,8 +217,8 @@ fn serve_stream(mut stream: Connection, master: &MasterKey) {
                         Ok(n) => {
                             recv.crypt(&mut head[len..len + n]);
                             len += n;
-                            if let Some(found) = parse_addr_header(&head[..len]) {
-                                return Some((recv, found, len));
+                            if let Some(request) = parse_request(&head[..len]) {
+                                return Some((recv, request, len));
                             }
                         }
                         Err(error) if crate::proxy::is_timeout(&error) => {}
@@ -197,14 +229,29 @@ fn serve_stream(mut stream: Connection, master: &MasterKey) {
             })
     };
     let _ = stream.set_read_timeout(None);
-    let Some((recv, (target, used), len)) = opened else {
+    let Some((recv, request, len)) = opened else {
         return;
+    };
+    stream = stream
+        .with_meter(authenticate(user))
+        .with_policy(Some(crate::policy::flow(user.level)));
+    let (target, consumed) = match request {
+        Request::Mux(consumed) => {
+            crate::accesslog::record_current(&format_args!("{MUX_HOST}:{MUX_PORT}"));
+            let Some(accepted) = stream_mux(&mut stream, &master, recv, &head[consumed..len])
+            else {
+                return;
+            };
+            serve_mux_connection(&stream, accepted);
+            return;
+        }
+        Request::Target(target, consumed) => (target, consumed),
     };
     crate::accesslog::record_current(&target);
     let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
-    if used < len && uplink.write_all(&head[used..len]).is_err() {
+    if consumed < len && uplink.write_all(&head[consumed..len]).is_err() {
         return;
     }
     let mut iv = [0u8; IV_LEN];
@@ -232,12 +279,12 @@ pub(crate) fn serve_ws(stream: Connection, users: &[SsUser], path: &str, freedom
     let Some((mut reader, mut writer)) = crate::ws::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, users, freedom) else {
+    let Some((accepted, meter)) = accept_on(&mut reader, &mut writer, users, freedom) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    serve_accepted(accepted, reader, writer, close, meter);
 }
 
 pub(crate) fn serve_httpupgrade(
@@ -250,7 +297,7 @@ pub(crate) fn serve_httpupgrade(
     let Some((mut reader, mut writer)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, users, freedom) else {
+    let Some((accepted, meter)) = accept_on(&mut reader, &mut writer, users, freedom) else {
         return;
     };
     let Ok(closer) = writer.try_clone() else {
@@ -259,7 +306,7 @@ pub(crate) fn serve_httpupgrade(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(Shutdown::Both);
     });
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    serve_accepted(accepted, reader, writer, close, meter);
 }
 
 /// The carrier's answer held back until a blocking peek finds the first byte of the request packet, so a dial that waits for the `101` before it writes is never answered: only a dial that puts the packet on the wire with the `GET` finishes.
@@ -292,7 +339,7 @@ pub(crate) fn serve_httpupgrade_answering_after_the_request(
     if write.write_all(crate::httpupgrade::SWITCH).is_err() {
         return;
     }
-    let Some((uplink, send, recv)) = accept_on(&mut read, &mut write, users, freedom) else {
+    let Some((accepted, meter)) = accept_on(&mut read, &mut write, users, freedom) else {
         return;
     };
     let Ok(closer) = write.try_clone() else {
@@ -301,7 +348,7 @@ pub(crate) fn serve_httpupgrade_answering_after_the_request(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(Shutdown::Both);
     });
-    pump_relay_carried(&uplink, read, write, &close, send, recv);
+    serve_accepted(accepted, read, write, close, meter);
 }
 
 #[cfg(test)]
@@ -323,34 +370,34 @@ pub(crate) fn serve_grpc_with(
     let Some((mut reader, mut writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
-    let Some((uplink, send, recv)) = under_handshake(&mut reader, |read| {
+    let Some((accepted, meter)) = under_handshake(&mut reader, |read| {
         accept_on(read, &mut writer, users, freedom)
     }) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    serve_accepted(accepted, reader, writer, close, meter);
 }
 
 pub(crate) fn serve_xhttp(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
     let Some((mut reader, mut writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, users, freedom) else {
+    let Some((accepted, meter)) = accept_on(&mut reader, &mut writer, users, freedom) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> =
         std::sync::Arc::new(move || closer.finish());
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    serve_accepted(accepted, reader, writer, close, meter);
 }
 
 pub(crate) fn serve_httpheader(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
     let Some((mut reader, mut writer)) = crate::httpheader::accept(stream, path) else {
         return;
     };
-    let Some((uplink, send, recv)) = accept_on(&mut reader, &mut writer, users, freedom) else {
+    let Some((accepted, meter)) = accept_on(&mut reader, &mut writer, users, freedom) else {
         return;
     };
     let Ok(closer) = writer.try_clone() else {
@@ -359,7 +406,7 @@ pub(crate) fn serve_httpheader(stream: Connection, users: &[SsUser], path: &str,
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(Shutdown::Both);
     });
-    pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+    serve_accepted(accepted, reader, writer, close, meter);
 }
 
 pub(crate) fn serve_session<R, W>(
@@ -372,7 +419,7 @@ pub(crate) fn serve_session<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    let Some((uplink, send, recv)) = accept_on(
+    let Some((accepted, meter)) = accept_on(
         &mut reader as &mut dyn Read,
         &mut writer as &mut dyn Write,
         users,
@@ -381,7 +428,13 @@ pub(crate) fn serve_session<R, W>(
         close();
         return;
     };
-    pump_relay_carried(&uplink, reader, writer, close, send, recv);
+    serve_accepted(
+        accepted,
+        reader,
+        writer,
+        std::sync::Arc::clone(close),
+        meter,
+    );
 }
 
 pub(crate) fn serve_kcp<R, W>(
@@ -394,7 +447,7 @@ pub(crate) fn serve_kcp<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    let Some((uplink, send, recv)) = accept_on(
+    let Some((accepted, meter)) = accept_on(
         &mut reader as &mut dyn Read,
         &mut writer as &mut dyn Write,
         users,
@@ -402,21 +455,29 @@ pub(crate) fn serve_kcp<R, W>(
     ) else {
         return;
     };
-    pump_relay_carried(&uplink, reader, writer, close, send, recv);
+    serve_accepted(
+        accepted,
+        reader,
+        writer,
+        std::sync::Arc::clone(close),
+        meter,
+    );
 }
 
 fn accept_stream(
     reader: &mut dyn Read,
     writer: &mut dyn Write,
-    master: &MasterKey,
-) -> Option<(Connection, Uplink, Recv)> {
+    user: &SsUser,
+) -> Option<(Accepted, crate::stats::Meter)> {
+    let meter = authenticate(user);
+    let master = &user.master;
     let mut iv = [0u8; IV_LEN];
     read_exact(reader, &mut iv).ok()?;
     let key = rc4_md5_key(master.as_bytes(), &iv)?;
     let mut recv = Rc4::new(&key)?;
     let mut head = [0u8; 512];
     let mut len = 0usize;
-    let (target, used) = loop {
+    let request = loop {
         if len >= 512 {
             return None;
         }
@@ -428,19 +489,34 @@ fn accept_stream(
         };
         recv.crypt(&mut head[len..len + n]);
         len += n;
-        if let Some(found) = parse_addr_header(&head[..len]) {
-            break found;
+        if let Some(request) = parse_request(&head[..len]) {
+            break request;
         }
     };
+    let (target, consumed) = match request {
+        Request::Mux(consumed) => {
+            crate::accesslog::record_current(&format_args!("{MUX_HOST}:{MUX_PORT}"));
+            return stream_mux(writer, master, recv, &head[consumed..len])
+                .map(|accepted| (accepted, meter));
+        }
+        Request::Target(target, consumed) => (target, consumed),
+    };
     crate::accesslog::record_current(&target);
-    let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
-    uplink.write_all(&head[used..len]).ok()?;
     let mut iv = [0u8; IV_LEN];
     getrandom::fill(&mut iv).ok()?;
     let key = rc4_md5_key(master.as_bytes(), &iv)?;
     let send = Rc4::new(&key)?;
+    let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
+    uplink.write_all(&head[consumed..len]).ok()?;
     writer.write_all(&iv).ok()?;
-    Some((uplink, Uplink::Stream(send), Recv::StreamReady(recv)))
+    Some((
+        Accepted::Direct {
+            uplink,
+            send: Uplink::Stream(send),
+            recv: Recv::StreamReady(recv),
+        },
+        meter,
+    ))
 }
 
 fn accept_on(
@@ -448,17 +524,27 @@ fn accept_on(
     writer: &mut dyn Write,
     users: &[SsUser],
     freedom: bool,
-) -> Option<(Connection, Uplink, Recv)> {
+) -> Option<(Accepted, crate::stats::Meter)> {
     if !freedom {
         return None;
     }
     if let Some(user) = stream_user(users) {
-        return accept_stream(reader, writer, &user.master);
+        return accept_stream(reader, writer, user);
     }
     let mut head = wire_buffer();
     let (user, mut recv, size) = accept_cipher(reader, users)?;
+    let meter = authenticate(user);
     let chunk = open_chunk_after(reader, &mut recv, &mut head, size)?;
-    let (target, header_len) = parse_addr_header(chunk)?;
+    let request = parse_request(chunk)?;
+    let (target, header_len) = match request {
+        Request::Mux(header_len) => {
+            crate::accesslog::record_current(&format_args!("{MUX_HOST}:{MUX_PORT}"));
+            let carried = chunk[header_len..].to_vec();
+            return mux_after_handshake(user, writer, Recv::Ready(recv), carried)
+                .map(|accepted| (accepted, meter));
+        }
+        Request::Target(target, header_len) => (target, header_len),
+    };
     crate::accesslog::record_current(&target);
     let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
     uplink.write_all(&chunk[header_len..]).ok()?;
@@ -468,7 +554,255 @@ fn accept_on(
     getrandom::fill(&mut salt[..salt_len]).ok()?;
     let send = Cipher::from_master_key(user.method, &user.master, &salt[..salt_len])?;
     writer.write_all(&salt[..salt_len]).ok()?;
-    Some((uplink, Uplink::Aead(send), Recv::Ready(recv)))
+    Some((
+        Accepted::Direct {
+            uplink,
+            send: Uplink::Aead(send),
+            recv: Recv::Ready(recv),
+        },
+        meter,
+    ))
+}
+
+/// The first request's destination: the mux name is one no resolver answers, so it is recognised
+/// from the raw header before resolution and never dialed.
+enum Request {
+    Mux(usize),
+    Target(SocketAddr, usize),
+}
+
+fn parse_request(buf: &[u8]) -> Option<Request> {
+    if let Some(used) = mux_header_len(buf) {
+        return Some(Request::Mux(used));
+    }
+    parse_addr_header(buf).map(|(target, used)| Request::Target(target, used))
+}
+
+/// The reference compares the mux domain alone, so the port a client chose never gates the session.
+fn mux_header_len(buf: &[u8]) -> Option<usize> {
+    if buf.first() != Some(&3) {
+        return None;
+    }
+    let (crate::proxy::AddrBody::Domain(host), at) =
+        crate::proxy::parse_addr_body(buf, crate::proxy::AddrKind::Domain)?
+    else {
+        return None;
+    };
+    if host != MUX_HOST || buf.len() < at + 2 {
+        return None;
+    }
+    Some(at + 2)
+}
+
+fn mux_after_handshake(
+    user: &SsUser,
+    writer: &mut dyn Write,
+    recv: Recv,
+    carried: Vec<u8>,
+) -> Option<Accepted> {
+    let salt_len = user.method.key_len();
+    let mut salt = [0u8; SALT_LEN];
+    getrandom::fill(&mut salt[..salt_len]).ok()?;
+    let send = Cipher::from_master_key(user.method, &user.master, &salt[..salt_len])?;
+    writer.write_all(&salt[..salt_len]).ok()?;
+    Some(Accepted::Mux {
+        send: Uplink::Aead(send),
+        recv,
+        carried,
+    })
+}
+
+/// The stream rung's mux answer: the reply IV goes out in the clear and whatever rode the header enters the session.
+fn stream_mux(
+    writer: &mut dyn Write,
+    master: &MasterKey,
+    recv: Rc4,
+    carried: &[u8],
+) -> Option<Accepted> {
+    let mut iv = [0u8; IV_LEN];
+    getrandom::fill(&mut iv).ok()?;
+    let key = rc4_md5_key(master.as_bytes(), &iv)?;
+    let send = Rc4::new(&key)?;
+    writer.write_all(&iv).ok()?;
+    Some(Accepted::Mux {
+        send: Uplink::Stream(send),
+        recv: Recv::StreamReady(recv),
+        carried: carried.to_vec(),
+    })
+}
+
+/// A mux session on a socket this thread owns: the reader, writer and close are the socket's own clones.
+fn serve_mux_connection(stream: &Connection, accepted: Accepted) {
+    let Ok(reader) = stream.try_clone() else {
+        return;
+    };
+    let Ok(writer) = stream.try_clone() else {
+        return;
+    };
+    let Ok(closer) = stream.try_clone() else {
+        return;
+    };
+    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
+        let _ = closer.shutdown(Shutdown::Both);
+    });
+    serve_accepted(
+        accepted,
+        reader,
+        writer,
+        close,
+        crate::stats::Meter::default(),
+    );
+}
+
+fn serve_accepted<R, W>(
+    accepted: Accepted,
+    reader: R,
+    writer: W,
+    close: std::sync::Arc<dyn Fn() + Send + Sync>,
+    meter: crate::stats::Meter,
+) where
+    R: Read + Send + 'static + crate::proxy::RelayPoll,
+    W: Write + Send + 'static,
+{
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
+    match accepted {
+        Accepted::Direct { uplink, send, recv } => {
+            pump_relay_carried(&uplink, reader, writer, &close, send, recv);
+        }
+        Accepted::Mux {
+            send,
+            recv,
+            carried,
+        } => {
+            let mut reader = reader;
+            reader.arm_relay_poll();
+            let reader = SsMuxReader::new(reader, recv);
+            let writer = SsMuxWriter::new(writer, send);
+            crate::proxy::serve_mux_tunnel(Box::new(reader), Box::new(writer), close, &carried);
+        }
+    }
+}
+
+pub(crate) struct SsMuxReader<R> {
+    downlink: Downlink<R>,
+    pending: Vec<u8>,
+    at: usize,
+    done: bool,
+}
+
+impl<R: Read> SsMuxReader<R> {
+    pub(crate) fn new(reader: R, recv: Recv) -> Self {
+        Self {
+            downlink: Downlink::new(reader, recv),
+            pending: Vec::new(),
+            at: 0,
+            done: false,
+        }
+    }
+}
+
+impl<R: Read> Read for SsMuxReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.at < self.pending.len() {
+                let n = (self.pending.len() - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&self.pending[self.at..self.at + n]);
+                self.at += n;
+                if self.at == self.pending.len() {
+                    self.pending.clear();
+                    self.at = 0;
+                }
+                return Ok(n);
+            }
+            if self.done {
+                return Ok(0);
+            }
+            let mut sink = VecSink(&mut self.pending);
+            let next = self.downlink.step(&mut sink, None);
+            if self.pending.is_empty() {
+                match next {
+                    crate::proxy::lane_pool::Next::Done => {
+                        self.done = true;
+                        return Ok(0);
+                    }
+                    crate::proxy::lane_pool::Next::Idle => {
+                        return Err(std::io::ErrorKind::WouldBlock.into());
+                    }
+                    crate::proxy::lane_pool::Next::More | crate::proxy::lane_pool::Next::Retry => {}
+                }
+            } else if matches!(next, crate::proxy::lane_pool::Next::Done) {
+                self.done = true;
+            }
+        }
+    }
+}
+
+pub(crate) struct SsMuxWriter<W> {
+    send: Uplink,
+    writer: W,
+    buf: Vec<u8>,
+}
+
+impl<W: Write> SsMuxWriter<W> {
+    pub(crate) fn new(writer: W, send: Uplink) -> Self {
+        Self {
+            send,
+            writer,
+            buf: crate::proxy::unfilled(BATCH),
+        }
+    }
+}
+
+impl<W: Write> Write for SsMuxWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut offset = 0;
+        while offset < buf.len() {
+            let take = (buf.len() - offset).min(MAX_CHUNK);
+            self.buf[SEAL_HEAD..SEAL_HEAD + take].copy_from_slice(&buf[offset..offset + take]);
+            seal_all(&mut self.send, &mut self.buf, take, &mut self.writer)?;
+            offset += take;
+        }
+        Ok(buf.len())
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        let mut total = 0;
+        for buf in bufs {
+            if buf.is_empty() {
+                continue;
+            }
+            self.write(buf)?;
+            total += buf.len();
+        }
+        Ok(total)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.writer.flush()
+    }
+}
+
+struct VecSink<'a>(&'a mut Vec<u8>);
+
+impl Write for VecSink<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> std::io::Result<usize> {
+        let mut total = 0;
+        for buf in bufs {
+            self.0.extend_from_slice(buf);
+            total += buf.len();
+        }
+        Ok(total)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 pub(crate) fn client_send_handshake(
@@ -516,6 +850,19 @@ pub(crate) enum Recv {
     Waiting(Method, MasterKey),
     StreamReady(Rc4),
     StreamWaiting(MasterKey),
+}
+
+pub(crate) enum Accepted {
+    Direct {
+        uplink: Connection,
+        send: Uplink,
+        recv: Recv,
+    },
+    Mux {
+        send: Uplink,
+        recv: Recv,
+        carried: Vec<u8>,
+    },
 }
 
 pub(crate) fn pump_relay(plain: &Connection, sealed: &Connection, send: Uplink, recv: Recv) {
@@ -848,48 +1195,143 @@ pub(crate) fn serve_udp(address: &str, users: &[SsUser], freedom: bool) {
     serve_udp_on(&clients, users, freedom);
 }
 
+/// The most client sources one AEAD listener carries: each source owns an upstream socket pair, and only a datagram whose tag verifies creates one.
+pub(crate) const SS_UDP_SOURCES: usize = 4096;
+
+/// The most destinations one stream-cipher listener routes replies for: that account seals no tag, so a reply goes to the last client whose datagram named it.
+const SS_UDP_DESTS: usize = 4096;
+
+/// Datagrams one ready socket drains in a pass: a flooder cannot keep the front from its other sockets, and a level-triggered `poll` names what is left next pass.
+const UDP_DRAIN: usize = 64;
+
+/// One client source's UDP association: the account its first datagram named, its own upstream sockets, and the reply cipher that account seals with.
+struct UdpSource {
+    user: usize,
+    v4: UdpSocket,
+    v6: Option<UdpSocket>,
+    hop: Option<Cipher>,
+    last: Instant,
+}
+
+/// One readiness wait over the front's client socket and every association's sockets, so a pass
+/// reads only what has data instead of trying each socket in turn.
+#[cfg(unix)]
+mod poll_set {
+    use std::io;
+    use std::net::UdpSocket;
+    use std::os::fd::AsRawFd;
+
+    pub(crate) type Row = libc::pollfd;
+
+    pub(crate) fn socket_row(socket: &UdpSocket) -> Row {
+        libc::pollfd {
+            fd: socket.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        }
+    }
+
+    pub(crate) fn wait(rows: &mut [Row], timeout: i32) -> io::Result<usize> {
+        let count = libc::nfds_t::try_from(rows.len()).unwrap_or(libc::nfds_t::MAX);
+        loop {
+            // SAFETY: `rows` is this call's array, `count` its length, and the call writes only `revents`.
+            let answered = unsafe { libc::poll(rows.as_mut_ptr(), count, timeout) };
+            if answered >= 0 {
+                return Ok(usize::try_from(answered).unwrap_or(0));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+
+    pub(crate) fn is_ready(row: Row) -> bool {
+        row.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+    }
+}
+
+/// The Windows spelling of the same wait: `WSAPoll`, whose error code comes from `WSAGetLastError`.
+#[cfg(windows)]
+mod poll_set {
+    use std::io;
+    use std::net::UdpSocket;
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        WSAGetLastError, WSAPoll, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLRDNORM, SOCKET, WSAPOLLFD,
+    };
+
+    pub(crate) type Row = WSAPOLLFD;
+
+    pub(crate) fn socket_row(socket: &UdpSocket) -> Row {
+        WSAPOLLFD {
+            fd: socket.as_raw_socket() as SOCKET,
+            events: POLLIN | POLLRDNORM,
+            revents: 0,
+        }
+    }
+
+    pub(crate) fn wait(rows: &mut [Row], timeout: i32) -> io::Result<usize> {
+        let count = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+        // SAFETY: `rows` is this call's array, `count` its length, and the call writes only `revents`.
+        let answered = unsafe { WSAPoll(rows.as_mut_ptr(), count, timeout) };
+        if answered < 0 {
+            return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+        }
+        Ok(usize::try_from(answered).unwrap_or(0))
+    }
+
+    pub(crate) fn is_ready(row: Row) -> bool {
+        row.revents & (POLLIN | POLLRDNORM | POLLERR | POLLHUP | POLLNVAL) != 0
+    }
+}
+
 pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool) {
     if !freedom || users.is_empty() {
         return;
     }
-    let mut upstreams: Vec<(UdpSocket, Option<UdpSocket>)> = Vec::with_capacity(users.len());
-    for _ in users {
-        let Ok(v4) = UdpSocket::bind("0.0.0.0:0") else {
-            return;
-        };
-        upstreams.push((v4, UdpSocket::bind("[::]:0").ok()));
-    }
     if clients.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
     }
-    for sock in upstreams
-        .iter()
-        .flat_map(|(v4, v6)| std::iter::once(v4).chain(v6.as_ref()))
-    {
-        if sock.set_nonblocking(true).is_err() {
-            return;
-        }
+    match users.iter().position(|user| user.method.is_stream()) {
+        // Nothing in a stream datagram proves which client sent it, so the first stream account owns the front's udp side.
+        Some(which) => serve_udp_stream(clients, &users[which]),
+        None => serve_udp_aead(clients, users),
     }
-    // One upstream socket per account: a reply is opened and sealed under the account whose socket it arrived on.
-    let mut tables: Vec<HashMap<SocketAddr, SocketAddr>> =
-        users.iter().map(|_| HashMap::new()).collect();
+}
+
+/// One socket pair and one destination table serve a stream account: a reply is addressed to the last client that named its destination, and the table is capped rather than grown, so a stream front admits no descriptor for traffic it cannot prove.
+fn serve_udp_stream(clients: &UdpSocket, user: &SsUser) {
+    let Ok(v4) = UdpSocket::bind("0.0.0.0:0") else {
+        return;
+    };
+    let v6 = UdpSocket::bind("[::]:0").ok();
+    if v4.set_nonblocking(true).is_err() {
+        return;
+    }
+    if v6
+        .as_ref()
+        .is_some_and(|sock| sock.set_nonblocking(true).is_err())
+    {
+        return;
+    }
+    let mut by_dest: HashMap<SocketAddr, SocketAddr> = HashMap::new();
+    let mut hop = None;
     let mut buf = crate::proxy::unfilled(DATAGRAM_MAX);
     let mut reply = crate::proxy::unfilled(DATAGRAM_MAX);
-    let mut hops: Vec<Option<Cipher>> = users.iter().map(|_| None).collect();
     loop {
         match clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
             Ok((n, src)) => {
-                if let Some((which, dest, payload)) =
-                    open_datagram_any(users, &mut buf[SEAL_ROOM..SEAL_ROOM + n], &mut hops)
+                let datagram = &mut buf[SEAL_ROOM..SEAL_ROOM + n];
+                if let Some((dest, payload)) =
+                    open_datagram(&user.master, user.method, datagram, &mut hop)
                 {
-                    if tables[which].len() >= 4096 {
-                        tables[which].clear();
+                    if by_dest.len() >= SS_UDP_DESTS {
+                        by_dest.clear();
                     }
-                    tables[which].insert(dest, src);
-                    let payload = &buf[SEAL_ROOM + payload.start..SEAL_ROOM + payload.end];
-                    let (v4, v6) = &upstreams[which];
+                    by_dest.insert(dest, src);
                     if dest.is_ipv6() {
-                        if let Some(sock) = v6 {
+                        if let Some(sock) = v6.as_ref() {
                             let _ = sock.send_to(payload, dest);
                         }
                     } else {
@@ -900,27 +1342,193 @@ pub(crate) fn serve_udp_on(clients: &UdpSocket, users: &[SsUser], freedom: bool)
             Err(error) if crate::proxy::is_timeout(&error) => {}
             Err(_) => break,
         }
-        for (which, (v4, v6)) in upstreams.iter().enumerate() {
-            for sock in std::iter::once(v4).chain(v6.as_ref()) {
-                while let Ok((n, src)) = sock.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF])
-                {
-                    if let Some(&client) = tables[which].get(&src) {
-                        let user = &users[which];
-                        if let Some(packet) = seal_datagram(
-                            &user.master,
-                            user.method,
-                            &src,
-                            &mut reply,
-                            SEAL_ROOM,
-                            n,
-                            &mut hops[which],
-                        ) {
-                            let _ = clients.send_to(packet, client);
-                        }
-                    }
+        for sock in std::iter::once(&v4).chain(v6.as_ref()) {
+            for _ in 0..UDP_DRAIN {
+                let Ok((n, from)) = sock.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF])
+                else {
+                    break;
+                };
+                let Some(&client) = by_dest.get(&from) else {
+                    continue;
+                };
+                if let Some(packet) = seal_datagram(
+                    &user.master,
+                    user.method,
+                    &from,
+                    &mut reply,
+                    SEAL_ROOM,
+                    n,
+                    &mut hop,
+                ) {
+                    let _ = clients.send_to(packet, client);
                 }
             }
         }
+    }
+}
+
+/// One association per client source, created only by a datagram whose tag verifies: a reply can only name a source the tag proved.
+#[allow(clippy::too_many_lines)]
+/// Serve an AEAD front: one upstream association per client source, each with its own sockets, so a
+/// reply reaches the one account that opened it. The pass parks in `poll` until a socket is ready or
+/// the earliest association goes idle, so a quiet front costs no wakeups.
+fn serve_udp_aead(clients: &UdpSocket, users: &[SsUser]) {
+    if clients.set_nonblocking(true).is_err() {
+        return;
+    }
+    let mut sources: HashMap<SocketAddr, UdpSource> = HashMap::new();
+    let mut probes: Vec<Option<Cipher>> = users.iter().map(|_| None).collect();
+    let mut buf = crate::proxy::unfilled(DATAGRAM_MAX);
+    let mut reply = crate::proxy::unfilled(DATAGRAM_MAX);
+    let mut rows: Vec<poll_set::Row> = Vec::new();
+    let mut owners: Vec<Option<(SocketAddr, bool)>> = Vec::new();
+    let idle = crate::budgets::udp_idle();
+    loop {
+        rows.clear();
+        owners.clear();
+        rows.push(poll_set::socket_row(clients));
+        owners.push(None);
+        for (address, source) in &sources {
+            rows.push(poll_set::socket_row(&source.v4));
+            owners.push(Some((*address, false)));
+            if let Some(v6) = source.v6.as_ref() {
+                rows.push(poll_set::socket_row(v6));
+                owners.push(Some((*address, true)));
+            }
+        }
+        let now = Instant::now();
+        let timeout = sources
+            .values()
+            .map(|source| (source.last + idle).saturating_duration_since(now))
+            .min()
+            .map_or(-1, |left| {
+                i32::try_from(left.as_millis()).unwrap_or(i32::MAX)
+            });
+        let Ok(ready) = poll_set::wait(&mut rows, timeout) else {
+            break;
+        };
+        if ready > 0 {
+            for (row, owner) in rows.iter().zip(owners.iter()) {
+                if !poll_set::is_ready(*row) {
+                    continue;
+                }
+                let Some((src, is_v6)) = *owner else {
+                    for _ in 0..UDP_DRAIN {
+                        let Ok((n, src)) =
+                            clients.recv_from(&mut buf[SEAL_ROOM..SEAL_ROOM + UDP_BUF])
+                        else {
+                            break;
+                        };
+                        let now = Instant::now();
+                        let datagram = &mut buf[SEAL_ROOM..SEAL_ROOM + n];
+                        let mut bound = false;
+                        if let Some(source) = sources.get_mut(&src) {
+                            let user = &users[source.user];
+                            if let Some((dest, payload)) =
+                                open_datagram(&user.master, user.method, datagram, &mut source.hop)
+                            {
+                                source.last = now;
+                                let uplink = if dest.is_ipv6() {
+                                    source.v6.as_ref()
+                                } else {
+                                    Some(&source.v4)
+                                };
+                                if let Some(uplink) = uplink {
+                                    let _ = uplink.send_to(payload, dest);
+                                }
+                                bound = true;
+                            }
+                        }
+                        if bound {
+                            continue;
+                        }
+                        let Some((which, dest, payload)) =
+                            open_datagram_any(users, datagram, &mut probes)
+                        else {
+                            continue;
+                        };
+                        if sources.len() >= SS_UDP_SOURCES {
+                            sources.retain(|_, source| now.duration_since(source.last) < idle);
+                            if sources.len() >= SS_UDP_SOURCES {
+                                continue;
+                            }
+                        }
+                        let Ok(v4) = UdpSocket::bind("0.0.0.0:0") else {
+                            continue;
+                        };
+                        if v4.set_nonblocking(true).is_err() {
+                            continue;
+                        }
+                        let v6 = UdpSocket::bind("[::]:0")
+                            .ok()
+                            .filter(|sock| sock.set_nonblocking(true).is_ok());
+                        let payload = &buf[SEAL_ROOM + payload.start..SEAL_ROOM + payload.end];
+                        let uplink = if dest.is_ipv6() {
+                            v6.as_ref()
+                        } else {
+                            Some(&v4)
+                        };
+                        if let Some(uplink) = uplink {
+                            let _ = uplink.send_to(payload, dest);
+                        }
+                        let hop = probes[which].take();
+                        sources.insert(
+                            src,
+                            UdpSource {
+                                user: which,
+                                v4,
+                                v6,
+                                hop,
+                                last: now,
+                            },
+                        );
+                    }
+                    continue;
+                };
+                let Some(source) = sources.get_mut(&src) else {
+                    continue;
+                };
+                let socket = if is_v6 {
+                    match source.v6.as_ref() {
+                        Some(socket) => socket,
+                        None => continue,
+                    }
+                } else {
+                    &source.v4
+                };
+                let mut dropped = false;
+                for _ in 0..UDP_DRAIN {
+                    match socket.recv_from(&mut reply[SEAL_ROOM..SEAL_ROOM + UDP_BUF]) {
+                        Ok((n, from)) => {
+                            source.last = Instant::now();
+                            let user = &users[source.user];
+                            if let Some(packet) = seal_datagram(
+                                &user.master,
+                                user.method,
+                                &from,
+                                &mut reply,
+                                SEAL_ROOM,
+                                n,
+                                &mut source.hop,
+                            ) {
+                                let _ = clients.send_to(packet, src);
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                        Err(_) => {
+                            dropped = true;
+                            break;
+                        }
+                    }
+                }
+                if dropped {
+                    sources.remove(&src);
+                }
+            }
+        }
+        let now = Instant::now();
+        sources.retain(|_, source| now.duration_since(source.last) < idle);
     }
 }
 
@@ -1287,19 +1895,13 @@ pub(crate) fn open_datagram<'a>(
     Some((target, &body[used..len]))
 }
 
-/// Open one wire datagram against every client: the first whose tag verifies names the flow and seals its replies, and a failed probe leaves the buffer untouched because the tag is checked before the body opens. A stream client has no tag to probe, so it owns the listener the way it owns the tcp side.
+/// Open one wire datagram against every client: the first whose tag verifies names the flow and seals its replies, and a failed probe leaves the buffer untouched because the tag is checked before the body opens.
 pub(crate) fn open_datagram_any(
     users: &[SsUser],
     packet: &mut [u8],
     hops: &mut [Option<Cipher>],
 ) -> Option<(usize, SocketAddr, std::ops::Range<usize>)> {
     let base = packet.as_ptr() as usize;
-    if let Some(which) = users.iter().position(|user| user.method.is_stream()) {
-        let user = &users[which];
-        let (target, payload) = open_datagram(&user.master, user.method, packet, &mut hops[which])?;
-        let start = payload.as_ptr() as usize - base;
-        return Some((which, target, start..start + payload.len()));
-    }
     for (which, user) in users.iter().enumerate() {
         if let Some((target, payload)) =
             open_datagram(&user.master, user.method, &mut *packet, &mut hops[which])
@@ -1771,6 +2373,8 @@ mod tests {
         .map(|(password, method)| SsUser {
             method,
             master: MasterKey::new(password, method.key_len()),
+            email: String::new(),
+            level: 0,
         })
         .collect();
         let mut hops: Vec<Option<Cipher>> = users.iter().map(|_| None).collect();
@@ -1808,6 +2412,134 @@ mod tests {
         );
         let mut wire = stranger;
         assert!(open_datagram_any(&users, &mut wire, &mut hops).is_none());
+    }
+
+    /// Each source answers on its own association: two clients naming one destination reach the
+    /// destination from two upstream sockets, and each hears only the answer to its own datagram.
+    #[test]
+    fn an_aead_front_answers_each_source_on_its_own_association() {
+        fn echo_and_report() -> (SocketAddr, std::sync::mpsc::Receiver<bool>) {
+            let sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            let addr = sock.local_addr().expect("addr");
+            let (reported, seen) = std::sync::mpsc::channel();
+            thread::spawn(move || {
+                let mut buf = vec![0u8; UDP_BUF];
+                let mut first = None;
+                let mut shared = true;
+                for _ in 0..2 {
+                    if let Ok((n, from)) = sock.recv_from(&mut buf) {
+                        shared &= first.is_none_or(|source| source == from);
+                        first.get_or_insert(from);
+                        let _ = sock.send_to(&buf[..n], from);
+                    }
+                }
+                let _ = reported.send(shared);
+            });
+            (addr, seen)
+        }
+        let (dest, upstream) = echo_and_report();
+        let users: Vec<SsUser> = [
+            ("first-password", Method::Aes256Gcm),
+            ("second-password", Method::Aes128Gcm),
+        ]
+        .into_iter()
+        .map(|(password, method)| SsUser {
+            method,
+            master: MasterKey::new(password, method.key_len()),
+            email: String::new(),
+            level: 0,
+        })
+        .collect();
+        let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        let serving = users.clone();
+        thread::spawn(move || serve_udp_on(&front, &serving, true));
+        let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let mut wire = vec![0u8; DATAGRAM_MAX];
+        for (client, user, marker) in [
+            (&first, &users[0], b"first".as_slice()),
+            (&second, &users[1], b"second".as_slice()),
+        ] {
+            client
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            let packet = seal_to_wire(&user.master, user.method, &dest, marker);
+            client.send_to(&packet, front_addr).expect("sends");
+            let (n, _) = client
+                .recv_from(&mut wire)
+                .expect("the source hears its answer");
+            let (from, payload) = open_from_wire(&user.master, user.method, &wire[..n])
+                .expect("the answer opens under that source's own account");
+            assert_eq!((from, payload.as_slice()), (dest, marker));
+        }
+        assert!(
+            !upstream.recv().expect("the destination reports"),
+            "each client source owns its upstream association"
+        );
+        for client in [&first, &second] {
+            client
+                .set_read_timeout(Some(Duration::from_millis(300)))
+                .expect("timeout");
+            assert!(
+                client.recv_from(&mut wire).is_err(),
+                "an answer is never fanned across sources"
+            );
+        }
+    }
+
+    /// A source whose stored account no longer opens its datagram is re-probed across the users, so an address another client now sends from is rebound instead of dropped.
+    #[test]
+    fn a_rebound_source_replaces_its_association() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let dest = echo.local_addr().expect("addr");
+        let (reported, seen) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, from)) = echo.recv_from(&mut buf) {
+                let _ = reported.send(from);
+                if echo.send_to(&buf[..n], from).is_err() {
+                    return;
+                }
+            }
+        });
+        let users: Vec<SsUser> = [
+            ("first-password", Method::Aes256Gcm),
+            ("second-password", Method::Aes128Gcm),
+        ]
+        .into_iter()
+        .map(|(password, method)| SsUser {
+            method,
+            master: MasterKey::new(password, method.key_len()),
+            email: String::new(),
+            level: 0,
+        })
+        .collect();
+        let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        let serving = users.clone();
+        thread::spawn(move || serve_udp_on(&front, &serving, true));
+        let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        let mut wire = vec![0u8; DATAGRAM_MAX];
+        for (user, marker) in [
+            (&users[0], b"first".as_slice()),
+            (&users[1], b"second".as_slice()),
+        ] {
+            let packet = seal_to_wire(&user.master, user.method, &dest, marker);
+            client.send_to(&packet, front_addr).expect("sends");
+            let (n, _) = client
+                .recv_from(&mut wire)
+                .expect("the rebound source hears its answer");
+            let (from, payload) = open_from_wire(&user.master, user.method, &wire[..n])
+                .expect("the answer opens under the account that now proves the source");
+            assert_eq!((from, payload.as_slice()), (dest, marker));
+        }
+        let first = seen.recv().expect("the first association's source");
+        let second = seen.recv().expect("the second association's source");
+        assert_ne!(first, second, "the rebound association is new");
     }
 
     #[test]
@@ -2618,6 +3350,58 @@ mod tests {
         );
         assert!(open_from_wire(&master, method, &packet[..10]).is_none());
         assert!(open_from_wire(&master, method, &[]).is_none());
+    }
+
+    /// A stream account seals no tag, so each destination's reply goes to the client whose datagram last named it rather than to whichever source spoke last.
+    #[test]
+    fn a_stream_front_routes_each_destination_back_to_its_client() {
+        fn answer(word: u8) -> (SocketAddr, thread::JoinHandle<()>) {
+            let sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            let addr = sock.local_addr().expect("addr");
+            let handle = thread::spawn(move || {
+                let mut buf = vec![0u8; UDP_BUF];
+                while let Ok((n, src)) = sock.recv_from(&mut buf) {
+                    if sock.send_to(&vec![word; n], src).is_err() {
+                        return;
+                    }
+                }
+            });
+            (addr, handle)
+        }
+        let (a_dest, _a) = answer(b'a');
+        let (b_dest, _b) = answer(b'b');
+        let method = Method::Rc4Md5;
+        let master = MasterKey::new("an-example-shared-password", 16);
+        let users = [SsUser {
+            method,
+            master: master.clone(),
+            email: String::new(),
+            level: 0,
+        }];
+        let front = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let front_addr = front.local_addr().expect("addr");
+        thread::spawn(move || serve_udp_on(&front, &users, true));
+        let (a, b) = (
+            UdpSocket::bind("127.0.0.1:0").expect("binds"),
+            UdpSocket::bind("127.0.0.1:0").expect("binds"),
+        );
+        a.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        b.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        a.send_to(&seal_to_wire(&master, method, &a_dest, b"one"), front_addr)
+            .expect("sends");
+        b.send_to(&seal_to_wire(&master, method, &b_dest, b"two"), front_addr)
+            .expect("sends");
+        let mut wire = vec![0u8; DATAGRAM_MAX];
+        let (n, _) = a.recv_from(&mut wire).expect("the first client hears back");
+        let (from, payload) = open_from_wire(&master, method, &wire[..n]).expect("opens");
+        assert_eq!((from, payload.as_slice()), (a_dest, b"aaa".as_slice()));
+        let (n, _) = b
+            .recv_from(&mut wire)
+            .expect("the second client hears back");
+        let (from, payload) = open_from_wire(&master, method, &wire[..n]).expect("opens");
+        assert_eq!((from, payload.as_slice()), (b_dest, b"bbb".as_slice()));
     }
 
     /// What a stage between the carrier and the codec asks for: its own capacity.

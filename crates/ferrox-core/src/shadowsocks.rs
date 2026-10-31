@@ -24,7 +24,9 @@ impl Method {
             "chacha20-ietf-poly1305" | "aead_chacha20_poly1305" | "chacha20-poly1305" => {
                 Self::Chacha20Poly1305
             }
-            "xchacha20-ietf-poly1305" | "aead_xchacha20_poly1305" => Self::XChacha20Poly1305,
+            "xchacha20-ietf-poly1305" | "xchacha20-poly1305" | "aead_xchacha20_poly1305" => {
+                Self::XChacha20Poly1305
+            }
             "rc4-md5" => Self::Rc4Md5,
             _ => return None,
         })
@@ -397,6 +399,7 @@ mod tests {
             ("aead_chacha20_poly1305", Method::Chacha20Poly1305),
             ("chacha20-poly1305", Method::Chacha20Poly1305),
             ("xchacha20-ietf-poly1305", Method::XChacha20Poly1305),
+            ("xchacha20-poly1305", Method::XChacha20Poly1305),
             ("aead_xchacha20_poly1305", Method::XChacha20Poly1305),
             ("  AES-256-GCM  ", Method::Aes256Gcm),
             ("rc4-md5", Method::Rc4Md5),

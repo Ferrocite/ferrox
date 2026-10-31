@@ -209,7 +209,7 @@ pub(crate) fn outbound(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.core.OutboundHandlerConfig");
     let mut settings = None;
     let mut tag = None;
-    let mut sender = None;
+    let mut sender = SenderConfig::default();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             // A tag names the handler for the router's rules.
@@ -281,8 +281,11 @@ pub(crate) fn outbound(bytes: &[u8]) -> Result<Json, String> {
         ],
         _ => return Err(format!("outbound protocol `{name}` is not carried")),
     };
-    if let Some(stream) = sender {
+    if let Some(stream) = sender.stream {
         pairs.push(("streamSettings", stream));
+    }
+    if let Some(mux) = sender.mux {
+        pairs.push(("mux", mux));
     }
     if let Some(tag) = tag {
         pairs.push(("tag", Json::Str(tag)));
@@ -642,25 +645,63 @@ fn sniffing_settings(bytes: &[u8]) -> Result<Json, String> {
     ]))
 }
 
-/// A sender's client-side stream policy: only its stream settings are carried, and a multiplex
-/// or via policy names a shape this tree arms from the outbound's own JSON key.
-fn sender_config(bytes: &[u8]) -> Result<Option<Json>, String> {
+/// A sender's client-side stream policy: only its stream settings and multiplex switch are
+/// carried, and a via policy names a shape this tree refuses by number.
+fn sender_config(bytes: &[u8]) -> Result<SenderConfig, String> {
     let mut reader = Reader::new(bytes, "xray.app.proxyman.SenderConfig");
-    let mut stream = None;
+    let mut config = SenderConfig::default();
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => return Err(reader.uncarried("the outbound's via address")),
             (2, 2) => {
                 // A sender's stream settings are a bare `internet.StreamConfig`, not a typed wrapper.
-                stream = Some(stream_settings(reader.bytes()?)?);
+                config.stream = Some(stream_settings(reader.bytes()?)?);
             }
-            (4, 2) => return Err(reader.uncarried("multiplex settings")),
+            (4, 2) => config.mux = Some(multiplex_settings(reader.bytes()?)?),
             (5, 2) => return Err(reader.uncarried("the via cidr")),
             (6, 0) => return Err(reader.uncarried("the target domain strategy")),
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    Ok(stream)
+    Ok(config)
+}
+
+#[derive(Default)]
+struct SenderConfig {
+    stream: Option<Json>,
+    mux: Option<Json>,
+}
+
+fn multiplex_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.app.proxyman.MultiplexingConfig");
+    let mut enabled = false;
+    let mut concurrency = 0i32;
+    let mut xudp_concurrency = 0i32;
+    let mut udp443 = String::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => enabled = reader.varint()? != 0,
+            (2, 0) => concurrency = int32(reader.varint()?),
+            (3, 0) => xudp_concurrency = int32(reader.varint()?),
+            (4, 2) => {
+                udp443 = String::from_utf8_lossy(reader.bytes()?).into_owned();
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(object(vec![
+        ("enabled", Json::Bool(enabled)),
+        ("concurrency", Json::Num(f64::from(concurrency))),
+        ("xudpConcurrency", Json::Num(f64::from(xudp_concurrency))),
+        ("xudpProxyUDP443", Json::Str(udp443)),
+    ]))
+}
+
+/// One protobuf `int32` out of its varint: a negative value arrives sign-extended across ten bytes, so the low 32 bits are the number.
+fn int32(raw: u64) -> i32 {
+    u32::try_from(raw & u64::from(u32::MAX))
+        .expect("the mask narrows to 32 bits")
+        .cast_signed()
 }
 
 /// xray's `SocketConfig` as far as a stream's dial reads it: the system dial this tree puts
@@ -2919,8 +2960,13 @@ fn vless_client(
     object(pairs)
 }
 
-/// A shadowsocks account: its password and the AEAD cipher, spelled the way this tree names it.
-type SsAccount = (String, &'static str);
+/// A shadowsocks account: its password, the AEAD cipher, and the email and level that name its stats.
+struct SsAccount {
+    password: String,
+    method: &'static str,
+    email: Option<String>,
+    level: Option<u32>,
+}
 
 /// The four ciphers the pinned enum names beyond `UNKNOWN`, in the spellings `Method::parse` reads.
 fn ss_cipher(value: u64) -> Result<&'static str, String> {
@@ -2935,7 +2981,7 @@ fn ss_cipher(value: u64) -> Result<&'static str, String> {
     }
 }
 
-/// The password and cipher a `shadowsocks.Account` names; `iv_check` asks for a check this tree does not run.
+/// The password and cipher a `shadowsocks.Account` names; `iv_check` is read and ignored, as the reference ignores it.
 fn ss_account(bytes: &[u8]) -> Result<SsAccount, String> {
     let mut reader = Reader::new(bytes, "xray.proxy.shadowsocks.Account");
     let mut password = None;
@@ -2944,28 +2990,36 @@ fn ss_account(bytes: &[u8]) -> Result<SsAccount, String> {
         match (field, wire) {
             (1, 2) => password = Some(account_text(&mut reader)?),
             (2, 0) => cipher = Some(ss_cipher(reader.varint()?)?),
-            (3, 0) => return Err(reader.uncarried("iv_check")),
+            (3, 0) => {
+                reader.varint()?;
+            }
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    Ok((
-        password.ok_or("xray.proxy.shadowsocks.Account: no password".to_owned())?,
-        cipher.ok_or("xray.proxy.shadowsocks.Account: no cipher".to_owned())?,
-    ))
+    Ok(SsAccount {
+        password: password.ok_or("xray.proxy.shadowsocks.Account: no password".to_owned())?,
+        method: cipher.ok_or("xray.proxy.shadowsocks.Account: no cipher".to_owned())?,
+        email: None,
+        level: None,
+    })
 }
 
-/// A `common.protocol.User` whose account is a shadowsocks one. Every scenario signs its server
-/// user with `level: 1`, which feeds the policy app and the stats nothing here reads, so the level
-/// is dropped; email names nothing here reads either.
+/// A `common.protocol.User` whose account is a shadowsocks one: the level and email key its policy and stats.
 fn ss_user(bytes: &[u8]) -> Result<SsAccount, String> {
     let mut reader = Reader::new(bytes, "xray.common.protocol.User");
     let mut account = None;
+    let mut level = None;
+    let mut email = None;
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
-            (1, 0) => {
-                reader.varint()?;
+            (1, 0) => level = Some(reader.varint()?.try_into().unwrap_or(u32::MAX)),
+            (2, 2) => {
+                email = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| "xray.common.protocol.User: email is not utf-8".to_owned())?
+                        .to_owned(),
+                );
             }
-            (2, 2) => return Err(reader.uncarried("user email")),
             (3, 2) => {
                 let (name, value) = typed_message(reader.bytes()?)?;
                 if name != "xray.proxy.shadowsocks.Account" {
@@ -2976,11 +3030,13 @@ fn ss_user(bytes: &[u8]) -> Result<SsAccount, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    account.ok_or("xray.common.protocol.User: no account".to_owned())
+    let mut account = account.ok_or("xray.common.protocol.User: no account".to_owned())?;
+    account.level = level;
+    account.email = email;
+    Ok(account)
 }
 
-/// The clients a shadowsocks inbound serves, one account per `users` entry. Its `network` list is
-/// checked, not carried: this front serves TCP and UDP on every shadowsocks inbound.
+/// The clients a shadowsocks inbound serves, one account per `users` entry, and the networks its config opened.
 fn ss_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
     let mut reader = Reader::new(bytes, "xray.proxy.shadowsocks.ServerConfig");
     let mut users = Vec::new();
@@ -2988,7 +3044,7 @@ fn ss_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
     while let Some((field, wire)) = reader.field()? {
         match (field, wire) {
             (1, 2) => users.push(ss_user(reader.bytes()?)?),
-            // A repeated enum arrives packed into one field or per field, and the packed payload carries no keys.
+            // A repeated enum arrives packed into one field or per field.
             (2, 2) => {
                 let mut packed =
                     Reader::new(reader.bytes()?, "xray.proxy.shadowsocks.ServerConfig");
@@ -3000,23 +3056,39 @@ fn ss_inbound_settings(bytes: &[u8]) -> Result<Json, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    for value in &networks {
-        if !matches!(value, 2 | 3) {
-            return Err(format!(
-                "xray.proxy.shadowsocks.ServerConfig: network {value} is not served"
-            ));
-        }
-    }
     let clients: Vec<Json> = users
         .into_iter()
-        .map(|(password, method)| {
-            object(vec![
-                ("method", Json::Str(method.to_owned())),
-                ("password", Json::Str(password)),
-            ])
+        .map(|account| {
+            let mut pairs = vec![
+                ("method", Json::Str(account.method.to_owned())),
+                ("password", Json::Str(account.password)),
+            ];
+            if let Some(email) = account.email {
+                pairs.push(("email", Json::Str(email)));
+            }
+            if let Some(level) = account.level {
+                pairs.push(("level", Json::Num(f64::from(level))));
+            }
+            object(pairs)
         })
         .collect();
-    Ok(object(vec![("users", Json::Arr(clients))]))
+    let mut settings = vec![("users", Json::Arr(clients))];
+    // Only tcp and udp reach a worker; a list that names neither opens nothing, as the reference's has no worker for it.
+    let mut opened: Vec<&str> = Vec::new();
+    if !networks.is_empty() {
+        for network in &networks {
+            let name = match network {
+                2 => "tcp",
+                3 => "udp",
+                _ => continue,
+            };
+            if !opened.contains(&name) {
+                opened.push(name);
+            }
+        }
+        settings.push(("network", Json::Str(opened.join(","))));
+    }
+    Ok(object(settings))
 }
 
 /// A shadowsocks outbound dials the one server its config names.
@@ -3029,15 +3101,15 @@ fn ss_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
             _ => return Err(reader.refuse(field, wire)),
         }
     }
-    let (address, port, (password, method)) =
+    let (address, port, account) =
         server.ok_or("xray.proxy.shadowsocks.ClientConfig: no server")?;
     Ok(object(vec![(
         "servers",
         Json::Arr(vec![object(vec![
             ("address", Json::Str(address)),
             ("port", Json::Num(f64::from(port))),
-            ("method", Json::Str(method.to_owned())),
-            ("password", Json::Str(password)),
+            ("method", Json::Str(account.method.to_owned())),
+            ("password", Json::Str(account.password)),
         ])]),
     )]))
 }
@@ -5104,6 +5176,57 @@ mod tests {
     }
 
     #[test]
+    fn a_sender_multiplex_switch_reaches_the_dial() {
+        let endpoint = message(&[
+            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+            varint_field(2, 443),
+            bytes_field(3, &ss_user(&ss_account(b"shadowsocks-password", 6), None)),
+        ]);
+        let mux = message(&[
+            varint_field(1, 1),
+            varint_field(2, 8),
+            varint_field(3, u64::from(u32::MAX)),
+            bytes_field(4, b"skip"),
+        ]);
+        let outbound = message(&[
+            bytes_field(
+                2,
+                &typed("xray.app.proxyman.SenderConfig", &bytes_field(4, &mux)),
+            ),
+            bytes_field(
+                3,
+                &typed(
+                    "xray.proxy.shadowsocks.ClientConfig",
+                    &bytes_field(1, &endpoint),
+                ),
+            ),
+        ]);
+        let json = to_json(&config(&dokodemo(5000, &[varint_field(7, 2)]), &outbound))
+            .expect("the sender's mux decodes");
+        let mux = json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0]
+            .get("mux")
+            .expect("the mux block");
+        assert_eq!(
+            mux.get("enabled").and_then(Json::as_bool),
+            Some(true),
+            "the client dials a mux session"
+        );
+        assert_eq!(
+            mux.get("xudpConcurrency").and_then(Json::as_i64),
+            Some(-1),
+            "a negative xudp pool turns UDP muxing off"
+        );
+        assert_eq!(
+            mux.get("xudpProxyUDP443").and_then(Json::as_str),
+            Some("skip"),
+            "the udp/443 policy reaches the dial"
+        );
+    }
+
+    #[test]
     fn a_shadowsocks_scenario_decodes_both_sides() {
         let settings = message(&[
             bytes_field(
@@ -5992,15 +6115,25 @@ mod tests {
     }
 
     #[test]
-    fn a_shadowsocks_iv_check_is_refused() {
+    fn a_shadowsocks_iv_check_is_ignored() {
         let account = typed(
             "xray.proxy.shadowsocks.Account",
             &message(&[bytes_field(1, b"a"), varint_field(2, 6), varint_field(3, 1)]),
         );
         let settings = bytes_field(1, &ss_user(&account, None));
-        let error = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
-            .expect_err("refused");
-        assert!(error.contains("iv_check"), "{error}");
+        let json = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
+            .expect("iv_check decodes");
+        let method = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .and_then(|inbounds| inbounds.first())
+            .and_then(|inbound| inbound.get("settings"))
+            .and_then(|settings| settings.get("users"))
+            .and_then(Json::as_arr)
+            .and_then(|users| users.first())
+            .and_then(|user| user.get("method"))
+            .and_then(Json::as_str);
+        assert_eq!(method, Some("aes-256-gcm"));
     }
 
     #[test]
@@ -6015,14 +6148,44 @@ mod tests {
     }
 
     #[test]
-    fn a_shadowsocks_unix_network_is_refused() {
+    fn a_shadowsocks_unix_network_opens_no_listener() {
         let settings = message(&[
             bytes_field(1, &ss_user(&ss_account(b"a", 6), None)),
             bytes_field(2, &[4]),
         ]);
-        let error = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
-            .expect_err("refused");
-        assert!(error.contains("network 4"), "{error}");
+        let json = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
+            .expect("a unix network decodes");
+        let named = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .and_then(|settings| settings.get("network"))
+            .and_then(Json::as_str);
+        assert_eq!(
+            named,
+            Some(""),
+            "a unix-only list names no network this front carries, so it opens neither"
+        );
+    }
+
+    #[test]
+    fn a_shadowsocks_network_list_narrows_the_front() {
+        let settings = message(&[
+            bytes_field(1, &ss_user(&ss_account(b"a", 6), None)),
+            bytes_field(2, &[2, 3]),
+            bytes_field(2, &[2]),
+        ]);
+        let json = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
+            .expect("both networks decode");
+        let named = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .and_then(|settings| settings.get("network"))
+            .and_then(Json::as_str);
+        assert_eq!(named, Some("tcp,udp"), "each network named once, in order");
     }
 
     #[test]
@@ -6052,15 +6215,25 @@ mod tests {
     }
 
     #[test]
-    fn a_shadowsocks_user_email_is_refused() {
+    fn a_shadowsocks_user_email_is_kept() {
         let user = message(&[
             bytes_field(2, b"who@example"),
             bytes_field(3, &ss_account(b"a", 6)),
         ]);
         let settings = bytes_field(1, &user);
-        let error = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
-            .expect_err("refused");
-        assert!(error.contains("email"), "{error}");
+        let json = to_json(&config(&ss_inbound(5000, &settings), &freedom_outbound()))
+            .expect("email decodes");
+        let email = json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .and_then(|inbounds| inbounds.first())
+            .and_then(|inbound| inbound.get("settings"))
+            .and_then(|settings| settings.get("users"))
+            .and_then(Json::as_arr)
+            .and_then(|users| users.first())
+            .and_then(|user| user.get("email"))
+            .and_then(Json::as_str);
+        assert_eq!(email, Some("who@example"));
     }
 
     #[test]
