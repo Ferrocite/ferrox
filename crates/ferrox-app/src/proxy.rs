@@ -4607,14 +4607,14 @@ where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    serve_mux_tunnel(Box::new(reader), Box::new(writer), close, Vec::new());
+    serve_mux_tunnel(Box::new(reader), Box::new(writer), close, &[]);
 }
 
 pub(crate) fn serve_mux_tunnel(
     reader: Box<dyn Read + Send>,
     writer: Box<dyn Write + Send>,
     close: Arc<dyn Fn() + Send + Sync>,
-    carried: Vec<u8>,
+    carried: &[u8],
 ) {
     let wire = MuxWire::Tunnel(crate::reverse::Tunnel::new(reader, writer, close));
     let io = MuxIo {
@@ -4629,7 +4629,7 @@ pub(crate) fn serve_mux_tunnel(
         (io.dial)(&address)
     });
     let udp: MuxUdpOk = Arc::new(|_| true);
-    serve_mux_wire(&wire, &dial, &udp, None, &carried);
+    serve_mux_wire(&wire, &dial, &udp, None, carried);
 }
 
 pub(crate) struct MeteredIo<T> {
@@ -12381,6 +12381,13 @@ fn mux_dial_uplink(client: &Connection, uplink: &mut dyn Write, id: u16) {
     let _ = uplink.write_all(&header);
 }
 
+/// The two halves of a mux carrier and the close that tears its socket down.
+type MuxHalves = (
+    Box<dyn Read + Send>,
+    Box<dyn Write + Send>,
+    Arc<dyn Fn() + Send + Sync>,
+);
+
 struct MuxUplink {
     read: Box<dyn Read + Send>,
     write: Box<dyn Write + Send>,
@@ -12434,11 +12441,7 @@ fn open_ss_mux(ss: &ShadowsocksOut) -> Option<MuxUplink> {
         crate::shadowsocks::MUX_HOST.to_owned(),
         crate::shadowsocks::MUX_PORT,
     );
-    let (read, write, close): (
-        Box<dyn Read + Send>,
-        Box<dyn Write + Send>,
-        Arc<dyn Fn() + Send + Sync>,
-    ) = match (&ss.carrier, ss.tls.as_deref()) {
+    let (read, write, close): MuxHalves = match (&ss.carrier, ss.tls.as_deref()) {
         (Carrier::Raw(_), None) => {
             let stream = dial_or_report(&server)?.with_mask(ss.carrier.tcp_mask());
             let read = stream.try_clone().ok()?;
@@ -12460,12 +12463,8 @@ fn open_ss_mux(ss: &ShadowsocksOut) -> Option<MuxUplink> {
         }
     };
     let mut write = write;
-    let (send, recv) = crate::shadowsocks::client_send_handshake(
-        &mut *write,
-        &ss.password,
-        &ss.method,
-        &target,
-    )?;
+    let (send, recv) =
+        crate::shadowsocks::client_send_handshake(&mut *write, &ss.password, &ss.method, &target)?;
     Some(MuxUplink {
         read: Box::new(crate::shadowsocks::SsMuxReader::new(read, recv)),
         write: Box::new(crate::shadowsocks::SsMuxWriter::new(write, send)),
@@ -20327,13 +20326,12 @@ fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
                 published = Some(src);
             }
         }
-        let (id, first) = match lanes.iter().find(|(known, _)| *known == dest) {
-            Some((_, id)) => (*id, false),
-            None => {
-                let Ok(id) = ids.take() else { continue };
-                lanes.push((dest, id));
-                (id, true)
-            }
+        let (id, first) = if let Some((_, id)) = lanes.iter().find(|(known, _)| *known == dest) {
+            (*id, false)
+        } else {
+            let Ok(id) = ids.take() else { continue };
+            lanes.push((dest, id));
+            (id, true)
         };
         let frame = ferrox_core::mux::Outgoing {
             id,

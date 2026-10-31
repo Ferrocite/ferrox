@@ -42,7 +42,7 @@ impl Drop for FlowGuard {
 pub(crate) fn reidentify(email: &str, level: u32) {
     FLOW.with(|flow| {
         let mut flow = flow.borrow_mut();
-        flow.email = email.to_owned();
+        email.clone_into(&mut flow.email);
         flow.level = level;
     });
 }

@@ -119,12 +119,11 @@ pub(crate) fn serve(mut stream: Connection, users: &[SsUser], freedom: bool) {
             crate::accesslog::record_current(&format_args!("{MUX_HOST}:{MUX_PORT}"));
             let carried = chunk[header_len..].to_vec();
             drop(head);
-            let Some(accepted) =
-                mux_after_handshake(user, &mut stream, Recv::Ready(recv), carried)
+            let Some(accepted) = mux_after_handshake(user, &mut stream, Recv::Ready(recv), carried)
             else {
                 return;
             };
-            serve_mux_connection(stream, accepted);
+            serve_mux_connection(&stream, accepted);
             return;
         }
         Request::Target(target, header_len) => (target, header_len),
@@ -236,22 +235,23 @@ fn serve_stream(mut stream: Connection, user: &SsUser) {
     stream = stream
         .with_meter(authenticate(user))
         .with_policy(Some(crate::policy::flow(user.level)));
-    let (target, used) = match request {
-        Request::Mux(used) => {
+    let (target, consumed) = match request {
+        Request::Mux(consumed) => {
             crate::accesslog::record_current(&format_args!("{MUX_HOST}:{MUX_PORT}"));
-            let Some(accepted) = stream_mux(&mut stream, &master, recv, &head[used..len]) else {
+            let Some(accepted) = stream_mux(&mut stream, &master, recv, &head[consumed..len])
+            else {
                 return;
             };
-            serve_mux_connection(stream, accepted);
+            serve_mux_connection(&stream, accepted);
             return;
         }
-        Request::Target(target, used) => (target, used),
+        Request::Target(target, consumed) => (target, consumed),
     };
     crate::accesslog::record_current(&target);
     let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
     };
-    if used < len && uplink.write_all(&head[used..len]).is_err() {
+    if consumed < len && uplink.write_all(&head[consumed..len]).is_err() {
         return;
     }
     let mut iv = [0u8; IV_LEN];
@@ -428,7 +428,13 @@ pub(crate) fn serve_session<R, W>(
         close();
         return;
     };
-    serve_accepted(accepted, reader, writer, std::sync::Arc::clone(close), meter);
+    serve_accepted(
+        accepted,
+        reader,
+        writer,
+        std::sync::Arc::clone(close),
+        meter,
+    );
 }
 
 pub(crate) fn serve_kcp<R, W>(
@@ -449,7 +455,13 @@ pub(crate) fn serve_kcp<R, W>(
     ) else {
         return;
     };
-    serve_accepted(accepted, reader, writer, std::sync::Arc::clone(close), meter);
+    serve_accepted(
+        accepted,
+        reader,
+        writer,
+        std::sync::Arc::clone(close),
+        meter,
+    );
 }
 
 fn accept_stream(
@@ -481,13 +493,13 @@ fn accept_stream(
             break request;
         }
     };
-    let (target, used) = match request {
-        Request::Mux(used) => {
+    let (target, consumed) = match request {
+        Request::Mux(consumed) => {
             crate::accesslog::record_current(&format_args!("{MUX_HOST}:{MUX_PORT}"));
-            return stream_mux(writer, master, recv, &head[used..len])
+            return stream_mux(writer, master, recv, &head[consumed..len])
                 .map(|accepted| (accepted, meter));
         }
-        Request::Target(target, used) => (target, used),
+        Request::Target(target, consumed) => (target, consumed),
     };
     crate::accesslog::record_current(&target);
     let mut iv = [0u8; IV_LEN];
@@ -495,7 +507,7 @@ fn accept_stream(
     let key = rc4_md5_key(master.as_bytes(), &iv)?;
     let send = Rc4::new(&key)?;
     let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
-    uplink.write_all(&head[used..len]).ok()?;
+    uplink.write_all(&head[consumed..len]).ok()?;
     writer.write_all(&iv).ok()?;
     Some((
         Accepted::Direct {
@@ -620,7 +632,7 @@ fn stream_mux(
 }
 
 /// A mux session on a socket this thread owns: the reader, writer and close are the socket's own clones.
-fn serve_mux_connection(stream: Connection, accepted: Accepted) {
+fn serve_mux_connection(stream: &Connection, accepted: Accepted) {
     let Ok(reader) = stream.try_clone() else {
         return;
     };
@@ -667,7 +679,7 @@ fn serve_accepted<R, W>(
             reader.arm_relay_poll();
             let reader = SsMuxReader::new(reader, recv);
             let writer = SsMuxWriter::new(writer, send);
-            crate::proxy::serve_mux_tunnel(Box::new(reader), Box::new(writer), close, carried);
+            crate::proxy::serve_mux_tunnel(Box::new(reader), Box::new(writer), close, &carried);
         }
     }
 }
@@ -717,8 +729,7 @@ impl<R: Read> Read for SsMuxReader<R> {
                     crate::proxy::lane_pool::Next::Idle => {
                         return Err(std::io::ErrorKind::WouldBlock.into());
                     }
-                    crate::proxy::lane_pool::Next::More
-                    | crate::proxy::lane_pool::Next::Retry => {}
+                    crate::proxy::lane_pool::Next::More | crate::proxy::lane_pool::Next::Retry => {}
                 }
             } else if matches!(next, crate::proxy::lane_pool::Next::Done) {
                 self.done = true;
@@ -3108,8 +3119,10 @@ mod tests {
             UdpSocket::bind("127.0.0.1:0").expect("binds"),
             UdpSocket::bind("127.0.0.1:0").expect("binds"),
         );
-        a.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
-        b.set_read_timeout(Some(Duration::from_secs(10))).expect("timeout");
+        a.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        b.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
         a.send_to(&seal_to_wire(&master, method, &a_dest, b"one"), front_addr)
             .expect("sends");
         b.send_to(&seal_to_wire(&master, method, &b_dest, b"two"), front_addr)
@@ -3118,7 +3131,9 @@ mod tests {
         let (n, _) = a.recv_from(&mut wire).expect("the first client hears back");
         let (from, payload) = open_from_wire(&master, method, &wire[..n]).expect("opens");
         assert_eq!((from, payload.as_slice()), (a_dest, b"aaa".as_slice()));
-        let (n, _) = b.recv_from(&mut wire).expect("the second client hears back");
+        let (n, _) = b
+            .recv_from(&mut wire)
+            .expect("the second client hears back");
         let (from, payload) = open_from_wire(&master, method, &wire[..n]).expect("opens");
         assert_eq!((from, payload.as_slice()), (b_dest, b"bbb".as_slice()));
     }
