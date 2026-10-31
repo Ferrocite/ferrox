@@ -30487,8 +30487,8 @@ mod tests {
         assert_eq!(counts.zeroed, 0, "the initial window is zeroed: {counts:?}");
 
         let mut buffer = RelayBuf::new();
-        let (_, counts) = ferrox_core::alloc_count::measure(|| {
-            buffer.filled(RELAY_SMALL_BUFFER);
+        let ((), counts) = ferrox_core::alloc_count::measure(|| {
+            let _ = buffer.filled(RELAY_SMALL_BUFFER);
         });
         assert_eq!(counts.zeroed, 0, "the promotion is zeroed: {counts:?}");
         assert_eq!(buffer.size(), RELAY_BUFFER, "the promotion kept its window");
