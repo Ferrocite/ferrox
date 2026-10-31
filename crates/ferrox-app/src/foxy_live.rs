@@ -65,6 +65,24 @@ fn account() -> Option<Account> {
     })
 }
 
+/// No secrets: a dummy credential reaches FxA, so the answer proves the UA class and not the account.
+#[test]
+#[ignore = "network: a dummy credential proves the pinned identity is not refused as a bot"]
+fn a_dummy_account_clears_the_edge_without_a_browser() {
+    let account = account().expect("the FxA host parses");
+    let denied = account
+        .sign_in("ferrox-dummy@example.com", "not-a-password")
+        .expect_err("a dummy credential must not sign in");
+    assert!(
+        !matches!(
+            denied,
+            crate::foxy_account::Denied::Challenged(406)
+                | crate::foxy_account::Denied::Unreachable(_)
+        ),
+        "the pinned Firefox identity reached FxA and cleared the UA class: {denied}"
+    );
+}
+
 /// One request through the tunnel, read back as its head: the tunnel is opaque bytes to whoever dials it.
 fn through_tunnel<T: Read + Write>(tunnel: &mut T, host: &str, path: &str) -> Option<String> {
     let request = format!("GET {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");

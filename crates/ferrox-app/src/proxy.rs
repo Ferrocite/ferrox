@@ -25728,6 +25728,12 @@ fn find_foxy_outbound(root: &Json) -> Option<FoxyOut> {
             continue;
         }
         let settings = outbound.get("settings");
+        let fxa_user_agent = foxy_text(settings, "fxaUserAgent");
+        if !fxa_user_agent.is_empty() {
+            if let Err(why) = crate::foxy_challenge::set_fxa_user_agent(&fxa_user_agent) {
+                eprintln!("foxy: fxaUserAgent {why}: using the pinned Firefox identity");
+            }
+        }
         let link = ferrox_core::foxy::link::FoxyLink::parse(&foxy_text(settings, "link"))
             .unwrap_or_default();
         let configured = foxy_text_or(&link, settings, "pass");

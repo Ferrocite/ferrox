@@ -90,6 +90,7 @@ CITY=""
 CITY_SET=0
 CARRIER="auto"
 CARRIER_SET=0
+FXA_USER_AGENT=""
 LOC_COUNTRY=""
 LOC_CITY=""
 LOC_FILTER=""
@@ -179,6 +180,15 @@ need_value() {
   die "$flag needs $hint; nothing was started (see --help)."
 }
 
+# A header value has to fit on one line and carry no control byte; trim the padding the binary trims.
+printable_ascii() {
+  local LC_ALL=C value="$1"
+  value="${value#"${value%%[![:space:]]*}"}"
+  value="${value%"${value##*[![:space:]]}"}"
+  [ -z "$value" ] && return 1
+  case "$value" in *[![:print:]]*) return 1 ;; esac
+}
+
 need_port() {
   local flag="$1" have="$2" value="${3:-}"
   need_value "$flag" "a port number" "$have" "$value"
@@ -257,6 +267,7 @@ foxy options (email + password is the whole setup; there is no server to name)
                          every runner, so auto opens on h2; h3 is still the
                          carrier UDP asks first, and a named h3 falls back to
                          h2 and h1 when the path drops QUIC
+  --fxa-user-agent UA    override the pinned desktop Firefox identity for FxA
   --upstream URL         http:// or socks5(h):// hop to reach the edge through
   --exclude-domains LIST domain suffixes that leave the tunnel and dial directly
                          (comma-separated; example.com also covers its subdomains)
@@ -709,10 +720,10 @@ adopt_lane_ports() {
 }
 
 foxy_outbound() {
-  python3 - "$EMAIL" "$PASSWORD" "$CODE" "$COUNTRY" "$CITY" "$CARRIER" "$UPSTREAM" "$TOKEN_FILE" "$EXCLUDE_DOMAINS" "$EXCLUDE_PORTS" <<'PY'
+  python3 - "$EMAIL" "$PASSWORD" "$CODE" "$COUNTRY" "$CITY" "$CARRIER" "$FXA_USER_AGENT" "$UPSTREAM" "$TOKEN_FILE" "$EXCLUDE_DOMAINS" "$EXCLUDE_PORTS" <<'PY'
 import json, sys
 
-email, password, code, country, city, carrier, upstream, token_file, domains, ports = sys.argv[1:11]
+email, password, code, country, city, carrier, fxa_user_agent, upstream, token_file, domains, ports = sys.argv[1:12]
 
 def split_domains(raw):
     names = []
@@ -750,9 +761,15 @@ def split_ports(raw):
         sys.exit("--exclude-ports wants at least one port; nothing was started.")
     return numbers
 
+fxa_user_agent = fxa_user_agent.strip()
+if fxa_user_agent and any(not 32 <= ord(ch) <= 126 for ch in fxa_user_agent):
+    sys.exit("--fxa-user-agent wants printable ASCII only; nothing was started.")
+
 # The account, not a minted pass: the pass the edge accepts lives 600 seconds,
 # so a lane handed a bare token cannot renew it and dies when it expires.
 settings = {"email": email, "password": password, "country": country.upper(), "carrier": carrier}
+if fxa_user_agent:
+    settings["fxaUserAgent"] = fxa_user_agent
 # The session the first sign-in leaves: later launches mint from it instead of
 # signing in again, which is what keeps FxA from mailing a new-sign-in notice.
 if token_file:
@@ -2480,6 +2497,10 @@ while [ $# -gt 0 ]; do
         *) die "--carrier wants auto, h1, h2 or h3, got '$2'; nothing was started." ;;
       esac
       CARRIER_SET=1; shift 2 ;;
+    --fxa-user-agent)
+      need_value --fxa-user-agent "a printable ASCII User-Agent" "$#" "${2:-}"
+      printable_ascii "$2" || die "--fxa-user-agent wants printable ASCII only; nothing was started."
+      FXA_USER_AGENT="$2"; shift 2 ;;
     --upstream) need_value --upstream "an http:// or socks5:// URL" "$#" "${2:-}"; UPSTREAM="$2"; shift 2 ;;
     --exclude-domains) need_value --exclude-domains "comma-separated domain suffixes" "$#" "${2:-}"; EXCLUDE_DOMAINS="$2"; shift 2 ;;
     --exclude-ports) need_value --exclude-ports "comma-separated ports" "$#" "${2:-}"; EXCLUDE_PORTS="$2"; shift 2 ;;
@@ -2513,6 +2534,9 @@ fi
 # Excluded targets leave the tunnel unencrypted, so the lists are foxy-only and refused before a lane is touched.
 if [ -n "$EXCLUDE_DOMAINS$EXCLUDE_PORTS" ] && [ "$OUTBOUND" != foxy ]; then
   die "--exclude-domains and --exclude-ports belong to the foxy lane; nothing was started."
+fi
+if [ -n "$FXA_USER_AGENT" ] && [ "$OUTBOUND" != foxy ]; then
+  die "--fxa-user-agent belongs to the foxy lane; nothing was started."
 fi
 
 if [ "$ALL" = 1 ]; then

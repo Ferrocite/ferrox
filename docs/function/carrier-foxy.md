@@ -2,6 +2,8 @@
 
 The Foxy lane is an account-authenticated CONNECT tunnel to a CDN edge: a Firefox Accounts login, a Guardian proxy pass, an edge list pinned to one country, and then the tunnel. The page above it is the account plane; this one is the four ways the tunnel's bytes can be carried, because that is what a connection method is:
 
+**One desktop Firefox identity is earned and presented by the same client.** The FxA edge refuses the `MozillaVPN/...` agent at the UA class, so `/account/login`, `/oauth/token`, `/session/verify_code`, the challenge page, its script and its post-back all carry one pinned identity: `Mozilla/5.0 (X11; Linux x86_64; rv:159.0) Gecko/20100101 Firefox/159.0`. `FIREFOX_VERSION` and `BROWSER_AGENT` move together, and `scripts/update-firefox-version.py` moves both from Mozilla's stable metadata on a schedule; the binary reads no network for its identity. `--fxa-user-agent` / `fxaUserAgent` overrides the text only after printable-ASCII validation, and an empty or absent value restores the pin. The page solver presents the identity that fetched the page — Firefox under FxA, `MozillaVPN/...` when the old account path earns its own challenge — so a revert that refuses Firefox still signs in. `the_pinned_identity_is_a_desktop_firefox` gates the pin's shape, `the_firefox_identity_clears_an_agent_class_refusal` the FxA denial, `the_old_identity_clears_a_firefox_refusal` the revert, and `an_override_is_printable_ascii_and_trims_to_nothing` the override. What is **not** removed: Guardian and Remote Settings keep `MozillaVPN/...`, an unanswered FxA call still falls back to the account path, and an explicit override is not chased by the daily workflow.
+
 | carrier | ALPN | what it is |
 | --- | --- | --- |
 | `h1` | `http/1.1` | CONNECT, then the target's own bytes |
@@ -390,7 +392,7 @@ This is a TCP-front behavior: the association that ends is the relayed flow, so 
 What a change here owes, read by `scripts/ci-scope.py`; see [`docs/ci-scope.md`](../ci-scope.md).
 
 <!-- scope:begin -->
-- paths: crates/ferrox-app/src/foxy.rs, crates/ferrox-app/src/foxy_account.rs, crates/ferrox-app/src/foxy_catalog.rs, crates/ferrox-app/src/foxy_challenge.rs, crates/ferrox-app/src/foxy_live.rs, crates/ferrox-core/src/foxy/*
+- paths: crates/ferrox-app/src/foxy.rs, crates/ferrox-app/src/foxy_account.rs, crates/ferrox-app/src/foxy_browser.rs, crates/ferrox-app/src/foxy_catalog.rs, crates/ferrox-app/src/foxy_challenge.rs, crates/ferrox-app/src/foxy_live.rs, crates/ferrox-core/src/foxy/*, scripts/update-firefox-version.py, .github/workflows/update-firefox-version.yml
 - symbols: foxy, FoxyOpen, probe_edge_exit
 - go: ./transport/internet/masque/...
 <!-- scope:end -->

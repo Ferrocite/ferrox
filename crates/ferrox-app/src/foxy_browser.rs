@@ -146,7 +146,7 @@ pub(crate) fn login(email: &str, token_file: &str, code: Option<&str>, no_open: 
         exit("the sign-in did not hand over a usable authorization code");
     };
     let body = verify_body(&code, &verifier);
-    let reply = crate::foxy_challenge::send_with_challenge(
+    let reply = crate::foxy_challenge::send_fxa(
         &endpoint,
         &jar,
         "POST",

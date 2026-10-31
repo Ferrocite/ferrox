@@ -784,8 +784,10 @@ pub(crate) fn ask(
 
 /// The browser plane's challenge only exists over HTTP/2 on the real Firefox host; every other host, and every pinned loopback edge, stays HTTP/1.1.
 fn wants_h2(endpoint: &Endpoint, agent: crate::foxy_challenge::Agent) -> bool {
-    agent != crate::foxy_challenge::Agent::Api
-        && endpoint.address.is_none()
+    !matches!(
+        agent,
+        crate::foxy_challenge::Agent::Api | crate::foxy_challenge::Agent::Fxa
+    ) && endpoint.address.is_none()
         && endpoint.host.ends_with("firefox.com")
 }
 
@@ -801,12 +803,13 @@ pub(crate) fn send(
 ) -> Result<Reply, Denied> {
     // The API is served under the origin's prefix; the challenge at its root, so only the API takes it.
     let url = match agent {
-        crate::foxy_challenge::Agent::Api => endpoint.url(path),
+        crate::foxy_challenge::Agent::Api | crate::foxy_challenge::Agent::Fxa => endpoint.url(path),
         _ => path.to_owned(),
     };
     let cookie = jar.lock().ok().and_then(|jar| jar.header(&endpoint.host));
+    let user_agent = agent.user_agent();
     let mut headers: Vec<(&str, &str)> = Vec::with_capacity(extra.len() + 4);
-    headers.push(("User-Agent", agent.user_agent()));
+    headers.push(("User-Agent", user_agent.as_ref()));
     headers.push(("Accept", agent.accept()));
     headers.push(("Connection", "close"));
     headers.extend_from_slice(extra);
@@ -906,7 +909,7 @@ fn login_on(
 ) -> Result<Login, Denied> {
     for method in [None, Some("email-2fa")] {
         let body = account::login_body(email, stretched, method);
-        let reply = foxy_challenge::send_with_challenge(
+        let reply = foxy_challenge::send_fxa(
             endpoint,
             jar,
             "POST",
@@ -978,16 +981,15 @@ pub(crate) fn token(
             if let Some(authorization) = authorization.as_deref() {
                 headers.push(("Authorization", authorization));
             }
-            let reply = match foxy_challenge::send_with_challenge(
-                &endpoint, jar, "POST", path, &headers, &body,
-            ) {
-                Ok(reply) => reply,
-                Err(denied) if host_may_fallback(&denied) => {
-                    last = denied;
-                    continue;
-                }
-                Err(denied) => return Err(denied),
-            };
+            let reply =
+                match foxy_challenge::send_fxa(&endpoint, jar, "POST", path, &headers, &body) {
+                    Ok(reply) => reply,
+                    Err(denied) if host_may_fallback(&denied) => {
+                        last = denied;
+                        continue;
+                    }
+                    Err(denied) => return Err(denied),
+                };
             match token_reply(&reply, refresh_token, timestamp, session_token.is_some()) {
                 Ok(auth) => return Ok(auth),
                 // A credential refusal on the origin's own route is the account's answer; the other spelling was only a probe, so ask the other host.
@@ -1151,6 +1153,7 @@ mod tests {
         let roots = Vec::new().into();
         let fxa = Endpoint::parse("https://oauth.accounts.firefox.com/v1", roots).expect("parses");
         assert!(!wants_h2(&fxa, crate::foxy_challenge::Agent::Api));
+        assert!(!wants_h2(&fxa, crate::foxy_challenge::Agent::Fxa));
         assert!(wants_h2(&fxa, crate::foxy_challenge::Agent::Page));
         assert!(wants_h2(&fxa, crate::foxy_challenge::Agent::Text));
         let pinned = Endpoint {
@@ -1654,7 +1657,7 @@ impl Account {
                 nonce: &nonce,
             }
             .header(&id, &mac);
-            let reply = match foxy_challenge::send_with_challenge(
+            let reply = match foxy_challenge::send_fxa(
                 &endpoint,
                 &self.jar,
                 "POST",
@@ -1898,11 +1901,53 @@ mod loopback {
     /// Whether the plane treats the entitlement as activated, which the activate-and-mint-again path turns on.
     pub(crate) static ACTIVE: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(true);
+    /// Whether the edge refuses the MozillaVPN agent on FxA calls, the UA-class denial the pinned Firefox identity clears.
+    pub(crate) static REFUSE_VPN_AGENT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    /// Whether the edge refuses the Firefox identity everywhere, the revert the old MozillaVPN path still has to clear.
+    pub(crate) static REFUSE_FIREFOX_AGENT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// Arms the UA-class refusal and clears it even when a test panics.
+    struct DenyVpnAgent;
+
+    impl DenyVpnAgent {
+        fn arm() -> Self {
+            REFUSE_VPN_AGENT.store(true, std::sync::atomic::Ordering::Relaxed);
+            Self
+        }
+    }
+
+    impl Drop for DenyVpnAgent {
+        fn drop(&mut self) {
+            REFUSE_VPN_AGENT.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    struct DenyFirefoxAgent;
+
+    impl DenyFirefoxAgent {
+        fn arm() -> Self {
+            REFUSE_FIREFOX_AGENT.store(true, std::sync::atomic::Ordering::Relaxed);
+            Self
+        }
+    }
+
+    impl Drop for DenyFirefoxAgent {
+        fn drop(&mut self) {
+            REFUSE_FIREFOX_AGENT.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn firefox_agent() -> String {
+        crate::foxy_challenge::Agent::Fxa.user_agent().into_owned()
+    }
 
     #[derive(Debug, Clone)]
     pub(crate) struct Seen {
         method: String,
         path: String,
+        host: String,
         agent: String,
         accept: String,
         cookie: Option<String>,
@@ -1922,6 +1967,7 @@ mod loopback {
         let mut seen = Seen {
             method,
             path,
+            host: String::new(),
             agent: String::new(),
             accept: String::new(),
             cookie: None,
@@ -1942,6 +1988,7 @@ mod loopback {
                 continue;
             };
             match name.to_ascii_lowercase().as_str() {
+                "host" => seen.host = value.trim().to_owned(),
                 "user-agent" => seen.agent = value.trim().to_owned(),
                 "accept" => seen.accept = value.trim().to_owned(),
                 "cookie" => seen.cookie = Some(value.trim().to_owned()),
@@ -2066,6 +2113,17 @@ mod loopback {
 
     fn answer(seen: &Seen, tx: &mpsc::Sender<Seen>) -> Vec<u8> {
         let _ = tx.send(seen.clone());
+        if REFUSE_FIREFOX_AGENT.load(std::sync::atomic::Ordering::Relaxed)
+            && seen.agent == firefox_agent()
+        {
+            return reply(406, &[], "");
+        }
+        if REFUSE_VPN_AGENT.load(std::sync::atomic::Ordering::Relaxed)
+            && seen.agent == USER_AGENT
+            && seen.path.starts_with("/v1/")
+        {
+            return reply(406, &[], "");
+        }
         let cleared = seen
             .cookie
             .as_deref()
@@ -2286,6 +2344,79 @@ mod loopback {
             seen.last().map(String::as_str),
             Some("GET /api/v1/fpn/token")
         );
+    }
+
+    /// A UA-class `406` on FxA is cleared by the pinned Firefox identity, with no challenge page in the log.
+    #[test]
+    fn the_firefox_identity_clears_an_agent_class_refusal() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        TWO_FACTOR.store(false, std::sync::atomic::Ordering::Relaxed);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _denied = DenyVpnAgent::arm();
+        let (address, roots, rx) = edge_with_log();
+        let account = account(address, roots);
+        account
+            .sign_in("person@example.com", "hunter2")
+            .expect("the Firefox identity clears the refusal");
+        let firefox = crate::foxy_challenge::Agent::Fxa.user_agent();
+        let log: Vec<Seen> = rx.try_iter().collect();
+        assert!(
+            log.iter().all(|seen| seen.path != "/"),
+            "no challenge page was fetched: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .filter(|seen| seen.host.ends_with("accounts.firefox.com"))
+                .all(|seen| seen.agent == firefox.as_ref()),
+            "every FxA call presents the Firefox identity: {log:?}"
+        );
+        assert!(
+            log.iter()
+                .filter(|seen| seen.host == "vpn.mozilla.org")
+                .all(|seen| seen.agent == USER_AGENT),
+            "the Guardian pass keeps the MozillaVPN identity: {log:?}"
+        );
+        assert!(
+            log.iter().any(|seen| seen.path == "/api/v1/fpn/token"),
+            "the pass was minted: {log:?}"
+        );
+    }
+
+    /// A revert that refuses the Firefox identity still signs in: the MozillaVPN path earns and presents its own cookie.
+    #[test]
+    fn the_old_identity_clears_a_firefox_refusal() {
+        let _turn = EDGE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        TWO_FACTOR.store(false, std::sync::atomic::Ordering::Relaxed);
+        ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _denied = DenyFirefoxAgent::arm();
+        let (address, roots, rx) = edge_with_log();
+        let account = account(address, roots);
+        account
+            .sign_in("person@example.com", "hunter2")
+            .expect("the old identity still signs in");
+        let log: Vec<Seen> = rx.try_iter().collect();
+        assert!(
+            log.iter()
+                .any(|seen| seen.agent == USER_AGENT && seen.path == "/v1/account/login"),
+            "the account call falls back to the MozillaVPN identity: {log:?}"
+        );
+        assert!(
+            log.iter().any(|seen| seen.agent == USER_AGENT
+                && seen.path == "/"
+                && seen.host.ends_with("accounts.firefox.com")),
+            "the solver earns the page under the identity it presents: {log:?}"
+        );
+        assert!(
+            log.iter().any(
+                |seen| seen.agent == USER_AGENT && seen.path.ends_with("script.js?reload=true")
+            ),
+            "the solver keeps that identity for its script: {log:?}"
+        );
+        assert!(account.current().token.starts_with("eyJ"), "and mints");
     }
 
     /// A login that only asks for email verification still exchanges: the password path does not need a browser.

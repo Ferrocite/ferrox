@@ -1,5 +1,6 @@
 //! A `406` from a Fastly host is a challenge ending in a cookie: without it the plane answers `406` forever.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::{IsTerminal as _, Write as _};
 use std::sync::Mutex;
@@ -14,6 +15,8 @@ use crate::json::{self, Json};
 pub(crate) enum Agent {
     /// The account plane: what the reference's Mozilla VPN client sends.
     Api,
+    /// A Firefox Accounts call under the pinned desktop Firefox identity the edge accepts and the solver presents.
+    Fxa,
     /// The challenge page and its script.
     Page,
     /// The challenge page asked for with the account client's own agent: an edge may serve the wall to one and not the other.
@@ -24,26 +27,61 @@ pub(crate) enum Agent {
 
 impl Agent {
     #[must_use]
-    pub(crate) fn user_agent(self) -> &'static str {
+    pub(crate) fn user_agent(self) -> Cow<'static, str> {
         match self {
-            Self::Api | Self::PageApi => crate::foxy_account::USER_AGENT,
-            Self::Page | Self::Text => BROWSER_AGENT,
+            Self::Api | Self::PageApi => Cow::Borrowed(crate::foxy_account::USER_AGENT),
+            Self::Fxa | Self::Page | Self::Text => fxa_user_agent(),
         }
     }
 
     #[must_use]
     pub(crate) fn accept(self) -> &'static str {
         match self {
-            Self::Api => crate::foxy_account::JSON_ACCEPT,
+            Self::Api | Self::Fxa => crate::foxy_account::JSON_ACCEPT,
             Self::Page | Self::PageApi => HTML_ACCEPT,
             Self::Text => "text/plain",
         }
     }
 }
 
+pub(crate) const FIREFOX_VERSION: &str = "159.0";
 const BROWSER_AGENT: &str =
-    "Mozilla/5.0 (X11; Linux x86_64; rv:148.0) Gecko/20100101 Firefox/148.0";
+    "Mozilla/5.0 (X11; Linux x86_64; rv:159.0) Gecko/20100101 Firefox/159.0";
 const BROWSER_LANGUAGE: &str = "en-US,en;q=0.5";
+
+static FXA_USER_AGENT: Mutex<Option<String>> = Mutex::new(None);
+
+/// One identity for both the FxA calls and the challenge solver: a solved cookie is bound to the client that earned it.
+fn fxa_user_agent() -> Cow<'static, str> {
+    match FXA_USER_AGENT
+        .lock()
+        .ok()
+        .and_then(|override_ua| override_ua.clone())
+    {
+        Some(override_ua) => Cow::Owned(override_ua),
+        None => Cow::Borrowed(BROWSER_AGENT),
+    }
+}
+
+/// Sets the identity both the FxA calls and the solver present; empty restores the pinned Firefox identity.
+pub(crate) fn set_fxa_user_agent(value: &str) -> Result<(), String> {
+    let value = validated_user_agent(value)?;
+    *FXA_USER_AGENT
+        .lock()
+        .map_err(|_| "the FxA identity lock is poisoned".to_owned())? = value;
+    Ok(())
+}
+
+fn validated_user_agent(value: &str) -> Result<Option<String>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if !value.bytes().all(|byte| (0x20..=0x7e).contains(&byte)) {
+        return Err("the FxA User-Agent must contain printable ASCII".to_owned());
+    }
+    Ok(Some(value.to_owned()))
+}
 const HTML_ACCEPT: &str = "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8";
 
 /// Rounds of post-back before the edge is taken at its word.
@@ -130,18 +168,67 @@ pub(crate) fn send_with_challenge(
     extra: &[(&str, &str)],
     body: &[u8],
 ) -> Result<Reply, Denied> {
+    if is_fxa_host(&endpoint.host) {
+        send_fxa(endpoint, jar, method, path, extra, body)
+    } else {
+        send_as(endpoint, jar, Agent::Api, method, path, extra, body)
+    }
+}
+
+/// A Firefox Accounts call, marked at the call site rather than by its host: the identity survives the account host moving.
+pub(crate) fn send_fxa(
+    endpoint: &Endpoint,
+    jar: &Mutex<Jar>,
+    method: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) -> Result<Reply, Denied> {
+    // The edge refuses the MozillaVPN agent as a UA class and binds a solved cookie to the identity that earned it, so the pinned Firefox identity goes first and solves under itself; the old MozillaVPN path stays as the fallback for a reverted edge.
+    match send_as(endpoint, jar, Agent::Fxa, method, path, extra, body) {
+        Ok(reply) => Ok(reply),
+        Err(Denied::Challenged(406)) => {
+            send_as(endpoint, jar, Agent::Api, method, path, extra, body)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// One identity's call, solved and retried under that same identity.
+fn send_as(
+    endpoint: &Endpoint,
+    jar: &Mutex<Jar>,
+    agent: Agent,
+    method: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) -> Result<Reply, Denied> {
     for attempt in 1..=MAX_ATTEMPTS {
-        let reply =
-            crate::foxy_account::send(endpoint, jar, Agent::Api, method, path, extra, body)?;
+        let reply = crate::foxy_account::send(endpoint, jar, agent, method, path, extra, body)?;
         if reply.status != 406 {
             return Ok(reply);
         }
         if attempt == MAX_ATTEMPTS {
             break;
         }
-        solve_reply(endpoint, jar, Some(&reply)).map_err(|_| Denied::Challenged(406))?;
+        solve_reply(endpoint, jar, Some(&reply), agent).map_err(|_| Denied::Challenged(406))?;
     }
     Err(Denied::Challenged(406))
+}
+
+/// The Firefox Accounts hosts whose edge refuses the MozillaVPN agent class; Remote Settings and Guardian are not among them.
+fn is_fxa_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("accounts.firefox.com")
+        || host.to_ascii_lowercase().ends_with(".accounts.firefox.com")
+}
+
+/// The page identities that may solve a challenge for a caller: the Firefox identity matching an FxA call, or the reference's two-page ladder for the MozillaVPN agent.
+fn solver_agents(agent: Agent) -> &'static [Agent] {
+    match agent {
+        Agent::Fxa => &[Agent::Page],
+        _ => &[Agent::Page, Agent::PageApi],
+    }
 }
 
 /// A challenged body may already be the page, so solve it before spending a GET; an empty one falls back to the host's own root.
@@ -149,6 +236,7 @@ fn solve_reply(
     endpoint: &Endpoint,
     jar: &Mutex<Jar>,
     reply: Option<&Reply>,
+    agent: Agent,
 ) -> Result<(), Challenge> {
     let mut asked = Vec::new();
     let mut last = Challenge::Absent;
@@ -159,7 +247,7 @@ fn solve_reply(
                 .filter(|origin| trusted_origin(origin, &endpoint.host))
                 .unwrap_or_else(|| format!("https://{}", endpoint.host));
             if let Some(challenged) = Endpoint::parse(&origin, endpoint.roots.clone()) {
-                match solve_page(&challenged, jar, &page) {
+                match solve_page(&challenged, jar, &page, solver_page(agent)) {
                     Ok(()) => return Ok(()),
                     Err(other) => last = other,
                 }
@@ -176,7 +264,7 @@ fn solve_reply(
         }
     }
     for host in &asked {
-        match solve_on(host, jar) {
+        match solve_on(host, jar, solver_agents(agent)) {
             Ok(()) => return Ok(()),
             Err(Challenge::Absent) => last = Challenge::Absent,
             Err(other) => last = other,
@@ -215,9 +303,9 @@ fn origin_of(page: &str) -> Option<String> {
     None
 }
 
-fn solve_on(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challenge> {
+fn solve_on(endpoint: &Endpoint, jar: &Mutex<Jar>, agents: &[Agent]) -> Result<(), Challenge> {
     let mut last = Challenge::Absent;
-    for agent in [Agent::Page, Agent::PageApi] {
+    for &agent in agents {
         let page = match get_as(endpoint, jar, "/", agent, None) {
             Ok(page) => page,
             Err(Challenge::Absent) => continue,
@@ -226,7 +314,7 @@ fn solve_on(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challenge> {
         if !looks_like_challenge(&page) {
             continue;
         }
-        match solve_page(endpoint, jar, &page) {
+        match solve_page(endpoint, jar, &page, agent) {
             Ok(()) => return Ok(()),
             Err(Challenge::Absent) => last = Challenge::Absent,
             Err(other) => last = other,
@@ -235,14 +323,27 @@ fn solve_on(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challenge> {
     Err(last)
 }
 
-fn solve_page(endpoint: &Endpoint, jar: &Mutex<Jar>, page: &str) -> Result<(), Challenge> {
+/// The page identity that earned a challenge body: FxA under Firefox, the account client under its own agent.
+fn solver_page(agent: Agent) -> Agent {
+    match agent {
+        Agent::Fxa => Agent::Page,
+        _ => Agent::PageApi,
+    }
+}
+
+fn solve_page(
+    endpoint: &Endpoint,
+    jar: &Mutex<Jar>,
+    page: &str,
+    agent: Agent,
+) -> Result<(), Challenge> {
     let prefix = prefix_of(page).ok_or(Challenge::Absent)?;
     let referer = format!("https://{}/", endpoint.host);
     let script = get_as(
         endpoint,
         jar,
         &format!("{prefix}/script.js?reload=true"),
-        Agent::Page,
+        agent,
         Some(&referer),
     )?;
     let (mut challenges, mut token) = parse_init(&script).ok_or(Challenge::Absent)?;
@@ -271,7 +372,7 @@ fn solve_page(endpoint: &Endpoint, jar: &Mutex<Jar>, page: &str) -> Result<(), C
         let reply = crate::foxy_account::send(
             endpoint,
             jar,
-            Agent::Page,
+            agent,
             "POST",
             &format!("{prefix}/fst-post-back"),
             &headers,
@@ -284,7 +385,7 @@ fn solve_page(endpoint: &Endpoint, jar: &Mutex<Jar>, page: &str) -> Result<(), C
         let answer =
             json::parse(&String::from_utf8_lossy(&reply.body)).map_err(|_| Challenge::Absent)?;
         if answer.get("status").and_then(Json::as_str) == Some("success") {
-            return confirm(endpoint, jar);
+            return confirm(endpoint, jar, agent);
         }
         let Some(next) = answer.get("ch").and_then(Json::as_arr) else {
             return Err(Challenge::Absent);
@@ -302,8 +403,8 @@ fn solve_page(endpoint: &Endpoint, jar: &Mutex<Jar>, page: &str) -> Result<(), C
 }
 
 /// The page must no longer be a challenge for the cookie to be worth keeping.
-fn confirm(endpoint: &Endpoint, jar: &Mutex<Jar>) -> Result<(), Challenge> {
-    let page = get_as(endpoint, jar, "/", Agent::Page, None)?;
+fn confirm(endpoint: &Endpoint, jar: &Mutex<Jar>, agent: Agent) -> Result<(), Challenge> {
+    let page = get_as(endpoint, jar, "/", agent, None)?;
     (!looks_like_challenge(&page))
         .then_some(())
         .ok_or(Challenge::Unsolved)
@@ -782,12 +883,65 @@ mod tests {
 
     #[test]
     fn an_agent_names_itself_and_its_accept() {
-        assert_eq!(Agent::Api.user_agent(), crate::foxy_account::USER_AGENT);
+        assert_eq!(
+            Agent::Api.user_agent().as_ref(),
+            crate::foxy_account::USER_AGENT
+        );
         assert_eq!(Agent::Page.accept(), HTML_ACCEPT);
         assert_eq!(Agent::Text.accept(), "text/plain");
         assert_eq!(Agent::Page.user_agent(), Agent::Text.user_agent());
         assert_ne!(Agent::Api.user_agent(), Agent::Page.user_agent());
         assert!(Agent::Page.user_agent().contains("Firefox"));
+        assert_eq!(Agent::Fxa.user_agent(), Agent::Page.user_agent());
+        assert_ne!(Agent::Fxa.user_agent(), Agent::Api.user_agent());
+        assert_eq!(Agent::Fxa.accept(), crate::foxy_account::JSON_ACCEPT);
+    }
+
+    #[test]
+    fn the_pinned_identity_is_a_desktop_firefox() {
+        assert!(FIREFOX_VERSION.ends_with(".0"));
+        let major = FIREFOX_VERSION.split('.').next().expect("a version");
+        assert!(BROWSER_AGENT.contains(&format!("rv:{major}.0")));
+        assert!(BROWSER_AGENT.contains(&format!("Firefox/{FIREFOX_VERSION}")));
+        assert!(BROWSER_AGENT.contains("X11; Linux x86_64"));
+    }
+
+    #[test]
+    fn an_override_is_printable_ascii_and_trims_to_nothing() {
+        assert_eq!(
+            validated_user_agent("  Firefox/1.0  "),
+            Ok(Some("Firefox/1.0".to_owned()))
+        );
+        assert_eq!(validated_user_agent("   "), Ok(None));
+        for value in [
+            "Firefox\r\nInjected: x",
+            "Firefox\n",
+            "Firefox\t",
+            "Firefox\u{7f}",
+            "火狐",
+        ] {
+            assert!(validated_user_agent(value).is_err(), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_accounts_hosts_are_asked_as_fxa() {
+        assert!(is_fxa_host("accounts.firefox.com"));
+        assert!(is_fxa_host("oauth.accounts.firefox.com"));
+        assert!(is_fxa_host("API.ACCOUNTS.FIREFOX.COM"));
+        assert!(!is_fxa_host("firefox.settings.services.mozilla.com"));
+        assert!(!is_fxa_host("vpn.mozilla.org"));
+        assert!(!is_fxa_host("accounts.firefox.com.evil"));
+        assert!(!is_fxa_host("evilaccounts.firefox.com"));
+    }
+
+    #[test]
+    fn an_fxa_call_is_solved_by_the_identity_it_presents() {
+        assert_eq!(solver_agents(Agent::Fxa), [Agent::Page].as_slice());
+        assert_eq!(
+            solver_agents(Agent::Api),
+            [Agent::Page, Agent::PageApi].as_slice()
+        );
     }
 
     #[test]
@@ -855,7 +1009,10 @@ mod tests {
 
     #[test]
     fn the_account_client_can_ask_for_the_same_page() {
-        assert_eq!(Agent::PageApi.user_agent(), crate::foxy_account::USER_AGENT);
+        assert_eq!(
+            Agent::PageApi.user_agent().as_ref(),
+            crate::foxy_account::USER_AGENT
+        );
         assert_eq!(Agent::PageApi.accept(), HTML_ACCEPT);
         assert_ne!(Agent::PageApi.user_agent(), Agent::Page.user_agent());
     }
