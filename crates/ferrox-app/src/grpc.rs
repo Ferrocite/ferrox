@@ -1039,10 +1039,10 @@ impl GrpcWriter {
         batch.flush_blocking(&self.shared)
     }
 
-    /// The same frames as `send`, but a window the peer has not granted parks the bytes after one
-    /// bounded turn instead of holding the worker the lane that reads the credit needs. A message
-    /// is the unit a window pays for, so it is taken whole: a half-sent one cannot be offered again
-    /// without duplicating the half the peer already has.
+    /// The same frames as `send`, but a window the peer has not granted parks the bytes instead of
+    /// holding the worker the lane that reads the credit needs. A message is the unit a window
+    /// pays for, so it is taken whole: a half-sent one cannot be offered again without duplicating
+    /// the half the peer already has.
     fn try_send(&self, data: &[u8]) -> crate::proxy::Push {
         if self.shared.dead.load(Ordering::SeqCst) {
             return crate::proxy::Push::Lost;
@@ -1078,11 +1078,7 @@ impl GrpcWriter {
                 {
                     return stop;
                 }
-                // Only a flush this call made can earn the update; nothing new on the wire gives the peer no reason to grant.
-                let deadline = Instant::now() + crate::budgets::RELAY_POLL;
-                if flushed == 0 || !take_window_until(&self.shared, total as u64, Some(deadline)) {
-                    return Self::took_or_parked(flushed);
-                }
+                return Self::took_or_parked(flushed);
             }
             let mut at = 0;
             while at < total {
@@ -1135,6 +1131,17 @@ impl GrpcWriter {
             Ok(mut stream) => stream.settle(),
             Err(_) => Settle::Lost,
         }
+    }
+
+    /// A parked relay turn ends on the peer's `WINDOW_UPDATE`; a wake that raced the park leaves the
+    /// full turn, which is the poll it would have paid anyway.
+    pub(crate) fn wait_for_room(&self, turn: Duration) {
+        let send = self
+            .shared
+            .send
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let _ = self.shared.wake.wait_timeout(send, turn);
     }
 
     pub(crate) fn upload_done(&self) {
@@ -1853,6 +1860,10 @@ impl crate::proxy::CarrierSink for GrpcWriter {
         self.settle()
     }
     #[inline]
+    fn wait_for_room(&self, turn: Duration) {
+        self.wait_for_room(turn);
+    }
+    #[inline]
     fn close(&self) {
         self.close();
     }
@@ -2388,27 +2399,28 @@ mod tests {
         assert_eq!(verdict, Ok(false), "a writer with no credit returned");
     }
 
-    /// A relay write whose next message has no window spends one poll quantum waiting for the
-    /// update its own flush earns, and only then gives the lane back: a peer that grants nothing
-    /// still costs a turn, but a peer that grants for the bytes it just read wakes the writer
-    /// instead of pacing it at one window per quantum.
+    /// A parked relay turn ends on the update its own flush earns: a peer that grants nothing still
+    /// costs the turn it already cost, and a peer that grants for the bytes it just read wakes the
+    /// lane instead of pacing it at one window per quantum.
     #[test]
-    fn a_parked_try_send_waits_one_quantum() {
-        let writer = writer_over(
-            Recorder(Arc::new(Mutex::new(Peer::default()))),
-            HUNK,
-            HUNK as u64,
-        );
-        let data = vec![0u8; 2 * HUNK];
+    fn a_window_update_ends_a_parked_room_wait() {
+        let writer = writer_over(Recorder(Arc::new(Mutex::new(Peer::default()))), HUNK, 0);
+        let shared = Arc::clone(&writer.shared);
+        let grant = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            {
+                let mut send = shared.send.lock().unwrap_or_else(PoisonError::into_inner);
+                send.conn = u64::MAX;
+                send.stream = u64::MAX;
+            }
+            shared.wake.notify_all();
+        });
         let began = Instant::now();
-        let pushed = writer.try_send(&data);
+        writer.wait_for_room(Duration::from_secs(2));
+        grant.join().expect("the granter ran");
         assert!(
-            matches!(pushed, crate::proxy::Push::Took(n) if n > 0),
-            "the flush that earned the update was not returned"
-        );
-        assert!(
-            began.elapsed() >= crate::budgets::RELAY_POLL,
-            "the parked write gave the lane back without waiting for the update"
+            began.elapsed() < Duration::from_secs(2),
+            "the update woke the parked relay turn before its deadline"
         );
     }
 
