@@ -38716,6 +38716,41 @@ mod tests {
         );
     }
 
+    /// The reference takes the flat settings whenever `address` is set, so a `vnext` beside it is
+    /// the entry it leaves unused; an `address` that names no server is the one case where this
+    /// tree reads the `vnext` the reference would have dialled empty.
+    #[test]
+    fn a_flat_outbound_beside_a_vnext_takes_the_flat_account() {
+        let both = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vmess", "settings": {
+                "address": "192.0.2.1", "port": 443,
+                "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "vnext": [{"address": "198.51.100.9", "port": 8443,
+                    "users": [{"id": "11111111-2222-3333-4444-555555555555"}]}]}}]}"#,
+        )
+        .expect("parses");
+        let out = find_vmess_outbound(&both).expect("the flat entry dials");
+        assert_eq!(out.address, "192.0.2.1");
+        assert_eq!(out.port, 443);
+        assert_eq!(
+            out.id,
+            uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id")
+        );
+        let blank = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vmess", "settings": {
+                "address": "",
+                "vnext": [{"address": "192.0.2.1", "port": 443,
+                    "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}]}}]}"#,
+        )
+        .expect("parses");
+        let out = find_vmess_outbound(&blank).expect("the vnext entry dials");
+        assert_eq!(out.address, "192.0.2.1", "an empty address names no server");
+        assert_eq!(
+            out.id,
+            uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id")
+        );
+    }
+
     // A ladder walk dials one uplink per rung, so a test server serves the bound rather than one connection.
     const LADDER_TEST_UPLINKS: usize = 6;
 
