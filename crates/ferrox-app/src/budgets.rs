@@ -10,6 +10,9 @@ pub(crate) const HANDSHAKE_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(crate) const RELAY_POLL: Duration = Duration::from_millis(1);
 
+/// A shaped handshake's read quantum: the core gives a hello 1500 polls, so 20 ms here is its 30 s budget.
+pub(crate) const HANDSHAKE_POLL: Duration = Duration::from_millis(20);
+
 /// How long a lane keeps reading after its sibling ended: a peer may answer after the FIN, and xray-core's own `UplinkOnly` default is one second. Past it the lane hands its thread back, so a peer that never answers cannot park it.
 pub(crate) const RELAY_RESPONSE_IDLE: Duration = Duration::from_secs(1);
 

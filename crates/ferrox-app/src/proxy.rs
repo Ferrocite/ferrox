@@ -9139,7 +9139,7 @@ impl Read for KcpIo {
         }
         // The directions share one half-lock, so a read that never returns wedges the other's write.
         let quantum = if KCP_HANDSHAKE_READ.with(std::cell::Cell::get) {
-            crate::quic::HANDSHAKE_TIMEOUT
+            crate::budgets::HANDSHAKE_POLL
         } else {
             RELAY_POLL
         };
@@ -45075,6 +45075,39 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "it answers within the poll quantum, not the idle timeout"
+        );
+        conn.close();
+    }
+
+    /// A shaped handshake's read waits the poll quantum, not the 30 s handshake clock: the shaped client's poll budget is what bounds a peer silent after the greeting.
+    #[test]
+    fn a_kcp_handshake_read_answers_in_the_poll_quantum() {
+        let listener = ferrox_core::kcp::Listener::bind(
+            "127.0.0.1:0".parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+        )
+        .expect("binds");
+        let conn = ferrox_core::kcp::dial(
+            listener.local_addr(),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        let _quantum = KcpHandshakeRead::enter();
+        let mut io = KcpIo::new(Arc::clone(&conn));
+        let started = std::time::Instant::now();
+        let mut buf = [0u8; 5];
+        let error = io
+            .read(&mut buf)
+            .expect_err("an empty handshake window yields rather than blocks");
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the retryable answer a shaped hello continues on"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "the shaped handshake polls a quantum, not the handshake clock"
         );
         conn.close();
     }
