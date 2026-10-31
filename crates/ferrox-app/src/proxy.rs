@@ -24715,6 +24715,21 @@ fn authenticated_length(client: &Json) -> bool {
         .is_some_and(|text| text.contains("AuthenticatedLength"))
 }
 
+/// The reference parses `security: "none"` as `auto`; only the authenticated length keeps that spelling out of the plain flow.
+fn vmess_cipher(account: &Json) -> crate::vmess::Cipher {
+    let cipher = crate::vmess::Cipher::parse(
+        account
+            .get("security")
+            .and_then(Json::as_str)
+            .unwrap_or("auto"),
+    );
+    if cipher == crate::vmess::Cipher::None && authenticated_length(account) {
+        crate::vmess::Cipher::Auto
+    } else {
+        cipher
+    }
+}
+
 fn inbound_id(inbound: &Json) -> [u8; 16] {
     inbound_first_client(inbound)
         .and_then(|client| client.get("id"))
@@ -25839,15 +25854,14 @@ fn loopback_dial(
         }
         "vmess" if matches!(stream_security(inbound), "" | "none") => {
             let (carrier, host) = loopback_carrier_of(inbound, address, tag)?;
-            let security = inbound_first_client(inbound).and_then(|client| client.get("security"));
-            let cipher =
-                crate::vmess::Cipher::parse(security.and_then(Json::as_str).unwrap_or("auto"));
+            let client = inbound_first_client(inbound);
+            let cipher = client.map_or(crate::vmess::Cipher::Auto, vmess_cipher);
             Ok(Outbound::Vmess(VmessOut {
                 address: address.to_owned(),
                 port,
                 id: inbound_id(inbound),
                 cipher,
-                auth_len: inbound_first_client(inbound).is_some_and(authenticated_length),
+                auth_len: client.is_some_and(authenticated_length),
                 carrier,
                 host,
                 tls: None,
@@ -27477,11 +27491,7 @@ fn find_vmess_outbound(root: &Json) -> Option<VmessOut> {
             .and_then(Json::as_arr)
             .and_then(|users| users.first())?;
         let id = user.get("id").and_then(Json::as_str).and_then(uuid_bytes)?;
-        let cipher = crate::vmess::Cipher::parse(
-            user.get("security")
-                .and_then(Json::as_str)
-                .unwrap_or("auto"),
-        );
+        let cipher = vmess_cipher(user);
         let auth_len = authenticated_length(user);
         if let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) {
             return Some(VmessOut {
@@ -35179,6 +35189,21 @@ mod tests {
                 .expect("finds the experiment")
                 .auth_len,
             "the account's experiments select the authenticated length"
+        );
+        let none = crate::json::parse(
+            r#"{"outbounds": [{"protocol": "vmess",
+                "settings": {"vnext": [{"address": "127.0.0.1", "port": 443,
+                    "users": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                        "security": "none", "experiments": "AuthenticatedLength|"}]}]},
+                "streamSettings": {"network": "tcp"}}]}"#,
+        )
+        .expect("parses");
+        let out = find_vmess_outbound(&none).expect("finds the experiment");
+        assert!(out.auth_len);
+        assert_eq!(
+            out.cipher,
+            crate::vmess::Cipher::Auto,
+            "security none is the reference's auto when the length is authenticated"
         );
         let _ = std::fs::remove_file(&ca);
     }
