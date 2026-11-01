@@ -2388,6 +2388,7 @@ mod tests {
         let mut fixed = vec![0u8; 11];
         fixed[1..9].copy_from_slice(&now_secs().to_be_bytes());
         fixed[9..11].copy_from_slice(&(variable.len() as u16).to_be_bytes());
+        let var_len = variable.len();
         let mut wire = Vec::new();
         let tag = cipher.seal_piece_in_place(&mut fixed).expect("seals");
         wire.extend_from_slice(&fixed);
@@ -2407,6 +2408,17 @@ mod tests {
         assert_eq!(
             counts.allocs, 1,
             "the header costs the sealed variable buffer and nothing else"
+        );
+        // The buffer is born inside `read_request_header`, so no caller address can be recorded beside it; what reaches from outside is the size of the one allocation and the capacity the returned vector still reports.
+        assert_eq!(
+            counts.bytes,
+            var_len + TAG_LEN,
+            "the single allocation is the sealed variable header, neither shorter nor larger"
+        );
+        assert_eq!(
+            data.capacity(),
+            var_len + TAG_LEN,
+            "and the returned bytes are that buffer: opened in place, truncated and drained, never reallocated"
         );
     }
 
