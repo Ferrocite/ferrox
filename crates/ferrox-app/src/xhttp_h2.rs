@@ -224,7 +224,14 @@ impl Read for H2StreamReader {
             }
             if self.conn.client_read.is_some() {
                 drop(st);
-                if !self.conn.pump_read() {
+                if !self.conn.pump_read(|| {
+                    let st = self
+                        .stream
+                        .state
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    !st.body.is_empty() || st.ended || st.dead
+                }) {
                     self.conn.forget_upload(self.id);
                     return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
                 }
@@ -469,7 +476,20 @@ impl H2Conn {
             if self.client_read.is_some() {
                 // A client's credit arrives on its reader's transport, so a parked writer pumps it itself.
                 drop(conn);
-                if !self.pump_read() {
+                if !self.pump_read(|| {
+                    if self.dead.load(Ordering::SeqCst) || stream.gone() {
+                        return true;
+                    }
+                    let conn = self
+                        .send_conn
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    let window = stream
+                        .send_window
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    *conn > 0 && *window > 0
+                }) {
                     return None;
                 }
                 conn = self
@@ -530,7 +550,6 @@ impl H2Conn {
             .remove(&stream);
         if let Some(state) = state {
             let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
-            st.ended = true;
             st.dead = true;
             state.cv.notify_all();
         }
@@ -717,12 +736,15 @@ impl H2Conn {
 impl H2Conn {
     /// A client's frames arrive on the same transport its reader consumes: one frame is parsed on
     /// demand, so a read and a credit-starved write both make progress without a parser thread.
-    fn pump_read(&self) -> bool {
+    fn pump_read(&self, ready: impl FnOnce() -> bool) -> bool {
         let Some(read) = self.client_read.as_ref() else {
             return false;
         };
         let frame = {
             let mut read = read.lock().unwrap_or_else(PoisonError::into_inner);
+            if ready() {
+                return true;
+            }
             let Some((len, kind, flags, sid)) = read_head_retry(&mut **read) else {
                 self.dead.store(true, Ordering::SeqCst);
                 return false;
@@ -748,12 +770,23 @@ impl H2Conn {
 }
 
 fn read_exact_retry(stream: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<()> {
+    let started = std::time::Instant::now();
     let mut at = 0;
     while at < buf.len() {
         match stream.read(&mut buf[at..]) {
             Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
             Ok(n) => at += n,
-            Err(error) if crate::proxy::is_timeout(&error) => {}
+            Err(error) if crate::proxy::is_timeout(&error) => {
+                if started.elapsed() >= crate::budgets::relay_stall() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "h2 frame stalled",
+                    ));
+                }
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    std::thread::sleep(crate::budgets::RELAY_POLL);
+                }
+            }
             Err(error) => return Err(error),
         }
     }

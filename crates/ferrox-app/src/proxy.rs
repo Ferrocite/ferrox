@@ -15928,7 +15928,8 @@ fn dial_vless_reality(
             vless,
             &header,
             client,
-            true,
+            // A sealed header is not served over H2 yet, so that pairing keeps H1.
+            vless.encryption.is_none(),
         ),
     }
 }
@@ -34247,7 +34248,7 @@ mod tests {
         flow: &str,
         network: &str,
     ) -> String {
-        reality_network_json_with_log(server_port, public_b64, flow, network, None)
+        reality_network_json_with_log(server_port, public_b64, flow, network, None, None)
     }
 
     fn reality_network_json_with_log(
@@ -34256,9 +34257,13 @@ mod tests {
         flow: &str,
         network: &str,
         log: Option<&str>,
+        xhttp_path: Option<&str>,
     ) -> String {
         let log = log
             .map(|path| format!(r#", "masterKeyLog": "{}""#, path.replace('\\', "\\\\")))
+            .unwrap_or_default();
+        let xhttp = xhttp_path
+            .map(|path| format!(r#", "xhttpSettings": {{"path": "{path}"}}"#))
             .unwrap_or_default();
         format!(
             r#"{{"outbounds": [{{"protocol": "vless", "settings": {{"vnext": [{{"address": "127.0.0.1",
@@ -34266,7 +34271,7 @@ mod tests {
             "streamSettings": {{"network": "{network}", "security": "reality",
             "realitySettings": {{"serverName": "{REALITY_TEST_SNI}",
             "publicKey": "{public_b64}", "shortId": "{REALITY_TEST_SHORT}",
-            "fingerprint": "chrome"{log}}}}}}}]}}"#,
+            "fingerprint": "chrome"{log}}}{xhttp}}}}}]}}"#,
         )
     }
 
@@ -34572,7 +34577,16 @@ mod tests {
     }
 
     fn reality_pair_with(flow: &str, network: &str, carrier: Carrier) -> RealityPair {
-        reality_pair_logged(flow, network, carrier, None)
+        reality_pair_logged(flow, network, carrier, None, None)
+    }
+
+    fn reality_pair_at_path(
+        flow: &str,
+        network: &str,
+        carrier: Carrier,
+        path: &str,
+    ) -> RealityPair {
+        reality_pair_logged(flow, network, carrier, None, Some(path))
     }
 
     fn reality_pair_logged(
@@ -34580,6 +34594,7 @@ mod tests {
         network: &str,
         carrier: Carrier,
         log: Option<&str>,
+        xhttp_path: Option<&str>,
     ) -> RealityPair {
         let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let echo_addr = echo.local_addr().expect("addr");
@@ -34632,6 +34647,7 @@ mod tests {
             flow,
             network,
             log,
+            xhttp_path,
         ))
         .expect("parses");
         let outbound = find_outbound(&root)
@@ -34733,7 +34749,13 @@ mod tests {
             std::env::temp_dir().join(format!("ferrox-reality-keylog-{}.log", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let named = path.to_string_lossy().into_owned();
-        let pair = reality_pair_logged("", "tcp", Carrier::Raw(Chain::default()), Some(&named));
+        let pair = reality_pair_logged(
+            "",
+            "tcp",
+            Carrier::Raw(Chain::default()),
+            Some(&named),
+            None,
+        );
         let (mut user, dialled) = dial_pair(&pair);
         assert_eq!(echo_bulk(&mut user, b"sealed"), b"sealed");
         drop(user);
@@ -34859,13 +34881,14 @@ mod tests {
     /// The reference chooses HTTP/2 for every REALITY xHTTP session (`decideHTTPVersion`, dialer.go:82), so the preface is the contract: an H1 head never carries this path.
     #[test]
     fn reality_xhttp_dial_opens_with_the_h2_preface() {
-        const WITNESS: &str = "/";
-        let pair = reality_pair_with(
+        const WITNESS: &str = "/h2-dial-witness";
+        let pair = reality_pair_at_path(
             "",
             "xhttp",
             Carrier::Xhttp {
                 settings: xhttp_settings(WITNESS),
             },
+            WITNESS,
         );
         let (mut user, dialled) = dial_pair(&pair);
         let payload: Vec<u8> = (0..4096u32)
