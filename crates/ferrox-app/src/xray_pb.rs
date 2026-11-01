@@ -175,6 +175,15 @@ pub(crate) fn inbound(bytes: &[u8]) -> Result<Vec<Json>, String> {
         "xray.proxy.vmess.inbound.Config" => ("vmess", vmess_inbound_settings(value)?),
         "xray.proxy.vless.inbound.Config" => ("vless", vless_inbound_settings(value)?),
         "xray.proxy.shadowsocks.ServerConfig" => ("shadowsocks", ss_inbound_settings(value)?),
+        "xray.proxy.shadowsocks_2022.ServerConfig" => {
+            ("shadowsocks", ss2022_server_settings(value)?)
+        }
+        "xray.proxy.shadowsocks_2022.MultiUserServerConfig" => {
+            ("shadowsocks", ss2022_multi_user_settings(value)?)
+        }
+        "xray.proxy.shadowsocks_2022.RelayServerConfig" => {
+            ("shadowsocks", ss2022_relay_settings(value)?)
+        }
         "xray.proxy.socks.ServerConfig" => ("socks", socks_inbound_settings(value)?),
         "xray.proxy.wireguard.DeviceConfig" => ("wireguard", wireguard_settings(value)?),
         "xray.proxy.masque.ServerConfig" => ("masque", masque_server_settings(value)?),
@@ -258,6 +267,10 @@ pub(crate) fn outbound(bytes: &[u8]) -> Result<Json, String> {
         "xray.proxy.shadowsocks.ClientConfig" => vec![
             ("protocol", Json::Str("shadowsocks".to_owned())),
             ("settings", ss_outbound_settings(value)?),
+        ],
+        "xray.proxy.shadowsocks_2022.ClientConfig" => vec![
+            ("protocol", Json::Str("shadowsocks".to_owned())),
+            ("settings", ss2022_outbound_settings(value)?),
         ],
         "xray.proxy.socks.ClientConfig" => vec![
             ("protocol", Json::Str("socks".to_owned())),
@@ -3170,6 +3183,351 @@ fn ss_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
     )]))
 }
 
+/// The networks a 2022 config opens, from one packed list or repeated fields: only tcp and udp reach a worker, as in the legacy conversion.
+fn ss2022_networks(items: &[u64]) -> Option<String> {
+    if items.is_empty() {
+        return None;
+    }
+    let mut opened: Vec<&str> = Vec::new();
+    for network in items {
+        let name = match network {
+            2 => "tcp",
+            3 => "udp",
+            _ => continue,
+        };
+        if !opened.contains(&name) {
+            opened.push(name);
+        }
+    }
+    Some(opened.join(","))
+}
+
+/// The one key a `shadowsocks_2022.Account` carries.
+fn ss2022_account(bytes: &[u8]) -> Result<String, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.shadowsocks_2022.Account");
+    let mut key = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => key = Some(account_text(&mut reader)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    key.ok_or("xray.proxy.shadowsocks_2022.Account: no key".to_owned())
+}
+
+/// The one client key a `users` entry of a 2022 multi-user config names, with the email and level its policy and stats key: a `common.protocol.User` around a 2022 account.
+fn ss2022_user(bytes: &[u8]) -> Result<(String, Option<String>, Option<u32>), String> {
+    let mut reader = Reader::new(bytes, "xray.common.protocol.User");
+    let mut key = None;
+    let mut level = None;
+    let mut email = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 0) => level = Some(reader.varint()?.try_into().unwrap_or(u32::MAX)),
+            (2, 2) => {
+                email = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| "xray.common.protocol.User: email is not utf-8".to_owned())?
+                        .to_owned(),
+                );
+            }
+            (3, 2) => {
+                let (name, value) = typed_message(reader.bytes()?)?;
+                if name != "xray.proxy.shadowsocks_2022.Account" {
+                    return Err(format!("shadowsocks 2022 account `{name}` is not carried"));
+                }
+                key = Some(ss2022_account(value)?);
+            }
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let key = key.ok_or("xray.common.protocol.User: no account".to_owned())?;
+    Ok((key, email, level))
+}
+
+/// A single-password 2022 server: the method and PSK the JSON inbound reads directly.
+fn ss2022_server_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.shadowsocks_2022.ServerConfig");
+    let mut method = None;
+    let mut key = None;
+    let mut email = None;
+    let mut level = None;
+    let mut networks = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => method = Some(account_text(&mut reader)?),
+            (2, 2) => key = Some(account_text(&mut reader)?),
+            (3, 2) => {
+                email = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.proxy.shadowsocks_2022.ServerConfig: email is not utf-8"
+                                .to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            (4, 0) => level = Some(reader.varint()?.try_into().unwrap_or(u32::MAX)),
+            (5, 2) => {
+                let mut packed =
+                    Reader::new(reader.bytes()?, "xray.proxy.shadowsocks_2022.ServerConfig");
+                while packed.more() {
+                    networks.push(packed.varint()?);
+                }
+            }
+            (5, 0) => networks.push(reader.varint()?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = vec![
+        (
+            "method",
+            Json::Str(
+                method.ok_or("xray.proxy.shadowsocks_2022.ServerConfig: no method".to_owned())?,
+            ),
+        ),
+        (
+            "password",
+            Json::Str(key.ok_or("xray.proxy.shadowsocks_2022.ServerConfig: no key".to_owned())?),
+        ),
+    ];
+    if let Some(email) = email {
+        pairs.push(("email", Json::Str(email)));
+    }
+    if let Some(level) = level {
+        pairs.push(("level", Json::Num(f64::from(level))));
+    }
+    if let Some(network) = ss2022_networks(&networks) {
+        pairs.push(("network", Json::Str(network)));
+    }
+    Ok(object(pairs))
+}
+
+/// A 2022 multi-user server arrives as a master key and one account per user; the JSON inbound reads the same list as one colon-joined password.
+fn ss2022_multi_user_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.shadowsocks_2022.MultiUserServerConfig");
+    let mut method = None;
+    let mut master = None;
+    let mut users = Vec::new();
+    let mut networks = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => method = Some(account_text(&mut reader)?),
+            (2, 2) => master = Some(account_text(&mut reader)?),
+            (3, 2) => users.push(ss2022_user(reader.bytes()?)?),
+            (4, 2) => {
+                let mut packed = Reader::new(
+                    reader.bytes()?,
+                    "xray.proxy.shadowsocks_2022.MultiUserServerConfig",
+                );
+                while packed.more() {
+                    networks.push(packed.varint()?);
+                }
+            }
+            (4, 0) => networks.push(reader.varint()?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut password = vec![master
+        .ok_or("xray.proxy.shadowsocks_2022.MultiUserServerConfig: no master key".to_owned())?];
+    password.extend(users.iter().map(|(key, _, _)| key.clone()));
+    let mut pairs = vec![
+        (
+            "method",
+            Json::Str(method.ok_or(
+                "xray.proxy.shadowsocks_2022.MultiUserServerConfig: no method".to_owned(),
+            )?),
+        ),
+        ("password", Json::Str(password.join(":"))),
+    ];
+    // The 2022 inbound keys each client off the encrypted identity header rather than this list, so the joined password stays the key ring and this array carries only each user's policy and stats identity.
+    let identities: Vec<Json> = users
+        .iter()
+        .map(|(_, email, level)| {
+            let mut id = Vec::new();
+            if let Some(email) = email {
+                id.push(("email", Json::Str(email.clone())));
+            }
+            if let Some(level) = level {
+                id.push(("level", Json::Num(f64::from(*level))));
+            }
+            object(id)
+        })
+        .collect();
+    if !identities.is_empty() {
+        pairs.push(("users", Json::Arr(identities)));
+    }
+    if let Some(network) = ss2022_networks(&networks) {
+        pairs.push(("network", Json::Str(network)));
+    }
+    Ok(object(pairs))
+}
+
+/// A 2022 relay server: the master key becomes the inbound's password and each destination keeps its own key, address and port.
+fn ss2022_relay_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.shadowsocks_2022.RelayServerConfig");
+    let mut method = None;
+    let mut master = None;
+    let mut destinations = Vec::new();
+    let mut networks = Vec::new();
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => method = Some(account_text(&mut reader)?),
+            (2, 2) => master = Some(account_text(&mut reader)?),
+            (3, 2) => destinations.push(ss2022_relay_destination(reader.bytes()?)?),
+            (4, 2) => {
+                let mut packed = Reader::new(
+                    reader.bytes()?,
+                    "xray.proxy.shadowsocks_2022.RelayServerConfig",
+                );
+                while packed.more() {
+                    networks.push(packed.varint()?);
+                }
+            }
+            (4, 0) => networks.push(reader.varint()?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = vec![
+        (
+            "method",
+            Json::Str(
+                method
+                    .ok_or("xray.proxy.shadowsocks_2022.RelayServerConfig: no method".to_owned())?,
+            ),
+        ),
+        (
+            "password",
+            Json::Str(master.ok_or(
+                "xray.proxy.shadowsocks_2022.RelayServerConfig: no master key".to_owned(),
+            )?),
+        ),
+        ("destinations", Json::Arr(destinations)),
+    ];
+    if let Some(network) = ss2022_networks(&networks) {
+        pairs.push(("network", Json::Str(network)));
+    }
+    Ok(object(pairs))
+}
+
+/// One relay destination: its key, address and port, with the email and level the reference keys its policy and stats on.
+fn ss2022_relay_destination(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.shadowsocks_2022.RelayDestination");
+    let mut key = None;
+    let mut address = None;
+    let mut port = None;
+    let mut email = None;
+    let mut level = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => key = Some(account_text(&mut reader)?),
+            (2, 2) => address = Some(ip_or_domain(reader.bytes()?)?),
+            (3, 0) => {
+                let value = reader.varint()?;
+                port = Some(u16::try_from(value).map_err(|_| {
+                    format!(
+                        "xray.proxy.shadowsocks_2022.RelayDestination: port {value} is above 65535"
+                    )
+                })?);
+            }
+            (4, 2) => {
+                email = Some(
+                    std::str::from_utf8(reader.bytes()?)
+                        .map_err(|_| {
+                            "xray.proxy.shadowsocks_2022.RelayDestination: email is not utf-8"
+                                .to_owned()
+                        })?
+                        .to_owned(),
+                );
+            }
+            (5, 0) => level = Some(reader.varint()?.try_into().unwrap_or(u32::MAX)),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    let mut pairs = vec![
+        (
+            "key",
+            Json::Str(
+                key.ok_or("xray.proxy.shadowsocks_2022.RelayDestination: no key".to_owned())?,
+            ),
+        ),
+        (
+            "address",
+            Json::Str(
+                address
+                    .ok_or("xray.proxy.shadowsocks_2022.RelayDestination: no address".to_owned())?,
+            ),
+        ),
+        (
+            "port",
+            Json::Num(f64::from(port.ok_or(
+                "xray.proxy.shadowsocks_2022.RelayDestination: no port".to_owned(),
+            )?)),
+        ),
+    ];
+    if let Some(email) = email {
+        pairs.push(("email", Json::Str(email)));
+    }
+    if let Some(level) = level {
+        pairs.push(("level", Json::Num(f64::from(level))));
+    }
+    Ok(object(pairs))
+}
+
+/// A 2022 outbound dials the one server its config names: the same endpoint shape, with the method and key in the entry the JSON path reads.
+fn ss2022_outbound_settings(bytes: &[u8]) -> Result<Json, String> {
+    let mut reader = Reader::new(bytes, "xray.proxy.shadowsocks_2022.ClientConfig");
+    let mut address = None;
+    let mut port = None;
+    let mut method = None;
+    let mut key = None;
+    while let Some((field, wire)) = reader.field()? {
+        match (field, wire) {
+            (1, 2) => address = Some(ip_or_domain(reader.bytes()?)?),
+            (2, 0) => {
+                let value = reader.varint()?;
+                port = Some(u16::try_from(value).map_err(|_| {
+                    format!("xray.proxy.shadowsocks_2022.ClientConfig: port {value} is above 65535")
+                })?);
+            }
+            (3, 2) => method = Some(account_text(&mut reader)?),
+            (4, 2) => key = Some(account_text(&mut reader)?),
+            _ => return Err(reader.refuse(field, wire)),
+        }
+    }
+    Ok(object(vec![(
+        "servers",
+        Json::Arr(vec![object(vec![
+            (
+                "address",
+                Json::Str(
+                    address
+                        .ok_or("xray.proxy.shadowsocks_2022.ClientConfig: no address".to_owned())?,
+                ),
+            ),
+            (
+                "port",
+                Json::Num(f64::from(port.ok_or(
+                    "xray.proxy.shadowsocks_2022.ClientConfig: no port".to_owned(),
+                )?)),
+            ),
+            (
+                "method",
+                Json::Str(
+                    method
+                        .ok_or("xray.proxy.shadowsocks_2022.ClientConfig: no method".to_owned())?,
+                ),
+            ),
+            (
+                "password",
+                Json::Str(
+                    key.ok_or("xray.proxy.shadowsocks_2022.ClientConfig: no key".to_owned())?,
+                ),
+            ),
+        ])]),
+    )]))
+}
+
 /// A socks server: the authentication it asks for and the accounts it accepts.
 ///
 /// The accounts arrive as a protobuf map — one entry per account, the name in the
@@ -5401,6 +5759,313 @@ mod tests {
             client.get("method").and_then(Json::as_str),
             Some("chacha20-ietf-poly1305")
         );
+    }
+
+    fn ss2022_account(key: &[u8]) -> Vec<u8> {
+        typed("xray.proxy.shadowsocks_2022.Account", &bytes_field(1, key))
+    }
+
+    fn ss2022_user(key: &[u8]) -> Vec<u8> {
+        message(&[bytes_field(3, &ss2022_account(key))])
+    }
+
+    fn ss2022_inbound(port: u64, name: &str, settings: &[u8]) -> Vec<u8> {
+        message(&[
+            bytes_field(
+                2,
+                &typed("xray.app.proxyman.ReceiverConfig", &receiver(port, None)),
+            ),
+            bytes_field(3, &typed(name, settings)),
+        ])
+    }
+
+    #[test]
+    fn a_shadowsocks_2022_scenario_decodes_both_roles() {
+        let key = b"MDEyMzQ1Njc4OWFiY2RlZg==";
+        let inbound = ss2022_inbound(
+            5000,
+            "xray.proxy.shadowsocks_2022.ServerConfig",
+            &message(&[
+                bytes_field(1, b"2022-blake3-aes-256-gcm"),
+                bytes_field(2, key),
+                bytes_field(5, &[3]),
+            ]),
+        );
+        let endpoint = message(&[
+            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+            varint_field(2, 443),
+            bytes_field(3, b"2022-blake3-aes-128-gcm"),
+            bytes_field(4, b"MDEyMzQ1Njc4OWFiY2RlZg=="),
+        ]);
+        let outbound = message(&[bytes_field(
+            3,
+            &typed("xray.proxy.shadowsocks_2022.ClientConfig", &endpoint),
+        )]);
+        let json = to_json(&config(&inbound, &outbound)).expect("2022 decodes both roles");
+        let server = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0];
+        assert_eq!(
+            server.get("protocol").and_then(Json::as_str),
+            Some("shadowsocks")
+        );
+        let settings = server.get("settings").expect("settings");
+        assert_eq!(
+            settings.get("method").and_then(Json::as_str),
+            Some("2022-blake3-aes-256-gcm")
+        );
+        assert_eq!(
+            settings.get("password").and_then(Json::as_str),
+            Some("MDEyMzQ1Njc4OWFiY2RlZg==")
+        );
+        assert_eq!(settings.get("network").and_then(Json::as_str), Some("udp"));
+        let client = &json
+            .get("outbounds")
+            .and_then(Json::as_arr)
+            .expect("outbounds")[0]
+            .get("settings")
+            .expect("settings")
+            .get("servers")
+            .and_then(Json::as_arr)
+            .expect("servers")[0];
+        assert_eq!(
+            client.get("address").and_then(Json::as_str),
+            Some("127.0.0.1")
+        );
+        assert_eq!(client.get("port").and_then(Json::as_port), Some(443));
+        assert_eq!(
+            client.get("method").and_then(Json::as_str),
+            Some("2022-blake3-aes-128-gcm")
+        );
+    }
+
+    #[test]
+    fn a_2022_multi_user_config_becomes_one_colon_password() {
+        let settings = message(&[
+            bytes_field(1, b"2022-blake3-aes-128-gcm"),
+            bytes_field(2, b"bWFzdGVyLWtleQ=="),
+            bytes_field(3, &ss2022_user(b"dXNlci1rZXktMQ==")),
+            bytes_field(3, &ss2022_user(b"dXNlci1rZXktMg==")),
+            bytes_field(4, &[2]),
+        ]);
+        let inbound = ss2022_inbound(
+            5000,
+            "xray.proxy.shadowsocks_2022.MultiUserServerConfig",
+            &settings,
+        );
+        let json = to_json(&config(&inbound, &freedom_outbound())).expect("multi-user decodes");
+        let settings = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .expect("settings");
+        assert_eq!(
+            settings.get("password").and_then(Json::as_str),
+            Some("bWFzdGVyLWtleQ==:dXNlci1rZXktMQ==:dXNlci1rZXktMg=="),
+            "the master and each client key join one colon list the inbound pins"
+        );
+        assert_eq!(settings.get("network").and_then(Json::as_str), Some("tcp"));
+    }
+
+    #[test]
+    fn a_2022_relay_config_carries_each_destination() {
+        let destination = message(&[
+            bytes_field(1, b"ZGVzdC1rZXk="),
+            bytes_field(2, &bytes_field(1, &[10, 0, 0, 1])),
+            varint_field(3, 8443),
+        ]);
+        let settings = message(&[
+            bytes_field(1, b"2022-blake3-aes-256-gcm"),
+            bytes_field(2, b"bWFzdGVyLWtleQ=="),
+            bytes_field(3, &destination),
+        ]);
+        let inbound = ss2022_inbound(
+            5000,
+            "xray.proxy.shadowsocks_2022.RelayServerConfig",
+            &settings,
+        );
+        let json = to_json(&config(&inbound, &freedom_outbound())).expect("relay decodes");
+        let settings = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .expect("settings");
+        assert_eq!(
+            settings.get("password").and_then(Json::as_str),
+            Some("bWFzdGVyLWtleQ==")
+        );
+        let dests = settings
+            .get("destinations")
+            .and_then(Json::as_arr)
+            .expect("destinations");
+        assert_eq!(dests.len(), 1);
+        assert_eq!(
+            dests[0].get("key").and_then(Json::as_str),
+            Some("ZGVzdC1rZXk=")
+        );
+        assert_eq!(
+            dests[0].get("address").and_then(Json::as_str),
+            Some("10.0.0.1")
+        );
+        assert_eq!(dests[0].get("port").and_then(Json::as_port), Some(8443));
+    }
+
+    #[test]
+    fn a_2022_single_server_keeps_its_email_and_level() {
+        let inbound = ss2022_inbound(
+            5000,
+            "xray.proxy.shadowsocks_2022.ServerConfig",
+            &message(&[
+                bytes_field(1, b"2022-blake3-aes-256-gcm"),
+                bytes_field(2, b"MDEyMzQ1Njc4OWFiY2RlZg=="),
+                bytes_field(3, b"operator@example.com"),
+                varint_field(4, 7),
+            ]),
+        );
+        let json = to_json(&config(&inbound, &freedom_outbound())).expect("server decodes");
+        let settings = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .expect("settings");
+        assert_eq!(
+            settings.get("email").and_then(Json::as_str),
+            Some("operator@example.com"),
+            "the account email the inbound's identity reads survives decoding"
+        );
+        assert_eq!(settings.get("level").and_then(Json::as_u32), Some(7));
+    }
+
+    #[test]
+    fn a_2022_multi_user_config_keeps_each_identity() {
+        let user = |level: u64, email: &[u8], key: &[u8]| {
+            message(&[
+                varint_field(1, level),
+                bytes_field(2, email),
+                bytes_field(3, &ss2022_account(key)),
+            ])
+        };
+        let settings = message(&[
+            bytes_field(1, b"2022-blake3-aes-128-gcm"),
+            bytes_field(2, b"bWFzdGVyLWtleQ=="),
+            bytes_field(3, &user(3, b"alice@example.com", b"dXNlci1rZXktMQ==")),
+            bytes_field(3, &user(5, b"bob@example.com", b"dXNlci1rZXktMg==")),
+        ]);
+        let inbound = ss2022_inbound(
+            5000,
+            "xray.proxy.shadowsocks_2022.MultiUserServerConfig",
+            &settings,
+        );
+        let json = to_json(&config(&inbound, &freedom_outbound())).expect("multi-user decodes");
+        let settings = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .expect("settings");
+        assert_eq!(
+            settings.get("password").and_then(Json::as_str),
+            Some("bWFzdGVyLWtleQ==:dXNlci1rZXktMQ==:dXNlci1rZXktMg=="),
+            "the keys still join the one list the 2022 inbound pins"
+        );
+        let users = settings
+            .get("users")
+            .and_then(Json::as_arr)
+            .expect("per-user identities");
+        assert_eq!(users.len(), 2);
+        assert_eq!(
+            users[0].get("email").and_then(Json::as_str),
+            Some("alice@example.com")
+        );
+        assert_eq!(users[0].get("level").and_then(Json::as_u32), Some(3));
+        assert_eq!(
+            users[1].get("email").and_then(Json::as_str),
+            Some("bob@example.com")
+        );
+        assert_eq!(users[1].get("level").and_then(Json::as_u32), Some(5));
+    }
+
+    #[test]
+    fn a_2022_relay_destination_keeps_its_identity() {
+        let destination = message(&[
+            bytes_field(1, b"ZGVzdC1rZXk="),
+            bytes_field(2, &bytes_field(1, &[10, 0, 0, 1])),
+            varint_field(3, 8443),
+            bytes_field(4, b"relay@example.com"),
+            varint_field(5, 2),
+        ]);
+        let settings = message(&[
+            bytes_field(1, b"2022-blake3-aes-256-gcm"),
+            bytes_field(2, b"bWFzdGVyLWtleQ=="),
+            bytes_field(3, &destination),
+        ]);
+        let inbound = ss2022_inbound(
+            5000,
+            "xray.proxy.shadowsocks_2022.RelayServerConfig",
+            &settings,
+        );
+        let json = to_json(&config(&inbound, &freedom_outbound())).expect("relay decodes");
+        let dests = &json
+            .get("inbounds")
+            .and_then(Json::as_arr)
+            .expect("inbounds")[0]
+            .get("settings")
+            .expect("settings")
+            .get("destinations")
+            .and_then(Json::as_arr)
+            .expect("destinations");
+        assert_eq!(
+            dests[0].get("email").and_then(Json::as_str),
+            Some("relay@example.com")
+        );
+        assert_eq!(dests[0].get("level").and_then(Json::as_u32), Some(2));
+    }
+
+    #[test]
+    fn a_2022_port_above_65535_is_rejected_not_clamped() {
+        let inbound = ss2022_inbound(
+            5000,
+            "xray.proxy.shadowsocks_2022.ServerConfig",
+            &message(&[
+                bytes_field(1, b"2022-blake3-aes-256-gcm"),
+                bytes_field(2, b"MDEyMzQ1Njc4OWFiY2RlZg=="),
+            ]),
+        );
+        let endpoint = message(&[
+            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+            varint_field(2, 70000),
+            bytes_field(3, b"2022-blake3-aes-128-gcm"),
+            bytes_field(4, b"MDEyMzQ1Njc4OWFiY2RlZg=="),
+        ]);
+        let outbound = message(&[bytes_field(
+            3,
+            &typed("xray.proxy.shadowsocks_2022.ClientConfig", &endpoint),
+        )]);
+        let error = to_json(&config(&inbound, &outbound)).expect_err("an above-range port refuses");
+        assert!(error.contains("65535"), "outbound: {error}");
+
+        let destination = message(&[
+            bytes_field(1, b"ZGVzdC1rZXk="),
+            bytes_field(2, &bytes_field(1, &[10, 0, 0, 1])),
+            varint_field(3, 70000),
+        ]);
+        let settings = message(&[
+            bytes_field(1, b"2022-blake3-aes-256-gcm"),
+            bytes_field(2, b"bWFzdGVyLWtleQ=="),
+            bytes_field(3, &destination),
+        ]);
+        let relay = ss2022_inbound(
+            5000,
+            "xray.proxy.shadowsocks_2022.RelayServerConfig",
+            &settings,
+        );
+        let error = to_json(&config(&relay, &freedom_outbound()))
+            .expect_err("an above-range relay port refuses");
+        assert!(error.contains("65535"), "relay: {error}");
     }
 
     fn socks_account(user: &[u8], pass: &[u8]) -> Vec<u8> {
