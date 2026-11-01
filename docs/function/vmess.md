@@ -117,6 +117,17 @@ The same cell ran at `standard` tier (3 repeats) on `main`'s `fe7723d6` (EPYC 77
 
 With the default wire bytes unchanged, the throughput and CPU leads widened on both servers and peak RSS held near 3x.
 
+The change that leaves the first frame where it opened re-ran the same cell narrowed to that row, `standard` tier with 5 medians on each side — `main`'s `6abf747d` (EPYC 7763, run `41258147033`) against this head `eed6d981` (EPYC 9V45, run `41258140761`) — read, as above, as each run's ratio to its own xray-core control.
+
+| server leg | run | throughput | cpu per GiB | peak rss |
+| --- | --- | --- | --- | --- |
+| ferrox | `6abf747d` | 2.719x | 1.909x | 3.113x |
+| ferrox | `eed6d981` | 3.194x | 2.013x | 3.060x |
+| xray-core | `6abf747d` | 2.316x | 1.815x | 3.029x |
+| xray-core | `eed6d981` | 3.002x | 2.107x | 3.030x |
+
+No row moved down on either leg, and the first pair this slice ran — head on a Xeon 8573C against `main` on a `9V74` — is the lesson the runners teach, not a result: its 2.36x-against-2.78x client leg compared two machines and read as a regression that the same-tier reruns do not show.
+
 The split those two totals are made of, in ms/GiB medians:
 
 | engine | user | sys | total | MiB/s | peak RSS MiB | threads |
