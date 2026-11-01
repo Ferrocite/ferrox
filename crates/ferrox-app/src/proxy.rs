@@ -12120,6 +12120,51 @@ struct TrojanUdpUplink {
     done: RelayEnd,
 }
 
+/// The outbound's direct UDP lane for a mux's skipped datagrams: one association, opened on the first.
+struct TrojanUdpLane<'a> {
+    trojan: &'a TrojanOut,
+    relay: &'a UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+    uplink: Option<TrojanUdpUplink>,
+    head: Vec<u8>,
+}
+
+impl<'a> TrojanUdpLane<'a> {
+    fn new(trojan: &'a TrojanOut, relay: &'a UdpSocket) -> Self {
+        Self {
+            trojan,
+            relay,
+            source: Arc::new(Mutex::new(None)),
+            uplink: None,
+            head: Vec::with_capacity(32),
+        }
+    }
+
+    fn send(&mut self, src: SocketAddr, dest: SocketAddr, payload: &[u8]) {
+        if let Ok(mut slot) = self.source.lock() {
+            *slot = Some(src);
+        }
+        if self.uplink.is_none() {
+            self.uplink =
+                dial_trojan_udp_uplink(self.trojan, &dest, self.relay, Arc::clone(&self.source));
+        }
+        if let Some(up) = &mut self.uplink {
+            if !write_trojan_datagram(&mut *up.write, &dest, payload, &mut self.head) {
+                if let Some(old) = self.uplink.take() {
+                    (old.close)();
+                }
+            }
+        }
+    }
+
+    fn close(self) {
+        if let Some(old) = self.uplink {
+            (old.close)();
+            join(&old.done);
+        }
+    }
+}
+
 /// The reader, writer and teardown of an association carried inside one carrier session.
 type TrojanUdpParts = (Box<dyn Read + Send>, Box<dyn Write>, Box<dyn Fn() + Send>);
 
@@ -21117,12 +21162,18 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
     let Some(mux) = open_vless_mux(vless) else {
         return;
     };
-    serve_socks_udp_mux(relay, mux, |dest| vless_udp_target_allowed(vless, dest));
+    serve_socks_udp_mux(
+        relay,
+        mux,
+        |dest| vless_udp_target_allowed(vless, dest),
+        |_, _, _| true,
+    );
 }
 
-fn serve_socks_udp_mux<F>(relay: &UdpSocket, mux: MuxUplink, allowed: F)
+fn serve_socks_udp_mux<F, G>(relay: &UdpSocket, mux: MuxUplink, allowed: F, mut skip: G)
 where
     F: Fn(&SocketAddr) -> bool,
+    G: FnMut(SocketAddr, SocketAddr, &[u8]) -> bool,
 {
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let Some(done) = spawn_xudp_reader(mux.read, relay, Arc::clone(&source)) else {
@@ -21138,7 +21189,13 @@ where
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
         };
-        if payload.is_empty() || !allowed(&dest) {
+        if payload.is_empty() {
+            continue;
+        }
+        if !allowed(&dest) {
+            if !skip(src, dest, payload) {
+                break;
+            }
             continue;
         }
         // The reply reader only needs the slot once: an association that keeps its socket writes it once.
@@ -21287,12 +21344,26 @@ fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
 fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
     if trojan.mux.udp {
         if let Some(mux) = open_trojan_mux(trojan) {
-            serve_socks_udp_mux(relay, mux, |dest| {
-                !matches!(ss_mux_443(trojan.mux.udp443, *dest), Udp443::Reject)
-            });
+            let mut lane: Option<TrojanUdpLane> = None;
+            serve_socks_udp_mux(
+                relay,
+                mux,
+                |dest| matches!(ss_mux_443(trojan.mux.udp443, *dest), Udp443::Allow),
+                |src, dest, payload| {
+                    if matches!(ss_mux_443(trojan.mux.udp443, dest), Udp443::Skip) {
+                        lane.get_or_insert_with(|| TrojanUdpLane::new(trojan, relay))
+                            .send(src, dest, payload);
+                    }
+                    true
+                },
+            );
+            if let Some(lane) = lane {
+                lane.close();
+            }
             return;
         }
     }
+    let policy = trojan.mux.udp.then_some(trojan.mux.udp443);
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let mut uplink: Option<TrojanUdpUplink> = None;
     let mut buf = udp_buffer();
@@ -21302,6 +21373,9 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
             continue;
         };
         if payload.is_empty() {
+            continue;
+        }
+        if policy.is_some_and(|policy| matches!(ss_mux_443(policy, dest), Udp443::Reject)) {
             continue;
         }
         if let Ok(mut slot) = source.lock() {
