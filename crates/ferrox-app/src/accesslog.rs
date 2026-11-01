@@ -20,16 +20,26 @@ thread_local! {
 /// The source and account a front's flows are logged with until the session ends.
 pub(crate) struct FlowGuard;
 
-pub(crate) fn flow(source: Option<SocketAddr>, email: &str, level: u32) -> FlowGuard {
-    FLOW.with(|flow| {
-        *flow.borrow_mut() = Flow {
-            source,
-            email: email.to_owned(),
-            level,
-            online: None,
-        };
-    });
+/// The flow a thread is serving, carried to a thread that continues the same session.
+#[derive(Clone, Default)]
+pub(crate) struct Snapshot(Flow);
+
+pub(crate) fn snapshot() -> Snapshot {
+    FLOW.with(|flow| Snapshot(flow.borrow().clone()))
+}
+
+pub(crate) fn install_snapshot(snapshot: Snapshot) -> FlowGuard {
+    FLOW.with(|flow| *flow.borrow_mut() = snapshot.0);
     FlowGuard
+}
+
+pub(crate) fn flow(source: Option<SocketAddr>, email: &str, level: u32) -> FlowGuard {
+    install_snapshot(Snapshot(Flow {
+        source,
+        email: email.to_owned(),
+        level,
+        online: None,
+    }))
 }
 
 impl Drop for FlowGuard {
@@ -292,6 +302,37 @@ mod tests {
         assert_eq!(
             text,
             "from 192.0.2.10:1234 accepted example.com:443 [proxy] accept email: a@b.c\n"
+        );
+        let _ = std::fs::remove_file(&path);
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+    }
+
+    #[test]
+    fn a_flow_snapshot_carries_the_identity_to_another_thread() {
+        let _guard = crate::stats::test_lock();
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-access-snapshot-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let mut quoted = String::new();
+        crate::json::write(&Json::Str(path.to_string_lossy().into_owned()), &mut quoted);
+        let root =
+            crate::json::parse(&format!(r#"{{"log":{{"access":{quoted}}}}}"#)).expect("parses");
+        install(&root).expect("access log installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        let _flow = flow(Some(source), "a@b.c", 1);
+        let snapshot = snapshot();
+        std::thread::spawn(move || {
+            let _flow = install_snapshot(snapshot);
+            record_current(&"example.com:443");
+        })
+        .join()
+        .expect("the detached flow records");
+        let text = std::fs::read_to_string(&path).expect("reads the line");
+        assert_eq!(
+            text,
+            "from 192.0.2.10:1234 accepted example.com:443 email: a@b.c\n"
         );
         let _ = std::fs::remove_file(&path);
         install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");

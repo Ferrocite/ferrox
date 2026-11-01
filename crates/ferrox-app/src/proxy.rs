@@ -7725,13 +7725,21 @@ where
             };
             match current.handshake() {
                 Ok(()) => {
-                    if let Some(transport) = transport.take() {
-                        let _ = transport.set_nonblocking(false);
-                        let _ = transport.set_read_timeout(Some(RELAY_POLL));
-                    }
+                    let ready = match transport.take() {
+                        Some(transport) => {
+                            let _ = transport.set_nonblocking(false);
+                            let _ = transport.set_read_timeout(Some(RELAY_POLL));
+                            transport.wait_readable(RELAY_POLL).unwrap_or(false)
+                        }
+                        None => true,
+                    };
                     if let Some(finish) = finish.take() {
-                        let _lane = HandshakeLane::enter();
-                        finish(current);
+                        if ready {
+                            let _lane = HandshakeLane::enter();
+                            finish(current);
+                        } else {
+                            thread::spawn(move || finish(current));
+                        }
                     }
                     Next::Done
                 }
@@ -10111,7 +10119,13 @@ where
 {
     if take_handshake_lane() {
         let carried = carried.to_vec();
-        thread::spawn(move || serve_trojan_mux(reader, writer, close, &carried));
+        let sniffing = crate::sniff::current();
+        let flow = crate::accesslog::snapshot();
+        thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let _flow = crate::accesslog::install_snapshot(flow);
+            serve_trojan_mux(reader, writer, close, &carried);
+        });
         return;
     }
     serve_mux_tunnel(Box::new(reader), Box::new(writer), close, carried);
@@ -16761,7 +16775,13 @@ where
     W: Write + Send + 'static,
 {
     if take_handshake_lane() {
-        thread::spawn(move || serve_trojan_udp_halves(read, write, close));
+        let sniffing = crate::sniff::current();
+        let flow = crate::accesslog::snapshot();
+        thread::spawn(move || {
+            crate::sniff::install_current(sniffing);
+            let _flow = crate::accesslog::install_snapshot(flow);
+            serve_trojan_udp_halves(read, write, close);
+        });
         return;
     }
     let mut write = write;
