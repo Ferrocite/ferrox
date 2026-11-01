@@ -49229,6 +49229,62 @@ mod tests {
             .expect("the lane completes the handshake");
     }
 
+    /// A reader that parks until the test releases it, so a continuation that stayed on the lane
+    /// would hold it for the full wait.
+    struct ParkedReader {
+        stop: Arc<AtomicBool>,
+        until: Instant,
+    }
+
+    impl Read for ParkedReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            while !self.stop.load(Ordering::Relaxed) && Instant::now() < self.until {
+                thread::sleep(Duration::from_millis(1));
+            }
+            Ok(0)
+        }
+    }
+
+    /// A mux continuation leaves the handshake lane before it reads: the lane is free for the next
+    /// handshake while the association runs on its own thread.
+    #[test]
+    fn a_mux_continuation_leaves_the_handshake_lane() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = ParkedReader {
+            stop: Arc::clone(&stop),
+            until: Instant::now() + Duration::from_secs(2),
+        };
+        let _lane = HandshakeLane::enter();
+        let started = Instant::now();
+        serve_trojan_mux(reader, Vec::new(), Arc::new(|| {}), b"");
+        let held = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        assert!(
+            held < Duration::from_secs(1),
+            "the mux continuation held the handshake lane for {held:?}"
+        );
+    }
+
+    /// A UDP continuation leaves the handshake lane before it binds or pumps: an association that
+    /// outlives its handshake does not spend a lane on the session.
+    #[test]
+    fn a_udp_continuation_leaves_the_handshake_lane() {
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader = ParkedReader {
+            stop: Arc::clone(&stop),
+            until: Instant::now() + Duration::from_secs(2),
+        };
+        let _lane = HandshakeLane::enter();
+        let started = Instant::now();
+        serve_trojan_udp_halves(reader, Vec::new(), || {});
+        let held = started.elapsed();
+        stop.store(true, Ordering::Relaxed);
+        assert!(
+            held < Duration::from_secs(1),
+            "the UDP continuation held the handshake lane for {held:?}"
+        );
+    }
+
     /// Brings up a hysteria inbound on a free port with the given masquerade cover, so a test can point a browser at it and read what the cover answers.
     fn hysteria_loop_masq(
         auth: &str,
