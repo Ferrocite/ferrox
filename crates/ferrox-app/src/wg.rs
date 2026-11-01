@@ -1722,13 +1722,11 @@ mod tests {
         assert!(entry.until > Instant::now());
     }
 
-    /// The DNS half of the truncated-answer witness: UDP answers the question with the truncation bit set, TCP answers the same one in full on the same port, and both keep serving while the question is asked again.
-    fn dns_servers(
-        udp: UdpSocket,
-        tcp: TcpListener,
-    ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
+    /// The DNS half of the truncated-answer witness: UDP answers the question with the truncation bit set, TCP answers the same one in full on the same port, and both keep serving while the question is asked again until the returned guard is dropped.
+    fn dns_servers(udp: UdpSocket, tcp: TcpListener) -> DnsServers {
         udp.set_read_timeout(Some(Duration::from_millis(100)))
             .expect("DNS server poll");
+        tcp.set_nonblocking(true).expect("DNS TCP accept poll");
         let stopped = Arc::new(AtomicBool::new(false));
         let udp_stopped = Arc::clone(&stopped);
         let dns_udp = std::thread::spawn(move || {
@@ -1752,15 +1750,22 @@ mod tests {
             }
         });
         let tcp_stopped = Arc::clone(&stopped);
-        // A question asked again is answered again, and a connection that never finishes its frame costs only the read that waited for it: a bound read keeps the accept loop free for the retry that follows an abandoned connection, and one second is far more than a loopback write needs.
-        std::thread::spawn(move || {
+        // A question asked again is answered again, and a connection that never finishes its frame costs only the reads that waited for it: the accept is polled so a stopped loop leaves even while no question arrives, and each stream's own bound reads put the ceiling on the join below.
+        let dns_tcp = std::thread::spawn(move || {
             while !tcp_stopped.load(Ordering::Relaxed) {
-                let Ok((mut stream, _)) = tcp.accept() else {
-                    return;
+                let (mut stream, _) = match tcp.accept() {
+                    Ok(accepted) => accepted,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                        continue;
+                    }
+                    Err(_) => return,
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(1)))
-                    .expect("DNS TCP poll");
+                // Where the platform says so an accepted stream keeps the listener's mode, and a nonblocking read ignores the timeout that bounds it.
+                stream.set_nonblocking(false).expect("DNS TCP blocking");
+                let bound = Some(Duration::from_secs(1));
+                stream.set_read_timeout(bound).expect("DNS TCP read");
+                stream.set_write_timeout(bound).expect("DNS TCP write");
                 let mut prefix = [0u8; 2];
                 if stream.read_exact(&mut prefix).is_err() {
                     continue;
@@ -1784,7 +1789,25 @@ mod tests {
                 let _ = stream.write_all(&framed);
             }
         });
-        (stopped, dns_udp)
+        DnsServers {
+            stopped,
+            servers: [Some(dns_udp), Some(dns_tcp)],
+        }
+    }
+
+    /// The two DNS servers of the witness above, stopped and joined on every exit from the test that made them — a deadline panic included — because a thread still parked in `accept` holds the port out of the next test's hands.
+    struct DnsServers {
+        stopped: Arc<AtomicBool>,
+        servers: [Option<std::thread::JoinHandle<()>>; 2],
+    }
+
+    impl Drop for DnsServers {
+        fn drop(&mut self) {
+            self.stopped.store(true, Ordering::Relaxed);
+            for handle in self.servers.iter_mut().filter_map(Option::take) {
+                let _ = handle.join();
+            }
+        }
     }
 
     /// A truncated UDP response retries the same DNS question over TCP on the reserved server port.
@@ -1809,7 +1832,7 @@ mod tests {
                 }
             })
             .expect("a port free for both DNS transports");
-        let (stopped, dns_udp) = dns_servers(udp, tcp);
+        let _servers = dns_servers(udp, tcp);
 
         let client_private = [0x11; 32];
         let server_private = [0x22; 32];
@@ -1850,8 +1873,6 @@ mod tests {
             wireguard.resolved.lock().expect("cache").clear();
             std::thread::sleep(Duration::from_millis(10));
         };
-        stopped.store(true, Ordering::Relaxed);
-        dns_udp.join().expect("DNS UDP server");
         assert_eq!(answer, vec!["127.0.0.1:7".parse().expect("address")]);
     }
 
