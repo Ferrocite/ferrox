@@ -9035,6 +9035,11 @@ pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::Interrupted || ferrox_core::tls::TlsError::is_timeout(error)
 }
 
+/// A timeout that waits on the socket: an interrupted read is retried, not parked on the descriptor.
+pub(crate) fn is_descriptor_wait(error: &std::io::Error) -> bool {
+    is_timeout(error) && error.kind() != std::io::ErrorKind::Interrupted
+}
+
 thread_local! {
     /// Set while a lane step runs: a framed reader that times out hands the lane back instead of sleeping in it.
     static RELAY_STEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
@@ -9042,6 +9047,29 @@ thread_local! {
 
 pub(crate) fn relay_step_owns_poll() -> bool {
     RELAY_STEP.with(std::cell::Cell::get)
+}
+
+#[cfg(unix)]
+thread_local! {
+    /// The socket a relay step's read timed out on: the lane waits on its readiness instead of the clock.
+    static WAIT_FD: std::cell::Cell<Option<std::os::fd::RawFd>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(unix)]
+pub(crate) fn note_wait_fd(fd: std::os::fd::RawFd) {
+    if relay_step_owns_poll() {
+        WAIT_FD.with(|slot| slot.set(Some(fd)));
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn take_wait_fd() -> Option<std::os::fd::RawFd> {
+    WAIT_FD.with(std::cell::Cell::take)
+}
+
+#[cfg(unix)]
+pub(crate) fn forget_wait_fd() {
+    WAIT_FD.with(|slot| slot.set(None));
 }
 
 /// Scoped claim, so a step that returns or panics leaves the thread as it found it.
@@ -23108,6 +23136,8 @@ pub(crate) mod lane_pool {
 
     impl Lane {
         fn run(&mut self) -> Next {
+            #[cfg(unix)]
+            crate::proxy::forget_wait_fd();
             if self.relay {
                 let _step = crate::proxy::RelayStep::enter();
                 (self.step)()
@@ -23135,6 +23165,19 @@ pub(crate) mod lane_pool {
         pending: Option<usize>,
         /// Setup workers retire when the queue is empty, so their threads do not sit beside the relay lanes during a transfer.
         idle_exit: bool,
+        /// Lanes whose source is a socket wait here; one reaper polls every descriptor and requeues
+        /// the lane that has bytes or whose check falls due.
+        #[cfg(unix)]
+        waiting: Mutex<Vec<Waiting>>,
+        #[cfg(unix)]
+        wake: Option<WakePipe>,
+        #[cfg(unix)]
+        reaper: Mutex<Option<std::thread::JoinHandle<()>>>,
+        /// Which park branch a lane took: a readiness park is a descriptor wait, a timer park is the clock.
+        #[cfg(all(test, unix))]
+        ready_parks: std::sync::atomic::AtomicUsize,
+        #[cfg(all(test, unix))]
+        timer_parks: std::sync::atomic::AtomicUsize,
         #[cfg(test)]
         stop: std::sync::atomic::AtomicBool,
         #[cfg(test)]
@@ -23146,6 +23189,73 @@ pub(crate) mod lane_pool {
     struct Parked {
         lanes: Vec<(std::time::Instant, Lane)>,
         waking: bool,
+    }
+
+    /// A lane parked on a socket: the descriptor wakes it when the peer writes, and the due keeps the
+    /// relay's end check inside its budget when nothing ever does.
+    #[cfg(unix)]
+    struct Waiting {
+        due: std::time::Instant,
+        fd: std::os::fd::RawFd,
+        lane: Lane,
+    }
+
+    /// The descriptor a parker writes to wake the reaper for a lane the reaper has not seen yet.
+    #[cfg(unix)]
+    struct WakePipe {
+        read: std::os::fd::RawFd,
+        write: std::os::fd::RawFd,
+    }
+
+    #[cfg(unix)]
+    impl WakePipe {
+        fn new() -> Option<Self> {
+            let mut fds = [-1; 2];
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+                return None;
+            }
+            for fd in fds {
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                    let flags = libc::fcntl(fd, libc::F_GETFL);
+                    if flags >= 0 {
+                        libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+                    }
+                }
+            }
+            Some(Self {
+                read: fds[0],
+                write: fds[1],
+            })
+        }
+
+        fn post(&self) {
+            let byte = 1u8;
+            unsafe {
+                libc::write(self.write, std::ptr::from_ref(&byte).cast(), 1);
+            }
+        }
+
+        fn drain(&self) {
+            let mut byte = 0u8;
+            loop {
+                let read =
+                    unsafe { libc::read(self.read, std::ptr::from_mut(&mut byte).cast(), 1) };
+                if read <= 0 {
+                    return;
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for WakePipe {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.read);
+                libc::close(self.write);
+            }
+        }
     }
 
     static POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
@@ -23211,6 +23321,16 @@ pub(crate) mod lane_pool {
             cap,
             pending,
             idle_exit,
+            #[cfg(unix)]
+            waiting: Mutex::new(Vec::new()),
+            #[cfg(unix)]
+            wake: WakePipe::new(),
+            #[cfg(unix)]
+            reaper: Mutex::new(None),
+            #[cfg(all(test, unix))]
+            ready_parks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(all(test, unix))]
+            timer_parks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             stop: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -23255,7 +23375,7 @@ pub(crate) mod lane_pool {
         true
     }
 
-    fn worker_loop(pool: &Pool) {
+    fn worker_loop(pool: &std::sync::Arc<Pool>) {
         loop {
             if stopping(pool) {
                 pool.workers
@@ -23316,6 +23436,11 @@ pub(crate) mod lane_pool {
                     }
                     Ok(Next::Idle) => {
                         lane.idle = lane.idle.saturating_add(1);
+                        #[cfg(unix)]
+                        match park_ready(pool, lane) {
+                            Ok(()) => break,
+                            Err(parked) => lane = parked,
+                        }
                         park(pool, lane);
                         break;
                     }
@@ -23354,6 +23479,9 @@ pub(crate) mod lane_pool {
     /// A lane inserted with an earlier deadline wakes the parker instead of waiting for the
     /// deadline already parked.
     fn park_with(pool: &Pool, lane: Lane, quantum: std::time::Duration) {
+        #[cfg(all(test, unix))]
+        pool.timer_parks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let due = std::time::Instant::now() + wait_for(lane.idle, quantum);
         let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
         if parked.waking {
@@ -23416,6 +23544,131 @@ pub(crate) mod lane_pool {
         quantum * (1u32 << idle.saturating_sub(1).min(4))
     }
 
+    /// Parks an idle lane on the descriptor its read timed out on, so the peer's write wakes it
+    /// instead of the lane re-reading every poll quantum. The check falls due once per response-idle
+    /// budget, which is what notices a sibling that ended while this direction stayed quiet.
+    #[cfg(unix)]
+    fn park_ready(pool: &std::sync::Arc<Pool>, lane: Lane) -> Result<(), Lane> {
+        if !lane.relay {
+            return Err(lane);
+        }
+        let Some(fd) = crate::proxy::take_wait_fd() else {
+            return Err(lane);
+        };
+        if pool.wake.is_none() || stopping(pool) || !start_reaper(pool) {
+            return Err(lane);
+        }
+        let due = std::time::Instant::now() + crate::budgets::RELAY_RESPONSE_IDLE;
+        pool.waiting
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(Waiting { due, fd, lane });
+        if let Some(wake) = pool.wake.as_ref() {
+            wake.post();
+        }
+        #[cfg(test)]
+        pool.ready_parks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// One reaper per pool, started by the first socket lane that parks. A spawn failure leaves the
+    /// lane to the timer path rather than parked on a descriptor nobody polls.
+    #[cfg(unix)]
+    fn start_reaper(pool: &std::sync::Arc<Pool>) -> bool {
+        let mut slot = pool.reaper.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_some() {
+            return true;
+        }
+        if stopping(pool) {
+            return false;
+        }
+        let weak = std::sync::Arc::downgrade(pool);
+        let Ok(handle) = thread::Builder::new()
+            .name("ferrox-relay-ready".into())
+            .spawn(move || reaper_loop(&weak))
+        else {
+            return false;
+        };
+        *slot = Some(handle);
+        true
+    }
+
+    #[cfg(unix)]
+    fn reaper_loop(pool: &std::sync::Weak<Pool>) {
+        let mut waits: Vec<Waiting> = Vec::new();
+        loop {
+            let Some(pool) = pool.upgrade() else {
+                return;
+            };
+            if stopping(&pool) {
+                return;
+            }
+            let Some(wake) = pool.wake.as_ref() else {
+                return;
+            };
+            {
+                let mut fresh = pool.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+                waits.append(&mut fresh);
+            }
+            if waits.is_empty() {
+                let mut row = libc::pollfd {
+                    fd: wake.read,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                unsafe { libc::poll(std::ptr::from_mut(&mut row), 1, 1000) };
+                wake.drain();
+                continue;
+            }
+            let now = std::time::Instant::now();
+            let due = waits.iter().map(|wait| wait.due).min().unwrap_or(now);
+            let left = due.saturating_duration_since(now);
+            let timeout = if left.is_zero() {
+                0
+            } else {
+                libc::c_int::try_from(left.as_millis().max(1)).unwrap_or(libc::c_int::MAX)
+            };
+            let mut rows: Vec<libc::pollfd> = Vec::with_capacity(waits.len() + 1);
+            rows.push(libc::pollfd {
+                fd: wake.read,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            for wait in &waits {
+                rows.push(libc::pollfd {
+                    fd: wait.fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+            let polled =
+                unsafe { libc::poll(rows.as_mut_ptr(), rows.len() as libc::nfds_t, timeout) };
+            if polled < 0 {
+                // An interrupted wait changed nothing: the same lanes stay parked.
+                continue;
+            }
+            wake.drain();
+            let now = std::time::Instant::now();
+            let mut ready = Vec::new();
+            let mut kept = Vec::with_capacity(waits.len());
+            for (index, wait) in waits.drain(..).enumerate() {
+                if rows[index + 1].revents != 0 || wait.due <= now {
+                    ready.push(wait.lane);
+                } else {
+                    kept.push(wait);
+                }
+            }
+            waits = kept;
+            if !ready.is_empty() {
+                let mut queue = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                queue.extend(ready);
+                drop(queue);
+                pool.notify.notify_all();
+            }
+        }
+    }
+
     #[cfg(test)]
     fn stopping(pool: &Pool) -> bool {
         pool.stop.load(std::sync::atomic::Ordering::Relaxed)
@@ -23433,6 +23686,16 @@ pub(crate) mod lane_pool {
         pool.stop.store(true, SeqCst);
         pool.notify.notify_all();
         drop(ready);
+        #[cfg(unix)]
+        {
+            if let Some(wake) = pool.wake.as_ref() {
+                wake.post();
+            }
+            let mut reaper = pool.reaper.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(handle) = reaper.take() {
+                let _ = handle.join();
+            }
+        }
         let handles =
             std::mem::take(&mut *pool.handles.lock().unwrap_or_else(PoisonError::into_inner));
         for handle in handles {
@@ -23758,6 +24021,66 @@ pub(crate) mod lane_pool {
             assert!(
                 (3..40).contains(&batches),
                 "one idle lane was re-queued {batches} times in 200 ms"
+            );
+        }
+
+        /// A lane whose source is a socket parks in the reaper's waiting set, on the descriptor its
+        /// read timed out on, and one peer byte wakes it. A lane on the timer never enters that set.
+        #[cfg(unix)]
+        #[test]
+        fn a_socket_lane_waits_on_readiness() {
+            use std::io::{Read as _, Write as _};
+
+            let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let address = front.local_addr().expect("addr");
+            let mut peer = crate::conn::Connection::connect(address).expect("connects");
+            let (served, _) = front.accept().expect("accepts");
+            served
+                .set_read_timeout(Some(Duration::from_millis(1)))
+                .expect("arms the read clock");
+            let received = Arc::new(AtomicUsize::new(0));
+            let bytes = Arc::clone(&received);
+            let mut source = Some(served);
+            let mut window = [0u8; 64];
+            let pool = TestPool(spawn_pool());
+            submit_to(
+                &pool,
+                Box::new(move || {
+                    let source = source.as_mut().expect("the lane keeps its source");
+                    match source.read(&mut window) {
+                        Ok(0) => Next::Done,
+                        Ok(n) => {
+                            bytes.fetch_add(n, Ordering::Relaxed);
+                            Next::Done
+                        }
+                        Err(error) if crate::proxy::is_timeout(&error) => Next::Idle,
+                        Err(_) => Next::Done,
+                    }
+                }),
+                Box::new(|| {}),
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while pool.ready_parks.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                pool.ready_parks.load(Ordering::Relaxed) > 0,
+                "the socket lane never parked on its descriptor"
+            );
+            assert_eq!(
+                pool.timer_parks.load(Ordering::Relaxed),
+                0,
+                "the socket lane fell back to the timer"
+            );
+            peer.write_all(b"x").expect("writes");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while received.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                received.load(Ordering::Relaxed),
+                1,
+                "the peer's byte never woke the parked lane"
             );
         }
 
@@ -31750,16 +32073,42 @@ mod tests {
             .expect("the polling leg ends on its sibling's finish");
     }
 
+    #[cfg(target_os = "linux")]
+    fn live_threads() -> usize {
+        std::fs::read_dir("/proc/self/task").map_or(0, std::iter::Iterator::count)
+    }
+
+    /// A live-thread census only means something when nothing else in the suite is spawning: run it
+    /// in a child process that carries this one test, so the count is the flow's, not the harness's.
+    #[cfg(target_os = "linux")]
+    fn census_in_a_quiet_process(name: &str) -> bool {
+        if std::env::var_os("FERROX_THREAD_CENSUS_CHILD").is_some() {
+            return true;
+        }
+        let exe = std::env::current_exe().expect("the test binary");
+        let output = std::process::Command::new(exe)
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env("FERROX_THREAD_CENSUS_CHILD", "1")
+            .output()
+            .expect("re-runs the census in a quiet process");
+        assert!(
+            output.status.success(),
+            "{name} failed in its quiet process:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
     /// A wrapped flow is a direction pair, not a pair of threads: the peak the matrix reads is
     /// the fixed lanes plus the accept loop, so a regression that buys a thread per flow shows up
     /// here as growth proportional to the connection count.
     #[cfg(target_os = "linux")]
     #[test]
     fn wrapped_flows_share_a_fixed_set_of_lanes() {
-        fn live_threads() -> usize {
-            std::fs::read_dir("/proc/self/task").map_or(0, std::iter::Iterator::count)
+        if !census_in_a_quiet_process("proxy::tests::wrapped_flows_share_a_fixed_set_of_lanes") {
+            return;
         }
-
         let before = live_threads();
         let flows = 24usize;
         let mut stops = Vec::new();
@@ -31798,10 +32147,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn carried_handshakes_share_the_lane_pool() {
-        fn live_threads() -> usize {
-            std::fs::read_dir("/proc/self/task").map_or(0, std::iter::Iterator::count)
+        if !census_in_a_quiet_process("proxy::tests::carried_handshakes_share_the_lane_pool") {
+            return;
         }
-
         let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
