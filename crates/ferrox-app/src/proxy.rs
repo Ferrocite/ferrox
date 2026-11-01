@@ -32068,12 +32068,37 @@ mod tests {
             .expect("the polling leg ends on its sibling's finish");
     }
 
+    /// A live-thread census only means something when nothing else in the suite is spawning: run it
+    /// in a child process that carries this one test, so the count is the flow's, not the harness's.
+    #[cfg(target_os = "linux")]
+    fn census_in_a_quiet_process(name: &str) -> bool {
+        if std::env::var_os("FERROX_THREAD_CENSUS_CHILD").is_some() {
+            return true;
+        }
+        let exe = std::env::current_exe().expect("the test binary");
+        let output = std::process::Command::new(exe)
+            .args(["--exact", name, "--test-threads=1", "--nocapture"])
+            .env("FERROX_THREAD_CENSUS_CHILD", "1")
+            .output()
+            .expect("re-runs the census in a quiet process");
+        assert!(
+            output.status.success(),
+            "{name} failed in its quiet process:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
     /// A wrapped flow is a direction pair, not a pair of threads: the peak the matrix reads is
     /// the fixed lanes plus the accept loop, so a regression that buys a thread per flow shows up
     /// here as growth proportional to the connection count.
     #[cfg(target_os = "linux")]
     #[test]
     fn wrapped_flows_share_a_fixed_set_of_lanes() {
+        if !census_in_a_quiet_process("proxy::tests::wrapped_flows_share_a_fixed_set_of_lanes") {
+            return;
+        }
         fn live_threads() -> usize {
             std::fs::read_dir("/proc/self/task").map_or(0, std::iter::Iterator::count)
         }
@@ -32116,6 +32141,9 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn carried_handshakes_share_the_lane_pool() {
+        if !census_in_a_quiet_process("proxy::tests::carried_handshakes_share_the_lane_pool") {
+            return;
+        }
         fn live_threads() -> usize {
             std::fs::read_dir("/proc/self/task").map_or(0, std::iter::Iterator::count)
         }
