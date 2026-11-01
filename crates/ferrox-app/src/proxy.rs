@@ -3308,19 +3308,22 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
         let role = role.clone();
         let tag = tag.map(str::to_owned);
         let sniffing = sniffing.clone();
+        let accepted_at = Instant::now();
         if role.tcp_stream() {
             let mut work = Some((stream, role, tag, sniffing));
             lane_pool::submit_setup(
                 Box::new(move || {
                     if let Some((stream, role, tag, sniffing)) = work.take() {
-                        serve_accepted(stream, role, tag.as_deref(), sniffing);
+                        serve_accepted(stream, role, tag.as_deref(), sniffing, accepted_at);
                     }
                     lane_pool::Next::Done
                 }),
                 Box::new(|| {}),
             );
         } else {
-            thread::spawn(move || serve_accepted(stream, role, tag.as_deref(), sniffing));
+            thread::spawn(move || {
+                serve_accepted(stream, role, tag.as_deref(), sniffing, accepted_at);
+            });
         }
     }
     drop(listener);
@@ -3334,7 +3337,14 @@ fn serve_accepted(
     role: Role,
     tag: Option<&str>,
     sniffing: Option<std::sync::Arc<crate::sniff::Sniffing>>,
+    accepted_at: Instant,
 ) {
+    let budget = budgets::handshake();
+    let waited = accepted_at.elapsed();
+    if waited >= budget {
+        return;
+    }
+    let _cap = budgets::cap_handshake(budget.saturating_sub(waited));
     crate::sniff::install_current(sniffing);
     let (stream, role) = match role {
         Role::Proxied(inner) => {
@@ -3357,6 +3367,15 @@ fn serve_accepted(
         .with_policy(Some(crate::policy::flow(0)));
     front_dispatch(stream, role);
 }
+
+fn spawn_carried<F: FnOnce() + Send + 'static>(body: F) {
+    let sniffing = crate::sniff::current();
+    thread::spawn(move || {
+        crate::sniff::install_current(sniffing);
+        body();
+    });
+}
+
 fn serve_shadowsocks(
     stream: Connection,
     accounts: &crate::shadowsocks::SsAccounts,
@@ -4237,13 +4256,16 @@ fn vless_raw_reply<D, R>(
         return;
     }
     if cmd == 2 {
-        return serve_vless_udp(stream, &target, carried);
+        spawn_carried(move || serve_vless_udp(stream, &target, carried));
+        return;
     }
     if cmd == 3 {
         if stream.write_all(&[0, 0]).is_err() {
             return;
         }
-        return serve_vless_mux_with(stream, io, &carried);
+        let io = io.clone();
+        spawn_carried(move || serve_vless_mux_with(stream, &io, &carried));
+        return;
     }
     if cmd != 1 {
         // The reference's decoder refuses a command past the id without falling back.
@@ -4459,23 +4481,24 @@ fn serve_sealed_raw<
                 sealed,
                 crate::stats::user(&user.email, user.level),
             ));
-            serve_udp_stream(
-                SealedHalf(Arc::clone(&shared)),
-                SealedHalf(shared),
-                &target,
-                Vec::new(),
-                closer,
-            );
+            let close = Arc::clone(closer);
+            spawn_carried(move || {
+                serve_udp_stream(
+                    SealedHalf(Arc::clone(&shared)),
+                    SealedHalf(shared),
+                    &target,
+                    Vec::new(),
+                    &close,
+                );
+            });
         }
         3 => {
             if sealed.write_all(&[0, 0]).is_err() {
                 return;
             }
-            serve_sealed_mux(
-                sealed,
-                crate::stats::user(&user.email, user.level),
-                Arc::clone(closer),
-            );
+            let close = Arc::clone(closer);
+            let meter = crate::stats::user(&user.email, user.level);
+            spawn_carried(move || serve_sealed_mux(sealed, meter, close));
         }
         1 => {
             let Some(uplink) = dial_or_report(&target) else {
@@ -4558,6 +4581,7 @@ fn serve_sealed_carried_with<R, W, A, B, C>(
     serve_sealed_split_with(reader, writer, users, freedom, close, after_decode);
 }
 
+#[allow(clippy::too_many_lines)]
 fn serve_sealed_split_with<R, W, C>(
     mut reader: ferrox_core::vless_encryption::EncryptedReader<R>,
     mut writer: ferrox_core::vless_encryption::EncryptedWriter<W>,
@@ -4634,7 +4658,10 @@ fn serve_sealed_split_with<R, W, C>(
                 inner: writer,
                 meter,
             };
-            serve_udp_stream(reader, writer, &target, Vec::new(), &closer);
+            let close = Arc::clone(&closer);
+            spawn_carried(move || {
+                serve_udp_stream(reader, writer, &target, Vec::new(), &close);
+            });
         }
         3 => {
             if writer.write_all(&[0, 0]).is_err() {
@@ -4648,7 +4675,7 @@ fn serve_sealed_split_with<R, W, C>(
                 inner: reader,
                 meter,
             };
-            serve_sealed_mux_split(reader, writer, closer);
+            spawn_carried(move || serve_sealed_mux_split(reader, writer, closer));
         }
         1 => {
             let Some(uplink) = dial_or_report(&target) else {
@@ -22531,6 +22558,8 @@ pub(crate) mod lane_pool {
         workers: std::sync::atomic::AtomicUsize,
         idle: std::sync::atomic::AtomicUsize,
         parks: std::sync::atomic::AtomicUsize,
+        cap: usize,
+        pending: Option<usize>,
         #[cfg(test)]
         stop: std::sync::atomic::AtomicBool,
         #[cfg(test)]
@@ -22545,12 +22574,21 @@ pub(crate) mod lane_pool {
     }
 
     static POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
+    static SETUP_POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
 
     /// The widest standard cell (eight connections) queues one download read per flow, and every
     /// one of them must sit in its read at once: a lane without a worker is a flow the peer's
     /// window cannot refill. This is the ceiling, not the shape: a worker starts when a lane is
     /// queued and no worker is idle, so a one-flow cell holds two lanes.
     const RELAY_LANES: usize = 8;
+
+    /// Setup lanes are separate from relay lanes so a handshake parked in a read cannot take a
+    /// relay worker with it. Four carry the widest cell's opening requests in two waves.
+    const SETUP_LANES: usize = 4;
+
+    /// Accepted work past the setup workers waits in this queue; past it the accept loop drops the
+    /// socket, so a burst cannot hold accepted connections without bound.
+    const SETUP_PENDING: usize = 8;
 
     /// How many steps a lane may take back to back before it rejoins the queue. A cell queues two
     /// lanes per stream against fewer threads, so a lane that never parks while it has bytes holds
@@ -22562,7 +22600,17 @@ pub(crate) mod lane_pool {
         std::sync::Arc::clone(POOL.get_or_init(spawn_pool))
     }
 
+    fn setup_pool() -> std::sync::Arc<Pool> {
+        std::sync::Arc::clone(
+            SETUP_POOL.get_or_init(|| spawn_pool_with(SETUP_LANES, Some(SETUP_PENDING))),
+        )
+    }
+
     fn spawn_pool() -> std::sync::Arc<Pool> {
+        spawn_pool_with(RELAY_LANES, None)
+    }
+
+    fn spawn_pool_with(cap: usize, pending: Option<usize>) -> std::sync::Arc<Pool> {
         std::sync::Arc::new(Pool {
             ready: Mutex::new(VecDeque::new()),
             parked: Mutex::new(Parked::default()),
@@ -22571,6 +22619,8 @@ pub(crate) mod lane_pool {
             workers: std::sync::atomic::AtomicUsize::new(0),
             idle: std::sync::atomic::AtomicUsize::new(0),
             parks: std::sync::atomic::AtomicUsize::new(0),
+            cap,
+            pending,
             #[cfg(test)]
             stop: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -22584,7 +22634,7 @@ pub(crate) mod lane_pool {
         use std::sync::atomic::Ordering::Relaxed;
         let mut workers = pool.workers.load(Relaxed);
         loop {
-            if workers >= RELAY_LANES {
+            if workers >= pool.cap {
                 return false;
             }
             match pool.workers.compare_exchange_weak(
@@ -22804,15 +22854,21 @@ pub(crate) mod lane_pool {
 
     /// A setup lane: the accept path's handshake and dispatch, run once on a pooled worker. It does
     /// not enter `RelayStep`, because its waits are bounded by the handshake budget, not the relay clock.
-    pub(crate) fn submit_setup(step: Step, complete: Complete) {
-        submit_to_with(&pool(), step, complete, false);
+    /// False means the setup queue is full and the lane, with the accepted socket it owns, was dropped.
+    pub(crate) fn submit_setup(step: Step, complete: Complete) -> bool {
+        submit_to_with(&setup_pool(), step, complete, false)
     }
 
     fn submit_to(pool: &std::sync::Arc<Pool>, step: Step, complete: Complete) {
-        submit_to_with(pool, step, complete, true);
+        let _ = submit_to_with(pool, step, complete, true);
     }
 
-    fn submit_to_with(pool: &std::sync::Arc<Pool>, step: Step, complete: Complete, relay: bool) {
+    fn submit_to_with(
+        pool: &std::sync::Arc<Pool>,
+        step: Step,
+        complete: Complete,
+        relay: bool,
+    ) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let lane = Lane {
             step,
@@ -22820,10 +22876,12 @@ pub(crate) mod lane_pool {
             idle: 0,
             relay,
         };
-        let (queued, idle) = {
-            let ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
-            (ready.len(), pool.idle.load(Relaxed))
-        };
+        let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        if pool.pending.is_some_and(|pending| ready.len() >= pending) {
+            return false;
+        }
+        let (queued, idle) = (ready.len(), pool.idle.load(Relaxed));
+        drop(ready);
         if queued >= idle {
             // Nobody is parked to take it: start a lane, or leave it to the cap's workers.
             let _ = grow(pool);
@@ -22831,13 +22889,16 @@ pub(crate) mod lane_pool {
         if pool.workers.load(Relaxed) == 0 {
             // A thread the process could not start still does the lane's work on the caller.
             run_to_end(lane);
-            return;
+            return true;
         }
-        pool.ready
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push_back(lane);
+        ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        if pool.pending.is_some_and(|pending| ready.len() >= pending) {
+            return false;
+        }
+        ready.push_back(lane);
+        drop(ready);
         pool.notify.notify_one();
+        true
     }
 
     #[cfg(test)]
@@ -22848,6 +22909,13 @@ pub(crate) mod lane_pool {
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn workers() -> usize {
         pool().workers.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn setup_workers() -> usize {
+        setup_pool()
+            .workers
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -23088,6 +23156,40 @@ pub(crate) mod lane_pool {
                 0,
                 "a setup lane's waits are its own"
             );
+        }
+
+        /// A setup pool drops accepted work past its pending bound instead of growing its queue.
+        #[test]
+        fn a_setup_pool_bounds_its_pending_queue() {
+            let pool = TestPool(spawn_pool_with(1, Some(1)));
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            assert!(submit_to_with(
+                &pool,
+                Box::new(move || {
+                    started_tx.send(()).expect("starts");
+                    release_rx.recv().expect("releases");
+                    Next::Done
+                }),
+                Box::new(|| {}),
+                false,
+            ));
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("runs");
+            assert!(submit_to_with(
+                &pool,
+                Box::new(|| Next::Done),
+                Box::new(|| {}),
+                false,
+            ));
+            assert!(!submit_to_with(
+                &pool,
+                Box::new(|| Next::Done),
+                Box::new(|| {}),
+                false,
+            ));
+            release_tx.send(()).expect("releases");
         }
 
         /// A relay lane is the other shape: the framed reader hands its timeout back to the step.
@@ -30886,11 +30988,11 @@ mod tests {
             .collect();
         thread::sleep(Duration::from_millis(100));
         let grown = live_threads().saturating_sub(before);
-        let lanes = lane_pool::workers();
-        assert!(lanes >= 8, "the lane count is the bound: {lanes}");
+        let lanes = lane_pool::setup_workers();
+        assert!(lanes >= 1, "the setup lane count is the bound: {lanes}");
         assert!(
             grown <= lanes + 8,
-            "{} carried handshakes grew the process by {grown} threads, past {lanes} lanes plus slack",
+            "{} carried handshakes grew the process by {grown} threads, past {lanes} setup lanes plus slack",
             clients.len()
         );
         assert!(
