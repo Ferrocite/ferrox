@@ -8456,16 +8456,7 @@ fn relay_vless_reply<S>(
         return;
     }
     if flow == Flow::Vision {
-        // The Link reads its own transport, so the split is not its shape: the quiet grain stops at the tick instead, and a park never outlasts a writer.
-        relay_shared(
-            Half::shared_armed_capped(
-                crate::vision::Link::new(session, raw, &wire_id),
-                super::vision::Link::arm_read_timeout,
-                SESSION_POLL,
-            ),
-            Half::socket(uplink),
-            &close,
-        );
+        relay_vision(session, raw, &wire_id, Half::socket(uplink), &close);
     } else {
         // No direct switch coming: the limiter stops bounding and tracking reads, the transport's wait leaves the lock, and only the decryption stays under it. A session that reads its own transport stays on the shared shape.
         match driven_halves(session, RELAY_POLL) {
@@ -14999,6 +14990,42 @@ where
     Ok(Half::split(read, write))
 }
 
+/// One Vision relay for both roles: the read drives the transport, so its wait holds no session
+/// lock and a duplicate that outlives its timeout on Windows cannot strand the echo's write. A
+/// session that cannot be driven keeps the shared shape, with the grain on every handle it reads.
+fn relay_vision<S, B>(
+    session: S,
+    raw: Option<Connection>,
+    uuid: &[u8; 16],
+    peer: Half<B>,
+    close: &Arc<dyn Fn() + Send + Sync>,
+) where
+    S: Read + Write + Send + ferrox_core::tls::RecordAlignment + Drivable + CipherOpen + 'static,
+    B: Read + Write + Send + 'static,
+{
+    match driven_link(session, raw.as_ref(), uuid, RELAY_POLL) {
+        Ok(vision) => relay_shared(vision, peer, close),
+        Err(session) => {
+            let transport = session.transport();
+            relay_shared(
+                Half::shared_armed_capped(
+                    crate::vision::Link::new(session, raw, uuid),
+                    move |link, grain| {
+                        link.arm_read_timeout(grain)?;
+                        match &transport {
+                            Some(transport) => transport.set_read_timeout(Some(grain)),
+                            None => Ok(()),
+                        }
+                    },
+                    SESSION_POLL,
+                ),
+                peer,
+                close,
+            );
+        }
+    }
+}
+
 /// The same driven session as one readable and writable stream, so a sealed layer can split it.
 struct DrivenIo<S, R> {
     reader: DrivenHalf<S, R>,
@@ -15877,18 +15904,13 @@ fn dial_vless_reality(
             }
             let close = shutdown_pair(downstream.try_clone().ok(), raw.try_clone().ok());
             if vless.is_vision() {
-                match driven_link(session, Some(&raw), &vless.id, RELAY_POLL) {
-                    Ok(half) => relay_shared(Half::socket(downstream), half, &close),
-                    Err(session) => relay_shared(
-                        Half::socket(downstream),
-                        Half::shared_armed_capped(
-                            crate::vision::Link::new(session, Some(raw), &vless.id),
-                            crate::vision::Link::arm_read_timeout,
-                            SESSION_POLL,
-                        ),
-                        &close,
-                    ),
-                }
+                relay_vision(
+                    session,
+                    Some(raw),
+                    &vless.id,
+                    Half::socket(downstream),
+                    &close,
+                );
             } else {
                 // The limiter stops bounding, the transport's wait leaves the lock, and only the decryption stays under it.
                 match driven_halves(session, RELAY_POLL) {
@@ -36472,6 +36494,144 @@ mod tests {
         assert!(wrote, "a write waited on a session the parked read holds");
         let _ = writing.join();
         let _ = reading.join();
+    }
+
+    struct Served {
+        wire: Connection,
+        read_entered: Arc<AtomicBool>,
+        opened: Arc<AtomicBool>,
+        sealed: Arc<AtomicBool>,
+    }
+
+    impl Read for Served {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.read_entered.store(true, Ordering::Release);
+            self.wire.read(buf)
+        }
+    }
+
+    impl Write for Served {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.sealed.store(true, Ordering::Release);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ferrox_core::tls::RecordAlignment for Served {}
+
+    impl Drivable for Served {
+        fn transport(&self) -> Option<Connection> {
+            self.wire.try_clone().ok()
+        }
+    }
+
+    impl CipherOpen for Served {
+        fn open(&mut self, ciphertext: &[u8], _buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+            self.opened.store(true, Ordering::Release);
+            Ok((0, ciphertext.len()))
+        }
+
+        fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+            self.sealed.store(true, Ordering::Release);
+            out.extend_from_slice(plaintext);
+            Ok(plaintext.len())
+        }
+    }
+
+    struct EchoOnce {
+        hold: std::sync::mpsc::Receiver<()>,
+        sent: bool,
+    }
+
+    impl Read for EchoOnce {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.sent || self.hold.recv().is_err() {
+                return Ok(0);
+            }
+            self.sent = true;
+            let n = buf.len().min(6);
+            buf[..n].copy_from_slice(&b"hello!"[..n]);
+            Ok(n)
+        }
+    }
+
+    impl Write for EchoOnce {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn holds(flag: &AtomicBool, budget: Duration) -> bool {
+        let began = Instant::now();
+        while !flag.load(Ordering::Acquire) && began.elapsed() < budget {
+            thread::sleep(Duration::from_millis(1));
+        }
+        flag.load(Ordering::Acquire)
+    }
+
+    /// A served Vision read parks on the transport, not on the session. A Windows duplicate can
+    /// outlive the timeout meant to release the shared lock, so the echo's write must not wait
+    /// for the read at all: the driven shape pairs an opened session with a transport park.
+    #[test]
+    fn a_served_vision_read_parks_off_the_sessions_lock() {
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = listener.local_addr().expect("addr");
+        let wire = Connection::connect(addr).expect("connects");
+        let (far, _) = listener.accept().expect("accepts");
+        let read_entered = Arc::new(AtomicBool::new(false));
+        let opened = Arc::new(AtomicBool::new(false));
+        let sealed = Arc::new(AtomicBool::new(false));
+        let (release, hold) = std::sync::mpsc::channel();
+        let ended = Arc::new(AtomicBool::new(false));
+        let closed = Arc::clone(&ended);
+        let close: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || closed.store(true, Ordering::Release));
+        let session = Served {
+            wire,
+            read_entered: Arc::clone(&read_entered),
+            opened: Arc::clone(&opened),
+            sealed: Arc::clone(&sealed),
+        };
+        let relay = thread::spawn(move || {
+            relay_vision(
+                session,
+                None,
+                &[0u8; 16],
+                Half::shared(EchoOnce { hold, sent: false }),
+                &close,
+            );
+        });
+        let began = Instant::now();
+        while !read_entered.load(Ordering::Acquire)
+            && !opened.load(Ordering::Acquire)
+            && began.elapsed() < Duration::from_secs(5)
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert!(
+            read_entered.load(Ordering::Acquire) || opened.load(Ordering::Acquire),
+            "the Vision read never started"
+        );
+        release.send(()).expect("releases the echo");
+        let wrote = holds(&sealed, Duration::from_secs(2));
+        let _ = far.shutdown(Shutdown::Both);
+        assert!(
+            holds(&ended, Duration::from_secs(2)),
+            "the relay never ended"
+        );
+        relay.join().expect("joins");
+        assert!(
+            wrote,
+            "the echo's write waited on the read parked in the session"
+        );
     }
 
     fn tls_over_carrier(
