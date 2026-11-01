@@ -1605,6 +1605,149 @@ impl Role {
             Role::Proxied(inner) => inner.account(),
         }
     }
+
+    /// Whether this role's TLS handshake can run on a lane instead of the accept thread.
+    fn serves_polled_tls(&self) -> bool {
+        matches!(self, Role::TrojanTls { .. })
+    }
+
+    /// Accepts the TLS session and hands it to the lanes, so the caller returns before the
+    /// peer's first byte and the handshake parks off the workers.
+    fn serve_polled_tls(self, stream: Connection, sniffing: Option<Arc<crate::sniff::Sniffing>>) {
+        let Role::TrojanTls {
+            keys,
+            carrier,
+            freedom,
+            server,
+            fallbacks,
+            account,
+        } = self
+        else {
+            return;
+        };
+        if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+            return;
+        }
+        let source = stream.peer_addr().ok();
+        let email = account.email;
+        let level = account.level;
+        match carrier {
+            Carrier::Raw(_) => {
+                let Ok(raw) = stream.try_clone() else {
+                    return;
+                };
+                let Ok(session) = ferrox_core::tls::accept(&server, stream) else {
+                    return;
+                };
+                run_tls_handshake(session, move |session| {
+                    let _flow = lane_flow(sniffing, source, &email, level);
+                    let front = FrontNames::of(&session);
+                    relay_trojan_with_fallbacks(
+                        session,
+                        Some(raw),
+                        None,
+                        keys.as_ref(),
+                        freedom,
+                        fallbacks.as_deref(),
+                        &front,
+                    );
+                });
+            }
+            Carrier::Ws { path, .. } => {
+                let Ok(out) = stream.try_clone() else {
+                    return;
+                };
+                let Ok(session) = ferrox_core::tls::accept(&server, stream) else {
+                    return;
+                };
+                run_tls_handshake(session, move |session| {
+                    let _flow = lane_flow(sniffing, source, &email, level);
+                    let (reader, writer) = session_halves(session, out);
+                    serve_session_trojan_ws(reader, writer, &path, keys.as_ref(), freedom);
+                });
+            }
+            Carrier::Xhttp { settings } => {
+                let Ok(out) = stream.try_clone() else {
+                    return;
+                };
+                let Ok(session) = ferrox_core::tls::accept(&server, stream) else {
+                    return;
+                };
+                run_tls_handshake(session, move |session| {
+                    let _flow = lane_flow(sniffing, source, &email, level);
+                    let (reader, writer) = session_halves(session, out);
+                    serve_session_trojan_xhttp(reader, writer, &settings, keys.as_ref(), freedom);
+                });
+            }
+            Carrier::HttpUpgrade { path, host, .. } => {
+                let Ok(raw) = stream.try_clone() else {
+                    return;
+                };
+                let Ok(out) = stream.try_clone() else {
+                    return;
+                };
+                let Ok(session) = ferrox_core::tls::accept(&server, stream) else {
+                    return;
+                };
+                run_tls_handshake(session, move |session| {
+                    let _flow = lane_flow(sniffing, source, &email, level);
+                    let (reader, writer) = session_halves(session, out);
+                    serve_session_trojan_httpupgrade(
+                        reader,
+                        writer,
+                        raw,
+                        &path,
+                        &host,
+                        keys.as_ref(),
+                        freedom,
+                    );
+                });
+            }
+            Carrier::HttpHeader { path } => {
+                let Ok(raw) = stream.try_clone() else {
+                    return;
+                };
+                let Ok(out) = stream.try_clone() else {
+                    return;
+                };
+                let Ok(session) = ferrox_core::tls::accept(&server, stream) else {
+                    return;
+                };
+                run_tls_handshake(session, move |session| {
+                    let _flow = lane_flow(sniffing, source, &email, level);
+                    let (reader, writer) = session_halves(session, out);
+                    serve_session_trojan_httpheader(
+                        reader,
+                        writer,
+                        raw,
+                        &path,
+                        keys.as_ref(),
+                        freedom,
+                    );
+                });
+            }
+            Carrier::Grpc(settings) => {
+                let Ok(out) = stream.try_clone() else {
+                    return;
+                };
+                let Ok(session) = ferrox_core::tls::accept(&server, stream) else {
+                    return;
+                };
+                run_tls_handshake(session, move |session| {
+                    let _flow = lane_flow(sniffing, source, &email, level);
+                    let (reader, writer) = session_halves(session, out);
+                    serve_session_trojan_grpc(reader, writer, &settings, keys.as_ref(), freedom);
+                });
+            }
+            Carrier::Quic
+            | Carrier::Kcp(_)
+            | Carrier::Hysteria(_)
+            | Carrier::Masque
+            | Carrier::Xdrive { .. }
+            | Carrier::Http
+            | Carrier::Unknown { .. } => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3287,8 +3430,17 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
         let Ok(mut stream) = stream else { continue };
         no_delay(&stream);
         let role = role.clone();
-        let tag = tag.map(str::to_owned);
         let sniffing = sniffing.clone();
+        if role.serves_polled_tls() {
+            let stream = stream
+                .with_mask(role.tcp_mask())
+                .with_meter(crate::stats::inbound(tag))
+                .with_policy(Some(crate::policy::flow(0)));
+            let stream = with_account(stream, role.account(), false);
+            role.serve_polled_tls(stream, sniffing);
+            continue;
+        }
+        let tag = tag.map(str::to_owned);
         thread::spawn(move || {
             crate::sniff::install_current(sniffing);
             let (stream, role) = match role {
@@ -7507,6 +7659,72 @@ fn shake_tls<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
             Err(_) => return false,
         }
     }
+}
+
+/// Drives a server handshake on the relay lanes: the socket is nonblocking, so a step that finds
+/// no bytes parks the lane instead of the caller, and the caller is free before the first byte.
+fn run_tls_handshake<S, F>(session: S, finish: F)
+where
+    S: ferrox_core::tls::TlsProvider + Drivable + Send + 'static,
+    F: FnOnce(S) + Send + 'static,
+{
+    let Some(transport) = session.transport() else {
+        let mut session = session;
+        thread::spawn(move || {
+            if shake_tls(&mut session) {
+                finish(session);
+            }
+        });
+        return;
+    };
+    if transport.set_nonblocking(true).is_err() {
+        let mut session = session;
+        thread::spawn(move || {
+            if shake_tls(&mut session) {
+                finish(session);
+            }
+        });
+        return;
+    }
+    let deadline = Instant::now() + crate::quic::HANDSHAKE_TIMEOUT;
+    let mut session = Some(session);
+    let mut finish = Some(finish);
+    let mut transport = Some(transport);
+    lane_pool::submit(
+        Box::new(move || {
+            let Some(mut current) = session.take() else {
+                return Next::Done;
+            };
+            match current.handshake() {
+                Ok(()) => {
+                    if let Some(transport) = transport.take() {
+                        let _ = transport.set_nonblocking(false);
+                        let _ = transport.set_read_timeout(Some(RELAY_POLL));
+                    }
+                    if let Some(finish) = finish.take() {
+                        finish(current);
+                    }
+                    Next::Done
+                }
+                Err(ferrox_core::tls::TlsError::Timeout) if Instant::now() < deadline => {
+                    session = Some(current);
+                    Next::Idle
+                }
+                Err(_) => Next::Done,
+            }
+        }),
+        Box::new(|| {}),
+    );
+}
+
+fn lane_flow(
+    sniffing: Option<Arc<crate::sniff::Sniffing>>,
+    source: Option<SocketAddr>,
+    email: &str,
+    level: u32,
+) -> crate::accesslog::FlowGuard {
+    crate::sniff::install_current(sniffing);
+    crate::accesslog::flow(source, email, level)
 }
 
 fn serve_vless_reality(
@@ -48907,6 +49125,71 @@ mod tests {
         (identity, roots)
     }
 
+    /// The accept call returns before the peer's first byte: the handshake rides a lane, and the
+    /// client's own handshake proves that lane completes it.
+    #[test]
+    fn a_tls_handshake_returns_the_accept_call_before_the_peer_speaks() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (identity, roots) = minted_tls_identity("localhost");
+        let role = Role::TrojanTls {
+            keys: Arc::new([[0u8; 56]]),
+            carrier: Carrier::Raw(ferrox_core::finalmask::Chain::default()),
+            freedom: true,
+            server: identity,
+            fallbacks: None,
+            account: InboundAccount {
+                email: String::new(),
+                level: 0,
+            },
+        };
+        let (addr_tx, addr_rx) = std::sync::mpsc::channel();
+        let (returned_tx, returned_rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+            addr_tx
+                .send(listener.local_addr().expect("addr"))
+                .expect("addr");
+            let (stream, _) = listener.accept().expect("accepts");
+            let started = Instant::now();
+            role.serve_polled_tls(Connection::Tcp(stream), None);
+            returned_tx.send(started.elapsed()).expect("returned");
+        });
+        let addr = addr_rx.recv().expect("addr");
+        let client = std::net::TcpStream::connect(addr).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let returned = returned_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the accept call returns without the client's hello");
+        assert!(
+            returned < Duration::from_secs(1),
+            "the accept call waited on the handshake: {returned:?}"
+        );
+        let config = ferrox_core::tls::TlsConfig {
+            server_name: "localhost".to_owned(),
+            alpn: std::sync::Arc::default(),
+            roots: roots.into(),
+            pins: ferrox_core::foxy::pin::Pins::default(),
+            cert_pins: std::sync::Arc::default(),
+            verify_names: std::sync::Arc::default(),
+            cipher_suites: std::sync::Arc::default(),
+            curves: std::sync::Arc::default(),
+            insecure: false,
+            resumption: true,
+            fingerprint: None,
+            ech_config_list: None,
+            websocket: false,
+            master_key_log: None,
+        };
+        let mut session =
+            ferrox_core::tls::connect(&config, Connection::Tcp(client)).expect("connects");
+        session
+            .handshake()
+            .expect("the lane completes the handshake");
+    }
+
     /// Brings up a hysteria inbound on a free port with the given masquerade cover, so a test can point a browser at it and read what the cover answers.
     fn hysteria_loop_masq(
         auth: &str,
@@ -58303,20 +58586,22 @@ fn front_dispatch(stream: Connection, role: Role) {
     dispatch(stream, role, account.as_ref());
 }
 
+fn with_account(stream: Connection, account: Option<&InboundAccount>, vmess: bool) -> Connection {
+    let Some(account) = account else {
+        return stream;
+    };
+    let stream = stream.with_policy(Some(crate::policy::flow(account.level)));
+    if vmess {
+        stream
+    } else {
+        stream.with_meter(crate::stats::user_traffic(&account.email, account.level))
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
     let vmess = matches!(role, Role::Vmess { .. } | Role::VmessTls { .. });
-    let stream = match account {
-        Some(account) => {
-            let stream = stream.with_policy(Some(crate::policy::flow(account.level)));
-            if vmess {
-                stream
-            } else {
-                stream.with_meter(crate::stats::user_traffic(&account.email, account.level))
-            }
-        }
-        None => stream,
-    };
+    let stream = with_account(stream, account, vmess);
     match role {
         Role::Vless {
             users,
