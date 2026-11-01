@@ -235,6 +235,9 @@ impl std::fmt::Debug for Shared {
 /// Bytes one read asks for: a header and its payload cost one syscall; a mid-frame read is finished by the next.
 const READ_AHEAD: usize = 32 * 1024;
 
+/// The relay window is bounded as the old relay buffer was; a larger frame keeps its remainder in `have` for the next call.
+const WINDOW_MAX: usize = crate::proxy::RELAY_BUFFER;
+
 #[derive(Debug)]
 pub(crate) struct WsReader<R: Read = Connection> {
     read: R,
@@ -548,18 +551,22 @@ impl<R: Read> crate::proxy::WindowRead for WsReader<R> {
     fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
         if self.eat < self.early.len() {
             let start = self.eat;
-            self.eat = self.early.len();
-            return Ok(crate::proxy::Window::one(&self.early[start..]));
+            let end = self.early.len().min(start.saturating_add(WINDOW_MAX));
+            self.eat = end;
+            return Ok(crate::proxy::Window::one(&self.early[start..end]));
         }
         let mut spans = [(0usize, 0usize); crate::proxy::WINDOW_PARTS];
         let mut len = 0;
+        let mut room = WINDOW_MAX;
         loop {
             if self.at < self.msg_end {
                 let start = self.at;
-                let end = self.msg_end;
+                let end = self.msg_end.min(start.saturating_add(room));
                 self.at = end;
-                spans[len] = (start, end - start);
+                let take = end - start;
+                spans[len] = (start, take);
                 len += 1;
+                room -= take;
             } else {
                 if self.eof {
                     break;
@@ -574,14 +581,16 @@ impl<R: Read> crate::proxy::WindowRead for WsReader<R> {
                     break;
                 }
                 let start = self.at;
-                let end = self.msg_end;
+                let end = self.msg_end.min(start.saturating_add(room));
                 self.at = end;
                 if end > start {
-                    spans[len] = (start, end - start);
+                    let take = end - start;
+                    spans[len] = (start, take);
                     len += 1;
+                    room -= take;
                 }
             }
-            if len == crate::proxy::WINDOW_PARTS {
+            if len == crate::proxy::WINDOW_PARTS || room == 0 {
                 break;
             }
         }
@@ -1634,6 +1643,42 @@ mod tests {
                 .is_empty(),
             "the buffered messages are spent"
         );
+    }
+
+    /// A frame larger than the relay window is handed over in bounded pieces, and the remainder stays in `have` for the next call.
+    #[test]
+    fn a_frame_larger_than_the_relay_window_keeps_its_remainder() {
+        let payload: Vec<u8> = (0..WINDOW_MAX + 300).map(|i| (i % 251) as u8).collect();
+        let mut wire = vec![0x80 | OP_DATA, 127];
+        wire.extend_from_slice(&(payload.len() as u64).to_be_bytes());
+        wire.extend_from_slice(&payload);
+        let mut reader = window_reader(std::io::Cursor::new(Vec::new()), wire);
+        let base = reader.have.as_ptr();
+        let first = {
+            let window = crate::proxy::WindowRead::read_window(&mut reader).expect("first piece");
+            assert_eq!(window.bytes().as_ptr(), base);
+            let total: usize = window.parts().iter().map(|&(_, len)| len).sum();
+            assert_eq!(
+                total, WINDOW_MAX,
+                "one call hands over at most the relay window"
+            );
+            let mut out = Vec::with_capacity(total);
+            for &(start, len) in window.parts() {
+                out.extend_from_slice(&window.bytes()[start..start + len]);
+            }
+            out
+        };
+        assert_eq!(first, payload[..WINDOW_MAX]);
+        let second = {
+            let window = crate::proxy::WindowRead::read_window(&mut reader).expect("remainder");
+            assert_eq!(window.bytes().as_ptr(), base);
+            let mut out = Vec::new();
+            for &(start, len) in window.parts() {
+                out.extend_from_slice(&window.bytes()[start..start + len]);
+            }
+            out
+        };
+        assert_eq!(second, payload[WINDOW_MAX..]);
     }
 
     fn window_reader<R: Read>(read: R, have: Vec<u8>) -> WsReader<R> {

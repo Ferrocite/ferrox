@@ -77,6 +77,7 @@ if [[ $fast == 0 ]]; then
   ./scripts/run-benchmark-matrix.sh --selftest
   python3 scripts/workflow-result.py --selftest
   python3 scripts/rewrite-depinfo.py --selftest
+  python3 scripts/psiphon-target.py --selftest
 
   step "cli arguments"
   python3 scripts/check-cli-args.py

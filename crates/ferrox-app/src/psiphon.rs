@@ -323,7 +323,11 @@ impl Inner {
                         return Err("psiphon: the lane is stopping".to_owned());
                     }
                     let session = Arc::new(session);
-                    eprintln!("psiphon: tunnel up via {}", session.server());
+                    eprintln!(
+                        "psiphon: tunnel up via {} {}",
+                        session.server(),
+                        session.protocol()
+                    );
                     let mut sessions = lock(&self.sessions);
                     sessions.retain(|session| !session.is_closed());
                     if sessions.len() >= self.settings.pool {
@@ -1428,10 +1432,20 @@ fn free_port(ip: IpAddr) -> Result<u16, String> {
 
 fn load_entries(settings: &Settings) -> Result<Vec<Server>, String> {
     if let Some(target) = settings.target.as_deref() {
-        if let Some(server) = decode_entry(target.trim()) {
-            return Ok(vec![server]);
+        let Some(server) = decode_entry(target.trim()) else {
+            return Err("psiphon: TargetServerEntry is not a valid server entry".to_owned());
+        };
+        let (limits, label, filter) = target_protocol_filter(settings);
+        if let Some(shape) = filter {
+            if !matches_shape(&server, shape) {
+                let protocol = if server.obfuscated() { "OSSH" } else { "SSH" };
+                return Err(format!(
+                    "psiphon: TargetServerEntry is {protocol} but {label} ({}) leaves it out",
+                    limits.join(",")
+                ));
+            }
         }
-        return Err("psiphon: TargetServerEntry is not a valid server entry".to_owned());
+        return Ok(vec![server]);
     }
     let mut servers = Vec::new();
     let mut seen = HashSet::new();
@@ -1506,6 +1520,32 @@ fn shape_filter(protocols: &[String], label: &str) -> Option<(bool, bool)> {
     Some((wants_plain, wants_obfuscated))
 }
 
+fn matches_shape(server: &Server, (plain, obfuscated): (bool, bool)) -> bool {
+    if server.obfuscated() {
+        obfuscated
+    } else {
+        plain
+    }
+}
+
+fn target_protocol_filter(settings: &Settings) -> (&[String], &'static str, Option<(bool, bool)>) {
+    if settings.initial_count > 0 && !settings.initial_protocols.is_empty() {
+        let shape = shape_filter(&settings.initial_protocols, "InitialLimitTunnelProtocols");
+        if shape.is_some() {
+            return (
+                &settings.initial_protocols,
+                "InitialLimitTunnelProtocols",
+                shape,
+            );
+        }
+    }
+    (
+        &settings.protocols,
+        "LimitTunnelProtocols",
+        shape_filter(&settings.protocols, "LimitTunnelProtocols"),
+    )
+}
+
 /// Plain SSH and unfronted OSSH are the shapes this transport dials; a limit naming neither keeps the full list.
 fn select_protocols(
     servers: Vec<Server>,
@@ -1519,19 +1559,12 @@ fn select_protocols(
     if normal.is_none() && !initial_active {
         return servers;
     }
-    let matches = |server: &Server, filter: (bool, bool)| {
-        if server.obfuscated() {
-            filter.1
-        } else {
-            filter.0
-        }
-    };
     let mut selected = Vec::new();
     let mut rest = Vec::new();
     for (index, server) in servers.iter().enumerate() {
         if initial_active
             && selected.len() < initial_count
-            && initial.is_some_and(|filter| matches(server, filter))
+            && initial.is_some_and(|filter| matches_shape(server, filter))
         {
             selected.push(index);
         } else {
@@ -1540,7 +1573,7 @@ fn select_protocols(
     }
     selected.extend(
         rest.into_iter()
-            .filter(|index| normal.is_none_or(|filter| matches(&servers[*index], filter))),
+            .filter(|index| normal.is_none_or(|filter| matches_shape(&servers[*index], filter))),
     );
     if selected.is_empty() {
         eprintln!(
@@ -2178,9 +2211,7 @@ fn udp_requests(
         if payload.is_empty() {
             continue;
         }
-        let Some((ip, port)) = resolve_udp_target(target) else {
-            continue;
-        };
+        let (ip, port) = (target.ip(), target.port());
         let flow = {
             let mut flows = lock(flows);
             if let Some(flow) = flows.get(&(ip, port)) {
@@ -2219,12 +2250,7 @@ fn spawn_udp_reader(
         });
 }
 
-enum UdpTarget {
-    Address(SocketAddr),
-    Name(String, u16),
-}
-
-fn parse_udp_frame(frame: &[u8]) -> Option<(UdpTarget, &[u8])> {
+fn parse_udp_frame(frame: &[u8]) -> Option<(SocketAddr, &[u8])> {
     if frame.len() < 4 || frame[0] != 0 || frame[1] != 0 || frame[2] != 0 {
         return None;
     }
@@ -2235,23 +2261,12 @@ fn parse_udp_frame(frame: &[u8]) -> Option<(UdpTarget, &[u8])> {
             at += 4;
             let port = u16::from_be_bytes([*frame.get(at)?, *frame.get(at + 1)?]);
             at += 2;
-            UdpTarget::Address(SocketAddr::new(
+            SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::new(
                     address[0], address[1], address[2], address[3],
                 )),
                 port,
-            ))
-        }
-        3 => {
-            let length = usize::from(*frame.get(at)?);
-            at += 1;
-            let name = std::str::from_utf8(frame.get(at..at + length)?)
-                .ok()?
-                .to_owned();
-            at += length;
-            let port = u16::from_be_bytes([*frame.get(at)?, *frame.get(at + 1)?]);
-            at += 2;
-            UdpTarget::Name(name, port)
+            )
         }
         4 => {
             let address = frame.get(at..at + 16)?;
@@ -2260,26 +2275,12 @@ fn parse_udp_frame(frame: &[u8]) -> Option<(UdpTarget, &[u8])> {
             octets.copy_from_slice(address);
             let port = u16::from_be_bytes([*frame.get(at)?, *frame.get(at + 1)?]);
             at += 2;
-            UdpTarget::Address(SocketAddr::new(
-                IpAddr::V6(std::net::Ipv6Addr::from(octets)),
-                port,
-            ))
+            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::from(octets)), port)
         }
+        // Any other target, including a SOCKS name, is dropped: a local lookup would send the name in cleartext outside the tunnel, and udpgw carries an address, not a name.
         _ => return None,
     };
     Some((target, frame.get(at..)?))
-}
-
-fn resolve_udp_target(target: UdpTarget) -> Option<(IpAddr, u16)> {
-    match target {
-        UdpTarget::Address(address) => Some((address.ip(), address.port())),
-        UdpTarget::Name(name, port) => {
-            std::net::ToSocketAddrs::to_socket_addrs(&(name.as_str(), port))
-                .ok()?
-                .next()
-                .map(|address| (address.ip(), port))
-        }
-    }
 }
 
 fn socks_udp_frame_into(frame: &mut Vec<u8>, ip: IpAddr, port: u16, payload: &[u8]) {
@@ -2472,6 +2473,41 @@ mod tests {
             )),
             [false, false]
         );
+    }
+
+    #[test]
+    fn a_target_entry_still_honors_the_protocol_limit() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshHostKey":"AAAA"}"#;
+        let target = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let settings = |protocol| {
+            let text = format!(
+                r#"{{"TargetServerEntry":"{target}","LimitTunnelProtocols":["{protocol}"]}}"#
+            );
+            Settings::from_json(Some(&json::parse(&text).expect("settings"))).expect("settings")
+        };
+        assert!(load_entries(&settings("OSSH")).is_err());
+        let selected = load_entries(&settings("SSH")).expect("plain SSH is named");
+        assert_eq!(selected.len(), 1);
+        assert!(!selected[0].obfuscated());
+    }
+
+    #[test]
+    fn a_target_uses_the_initial_limit_only_when_it_names_a_shape() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshObfuscatedPort":443,"sshObfuscatedKey":"k","sshHostKey":"AAAA"}"#;
+        let target = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let settings = |initial| {
+            let text = format!(
+                r#"{{"TargetServerEntry":"{target}","LimitTunnelProtocols":["SSH"],"InitialLimitTunnelProtocols":["{initial}"],"InitialLimitTunnelProtocolsCandidateCount":1}}"#
+            );
+            Settings::from_json(Some(&json::parse(&text).expect("settings"))).expect("settings")
+        };
+        assert!(
+            load_entries(&settings("TLS-OSSH")).is_err(),
+            "an unsupported initial list must fall back to the normal limit"
+        );
+        let selected = load_entries(&settings("OSSH")).expect("the initial list names OSSH");
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].obfuscated());
     }
 
     #[test]
@@ -2799,13 +2835,21 @@ mod tests {
             b"hello",
         );
         let (target, payload) = parse_udp_frame(&frame).expect("frame");
-        assert!(matches!(
+        assert_eq!(
             target,
-            UdpTarget::Address(address)
-                if address.ip() == IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1))
-                    && address.port() == 5300
-        ));
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 5300)
+        );
         assert_eq!(payload, b"hello");
+    }
+
+    #[test]
+    fn a_socks_udp_name_is_not_resolved_outside_the_tunnel() {
+        let name = b"example.com";
+        let mut frame = vec![0, 0, 0, 3, name.len() as u8];
+        frame.extend_from_slice(name);
+        frame.extend_from_slice(&53u16.to_be_bytes());
+        frame.extend_from_slice(b"dns");
+        assert!(parse_udp_frame(&frame).is_none());
     }
 
     #[test]
