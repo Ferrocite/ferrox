@@ -98,6 +98,8 @@ jobs:
           python3 scripts/check-matrix-legs.py --selftest
           python3 scripts/workflow-result.py --selftest
           python3 scripts/rewrite-depinfo.py --selftest
+      - name: the live comparison helper
+        run: python3 scripts/psiphon-target.py --selftest
 
   lint:
     name: lint, docs and stall detector

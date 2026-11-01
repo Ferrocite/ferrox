@@ -355,6 +355,7 @@ struct Inner {
     socket: TcpStream,
     opened_at: Instant,
     server: String,
+    protocol: &'static str,
 }
 
 struct ChannelState {
@@ -481,6 +482,7 @@ impl Session {
             socket,
             opened_at: Instant::now(),
             server: format!("{}:{}", server.host, server.port),
+            protocol: if server.obfuscated() { "OSSH" } else { "SSH" },
         });
         let read_inner = Arc::clone(&inner);
         std::thread::Builder::new()
@@ -563,6 +565,11 @@ impl Session {
     #[must_use]
     pub(crate) fn server(&self) -> &str {
         &self.inner.server
+    }
+
+    #[must_use]
+    pub(crate) fn protocol(&self) -> &'static str {
+        self.inner.protocol
     }
 }
 
@@ -674,6 +681,19 @@ impl Channel {
 }
 
 impl ChannelState {
+    /// The peer ended the channel: refuse further writes, but let queued data drain to the reader.
+    fn peer_closed(&self) {
+        if let Some(tx) = lock(&self.open).take() {
+            let _ = tx.send(Err("psiphon ssh closed the channel".to_owned()));
+        }
+        let mut recv = lock(&self.recv);
+        recv.eof = true;
+        recv.closed = true;
+        drop(recv);
+        self.cond.notify_all();
+        self.window_cond.notify_all();
+    }
+
     fn fail(&self, why: &str) {
         if let Some(tx) = lock(&self.open).take() {
             let _ = tx.send(Err(why.to_owned()));
@@ -1985,7 +2005,7 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
             if let Some(state) = by_local(inner, local) {
                 lock(&inner.channels).remove(&local);
                 inner.close_channel(&state);
-                state.fail("psiphon ssh closed the channel");
+                state.peer_closed();
             }
             Dispatch::Recycle(packet.buffer)
         }
@@ -2022,7 +2042,8 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
             }
             Dispatch::Recycle(packet.buffer)
         }
-        MSG_DISCONNECT => Dispatch::Stop,
+        // Rekey is not implemented; a stalled session is worse than a reconnect.
+        MSG_DISCONNECT | MSG_KEXINIT => Dispatch::Stop,
         _ => Dispatch::Recycle(packet.buffer),
     }
 }
@@ -2268,6 +2289,7 @@ mod tests {
             socket: peer,
             opened_at: Instant::now(),
             server: "test".to_owned(),
+            protocol: "SSH",
         });
         let state = Arc::new(ChannelState {
             local: 1,
@@ -2325,6 +2347,7 @@ mod tests {
             socket: peer,
             opened_at: Instant::now(),
             server: "test".to_owned(),
+            protocol: "SSH",
         });
         let state = Arc::new(ChannelState {
             local: 1,
@@ -2385,6 +2408,7 @@ mod tests {
             socket: peer,
             opened_at: Instant::now(),
             server: "test".to_owned(),
+            protocol: "SSH",
         });
         let (tx, rx) = mpsc::channel();
         let state = Arc::new(ChannelState {
@@ -2451,6 +2475,122 @@ mod tests {
     }
 
     #[test]
+    fn a_server_close_keeps_the_data_it_already_sent() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
+        let (_local, _) = listener.accept().expect("accept");
+        let pool = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::new(Inner {
+            writer: Mutex::new(PacketWriter::new(
+                peer.try_clone().expect("clone"),
+                None,
+                None,
+                None,
+            )),
+            channels: Mutex::new(HashMap::new()),
+            pool: Arc::clone(&pool),
+            next_channel: AtomicU32::new(2),
+            closed: AtomicBool::new(false),
+            socket: peer,
+            opened_at: Instant::now(),
+            server: "test".to_owned(),
+            protocol: "SSH",
+        });
+        let state = Arc::new(ChannelState {
+            local: 1,
+            remote: AtomicU32::new(2),
+            remote_window: Mutex::new(0),
+            remote_packet: AtomicU32::new(CHANNEL_PACKET),
+            recv: Mutex::new(Recv {
+                chunks: VecDeque::new(),
+                eof: false,
+                closed: false,
+                pending_adjust: 0,
+                local_window: u64::from(CHANNEL_WINDOW),
+            }),
+            cond: Condvar::new(),
+            window_cond: Condvar::new(),
+            open: Mutex::new(None),
+            pool: Arc::clone(&pool),
+        });
+        lock(&inner.channels).insert(1, Arc::clone(&state));
+
+        let mut data = vec![MSG_CHANNEL_DATA];
+        put_u32(&mut data, 1);
+        put_str(&mut data, b"hi");
+        let end = data.len();
+        assert!(matches!(
+            dispatch(
+                &inner,
+                Packet {
+                    buffer: data,
+                    start: 0,
+                    end
+                }
+            ),
+            Dispatch::Queued
+        ));
+        let mut close = vec![MSG_CHANNEL_CLOSE];
+        put_u32(&mut close, 1);
+        let end = close.len();
+        assert!(matches!(
+            dispatch(
+                &inner,
+                Packet {
+                    buffer: close,
+                    start: 0,
+                    end
+                }
+            ),
+            Dispatch::Recycle(_)
+        ));
+
+        let mut channel = Channel {
+            session: Arc::clone(&inner),
+            state,
+        };
+        let mut out = [0u8; 2];
+        channel.read_exact(&mut out).expect("read the queued bytes");
+        assert_eq!(&out, b"hi");
+        assert_eq!(channel.read(&mut out).expect("eof"), 0);
+        assert!(channel.write(b"late").is_err());
+    }
+
+    #[test]
+    fn a_post_handshake_kexinit_reconnects_instead_of_stalling() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
+        let (_local, _) = listener.accept().expect("accept");
+        let inner = Arc::new(Inner {
+            writer: Mutex::new(PacketWriter::new(
+                peer.try_clone().expect("clone"),
+                None,
+                None,
+                None,
+            )),
+            channels: Mutex::new(HashMap::new()),
+            pool: Arc::new(Mutex::new(Vec::new())),
+            next_channel: AtomicU32::new(1),
+            closed: AtomicBool::new(false),
+            socket: peer,
+            opened_at: Instant::now(),
+            server: "test".to_owned(),
+            protocol: "SSH",
+        });
+        assert!(matches!(
+            dispatch(
+                &inner,
+                Packet {
+                    buffer: vec![MSG_KEXINIT],
+                    start: 0,
+                    end: 1
+                }
+            ),
+            Dispatch::Stop
+        ));
+    }
+
+    #[test]
     fn a_closed_channel_sends_no_data_after_its_close() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
@@ -2472,6 +2612,7 @@ mod tests {
             socket: peer,
             opened_at: Instant::now(),
             server: "test".to_owned(),
+            protocol: "SSH",
         });
         let state = Arc::new(ChannelState {
             local: 1,

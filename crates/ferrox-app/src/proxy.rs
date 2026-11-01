@@ -25092,7 +25092,8 @@ where
             uplink.upload_done();
             if CLOSE_FIRST {
                 uplink.close();
-                let _ = peer_read.shutdown(Shutdown::Both);
+                // The peer ended its upload: keep the write half for the download leg's retained bytes.
+                let _ = peer_read.shutdown(Shutdown::Read);
             }
             Next::Done
         }),
@@ -32834,6 +32835,91 @@ mod tests {
         fn close(&self) {
             self.state.lock().expect("locks").0 = true;
         }
+    }
+
+    /// A peer that ends its upload must still take every window the download lane has already parsed.
+    #[test]
+    fn a_half_closed_peer_still_takes_the_retained_window() {
+        struct TwoWindows {
+            stage: u8,
+            flow: Arc<Mutex<Option<Arc<RelayFinish>>>>,
+        }
+
+        impl Read for TwoWindows {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+
+        impl WindowRead for TwoWindows {
+            fn read_window(&mut self) -> std::io::Result<Window<'_>> {
+                match self.stage {
+                    0 => {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        while self.flow.lock().expect("flow").is_none() {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "the relay flow was registered"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        self.stage = 1;
+                        Ok(Window::one(b"first"))
+                    }
+                    1 => {
+                        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                        let flow = {
+                            let slot = self.flow.lock().expect("flow");
+                            Arc::clone(slot.as_ref().expect("flow registered"))
+                        };
+                        while flow.left.load(Ordering::Acquire) == 2 {
+                            assert!(
+                                std::time::Instant::now() < deadline,
+                                "the upload lane ended before the download lane read again"
+                            );
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        self.stage = 2;
+                        Ok(Window::one(b"second"))
+                    }
+                    _ => Ok(Window::one(b"")),
+                }
+            }
+        }
+
+        let peer = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let peer_port = peer.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = peer.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            stream.shutdown(Shutdown::Write).expect("half closes");
+            let mut got = [0u8; 11];
+            stream.read_exact(&mut got).expect("reads both windows");
+            got.to_vec()
+        });
+        let connection = Connection::connect(("127.0.0.1", peer_port)).expect("dials");
+        let sink = ClosingSink::default();
+        let registered = Arc::new(Mutex::new(None));
+        let flow = relay_ordered::<TwoWindows, ClosingSink, _, _, CLOSE_BEFORE_JOIN, false>(
+            TwoWindows {
+                stage: 0,
+                flow: Arc::clone(&registered),
+            },
+            &sink,
+            &connection,
+            |_| {},
+            |_| false,
+        )
+        .expect("relay");
+        *registered.lock().expect("flow") = Some(Arc::clone(&flow));
+        flow.wait();
+        assert_eq!(
+            server.join().expect("joins"),
+            b"firstsecond",
+            "the retained window reached the half-closed peer"
+        );
     }
 
     fn relay_against_a_late_peer(drain: bool) -> (bool, Vec<u8>) {
