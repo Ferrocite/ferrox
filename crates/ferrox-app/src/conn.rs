@@ -264,37 +264,52 @@ impl ferrox_core::tls::RecordAlignment for Connection {}
 
 impl Read for Connection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
+        let result = match self {
             Connection::Tcp(stream) => stream.read(buf),
             Connection::Masked(masked) => masked.stream.read(buf),
-            Connection::Metered(metered) => {
-                let n = metered.inner.read(buf)?;
-                metered.meter.read(n);
-                Ok(n)
-            }
+            Connection::Metered(metered) => match metered.inner.read(buf) {
+                Ok(n) => {
+                    metered.meter.read(n);
+                    Ok(n)
+                }
+                Err(error) => Err(error),
+            },
             Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
                 inner.read(buf)
             }
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.read(buf),
+        };
+        // A relay step's timed-out read names the socket the lane can wait on instead of polling the clock.
+        #[cfg(unix)]
+        if result.as_ref().is_err_and(crate::proxy::is_timeout) {
+            crate::proxy::note_wait_fd(std::os::fd::AsRawFd::as_raw_fd(&*self));
         }
+        result
     }
 
     fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
-        match self {
+        let result = match self {
             Connection::Tcp(stream) => stream.read_vectored(bufs),
             Connection::Masked(masked) => masked.stream.read_vectored(bufs),
-            Connection::Metered(metered) => {
-                let n = metered.inner.read_vectored(bufs)?;
-                metered.meter.read(n);
-                Ok(n)
-            }
+            Connection::Metered(metered) => match metered.inner.read_vectored(bufs) {
+                Ok(n) => {
+                    metered.meter.read(n);
+                    Ok(n)
+                }
+                Err(error) => Err(error),
+            },
             Connection::Proxied { inner, .. } | Connection::Policied { inner, .. } => {
                 inner.read_vectored(bufs)
             }
             #[cfg(any(unix, windows))]
             Connection::Unix(stream) => stream.read_vectored(bufs),
+        };
+        #[cfg(unix)]
+        if result.as_ref().is_err_and(crate::proxy::is_timeout) {
+            crate::proxy::note_wait_fd(std::os::fd::AsRawFd::as_raw_fd(&*self));
         }
+        result
     }
 }
 
@@ -349,7 +364,7 @@ impl Write for Connection {
 // A socket answers on a shared descriptor, so `std` impls `Read`/`Write` for `&TcpStream` and the relay drains each leg by shared reference; `&Connection` does the same for whichever arm it holds, and a masked leg's writes reach its chain the same way.
 impl Read for &Connection {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match *self {
+        let result = match *self {
             Connection::Tcp(stream) => {
                 let mut inner = stream;
                 inner.read(buf)
@@ -360,9 +375,13 @@ impl Read for &Connection {
             }
             Connection::Metered(ref metered) => {
                 let mut inner = &*metered.inner;
-                let n = inner.read(buf)?;
-                metered.meter.read(n);
-                Ok(n)
+                match inner.read(buf) {
+                    Ok(n) => {
+                        metered.meter.read(n);
+                        Ok(n)
+                    }
+                    Err(error) => Err(error),
+                }
             }
             Connection::Proxied { ref inner, .. } | Connection::Policied { ref inner, .. } => {
                 let mut inner = &**inner;
@@ -373,11 +392,16 @@ impl Read for &Connection {
                 let mut inner = stream;
                 inner.read(buf)
             }
+        };
+        #[cfg(unix)]
+        if result.as_ref().is_err_and(crate::proxy::is_timeout) {
+            crate::proxy::note_wait_fd(std::os::fd::AsRawFd::as_raw_fd(*self));
         }
+        result
     }
 
     fn read_vectored(&mut self, bufs: &mut [io::IoSliceMut<'_>]) -> io::Result<usize> {
-        match *self {
+        let result = match *self {
             Connection::Tcp(stream) => {
                 let mut inner = stream;
                 inner.read_vectored(bufs)
@@ -388,9 +412,13 @@ impl Read for &Connection {
             }
             Connection::Metered(ref metered) => {
                 let mut inner = &*metered.inner;
-                let n = inner.read_vectored(bufs)?;
-                metered.meter.read(n);
-                Ok(n)
+                match inner.read_vectored(bufs) {
+                    Ok(n) => {
+                        metered.meter.read(n);
+                        Ok(n)
+                    }
+                    Err(error) => Err(error),
+                }
             }
             Connection::Proxied { ref inner, .. } | Connection::Policied { ref inner, .. } => {
                 let mut inner = &**inner;
@@ -401,7 +429,12 @@ impl Read for &Connection {
                 let mut inner = stream;
                 inner.read_vectored(bufs)
             }
+        };
+        #[cfg(unix)]
+        if result.as_ref().is_err_and(crate::proxy::is_timeout) {
+            crate::proxy::note_wait_fd(std::os::fd::AsRawFd::as_raw_fd(*self));
         }
+        result
     }
 }
 
