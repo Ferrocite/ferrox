@@ -9097,6 +9097,7 @@ pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
 }
 
 /// A timeout that waits on the socket: an interrupted read is retried, not parked on the descriptor.
+#[cfg(unix)]
 pub(crate) fn is_descriptor_wait(error: &std::io::Error) -> bool {
     is_timeout(error) && error.kind() != std::io::ErrorKind::Interrupted
 }
