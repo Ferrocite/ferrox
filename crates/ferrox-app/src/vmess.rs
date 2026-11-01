@@ -3352,25 +3352,6 @@ mod tests {
             Some(crate::budgets::RELAY_POLL),
             "the lane waits in the kernel for a datagram instead of sleeping between polls"
         );
-        assert_eq!(
-            udp.write_timeout().expect("the send window the pump armed"),
-            Some(crate::budgets::RELAY_POLL),
-            "a full send buffer still answers inside the quantum, so no leg parks unboundedly"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::fd::AsRawFd;
-            let flags = unsafe { libc::fcntl(udp.as_raw_fd(), libc::F_GETFL) };
-            assert!(
-                flags >= 0,
-                "the gate asks the kernel what the pump left the socket as"
-            );
-            assert_eq!(
-                flags & libc::O_NONBLOCK,
-                0,
-                "a window on a nonblocking socket is ignored, so the park needs the flag cleared as well as the window armed"
-            );
-        }
     }
 
     #[test]

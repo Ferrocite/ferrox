@@ -22499,11 +22499,8 @@ pub(crate) fn pump_vmess_udp<R, W>(
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    // The lane parks in the kernel rather than sleeping between polls: a datagram wakes the recv at once, and a full send buffer still answers inside the same quantum.
-    if udp.set_nonblocking(false).is_err()
-        || udp.set_read_timeout(Some(RELAY_POLL)).is_err()
-        || udp.set_write_timeout(Some(RELAY_POLL)).is_err()
-    {
+    // The lane parks in the kernel rather than sleeping between polls: a datagram wakes the recv at once. The socket arrives blocking from its bind, so the window alone is the park — the shape every other UDP lane here arms, and a send window of one millisecond is not part of it.
+    if udp.set_read_timeout(Some(RELAY_POLL)).is_err() {
         close();
         return;
     }
