@@ -11198,23 +11198,28 @@ fn serve_ss_relay_inbound(address: &str, inbound: &Json, password: &str, method:
     else {
         return false;
     };
+    let (tcp, udp) = inbound_ss_networks(inbound);
     let tcp_address = address.to_owned();
-    let udp_address = address.to_owned();
-    let method = method.to_owned();
-    let udp_dests = relay_dests.clone();
-    let udp_psk = psk.clone();
-    thread::spawn(move || {
-        let Ok(target) = parse_target(&tcp_address) else {
-            return;
-        };
-        let Ok(listener) = Listener::bind(&target) else {
-            return;
-        };
-        for stream in listener.incoming().flatten() {
-            crate::shadowsocks2022::serve_relay(stream, &method, &psk, &relay_dests);
-        }
-    });
-    if !parsed.is_chacha() {
+    if tcp {
+        let method = method.to_owned();
+        let psk = psk.clone();
+        let relay_dests = relay_dests.clone();
+        thread::spawn(move || {
+            let Ok(target) = parse_target(&tcp_address) else {
+                return;
+            };
+            let Ok(listener) = Listener::bind(&target) else {
+                return;
+            };
+            for stream in listener.incoming().flatten() {
+                crate::shadowsocks2022::serve_relay(stream, &method, &psk, &relay_dests);
+            }
+        });
+    }
+    if udp && !parsed.is_chacha() {
+        let udp_address = address.to_owned();
+        let udp_dests = relay_dests.clone();
+        let udp_psk = psk.clone();
         thread::spawn(move || {
             let Ok(clients) = UdpSocket::bind(&udp_address) else {
                 return;
@@ -11262,7 +11267,7 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     let (tcp, udp) = inbound_ss_networks(inbound);
     let accounts = ss_accounts(inbound, address, password, method);
     let udp_accounts = (udp && matches!(carrier, Carrier::Raw(_))).then(|| Arc::clone(&accounts));
-    // The 2022 relay serves its own tcp and udp listeners as one unit, so a network list does not split it.
+    // The 2022 relay opens each listener the inbound's network list names, so a tcp-only relay binds no udp socket.
     if matches!(carrier, Carrier::Raw(_))
         && serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method)
     {
