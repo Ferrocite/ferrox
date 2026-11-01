@@ -988,9 +988,12 @@ pub(crate) fn read_frame<'a>(
 /// pays for two — the first of them moving two bytes. A relay batch cannot be read this way
 /// because a window hides how much it holds, which is why [`Wire`] holds the sealed bytes itself;
 /// a frame per packet has no batch to hide, so it reads through here.
+///
+/// The window is the relay pool's own 16 KiB [`crate::proxy::RelayBuf`]: initialised storage a busy
+/// lane hands from one datagram direction to the next instead of allocating per direction.
 pub(crate) struct Buffered<R: Read> {
     carrier: R,
-    held: Vec<u8>,
+    held: crate::proxy::RelayBuf,
     at: usize,
     end: usize,
 }
@@ -1000,7 +1003,7 @@ impl<R: Read> Buffered<R> {
     pub(crate) fn new(carrier: R) -> Self {
         Self {
             carrier,
-            held: crate::proxy::unfilled(crate::proxy::RELAY_SMALL_BUFFER),
+            held: crate::proxy::RelayBuf::with_window(crate::proxy::RELAY_SMALL_BUFFER),
             at: 0,
             end: 0,
         }
@@ -1011,10 +1014,11 @@ impl<R: Read> Read for Buffered<R> {
     fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
         if self.at == self.end {
             self.at = 0;
-            self.end = self.carrier.read(&mut self.held)?;
+            self.end = self.carrier.read(self.held.as_mut())?;
         }
         let take = (self.end - self.at).min(dst.len());
-        dst[..take].copy_from_slice(&self.held[self.at..self.at + take]);
+        let held = self.held.as_mut();
+        dst[..take].copy_from_slice(&held[self.at..self.at + take]);
         self.at += take;
         Ok(take)
     }
@@ -3157,6 +3161,11 @@ mod tests {
             reads: 0,
         };
         let mut windowed = Buffered::new(&mut carrier);
+        assert_eq!(
+            windowed.held.size(),
+            crate::proxy::RELAY_SMALL_BUFFER,
+            "the leg reads through the pool's own window, not a size of its own"
+        );
         let mut got = Vec::new();
         let mut sizes = Vec::new();
         let mut scratch = Vec::new();
@@ -4262,21 +4271,6 @@ mod tests {
             "and it is the window the leg reads into"
         );
         drop(window);
-        let (windowed, counts) = ferrox_core::alloc_count::measure(|| {
-            Buffered::new(Sealed {
-                held: Vec::new(),
-                at: 0,
-                grain: 0,
-                reads: 0,
-            })
-        });
-        assert_eq!(counts.zeroed, 0, "the datagram leg's window is not zeroed");
-        assert_eq!(
-            counts.bytes,
-            crate::proxy::RELAY_SMALL_BUFFER,
-            "and it is the window the leg reads into"
-        );
-        drop(windowed);
     }
 
     #[test]
