@@ -62,11 +62,20 @@ def free_port() -> int:
                 return port
 
 
+def shim(path: pathlib.Path, text: str) -> None:
+    # A later call re-arms the tool while a lane child of an earlier one still executes it, and Linux refuses to truncate a running script with ETXTBSY; replacing the entry leaves that child on the old inode.
+    staging = path.with_name(f"{path.name}.staging-{os.getpid()}")
+    staging.write_text(text, encoding="utf-8")
+    staging.chmod(0o755)
+    os.replace(staging, path)
+
+
 def fake_networksetup(state: pathlib.Path) -> pathlib.Path:
     bin_dir = state / "fake-bin"
     bin_dir.mkdir(exist_ok=True)
     tool = bin_dir / "networksetup"
-    tool.write_text(
+    shim(
+        tool,
         """#!/bin/sh
 state="${FERROX_CONF_DIR:?}"
 machine="${FERROX_STATE_DIR:-$state}"
@@ -213,12 +222,11 @@ case "$command" in
 esac
 exit 0
 """,
-        encoding="utf-8",
     )
-    tool.chmod(0o755)
 
     scutil = bin_dir / "scutil"
-    scutil.write_text(
+    shim(
+        scutil,
         """#!/bin/sh
 state="${FERROX_CONF_DIR:?}"
 machine="${FERROX_STATE_DIR:-$state}"
@@ -279,9 +287,7 @@ for kind in http https socks; do
 done
 echo "}"
 """,
-        encoding="utf-8",
     )
-    scutil.chmod(0o755)
     return bin_dir
 
 
@@ -289,7 +295,8 @@ def fake_curl(state: pathlib.Path) -> pathlib.Path:
     bin_dir = state / "fake-curl-bin"
     bin_dir.mkdir(exist_ok=True)
     tool = bin_dir / "curl"
-    tool.write_text(
+    shim(
+        tool,
         """#!/bin/sh
 if [ -n "${FERROX_FAKE_CURL_LOG:-}" ]; then
   {
@@ -313,9 +320,7 @@ if [ "${FERROX_FAKE_TRACE:-}" = 1 ]; then
 fi
 exit 7
 """,
-        encoding="utf-8",
     )
-    tool.chmod(0o755)
     return bin_dir
 
 
@@ -406,8 +411,7 @@ def env_for(
         bin_dir = state / "fake-darwin-bin"
         bin_dir.mkdir(exist_ok=True)
         uname = bin_dir / "uname"
-        uname.write_text("#!/bin/sh\nprintf 'Darwin\\n'\n", encoding="utf-8")
-        uname.chmod(0o755)
+        shim(uname, "#!/bin/sh\nprintf 'Darwin\\n'\n")
         path = f"{bin_dir}:{path}"
     if curl:
         path = f"{fake_curl(state)}:{path}"
