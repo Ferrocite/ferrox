@@ -13,7 +13,7 @@ use std::net::{
     IpAddr, Ipv4Addr, Ipv6Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket,
 };
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -30,7 +30,7 @@ const MAX_LIST_BYTES: u64 = 16 * 1024 * 1024;
 const RELAY_BUFFER: usize = 32 * 1024;
 const MAX_REQUEST: usize = 16 * 1024;
 const DIAL_ATTEMPTS: usize = 64;
-const DIAL_RACE: usize = 4;
+const DIAL_WORKERS: usize = 10;
 const DIAL_TIMEOUT: Duration = Duration::from_secs(12);
 const FLOW_STACK: usize = 128 * 1024;
 
@@ -52,7 +52,8 @@ pub(crate) struct PsiphonOut {
 struct Inner {
     settings: Settings,
     entries: Vec<Server>,
-    session: Mutex<Option<Arc<Session>>>,
+    sessions: Mutex<Vec<Arc<Session>>>,
+    next_session: AtomicUsize,
     connecting: Mutex<()>,
     session_id: String,
     stopping: AtomicBool,
@@ -70,7 +71,14 @@ struct Settings {
     entries: Option<PathBuf>,
     target: Option<String>,
     protocols: Vec<String>,
-    beast: bool,
+    initial_protocols: Vec<String>,
+    initial_count: usize,
+    pool: usize,
+    latency: f64,
+    establish: Option<Duration>,
+    workers: usize,
+    stagger: Duration,
+    relay_buffer: usize,
     server_lists: Vec<String>,
     server_lists_explicit: bool,
     remote_fetch_disabled: bool,
@@ -126,7 +134,8 @@ impl PsiphonOut {
             session_id: hex(&random::<16>()),
             settings,
             entries,
-            session: Mutex::new(None),
+            sessions: Mutex::new(Vec::new()),
+            next_session: AtomicUsize::new(0),
             connecting: Mutex::new(()),
             stopping: AtomicBool::new(false),
             endpoint,
@@ -224,7 +233,7 @@ impl Drop for Inner {
         if let Some(gateway) = lock(&self.udpgw).take() {
             gateway.close();
         }
-        if let Some(session) = lock(&self.session).take() {
+        for session in lock(&self.sessions).drain(..) {
             session.close();
         }
     }
@@ -241,7 +250,26 @@ fn wake_address(endpoint: SocketAddr) -> SocketAddr {
 }
 
 impl Inner {
-    fn connect(&self) -> Result<(), String> {
+    /// Live sessions, with dead ones retired before any count is read.
+    fn live(&self) -> usize {
+        let mut sessions = lock(&self.sessions);
+        sessions.retain(|session| !session.is_closed());
+        sessions.len()
+    }
+
+    /// Spread flows over the pool round-robin, so one tunnel's window is not a global cap.
+    fn pick(&self) -> Option<Arc<Session>> {
+        let mut sessions = lock(&self.sessions);
+        sessions.retain(|session| !session.is_closed());
+        if sessions.is_empty() {
+            return None;
+        }
+        let at = self.next_session.fetch_add(1, Ordering::Relaxed) % sessions.len();
+        Some(Arc::clone(&sessions[at]))
+    }
+
+    /// Dial and add one tunnel; the caller holds the `connecting` lock.
+    fn connect_locked(&self) -> Result<Arc<Session>, String> {
         if self.stopping.load(Ordering::Acquire) {
             return Err("psiphon: the lane is stopping".to_owned());
         }
@@ -252,6 +280,7 @@ impl Inner {
         let start = usize::from(random::<1>()[0]) % entries.len();
         let deadline = Instant::now() + self.settings.ready;
         let limit = entries.len().min(DIAL_ATTEMPTS);
+        let timeout = self.settings.dial_timeout();
         let mut last = String::new();
         let mut offset = 0;
         while offset < limit {
@@ -259,42 +288,53 @@ impl Inner {
             if remaining.is_zero() {
                 break;
             }
-            let width = if self.settings.beast {
-                DIAL_RACE.saturating_mul(2).min(limit - offset)
-            } else {
-                DIAL_RACE.min(limit - offset)
-            };
+            let width = self.settings.workers.min(limit - offset);
+            if width == 0 {
+                break;
+            }
             let batch: Vec<Server> = (0..width)
                 .map(|step| entries[(start + offset + step) % entries.len()].clone())
                 .collect();
             offset += width;
+            let last_delay = self
+                .settings
+                .stagger
+                .saturating_mul(u32::try_from(width - 1).unwrap_or(u32::MAX));
+            let stagger = if last_delay.saturating_add(timeout) <= remaining {
+                self.settings.stagger
+            } else {
+                Duration::ZERO
+            };
+            let budget = if stagger.is_zero() {
+                remaining.min(timeout)
+            } else {
+                last_delay.saturating_add(timeout).min(remaining)
+            };
             let session_id = self.session_id.clone();
             let sponsor = self.settings.sponsor.clone();
             let proxy = self.settings.proxy.clone();
             let attempt = move |server: &Server| {
-                Session::connect(
-                    server,
-                    &session_id,
-                    &sponsor,
-                    remaining.min(DIAL_TIMEOUT),
-                    proxy.as_ref(),
-                )
+                Session::connect(server, &session_id, &sponsor, timeout, proxy.as_ref())
             };
-            match race(batch, attempt, remaining.min(DIAL_TIMEOUT)) {
+            match race(batch, attempt, budget, stagger) {
                 Ok(session) => {
                     if self.stopping.load(Ordering::Acquire) {
                         session.close();
                         return Err("psiphon: the lane is stopping".to_owned());
                     }
+                    let session = Arc::new(session);
                     eprintln!("psiphon: tunnel up via {}", session.server());
-                    if let Some(gateway) = lock(&self.udpgw).take() {
-                        gateway.close();
+                    let mut sessions = lock(&self.sessions);
+                    sessions.retain(|session| !session.is_closed());
+                    if sessions.len() >= self.settings.pool {
+                        let at = self.next_session.fetch_add(1, Ordering::Relaxed) % sessions.len();
+                        let existing = Arc::clone(&sessions[at]);
+                        drop(sessions);
+                        session.close();
+                        return Ok(existing);
                     }
-                    if let Some(old) = lock(&self.session).take() {
-                        old.close();
-                    }
-                    *lock(&self.session) = Some(Arc::new(session));
-                    return Ok(());
+                    sessions.push(Arc::clone(&session));
+                    return Ok(session);
                 }
                 Err(why) => last = why,
             }
@@ -333,41 +373,44 @@ impl Inner {
                 Err(why) if !session.is_closed() => return Err(why),
                 Err(_) => {
                     session.close();
-                    let mut slot = lock(&self.session);
-                    if slot
-                        .as_ref()
-                        .is_some_and(|current| Arc::ptr_eq(current, &session))
-                    {
-                        *slot = None;
-                    }
+                    lock(&self.sessions).retain(|current| !Arc::ptr_eq(current, &session));
                 }
             }
         }
         Err(format!("psiphon: {host}:{port} was not reachable"))
     }
 
-    /// The open session, dialing at most once beside any other caller.
+    /// A live tunnel, dialing at most one beside any other caller.
     fn ensure(&self) -> Result<Arc<Session>, String> {
-        let current = lock(&self.session);
-        if let Some(session) = current.as_ref().filter(|session| !session.is_closed()) {
-            return Ok(Arc::clone(session));
+        if let Some(session) = self.pick() {
+            return Ok(session);
         }
-        drop(current);
         let _connecting = lock(&self.connecting);
-        let current = lock(&self.session);
-        if let Some(session) = current.as_ref().filter(|session| !session.is_closed()) {
-            return Ok(Arc::clone(session));
+        if let Some(session) = self.pick() {
+            return Ok(session);
         }
-        drop(current);
-        self.connect()?;
-        lock(&self.session)
-            .as_ref()
-            .map(Arc::clone)
-            .ok_or_else(|| "psiphon: no tunnel".to_owned())
+        self.connect_locked()
+    }
+
+    /// Fill the configured pool one tunnel at a time, stopping on the first refusal.
+    fn fill(&self) -> Result<(), String> {
+        loop {
+            if self.stopping.load(Ordering::Acquire) {
+                return Err("psiphon: the lane is stopping".to_owned());
+            }
+            if self.live() >= self.settings.pool {
+                return Ok(());
+            }
+            let _connecting = lock(&self.connecting);
+            if self.live() >= self.settings.pool {
+                return Ok(());
+            }
+            self.connect_locked()?;
+        }
     }
 }
 
-/// Keep the tunnel warm beside the edge: a refused dial is a retry, not an exit.
+/// Keep the pool warm beside the edge: a refused dial is a retry, not an exit.
 fn warm_tunnel(lane: &Weak<Inner>) {
     let mut logged: Option<Instant> = None;
     loop {
@@ -377,10 +420,13 @@ fn warm_tunnel(lane: &Weak<Inner>) {
         if inner.stopping.load(Ordering::Acquire) {
             return;
         }
-        let outcome = inner.ensure();
+        let outcome = inner.fill();
         drop(inner);
         match outcome {
-            Ok(_) => return,
+            Ok(()) => {
+                thread::sleep(Duration::from_secs(10));
+                continue;
+            }
             Err(why) => {
                 let now = Instant::now();
                 // One line per cycle at most, so an instantly refused list cannot flood the log.
@@ -419,13 +465,14 @@ fn serve(mut client: TcpStream, inner: &Arc<Inner>) {
     match ask {
         Ask::Connect(host, port) => match inner.dial(&host, port) {
             Ok(channel) => {
+                trace_flow(&channel);
                 if !ask_reply(&mut client, version, Ok(())) {
                     channel.close();
                     return;
                 }
                 let _ = client.set_read_timeout(None);
                 let _ = client.set_write_timeout(None);
-                relay(client, channel);
+                relay(client, channel, inner.settings.relay_buffer);
             }
             Err(why) => {
                 eprintln!("psiphon: {why}");
@@ -602,7 +649,7 @@ fn ask_reply(client: &mut TcpStream, version: Version, result: Result<(), u8>) -
 }
 
 #[allow(clippy::needless_pass_by_value)]
-fn relay(mut client: TcpStream, channel: Channel) {
+fn relay(mut client: TcpStream, channel: Channel, buffer: usize) {
     let Ok(mut client_read) = client.try_clone() else {
         channel.close();
         return;
@@ -612,12 +659,12 @@ fn relay(mut client: TcpStream, channel: Channel) {
         .name("psiphon-flow-forward".to_owned())
         .stack_size(FLOW_STACK)
         .spawn(move || {
-            pump_out(&mut client_read, &mut channel_write);
+            pump_out(&mut client_read, &mut channel_write, buffer);
             channel_write.shutdown();
         })
         .ok();
     let mut channel_read = channel.clone();
-    pump(&mut channel_read, &mut client);
+    pump_channel(&mut channel_read, &mut client);
     let _ = client.shutdown(Shutdown::Write);
     if let Some(forward) = forward {
         let _ = forward.join();
@@ -625,36 +672,52 @@ fn relay(mut client: TcpStream, channel: Channel) {
     channel.close();
 }
 
-/// One direction of a flow through one buffer: `io::copy`'s 8 KiB and its per-call allocation are the floor we raise.
-fn pump(source: &mut impl Read, sink: &mut impl Write) {
-    let mut buffer = vec![0u8; RELAY_BUFFER];
+fn trace_flow(channel: &Channel) {
+    if std::env::var_os("AETHER_PSIPHON_TRACE_FLOWS").is_some() {
+        eprintln!(
+            "psiphon: flow via session {} {}",
+            channel.session_id(),
+            channel.server()
+        );
+    }
+}
+
+/// The download half writes each received packet straight from the SSH buffer,
+/// so a relayed byte is copied by the kernel and never staged in userspace.
+fn pump_channel(channel: &mut Channel, sink: &mut impl Write) {
     loop {
-        match source.read(&mut buffer) {
-            Ok(0) => return,
-            Ok(read) => {
-                if sink.write_all(&buffer[..read]).is_err() {
+        match channel.next_chunk() {
+            Ok(Some(chunk)) => {
+                let wrote = sink.write_all(chunk.data()).is_ok();
+                channel.recycle_chunk(chunk);
+                if !wrote {
                     return;
                 }
             }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
-            Err(_) => return,
+            Ok(None) | Err(_) => return,
         }
     }
 }
 
 /// The client-to-tunnel side encrypts the read buffer in place, so the payload is not copied into a packet.
-fn pump_out(source: &mut impl Read, sink: &mut Channel) {
-    let mut buffer = vec![0u8; RELAY_BUFFER];
+fn pump_out(source: &mut impl Read, sink: &mut Channel, buffer: usize) {
+    let mut buffer = vec![0u8; buffer];
     loop {
-        match source.read(&mut buffer) {
+        let read = match source.read(&mut buffer) {
             Ok(0) => return,
-            Ok(read) => {
-                if sink.write_in_place(&mut buffer[..read]).is_err() {
-                    return;
-                }
-            }
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+            Ok(read) => read,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => return,
+        };
+        // A window or a smaller remote packet can take less than the read, so the remainder leaves next packet.
+        let mut at = 0;
+        while at < read {
+            match sink.write_in_place(&mut buffer[at..read]) {
+                Ok(0) => return,
+                Ok(written) => at += written,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
+                Err(_) => return,
+            }
         }
     }
 }
@@ -741,6 +804,7 @@ fn serve_http(mut client: TcpStream, inner: &Arc<Inner>) {
     };
     match inner.dial(host, port) {
         Ok(mut channel) => {
+            trace_flow(&channel);
             if client
                 .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 .is_err()
@@ -751,7 +815,7 @@ fn serve_http(mut client: TcpStream, inner: &Arc<Inner>) {
             }
             let _ = client.set_read_timeout(None);
             let _ = client.set_write_timeout(None);
-            relay(client, channel);
+            relay(client, channel, inner.settings.relay_buffer);
         }
         Err(why) => {
             eprintln!("psiphon: {why}");
@@ -901,6 +965,75 @@ impl Settings {
                         .and_then(|value| value.parse::<u16>().ok())
                 })
         };
+        let target =
+            text(settings, "TargetServerEntry").or_else(|| env("AETHER_PSIPHON_TARGET_ENTRY"));
+        // The reference pins a targeted entry to one tunnel, and so does this lane.
+        let pool = if target.is_some() {
+            1
+        } else {
+            number(settings, "TunnelPoolSize")
+                .or_else(|| number(settings, "tunnelPoolSize"))
+                .or_else(|| env("AETHER_PSIPHON_TUNNEL_POOL").and_then(|value| value.parse().ok()))
+                .unwrap_or(1)
+                .clamp(1, 32) as usize
+        };
+        let latency = decimal(settings, "NetworkLatencyMultiplier")
+            .or_else(|| env("AETHER_PSIPHON_LATENCY").and_then(|value| value.parse().ok()))
+            .filter(|multiplier| *multiplier >= 1.0)
+            .unwrap_or(1.0)
+            .min(60.0);
+        let establish = number(settings, "EstablishTunnelTimeoutSeconds")
+            .map(|seconds| Duration::from_secs(seconds.clamp(1, 600)));
+        let initial_protocols = protocol_list_named(settings, "InitialLimitTunnelProtocols");
+        let initial_count = number(settings, "InitialLimitTunnelProtocolsCandidateCount")
+            .or_else(|| {
+                env("AETHER_PSIPHON_INITIAL_PROTOCOL_COUNT").and_then(|value| value.parse().ok())
+            })
+            .unwrap_or(0) as usize;
+        let aggressive = flag(settings, "beastMode", "AETHER_PSIPHON_BEAST")
+            || flag(
+                settings,
+                "AggressiveEstablishment",
+                "AETHER_PSIPHON_AGGRESSIVE",
+            );
+        let workers = number(settings, "ConnectionWorkerPoolSize")
+            .or_else(|| env("AETHER_PSIPHON_WORKERS").and_then(|value| value.parse().ok()))
+            .unwrap_or(DIAL_WORKERS as u64)
+            .clamp(1, 32) as usize;
+        let worker_cap = number(settings, "ConnectionWorkerPoolMaxSize")
+            .unwrap_or(32)
+            .clamp(1, 32) as usize;
+        let workers = if target.is_some() {
+            1
+        } else if aggressive {
+            workers.max(30).min(worker_cap)
+        } else {
+            workers.min(worker_cap)
+        };
+        let workers = if flag(
+            settings,
+            "DisableConnectionWorkerPool",
+            "AETHER_PSIPHON_DISABLE_WORKERS",
+        ) {
+            1
+        } else {
+            workers
+        };
+        let stagger = Duration::from_millis(
+            number(settings, "StaggerConnectionWorkersMilliseconds")
+                .or_else(|| env("AETHER_PSIPHON_STAGGER_MS").and_then(|value| value.parse().ok()))
+                .unwrap_or(0)
+                .min(60_000),
+        );
+        let relay_buffer = if flag(
+            settings,
+            "LimitRelayBufferSizes",
+            "AETHER_PSIPHON_SMALL_RELAY",
+        ) {
+            16 * 1024
+        } else {
+            RELAY_BUFFER
+        };
         Ok(Self {
             state: text(settings, "state")
                 .or_else(|| text(settings, "dataRootDirectory"))
@@ -914,10 +1047,16 @@ impl Settings {
             region,
             ready: Duration::from_secs(ready),
             entries: server_entries(settings),
-            target: text(settings, "TargetServerEntry")
-                .or_else(|| env("AETHER_PSIPHON_TARGET_ENTRY")),
+            target,
             protocols: protocol_list(settings),
-            beast: flag(settings, "beastMode", "AETHER_PSIPHON_BEAST"),
+            initial_protocols,
+            initial_count,
+            pool,
+            latency,
+            establish,
+            workers,
+            stagger,
+            relay_buffer,
             server_lists,
             server_lists_explicit,
             remote_fetch_disabled: flag(
@@ -944,6 +1083,16 @@ impl Settings {
     }
 }
 
+impl Settings {
+    /// The reference scales every network budget by `NetworkLatencyMultiplier`.
+    fn dial_timeout(&self) -> Duration {
+        self.establish
+            .unwrap_or(DIAL_TIMEOUT)
+            .mul_f64(self.latency)
+            .min(Duration::from_secs(600))
+    }
+}
+
 fn port_number(settings: Option<&Json>, key: &str) -> Option<u16> {
     let value = settings.and_then(|settings| settings.get(key))?;
     value
@@ -951,6 +1100,31 @@ fn port_number(settings: Option<&Json>, key: &str) -> Option<u16> {
         .or_else(|| value.as_u32().and_then(|port| u16::try_from(port).ok()))
         .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
         .filter(|port| *port > 0)
+}
+
+fn number(settings: Option<&Json>, key: &str) -> Option<u64> {
+    let value = settings.and_then(|settings| settings.get(key))?;
+    value
+        .as_u32()
+        .map(u64::from)
+        .or_else(|| value.as_i64().and_then(|number| u64::try_from(number).ok()))
+        .or_else(|| value.as_str().and_then(|text| text.trim().parse().ok()))
+}
+
+fn decimal(settings: Option<&Json>, key: &str) -> Option<f64> {
+    let value = settings.and_then(|settings| settings.get(key))?;
+    match value {
+        Json::Num(number) => Some(*number),
+        Json::Str(text) => text.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn protocol_list_named(settings: Option<&Json>, key: &str) -> Vec<String> {
+    string_list(settings, key)
+        .into_iter()
+        .map(|protocol| protocol.to_ascii_uppercase())
+        .collect()
 }
 
 fn protocol_list(settings: Option<&Json>) -> Vec<String> {
@@ -1057,6 +1231,18 @@ fn warn_ignored(settings: Option<&Json>) {
         "UpstreamProxyURL",
         "protocolSelection",
         "beastMode",
+        "AggressiveEstablishment",
+        "TunnelPoolSize",
+        "tunnelPoolSize",
+        "ConnectionWorkerPoolSize",
+        "ConnectionWorkerPoolMaxSize",
+        "DisableConnectionWorkerPool",
+        "EstablishTunnelTimeoutSeconds",
+        "StaggerConnectionWorkersMilliseconds",
+        "LimitRelayBufferSizes",
+        "NetworkLatencyMultiplier",
+        "InitialLimitTunnelProtocols",
+        "InitialLimitTunnelProtocolsCandidateCount",
         "LimitTunnelProtocols",
         "limitTunnelProtocols",
         "TunnelProtocol",
@@ -1271,7 +1457,12 @@ fn load_entries(settings: &Settings) -> Result<Vec<Server>, String> {
             absorb(&text, &mut servers, &mut seen);
         }
     }
-    servers = select_protocols(servers, &settings.protocols);
+    servers = select_protocols(
+        servers,
+        &settings.protocols,
+        &settings.initial_protocols,
+        settings.initial_count,
+    );
     if let Some(region) = settings.region.as_deref() {
         let regional: Vec<Server> = servers
             .iter()
@@ -1290,10 +1481,10 @@ fn load_entries(settings: &Settings) -> Result<Vec<Server>, String> {
     Ok(servers)
 }
 
-/// Plain SSH and unfronted OSSH are the shapes this transport dials; a limit naming neither keeps the full list.
-fn select_protocols(servers: Vec<Server>, protocols: &[String]) -> Vec<Server> {
+/// The shapes a protocol list names; `None` means the list asks for no restriction.
+fn shape_filter(protocols: &[String], label: &str) -> Option<(bool, bool)> {
     if protocols.is_empty() {
-        return servers;
+        return None;
     }
     let mut wants_plain = false;
     let mut wants_obfuscated = false;
@@ -1306,26 +1497,51 @@ fn select_protocols(servers: Vec<Server>, protocols: &[String]) -> Vec<Server> {
         }
     }
     if !unsupported.is_empty() {
-        eprintln!(
-            "psiphon: LimitTunnelProtocols ignores {}",
-            unsupported.join(",")
-        );
+        eprintln!("psiphon: {label} ignores {}", unsupported.join(","));
     }
     if !wants_plain && !wants_obfuscated {
-        eprintln!("psiphon: LimitTunnelProtocols names no SSH or OSSH shape; using the whole list");
+        eprintln!("psiphon: {label} names no SSH or OSSH shape; using the whole list");
+        return None;
+    }
+    Some((wants_plain, wants_obfuscated))
+}
+
+/// Plain SSH and unfronted OSSH are the shapes this transport dials; a limit naming neither keeps the full list.
+fn select_protocols(
+    servers: Vec<Server>,
+    protocols: &[String],
+    initial_protocols: &[String],
+    initial_count: usize,
+) -> Vec<Server> {
+    let normal = shape_filter(protocols, "LimitTunnelProtocols");
+    let initial_active = initial_count > 0 && !initial_protocols.is_empty();
+    let initial = shape_filter(initial_protocols, "InitialLimitTunnelProtocols");
+    if normal.is_none() && !initial_active {
         return servers;
     }
-    let selected: Vec<Server> = servers
-        .iter()
-        .filter(|server| {
-            if server.obfuscated() {
-                wants_obfuscated
-            } else {
-                wants_plain
-            }
-        })
-        .cloned()
-        .collect();
+    let matches = |server: &Server, filter: (bool, bool)| {
+        if server.obfuscated() {
+            filter.1
+        } else {
+            filter.0
+        }
+    };
+    let mut selected = Vec::new();
+    let mut rest = Vec::new();
+    for (index, server) in servers.iter().enumerate() {
+        if initial_active
+            && selected.len() < initial_count
+            && initial.is_some_and(|filter| matches(server, filter))
+        {
+            selected.push(index);
+        } else {
+            rest.push(index);
+        }
+    }
+    selected.extend(
+        rest.into_iter()
+            .filter(|index| normal.is_none_or(|filter| matches(&servers[*index], filter))),
+    );
     if selected.is_empty() {
         eprintln!(
             "psiphon: no server matches LimitTunnelProtocols ({}); using the whole list",
@@ -1334,6 +1550,9 @@ fn select_protocols(servers: Vec<Server>, protocols: &[String]) -> Vec<Server> {
         return servers;
     }
     selected
+        .into_iter()
+        .map(|index| servers[index].clone())
+        .collect()
 }
 
 fn cache_path(settings: &Settings) -> PathBuf {
@@ -1540,16 +1759,30 @@ fn race<T: Send + 'static>(
     batch: Vec<Server>,
     attempt: impl Fn(&Server) -> Result<T, String> + Send + Sync + 'static,
     budget: Duration,
+    stagger: Duration,
 ) -> Result<T, String> {
     let attempt = Arc::new(attempt);
+    let done = Arc::new(AtomicBool::new(false));
     let (sender, answers) = std::sync::mpsc::channel();
-    for server in batch {
+    for (index, server) in batch.into_iter().enumerate() {
         let sender = sender.clone();
         let attempt = Arc::clone(&attempt);
+        let done = Arc::clone(&done);
+        let delay = stagger.saturating_mul(u32::try_from(index).unwrap_or(u32::MAX));
         let _ = thread::Builder::new()
             .name("psiphon-dial".to_owned())
             .spawn(move || {
-                let _ = sender.send(attempt(&server));
+                if !delay.is_zero() {
+                    thread::sleep(delay);
+                }
+                if done.load(Ordering::Acquire) {
+                    return;
+                }
+                let result = attempt(&server);
+                if result.is_ok() {
+                    done.store(true, Ordering::Release);
+                }
+                let _ = sender.send(result);
             });
     }
     drop(sender);
@@ -1561,11 +1794,15 @@ fn race<T: Send + 'static>(
             break;
         }
         match answers.recv_timeout(left) {
-            Ok(Ok(value)) => return Ok(value),
+            Ok(Ok(value)) => {
+                done.store(true, Ordering::Release);
+                return Ok(value);
+            }
             Ok(Err(why)) => last = why,
             Err(_) => break,
         }
     }
+    done.store(true, Ordering::Release);
     if last.is_empty() {
         "no server answered inside the attempt budget".clone_into(&mut last);
     }
@@ -2156,23 +2393,84 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            shapes(select_protocols(servers(), &["SSH".to_owned()])),
+            shapes(select_protocols(servers(), &["SSH".to_owned()], &[], 0)),
             [false]
         );
         assert_eq!(
-            shapes(select_protocols(servers(), &["UNFRONTED-OSSH".to_owned()])),
+            shapes(select_protocols(
+                servers(),
+                &["UNFRONTED-OSSH".to_owned()],
+                &[],
+                0
+            )),
             [true]
         );
         assert_eq!(
             shapes(select_protocols(
                 servers(),
-                &["SSH".to_owned(), "OSSH".to_owned()]
+                &["SSH".to_owned(), "OSSH".to_owned()],
+                &[],
+                0
             )),
             [false, true]
         );
         assert_eq!(
-            shapes(select_protocols(servers(), &["TLS-OSSH".to_owned()])),
+            shapes(select_protocols(
+                servers(),
+                &["TLS-OSSH".to_owned()],
+                &[],
+                0
+            )),
             [false, true]
+        );
+    }
+
+    #[test]
+    fn an_initial_protocol_limit_applies_to_its_first_candidates() {
+        let servers = || {
+            vec![
+                test_server(false),
+                test_server(true),
+                test_server(false),
+                test_server(true),
+            ]
+        };
+        let shapes = |selected: Vec<Server>| {
+            selected
+                .into_iter()
+                .map(|server| server.obfuscated())
+                .collect::<Vec<_>>()
+        };
+        // The first two OSSH candidates lead; the normal limit keeps every plain entry after them.
+        assert_eq!(
+            shapes(select_protocols(
+                servers(),
+                &["SSH".to_owned()],
+                &["OSSH".to_owned()],
+                2
+            )),
+            [true, true, false, false]
+        );
+        // An entry the initial phase skips is not lost while it matches the normal limit.
+        let servers = || vec![test_server(false), test_server(true), test_server(false)];
+        assert_eq!(
+            shapes(select_protocols(
+                servers(),
+                &["SSH".to_owned()],
+                &["OSSH".to_owned()],
+                1
+            )),
+            [true, false, false]
+        );
+        // No initial phase leaves the normal limit in force from the first entry.
+        assert_eq!(
+            shapes(select_protocols(
+                servers(),
+                &["SSH".to_owned()],
+                &["OSSH".to_owned()],
+                0
+            )),
+            [false, false]
         );
     }
 
@@ -2181,6 +2479,99 @@ mod tests {
         let settings =
             json::parse(r#"{"LimitTunnelProtocols":["AAAA","ossh"]}"#).expect("settings");
         assert_eq!(protocol_list(Some(&settings)), ["AAAA", "OSSH"]);
+    }
+
+    #[test]
+    fn a_tunnel_pool_is_read_and_clamped_to_the_reference_ceiling() {
+        let settings = json::parse(r#"{"TunnelPoolSize":99}"#).expect("settings");
+        assert_eq!(
+            Settings::from_json(Some(&settings)).expect("settings").pool,
+            32
+        );
+        let settings = json::parse(r#"{"TunnelPoolSize":0}"#).expect("settings");
+        assert_eq!(
+            Settings::from_json(Some(&settings)).expect("settings").pool,
+            1
+        );
+    }
+
+    #[test]
+    fn a_targeted_entry_pins_the_pool_to_one_tunnel() {
+        let settings = json::parse(
+            r#"{"TunnelPoolSize":8,"ConnectionWorkerPoolSize":8,"TargetServerEntry":"entry"}"#,
+        )
+        .expect("settings");
+        let settings = Settings::from_json(Some(&settings)).expect("settings");
+        assert_eq!(settings.pool, 1);
+        assert_eq!(settings.workers, 1);
+    }
+
+    #[test]
+    fn a_limited_relay_buffer_and_stagger_are_read() {
+        let settings = json::parse(
+            r#"{"LimitRelayBufferSizes":true,"StaggerConnectionWorkersMilliseconds":250}"#,
+        )
+        .expect("settings");
+        let settings = Settings::from_json(Some(&settings)).expect("settings");
+        assert_eq!(settings.relay_buffer, 16 * 1024);
+        assert_eq!(settings.stagger, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn aggressive_establishment_widens_the_race() {
+        let settings = json::parse(r#"{"AggressiveEstablishment":true}"#).expect("settings");
+        assert_eq!(
+            Settings::from_json(Some(&settings))
+                .expect("settings")
+                .workers,
+            30
+        );
+        let settings = json::parse(r#"{"ConnectionWorkerPoolSize":32}"#).expect("settings");
+        assert_eq!(
+            Settings::from_json(Some(&settings))
+                .expect("settings")
+                .workers,
+            32
+        );
+        let settings =
+            json::parse(r#"{"AggressiveEstablishment":true,"ConnectionWorkerPoolMaxSize":8}"#)
+                .expect("settings");
+        assert_eq!(
+            Settings::from_json(Some(&settings))
+                .expect("settings")
+                .workers,
+            8
+        );
+    }
+
+    #[test]
+    fn a_latency_multiplier_scales_the_dial_budget() {
+        let settings = json::parse(r#"{"NetworkLatencyMultiplier":2}"#).expect("settings");
+        let settings = Settings::from_json(Some(&settings)).expect("settings");
+        assert_eq!(settings.dial_timeout(), DIAL_TIMEOUT * 2);
+        let settings = json::parse(r#"{"NetworkLatencyMultiplier":1.5}"#).expect("settings");
+        assert_eq!(
+            Settings::from_json(Some(&settings))
+                .expect("settings")
+                .dial_timeout(),
+            DIAL_TIMEOUT.mul_f64(1.5)
+        );
+        let settings = json::parse(r#"{"NetworkLatencyMultiplier":0.5}"#).expect("settings");
+        assert_eq!(
+            Settings::from_json(Some(&settings))
+                .expect("settings")
+                .dial_timeout(),
+            DIAL_TIMEOUT
+        );
+        let settings =
+            json::parse(r#"{"EstablishTunnelTimeoutSeconds":30,"NetworkLatencyMultiplier":2}"#)
+                .expect("settings");
+        assert_eq!(
+            Settings::from_json(Some(&settings))
+                .expect("settings")
+                .dial_timeout(),
+            Duration::from_secs(60)
+        );
     }
 
     #[test]
@@ -2213,7 +2604,8 @@ mod tests {
             session_id: String::new(),
             settings,
             entries: Vec::new(),
-            session: Mutex::new(None),
+            sessions: Mutex::new(Vec::new()),
+            next_session: AtomicUsize::new(0),
             connecting: Mutex::new(()),
             stopping: AtomicBool::new(false),
             endpoint: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -2255,7 +2647,8 @@ mod tests {
             session_id: String::new(),
             settings,
             entries: Vec::new(),
-            session: Mutex::new(None),
+            sessions: Mutex::new(Vec::new()),
+            next_session: AtomicUsize::new(0),
             connecting: Mutex::new(()),
             stopping: AtomicBool::new(false),
             endpoint: SocketAddr::from(([127, 0, 0, 1], 0)),
@@ -2326,6 +2719,7 @@ mod tests {
                 Ok(server.host.clone())
             },
             Duration::from_secs(2),
+            Duration::ZERO,
         )
         .expect("the answering server wins");
         assert_eq!(winner, "answers");
@@ -2355,6 +2749,7 @@ mod tests {
                 Err("stalled".to_owned())
             },
             Duration::from_millis(100),
+            Duration::ZERO,
         );
         assert!(outcome.is_err());
         let elapsed = began.elapsed();
