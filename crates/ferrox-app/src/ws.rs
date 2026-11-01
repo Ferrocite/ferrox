@@ -544,6 +544,54 @@ impl<R: Read> Read for WsReader<R> {
     }
 }
 
+impl<R: Read> crate::proxy::WindowRead for WsReader<R> {
+    fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+        if self.eat < self.early.len() {
+            let start = self.eat;
+            self.eat = self.early.len();
+            return Ok(crate::proxy::Window::one(&self.early[start..]));
+        }
+        let mut spans = [(0usize, 0usize); crate::proxy::WINDOW_PARTS];
+        let mut len = 0;
+        loop {
+            if self.at < self.msg_end {
+                let start = self.at;
+                let end = self.msg_end;
+                self.at = end;
+                spans[len] = (start, end - start);
+                len += 1;
+            } else {
+                if self.eof {
+                    break;
+                }
+                self.early.clear();
+                self.eat = 0;
+                let fill = len == 0;
+                if !self.message(fill)? {
+                    if fill {
+                        self.eof = true;
+                    }
+                    break;
+                }
+                let start = self.at;
+                let end = self.msg_end;
+                self.at = end;
+                if end > start {
+                    spans[len] = (start, end - start);
+                    len += 1;
+                }
+            }
+            if len == crate::proxy::WINDOW_PARTS {
+                break;
+            }
+        }
+        if len == 0 {
+            return Ok(crate::proxy::Window::empty());
+        }
+        Ok(crate::proxy::Window::new(&self.have, spans, len))
+    }
+}
+
 impl WsWriter {
     pub(crate) fn send(&self, data: &[u8]) -> bool {
         let Ok(mut stream) = self.shared.stream.lock() else {
@@ -1532,6 +1580,144 @@ mod tests {
             reader.reads(),
             1,
             "{frames} frames cost one read, not one per frame header"
+        );
+    }
+
+    /// The relay's window is the reader's own bytes: the slice points inside `have`, and taking it moves neither the buffer nor its capacity.
+    #[test]
+    fn the_relay_window_is_the_readers_own_buffer() {
+        let frame = |payload: &[u8]| {
+            let mut wire = vec![0x80 | OP_DATA, 126];
+            wire.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+            wire.extend_from_slice(payload);
+            wire
+        };
+        let first = [0x11u8; 300];
+        let second = [0x22u8; 300];
+        let mut wire = frame(&first);
+        let second_start = wire.len();
+        wire.extend(frame(&second));
+        let mut reader = window_reader(std::io::Cursor::new(Vec::new()), wire);
+        let base = reader.have.as_ptr();
+        let capacity = reader.have.capacity();
+        {
+            let window = crate::proxy::WindowRead::read_window(&mut reader)
+                .expect("reads the buffered frames");
+            assert!(!window.is_empty());
+            assert_eq!(
+                window.parts(),
+                &[(4, first.len()), (second_start + 4, second.len())],
+                "one span per buffered message, headers left out"
+            );
+            assert_eq!(
+                window.bytes().as_ptr(),
+                base,
+                "the window is the reader's own buffer, not a copy"
+            );
+            assert!(
+                window.bytes().as_ptr() as usize + window.bytes().len() <= base as usize + capacity
+            );
+            assert_eq!(
+                &window.bytes()[window.parts()[0].0..][..window.parts()[0].1],
+                &first[..]
+            );
+            assert_eq!(
+                &window.bytes()[window.parts()[1].0..][..window.parts()[1].1],
+                &second[..]
+            );
+        }
+        assert_eq!(reader.have.as_ptr(), base, "the buffer did not move");
+        assert_eq!(reader.have.capacity(), capacity, "the buffer did not grow");
+        assert!(
+            crate::proxy::WindowRead::read_window(&mut reader)
+                .expect("reads")
+                .is_empty(),
+            "the buffered messages are spent"
+        );
+    }
+
+    fn window_reader<R: Read>(read: R, have: Vec<u8>) -> WsReader<R> {
+        WsReader {
+            read,
+            shared: Arc::new(Shared {
+                stream: Mutex::new(Box::new(Sink::default())),
+                closed: AtomicBool::new(false),
+                masked: false,
+            }),
+            have,
+            at: 0,
+            msg_end: 0,
+            early: Vec::new(),
+            eat: 0,
+            eof: false,
+            assembling: false,
+            whole: 0,
+            filled: 0,
+            handshake: None,
+            reads: 0,
+        }
+    }
+
+    /// A masked payload unmasks in place, and the window still points at those bytes rather than a copy.
+    #[test]
+    fn a_masked_window_unmasks_where_it_lies() {
+        let payload = [0x5Au8; 300];
+        let mask = [1u8, 2, 3, 4];
+        let mut wire = vec![0x80 | OP_DATA, 0x80 | 0x7E];
+        wire.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        wire.extend_from_slice(&mask);
+        wire.extend(
+            payload
+                .iter()
+                .enumerate()
+                .map(|(i, byte)| byte ^ mask[i % 4]),
+        );
+        let mut reader = window_reader(std::io::Cursor::new(Vec::new()), wire);
+        let base = reader.have.as_ptr();
+        let window = crate::proxy::WindowRead::read_window(&mut reader).expect("reads");
+        assert_eq!(window.parts(), &[(8, payload.len())]);
+        assert_eq!(&window.bytes()[8..][..payload.len()], &payload[..]);
+        assert_eq!(window.bytes().as_ptr(), base);
+    }
+
+    /// A fragmented message whose second fragment is not in hand joins across calls, and the first fragment is not delivered twice.
+    #[test]
+    fn a_fragmented_window_joins_across_calls() {
+        struct Chunks(std::vec::IntoIter<Vec<u8>>);
+
+        impl Read for Chunks {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                match self.0.next() {
+                    Some(chunk) => {
+                        let n = chunk.len().min(buf.len());
+                        buf[..n].copy_from_slice(&chunk[..n]);
+                        Ok(n)
+                    }
+                    None => Ok(0),
+                }
+            }
+        }
+
+        let frame = |fin: bool, opcode: u8, payload: &[u8]| {
+            let mut wire = vec![if fin { 0x80 } else { 0 } | opcode, payload.len() as u8];
+            wire.extend_from_slice(payload);
+            wire
+        };
+        let mut first = frame(true, OP_DATA, b"A");
+        first.extend(frame(false, OP_DATA, b"hello"));
+        let second = frame(true, OP_CONT, b" world");
+        let mut reader = window_reader(Chunks(vec![first, second].into_iter()), Vec::new());
+        {
+            let one = crate::proxy::WindowRead::read_window(&mut reader).expect("reads A");
+            assert_eq!(
+                &one.bytes()[one.parts()[0].0..][..one.parts()[0].1],
+                &b"A"[..]
+            );
+        }
+        let two = crate::proxy::WindowRead::read_window(&mut reader).expect("reads the rest");
+        assert_eq!(
+            &two.bytes()[two.parts()[0].0..][..two.parts()[0].1],
+            b"hello world"
         );
     }
 
