@@ -22648,11 +22648,11 @@ pub(crate) mod lane_pool {
     /// one of them must sit in its read at once: a lane without a worker is a flow the peer's
     /// window cannot refill. This is the ceiling, not the shape: a worker starts when a lane is
     /// queued and no worker is idle, so a one-flow cell holds two lanes.
-    const RELAY_LANES: usize = 8;
+    pub(crate) const RELAY_LANES: usize = 8;
 
     /// Setup lanes are separate from relay lanes so a handshake parked in a read cannot take a
     /// relay worker with it. Four carry the widest cell's opening requests in two waves.
-    const SETUP_LANES: usize = 4;
+    pub(crate) const SETUP_LANES: usize = 4;
 
     /// Accepted work past the setup workers waits in this queue; past it the accept loop drops the
     /// socket, so a burst cannot hold accepted connections without bound.
@@ -31084,9 +31084,15 @@ mod tests {
         let lanes = lane_pool::setup_workers();
         assert!(lanes >= 1, "the setup lane count is the bound: {lanes}");
         assert!(
-            grown <= lanes + 8,
-            "{} carried handshakes grew the process by {grown} threads, past {lanes} setup lanes plus slack",
-            clients.len()
+            lanes <= lane_pool::SETUP_LANES,
+            "the setup pool grew past its {0} lanes: {lanes}",
+            lane_pool::SETUP_LANES
+        );
+        assert!(
+            grown <= lanes + lane_pool::RELAY_LANES + 8,
+            "{} carried handshakes grew the process by {grown} threads, past {lanes} setup lanes and {} relay lanes plus slack",
+            clients.len(),
+            lane_pool::RELAY_LANES
         );
         assert!(
             grown < clients.len(),
