@@ -1613,6 +1613,7 @@ impl Role {
 
     /// Accepts the TLS session and hands it to the lanes, so the caller returns before the
     /// peer's first byte and the handshake parks off the workers.
+    #[allow(clippy::too_many_lines)]
     fn serve_polled_tls(self, stream: Connection, sniffing: Option<Arc<crate::sniff::Sniffing>>) {
         let Role::TrojanTls {
             keys,
