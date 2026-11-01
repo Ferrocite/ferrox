@@ -23168,6 +23168,11 @@ pub(crate) mod lane_pool {
         wake: Option<WakePipe>,
         #[cfg(unix)]
         reaper: Mutex<Option<std::thread::JoinHandle<()>>>,
+        /// Which park branch a lane took: a readiness park is a descriptor wait, a timer park is the clock.
+        #[cfg(all(test, unix))]
+        ready_parks: std::sync::atomic::AtomicUsize,
+        #[cfg(all(test, unix))]
+        timer_parks: std::sync::atomic::AtomicUsize,
         #[cfg(test)]
         stop: std::sync::atomic::AtomicBool,
         #[cfg(test)]
@@ -23317,6 +23322,10 @@ pub(crate) mod lane_pool {
             wake: WakePipe::new(),
             #[cfg(unix)]
             reaper: Mutex::new(None),
+            #[cfg(all(test, unix))]
+            ready_parks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(all(test, unix))]
+            timer_parks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             stop: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -23465,6 +23474,9 @@ pub(crate) mod lane_pool {
     /// A lane inserted with an earlier deadline wakes the parker instead of waiting for the
     /// deadline already parked.
     fn park_with(pool: &Pool, lane: Lane, quantum: std::time::Duration) {
+        #[cfg(all(test, unix))]
+        pool.timer_parks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let due = std::time::Instant::now() + wait_for(lane.idle, quantum);
         let mut parked = pool.parked.lock().unwrap_or_else(PoisonError::into_inner);
         if parked.waking {
@@ -23549,6 +23561,9 @@ pub(crate) mod lane_pool {
         if let Some(wake) = pool.wake.as_ref() {
             wake.post();
         }
+        #[cfg(test)]
+        pool.ready_parks
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -24004,8 +24019,8 @@ pub(crate) mod lane_pool {
             );
         }
 
-        /// A lane whose source is a socket waits on the descriptor instead of re-reading every poll
-        /// quantum: a quarter second of silence costs one step, and the peer's byte wakes the lane.
+        /// A lane whose source is a socket parks in the reaper's waiting set, on the descriptor its
+        /// read timed out on, and one peer byte wakes it. A lane on the timer never enters that set.
         #[cfg(unix)]
         #[test]
         fn a_socket_lane_waits_on_readiness() {
@@ -24018,9 +24033,7 @@ pub(crate) mod lane_pool {
             served
                 .set_read_timeout(Some(Duration::from_millis(1)))
                 .expect("arms the read clock");
-            let runs = Arc::new(AtomicUsize::new(0));
             let received = Arc::new(AtomicUsize::new(0));
-            let steps = Arc::clone(&runs);
             let bytes = Arc::clone(&received);
             let mut source = Some(served);
             let mut window = [0u8; 64];
@@ -24029,7 +24042,6 @@ pub(crate) mod lane_pool {
                 &pool,
                 Box::new(move || {
                     let source = source.as_mut().expect("the lane keeps its source");
-                    steps.fetch_add(1, Ordering::Relaxed);
                     match source.read(&mut window) {
                         Ok(0) => Next::Done,
                         Ok(n) => {
@@ -24042,11 +24054,18 @@ pub(crate) mod lane_pool {
                 }),
                 Box::new(|| {}),
             );
-            thread::sleep(Duration::from_millis(250));
-            let idle_steps = runs.load(Ordering::Relaxed);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while pool.ready_parks.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
             assert!(
-                idle_steps <= 3,
-                "a parked socket lane stepped {idle_steps} times in 250 ms: it polled the clock"
+                pool.ready_parks.load(Ordering::Relaxed) > 0,
+                "the socket lane never parked on its descriptor"
+            );
+            assert_eq!(
+                pool.timer_parks.load(Ordering::Relaxed),
+                0,
+                "the socket lane fell back to the timer"
             );
             peer.write_all(b"x").expect("writes");
             let deadline = Instant::now() + Duration::from_secs(2);
