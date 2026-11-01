@@ -7762,14 +7762,14 @@ where
     );
 }
 
-/// Reads the plaintext already buffered after the handshake; empty means silence, so the continuation leaves the lane.
+/// Reads the plaintext already buffered after the handshake, waiting one handshake poll for a request still in flight; empty means silence, so the continuation leaves the lane.
 fn read_ready_prefix<S: ferrox_core::tls::TlsProvider>(
     session: &mut S,
     transport: &Connection,
 ) -> Vec<u8> {
     let mut prefix = Vec::new();
     let mut buf = [0u8; PROBE_READ];
-    let mut waited = false;
+    let until = Instant::now() + budgets::HANDSHAKE_POLL;
     loop {
         match session.read(&mut buf) {
             Ok(0) => break,
@@ -7780,11 +7780,11 @@ fn read_ready_prefix<S: ferrox_core::tls::TlsProvider>(
                 }
             }
             Err(error) if is_timeout(&error) => {
-                if waited {
+                let left = until.saturating_duration_since(Instant::now());
+                if left.is_zero() {
                     break;
                 }
-                waited = true;
-                let _ = transport.wait_readable(RELAY_POLL);
+                let _ = transport.wait_readable(left.min(RELAY_POLL));
             }
             Err(_) => break,
         }
