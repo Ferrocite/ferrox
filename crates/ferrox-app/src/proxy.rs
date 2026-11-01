@@ -30903,6 +30903,10 @@ mod tests {
             reader.set_poll(Some(RELAY_POLL));
             reader.set_handshake_budget(Some(Instant::now() + SINK_GRACE));
             let _ = reader.read_to_end(&mut Vec::new());
+            assert!(
+                crate::grpc::request_ended(&reader),
+                "the response end was not drained before the close"
+            );
             assert!(writer.send(b"more"), "the request lane was closed early");
             writer.close();
         });
