@@ -1151,4 +1151,35 @@ mod tests {
             assert!(r < BAR, "a real regression must fail: {ratios:?} read {r}");
         }
     }
+
+    /// The report half of a traffic leg, which is what a comparison of two live engines writes above its gate 5 table.
+    #[test]
+    fn a_traffic_legs_report_says_what_it_left_out_instead_of_printing_an_empty_table() {
+        let row = Row {
+            len: 4096,
+            base: 1.2e-6,
+            ours: 1.0e-6,
+            ratio: 1.2,
+            remeasured: false,
+        };
+        let traffic = build_report("the declared reference", 7, 235, &[]);
+        assert!(
+            traffic.contains("Not measured here"),
+            "a leg that timed nothing says so: {traffic}"
+        );
+        assert!(
+            !traffic.contains("| len | reference ns/op |"),
+            "and prints no table over it: {traffic}"
+        );
+
+        let bare = build_report("the declared reference", 7, 235, &[row]);
+        assert!(
+            !bare.contains("Not measured here"),
+            "a bare run does not apologize for rows it measured"
+        );
+        assert!(
+            bare.contains("| len | reference ns/op |") && bare.contains("| 4096 |"),
+            "and prints them: {bare}"
+        );
+    }
 }
