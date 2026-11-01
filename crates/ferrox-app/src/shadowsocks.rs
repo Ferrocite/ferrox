@@ -633,6 +633,13 @@ fn stream_mux(
 
 /// A mux session on a socket this thread owns: the reader, writer and close are the socket's own clones.
 fn serve_mux_connection(stream: &Connection, accepted: Accepted) {
+    let Ok(stream) = stream.try_clone() else {
+        return;
+    };
+    crate::proxy::spawn_carried(move || serve_mux_connection_owned(&stream, accepted));
+}
+
+fn serve_mux_connection_owned(stream: &Connection, accepted: Accepted) {
     let Ok(reader) = stream.try_clone() else {
         return;
     };

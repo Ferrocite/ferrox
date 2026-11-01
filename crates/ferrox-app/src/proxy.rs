@@ -3368,12 +3368,33 @@ fn serve_accepted(
     front_dispatch(stream, role);
 }
 
-fn spawn_carried<F: FnOnce() + Send + 'static>(body: F) {
+pub(crate) fn spawn_carried<F: FnOnce() + Send + 'static>(body: F) {
     let sniffing = crate::sniff::current();
     thread::spawn(move || {
         crate::sniff::install_current(sniffing);
         body();
     });
+}
+
+fn spawn_trojan_udp<R, W, C>(reader: R, writer: W, close: C)
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+    C: FnOnce() + Send + 'static,
+{
+    spawn_carried(move || serve_trojan_udp_halves(reader, writer, close));
+}
+
+fn spawn_trojan_mux<R, W>(
+    reader: R,
+    writer: W,
+    close: Arc<dyn Fn() + Send + Sync>,
+    carried: Vec<u8>,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    spawn_carried(move || serve_trojan_mux(reader, writer, close, &carried));
 }
 
 fn serve_shadowsocks(
@@ -16448,14 +16469,15 @@ fn serve_trojan_raw(mut stream: Connection, key: &[[u8; 56]], freedom: bool) {
         let Ok(close) = stream.try_clone() else {
             return;
         };
-        return serve_trojan_mux(
+        spawn_trojan_mux(
             read,
             stream,
             Arc::new(move || {
                 let _ = close.shutdown(Shutdown::Both);
             }),
-            &[],
+            Vec::new(),
         );
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -16473,8 +16495,10 @@ fn serve_trojan_udp(stream: Connection) {
     let Ok(close) = stream.try_clone() else {
         return;
     };
-    serve_trojan_udp_halves(read, stream, move || {
-        let _ = close.shutdown(Shutdown::Both);
+    spawn_carried(move || {
+        serve_trojan_udp_halves(read, stream, move || {
+            let _ = close.shutdown(Shutdown::Both);
+        });
     });
 }
 
@@ -16599,14 +16623,16 @@ fn serve_trojan_ws(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bo
     crate::accesslog::record_current(&target);
     if cmd == 3 {
         let closer = writer.clone();
-        return serve_trojan_udp_halves(reader, writer, move || closer.close());
+        spawn_trojan_udp(reader, writer, move || closer.close());
+        return;
     }
     if cmd != 1 {
         return;
     }
     if target.is_mux() {
         let closer = writer.clone();
-        return serve_trojan_mux(reader, writer, Arc::new(move || closer.close()), &[]);
+        spawn_trojan_mux(reader, writer, Arc::new(move || closer.close()), Vec::new());
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -16637,18 +16663,19 @@ fn serve_trojan_httpupgrade(
     crate::accesslog::record_current(&target);
     if cmd == 3 {
         let close = write.try_clone().ok();
-        return serve_trojan_udp_halves(reader, write, move || {
+        spawn_trojan_udp(reader, write, move || {
             if let Some(stream) = close {
                 let _ = stream.shutdown(Shutdown::Both);
             }
         });
+        return;
     }
     if cmd != 1 {
         return;
     }
     if target.is_mux() {
         let close = write.try_clone().ok();
-        return serve_trojan_mux(
+        spawn_trojan_mux(
             reader,
             write,
             Arc::new(move || {
@@ -16656,8 +16683,9 @@ fn serve_trojan_httpupgrade(
                     let _ = stream.shutdown(Shutdown::Both);
                 }
             }),
-            &[],
+            Vec::new(),
         );
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -16688,14 +16716,16 @@ fn serve_trojan_grpc(
     crate::accesslog::record_current(&target);
     if cmd == 3 {
         let closer = writer.clone();
-        return serve_trojan_udp_halves(reader, writer, move || closer.close());
+        spawn_trojan_udp(reader, writer, move || closer.close());
+        return;
     }
     if cmd != 1 {
         return;
     }
     if target.is_mux() {
         let closer = writer.clone();
-        return serve_trojan_mux(reader, writer, Arc::new(move || closer.close()), &[]);
+        spawn_trojan_mux(reader, writer, Arc::new(move || closer.close()), Vec::new());
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -16726,14 +16756,21 @@ fn serve_trojan_xhttp(stream: Connection, key: &[[u8; 56]], path: &str, freedom:
     crate::accesslog::record_current(&target);
     if cmd == 3 {
         let closer = writer.clone();
-        return serve_trojan_udp_halves(reader, writer, move || closer.finish());
+        spawn_trojan_udp(reader, writer, move || closer.finish());
+        return;
     }
     if cmd != 1 {
         return;
     }
     if target.is_mux() {
         let closer = writer.clone();
-        return serve_trojan_mux(reader, writer, Arc::new(move || closer.finish()), &[]);
+        spawn_trojan_mux(
+            reader,
+            writer,
+            Arc::new(move || closer.finish()),
+            Vec::new(),
+        );
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -16758,18 +16795,19 @@ fn serve_trojan_httpheader(stream: Connection, key: &[[u8; 56]], path: &str, fre
     crate::accesslog::record_current(&target);
     if cmd == 3 {
         let close = write.try_clone().ok();
-        return serve_trojan_udp_halves(reader, write, move || {
+        spawn_trojan_udp(reader, write, move || {
             if let Some(stream) = close {
                 let _ = stream.shutdown(Shutdown::Both);
             }
         });
+        return;
     }
     if cmd != 1 {
         return;
     }
     if target.is_mux() {
         let close = write.try_clone().ok();
-        return serve_trojan_mux(
+        spawn_trojan_mux(
             reader,
             write,
             Arc::new(move || {
@@ -16777,8 +16815,9 @@ fn serve_trojan_httpheader(stream: Connection, key: &[[u8; 56]], path: &str, fre
                     let _ = stream.shutdown(Shutdown::Both);
                 }
             }),
-            &[],
+            Vec::new(),
         );
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -17120,12 +17159,14 @@ fn relay_trojan_request<S>(
         };
         if let Some(raw) = raw {
             let (reader, writer) = session_halves(session, raw);
-            return serve_trojan_mux(reader, writer, close, carried);
+            spawn_trojan_mux(reader, writer, close, carried.to_vec());
+            return;
         }
         if let Some(kcp) = kcp {
             let (reader, writer) =
                 session_halves(session, KcpIo::with_meter(Arc::clone(&kcp), meter));
-            return serve_trojan_mux(reader, writer, close, carried);
+            spawn_trojan_mux(reader, writer, close, carried.to_vec());
+            return;
         }
         return;
     }
@@ -17139,7 +17180,7 @@ fn relay_trojan_request<S>(
             };
             // A driven reader hands over one record's plaintext and withholds the rest until the next lands, and a datagram is read a field at a time: the pump reads through the shared session.
             let (_driven, half) = session_halves(session, raw);
-            serve_trojan_udp_halves(
+            spawn_trojan_udp(
                 CarriedReader::new(carried.to_vec(), half.clone()),
                 half,
                 move || {
@@ -17151,7 +17192,7 @@ fn relay_trojan_request<S>(
         if let Some(kcp) = kcp {
             let (reader, writer) =
                 session_halves(session, KcpIo::with_meter(Arc::clone(&kcp), meter));
-            serve_trojan_udp_halves(
+            spawn_trojan_udp(
                 CarriedReader::new(carried.to_vec(), reader),
                 writer,
                 move || kcp.close(),
@@ -17225,7 +17266,8 @@ fn serve_session_trojan_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     }
     if cmd == 3 {
         let closer = cwriter.clone();
-        return serve_trojan_udp_halves(creader, cwriter, move || closer.close());
+        spawn_trojan_udp(creader, cwriter, move || closer.close());
+        return;
     }
     if cmd != 1 {
         echo_trace("session ws trojan cmd refused");
@@ -17233,7 +17275,13 @@ fn serve_session_trojan_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     }
     if target.is_mux() {
         let closer = cwriter.clone();
-        return serve_trojan_mux(creader, cwriter, Arc::new(move || closer.close()), &[]);
+        spawn_trojan_mux(
+            creader,
+            cwriter,
+            Arc::new(move || closer.close()),
+            Vec::new(),
+        );
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -17273,7 +17321,8 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
     }
     if cmd == 3 {
         let closer = cwriter.clone();
-        return serve_trojan_udp_halves(creader, cwriter, move || closer.finish());
+        spawn_trojan_udp(creader, cwriter, move || closer.finish());
+        return;
     }
     if cmd != 1 {
         echo_trace("session xhttp trojan cmd refused");
@@ -17282,7 +17331,13 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
     }
     if target.is_mux() {
         let closer = cwriter.clone();
-        return serve_trojan_mux(creader, cwriter, Arc::new(move || closer.finish()), &[]);
+        spawn_trojan_mux(
+            creader,
+            cwriter,
+            Arc::new(move || closer.finish()),
+            Vec::new(),
+        );
+        return;
     }
     let Some(target) = target.socket() else {
         cwriter.finish();
@@ -17333,9 +17388,10 @@ fn serve_session_trojan_httpupgrade<R: Read + Send + 'static, W: Write + Clone +
     }
     if cmd == 3 {
         let raw = Arc::clone(&raw);
-        return serve_trojan_udp_halves(creader, cwriter, move || {
+        spawn_trojan_udp(creader, cwriter, move || {
             let _ = raw.shutdown(Shutdown::Both);
         });
+        return;
     }
     if cmd != 1 {
         echo_trace("session httpupgrade trojan cmd refused");
@@ -17344,14 +17400,15 @@ fn serve_session_trojan_httpupgrade<R: Read + Send + 'static, W: Write + Clone +
     }
     if target.is_mux() {
         let raw = Arc::clone(&raw);
-        return serve_trojan_mux(
+        spawn_trojan_mux(
             creader,
             cwriter,
             Arc::new(move || {
                 let _ = raw.shutdown(Shutdown::Both);
             }),
-            &[],
+            Vec::new(),
         );
+        return;
     }
     let Some(target) = target.socket() else {
         crate::httpupgrade::quiet(&raw);
@@ -17403,9 +17460,10 @@ fn serve_session_trojan_httpheader<R: Read + Send + 'static, W: Write + Clone + 
         return;
     }
     if cmd == 3 {
-        return serve_trojan_udp_halves(creader, cwriter, move || {
+        spawn_trojan_udp(creader, cwriter, move || {
             let _ = raw.shutdown(Shutdown::Both);
         });
+        return;
     }
     if cmd != 1 {
         echo_trace("session httpheader trojan cmd refused");
@@ -17413,14 +17471,15 @@ fn serve_session_trojan_httpheader<R: Read + Send + 'static, W: Write + Clone + 
     }
     if target.is_mux() {
         let raw = Arc::new(raw);
-        return serve_trojan_mux(
+        spawn_trojan_mux(
             creader,
             cwriter,
             Arc::new(move || {
                 let _ = raw.shutdown(Shutdown::Both);
             }),
-            &[],
+            Vec::new(),
         );
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -17462,7 +17521,8 @@ fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     }
     if cmd == 3 {
         let closer = cwriter.clone();
-        return serve_trojan_udp_halves(creader, cwriter, move || closer.close());
+        spawn_trojan_udp(creader, cwriter, move || closer.close());
+        return;
     }
     if cmd != 1 {
         echo_trace("session grpc trojan cmd refused");
@@ -17470,7 +17530,13 @@ fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     }
     if target.is_mux() {
         let closer = cwriter.clone();
-        return serve_trojan_mux(creader, cwriter, Arc::new(move || closer.close()), &[]);
+        spawn_trojan_mux(
+            creader,
+            cwriter,
+            Arc::new(move || closer.close()),
+            Vec::new(),
+        );
+        return;
     }
     let Some(target) = target.socket() else {
         return;
