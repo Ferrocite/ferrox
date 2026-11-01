@@ -12276,6 +12276,16 @@ fn dial_trojan_udp_uplink(
             let close = move || conn.close();
             (Box::new(read), Box::new(write), Box::new(close))
         }
+        (Carrier::Raw(_), None, None) => {
+            let mut uplink = dial_or_report(&server)?.with_mask(mask);
+            uplink.write_all(&header).ok()?;
+            let read = uplink.try_clone().ok()?;
+            let write = uplink.try_clone().ok()?;
+            let close = move || {
+                let _ = uplink.shutdown(Shutdown::Both);
+            };
+            (Box::new(read), Box::new(write), Box::new(close))
+        }
         (Carrier::Kcp(_), None, None) => {
             let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
             if conn.write(&header).is_err() {
