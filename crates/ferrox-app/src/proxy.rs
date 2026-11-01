@@ -1640,7 +1640,7 @@ impl Role {
                 let Ok(session) = ferrox_core::tls::accept(&server, stream) else {
                     return;
                 };
-                run_tls_handshake(session, move |session| {
+                run_tls_handshake(session, move |session, prefix| {
                     let _flow = lane_flow(sniffing, source, &email, level);
                     let front = FrontNames::of(&session);
                     relay_trojan_with_fallbacks(
@@ -1651,6 +1651,7 @@ impl Role {
                         freedom,
                         fallbacks.as_deref(),
                         &front,
+                        &prefix,
                     );
                 });
             }
@@ -1661,9 +1662,10 @@ impl Role {
                 let Ok(session) = ferrox_core::tls::accept(&server, stream) else {
                     return;
                 };
-                run_tls_handshake(session, move |session| {
+                run_tls_handshake(session, move |session, prefix| {
                     let _flow = lane_flow(sniffing, source, &email, level);
                     let (reader, writer) = session_halves(session, out);
+                    let reader = crate::xhttp::ChainReader::new(prefix, reader);
                     serve_session_trojan_ws(reader, writer, &path, keys.as_ref(), freedom);
                 });
             }
@@ -1674,9 +1676,10 @@ impl Role {
                 let Ok(session) = ferrox_core::tls::accept(&server, stream) else {
                     return;
                 };
-                run_tls_handshake(session, move |session| {
+                run_tls_handshake(session, move |session, prefix| {
                     let _flow = lane_flow(sniffing, source, &email, level);
                     let (reader, writer) = session_halves(session, out);
+                    let reader = crate::xhttp::ChainReader::new(prefix, reader);
                     serve_session_trojan_xhttp(reader, writer, &settings, keys.as_ref(), freedom);
                 });
             }
@@ -1690,9 +1693,10 @@ impl Role {
                 let Ok(session) = ferrox_core::tls::accept(&server, stream) else {
                     return;
                 };
-                run_tls_handshake(session, move |session| {
+                run_tls_handshake(session, move |session, prefix| {
                     let _flow = lane_flow(sniffing, source, &email, level);
                     let (reader, writer) = session_halves(session, out);
+                    let reader = crate::xhttp::ChainReader::new(prefix, reader);
                     serve_session_trojan_httpupgrade(
                         reader,
                         writer,
@@ -1714,9 +1718,10 @@ impl Role {
                 let Ok(session) = ferrox_core::tls::accept(&server, stream) else {
                     return;
                 };
-                run_tls_handshake(session, move |session| {
+                run_tls_handshake(session, move |session, prefix| {
                     let _flow = lane_flow(sniffing, source, &email, level);
                     let (reader, writer) = session_halves(session, out);
+                    let reader = crate::xhttp::ChainReader::new(prefix, reader);
                     serve_session_trojan_httpheader(
                         reader,
                         writer,
@@ -1734,9 +1739,10 @@ impl Role {
                 let Ok(session) = ferrox_core::tls::accept(&server, stream) else {
                     return;
                 };
-                run_tls_handshake(session, move |session| {
+                run_tls_handshake(session, move |session, prefix| {
                     let _flow = lane_flow(sniffing, source, &email, level);
                     let (reader, writer) = session_halves(session, out);
+                    let reader = crate::xhttp::ChainReader::new(prefix, reader);
                     serve_session_trojan_grpc(reader, writer, &settings, keys.as_ref(), freedom);
                 });
             }
@@ -7694,13 +7700,13 @@ fn take_handshake_lane() -> bool {
 fn run_tls_handshake<S, F>(session: S, finish: F)
 where
     S: ferrox_core::tls::TlsProvider + Drivable + Send + 'static,
-    F: FnOnce(S) + Send + 'static,
+    F: FnOnce(S, Vec<u8>) + Send + 'static,
 {
     let Some(transport) = session.transport() else {
         let mut session = session;
         thread::spawn(move || {
             if shake_tls(&mut session) {
-                finish(session);
+                finish(session, Vec::new());
             }
         });
         return;
@@ -7709,7 +7715,7 @@ where
         let mut session = session;
         thread::spawn(move || {
             if shake_tls(&mut session) {
-                finish(session);
+                finish(session, Vec::new());
             }
         });
         return;
@@ -7725,20 +7731,22 @@ where
             };
             match current.handshake() {
                 Ok(()) => {
-                    let ready = match transport.take() {
+                    // The request may already be decrypted inside the session, where the socket cannot see it.
+                    let prefix = match transport.take() {
                         Some(transport) => {
+                            let prefix = read_ready_prefix(&mut current, &transport);
                             let _ = transport.set_nonblocking(false);
                             let _ = transport.set_read_timeout(Some(RELAY_POLL));
-                            transport.wait_readable(RELAY_POLL).unwrap_or(false)
+                            prefix
                         }
-                        None => true,
+                        None => Vec::new(),
                     };
                     if let Some(finish) = finish.take() {
-                        if ready {
-                            let _lane = HandshakeLane::enter();
-                            finish(current);
+                        if prefix.is_empty() {
+                            thread::spawn(move || finish(current, Vec::new()));
                         } else {
-                            thread::spawn(move || finish(current));
+                            let _lane = HandshakeLane::enter();
+                            finish(current, prefix);
                         }
                     }
                     Next::Done
@@ -7752,6 +7760,36 @@ where
         }),
         Box::new(|| {}),
     );
+}
+
+/// Reads the plaintext already buffered after the handshake; empty means silence, so the continuation leaves the lane.
+fn read_ready_prefix<S: ferrox_core::tls::TlsProvider>(
+    session: &mut S,
+    transport: &Connection,
+) -> Vec<u8> {
+    let mut prefix = Vec::new();
+    let mut buf = [0u8; PROBE_READ];
+    let mut waited = false;
+    loop {
+        match session.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                prefix.extend_from_slice(&buf[..n]);
+                if prefix.len() >= PROBE_READ {
+                    break;
+                }
+            }
+            Err(error) if is_timeout(&error) => {
+                if waited {
+                    break;
+                }
+                waited = true;
+                let _ = transport.wait_readable(RELAY_POLL);
+            }
+            Err(_) => break,
+        }
+    }
+    prefix
 }
 
 fn lane_flow(
@@ -10180,7 +10218,7 @@ fn serve_trojan_kcp_tls(
     if !shake_tls(&mut tls) {
         return;
     }
-    relay_trojan(tls, None, Some(Arc::clone(conn)), key, freedom, meter);
+    relay_trojan(tls, None, Some(Arc::clone(conn)), key, freedom, meter, &[]);
 }
 
 fn serve_trojan_kcp_reality(
@@ -17114,7 +17152,7 @@ fn serve_trojan_tls(
                 return;
             }
             let front = FrontNames::of(&tls);
-            relay_trojan_with_fallbacks(tls, Some(raw), None, key, freedom, fallbacks, &front);
+            relay_trojan_with_fallbacks(tls, Some(raw), None, key, freedom, fallbacks, &front, &[]);
         }
         Carrier::Ws { path, .. } => {
             let Ok(out) = stream.try_clone() else { return };
@@ -17283,7 +17321,7 @@ fn finish_trojan_reality<S>(
         return;
     }
     let front = FrontNames::of(&session);
-    relay_trojan_with_fallbacks(session, raw, kcp, key, freedom, fallbacks, &front);
+    relay_trojan_with_fallbacks(session, raw, kcp, key, freedom, fallbacks, &front, &[]);
 }
 
 /// The served trojan session: the request is read under the handshake clock, then the relay drives the session's transport, so a read parked in the socket holds no lock its writer asks for.
@@ -17294,6 +17332,7 @@ fn relay_trojan<S>(
     key: &[[u8; 56]],
     freedom: bool,
     meter: crate::stats::Meter,
+    first: &[u8],
 ) where
     S: std::io::Read
         + std::io::Write
@@ -17304,20 +17343,50 @@ fn relay_trojan<S>(
         + CipherOpen
         + 'static,
 {
-    let bounded = {
+    if first.is_empty() {
+        let bounded = {
+            let mut deadline = HandshakeDeadline {
+                inner: &mut session,
+                until: Instant::now() + budgets::handshake(),
+            };
+            decode_trojan_request(&mut deadline, key)
+        };
+        let Some(header) = bounded else {
+            return;
+        };
+        return relay_trojan_request(session, raw, kcp, header, freedom, &[], meter);
+    }
+    let mut read_ahead = Vec::new();
+    let (bounded, consumed) = {
         let mut deadline = HandshakeDeadline {
             inner: &mut session,
             until: Instant::now() + budgets::handshake(),
         };
-        decode_trojan_request(&mut deadline, key)
+        let mut replay = Prefixed {
+            head: first,
+            at: 0,
+            tail: &mut deadline,
+            carried: &mut read_ahead,
+        };
+        let header = decode_trojan_request(&mut replay, key);
+        (header, replay.at)
     };
     let Some(header) = bounded else {
         return;
     };
-    relay_trojan_request(session, raw, kcp, header, freedom, &[], meter);
+    relay_trojan_request(
+        session,
+        raw,
+        kcp,
+        header,
+        freedom,
+        &first[consumed..],
+        meter,
+    );
 }
 
 /// A trojan front with fallbacks: the first read names the inbound or routes to the cover site.
+#[allow(clippy::too_many_arguments)]
 fn relay_trojan_with_fallbacks<S>(
     mut session: S,
     raw: Option<Connection>,
@@ -17326,6 +17395,7 @@ fn relay_trojan_with_fallbacks<S>(
     freedom: bool,
     fallbacks: Option<&[Fallback]>,
     front: &FrontNames,
+    first: &[u8],
 ) where
     S: std::io::Read
         + std::io::Write
@@ -17344,32 +17414,43 @@ fn relay_trojan_with_fallbacks<S>(
             key,
             freedom,
             crate::stats::Meter::default(),
+            first,
         );
     };
     let mut window = [0u8; PROBE_READ];
-    let n = {
-        let mut deadline = HandshakeDeadline {
-            inner: &mut session,
-            until: Instant::now() + budgets::handshake(),
+    let window: &[u8] = if first.is_empty() {
+        let n = {
+            let mut deadline = HandshakeDeadline {
+                inner: &mut session,
+                until: Instant::now() + budgets::handshake(),
+            };
+            match deadline.read(&mut window) {
+                Ok(0) | Err(_) => return,
+                Ok(n) => n,
+            }
         };
-        match deadline.read(&mut window) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => n,
-        }
+        &window[..n]
+    } else {
+        &first[..first.len().min(PROBE_READ)]
     };
+    let n = window.len();
     if n < 58 || window[56] != b'\r' || !key.iter().any(|key| key_agrees(&window[..56], key)) {
         let Some(raw) = raw.as_ref() else {
             return;
         };
         return seize_fallback_tls(session, raw, rows, &window[..n], &[], front);
     }
-    let mut tail = Vec::new();
+    let mut read_ahead = Vec::new();
     let (header, consumed) = {
+        let mut deadline = HandshakeDeadline {
+            inner: &mut session,
+            until: Instant::now() + budgets::handshake(),
+        };
         let mut replay = Prefixed {
-            head: &window[..n],
+            head: window,
             at: 0,
-            tail: &mut session,
-            carried: &mut tail,
+            tail: &mut deadline,
+            carried: &mut read_ahead,
         };
         let header = decode_trojan_request(&mut replay, key);
         (header, replay.at)
