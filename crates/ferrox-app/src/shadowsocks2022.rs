@@ -71,7 +71,7 @@ pub(crate) fn serve(mut stream: Connection, password: &str, method: &str, freedo
 
 /// Read and open the fixed+variable header of an already-salted request, returning the target and any early data; the single- and multi-psk handshakes share this so the framing lives in one place.
 fn read_request_header(stream: &mut dyn Read, recv: &mut Cipher) -> Option<(SocketAddr, Vec<u8>)> {
-    let mut fixed = vec![0u8; 11 + TAG_LEN];
+    let mut fixed = [0u8; 11 + TAG_LEN];
     if read_exact(stream, &mut fixed).is_err() {
         return None;
     }
@@ -84,7 +84,7 @@ fn read_request_header(stream: &mut dyn Read, recv: &mut Cipher) -> Option<(Sock
         return None;
     }
     let var_len = usize::from(u16::from_be_bytes([fixed[9], fixed[10]]));
-    if var_len == 0 || var_len > 2048 {
+    if var_len == 0 {
         return None;
     }
     let mut variable = vec![0u8; var_len + TAG_LEN];
@@ -102,7 +102,8 @@ fn read_request_header(stream: &mut dyn Read, recv: &mut Cipher) -> Option<(Sock
     if at > variable.len() || (pad == 0 && at == variable.len()) {
         return None;
     }
-    Some((target, variable[at..].to_vec()))
+    variable.drain(..at);
+    Some((target, variable))
 }
 
 fn serve_single(stream: &mut Connection, method: Method, psk: &[u8], freedom: bool) {
@@ -346,7 +347,7 @@ fn accept_on(
             .find(|p| shadowsocks2022::user_hash(p) == hash)?
             .clone();
         let mut recv = Cipher::from_psk(method, &user, &salt_probe)?;
-        let target = open_handshake(reader, &mut recv)?;
+        let target = read_request_header(reader, &mut recv)?;
         crate::accesslog::record_current(&target.0);
         let mut uplink = crate::conn::dial_tcp(&target.0, Duration::from_secs(8)).ok()?;
         uplink.write_all(&target.1).ok()?;
@@ -363,7 +364,7 @@ fn accept_on(
         return None;
     }
     let mut recv = Cipher::from_psk(method, &psk, &salt)?;
-    let (target, early) = open_handshake(reader, &mut recv)?;
+    let (target, early) = read_request_header(reader, &mut recv)?;
     crate::accesslog::record_current(&target);
     let mut uplink = crate::conn::dial_tcp(&target, Duration::from_secs(8)).ok()?;
     uplink.write_all(&early).ok()?;
@@ -371,37 +372,6 @@ fn accept_on(
     let send = Cipher::from_psk(method, &psk, &server_salt)?;
     let response = Response::new(send, server_salt, salt);
     Some((uplink, response, Recv::Ready(recv)))
-}
-
-fn open_handshake(reader: &mut dyn Read, recv: &mut Cipher) -> Option<(SocketAddr, Vec<u8>)> {
-    let mut fixed = vec![0u8; 11 + TAG_LEN];
-    read_exact(reader, &mut fixed).ok()?;
-    let len = recv.open_in_place(&mut fixed)?;
-    if len != 11 || fixed[0] != 0 {
-        return None;
-    }
-    let stamp = u64::from_be_bytes(fixed[1..9].try_into().ok()?);
-    if now_secs().abs_diff(stamp) > SKEW {
-        return None;
-    }
-    let var_len = usize::from(u16::from_be_bytes([fixed[9], fixed[10]]));
-    if var_len == 0 || var_len > 2048 {
-        return None;
-    }
-    let mut variable = vec![0u8; var_len + TAG_LEN];
-    read_exact(reader, &mut variable).ok()?;
-    recv.open_in_place(&mut variable)?;
-    variable.truncate(var_len);
-    let (target, used) = parse_addr_header(&variable)?;
-    if variable.len() < used + 2 {
-        return None;
-    }
-    let pad = usize::from(u16::from_be_bytes([variable[used], variable[used + 1]]));
-    let at = used + 2 + pad;
-    if at > variable.len() || (pad == 0 && at == variable.len()) {
-        return None;
-    }
-    Some((target, variable[at..].to_vec()))
 }
 
 pub(crate) fn serve_ws(
@@ -1175,13 +1145,14 @@ impl<R: Read> Downlink<R> {
     }
 }
 
-/// Chunks one window batch opens and hands to the target at once.
-const CHUNKS_PER_BATCH: usize = 4;
+/// Chunks one window batch opens and hands to the target at once: a peer that frames 8 KiB chunks
+/// fills a window with eight of them, so one opened batch is one target write.
+const CHUNKS_PER_BATCH: usize = 8;
 
-/// The relay's read window: a slot of the uplink's own read size for every chunk of a batch, so one
-/// ask covers a batch of relay-sized chunks, and the widest chunk a peer can name — `MAX_CHUNK` with
-/// its sealed length and tag — still lands in it whole.
-const WINDOW: usize = CHUNKS_PER_BATCH * (SEAL_HEAD + READ_CHUNK + TAG_LEN);
+/// The relay's read window: four slots of the uplink's own read size, so one ask covers a batch of
+/// relay-sized chunks, and the widest chunk a peer can name — `MAX_CHUNK` with its sealed length and
+/// tag — still lands in it whole.
+const WINDOW: usize = 4 * (SEAL_HEAD + READ_CHUNK + TAG_LEN);
 
 /// One relay connection's downlink window: wire bytes land here once and chunks open where they lie,
 /// so a sealed length never costs its own carrier ask and a payload byte crosses user space once.
@@ -2394,6 +2365,46 @@ mod tests {
     }
 
     #[test]
+    fn a_large_variable_header_is_a_request_not_a_refusal() {
+        let method = Method::Aes128Gcm;
+        let psk = vec![0x42u8; method.key_len()];
+        let salt = vec![0x11u8; method.key_len()];
+        let target: SocketAddr = "127.0.0.1:443".parse().expect("addr");
+        let early = vec![0x5au8; 8192];
+        let padding = 0usize;
+        let mut cipher = Cipher::from_psk(method, &psk, &salt).expect("derives");
+        let mut variable = Vec::new();
+        crate::proxy::Destination::from(target).push_addr(&mut variable, 4, 3);
+        variable.extend_from_slice(&target.port().to_be_bytes());
+        variable.extend_from_slice(&(padding as u16).to_be_bytes());
+        variable.resize(variable.len() + padding, 0);
+        variable.extend_from_slice(&early);
+        let mut fixed = vec![0u8; 11];
+        fixed[1..9].copy_from_slice(&now_secs().to_be_bytes());
+        fixed[9..11].copy_from_slice(&(variable.len() as u16).to_be_bytes());
+        let mut wire = Vec::new();
+        let tag = cipher.seal_piece_in_place(&mut fixed).expect("seals");
+        wire.extend_from_slice(&fixed);
+        wire.extend_from_slice(&tag);
+        let at = wire.len();
+        wire.extend_from_slice(&variable);
+        let tag = cipher.seal_piece_in_place(&mut wire[at..]).expect("seals");
+        wire.extend_from_slice(&tag);
+
+        let mut recv = Cipher::from_psk(method, &psk, &salt).expect("derives");
+        let (parsed, counts) = ferrox_core::alloc_count::measure(|| {
+            read_request_header(&mut std::io::Cursor::new(&wire), &mut recv)
+        });
+        let (got, data) = parsed.expect("an 8 KiB first write is a request, not a refusal");
+        assert_eq!(got, target);
+        assert_eq!(data, early);
+        assert_eq!(
+            counts.allocs, 1,
+            "the header costs the sealed variable buffer and nothing else"
+        );
+    }
+
+    #[test]
     fn a_client_handshake_leaves_in_one_write() {
         let method = Method::Aes256Gcm;
         let name = "2022-blake3-aes-256-gcm";
@@ -2423,8 +2434,9 @@ mod tests {
         };
         assert_eq!(m, method);
         let mut cipher = Cipher::from_psk(m, &p, &s).expect("derives");
-        let (got, early) = open_handshake(&mut std::io::Cursor::new(&seen[s.len()..]), &mut cipher)
-            .expect("the one-write handshake parses");
+        let (got, early) =
+            read_request_header(&mut std::io::Cursor::new(&seen[s.len()..]), &mut cipher)
+                .expect("the one-write handshake parses");
         assert_eq!(got, target);
         assert_eq!(early, Vec::<u8>::new());
     }
@@ -3132,7 +3144,7 @@ mod tests {
     }
 
     /// The downlink's batch path end to end, counted where the count is exact: a source that answers
-    /// the whole window in one read, a target that counts vectored writes, and four chunks that open
+    /// the whole window in one read, a target that counts vectored writes, and eight chunks that open
     /// and leave without one byte copied out of the window.
     #[test]
     fn a_bulk_read_serves_every_buffered_chunk() {
@@ -3140,7 +3152,7 @@ mod tests {
         let psk = vec![7u8; 32];
         let salt = vec![7u8; 32];
         let mut send = Cipher::from_psk(method, &psk, &salt).expect("derives");
-        let sizes = [READ_CHUNK, 100, 4000, 17];
+        let sizes = [8000, 100, 4000, 17, 8000, 4000, 500, 2000];
         let mut plain = Vec::new();
         let mut wire = Vec::new();
         for (part, size) in sizes.iter().enumerate() {
