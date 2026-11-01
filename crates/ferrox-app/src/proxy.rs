@@ -3370,8 +3370,10 @@ fn serve_accepted(
 
 pub(crate) fn spawn_carried<F: FnOnce() + Send + 'static>(body: F) {
     let sniffing = crate::sniff::current();
+    let access = crate::accesslog::capture_flow();
     thread::spawn(move || {
         crate::sniff::install_current(sniffing);
+        let _flow = crate::accesslog::install_flow(access);
         body();
     });
 }
@@ -4152,7 +4154,8 @@ fn serve_vless_raw_with<D, R>(
     let handshake = stream
         .policy()
         .and_then(|flow| flow.handshake())
-        .unwrap_or_else(budgets::handshake);
+        .unwrap_or_else(budgets::handshake)
+        .min(budgets::handshake());
     let _ = stream.set_read_timeout(Some(handshake));
     let peer = stream.peer_addr().ok();
     let opening = match fallbacks {
@@ -4313,7 +4316,8 @@ fn serve_vless_encrypted_raw(
     let handshake = stream
         .policy()
         .and_then(|flow| flow.handshake())
-        .unwrap_or_else(budgets::handshake);
+        .unwrap_or_else(budgets::handshake)
+        .min(budgets::handshake());
     let _ = stream.set_read_timeout(Some(handshake));
     let sealed = match decryption.handshake(stream) {
         Ok(sealed) => sealed,
@@ -22651,8 +22655,8 @@ pub(crate) mod lane_pool {
     pub(crate) const RELAY_LANES: usize = 8;
 
     /// Setup lanes are separate from relay lanes so a handshake parked in a read cannot take a
-    /// relay worker with it. Four carry the widest cell's opening requests in two waves.
-    pub(crate) const SETUP_LANES: usize = 4;
+    /// relay worker with it. Two keep the setup peak under the reference's server threads.
+    pub(crate) const SETUP_LANES: usize = 2;
 
     /// Accepted work past the setup workers waits in this queue; past it the accept loop drops the
     /// socket, so a burst cannot hold accepted connections without bound.
@@ -22987,6 +22991,11 @@ pub(crate) mod lane_pool {
         ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
         if pool.pending.is_some_and(|pending| ready.len() >= pending) {
             return false;
+        }
+        if pool.workers.load(Relaxed) == 0 {
+            drop(ready);
+            run_to_end(lane);
+            return true;
         }
         ready.push_back(lane);
         drop(ready);

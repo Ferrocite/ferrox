@@ -6,7 +6,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 #[derive(Clone, Default)]
-struct Flow {
+pub(crate) struct Flow {
     source: Option<SocketAddr>,
     email: String,
     level: u32,
@@ -36,6 +36,17 @@ impl Drop for FlowGuard {
     fn drop(&mut self) {
         FLOW.with(|flow| *flow.borrow_mut() = Flow::default());
     }
+}
+
+/// The flow a thread is serving, cloned for a session that outlives the dispatch thread.
+pub(crate) fn capture_flow() -> Flow {
+    FLOW.with(|flow| flow.borrow().clone())
+}
+
+/// Install a captured flow in a thread that now owns the session, so its online lease outlives the parent guard.
+pub(crate) fn install_flow(flow: Flow) -> FlowGuard {
+    FLOW.with(|slot| *slot.borrow_mut() = flow);
+    FlowGuard
 }
 
 /// The account a front authenticates after its flow opened: the source and the lease stay, the identity is the one the client proved.
