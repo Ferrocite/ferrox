@@ -47,6 +47,7 @@ mod policy;
 mod process;
 mod proxy;
 mod psiphon;
+mod psiphon_meek;
 mod psiphon_ssh;
 mod quic;
 mod reverse;
@@ -114,6 +115,9 @@ fn usage() -> ! {
     eprintln!("                                finish the Firefox sign-in in a real browser");
     eprintln!(
         "  ferrox-app edges [--ping]         list the catalogue's edges as JSON rows; --ping adds a handshake ms (null when silent)"
+    );
+    eprintln!(
+        "  ferrox-app psiphon-regions -c <config.json>   list the signed server list's region codes"
     );
     std::process::exit(2);
 }
@@ -274,6 +278,64 @@ fn cmd_run(link_str: &str, opt_in: UnsafeOptIn) {
     let _ = std::io::stdout().flush();
 }
 
+fn cmd_psiphon_regions<I: Iterator<Item = String>>(args: &mut I) {
+    let mut path = String::new();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-c" | "-config" | "--config" => {
+                path = args.next().unwrap_or_else(|| usage());
+            }
+            other if other.starts_with("--config=") => {
+                path.clear();
+                path.push_str(&other["--config=".len()..]);
+            }
+            _ => usage(),
+        }
+    }
+    if path.is_empty() {
+        usage();
+    }
+    let text = if path == "-" || path == "stdin:" {
+        let mut text = String::new();
+        std::io::stdin()
+            .read_to_string(&mut text)
+            .unwrap_or_else(|error| {
+                eprintln!("psiphon-regions: stdin: {error}");
+                std::process::exit(1);
+            });
+        text
+    } else {
+        std::fs::read_to_string(&path).unwrap_or_else(|error| {
+            eprintln!("psiphon-regions: {path}: {error}");
+            std::process::exit(1);
+        })
+    };
+    let root = json::parse(&text).unwrap_or_else(|error| {
+        eprintln!("psiphon-regions: {error}");
+        std::process::exit(1);
+    });
+    let settings = root
+        .get("outbounds")
+        .and_then(json::Json::as_arr)
+        .and_then(|outbounds| {
+            outbounds.iter().find(|outbound| {
+                outbound.get("protocol").and_then(json::Json::as_str) == Some("psiphon")
+            })
+        })
+        .and_then(|outbound| outbound.get("settings"));
+    match psiphon::regions(settings) {
+        Ok(rows) => {
+            for (region, count) in rows {
+                println!("{region}\t{count}");
+            }
+        }
+        Err(why) => {
+            eprintln!("{why}");
+            std::process::exit(1);
+        }
+    }
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let Some(cmd) = args.next() else {
@@ -355,6 +417,7 @@ fn main() {
             }
             proxy::print_foxy_edges(ping);
         }
+        "psiphon-regions" => cmd_psiphon_regions(&mut args),
         "x25519" => {
             if args.next().is_some() {
                 usage();

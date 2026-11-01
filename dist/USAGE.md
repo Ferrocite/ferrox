@@ -44,16 +44,20 @@ That sign-in is also the only one. The first launch writes the session FxA retur
 The catalogue is public and unauthenticated, so the location list needs no account:
 
 ```bash
-./dist/ferrox-cli.sh locations              # every country, and the cities each one publishes
-./dist/ferrox-cli.sh locations US           # one country in detail
-./dist/ferrox-cli.sh locations --ping       # the same list, nearest exit first
-./dist/ferrox-cli.sh locations --ping US    # one country, its cities by latency
-./dist/ferrox-cli.sh location DE            # remember Germany for every up
-./dist/ferrox-cli.sh location US SFO        # remember a country and a city
-./dist/ferrox-cli.sh up --foxy --vpn        # connects to the remembered exit
+./dist/ferrox-cli.sh locations --foxy        # every country, and the cities each one publishes
+./dist/ferrox-cli.sh locations --foxy US     # one country in detail
+./dist/ferrox-cli.sh locations --ping        # the same list, nearest exit first
+./dist/ferrox-cli.sh locations --ping US     # one country, its cities by latency
+./dist/ferrox-cli.sh locations --veepn       # VeePN region ids from its public list
+./dist/ferrox-cli.sh locations --psiphon     # regions in the signed Psiphon server list
+./dist/ferrox-cli.sh location --foxy DE      # remember Germany for every foxy up
+./dist/ferrox-cli.sh location --foxy US SFO  # remember a country and a city
+./dist/ferrox-cli.sh location --veepn nl     # remember a VeePN region
+./dist/ferrox-cli.sh location --psiphon US   # remember a Psiphon region
+./dist/ferrox-cli.sh up --foxy --vpn         # connects to the remembered exit
 ```
 
-The list prints one line per country and one per city with the number of published edges, marks the remembered choice with `*`, and keeps the raw JSON rows in `~/.config/ferrox/foxy-locations.jsonl`; when the catalogue cannot be reached, the last copy is what `locations` prints. `--country` and `--city` still win over the remembered exit for one launch and become the new remembered one. `REC` is the catalogue's recommended country: it picks the exit Mozilla considers best and verification accepts whichever country that edge reports.
+The foxy list prints one line per country and one per city with the number of published edges, marks the remembered choice with `*`, and keeps the raw JSON rows in `~/.config/ferrox/foxy-locations.jsonl`; when the catalogue cannot be reached, the last copy is what `locations --foxy` prints. `--country` and `--city` still win over the remembered exit for one launch and become the new remembered one. `REC` is the catalogue's recommended country: it picks the exit Mozilla considers best and verification accepts whichever country that edge reports. VeePN's public list is kept in `~/.config/ferrox/veepn-locations.jsonl`, and Psiphon's regions come from the signed server list the lane already downloads. Each lane has its own remembered exit file, so moving one does not move another.
 
 `--ping` adds one TCP handshake per edge and prints its time in milliseconds. Countries and cities sort fastest first, and `REC` stays at the top because it is a recommendation rather than a measurement. An edge that does not answer inside 1.5 s prints `no answer`, the same silence that would cost a flow its dial. The reading is this machine's own path to the edge's TCP port: it measures the hop, not the MASQUE session, and an `--upstream` hop is not in it. The readings are not kept: `foxy-locations.jsonl` stores the rows without them, and an offline `locations --ping` says the latency was not measured instead of printing stale numbers.
 
@@ -144,11 +148,11 @@ ferrox-cli up --veepn --region us-va      # anonymous: no account, no server
 ferrox-cli up --vmess host:443 --uuid ID --network tcp
 ferrox-cli up --trojan host:443 --password PW
 ferrox-cli up --ss host:8388 --method aes-256-gcm --password PW
-ferrox-cli up --psiphon                   # its own psiphon-tunnel-core beside ferrox-app
+ferrox-cli up --psiphon                   # native OSSH/SSH, no client binary
 ferrox-cli up --config mine.json          # served verbatim, any inbound/outbound
 ```
 
-The Psiphon lane needs no account; `--psiphon-bin FILE` names the client when it is not beside `ferrox-app`, `--psiphon-conduit-mode shirokhorshid` or `--psiphon-cdn-profile shirokhorshid` selects the Shiroy variants, and `auto`/`public` with `legacy`/`android`/`off` keeps the built-in paths.
+The Psiphon lane needs no account and no client binary: it fetches the signed server list and speaks OSSH/SSH itself. `--psiphon` is the normal path; `--psiphon-cdn` asks for CDN fronting and beast mode in one flag, while `--psiphon-conduit-mode private` and `--psiphon-cdn-profile fronted` name the two settings directly. Fronted-meek entries are dialled through their CDN front with the version-4 meek cookie; a list with no fronted entry falls back to SSH/OSSH, and conduits still need volunteer relays. The public private-compartment id is the default, and `--psiphon-compartment ID` overrides it.
 
 The vless converter writes `tcp`, `ws`, `grpc`, `httpupgrade` and `xhttp`, with `security=none|tls|reality`. Anything else (kcp, quic, hysteria, httpheader, masque, xdrive) goes through `--config`: those are config shapes this binary already serves, and the converter does not guess at them. A share-link lane with no link, a missing `--uuid`, or a missing password is refused before the lane starts, with the example to run.
 

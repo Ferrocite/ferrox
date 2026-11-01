@@ -16,12 +16,12 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 use x25519_dalek::{x25519, X25519_BASEPOINT_BYTES};
 
-const MAGIC: u32 = 0x0BF5_CA7E;
-const HASH_ITERATIONS: usize = 6000;
-const SEED_LENGTH: usize = 16;
-const KEY_LENGTH: usize = 16;
-const MIN_PADDING: usize = 32;
-const MAX_PADDING: usize = 8192;
+pub(crate) const MAGIC: u32 = 0x0BF5_CA7E;
+pub(crate) const HASH_ITERATIONS: usize = 6000;
+pub(crate) const SEED_LENGTH: usize = 16;
+pub(crate) const KEY_LENGTH: usize = 16;
+pub(crate) const MIN_PADDING: usize = 32;
+pub(crate) const MAX_PADDING: usize = 8192;
 const MAX_PACKET: usize = 256 * 1024;
 const CHANNEL_WINDOW: u32 = 2 * 1024 * 1024;
 const CHANNEL_PACKET: u32 = 32 * 1024;
@@ -77,6 +77,8 @@ pub(crate) struct Server {
     pub(crate) host_key: Vec<u8>,
     pub(crate) obfuscation_key: Option<String>,
     pub(crate) region: Option<String>,
+    pub(crate) direct: bool,
+    pub(crate) meek: Option<crate::psiphon_meek::Meek>,
 }
 
 impl Server {
@@ -150,7 +152,11 @@ impl Proxy {
     }
 
     /// Dial the server through the hop, so the SSH socket itself is the tunnel's first leg.
-    fn connect(&self, target: SocketAddr, timeout: Duration) -> Result<TcpStream, String> {
+    pub(crate) fn connect(
+        &self,
+        target: SocketAddr,
+        timeout: Duration,
+    ) -> Result<TcpStream, String> {
         let mut last = String::new();
         for address in (self.host.as_str(), self.port)
             .to_socket_addrs()
@@ -411,22 +417,33 @@ impl std::fmt::Debug for Channel {
     }
 }
 
+/// The fields the server's auth and handshake read, taken from the lane's settings.
+pub(crate) struct Identity<'a> {
+    pub(crate) session_id: &'a str,
+    pub(crate) sponsor: &'a str,
+    pub(crate) propagation: &'a str,
+    pub(crate) platform: &'a str,
+    pub(crate) version: &'a str,
+}
+
 impl Session {
     /// Dial a server, negotiate the tunnel, and authenticate as the entry's user.
     pub(crate) fn connect(
         server: &Server,
-        session_id: &str,
-        sponsor: &str,
+        identity: &Identity<'_>,
         timeout: Duration,
         proxy: Option<&Proxy>,
     ) -> Result<Self, String> {
         let address = SocketAddr::new(server.address, server.port);
-        let socket = match proxy {
-            Some(proxy) => proxy
-                .connect(address, timeout)
-                .map_err(|error| format!("psiphon ssh proxy {}: {error}", proxy.display()))?,
-            None => TcpStream::connect_timeout(&address, timeout)
-                .map_err(|error| format!("psiphon ssh {}: {error}", server.host))?,
+        let socket = match &server.meek {
+            Some(meek) => crate::psiphon_meek::connect(meek, timeout, proxy)?,
+            None => match proxy {
+                Some(proxy) => proxy
+                    .connect(address, timeout)
+                    .map_err(|error| format!("psiphon ssh proxy {}: {error}", proxy.display()))?,
+                None => TcpStream::connect_timeout(&address, timeout)
+                    .map_err(|error| format!("psiphon ssh {}: {error}", server.host))?,
+            },
         };
         socket
             .set_read_timeout(Some(timeout))
@@ -455,18 +472,22 @@ impl Session {
         output.activate(kex.client_cipher.0, kex.client_cipher.1, kex.client_mac);
         input.activate(kex.server_cipher.0, kex.server_cipher.1, kex.server_mac);
         service(&mut output, &mut input)?;
-        authenticate(&mut output, &mut input, server, session_id, sponsor)?;
-        // A Psiphon server refuses every port forward until this handshake completes.
-        handshake(
+        authenticate(
             &mut output,
             &mut input,
-            if server.obfuscation_key.is_some() {
-                "OSSH"
-            } else {
-                "SSH"
-            },
-            sponsor,
+            server,
+            identity.session_id,
+            identity.sponsor,
         )?;
+        // A Psiphon server refuses every port forward until this handshake completes.
+        let relay_protocol = if server.meek.is_some() {
+            "FRONTED-MEEK-OSSH"
+        } else if server.obfuscation_key.is_some() {
+            "OSSH"
+        } else {
+            "SSH"
+        };
+        handshake(&mut output, &mut input, relay_protocol, identity)?;
         control
             .set_read_timeout(None)
             .and_then(|()| control.set_write_timeout(None))
@@ -749,43 +770,52 @@ impl Channel {
         Arc::as_ptr(&self.session) as usize
     }
 
+    /// One queued chunk and the window credit it releases, without waiting.
+    fn take_chunk(&self) -> (Option<ChannelChunk>, u64) {
+        let mut adjust = 0u64;
+        let chunk = {
+            let mut recv = lock(&self.state.recv);
+            loop {
+                let Some((start, end)) = recv.chunks.front().map(|front| (front.start, front.end))
+                else {
+                    break None;
+                };
+                if start >= end {
+                    let spent = recv
+                        .chunks
+                        .pop_front()
+                        .unwrap_or_else(|| unreachable!("the front chunk is the one just named"));
+                    recycle(&self.state.pool, spent.buffer);
+                    continue;
+                }
+                recv.pending_adjust += (end - start) as u64;
+                if recv.pending_adjust >= WINDOW_ADJUST_AT {
+                    adjust = recv.pending_adjust;
+                    recv.pending_adjust = 0;
+                    recv.local_window += adjust;
+                }
+                break recv.chunks.pop_front();
+            }
+        };
+        (
+            chunk.map(|chunk| ChannelChunk {
+                buffer: chunk.buffer,
+                start: chunk.start,
+                end: chunk.end,
+            }),
+            adjust,
+        )
+    }
+
     /// The next packet's payload without copying it out of the receive buffer.
     pub(crate) fn next_chunk(&mut self) -> io::Result<Option<ChannelChunk>> {
         loop {
-            let mut adjust = 0u64;
-            let chunk = {
-                let mut recv = lock(&self.state.recv);
-                loop {
-                    let Some((start, end)) =
-                        recv.chunks.front().map(|front| (front.start, front.end))
-                    else {
-                        break None;
-                    };
-                    if start >= end {
-                        let spent = recv.chunks.pop_front().unwrap_or_else(|| {
-                            unreachable!("the front chunk is the one just named")
-                        });
-                        recycle(&self.state.pool, spent.buffer);
-                        continue;
-                    }
-                    recv.pending_adjust += (end - start) as u64;
-                    if recv.pending_adjust >= WINDOW_ADJUST_AT {
-                        adjust = recv.pending_adjust;
-                        recv.pending_adjust = 0;
-                        recv.local_window += adjust;
-                    }
-                    break recv.chunks.pop_front();
-                }
-            };
+            let (chunk, adjust) = self.take_chunk();
             if adjust != 0 {
                 self.adjust(adjust);
             }
-            if let Some(chunk) = chunk {
-                return Ok(Some(ChannelChunk {
-                    buffer: chunk.buffer,
-                    start: chunk.start,
-                    end: chunk.end,
-                }));
+            if chunk.is_some() {
+                return Ok(chunk);
             }
             let mut recv = lock(&self.state.recv);
             if !recv.chunks.is_empty() {
@@ -804,6 +834,13 @@ impl Channel {
                 return Ok(None);
             }
         }
+    }
+
+    /// A chunk already queued, for a writer that coalesces the packets it has.
+    pub(crate) fn try_next_chunk(&mut self) -> Option<ChannelChunk> {
+        let (chunk, adjust) = self.take_chunk();
+        self.adjust(adjust);
+        chunk
     }
 
     /// Hand a consumed chunk's allocation back to the packet pool.
@@ -993,18 +1030,18 @@ fn split(
     }
 }
 
-fn random_padding() -> usize {
+pub(crate) fn random_padding() -> usize {
     let bytes = random::<2>();
     MIN_PADDING + usize::from(u16::from_be_bytes(bytes)) % (MAX_PADDING - MIN_PADDING + 1)
 }
 
-fn random<const N: usize>() -> [u8; N] {
+pub(crate) fn random<const N: usize>() -> [u8; N] {
     let mut bytes = [0u8; N];
     getrandom::fill(&mut bytes).expect("psiphon: system entropy");
     bytes
 }
 
-fn derive_key(seed: &[u8], keyword: &[u8], iv: &[u8]) -> [u8; KEY_LENGTH] {
+pub(crate) fn derive_key(seed: &[u8], keyword: &[u8], iv: &[u8]) -> [u8; KEY_LENGTH] {
     let mut hasher = Sha1::new();
     hasher.update(seed);
     hasher.update(keyword);
@@ -1020,14 +1057,14 @@ fn derive_key(seed: &[u8], keyword: &[u8], iv: &[u8]) -> [u8; KEY_LENGTH] {
     key
 }
 
-struct Rc4 {
+pub(crate) struct Rc4 {
     s: [u8; 256],
     i: u8,
     j: u8,
 }
 
 impl Rc4 {
-    fn new(key: &[u8]) -> Self {
+    pub(crate) fn new(key: &[u8]) -> Self {
         let mut s = [0u8; 256];
         for (index, byte) in s.iter_mut().enumerate() {
             *byte = u8::try_from(index).unwrap_or(0);
@@ -1040,7 +1077,7 @@ impl Rc4 {
         Self { s, i: 0, j: 0 }
     }
 
-    fn apply(&mut self, bytes: &mut [u8]) {
+    pub(crate) fn apply(&mut self, bytes: &mut [u8]) {
         for byte in bytes {
             self.i = self.i.wrapping_add(1);
             self.j = self.j.wrapping_add(self.s[usize::from(self.i)]);
@@ -1836,11 +1873,14 @@ fn handshake(
     writer: &mut PacketWriter,
     reader: &mut PacketReader,
     relay_protocol: &str,
-    sponsor: &str,
+    identity: &Identity<'_>,
 ) -> Result<(), String> {
     let body = format!(
-        r#"{{"propagation_channel_id":"FFFFFFFFFFFFFFFF","sponsor_id":"{}","client_version":"1","client_platform":"Linux","relay_protocol":"{}"}}"#,
-        json_escape(sponsor),
+        r#"{{"propagation_channel_id":"{}","sponsor_id":"{}","client_version":"{}","client_platform":"{}","relay_protocol":"{}"}}"#,
+        json_escape(identity.propagation),
+        json_escape(identity.sponsor),
+        json_escape(identity.version),
+        json_escape(identity.platform),
         relay_protocol
     );
     let mut request = vec![MSG_GLOBAL_REQUEST];
@@ -1977,13 +2017,17 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
                 return Dispatch::Stop;
             }
             recv.local_window -= data_len as u64;
+            let was_empty = recv.chunks.is_empty();
             recv.chunks.push_back(Chunk {
                 buffer: packet.buffer,
                 start: offset,
                 end,
             });
             drop(recv);
-            state.cond.notify_all();
+            // A reader already draining does not need a wake per packet; only the transition does.
+            if was_empty {
+                state.cond.notify_one();
+            }
             Dispatch::Queued
         }
         MSG_CHANNEL_EOF => {
@@ -2115,6 +2159,64 @@ fn mpint(value: &[u8]) -> Vec<u8> {
     out.push(0);
     out.extend_from_slice(value);
     out
+}
+
+#[cfg(test)]
+pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("listener");
+    let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
+    let _ = listener.accept().expect("accept");
+    let pool = Arc::new(Mutex::new(Vec::new()));
+    let inner = Arc::new(Inner {
+        writer: Mutex::new(PacketWriter::new(
+            peer.try_clone().expect("clone"),
+            None,
+            None,
+            None,
+        )),
+        channels: Mutex::new(HashMap::new()),
+        pool: Arc::clone(&pool),
+        next_channel: AtomicU32::new(1),
+        closed: AtomicBool::new(false),
+        socket: peer,
+        opened_at: Instant::now(),
+        server: "test".to_owned(),
+        protocol: "SSH",
+    });
+    let state = Arc::new(ChannelState {
+        local: 1,
+        remote: AtomicU32::new(2),
+        remote_window: Mutex::new(0),
+        remote_packet: AtomicU32::new(CHANNEL_PACKET),
+        recv: Mutex::new(Recv {
+            chunks: VecDeque::new(),
+            eof: false,
+            closed: false,
+            pending_adjust: 0,
+            local_window: u64::from(CHANNEL_WINDOW),
+        }),
+        cond: Condvar::new(),
+        window_cond: Condvar::new(),
+        open: Mutex::new(None),
+        pool,
+    });
+    {
+        let mut recv = lock(&state.recv);
+        for payload in payloads {
+            let mut buffer = vec![0u8; PACKET_CHUNK];
+            buffer[8..8 + payload.len()].copy_from_slice(payload);
+            recv.chunks.push_back(Chunk {
+                buffer,
+                start: 8,
+                end: 8 + payload.len(),
+            });
+        }
+        recv.eof = true;
+    }
+    Channel {
+        session: inner,
+        state,
+    }
 }
 
 #[cfg(test)]

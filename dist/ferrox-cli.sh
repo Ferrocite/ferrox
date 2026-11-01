@@ -5,6 +5,8 @@
 #   ferrox-cli up --foxy --vpn                 the Foxy lane, whole-device proxy
 #   ferrox-cli up --veepn --vpn                the VeePN lane, no account needed
 #   ferrox-cli up --psiphon --vpn              the Psiphon lane, native OSSH/SSH
+#   ferrox-cli up --psiphon-cdn --vpn          the same lane, CDN fronting requested
+#   ferrox-cli locations --veepn               VeePN region ids
 #   ferrox-cli up --vless 'vless://...'        any vless share link
 #   ferrox-cli up --config mine.json           any config the binary serves
 #   ferrox-cli down | status | ports | tun | version
@@ -59,8 +61,8 @@ CFG="$CONF_DIR/lane.json"
 TOKEN_FILE="$CONF_DIR/foxy-token.json"
 # The exit the user remembered, and the last published edge list kept so the
 # selection still answers when the catalogue is down.
-LOCATION_FILE="$CONF_DIR/foxy-location"
-LOCATIONS_FILE="$CONF_DIR/foxy-locations.jsonl"
+LOCATION_FILE=""
+LOCATIONS_FILE=""
 PID_FILE="$CONF_DIR/lane.pid"
 LOG="$CONF_DIR/lane.log"
 PROXY_PORTS="$STATE_DIR/system-proxy.ports"
@@ -204,9 +206,9 @@ usage: ferrox-cli <command> [options]
 commands
   login      save the foxy account once (prompts for the password; file is 0600)
   logout     stop the lane, then forget the account and its stored session
-  locations  list the countries and cities the catalogue publishes
-             (--ping measures the handshake to each edge, fastest first)
-  location   remember an exit: location CC [CITY] (survives every up)
+  locations  list exits: locations [--foxy|--veepn|--psiphon] [CC]
+             (--ping measures foxy's handshake to each edge, fastest first)
+  location   remember an exit: location --foxy|--veepn|--psiphon CC [CITY]
   up         start the lane in the background, print the port map (default)
   serve      start the lane in this terminal, until Ctrl-C
   down       stop the lane and clear the system proxy it set (--all: every lane)
@@ -221,9 +223,13 @@ so no password is asked again and FxA sends no new-sign-in mail.
 
   ferrox-cli up --foxy --vpn                    # asks once, then connects
   ferrox-cli up --foxy --vpn                    # second run: resumes, no sign-in
-  ferrox-cli locations                          # countries and cities to pin
+  ferrox-cli locations --foxy                   # countries and cities to pin
   ferrox-cli locations --ping                   # the same list, nearest exit first
-  ferrox-cli location DE                        # remember Germany for every up
+  ferrox-cli locations --veepn                  # VeePN region ids, no account
+  ferrox-cli locations --psiphon                # regions in the signed server list
+  ferrox-cli location --foxy DE                 # remember Germany for every up
+  ferrox-cli location --veepn nl                # remember the Netherlands for VeePN
+  ferrox-cli location --psiphon US              # remember the US for Psiphon
   ferrox-cli status                             # exit IP and country
   ferrox-cli down                               # stop, clear the system proxy
   ferrox-cli logout                             # forget the account and session
@@ -247,6 +253,7 @@ outbound (choose one)
   --foxy                 Foxy lane; account from \$FOXY_CREDENTIALS
   --veepn                VeePN lane; anonymous, no account and no server
   --psiphon              Psiphon lane; native OSSH/SSH, no client binary
+  --psiphon-cdn          the same lane with CDN fronting + beast mode requested
   --vless LINK           a vless:// share link (tcp, ws, grpc, httpupgrade, xhttp)
   --vmess HOST:PORT --uuid ID
   --trojan HOST:PORT --password PW
@@ -273,15 +280,27 @@ foxy options (email + password is the whole setup; there is no server to name)
                          (comma-separated; 22,53 are the usual ones)
 
 locations
-  ferrox-cli locations [--ping] [CC]   every country, and the cities each one has
-  ferrox-cli location CC [CITY]        remember it; up --foxy moves there
-  The list is public: it needs no account and is cached by the binary, and the
-  last one fetched is kept in \$CONF_DIR/foxy-locations.jsonl for when the
-  catalogue cannot be reached.  --ping adds a TCP-handshake latency per edge,
-  sorts the exits fastest first, and marks an edge that did not answer.
+  ferrox-cli locations --foxy [--ping] [CC]   countries and cities; --ping measures edges
+  ferrox-cli locations --veepn [CC]           VeePN region ids from its public list
+  ferrox-cli locations --psiphon [CC]         regions in the signed Psiphon server list
+  ferrox-cli location --foxy CC [CITY]        remember it; up --foxy moves there
+  ferrox-cli location --veepn REGION          remember a VeePN region; up --veepn moves there
+  ferrox-cli location --psiphon CC            remember a Psiphon region; up --psiphon moves there
+  The foxy list is public and cached by the binary; the last answer is kept in
+  \$CONF_DIR/foxy-locations.jsonl. VeePN's list is public too and is kept in
+  \$CONF_DIR/veepn-locations.jsonl. Psiphon's list is the signed server list the
+  lane already downloads. Each lane remembers its own exit, so changing one
+  does not move another.
 
 psiphon options (native OSSH/SSH transport and the lane's local SOCKS)
-  --psiphon-region CC    two-letter egress region, else any server
+  --psiphon-cdn          CDN fronting + beast mode in one shortcut; fronted
+                         entries ride fronted-meek, and a list with no fronted
+                         entry falls back to SSH/OSSH with one line
+  --psiphon-fronted      an alias for --psiphon-cdn
+  --psiphon-region CC    two-letter egress region, else the remembered one
+  --country CC           an alias for --psiphon-region on this lane
+  --psiphon-compartment ID  the private conduit compartment, default is the
+                         public private-compartment value built into the binary
   --psiphon-listen ADDR  the lane's local SOCKS address, default 127.0.0.1:1821
   --psiphon-dir DIR      the lane's state, default \$CONF_DIR/psiphon
   --psiphon-ready SECS   how long a tunnel may take, default 180
@@ -294,6 +313,10 @@ psiphon options (native OSSH/SSH transport and the lane's local SOCKS)
   --psiphon-list-key KEY  the signed list's RSA publisher key
   --upstream URL         accepted for compatibility; this lane dials its SSH
                          servers directly and names the field as ignored
+  --psiphon-conduit-mode MODE  auto, private or public; private uses the
+                         private compartment, and conduits need volunteer relays
+  --psiphon-cdn-profile NAME   fronted, legacy, android or off; fronted selects
+                         fronted-meek
   The client-tuning flags from earlier releases (--psiphon-bin, --psiphon-mode,
   --psiphon-http, --psiphon-base, --psiphon-pool, --psiphon-workers,
   --psiphon-aggressive, --psiphon-no-aggressive, --psiphon-conduit-*,
@@ -306,7 +329,7 @@ psiphon options (native OSSH/SSH transport and the lane's local SOCKS)
   compatibility; the native engine names each one as ignored in one line.
 
 veepn options (nothing is required: the plane names the region and its edges)
-  --region CC            exit region id (lowercase, e.g. nl, us-va), else the plane picks
+  --region CC            exit region id (lowercase, e.g. nl, us-va), else the remembered one
   --country CC           an alias for --region on this lane
   --domains URLS         comma-separated https origins to ask, else the shipped seven
   --udid ID              the device identity the plane sees, else one kept per machine
@@ -408,6 +431,15 @@ action_logout() {
 # The list is public and needs no account, so it is the binary's catalogue call
 # and not an authenticated one; the last answer is kept for an offline listing.
 action_locations() {
+  case "${OUTBOUND:-foxy}" in
+    foxy) action_locations_foxy ;;
+    veepn) action_locations_veepn ;;
+    psiphon) action_locations_psiphon ;;
+    *) die "locations names foxy, veepn or psiphon; nothing was started." ;;
+  esac
+}
+
+action_locations_foxy() {
   local filter rows plain formatter
   filter="$(printf '%s' "$LOC_FILTER" | tr '[:lower:]' '[:upper:]')"
   require_bin
@@ -529,20 +561,143 @@ PY
   printf '%s\n' "$rows" | python3 -c "$formatter" "$filter" "$(remembered_country)" "$(remembered_city)" "$LOCATIONS_FILE" "$LOC_PING"
 }
 
-action_location() {
-  local country city
-  country="$(printf '%s' "$LOC_COUNTRY" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
-  city="$(printf '%s' "$LOC_CITY" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
-  [ -n "$country" ] || die "usage: ferrox-cli location <CC> [CITY]   (see 'ferrox-cli locations')"
-  if [ -s "$LOCATIONS_FILE" ] && ! grep -qiF "\"country\":\"$country\"" "$LOCATIONS_FILE"; then
-    die "'$country' is not in the saved catalogue list; run 'ferrox-cli locations' to refresh it, or pick a code it prints."
-  fi
+action_locations_veepn() {
+  local filter rows
+  filter="$(printf '%s' "$LOC_FILTER" | tr '[:lower:]' '[:upper:]')"
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
-  ( umask 077; printf '%s %s\n' "$country" "$city" >"$LOCATION_FILE" )
-  if [ -n "$city" ]; then
-    say "exit remembered: $country / $city. The next 'up --foxy' moves there."
+  rows="$(curl -q -sS --max-time 20 https://antpeak.com/v3/location/extension/ 2>/dev/null)" || rows=""
+  if [ -z "$rows" ]; then
+    if [ -s "$LOCATIONS_FILE" ]; then
+      say "the VeePN list did not answer; showing the last list it gave ($LOCATIONS_FILE)."
+      rows="$(cat "$LOCATIONS_FILE")"
+    else
+      die "the VeePN list did not answer and no list is saved yet: check the network, then run 'ferrox-cli locations --veepn' again."
+    fi
   else
+    ( umask 077; printf '%s\n' "$rows" >"$LOCATIONS_FILE" )
+  fi
+  printf '%s' "$rows" | python3 -c '
+import json, sys
+wanted, current = sys.argv[1:3]
+try:
+    document = json.load(sys.stdin)
+except ValueError:
+    sys.exit("the VeePN list was not JSON")
+places = {}
+for location in document.get("locations", []):
+    code = str(location.get("countryCode") or "").upper()
+    region = str(location.get("region") or "")
+    name = str(location.get("name") or "")
+    if not code:
+        continue
+    if wanted and wanted not in (code, region.upper()):
+        continue
+    places.setdefault(code, []).append((region, name))
+if not places:
+    if wanted:
+        sys.exit(f"{wanted} is not in the VeePN list; run ferrox-cli locations --veepn for every code it lists.")
+    sys.exit("the VeePN list named no region just now.")
+current = current.upper()
+print(f"exit locations from VeePN: {len(places)} countries, {sum(len(v) for v in places.values())} regions")
+print("the region id is what --region takes (lowercase); --country takes either it or the two-letter code.")
+for code in sorted(places):
+    mark = "*" if code == current else " "
+    print(f" {mark} {code}  {len(places[code]):>3} regions")
+    for region, name in sorted(places[code]):
+        print(f"      {region:<18} {name}")
+' "$filter" "$(remembered_country)"
+}
+
+action_locations_psiphon() {
+  local filter rows tmp outbound
+  filter="$(printf '%s' "$LOC_FILTER" | tr '[:lower:]' '[:upper:]')"
+  require_bin
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  tmp="$(mktemp)" || die "cannot make a temporary config for the Psiphon list"
+  outbound="$(psiphon_outbound)" || { rm -f "$tmp"; die "$outbound"; }
+  printf '{"inbounds":[],"outbounds":[%s]}\n' "$outbound" >"$tmp"
+  rows="$("$BIN" psiphon-regions -c "$tmp" 2>/dev/null)" || rows=""
+  rm -f "$tmp"
+  if [ -z "$rows" ]; then
+    if [ -s "$LOCATIONS_FILE" ]; then
+      say "the Psiphon list did not answer; showing the last list it gave ($LOCATIONS_FILE)."
+      rows="$(cat "$LOCATIONS_FILE")"
+    else
+      die "the Psiphon list did not answer and no list is saved yet: check the network, then run 'ferrox-cli locations --psiphon' again."
+    fi
+  else
+    ( umask 077; printf '%s\n' "$rows" >"$LOCATIONS_FILE" )
+  fi
+  printf '%s\n' "$rows" | python3 -c '
+import sys
+wanted, current = sys.argv[1:3]
+rows = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    code, _, count = line.partition("\t")
+    code = code.upper()
+    if wanted and code != wanted:
+        continue
+    rows.append((code, int(count or 0)))
+if not rows:
+    if wanted:
+        sys.exit(f"{wanted} is not in the Psiphon server list; run ferrox-cli locations --psiphon for every code it lists.")
+    sys.exit("the Psiphon server list named no region just now.")
+current = current.upper()
+print(f"exit regions from the signed Psiphon server list: {len(rows)} codes")
+print("the code is what --psiphon-region takes; a code with no entry is not dialable from that list.")
+for code, count in rows:
+    mark = "*" if code == current else " "
+    print(f" {mark} {code:<4} {count:>4} entries")
+' "$filter" "$(remembered_country)"
+}
+
+action_location() {
+  local lane="${OUTBOUND:-foxy}" raw country city
+  raw="$(printf '%s' "$LOC_COUNTRY" | tr -d '[:space:]')"
+  country="$(printf '%s' "$raw" | tr '[:lower:]' '[:upper:]')"
+  city="$(printf '%s' "$LOC_CITY" | tr -d '[:space:]' | tr '[:lower:]' '[:upper:]')"
+  [ -n "$country" ] || die "usage: ferrox-cli location --foxy|--veepn|--psiphon <CC> [CITY]   (see 'ferrox-cli locations')"
+  case "$lane" in
+    foxy)
+      if [ -s "$LOCATIONS_FILE" ] && ! grep -qiF "\"country\":\"$country\"" "$LOCATIONS_FILE"; then
+        die "'$country' is not in the saved catalogue list; run 'ferrox-cli locations --foxy' to refresh it, or pick a code it prints."
+      fi ;;
+    veepn)
+      if [ -s "$LOCATIONS_FILE" ]; then
+        python3 - "$LOCATIONS_FILE" "$raw" <<'PY' || die "'$raw' is not in the saved VeePN list; run 'ferrox-cli locations --veepn' to refresh it, or pick a region it prints."
+import json, sys
+path, wanted = sys.argv[1:3]
+wanted = wanted.upper()
+with open(path, encoding="utf-8") as handle:
+    document = json.load(handle)
+for location in document.get("locations", []):
+    code = str(location.get("countryCode") or "").upper()
+    region = str(location.get("region") or "").upper()
+    if wanted in (code, region):
+        raise SystemExit(0)
+raise SystemExit(1)
+PY
+      fi ;;
+    psiphon)
+      if [ -s "$LOCATIONS_FILE" ] && ! awk -F'\t' -v code="$country" '$1 == code { found = 1 } END { exit !found }' "$LOCATIONS_FILE"; then
+        die "'$country' is not in the saved Psiphon list; run 'ferrox-cli locations --psiphon' to refresh it, or pick a code it prints."
+      fi ;;
+    *) die "location names foxy, veepn or psiphon; nothing was started." ;;
+  esac
+  mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
+  case "$lane" in
+    veepn) ( umask 077; printf '%s\n' "$(printf '%s' "$raw" | tr '[:upper:]' '[:lower:]')" >"$LOCATION_FILE" ) ;;
+    *) ( umask 077; printf '%s %s\n' "$country" "$city" >"$LOCATION_FILE" ) ;;
+  esac
+  if [ "$lane" = foxy ] && [ -n "$city" ]; then
+    say "exit remembered: $country / $city. The next 'up --foxy' moves there."
+  elif [ "$lane" = foxy ]; then
     say "exit remembered: $country (its catalogue order picks the city). The next 'up --foxy' moves there."
+  else
+    say "exit remembered: $raw. The next 'up --$lane' moves there."
   fi
 }
 
@@ -759,27 +914,46 @@ PY
 
 # ---------------------------------------------------------------- locations
 
-# The remembered exit fills only the flags nobody typed: a country typed now
-# starts from that country's own edges, so a city remembered for another one is dropped.
-load_foxy_location() {
+# The remembered exit fills only the flag nobody typed, so a country named now
+# starts from that country's own edges and never inherits another lane's city.
+load_lane_location() {
   [ -f "$LOCATION_FILE" ] || return 0
-  [ "$COUNTRY_SET" = 1 ] && return 0
+  case "$OUTBOUND" in
+    foxy) [ "$COUNTRY_SET" = 1 ] && return 0 ;;
+    veepn) { [ -n "$REGION" ] || [ "$COUNTRY_SET" = 1 ]; } && return 0 ;;
+    psiphon) [ -n "$PSIPHON_REGION" ] && return 0 ;;
+  esac
   local country city
   IFS=' ' read -r country city < "$LOCATION_FILE" || true
   [ -n "$country" ] || return 0
-  COUNTRY="$country"
-  if [ "$CITY_SET" = 0 ] && [ -n "$city" ]; then CITY="$city"; fi
+  case "$OUTBOUND" in
+    foxy)
+      COUNTRY="$country"
+      if [ "$CITY_SET" = 0 ] && [ -n "$city" ]; then CITY="$city"; fi ;;
+    veepn) REGION="$country" ;;
+    psiphon) PSIPHON_REGION="$country" ;;
+  esac
   return 0
 }
 
-save_foxy_location() {
-  [ -n "$COUNTRY" ] || return 0
+save_lane_location() {
+  local country="" city=""
+  case "$OUTBOUND" in
+    foxy) country="$COUNTRY"; city="$CITY" ;;
+    veepn) country="$(effective_region)" ;;
+    psiphon) country="$PSIPHON_REGION" ;;
+    *) return 0 ;;
+  esac
+  [ -n "$country" ] || return 0
   mkdir -p "$CONF_DIR"; chmod 700 "$CONF_DIR" 2>/dev/null || true
   (
     umask 077
-    printf '%s %s\n' \
-      "$(printf '%s' "$COUNTRY" | tr '[:lower:]' '[:upper:]')" \
-      "$(printf '%s' "$CITY" | tr '[:lower:]' '[:upper:]')" >"$LOCATION_FILE"
+    case "$OUTBOUND" in
+      veepn) printf '%s\n' "$(printf '%s' "$country" | tr '[:upper:]' '[:lower:]')" ;;
+      *) printf '%s %s\n' \
+           "$(printf '%s' "$country" | tr '[:lower:]' '[:upper:]')" \
+           "$(printf '%s' "$city" | tr '[:lower:]' '[:upper:]')" ;;
+    esac >"$LOCATION_FILE"
   )
 }
 
@@ -866,7 +1040,7 @@ import json, sys
  latency, cdn_profile, geoip, reject_censored, reject_countries, compartment,
  disable_timeouts, dns_alternate, device_location, device_region, network_id,
  additional_params, establish_timeout, emit_bytes, conduit_mode, conduit_timeout,
- share, server_lists, osl, entry_key, exchange_key, cdn_ips, cdn_sni,
+ share, server_lists, osl, entry_key, list_key, exchange_key, cdn_ips, cdn_sni,
  cdn_sets, unsafe_alerts, location_precision, share_port, share_http) = sys.argv[1:]
 settings = {"dataRootDirectory": state}
 if binary:
@@ -877,8 +1051,10 @@ if http:
     settings["httpListen"] = http
 if region:
     settings["region"] = region
-if shape:
-    settings["shape"] = shape
+if conduit_mode in ("private", "public"):
+    settings["protocolSelection"] = "conduit"
+if shape == "cdn":
+    settings["protocolSelection"] = "cdn_fronting"
 if ready:
     settings["readySeconds"] = int(ready)
 if base:
@@ -1713,7 +1889,9 @@ apply_instance() {
   PROXY_STATE="$STATE_DIR/system-proxy$suffix.state"
   SUPERVISOR_FILE="$STATE_DIR/system-proxy$suffix.supervisor"
   SUPERVISOR_PID_FILE="$STATE_DIR/system-proxy$suffix.supervisor.pid"
-  LOCATION_FILE="$CONF_DIR/foxy-location$suffix"
+  local lane="${OUTBOUND:-foxy}"
+  LOCATION_FILE="$CONF_DIR/$lane-location$suffix"
+  LOCATIONS_FILE="$CONF_DIR/$lane-locations.jsonl"
 }
 
 lane_running() {
@@ -1808,7 +1986,7 @@ build_config() {
   case "$OUTBOUND" in
     foxy)
       read_credentials
-      load_foxy_location
+      load_lane_location
       # A session already signed in is the account: the credentials file only
       # has to exist for the first sign-in, and a resume needs no password.
       if [ -z "$EMAIL" ]; then EMAIL="$(stored_email)"; fi
@@ -1820,7 +1998,7 @@ build_config() {
         read_credentials
       fi
       outbound="$(build_outbound foxy)" || exit 1
-      save_foxy_location
+      save_lane_location
       ;;
     vless)
       case "$VLESS" in
@@ -1830,8 +2008,16 @@ build_config() {
       esac
       outbound="$(build_outbound vless)" || exit 1
       ;;
-    veepn) outbound="$(build_outbound veepn)" || exit 1 ;;
-    psiphon) outbound="$(build_outbound psiphon)" || exit 1 ;;
+    veepn)
+      load_lane_location
+      outbound="$(build_outbound veepn)" || exit 1
+      save_lane_location
+      ;;
+    psiphon)
+      load_lane_location
+      outbound="$(build_outbound psiphon)" || exit 1
+      save_lane_location
+      ;;
     vmess) outbound="$(build_outbound vmess)" || exit 1 ;;
     trojan) outbound="$(build_outbound trojan)" || exit 1 ;;
     ss) outbound="$(build_outbound ss)" || exit 1 ;;
@@ -2369,27 +2555,28 @@ while [ $# -gt 0 ]; do
     locations)
       ACTION=locations; shift
       # Both spellings: `locations --ping US` and `locations US --ping`.
-      if [ $# -gt 0 ] && [ "$1" = --ping ]; then LOC_PING=1; shift; fi
-      if [ $# -gt 0 ]; then
+      while [ $# -gt 0 ]; do
         case "$1" in
-          -*) ;;
+          --ping) LOC_PING=1; shift ;;
+          --foxy|--veepn|--psiphon) OUTBOUND="${1#--}"; shift ;;
+          -*) break ;;
           *) LOC_FILTER="$1"; shift ;;
         esac
-      fi ;;
+      done ;;
     location)
       ACTION=location; shift
-      if [ $# -gt 0 ]; then
+      while [ $# -gt 0 ]; do
         case "$1" in
-          -*) ;;
-          *) LOC_COUNTRY="$1"; shift ;;
+          --foxy|--veepn|--psiphon) OUTBOUND="${1#--}"; shift ;;
+          -*) break ;;
+          *)
+            if [ -z "$LOC_COUNTRY" ]; then LOC_COUNTRY="$1"
+            elif [ -z "$LOC_CITY" ]; then LOC_CITY="$1"
+            else break
+            fi
+            shift ;;
         esac
-      fi
-      if [ $# -gt 0 ]; then
-        case "$1" in
-          -*) ;;
-          *) LOC_CITY="$1"; shift ;;
-        esac
-      fi ;;
+      done ;;
     --foxy) OUTBOUND=foxy; shift ;;
     --veepn) OUTBOUND=veepn; shift ;;
     --psiphon) OUTBOUND=psiphon; shift ;;
@@ -2416,10 +2603,10 @@ while [ $# -gt 0 ]; do
     --psiphon-aggressive) PSIPHON_AGGRESSIVE=1; shift ;;
     --psiphon-no-aggressive) PSIPHON_AGGRESSIVE=0; shift ;;
     --psiphon-conduit-mode)
-      need_value --psiphon-conduit-mode "auto, shirokhorshid or public" "$#" "${2:-}"
+      need_value --psiphon-conduit-mode "auto, private or public" "$#" "${2:-}"
       case "$2" in
-        auto|shirokhorshid|public) PSIPHON_CONDUIT_MODE="$2" ;;
-        *) die "--psiphon-conduit-mode wants auto, shirokhorshid or public, got '$2'; nothing was started." ;;
+        auto|public|private) PSIPHON_CONDUIT_MODE="$2" ;;
+        *) die "--psiphon-conduit-mode wants auto, private or public, got '$2'; nothing was started." ;;
       esac; shift 2 ;;
     --psiphon-conduit-timeout) need_value --psiphon-conduit-timeout "seconds, at least 1" "$#" "${2:-}"; case "$2" in ''|*[!0-9]*|0) die "--psiphon-conduit-timeout wants seconds, at least 1, got '$2'; nothing was started." ;; esac; PSIPHON_CONDUIT_TIMEOUT="$2"; shift 2 ;;
     --psiphon-share) PSIPHON_SHARE=1; shift ;;
@@ -2431,7 +2618,8 @@ while [ $# -gt 0 ]; do
     --psiphon-feature) need_value --psiphon-feature "client features" "$#" "${2:-}"; PSIPHON_FEATURES="$2"; shift 2 ;;
     --psiphon-latency) need_value --psiphon-latency "a multiplier of at least 1" "$#" "${2:-}"; PSIPHON_LATENCY="$2"; shift 2 ;;
     --psiphon-disable-timeouts) PSIPHON_DISABLE_TIMEOUTS=1; shift ;;
-    --psiphon-cdn-profile) need_value --psiphon-cdn-profile "shirokhorshid, legacy, android or off" "$#" "${2:-}"; case "$2" in shirokhorshid|legacy|android|off) PSIPHON_CDN_PROFILE="$2" ;; *) die "--psiphon-cdn-profile wants shirokhorshid, legacy, android or off, got '$2'; nothing was started." ;; esac; shift 2 ;;
+    --psiphon-cdn|--psiphon-fronted) OUTBOUND=psiphon; PSIPHON_CDN_PROFILE=fronted; PSIPHON_AGGRESSIVE=1; PSIPHON_SHAPE=cdn; shift ;;
+    --psiphon-cdn-profile) need_value --psiphon-cdn-profile "fronted, legacy, android or off" "$#" "${2:-}"; case "$2" in fronted|legacy|android|off) PSIPHON_CDN_PROFILE="$2" ;; *) die "--psiphon-cdn-profile wants fronted, legacy, android or off, got '$2'; nothing was started." ;; esac; shift 2 ;;
     --psiphon-cdn-ip) need_value --psiphon-cdn-ip "CDN edge addresses" "$#" "${2:-}"; PSIPHON_CDN_IPS="$2"; shift 2 ;;
     --psiphon-cdn-sni) need_value --psiphon-cdn-sni "CDN edge names" "$#" "${2:-}"; PSIPHON_CDN_SNI="$2"; shift 2 ;;
     --psiphon-cdn-set) need_value --psiphon-cdn-set "built-in CDN set names" "$#" "${2:-}"; PSIPHON_CDN_SETS="$2"; shift 2 ;;
@@ -2505,6 +2693,16 @@ done
 # A measurement flag belongs to the listing: a lane started by a typo is not one.
 if [ "$LOC_PING" = 1 ] && [ "$ACTION" != locations ]; then
   die "--ping belongs to 'locations' (ferrox-cli locations --ping); nothing was started."
+fi
+
+# One country spelling for every lane: --country and --region both name the
+# Psiphon egress region, and --psiphon-region still wins when all three appear.
+if [ "$OUTBOUND" = psiphon ] && [ -z "$PSIPHON_REGION" ]; then
+  if [ -n "$REGION" ]; then
+    PSIPHON_REGION="$REGION"
+  elif [ "$COUNTRY_SET" = 1 ]; then
+    PSIPHON_REGION="$COUNTRY"
+  fi
 fi
 
 # Excluded targets leave the tunnel unencrypted, so the lists are foxy-only and refused before a lane is touched.

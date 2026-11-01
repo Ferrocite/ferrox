@@ -52,11 +52,15 @@ The answer is stored once, in `~/.config/ferrox/credentials`, mode 0600, outside
 Pick an exit before connecting — the catalogue is public, so this needs no account:
 
 ```bash
-./ferrox-cli.sh locations           # every country and its cities, remembered one marked *
+./ferrox-cli.sh locations --foxy    # every country and its cities, remembered one marked *
 ./ferrox-cli.sh locations --ping    # nearest exit first: one handshake per edge, in ms
-./ferrox-cli.sh locations US        # one country in detail
-./ferrox-cli.sh location DE         # remember Germany for every up
-./ferrox-cli.sh location US SFO     # remember a country and a city
+./ferrox-cli.sh locations --foxy US # one country in detail
+./ferrox-cli.sh locations --veepn   # VeePN region ids from its public list
+./ferrox-cli.sh locations --psiphon # regions in the signed Psiphon server list
+./ferrox-cli.sh location --foxy DE  # remember Germany for every foxy up
+./ferrox-cli.sh location --foxy US SFO
+./ferrox-cli.sh location --veepn nl # remember a VeePN region
+./ferrox-cli.sh location --psiphon US
 ./ferrox-cli.sh up --foxy --exclude-ports 22 --exclude-domains printer.lan   # these leave the tunnel
 ```
 
@@ -96,7 +100,7 @@ Every share link this build dials goes through the same one command; anything be
 
 Here the server is in the link or the `HOST:PORT` — unlike Foxy, these lanes dial the server you name. An invocation that cannot start the lane it names is refused before anything runs: `up --vless` with no link prints the example, `up --vmess` without `--uuid` names the missing id, and a rejected `up` leaves a lane that is already carrying traffic untouched.
 
-The Psiphon lane starts its own `psiphon-tunnel-core`, kept beside `ferrox-app` or named with `--psiphon-bin FILE`: `./ferrox-cli.sh up --psiphon --vpn`. Add `--psiphon-conduit-mode shirokhorshid` or `--psiphon-cdn-profile shirokhorshid` for the Shiroy variants; `auto`/`public` and `legacy`/`android`/`off` keep the built-in paths.
+The Psiphon lane is native: `./ferrox-cli.sh up --psiphon --vpn` fetches the signed server list and speaks OSSH/SSH itself, with no `psiphon-tunnel-core` and no account. `--psiphon-cdn` asks for CDN fronting and beast mode in one flag; `--psiphon-conduit-mode private` and `--psiphon-cdn-profile fronted` name the two settings directly. A fronted entry is dialled through its CDN front with the version-4 meek cookie; a list with no fronted entry falls back to SSH/OSSH with one line, and conduit still needs volunteer relays. The public private-compartment id is the default; `--psiphon-compartment ID` overrides it.
 
 ## Ports, on every platform
 
