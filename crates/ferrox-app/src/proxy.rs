@@ -3951,6 +3951,19 @@ fn serve_vless_grpc(
     freedom: bool,
     decryption: Option<&ferrox_core::vless_encryption::Server>,
 ) {
+    if decryption.is_none() {
+        let Ok(write) = stream.try_clone() else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(RELAY_POLL));
+        return crate::grpc::serve_muxed(
+            stream,
+            crate::grpc::Tail::new(Box::new(write)),
+            settings,
+            users,
+            freedom,
+        );
+    }
     let Some((reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
@@ -4000,6 +4013,50 @@ fn serve_vless_grpc(
     }
     reader.set_poll(Some(RELAY_POLL));
     crate::proxy::relay_sink_drained_with(
+        reader,
+        &writer,
+        &uplink,
+        crate::grpc::mark_reader_dead,
+        |reader| crate::grpc::request_ended(reader),
+    );
+}
+
+/// The VLESS handler for one stream of a multiplexed gRPC connection: the demux has already
+/// answered the HTTP/2 head, so only the encrypted-VLESS handshake and the relay remain.
+pub(crate) fn serve_grpc_muxed(
+    mut reader: crate::grpc::GrpcReader<crate::grpc::BodyFrames>,
+    writer: crate::grpc::GrpcWriter,
+    users: &[VlessUser],
+    freedom: bool,
+    opened: &std::sync::atomic::AtomicBool,
+) {
+    reader.arm_mux_poll();
+    let Some((got, flow, cmd, target)) = under_handshake(&mut reader, |read| {
+        decode_request_gated(
+            read,
+            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+            resolve_endpoint,
+        )
+    }) else {
+        return;
+    };
+    opened.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if !matches!(ask, ReverseAsk::NotReverse) {
+        let closer = writer.clone();
+        reverse_carried(ask, reader, writer, Arc::new(move || closer.close()));
+        return;
+    }
+    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        return;
+    };
+    if !writer.send(&[0, 0]) {
+        return;
+    }
+    relay_sink_drained_with(
         reader,
         &writer,
         &uplink,
@@ -7556,12 +7613,16 @@ fn serve_session_httpheader<R: Read + Send + 'static, W: Write + Clone + Send + 
 
 fn serve_session_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     read: R,
-    write: W,
+    mut write: W,
     settings: &crate::config::GrpcSettings,
     users: &[VlessUser],
     freedom: bool,
     decryption: Option<&ferrox_core::vless_encryption::Server>,
 ) {
+    if decryption.is_none() {
+        write.arm_write(RELAY_POLL);
+        return crate::grpc::serve_muxed(read, write, settings, users, freedom);
+    }
     let Some((creader, cwriter)) = crate::grpc::accept_split_with(read, write, settings) else {
         echo_trace("session grpc accept refused");
         return;
@@ -24956,6 +25017,15 @@ pub(crate) trait FrameWrite: Write + Send {
             Accepted::Lost
         }
     }
+
+    /// Bytes the transport's own flow control will take without waiting; a writer that gates on a
+    /// peer window reports it so a batch is sized to what fits and a full window parks the lane.
+    fn room(&self) -> u64 {
+        u64::MAX
+    }
+
+    /// Blocks a caller that may wait until a window opens; a lane never reaches this, it parks.
+    fn wait_room(&self, _turn: Duration) {}
 
     /// Drains a paced tail without waiting; `Clear` when there is nothing left to write.
     fn settle(&mut self) -> Settle {
