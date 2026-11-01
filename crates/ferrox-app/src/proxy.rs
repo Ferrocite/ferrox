@@ -32068,6 +32068,11 @@ mod tests {
             .expect("the polling leg ends on its sibling's finish");
     }
 
+    #[cfg(target_os = "linux")]
+    fn live_threads() -> usize {
+        std::fs::read_dir("/proc/self/task").map_or(0, std::iter::Iterator::count)
+    }
+
     /// A live-thread census only means something when nothing else in the suite is spawning: run it
     /// in a child process that carries this one test, so the count is the flow's, not the harness's.
     #[cfg(target_os = "linux")]
@@ -32099,10 +32104,6 @@ mod tests {
         if !census_in_a_quiet_process("proxy::tests::wrapped_flows_share_a_fixed_set_of_lanes") {
             return;
         }
-        fn live_threads() -> usize {
-            std::fs::read_dir("/proc/self/task").map_or(0, std::iter::Iterator::count)
-        }
-
         let before = live_threads();
         let flows = 24usize;
         let mut stops = Vec::new();
@@ -32144,10 +32145,6 @@ mod tests {
         if !census_in_a_quiet_process("proxy::tests::carried_handshakes_share_the_lane_pool") {
             return;
         }
-        fn live_threads() -> usize {
-            std::fs::read_dir("/proc/self/task").map_or(0, std::iter::Iterator::count)
-        }
-
         let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
