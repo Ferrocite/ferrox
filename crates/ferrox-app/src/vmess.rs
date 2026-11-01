@@ -1042,14 +1042,13 @@ impl<R: Read> Wire<R> {
     }
 
     /// One step of the relay: open up to `FRAMES_PER_WRITE` frames, waiting only for the first,
-    /// and hand back their plaintext as one slice. A wait with nothing yet gathered is `Idle` so
-    /// the lane can come back to it.
+    /// and hand back their plaintext as one slice starting where the first of them opened. A wait
+    /// with nothing yet gathered is `Idle` so the lane can come back to it.
     fn step(&mut self, recv: &mut Flow) -> Opened {
         if self.last {
             return Opened::End;
         }
         self.compact();
-        self.front = 0;
         self.plain = 0;
         let mut decoded = 0;
         while decoded < FRAMES_PER_WRITE {
@@ -1057,16 +1056,10 @@ impl<R: Read> Wire<R> {
                 Frame::Decoded { at, len } => {
                     if decoded == 0 {
                         self.front = at;
-                        self.plain = len;
                     } else {
-                        if self.front != 0 {
-                            self.held
-                                .copy_within(self.front..self.front + self.plain, 0);
-                            self.front = 0;
-                        }
-                        self.held.copy_within(at..at + len, self.plain);
-                        self.plain += len;
+                        self.held.copy_within(at..at + len, self.front + self.plain);
                     }
+                    self.plain += len;
                     decoded += 1;
                 }
                 Frame::Idle => break,
@@ -4166,6 +4159,7 @@ mod tests {
     #[test]
     fn the_pump_gathers_into_its_own_buffer_and_never_moves_it() {
         let (sealed, plain, mut recv) = frames(&[1000; 3]);
+        let head: [u8; HEADER_LEN] = sealed[..HEADER_LEN].try_into().expect("a size field");
         let carrier = Sealed {
             held: sealed,
             at: 0,
@@ -4184,8 +4178,14 @@ mod tests {
             let (front, len) = (batch.as_ptr() as usize, batch.len());
             got.extend_from_slice(batch);
             assert_eq!(
-                front, base,
-                "a batch is not the pump's own bytes gathered at its front"
+                front,
+                base + HEADER_LEN,
+                "the batch was moved to the front instead of gathered where its first frame opened"
+            );
+            assert_eq!(
+                &wire.held[..HEADER_LEN],
+                &head,
+                "the first frame still sits behind the batch, so nothing relocated it"
             );
             assert_eq!(
                 wire.held.as_ptr() as usize,
