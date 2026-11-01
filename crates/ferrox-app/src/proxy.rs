@@ -12140,7 +12140,7 @@ impl<'a> TrojanUdpLane<'a> {
         }
     }
 
-    fn send(&mut self, src: SocketAddr, dest: SocketAddr, payload: &[u8]) {
+    fn send(&mut self, src: SocketAddr, dest: SocketAddr, payload: &[u8]) -> bool {
         if let Ok(mut slot) = self.source.lock() {
             *slot = Some(src);
         }
@@ -12153,8 +12153,10 @@ impl<'a> TrojanUdpLane<'a> {
                 if let Some(old) = self.uplink.take() {
                     (old.close)();
                 }
+                return false;
             }
         }
+        true
     }
 
     fn close(self) {
@@ -21351,7 +21353,8 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
                 |dest| matches!(ss_mux_443(trojan.mux.udp443, *dest), Udp443::Allow),
                 |src, dest, payload| {
                     if matches!(ss_mux_443(trojan.mux.udp443, dest), Udp443::Skip) {
-                        lane.get_or_insert_with(|| TrojanUdpLane::new(trojan, relay))
+                        return lane
+                            .get_or_insert_with(|| TrojanUdpLane::new(trojan, relay))
                             .send(src, dest, payload);
                     }
                     true
