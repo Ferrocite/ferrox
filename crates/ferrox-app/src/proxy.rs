@@ -1586,6 +1586,25 @@ impl Role {
         }
     }
 
+    /// Whether this role's serve path ends in the pooled relay instead of pinning a thread for the flow.
+    fn tcp_stream(&self) -> bool {
+        match self {
+            Role::Vless { carrier, .. }
+            | Role::VlessTls { carrier, .. }
+            | Role::VlessReality { carrier, .. }
+            | Role::Trojan { carrier, .. }
+            | Role::TrojanTls { carrier, .. }
+            | Role::TrojanReality { carrier, .. }
+            | Role::Vmess { carrier, .. }
+            | Role::VmessTls { carrier, .. }
+            | Role::Shadowsocks { carrier, .. } => carrier.tcp_stream(),
+            Role::Proxied(inner) => inner.tcp_stream(),
+            Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } | Role::Dokodemo { .. } => {
+                false
+            }
+        }
+    }
+
     /// The account a protocol's front authenticated, when the config names one.
     fn account(&self) -> Option<&InboundAccount> {
         match self {
@@ -3434,7 +3453,7 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
         if stop.as_ref().is_some_and(|stop| stop.stopped()) {
             break;
         }
-        let Ok(mut stream) = stream else { continue };
+        let Ok(stream) = stream else { continue };
         no_delay(&stream);
         let role = role.clone();
         let sniffing = sniffing.clone();
@@ -3448,35 +3467,97 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
             continue;
         }
         let tag = tag.map(str::to_owned);
-        thread::spawn(move || {
-            crate::sniff::install_current(sniffing);
-            let (stream, role) = match role {
-                Role::Proxied(inner) => {
-                    let _ = stream.set_read_timeout(Some(budgets::handshake()));
-                    let source = crate::conn::read_proxy_header(&mut stream);
-                    let _ = stream.set_read_timeout(None);
-                    let Ok(source) = source else { return };
-                    let stream = match source {
-                        Some(source) => stream.with_peer(source),
-                        None => stream,
-                    };
-                    (stream, *inner)
-                }
-                role => (stream, role),
-            };
-            // Armed once per accepted stream, as the reference wraps its listener's conn.
-            let stream = stream
-                .with_mask(role.tcp_mask())
-                .with_meter(crate::stats::inbound(tag.as_deref()))
-                .with_policy(Some(crate::policy::flow(0)));
-            front_dispatch(stream, role);
-        });
+        let accepted_at = Instant::now();
+        if role.tcp_stream() {
+            let mut work = Some((stream, role, tag, sniffing));
+            lane_pool::submit_setup(
+                Box::new(move || {
+                    if let Some((stream, role, tag, sniffing)) = work.take() {
+                        serve_accepted(stream, role, tag.as_deref(), sniffing, accepted_at);
+                    }
+                    lane_pool::Next::Done
+                }),
+                Box::new(|| {}),
+            );
+        } else {
+            thread::spawn(move || {
+                serve_accepted(stream, role, tag.as_deref(), sniffing, accepted_at);
+            });
+        }
     }
     drop(listener);
     if let Some(stop) = stop {
         stop.mark_closed();
     }
 }
+
+fn serve_accepted(
+    mut stream: Connection,
+    role: Role,
+    tag: Option<&str>,
+    sniffing: Option<std::sync::Arc<crate::sniff::Sniffing>>,
+    accepted_at: Instant,
+) {
+    let budget = budgets::handshake();
+    let waited = accepted_at.elapsed();
+    if waited >= budget {
+        return;
+    }
+    let _cap = budgets::cap_handshake(budget.saturating_sub(waited));
+    crate::sniff::install_current(sniffing);
+    let (stream, role) = match role {
+        Role::Proxied(inner) => {
+            let _ = stream.set_read_timeout(Some(budgets::handshake()));
+            let source = crate::conn::read_proxy_header(&mut stream);
+            let _ = stream.set_read_timeout(None);
+            let Ok(source) = source else { return };
+            let stream = match source {
+                Some(source) => stream.with_peer(source),
+                None => stream,
+            };
+            (stream, *inner)
+        }
+        role => (stream, role),
+    };
+    // Armed once per accepted stream, as the reference wraps its listener's conn.
+    let stream = stream
+        .with_mask(role.tcp_mask())
+        .with_meter(crate::stats::inbound(tag))
+        .with_policy(Some(crate::policy::flow(0)));
+    front_dispatch(stream, role);
+}
+
+pub(crate) fn spawn_carried<F: FnOnce() + Send + 'static>(body: F) {
+    let sniffing = crate::sniff::current();
+    let access = crate::accesslog::snapshot();
+    thread::spawn(move || {
+        crate::sniff::install_current(sniffing);
+        let _flow = crate::accesslog::install_snapshot(access);
+        body();
+    });
+}
+
+fn spawn_trojan_udp<R, W, C>(reader: R, writer: W, close: C)
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+    C: FnOnce() + Send + 'static,
+{
+    spawn_carried(move || serve_trojan_udp_halves(reader, writer, close));
+}
+
+fn spawn_trojan_mux<R, W>(
+    reader: R,
+    writer: W,
+    close: Arc<dyn Fn() + Send + Sync>,
+    carried: Vec<u8>,
+) where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    spawn_carried(move || serve_trojan_mux(reader, writer, close, &carried));
+}
+
 fn serve_shadowsocks(
     stream: Connection,
     accounts: &crate::shadowsocks::SsAccounts,
@@ -4246,7 +4327,8 @@ fn serve_vless_raw_with<D, R>(
     let handshake = stream
         .policy()
         .and_then(|flow| flow.handshake())
-        .unwrap_or_else(budgets::handshake);
+        .unwrap_or_else(budgets::handshake)
+        .min(budgets::handshake());
     let _ = stream.set_read_timeout(Some(handshake));
     let peer = stream.peer_addr().ok();
     let opening = match fallbacks {
@@ -4371,13 +4453,16 @@ fn vless_raw_reply<D, R>(
         return;
     }
     if cmd == 2 {
-        return serve_vless_udp(stream, &target, carried);
+        spawn_carried(move || serve_vless_udp(stream, &target, carried));
+        return;
     }
     if cmd == 3 {
         if stream.write_all(&[0, 0]).is_err() {
             return;
         }
-        return serve_vless_mux_with(stream, io, &carried);
+        let io = io.clone();
+        spawn_carried(move || serve_vless_mux_with(stream, &io, &carried));
+        return;
     }
     if cmd != 1 {
         // The reference's decoder refuses a command past the id without falling back.
@@ -4404,7 +4489,8 @@ fn serve_vless_encrypted_raw(
     let handshake = stream
         .policy()
         .and_then(|flow| flow.handshake())
-        .unwrap_or_else(budgets::handshake);
+        .unwrap_or_else(budgets::handshake)
+        .min(budgets::handshake());
     let _ = stream.set_read_timeout(Some(handshake));
     let sealed = match decryption.handshake(stream) {
         Ok(sealed) => sealed,
@@ -4593,23 +4679,24 @@ fn serve_sealed_raw<
                 sealed,
                 crate::stats::user(&user.email, user.level),
             ));
-            serve_udp_stream(
-                SealedHalf(Arc::clone(&shared)),
-                SealedHalf(shared),
-                &target,
-                Vec::new(),
-                closer,
-            );
+            let close = Arc::clone(closer);
+            spawn_carried(move || {
+                serve_udp_stream(
+                    SealedHalf(Arc::clone(&shared)),
+                    SealedHalf(shared),
+                    &target,
+                    Vec::new(),
+                    &close,
+                );
+            });
         }
         3 => {
             if sealed.write_all(&[0, 0]).is_err() {
                 return;
             }
-            serve_sealed_mux(
-                sealed,
-                crate::stats::user(&user.email, user.level),
-                Arc::clone(closer),
-            );
+            let close = Arc::clone(closer);
+            let meter = crate::stats::user(&user.email, user.level);
+            spawn_carried(move || serve_sealed_mux(sealed, meter, close));
         }
         1 => {
             let Some(uplink) = dial_or_report(&target) else {
@@ -4692,6 +4779,7 @@ fn serve_sealed_carried_with<R, W, A, B, C>(
     serve_sealed_split_with(reader, writer, users, freedom, close, after_decode);
 }
 
+#[allow(clippy::too_many_lines)]
 fn serve_sealed_split_with<R, W, C>(
     mut reader: ferrox_core::vless_encryption::EncryptedReader<R>,
     mut writer: ferrox_core::vless_encryption::EncryptedWriter<W>,
@@ -4768,7 +4856,10 @@ fn serve_sealed_split_with<R, W, C>(
                 inner: writer,
                 meter,
             };
-            serve_udp_stream(reader, writer, &target, Vec::new(), &closer);
+            let close = Arc::clone(&closer);
+            spawn_carried(move || {
+                serve_udp_stream(reader, writer, &target, Vec::new(), &close);
+            });
         }
         3 => {
             if writer.write_all(&[0, 0]).is_err() {
@@ -4782,7 +4873,7 @@ fn serve_sealed_split_with<R, W, C>(
                 inner: reader,
                 meter,
             };
-            serve_sealed_mux_split(reader, writer, closer);
+            spawn_carried(move || serve_sealed_mux_split(reader, writer, closer));
         }
         1 => {
             let Some(uplink) = dial_or_report(&target) else {
@@ -16792,14 +16883,15 @@ fn serve_trojan_raw(mut stream: Connection, key: &[[u8; 56]], freedom: bool) {
         let Ok(close) = stream.try_clone() else {
             return;
         };
-        return serve_trojan_mux(
+        spawn_trojan_mux(
             read,
             stream,
             Arc::new(move || {
                 let _ = close.shutdown(Shutdown::Both);
             }),
-            &[],
+            Vec::new(),
         );
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -16817,8 +16909,10 @@ fn serve_trojan_udp(stream: Connection) {
     let Ok(close) = stream.try_clone() else {
         return;
     };
-    serve_trojan_udp_halves(read, stream, move || {
-        let _ = close.shutdown(Shutdown::Both);
+    spawn_carried(move || {
+        serve_trojan_udp_halves(read, stream, move || {
+            let _ = close.shutdown(Shutdown::Both);
+        });
     });
 }
 
@@ -16954,14 +17048,16 @@ fn serve_trojan_ws(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bo
     crate::accesslog::record_current(&target);
     if cmd == 3 {
         let closer = writer.clone();
-        return serve_trojan_udp_halves(reader, writer, move || closer.close());
+        spawn_trojan_udp(reader, writer, move || closer.close());
+        return;
     }
     if cmd != 1 {
         return;
     }
     if target.is_mux() {
         let closer = writer.clone();
-        return serve_trojan_mux(reader, writer, Arc::new(move || closer.close()), &[]);
+        spawn_trojan_mux(reader, writer, Arc::new(move || closer.close()), Vec::new());
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -16992,18 +17088,19 @@ fn serve_trojan_httpupgrade(
     crate::accesslog::record_current(&target);
     if cmd == 3 {
         let close = write.try_clone().ok();
-        return serve_trojan_udp_halves(reader, write, move || {
+        spawn_trojan_udp(reader, write, move || {
             if let Some(stream) = close {
                 let _ = stream.shutdown(Shutdown::Both);
             }
         });
+        return;
     }
     if cmd != 1 {
         return;
     }
     if target.is_mux() {
         let close = write.try_clone().ok();
-        return serve_trojan_mux(
+        spawn_trojan_mux(
             reader,
             write,
             Arc::new(move || {
@@ -17011,8 +17108,9 @@ fn serve_trojan_httpupgrade(
                     let _ = stream.shutdown(Shutdown::Both);
                 }
             }),
-            &[],
+            Vec::new(),
         );
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -17043,14 +17141,16 @@ fn serve_trojan_grpc(
     crate::accesslog::record_current(&target);
     if cmd == 3 {
         let closer = writer.clone();
-        return serve_trojan_udp_halves(reader, writer, move || closer.close());
+        spawn_trojan_udp(reader, writer, move || closer.close());
+        return;
     }
     if cmd != 1 {
         return;
     }
     if target.is_mux() {
         let closer = writer.clone();
-        return serve_trojan_mux(reader, writer, Arc::new(move || closer.close()), &[]);
+        spawn_trojan_mux(reader, writer, Arc::new(move || closer.close()), Vec::new());
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -17081,14 +17181,21 @@ fn serve_trojan_xhttp(stream: Connection, key: &[[u8; 56]], path: &str, freedom:
     crate::accesslog::record_current(&target);
     if cmd == 3 {
         let closer = writer.clone();
-        return serve_trojan_udp_halves(reader, writer, move || closer.finish());
+        spawn_trojan_udp(reader, writer, move || closer.finish());
+        return;
     }
     if cmd != 1 {
         return;
     }
     if target.is_mux() {
         let closer = writer.clone();
-        return serve_trojan_mux(reader, writer, Arc::new(move || closer.finish()), &[]);
+        spawn_trojan_mux(
+            reader,
+            writer,
+            Arc::new(move || closer.finish()),
+            Vec::new(),
+        );
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -17113,18 +17220,19 @@ fn serve_trojan_httpheader(stream: Connection, key: &[[u8; 56]], path: &str, fre
     crate::accesslog::record_current(&target);
     if cmd == 3 {
         let close = write.try_clone().ok();
-        return serve_trojan_udp_halves(reader, write, move || {
+        spawn_trojan_udp(reader, write, move || {
             if let Some(stream) = close {
                 let _ = stream.shutdown(Shutdown::Both);
             }
         });
+        return;
     }
     if cmd != 1 {
         return;
     }
     if target.is_mux() {
         let close = write.try_clone().ok();
-        return serve_trojan_mux(
+        spawn_trojan_mux(
             reader,
             write,
             Arc::new(move || {
@@ -17132,8 +17240,9 @@ fn serve_trojan_httpheader(stream: Connection, key: &[[u8; 56]], path: &str, fre
                     let _ = stream.shutdown(Shutdown::Both);
                 }
             }),
-            &[],
+            Vec::new(),
         );
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -17518,12 +17627,14 @@ fn relay_trojan_request<S>(
         };
         if let Some(raw) = raw {
             let (reader, writer) = session_halves(session, raw);
-            return serve_trojan_mux(reader, writer, close, carried);
+            spawn_trojan_mux(reader, writer, close, carried.to_vec());
+            return;
         }
         if let Some(kcp) = kcp {
             let (reader, writer) =
                 session_halves(session, KcpIo::with_meter(Arc::clone(&kcp), meter));
-            return serve_trojan_mux(reader, writer, close, carried);
+            spawn_trojan_mux(reader, writer, close, carried.to_vec());
+            return;
         }
         return;
     }
@@ -17537,7 +17648,7 @@ fn relay_trojan_request<S>(
             };
             // A driven reader hands over one record's plaintext and withholds the rest until the next lands, and a datagram is read a field at a time: the pump reads through the shared session.
             let (_driven, half) = session_halves(session, raw);
-            serve_trojan_udp_halves(
+            spawn_trojan_udp(
                 CarriedReader::new(carried.to_vec(), half.clone()),
                 half,
                 move || {
@@ -17549,7 +17660,7 @@ fn relay_trojan_request<S>(
         if let Some(kcp) = kcp {
             let (reader, writer) =
                 session_halves(session, KcpIo::with_meter(Arc::clone(&kcp), meter));
-            serve_trojan_udp_halves(
+            spawn_trojan_udp(
                 CarriedReader::new(carried.to_vec(), reader),
                 writer,
                 move || kcp.close(),
@@ -17623,7 +17734,8 @@ fn serve_session_trojan_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     }
     if cmd == 3 {
         let closer = cwriter.clone();
-        return serve_trojan_udp_halves(creader, cwriter, move || closer.close());
+        spawn_trojan_udp(creader, cwriter, move || closer.close());
+        return;
     }
     if cmd != 1 {
         echo_trace("session ws trojan cmd refused");
@@ -17631,7 +17743,13 @@ fn serve_session_trojan_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     }
     if target.is_mux() {
         let closer = cwriter.clone();
-        return serve_trojan_mux(creader, cwriter, Arc::new(move || closer.close()), &[]);
+        spawn_trojan_mux(
+            creader,
+            cwriter,
+            Arc::new(move || closer.close()),
+            Vec::new(),
+        );
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -17671,7 +17789,8 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
     }
     if cmd == 3 {
         let closer = cwriter.clone();
-        return serve_trojan_udp_halves(creader, cwriter, move || closer.finish());
+        spawn_trojan_udp(creader, cwriter, move || closer.finish());
+        return;
     }
     if cmd != 1 {
         echo_trace("session xhttp trojan cmd refused");
@@ -17680,7 +17799,13 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
     }
     if target.is_mux() {
         let closer = cwriter.clone();
-        return serve_trojan_mux(creader, cwriter, Arc::new(move || closer.finish()), &[]);
+        spawn_trojan_mux(
+            creader,
+            cwriter,
+            Arc::new(move || closer.finish()),
+            Vec::new(),
+        );
+        return;
     }
     let Some(target) = target.socket() else {
         cwriter.finish();
@@ -17731,9 +17856,10 @@ fn serve_session_trojan_httpupgrade<R: Read + Send + 'static, W: Write + Clone +
     }
     if cmd == 3 {
         let raw = Arc::clone(&raw);
-        return serve_trojan_udp_halves(creader, cwriter, move || {
+        spawn_trojan_udp(creader, cwriter, move || {
             let _ = raw.shutdown(Shutdown::Both);
         });
+        return;
     }
     if cmd != 1 {
         echo_trace("session httpupgrade trojan cmd refused");
@@ -17742,14 +17868,15 @@ fn serve_session_trojan_httpupgrade<R: Read + Send + 'static, W: Write + Clone +
     }
     if target.is_mux() {
         let raw = Arc::clone(&raw);
-        return serve_trojan_mux(
+        spawn_trojan_mux(
             creader,
             cwriter,
             Arc::new(move || {
                 let _ = raw.shutdown(Shutdown::Both);
             }),
-            &[],
+            Vec::new(),
         );
+        return;
     }
     let Some(target) = target.socket() else {
         crate::httpupgrade::quiet(&raw);
@@ -17801,9 +17928,10 @@ fn serve_session_trojan_httpheader<R: Read + Send + 'static, W: Write + Clone + 
         return;
     }
     if cmd == 3 {
-        return serve_trojan_udp_halves(creader, cwriter, move || {
+        spawn_trojan_udp(creader, cwriter, move || {
             let _ = raw.shutdown(Shutdown::Both);
         });
+        return;
     }
     if cmd != 1 {
         echo_trace("session httpheader trojan cmd refused");
@@ -17811,14 +17939,15 @@ fn serve_session_trojan_httpheader<R: Read + Send + 'static, W: Write + Clone + 
     }
     if target.is_mux() {
         let raw = Arc::new(raw);
-        return serve_trojan_mux(
+        spawn_trojan_mux(
             creader,
             cwriter,
             Arc::new(move || {
                 let _ = raw.shutdown(Shutdown::Both);
             }),
-            &[],
+            Vec::new(),
         );
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -17860,7 +17989,8 @@ fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     }
     if cmd == 3 {
         let closer = cwriter.clone();
-        return serve_trojan_udp_halves(creader, cwriter, move || closer.close());
+        spawn_trojan_udp(creader, cwriter, move || closer.close());
+        return;
     }
     if cmd != 1 {
         echo_trace("session grpc trojan cmd refused");
@@ -17868,7 +17998,13 @@ fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     }
     if target.is_mux() {
         let closer = cwriter.clone();
-        return serve_trojan_mux(creader, cwriter, Arc::new(move || closer.close()), &[]);
+        spawn_trojan_mux(
+            creader,
+            cwriter,
+            Arc::new(move || closer.close()),
+            Vec::new(),
+        );
+        return;
     }
     let Some(target) = target.socket() else {
         return;
@@ -22944,11 +23080,18 @@ pub(crate) mod lane_pool {
         complete: Option<Complete>,
         /// Consecutive rounds that found nothing to read; each one doubles the wait before the next.
         idle: u32,
+        /// A relay lane's reads hand a timeout back to the step; a setup lane's own budget owns its wait.
+        relay: bool,
     }
 
     impl Lane {
         fn run(&mut self) -> Next {
-            (self.step)()
+            if self.relay {
+                let _step = crate::proxy::RelayStep::enter();
+                (self.step)()
+            } else {
+                (self.step)()
+            }
         }
 
         fn finish(&mut self) {
@@ -22966,6 +23109,10 @@ pub(crate) mod lane_pool {
         workers: std::sync::atomic::AtomicUsize,
         idle: std::sync::atomic::AtomicUsize,
         parks: std::sync::atomic::AtomicUsize,
+        cap: usize,
+        pending: Option<usize>,
+        /// Setup workers retire when the queue is empty, so their threads do not sit beside the relay lanes during a transfer.
+        idle_exit: bool,
         #[cfg(test)]
         stop: std::sync::atomic::AtomicBool,
         #[cfg(test)]
@@ -22980,12 +23127,27 @@ pub(crate) mod lane_pool {
     }
 
     static POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
+    static SETUP_POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
+    static BORROWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// The widest standard cell (eight connections) queues one download read per flow, and every
     /// one of them must sit in its read at once: a lane without a worker is a flow the peer's
     /// window cannot refill. This is the ceiling, not the shape: a worker starts when a lane is
     /// queued and no worker is idle, so a one-flow cell holds two lanes.
-    const RELAY_LANES: usize = 8;
+    pub(crate) const RELAY_LANES: usize = 8;
+
+    /// Setup lanes are separate from relay lanes so a handshake parked in a read cannot take a
+    /// relay worker with it. Two keep the setup peak under the reference's server threads.
+    pub(crate) const SETUP_LANES: usize = 2;
+
+    /// Accepted work past the setup workers waits in this queue; past it the accept loop drops the
+    /// socket, so a burst cannot hold accepted connections without bound.
+    const SETUP_PENDING: usize = 8;
+
+    /// Handshakes past the dedicated setup lanes may borrow a relay worker, so a burst keeps four
+    /// handshakes in flight without adding threads to the peak; two borrowed lanes leave six relay
+    /// workers for the flows behind them.
+    const SETUP_BORROW_LANES: usize = 2;
 
     /// How many steps a lane may take back to back before it rejoins the queue. A cell queues two
     /// lanes per stream against fewer threads, so a lane that never parks while it has bytes holds
@@ -22997,7 +23159,25 @@ pub(crate) mod lane_pool {
         std::sync::Arc::clone(POOL.get_or_init(spawn_pool))
     }
 
+    fn setup_pool() -> std::sync::Arc<Pool> {
+        std::sync::Arc::clone(
+            SETUP_POOL.get_or_init(|| spawn_pool_full(SETUP_LANES, Some(SETUP_PENDING), true)),
+        )
+    }
+
     fn spawn_pool() -> std::sync::Arc<Pool> {
+        spawn_pool_with(RELAY_LANES, None)
+    }
+
+    fn spawn_pool_with(cap: usize, pending: Option<usize>) -> std::sync::Arc<Pool> {
+        spawn_pool_full(cap, pending, false)
+    }
+
+    fn spawn_pool_full(
+        cap: usize,
+        pending: Option<usize>,
+        idle_exit: bool,
+    ) -> std::sync::Arc<Pool> {
         std::sync::Arc::new(Pool {
             ready: Mutex::new(VecDeque::new()),
             parked: Mutex::new(Parked::default()),
@@ -23006,6 +23186,9 @@ pub(crate) mod lane_pool {
             workers: std::sync::atomic::AtomicUsize::new(0),
             idle: std::sync::atomic::AtomicUsize::new(0),
             parks: std::sync::atomic::AtomicUsize::new(0),
+            cap,
+            pending,
+            idle_exit,
             #[cfg(test)]
             stop: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -23019,7 +23202,7 @@ pub(crate) mod lane_pool {
         use std::sync::atomic::Ordering::Relaxed;
         let mut workers = pool.workers.load(Relaxed);
         loop {
-            if workers >= RELAY_LANES {
+            if workers >= pool.cap {
                 return false;
             }
             match pool.workers.compare_exchange_weak(
@@ -23069,19 +23252,32 @@ pub(crate) mod lane_pool {
                         break lane;
                     }
                     pool.idle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    ready = pool
-                        .notify
-                        .wait(ready)
-                        .unwrap_or_else(PoisonError::into_inner);
+                    let (guard, timed_out) = if pool.idle_exit {
+                        let (guard, timeout) = pool
+                            .notify
+                            .wait_timeout(ready, std::time::Duration::ZERO)
+                            .unwrap_or_else(PoisonError::into_inner);
+                        (guard, timeout.timed_out())
+                    } else {
+                        (
+                            pool.notify
+                                .wait(ready)
+                                .unwrap_or_else(PoisonError::into_inner),
+                            false,
+                        )
+                    };
                     pool.idle.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    ready = guard;
+                    if timed_out && ready.is_empty() {
+                        pool.workers
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
                 }
             };
             let mut streak = 0usize;
             loop {
-                let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _step = crate::proxy::RelayStep::enter();
-                    lane.run()
-                }));
+                let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.run()));
                 match stepped {
                     // Still has bytes: keep the worker for a streak, then rejoin the queue behind the lanes waiting there.
                     Ok(Next::More) => {
@@ -23224,10 +23420,7 @@ pub(crate) mod lane_pool {
 
     fn run_to_end(mut lane: Lane) {
         loop {
-            let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _step = crate::proxy::RelayStep::enter();
-                lane.run()
-            }));
+            let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.run()));
             match stepped {
                 Ok(Next::Idle | Next::More | Next::Retry) => {}
                 Ok(Next::Done) | Err(_) => {
@@ -23243,17 +23436,52 @@ pub(crate) mod lane_pool {
         submit_to(&pool(), step, complete);
     }
 
+    /// A setup lane: the accept path's handshake and dispatch, run once on a pooled worker. It does
+    /// not enter `RelayStep`, because its waits are bounded by the handshake budget, not the relay clock.
+    /// False means the setup queue is full and the lane, with the accepted socket it owns, was dropped.
+    pub(crate) fn submit_setup(step: Step, complete: Complete) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        let setup = setup_pool();
+        let saturated = setup.idle.load(Relaxed) == 0 && setup.workers.load(Relaxed) >= SETUP_LANES;
+        if saturated
+            && BORROWED
+                .try_update(Relaxed, Relaxed, |borrowed| {
+                    (borrowed < SETUP_BORROW_LANES).then_some(borrowed + 1)
+                })
+                .is_ok()
+        {
+            let complete = Box::new(move || {
+                BORROWED.fetch_sub(1, Relaxed);
+                complete();
+            });
+            return submit_to_with(&pool(), step, complete, false);
+        }
+        submit_to_with(&setup, step, complete, false)
+    }
+
     fn submit_to(pool: &std::sync::Arc<Pool>, step: Step, complete: Complete) {
+        let _ = submit_to_with(pool, step, complete, true);
+    }
+
+    fn submit_to_with(
+        pool: &std::sync::Arc<Pool>,
+        step: Step,
+        complete: Complete,
+        relay: bool,
+    ) -> bool {
         use std::sync::atomic::Ordering::Relaxed;
         let lane = Lane {
             step,
             complete: Some(complete),
             idle: 0,
+            relay,
         };
-        let (queued, idle) = {
-            let ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
-            (ready.len(), pool.idle.load(Relaxed))
-        };
+        let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        if pool.pending.is_some_and(|pending| ready.len() >= pending) {
+            return false;
+        }
+        let (queued, idle) = (ready.len(), pool.idle.load(Relaxed));
+        drop(ready);
         if queued >= idle {
             // Nobody is parked to take it: start a lane, or leave it to the cap's workers.
             let _ = grow(pool);
@@ -23261,13 +23489,21 @@ pub(crate) mod lane_pool {
         if pool.workers.load(Relaxed) == 0 {
             // A thread the process could not start still does the lane's work on the caller.
             run_to_end(lane);
-            return;
+            return true;
         }
-        pool.ready
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push_back(lane);
+        ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+        if pool.pending.is_some_and(|pending| ready.len() >= pending) {
+            return false;
+        }
+        if pool.workers.load(Relaxed) == 0 {
+            drop(ready);
+            run_to_end(lane);
+            return true;
+        }
+        ready.push_back(lane);
+        drop(ready);
         pool.notify.notify_one();
+        true
     }
 
     #[cfg(test)]
@@ -23278,6 +23514,13 @@ pub(crate) mod lane_pool {
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn workers() -> usize {
         pool().workers.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn setup_workers() -> usize {
+        setup_pool()
+            .workers
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -23491,6 +23734,92 @@ pub(crate) mod lane_pool {
             );
         }
 
+        /// The accept path's handshake is a setup lane: its waits are bounded by the handshake
+        /// budget, so it must not claim the relay clock a framed reader hands timeouts back to.
+        #[test]
+        fn a_setup_lane_keeps_the_relay_step_off() {
+            let pool = TestPool(spawn_pool());
+            let seen = Arc::new(AtomicUsize::new(2));
+            let seen_lane = Arc::clone(&seen);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            submit_to_with(
+                &pool,
+                Box::new(move || {
+                    seen_lane.store(
+                        usize::from(crate::proxy::relay_step_owns_poll()),
+                        Ordering::SeqCst,
+                    );
+                    done_tx.send(()).expect("reports");
+                    Next::Done
+                }),
+                Box::new(|| {}),
+                false,
+            );
+            done_rx.recv_timeout(Duration::from_secs(5)).expect("runs");
+            assert_eq!(
+                seen.load(Ordering::SeqCst),
+                0,
+                "a setup lane's waits are its own"
+            );
+        }
+
+        /// A setup pool drops accepted work past its pending bound instead of growing its queue.
+        #[test]
+        fn a_setup_pool_bounds_its_pending_queue() {
+            let pool = TestPool(spawn_pool_with(1, Some(1)));
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            assert!(submit_to_with(
+                &pool,
+                Box::new(move || {
+                    started_tx.send(()).expect("starts");
+                    release_rx.recv().expect("releases");
+                    Next::Done
+                }),
+                Box::new(|| {}),
+                false,
+            ));
+            started_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("runs");
+            assert!(submit_to_with(
+                &pool,
+                Box::new(|| Next::Done),
+                Box::new(|| {}),
+                false,
+            ));
+            assert!(!submit_to_with(
+                &pool,
+                Box::new(|| Next::Done),
+                Box::new(|| {}),
+                false,
+            ));
+            release_tx.send(()).expect("releases");
+        }
+
+        /// A relay lane is the other shape: the framed reader hands its timeout back to the step.
+        #[test]
+        fn a_relay_lane_claims_the_relay_step() {
+            let pool = TestPool(spawn_pool());
+            let seen = Arc::new(AtomicUsize::new(2));
+            let seen_lane = Arc::clone(&seen);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            submit_to(
+                &pool,
+                Box::new(move || {
+                    seen_lane.store(
+                        usize::from(crate::proxy::relay_step_owns_poll()),
+                        Ordering::SeqCst,
+                    );
+                    done_tx.send(()).expect("reports");
+                    Next::Done
+                }),
+                Box::new(|| {}),
+            );
+            done_rx.recv_timeout(Duration::from_secs(5)).expect("runs");
+            assert_eq!(seen.load(Ordering::SeqCst), 1, "a relay lane owns the poll");
+        }
+
         fn marker(ran: Arc<Mutex<Option<Instant>>>) -> Lane {
             Lane {
                 step: Box::new(move || {
@@ -23499,6 +23828,7 @@ pub(crate) mod lane_pool {
                 }),
                 complete: Some(Box::new(|| {})),
                 idle: 0,
+                relay: true,
             }
         }
 
@@ -31437,6 +31767,73 @@ mod tests {
             grown < flows,
             "{flows} wrapped flows grew the process by {grown} threads: a thread per flow"
         );
+    }
+
+    /// A carriered accept hands its handshake to the lane pool, so a burst of connections grows the
+    /// process by lanes, not by connections.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn carried_handshakes_share_the_lane_pool() {
+        fn live_threads() -> usize {
+            std::fs::read_dir("/proc/self/task").map_or(0, std::iter::Iterator::count)
+        }
+
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        let role = Role::Vless {
+            users: one_user([9u8; 16]),
+            carrier: Carrier::Raw(Chain::default()),
+            freedom: true,
+            fallbacks: None,
+            decryption: None,
+        };
+        let stop = std::sync::Arc::new(Stop::new());
+        let before = live_threads();
+        let serving = {
+            let address = address.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            thread::spawn(move || accept_loop(&address, &role, None, Some(stop)))
+        };
+        let clients: Vec<_> = (0..24)
+            .map(|_| {
+                let until = Instant::now() + Duration::from_secs(10);
+                loop {
+                    match Connection::connect(("127.0.0.1", port)) {
+                        Ok(client) => return client,
+                        Err(_) if Instant::now() < until => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("the listener never came up: {error}"),
+                    }
+                }
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(100));
+        let grown = live_threads().saturating_sub(before);
+        let lanes = lane_pool::setup_workers();
+        assert!(lanes >= 1, "the setup lane count is the bound: {lanes}");
+        assert!(
+            lanes <= lane_pool::SETUP_LANES,
+            "the setup pool grew past its {0} lanes: {lanes}",
+            lane_pool::SETUP_LANES
+        );
+        assert!(
+            grown <= lanes + lane_pool::RELAY_LANES + 8,
+            "{} carried handshakes grew the process by {grown} threads, past {lanes} setup lanes and {} relay lanes plus slack",
+            clients.len(),
+            lane_pool::RELAY_LANES
+        );
+        assert!(
+            grown < clients.len(),
+            "{} carried handshakes grew the process by {grown} threads: a thread per handshake",
+            clients.len()
+        );
+        stop.stop();
+        wake_listener(&stop, &address);
+        serving.join().expect("the accept loop stops");
+        drop(clients);
     }
 
     #[test]

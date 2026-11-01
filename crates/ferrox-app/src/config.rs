@@ -1617,6 +1617,19 @@ impl Carrier {
             _ => None,
         }
     }
+
+    /// Whether this carrier's serve path ends in the pooled relay instead of pinning a thread for the flow.
+    pub(crate) fn tcp_stream(&self) -> bool {
+        matches!(
+            self,
+            Carrier::Raw(_)
+                | Carrier::Ws { .. }
+                | Carrier::HttpUpgrade { .. }
+                | Carrier::Grpc(_)
+                | Carrier::Xhttp { .. }
+                | Carrier::HttpHeader { .. }
+        )
+    }
 }
 
 // One row per network this tree recognises; a new method adds a row, not a match arm.

@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -150,8 +151,27 @@ pub(crate) fn dial() -> Duration {
     wait(Named::Dial)
 }
 
+thread_local! {
+    static HANDSHAKE_CAP: Cell<Option<Duration>> = const { Cell::new(None) };
+}
+
+pub(crate) struct HandshakeCap(Option<Duration>);
+
+pub(crate) fn cap_handshake(remaining: Duration) -> HandshakeCap {
+    let previous = HANDSHAKE_CAP.with(|cell| cell.replace(Some(remaining)));
+    HandshakeCap(previous)
+}
+
+impl Drop for HandshakeCap {
+    fn drop(&mut self) {
+        let previous = self.0;
+        HANDSHAKE_CAP.with(|cell| cell.set(previous));
+    }
+}
+
 pub(crate) fn handshake() -> Duration {
-    wait(Named::Handshake)
+    let configured = wait(Named::Handshake);
+    HANDSHAKE_CAP.with(|cell| cell.get().map_or(configured, |cap| configured.min(cap)))
 }
 
 pub(crate) fn head_arrival() -> Duration {
@@ -314,6 +334,16 @@ mod tests {
             CARRIER_PROBE,
             "an unnamed wait is its constant"
         );
+    }
+
+    /// A setup lane that waited in the queue spends that wait from the handshake budget it has left.
+    #[test]
+    fn a_setup_lane_spends_its_queue_time_from_the_handshake_budget() {
+        let full = handshake();
+        let cap = cap_handshake(Duration::from_millis(1));
+        assert_eq!(handshake(), Duration::from_millis(1));
+        drop(cap);
+        assert_eq!(handshake(), full);
     }
 
     /// A thread a test starts reads the table it armed, so a flow that runs off the test's own thread is still measured against the named wait.
