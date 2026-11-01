@@ -1586,6 +1586,24 @@ impl Role {
         }
     }
 
+    /// Whether this role's serve path ends in the pooled relay instead of pinning a thread for the flow.
+    fn tcp_stream(&self) -> bool {
+        match self {
+            Role::Vless { carrier, .. }
+            | Role::VlessTls { carrier, .. }
+            | Role::VlessReality { carrier, .. }
+            | Role::Trojan { carrier, .. }
+            | Role::TrojanTls { carrier, .. }
+            | Role::Vmess { carrier, .. }
+            | Role::VmessTls { carrier, .. }
+            | Role::Shadowsocks { carrier, .. } => carrier.tcp_stream(),
+            Role::Proxied(inner) => inner.tcp_stream(),
+            Role::Socks { .. } | Role::Http { .. } | Role::Mixed { .. } | Role::Dokodemo { .. } => {
+                false
+            }
+        }
+    }
+
     /// The account a protocol's front authenticated, when the config names one.
     fn account(&self) -> Option<&InboundAccount> {
         match self {
@@ -3284,39 +3302,59 @@ fn accept_loop(address: &str, role: &Role, tag: Option<&str>, stop: Option<std::
         if stop.as_ref().is_some_and(|stop| stop.stopped()) {
             break;
         }
-        let Ok(mut stream) = stream else { continue };
+        let Ok(stream) = stream else { continue };
         no_delay(&stream);
         let role = role.clone();
         let tag = tag.map(str::to_owned);
         let sniffing = sniffing.clone();
-        thread::spawn(move || {
-            crate::sniff::install_current(sniffing);
-            let (stream, role) = match role {
-                Role::Proxied(inner) => {
-                    let _ = stream.set_read_timeout(Some(budgets::handshake()));
-                    let source = crate::conn::read_proxy_header(&mut stream);
-                    let _ = stream.set_read_timeout(None);
-                    let Ok(source) = source else { return };
-                    let stream = match source {
-                        Some(source) => stream.with_peer(source),
-                        None => stream,
-                    };
-                    (stream, *inner)
-                }
-                role => (stream, role),
-            };
-            // Armed once per accepted stream, as the reference wraps its listener's conn.
-            let stream = stream
-                .with_mask(role.tcp_mask())
-                .with_meter(crate::stats::inbound(tag.as_deref()))
-                .with_policy(Some(crate::policy::flow(0)));
-            front_dispatch(stream, role);
-        });
+        if role.tcp_stream() {
+            let mut work = Some((stream, role, tag, sniffing));
+            lane_pool::submit_setup(
+                Box::new(move || {
+                    if let Some((stream, role, tag, sniffing)) = work.take() {
+                        serve_accepted(stream, role, tag.as_deref(), sniffing);
+                    }
+                    lane_pool::Next::Done
+                }),
+                Box::new(|| {}),
+            );
+        } else {
+            thread::spawn(move || serve_accepted(stream, role, tag.as_deref(), sniffing));
+        }
     }
     drop(listener);
     if let Some(stop) = stop {
         stop.mark_closed();
     }
+}
+
+fn serve_accepted(
+    mut stream: Connection,
+    role: Role,
+    tag: Option<&str>,
+    sniffing: Option<std::sync::Arc<crate::sniff::Sniffing>>,
+) {
+    crate::sniff::install_current(sniffing);
+    let (stream, role) = match role {
+        Role::Proxied(inner) => {
+            let _ = stream.set_read_timeout(Some(budgets::handshake()));
+            let source = crate::conn::read_proxy_header(&mut stream);
+            let _ = stream.set_read_timeout(None);
+            let Ok(source) = source else { return };
+            let stream = match source {
+                Some(source) => stream.with_peer(source),
+                None => stream,
+            };
+            (stream, *inner)
+        }
+        role => (stream, role),
+    };
+    // Armed once per accepted stream, as the reference wraps its listener's conn.
+    let stream = stream
+        .with_mask(role.tcp_mask())
+        .with_meter(crate::stats::inbound(tag))
+        .with_policy(Some(crate::policy::flow(0)));
+    front_dispatch(stream, role);
 }
 fn serve_shadowsocks(
     stream: Connection,
@@ -22463,11 +22501,18 @@ pub(crate) mod lane_pool {
         complete: Option<Complete>,
         /// Consecutive rounds that found nothing to read; each one doubles the wait before the next.
         idle: u32,
+        /// A relay lane's reads hand a timeout back to the step; a setup lane's own budget owns its wait.
+        relay: bool,
     }
 
     impl Lane {
         fn run(&mut self) -> Next {
-            (self.step)()
+            if self.relay {
+                let _step = crate::proxy::RelayStep::enter();
+                (self.step)()
+            } else {
+                (self.step)()
+            }
         }
 
         fn finish(&mut self) {
@@ -22597,10 +22642,7 @@ pub(crate) mod lane_pool {
             };
             let mut streak = 0usize;
             loop {
-                let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let _step = crate::proxy::RelayStep::enter();
-                    lane.run()
-                }));
+                let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.run()));
                 match stepped {
                     // Still has bytes: keep the worker for a streak, then rejoin the queue behind the lanes waiting there.
                     Ok(Next::More) => {
@@ -22743,10 +22785,7 @@ pub(crate) mod lane_pool {
 
     fn run_to_end(mut lane: Lane) {
         loop {
-            let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                let _step = crate::proxy::RelayStep::enter();
-                lane.run()
-            }));
+            let stepped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lane.run()));
             match stepped {
                 Ok(Next::Idle | Next::More | Next::Retry) => {}
                 Ok(Next::Done) | Err(_) => {
@@ -22762,12 +22801,23 @@ pub(crate) mod lane_pool {
         submit_to(&pool(), step, complete);
     }
 
+    /// A setup lane: the accept path's handshake and dispatch, run once on a pooled worker. It does
+    /// not enter `RelayStep`, because its waits are bounded by the handshake budget, not the relay clock.
+    pub(crate) fn submit_setup(step: Step, complete: Complete) {
+        submit_to_with(&pool(), step, complete, false);
+    }
+
     fn submit_to(pool: &std::sync::Arc<Pool>, step: Step, complete: Complete) {
+        submit_to_with(pool, step, complete, true);
+    }
+
+    fn submit_to_with(pool: &std::sync::Arc<Pool>, step: Step, complete: Complete, relay: bool) {
         use std::sync::atomic::Ordering::Relaxed;
         let lane = Lane {
             step,
             complete: Some(complete),
             idle: 0,
+            relay,
         };
         let (queued, idle) = {
             let ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
@@ -23010,6 +23060,58 @@ pub(crate) mod lane_pool {
             );
         }
 
+        /// The accept path's handshake is a setup lane: its waits are bounded by the handshake
+        /// budget, so it must not claim the relay clock a framed reader hands timeouts back to.
+        #[test]
+        fn a_setup_lane_keeps_the_relay_step_off() {
+            let pool = TestPool(spawn_pool());
+            let seen = Arc::new(AtomicUsize::new(2));
+            let seen_lane = Arc::clone(&seen);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            submit_to_with(
+                &pool,
+                Box::new(move || {
+                    seen_lane.store(
+                        usize::from(crate::proxy::relay_step_owns_poll()),
+                        Ordering::SeqCst,
+                    );
+                    done_tx.send(()).expect("reports");
+                    Next::Done
+                }),
+                Box::new(|| {}),
+                false,
+            );
+            done_rx.recv_timeout(Duration::from_secs(5)).expect("runs");
+            assert_eq!(
+                seen.load(Ordering::SeqCst),
+                0,
+                "a setup lane's waits are its own"
+            );
+        }
+
+        /// A relay lane is the other shape: the framed reader hands its timeout back to the step.
+        #[test]
+        fn a_relay_lane_claims_the_relay_step() {
+            let pool = TestPool(spawn_pool());
+            let seen = Arc::new(AtomicUsize::new(2));
+            let seen_lane = Arc::clone(&seen);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            submit_to(
+                &pool,
+                Box::new(move || {
+                    seen_lane.store(
+                        usize::from(crate::proxy::relay_step_owns_poll()),
+                        Ordering::SeqCst,
+                    );
+                    done_tx.send(()).expect("reports");
+                    Next::Done
+                }),
+                Box::new(|| {}),
+            );
+            done_rx.recv_timeout(Duration::from_secs(5)).expect("runs");
+            assert_eq!(seen.load(Ordering::SeqCst), 1, "a relay lane owns the poll");
+        }
+
         fn marker(ran: Arc<Mutex<Option<Instant>>>) -> Lane {
             Lane {
                 step: Box::new(move || {
@@ -23018,6 +23120,7 @@ pub(crate) mod lane_pool {
                 }),
                 complete: Some(Box::new(|| {})),
                 idle: 0,
+                relay: true,
             }
         }
 
@@ -30737,6 +30840,67 @@ mod tests {
             grown < flows,
             "{flows} wrapped flows grew the process by {grown} threads: a thread per flow"
         );
+    }
+
+    /// A carriered accept hands its handshake to the lane pool, so a burst of connections grows the
+    /// process by lanes, not by connections.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn carried_handshakes_share_the_lane_pool() {
+        fn live_threads() -> usize {
+            std::fs::read_dir("/proc/self/task").map_or(0, std::iter::Iterator::count)
+        }
+
+        let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = probe.local_addr().expect("addr").port();
+        drop(probe);
+        let address = format!("127.0.0.1:{port}");
+        let role = Role::Vless {
+            users: one_user([9u8; 16]),
+            carrier: Carrier::Raw(Chain::default()),
+            freedom: true,
+            fallbacks: None,
+            decryption: None,
+        };
+        let stop = std::sync::Arc::new(Stop::new());
+        let before = live_threads();
+        let serving = {
+            let address = address.clone();
+            let stop = std::sync::Arc::clone(&stop);
+            thread::spawn(move || accept_loop(&address, &role, None, Some(stop)))
+        };
+        let clients: Vec<_> = (0..24)
+            .map(|_| {
+                let until = Instant::now() + Duration::from_secs(10);
+                loop {
+                    match Connection::connect(("127.0.0.1", port)) {
+                        Ok(client) => return client,
+                        Err(_) if Instant::now() < until => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("the listener never came up: {error}"),
+                    }
+                }
+            })
+            .collect();
+        thread::sleep(Duration::from_millis(100));
+        let grown = live_threads().saturating_sub(before);
+        let lanes = lane_pool::workers();
+        assert!(lanes >= 8, "the lane count is the bound: {lanes}");
+        assert!(
+            grown <= lanes + 8,
+            "{} carried handshakes grew the process by {grown} threads, past {lanes} lanes plus slack",
+            clients.len()
+        );
+        assert!(
+            grown < clients.len(),
+            "{} carried handshakes grew the process by {grown} threads: a thread per handshake",
+            clients.len()
+        );
+        stop.stop();
+        wake_listener(&stop, &address);
+        serving.join().expect("the accept loop stops");
+        drop(clients);
     }
 
     #[test]
