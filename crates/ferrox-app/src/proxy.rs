@@ -23140,8 +23140,8 @@ pub(crate) mod lane_pool {
     /// relay worker with it. Two keep the setup peak under the reference's server threads.
     pub(crate) const SETUP_LANES: usize = 2;
 
-    /// Accepted work past the setup workers waits in this queue; past it the accept loop drops the
-    /// socket, so a burst cannot hold accepted connections without bound.
+    /// Accepted work past the setup workers waits in this queue; past it the handshake runs on its
+    /// own thread, so a burst is slower, not refused.
     const SETUP_PENDING: usize = 8;
 
     /// Handshakes past the dedicated setup lanes may borrow a relay worker, so a burst keeps four
