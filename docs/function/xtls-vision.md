@@ -47,6 +47,7 @@ graph TD
 | seal-open-staging-allocations | 0 | ferrox-bench-gate-2 |
 | coalesce-segment-allocations | 0 | ferrox-core-tls::rustls_backend::tests::the_framer_path_coalesces_without_a_heap_buffer |
 | vision-read-waits-outside-the-lock | 0 | ferrox-app-proxy::tests::a_vision_read_waits_outside_the_lock |
+| driven-session-opens-per-steady-read | 1 | ferrox-app-proxy::tests::a_steady_read_opens_the_session_once |
 | shared-state-acquisitions-per-steady-framed-write | 1 | ferrox-app-vision::tests::a_steady_framed_write_takes_the_shared_state_once |
 | shared-state-acquisitions-per-spent-direct-read | 0 | ferrox-app-vision::tests::a_spent_direct_read_takes_no_shared_state |
 <!-- counts:end -->
