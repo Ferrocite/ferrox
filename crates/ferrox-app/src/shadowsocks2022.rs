@@ -1149,10 +1149,8 @@ impl<R: Read> Downlink<R> {
 /// fills a window with eight of them, so one opened batch is one target write.
 const CHUNKS_PER_BATCH: usize = 8;
 
-/// The relay's read window: four slots of the uplink's own read size, so one ask covers a batch of
-/// relay-sized chunks, and the widest chunk a peer can name — `MAX_CHUNK` with its sealed length and
-/// tag — still lands in it whole.
-const WINDOW: usize = 4 * (SEAL_HEAD + READ_CHUNK + TAG_LEN);
+/// The relay's read window: one slot per chunk of the batch above, each slot a half-size chunk's whole wire cost — sealed length, payload, payload tag — so eight of the framing a peer actually uses fill it to the last byte, and the widest chunk a peer can name, `MAX_CHUNK` with its length and both tags, still lands in it whole.
+const WINDOW: usize = CHUNKS_PER_BATCH * (SEAL_HEAD + READ_CHUNK / 2 + TAG_LEN);
 
 /// One relay connection's downlink window: wire bytes land here once and chunks open where they lie,
 /// so a sealed length never costs its own carrier ask and a payload byte crosses user space once.
@@ -3197,15 +3195,15 @@ mod tests {
     }
 
     /// The downlink's batch path end to end, counted where the count is exact: a source that answers
-    /// the whole window in one read, a target that counts vectored writes, and eight chunks that open
-    /// and leave without one byte copied out of the window.
+    /// the whole window in one read, a target that counts vectored writes, and eight 8 KiB chunks —
+    /// the framing the window is sized to, filling it to its last byte — opening and leaving whole.
     #[test]
     fn a_bulk_read_serves_every_buffered_chunk() {
         let method = Method::Aes256Gcm;
         let psk = vec![7u8; 32];
         let salt = vec![7u8; 32];
         let mut send = Cipher::from_psk(method, &psk, &salt).expect("derives");
-        let sizes = [8000, 100, 4000, 17, 8000, 4000, 500, 2000];
+        let sizes = [8192; CHUNKS_PER_BATCH];
         let mut plain = Vec::new();
         let mut wire = Vec::new();
         for (part, size) in sizes.iter().enumerate() {
