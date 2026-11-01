@@ -37,7 +37,7 @@ pub(crate) fn owner(_network: Network, _source: SocketAddr) -> Option<Owner> {
 /// The inode of the local socket bound to `source`. The `/proc/net` tables list each socket's *local*
 /// address, so a remote peer's address never matches and needs no local-address test of its own.
 #[cfg(target_os = "linux")]
-fn socket_inode(network: Network, source: SocketAddr) -> Option<String> {
+pub(crate) fn socket_inode(network: Network, source: SocketAddr) -> Option<String> {
     let (files, address): (&[&str], String) = match (network, source.ip().to_canonical()) {
         (Network::Tcp, std::net::IpAddr::V4(ip)) => {
             (&["/proc/net/tcp"], local_hex(&ip.octets(), source.port()))
@@ -62,31 +62,46 @@ fn socket_inode(network: Network, source: SocketAddr) -> Option<String> {
         let Ok(table) = std::fs::read_to_string(file) else {
             continue;
         };
-        for line in table.lines().skip(1) {
-            let mut fields = line.split_ascii_whitespace();
-            let Some(_slot) = fields.next() else {
-                break;
-            };
-            let Some(local) = fields.next() else {
-                break;
-            };
-            // sl, local_address, rem_address, st, tx:rx, tr:tm->when, retrnsmt, uid, timeout, inode.
-            let Some(inode) = fields.nth(7) else {
-                break;
-            };
-            if local == address {
-                return Some(inode.to_owned());
-            }
-            if let Some(suffix) = &port {
-                if let Some(bound) = local.strip_suffix(suffix.as_str()) {
-                    if matches!(bound.len(), 8 | 32) && bound.bytes().all(|byte| byte == b'0') {
-                        wildcard = Some(inode.to_owned());
-                    }
+        let (exact, file_wildcard) = inodes_in(&table, &address, port.as_deref());
+        if let Some(inode) = exact {
+            return Some(inode);
+        }
+        wildcard = file_wildcard.or(wildcard);
+    }
+    wildcard
+}
+
+/// The two inodes one `/proc/net` table names for a source — the row that spells the address exactly and the last wildcard row on the same port — with the rows the kernel prints with an inode of `0` skipped, because a socket with no descriptor names no process and must not end the scan.
+#[cfg(target_os = "linux")]
+fn inodes_in(table: &str, address: &str, port: Option<&str>) -> (Option<String>, Option<String>) {
+    let mut wildcard = None;
+    for line in table.lines().skip(1) {
+        let mut fields = line.split_ascii_whitespace();
+        let Some(_slot) = fields.next() else {
+            break;
+        };
+        let Some(local) = fields.next() else {
+            break;
+        };
+        // sl, local_address, rem_address, st, tx:rx, tr:tm->when, retrnsmt, uid, timeout, inode.
+        let Some(inode) = fields.nth(7) else {
+            break;
+        };
+        if inode == "0" {
+            continue;
+        }
+        if local == address {
+            return (Some(inode.to_owned()), wildcard);
+        }
+        if let Some(suffix) = port {
+            if let Some(bound) = local.strip_suffix(suffix) {
+                if matches!(bound.len(), 8 | 32) && bound.bytes().all(|byte| byte == b'0') {
+                    wildcard = Some(inode.to_owned());
                 }
             }
         }
     }
-    wildcard
+    (None, wildcard)
 }
 
 /// The local address as the `/proc/net` tables spell it: each 32-bit word in host byte order, then
@@ -104,7 +119,7 @@ fn local_hex(octets: &[u8], port: u16) -> String {
 
 /// The pid holding `inode`, by the one file descriptor that links it to `socket:[inode]`.
 #[cfg(target_os = "linux")]
-fn owner_pid(inode: &str) -> Option<u32> {
+pub(crate) fn owner_pid(inode: &str) -> Option<u32> {
     let target = format!("socket:[{inode}]");
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let Some(pid) = entry
@@ -145,6 +160,46 @@ mod tests {
         assert_eq!(local_hex(&[127, 0, 0, 1], 80), v4);
         let loopback = std::net::Ipv6Addr::LOCALHOST.octets();
         assert_eq!(local_hex(&loopback, 443), v6);
+    }
+
+    /// A row the kernel leaves ownerless is no answer: the live row anywhere else in the table names
+    /// the process, and a table of ownerless rows names nothing.
+    #[test]
+    fn an_ownerless_row_does_not_end_the_scan() {
+        const HEADER: &str =
+            "sl local_address rem_address st tx:rx tr:tm->when retrnsmt uid timeout inode";
+        let row = |slot: &str, local: &str, state: &str, inode: &str| {
+            format!("{slot} {local} 0100007F:0050 {state} 0:0 0:0 0 0 0 {inode}")
+        };
+        let table = |rows: [String; 4]| format!("{HEADER}\n{}\n", rows.join("\n"));
+        let mixed = table([
+            row("0:", "0100007F:1F90", "06", "0"),
+            row("1:", "00000000:1F90", "07", "5678"),
+            row("2:", "00000000:1F90", "06", "0"),
+            row("3:", "0100007F:1F90", "01", "1234"),
+        ]);
+        let (exact, wildcard) = inodes_in(&mixed, "0100007F:1F90", Some(":1F90"));
+        assert_eq!(
+            exact.as_deref(),
+            Some("1234"),
+            "the source's own row, not the ownerless one ahead of it"
+        );
+        assert_eq!(
+            wildcard.as_deref(),
+            Some("5678"),
+            "an ownerless wildcard row behind the live one is no answer either"
+        );
+        let dead = table([
+            row("0:", "0100007F:1F90", "06", "0"),
+            row("1:", "00000000:1F90", "06", "0"),
+            row("2:", "00000000:1F90", "06", "0"),
+            row("3:", "0100007F:1F90", "06", "0"),
+        ]);
+        assert_eq!(
+            inodes_in(&dead, "0100007F:1F90", Some(":1F90")),
+            (None, None),
+            "a table of ownerless rows names no process"
+        );
     }
 
     /// The socket this process opened is the socket this process owns: the pid is ours and the path
