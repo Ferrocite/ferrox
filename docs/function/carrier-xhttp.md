@@ -56,6 +56,24 @@ What is *not* sent yet, and named rather than rounded off:
 - The `xmux` pool the reference grows a `stream-up` session out of, and `serverMaxHeaderBytes`, which bounds the head a reference hub reads. Neither changes a byte the modes above put on the wire. The block itself is read with the reference's `Int32Range` spelling and pool defaults, a config that sets both `maxConnections` and `maxConcurrency` is refused with the reference's sentence, and a stated block gets one stderr line because no pool here applies it.
 - The keep-alive padding the reference hub injects down an open stream-up response: once `scStreamUpServerSecs` is above zero, `hub.go:219` writes a random `xPaddingBytes`-sized run of `X` down the response every that many seconds until the request context ends. Our `sse_ok` answers `200` without the filler — a reference dialer that pads against such a stream waits on content that does not arrive on this side, so until that lands a served stream-up session is a quiet answer instead of a padded one.
 
+## The REALITY H2 dial
+
+The reference decides the protocol at dial time, and REALITY always wins it: `decideHTTPVersion` returns `2` for any session with a REALITY config (`dialer.go:82`), whatever the transport block says. Until this slice our dial wrote the H1 head there, so a REALITY xHTTP inbound served by the reference answered a protocol its own client never sends. `ride_carrier`'s REALITY call site now passes `h2`, and `tls_xhttp` routes a stream-one session through `xhttp_h2::connect_split` instead of `xhttp::connect_split`.
+
+The client reuses the server's connection type rather than a second parser: the 24-octet preface, `SETTINGS` with a 4 MiB stream window, a connection `WINDOW_UPDATE`, then one `HEADERS` carrying the same fields the H1 head would (`xhttp::dial_fields`: the masked fetch set, the padded `Referer`, the body's type). The request body leaves as `DATA`, the answer is read from the response `DATA`, and a frame is parsed on demand by whichever of the reader or a credit-starved writer asks first — no parser thread, so a session that is never read still closes with its socket. The dial's `XhttpWriter` holds the stream in the same `OnceLock` the H2 server uses; its clones share one `Arc<ClientOwner>`, because the relay clones the sink and the last clone out is what may shut the socket down, not the first to drop.
+
+The gate is `proxy::tests::reality_xhttp_dial_opens_with_the_h2_preface`: it drives a REALITY stream-one dial against the loopback hub and asserts the server saw the preface on the path the dial sent, then completes the echo; the server's H2 suites and the H1 `xhttp`/`reality` suites are unchanged. What this does not claim, named rather than rounded off: the TLS `alpn: ["h2"]` opt-in, the `h2c` cleartext spelling (which still needs the confidentiality layer #593 asks for), the `xmux` pool, and a fallback to H1 when a server answers the H2 attempt with `400` — that is still the ladder's job. Counts do not move: the change replaces the head a REALITY dial writes, and the existing `carrier-xhttp` rows measure the chunked framing, which is untouched.
+
+```mermaid
+graph TD
+    A["stream-one dial under REALITY"] --> P["preface + SETTINGS + WINDOW_UPDATE"]
+    P --> H["HEADERS: masked fetch set,<br/>padded Referer, :path"]
+    H --> D["VLESS header as DATA"]
+    D --> X(("wire"))
+    X --> R["response HEADERS ignored,<br/>response DATA delivered"]
+    R --> E["finish_stream: empty DATA with F_END"]
+```
+
 ## Connection reuse
 
 A packet-up uplink is a sequence of `POST {sid}/{seq}` requests, and the reference hub is an `http.Server` that never closes the connection under it: `plain_ok` answers `Content-Length: 0` with `Connection: keep-alive`, and Go's transport puts the socket back in its idle pool and writes the *next* packet on it (`hub.go:561` only arms a 4 s timeout for the next head). Our hub answered the first POST, promised keep-alive in that very response, and then tore the connection down, because `accept_core` could only return a session or nothing.

@@ -7363,6 +7363,9 @@ fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static>(
     serve_session_xhttp_with(creader, &cwriter, users, freedom);
 }
 
+#[cfg(test)]
+pub(crate) static H2_DIAL_WITNESS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
 fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
     mut read: R,
     write: W,
@@ -7403,6 +7406,10 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
     }
     let chained = crate::xhttp::ChainReader::new(magic[..at].to_vec(), read);
     if at == magic.len() && magic == *crate::h2::MAGIC {
+        #[cfg(test)]
+        if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
+            paths.push(settings.path.clone());
+        }
         if decryption.is_some() {
             eprintln!("vless: decryption over h2 is not served yet");
             return;
@@ -12484,6 +12491,7 @@ fn open_vmess_udp_tls(
                 || dial_tls_session(server, cfg, mask),
                 &vmess.host,
                 settings,
+                false,
             )?;
             let (request, send, recv, response_key, response_iv, auth) =
                 vmess_udp_request(vmess, dest)?;
@@ -13441,7 +13449,7 @@ where
             })
         }
         Carrier::Xhttp { settings, .. } => {
-            let (read, writer) = tls_xhttp(server, session, second, &trojan.host, settings)?;
+            let (read, writer) = tls_xhttp(server, session, second, &trojan.host, settings, false)?;
             if !writer.send(&header) {
                 return None;
             }
@@ -14449,9 +14457,16 @@ fn tls_xhttp<S: Dialed, D: Dialed>(
     second: impl FnOnce() -> Option<D>,
     host: &str,
     settings: &crate::xhttp::XhttpSettings,
+    h2: bool,
 ) -> Option<(Box<dyn Read + Send>, crate::xhttp::XhttpWriter)> {
-    let (reader, writer, _) = session.into_halves()?;
+    let (reader, writer, raw) = session.into_halves()?;
     if settings.mode == crate::xhttp::XhttpMode::StreamOne {
+        if h2 {
+            // REALITY always dials HTTP/2 (`decideHTTPVersion`, dialer.go:82), never an H1 head.
+            return crate::xhttp_h2::connect_split(reader, writer, raw, host, settings, "https")
+                .map(|(reader, writer)| (Box::new(reader) as Box<dyn Read + Send>, writer))
+                .or_else(|| tls_unreachable(server));
+        }
         let head = crate::xhttp::dial_path(settings);
         return crate::xhttp::connect_split(reader, writer, host, &head, &settings.headers)
             .map(|(reader, writer)| (Box::new(reader) as Box<dyn Read + Send>, writer))
@@ -15322,6 +15337,7 @@ fn ride_carrier<S: Dialed, D: Dialed>(
     vless: &VlessOut,
     header: &[u8],
     client: &Connection,
+    h2: bool,
 ) {
     let first = if vless.encryption.is_some() {
         &[][..]
@@ -15400,7 +15416,8 @@ fn ride_carrier<S: Dialed, D: Dialed>(
             );
         }
         Carrier::Xhttp { settings, .. } => {
-            let Some((reader, writer)) = tls_xhttp(server, session, second, &vless.host, settings)
+            let Some((reader, writer)) =
+                tls_xhttp(server, session, second, &vless.host, settings, h2)
             else {
                 return;
             };
@@ -15565,6 +15582,7 @@ fn dial_vless_tls(
             vless,
             &header,
             client,
+            false,
         ),
     }
 }
@@ -15910,6 +15928,7 @@ fn dial_vless_reality(
             vless,
             &header,
             client,
+            true,
         ),
     }
 }
@@ -16025,7 +16044,8 @@ fn dial_trojan_session<S, D>(
             );
         }
         Carrier::Xhttp { settings, .. } => {
-            let Some((reader, writer)) = tls_xhttp(server, session, second, &trojan.host, settings)
+            let Some((reader, writer)) =
+                tls_xhttp(server, session, second, &trojan.host, settings, false)
             else {
                 return;
             };
@@ -16217,6 +16237,7 @@ fn vmess_tls_carried(
                 || dial_tls_session(server, vmess.tls.as_deref()?, vmess.carrier.tcp_mask()),
                 &vmess.host,
                 settings,
+                false,
             ) else {
                 return;
             };
@@ -16562,6 +16583,7 @@ fn dial_ss_tls_rung(
                 || dial_tls_session(server, cfg, ss.carrier.tcp_mask()),
                 &ss.host,
                 settings,
+                false,
             ) else {
                 return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
             };
@@ -34832,6 +34854,36 @@ mod tests {
         dialled.join().expect("joins");
         pair.echo.join().expect("joins");
         pair.front.join().expect("joins");
+    }
+
+    /// The reference chooses HTTP/2 for every REALITY xHTTP session (`decideHTTPVersion`, dialer.go:82), so the preface is the contract: an H1 head never carries this path.
+    #[test]
+    fn reality_xhttp_dial_opens_with_the_h2_preface() {
+        const WITNESS: &str = "/";
+        let pair = reality_pair_with(
+            "",
+            "xhttp",
+            Carrier::Xhttp {
+                settings: xhttp_settings(WITNESS),
+            },
+        );
+        let (mut user, dialled) = dial_pair(&pair);
+        let payload: Vec<u8> = (0..4096u32)
+            .map(|index| (index as u8).wrapping_mul(19).wrapping_add(3))
+            .collect();
+        assert_eq!(echo_bulk(&mut user, &payload), payload);
+        drop(user);
+        dialled.join().expect("joins");
+        pair.echo.join().expect("joins");
+        pair.front.join().expect("joins");
+        assert!(
+            H2_DIAL_WITNESS
+                .lock()
+                .expect("witness lock")
+                .iter()
+                .any(|path| path == WITNESS),
+            "the REALITY xHTTP dial did not open with the H2 preface"
+        );
     }
 
     #[test]
