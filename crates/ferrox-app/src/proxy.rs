@@ -22499,7 +22499,8 @@ pub(crate) fn pump_vmess_udp<R, W>(
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    if udp.set_nonblocking(true).is_err() {
+    // The lane parks in the kernel rather than sleeping between polls: a datagram wakes the recv at once. The socket arrives blocking from its bind, so the window alone is the park — the shape every other UDP lane here arms, and a send window of one millisecond is not part of it.
+    if udp.set_read_timeout(Some(RELAY_POLL)).is_err() {
         close();
         return;
     }
@@ -22550,11 +22551,10 @@ pub(crate) fn pump_vmess_udp<R, W>(
                     break;
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if is_timeout(&error) => {
                 if done.load(Ordering::Relaxed) {
                     break;
                 }
-                thread::sleep(RELAY_POLL);
             }
             Err(_) => break,
         }

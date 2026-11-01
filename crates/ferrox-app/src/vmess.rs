@@ -3347,6 +3347,11 @@ mod tests {
             2,
             "the pump asked the carrier for the window once, and once more to learn it is over"
         );
+        assert_eq!(
+            udp.read_timeout().expect("the read window the pump armed"),
+            Some(crate::budgets::RELAY_POLL),
+            "the lane waits in the kernel for a datagram instead of sleeping between polls"
+        );
     }
 
     #[test]
