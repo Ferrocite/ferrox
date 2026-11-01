@@ -22647,6 +22647,7 @@ pub(crate) mod lane_pool {
 
     static POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
     static SETUP_POOL: OnceLock<std::sync::Arc<Pool>> = OnceLock::new();
+    static BORROWED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
     /// The widest standard cell (eight connections) queues one download read per flow, and every
     /// one of them must sit in its read at once: a lane without a worker is a flow the peer's
@@ -22661,6 +22662,11 @@ pub(crate) mod lane_pool {
     /// Accepted work past the setup workers waits in this queue; past it the accept loop drops the
     /// socket, so a burst cannot hold accepted connections without bound.
     const SETUP_PENDING: usize = 8;
+
+    /// Handshakes past the dedicated setup lanes may borrow a relay worker, so a burst keeps four
+    /// handshakes in flight without adding threads to the peak; two borrowed lanes leave six relay
+    /// workers for the flows behind them.
+    const SETUP_BORROW_LANES: usize = 2;
 
     /// How many steps a lane may take back to back before it rejoins the queue. A cell queues two
     /// lanes per stream against fewer threads, so a lane that never parks while it has bytes holds
@@ -22953,7 +22959,23 @@ pub(crate) mod lane_pool {
     /// not enter `RelayStep`, because its waits are bounded by the handshake budget, not the relay clock.
     /// False means the setup queue is full and the lane, with the accepted socket it owns, was dropped.
     pub(crate) fn submit_setup(step: Step, complete: Complete) -> bool {
-        submit_to_with(&setup_pool(), step, complete, false)
+        use std::sync::atomic::Ordering::Relaxed;
+        let setup = setup_pool();
+        let saturated = setup.idle.load(Relaxed) == 0 && setup.workers.load(Relaxed) >= SETUP_LANES;
+        if saturated
+            && BORROWED
+                .try_update(Relaxed, Relaxed, |borrowed| {
+                    (borrowed < SETUP_BORROW_LANES).then_some(borrowed + 1)
+                })
+                .is_ok()
+        {
+            let complete = Box::new(move || {
+                BORROWED.fetch_sub(1, Relaxed);
+                complete();
+            });
+            return submit_to_with(&pool(), step, complete, false);
+        }
+        submit_to_with(&setup, step, complete, false)
     }
 
     fn submit_to(pool: &std::sync::Arc<Pool>, step: Step, complete: Complete) {
