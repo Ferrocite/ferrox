@@ -14,7 +14,9 @@ A raw TLS listener that names `settings.fallbacks` spends the reference's first 
 
 A UDP association rides every TCP carrier the outbound dials — raw, ws, httpUpgrade, gRPC, xhttp (stream-one), http header and KCP — plain or under a terminated session, on both the client and the listener. The listener parses the association off whatever carrier the dial wrote; the client splits the session into the reader and writer its pump needs and wakes a parked reader by closing the carrier it came from. `a_trojan_udp_association_crosses_every_carrier` runs all fourteen pairs and holds two datagrams through each, 250 ms apart so a pump that gives up on an idle association is caught. QUIC carries the same SOCKS address, length, CRLF and payload frame on its stream, and Hysteria carries the association through its own datagram lane; `quic_serves_trojan_udp_over_loopback` and `hysteria_carries_a_trojan_udp_association_over_the_carrier` hold both ends.
 
-Two things are deliberately not implemented and are named rather than rounded off: mux is VLESS-only on both ends, so a trojan row that asks for it is not carried; and an inbound that declares `security: reality` is refused by name rather than served as plaintext — a silent downgrade of a session the config asked for is the failure mode, and `a_trojan_reality_inbound_is_refused_not_downgraded` is the gate. The `trojan://` share link is parsed by `ferrox_core::trojan::TrojanLink`, which `check`/`run` accept beside `vless://`, and its header probe goes through the same `encode_header` the dial uses. These are capability statements, not performance ones.
+REALITY is carried both roles on every TCP carrier the row names — raw, ws, httpUpgrade, gRPC, xhttp and http header — and above KCP, where the session wraps the connection. xray restricts REALITY to raw, XHTTP and gRPC, so the other carriers are a superset rather than a gap. `a_trojan_reality_inbound_answers_every_tcp_carrier` holds the six pairs, `a_trojan_reality_kcp_inbound_answers_the_session` holds the KCP pair, and an inbound that declares `security: reality` without an identity is refused by name rather than served as plaintext — `a_trojan_reality_inbound_without_identity_is_refused_not_downgraded` is the gate against a silent downgrade.
+
+Mux opens `v1.mux.cool:9527` on every carrier xray pairs it with — raw, ws, httpUpgrade, gRPC, xhttp, http header and KCP — plain, under TLS, and under REALITY, carrying a TCP stream or a UDP association through one session; `a_trojan_mux_carries_a_tcp_stream_over_every_carrier` holds the twenty-one TCP pairs and `a_trojan_mux_carries_a_udp_association_over_raw_and_reality` holds the UDP lane, including a non-raw ws pair. A carrier xray does not pair with mux — QUIC, Hysteria — is dialed directly rather than refused, and the outbound says so once. The `trojan://` share link is parsed by `ferrox_core::trojan::TrojanLink`, which `check`/`run` accept beside `vless://`, and its header probe goes through the same `encode_header` the dial uses. These are capability statements, not performance ones.
 
 ## Data path
 
@@ -37,11 +39,15 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 1315 | scripts/count-ops.sh |
+| ops-retired-instructions | 1170 | scripts/count-ops.sh |
 | password-bytes-on-the-wire | 56 | ferrox-app-proxy::tests::trojan_key_is_sha224_hex |
 | framing-bytes-added-after-the-header | 0 | ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers |
 | udp-framing-bytes-per-datagram | 2 | ferrox-app-proxy::tests::trojan_udp_frames_carry |
 | udp-carriers-holding-an-association | 7 | ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier |
+| reality-tcp-carriers-holding-an-echo | 6 | ferrox-app-proxy::tests::a_trojan_reality_inbound_answers_every_tcp_carrier |
+| reality-kcp-pairs-holding-an-echo | 1 | ferrox-app-proxy::tests::a_trojan_reality_kcp_inbound_answers_the_session |
+| mux-tcp-carriers-holding-a-stream | 21 | ferrox-app-proxy::tests::a_trojan_mux_carries_a_tcp_stream_over_every_carrier |
+| mux-udp-carriers-holding-an-association | 4 | ferrox-app-proxy::tests::a_trojan_mux_carries_a_udp_association_over_raw_and_reality |
 | header-reads-numeric-address | 2 | ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven |
 | header-reads-domain-address | 3 | ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven |
 | header-bytes-copied-out-of-the-buffer | 0 | ferrox-app-proxy::tests::the_trojan_header_costs_two_reads_not_seven |
@@ -56,7 +62,7 @@ graph TD
   proxy::tests::the_trojan_header_costs_two_reads_not_seven 'proxy::decode_trojan_request'
 ```
 
-The frame is `decode_trojan_request` over three fixed in-memory headers. The domain form carries the literal `127.0.0.1`, so the parser takes `resolve_name`'s literal arm and never enters `getaddrinfo`; the count is the header parse alone and reproduces across runs. It is **1315** retired instructions, blessed in `scripts/expected-ops.txt`; before the literal arm and the word fold the same frame read `80397` then `80812` across two runs of one binary because the resolver was inside it. The wire bytes and the three-read domain parse are unchanged.
+The frame is `decode_trojan_request` over three fixed in-memory headers. The domain form carries the literal `127.0.0.1`, so the byte-level IPv4 reader returns the address directly and neither `resolve_name` nor `getaddrinfo` is entered; the count is the header parse alone and reproduces across runs. It is **1170** retired instructions, blessed in `scripts/expected-ops.txt`; the domain arm now compares the host against the mux rendezvous before the resolver, three instructions on every domain header, and before that the frame read `1167`, before the literal arm and the word fold `80397` then `80812` across two runs of one binary because the resolver was inside it, and before the byte-level IPv4 reader `1315`. The wire bytes and the three-read domain parse are unchanged.
 
 ## Time
 
@@ -77,6 +83,8 @@ Read from one CI run of one `benchmark-matrix.yml` cell, `trojan-tls-raw-down-8`
 - **A key compare that returned on the first wrong byte, then walked it a byte at a time.** `got != *key` short-circuits, so the time it took said how much of the key was right. `key_agrees` folds the 56 bytes as seven `u64` words into one accumulator — seven XOR/OR pairs instead of fifty-six byte folds, every byte still read — and refuses a short read outright. `the_key_compare_reads_every_byte` is the gate.
 - **An MD5 or SHA-1 chain per connection.** The password arrives as its SHA-224 hex, so there is nothing to derive: 56 bytes on the wire, 56 bytes compared. Contrast Shadowsocks, where the MD5 chain and HKDF are real work and are named in [that page](shadowsocks.md).
 - **The `host:port` `String` a domain header serialised for the resolver.** `resolve_endpoint` did `format!("{host}:{port}").to_socket_addrs()`: it built one owned `String` and the `str` form then re-scanned it for the last `:` to split host and port back apart. The `(&str, u16)` tuple hands the resolver both as separate arguments — no serialisation, no `String`, no port re-scan — and a bracketless IPv6 host is no longer mangled by that split. The tuple still carries a real name to the resolver; see the literal arm below for the numeric form.
+
+- **The UTF-8 check and generic address parser a numeric domain paid for.** The domain form's bytes are already a slice, but the parser turned them into `&str` and then asked `IpAddr::from_str` to try IPv4 and IPv6 before `resolve_name`'s own literal arm. A byte-level IPv4 reader now consumes the same digits with the same leading-zero and three-digit rules, so a numeric host never crosses into UTF-8 validation or the generic parser. `the_trojan_ipv4_reader_matches_the_standard_parser` holds a table of valid and malformed literals against `Ipv4Addr::from_str`; the frame drops 148 instructions, and the reads, wire bytes and resolver path for a real name are unchanged.
 
 - **The resolver iterator a numeric domain paid for.** `resolve_name` parsed the literal to decide the address was numeric, then handed the same `(host, port)` to `to_socket_addrs`, which parses it again and allocates a one-element `Vec` for the iterator. The literal arm now returns `SocketAddr::new(ip, port)` directly, with no second parse, no `Vec` and no resolver entry. `the_trojan_numeric_domain_header_allocates_nothing` measures a Trojan domain-form header carrying `127.0.0.1` through the counting allocator and asserts zero allocations; `a_datagram_target_is_resolved_without_a_host_port_string` holds the same zero on the Shadowsocks datagram path. Both the answer and the wire bytes are unchanged; a real name still takes the resolver tuple.
 

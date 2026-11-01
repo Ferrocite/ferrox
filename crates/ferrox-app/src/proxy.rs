@@ -1515,6 +1515,14 @@ enum Role {
         fallbacks: Option<Arc<[Fallback]>>,
         account: InboundAccount,
     },
+    TrojanReality {
+        keys: std::sync::Arc<[[u8; 56]]>,
+        carrier: Carrier,
+        freedom: bool,
+        server: Arc<ferrox_core::tls::RealityServerConfig>,
+        fallbacks: Option<Arc<[Fallback]>>,
+        account: InboundAccount,
+    },
     Vmess {
         users: crate::vmess::UsersRef,
         carrier: Carrier,
@@ -1566,6 +1574,7 @@ impl Role {
             | Role::VlessReality { carrier, .. }
             | Role::Trojan { carrier, .. }
             | Role::TrojanTls { carrier, .. }
+            | Role::TrojanReality { carrier, .. }
             | Role::Vmess { carrier, .. }
             | Role::VmessTls { carrier, .. }
             | Role::Shadowsocks { carrier, .. } => carrier.tcp_mask(),
@@ -1582,6 +1591,7 @@ impl Role {
         match self {
             Role::Trojan { account, .. }
             | Role::TrojanTls { account, .. }
+            | Role::TrojanReality { account, .. }
             | Role::Vmess { account, .. }
             | Role::VmessTls { account, .. } => Some(account),
             Role::Vless { .. }
@@ -3229,6 +3239,8 @@ pub(crate) struct TrojanOut {
     quic_roots: Option<ferrox_core::tls::Anchors>,
     quic_ech: Option<Arc<[u8]>>,
     hysteria_roots: Option<ferrox_core::tls::Anchors>,
+    mux: Mux,
+    reality: Option<Arc<ferrox_core::tls::RealityClientConfig>>,
 }
 
 #[derive(Debug, Clone)]
@@ -9633,16 +9645,21 @@ fn kcp_tls_connect(
 }
 
 /// KCP is the transport and the security rides it, as it does upstream: the session carries the header and both relay legs, not the connection.
-fn relay_kcp_under_tls(
+fn relay_kcp_under<S>(
     client: &Connection,
     conn: &Arc<ferrox_core::kcp::Connection>,
-    cfg: &ferrox_core::tls::TlsConfig,
+    mut session: S,
     header: &[u8],
-    ready: impl FnOnce(&mut ferrox_core::tls::ClientSession<KcpIo>) -> bool,
-) {
-    let Some(mut session) = kcp_tls_connect(conn, cfg) else {
-        return;
-    };
+    ready: impl FnOnce(&mut S) -> bool,
+) where
+    S: std::io::Read
+        + std::io::Write
+        + ferrox_core::tls::TlsProvider
+        + ferrox_core::tls::RecordAlignment
+        + Drivable
+        + Send
+        + 'static,
+{
     if session.write_all(header).is_err() || !ready(&mut session) {
         return;
     }
@@ -9668,6 +9685,41 @@ fn relay_kcp_under_tls(
         Half::split(reader, writer),
         &close,
     );
+}
+
+fn relay_kcp_under_tls(
+    client: &Connection,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    cfg: &ferrox_core::tls::TlsConfig,
+    header: &[u8],
+    ready: impl FnOnce(&mut ferrox_core::tls::ClientSession<KcpIo>) -> bool,
+) {
+    let Some(session) = kcp_tls_connect(conn, cfg) else {
+        return;
+    };
+    relay_kcp_under(client, conn, session, header, ready);
+}
+
+fn kcp_reality_connect(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    cfg: &ferrox_core::tls::RealityClientConfig,
+) -> Option<ferrox_core::tls::RealityClientSession<ferrox_core::tls::reality::RecordLimiter<KcpIo>>>
+{
+    let now = u32::try_from(unix_millis() / 1000).unwrap_or(u32::MAX);
+    let limiter = ferrox_core::tls::reality::RecordLimiter::new(KcpIo::new(Arc::clone(conn)));
+    ferrox_core::tls::RealityClientSession::connect(cfg, now, limiter).ok()
+}
+
+fn relay_kcp_under_reality(
+    client: &Connection,
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    cfg: &ferrox_core::tls::RealityClientConfig,
+    header: &[u8],
+) {
+    let Some(session) = kcp_reality_connect(conn, cfg) else {
+        return;
+    };
+    relay_kcp_under(client, conn, session, header, |_| true);
 }
 
 fn dial_vless_kcp(
@@ -9726,6 +9778,14 @@ fn serve_vless_kcp_reality(
     }
 }
 
+fn serve_trojan_mux<R, W>(reader: R, writer: W, close: Arc<dyn Fn() + Send + Sync>, carried: &[u8])
+where
+    R: Read + Send + 'static,
+    W: Write + Send + 'static,
+{
+    serve_mux_tunnel(Box::new(reader), Box::new(writer), close, carried);
+}
+
 fn serve_trojan_kcp(
     conn: &Arc<ferrox_core::kcp::Connection>,
     key: &[[u8; 56]],
@@ -9747,6 +9807,13 @@ fn serve_trojan_kcp(
     if cmd != 1 {
         return;
     }
+    if target.is_mux() {
+        let (reader, writer, close) = kcp_parts_metered(conn, meter);
+        return serve_trojan_mux(reader, writer, close, &[]);
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -9769,6 +9836,33 @@ fn serve_trojan_kcp_tls(
         return;
     }
     relay_trojan(tls, None, Some(Arc::clone(conn)), key, freedom, meter);
+}
+
+fn serve_trojan_kcp_reality(
+    conn: &Arc<ferrox_core::kcp::Connection>,
+    key: &[[u8; 56]],
+    freedom: bool,
+    server: &ferrox_core::tls::RealityServerConfig,
+    meter: crate::stats::Meter,
+) {
+    let accepted = ferrox_core::tls::RealityServer::accept(
+        server,
+        unix_millis(),
+        KcpIo::with_meter(Arc::clone(conn), meter),
+        Edges::default(),
+    );
+    let Ok(accepted) = accepted else {
+        if server.show {
+            eprintln!("REALITY: the cover origin refused the splice");
+        }
+        return;
+    };
+    match accepted {
+        ferrox_core::tls::RealityAccept::Session(session) => {
+            finish_trojan_reality(session, None, Some(Arc::clone(conn)), key, freedom, None);
+        }
+        ferrox_core::tls::RealityAccept::Proxied(proxied) => relay_fallback(proxied),
+    }
 }
 
 fn kcp_dial_session(
@@ -9795,6 +9889,10 @@ fn dial_trojan_kcp(
     target: &Destination,
 ) {
     let header = trojan_header(&trojan.key, 1, target);
+    if let Some(cfg) = trojan.reality.as_deref() {
+        relay_kcp_under_reality(client, conn, cfg, &header);
+        return;
+    }
     if let Some(cfg) = trojan.tls.as_deref() {
         relay_kcp_under_tls(client, conn, cfg, &header, |_| true);
         return;
@@ -10191,6 +10289,13 @@ fn serve_trojan_xdrive(mut session: crate::xdrive::Conn, key: &[[u8; 56]], freed
         return;
     }
     crate::accesslog::record_current(&target);
+    if target.is_mux() {
+        let close = xdrive_close(&session);
+        return serve_trojan_mux(session.clone(), session, close, &[]);
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -10413,22 +10518,22 @@ fn hc_content_length(head: &str) -> Option<usize> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
     let key = inbound_trojan_keys(inbound);
     let account = inbound_account(inbound);
     let sec = stream_security(inbound);
-    // A REALITY inbound has no Trojan arm yet, and reading only `tls` here would serve it as plaintext.
-    if sec == "reality" {
-        eprintln!("trojan reality inbound on {address}: refused, not served as plaintext");
+    let carrier = inbound_carrier(inbound);
+    if sec == "reality" && matches!(&carrier, Carrier::Quic | Carrier::Hysteria(_)) {
+        eprintln!("trojan reality on {address}: not carried on that transport");
         return false;
     }
-    let carrier = inbound_carrier(inbound);
     if let Some(served) =
         serve_trojan_transport_inbound(address, inbound, Arc::clone(&key), &carrier, freedom)
     {
         return served;
     }
-    let fallbacks = if sec == "tls" {
+    let fallbacks = if sec == "tls" || sec == "reality" {
         match server_fallbacks(inbound) {
             Ok(fallbacks) => fallbacks.map(Arc::from),
             Err(error) => {
@@ -10444,7 +10549,21 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
             let email = account.email.clone();
             let level = account.level;
             let meter = crate::stats::inbound(inbound_tag(inbound).as_deref());
-            let serve: KcpServe = if sec == "tls" {
+            let serve: KcpServe = if sec == "reality" {
+                let Some(server) = inbound_reality_config(inbound) else {
+                    eprintln!("unreadable trojan reality settings on {address}: serves nothing");
+                    return false;
+                };
+                if let Err(error) = crate::config::reality_mldsa(inbound, true) {
+                    eprintln!("{error} on {address}: inbound refused");
+                    return false;
+                }
+                let server = Arc::new(server);
+                Arc::new(move |conn| {
+                    let _flow = crate::accesslog::flow(None, &email, level);
+                    serve_trojan_kcp_reality(conn, &key, freedom, &server, meter.clone());
+                })
+            } else if sec == "tls" {
                 let Some(server) = inbound_tls_identity(inbound) else {
                     eprintln!("unreadable trojan tls identity on {address}: refused, not served");
                     return false;
@@ -10470,6 +10589,33 @@ fn serve_trojan_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
                 serve_trojan_xdrive(session.with_meter(meter.clone()), &key, freedom);
             });
             serve_xdrive_loop(&settings, address, accept);
+            true
+        }
+        // A listener that declares reality answers the session its config names; unreadable settings are refused, never served as plaintext.
+        carrier if sec == "reality" => {
+            let Some(server) = inbound_reality_config(inbound) else {
+                eprintln!("unreadable trojan reality settings on {address}: serves nothing");
+                return false;
+            };
+            if let Err(error) = crate::config::reality_mldsa(inbound, true) {
+                eprintln!("{error} on {address}: inbound refused");
+                return false;
+            }
+            spawn_role(
+                address,
+                inbound_role(
+                    inbound,
+                    Role::TrojanReality {
+                        keys: key,
+                        carrier,
+                        freedom,
+                        server: Arc::new(server),
+                        fallbacks,
+                        account,
+                    },
+                ),
+                inbound_tag(inbound),
+            );
             true
         }
         // A listener that declares tls answers the session its config names; an identity it cannot load is refused, never served as plaintext.
@@ -10606,7 +10752,22 @@ fn serve_trojan_quic(mut stream: crate::quic::QuicStream, key: &[[u8; 56]], free
     };
     crate::accesslog::record_current(&target);
     match cmd {
-        1 => serve_trojan_quic_tcp(stream, &target),
+        1 => {
+            if target.is_mux() {
+                let close = stream.clone();
+                return serve_trojan_mux(
+                    stream.clone(),
+                    stream,
+                    Arc::new(move || close.close()),
+                    &[],
+                );
+            }
+            let Some(target) = target.socket() else {
+                stream.close();
+                return;
+            };
+            serve_trojan_quic_tcp(stream, &target);
+        }
         3 => {
             let close = stream.clone();
             serve_trojan_udp_halves(stream.clone(), stream, move || close.close());
@@ -10660,6 +10821,14 @@ fn serve_trojan_hysteria(mut io: crate::hysteria::Flow, key: &[[u8; 56]], freedo
     crate::accesslog::record_current(&target);
     match cmd {
         1 => {
+            if target.is_mux() {
+                let close = io.clone();
+                return serve_trojan_mux(io.clone(), io, Arc::new(move || close.close()), &[]);
+            }
+            let Some(target) = target.socket() else {
+                io.close();
+                return;
+            };
             let Some(uplink) = dial_or_report(&target) else {
                 io.close();
                 return;
@@ -11951,6 +12120,53 @@ struct TrojanUdpUplink {
     done: RelayEnd,
 }
 
+/// The outbound's direct UDP lane for a mux's skipped datagrams: one association, opened on the first.
+struct TrojanUdpLane<'a> {
+    trojan: &'a TrojanOut,
+    relay: &'a UdpSocket,
+    source: Arc<Mutex<Option<SocketAddr>>>,
+    uplink: Option<TrojanUdpUplink>,
+    head: Vec<u8>,
+}
+
+impl<'a> TrojanUdpLane<'a> {
+    fn new(trojan: &'a TrojanOut, relay: &'a UdpSocket) -> Self {
+        Self {
+            trojan,
+            relay,
+            source: Arc::new(Mutex::new(None)),
+            uplink: None,
+            head: Vec::with_capacity(32),
+        }
+    }
+
+    fn send(&mut self, src: SocketAddr, dest: SocketAddr, payload: &[u8]) -> bool {
+        if let Ok(mut slot) = self.source.lock() {
+            *slot = Some(src);
+        }
+        if self.uplink.is_none() {
+            self.uplink =
+                dial_trojan_udp_uplink(self.trojan, &dest, self.relay, Arc::clone(&self.source));
+        }
+        if let Some(up) = &mut self.uplink {
+            if !write_trojan_datagram(&mut *up.write, &dest, payload, &mut self.head) {
+                if let Some(old) = self.uplink.take() {
+                    (old.close)();
+                }
+                return false;
+            }
+        }
+        true
+    }
+
+    fn close(self) {
+        if let Some(old) = self.uplink {
+            (old.close)();
+            join(&old.done);
+        }
+    }
+}
+
 /// The reader, writer and teardown of an association carried inside one carrier session.
 type TrojanUdpParts = (Box<dyn Read + Send>, Box<dyn Write>, Box<dyn Fn() + Send>);
 
@@ -11994,6 +12210,7 @@ fn trojan_hysteria_dial(trojan: &TrojanOut) -> Option<crate::hysteria::Dial> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn dial_trojan_udp_uplink(
     trojan: &TrojanOut,
     dest: &SocketAddr,
@@ -12006,20 +12223,28 @@ fn dial_trojan_udp_uplink(
     let server = resolve_outbound(&trojan.address, trojan.port)?;
     let header = trojan_header(&trojan.key, 3, &Destination::from(*dest));
     let udp_send = relay.try_clone().ok()?;
+    let mask = trojan.carrier.tcp_mask();
     // The association rides whatever the outbound names: a terminated session splits into the reader and writer the pump needs, and the header goes inside it.
-    let (read, write, close): TrojanUdpParts = match (&trojan.carrier, trojan.tls.as_deref()) {
-        (Carrier::Raw(_), None) => {
-            let mut uplink = dial_or_report(&server)?.with_mask(trojan.carrier.tcp_mask());
-            uplink.write_all(&header).ok()?;
-            let read = uplink.try_clone().ok()?;
-            let write = uplink.try_clone().ok()?;
+    let (read, write, close): TrojanUdpParts = match (
+        &trojan.carrier,
+        trojan.reality.as_deref(),
+        trojan.tls.as_deref(),
+    ) {
+        (Carrier::Raw(_), Some(cfg), _) => {
+            let mut session = dial_reality_session(&server, cfg, mask)?;
+            if session.write_all(&header).is_err() {
+                return None;
+            }
+            let out = session.get_ref().get_ref().try_clone().ok()?;
+            let socket = out.try_clone().ok()?;
+            let (_driven, half) = session_halves(session, out);
             let close = move || {
-                let _ = uplink.shutdown(Shutdown::Both);
+                let _ = socket.shutdown(Shutdown::Both);
             };
-            (Box::new(read), Box::new(write), Box::new(close))
+            (Box::new(half.clone()), Box::new(half), Box::new(close))
         }
-        (Carrier::Raw(_), Some(cfg)) => {
-            let mut session = dial_tls_session(&server, cfg, trojan.carrier.tcp_mask())?;
+        (Carrier::Raw(_), None, Some(cfg)) => {
+            let mut session = dial_tls_session(&server, cfg, mask)?;
             if session.write_all(&header).is_err() {
                 return None;
             }
@@ -12032,16 +12257,17 @@ fn dial_trojan_udp_uplink(
             };
             (Box::new(half.clone()), Box::new(half), Box::new(close))
         }
-        (Carrier::Kcp(_), None) => {
+        (Carrier::Kcp(_), Some(cfg), _) => {
             let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
-            if conn.write(&header).is_err() {
+            let mut session = kcp_reality_connect(&conn, cfg)?;
+            if session.write_all(&header).is_err() {
                 return None;
             }
-            let (read, write, closed) = kcp_parts(&conn);
-            let close = move || closed();
+            let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
+            let close = move || conn.close();
             (Box::new(read), Box::new(write), Box::new(close))
         }
-        (Carrier::Kcp(_), Some(cfg)) => {
+        (Carrier::Kcp(_), None, Some(cfg)) => {
             let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
             let mut session = ferrox_core::tls::connect(cfg, KcpIo::new(Arc::clone(&conn))).ok()?;
             if !shake_tls(&mut session) || session.write_all(&header).is_err() {
@@ -12051,13 +12277,48 @@ fn dial_trojan_udp_uplink(
             let close = move || conn.close();
             (Box::new(read), Box::new(write), Box::new(close))
         }
-        (carrier, None) => {
-            let uplink = dial_or_report(&server)?.with_mask(trojan.carrier.tcp_mask());
-            trojan_udp_plain(uplink, carrier, trojan, &header)?
+        (Carrier::Raw(_), None, None) => {
+            let mut uplink = dial_or_report(&server)?.with_mask(mask);
+            uplink.write_all(&header).ok()?;
+            let read = uplink.try_clone().ok()?;
+            let write = uplink.try_clone().ok()?;
+            let close = move || {
+                let _ = uplink.shutdown(Shutdown::Both);
+            };
+            (Box::new(read), Box::new(write), Box::new(close))
         }
-        (carrier, Some(cfg)) => {
-            let session = dial_tls_session(&server, cfg, trojan.carrier.tcp_mask())?;
-            trojan_udp_tls(&server, session, cfg, carrier, trojan, &header)?
+        (Carrier::Kcp(_), None, None) => {
+            let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
+            if conn.write(&header).is_err() {
+                return None;
+            }
+            let (read, write, closed) = kcp_parts(&conn);
+            let close = move || closed();
+            (Box::new(read), Box::new(write), Box::new(close))
+        }
+        (carrier, Some(cfg), _) => {
+            let session = dial_reality_session(&server, cfg, mask)?;
+            trojan_udp_session(
+                session,
+                || dial_reality_session(&server, cfg, mask),
+                carrier,
+                trojan,
+                &header,
+            )?
+        }
+        (carrier, None, Some(cfg)) => {
+            let session = dial_tls_session(&server, cfg, mask)?;
+            trojan_udp_session(
+                session,
+                || dial_tls_session(&server, cfg, mask),
+                carrier,
+                trojan,
+                &header,
+            )?
+        }
+        (carrier, None, None) => {
+            let uplink = dial_or_report(&server)?.with_mask(mask);
+            trojan_udp_plain(uplink, carrier, trojan, &header)?
         }
     };
     let done = spawn_trojan_uplink_reader(read, udp_send, source);
@@ -12168,10 +12429,9 @@ fn trojan_udp_plain(
     }
 }
 
-fn trojan_udp_tls<S: Dialed>(
-    server: &SocketAddr,
+fn trojan_udp_session<S: Dialed>(
     session: S,
-    cfg: &ferrox_core::tls::TlsConfig,
+    second: impl FnOnce() -> Option<S>,
     carrier: &Carrier,
     trojan: &TrojanOut,
     header: &[u8],
@@ -12243,8 +12503,7 @@ fn trojan_udp_tls<S: Dialed>(
                 return Some((Box::new(reader), Box::new(writer), Box::new(close)));
             }
             // The GET downlink dials its own session: one transport per direction, both under one session id (`dialer.go:411`).
-            let (down, down_write, down_raw) =
-                dial_tls_session(server, cfg, carrier.tcp_mask())?.into_halves()?;
+            let (down, down_write, down_raw) = second()?.into_halves()?;
             let (reader, writer) =
                 crate::xhttp::connect_dual_split(down, down_write, up, host, settings)?;
             if !writer.send(header) {
@@ -12510,6 +12769,274 @@ fn open_ss_mux(ss: &ShadowsocksOut) -> Option<MuxUplink> {
         write: Box::new(crate::shadowsocks::SsMuxWriter::new(write, send)),
         close,
     })
+}
+
+fn open_trojan_mux(trojan: &TrojanOut) -> Option<MuxUplink> {
+    if matches!(trojan.carrier, Carrier::Kcp(_)) {
+        return trojan_mux_kcp(trojan);
+    }
+    if !matches!(
+        trojan.carrier,
+        Carrier::Raw(_)
+            | Carrier::Ws { .. }
+            | Carrier::HttpUpgrade { .. }
+            | Carrier::Grpc(_)
+            | Carrier::Xhttp { .. }
+            | Carrier::HttpHeader { .. }
+    ) {
+        return trojan_mux_unserved();
+    }
+    let server = resolve_outbound(&trojan.address, trojan.port)?;
+    let mask = trojan.carrier.tcp_mask();
+    if let Some(cfg) = trojan.reality.as_deref() {
+        let session = dial_reality_session(&server, cfg, mask)?;
+        return trojan_mux_session(&server, trojan, session, || {
+            dial_reality_session(&server, cfg, mask)
+        });
+    }
+    if let Some(cfg) = trojan.tls.as_deref() {
+        let session = dial_tls_session(&server, cfg, mask)?;
+        return trojan_mux_session(&server, trojan, session, || {
+            dial_tls_session(&server, cfg, mask)
+        });
+    }
+    trojan_mux_plain(&server, trojan)
+}
+
+fn trojan_mux_target() -> Destination {
+    Destination::Name("v1.mux.cool".to_owned(), TROJAN_MUX_PORT)
+}
+
+fn trojan_mux_plain(server: &SocketAddr, trojan: &TrojanOut) -> Option<MuxUplink> {
+    let header = trojan_header(&trojan.key, 1, &trojan_mux_target());
+    let uplink = dial_or_report(server)?.with_mask(trojan.carrier.tcp_mask());
+    match &trojan.carrier {
+        Carrier::Raw(_) => {
+            let read = uplink.try_clone().ok()?;
+            let mut write = uplink.try_clone().ok()?;
+            write.write_all(&header).ok()?;
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(write),
+                close: connection_closer(&uplink),
+            })
+        }
+        Carrier::Ws { path, ed } => {
+            let (read, writer) = crate::ws::connect(
+                uplink,
+                &trojan.host,
+                path,
+                *ed,
+                &header,
+                &trojan.headers,
+                trojan.heartbeat,
+            )?;
+            let closer = writer.clone();
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(writer),
+                close: Arc::new(move || closer.close()),
+            })
+        }
+        Carrier::HttpUpgrade { path, ed, .. } => {
+            let close = connection_closer(&uplink);
+            let (read, writer) = crate::httpupgrade::connect(
+                uplink,
+                &trojan.host,
+                path,
+                *ed,
+                &header,
+                &trojan.headers,
+            )?;
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(writer),
+                close,
+            })
+        }
+        Carrier::Grpc(settings) => {
+            let (read, writer) = crate::grpc::connect_with(uplink, &trojan.host, settings)?;
+            if !writer.send(&header) {
+                return None;
+            }
+            let closer = writer.clone();
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(writer),
+                close: Arc::new(move || closer.close()),
+            })
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let (read, writer) = xhttp_pair(uplink, &trojan.host, settings)?;
+            if !writer.send(&header) {
+                return None;
+            }
+            let closer = writer.clone();
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(writer),
+                close: Arc::new(move || closer.finish()),
+            })
+        }
+        Carrier::HttpHeader { path } => {
+            let close = connection_closer(&uplink);
+            let (read, mut writer) =
+                crate::httpheader::connect(uplink, &trojan.host, path, &trojan.headers)?;
+            writer.write_all(&header).ok()?;
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(writer),
+                close,
+            })
+        }
+        _ => trojan_mux_unserved(),
+    }
+}
+
+fn trojan_mux_session<S, D>(
+    server: &SocketAddr,
+    trojan: &TrojanOut,
+    session: S,
+    second: impl FnOnce() -> Option<D>,
+) -> Option<MuxUplink>
+where
+    S: Dialed,
+    D: Dialed,
+{
+    let header = trojan_header(&trojan.key, 1, &trojan_mux_target());
+    match &trojan.carrier {
+        Carrier::Raw(_) => {
+            let mut session = session;
+            session.write_all(&header).ok()?;
+            let (read, write, raw) = session.into_halves()?;
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(write),
+                close: connection_closer(&raw),
+            })
+        }
+        Carrier::Ws { path, ed } => {
+            let (read, writer) = tls_ws(
+                server,
+                session,
+                &trojan.host,
+                path,
+                *ed,
+                &header,
+                &trojan.headers,
+                trojan.heartbeat,
+            )?;
+            let closer = writer.clone();
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(writer),
+                close: Arc::new(move || closer.close()),
+            })
+        }
+        Carrier::HttpUpgrade { path, ed, .. } => {
+            let (read, writer) = tls_httpupgrade(
+                server,
+                session,
+                &trojan.host,
+                path,
+                *ed,
+                &header,
+                &trojan.headers,
+            )?;
+            let close = connection_closer(&writer.raw);
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(writer),
+                close,
+            })
+        }
+        Carrier::Grpc(settings) => {
+            let (read, writer) = tls_grpc(server, session, &trojan.host, settings)?;
+            if !writer.send(&header) {
+                return None;
+            }
+            let closer = writer.clone();
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(writer),
+                close: Arc::new(move || closer.close()),
+            })
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let (read, writer) = tls_xhttp(server, session, second, &trojan.host, settings)?;
+            if !writer.send(&header) {
+                return None;
+            }
+            let closer = writer.clone();
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(writer),
+                close: Arc::new(move || closer.finish()),
+            })
+        }
+        Carrier::HttpHeader { path } => {
+            let (read, mut writer) =
+                tls_httpheader(server, session, &trojan.host, path, &trojan.headers)?;
+            writer.write_all(&header).ok()?;
+            let close = connection_closer(&writer.raw);
+            Some(MuxUplink {
+                read: Box::new(read),
+                write: Box::new(writer),
+                close,
+            })
+        }
+        _ => trojan_mux_unserved(),
+    }
+}
+
+fn trojan_mux_kcp(trojan: &TrojanOut) -> Option<MuxUplink> {
+    let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
+    let header = trojan_header(&trojan.key, 1, &trojan_mux_target());
+    if let Some(cfg) = trojan.reality.as_deref() {
+        let mut session = kcp_reality_connect(&conn, cfg)?;
+        session.write_all(&header).ok()?;
+        let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
+        return Some(MuxUplink {
+            read: Box::new(read),
+            write: Box::new(write),
+            close: kcp_close(&conn),
+        });
+    }
+    if let Some(cfg) = trojan.tls.as_deref() {
+        let mut session = kcp_tls_connect(&conn, cfg)?;
+        session.write_all(&header).ok()?;
+        let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
+        return Some(MuxUplink {
+            read: Box::new(read),
+            write: Box::new(write),
+            close: kcp_close(&conn),
+        });
+    }
+    if conn.write(&header).is_err() {
+        return None;
+    }
+    let (read, write, close) = kcp_parts(&conn);
+    Some(MuxUplink {
+        read: Box::new(read),
+        write: Box::new(write),
+        close,
+    })
+}
+
+fn trojan_mux_unserved() -> Option<MuxUplink> {
+    static SAID: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    if SAID.set(()).is_ok() {
+        eprintln!("trojan: this carrier does not pair with mux; dialing directly");
+    }
+    None
+}
+
+fn dial_trojan_mux(client: &Connection, trojan: &TrojanOut, target: &Destination) -> bool {
+    let Some(mux) = open_trojan_mux(trojan) else {
+        return false;
+    };
+    dial_mux_stream(client, mux, target);
+    true
 }
 
 fn open_vless_mux_quic(vless: &VlessOut) -> Option<MuxUplink> {
@@ -13026,6 +13553,10 @@ fn dial_trojan(
     ladder: &Ladder,
 ) {
     let header = trojan_header(&trojan.key, 1, target);
+    if trojan.reality.is_some() {
+        dial_trojan_reality(client, server, trojan, &header);
+        return;
+    }
     if trojan.tls.is_some() {
         dial_trojan_tls(client, server, trojan, &header);
         return;
@@ -13787,6 +14318,14 @@ impl Drivable
 {
     fn transport(&self) -> Option<Connection> {
         self.get_ref().get_ref().try_clone().ok()
+    }
+}
+
+impl Drivable
+    for ferrox_core::tls::RealityClientSession<ferrox_core::tls::reality::RecordLimiter<KcpIo>>
+{
+    fn transport(&self) -> Option<Connection> {
+        None
     }
 }
 
@@ -14874,12 +15413,11 @@ fn dial_vless_reality(
     }
 }
 
-#[allow(clippy::too_many_lines)]
 fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut, header: &[u8]) {
     let Some(cfg) = trojan.tls.as_deref() else {
         return;
     };
-    let Some(mut session) = dial_tls_session(server, cfg, trojan.carrier.tcp_mask()) else {
+    let Some(session) = dial_tls_session(server, cfg, trojan.carrier.tcp_mask()) else {
         return;
     };
     // The session is this relay's one shared half: its read holds the lock the other direction's write wants, so it starts on the shared grain and the adaptive grain lengthens it once the flow is quiet.
@@ -14890,6 +15428,40 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
     {
         return;
     }
+    dial_trojan_session(client, server, trojan, header, session, || {
+        dial_tls_session(server, cfg, trojan.carrier.tcp_mask())
+    });
+}
+
+fn dial_trojan_reality(
+    client: &Connection,
+    server: &SocketAddr,
+    trojan: &TrojanOut,
+    header: &[u8],
+) {
+    let Some(cfg) = trojan.reality.as_deref() else {
+        return;
+    };
+    let Some(session) = dial_reality_session(server, cfg, trojan.carrier.tcp_mask()) else {
+        return;
+    };
+    dial_trojan_session(client, server, trojan, header, session, || {
+        dial_reality_session(server, cfg, trojan.carrier.tcp_mask())
+    });
+}
+
+#[allow(clippy::too_many_lines)]
+fn dial_trojan_session<S, D>(
+    client: &Connection,
+    server: &SocketAddr,
+    trojan: &TrojanOut,
+    header: &[u8],
+    mut session: S,
+    second: impl FnOnce() -> Option<D>,
+) where
+    S: Dialed + Drivable + CipherOpen + 'static,
+    D: Dialed,
+{
     match &trojan.carrier {
         Carrier::Raw(_) => {
             let Ok(downstream) = client.try_clone() else {
@@ -14952,13 +15524,8 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
             );
         }
         Carrier::Xhttp { settings, .. } => {
-            let Some((reader, writer)) = tls_xhttp(
-                server,
-                session,
-                || dial_tls_session(server, cfg, trojan.carrier.tcp_mask()),
-                &trojan.host,
-                settings,
-            ) else {
+            let Some((reader, writer)) = tls_xhttp(server, session, second, &trojan.host, settings)
+            else {
                 return;
             };
             if !writer.send(header) {
@@ -15808,6 +16375,25 @@ fn serve_trojan_raw(mut stream: Connection, key: &[[u8; 56]], freedom: bool) {
     if cmd != 1 {
         return;
     }
+    if target.is_mux() {
+        let Ok(read) = stream.try_clone() else {
+            return;
+        };
+        let Ok(close) = stream.try_clone() else {
+            return;
+        };
+        return serve_trojan_mux(
+            read,
+            stream,
+            Arc::new(move || {
+                let _ = close.shutdown(Shutdown::Both);
+            }),
+            &[],
+        );
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -15952,6 +16538,13 @@ fn serve_trojan_ws(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bo
     if cmd != 1 {
         return;
     }
+    if target.is_mux() {
+        let closer = writer.clone();
+        return serve_trojan_mux(reader, writer, Arc::new(move || closer.close()), &[]);
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -15987,6 +16580,22 @@ fn serve_trojan_httpupgrade(
     if cmd != 1 {
         return;
     }
+    if target.is_mux() {
+        let close = write.try_clone().ok();
+        return serve_trojan_mux(
+            reader,
+            write,
+            Arc::new(move || {
+                if let Some(stream) = close.as_ref() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+            }),
+            &[],
+        );
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -16018,6 +16627,13 @@ fn serve_trojan_grpc(
     if cmd != 1 {
         return;
     }
+    if target.is_mux() {
+        let closer = writer.clone();
+        return serve_trojan_mux(reader, writer, Arc::new(move || closer.close()), &[]);
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -16049,6 +16665,13 @@ fn serve_trojan_xhttp(stream: Connection, key: &[[u8; 56]], path: &str, freedom:
     if cmd != 1 {
         return;
     }
+    if target.is_mux() {
+        let closer = writer.clone();
+        return serve_trojan_mux(reader, writer, Arc::new(move || closer.finish()), &[]);
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -16078,6 +16701,22 @@ fn serve_trojan_httpheader(stream: Connection, key: &[[u8; 56]], path: &str, fre
     if cmd != 1 {
         return;
     }
+    if target.is_mux() {
+        let close = write.try_clone().ok();
+        return serve_trojan_mux(
+            reader,
+            write,
+            Arc::new(move || {
+                if let Some(stream) = close.as_ref() {
+                    let _ = stream.shutdown(Shutdown::Both);
+                }
+            }),
+            &[],
+        );
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         return;
     };
@@ -16153,6 +16792,130 @@ fn serve_trojan_tls(
         }
         refused_carriers!() => {}
     }
+}
+
+fn serve_trojan_reality(
+    stream: Connection,
+    key: &[[u8; 56]],
+    carrier: &Carrier,
+    freedom: bool,
+    server: &ferrox_core::tls::RealityServerConfig,
+    fallbacks: Option<&[Fallback]>,
+) {
+    if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
+        return;
+    }
+    match carrier {
+        Carrier::Raw(_) => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let edges = reality_edges(server, &stream);
+            let accepted =
+                ferrox_core::tls::RealityServer::accept(server, unix_millis(), stream, edges);
+            answer_trojan_reality(accepted, Some(raw), key, freedom, server, fallbacks);
+        }
+        Carrier::Ws { path, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                serve_session_trojan_ws(reader, writer, path, key, freedom);
+            });
+        }
+        Carrier::Xhttp { settings, .. } => {
+            let Ok(out) = stream.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                serve_session_trojan_xhttp(reader, writer, settings, key, freedom);
+            });
+        }
+        Carrier::HttpUpgrade { path, host, .. } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                serve_session_trojan_httpupgrade(reader, writer, raw, path, host, key, freedom);
+            });
+        }
+        Carrier::HttpHeader { path } => {
+            let Ok(raw) = stream.try_clone() else { return };
+            let Ok(out) = stream.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                serve_session_trojan_httpheader(reader, writer, raw, path, key, freedom);
+            });
+        }
+        Carrier::Grpc(settings) => {
+            let Ok(out) = stream.try_clone() else { return };
+            serve_carrier_reality(stream, server, |mut session| {
+                if !shake_tls(&mut session) {
+                    return;
+                }
+                let (reader, writer) = session_halves(session, out);
+                serve_session_trojan_grpc(reader, writer, settings, key, freedom);
+            });
+        }
+        refused_carriers!() => {}
+    }
+}
+
+fn answer_trojan_reality(
+    accepted: Result<ferrox_core::tls::RealityAccept<Connection>, ferrox_core::tls::TlsError>,
+    raw: Option<Connection>,
+    key: &[[u8; 56]],
+    freedom: bool,
+    server: &ferrox_core::tls::RealityServerConfig,
+    fallbacks: Option<&[Fallback]>,
+) {
+    let accepted = match accepted {
+        Ok(accepted) => accepted,
+        Err(why) => {
+            if server.show {
+                eprintln!("REALITY: {why}");
+            }
+            return;
+        }
+    };
+    match accepted {
+        ferrox_core::tls::RealityAccept::Session(session) => {
+            finish_trojan_reality(session, raw, None, key, freedom, fallbacks);
+        }
+        ferrox_core::tls::RealityAccept::Proxied(proxied) => relay_fallback(proxied),
+    }
+}
+
+fn finish_trojan_reality<S>(
+    mut session: S,
+    raw: Option<Connection>,
+    kcp: Option<Arc<ferrox_core::kcp::Connection>>,
+    key: &[[u8; 56]],
+    freedom: bool,
+    fallbacks: Option<&[Fallback]>,
+) where
+    S: std::io::Read
+        + std::io::Write
+        + Send
+        + ferrox_core::tls::RecordAlignment
+        + ferrox_core::tls::TlsProvider
+        + Drivable
+        + CipherOpen
+        + 'static,
+{
+    if !shake_tls(&mut session) {
+        return;
+    }
+    let front = FrontNames::of(&session);
+    relay_trojan_with_fallbacks(session, raw, kcp, key, freedom, fallbacks, &front);
 }
 
 /// The served trojan session: the request is read under the handshake clock, then the relay drives the session's transport, so a read parked in the socket holds no lock its writer asks for.
@@ -16261,7 +17024,7 @@ fn relay_trojan_request<S>(
     session: S,
     raw: Option<Connection>,
     kcp: Option<Arc<ferrox_core::kcp::Connection>>,
-    (cmd, target): (u8, SocketAddr),
+    (cmd, target): (u8, TrojanTarget),
     freedom: bool,
     carried: &[u8],
     meter: crate::stats::Meter,
@@ -16279,6 +17042,30 @@ fn relay_trojan_request<S>(
         return;
     }
     crate::accesslog::record_current(&target);
+    if target.is_mux() {
+        let close: Arc<dyn Fn() + Send + Sync> = match &kcp {
+            Some(kcp) => {
+                let kcp = Arc::clone(kcp);
+                Arc::new(move || kcp.close())
+            }
+            None => raw
+                .as_ref()
+                .map_or_else(|| Arc::new(|| {}), connection_closer),
+        };
+        if let Some(raw) = raw {
+            let (reader, writer) = session_halves(session, raw);
+            return serve_trojan_mux(reader, writer, close, carried);
+        }
+        if let Some(kcp) = kcp {
+            let (reader, writer) =
+                session_halves(session, KcpIo::with_meter(Arc::clone(&kcp), meter));
+            return serve_trojan_mux(reader, writer, close, carried);
+        }
+        return;
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
     if cmd == 3 {
         if let Some(raw) = raw {
             let Ok(close) = raw.try_clone() else {
@@ -16378,6 +17165,13 @@ fn serve_session_trojan_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
         echo_trace("session ws trojan cmd refused");
         return;
     }
+    if target.is_mux() {
+        let closer = cwriter.clone();
+        return serve_trojan_mux(creader, cwriter, Arc::new(move || closer.close()), &[]);
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         echo_trace("session ws uplink refused");
         return;
@@ -16420,6 +17214,14 @@ fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + '
         cwriter.finish();
         return;
     }
+    if target.is_mux() {
+        let closer = cwriter.clone();
+        return serve_trojan_mux(creader, cwriter, Arc::new(move || closer.finish()), &[]);
+    }
+    let Some(target) = target.socket() else {
+        cwriter.finish();
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         echo_trace("session xhttp uplink refused");
         cwriter.finish();
@@ -16474,6 +17276,21 @@ fn serve_session_trojan_httpupgrade<R: Read + Send + 'static, W: Write + Clone +
         crate::httpupgrade::quiet(&raw);
         return;
     }
+    if target.is_mux() {
+        let raw = Arc::clone(&raw);
+        return serve_trojan_mux(
+            creader,
+            cwriter,
+            Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            }),
+            &[],
+        );
+    }
+    let Some(target) = target.socket() else {
+        crate::httpupgrade::quiet(&raw);
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         echo_trace("session httpupgrade uplink refused");
         crate::httpupgrade::quiet(&raw);
@@ -16528,6 +17345,20 @@ fn serve_session_trojan_httpheader<R: Read + Send + 'static, W: Write + Clone + 
         echo_trace("session httpheader trojan cmd refused");
         return;
     }
+    if target.is_mux() {
+        let raw = Arc::new(raw);
+        return serve_trojan_mux(
+            creader,
+            cwriter,
+            Arc::new(move || {
+                let _ = raw.shutdown(Shutdown::Both);
+            }),
+            &[],
+        );
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         echo_trace("session httpheader uplink refused");
         return;
@@ -16571,6 +17402,13 @@ fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
         echo_trace("session grpc trojan cmd refused");
         return;
     }
+    if target.is_mux() {
+        let closer = cwriter.clone();
+        return serve_trojan_mux(creader, cwriter, Arc::new(move || closer.close()), &[]);
+    }
+    let Some(target) = target.socket() else {
+        return;
+    };
     let Some(uplink) = dial_or_report(&target) else {
         echo_trace("session grpc uplink refused");
         return;
@@ -17177,7 +18015,11 @@ fn dial_socks_outbound(
             }
         }
         Outbound::Vmess(vmess) => dial_vmess(client, server, vmess, target, ladder),
-        Outbound::Trojan(trojan) => dial_trojan(client, server, trojan, target, ladder),
+        Outbound::Trojan(trojan) => {
+            if !trojan.mux.tcp || !dial_trojan_mux(client, trojan, target) {
+                dial_trojan(client, server, trojan, target, ladder);
+            }
+        }
         Outbound::Shadowsocks(shadowsocks) => {
             if !shadowsocks.mux.tcp || !dial_ss_mux(client, shadowsocks, target) {
                 dial_shadowsocks(client, server, shadowsocks, target, ladder);
@@ -20365,6 +21207,19 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
     let Some(mux) = open_vless_mux(vless) else {
         return;
     };
+    serve_socks_udp_mux(
+        relay,
+        mux,
+        |dest| vless_udp_target_allowed(vless, dest),
+        |_, _, _| true,
+    );
+}
+
+fn serve_socks_udp_mux<F, G>(relay: &UdpSocket, mux: MuxUplink, allowed: F, mut skip: G)
+where
+    F: Fn(&SocketAddr) -> bool,
+    G: FnMut(SocketAddr, SocketAddr, &[u8]) -> bool,
+{
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let Some(done) = spawn_xudp_reader(mux.read, relay, Arc::clone(&source)) else {
         (mux.close)();
@@ -20379,7 +21234,13 @@ fn serve_socks_udp_vless_xudp(relay: &UdpSocket, vless: &VlessOut) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
             continue;
         };
-        if payload.is_empty() || !vless_udp_target_allowed(vless, &dest) {
+        if payload.is_empty() {
+            continue;
+        }
+        if !allowed(&dest) {
+            if !skip(src, dest, payload) {
+                break;
+            }
             continue;
         }
         // The reply reader only needs the slot once: an association that keeps its socket writes it once.
@@ -20526,6 +21387,29 @@ fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
 }
 
 fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
+    if trojan.mux.udp {
+        if let Some(mux) = open_trojan_mux(trojan) {
+            let mut lane: Option<TrojanUdpLane> = None;
+            serve_socks_udp_mux(
+                relay,
+                mux,
+                |dest| matches!(ss_mux_443(trojan.mux.udp443, *dest), Udp443::Allow),
+                |src, dest, payload| {
+                    if matches!(ss_mux_443(trojan.mux.udp443, dest), Udp443::Skip) {
+                        return lane
+                            .get_or_insert_with(|| TrojanUdpLane::new(trojan, relay))
+                            .send(src, dest, payload);
+                    }
+                    true
+                },
+            );
+            if let Some(lane) = lane {
+                lane.close();
+            }
+            return;
+        }
+    }
+    let policy = trojan.mux.udp.then_some(trojan.mux.udp443);
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let mut uplink: Option<TrojanUdpUplink> = None;
     let mut buf = udp_buffer();
@@ -20535,6 +21419,9 @@ fn serve_socks_udp_trojan(relay: &UdpSocket, trojan: &TrojanOut) {
             continue;
         };
         if payload.is_empty() {
+            continue;
+        }
+        if policy.is_some_and(|policy| matches!(ss_mux_443(policy, dest), Udp443::Reject)) {
             continue;
         }
         if let Ok(mut slot) = source.lock() {
@@ -24238,8 +25125,78 @@ fn trojan_take(
     true
 }
 
+/// Reads a decimal IPv4 literal exactly as `Ipv4Addr::from_str` does, without validating UTF-8 first.
+fn trojan_ipv4(bytes: &[u8]) -> Option<std::net::Ipv4Addr> {
+    let digit = |byte: u8| match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        _ => None,
+    };
+    let mut octets = [0u8; 4];
+    let mut at = 0usize;
+    for (index, octet) in octets.iter_mut().enumerate() {
+        if index > 0 {
+            if bytes.get(at) != Some(&b'.') {
+                return None;
+            }
+            at += 1;
+        }
+        let first = digit(*bytes.get(at)?)?;
+        at += 1;
+        if first == 0 && bytes.get(at).and_then(|byte| digit(*byte)).is_some() {
+            return None;
+        }
+        let mut value = u16::from(first);
+        let mut digits = 1;
+        while digits < 3 {
+            let Some(next) = bytes.get(at).and_then(|byte| digit(*byte)) else {
+                break;
+            };
+            value = value * 10 + u16::from(next);
+            at += 1;
+            digits += 1;
+        }
+        if value > 255 {
+            return None;
+        }
+        *octet = value as u8;
+    }
+    (at == bytes.len()).then_some(octets.into())
+}
+
+/// The reference's mux rendezvous: a trojan request naming it opens a session whose frames carry every flow.
+const TROJAN_MUX_HOST: &[u8] = b"v1.mux.cool";
+const TROJAN_MUX_PORT: u16 = 9527;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrojanTarget {
+    Mux,
+    Address(SocketAddr),
+}
+
+impl TrojanTarget {
+    fn is_mux(&self) -> bool {
+        matches!(self, Self::Mux)
+    }
+
+    fn socket(&self) -> Option<SocketAddr> {
+        match self {
+            Self::Mux => None,
+            Self::Address(address) => Some(*address),
+        }
+    }
+}
+
+impl std::fmt::Display for TrojanTarget {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Mux => write!(f, "v1.mux.cool:{TROJAN_MUX_PORT}"),
+            Self::Address(address) => address.fmt(f),
+        }
+    }
+}
+
 /// The whole header in one read, parsed in place: 2-3 reads where the field-at-a-time parse spent 7-8.
-fn decode_trojan_request(stream: &mut dyn Read, key: &[[u8; 56]]) -> Option<(u8, SocketAddr)> {
+fn decode_trojan_request(stream: &mut dyn Read, key: &[[u8; 56]]) -> Option<(u8, TrojanTarget)> {
     let mut head = [0u8; TROJAN_HEAD_MAX];
     let mut filled = 0usize;
     if !trojan_take(stream, &mut head, &mut filled, 60)
@@ -24258,7 +25215,10 @@ fn decode_trojan_request(stream: &mut dyn Read, key: &[[u8; 56]]) -> Option<(u8,
             let mut ip = [0u8; 4];
             ip.copy_from_slice(&head[60..64]);
             let port = u16::from_be_bytes([head[64], head[65]]);
-            (SocketAddr::new(std::net::IpAddr::V4(ip.into()), port), 66)
+            (
+                TrojanTarget::Address(SocketAddr::new(std::net::IpAddr::V4(ip.into()), port)),
+                66,
+            )
         }
         4 => {
             if !trojan_take(stream, &mut head, &mut filled, 80) {
@@ -24267,7 +25227,10 @@ fn decode_trojan_request(stream: &mut dyn Read, key: &[[u8; 56]]) -> Option<(u8,
             let mut ip = [0u8; 16];
             ip.copy_from_slice(&head[60..76]);
             let port = u16::from_be_bytes([head[76], head[77]]);
-            (SocketAddr::new(std::net::IpAddr::V6(ip.into()), port), 78)
+            (
+                TrojanTarget::Address(SocketAddr::new(std::net::IpAddr::V6(ip.into()), port)),
+                78,
+            )
         }
         3 => {
             if !trojan_take(stream, &mut head, &mut filled, 61) {
@@ -24277,9 +25240,17 @@ fn decode_trojan_request(stream: &mut dyn Read, key: &[[u8; 56]]) -> Option<(u8,
             if !trojan_take(stream, &mut head, &mut filled, name_end + 4) {
                 return None;
             }
-            let host = std::str::from_utf8(&head[61..name_end]).ok()?;
+            let host = &head[61..name_end];
             let port = u16::from_be_bytes([head[name_end], head[name_end + 1]]);
-            (resolve_endpoint(host, port)?, name_end + 2)
+            if host == TROJAN_MUX_HOST {
+                (TrojanTarget::Mux, name_end + 2)
+            } else {
+                let target = match trojan_ipv4(host) {
+                    Some(ip) => SocketAddr::new(IpAddr::V4(ip), port),
+                    None => resolve_endpoint(std::str::from_utf8(host).ok()?, port)?,
+                };
+                (TrojanTarget::Address(target), name_end + 2)
+            }
         }
         _ => return None,
     };
@@ -26133,6 +27104,8 @@ fn loopback_dial(
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
+                mux: Mux::default(),
+                reality: None,
             }))
         }
         "vmess" if matches!(stream_security(inbound), "" | "none") => {
@@ -26764,6 +27737,34 @@ pub(crate) fn mint_foxy_pass(config: &str, out: &str) -> ! {
     std::process::exit(0);
 }
 
+/// The mux session an outbound's `mux` object enables: xray's negative pool size turns the manager off.
+fn outbound_mux(outbound: &Json) -> Mux {
+    let mux = outbound.get("mux");
+    let enabled = mux.and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true));
+    let concurrency = mux
+        .and_then(|mux| mux.get("concurrency"))
+        .and_then(Json::as_i64)
+        .unwrap_or(0);
+    let xudp = mux
+        .and_then(|mux| mux.get("xudpConcurrency"))
+        .and_then(Json::as_i64)
+        .unwrap_or(0);
+    let udp443 = match mux
+        .and_then(|mux| mux.get("xudpProxyUDP443"))
+        .and_then(Json::as_str)
+    {
+        Some("skip") => Udp443::Skip,
+        Some("allow") => Udp443::Allow,
+        _ => Udp443::Reject,
+    };
+    Mux {
+        tcp: enabled && concurrency >= 0,
+        udp: enabled && (xudp > 0 || (xudp == 0 && concurrency >= 0)),
+        udp443,
+    }
+}
+
+#[allow(clippy::too_many_lines)]
 fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
     let empty = Vec::new();
     let outbounds = root
@@ -26785,6 +27786,7 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
         let password = server.get("password").and_then(Json::as_str)?;
         let key = trojan_key(password);
         let security = stream_security(outbound);
+        let mux = outbound_mux(outbound);
         let quic_tls = outbound
             .get("streamSettings")
             .and_then(|s| s.get("network"))
@@ -26792,6 +27794,41 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
             == Some("quic")
             && security == "tls";
         let hysteria_tls = hysteria_transport(outbound) && security == "tls";
+        if security == "reality" {
+            let (carrier, host) = outbound_carrier(outbound, &address);
+            if !matches!(
+                carrier,
+                Carrier::Raw(_)
+                    | Carrier::Ws { .. }
+                    | Carrier::HttpUpgrade { .. }
+                    | Carrier::Grpc(_)
+                    | Carrier::Xhttp { .. }
+                    | Carrier::HttpHeader { .. }
+                    | Carrier::Kcp(_)
+            ) {
+                return None;
+            }
+            let reality = outbound_reality(outbound, &address)?;
+            if let Err(error) = crate::config::reality_mldsa(outbound, false) {
+                eprintln!("trojan: {error}; outbound refused");
+                return None;
+            }
+            return Some(TrojanOut {
+                address,
+                port,
+                key,
+                carrier,
+                host,
+                tls: None,
+                headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
+                heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                mux,
+                reality: Some(reality),
+            });
+        }
         if security == "tls" && !quic_tls && !hysteria_tls {
             if let Some((carrier, host, tls)) = tls_carried_parts(outbound, &address) {
                 return Some(TrojanOut {
@@ -26806,6 +27843,8 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
                     quic_roots: None,
                     quic_ech: None,
                     hysteria_roots: None,
+                    mux,
+                    reality: None,
                 });
             }
         }
@@ -26844,6 +27883,8 @@ fn find_trojan_outbound(root: &Json) -> Option<TrojanOut> {
             quic_roots,
             quic_ech,
             hysteria_roots,
+            mux,
+            reality: None,
         });
     }
     None
@@ -27042,25 +28083,6 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
             }
             _ => continue,
         };
-        // A negative pool size turns that manager off: tcp and udp each read xray's own rule.
-        let mux = outbound.get("mux");
-        let enabled = mux.and_then(|mux| mux.get("enabled")) == Some(&Json::Bool(true));
-        let concurrency = mux
-            .and_then(|mux| mux.get("concurrency"))
-            .and_then(Json::as_i64)
-            .unwrap_or(0);
-        let xudp = mux
-            .and_then(|mux| mux.get("xudpConcurrency"))
-            .and_then(Json::as_i64)
-            .unwrap_or(0);
-        let udp443 = match mux
-            .and_then(|mux| mux.get("xudpProxyUDP443"))
-            .and_then(Json::as_str)
-        {
-            Some("skip") => Udp443::Skip,
-            Some("allow") => Udp443::Allow,
-            _ => Udp443::Reject,
-        };
         return Some(ShadowsocksOut {
             address,
             port,
@@ -27068,11 +28090,7 @@ fn find_shadowsocks_outbound(root: &Json) -> Option<ShadowsocksOut> {
             password,
             carrier,
             host,
-            mux: Mux {
-                tcp: enabled && concurrency >= 0,
-                udp: enabled && (xudp > 0 || (xudp == 0 && concurrency >= 0)),
-                udp443,
-            },
+            mux: outbound_mux(outbound),
             tls,
             headers: crate::config::carrier_headers(outbound.get("streamSettings")).0,
             heartbeat: crate::config::carrier_headers(outbound.get("streamSettings")).1,
@@ -31543,6 +32561,39 @@ mod tests {
     }
 
     #[test]
+    fn the_trojan_ipv4_reader_matches_the_standard_parser() {
+        for text in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "255.255.255.255",
+            "192.0.2.1",
+            "10.20.30.40",
+            "192.0.2.256",
+            "192.0.2.1000",
+            "192.0.2.04",
+            "0.0.0.01",
+            "192.0.2",
+            "192.0.2.1.5",
+            "192..0.2",
+            "192.0.2.",
+            ".192.0.2",
+            "",
+            " 192.0.2.1",
+            "192.0.2.1 ",
+            "192.0.2.1\n",
+            "192.0.2.a",
+            "192.0.2.-1",
+            "192.0.2.1a",
+        ] {
+            assert_eq!(
+                trojan_ipv4(text.as_bytes()),
+                text.parse::<std::net::Ipv4Addr>().ok(),
+                "{text:?}"
+            );
+        }
+    }
+
+    #[test]
     fn the_trojan_numeric_domain_header_allocates_nothing() {
         let key = trojan_key("an-example-shared-password");
         let numeric = b"\x03\x09127.0.0.1\x1f\x90";
@@ -31675,7 +32726,7 @@ mod tests {
         let (cmd, target) =
             decode_trojan_request(&mut second, &keys).expect("the second client authenticates");
         assert_eq!(cmd, 1);
-        assert_eq!(target.port(), 8080);
+        assert_eq!(target.socket().expect("address").port(), 8080);
         assert_eq!(keys.len(), 2, "one key per client");
         let mut stranger = std::io::Cursor::new(ask("nobody-lists-this"));
         assert!(
@@ -36348,6 +37399,8 @@ mod tests {
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
+                mux: Mux::default(),
+                reality: None,
             };
             echo_trace(&format!("cli {port} dialing"));
             dial_trojan(
@@ -36464,6 +37517,8 @@ mod tests {
                 quic_roots: None,
                 quic_ech: None,
                 hysteria_roots: None,
+                mux: Mux::default(),
+                reality: None,
             };
             let listener: SocketAddr = address.parse().expect("addr");
             thread::spawn(move || {
@@ -36556,6 +37611,11 @@ mod tests {
     /// probe ports, and a leaked suite must not take another's.
     fn trojan_probe_base() -> u16 {
         22000 + (std::process::id() as u16 % 256) * 32
+    }
+
+    fn trojan_mux_probe_port() -> u16 {
+        static NEXT: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+        trojan_probe_base() + 100 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// A trojan client that pipelines its first payload with the request header keeps it: the
@@ -36795,16 +37855,6 @@ mod tests {
         client: Option<&Arc<ferrox_core::tls::TlsConfig>>,
         udp: &UdpSocket,
     ) {
-        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
-        let echo_port = echo.local_addr().expect("addr").port();
-        thread::spawn(move || {
-            let mut buf = vec![0u8; UDP_BUF];
-            while let Ok((n, src)) = echo.recv_from(&mut buf) {
-                if echo.send_to(&buf[..n], src).is_err() {
-                    return;
-                }
-            }
-        });
         let trojan = TrojanOut {
             address: "127.0.0.1".to_owned(),
             port,
@@ -36817,7 +37867,24 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            reality: None,
         };
+        assert_trojan_udp_echo_with(tag, &trojan, udp);
+    }
+
+    fn assert_trojan_udp_echo_with(tag: &str, trojan: &TrojanOut, udp: &UdpSocket) {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, src)) = echo.recv_from(&mut buf) {
+                if echo.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let trojan = trojan.clone();
         let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("binds"));
         let relay_addr = relay.local_addr().expect("addr");
         let served = Arc::clone(&relay);
@@ -36942,15 +38009,509 @@ mod tests {
         }
     }
 
-    /// A trojan listener that declares reality is refused by name: serving it as plaintext would be a silent downgrade.
+    /// The association rides REALITY on every carrier, with mux off, so the datagram path selects the session before the header.
     #[test]
-    fn a_trojan_reality_inbound_is_refused_not_downgraded() {
+    fn a_trojan_udp_association_crosses_reality() {
+        let carriers = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x", "mode": "stream-one"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+            ("kcp", r#""network": "kcp""#),
+        ];
+        let mut held = Vec::new();
+        for (index, (tag, stream)) in carriers.into_iter().enumerate() {
+            let inbound = trojan_reality_inbound(stream);
+            let port = trojan_probe_base() + 48 + index as u16;
+            let address = format!("127.0.0.1:{port}");
+            assert!(serve_trojan_inbound(&address, &inbound, true), "{tag}");
+            if tag != "kcp" {
+                let waited = Instant::now();
+                while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                    assert!(
+                        waited.elapsed() < Duration::from_secs(10),
+                        "{tag} listener never bound"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            let trojan = find_trojan_outbound(&trojan_reality_outbound(stream, port))
+                .unwrap_or_else(|| panic!("{tag} reality outbound"));
+            assert!(trojan.reality.is_some(), "{tag} dials reality");
+            let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            assert_trojan_udp_echo_with(tag, &trojan, &udp);
+            held.push(udp);
+        }
+    }
+
+    fn trojan_reality_inbound(stream: &str) -> Json {
+        crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{{stream}, "security": "reality",
+                    "realitySettings": {{"privateKey": "{}",
+                        "shortIds": ["{REALITY_TEST_SHORT}"],
+                        "serverNames": ["{REALITY_TEST_SNI}"]}}}}}}"#,
+            b64url(&REALITY_TEST_PRIVATE),
+        ))
+        .expect("parses")
+    }
+
+    fn trojan_reality_outbound(stream: &str, port: u16) -> Json {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        crate::json::parse(&format!(
+            r#"{{"outbounds": [{{"protocol": "trojan",
+                "settings": {{"servers": [{{"address": "127.0.0.1", "port": {port},
+                    "password": "secret"}}]}},
+                "streamSettings": {{{stream}, "security": "reality",
+                    "realitySettings": {{"serverName": "{REALITY_TEST_SNI}",
+                        "publicKey": "{}", "shortId": "{REALITY_TEST_SHORT}",
+                        "fingerprint": "chrome"}}}}}}]}}"#,
+            b64url(&public),
+        ))
+        .expect("parses")
+    }
+
+    fn trojan_reality_client() -> Arc<ferrox_core::tls::RealityClientConfig> {
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        Arc::new(ferrox_core::tls::RealityClientConfig {
+            server_name: REALITY_TEST_SNI.to_owned(),
+            public_key: public,
+            short_id: [1, 35, 69, 103, 137, 171, 205, 239],
+            fingerprint: "chrome".to_owned(),
+            key_log: None,
+        })
+    }
+
+    /// A trojan listener that declares reality without an identity is refused by name: serving it as plaintext would be a silent downgrade.
+    #[test]
+    fn a_trojan_reality_inbound_without_identity_is_refused_not_downgraded() {
         let inbound = crate::json::parse(
             r#"{"protocol": "trojan", "settings": {"clients": [{"password": "secret"}]},
                 "streamSettings": {"network": "tcp", "security": "reality"}}"#,
         )
         .expect("parses");
         assert!(!serve_trojan_inbound("127.0.0.1:9", &inbound, true));
+    }
+
+    /// REALITY answers every TCP carrier the outbound dials, and a wrong public key never reaches the header.
+    #[test]
+    fn a_trojan_reality_inbound_answers_every_tcp_carrier() {
+        let carriers = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x", "mode": "stream-one"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+        ];
+        for (index, (tag, stream)) in carriers.into_iter().enumerate() {
+            let inbound = trojan_reality_inbound(stream);
+            let port = trojan_probe_base() + 32 + index as u16;
+            let address = format!("127.0.0.1:{port}");
+            assert!(serve_trojan_inbound(&address, &inbound, true), "{tag}");
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let echo_port = echo_loop();
+            let trojan = find_trojan_outbound(&trojan_reality_outbound(stream, port))
+                .unwrap_or_else(|| panic!("{tag} reality outbound"));
+            assert!(trojan.reality.is_some(), "{tag} dials reality");
+            let target = Destination::from(
+                format!("127.0.0.1:{echo_port}")
+                    .parse::<SocketAddr>()
+                    .expect("addr"),
+            );
+            let listener: SocketAddr = address.parse().expect("addr");
+            let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let dport = downstream.local_addr().expect("addr").port();
+            thread::spawn(move || {
+                let (socket, _) = downstream.accept().expect("accepts");
+                dial_trojan(&socket, &listener, &trojan, &target, Ladder::global());
+            });
+            let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+            sock.set_read_timeout(Some(Duration::from_secs(30)))
+                .expect("timeout");
+            sock.write_all(b"ping").expect("writes");
+            assert_eq!(&read_echo(&mut sock), b"ping", "{tag} over reality echoes");
+        }
+    }
+
+    /// KCP carries the REALITY session above the connection both roles, as it carries TLS.
+    #[test]
+    fn a_trojan_reality_kcp_inbound_answers_the_session() {
+        let inbound = trojan_reality_inbound(r#""network": "kcp""#);
+        let port = trojan_probe_base() + 17;
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_trojan_inbound(&address, &inbound, true));
+        let echo_port = echo_loop();
+        let trojan = find_trojan_outbound(&trojan_reality_outbound(r#""network": "kcp""#, port))
+            .expect("reality kcp outbound");
+        assert!(trojan.reality.is_some());
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let conn = ferrox_core::kcp::dial(
+            format!("127.0.0.1:{port}").parse().expect("addr"),
+            ferrox_core::kcp::Config::default(),
+            ferrox_core::kcp::fresh_conversation(),
+        )
+        .expect("dials");
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (socket, _) = downstream.accept().expect("accepts");
+            dial_trojan_kcp(&socket, &conn, &trojan, &target);
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(
+            &read_echo(&mut sock),
+            b"ping",
+            "the header rides the session"
+        );
+    }
+
+    fn assert_trojan_mux_tcp_echo(
+        tag: &'static str,
+        serve: impl FnOnce(Connection) + Send + 'static,
+        trojan: TrojanOut,
+    ) {
+        let echo_port = echo_loop();
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve(stream);
+        });
+        let mut trojan = trojan;
+        trojan.port = port;
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            assert!(
+                dial_trojan_mux(&client, &trojan, &target),
+                "{tag} opens the mux"
+            );
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "{tag} mux echoes");
+    }
+
+    fn assert_trojan_mux_against_inbound(
+        tag: &'static str,
+        inbound: &Json,
+        mut trojan: TrojanOut,
+        wait_for_tcp: bool,
+    ) {
+        let port = trojan_mux_probe_port();
+        let address = format!("127.0.0.1:{port}");
+        assert!(serve_trojan_inbound(&address, inbound, true), "{tag}");
+        if wait_for_tcp {
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+        } else {
+            thread::sleep(Duration::from_millis(50));
+        }
+        let echo_port = echo_loop();
+        trojan.port = port;
+        trojan.carrier = inbound_carrier(inbound);
+        let target = Destination::from(
+            format!("127.0.0.1:{echo_port}")
+                .parse::<SocketAddr>()
+                .expect("addr"),
+        );
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            assert!(
+                dial_trojan_mux(&client, &trojan, &target),
+                "{tag} opens the mux"
+            );
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.set_read_timeout(Some(Duration::from_secs(30)))
+            .expect("timeout");
+        sock.write_all(b"ping").expect("writes");
+        assert_eq!(&read_echo(&mut sock), b"ping", "{tag} mux echoes");
+    }
+
+    /// A muxed TCP stream rides one session on every carrier xray pairs with mux, plain, under
+    /// TLS, and under REALITY.
+    #[test]
+    fn a_trojan_mux_carries_a_tcp_stream_over_every_carrier() {
+        let carriers = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x", "mode": "stream-one"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+        ];
+        let key = trojan_key("secret");
+        let base = TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port: 0,
+            key,
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            mux: Mux::default(),
+            reality: None,
+        };
+        for (tag, stream) in carriers {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                    "streamSettings": {{{stream}}}}}"#
+            ))
+            .expect("parses");
+            assert_trojan_mux_against_inbound(tag, &inbound, base.clone(), true);
+        }
+        let (cert, cert_key, client) = tls_cert_json();
+        for (tag, stream) in carriers {
+            let inbound = crate::json::parse(&format!(
+                r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                    "streamSettings": {{{stream}, "security": "tls",
+                        "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {cert_key}}}]}}}}}}"#
+            ))
+            .expect("parses");
+            let trojan = TrojanOut {
+                tls: Some(Arc::clone(&client)),
+                ..base.clone()
+            };
+            assert_trojan_mux_against_inbound(tag, &inbound, trojan, true);
+        }
+        for (tag, stream) in carriers {
+            let inbound = trojan_reality_inbound(stream);
+            let trojan = find_trojan_outbound(&trojan_reality_outbound(stream, 0))
+                .unwrap_or_else(|| panic!("{tag} reality outbound"));
+            assert_trojan_mux_against_inbound(tag, &inbound, trojan, true);
+        }
+        let kcp = crate::json::parse(
+            r#"{"protocol": "trojan", "settings": {"clients": [{"password": "secret"}]},
+                "streamSettings": {"network": "kcp"}}"#,
+        )
+        .expect("parses");
+        assert_trojan_mux_against_inbound("kcp", &kcp, base.clone(), false);
+        let kcp_tls = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{"network": "kcp", "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {cert_key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let kcp_tls_out = TrojanOut {
+            tls: Some(Arc::clone(&client)),
+            ..base.clone()
+        };
+        assert_trojan_mux_against_inbound("kcp-tls", &kcp_tls, kcp_tls_out, false);
+        let kcp_reality = trojan_reality_inbound(r#""network": "kcp""#);
+        let kcp_reality_out =
+            find_trojan_outbound(&trojan_reality_outbound(r#""network": "kcp""#, 0))
+                .expect("reality kcp outbound");
+        assert_trojan_mux_against_inbound("kcp-reality", &kcp_reality, kcp_reality_out, false);
+    }
+
+    /// A muxed TCP stream rides one session on a raw carrier, plain, under TLS, and under REALITY.
+    #[test]
+    fn a_trojan_mux_carries_a_tcp_stream_over_raw_tls_and_reality() {
+        let key = trojan_key("secret");
+        let (server_config, client_config) = carried_tls_configs();
+        let mux = Mux {
+            tcp: true,
+            udp: true,
+            udp443: Udp443::Reject,
+        };
+        let raw = TrojanOut {
+            address: "127.0.0.1".to_owned(),
+            port: 0,
+            key,
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            mux,
+            reality: None,
+        };
+        assert_trojan_mux_tcp_echo(
+            "raw",
+            move |stream| serve_trojan_raw(stream, &[key], true),
+            raw.clone(),
+        );
+        let tls = TrojanOut {
+            tls: Some(Arc::new(client_config)),
+            ..raw.clone()
+        };
+        let tls_server = Arc::clone(&server_config);
+        assert_trojan_mux_tcp_echo(
+            "tls",
+            move |stream| {
+                serve_trojan_tls(
+                    stream,
+                    &[key],
+                    &Carrier::Raw(Chain::default()),
+                    true,
+                    &tls_server,
+                    None,
+                );
+            },
+            tls,
+        );
+        let reality = TrojanOut {
+            reality: Some(trojan_reality_client()),
+            ..raw
+        };
+        let reality_server = reality_server_config();
+        assert_trojan_mux_tcp_echo(
+            "reality",
+            move |stream| {
+                serve_trojan_reality(
+                    stream,
+                    &[key],
+                    &Carrier::Raw(Chain::default()),
+                    true,
+                    &reality_server,
+                    None,
+                );
+            },
+            reality,
+        );
+    }
+
+    /// A muxed UDP association rides one session on raw and REALITY, and on a non-raw ws
+    /// carrier plain and under TLS.
+    #[test]
+    fn a_trojan_mux_carries_a_udp_association_over_raw_and_reality() {
+        let plain = crate::json::parse(
+            r#"{"protocol": "trojan", "settings": {"clients": [{"password": "secret"}]}}"#,
+        )
+        .expect("parses");
+        let reality = trojan_reality_inbound(r#""network": "tcp""#);
+        let ws = crate::json::parse(
+            r#"{"protocol": "trojan", "settings": {"clients": [{"password": "secret"}]},
+                "streamSettings": {"network": "ws", "wsSettings": {"path": "/t"}}}"#,
+        )
+        .expect("parses");
+        let (cert, cert_key, client) = tls_cert_json();
+        let ws_tls = crate::json::parse(&format!(
+            r#"{{"protocol": "trojan", "settings": {{"clients": [{{"password": "secret"}}]}},
+                "streamSettings": {{"network": "ws", "wsSettings": {{"path": "/t"}},
+                    "security": "tls",
+                    "tlsSettings": {{"certificates": [{{"certificate": {cert}, "key": {cert_key}}}]}}}}}}"#
+        ))
+        .expect("parses");
+        let mux = Mux {
+            tcp: true,
+            udp: true,
+            udp443: Udp443::Reject,
+        };
+        for (tag, inbound, reality, tls) in [
+            ("raw", plain, None, None),
+            ("reality", reality, Some(trojan_reality_client()), None),
+            ("ws", ws, None, None),
+            ("ws-tls", ws_tls, None, Some(client)),
+        ] {
+            let port = trojan_mux_probe_port();
+            let address = format!("127.0.0.1:{port}");
+            assert!(serve_trojan_inbound(&address, &inbound, true), "{tag}");
+            let waited = Instant::now();
+            while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                assert!(
+                    waited.elapsed() < Duration::from_secs(10),
+                    "{tag} listener never bound"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            let trojan = TrojanOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                key: trojan_key("secret"),
+                carrier: inbound_carrier(&inbound),
+                host: "127.0.0.1".to_owned(),
+                tls,
+                headers: Vec::new(),
+                heartbeat: 0,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                mux,
+                reality,
+            };
+            let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            assert_trojan_udp_echo_with(tag, &trojan, &udp);
+        }
     }
 
     /// A listener whose port is already taken is refused, not announced as served: the bind is the listener's verdict, not a thread's later accident.
@@ -37067,6 +38628,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            reality: None,
         };
         let target = Destination::from(
             format!("127.0.0.1:{echo_port}")
@@ -38467,6 +40030,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            reality: None,
         })
     }
 
@@ -40390,6 +41955,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            reality: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -43374,6 +44941,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            reality: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -43444,6 +45013,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            reality: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -43515,6 +45086,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            reality: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -43583,6 +45156,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            reality: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -43651,6 +45226,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            reality: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -47253,6 +48830,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: Some(roots.into()),
+            mux: Mux::default(),
+            reality: None,
         });
         thread::spawn(move || {
             let (stream, _) = front.accept().expect("accepts");
@@ -51839,6 +53418,8 @@ mod tests {
             quic_roots: None,
             quic_ech: None,
             hysteria_roots: None,
+            mux: Mux::default(),
+            reality: None,
         }));
         let mut client = socks_tcp_client(front_port, echo_port);
         client.write_all(b"ping").expect("writes");
@@ -56449,6 +58030,21 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             fallbacks,
             account: _,
         } => serve_trojan_tls(
+            stream,
+            &keys,
+            &carrier,
+            freedom,
+            &server,
+            fallbacks.as_deref(),
+        ),
+        Role::TrojanReality {
+            keys,
+            carrier,
+            freedom,
+            server,
+            fallbacks,
+            account: _,
+        } => serve_trojan_reality(
             stream,
             &keys,
             &carrier,

@@ -111,11 +111,15 @@ vless sealed-record-buffer-growth 0 ferrox-core-vless::tests::a_record_is_opened
 vless sealed-record-sizes-swept 12 ferrox-core-vless::tests::a_record_of_any_size_reads_back_the_octets_that_were_written
 
 # --- Trojan -----------------------------------------------------------------
-trojan ops-retired-instructions 1315 scripts/count-ops.sh
+trojan ops-retired-instructions 1170 scripts/count-ops.sh
 trojan password-bytes-on-the-wire 56 ferrox-app-proxy::tests::trojan_key_is_sha224_hex
 trojan framing-bytes-added-after-the-header 0 ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers
 trojan udp-framing-bytes-per-datagram 2 ferrox-app-proxy::tests::trojan_udp_frames_carry
 trojan udp-carriers-holding-an-association 7 ferrox-app-proxy::tests::a_trojan_udp_association_crosses_every_carrier
+trojan reality-tcp-carriers-holding-an-echo 6 ferrox-app-proxy::tests::a_trojan_reality_inbound_answers_every_tcp_carrier
+trojan reality-kcp-pairs-holding-an-echo 1 ferrox-app-proxy::tests::a_trojan_reality_kcp_inbound_answers_the_session
+trojan mux-tcp-carriers-holding-a-stream 21 ferrox-app-proxy::tests::a_trojan_mux_carries_a_tcp_stream_over_every_carrier
+trojan mux-udp-carriers-holding-an-association 4 ferrox-app-proxy::tests::a_trojan_mux_carries_a_udp_association_over_raw_and_reality
 
 # --- XTLS Vision ------------------------------------------------------------
 xtls-vision ops-retired-instructions 26240 scripts/count-ops.sh
