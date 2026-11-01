@@ -9035,6 +9035,11 @@ pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::Interrupted || ferrox_core::tls::TlsError::is_timeout(error)
 }
 
+/// A timeout that waits on the socket: an interrupted read is retried, not parked on the descriptor.
+pub(crate) fn is_descriptor_wait(error: &std::io::Error) -> bool {
+    is_timeout(error) && error.kind() != std::io::ErrorKind::Interrupted
+}
+
 thread_local! {
     /// Set while a lane step runs: a framed reader that times out hands the lane back instead of sleeping in it.
     static RELAY_STEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };

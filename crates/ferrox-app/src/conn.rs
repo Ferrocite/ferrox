@@ -282,7 +282,7 @@ impl Read for Connection {
         };
         // A relay step's timed-out read names the socket the lane can wait on instead of polling the clock.
         #[cfg(unix)]
-        if result.as_ref().is_err_and(crate::proxy::is_timeout) {
+        if result.as_ref().is_err_and(crate::proxy::is_descriptor_wait) {
             crate::proxy::note_wait_fd(std::os::fd::AsRawFd::as_raw_fd(&*self));
         }
         result
@@ -306,7 +306,7 @@ impl Read for Connection {
             Connection::Unix(stream) => stream.read_vectored(bufs),
         };
         #[cfg(unix)]
-        if result.as_ref().is_err_and(crate::proxy::is_timeout) {
+        if result.as_ref().is_err_and(crate::proxy::is_descriptor_wait) {
             crate::proxy::note_wait_fd(std::os::fd::AsRawFd::as_raw_fd(&*self));
         }
         result
@@ -394,7 +394,7 @@ impl Read for &Connection {
             }
         };
         #[cfg(unix)]
-        if result.as_ref().is_err_and(crate::proxy::is_timeout) {
+        if result.as_ref().is_err_and(crate::proxy::is_descriptor_wait) {
             crate::proxy::note_wait_fd(std::os::fd::AsRawFd::as_raw_fd(*self));
         }
         result
@@ -431,7 +431,7 @@ impl Read for &Connection {
             }
         };
         #[cfg(unix)]
-        if result.as_ref().is_err_and(crate::proxy::is_timeout) {
+        if result.as_ref().is_err_and(crate::proxy::is_descriptor_wait) {
             crate::proxy::note_wait_fd(std::os::fd::AsRawFd::as_raw_fd(*self));
         }
         result
