@@ -1722,28 +1722,11 @@ mod tests {
         assert!(entry.until > Instant::now());
     }
 
-    /// A truncated UDP response retries the same DNS question over TCP on the reserved server port.
-    #[test]
-    fn a_truncated_answer_is_asked_again_over_tcp() {
-        // The listening transport picks the port: a Windows runner hands out UDP ephemerals that its excluded ranges and TIME_WAIT band hold shut for TCP, which is what ran the sixty tries out, and a port TCP just bound is bindable by definition.
-        let (tcp, udp, dns_address) = (0..64)
-            .find_map(|_| {
-                let tcp = TcpListener::bind("127.0.0.1:0").expect("dns tcp");
-                let address = tcp.local_addr().expect("dns address");
-                match UdpSocket::bind(address) {
-                    Ok(udp) => Some((tcp, udp, address)),
-                    Err(error)
-                        if matches!(
-                            error.kind(),
-                            std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
-                        ) =>
-                    {
-                        None
-                    }
-                    Err(error) => panic!("dns udp: {error}"),
-                }
-            })
-            .expect("a port free for both DNS transports");
+    /// The DNS half of the truncated-answer witness: UDP answers the question with the truncation bit set, TCP answers the same one in full on the same port, and both keep serving while the question is asked again.
+    fn dns_servers(
+        udp: UdpSocket,
+        tcp: TcpListener,
+    ) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         udp.set_read_timeout(Some(Duration::from_millis(100)))
             .expect("DNS server poll");
         let stopped = Arc::new(AtomicBool::new(false));
@@ -1769,7 +1752,7 @@ mod tests {
             }
         });
         let tcp_stopped = Arc::clone(&stopped);
-        // A question asked again is answered again: the server keeps accepting while the witness retries, and a half-read connection costs only the attempt that read it.
+        // A question asked again is answered again, and a half-read connection costs only the attempt that read it.
         std::thread::spawn(move || {
             while !tcp_stopped.load(Ordering::Relaxed) {
                 let Ok((mut stream, _)) = tcp.accept() else {
@@ -1798,6 +1781,32 @@ mod tests {
                 let _ = stream.write_all(&framed);
             }
         });
+        (stopped, dns_udp)
+    }
+
+    /// A truncated UDP response retries the same DNS question over TCP on the reserved server port.
+    #[test]
+    fn a_truncated_answer_is_asked_again_over_tcp() {
+        // The listening transport picks the port: a Windows runner hands out UDP ephemerals that its excluded ranges and TIME_WAIT band hold shut for TCP, which is what ran the sixty tries out, and a port TCP just bound is bindable by definition.
+        let (tcp, udp, dns_address) = (0..64)
+            .find_map(|_| {
+                let tcp = TcpListener::bind("127.0.0.1:0").expect("dns tcp");
+                let address = tcp.local_addr().expect("dns address");
+                match UdpSocket::bind(address) {
+                    Ok(udp) => Some((tcp, udp, address)),
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::AddrInUse | std::io::ErrorKind::PermissionDenied
+                        ) =>
+                    {
+                        None
+                    }
+                    Err(error) => panic!("dns udp: {error}"),
+                }
+            })
+            .expect("a port free for both DNS transports");
+        let (stopped, dns_udp) = dns_servers(udp, tcp);
 
         let client_private = [0x11; 32];
         let server_private = [0x22; 32];
