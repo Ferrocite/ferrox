@@ -311,6 +311,55 @@ impl<R: Read> Reader<R> {
         }
         self.take(buf)
     }
+
+    /// Walk the framing until a body is open or the body ends: `left` says how much is owed, and a poll timeout inside a pair or a size line leaves it where it broke.
+    fn open(&mut self) -> std::io::Result<()> {
+        self.parse_head()?;
+        while !self.ended && self.left == 0 {
+            if self.chunk == Chunk::Crlf {
+                // Both bytes or neither: a poll timeout inside the CRLF leaves the pair unread, so the next read resumes on the same two bytes.
+                while self.prefix.len() - self.at < 2 {
+                    self.prefix.drain(..self.at);
+                    self.at = 0;
+                    // One promoted window instead of a two-byte read: the bytes past the CRLF are the next size lines and bodies.
+                    let n = self.fill(CHUNK)?;
+                    if n == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                    }
+                }
+                if &self.prefix[self.at..self.at + 2] != b"\r\n" {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                }
+                self.at += 2;
+                self.chunk = Chunk::Body;
+            }
+            if self.chunk == Chunk::Trailers {
+                let mut trailer = [0u8; 130];
+                let len = read_line_into(self, &mut trailer)?
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+                if len == 0 {
+                    self.chunk = Chunk::Body;
+                    self.ended = true;
+                    return Ok(());
+                }
+                continue;
+            }
+            let mut line = [0u8; 130];
+            let len = read_line_into(self, &mut line)?
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+            let size = chunk_size(&line[..len])
+                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+            if size == 0 {
+                self.chunk = Chunk::Trailers;
+                continue;
+            }
+            if size > 64 * 1024 * 1024 {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+            }
+            self.left = size;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -547,66 +596,48 @@ impl<R: Read> Read for Reader<R> {
         if buf.is_empty() {
             return Ok(0);
         }
-        self.parse_head()?;
-        loop {
-            if self.ended {
-                return Ok(0);
-            }
-            if self.left > 0 {
-                let n = self.left.min(buf.len());
-                let got = self.body(&mut buf[..n])?;
-                if got == 0 {
-                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
-                }
-                self.left -= got;
-                if self.left == 0 {
-                    // The pair is taken on the next call, so a poll timeout after these bytes cannot lose them.
-                    self.chunk = Chunk::Crlf;
-                }
-                return Ok(got);
-            }
-            if self.chunk == Chunk::Crlf {
-                // Both bytes or neither: a poll timeout inside the CRLF leaves the pair unread, so the next read resumes on the same two bytes.
-                while self.prefix.len() - self.at < 2 {
-                    self.prefix.drain(..self.at);
-                    self.at = 0;
-                    // One promoted window instead of a two-byte read: the bytes past the CRLF are the next size lines and bodies.
-                    let n = self.fill(CHUNK)?;
-                    if n == 0 {
-                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
-                    }
-                }
-                if &self.prefix[self.at..self.at + 2] != b"\r\n" {
-                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
-                }
-                self.at += 2;
-                self.chunk = Chunk::Body;
-            }
-            if self.chunk == Chunk::Trailers {
-                let mut trailer = [0u8; 130];
-                let len = read_line_into(self, &mut trailer)?
-                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
-                if len == 0 {
-                    self.chunk = Chunk::Body;
-                    self.ended = true;
-                    return Ok(0);
-                }
-                continue;
-            }
-            let mut line = [0u8; 130];
-            let len = read_line_into(self, &mut line)?
-                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-            let size = chunk_size(&line[..len])
-                .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
-            if size == 0 {
-                self.chunk = Chunk::Trailers;
-                continue;
-            }
-            if size > 64 * 1024 * 1024 {
-                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
-            }
-            self.left = size;
+        self.open()?;
+        if self.ended {
+            return Ok(0);
         }
+        let n = self.left.min(buf.len());
+        let got = self.body(&mut buf[..n])?;
+        if got == 0 {
+            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        }
+        self.left -= got;
+        if self.left == 0 {
+            // The pair is taken on the next call, so a poll timeout after these bytes cannot lose them.
+            self.chunk = Chunk::Crlf;
+        }
+        Ok(got)
+    }
+}
+
+impl<R: Read> crate::proxy::WindowRead for Reader<R> {
+    /// The body bytes as a span of the buffer that read them: the relay writes them out without moving them again.
+    fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+        self.open()?;
+        if self.ended {
+            return Ok(crate::proxy::Window::empty());
+        }
+        if self.at == self.prefix.len() {
+            self.prefix.clear();
+            self.at = 0;
+            if self.fill(CHUNK)? == 0 {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+        }
+        let n = self.left.min(self.prefix.len() - self.at);
+        let at = self.at;
+        self.at += n;
+        self.left -= n;
+        if self.left == 0 {
+            self.chunk = Chunk::Crlf;
+        }
+        let mut spans = [(0, 0); crate::proxy::WINDOW_PARTS];
+        spans[0] = (at, n);
+        Ok(crate::proxy::Window::new(&self.prefix, spans, 1))
     }
 }
 
@@ -3236,6 +3267,107 @@ mod tests {
             "delivered from the buffer those bytes arrived in"
         );
         assert_eq!(reader.prefix.capacity(), capacity, "on a held capacity");
+    }
+
+    /// The downlink's body is handed to the relay as a span of the buffer that read it: taking the window neither moves those bytes nor grows the buffer.
+    #[test]
+    fn a_body_window_is_the_readers_own_buffer() {
+        let line = format!("{CHUNK:X}\r\n");
+        let line_len = line.len();
+        let payload: Vec<u8> = (0..CHUNK).map(|i| (i % 251) as u8).collect();
+        let mut wire = line.into_bytes();
+        wire.extend_from_slice(&payload);
+        wire.extend_from_slice(b"\r\n0\r\n\r\n");
+        let base = wire.as_ptr();
+        let capacity = wire.capacity();
+        let (mut reader, _writer) = split_halves(
+            std::io::Cursor::new(Vec::new()),
+            Sink(Arc::new(Mutex::new(Vec::new()))),
+            wire,
+            0,
+        );
+        {
+            let window = crate::proxy::WindowRead::read_window(&mut reader).expect("reads");
+            assert_eq!(window.parts(), &[(line_len, CHUNK)]);
+            assert_eq!(
+                window.bytes().as_ptr(),
+                base,
+                "the window is the buffer the body arrived in, not a copy"
+            );
+            assert_eq!(&window.bytes()[line_len..][..CHUNK], &payload[..]);
+        }
+        assert_eq!(reader.reads(), 0, "the socket was never asked");
+        assert_eq!(reader.prefix.as_ptr(), base, "the buffer did not move");
+        assert_eq!(
+            reader.prefix.capacity(),
+            capacity,
+            "the buffer did not grow"
+        );
+        assert!(
+            crate::proxy::WindowRead::read_window(&mut reader)
+                .expect("ends")
+                .is_empty(),
+            "the terminator ends the body"
+        );
+        assert!(reader.ended);
+    }
+
+    /// Every byte the `Read` path delivers, the window path delivers too, across chunk sizes either side of the prefetch window.
+    #[test]
+    fn a_window_delivers_every_byte_the_read_does() {
+        let chunks = [1usize, 2, 3, 5, 7, 11, 64, 8 * 1024, CHUNK, CHUNK + 1];
+        let mut wire = Vec::new();
+        for &n in &chunks {
+            wire.extend_from_slice(format!("{n:X}\r\n").as_bytes());
+            wire.extend(std::iter::repeat_n((n % 251) as u8, n));
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        let mut plain = Reader {
+            read: std::io::Cursor::new(wire.clone()),
+            prefix: Vec::new(),
+            at: 0,
+            left: 0,
+            ended: false,
+            reads: 0,
+            pending_head: false,
+            chunk: Chunk::Body,
+        };
+        let mut want = Vec::new();
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            let n = plain.read(&mut buf).expect("reads");
+            if n == 0 {
+                break;
+            }
+            want.extend_from_slice(&buf[..n]);
+        }
+        let mut windowed = Reader {
+            read: std::io::Cursor::new(wire),
+            prefix: Vec::new(),
+            at: 0,
+            left: 0,
+            ended: false,
+            reads: 0,
+            pending_head: false,
+            chunk: Chunk::Body,
+        };
+        let mut got = Vec::new();
+        loop {
+            let window = crate::proxy::WindowRead::read_window(&mut windowed).expect("reads");
+            if window.is_empty() {
+                break;
+            }
+            for &(start, len) in window.parts() {
+                got.extend_from_slice(&window.bytes()[start..start + len]);
+            }
+        }
+        assert_eq!(got, want, "the window path is byte-identical");
+        assert_eq!(
+            want.len(),
+            chunks.iter().sum::<usize>(),
+            "every chunk body was delivered"
+        );
     }
 
     /// The counter must see the *short* reads too: one byte at a time is the worst case, and it is what makes a bounded window better than an unbounded one.

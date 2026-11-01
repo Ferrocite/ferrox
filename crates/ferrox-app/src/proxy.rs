@@ -9478,7 +9478,7 @@ fn dial_vless_rung(
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
             reader.set_poll(Some(RELAY_POLL));
-            crate::proxy::relay_sink_drained(reader, &writer, client);
+            crate::proxy::relay_sink_xhttp_drained(reader, &writer, client);
             true
         }
         Rung::Raw => {
@@ -14107,7 +14107,7 @@ fn dial_trojan_rung(
             }
             note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             reader.set_poll(Some(RELAY_POLL));
-            crate::proxy::relay_sink_drained(reader, &writer, client);
+            crate::proxy::relay_sink_xhttp_drained(reader, &writer, client);
             true
         }
     }
@@ -24524,6 +24524,25 @@ where
     W: CarrierSink,
 {
     relay_ordered::<crate::ws::WsReader<R>, W, _, _, CLOSE_BEFORE_JOIN, false>(
+        reader,
+        writer,
+        peer,
+        |_| {},
+        |_| false,
+    )
+}
+
+/// The plain-xhttp downlink as windows: a chunk's body stays in the reader's own buffer, so the relay writes it out without the `Copied` memcpy.
+pub(crate) fn relay_sink_xhttp_drained<R, W>(
+    reader: crate::xhttp::Reader<R>,
+    writer: &W,
+    peer: &Connection,
+) -> Option<Arc<RelayFinish>>
+where
+    R: Read + Send + 'static,
+    W: CarrierSink,
+{
+    relay_ordered::<crate::xhttp::Reader<R>, W, _, _, CLOSE_AFTER_JOIN, false>(
         reader,
         writer,
         peer,
