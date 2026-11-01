@@ -31770,8 +31770,8 @@ mod tests {
         );
     }
 
-    /// A carriered accept hands its handshake to the lane pool, so a burst of connections stays
-    /// below one thread per handshake; only the overflow past the setup queue takes a thread.
+    /// A carriered accept hands its handshake to the lane pool, so an eight-flow cell grows the
+    /// process by the setup lanes and their borrow ceiling, not by connections.
     #[cfg(target_os = "linux")]
     #[test]
     fn carried_handshakes_share_the_lane_pool() {
@@ -31797,7 +31797,7 @@ mod tests {
             let stop = std::sync::Arc::clone(&stop);
             thread::spawn(move || accept_loop(&address, &role, None, Some(stop)))
         };
-        let clients: Vec<_> = (0..24)
+        let clients: Vec<_> = (0..8)
             .map(|_| {
                 let until = Instant::now() + Duration::from_secs(10);
                 loop {
@@ -31821,10 +31821,9 @@ mod tests {
             lane_pool::SETUP_LANES
         );
         assert!(
-            grown <= lanes + lane_pool::RELAY_LANES + 8,
-            "{} carried handshakes grew the process by {grown} threads, past {lanes} setup lanes and {} relay lanes plus slack",
-            clients.len(),
-            lane_pool::RELAY_LANES
+            grown <= lanes + 4,
+            "{} carried handshakes grew the process by {grown} threads, past {lanes} setup lanes, their borrow ceiling and the accept thread",
+            clients.len()
         );
         assert!(
             grown < clients.len(),
