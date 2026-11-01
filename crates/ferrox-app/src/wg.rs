@@ -1725,12 +1725,13 @@ mod tests {
     /// A truncated UDP response retries the same DNS question over TCP on the reserved server port.
     #[test]
     fn a_truncated_answer_is_asked_again_over_tcp() {
+        // The listening transport picks the port: a Windows runner hands out UDP ephemerals that its excluded ranges and TIME_WAIT band hold shut for TCP, which is what ran the sixty tries out, and a port TCP just bound is bindable by definition.
         let (tcp, udp, dns_address) = (0..64)
             .find_map(|_| {
-                let udp = UdpSocket::bind("127.0.0.1:0").expect("dns udp");
-                let address = udp.local_addr().expect("dns address");
-                match TcpListener::bind(address) {
-                    Ok(tcp) => Some((tcp, udp, address)),
+                let tcp = TcpListener::bind("127.0.0.1:0").expect("dns tcp");
+                let address = tcp.local_addr().expect("dns address");
+                match UdpSocket::bind(address) {
+                    Ok(udp) => Some((tcp, udp, address)),
                     Err(error)
                         if matches!(
                             error.kind(),
@@ -1739,7 +1740,7 @@ mod tests {
                     {
                         None
                     }
-                    Err(error) => panic!("dns tcp: {error}"),
+                    Err(error) => panic!("dns udp: {error}"),
                 }
             })
             .expect("a port free for both DNS transports");
@@ -1767,30 +1768,35 @@ mod tests {
                 udp.send_to(&reply, from).expect("truncated DNS reply");
             }
         });
+        let tcp_stopped = Arc::clone(&stopped);
+        // A question asked again is answered again: the server keeps accepting while the witness retries, and a half-read connection costs only the attempt that read it.
         std::thread::spawn(move || {
-            let Ok((mut stream, _)) = tcp.accept() else {
-                return;
-            };
-            let mut prefix = [0u8; 2];
-            if stream.read_exact(&mut prefix).is_err() {
-                return;
+            while !tcp_stopped.load(Ordering::Relaxed) {
+                let Ok((mut stream, _)) = tcp.accept() else {
+                    return;
+                };
+                let mut prefix = [0u8; 2];
+                if stream.read_exact(&mut prefix).is_err() {
+                    continue;
+                }
+                let mut query = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+                if stream.read_exact(&mut query).is_err() {
+                    continue;
+                }
+                let Some(question) = ferrox_core::dns::parse_query(&query) else {
+                    continue;
+                };
+                let Some(reply) =
+                    ferrox_core::dns::ip_answer(&question, 0, 60, &[vec![127, 0, 0, 1]])
+                else {
+                    continue;
+                };
+                let len = u16::try_from(reply.len()).expect("fits");
+                let mut framed = Vec::with_capacity(2 + reply.len());
+                framed.extend_from_slice(&len.to_be_bytes());
+                framed.extend_from_slice(&reply);
+                let _ = stream.write_all(&framed);
             }
-            let mut query = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
-            if stream.read_exact(&mut query).is_err() {
-                return;
-            }
-            let Some(question) = ferrox_core::dns::parse_query(&query) else {
-                return;
-            };
-            let Some(reply) = ferrox_core::dns::ip_answer(&question, 0, 60, &[vec![127, 0, 0, 1]])
-            else {
-                return;
-            };
-            let len = u16::try_from(reply.len()).expect("fits");
-            let mut framed = Vec::with_capacity(2 + reply.len());
-            framed.extend_from_slice(&len.to_be_bytes());
-            framed.extend_from_slice(&reply);
-            let _ = stream.write_all(&framed);
         });
 
         let client_private = [0x11; 32];
@@ -1818,7 +1824,20 @@ mod tests {
         )
         .expect("device");
         let wireguard = WireGuardOut::with_dns_port(client, dns_address.port()).expect("outbound");
-        let answer = wireguard.resolve("example.test", 7);
+        // The exchange's own five seconds measure the runner under a 1 700-test suite rather than the tunnel, and a give-up caches its empty answer for five more, so the wall clock bounds the wait, the answer stays the assertion, and a stale negative goes first.
+        let until = Instant::now() + Duration::from_secs(30);
+        let answer = loop {
+            let answer = wireguard.resolve("example.test", 7);
+            if !answer.is_empty() {
+                break answer;
+            }
+            assert!(
+                Instant::now() < until,
+                "the truncated answer never reached the TCP retry"
+            );
+            wireguard.resolved.lock().expect("cache").clear();
+            std::thread::sleep(Duration::from_millis(10));
+        };
         stopped.store(true, Ordering::Relaxed);
         dns_udp.join().expect("DNS UDP server");
         assert_eq!(answer, vec!["127.0.0.1:7".parse().expect("address")]);
