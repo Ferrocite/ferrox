@@ -708,8 +708,24 @@ impl<R: Read> crate::proxy::WindowRead for Reader<R> {
             if self.left == 0 {
                 self.chunk = Chunk::Crlf;
             }
-            if len == crate::proxy::WINDOW_PARTS || !self.try_open_prefix()? {
+            if len == crate::proxy::WINDOW_PARTS {
                 break;
+            }
+            let before = (self.at, self.left, self.chunk, self.ended);
+            match self.try_open_prefix() {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    // The body already gathered still belongs to this read; `Read` reports the bad framing on the next call, and so does this.
+                    self.at = before.0;
+                    self.left = before.1;
+                    self.chunk = before.2;
+                    self.ended = before.3;
+                    if len == 0 {
+                        return Err(error);
+                    }
+                    break;
+                }
             }
         }
         if len == 0 {
@@ -3488,6 +3504,34 @@ mod tests {
             want.extend(std::iter::repeat_n((n % 251) as u8, body));
         }
         assert_eq!(got, want, "the gather is byte-identical to the bodies");
+    }
+
+    /// A bad size line after a body is the next call's error, so the body already gathered still leaves first, as `Read` does.
+    #[test]
+    fn a_window_defers_a_framing_error_until_the_body_it_gathered_is_out() {
+        let mut reader = Reader {
+            read: std::io::Cursor::new(Vec::new()),
+            prefix: b"1\r\na\r\nG\r\n".to_vec(),
+            at: 0,
+            left: 0,
+            ended: false,
+            reads: 0,
+            pending_head: false,
+            chunk: Chunk::Body,
+        };
+        let mut got = Vec::new();
+        {
+            let window =
+                crate::proxy::WindowRead::read_window(&mut reader).expect("the body first");
+            for &(start, len) in window.parts() {
+                got.extend_from_slice(&window.bytes()[start..start + len]);
+            }
+        }
+        assert_eq!(got, b"a");
+        assert!(
+            crate::proxy::WindowRead::read_window(&mut reader).is_err(),
+            "the invalid size line is reported on the next read"
+        );
     }
 
     /// The counter must see the *short* reads too: one byte at a time is the worst case, and it is what makes a bounded window better than an unbounded one.
