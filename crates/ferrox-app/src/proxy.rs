@@ -27841,7 +27841,7 @@ fn b64url(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::budgets::{HEAD_DEADLINE, RELAY_JOIN};
+    use crate::budgets::{HEAD_DEADLINE, RELAY_JOIN, SINK_GRACE};
     use crate::config::{grpc_path, stream_carrier};
     use ferrox_core::finalmask::Chain;
 
@@ -30899,6 +30899,10 @@ mod tests {
             assert_eq!(&reply, b"reply");
             // Past the response lane's idle interval, the request lane must still take bytes.
             thread::sleep(Duration::from_millis(1_500));
+            // The relay writes the response end the moment the target half-closes, so that frame is owed here: a socket closed with received bytes unread answers with a reset, and the reset eats the request window still behind it. Draining is what a client does, and the grace is the wait's own bound.
+            reader.set_poll(Some(RELAY_POLL));
+            reader.set_handshake_budget(Some(Instant::now() + SINK_GRACE));
+            let _ = reader.read_to_end(&mut Vec::new());
             assert!(writer.send(b"more"), "the request lane was closed early");
             writer.close();
         });
@@ -41058,18 +41062,24 @@ mod tests {
         .expect("seals")
         .to_vec();
         let dial = UdpSocket::bind("127.0.0.1:0").expect("binds");
-        dial.set_read_timeout(Some(Duration::from_secs(5)))
+        dial.set_read_timeout(Some(Duration::from_millis(50)))
             .expect("timeout");
         let mut back = vec![0u8; UDP_BUF];
-        // A windows front still binding reads as a reset from a port nothing owns yet, so the retry waits for its bind.
-        let mut attempts = 0;
+        // A front still binding reads as a reset from a port nothing owns yet, and a macOS read that finds nothing is a would-block; both mean "not up yet", and the re-send below restarts the wait, so the bound is the wall clock rather than the attempts.
+        let until = Instant::now() + Duration::from_secs(10);
         let n = loop {
             dial.send_to(&packet, &address).expect("sends");
             match dial.recv_from(&mut back) {
                 Ok((n, _)) => break n,
-                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {
-                    attempts += 1;
-                    assert!(attempts < 200, "the udp front still answers");
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    assert!(Instant::now() < until, "the udp front still answers");
                     thread::sleep(Duration::from_millis(10));
                 }
                 Err(error) => panic!("the udp front still answers: {error}"),
