@@ -3331,16 +3331,27 @@ fn serve_shadowsocks(
     }
     if accounts.is_2022 {
         let (password, method) = (accounts.password.as_str(), accounts.method.as_str());
+        let identities = accounts.identities.as_slice();
         match carrier {
-            Carrier::Raw(_) => crate::shadowsocks2022::serve(stream, password, method, freedom),
+            Carrier::Raw(_) => {
+                crate::shadowsocks2022::serve(stream, password, method, identities, freedom);
+            }
             Carrier::Ws { path, .. } => {
-                crate::shadowsocks2022::serve_ws(stream, password, method, path.as_str(), freedom);
+                crate::shadowsocks2022::serve_ws(
+                    stream,
+                    password,
+                    method,
+                    identities,
+                    path.as_str(),
+                    freedom,
+                );
             }
             Carrier::HttpUpgrade { path, host, .. } => {
                 crate::shadowsocks2022::serve_httpupgrade(
                     stream,
                     password,
                     method,
+                    identities,
                     path.as_str(),
                     host,
                     freedom,
@@ -3348,7 +3359,7 @@ fn serve_shadowsocks(
             }
             Carrier::Grpc(settings) => {
                 crate::shadowsocks2022::serve_grpc_with(
-                    stream, password, method, settings, freedom,
+                    stream, password, method, identities, settings, freedom,
                 );
             }
             Carrier::Xhttp { settings, .. } => {
@@ -3356,6 +3367,7 @@ fn serve_shadowsocks(
                     stream,
                     password,
                     method,
+                    identities,
                     settings.path.as_str(),
                     freedom,
                 );
@@ -3365,6 +3377,7 @@ fn serve_shadowsocks(
                     stream,
                     password,
                     method,
+                    identities,
                     path.as_str(),
                     freedom,
                 );
@@ -3516,6 +3529,7 @@ fn serve_ss_tls_session<R, W>(
             writer,
             &accounts.password,
             &accounts.method,
+            &accounts.identities,
             freedom,
             close,
         );
@@ -10032,6 +10046,7 @@ fn serve_ss_kcp_tls(
             writer,
             &accounts.password,
             &accounts.method,
+            &accounts.identities,
             freedom,
             &close,
         );
@@ -10319,6 +10334,7 @@ fn serve_ss_xdrive(
             session,
             &accounts.password,
             &accounts.method,
+            &accounts.identities,
             freedom,
             &close,
         );
@@ -11174,6 +11190,7 @@ fn serve_ss_kcp_listener(
                     writer,
                     &accounts.password,
                     &accounts.method,
+                    &accounts.identities,
                     freedom,
                     &close,
                 );
@@ -20901,6 +20918,20 @@ fn spawn_ss_udp_sources(
     }))
 }
 
+/// The reply destination is the peer that first sent on this association; a later sender from another address is dropped, as the reference's `TempUDPConn` pins the ASSOCIATE peer.
+fn pin_udp_source(source: &Arc<Mutex<Option<SocketAddr>>>, src: SocketAddr) -> bool {
+    let Ok(mut slot) = source.lock() else {
+        return false;
+    };
+    match *slot {
+        None => {
+            *slot = Some(src);
+            true
+        }
+        Some(seen) => seen == src,
+    }
+}
+
 fn serve_socks_udp_shadowsocks2022(
     relay: &UdpSocket,
     ss: &ShadowsocksOut,
@@ -20956,8 +20987,8 @@ fn serve_socks_udp_shadowsocks2022(
         if payload.is_empty() {
             continue;
         }
-        if let Ok(mut slot) = source.lock() {
-            *slot = Some(src);
+        if !pin_udp_source(&source, src) {
+            continue;
         }
         if multi {
             if let Some(packet) = datagrams.seal_list(method, &list, &dest, payload) {
@@ -26391,6 +26422,29 @@ fn inbound_ss_users(
     std::sync::Arc::from(users)
 }
 
+/// The (email, level) pair each client PSK a 2022 multi-user config carries, one entry per user and in the same order as the colon-joined password's tail; the master is not named here.
+fn ss2022_identities(inbound: &Json) -> Vec<(String, u32)> {
+    inbound
+        .get("settings")
+        .and_then(|s| s.get("users"))
+        .and_then(Json::as_arr)
+        .map(|listed| {
+            listed
+                .iter()
+                .map(|user| {
+                    (
+                        user.get("email")
+                            .and_then(Json::as_str)
+                            .unwrap_or("")
+                            .to_owned(),
+                        user.get("level").and_then(Json::as_u32).unwrap_or(0),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// An inbound's parsed accounts: 2022 reads its PSK list from the single password, everything else from the client list.
 fn ss_accounts(
     inbound: &Json,
@@ -26399,16 +26453,23 @@ fn ss_accounts(
     method: String,
 ) -> Arc<crate::shadowsocks::SsAccounts> {
     let is_2022 = ferrox_core::shadowsocks2022::Method::parse(&method).is_some();
-    let users = if is_2022 {
-        crate::shadowsocks::SsUsers::default()
+    let (users, identities) = if is_2022 {
+        (
+            crate::shadowsocks::SsUsers::default(),
+            ss2022_identities(inbound),
+        )
     } else {
-        inbound_ss_users(inbound, &password, &method, address)
+        (
+            inbound_ss_users(inbound, &password, &method, address),
+            Vec::new(),
+        )
     };
     Arc::new(crate::shadowsocks::SsAccounts {
         users,
         password,
         method,
         is_2022,
+        identities,
     })
 }
 
@@ -40723,7 +40784,7 @@ mod tests {
         path: &str,
         freedom: bool,
     ) {
-        crate::shadowsocks2022::serve_httpupgrade(stream, password, method, path, "", freedom);
+        crate::shadowsocks2022::serve_httpupgrade(stream, password, method, &[], path, "", freedom);
     }
 
     /// Adapt a single-account legacy server to the ladder harness's password-and-method shape.
@@ -55096,6 +55157,77 @@ end
         let mut back = [0u8; 4];
         client.read_exact(&mut back).expect("echoes");
         assert_eq!(&back, b"ping");
+    }
+
+    /// The reply destination of an ASSOCIATE lane belongs to the peer that first sent; a later sender from another address is dropped, not rebinded.
+    #[test]
+    fn a_socks_udp_association_pins_the_first_source_and_drops_others() {
+        let first: SocketAddr = "127.0.0.1:5001".parse().expect("addr");
+        let other: SocketAddr = "127.0.0.1:5002".parse().expect("addr");
+        let slot: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
+        assert!(
+            pin_udp_source(&slot, first),
+            "the first sender opens the association"
+        );
+        assert!(
+            pin_udp_source(&slot, first),
+            "a repeat from the pinned peer keeps"
+        );
+        assert!(
+            !pin_udp_source(&slot, other),
+            "a different address does not rebind the reply destination"
+        );
+        assert_eq!(
+            *slot.lock().expect("locks"),
+            Some(first),
+            "the pinned peer is still the first one"
+        );
+    }
+
+    /// A 2022 multi-user inbound carries one identity per client PSK in the same order as the joined password's tail; the master is not named.
+    #[test]
+    fn a_2022_multi_user_inbound_yields_one_identity_per_client_psk() {
+        let inbound = crate::json::parse(
+            r#"{"protocol": "shadowsocks", "settings": {"method": "2022-blake3-aes-256-gcm", "password": "master:alpha:bravo", "users": [
+                {"email": "alice@example", "level": 2},
+                {"email": "bob@example", "level": 0}]}}"#,
+        )
+        .expect("parses");
+        let accounts = ss_accounts(
+            &inbound,
+            "127.0.0.1:0",
+            "master:alpha:bravo".to_owned(),
+            "2022-blake3-aes-256-gcm".to_owned(),
+        );
+        assert!(accounts.is_2022, "the method names a 2022 cipher");
+        assert_eq!(
+            accounts.identities.as_slice(),
+            &[
+                ("alice@example".to_owned(), 2u32),
+                ("bob@example".to_owned(), 0u32)
+            ],
+            "each user's identity is at its PSK's index in the joined password's tail"
+        );
+    }
+
+    /// A 2022 single-password inbound names no users array, so its identities list stays empty and the flow reads the inbound's own default.
+    #[test]
+    fn a_2022_single_password_inbound_carries_no_per_user_identity() {
+        let inbound = crate::json::parse(
+            r#"{"protocol": "shadowsocks", "settings": {"method": "2022-blake3-aes-128-gcm", "password": "secret"}}"#,
+        )
+        .expect("parses");
+        let accounts = ss_accounts(
+            &inbound,
+            "127.0.0.1:0",
+            "secret".to_owned(),
+            "2022-blake3-aes-128-gcm".to_owned(),
+        );
+        assert!(accounts.is_2022, "the method names a 2022 cipher");
+        assert!(
+            accounts.identities.is_empty(),
+            "one PSK has no per-user identity list to build"
+        );
     }
 }
 

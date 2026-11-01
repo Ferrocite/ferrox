@@ -50,6 +50,8 @@ pub(crate) struct SsAccounts {
     pub(crate) password: String,
     pub(crate) method: String,
     pub(crate) is_2022: bool,
+    /// One (email, level) per client PSK a 2022 multi-user password names after the master; empty for a legacy or single-password inbound.
+    pub(crate) identities: Vec<(String, u32)>,
 }
 
 impl std::fmt::Debug for SsAccounts {
