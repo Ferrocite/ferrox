@@ -89,6 +89,7 @@ vmess counters-per-frame 1 ferrox-app-vmess::tests::counters_advance_one_per_fra
 vmess replay-keys-held-at-most 131072 ferrox-app-vmess::tests::the_window_holds_two_rotations_at_most
 vmess zero-filled-bytes-per-flow 0 ferrox-app-vmess::tests::the_flows_windows_are_not_zero_filled
 vmess response-header-allocations-per-read 0 ferrox-app-vmess::tests::a_response_header_reads_without_allocating
+vmess carrier-reads-per-full-window-of-datagram-frames-at-most 2 ferrox-app-vmess::tests::the_datagram_pump_reads_the_carrier_through_its_window
 shadowsocks host-port-strings-per-datagram 0 ferrox-app-shadowsocks::tests::a_datagram_target_is_resolved_without_a_host_port_string
 
 # --- VLESS ------------------------------------------------------------------
