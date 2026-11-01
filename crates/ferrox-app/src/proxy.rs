@@ -7775,14 +7775,13 @@ fn read_ready_prefix<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> Optio
     let mut prefix = Vec::new();
     let mut buf = [0u8; PROBE_READ];
     loop {
-        match session.read(&mut buf) {
+        let room = PROBE_READ - prefix.len();
+        if room == 0 {
+            return Some(prefix);
+        }
+        match session.read(&mut buf[..room]) {
             Ok(0) => return (!prefix.is_empty()).then_some(prefix),
-            Ok(n) => {
-                prefix.extend_from_slice(&buf[..n]);
-                if prefix.len() >= PROBE_READ {
-                    return Some(prefix);
-                }
-            }
+            Ok(n) => prefix.extend_from_slice(&buf[..n]),
             Err(error) if is_timeout(&error) => return Some(prefix),
             Err(_) => return (!prefix.is_empty()).then_some(prefix),
         }
