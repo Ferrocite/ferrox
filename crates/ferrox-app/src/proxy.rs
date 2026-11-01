@@ -22499,7 +22499,11 @@ pub(crate) fn pump_vmess_udp<R, W>(
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
-    if udp.set_nonblocking(true).is_err() {
+    // The lane parks in the kernel rather than sleeping between polls: a datagram wakes the recv at once, and a full send buffer still answers inside the same quantum.
+    if udp.set_nonblocking(false).is_err()
+        || udp.set_read_timeout(Some(RELAY_POLL)).is_err()
+        || udp.set_write_timeout(Some(RELAY_POLL)).is_err()
+    {
         close();
         return;
     }
@@ -22550,11 +22554,10 @@ pub(crate) fn pump_vmess_udp<R, W>(
                     break;
                 }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(error) if is_timeout(&error) => {
                 if done.load(Ordering::Relaxed) {
                     break;
                 }
-                thread::sleep(RELAY_POLL);
             }
             Err(_) => break,
         }
