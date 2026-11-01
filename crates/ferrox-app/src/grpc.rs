@@ -1857,8 +1857,13 @@ impl Tail {
         Accepted::All
     }
 
-    /// The bytes the socket did not take, kept until a settle writes them.
+    /// The bytes the socket did not take, kept until a settle writes them. What the socket already
+    /// took is dropped here, so the buffer holds the pending suffix and not the whole transfer.
     fn keep(&mut self, parts: &[&[u8]], mut skip: usize) {
+        if self.at > 0 {
+            self.bytes.drain(..self.at);
+            self.at = 0;
+        }
         for part in parts {
             if skip >= part.len() {
                 skip -= part.len();
@@ -1922,7 +1927,9 @@ impl crate::proxy::FrameWrite for Tail {
         if self.lost {
             return false;
         }
-        let _ = self.drain();
+        if matches!(self.drain(), Settle::Lost) {
+            return false;
+        }
         if self.at < self.bytes.len() {
             self.keep(parts, 0);
             return true;
