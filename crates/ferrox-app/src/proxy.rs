@@ -12210,6 +12210,7 @@ fn trojan_hysteria_dial(trojan: &TrojanOut) -> Option<crate::hysteria::Dial> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn dial_trojan_udp_uplink(
     trojan: &TrojanOut,
     dest: &SocketAddr,
