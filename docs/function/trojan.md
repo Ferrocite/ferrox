@@ -39,7 +39,7 @@ graph TD
 <!-- counts:begin -->
 | key | value | checked by |
 | --- | --- | --- |
-| ops-retired-instructions | 1167 | scripts/count-ops.sh |
+| ops-retired-instructions | 1170 | scripts/count-ops.sh |
 | password-bytes-on-the-wire | 56 | ferrox-app-proxy::tests::trojan_key_is_sha224_hex |
 | framing-bytes-added-after-the-header | 0 | ferrox-app-proxy::tests::trojan_relay_round_trips_and_refuses_strangers |
 | udp-framing-bytes-per-datagram | 2 | ferrox-app-proxy::tests::trojan_udp_frames_carry |
@@ -62,7 +62,7 @@ graph TD
   proxy::tests::the_trojan_header_costs_two_reads_not_seven 'proxy::decode_trojan_request'
 ```
 
-The frame is `decode_trojan_request` over three fixed in-memory headers. The domain form carries the literal `127.0.0.1`, so the byte-level IPv4 reader returns the address directly and neither `resolve_name` nor `getaddrinfo` is entered; the count is the header parse alone and reproduces across runs. It is **1167** retired instructions, blessed in `scripts/expected-ops.txt`; before the literal arm and the word fold the same frame read `80397` then `80812` across two runs of one binary because the resolver was inside it, and before the byte-level IPv4 reader it read `1315`. The wire bytes and the three-read domain parse are unchanged.
+The frame is `decode_trojan_request` over three fixed in-memory headers. The domain form carries the literal `127.0.0.1`, so the byte-level IPv4 reader returns the address directly and neither `resolve_name` nor `getaddrinfo` is entered; the count is the header parse alone and reproduces across runs. It is **1170** retired instructions, blessed in `scripts/expected-ops.txt`; the domain arm now compares the host against the mux rendezvous before the resolver, three instructions on every domain header, and before that the frame read `1167`, before the literal arm and the word fold `80397` then `80812` across two runs of one binary because the resolver was inside it, and before the byte-level IPv4 reader `1315`. The wire bytes and the three-read domain parse are unchanged.
 
 ## Time
 

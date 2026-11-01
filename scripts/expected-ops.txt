@@ -173,9 +173,10 @@ ferrox_core::dns::tests::the_decide_probe_costs_the_parse_rules_and_answer_and_n
 # 4608 (14.9%); the frames, commands and bytes are unchanged.
 vision::Linkferrox_app::vision::tests::Fake::pump 26240 vision::tests::the_frame_parser_probe_costs_the_walk_and_nothing_else
 
-# Blessed 1167 by the byte-level IPv4 reader: the probe's domain header carries
-# `127.0.0.1`, so the parser no longer validates UTF-8 or tries the generic
-# IPv4/IPv6 parser before the literal arm. The frame was 1315 after the literal
-# arm and key fold, 80397/80812 before them; the reads, wire bytes, leading-zero
-# refusal and the resolver path for a real name are unchanged.
-proxy::decode_trojan_request 1167 proxy::tests::the_trojan_header_costs_two_reads_not_seven
+# Blessed 1170 by the mux rendezvous: the domain arm compares the host against
+# `v1.mux.cool` before the resolver, which is three instructions on every domain
+# header and lets a mux request skip resolution. The frame was 1167 after the
+# byte-level IPv4 reader, 1315 after the literal arm and key fold, 80397/80812
+# before them; the reads, wire bytes, leading-zero refusal and the resolver path
+# for a real name are unchanged.
+proxy::decode_trojan_request 1170 proxy::tests::the_trojan_header_costs_two_reads_not_seven
