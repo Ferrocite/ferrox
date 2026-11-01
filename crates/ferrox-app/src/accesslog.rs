@@ -419,6 +419,39 @@ mod tests {
     }
 
     #[test]
+    fn a_spawned_flow_keeps_the_online_lease_after_its_parent_returns() {
+        let _guard = crate::stats::test_lock();
+        crate::stats::clear();
+        crate::policy::clear();
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+        let root = crate::json::parse(
+            r#"{"stats":{},"policy":{"levels":{"1":{"statsUserOnline":true}}}}"#,
+        )
+        .expect("parses");
+        crate::policy::install(&root).expect("policy installs");
+        crate::stats::install(&root).expect("stats installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        let carried = {
+            let flow = flow(Some(source), "a@b.c", 1);
+            record_current(&"example.com:443");
+            let carried = snapshot();
+            drop(flow);
+            carried
+        };
+        assert_eq!(crate::stats::snapshot().online.get("a@b.c"), Some(&1));
+        std::thread::spawn(move || {
+            let _flow = install_snapshot(carried);
+            assert_eq!(crate::stats::snapshot().online.get("a@b.c"), Some(&1));
+            record_current(&"example.net:443");
+        })
+        .join()
+        .expect("the spawned flow records");
+        assert_eq!(crate::stats::snapshot().online.get("a@b.c"), None);
+        crate::stats::clear();
+        crate::policy::clear();
+    }
+
+    #[test]
     fn a_masked_address_keeps_the_first_octet_and_the_port() {
         let peer: SocketAddr = "192.0.2.10:443".parse().expect("address");
         assert_eq!(address(peer, true), "192:443");
