@@ -960,7 +960,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         "vmess-raw-duplex-8", "vmess-tls-ws-up-1", "vmess-tls-ws-duplex-8",
         "vmess-tls-raw-down-8", "vmess-tls-raw-up-1", "vmess-tls-raw-duplex-8",
     ]
-    ok = plan["scenarios"] == vmess_cells and len(plan["rows"]) == 3 \
+    ok = plan["scenarios"] == vmess_cells and len(plan["rows"]) == 7 \
         and "vmess_over_raw_tcp_matches_the_oracle" in plan["suites"].get("zeronet", "") \
         and "vmess" not in plan["suites"].get("xray-rust", "") \
         and "rust_" not in plan["suites"].get("xray-rust", "") \
@@ -1009,8 +1009,9 @@ def cmd_selftest(args: argparse.Namespace) -> int:
           f"does not owe the test matrix (rust={infra['rust']}, "
           f"matrix={infra['matrix']})")
     prose = output_flags(build_plan(root, ["docs/function/vmess.md"]))
+    # The vmess op-row count is asserted twice, once as a plan and once as a flag; a new row moves both.
     ok = prose["rust"] == "false" and prose["matrix"] == "true" \
-        and prose["ops_rows"] == "3" and prose["go"] == "true"
+        and prose["ops_rows"] == "7" and prose["go"] == "true"
     failed += 0 if ok else 1
     print(f"selftest: {'ok  ' if ok else 'FAIL'} a page edit owes the comparisons "
           f"but not the compiler (rust={prose['rust']}, cells={prose['cells']})")
