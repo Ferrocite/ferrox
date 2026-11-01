@@ -178,12 +178,18 @@ jobs:
           pattern: pkg-*
           path: packages
           merge-multiple: true
+      - name: fetch the optional country database
+        shell: bash
+        run: |
+          curl -fsSL --retry 3 -o packages/GeoLite2-Country.mmdb \
+            https://github.com/mojolabs-id/GeoLite2-Database/releases/download/2026.11.01/GeoLite2-Country.mmdb
+          test -s packages/GeoLite2-Country.mmdb
       - name: write the checksums
         shell: bash
         run: |
           cd packages
           rm -f SHA256SUMS
-          sha256sum ./*.tar.gz ./*.zip >SHA256SUMS
+          sha256sum ./*.tar.gz ./*.zip ./*.mmdb >SHA256SUMS
           sha256sum --check SHA256SUMS
           cat SHA256SUMS
       - name: the handout
@@ -214,27 +220,65 @@ jobs:
             ```bash
             tar xzf ferrox-VERSION_PLACEHOLDER-x86_64-apple-darwin.tar.gz   # choose your package
             cd ferrox-VERSION_PLACEHOLDER-x86_64-apple-darwin
-            ./ferrox-cli.sh up --foxy --vpn
+            ./ferrox-cli.sh up --foxy
             ./ferrox-cli.sh status
             ./ferrox-cli.sh down
             ```
 
-            On Windows, replace `./ferrox-cli.sh` with `.\ferrox-cli.exe` in the lane commands below.
+            On macOS, add `--vpn` to `up` to point the system proxy at the fronts. On Linux, use the loopback fronts directly.
+
+            On Windows, replace `./ferrox-cli.sh` with `.\ferrox-cli.exe` in the Foxy, VeePN and protocol lane commands below. The Windows launcher does not accept the Psiphon flags or the lane-specific `locations`/`location` selectors; use the macOS/Linux package for those.
 
             ### Lanes
 
             | lane | what it needs | start it |
             | --- | --- | --- |
-            | Foxy | a Firefox account: email and password; no server | `ferrox-cli up --foxy --vpn` |
-            | VeePN | nothing: anonymous, no account, no server | `ferrox-cli up --veepn --vpn` |
-            | Psiphon | `psiphon-tunnel-core` beside `ferrox-app`; no account | `ferrox-cli.sh up --psiphon --vpn` |
+            | Foxy | a Firefox account: email and password; no server | `ferrox-cli up --foxy` |
+            | VeePN | nothing: anonymous, no account, no server | `ferrox-cli up --veepn` |
+            | Psiphon | nothing: no account, no client binary | `ferrox-cli up --psiphon` |
             | VLESS | a `vless://` link | `ferrox-cli up --vless 'vless://...'` |
             | VMess | `HOST:PORT` and a user id | `ferrox-cli up --vmess host:443 --uuid ID` |
             | Trojan | `HOST:PORT` and a password | `ferrox-cli up --trojan host:443 --password PW` |
             | Shadowsocks | `HOST:PORT`, method, and password | `ferrox-cli up --ss host:8388 --method aes-256-gcm --password PW` |
             | Any config | a JSON config the binary serves | `ferrox-cli up --config mine.json` |
 
-            Psiphon runs its own client: `--psiphon-conduit-mode shirokhorshid` or `--psiphon-cdn-profile shirokhorshid` selects the Shiroy variants; `auto`/`public` and `legacy`/`android`/`off` keep the built-in paths.
+            Psiphon is native: the lane fetches the signed server list and speaks OSSH/SSH itself, with no `psiphon-tunnel-core` and no account.
+
+            Normal Psiphon:
+
+            ```bash
+            ./ferrox-cli.sh up --psiphon
+            ```
+
+            CDN fronting plus beast mode in one shortcut:
+
+            ```bash
+            ./ferrox-cli.sh up --psiphon-cdn
+            ```
+
+            On macOS, add `--vpn` to either command. On Linux, point apps at the local fronts: SOCKS5 `127.0.0.1:10808`, HTTP `127.0.0.1:8080`, or mixed `127.0.0.1:10809`.
+
+            `--psiphon-fronted` is the same shortcut. Use the individual settings when you want only one of them: `--psiphon-cdn-profile fronted` selects fronted-meek, and `--psiphon-aggressive` raises the dial width for beast mode. `--psiphon-conduit-mode private` is accepted but conduit is not built, so it falls back to SSH/OSSH; use the CDN shortcut for fronted-meek. Fronted entries are dialled through their CDN front with the version-4 meek cookie; a list with no fronted entry falls back to SSH/OSSH with one line.
+
+            Every lane takes the same country spelling. `--country DE` and `--psiphon-region DE` are the same on this lane; `--region nl` is the VeePN spelling. List before you pick:
+
+            ```bash
+            ./ferrox-cli.sh locations --psiphon
+            ./ferrox-cli.sh location --psiphon DE
+            ```
+
+            ### Exit locations
+
+            Each lane lists and remembers its own exit:
+
+            ```bash
+            ./ferrox-cli.sh locations --foxy              # countries and cities
+            ./ferrox-cli.sh locations --veepn             # VeePN region ids (ferrox-cli.sh only)
+            ./ferrox-cli.sh locations --psiphon           # regions in the signed list (ferrox-cli.sh only)
+            ./ferrox-cli.sh location DE --foxy
+            ./ferrox-cli.sh location nl --veepn
+            ./ferrox-cli.sh location US --psiphon
+            ```
 
             All lanes serve the same loopback fronts: SOCKS5 `127.0.0.1:10808`, HTTP and HTTPS `127.0.0.1:8080`, and mixed `127.0.0.1:10809`.
 
@@ -268,7 +312,7 @@ jobs:
             Get-FileHash .\ferrox-*-x86_64-pc-windows-msvc.zip -Algorithm SHA256
             ```
 
-            `README.md` in each package is the quickstart; `USAGE.md` is the full manual.
+            `README.md` in each package is the quickstart; `USAGE.md` is the full manual. `GeoLite2-Country.mmdb` is a separate optional asset for configs that ask the binary for country data; it is not unpacked by the lane packages. Its checksum is in the same `SHA256SUMS`.
         run: |
           printf '%s\n\nBuilt by `release.yml` from commit `%s`.\n' "$BODY" "${GITHUB_SHA::8}" \
             | sed "s/VERSION_PLACEHOLDER/${VERSION#v}/g" >RELEASE-BODY.md

@@ -27,7 +27,7 @@ CASES = [
     ("up --psiphon-workers with a non-number", ["up", "--psiphon", "--psiphon-workers", "many"], "--psiphon-workers wants a number"),
     ("up --psiphon-establish-timeout with a non-number", ["up", "--psiphon", "--psiphon-establish-timeout", "soon"], "--psiphon-establish-timeout wants seconds"),
     ("up --psiphon-establish-timeout with zero", ["up", "--psiphon", "--psiphon-establish-timeout", "0"], "--psiphon-establish-timeout wants seconds"),
-    ("up --psiphon-cdn-profile with a bad profile", ["up", "--psiphon", "--psiphon-cdn-profile", "turbo"], "--psiphon-cdn-profile wants shirokhorshid"),
+    ("up --psiphon-cdn-profile with a bad profile", ["up", "--psiphon", "--psiphon-cdn-profile", "turbo"], "--psiphon-cdn-profile wants fronted"),
     ("up --psiphon-conduit-mode with a bad mode", ["up", "--psiphon", "--psiphon-conduit-mode", "turbo"], "--psiphon-conduit-mode wants auto"),
     ("up --psiphon-conduit-timeout with a non-number", ["up", "--psiphon", "--psiphon-conduit-timeout", "soon"], "--psiphon-conduit-timeout wants seconds"),
     ("up --psiphon-conduit-timeout with zero", ["up", "--psiphon", "--psiphon-conduit-timeout", "0"], "--psiphon-conduit-timeout wants seconds"),
