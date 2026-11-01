@@ -626,34 +626,45 @@ fn build_report(declared: &str, shapes: usize, measured_lengths: usize, rows: &[
     );
 
     let _ = writeln!(report, "\n## Gate 3 — timing\n");
-    let timed = rows.len();
-    let listed = lengths().len();
-    let _ = writeln!(
-        report,
-        "Best of {ROUNDS} interleaved rounds per side (reference/ferrox/reference/…,\n\
-         so a thermal drift cannot favour one side). The bar is {BAR:.2}x: 5% is\n\
-         runner noise, and any length under it is re-measured at 4x the budget\n\
-         and marked `remeasured`, and still fails the job if it stays under the\n\
-         bar. The re-measure confirms the number; it does not lower the bar.\n\n\
-         {timed} of {listed} listed lengths are timed, starting at {TIMING_MIN} bytes:\n\
-         lengths 1-64 are one block, a tie by construction, so they are covered\n\
-         byte for byte in gate 1 and not timed here.\n"
-    );
-    let _ = writeln!(
-        report,
-        "| len | reference ns/op | ferrox ns/op | speedup | remeasured |"
-    );
-    let _ = writeln!(report, "|---:|---:|---:|---:|:--:|");
-    for r in rows {
+    if rows.is_empty() {
         let _ = writeln!(
             report,
-            "| {} | {:.1} | {:.1} | {:.2}x | {} |",
-            r.len,
-            r.base * 1e9,
-            r.ours * 1e9,
-            r.ratio,
-            if r.remeasured { "yes" } else { "" }
+            "Not measured here: this invocation drives traffic legs. Gates 3 to 11 time one\n\
+             operation against a reference, and a matrix job runs several cells at once on one\n\
+             runner, so a nanosecond ratio read there measures the neighbours — `bench.yml` runs\n\
+             them on a machine of its own. The identity and integer gates above are what this leg\n\
+             still asserts, and the process comparison below is what it decides on."
         );
+    } else {
+        let timed = rows.len();
+        let listed = lengths().len();
+        let _ = writeln!(
+            report,
+            "Best of {ROUNDS} interleaved rounds per side (reference/ferrox/reference/…,\n\
+             so a thermal drift cannot favour one side). The bar is {BAR:.2}x: 5% is\n\
+             runner noise, and any length under it is re-measured at 4x the budget\n\
+             and marked `remeasured`, and still fails the job if it stays under the\n\
+             bar. The re-measure confirms the number; it does not lower the bar.\n\n\
+             {timed} of {listed} listed lengths are timed, starting at {TIMING_MIN} bytes:\n\
+             lengths 1-64 are one block, a tie by construction, so they are covered\n\
+             byte for byte in gate 1 and not timed here.\n"
+        );
+        let _ = writeln!(
+            report,
+            "| len | reference ns/op | ferrox ns/op | speedup | remeasured |"
+        );
+        let _ = writeln!(report, "|---:|---:|---:|---:|:--:|");
+        for r in rows {
+            let _ = writeln!(
+                report,
+                "| {} | {:.1} | {:.1} | {:.2}x | {} |",
+                r.len,
+                r.base * 1e9,
+                r.ours * 1e9,
+                r.ratio,
+                if r.remeasured { "yes" } else { "" }
+            );
+        }
     }
 
     if let (Some(worst), Some(best)) = (
@@ -719,6 +730,11 @@ struct Gate5 {
     engines: usize,
 }
 
+/// Whether this invocation is the codec's own measurement: a run that names no engines to drive traffic is the one with the machine to itself, and gates 3 to 11 are only readable there.
+fn codec_measured(args: &Args) -> bool {
+    args.engines.is_empty()
+}
+
 fn gate5_section(args: &Args) -> Result<Gate5, String> {
     if args.engines.is_empty() {
         return Ok(Gate5 {
@@ -731,7 +747,8 @@ fn gate5_section(args: &Args) -> Result<Gate5, String> {
         return Err(
             "gate 5 needs at least two --engine arguments to have something to \
              compare against; one engine is a measurement, not a comparison. Gates \
-             1-4 ran and their report is at target/bench-report.md."
+             3 to 11 are a bare run's to measure; run `ferrox-bench` with no \
+             `--engine` for them."
                 .to_owned(),
         );
     }
@@ -916,26 +933,37 @@ fn main() {
         "gate 2 passed: 0 discarded blocks, 0 allocations, 0 zero-fills at {measured_lengths} lengths"
     );
 
-    let rows: Vec<Row> = lengths()
-        .iter()
-        .filter(|&&l| l >= TIMING_MIN)
-        .map(|&len| measure_len(&key, &nonce, len))
-        .collect();
+    let codec = codec_measured(&args);
+
+    let rows: Vec<Row> = if codec {
+        lengths()
+            .iter()
+            .filter(|&&l| l >= TIMING_MIN)
+            .map(|&len| measure_len(&key, &nonce, len))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut report = build_report(&declared, shapes, measured_lengths, &rows);
 
-    let frames = gate_four(&mut report);
-    let seals = gate_seven(&key, &nonce, &mut report);
-    let muxed = gate_six(&mut report);
-    let early = gate_eight(&mut report);
-    gate_nine(&mut report);
-    let aes_gcm_rows = gate_ten(&mut report);
-    let b64_rows = b64bench::gate_b64();
-    println!(
-        "gate 11 passed: {} base64 rows, each the shipped coder against the loop it replaced",
-        b64_rows.len()
-    );
-    report.push_str(&b64bench::report(&b64_rows));
+    let (frames, seals, muxed, early, aes_gcm_rows, b64_rows) = if codec {
+        let frames = gate_four(&mut report);
+        let seals = gate_seven(&key, &nonce, &mut report);
+        let muxed = gate_six(&mut report);
+        let early = gate_eight(&mut report);
+        gate_nine(&mut report);
+        let aes_gcm_rows = gate_ten(&mut report);
+        let b64_rows = b64bench::gate_b64();
+        println!(
+            "gate 11 passed: {} base64 rows, each the shipped coder against the loop it replaced",
+            b64_rows.len()
+        );
+        report.push_str(&b64bench::report(&b64_rows));
+        (frames, seals, muxed, early, aes_gcm_rows, b64_rows)
+    } else {
+        Default::default()
+    };
 
     report.push_str(&config_section(args.config.as_deref()));
 
@@ -1015,19 +1043,21 @@ fn main() {
             .join(" ")
     );
 
-    let (worst, best) = extremes(&rows);
-    println!(
-        "gate 3 passed: {} lengths, none below {BAR:.2}x. Worst {:.2}x @ {}B, best {:.2}x @ {}B",
-        rows.len(),
-        worst.ratio,
-        worst.len,
-        best.ratio,
-        best.len
-    );
-    assert_gate5(&gate5, shapes, args.keep_going);
+    if codec {
+        let (worst, best) = extremes(&rows);
+        println!(
+            "gate 3 passed: {} lengths, none below {BAR:.2}x. Worst {:.2}x @ {}B, best {:.2}x @ {}B",
+            rows.len(),
+            worst.ratio,
+            worst.len,
+            best.ratio,
+            best.len
+        );
+    }
+    assert_gate5(&gate5, shapes, args.keep_going, codec);
 }
 
-fn assert_gate5(gate5: &Gate5, shapes: usize, keep_going: bool) {
+fn assert_gate5(gate5: &Gate5, shapes: usize, keep_going: bool, codec: bool) {
     if let Some(comparison) = &gate5.comparison {
         let gate = comparison.gate();
         // A lost repeat is not a measured regression: when rows are unproven because runs never landed, the panic names that, beside the rows, so the claim matches what ran.
@@ -1067,9 +1097,15 @@ fn assert_gate5(gate5: &Gate5, shapes: usize, keep_going: bool) {
         println!("gate 5 passed: {}", gate.lines.len());
     }
 
-    println!(
-        "PASS: bit-identical at {shapes} shapes, no discarded work or allocation, and not slower at any length"
-    );
+    if codec {
+        println!(
+            "PASS: bit-identical at {shapes} shapes, no discarded work or allocation, and not slower at any length"
+        );
+    } else {
+        println!(
+            "PASS: bit-identical at {shapes} shapes and no discarded work or allocation; the codec's ratios are a bare run's to read, and this leg decided on gate 5"
+        );
+    }
 }
 
 struct Row {
@@ -1114,5 +1150,36 @@ mod tests {
             let r = base / ours;
             assert!(r < BAR, "a real regression must fail: {ratios:?} read {r}");
         }
+    }
+
+    /// The report half of a traffic leg, which is what a comparison of two live engines writes above its gate 5 table.
+    #[test]
+    fn a_traffic_legs_report_says_what_it_left_out_instead_of_printing_an_empty_table() {
+        let row = Row {
+            len: 4096,
+            base: 1.2e-6,
+            ours: 1.0e-6,
+            ratio: 1.2,
+            remeasured: false,
+        };
+        let traffic = build_report("the declared reference", 7, 235, &[]);
+        assert!(
+            traffic.contains("Not measured here"),
+            "a leg that timed nothing says so: {traffic}"
+        );
+        assert!(
+            !traffic.contains("| len | reference ns/op |"),
+            "and prints no table over it: {traffic}"
+        );
+
+        let bare = build_report("the declared reference", 7, 235, &[row]);
+        assert!(
+            !bare.contains("Not measured here"),
+            "a bare run does not apologize for rows it measured"
+        );
+        assert!(
+            bare.contains("| len | reference ns/op |") && bare.contains("| 4096 |"),
+            "and prints them: {bare}"
+        );
     }
 }
