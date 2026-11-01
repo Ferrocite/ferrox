@@ -1752,12 +1752,15 @@ mod tests {
             }
         });
         let tcp_stopped = Arc::clone(&stopped);
-        // A question asked again is answered again, and a half-read connection costs only the attempt that read it.
+        // A question asked again is answered again, and a connection that never finishes its frame costs only the read that waited for it: a bound read keeps the accept loop free for the retry that follows an abandoned connection, and one second is far more than a loopback write needs.
         std::thread::spawn(move || {
             while !tcp_stopped.load(Ordering::Relaxed) {
                 let Ok((mut stream, _)) = tcp.accept() else {
                     return;
                 };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .expect("DNS TCP poll");
                 let mut prefix = [0u8; 2];
                 if stream.read_exact(&mut prefix).is_err() {
                     continue;
