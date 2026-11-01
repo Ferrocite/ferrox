@@ -1013,8 +1013,10 @@ impl<R: Read> Buffered<R> {
 impl<R: Read> Read for Buffered<R> {
     fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
         if self.at == self.end {
+            // The window moves only on a read that answered: `read_exact` retries a poll expiry, and a cursor reset before the ask would replay the bytes the last window already served.
+            let end = self.carrier.read(self.held.as_mut())?;
             self.at = 0;
-            self.end = self.carrier.read(self.held.as_mut())?;
+            self.end = end;
         }
         let take = (self.end - self.at).min(dst.len());
         let held = self.held.as_mut();
@@ -3228,6 +3230,61 @@ mod tests {
         assert!(
             carrier.reads > 2,
             "the carrier handed short reads, so the window refilled"
+        );
+    }
+
+    #[test]
+    fn a_refill_that_parks_serves_no_stale_bytes() {
+        // The leg's carrier is a poll-armed socket, and `read_exact` asks again after an expiry rather than ending the leg, so a refill that waits must leave the window exactly where it was.
+        struct Stalling {
+            held: Vec<u8>,
+            at: usize,
+            grain: usize,
+            waits: usize,
+            reads: usize,
+        }
+
+        impl Read for Stalling {
+            fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+                self.reads += 1;
+                if self.reads == self.waits {
+                    return Err(std::io::Error::from(std::io::ErrorKind::TimedOut));
+                }
+                let take = self.grain.min(self.held.len() - self.at).min(dst.len());
+                dst[..take].copy_from_slice(&self.held[self.at..self.at + take]);
+                self.at += take;
+                Ok(take)
+            }
+        }
+
+        let lens: Vec<usize> = (500..510).collect();
+        let (sealed, plain, mut recv) = frames(&lens);
+        let mut carrier = Stalling {
+            held: sealed,
+            at: 0,
+            grain: 700,
+            waits: 2,
+            reads: 0,
+        };
+        let mut windowed = Buffered::new(&mut carrier);
+        let mut got = Vec::new();
+        let mut sizes = Vec::new();
+        let mut scratch = Vec::new();
+        while let Some(chunk) = read_frame(&mut windowed, &mut recv, &mut scratch) {
+            sizes.push(chunk.len());
+            got.extend_from_slice(chunk);
+        }
+        assert_eq!(
+            sizes, lens,
+            "the window refilled after the wait and lost no frame"
+        );
+        assert_eq!(
+            got, plain,
+            "a refill that waited replayed no byte the first window had already served"
+        );
+        assert!(
+            carrier.reads > 2,
+            "the wait is the second ask, and the wire only ends after the refill that follows it"
         );
     }
 
