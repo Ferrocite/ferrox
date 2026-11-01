@@ -143,6 +143,7 @@ xtls-vision commands-the-validator-accepts 3 ferrox-core-vless::tests::the_comma
 xtls-vision seal-open-staging-allocations 0 ferrox-bench-gate-2
 xtls-vision coalesce-segment-allocations 0 ferrox-core-tls::rustls_backend::tests::the_framer_path_coalesces_without_a_heap_buffer
 xtls-vision vision-read-waits-outside-the-lock 0 ferrox-app-proxy::tests::a_vision_read_waits_outside_the_lock
+xtls-vision driven-session-opens-per-steady-read 1 ferrox-app-proxy::tests::a_steady_read_opens_the_session_once
 xtls-vision shared-state-acquisitions-per-steady-framed-write 1 ferrox-app-vision::tests::a_steady_framed_write_takes_the_shared_state_once
 xtls-vision shared-state-acquisitions-per-spent-direct-read 0 ferrox-app-vision::tests::a_spent_direct_read_takes_no_shared_state
 
@@ -452,6 +453,7 @@ reality-tls relay-write-waits-for-a-parked-read 0 ferrox-app-proxy::tests::a_rel
 reality-tls session-write-waits-for-a-parked-read 0 ferrox-app-proxy::tests::a_session_write_goes_out_while_its_read_is_parked
 reality-tls session-read-waits-for-a-parked-write 0 ferrox-app-proxy::tests::a_session_read_runs_while_its_write_is_parked
 reality-tls transport-reads-behind-ready-plaintext 0 ferrox-app-proxy::tests::a_driven_read_hands_over_ready_plaintext_without_another_transport_read
+reality-tls driven-session-opens-per-steady-read 1 ferrox-app-proxy::tests::a_steady_read_opens_the_session_once
 reality-tls relay-reads-on-an-unarmed-handle 0 ferrox-app-proxy::tests::the_socket_half_reads_on_the_armed_handle
 reality-tls relay-writes-on-an-unarmed-handle 0 ferrox-app-proxy::tests::eight_downloads_finish_over_each_grpc_carrier
 reality-tls tls-arm-cells 4 scripts/run-benchmark-matrix.sh

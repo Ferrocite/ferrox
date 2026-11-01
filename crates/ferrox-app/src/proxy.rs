@@ -14989,6 +14989,11 @@ struct DrivenHalf<S, R> {
     scratch: Vec<u8>,
     pending_at: usize,
     pending_end: usize,
+    /// The session may hold plaintext this half has not delivered, so the next read opens it
+    /// before the transport; with nothing pending and nothing queued the socket is the only source.
+    queued: bool,
+    /// The session reported the peer's close: no later read asks the transport again.
+    closed: bool,
 }
 
 impl<S, R> Clone for DrivenHalf<S, R> {
@@ -15000,6 +15005,8 @@ impl<S, R> Clone for DrivenHalf<S, R> {
             scratch: self.scratch.clone(),
             pending_at: self.pending_at,
             pending_end: self.pending_end,
+            queued: self.queued,
+            closed: self.closed,
         }
     }
 }
@@ -15015,6 +15022,9 @@ impl<S, R> DrivenHalf<S, R> {
             scratch: Vec::new(),
             pending_at: 0,
             pending_end: 0,
+            // The answer read may have left plaintext in the session, so the first read asks it first.
+            queued: true,
+            closed: false,
         }
     }
 }
@@ -15030,6 +15040,34 @@ impl<S: CipherOpen, R: Read> DrivenHalf<S, R> {
                 // The caller's window is full: the rest waits for the next read.
                 return Ok(filled);
             }
+            if self.closed && self.pending_at == self.pending_end && !self.queued {
+                // The peer's close was read and nothing is queued: no later read asks the session or the transport again.
+                return Ok(filled);
+            }
+            if self.pending_at == self.pending_end && !self.queued && filled == 0 {
+                // Nothing pending or queued: the transport is the only source and its wait holds no lock.
+                let read = {
+                    let mut reader = self
+                        .reader
+                        .lock()
+                        .map_err(|_| std::io::Error::other("tls half poisoned"))?;
+                    reader.read(&mut self.scratch)
+                };
+                match read {
+                    Ok(0) => {
+                        // The peer is gone: what was read is handed over, and the next read reports the end.
+                        return Ok(filled);
+                    }
+                    Ok(read) => {
+                        self.pending_at = 0;
+                        self.pending_end = read;
+                    }
+                    Err(error) if is_timeout(&error) => return Err(error),
+                    Err(error) => return Err(error),
+                }
+                continue;
+            }
+            let room = buf.len() - filled;
             // The session's own plaintext comes out first, and the ciphertext it has not taken yet is fed after it.
             let pending = &self.scratch[self.pending_at..self.pending_end];
             let (plain, taken, closed) = {
@@ -15042,6 +15080,11 @@ impl<S: CipherOpen, R: Read> DrivenHalf<S, R> {
             };
             self.pending_at += taken;
             filled += plain;
+            if self.pending_at == self.pending_end {
+                // A read that filled its room may have left plaintext in the session; a short one took it all.
+                self.queued = plain == room;
+            }
+            self.closed = self.closed || closed;
             if filled == buf.len() {
                 // The caller's window is full: what the session still holds waits for the next read rather than a transport wait it does not need.
                 return Ok(filled);
@@ -15054,34 +15097,10 @@ impl<S: CipherOpen, R: Read> DrivenHalf<S, R> {
                 // The session has more ciphertext to take.
                 continue;
             }
-            if filled > 0 || closed {
+            if filled > 0 || self.closed {
                 // Plaintext is ready, or the peer's close was already read: the transport waits for the next read, not behind this one.
                 return Ok(filled);
             }
-            // The transport's wait happens here, with no session lock held.
-            let read = {
-                let mut reader = self
-                    .reader
-                    .lock()
-                    .map_err(|_| std::io::Error::other("tls half poisoned"))?;
-                reader.read(&mut self.scratch)
-            };
-            let read = match read {
-                Ok(0) => {
-                    // The peer is gone: what was read is handed over, and the next read reports the end.
-                    return Ok(filled);
-                }
-                Ok(read) => read,
-                Err(error) if is_timeout(&error) => {
-                    if filled > 0 {
-                        return Ok(filled);
-                    }
-                    return Err(error);
-                }
-                Err(error) => return Err(error),
-            };
-            self.pending_at = 0;
-            self.pending_end = read;
         }
     }
 }
@@ -29905,6 +29924,131 @@ mod tests {
             cvar.notify_all();
         }
         let _ = leg.join().expect("joins");
+    }
+
+    /// A steady read opens the session once. With nothing pending and nothing queued the
+    /// transport is the only source, so the read asks it first and opens the session only for
+    /// the bytes it brought; an empty open would queue the duplex writer's seal behind it.
+    #[test]
+    fn a_steady_read_opens_the_session_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct Counting {
+            opens: Arc<AtomicUsize>,
+        }
+
+        impl CipherOpen for Counting {
+            fn open(
+                &mut self,
+                ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                self.opens.fetch_add(1, Ordering::Relaxed);
+                let n = ciphertext.len().min(buf.len());
+                buf[..n].copy_from_slice(&ciphertext[..n]);
+                Ok((n, n))
+            }
+
+            fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+                out.extend_from_slice(plaintext);
+                Ok(plaintext.len())
+            }
+        }
+
+        /// Sixteen ciphertext bytes a read, short of the caller's window, so a read that
+        /// delivered them took everything the session held.
+        struct Wire {
+            left: usize,
+        }
+
+        impl Read for Wire {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.left.min(buf.len()).min(16);
+                for (at, slot) in buf[..n].iter_mut().enumerate() {
+                    *slot = at as u8;
+                }
+                self.left -= n;
+                Ok(n)
+            }
+        }
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let session = Arc::new(Mutex::new(Counting {
+            opens: Arc::clone(&opens),
+        }));
+        let reader = Arc::new(Mutex::new(Wire { left: 8 * 16 }));
+        let out = Arc::new(Mutex::new(Sealed::new(std::io::sink())));
+        let mut half = DrivenHalf::new(session, reader, out);
+        let mut buf = [0u8; 64];
+        // The first read asks the session for anything the answer left before it reads the transport.
+        assert_eq!(half.read(&mut buf).expect("warms"), 16);
+        for _ in 0..4 {
+            let before = opens.load(Ordering::Relaxed);
+            let read = half.read(&mut buf).expect("reads");
+            assert_eq!(read, 16, "one transport read per steady read");
+            assert_eq!(buf[..16], (0u8..16).collect::<Vec<_>>()[..], "the bytes");
+            assert_eq!(
+                opens.load(Ordering::Relaxed) - before,
+                1,
+                "each steady read opened the session once, not once empty and once for its bytes"
+            );
+        }
+    }
+
+    /// A closed session that still holds plaintext delivers it: a read that filled the caller's
+    /// window exactly must not turn the peer's close into an early end that drops what is queued.
+    #[test]
+    fn a_closed_session_hands_over_its_queued_plaintext() {
+        struct Draining {
+            plain: Vec<u8>,
+        }
+
+        impl CipherOpen for Draining {
+            fn open(
+                &mut self,
+                _ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                let n = self.plain.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.plain[..n]);
+                self.plain.drain(..n);
+                Ok((n, 0))
+            }
+
+            fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+                out.extend_from_slice(plaintext);
+                Ok(plaintext.len())
+            }
+
+            fn closed(&self) -> bool {
+                true
+            }
+        }
+
+        struct Silent;
+
+        impl Read for Silent {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                panic!("a closed session with queued plaintext must not read the transport");
+            }
+        }
+
+        let session = Arc::new(Mutex::new(Draining {
+            plain: (0u8..8).collect(),
+        }));
+        let reader = Arc::new(Mutex::new(Silent));
+        let out = Arc::new(Mutex::new(Sealed::new(std::io::sink())));
+        let mut half = DrivenHalf::new(session, reader, out);
+        let mut buf = [0u8; 4];
+        assert_eq!(half.read(&mut buf).expect("first"), 4);
+        assert_eq!(buf, [0, 1, 2, 3]);
+        assert_eq!(
+            half.read(&mut buf).expect("second"),
+            4,
+            "the queued plaintext is handed over, not dropped at the close"
+        );
+        assert_eq!(buf, [4, 5, 6, 7]);
+        assert_eq!(half.read(&mut buf).expect("end"), 0);
     }
 
     /// A Vision link over a driven session: the reader parks in the transport read with no
