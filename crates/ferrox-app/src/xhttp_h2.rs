@@ -740,27 +740,24 @@ impl H2Conn {
         let Some(read) = self.client_read.as_ref() else {
             return false;
         };
-        let frame = {
-            let mut read = read.lock().unwrap_or_else(PoisonError::into_inner);
-            if ready() {
-                return true;
-            }
-            let Some((len, kind, flags, sid)) = read_head_retry(&mut **read) else {
-                self.dead.store(true, Ordering::SeqCst);
-                return false;
-            };
-            if len > MAX_RECV_FRAME {
-                self.dead.store(true, Ordering::SeqCst);
-                return false;
-            }
-            let mut body = crate::proxy::unfilled(len);
-            if read_exact_retry(&mut **read, &mut body).is_err() {
-                self.dead.store(true, Ordering::SeqCst);
-                return false;
-            }
-            (kind, flags, sid, body)
+        let mut read = read.lock().unwrap_or_else(PoisonError::into_inner);
+        if ready() {
+            return true;
+        }
+        let Some((len, kind, flags, sid)) = read_head_retry(&mut **read) else {
+            self.dead.store(true, Ordering::SeqCst);
+            return false;
         };
-        let (kind, flags, sid, body) = frame;
+        if len > MAX_RECV_FRAME {
+            self.dead.store(true, Ordering::SeqCst);
+            return false;
+        }
+        let mut body = crate::proxy::unfilled(len);
+        if read_exact_retry(&mut **read, &mut body).is_err() {
+            self.dead.store(true, Ordering::SeqCst);
+            return false;
+        }
+        // Dispatch under the lock so a later frame cannot overtake an earlier one on the wire.
         let alive = client_frame(self, kind, flags, sid, body);
         if !alive {
             self.dead.store(true, Ordering::SeqCst);
