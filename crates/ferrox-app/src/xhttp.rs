@@ -77,6 +77,20 @@ fn size_line(n: usize, out: &mut [u8; 7]) -> usize {
     }
 }
 
+fn take_into<R: Read>(read: &mut R, reads: &mut usize, buf: &mut [u8]) -> std::io::Result<usize> {
+    loop {
+        *reads += 1;
+        match read.read(buf) {
+            Err(error)
+                if crate::proxy::is_timeout(&error) && !crate::proxy::relay_step_owns_poll() =>
+            {
+                std::thread::sleep(crate::budgets::RELAY_POLL);
+            }
+            other => return other,
+        }
+    }
+}
+
 fn read_line_into(
     reader: &mut Reader<impl Read>,
     out: &mut [u8; 130],
@@ -239,16 +253,21 @@ impl<R: Read> Reader<R> {
     /// Every read that reaches the stream, counted where it happens. A relay's poll timeout comes
     /// back to the lane instead of being retried here: the chunk stays where it broke.
     fn take(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            self.reads += 1;
-            match self.read.read(buf) {
+        take_into(&mut self.read, &mut self.reads, buf)
+    }
+
+    /// One read past the framing into the buffer holding what it proved: xray's 8 KiB chunks otherwise cost a framing syscall each.
+    fn fill(&mut self, want: usize) -> std::io::Result<usize> {
+        let base = self.prefix.len();
+        crate::proxy::grow_scratch(&mut self.prefix, base + want);
+        match take_into(&mut self.read, &mut self.reads, &mut self.prefix[base..]) {
+            Ok(n) => {
+                self.prefix.truncate(base + n);
+                Ok(n)
+            }
+            Err(error) => {
+                self.prefix.truncate(base);
                 Err(error)
-                    if crate::proxy::is_timeout(&error)
-                        && !crate::proxy::relay_step_owns_poll() =>
-                {
-                    std::thread::sleep(crate::budgets::RELAY_POLL);
-                }
-                other => return other,
             }
         }
     }
@@ -551,13 +570,11 @@ impl<R: Read> Read for Reader<R> {
                 while self.prefix.len() - self.at < 2 {
                     self.prefix.drain(..self.at);
                     self.at = 0;
-                    let mut tmp = [0u8; 128];
-                    // One window instead of a two-byte read: the bytes past the CRLF are the next size line, found without asking the socket, and a peer segmenting the CRLF across reads still gets through.
-                    let n = self.take(&mut tmp)?;
+                    // One promoted window instead of a two-byte read: the bytes past the CRLF are the next size lines and bodies.
+                    let n = self.fill(CHUNK)?;
                     if n == 0 {
                         return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
                     }
-                    self.prefix.extend_from_slice(&tmp[..n]);
                 }
                 if &self.prefix[self.at..self.at + 2] != b"\r\n" {
                     return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
@@ -3095,17 +3112,6 @@ mod tests {
     /// Reads are driven with a fixed CHUNK buffer, the way `relay_ordered` drives them, so the count is the reader's and not `read_to_end`'s buffer growth; `reads` is the counter that says so.
     #[test]
     fn a_chunk_costs_two_reads_not_three() {
-        fn framed(chunks: &[usize]) -> Vec<u8> {
-            let mut wire = Vec::new();
-            for &n in chunks {
-                wire.extend_from_slice(format!("{n:X}\r\n").as_bytes());
-                wire.extend(std::iter::repeat_n(0x5Au8, n));
-                wire.extend_from_slice(b"\r\n");
-            }
-            wire.extend_from_slice(b"0\r\n\r\n");
-            wire
-        }
-
         for count in [1usize, 2, 4, 8, 16] {
             let chunks: Vec<usize> = std::iter::repeat_n(CHUNK, count).collect();
             let payload: Vec<u8> = vec![0x5Au8; CHUNK * count];
@@ -3136,6 +3142,40 @@ mod tests {
                 "{count} chunks: framing reads must amortise to one per chunk"
             );
         }
+    }
+
+    /// xray writes 8 KiB per chunk, a quarter of the relay window; the framing read must cover several of them.
+    #[test]
+    fn a_peer_chunk_smaller_than_the_window_amortises_its_framing() {
+        const PEER: usize = 8 * 1024;
+        let count = 16;
+        let chunks: Vec<usize> = std::iter::repeat_n(PEER, count).collect();
+        let payload: Vec<u8> = vec![0x5Au8; PEER * count];
+        let mut reader = Reader {
+            read: std::io::Cursor::new(framed(&chunks)),
+            prefix: Vec::new(),
+            at: 0,
+            left: 0,
+            ended: false,
+            reads: 0,
+            pending_head: false,
+            chunk: Chunk::Body,
+        };
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; CHUNK];
+        loop {
+            let n = reader.read(&mut buf).expect("reads");
+            if n == 0 {
+                break;
+            }
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, payload, "the bytes must be unchanged");
+        assert_eq!(
+            reader.reads(),
+            5,
+            "{count} peer chunks must not cost a read each"
+        );
     }
 
     /// The record arm takes the buffer its own head read filled, head octets and all: what rode behind the delimiter is handed over inside it, not copied into a second owner.
@@ -3843,6 +3883,17 @@ mod tests {
         )
         .session_id();
         assert_eq!(uuid.len(), 36, "no table keeps the UUID: {uuid}");
+    }
+
+    fn framed(chunks: &[usize]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for &n in chunks {
+            wire.extend_from_slice(format!("{n:X}\r\n").as_bytes());
+            wire.extend(std::iter::repeat_n(0x5Au8, n));
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        wire
     }
 
     fn packet_settings(mode: XhttpMode) -> XhttpSettings {
