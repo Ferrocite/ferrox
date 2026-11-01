@@ -3618,7 +3618,7 @@ fn serve_vless_ws(
         return;
     }
     reader.set_poll(Some(RELAY_POLL));
-    crate::proxy::relay_sink(reader, &writer, &uplink, |_| {});
+    crate::proxy::relay_sink_ws(reader, &writer, &uplink);
 }
 
 fn serve_vless_httpupgrade(
@@ -7050,7 +7050,7 @@ fn serve_session_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
         return;
     }
     echo_trace("session ws relaying");
-    relay_sink(creader, &cwriter, &uplink, |_| {});
+    relay_sink_ws(creader, &cwriter, &uplink);
 }
 
 fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static>(
@@ -8986,7 +8986,7 @@ fn dial_vless_rung(
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
             reader.set_poll(Some(RELAY_POLL));
-            crate::proxy::relay_sink(reader, &writer, client, |_| {});
+            crate::proxy::relay_sink_ws(reader, &writer, client);
             true
         }
         Rung::HttpUpgrade => {
@@ -13069,7 +13069,7 @@ fn dial_trojan_rung(
             };
             note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             reader.set_poll(Some(RELAY_POLL));
-            crate::proxy::relay_sink(reader, &writer, client, |_| {});
+            crate::proxy::relay_sink_ws(reader, &writer, client);
             true
         }
         Rung::Raw => {
@@ -14867,7 +14867,7 @@ fn dial_trojan_tls(client: &Connection, server: &SocketAddr, trojan: &TrojanOut,
             ) else {
                 return;
             };
-            relay_sink(reader, &writer, client, |_| {});
+            relay_sink_ws(reader, &writer, client);
         }
         Carrier::HttpUpgrade { path, ed, .. } => {
             let Some((reader, sink)) = tls_httpupgrade(
@@ -15893,7 +15893,7 @@ fn serve_trojan_ws(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bo
         return;
     };
     reader.set_poll(Some(RELAY_POLL));
-    crate::proxy::relay_sink(reader, &writer, &uplink, |_| {});
+    crate::proxy::relay_sink_ws(reader, &writer, &uplink);
 }
 
 fn serve_trojan_httpupgrade(
@@ -16320,7 +16320,7 @@ fn serve_session_trojan_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
         return;
     };
     echo_trace("session ws relaying");
-    relay_sink(creader, &cwriter, &uplink, |_| {});
+    relay_sink_ws(creader, &cwriter, &uplink);
 }
 
 fn serve_session_trojan_xhttp<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
@@ -22874,6 +22874,83 @@ impl<S: ferrox_core::tls::TlsProvider + ferrox_core::tls::RecordAlignment + Send
     }
 }
 
+/// The spans one read hands the relay: offsets into `bytes`, never a copy of them.
+pub(crate) const WINDOW_PARTS: usize = 16;
+
+pub(crate) struct Window<'a> {
+    bytes: &'a [u8],
+    spans: [(usize, usize); WINDOW_PARTS],
+    len: usize,
+}
+
+impl<'a> Window<'a> {
+    pub(crate) fn empty() -> Self {
+        Self {
+            bytes: &[],
+            spans: [(0, 0); WINDOW_PARTS],
+            len: 0,
+        }
+    }
+
+    pub(crate) fn one(bytes: &'a [u8]) -> Self {
+        let mut spans = [(0, 0); WINDOW_PARTS];
+        spans[0] = (0, bytes.len());
+        Self {
+            bytes,
+            spans,
+            len: 1,
+        }
+    }
+
+    pub(crate) fn new(bytes: &'a [u8], spans: [(usize, usize); WINDOW_PARTS], len: usize) -> Self {
+        Self { bytes, spans, len }
+    }
+
+    pub(crate) fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    pub(crate) fn parts(&self) -> &[(usize, usize)] {
+        &self.spans[..self.len]
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.spans[..self.len].iter().all(|&(_, part)| part == 0)
+    }
+}
+
+pub(crate) trait WindowRead: Read {
+    fn read_window(&mut self) -> std::io::Result<Window<'_>>;
+}
+
+/// A `Read` reader behind the window trait: its window is the buffer it just filled.
+pub(crate) struct Copied<R> {
+    inner: R,
+    buffer: RelayBuf,
+}
+
+impl<R> Copied<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buffer: RelayBuf::new(),
+        }
+    }
+}
+
+impl<R: Read> Read for Copied<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl<R: Read> WindowRead for Copied<R> {
+    fn read_window(&mut self) -> std::io::Result<Window<'_>> {
+        let n = self.inner.read(self.buffer.as_mut())?;
+        Ok(Window::one(self.buffer.filled(n)))
+    }
+}
+
 pub(crate) fn relay_sink<R, W, F>(
     reader: R,
     writer: &W,
@@ -22885,11 +22962,29 @@ where
     W: CarrierSink,
     F: FnOnce(&mut R) + Send + 'static,
 {
-    relay_ordered::<R, W, F, _, CLOSE_BEFORE_JOIN, false>(
+    relay_ordered::<Copied<R>, W, _, _, CLOSE_BEFORE_JOIN, false>(
+        Copied::new(reader),
+        writer,
+        peer,
+        move |reader: &mut Copied<R>| on_reader_done(&mut reader.inner),
+        |_| false,
+    )
+}
+
+pub(crate) fn relay_sink_ws<R, W>(
+    reader: crate::ws::WsReader<R>,
+    writer: &W,
+    peer: &Connection,
+) -> Option<Arc<RelayFinish>>
+where
+    R: Read + Send + 'static,
+    W: CarrierSink,
+{
+    relay_ordered::<crate::ws::WsReader<R>, W, _, _, CLOSE_BEFORE_JOIN, false>(
         reader,
         writer,
         peer,
-        on_reader_done,
+        |_| {},
         |_| false,
     )
 }
@@ -22922,9 +23017,8 @@ impl Forward {
     }
 }
 
-/// Where one upload leg stands: the buffer the peer has not taken, and whether a normal request end already closed its write half.
+/// Where one upload leg stands: whether the first window has moved, and whether a normal request end already closed its write half.
 struct Upload {
-    buffer: RelayBuf,
     first: bool,
     half_closed: bool,
 }
@@ -22932,7 +23026,6 @@ struct Upload {
 impl Upload {
     fn new() -> Self {
         Self {
-            buffer: RelayBuf::new(),
             first: true,
             half_closed: false,
         }
@@ -23038,64 +23131,7 @@ fn forward_finished(
     }
 }
 
-/// Classifies one upload wait: the peer's write error ends the leg, and a timeout only ends it
-/// when the sibling already did.
-fn upload_finished(
-    read: std::io::Result<usize>,
-    upload: &mut Upload,
-    peer_write: &mut Connection,
-    stall: Duration,
-    request_ended: bool,
-    ended: impl FnOnce() -> bool,
-) -> Next {
-    let _ = stall;
-    let next = match read {
-        Ok(n) if n > 0 => {
-            if upload.first {
-                echo_trace("relay bwd first read");
-                echo_trace("relay bwd forwarding");
-            }
-            census!(
-                "carrier-write",
-                crate::census::handle(peer_write),
-                Some(stall)
-            );
-            if peer_write.write_all(upload.buffer.filled(n)).is_err() {
-                echo_trace("relay bwd peer write failed");
-                Next::Done
-            } else {
-                if upload.first {
-                    echo_trace("relay bwd forwarded");
-                    upload.first = false;
-                }
-                Next::More
-            }
-        }
-        // A carrier read that times out is not an idle socket to park: the frame that grants the sibling's window arrives on this read, so the lane takes another turn at once rather than a quantum later.
-        Err(error) if is_timeout(&error) => {
-            if ended() {
-                Next::Done
-            } else {
-                Next::More
-            }
-        }
-        Err(error) => {
-            echo_trace(&format!("relay bwd read err {error:?}"));
-            Next::Done
-        }
-        Ok(_) => {
-            echo_trace("relay bwd eof");
-            Next::Done
-        }
-    };
-    // A normal request end still needs the target write half closed, even while this lane pumps control frames.
-    if request_ended && !upload.half_closed {
-        let _ = peer_write.shutdown(Shutdown::Write);
-        upload.half_closed = true;
-    }
-    next
-}
-
+#[allow(clippy::too_many_lines)]
 fn relay_ordered<R, W, F, E, const CLOSE_FIRST: bool, const DRAIN_REQUEST: bool>(
     reader: R,
     writer: &W,
@@ -23104,7 +23140,7 @@ fn relay_ordered<R, W, F, E, const CLOSE_FIRST: bool, const DRAIN_REQUEST: bool>
     mut request_ended: E,
 ) -> Option<Arc<RelayFinish>>
 where
-    R: Read + Send + 'static,
+    R: WindowRead + Send + 'static,
     W: CarrierSink,
     F: FnOnce(&mut R) + Send + 'static,
     E: FnMut(&mut R) -> bool + Send + 'static,
@@ -23180,19 +23216,63 @@ where
     let _ = peer_write.set_write_timeout(Some(stall));
     lane_pool::submit(
         Box::new(move || {
-            let read = reader.read(upload.buffer.as_mut());
+            let read = reader.read_window();
+            let (next, timed_out) = match read {
+                Ok(window) if !window.is_empty() => {
+                    if upload.first {
+                        echo_trace("relay bwd first read");
+                        echo_trace("relay bwd forwarding");
+                    }
+                    census!(
+                        "carrier-write",
+                        crate::census::handle(&peer_write),
+                        Some(stall)
+                    );
+                    if write_all_runs::<WINDOW_PARTS>(
+                        &mut peer_write,
+                        window.bytes(),
+                        window.parts(),
+                    )
+                    .is_err()
+                    {
+                        echo_trace("relay bwd peer write failed");
+                        (Next::Done, false)
+                    } else {
+                        if upload.first {
+                            echo_trace("relay bwd forwarded");
+                            upload.first = false;
+                        }
+                        (Next::More, false)
+                    }
+                }
+                Ok(_) => {
+                    echo_trace("relay bwd eof");
+                    (Next::Done, false)
+                }
+                // A carrier read that times out is not an idle socket to park: the frame that grants the sibling's window arrives on this read, so the lane takes another turn at once rather than a quantum later.
+                Err(error) if is_timeout(&error) => (Next::More, true),
+                Err(error) => {
+                    echo_trace(&format!("relay bwd read err {error:?}"));
+                    (Next::Done, false)
+                }
+            };
             let ended_request = DRAIN_REQUEST && request_ended(&mut reader);
-            let next = upload_finished(
-                read,
-                &mut upload,
-                &mut peer_write,
-                stall,
-                ended_request,
-                || {
-                    (!DRAIN_REQUEST || ended_request)
-                        && upload_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
-                },
-            );
+            let next = if timed_out {
+                if (!DRAIN_REQUEST || ended_request)
+                    && upload_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
+                {
+                    Next::Done
+                } else {
+                    Next::More
+                }
+            } else {
+                next
+            };
+            // A normal request end still needs the target write half closed, even while this lane pumps control frames.
+            if ended_request && !upload.half_closed {
+                let _ = peer_write.shutdown(Shutdown::Write);
+                upload.half_closed = true;
+            }
             if next != Next::Done {
                 return next;
             }
@@ -23219,7 +23299,13 @@ pub(crate) fn relay_sink_drained<R: Read + Send + 'static, W: CarrierSink>(
     writer: &W,
     peer: &Connection,
 ) -> Option<Arc<RelayFinish>> {
-    relay_ordered::<R, W, _, _, CLOSE_AFTER_JOIN, false>(reader, writer, peer, |_| {}, |_| false)
+    relay_ordered::<Copied<R>, W, _, _, CLOSE_AFTER_JOIN, false>(
+        Copied::new(reader),
+        writer,
+        peer,
+        |_| {},
+        |_| false,
+    )
 }
 
 pub(crate) fn relay_sink_drained_with<R, W, F, E>(
@@ -23227,7 +23313,7 @@ pub(crate) fn relay_sink_drained_with<R, W, F, E>(
     writer: &W,
     peer: &Connection,
     on_reader_done: F,
-    request_ended: E,
+    mut request_ended: E,
 ) -> Option<Arc<RelayFinish>>
 where
     R: Read + Send + 'static,
@@ -23235,12 +23321,12 @@ where
     F: FnOnce(&mut R) + Send + 'static,
     E: FnMut(&mut R) -> bool + Send + 'static,
 {
-    relay_ordered::<R, W, F, E, CLOSE_AFTER_JOIN, true>(
-        reader,
+    relay_ordered::<Copied<R>, W, _, _, CLOSE_AFTER_JOIN, true>(
+        Copied::new(reader),
         writer,
         peer,
-        on_reader_done,
-        request_ended,
+        move |reader: &mut Copied<R>| on_reader_done(&mut reader.inner),
+        move |reader: &mut Copied<R>| request_ended(&mut reader.inner),
     )
 }
 
