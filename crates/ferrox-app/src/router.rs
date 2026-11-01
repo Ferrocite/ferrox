@@ -5209,8 +5209,13 @@ mod tests {
             std::net::TcpStream::connect(listener.local_addr().expect("local")).expect("connects");
         let (_server, _) = listener.accept().expect("accepts");
         let source = client.local_addr().expect("source");
-        let owner =
-            crate::process::owner(Network::Tcp, source).expect("this process owns the socket");
+        let owner = crate::process::owner(Network::Tcp, source).unwrap_or_else(|| {
+            let inode = crate::process::socket_inode(Network::Tcp, source)
+                .unwrap_or_else(|| panic!("no row of the kernel table spells the source {source}"));
+            let pid = crate::process::owner_pid(&inode)
+                .unwrap_or_else(|| panic!("no descriptor of any process holds socket:[{inode}]"));
+            panic!("pid {pid} names no executable")
+        });
         let route = |names: &[&str], owner: Option<&crate::process::Owner>| {
             let root = object(vec![(
                 "routing",
