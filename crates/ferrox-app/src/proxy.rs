@@ -12222,20 +12222,28 @@ fn dial_trojan_udp_uplink(
     let server = resolve_outbound(&trojan.address, trojan.port)?;
     let header = trojan_header(&trojan.key, 3, &Destination::from(*dest));
     let udp_send = relay.try_clone().ok()?;
+    let mask = trojan.carrier.tcp_mask();
     // The association rides whatever the outbound names: a terminated session splits into the reader and writer the pump needs, and the header goes inside it.
-    let (read, write, close): TrojanUdpParts = match (&trojan.carrier, trojan.tls.as_deref()) {
-        (Carrier::Raw(_), None) => {
-            let mut uplink = dial_or_report(&server)?.with_mask(trojan.carrier.tcp_mask());
-            uplink.write_all(&header).ok()?;
-            let read = uplink.try_clone().ok()?;
-            let write = uplink.try_clone().ok()?;
+    let (read, write, close): TrojanUdpParts = match (
+        &trojan.carrier,
+        trojan.reality.as_deref(),
+        trojan.tls.as_deref(),
+    ) {
+        (Carrier::Raw(_), Some(cfg), _) => {
+            let mut session = dial_reality_session(&server, cfg, mask)?;
+            if session.write_all(&header).is_err() {
+                return None;
+            }
+            let out = session.get_ref().get_ref().try_clone().ok()?;
+            let socket = out.try_clone().ok()?;
+            let (_driven, half) = session_halves(session, out);
             let close = move || {
-                let _ = uplink.shutdown(Shutdown::Both);
+                let _ = socket.shutdown(Shutdown::Both);
             };
-            (Box::new(read), Box::new(write), Box::new(close))
+            (Box::new(half.clone()), Box::new(half), Box::new(close))
         }
-        (Carrier::Raw(_), Some(cfg)) => {
-            let mut session = dial_tls_session(&server, cfg, trojan.carrier.tcp_mask())?;
+        (Carrier::Raw(_), None, Some(cfg)) => {
+            let mut session = dial_tls_session(&server, cfg, mask)?;
             if session.write_all(&header).is_err() {
                 return None;
             }
@@ -12248,16 +12256,17 @@ fn dial_trojan_udp_uplink(
             };
             (Box::new(half.clone()), Box::new(half), Box::new(close))
         }
-        (Carrier::Kcp(_), None) => {
+        (Carrier::Kcp(_), Some(cfg), _) => {
             let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
-            if conn.write(&header).is_err() {
+            let mut session = kcp_reality_connect(&conn, cfg)?;
+            if session.write_all(&header).is_err() {
                 return None;
             }
-            let (read, write, closed) = kcp_parts(&conn);
-            let close = move || closed();
+            let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
+            let close = move || conn.close();
             (Box::new(read), Box::new(write), Box::new(close))
         }
-        (Carrier::Kcp(_), Some(cfg)) => {
+        (Carrier::Kcp(_), None, Some(cfg)) => {
             let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
             let mut session = ferrox_core::tls::connect(cfg, KcpIo::new(Arc::clone(&conn))).ok()?;
             if !shake_tls(&mut session) || session.write_all(&header).is_err() {
@@ -12267,13 +12276,38 @@ fn dial_trojan_udp_uplink(
             let close = move || conn.close();
             (Box::new(read), Box::new(write), Box::new(close))
         }
-        (carrier, None) => {
-            let uplink = dial_or_report(&server)?.with_mask(trojan.carrier.tcp_mask());
-            trojan_udp_plain(uplink, carrier, trojan, &header)?
+        (Carrier::Kcp(_), None, None) => {
+            let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
+            if conn.write(&header).is_err() {
+                return None;
+            }
+            let (read, write, closed) = kcp_parts(&conn);
+            let close = move || closed();
+            (Box::new(read), Box::new(write), Box::new(close))
         }
-        (carrier, Some(cfg)) => {
-            let session = dial_tls_session(&server, cfg, trojan.carrier.tcp_mask())?;
-            trojan_udp_tls(&server, session, cfg, carrier, trojan, &header)?
+        (carrier, Some(cfg), _) => {
+            let session = dial_reality_session(&server, cfg, mask)?;
+            trojan_udp_session(
+                session,
+                || dial_reality_session(&server, cfg, mask),
+                carrier,
+                trojan,
+                &header,
+            )?
+        }
+        (carrier, None, Some(cfg)) => {
+            let session = dial_tls_session(&server, cfg, mask)?;
+            trojan_udp_session(
+                session,
+                || dial_tls_session(&server, cfg, mask),
+                carrier,
+                trojan,
+                &header,
+            )?
+        }
+        (carrier, None, None) => {
+            let uplink = dial_or_report(&server)?.with_mask(mask);
+            trojan_udp_plain(uplink, carrier, trojan, &header)?
         }
     };
     let done = spawn_trojan_uplink_reader(read, udp_send, source);
@@ -12384,10 +12418,9 @@ fn trojan_udp_plain(
     }
 }
 
-fn trojan_udp_tls<S: Dialed>(
-    server: &SocketAddr,
+fn trojan_udp_session<S: Dialed>(
     session: S,
-    cfg: &ferrox_core::tls::TlsConfig,
+    second: impl FnOnce() -> Option<S>,
     carrier: &Carrier,
     trojan: &TrojanOut,
     header: &[u8],
@@ -12459,8 +12492,7 @@ fn trojan_udp_tls<S: Dialed>(
                 return Some((Box::new(reader), Box::new(writer), Box::new(close)));
             }
             // The GET downlink dials its own session: one transport per direction, both under one session id (`dialer.go:411`).
-            let (down, down_write, down_raw) =
-                dial_tls_session(server, cfg, carrier.tcp_mask())?.into_halves()?;
+            let (down, down_write, down_raw) = second()?.into_halves()?;
             let (reader, writer) =
                 crate::xhttp::connect_dual_split(down, down_write, up, host, settings)?;
             if !writer.send(header) {
@@ -37963,6 +37995,55 @@ mod tests {
                 // Held for the test: a leaked association still addresses the port it last saw, and a freed one can become a later call's relay.
                 held.push(udp);
             }
+        }
+    }
+
+    /// The association rides REALITY on every carrier, with mux off, so the datagram path selects the session before the header.
+    #[test]
+    fn a_trojan_udp_association_crosses_reality() {
+        let carriers = [
+            ("raw", r#""network": "tcp""#),
+            ("ws", r#""network": "ws", "wsSettings": {"path": "/t"}"#),
+            (
+                "httpupgrade",
+                r#""network": "httpupgrade", "httpupgradeSettings": {"path": "/u"}"#,
+            ),
+            (
+                "grpc",
+                r#""network": "grpc", "grpcSettings": {"serviceName": "/TunnelService/Tun"}"#,
+            ),
+            (
+                "xhttp",
+                r#""network": "xhttp", "xhttpSettings": {"path": "/x", "mode": "stream-one"}"#,
+            ),
+            (
+                "httpheader",
+                r#""network": "tcp", "tcpSettings": {"header": {"type": "http", "request": {"path": ["/c"]}}}"#,
+            ),
+            ("kcp", r#""network": "kcp""#),
+        ];
+        let mut held = Vec::new();
+        for (index, (tag, stream)) in carriers.into_iter().enumerate() {
+            let inbound = trojan_reality_inbound(stream);
+            let port = trojan_probe_base() + 48 + index as u16;
+            let address = format!("127.0.0.1:{port}");
+            assert!(serve_trojan_inbound(&address, &inbound, true), "{tag}");
+            if tag != "kcp" {
+                let waited = Instant::now();
+                while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+                    assert!(
+                        waited.elapsed() < Duration::from_secs(10),
+                        "{tag} listener never bound"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+            let trojan = find_trojan_outbound(&trojan_reality_outbound(stream, port))
+                .unwrap_or_else(|| panic!("{tag} reality outbound"));
+            assert!(trojan.reality.is_some(), "{tag} dials reality");
+            let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            assert_trojan_udp_echo_with(tag, &trojan, &udp);
+            held.push(udp);
         }
     }
 
