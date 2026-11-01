@@ -52,7 +52,13 @@ fn padding_for(payload_len: usize) -> usize {
     }
 }
 
-pub(crate) fn serve(mut stream: Connection, password: &str, method: &str, freedom: bool) {
+pub(crate) fn serve(
+    mut stream: Connection,
+    password: &str,
+    method: &str,
+    identities: &[(String, u32)],
+    freedom: bool,
+) {
     let Some(method) = Method::parse(method) else {
         return;
     };
@@ -65,7 +71,7 @@ pub(crate) fn serve(mut stream: Connection, password: &str, method: &str, freedo
     if list.len() == 1 {
         serve_single(&mut stream, method, &list[0], freedom);
     } else if !method.is_chacha() {
-        serve_multi(&mut stream, method, &list, freedom);
+        serve_multi(stream, method, &list, identities, freedom);
     }
 }
 
@@ -157,7 +163,13 @@ fn serve_single(stream: &mut Connection, method: Method, psk: &[u8], freedom: bo
     pump_relay_with_response(&uplink, stream, response, Recv::Ready(recv));
 }
 
-fn serve_multi(stream: &mut Connection, method: Method, list: &[Vec<u8>], freedom: bool) {
+fn serve_multi(
+    mut stream: Connection,
+    method: Method,
+    list: &[Vec<u8>],
+    identities: &[(String, u32)],
+    freedom: bool,
+) {
     if !freedom || list.len() < 2 {
         return;
     }
@@ -168,7 +180,7 @@ fn serve_multi(stream: &mut Connection, method: Method, list: &[Vec<u8>], freedo
     let _ = stream.set_read_timeout(Some(budget));
     let opened = {
         let mut bounded = crate::proxy::HandshakeDeadline {
-            inner: stream,
+            inner: &mut stream,
             until: std::time::Instant::now() + budget,
         };
         'req: {
@@ -186,26 +198,30 @@ fn serve_multi(stream: &mut Connection, method: Method, list: &[Vec<u8>], freedo
             let Some(hash) = shadowsocks2022::decrypt_eih(method, master, &salt, &eih) else {
                 break 'req None;
             };
-            let Some(psk) = list[1..]
+            let Some(idx) = list[1..]
                 .iter()
-                .find(|p| shadowsocks2022::user_hash(p) == hash)
+                .position(|p| shadowsocks2022::user_hash(p) == hash)
             else {
                 break 'req None;
             };
-            let psk = psk.clone();
+            let psk = list[1 + idx].clone();
             let Some(mut recv) = Cipher::from_psk(method, &psk, &salt) else {
                 break 'req None;
             };
             let Some((target, early)) = read_request_header(&mut bounded, &mut recv) else {
                 break 'req None;
             };
-            Some((recv, psk, salt, target, early))
+            Some((recv, psk, salt, target, early, idx))
         }
     };
     let _ = stream.set_read_timeout(None);
-    let Some((recv, psk, salt, target, early)) = opened else {
+    let Some((recv, psk, salt, target, early, idx)) = opened else {
         return;
     };
+    // The identity header names one account, so the flow line and the byte counters read that user, not the inbound's default.
+    if let Some((email, level)) = identities.get(idx) {
+        stream = stream.with_meter(authenticate(email, *level));
+    }
     crate::accesslog::record_current(&target);
     let Ok(mut uplink) = crate::conn::dial_tcp(&target, Duration::from_secs(8)) else {
         return;
@@ -220,7 +236,13 @@ fn serve_multi(stream: &mut Connection, method: Method, list: &[Vec<u8>], freedo
         return;
     };
     let response = Response::new(send, server_salt, salt);
-    pump_relay_with_response(&uplink, stream, response, Recv::Ready(recv));
+    pump_relay_with_response(&uplink, &stream, response, Recv::Ready(recv));
+}
+
+/// The account whose identity header opened the request: from here its email and level are the flow's, and the counters ride the stream.
+fn authenticate(email: &str, level: u32) -> crate::stats::Meter {
+    crate::accesslog::reidentify(email, level);
+    crate::stats::user_traffic(email, level)
 }
 
 pub(crate) fn serve_relay(
@@ -321,8 +343,9 @@ fn accept_on(
     reader: &mut dyn Read,
     password: &str,
     method: &str,
+    identities: &[(String, u32)],
     freedom: bool,
-) -> Option<(Connection, Response, Recv)> {
+) -> Option<(Connection, Response, Recv, crate::stats::Meter)> {
     let method = Method::parse(method)?;
     if !freedom {
         return None;
@@ -342,10 +365,15 @@ fn accept_on(
         let mut eih = [0u8; BLOCK_LEN];
         read_exact(reader, &mut eih).ok()?;
         let hash = shadowsocks2022::decrypt_eih(method, &list[0], &salt_probe, &eih)?;
-        let user = list[1..]
+        let idx = list[1..]
             .iter()
-            .find(|p| shadowsocks2022::user_hash(p) == hash)?
-            .clone();
+            .position(|p| shadowsocks2022::user_hash(p) == hash)?;
+        let user = list[1 + idx].clone();
+        // The identity header names one account: the flow line reads that user and the counters ride both legs.
+        let meter = identities
+            .get(idx)
+            .map(|(email, level)| authenticate(email, *level))
+            .unwrap_or_default();
         let mut recv = Cipher::from_psk(method, &user, &salt_probe)?;
         let target = read_request_header(reader, &mut recv)?;
         crate::accesslog::record_current(&target.0);
@@ -354,7 +382,7 @@ fn accept_on(
         let server_salt = fresh_salt(method.key_len())?;
         let send = Cipher::from_psk(method, &user, &server_salt)?;
         let response = Response::new(send, server_salt, salt_probe);
-        return Some((uplink, response, Recv::Ready(recv)));
+        return Some((uplink, response, Recv::Ready(recv), meter));
     };
     let _ = eih_len;
     let key_len = method.key_len();
@@ -371,24 +399,35 @@ fn accept_on(
     let server_salt = fresh_salt(key_len)?;
     let send = Cipher::from_psk(method, &psk, &server_salt)?;
     let response = Response::new(send, server_salt, salt);
-    Some((uplink, response, Recv::Ready(recv)))
+    // A single-PSK inbound names no user, so the flow keeps the inbound's default attribution and no per-user counters ride.
+    Some((
+        uplink,
+        response,
+        Recv::Ready(recv),
+        crate::stats::Meter::default(),
+    ))
 }
 
 pub(crate) fn serve_ws(
     stream: Connection,
     password: &str,
     method: &str,
+    identities: &[(String, u32)],
     path: &str,
     freedom: bool,
 ) {
     let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
         return;
     };
-    let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
+    let Some((uplink, response, recv, meter)) =
+        accept_on(&mut reader, password, method, identities, freedom)
+    else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
     pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
@@ -396,6 +435,7 @@ pub(crate) fn serve_httpupgrade(
     stream: Connection,
     password: &str,
     method: &str,
+    identities: &[(String, u32)],
     path: &str,
     host: &str,
     freedom: bool,
@@ -403,7 +443,9 @@ pub(crate) fn serve_httpupgrade(
     let Some((mut reader, writer)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
-    let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
+    let Some((uplink, response, recv, meter)) =
+        accept_on(&mut reader, password, method, identities, freedom)
+    else {
         return;
     };
     let Ok(closer) = writer.try_clone() else {
@@ -412,6 +454,8 @@ pub(crate) fn serve_httpupgrade(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(std::net::Shutdown::Both);
     });
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
     pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
@@ -420,6 +464,7 @@ pub(crate) fn serve_grpc(
     stream: Connection,
     password: &str,
     method: &str,
+    identities: &[(String, u32)],
     path: &str,
     freedom: bool,
 ) {
@@ -427,6 +472,7 @@ pub(crate) fn serve_grpc(
         stream,
         password,
         method,
+        identities,
         &crate::config::GrpcSettings::path(path),
         freedom,
     );
@@ -436,19 +482,22 @@ pub(crate) fn serve_grpc_with(
     stream: Connection,
     password: &str,
     method: &str,
+    identities: &[(String, u32)],
     settings: &crate::config::GrpcSettings,
     freedom: bool,
 ) {
     let Some((mut reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
-    let Some((uplink, response, recv)) = under_handshake(&mut reader, |read| {
-        accept_on(read, password, method, freedom)
+    let Some((uplink, response, recv, meter)) = under_handshake(&mut reader, |read| {
+        accept_on(read, password, method, identities, freedom)
     }) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
     pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
@@ -456,18 +505,23 @@ pub(crate) fn serve_xhttp(
     stream: Connection,
     password: &str,
     method: &str,
+    identities: &[(String, u32)],
     path: &str,
     freedom: bool,
 ) {
     let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
-    let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
+    let Some((uplink, response, recv, meter)) =
+        accept_on(&mut reader, password, method, identities, freedom)
+    else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> =
         std::sync::Arc::new(move || closer.finish());
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
     pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
@@ -475,13 +529,16 @@ pub(crate) fn serve_httpheader(
     stream: Connection,
     password: &str,
     method: &str,
+    identities: &[(String, u32)],
     path: &str,
     freedom: bool,
 ) {
     let Some((mut reader, writer)) = crate::httpheader::accept(stream, path) else {
         return;
     };
-    let Some((uplink, response, recv)) = accept_on(&mut reader, password, method, freedom) else {
+    let Some((uplink, response, recv, meter)) =
+        accept_on(&mut reader, password, method, identities, freedom)
+    else {
         return;
     };
     let Ok(closer) = writer.try_clone() else {
@@ -490,6 +547,8 @@ pub(crate) fn serve_httpheader(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(std::net::Shutdown::Both);
     });
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
     pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
@@ -498,18 +557,25 @@ pub(crate) fn serve_session<R, W>(
     writer: W,
     password: &str,
     method: &str,
+    identities: &[(String, u32)],
     freedom: bool,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
 ) where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    let Some((uplink, response, recv)) =
-        accept_on(&mut reader as &mut dyn Read, password, method, freedom)
-    else {
+    let Some((uplink, response, recv, meter)) = accept_on(
+        &mut reader as &mut dyn Read,
+        password,
+        method,
+        identities,
+        freedom,
+    ) else {
         close();
         return;
     };
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
     pump_relay_carried_with_response(&uplink, reader, writer, close, response, recv);
 }
 
@@ -518,17 +584,24 @@ pub(crate) fn serve_kcp<R, W>(
     writer: W,
     password: &str,
     method: &str,
+    identities: &[(String, u32)],
     freedom: bool,
     close: &std::sync::Arc<dyn Fn() + Send + Sync>,
 ) where
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    let Some((uplink, response, recv)) =
-        accept_on(&mut reader as &mut dyn Read, password, method, freedom)
-    else {
+    let Some((uplink, response, recv, meter)) = accept_on(
+        &mut reader as &mut dyn Read,
+        password,
+        method,
+        identities,
+        freedom,
+    ) else {
         return;
     };
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
     pump_relay_carried_with_response(&uplink, reader, writer, close, response, recv);
 }
 
@@ -2251,7 +2324,7 @@ mod tests {
         let psk = psk_b64(32);
         let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve(stream, &psk, "2022-blake3-aes-256-gcm", true);
+            serve(stream, &psk, "2022-blake3-aes-256-gcm", &[], true);
             let _ = done_tx.send(());
         });
         let _peer = Connection::connect(addr).expect("connects");
@@ -2274,7 +2347,7 @@ mod tests {
         let psk = psk_b64(32);
         let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve_grpc(stream, &psk, "2022-blake3-aes-256-gcm", "/p", true);
+            serve_grpc(stream, &psk, "2022-blake3-aes-256-gcm", &[], "/p", true);
             let _ = done_tx.send(());
         });
         let stream = Connection::connect(addr).expect("connects");
@@ -2297,7 +2370,7 @@ mod tests {
         let password = format!("{}:{}", psk_b64(32), psk_b64(32));
         let serving = crate::budgets::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
-            serve(stream, &password, "2022-blake3-aes-256-gcm", true);
+            serve(stream, &password, "2022-blake3-aes-256-gcm", &[], true);
             let _ = done_tx.send(());
         });
         let _peer = Connection::connect(addr).expect("connects");
@@ -2328,7 +2401,7 @@ mod tests {
                 let announced = announced.clone();
                 let named = named.clone();
                 thread::spawn(move || {
-                    serve(stream, &announced, &named, true);
+                    serve(stream, &announced, &named, &[], true);
                 });
             }
         });
@@ -2516,7 +2589,7 @@ mod tests {
                     let announced = announced.clone();
                     let named = named.clone();
                     thread::spawn(move || {
-                        serve(stream, &announced, &named, true);
+                        serve(stream, &announced, &named, &[], true);
                     });
                 }
             });
@@ -3043,7 +3116,13 @@ mod tests {
         let dest_psk_thread = dest_psk.clone();
         thread::spawn(move || {
             let (stream, _) = dest.accept().expect("accepts");
-            serve(stream, &dest_psk_thread, "2022-blake3-aes-256-gcm", true);
+            serve(
+                stream,
+                &dest_psk_thread,
+                "2022-blake3-aes-256-gcm",
+                &[],
+                true,
+            );
         });
         let relay = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let relay_port = relay.local_addr().expect("addr").port();
