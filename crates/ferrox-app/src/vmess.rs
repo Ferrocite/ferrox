@@ -2155,7 +2155,10 @@ pub(crate) fn serve(mut stream: Connection, users: &Users, freedom: bool) {
     }
     crate::accesslog::record_current(&target);
     if cmd == 2 {
-        return serve_vmess_udp(stream, &target, send, recv, &prefix, &user);
+        crate::proxy::spawn_carried(move || {
+            serve_vmess_udp(stream, &target, send, recv, &prefix, &user);
+        });
+        return;
     }
     if cmd != 1 {
         return;
