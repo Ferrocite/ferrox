@@ -134,6 +134,8 @@ pub(crate) struct H2Stream {
 struct StreamState {
     body: VecDeque<Vec<u8>>,
     ended: bool,
+    /// The response `END_STREAM` has gone out: a stream retires once both halves are done.
+    finished: bool,
     dead: bool,
 }
 
@@ -550,16 +552,39 @@ impl H2Conn {
     }
 
     fn end_stream(&self, stream: u32) {
-        let responded = self
+        let (responded, ended) = {
+            let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(state) = streams.get(&stream) else {
+                drop(streams);
+                self.reset_stream(stream);
+                return;
+            };
+            let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+            st.finished = true;
+            (state.responded.load(Ordering::SeqCst), st.ended)
+        };
+        if responded {
+            let _ = self.frame(T_DATA, F_END, stream, &[]);
+            if ended {
+                self.retire(stream);
+            }
+        } else {
+            self.reset_stream(stream);
+        }
+    }
+
+    /// Both halves have ended, so the table frees the id: keeping it would refuse every call past
+    /// `MAX_STREAMS` on a connection that is otherwise healthy.
+    fn retire(&self, stream: u32) {
+        let removed = self
             .streams
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&stream)
-            .is_some_and(|s| s.responded.load(Ordering::SeqCst));
-        if responded {
-            let _ = self.frame(T_DATA, F_END, stream, &[]);
-        } else {
-            self.reset_stream(stream);
+            .remove(&stream)
+            .is_some();
+        if removed {
+            self.forget_upload(stream);
+            self.end_session_of(stream);
         }
     }
 
@@ -758,6 +783,7 @@ impl H2Conn {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: end_stream,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -929,6 +955,7 @@ fn open_stream(
         state: Mutex::new(StreamState {
             body: VecDeque::new(),
             ended: end_stream,
+            finished: false,
             dead: false,
         }),
         cv: Condvar::new(),
@@ -1250,8 +1277,9 @@ fn pump_frame(
                 return true;
             };
             drop(streams);
-            {
+            let finished = {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+                let finished = st.finished;
                 if !st.dead {
                     st.body.push_back(body);
                     if flags & F_END != 0 {
@@ -1259,6 +1287,10 @@ fn pump_frame(
                     }
                 }
                 state.cv.notify_all();
+                finished && flags & F_END != 0
+            };
+            if finished {
+                conn.retire(sid);
             }
             conn.replenish(sid, wire_len);
             true
@@ -1641,6 +1673,7 @@ mod tests {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: false,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -1727,6 +1760,7 @@ mod tests {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: false,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -2200,6 +2234,7 @@ mod tests {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: false,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -2308,6 +2343,30 @@ mod tests {
         (conn, written, slices)
     }
 
+    /// A finished call gives its id back: two hundred sequential calls on one connection must not
+    /// hit the table's cap, which is what a completed stream left behind would do.
+    #[test]
+    fn a_completed_stream_frees_its_id() {
+        let (conn, _, _) = bare_conn();
+        for round in 0..2u32 {
+            for sid in 1..=MAX_STREAMS {
+                let sid = sid + round * MAX_STREAMS;
+                let Some((_reader, _writer, out)) = conn.open(sid, true) else {
+                    panic!("stream {sid} was refused after {} completed", sid - 1);
+                };
+                assert!(conn.respond(sid, &[(":status", "200")]));
+                out.end();
+            }
+        }
+        assert!(
+            conn.streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "every completed stream left the table"
+        );
+    }
+
     /// One credit is both `WINDOW_UPDATE`s: the pair differs only by stream id, so it goes out as one 26-byte write under one lock, where two `frame()` calls were two locks and two records on the wire for the same bytes.
     #[test]
     fn a_credit_grants_both_windows_in_one_write() {
@@ -2353,6 +2412,7 @@ mod tests {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: false,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -2442,6 +2502,7 @@ mod tests {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: false,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -2482,6 +2543,7 @@ mod tests {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: true,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -2540,6 +2602,7 @@ mod tests {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: false,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -2662,6 +2725,7 @@ mod tests {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: false,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
