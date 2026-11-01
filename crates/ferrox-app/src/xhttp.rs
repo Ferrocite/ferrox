@@ -3315,7 +3315,7 @@ mod tests {
     /// Every byte the `Read` path delivers, the window path delivers too, across chunk sizes either side of the prefetch window.
     #[test]
     fn a_window_delivers_every_byte_the_read_does() {
-        let chunks = [1usize, 2, 3, 5, 7, 11, 64, 8 * 1024, CHUNK];
+        let chunks = [1usize, 2, 3, 5, 7, 11, 64, 8 * 1024, CHUNK, CHUNK + 1];
         let mut wire = Vec::new();
         for &n in &chunks {
             wire.extend_from_slice(format!("{n:X}\r\n").as_bytes());
