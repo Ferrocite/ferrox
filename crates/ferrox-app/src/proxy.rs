@@ -1594,6 +1594,7 @@ impl Role {
             | Role::VlessReality { carrier, .. }
             | Role::Trojan { carrier, .. }
             | Role::TrojanTls { carrier, .. }
+            | Role::TrojanReality { carrier, .. }
             | Role::Vmess { carrier, .. }
             | Role::VmessTls { carrier, .. }
             | Role::Shadowsocks { carrier, .. } => carrier.tcp_stream(),
