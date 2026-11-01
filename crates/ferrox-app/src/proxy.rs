@@ -22626,6 +22626,8 @@ pub(crate) mod lane_pool {
         parks: std::sync::atomic::AtomicUsize,
         cap: usize,
         pending: Option<usize>,
+        /// Setup workers retire when the queue is empty, so their threads do not sit beside the relay lanes during a transfer.
+        idle_exit: bool,
         #[cfg(test)]
         stop: std::sync::atomic::AtomicBool,
         #[cfg(test)]
@@ -22668,7 +22670,7 @@ pub(crate) mod lane_pool {
 
     fn setup_pool() -> std::sync::Arc<Pool> {
         std::sync::Arc::clone(
-            SETUP_POOL.get_or_init(|| spawn_pool_with(SETUP_LANES, Some(SETUP_PENDING))),
+            SETUP_POOL.get_or_init(|| spawn_pool_full(SETUP_LANES, Some(SETUP_PENDING), true)),
         )
     }
 
@@ -22677,6 +22679,14 @@ pub(crate) mod lane_pool {
     }
 
     fn spawn_pool_with(cap: usize, pending: Option<usize>) -> std::sync::Arc<Pool> {
+        spawn_pool_full(cap, pending, false)
+    }
+
+    fn spawn_pool_full(
+        cap: usize,
+        pending: Option<usize>,
+        idle_exit: bool,
+    ) -> std::sync::Arc<Pool> {
         std::sync::Arc::new(Pool {
             ready: Mutex::new(VecDeque::new()),
             parked: Mutex::new(Parked::default()),
@@ -22687,6 +22697,7 @@ pub(crate) mod lane_pool {
             parks: std::sync::atomic::AtomicUsize::new(0),
             cap,
             pending,
+            idle_exit,
             #[cfg(test)]
             stop: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -22750,11 +22761,27 @@ pub(crate) mod lane_pool {
                         break lane;
                     }
                     pool.idle.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    ready = pool
-                        .notify
-                        .wait(ready)
-                        .unwrap_or_else(PoisonError::into_inner);
+                    let (guard, timed_out) = if pool.idle_exit {
+                        let (guard, timeout) = pool
+                            .notify
+                            .wait_timeout(ready, std::time::Duration::ZERO)
+                            .unwrap_or_else(PoisonError::into_inner);
+                        (guard, timeout.timed_out())
+                    } else {
+                        (
+                            pool.notify
+                                .wait(ready)
+                                .unwrap_or_else(PoisonError::into_inner),
+                            false,
+                        )
+                    };
                     pool.idle.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                    ready = guard;
+                    if timed_out && ready.is_empty() {
+                        pool.workers
+                            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
                 }
             };
             let mut streak = 0usize;
