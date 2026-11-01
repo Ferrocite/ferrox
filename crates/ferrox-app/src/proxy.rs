@@ -23438,8 +23438,8 @@ pub(crate) mod lane_pool {
 
     /// A setup lane: the accept path's handshake and dispatch, run once on a pooled worker. It does
     /// not enter `RelayStep`, because its waits are bounded by the handshake budget, not the relay clock.
-    /// False means the setup queue is full and the lane, with the accepted socket it owns, was dropped.
-    pub(crate) fn submit_setup(step: Step, complete: Complete) -> bool {
+    /// A queue that is full runs the lane on its own thread rather than refusing the connection.
+    pub(crate) fn submit_setup(step: Step, complete: Complete) {
         use std::sync::atomic::Ordering::Relaxed;
         let setup = setup_pool();
         let saturated = setup.idle.load(Relaxed) == 0 && setup.workers.load(Relaxed) >= SETUP_LANES;
@@ -23454,9 +23454,14 @@ pub(crate) mod lane_pool {
                 BORROWED.fetch_sub(1, Relaxed);
                 complete();
             });
-            return submit_to_with(&pool(), step, complete, false);
+            if let Err(lane) = submit_to_with(&pool(), step, complete, false) {
+                thread::spawn(move || run_to_end(lane));
+            }
+            return;
         }
-        submit_to_with(&setup, step, complete, false)
+        if let Err(lane) = submit_to_with(&setup, step, complete, false) {
+            thread::spawn(move || run_to_end(lane));
+        }
     }
 
     fn submit_to(pool: &std::sync::Arc<Pool>, step: Step, complete: Complete) {
@@ -23468,7 +23473,7 @@ pub(crate) mod lane_pool {
         step: Step,
         complete: Complete,
         relay: bool,
-    ) -> bool {
+    ) -> Result<(), Lane> {
         use std::sync::atomic::Ordering::Relaxed;
         let lane = Lane {
             step,
@@ -23478,7 +23483,7 @@ pub(crate) mod lane_pool {
         };
         let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
         if pool.pending.is_some_and(|pending| ready.len() >= pending) {
-            return false;
+            return Err(lane);
         }
         let (queued, idle) = (ready.len(), pool.idle.load(Relaxed));
         drop(ready);
@@ -23489,21 +23494,21 @@ pub(crate) mod lane_pool {
         if pool.workers.load(Relaxed) == 0 {
             // A thread the process could not start still does the lane's work on the caller.
             run_to_end(lane);
-            return true;
+            return Ok(());
         }
         ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
         if pool.pending.is_some_and(|pending| ready.len() >= pending) {
-            return false;
+            return Err(lane);
         }
         if pool.workers.load(Relaxed) == 0 {
             drop(ready);
             run_to_end(lane);
-            return true;
+            return Ok(());
         }
         ready.push_back(lane);
         drop(ready);
         pool.notify.notify_one();
-        true
+        Ok(())
     }
 
     #[cfg(test)]
@@ -23742,7 +23747,7 @@ pub(crate) mod lane_pool {
             let seen = Arc::new(AtomicUsize::new(2));
             let seen_lane = Arc::clone(&seen);
             let (done_tx, done_rx) = std::sync::mpsc::channel();
-            submit_to_with(
+            let _ = submit_to_with(
                 &pool,
                 Box::new(move || {
                     seen_lane.store(
@@ -23763,7 +23768,8 @@ pub(crate) mod lane_pool {
             );
         }
 
-        /// A setup pool drops accepted work past its pending bound instead of growing its queue.
+        /// A setup pool reports a full queue instead of growing it, so the accept path can run the
+        /// work on its own thread rather than refusing the connection.
         #[test]
         fn a_setup_pool_bounds_its_pending_queue() {
             let pool = TestPool(spawn_pool_with(1, Some(1)));
@@ -23778,22 +23784,17 @@ pub(crate) mod lane_pool {
                 }),
                 Box::new(|| {}),
                 false,
-            ));
+            )
+            .is_ok());
             started_rx
                 .recv_timeout(Duration::from_secs(5))
                 .expect("runs");
-            assert!(submit_to_with(
-                &pool,
-                Box::new(|| Next::Done),
-                Box::new(|| {}),
-                false,
-            ));
-            assert!(!submit_to_with(
-                &pool,
-                Box::new(|| Next::Done),
-                Box::new(|| {}),
-                false,
-            ));
+            assert!(
+                submit_to_with(&pool, Box::new(|| Next::Done), Box::new(|| {}), false,).is_ok()
+            );
+            assert!(
+                submit_to_with(&pool, Box::new(|| Next::Done), Box::new(|| {}), false,).is_err()
+            );
             release_tx.send(()).expect("releases");
         }
 
@@ -31769,8 +31770,8 @@ mod tests {
         );
     }
 
-    /// A carriered accept hands its handshake to the lane pool, so a burst of connections grows the
-    /// process by lanes, not by connections.
+    /// A carriered accept hands its handshake to the lane pool, so a burst of connections stays
+    /// below one thread per handshake; only the overflow past the setup queue takes a thread.
     #[cfg(target_os = "linux")]
     #[test]
     fn carried_handshakes_share_the_lane_pool() {
