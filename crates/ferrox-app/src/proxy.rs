@@ -7662,6 +7662,33 @@ fn shake_tls<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> bool {
     }
 }
 
+thread_local! {
+    /// Set while a handshake continuation runs on a lane, so a long-lived association detaches
+    /// instead of holding the lane the handshake just finished on.
+    static HANDSHAKE_LANE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Scoped claim, so a finish that returns or panics leaves the lane as it found it.
+struct HandshakeLane(bool);
+
+impl HandshakeLane {
+    fn enter() -> Self {
+        Self(HANDSHAKE_LANE.with(|on| on.replace(true)))
+    }
+}
+
+impl Drop for HandshakeLane {
+    fn drop(&mut self) {
+        HANDSHAKE_LANE.with(|on| on.set(self.0));
+    }
+}
+
+/// Takes the claim, so a continuation that blocks for the life of an association moves itself off
+/// the lane and the recursive call on the new thread sees a clean thread-local.
+fn take_handshake_lane() -> bool {
+    HANDSHAKE_LANE.with(|on| on.replace(false))
+}
+
 /// Drives a server handshake on the relay lanes: the socket is nonblocking, so a step that finds
 /// no bytes parks the lane instead of the caller, and the caller is free before the first byte.
 fn run_tls_handshake<S, F>(session: S, finish: F)
@@ -7703,6 +7730,7 @@ where
                         let _ = transport.set_read_timeout(Some(RELAY_POLL));
                     }
                     if let Some(finish) = finish.take() {
+                        let _lane = HandshakeLane::enter();
                         finish(current);
                     }
                     Next::Done
@@ -10081,6 +10109,11 @@ where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
 {
+    if take_handshake_lane() {
+        let carried = carried.to_vec();
+        thread::spawn(move || serve_trojan_mux(reader, writer, close, &carried));
+        return;
+    }
     serve_mux_tunnel(Box::new(reader), Box::new(writer), close, carried);
 }
 
@@ -16722,11 +16755,16 @@ fn serve_trojan_udp(stream: Connection) {
     });
 }
 
-fn serve_trojan_udp_halves<R, W>(read: R, mut write: W, close: impl FnOnce())
+fn serve_trojan_udp_halves<R, W>(read: R, write: W, close: impl FnOnce() + Send + 'static)
 where
     R: Read + Send + 'static,
-    W: Write,
+    W: Write + Send + 'static,
 {
+    if take_handshake_lane() {
+        thread::spawn(move || serve_trojan_udp_halves(read, write, close));
+        return;
+    }
+    let mut write = write;
     let Ok(udp4) = UdpSocket::bind("0.0.0.0:0") else {
         return;
     };
