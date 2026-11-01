@@ -20929,18 +20929,20 @@ fn serve_socks_udp_shadowsocks2022(
     }
     let source: Arc<Mutex<Option<SocketAddr>>> = Arc::new(Mutex::new(None));
     let done = Arc::new(AtomicBool::new(false));
+    let mut datagrams = crate::shadowsocks2022::Datagrams::new();
+    // The reader opens replies that echo this association's session, so it is seeded with the same session `seal` puts on the wire; a reader of its own session drops every reply as forged.
     let Some(reader) = spawn_ss_udp_reader2022(
         &uplink,
         relay,
         &psk,
         method,
+        datagrams.client_session(),
         Arc::clone(&source),
         Arc::clone(&done),
     ) else {
         return;
     };
     let mut buf = udp_buffer();
-    let mut datagrams = crate::shadowsocks2022::Datagrams::new();
     let multi = !method.is_chacha() && list.len() > 1;
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
@@ -20969,6 +20971,7 @@ fn spawn_ss_udp_reader2022(
     relay: &UdpSocket,
     psk: &[u8],
     method: ferrox_core::shadowsocks2022::Method,
+    client_session: u64,
     source: Arc<Mutex<Option<SocketAddr>>>,
     done: Arc<AtomicBool>,
 ) -> Option<RelayEnd> {
@@ -20979,7 +20982,7 @@ fn spawn_ss_udp_reader2022(
     Some(RelayPool::global().run(move || {
         let mut buf = udp_buffer();
         let mut reply = Vec::with_capacity(UDP_BUF);
-        let mut datagrams = crate::shadowsocks2022::Datagrams::new();
+        let mut datagrams = crate::shadowsocks2022::Datagrams::with_client_session(client_session);
         loop {
             match read.recv(&mut buf) {
                 Ok(n) => {

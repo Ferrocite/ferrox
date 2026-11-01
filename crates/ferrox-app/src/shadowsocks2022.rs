@@ -1340,9 +1340,17 @@ impl Datagrams {
     pub(crate) fn new() -> Self {
         let mut session = [0u8; 8];
         let _ = getrandom::fill(&mut session);
+        Self::with_client_session(u64::from_be_bytes(session))
+    }
+    /// The client's identity session: `seal` puts it on every request and the server echoes it back, so a reply reader must know it.
+    pub(crate) fn client_session(&self) -> u64 {
+        self.session
+    }
+    /// A reply reader seeded with the request writer's session, which is what `open_server` checks a reply carries.
+    pub(crate) fn with_client_session(session: u64) -> Self {
         Self {
             sealed: Vec::new(),
-            session: u64::from_be_bytes(session),
+            session,
             packet: 0,
             sessions: HashMap::new(),
             peers: HashMap::new(),
@@ -2774,6 +2782,51 @@ mod tests {
                     .open_server(&psk, method, &mut tampered)
                     .is_none(),
                 "{method}: damage is refused"
+            );
+        }
+    }
+
+    /// The assembled client seals requests on one codec and opens replies on another in a reader thread: the reply codec must be seeded with the request codec's session, or every reply drops as forged.
+    #[test]
+    fn a_reply_reader_seeded_with_the_request_session_opens_the_server_reply() {
+        for method in [
+            Method::Aes128Gcm,
+            Method::Aes256Gcm,
+            Method::Chacha20Poly1305,
+        ] {
+            let psk = vec![0x5au8; method.key_len()];
+            let target: SocketAddr = "127.0.0.1:53".parse().expect("addr");
+            let mut writer = Datagrams::new();
+            let packet = writer
+                .seal(&psk, method, &target, b"udp-ping")
+                .expect("seals")
+                .to_vec();
+            let mut server = Datagrams::new();
+            let mut opened = packet.clone();
+            let (_, request, session) = server.open(&psk, method, &mut opened).expect("opens");
+            assert_eq!(request, b"udp-ping");
+            assert_eq!(
+                session,
+                writer.client_session(),
+                "the request carries the writer's session"
+            );
+            let reply = server
+                .seal_server(method, &psk, session, &target, b"udp-pong")
+                .expect("seals")
+                .to_vec();
+            let mut reader = Datagrams::with_client_session(writer.client_session());
+            let mut buf = reply.clone();
+            let (got, payload) = reader
+                .open_server(&psk, method, &mut buf)
+                .expect("opens the reply");
+            assert_eq!(got, target, "{method}");
+            assert_eq!(payload, b"udp-pong", "{method}");
+            let mut stranger = Datagrams::new();
+            stranger.session = writer.client_session() ^ 1;
+            let mut buf = reply.clone();
+            assert!(
+                stranger.open_server(&psk, method, &mut buf).is_none(),
+                "{method}: an unseeded reader drops the reply, as the split client used to"
             );
         }
     }
