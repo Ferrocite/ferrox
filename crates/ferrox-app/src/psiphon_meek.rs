@@ -29,6 +29,10 @@ pub(crate) struct Meek {
     pub(crate) sni: String,
     pub(crate) public_key: String,
     pub(crate) obfuscated_key: String,
+    pub(crate) disable_sni: bool,
+    pub(crate) alpn: Vec<Vec<u8>>,
+    pub(crate) fronts: Vec<(String, u16)>,
+    pub(crate) hosts: Vec<String>,
 }
 
 /// Start the loopback relay and return the socket the SSH handshake rides.
@@ -116,6 +120,8 @@ struct MeekHttp {
     tls: Option<ClientSession<TcpStream>>,
     cookie_name: String,
     cookie_value: String,
+    front_index: usize,
+    alpn_warned: bool,
 }
 
 impl MeekHttp {
@@ -128,6 +134,8 @@ impl MeekHttp {
             tls: None,
             cookie_name,
             cookie_value,
+            front_index: 0,
+            alpn_warned: false,
         })
     }
 
@@ -150,6 +158,7 @@ impl MeekHttp {
     }
 
     fn open(&mut self) -> Result<(), String> {
+        self.rotate_front();
         let address = (self.meek.dial.as_str(), self.meek.port)
             .to_socket_addrs()
             .map_err(|error| format!("psiphon meek resolve {}: {error}", self.meek.dial))?
@@ -165,9 +174,24 @@ impl MeekHttp {
             .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
             .map_err(|error| format!("psiphon meek socket: {error}"))?;
         // The SSH host key authenticates the payload; the fronting certificate is only cover.
+        let server_name = if self.meek.disable_sni {
+            address.ip().to_string()
+        } else {
+            self.meek.sni.clone()
+        };
+        let alpn =
+            if self.meek.alpn.is_empty() || self.meek.alpn.iter().any(|name| name == b"http/1.1") {
+                vec![b"http/1.1".to_vec()]
+            } else {
+                if !self.alpn_warned {
+                    eprintln!("psiphon: fronting ALPN names no http/1.1; using http/1.1");
+                    self.alpn_warned = true;
+                }
+                vec![b"http/1.1".to_vec()]
+            };
         let config = TlsConfig {
-            server_name: self.meek.sni.clone(),
-            alpn: vec![b"http/1.1".to_vec()].into(),
+            server_name,
+            alpn: alpn.into(),
             roots: crate::quic::system_roots(),
             insecure: true,
             resumption: true,
@@ -179,6 +203,18 @@ impl MeekHttp {
             .map_err(|error| format!("psiphon meek handshake {}: {error}", self.meek.sni))?;
         self.tls = Some(tls);
         Ok(())
+    }
+
+    fn rotate_front(&mut self) {
+        let index = self.front_index;
+        self.front_index = self.front_index.wrapping_add(1);
+        if let Some((dial, port)) = self.meek.fronts.get(index % self.meek.fronts.len().max(1)) {
+            self.meek.dial.clone_from(dial);
+            self.meek.port = *port;
+        }
+        if let Some(host) = self.meek.hosts.get(index % self.meek.hosts.len().max(1)) {
+            self.meek.host.clone_from(host);
+        }
     }
 
     fn peer_closed(&self) -> bool {
@@ -299,6 +335,10 @@ mod tests {
             sni: "front.example".to_owned(),
             public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             obfuscated_key: "key".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
         }
     }
 
