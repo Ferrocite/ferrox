@@ -1,6 +1,5 @@
-//! The fronted-meek relay the native `Psiphon` lane rides when a server entry
-//! carries a CDN front: a loopback TCP stream whose bytes are carried in
-//! `POST /` requests to the fronting host.
+//! The meek relay the native `Psiphon` lane rides for unfronted and CDN-fronted
+//! entries: a loopback TCP stream whose bytes are carried in `POST /` requests.
 
 use crate::psiphon_ssh::{derive_key, random, Proxy, Rc4, MAGIC, SEED_LENGTH};
 use crypto_box::aead::{Aead, OsRng};
@@ -16,11 +15,10 @@ const MAX_COOKIE_PADDING: usize = 256;
 const POLL: Duration = Duration::from_millis(100);
 const MAX_POLL: Duration = Duration::from_secs(5);
 const POLL_GROWTH: f64 = 1.5;
-const COOKIE_PROTOCOL: &str = "FRONTED-MEEK-OSSH";
 const USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0 Safari/537.36";
 
-/// One server entry's CDN front.
+/// One server entry's meek front.
 #[derive(Debug, Clone)]
 pub(crate) struct Meek {
     pub(crate) dial: String,
@@ -33,6 +31,9 @@ pub(crate) struct Meek {
     pub(crate) alpn: Vec<Vec<u8>>,
     pub(crate) fronts: Vec<(String, u16)>,
     pub(crate) hosts: Vec<String>,
+    pub(crate) https: bool,
+    pub(crate) fronted: bool,
+    pub(crate) protocol: &'static str,
 }
 
 /// Start the loopback relay and return the socket the SSH handshake rides.
@@ -113,11 +114,63 @@ fn relay(
     Ok(())
 }
 
+/// A plain TCP or TLS stream carrying meek HTTP.
+enum MeekStream {
+    Plain(TcpStream),
+    Tls(ClientSession<TcpStream>),
+}
+
+impl Read for MeekStream {
+    /// Read from the plain or TLS stream.
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.read(buf),
+            Self::Tls(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for MeekStream {
+    /// Write to the plain or TLS stream.
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(stream) => stream.write(buf),
+            Self::Tls(stream) => stream.write(buf),
+        }
+    }
+
+    /// Flush the plain or TLS stream.
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => stream.flush(),
+            Self::Tls(stream) => stream.flush(),
+        }
+    }
+}
+
+impl MeekStream {
+    /// Whether the peer closed the stream.
+    fn peer_closed(&self) -> bool {
+        let stream = match self {
+            Self::Plain(stream) => stream,
+            Self::Tls(stream) if stream.closed() => return true,
+            Self::Tls(stream) => stream.get_ref(),
+        };
+        if stream.set_nonblocking(true).is_err() {
+            return false;
+        }
+        let mut byte = [0u8; 1];
+        let closed = matches!(stream.peek(&mut byte), Ok(0));
+        let _ = stream.set_nonblocking(false);
+        closed
+    }
+}
+
 struct MeekHttp {
     meek: Meek,
     proxy: Option<Proxy>,
     timeout: Duration,
-    tls: Option<ClientSession<TcpStream>>,
+    stream: Option<MeekStream>,
     cookie_name: String,
     cookie_value: String,
     front_index: usize,
@@ -125,13 +178,14 @@ struct MeekHttp {
 }
 
 impl MeekHttp {
+    /// Build a meek HTTP client from an entry and optional proxy.
     fn new(meek: Meek, proxy: Option<Proxy>, timeout: Duration) -> Result<Self, String> {
         let (cookie_name, cookie_value) = make_cookie(&meek)?;
         Ok(Self {
             meek,
             proxy,
             timeout,
-            tls: None,
+            stream: None,
             cookie_name,
             cookie_value,
             front_index: 0,
@@ -139,24 +193,26 @@ impl MeekHttp {
         })
     }
 
+    /// Send one request body and return the response body.
     fn round_trip(&mut self, body: &[u8]) -> Result<Vec<u8>, String> {
-        if self.tls.is_none() {
+        if self.stream.is_none() {
             self.open()?;
         }
         match self.exchange(body) {
             Ok(reply) => Ok(reply),
             Err(why) if body.is_empty() => {
-                self.tls = None;
+                self.stream = None;
                 self.open()?;
                 self.exchange(body).map_err(|_| why)
             }
             Err(why) => {
-                self.tls = None;
+                self.stream = None;
                 Err(why)
             }
         }
     }
 
+    /// Dial the next front and start a TLS session when required.
     fn open(&mut self) -> Result<(), String> {
         self.rotate_front();
         let address = (self.meek.dial.as_str(), self.meek.port)
@@ -173,6 +229,10 @@ impl MeekHttp {
             .set_read_timeout(Some(self.timeout))
             .and_then(|()| stream.set_write_timeout(Some(self.timeout)))
             .map_err(|error| format!("psiphon meek socket: {error}"))?;
+        if !self.meek.https {
+            self.stream = Some(MeekStream::Plain(stream));
+            return Ok(());
+        }
         // The SSH host key authenticates the payload; the fronting certificate is only cover.
         let server_name = if self.meek.disable_sni {
             address.ip().to_string()
@@ -201,10 +261,11 @@ impl MeekHttp {
             .map_err(|error| format!("psiphon meek tls {}: {error}", self.meek.sni))?;
         tls.handshake()
             .map_err(|error| format!("psiphon meek handshake {}: {error}", self.meek.sni))?;
-        self.tls = Some(tls);
+        self.stream = Some(MeekStream::Tls(tls));
         Ok(())
     }
 
+    /// Advance to the next fronting address.
     fn rotate_front(&mut self) {
         let index = self.front_index;
         self.front_index = self.front_index.wrapping_add(1);
@@ -217,29 +278,18 @@ impl MeekHttp {
         }
     }
 
+    /// Whether the current front closed the stream.
     fn peer_closed(&self) -> bool {
-        let Some(tls) = self.tls.as_ref() else {
-            return true;
-        };
-        if tls.closed() {
-            return true;
-        }
-        let stream = tls.get_ref();
-        if stream.set_nonblocking(true).is_err() {
-            return false;
-        }
-        let mut byte = [0u8; 1];
-        let closed = matches!(stream.peek(&mut byte), Ok(0));
-        let _ = stream.set_nonblocking(false);
-        closed
+        self.stream.as_ref().is_none_or(MeekStream::peer_closed)
     }
 
+    /// Exchange one request, rotating to a fresh front after a failure.
     fn exchange(&mut self, body: &[u8]) -> Result<Vec<u8>, String> {
-        if self.tls.is_none() {
+        if self.stream.is_none() {
             self.open()?;
         }
         if !body.is_empty() && self.peer_closed() {
-            self.tls = None;
+            self.stream = None;
             self.open()?;
         }
         let cookie = format!("{}={}", self.cookie_name, self.cookie_value);
@@ -251,15 +301,16 @@ impl MeekHttp {
             ("Connection", "keep-alive"),
         ];
         let request = crate::foxy_account::request("POST", &self.meek.host, "/", &headers, body);
-        let tls = self
-            .tls
+        let stream = self
+            .stream
             .as_mut()
             .ok_or_else(|| "psiphon meek has no connection".to_owned())?;
-        tls.write_all(&request)
-            .and_then(|()| tls.flush())
+        stream
+            .write_all(&request)
+            .and_then(|()| stream.flush())
             .map_err(|error| format!("psiphon meek request: {error}"))?;
-        let reply =
-            crate::foxy_account::read_reply(tls).map_err(|_| "psiphon meek response".to_owned())?;
+        let reply = crate::foxy_account::read_reply(stream)
+            .map_err(|_| "psiphon meek response".to_owned())?;
         if reply.status != 200 {
             return Err(format!("psiphon meek status {}", reply.status));
         }
@@ -278,12 +329,18 @@ impl MeekHttp {
             .header("connection")
             .is_some_and(|value| value.eq_ignore_ascii_case("close"))
         {
-            self.tls = None;
+            self.stream = None;
         }
         Ok(reply.body)
     }
 }
 
+/// The protocol name the meek cookie reports, with the CDN marker removed.
+fn cookie_protocol(protocol: &str) -> String {
+    protocol.replacen("-CDN", "", 1)
+}
+
+/// Build the cookie header for a meek request.
 fn make_cookie(meek: &Meek) -> Result<(String, String), String> {
     let key = ferrox_core::b64::decode(meek.public_key.as_bytes())
         .ok_or_else(|| "psiphon meek cookie key is not base64".to_owned())?;
@@ -294,7 +351,7 @@ fn make_cookie(meek: &Meek) -> Result<(String, String), String> {
     let ephemeral = secret.public_key();
     let boxed = SalsaBox::new(&key, &secret);
     let nonce = crypto_box::aead::Nonce::<SalsaBox>::from_slice(&[0u8; 24]);
-    let plaintext = format!(r#"{{"v":4,"t":"{COOKIE_PROTOCOL}"}}"#);
+    let plaintext = format!(r#"{{"v":4,"t":"{}"}}"#, cookie_protocol(meek.protocol));
     let sealed = boxed
         .encrypt(nonce, plaintext.as_bytes())
         .map_err(|_| "psiphon meek cookie encryption".to_owned())?;
@@ -339,6 +396,9 @@ mod tests {
             alpn: Vec::new(),
             fronts: vec![("front.example".to_owned(), 443)],
             hosts: vec!["cdn.example".to_owned()],
+            https: true,
+            fronted: true,
+            protocol: "FRONTED-MEEK-OSSH",
         }
     }
 
@@ -354,5 +414,21 @@ mod tests {
     fn the_cookie_name_is_one_letter() {
         let (name, _) = make_cookie(&entry()).expect("cookie");
         assert_eq!(name.len(), 1);
+    }
+
+    #[test]
+    fn the_cookie_names_the_base_tunnel_protocol() {
+        assert_eq!(
+            cookie_protocol("FRONTED-MEEK-CDN-OSSH"),
+            "FRONTED-MEEK-OSSH"
+        );
+        assert_eq!(
+            cookie_protocol("FRONTED-MEEK-CDN-HTTP-OSSH"),
+            "FRONTED-MEEK-HTTP-OSSH"
+        );
+        assert_eq!(
+            cookie_protocol("UNFRONTED-MEEK-HTTPS-OSSH"),
+            "UNFRONTED-MEEK-HTTPS-OSSH"
+        );
     }
 }
