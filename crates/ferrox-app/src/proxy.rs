@@ -7724,72 +7724,69 @@ where
     let mut session = Some(session);
     let mut finish = Some(finish);
     let mut transport = Some(transport);
+    let mut handshaken = false;
+    let mut request_until = None;
     lane_pool::submit(
         Box::new(move || {
             let Some(mut current) = session.take() else {
                 return Next::Done;
             };
-            match current.handshake() {
-                Ok(()) => {
-                    // The request may already be decrypted inside the session, where the socket cannot see it.
-                    let prefix = match transport.take() {
-                        Some(transport) => {
-                            let prefix = read_ready_prefix(&mut current, &transport);
-                            let _ = transport.set_nonblocking(false);
-                            let _ = transport.set_read_timeout(Some(RELAY_POLL));
-                            prefix
-                        }
-                        None => Vec::new(),
-                    };
+            if !handshaken {
+                match current.handshake() {
+                    Ok(()) => {
+                        handshaken = true;
+                        request_until = Some(Instant::now() + budgets::handshake());
+                    }
+                    Err(ferrox_core::tls::TlsError::Timeout) if Instant::now() < deadline => {
+                        session = Some(current);
+                        return Next::Idle;
+                    }
+                    Err(_) => return Next::Done,
+                }
+            }
+            if request_until.is_some_and(|until| Instant::now() >= until) {
+                return Next::Done;
+            }
+            match read_ready_prefix(&mut current) {
+                Some(prefix) if !prefix.is_empty() => {
+                    if let Some(transport) = transport.take() {
+                        let _ = transport.set_nonblocking(false);
+                        let _ = transport.set_read_timeout(Some(RELAY_POLL));
+                    }
                     if let Some(finish) = finish.take() {
-                        if prefix.is_empty() {
-                            thread::spawn(move || finish(current, Vec::new()));
-                        } else {
-                            let _lane = HandshakeLane::enter();
-                            finish(current, prefix);
-                        }
+                        let _lane = HandshakeLane::enter();
+                        finish(current, prefix);
                     }
                     Next::Done
                 }
-                Err(ferrox_core::tls::TlsError::Timeout) if Instant::now() < deadline => {
+                Some(_) => {
                     session = Some(current);
                     Next::Idle
                 }
-                Err(_) => Next::Done,
+                None => Next::Done,
             }
         }),
         Box::new(|| {}),
     );
 }
 
-/// Reads the plaintext already buffered after the handshake, waiting one handshake poll for a request still in flight; empty means silence, so the continuation leaves the lane.
-fn read_ready_prefix<S: ferrox_core::tls::TlsProvider>(
-    session: &mut S,
-    transport: &Connection,
-) -> Vec<u8> {
+/// Drains the plaintext the session already holds; `None` is a closed or failed session and an empty `Some` is a peer that has not sent its request yet.
+fn read_ready_prefix<S: ferrox_core::tls::TlsProvider>(session: &mut S) -> Option<Vec<u8>> {
     let mut prefix = Vec::new();
     let mut buf = [0u8; PROBE_READ];
-    let until = Instant::now() + budgets::HANDSHAKE_POLL;
     loop {
         match session.read(&mut buf) {
-            Ok(0) => break,
+            Ok(0) => return (!prefix.is_empty()).then_some(prefix),
             Ok(n) => {
                 prefix.extend_from_slice(&buf[..n]);
                 if prefix.len() >= PROBE_READ {
-                    break;
+                    return Some(prefix);
                 }
             }
-            Err(error) if is_timeout(&error) => {
-                let left = until.saturating_duration_since(Instant::now());
-                if left.is_zero() {
-                    break;
-                }
-                let _ = transport.wait_readable(left.min(RELAY_POLL));
-            }
-            Err(_) => break,
+            Err(error) if is_timeout(&error) => return Some(prefix),
+            Err(_) => return (!prefix.is_empty()).then_some(prefix),
         }
     }
-    prefix
 }
 
 fn lane_flow(
