@@ -981,6 +981,45 @@ pub(crate) fn read_frame<'a>(
     Some(&scratch[..len])
 }
 
+/// A carrier read a window at a time, for the leg that keeps its frames apart.
+///
+/// [`read_frame`] asks for a frame's two length octets and then for its body, and a bare socket
+/// answers each ask with its own syscall copying only what was asked, so every datagram on the leg
+/// pays for two — the first of them moving two bytes. A relay batch cannot be read this way
+/// because a window hides how much it holds, which is why [`Wire`] holds the sealed bytes itself;
+/// a frame per packet has no batch to hide, so it reads through here.
+pub(crate) struct Buffered<R: Read> {
+    carrier: R,
+    held: Vec<u8>,
+    at: usize,
+    end: usize,
+}
+
+impl<R: Read> Buffered<R> {
+    #[must_use]
+    pub(crate) fn new(carrier: R) -> Self {
+        Self {
+            carrier,
+            held: crate::proxy::unfilled(crate::proxy::RELAY_SMALL_BUFFER),
+            at: 0,
+            end: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for Buffered<R> {
+    fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+        if self.at == self.end {
+            self.at = 0;
+            self.end = self.carrier.read(&mut self.held)?;
+        }
+        let take = (self.end - self.at).min(dst.len());
+        dst[..take].copy_from_slice(&self.held[self.at..self.at + take]);
+        self.at += take;
+        Ok(take)
+    }
+}
+
 /// What one decode step of a [`Wire`] did.
 enum Frame {
     /// A frame opened in place at `at`, `len` plain bytes long.
@@ -3108,6 +3147,143 @@ mod tests {
     }
 
     #[test]
+    fn a_frame_window_reads_the_carrier_once_for_a_batch_of_datagrams() {
+        let lens: Vec<usize> = (500..510).collect();
+        let (sealed, plain, mut recv) = frames(&lens);
+        let mut carrier = Sealed {
+            held: sealed.clone(),
+            at: 0,
+            grain: usize::MAX,
+            reads: 0,
+        };
+        let mut windowed = Buffered::new(&mut carrier);
+        let mut got = Vec::new();
+        let mut sizes = Vec::new();
+        let mut scratch = Vec::new();
+        while let Some(chunk) = read_frame(&mut windowed, &mut recv, &mut scratch) {
+            sizes.push(chunk.len());
+            got.extend_from_slice(chunk);
+        }
+        assert_eq!(sizes, lens, "every datagram stayed its own frame");
+        assert_eq!(got, plain, "and the window opened the whole wire, in order");
+        assert_eq!(
+            carrier.reads, 2,
+            "one read fills the window for all ten frames and one says the carrier is over"
+        );
+
+        let mut bare = Sealed {
+            held: sealed,
+            at: 0,
+            grain: usize::MAX,
+            reads: 0,
+        };
+        let (_, _, mut second) = frames(&lens);
+        let mut had = 0;
+        let mut back = Vec::new();
+        while let Some(chunk) = read_frame(&mut bare, &mut second, &mut scratch) {
+            had += 1;
+            back.extend_from_slice(chunk);
+        }
+        assert_eq!(had, lens.len(), "the window opened what it did not read");
+        assert_eq!(back, plain);
+        assert_eq!(
+            bare.reads,
+            2 * lens.len() + 1,
+            "without the window the same wire asks twice per frame: the length, then the body"
+        );
+    }
+
+    #[test]
+    fn a_frame_window_serves_the_frames_that_straddle_its_refills() {
+        let lens: Vec<usize> = (500..510).collect();
+        let (sealed, plain, mut recv) = frames(&lens);
+        let mut carrier = Sealed {
+            held: sealed,
+            at: 0,
+            grain: 700,
+            reads: 0,
+        };
+        let mut windowed = Buffered::new(&mut carrier);
+        let mut got = Vec::new();
+        let mut sizes = Vec::new();
+        let mut scratch = Vec::new();
+        while let Some(chunk) = read_frame(&mut windowed, &mut recv, &mut scratch) {
+            sizes.push(chunk.len());
+            got.extend_from_slice(chunk);
+        }
+        assert_eq!(
+            sizes, lens,
+            "a frame cut across a refill still ends at its own length"
+        );
+        assert_eq!(got, plain);
+        assert!(
+            carrier.reads > 2,
+            "the carrier handed short reads, so the window refilled"
+        );
+    }
+
+    #[test]
+    fn the_datagram_pump_reads_the_carrier_through_its_window() {
+        // The pumps are what the row is about: a datagram leg that framed every packet with its own two asks would read the carrier twice per frame however the window is built.
+        struct Counted {
+            held: Vec<u8>,
+            at: usize,
+            reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Read for Counted {
+            fn read(&mut self, dst: &mut [u8]) -> std::io::Result<usize> {
+                self.reads
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let take = (self.held.len() - self.at).min(dst.len());
+                dst[..take].copy_from_slice(&self.held[self.at..self.at + take]);
+                self.at += take;
+                Ok(take)
+            }
+        }
+
+        let lens: Vec<usize> = (500..510).collect();
+        let (sealed, plain, _recv) = frames(&lens);
+        let target = UdpSocket::bind("127.0.0.1:0").expect("binds the target");
+        let target_addr = target.local_addr().expect("addr");
+        target
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("arms the read");
+        let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let carrier = Counted {
+            held: sealed,
+            at: 0,
+            reads: std::sync::Arc::clone(&reads),
+        };
+        let key = [0x55u8; 16];
+        let iv = [0x66u8; 16];
+        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
+        let send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
+        let (_, _, recv) = frames(&lens);
+        let close: Close = std::sync::Arc::new(|| {});
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds the uplink");
+        udp.connect(target_addr).expect("connects");
+        let meter = crate::stats::Meter::default();
+        crate::proxy::pump_vmess_udp(carrier, Vec::new(), &close, &udp, send, recv, &meter);
+
+        let mut sizes = Vec::new();
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 65535];
+        for _ in &lens {
+            let n = target.recv(&mut buf).expect("a datagram arrives");
+            sizes.push(n);
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(sizes, lens, "one VMess frame per datagram, in order");
+        assert_eq!(got, plain);
+        assert_eq!(
+            reads.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the pump asked the carrier for the window once, and once more to learn it is over"
+        );
+    }
+
+    #[test]
     fn kdf_is_stable_and_keyed() {
         let a = kdf(b"key", &[b"path"]);
         assert_eq!(a, kdf(b"key", &[b"path"]));
@@ -4086,6 +4262,21 @@ mod tests {
             "and it is the window the leg reads into"
         );
         drop(window);
+        let (windowed, counts) = ferrox_core::alloc_count::measure(|| {
+            Buffered::new(Sealed {
+                held: Vec::new(),
+                at: 0,
+                grain: 0,
+                reads: 0,
+            })
+        });
+        assert_eq!(counts.zeroed, 0, "the datagram leg's window is not zeroed");
+        assert_eq!(
+            counts.bytes,
+            crate::proxy::RELAY_SMALL_BUFFER,
+            "and it is the window the leg reads into"
+        );
+        drop(windowed);
     }
 
     #[test]

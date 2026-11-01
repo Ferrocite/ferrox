@@ -12098,7 +12098,7 @@ where
     R: Read + Send + 'static,
 {
     RelayPool::global().run(move || {
-        let mut read = read;
+        let mut read = crate::vmess::Buffered::new(read);
         let mut recv = recv;
         let mut scratch = Vec::with_capacity(UDP_BUF);
         let mut reply = Vec::with_capacity(UDP_BUF);
@@ -22056,7 +22056,7 @@ pub(crate) fn pump_vmess_udp<R, W>(
     let done_in = Arc::clone(&done);
     let forward_user = user.clone();
     let forward = move || {
-        let mut reader = reader;
+        let mut reader = crate::vmess::Buffered::new(reader);
         let mut recv = recv;
         let mut scratch = Vec::with_capacity(UDP_BUF);
         while let Some(chunk) = crate::vmess::read_frame(&mut reader, &mut recv, &mut scratch) {
