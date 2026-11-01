@@ -1080,17 +1080,21 @@ impl GrpcWriter {
                 }
                 return Self::took_or_parked(flushed);
             }
-            let mut at = 0;
-            while at < total {
-                let n = (total - at).min(max);
-                if at + n <= plen {
-                    batch.add(self.stream, 0, &prefix[at..at + n], &[]);
-                } else if at >= plen {
-                    batch.add(self.stream, 0, &[], &piece[at - plen..at - plen + n]);
-                } else {
-                    batch.add(self.stream, 0, &prefix[at..plen], &piece[..n - (plen - at)]);
+            if total <= max {
+                batch.add(self.stream, 0, &prefix[..plen], piece);
+            } else {
+                let mut at = 0;
+                while at < total {
+                    let n = (total - at).min(max);
+                    if at + n <= plen {
+                        batch.add(self.stream, 0, &prefix[at..at + n], &[]);
+                    } else if at >= plen {
+                        batch.add(self.stream, 0, &[], &piece[at - plen..at - plen + n]);
+                    } else {
+                        batch.add(self.stream, 0, &prefix[at..plen], &piece[..n - (plen - at)]);
+                    }
+                    at += n;
                 }
-                at += n;
             }
             held += piece.len();
         }
@@ -1220,6 +1224,21 @@ impl GrpcWriter {
         if reserved && !self.credit(batch, total as u64) {
             return false;
         }
+        if total <= max {
+            if !reserved && !self.credit(batch, total as u64) {
+                return false;
+            }
+            if batch.full() && !batch.flush_blocking(&self.shared) {
+                return false;
+            }
+            batch.add(
+                self.stream,
+                if end { F_END } else { 0 },
+                &prefix[..plen],
+                data,
+            );
+            return true;
+        }
         let mut at = 0;
         while at < total {
             let n = (total - at).min(max);
@@ -1270,7 +1289,7 @@ fn message_payload(max_frame: usize) -> usize {
     let max = max_frame.min(FRAME_CAP);
     let mut payload = max.saturating_sub(6);
     loop {
-        let plen = frame_prefix(payload, &mut [0u8; 16]);
+        let plen = 6 + varint_len(payload as u64);
         let next = max.saturating_sub(plen);
         if next >= payload {
             return payload;
@@ -1279,21 +1298,40 @@ fn message_payload(max_frame: usize) -> usize {
     }
 }
 
-fn frame_prefix(data_len: usize, out: &mut [u8; 16]) -> usize {
-    let mut value = data_len as u64;
-    let mut at = 6;
-    loop {
-        let byte = (value & 0x7F) as u8;
+fn varint_len(mut value: u64) -> usize {
+    let mut len = 1;
+    while value >= 0x80 {
         value >>= 7;
-        if value == 0 {
-            out[at] = byte;
-            at += 1;
-            break;
-        }
-        out[at] = byte | 0x80;
-        at += 1;
+        len += 1;
     }
-    let inner = (at - 5 + data_len) as u32;
+    len
+}
+
+#[inline]
+fn frame_prefix(data_len: usize, out: &mut [u8; 16]) -> usize {
+    let (at, inner) = if data_len < 0x80 {
+        out[6] = data_len as u8;
+        (7, (2 + data_len) as u32)
+    } else if data_len < 0x4000 {
+        out[6] = (data_len as u8 & 0x7F) | 0x80;
+        out[7] = (data_len >> 7) as u8;
+        (8, (3 + data_len) as u32)
+    } else {
+        let mut value = data_len as u64;
+        let mut at = 6;
+        loop {
+            let byte = (value & 0x7F) as u8;
+            value >>= 7;
+            if value == 0 {
+                out[at] = byte;
+                at += 1;
+                break;
+            }
+            out[at] = byte | 0x80;
+            at += 1;
+        }
+        (at, (at - 5 + data_len) as u32)
+    };
     out[0] = 0;
     out[1..5].copy_from_slice(&inner.to_be_bytes());
     out[5] = 0x0A;
@@ -1309,9 +1347,15 @@ fn push_varint(out: &mut Vec<u8>, mut value: u64) {
     out.push(value as u8);
 }
 
+#[inline]
 fn read_varint(msg: &[u8], at: &mut usize) -> Option<u64> {
-    let mut value = 0u64;
-    for shift in (0..70).step_by(7) {
+    let first = *msg.get(*at)?;
+    *at += 1;
+    if first & 0x80 == 0 {
+        return Some(u64::from(first));
+    }
+    let mut value = u64::from(first & 0x7F);
+    for shift in (7..70).step_by(7) {
         let byte = *msg.get(*at)?;
         *at += 1;
         if shift == 63 && byte > 1 {
@@ -1326,6 +1370,7 @@ fn read_varint(msg: &[u8], at: &mut usize) -> Option<u64> {
 }
 
 /// The `Data` field of a `Hunk`, and where it sits inside the message: the reader hands over the bytes where they lie, so the offset is part of the answer rather than something the caller finds again.
+#[inline]
 fn hunk_decode(msg: &[u8]) -> Option<(usize, &[u8])> {
     let mut at = 0;
     let mut data: &[u8] = &[];
