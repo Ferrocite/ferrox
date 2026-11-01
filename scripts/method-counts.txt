@@ -824,10 +824,8 @@ carrier-masque h2-frame-body-allocations 0 ferrox-app-masque-h2::tests::a_frame_
 carrier-masque h2-capsule-staging-allocations 0 ferrox-app-masque-h2::tests::a_whole_capsule_is_read_where_it_landed
 carrier-masque h2-datagram-packet-queue-copies 0 ferrox-app-masque-h2::tests::a_datagram_capsule_goes_straight_to_its_lane
 carrier-masque h2-queued-capsule-cap 64 ferrox-app-masque-h2::tests::a_stalled_send_window_bounds_the_queued_capsules
-carrier-psiphon ops-retired-instructions UNBLESSED scripts/count-ops.sh
-carrier-psiphon syscalls-per-notice-line UNBLESSED scripts/count-ops.sh
-carrier-psiphon notice-scan-allocations-per-line 0 ferrox-core-psiphon::tests::a_notice_scan_takes_no_buffer_of_its_own
-carrier-psiphon notice-line-copies-when-it-fits 0 ferrox-app-psiphon::tests::a_notice_line_is_visited_where_the_reader_holds_it
-carrier-psiphon notice-line-allocations-when-it-fits 0 ferrox-app-psiphon::tests::a_notice_line_that_fits_the_reader_takes_no_buffer
+carrier-psiphon ops-per-ssh-handshake UNBLESSED scripts/count-ops.sh
+carrier-psiphon syscalls-per-relayed-megabyte UNBLESSED scripts/count-ops.sh
+carrier-psiphon relay-staging-copies-per-byte UNBLESSED not measured
 carrier-psiphon flow-clone-allocations 0 ferrox-app-psiphon::tests::a_flow_clone_shares_the_credential_words
 carrier-psiphon seconds-per-live-transfer UNBLESSED .github/workflows/psiphon-live.yml
