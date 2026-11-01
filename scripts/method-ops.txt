@@ -78,8 +78,8 @@ vmess  vmess::tests::frames_reuse_the_callers_buffers  vmess::read_frame
 vmess  vmess::tests::an_aes_batch_is_the_frames_written_one_at_a_time  vmess::stage_frame
 vmess  vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time  ferrox_core::chacha::avx512::xor_blocks_from
 vmess  vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time  ferrox_core::chacha::avx2::xor_blocks_from
-vmess  vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write  vmess::Wire::step
-vmess  vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write  vmess::Wire::batch
+vmess  vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write  ferrox_app::vmess::Wire<ferrox_app::vmess::tests::Sealed>::step
+vmess  vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write  ferrox_app::vmess::Wire<ferrox_app::vmess::tests::Sealed>::batch
 trojan  proxy::tests::the_trojan_header_costs_two_reads_not_seven  proxy::decode_trojan_request
 vless  vless::tests::first_method_header_is_stable  ferrox_core::vless::VlessLink::encode_into
 vless  vless::tests::the_request_parse_probe_costs_the_read_and_nothing_else  ferrox_core::vless::decode_request
