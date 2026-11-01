@@ -8688,6 +8688,58 @@ impl Drop for RelayStep {
     }
 }
 
+const VLESS_VISION_ADDONS: &[u8] = b"\x0A\x10xtls-rprx-vision";
+
+/// The largest dial header: the 21-byte head, the Vision add-ons, and a 255-byte name.
+const VLESS_DIAL_HEADER_MAX: usize = 21 + VLESS_VISION_ADDONS.len() + 257;
+
+/// A dial header written into a fixed buffer: the one allocation `vless_request_header`
+/// used to pay per dial is gone, and the bytes still go out in one write.
+struct VlessDialHeader {
+    bytes: [u8; VLESS_DIAL_HEADER_MAX],
+    len: usize,
+}
+
+impl std::ops::Deref for VlessDialHeader {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.bytes[..self.len]
+    }
+}
+
+fn write_vless_header(
+    id: &[u8; 16],
+    cmd: u8,
+    target: &Destination,
+    vision: bool,
+    out: &mut [u8],
+) -> Option<usize> {
+    let addons = if vision { VLESS_VISION_ADDONS.len() } else { 0 };
+    let need = 21 + addons + target.addr_len();
+    if need > out.len() {
+        return None;
+    }
+    let mut at = 0;
+    out[at] = 0;
+    at += 1;
+    out[at..at + 16].copy_from_slice(id);
+    at += 16;
+    out[at] = addons as u8;
+    at += 1;
+    if vision {
+        out[at..at + addons].copy_from_slice(VLESS_VISION_ADDONS);
+        at += addons;
+    }
+    out[at] = cmd;
+    at += 1;
+    out[at..at + 2].copy_from_slice(&target.port().to_be_bytes());
+    at += 2;
+    at += target.write_addr(&mut out[at..])?;
+    debug_assert_eq!(at, need);
+    Some(at)
+}
+
 pub(crate) fn vless_header(id: &[u8; 16], cmd: u8, target: &Destination) -> Vec<u8> {
     // version + uuid + addonsLen + command + port = 21, then the family byte and its body.
     let mut header = Vec::with_capacity(21 + target.addr_len());
@@ -8701,14 +8753,14 @@ pub(crate) fn vless_header(id: &[u8; 16], cmd: u8, target: &Destination) -> Vec<
 }
 
 /// The VLESS header with the Vision flow in its addons, the bytes the core encoder writes.
+#[cfg(test)]
 pub(crate) fn vless_vision_header(id: &[u8; 16], cmd: u8, target: &Destination) -> Vec<u8> {
-    const ADDONS: &[u8] = b"\x0A\x10xtls-rprx-vision";
     // The bare header plus the fixed Flow addon, then the family byte and its body.
-    let mut header = Vec::with_capacity(21 + ADDONS.len() + target.addr_len());
+    let mut header = Vec::with_capacity(21 + VLESS_VISION_ADDONS.len() + target.addr_len());
     header.push(0);
     header.extend_from_slice(id);
-    header.push(ADDONS.len() as u8);
-    header.extend_from_slice(ADDONS);
+    header.push(VLESS_VISION_ADDONS.len() as u8);
+    header.extend_from_slice(VLESS_VISION_ADDONS);
     header.push(cmd);
     header.extend_from_slice(&target.port().to_be_bytes());
     target.push_addr(&mut header, 3, 2);
@@ -8726,6 +8778,7 @@ pub(crate) fn vless_mux_header(id: &[u8; 16]) -> Vec<u8> {
 
 /// The reverse request: command 4 names no address, so the header ends after the command, as the
 /// reference's own encoder writes it.
+#[cfg(test)]
 pub(crate) fn vless_reverse_header(id: &[u8; 16]) -> Vec<u8> {
     let mut header = Vec::with_capacity(19);
     header.push(0);
@@ -8737,12 +8790,19 @@ pub(crate) fn vless_reverse_header(id: &[u8; 16]) -> Vec<u8> {
 
 /// The header a vless outbound opens with: a forward request names its target, the bridge's
 /// monitor names none and asks the portal for a reverse session instead.
-fn vless_request_header(vless: &VlessOut, target: Option<&Destination>) -> Vec<u8> {
-    match target {
-        None => vless_reverse_header(&vless.id),
-        Some(target) if vless.is_vision() => vless_vision_header(&vless.id, 1, target),
-        Some(target) => vless_header(&vless.id, 1, target),
-    }
+fn vless_request_header(vless: &VlessOut, target: Option<&Destination>) -> Option<VlessDialHeader> {
+    let mut bytes = [0u8; VLESS_DIAL_HEADER_MAX];
+    let len = match target {
+        None => {
+            bytes[0] = 0;
+            bytes[1..17].copy_from_slice(&vless.id);
+            bytes[17] = 0;
+            bytes[18] = 4;
+            19
+        }
+        Some(target) => write_vless_header(&vless.id, 1, target, vless.is_vision(), &mut bytes)?,
+    };
+    Some(VlessDialHeader { bytes, len })
 }
 
 // Records a rung failure and reports whether the session stops here.
@@ -8787,7 +8847,6 @@ fn dial_vless(
     target: Option<&Destination>,
     ladder: &Ladder,
 ) {
-    let header = vless_request_header(vless, target);
     if let Some(encryption) = &vless.encryption {
         if vless.tls.is_some() {
             dial_vless_tls(client, server, vless, target);
@@ -8798,6 +8857,9 @@ fn dial_vless(
             return;
         }
         if matches!(vless.carrier, Carrier::Raw(_)) {
+            let Some(header) = vless_request_header(vless, target) else {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            };
             dial_vless_encrypted_raw(client, server, vless, encryption, &header);
             return;
         }
@@ -8810,6 +8872,9 @@ fn dial_vless(
         dial_vless_reality(client, server, vless, target);
         return;
     }
+    let Some(header) = vless_request_header(vless, target) else {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    };
     let params = stream_params(&vless.carrier);
     let explicit = rung_of(&vless.carrier);
     if explicit.is_none() {
@@ -14983,7 +15048,9 @@ fn dial_vless_tls(
     let Some(cfg) = vless.tls.as_deref() else {
         return;
     };
-    let header = vless_request_header(vless, target);
+    let Some(header) = vless_request_header(vless, target) else {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    };
     let Some(mut session) = dial_tls_session(server, cfg, vless.carrier.tcp_mask()) else {
         return;
     };
@@ -15314,7 +15381,9 @@ fn dial_vless_reality(
     if raw.set_read_timeout(Some(SESSION_POLL)).is_err() {
         return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
     }
-    let header = vless_request_header(vless, target);
+    let Some(header) = vless_request_header(vless, target) else {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    };
     match &vless.carrier {
         Carrier::Raw(_) => {
             if let Some(encryption) = &vless.encryption {
@@ -25872,6 +25941,34 @@ impl Destination {
             Self::Name(host, _) => host.len() + 2,
         }
     }
+
+    /// `push_addr`'s bytes into a caller's buffer, so a dial header never needs a heap copy.
+    /// A name the wire's one-byte length cannot carry is refused rather than truncated.
+    fn write_addr(&self, out: &mut [u8]) -> Option<usize> {
+        match self {
+            Self::Address(address) => match address.ip() {
+                IpAddr::V4(ip) => {
+                    out[0] = 1;
+                    out[1..5].copy_from_slice(&ip.octets());
+                    Some(5)
+                }
+                IpAddr::V6(ip) => {
+                    out[0] = 3;
+                    out[1..17].copy_from_slice(&ip.octets());
+                    Some(17)
+                }
+            },
+            Self::Name(host, _) => {
+                if host.len() > u8::MAX as usize {
+                    return None;
+                }
+                out[0] = 2;
+                out[1] = host.len() as u8;
+                out[2..2 + host.len()].copy_from_slice(host.as_bytes());
+                Some(host.len() + 2)
+            }
+        }
+    }
 }
 
 impl From<SocketAddr> for Destination {
@@ -30019,7 +30116,8 @@ mod tests {
             heartbeat: crate::config::carrier_headers(None).1,
             encryption: Some(Arc::clone(&client)),
         };
-        let header = vless_request_header(&vless, Some(&Destination::from(echo_addr)));
+        let header = vless_request_header(&vless, Some(&Destination::from(echo_addr)))
+            .expect("the header fits");
 
         let (app, mut peer) = UnixStream::pair().expect("pair");
         peer.set_read_timeout(Some(Duration::from_secs(10)))
@@ -33275,9 +33373,12 @@ mod tests {
             ferrox_core::vless::VISION_UDP443_FLOW
         ))
         .expect("parses");
+        let core_header = core.encode_request_header("192.0.2.1", 443);
+        let alias_header = vless_request_header(&alias, Some(&Destination::from(target)))
+            .expect("the alias header fits");
         assert_eq!(
-            vless_request_header(&alias, Some(&Destination::from(target))),
-            core.encode_request_header("192.0.2.1", 443),
+            &*alias_header,
+            core_header.as_slice(),
             "the alias writes the same bytes as the core link"
         );
         let reality = out.reality.expect("carries its identity");
@@ -33298,6 +33399,53 @@ mod tests {
             find_vless_outbound(&bad_flow).is_none(),
             "an unknown flow is refused, never sent plain"
         );
+    }
+
+    fn header_test_outbound() -> VlessOut {
+        VlessOut {
+            address: "192.0.2.1".to_owned(),
+            port: 443,
+            id: [0x11; 16],
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: false,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: ferrox_core::vless::VISION_UDP443_FLOW.to_owned(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        }
+    }
+
+    #[test]
+    fn an_overlong_destination_refuses_the_dial_header() {
+        let vless = header_test_outbound();
+        let name = Destination::Name("a".repeat(256), 443);
+        assert!(
+            vless_request_header(&vless, Some(&name)).is_none(),
+            "a name the wire's one-byte length cannot carry is refused"
+        );
+    }
+
+    #[test]
+    fn the_vless_dial_header_allocates_nothing() {
+        let vless = header_test_outbound();
+        let target = Destination::from(SocketAddr::from(([192, 0, 2, 53], 443)));
+        let (header, counts) =
+            ferrox_core::alloc_count::measure(|| vless_request_header(&vless, Some(&target)));
+        let header = header.expect("the alias header fits");
+        assert_eq!(
+            counts.allocs, 0,
+            "the alias header is written into the stack"
+        );
+        assert_eq!(counts.bytes, 0);
+        assert_eq!(counts.zeroed, 0);
+        let expected = vless_vision_header(&vless.id, 1, &target);
+        assert_eq!(&*header, expected.as_slice());
     }
 
     #[test]
