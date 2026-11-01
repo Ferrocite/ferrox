@@ -73,6 +73,19 @@ impl<'a> DataBatch<'a> {
     }
 
     fn flush(&mut self, conn: &H2Conn) -> bool {
+        let Ok(mut write) = conn.write.lock() else {
+            return false;
+        };
+        self.flush_locked(conn, &mut **write)
+    }
+
+    /// The same bytes into a write half the caller already holds: a lane takes the lock without
+    /// waiting, so a busy writer parks the lane instead of stacking workers behind the mutex.
+    fn flush_locked(
+        &mut self,
+        conn: &H2Conn,
+        write: &mut (dyn crate::proxy::FrameWrite + Send),
+    ) -> bool {
         if self.used == 0 {
             return true;
         }
@@ -89,7 +102,11 @@ impl<'a> DataBatch<'a> {
             }
         }
         self.used = 0;
-        conn.write_batch(&parts[..pieces])
+        if !write.write_slices(&parts[..pieces]) {
+            conn.dead.store(true, Ordering::SeqCst);
+            return false;
+        }
+        true
     }
 }
 
@@ -108,6 +125,24 @@ impl H2StreamOut {
     /// written side by side, so a gRPC envelope and its payload stay one message in one frame.
     pub(crate) fn batch_parts(&self, groups: &[&[&[u8]]]) -> bool {
         self.conn.send_grouped(self.stream, groups)
+    }
+
+    /// The non-blocking offer: the whole batch or nothing, so a lane that finds no window parks
+    /// instead of holding the worker the peer's credit is read on.
+    pub(crate) fn try_batch_parts(&self, groups: &[&[&[u8]]]) -> Option<bool> {
+        self.conn.try_send_grouped(self.stream, groups)
+    }
+
+    pub(crate) fn room(&self) -> u64 {
+        self.conn.room(self.stream)
+    }
+
+    pub(crate) fn wait_room(&self, turn: std::time::Duration) {
+        self.conn.wait_room(self.stream, turn);
+    }
+
+    pub(crate) fn settle(&self) -> crate::proxy::Settle {
+        self.conn.settle()
     }
 
     pub(crate) fn bind_session(&self, sid: &str) {
@@ -378,17 +413,6 @@ impl H2Conn {
         true
     }
 
-    fn write_batch(&self, parts: &[&[u8]]) -> bool {
-        let Ok(mut write) = self.write.lock() else {
-            return false;
-        };
-        if !write.write_slices(parts) {
-            self.dead.store(true, Ordering::SeqCst);
-            return false;
-        }
-        true
-    }
-
     /// Refuse the connection: the GOAWAY goes out now, and `refused` remembers that the peer still has to be given the window to read it.
     fn refuse(&self, code: u32) {
         self.refused.store(true, Ordering::SeqCst);
@@ -482,6 +506,129 @@ impl H2Conn {
             }
         }
         batch.flush(self)
+    }
+
+    /// The whole batch off the two windows or none of it: a lane that offered bytes no window
+    /// covers parks and retries, so a blocked sender never holds the worker its peer's credit runs on.
+    fn try_send_grouped(&self, stream: u32, groups: &[&[&[u8]]]) -> Option<bool> {
+        let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .cloned()
+        else {
+            return Some(false);
+        };
+        let total: u64 = groups
+            .iter()
+            .filter(|group| group.len() <= 4)
+            .map(|group| group.iter().map(|part| part.len() as u64).sum::<u64>())
+            .sum();
+        if total == 0 {
+            return Some(true);
+        }
+        let Ok(mut write) = self.write.try_lock() else {
+            return None;
+        };
+        let (Ok(mut conn), Ok(mut window)) =
+            (self.send_conn.try_lock(), state.send_window.try_lock())
+        else {
+            return None;
+        };
+        if *conn < total || *window < total {
+            return None;
+        }
+        *conn -= total;
+        *window -= total;
+        let max = *self
+            .max_frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut batch = DataBatch::new();
+        for group in groups {
+            let mut need: usize = group.iter().map(|part| part.len()).sum();
+            if need == 0 || group.len() > 4 {
+                continue;
+            }
+            let mut index = 0;
+            let mut offset = 0;
+            while need > 0 {
+                let chunk = need.min(max);
+                if batch.full() && !batch.flush_locked(self, &mut **write) {
+                    return Some(false);
+                }
+                let mut parts: [&[u8]; 4] = [&[]; 4];
+                let mut used = 0;
+                let mut left = chunk;
+                while left > 0 && index < group.len() {
+                    let part = &group[index][offset..];
+                    if part.len() <= left {
+                        parts[used] = part;
+                        used += 1;
+                        left -= part.len();
+                        index += 1;
+                        offset = 0;
+                    } else {
+                        parts[used] = &part[..left];
+                        used += 1;
+                        offset += left;
+                        left = 0;
+                    }
+                }
+                batch.add_parts(stream, &parts[..used]);
+                need -= chunk;
+            }
+        }
+        Some(batch.flush_locked(self, &mut **write))
+    }
+
+    /// Drains a writer that kept a paced tail for a peer that had not read: the lane settles it,
+    /// so an `END_STREAM` behind that tail is not left waiting for a write nobody offers.
+    fn settle(&self) -> crate::proxy::Settle {
+        let Ok(mut write) = self.write.lock() else {
+            return crate::proxy::Settle::Lost;
+        };
+        write.settle()
+    }
+
+    fn room(&self, stream: u32) -> u64 {
+        let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .cloned()
+        else {
+            return 0;
+        };
+        let conn = *self
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let window = *state
+            .send_window
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        conn.min(window)
+    }
+
+    /// The caller already knows its batch does not fit, so any wait here is the poll it would pay
+    /// anyway; holding the connection window across it is what keeps the grant and the wake atomic.
+    fn wait_room(&self, stream: u32, turn: std::time::Duration) {
+        if !self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&stream)
+        {
+            return;
+        }
+        let conn = self
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let _ = self.wake.wait_timeout(conn, turn);
     }
 
     /// Take what the two windows allow, waiting only after the frames already reserved have reached the peer.

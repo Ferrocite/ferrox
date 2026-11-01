@@ -78,6 +78,8 @@ struct Shared {
     upload_gate: Mutex<()>,
     dead: AtomicBool,
     pong: AtomicU64,
+    /// The transport is the multiplexed sender, whose own windows are the only gate.
+    muxed: bool,
 }
 
 impl std::fmt::Debug for Shared {
@@ -1028,6 +1030,9 @@ impl<'a> Gather<'a> {
                     if !take_window(shared, self.credit, true) {
                         return false;
                     }
+                    if let Ok(stream) = shared.stream.lock() {
+                        stream.wait_room(crate::budgets::RELAY_POLL);
+                    }
                 }
             }
         }
@@ -1069,17 +1074,21 @@ impl GrpcWriter {
         let mut batch = Gather::new();
         let mut flushed = 0usize;
         let mut held = 0usize;
+        let mut room = self.send_room();
         for piece in data.chunks(payload) {
             let mut prefix = [0u8; 16];
             let plen = frame_prefix(piece.len(), &mut prefix);
             let total = plen + piece.len();
             let frames = total.div_ceil(max);
-            if batch.used + frames > FRAMES_PER_WRITE {
+            if batch.used + frames > FRAMES_PER_WRITE
+                || (batch.used > 0 && batch.credit + total as u64 > room)
+            {
                 if let Some(stop) =
                     Self::flush_held(&self.shared, &mut batch, &mut flushed, &mut held)
                 {
                     return stop;
                 }
+                room = self.send_room();
             }
             if !take_window(&self.shared, total as u64, false) {
                 if let Some(stop) =
@@ -1150,6 +1159,13 @@ impl GrpcWriter {
             .send
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        if send.unlimited {
+            drop(send);
+            if let Ok(stream) = self.shared.stream.lock() {
+                stream.wait_room(turn);
+            }
+            return;
+        }
         let _ = self.shared.wake.wait_timeout(send, turn);
     }
 
@@ -1205,6 +1221,15 @@ impl GrpcWriter {
             .max_frame
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What the transport's window takes now: a batch is cut to this so a lane's offer is the batch
+    /// that fits, and one that still does not parks instead of holding a worker.
+    fn send_room(&self) -> u64 {
+        if !self.shared.muxed {
+            return u64::MAX;
+        }
+        self.shared.stream.lock().map_or(0, |stream| stream.room())
     }
 
     /// Window for one more frame, or the batch out to the peer first: a credit the peer has not given
@@ -1414,17 +1439,28 @@ impl Write for MuxSink {
     }
 }
 
-impl FrameWrite for MuxSink {
-    fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
-        let mut groups: [[&[u8]; 2]; 16] = [[&[]; 2]; 16];
-        let mut sizes = [0usize; 16];
-        let mut groups_at = 0;
+/// One batch of framed DATA bodies apart from their frame heads: each group is one frame's parts.
+struct Batched<'a> {
+    groups: [[&'a [u8]; 2]; 16],
+    sizes: [usize; 16],
+    count: usize,
+    end: bool,
+}
+
+impl MuxSink {
+    /// The framed DATA bodies apart from the frame heads, and whether the batch carries `END_STREAM`.
+    fn split<'a>(parts: &[&'a [u8]]) -> Option<Batched<'a>> {
+        let mut batched = Batched {
+            groups: [[&[]; 2]; 16],
+            sizes: [0usize; 16],
+            count: 0,
+            end: false,
+        };
         let mut at = 0;
-        let mut end = false;
         while at < parts.len() {
             let frame = parts[at];
             if frame.len() < 9 {
-                return false;
+                return None;
             }
             let len =
                 usize::from(frame[0]) << 16 | usize::from(frame[1]) << 8 | usize::from(frame[2]);
@@ -1438,36 +1474,82 @@ impl FrameWrite for MuxSink {
                 at += 1;
                 &[]
             };
-            if kind == T_DATA && groups_at < groups.len() {
+            if kind == T_DATA && batched.count < batched.groups.len() {
                 let mut size = 0;
                 if !prefix.is_empty() {
-                    groups[groups_at][size] = prefix;
+                    batched.groups[batched.count][size] = prefix;
                     size += 1;
                 }
                 if !body.is_empty() {
-                    groups[groups_at][size] = body;
+                    batched.groups[batched.count][size] = body;
                     size += 1;
                 }
                 if size > 0 {
-                    sizes[groups_at] = size;
-                    groups_at += 1;
+                    batched.sizes[batched.count] = size;
+                    batched.count += 1;
                 }
             }
             if flags & F_END != 0 {
-                end = true;
+                batched.end = true;
             }
         }
+        Some(batched)
+    }
+}
+
+impl Batched<'_> {
+    fn slices(&self) -> [&[&[u8]]; 16] {
         let mut slices: [&[&[u8]]; 16] = [&[]; 16];
-        for at in 0..groups_at {
-            slices[at] = &groups[at][..sizes[at]];
+        for (at, slice) in slices.iter_mut().enumerate().take(self.count) {
+            *slice = &self.groups[at][..self.sizes[at]];
         }
-        if groups_at > 0 && !self.out.batch_parts(&slices[..groups_at]) {
+        slices
+    }
+}
+
+impl FrameWrite for MuxSink {
+    fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+        let Some(batched) = Self::split(parts) else {
+            return false;
+        };
+        let slices = batched.slices();
+        if batched.count > 0 && !self.out.batch_parts(&slices[..batched.count]) {
             return false;
         }
-        if end {
+        if batched.end {
             self.out.end();
         }
         true
+    }
+
+    fn offer_slices(&mut self, parts: &[&[u8]]) -> crate::proxy::Accepted {
+        use crate::proxy::Accepted;
+        let Some(batched) = Self::split(parts) else {
+            return Accepted::Lost;
+        };
+        let slices = batched.slices();
+        match self.out.try_batch_parts(&slices[..batched.count]) {
+            Some(true) => {
+                if batched.end {
+                    self.out.end();
+                }
+                Accepted::All
+            }
+            Some(false) => Accepted::Lost,
+            None => Accepted::Full,
+        }
+    }
+
+    fn room(&self) -> u64 {
+        self.out.room()
+    }
+
+    fn wait_room(&self, turn: Duration) {
+        self.out.wait_room(turn);
+    }
+
+    fn settle(&mut self) -> Settle {
+        self.out.settle()
     }
 }
 
@@ -1575,6 +1657,7 @@ fn mux_shared(write: Box<dyn FrameWrite + Send>, max: usize, window: u64) -> Arc
         upload_gate: Mutex::new(()),
         dead: AtomicBool::new(false),
         pong: AtomicU64::new(0),
+        muxed: true,
     })
 }
 
@@ -1708,7 +1791,7 @@ pub(crate) fn accept_with(
 /// The plaintext a bare socket cannot hold itself: an offer is taken whole into this tail and the
 /// socket drains it at its own pace, so a lane never parks in a full send buffer and the bytes an
 /// offer acknowledged are still owed a write.
-struct Tail {
+pub(crate) struct Tail {
     inner: Box<dyn crate::proxy::FrameWrite + Send>,
     bytes: Vec<u8>,
     at: usize,
@@ -1716,13 +1799,62 @@ struct Tail {
 }
 
 impl Tail {
-    fn new(inner: Box<dyn crate::proxy::FrameWrite + Send>) -> Self {
+    pub(crate) fn new(mut inner: Box<dyn crate::proxy::FrameWrite + Send>) -> Self {
+        inner.arm_write(crate::budgets::RELAY_POLL);
         Self {
             inner,
             bytes: Vec::new(),
             at: 0,
             lost: false,
         }
+    }
+
+    /// The most this tail keeps ahead of a socket that has no pacing of its own.
+    const MOST: usize = 256 * 1024;
+
+    /// The caller's parts straight at the socket; only the suffix it would not take is copied.
+    fn put(&mut self, parts: &[&[u8]]) -> Accepted {
+        let total = parts.iter().map(|part| part.len()).sum::<usize>();
+        let mut wrote = 0;
+        while wrote < total {
+            let mut bufs: [std::io::IoSlice<'_>; 2 * FRAMES_PER_WRITE] =
+                std::array::from_fn(|_| std::io::IoSlice::new(NO_FRAME));
+            let mut skip = wrote;
+            let mut pieces = 0;
+            for part in parts {
+                if skip >= part.len() {
+                    skip -= part.len();
+                    continue;
+                }
+                bufs[pieces] = std::io::IoSlice::new(&part[skip..]);
+                pieces += 1;
+                skip = 0;
+                if pieces == bufs.len() {
+                    break;
+                }
+            }
+            match self.inner.write_vectored(&bufs[..pieces]) {
+                Ok(0) => {
+                    self.lost = true;
+                    return Accepted::Lost;
+                }
+                Ok(n) => wrote += n,
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::WouldBlock
+                        || crate::proxy::is_timeout(&error) =>
+                {
+                    break;
+                }
+                Err(_) => {
+                    self.lost = true;
+                    return Accepted::Lost;
+                }
+            }
+        }
+        if wrote < total {
+            self.keep(parts, wrote);
+        }
+        Accepted::All
     }
 
     /// The bytes the socket did not take, kept until a settle writes them.
@@ -1734,22 +1866,6 @@ impl Tail {
             }
             self.bytes.extend_from_slice(&part[skip..]);
             skip = 0;
-        }
-    }
-
-    /// Waits the tail down to empty for a caller that asked for every byte before it returns.
-    fn drain_until(&mut self, deadline: &Instant) -> bool {
-        loop {
-            match self.drain() {
-                Settle::Clear => return true,
-                Settle::Lost => return false,
-                Settle::Parked => {
-                    if Instant::now() >= *deadline {
-                        return false;
-                    }
-                    std::thread::sleep(crate::budgets::RELAY_POLL);
-                }
-            }
         }
     }
 
@@ -1800,20 +1916,18 @@ impl std::io::Write for Tail {
 }
 
 impl crate::proxy::FrameWrite for Tail {
+    /// A control frame ordered behind bytes the peer has not read still has to be accepted: the
+    /// demux writes it while no lane may wait, so it appends past the cap instead of being refused.
     fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
-        let deadline = Instant::now() + crate::budgets::relay_stall();
-        loop {
-            match self.offer_slices(parts) {
-                Accepted::All => break,
-                Accepted::Lost => return false,
-                Accepted::Full => {
-                    if Instant::now() >= deadline || !self.drain_until(&deadline) {
-                        return false;
-                    }
-                }
-            }
+        if self.lost {
+            return false;
         }
-        self.drain_until(&deadline)
+        let _ = self.drain();
+        if self.at < self.bytes.len() {
+            self.keep(parts, 0);
+            return true;
+        }
+        matches!(self.put(parts), Accepted::All)
     }
 
     /// The caller's parts go straight to the socket when it has room; only the suffix a timed-out
@@ -1824,38 +1938,18 @@ impl crate::proxy::FrameWrite for Tail {
         }
         if self.at < self.bytes.len() {
             match self.drain() {
-                Settle::Clear => {}
-                Settle::Parked => return Accepted::Full,
                 Settle::Lost => return Accepted::Lost,
+                Settle::Clear | Settle::Parked => {}
             }
         }
-        let total = parts.iter().map(|part| part.len()).sum::<usize>();
-        let mut bufs = [std::io::IoSlice::new(NO_FRAME); 2 * FRAMES_PER_WRITE];
-        for (buf, part) in bufs.iter_mut().zip(parts) {
-            *buf = std::io::IoSlice::new(part);
+        if self.at < self.bytes.len() {
+            if self.bytes.len() - self.at >= Self::MOST {
+                return Accepted::Full;
+            }
+            self.keep(parts, 0);
+            return Accepted::All;
         }
-        match self.inner.write_vectored(&bufs[..parts.len()]) {
-            Ok(0) => {
-                self.lost = true;
-                Accepted::Lost
-            }
-            Ok(n) if n == total => Accepted::All,
-            Ok(n) => {
-                self.keep(parts, n);
-                Accepted::All
-            }
-            Err(error)
-                if error.kind() == std::io::ErrorKind::WouldBlock
-                    || crate::proxy::is_timeout(&error) =>
-            {
-                self.keep(parts, 0);
-                Accepted::All
-            }
-            Err(_) => {
-                self.lost = true;
-                Accepted::Lost
-            }
-        }
+        self.put(parts)
     }
 
     fn settle(&mut self) -> Settle {
@@ -1883,6 +1977,7 @@ fn new_shared(write: Box<dyn crate::proxy::FrameWrite + Send>) -> Arc<Shared> {
         upload_gate: Mutex::new(()),
         dead: AtomicBool::new(false),
         pong: AtomicU64::new(0),
+        muxed: false,
     })
 }
 
@@ -3543,6 +3638,7 @@ mod tests {
                         upload_gate: Mutex::new(()),
                         dead: AtomicBool::new(false),
                         pong: AtomicU64::new(0),
+                        muxed: false,
                     });
                     let writer = GrpcWriter { shared, stream: 1 };
                     let mut batch = Gather::new();

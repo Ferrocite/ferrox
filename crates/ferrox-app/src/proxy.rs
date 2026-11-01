@@ -3956,7 +3956,13 @@ fn serve_vless_grpc(
             return;
         };
         let _ = stream.set_read_timeout(Some(RELAY_POLL));
-        return crate::grpc::serve_muxed(stream, write, settings, users, freedom);
+        return crate::grpc::serve_muxed(
+            stream,
+            crate::grpc::Tail::new(Box::new(write)),
+            settings,
+            users,
+            freedom,
+        );
     }
     let Some((reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
@@ -7607,13 +7613,14 @@ fn serve_session_httpheader<R: Read + Send + 'static, W: Write + Clone + Send + 
 
 fn serve_session_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     read: R,
-    write: W,
+    mut write: W,
     settings: &crate::config::GrpcSettings,
     users: &[VlessUser],
     freedom: bool,
     decryption: Option<&ferrox_core::vless_encryption::Server>,
 ) {
     if decryption.is_none() {
+        write.arm_write(RELAY_POLL);
         return crate::grpc::serve_muxed(read, write, settings, users, freedom);
     }
     let Some((creader, cwriter)) = crate::grpc::accept_split_with(read, write, settings) else {
@@ -25009,6 +25016,15 @@ pub(crate) trait FrameWrite: Write + Send {
             Accepted::Lost
         }
     }
+
+    /// Bytes the transport's own flow control will take without waiting; a writer that gates on a
+    /// peer window reports it so a batch is sized to what fits and a full window parks the lane.
+    fn room(&self) -> u64 {
+        u64::MAX
+    }
+
+    /// Blocks a caller that may wait until a window opens; a lane never reaches this, it parks.
+    fn wait_room(&self, _turn: Duration) {}
 
     /// Drains a paced tail without waiting; `Clear` when there is nothing left to write.
     fn settle(&mut self) -> Settle {
