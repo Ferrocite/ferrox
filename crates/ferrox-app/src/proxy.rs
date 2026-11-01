@@ -29628,17 +29628,17 @@ mod tests {
         let mut buf = [0u8; 64];
         // The first read asks the session for anything the answer left before it reads the transport.
         assert_eq!(half.read(&mut buf).expect("warms"), 16);
-        let first = opens.load(Ordering::Relaxed);
         for _ in 0..4 {
+            let before = opens.load(Ordering::Relaxed);
             let read = half.read(&mut buf).expect("reads");
             assert_eq!(read, 16, "one transport read per steady read");
             assert_eq!(buf[..16], (0u8..16).collect::<Vec<_>>()[..], "the bytes");
+            assert_eq!(
+                opens.load(Ordering::Relaxed) - before,
+                1,
+                "each steady read opened the session once, not once empty and once for its bytes"
+            );
         }
-        assert_eq!(
-            opens.load(Ordering::Relaxed) - first,
-            4,
-            "each steady read opened the session once, not once empty and once for its bytes"
-        );
     }
 
     /// A closed session that still holds plaintext delivers it: a read that filled the caller's
