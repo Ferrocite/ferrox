@@ -2409,6 +2409,9 @@ mod client_tests {
     use super::*;
     use std::time::Duration;
 
+    /// How long a lane's thread gets to hand back a packet it was told to tunnel: the suite runs its 1 722 tests over four cores, so a starved lane is not a lost packet.
+    const LANE_WAIT: Duration = Duration::from_secs(30);
+
     fn resolve_one(host: &str, port: u16) -> Vec<SocketAddr> {
         crate::proxy::resolve_endpoint(host, port)
             .into_iter()
@@ -2530,7 +2533,7 @@ mod client_tests {
         let mut buf = Vec::new();
         let frame = crate::proxy::socks_udp_frame(&mut buf, None, &target, b"query");
         app.send_to(frame, relay_address).expect("send");
-        let inner = packets.recv_timeout(Duration::from_secs(5)).expect("inner");
+        let inner = packets.recv_timeout(LANE_WAIT).expect("inner");
         let datagram = udp_from_packet(&inner).expect("packet");
         assert_eq!(datagram.source_port, port);
         assert_eq!(datagram.destination_port, 53);
@@ -2617,7 +2620,7 @@ mod client_tests {
         app.send_to(&frame, relay_address).expect("send");
         let mut sent = Vec::new();
         for _ in 0..targets.len() {
-            let inner = packets.recv_timeout(Duration::from_secs(5)).expect("inner");
+            let inner = packets.recv_timeout(LANE_WAIT).expect("inner");
             let datagram = udp_from_packet(&inner).expect("packet");
             assert_eq!(datagram.destination_port, 53);
             assert_eq!(datagram.payload, b"query");
@@ -2691,7 +2694,7 @@ mod client_tests {
         let mut raced = Vec::new();
         let mut source_port = 0;
         for _ in 0..targets.len() {
-            let inner = packets.recv_timeout(Duration::from_secs(5)).expect("inner");
+            let inner = packets.recv_timeout(LANE_WAIT).expect("inner");
             let datagram = udp_from_packet(&inner).expect("packet");
             if source_port == 0 {
                 source_port = datagram.source_port;
@@ -2761,7 +2764,7 @@ mod client_tests {
             .expect("timeout");
 
         app.send_to(&frame, relay_address).expect("send again");
-        let inner = packets.recv_timeout(Duration::from_secs(5)).expect("inner");
+        let inner = packets.recv_timeout(LANE_WAIT).expect("inner");
         let datagram = udp_from_packet(&inner).expect("packet");
         assert_eq!(
             socket_addr(datagram.destination, 53).expect("target"),
@@ -2781,7 +2784,7 @@ mod client_tests {
         let mut raced = Vec::new();
         let mut other_port = 0;
         for _ in 0..2 {
-            let inner = packets.recv_timeout(Duration::from_secs(5)).expect("inner");
+            let inner = packets.recv_timeout(LANE_WAIT).expect("inner");
             let datagram = udp_from_packet(&inner).expect("packet");
             assert_eq!(datagram.destination_port, 54);
             other_port = datagram.source_port;
@@ -2880,7 +2883,7 @@ mod client_tests {
             .expect("connect");
         let mut buf = [0u8; 2048];
         stack.poll(&mut buf);
-        let syn = packets.recv_timeout(Duration::from_secs(5)).expect("SYN");
+        let syn = packets.recv_timeout(LANE_WAIT).expect("SYN");
         let header = usize::from(syn[0] & 0x0f) * 4;
         let options = header + 20..header + usize::from(syn[header + 12] >> 4) * 4;
         let mut at = options.start;

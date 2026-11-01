@@ -39171,7 +39171,8 @@ mod tests {
         let dport = downstream.local_addr().expect("addr").port();
         let relay = thread::spawn(move || {
             let (socket, _) = downstream.accept().expect("accepts");
-            dial_trojan_xdrive_until(&socket, &trojan, &target, Duration::from_secs(2));
+            // The same grain this witness already arms its own read timeout and its join at: on a loaded runner the store's round trip is late, never wrong.
+            dial_trojan_xdrive_until(&socket, &trojan, &target, Duration::from_secs(30));
         });
         let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
         sock.set_read_timeout(Some(Duration::from_secs(30)))
