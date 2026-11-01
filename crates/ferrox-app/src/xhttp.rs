@@ -96,23 +96,7 @@ fn read_line_into(
     out: &mut [u8; 130],
 ) -> std::io::Result<Option<usize>> {
     loop {
-        let start = reader.at;
-        let end = reader.prefix.len().min(start + 130);
-        let mut found = None;
-        let mut i = start;
-        while i + 1 < end {
-            if reader.prefix[i] == b'\r' && reader.prefix[i + 1] == b'\n' {
-                found = Some(i - start);
-                break;
-            }
-            i += 1;
-        }
-        if let Some(end_pos) = found {
-            if end_pos > 127 {
-                return Ok(None);
-            }
-            out[..end_pos].copy_from_slice(&reader.prefix[reader.at..reader.at + end_pos]);
-            reader.at = reader.at + end_pos + 2;
+        if let Some(end_pos) = reader.line_in_prefix(out) {
             return Ok(Some(end_pos));
         }
         if reader.prefix.len() - reader.at >= 129 {
@@ -359,6 +343,84 @@ impl<R: Read> Reader<R> {
             self.left = size;
         }
         Ok(())
+    }
+
+    /// A size or trailer line already in `prefix`; `None` leaves `at` where it was for [`Self::open`] to fill.
+    fn line_in_prefix(&mut self, out: &mut [u8; 130]) -> Option<usize> {
+        let start = self.at;
+        let end = self.prefix.len().min(start + 130);
+        let mut i = start;
+        while i + 1 < end {
+            if self.prefix[i] == b'\r' && self.prefix[i + 1] == b'\n' {
+                let end_pos = i - start;
+                if end_pos > 127 {
+                    return None;
+                }
+                out[..end_pos].copy_from_slice(&self.prefix[start..i]);
+                self.at = i + 2;
+                return Some(end_pos);
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Framing that is already in `prefix` and nowhere else: `true` leaves a body open, `false` says the next chunk needs a read or the body ended.
+    fn try_open_prefix(&mut self) -> std::io::Result<bool> {
+        loop {
+            if self.ended {
+                return Ok(false);
+            }
+            if self.left > 0 {
+                return Ok(true);
+            }
+            if self.chunk == Chunk::Crlf {
+                if self.prefix.len() - self.at < 2 {
+                    return Ok(false);
+                }
+                if &self.prefix[self.at..self.at + 2] != b"\r\n" {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                }
+                self.at += 2;
+                self.chunk = Chunk::Body;
+            }
+            if self.chunk == Chunk::Trailers {
+                let mut trailer = [0u8; 130];
+                match self.line_in_prefix(&mut trailer) {
+                    Some(0) => {
+                        self.chunk = Chunk::Body;
+                        self.ended = true;
+                        return Ok(false);
+                    }
+                    Some(_) => continue,
+                    None => {
+                        if self.prefix.len() - self.at >= 129 {
+                            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                        }
+                        return Ok(false);
+                    }
+                }
+            }
+            let mut line = [0u8; 130];
+            let Some(len) = self.line_in_prefix(&mut line) else {
+                if self.prefix.len() - self.at >= 129 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                }
+                return Ok(false);
+            };
+            let Some(size) = chunk_size(&line[..len]) else {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+            };
+            if size == 0 {
+                self.chunk = Chunk::Trailers;
+                continue;
+            }
+            if size > 64 * 1024 * 1024 {
+                return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+            }
+            self.left = size;
+            return Ok(true);
+        }
     }
 }
 
@@ -615,29 +677,45 @@ impl<R: Read> Read for Reader<R> {
 }
 
 impl<R: Read> crate::proxy::WindowRead for Reader<R> {
-    /// The body bytes as a span of the buffer that read them: the relay writes them out without moving them again.
+    /// Every body the prefix already holds, as spans of it: the relay writes them in one gather without moving them again.
     fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
         self.open()?;
-        if self.ended {
-            return Ok(crate::proxy::Window::empty());
-        }
-        if self.at == self.prefix.len() {
-            self.prefix.clear();
-            self.at = 0;
-            if self.fill(CHUNK)? == 0 {
-                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+        let mut spans = [(0, 0); crate::proxy::WINDOW_PARTS];
+        let mut len = 0;
+        loop {
+            if self.ended {
+                break;
+            }
+            if self.at == self.prefix.len() {
+                if len == 0 {
+                    self.prefix.clear();
+                    self.at = 0;
+                    if self.fill(CHUNK)? == 0 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                    }
+                    continue;
+                }
+                break;
+            }
+            let n = self.left.min(self.prefix.len() - self.at);
+            if n == 0 {
+                break;
+            }
+            spans[len] = (self.at, n);
+            len += 1;
+            self.at += n;
+            self.left -= n;
+            if self.left == 0 {
+                self.chunk = Chunk::Crlf;
+            }
+            if len == crate::proxy::WINDOW_PARTS || !self.try_open_prefix()? {
+                break;
             }
         }
-        let n = self.left.min(self.prefix.len() - self.at);
-        let at = self.at;
-        self.at += n;
-        self.left -= n;
-        if self.left == 0 {
-            self.chunk = Chunk::Crlf;
+        if len == 0 {
+            return Ok(crate::proxy::Window::empty());
         }
-        let mut spans = [(0, 0); crate::proxy::WINDOW_PARTS];
-        spans[0] = (at, n);
-        Ok(crate::proxy::Window::new(&self.prefix, spans, 1))
+        Ok(crate::proxy::Window::new(&self.prefix, spans, len))
     }
 }
 
@@ -3368,6 +3446,48 @@ mod tests {
             chunks.iter().sum::<usize>(),
             "every chunk body was delivered"
         );
+    }
+
+    /// One read's worth of prefix leaves as one gather: eight 8 KiB bodies in one window, not eight windows.
+    #[test]
+    fn a_window_gathers_every_chunk_one_read_brought() {
+        let body = 8 * 1024usize;
+        let chunks = 8usize;
+        let mut wire = Vec::new();
+        for n in 0..chunks {
+            wire.extend_from_slice(format!("{body:X}\r\n").as_bytes());
+            wire.extend(std::iter::repeat_n((n % 251) as u8, body));
+            wire.extend_from_slice(b"\r\n");
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        let mut reader = Reader {
+            read: std::io::Cursor::new(Vec::new()),
+            prefix: wire,
+            at: 0,
+            left: 0,
+            ended: false,
+            reads: 0,
+            pending_head: false,
+            chunk: Chunk::Body,
+        };
+        let mut got = Vec::new();
+        let windows = {
+            let window = crate::proxy::WindowRead::read_window(&mut reader).expect("reads");
+            for &(start, len) in window.parts() {
+                got.extend_from_slice(&window.bytes()[start..start + len]);
+            }
+            window.parts().len()
+        };
+        assert_eq!(
+            windows, chunks,
+            "one window carries every chunk the prefix holds"
+        );
+        assert_eq!(reader.reads(), 0, "the prefix was already answered");
+        let mut want = Vec::new();
+        for n in 0..chunks {
+            want.extend(std::iter::repeat_n((n % 251) as u8, body));
+        }
+        assert_eq!(got, want, "the gather is byte-identical to the bodies");
     }
 
     /// The counter must see the *short* reads too: one byte at a time is the worst case, and it is what makes a bounded window better than an unbounded one.

@@ -22,7 +22,7 @@ graph TD
     W --> E["zero-length terminator, then CRLF"]
     E --> X(("wire"))
     X --> R["read the chunked body into prefix"]
-    R --> C["the window is a span of prefix,<br/>not a copy"]
+    R --> C["the window is a run of spans in prefix,<br/>not a copy"]
     C --> D["hand to the target"]
 ```
 
@@ -105,7 +105,7 @@ Both H1 handshakes — the `POST` a server reads and the `200` a dialer reads �
 
 A chunked body's reader keeps its place across a poll timeout: the offset into the chunk, the phase (`chunk`: body, the closing CRLF, or the trailer lines), and the read-ahead cursor are fields, so a lane's quantum expiring mid-chunk returns `WouldBlock` and the next step continues at the same byte. The framing stays atomic: the last body bytes are delivered before the CRLF is taken, so a timeout on the pair loses nothing. A peer chunk as large as the relay window still costs two reads (`xhttp::tests::a_chunk_costs_two_reads_not_three`). xray writes its 8 KiB buffer per chunk, a quarter of that window, so the CRLF fill now takes a whole window instead of 128 bytes and the following bodies are parsed out of it: 16 peer chunks cost 5 reads, not 33 (`xhttp::tests::a_peer_chunk_smaller_than_the_window_amortises_its_framing`).
 
-`Reader` is a `WindowRead` now: `read_window` walks the same framing, then hands the relay a span of `prefix` instead of copying the body into the relay's own buffer. The plain-xHTTP downlink on the VLESS and Trojan ladder rungs relays through it directly instead of through `Copied`; `a_body_window_is_the_readers_own_buffer` holds the witness a byte comparison cannot see — the span's base is the prefix allocation's base, the buffer neither moves nor grows, and the socket is never asked because the body rode in with the head — and `a_window_delivers_every_byte_the_read_does` sweeps chunk sizes either side of the prefetch window, including one larger than it, against the `Read` path byte for byte. That is `read-window-copies 0`. What is not removed: the socket-to-`prefix` read is still a copy (it is the read that fills the span), the TLS-wrapped xHTTP arm still goes through `Copied` because `tls_xhttp` hands back a boxed `Read`, an encrypted VLESS session and VMess decode between the window and the target, the server's `SessionReader` upload still copies a POST body into the session, and `Read::read` still copies for every caller that is not a windowed relay. The split-CRLF and trickle shapes are unchanged and still gated by `a_crlf_split_across_reads_still_drains` and `a_trickling_stream_still_drains_whole`.
+`Reader` is a `WindowRead` now: `read_window` walks the same framing, then hands the relay every body the prefix already holds as spans of `prefix` instead of copying the body into the relay's own buffer. The plain-xHTTP downlink on the VLESS and Trojan ladder rungs relays through it directly instead of through `Copied`; `a_body_window_is_the_readers_own_buffer` holds the witness a byte comparison cannot see — the span's base is the prefix allocation's base, the buffer neither moves nor grows, and the socket is never asked because the body rode in with the head — and `a_window_delivers_every_byte_the_read_does` sweeps chunk sizes either side of the prefetch window, including one larger than it, against the `Read` path byte for byte. One window carries every peer chunk one prefetch read brought, so eight 8 KiB bodies leave as one gather instead of eight: `a_window_gathers_every_chunk_one_read_brought` reads eight parts from one prefix with 0 socket reads. That is `read-window-copies 0` and `chunk-bodies-per-window 8`. What is not removed: the socket-to-`prefix` read is still a copy (it is the read that fills the span), the TLS-wrapped xHTTP arm still goes through `Copied` because `tls_xhttp` hands back a boxed `Read`, an encrypted VLESS session and VMess decode between the window and the target, the server's `SessionReader` upload still copies a POST body into the session, and `Read::read` still copies for every caller that is not a windowed relay. The split-CRLF and trickle shapes are unchanged and still gated by `a_crlf_split_across_reads_still_drains` and `a_trickling_stream_still_drains_whole`.
 
 ## Measured
 
@@ -120,6 +120,7 @@ A chunked body's reader keeps its place across a poll timeout: the offset into t
 | write-slices-per-window | 1 | ferrox-app-xhttp::tests::one_window_is_one_chunked_frame |
 | user-space-copies-per-byte-written | 1 | ferrox-app-xhttp::tests::exchange_carries_an_echo_over_loopback |
 | read-window-copies | 0 | ferrox-app-xhttp::tests::a_body_window_is_the_readers_own_buffer |
+| chunk-bodies-per-window | 8 | ferrox-app-xhttp::tests::a_window_gathers_every_chunk_one_read_brought |
 | requests-served-per-connection | 2 | ferrox-app-xhttp::tests::one_connection_carries_the_packet_up_uplink |
 | requests-served-before-a-close | 1 | ferrox-app-xhttp::tests::a_request_that_says_close_takes_the_connection_with_it |
 | writes-per-credit | 1 | ferrox-app-xhttp_h2::tests::a_credit_grants_both_windows_in_one_write |
