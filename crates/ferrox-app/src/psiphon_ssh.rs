@@ -32,8 +32,12 @@ const WINDOW_ADJUST_AT: u64 = 1024 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_IDENTIFICATION: usize = 1024;
 const CLIENT_CAPABILITIES: &str = "server-requests";
-const PACKET_CHUNK: usize = 64 * 1024;
-const PACKET_POOL: usize = 8;
+/// One channel packet plus its header, padding and tag; a larger peer packet
+/// grows the one buffer it needs instead of every pooled buffer.
+const PACKET_CHUNK: usize = CHANNEL_PACKET as usize + 1024;
+/// The pool holds a whole channel window plus the packets a flow is writing,
+/// so a saturated download recycles buffers instead of allocating one per packet.
+const PACKET_POOL: usize = (CHANNEL_WINDOW / CHANNEL_PACKET) as usize + 8;
 const ENTROPY: usize = 4096;
 
 const MSG_DISCONNECT: u8 = 1;
@@ -697,6 +701,97 @@ fn recycle(pool: &Mutex<Vec<Vec<u8>>>, buffer: Vec<u8>) {
     }
 }
 
+/// A received payload still inside its pooled packet buffer; writing it straight
+/// to the client keeps the download path at one copy from the kernel, not two.
+pub(crate) struct ChannelChunk {
+    buffer: Vec<u8>,
+    start: usize,
+    end: usize,
+}
+
+impl ChannelChunk {
+    #[must_use]
+    pub(crate) fn data(&self) -> &[u8] {
+        &self.buffer[self.start..self.end]
+    }
+}
+
+impl Channel {
+    /// The server this flow's tunnel landed on, for the pool distribution check.
+    #[must_use]
+    pub(crate) fn server(&self) -> &str {
+        &self.session.server
+    }
+
+    /// The tunnel's identity, so two sessions on one server still count apart.
+    #[must_use]
+    pub(crate) fn session_id(&self) -> usize {
+        Arc::as_ptr(&self.session) as usize
+    }
+
+    /// The next packet's payload without copying it out of the receive buffer.
+    pub(crate) fn next_chunk(&mut self) -> io::Result<Option<ChannelChunk>> {
+        loop {
+            let mut adjust = 0u64;
+            let chunk = {
+                let mut recv = lock(&self.state.recv);
+                loop {
+                    let Some((start, end)) =
+                        recv.chunks.front().map(|front| (front.start, front.end))
+                    else {
+                        break None;
+                    };
+                    if start >= end {
+                        let spent = recv.chunks.pop_front().unwrap_or_else(|| {
+                            unreachable!("the front chunk is the one just named")
+                        });
+                        recycle(&self.state.pool, spent.buffer);
+                        continue;
+                    }
+                    recv.pending_adjust += (end - start) as u64;
+                    if recv.pending_adjust >= WINDOW_ADJUST_AT {
+                        adjust = recv.pending_adjust;
+                        recv.pending_adjust = 0;
+                        recv.local_window += adjust;
+                    }
+                    break recv.chunks.pop_front();
+                }
+            };
+            if adjust != 0 {
+                self.adjust(adjust);
+            }
+            if let Some(chunk) = chunk {
+                return Ok(Some(ChannelChunk {
+                    buffer: chunk.buffer,
+                    start: chunk.start,
+                    end: chunk.end,
+                }));
+            }
+            let mut recv = lock(&self.state.recv);
+            if !recv.chunks.is_empty() {
+                continue;
+            }
+            if recv.eof || recv.closed || self.session.closed.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            let (guard, _) = self
+                .state
+                .cond
+                .wait_timeout(recv, IO_TIMEOUT)
+                .unwrap_or_else(PoisonError::into_inner);
+            recv = guard;
+            if recv.chunks.is_empty() && (recv.eof || recv.closed) {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Hand a consumed chunk's allocation back to the packet pool.
+    pub(crate) fn recycle_chunk(&self, chunk: ChannelChunk) {
+        recycle(&self.state.pool, chunk.buffer);
+    }
+}
+
 impl Read for Channel {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
@@ -1007,6 +1102,7 @@ struct PacketReader {
     sequence: u32,
     block: usize,
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
+    spare: Option<Vec<u8>>,
 }
 
 impl PacketWriter {
@@ -1162,6 +1258,7 @@ impl PacketReader {
             sequence: 0,
             block,
             pool,
+            spare: None,
         }
     }
 
@@ -1177,12 +1274,20 @@ impl PacketReader {
     }
 
     fn recycle(&mut self, buffer: Vec<u8>) {
-        recycle(&self.pool, buffer);
+        if self.spare.is_none() {
+            self.spare = Some(buffer);
+        } else {
+            recycle(&self.pool, buffer);
+        }
     }
 
     /// Read one packet into a pooled buffer; the caller hands it back or moves it to a channel.
     fn recv(&mut self) -> io::Result<Packet> {
-        let mut buffer = lock(&self.pool).pop().unwrap_or_default();
+        let mut buffer = self
+            .spare
+            .take()
+            .or_else(|| lock(&self.pool).pop())
+            .unwrap_or_default();
         if buffer.len() < PACKET_CHUNK {
             buffer.resize(PACKET_CHUNK, 0);
         }
@@ -1204,10 +1309,12 @@ impl PacketReader {
         if length < 5 || total < self.block || total > MAX_PACKET {
             return Err(io::Error::other("invalid ssh packet length"));
         }
-        if buffer.len() < total {
-            buffer.resize(total, 0);
+        // The tag follows the packet bytes, so one read takes both and a packet costs two reads.
+        let framed = total + if self.mac.is_some() { 32 } else { 0 };
+        if buffer.len() < framed {
+            buffer.resize(framed, 0);
         }
-        self.io.read_exact(&mut buffer[self.block..total])?;
+        self.io.read_exact(&mut buffer[self.block..framed])?;
         if let Some(obfuscation) = self.obfuscation.as_mut() {
             obfuscation.apply(&mut buffer[self.block..total]);
         }
@@ -1215,9 +1322,10 @@ impl PacketReader {
             cipher.apply_keystream(&mut buffer[self.block..total]);
         }
         if let Some(mac) = self.mac.as_ref() {
-            let mut tag = [0u8; 32];
-            self.io.read_exact(&mut tag)?;
-            if !constant_time_eq(&mac.tag(self.sequence, &buffer[..total]), &tag) {
+            if !constant_time_eq(
+                &mac.tag(self.sequence, &buffer[..total]),
+                &buffer[total..framed],
+            ) {
                 return Err(io::Error::other("ssh packet mac mismatch"));
             }
         }
@@ -2132,6 +2240,15 @@ mod tests {
     }
 
     #[test]
+    fn the_packet_pool_stops_at_its_ceiling() {
+        let pool = Mutex::new(Vec::new());
+        for _ in 0..PACKET_POOL + 8 {
+            recycle(&pool, vec![0u8; PACKET_CHUNK]);
+        }
+        assert_eq!(lock(&pool).len(), PACKET_POOL);
+    }
+
+    #[test]
     fn a_channel_read_hands_its_packet_buffer_back_to_the_pool() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
@@ -2186,6 +2303,66 @@ mod tests {
         assert_eq!(&out[..5], b"hello");
         let buffer = lock(&pool).pop().expect("the packet buffer came back");
         assert_eq!(buffer.as_ptr(), pointer);
+    }
+
+    #[test]
+    fn a_channel_chunk_is_the_packet_allocation() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
+        let (_local, _) = listener.accept().expect("accept");
+        let pool = Arc::new(Mutex::new(Vec::new()));
+        let inner = Arc::new(Inner {
+            writer: Mutex::new(PacketWriter::new(
+                peer.try_clone().expect("clone"),
+                None,
+                None,
+                None,
+            )),
+            channels: Mutex::new(HashMap::new()),
+            pool: Arc::clone(&pool),
+            next_channel: AtomicU32::new(1),
+            closed: AtomicBool::new(false),
+            socket: peer,
+            opened_at: Instant::now(),
+            server: "test".to_owned(),
+        });
+        let state = Arc::new(ChannelState {
+            local: 1,
+            remote: AtomicU32::new(2),
+            remote_window: Mutex::new(0),
+            remote_packet: AtomicU32::new(CHANNEL_PACKET),
+            recv: Mutex::new(Recv {
+                chunks: VecDeque::new(),
+                eof: false,
+                closed: false,
+                pending_adjust: 0,
+                local_window: u64::from(CHANNEL_WINDOW),
+            }),
+            cond: Condvar::new(),
+            window_cond: Condvar::new(),
+            open: Mutex::new(None),
+            pool: Arc::clone(&pool),
+        });
+        let mut channel = Channel {
+            session: Arc::clone(&inner),
+            state: Arc::clone(&state),
+        };
+        let mut buffer = vec![0u8; PACKET_CHUNK];
+        let pointer = buffer.as_ptr();
+        let capacity = buffer.capacity();
+        buffer[8..13].copy_from_slice(b"hello");
+        lock(&state.recv).chunks.push_back(Chunk {
+            buffer,
+            start: 8,
+            end: 13,
+        });
+        let chunk = channel.next_chunk().expect("chunk").expect("payload");
+        assert_eq!(chunk.data(), b"hello");
+        assert_eq!(chunk.data().as_ptr(), pointer.wrapping_add(8));
+        channel.recycle_chunk(chunk);
+        let buffer = lock(&pool).pop().expect("the packet buffer came back");
+        assert_eq!(buffer.as_ptr(), pointer);
+        assert_eq!(buffer.capacity(), capacity);
     }
 
     #[test]

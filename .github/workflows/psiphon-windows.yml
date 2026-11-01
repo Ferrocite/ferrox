@@ -21,6 +21,10 @@ on:
         description: two-letter egress region; blank lets each lane choose
         required: false
         default: ""
+      pool:
+        description: tunnels each implementation keeps; blank is one
+        required: false
+        default: ""
 
 concurrency:
   group: psiphon-windows-${{ github.ref }}
@@ -87,6 +91,7 @@ jobs:
       - name: Carry a megabyte through both implementations
         env:
           PSIPHON_REGION: ${{ inputs.region }}
+          PSIPHON_POOL: ${{ inputs.pool }}
         run: |
           BIN=target/release/ferrox-app.exe
           test -s "$BIN"
@@ -180,6 +185,10 @@ jobs:
           }
           # The two signature values are read out of the lane's own source, so the
           # shipped engine verifies the same list with the same key this tree pins.
+          if [ -n "${PSIPHON_POOL:-}" ] && ! [[ "$PSIPHON_POOL" =~ ^[0-9]+$ && "$PSIPHON_POOL" -ge 1 && "$PSIPHON_POOL" -le 32 ]]; then
+            echo "::error::pool must be an integer from 1 to 32, got '$PSIPHON_POOL'"
+            exit 1
+          fi
           PSIPHON_REGION="$PSIPHON_REGION" STATE="$RUNNER_TEMP/psiphon-state" python - <<'PY'
           import json, os
           settings = {
@@ -190,6 +199,8 @@ jobs:
           }
           if os.environ.get("PSIPHON_REGION"):
               settings["region"] = os.environ["PSIPHON_REGION"]
+          if os.environ.get("PSIPHON_POOL"):
+              settings["TunnelPoolSize"] = int(os.environ["PSIPHON_POOL"])
           document = {
               "inbounds": [
                   {"protocol": "socks", "listen": "127.0.0.1", "port": 10808},
@@ -222,6 +233,8 @@ jobs:
           }
           if os.environ.get("PSIPHON_REGION"):
               config["EgressRegion"] = os.environ["PSIPHON_REGION"].upper()
+          if os.environ.get("PSIPHON_POOL"):
+              config["TunnelPoolSize"] = int(os.environ["PSIPHON_POOL"])
           with open("psiphon-reference.json", "w") as handle:
               json.dump(config, handle)
           PY
@@ -233,7 +246,7 @@ jobs:
           "$BIN" -test -c psiphon-windows.json
           # The binary is the job, so its pid is `$!`: a wrapper subshell hides the
           # pid that died and the status it died with.
-          "$BIN" run -c psiphon-windows.json > psiphon-windows.log 2>&1 &
+          AETHER_PSIPHON_TRACE_FLOWS=1 "$BIN" run -c psiphon-windows.json > psiphon-windows.log 2>&1 &
           LANE_PID=$!
           LANE_LABEL=native
           READY_AT=$SECONDS
@@ -245,6 +258,11 @@ jobs:
             wait "$LANE_PID" 2>/dev/null
             echo "$LANE_LABEL $?" > lane-status.txt
             return 0
+          }
+          pool_live() {
+            local live
+            live=$(grep -c 'psiphon: tunnel up via' psiphon-windows.log 2>/dev/null || true)
+            echo "${live:-0}"
           }
           lane_report() {
             if [ -f lane-status.txt ]; then
@@ -289,6 +307,49 @@ jobs:
           sample_native "native done" "$NATIVE_LANE"
           trace_front mixed 10809 "native mixed" || FAILED="$FAILED native(mixed trace)"
           fetch_mb mixed 10809 psiphon-mixed.bin "native mixed" || FAILED="$FAILED native(mixed)"
+          # A pool is only exercised by concurrent flows; eight downloads are the
+          # aggregate gate when the dispatch asks for more than one tunnel.
+          if [ "${PSIPHON_POOL:-1}" -gt 1 ]; then
+            POOL_STOP=$((SECONDS + 300))
+            while [ "$(pool_live)" -lt 2 ] && [ "$SECONDS" -lt "$POOL_STOP" ]; do
+              lane_exited && break
+              sleep 2
+            done
+            POOL_LIVE=$(pool_live)
+            if [ "$POOL_LIVE" -lt 2 ]; then
+              echo "native pool FAILED: only $POOL_LIVE live tunnel(s)" >&2
+              FAILED="$FAILED native(pool live)"
+            fi
+            FLOW_BASE=$(wc -l < psiphon-windows.log 2>/dev/null || true)
+            FLOW_BASE="${FLOW_BASE:-0}"
+            PAR_DIR=$(mktemp -d)
+            PAR_START=$(python -c 'import time; print(time.time())')
+            PAR_PIDS=""
+            for index in 1 2 3 4 5 6 7 8; do
+              via socks 10808 --fail --max-time 300 -sS -o "$PAR_DIR/$index" \
+                'https://speed.cloudflare.com/__down?bytes=1000000' &
+              PAR_PIDS="$PAR_PIDS $!"
+            done
+            PAR_CODE=0
+            for pid in $PAR_PIDS; do wait "$pid" || PAR_CODE=1; done
+            PAR_END=$(python -c 'import time; print(time.time())')
+            PAR_BYTES=$(find "$PAR_DIR" -type f -exec cat {} + 2>/dev/null | wc -c | tr -d ' ' || true)
+            PAR_BYTES="${PAR_BYTES:-0}"
+            PAR_SECONDS=$(python -c "print($PAR_END - $PAR_START)")
+            PAR_SPEED=$(python -c "print($PAR_BYTES / max($PAR_SECONDS, 0.001))")
+            echo "native pool parallel $PAR_BYTES $PAR_SECONDS $PAR_SPEED" >> psiphon-legs.tsv
+            FLOW_SERVERS=$(tail -n +"$((FLOW_BASE + 1))" psiphon-windows.log 2>/dev/null | sed -n 's/.*flow via session \([0-9]*\).*/\1/p' | sort -u | wc -l | tr -d ' ' || true)
+            FLOW_SERVERS="${FLOW_SERVERS:-0}"
+            if [ "$PAR_CODE" != 0 ] || [ "$PAR_BYTES" != 8000000 ]; then
+              echo "native pool parallel FAILED: curl exit $PAR_CODE after $PAR_BYTES of 8000000 B" >&2
+              FAILED="$FAILED native(pool parallel)"
+            fi
+            if [ "$FLOW_SERVERS" -lt 2 ]; then
+              echo "native pool FAILED: $FLOW_SERVERS server(s) carried the eight flows" >&2
+              FAILED="$FAILED native(pool spread)"
+            fi
+            rm -rf "$PAR_DIR"
+          fi
           fi
           stop_lane
 
@@ -410,7 +471,8 @@ jobs:
           print("through its socks front, its HTTP front and a warm repeat. The")
           print("engine is pinned to the server and SSH/OSSH protocol the native lane")
           print("chose, so the ratio is the implementation and not a different carrier.")
-          print("Both verify the")
+          print("When the dispatch asks for a pool above one, the reference is still")
+          print("pinned to one server, so the pool rows are native-only. Both verify the")
           print("same signed list with the key this tree pins. The runner's own egress")
           print("is the control; byte counts are the gate.")
           print()
