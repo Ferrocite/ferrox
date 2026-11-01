@@ -26452,8 +26452,9 @@ fn ss_accounts(
     password: String,
     method: String,
 ) -> Arc<crate::shadowsocks::SsAccounts> {
-    let is_2022 = ferrox_core::shadowsocks2022::Method::parse(&method).is_some();
-    let (users, identities) = if is_2022 {
+    let parsed = ferrox_core::shadowsocks2022::Method::parse(&method);
+    let is_2022 = parsed.is_some();
+    let (users, mut identities) = if is_2022 {
         (
             crate::shadowsocks::SsUsers::default(),
             ss2022_identities(inbound),
@@ -26464,6 +26465,21 @@ fn ss_accounts(
             Vec::new(),
         )
     };
+    // A 2022 inbound whose users[] array does not line up with its password's PSK tail leaves one side unmatched; warn once and serve the shorter list so no identity is looked up past its PSK. A password that does not parse is the handshake's failure to surface, not this check's.
+    if let Some(parsed) = parsed {
+        if let Some(list) =
+            ferrox_core::shadowsocks2022::parse_psk_list(&password, parsed.key_len())
+        {
+            let psks = list.len().saturating_sub(1);
+            if identities.len() != psks {
+                eprintln!(
+                    "shadowsocks 2022 inbound on {address}: {} users for {psks} client psks, using the shorter list",
+                    identities.len()
+                );
+                identities.truncate(psks);
+            }
+        }
+    }
     Arc::new(crate::shadowsocks::SsAccounts {
         users,
         password,
@@ -55207,6 +55223,35 @@ end
                 ("bob@example".to_owned(), 0u32)
             ],
             "each user's identity is at its PSK's index in the joined password's tail"
+        );
+    }
+
+    /// A 2022 inbound whose `users` array runs past its password's client-PSK tail is a config error; the fix warns once and drops the excess so no identity is looked up past its PSK.
+    #[test]
+    fn a_2022_users_array_longer_than_the_client_psks_truncates_to_the_shorter_list() {
+        use base64::Engine as _;
+        let key = |b: u8| base64::engine::general_purpose::STANDARD.encode(vec![b; 32]);
+        let password = format!("{}:{}:{}", key(1), key(2), key(3));
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks", "settings": {{"method": "2022-blake3-aes-256-gcm", "password": "{password}", "users": [
+                {{"email": "alice@example", "level": 2}},
+                {{"email": "bob@example", "level": 0}},
+                {{"email": "carol@example", "level": 1}}]}}}}"#
+        ))
+        .expect("parses");
+        let accounts = ss_accounts(
+            &inbound,
+            "127.0.0.1:0",
+            password.clone(),
+            "2022-blake3-aes-256-gcm".to_owned(),
+        );
+        assert_eq!(
+            accounts.identities.as_slice(),
+            &[
+                ("alice@example".to_owned(), 2u32),
+                ("bob@example".to_owned(), 0u32),
+            ],
+            "carol has no PSK to match, so the fix drops her rather than serve a mismatched identity"
         );
     }
 

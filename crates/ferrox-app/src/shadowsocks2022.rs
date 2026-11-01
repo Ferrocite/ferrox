@@ -345,7 +345,7 @@ fn accept_on(
     method: &str,
     identities: &[(String, u32)],
     freedom: bool,
-) -> Option<(Connection, Response, Recv)> {
+) -> Option<(Connection, Response, Recv, crate::stats::Meter)> {
     let method = Method::parse(method)?;
     if !freedom {
         return None;
@@ -369,10 +369,11 @@ fn accept_on(
             .iter()
             .position(|p| shadowsocks2022::user_hash(p) == hash)?;
         let user = list[1 + idx].clone();
-        // The identity header names one account, so the flow line reads that user rather than the inbound's default.
-        if let Some((email, level)) = identities.get(idx) {
-            crate::accesslog::reidentify(email, *level);
-        }
+        // The identity header names one account: the flow line reads that user and the counters ride both legs.
+        let meter = identities
+            .get(idx)
+            .map(|(email, level)| authenticate(email, *level))
+            .unwrap_or_default();
         let mut recv = Cipher::from_psk(method, &user, &salt_probe)?;
         let target = read_request_header(reader, &mut recv)?;
         crate::accesslog::record_current(&target.0);
@@ -381,7 +382,7 @@ fn accept_on(
         let server_salt = fresh_salt(method.key_len())?;
         let send = Cipher::from_psk(method, &user, &server_salt)?;
         let response = Response::new(send, server_salt, salt_probe);
-        return Some((uplink, response, Recv::Ready(recv)));
+        return Some((uplink, response, Recv::Ready(recv), meter));
     };
     let _ = eih_len;
     let key_len = method.key_len();
@@ -398,7 +399,13 @@ fn accept_on(
     let server_salt = fresh_salt(key_len)?;
     let send = Cipher::from_psk(method, &psk, &server_salt)?;
     let response = Response::new(send, server_salt, salt);
-    Some((uplink, response, Recv::Ready(recv)))
+    // A single-PSK inbound names no user, so the flow keeps the inbound's default attribution and no per-user counters ride.
+    Some((
+        uplink,
+        response,
+        Recv::Ready(recv),
+        crate::stats::Meter::default(),
+    ))
 }
 
 pub(crate) fn serve_ws(
@@ -412,13 +419,15 @@ pub(crate) fn serve_ws(
     let Some((mut reader, writer)) = crate::ws::accept(stream, path) else {
         return;
     };
-    let Some((uplink, response, recv)) =
+    let Some((uplink, response, recv, meter)) =
         accept_on(&mut reader, password, method, identities, freedom)
     else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
     pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
@@ -434,7 +443,7 @@ pub(crate) fn serve_httpupgrade(
     let Some((mut reader, writer)) = crate::httpupgrade::accept(stream, path, host) else {
         return;
     };
-    let Some((uplink, response, recv)) =
+    let Some((uplink, response, recv, meter)) =
         accept_on(&mut reader, password, method, identities, freedom)
     else {
         return;
@@ -445,6 +454,8 @@ pub(crate) fn serve_httpupgrade(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(std::net::Shutdown::Both);
     });
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
     pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
@@ -478,13 +489,15 @@ pub(crate) fn serve_grpc_with(
     let Some((mut reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
-    let Some((uplink, response, recv)) = under_handshake(&mut reader, |read| {
+    let Some((uplink, response, recv, meter)) = under_handshake(&mut reader, |read| {
         accept_on(read, password, method, identities, freedom)
     }) else {
         return;
     };
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || closer.close());
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
     pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
@@ -499,7 +512,7 @@ pub(crate) fn serve_xhttp(
     let Some((mut reader, writer)) = crate::xhttp::accept(stream, path) else {
         return;
     };
-    let Some((uplink, response, recv)) =
+    let Some((uplink, response, recv, meter)) =
         accept_on(&mut reader, password, method, identities, freedom)
     else {
         return;
@@ -507,6 +520,8 @@ pub(crate) fn serve_xhttp(
     let closer = writer.clone();
     let close: std::sync::Arc<dyn Fn() + Send + Sync> =
         std::sync::Arc::new(move || closer.finish());
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
     pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
@@ -521,7 +536,7 @@ pub(crate) fn serve_httpheader(
     let Some((mut reader, writer)) = crate::httpheader::accept(stream, path) else {
         return;
     };
-    let Some((uplink, response, recv)) =
+    let Some((uplink, response, recv, meter)) =
         accept_on(&mut reader, password, method, identities, freedom)
     else {
         return;
@@ -532,6 +547,8 @@ pub(crate) fn serve_httpheader(
     let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
         let _ = closer.shutdown(std::net::Shutdown::Both);
     });
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
     pump_relay_carried_with_response(&uplink, reader, writer, &close, response, recv);
 }
 
@@ -547,7 +564,7 @@ pub(crate) fn serve_session<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    let Some((uplink, response, recv)) = accept_on(
+    let Some((uplink, response, recv, meter)) = accept_on(
         &mut reader as &mut dyn Read,
         password,
         method,
@@ -557,6 +574,8 @@ pub(crate) fn serve_session<R, W>(
         close();
         return;
     };
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
     pump_relay_carried_with_response(&uplink, reader, writer, close, response, recv);
 }
 
@@ -572,7 +591,7 @@ pub(crate) fn serve_kcp<R, W>(
     R: Read + Send + 'static + crate::proxy::RelayPoll,
     W: Write + Send + 'static,
 {
-    let Some((uplink, response, recv)) = accept_on(
+    let Some((uplink, response, recv, meter)) = accept_on(
         &mut reader as &mut dyn Read,
         password,
         method,
@@ -581,6 +600,8 @@ pub(crate) fn serve_kcp<R, W>(
     ) else {
         return;
     };
+    let reader = crate::proxy::metered(reader, meter.clone());
+    let writer = crate::proxy::metered(writer, meter);
     pump_relay_carried_with_response(&uplink, reader, writer, close, response, recv);
 }
 
