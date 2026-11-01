@@ -113,7 +113,7 @@ On the same twelve-length sweep — 174 `stage_frame` calls — `vmess::stage_fr
 
 `ferrox-bench` gate 4 (`framing.rs`) compares VMess-style framing rows byte for byte against the pinned reference, and gate 7b compares the AEAD seals; neither is a clock. The clock is gate 3's ratio at every measured length plus `.github/workflows/parity.yml`'s `vmess-raw` scenario, and the batch's own number is `benchmark-matrix.yml`'s `vmess-raw-down-8` cell at the shape this section has always read: **8 flows × 16 384 × 64 KiB = 8 GiB per repeat, 5 medians per engine, ubuntu-latest with 4 logical CPUs.** The cell's `standard_scenarios` line now runs 256 iterations, so these are run `41353822175` at `6e6815c4`, which sets that one line back; the ferrox server could not land the reference at this length (the cell records `no-reference` with the xray-core client's flows ending early), so the ratios and split below are the xray-core-server cell, whose gate passed.
 
-| ratio vs xray-core (higher throughput / lower CPU is better) | interval | verdict |
+| ratio vs xray-core (times better; throughput is this tree ÷ the reference, cpu and rss are the reference ÷ this tree) | interval | verdict |
 | --- | --- | --- |
 | throughput | 1.184 [1.173, 1.196] | better, gating |
 | cpu per GiB | 1.600 [1.587, 1.612] | better, gating |
