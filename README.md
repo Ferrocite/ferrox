@@ -69,7 +69,7 @@ printf '%s %s %s %s\n' '<doc>' '<key>' '<value>' '<checker>' >> scripts/method-c
 | record layer (ChaCha20) | [record-layer](docs/function/record-layer.md) | 0 | 0 (in place) | `UNBLESSED` | not measured |
 | Shadowsocks AEAD | [shadowsocks](docs/function/shadowsocks.md) | 1 read + 1 write per 64 KiB | **0** | `UNBLESSED` | 1.394× xray-core throughput (CI) |
 | Shadowsocks 2022 | [shadowsocks-2022](docs/function/shadowsocks-2022.md) | 1 write per 16 KiB read | 1 written, 0 read | `UNBLESSED` | not measured |
-| VMess AEAD | [vmess](docs/function/vmess.md) | 1 write per 128 KiB read | 1 written, 0 read | `UNBLESSED` | 1.235× xray-core throughput, 1.178× cpu per GiB (CI) |
+| VMess AEAD | [vmess](docs/function/vmess.md) | 1 write per 128 KiB read | 1 written, 0 read | `UNBLESSED` | 1.184× xray-core throughput, 1.600× cpu per GiB (CI) |
 | VLESS TCP | [vless](docs/function/vless.md) | 1 write per header | 1 (relay's own) | `UNBLESSED` | not measured |
 | Trojan TCP | [trojan](docs/function/trojan.md) | 1 write per header | 1 (relay's own) | 1170 | not measured |
 | XTLS Vision | [xtls-vision](docs/function/xtls-vision.md) | 0 framing after switch | 2 framed, 0 after | `UNBLESSED` | not measured |
