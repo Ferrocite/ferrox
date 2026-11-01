@@ -311,6 +311,138 @@ impl<R: Read> Reader<R> {
         }
         self.take(buf)
     }
+
+    fn compact(&mut self) {
+        if self.at > 0 {
+            self.prefix.drain(..self.at);
+            self.at = 0;
+        }
+    }
+
+    /// A complete framing line at the cursor, without moving the buffer a window may be borrowing.
+    fn line_end(&self) -> std::io::Result<Option<(usize, usize)>> {
+        let start = self.at;
+        let end = self.prefix.len().min(start + 130);
+        let mut i = start;
+        while i + 1 < end {
+            if self.prefix[i] == b'\r' && self.prefix[i + 1] == b'\n' {
+                let len = i - start;
+                if len > 127 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                }
+                return Ok(Some((len, i + 2)));
+            }
+            i += 1;
+        }
+        if self.prefix.len() - start >= 129 {
+            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+        }
+        Ok(None)
+    }
+}
+
+impl<R: Read> crate::proxy::WindowRead for Reader<R> {
+    /// The chunk bodies as spans into `prefix`: the relay writes the reader's own bytes, so the
+    /// download path no longer copies each body out of the window that carried it.
+    fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+        self.parse_head()?;
+        let mut spans = [(0usize, 0usize); crate::proxy::WINDOW_PARTS];
+        let mut len = 0;
+        loop {
+            if self.ended {
+                break;
+            }
+            if self.left > 0 {
+                let available = self.prefix.len() - self.at;
+                if available > 0 {
+                    let n = self.left.min(available);
+                    spans[len] = (self.at, n);
+                    len += 1;
+                    self.at += n;
+                    self.left -= n;
+                    if self.left == 0 {
+                        self.chunk = Chunk::Crlf;
+                    }
+                    if len == crate::proxy::WINDOW_PARTS {
+                        break;
+                    }
+                    continue;
+                }
+                if len > 0 {
+                    break;
+                }
+                self.compact();
+                if self.fill(CHUNK)? == 0 {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                continue;
+            }
+            match self.chunk {
+                Chunk::Crlf => {
+                    if self.prefix.len() - self.at < 2 {
+                        if len > 0 {
+                            break;
+                        }
+                        self.compact();
+                        if self.fill(CHUNK)? == 0 {
+                            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                        }
+                        continue;
+                    }
+                    if &self.prefix[self.at..self.at + 2] != b"\r\n" {
+                        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                    }
+                    self.at += 2;
+                    self.chunk = Chunk::Body;
+                }
+                Chunk::Trailers => {
+                    let Some((line_len, end)) = self.line_end()? else {
+                        if len > 0 {
+                            break;
+                        }
+                        self.compact();
+                        if self.fill(CHUNK)? == 0 {
+                            return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                        }
+                        continue;
+                    };
+                    self.at = end;
+                    if line_len == 0 {
+                        self.chunk = Chunk::Body;
+                        self.ended = true;
+                        break;
+                    }
+                }
+                Chunk::Body => {
+                    let Some((line_len, end)) = self.line_end()? else {
+                        if len > 0 {
+                            break;
+                        }
+                        self.compact();
+                        if self.fill(CHUNK)? == 0 {
+                            return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                        }
+                        continue;
+                    };
+                    let size = chunk_size(&self.prefix[self.at..self.at + line_len])
+                        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
+                    self.at = end;
+                    if size == 0 {
+                        self.chunk = Chunk::Trailers;
+                        continue;
+                    }
+                    if size > 64 * 1024 * 1024 {
+                        return Err(std::io::Error::from(std::io::ErrorKind::InvalidData));
+                    }
+                    self.left = size;
+                }
+            }
+        }
+        if len == 0 {
+            return Ok(crate::proxy::Window::empty());
+        }
+        Ok(crate::proxy::Window::new(&self.prefix, spans, len))
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -3176,6 +3308,94 @@ mod tests {
             5,
             "{count} peer chunks must not cost a read each"
         );
+    }
+
+    /// The relay's window is spans into the reader's own buffer: a chunk body is never copied out of the window that carried it, and the pointer identity is what witnesses the removal.
+    #[test]
+    fn a_window_hands_back_the_readers_own_bytes() {
+        const PEER: usize = 8 * 1024;
+        let chunks = [PEER; 4];
+        let payload: Vec<u8> = (0..PEER * chunks.len()).map(|i| (i % 251) as u8).collect();
+        let mut wire = Vec::new();
+        let mut at = 0;
+        for &n in &chunks {
+            wire.extend_from_slice(format!("{n:X}\r\n").as_bytes());
+            wire.extend_from_slice(&payload[at..at + n]);
+            wire.extend_from_slice(b"\r\n");
+            at += n;
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        let base = wire.as_ptr();
+        let mut reader = Reader {
+            read: std::io::Cursor::new(Vec::new()),
+            prefix: wire,
+            at: 0,
+            left: 0,
+            ended: false,
+            reads: 0,
+            pending_head: false,
+            chunk: Chunk::Body,
+        };
+        let window = crate::proxy::WindowRead::read_window(&mut reader).expect("reads");
+        assert_eq!(
+            window.bytes().as_ptr(),
+            base,
+            "the window borrows the reader's buffer"
+        );
+        assert_eq!(window.parts().len(), chunks.len(), "one span per body");
+        let mut got = Vec::new();
+        for &(start, len) in window.parts() {
+            let part = &window.bytes()[start..start + len];
+            assert!(
+                part.as_ptr() as usize >= base as usize
+                    && part.as_ptr() as usize + len <= base as usize + window.bytes().len(),
+                "a body lies inside the buffer"
+            );
+            got.extend_from_slice(part);
+        }
+        assert_eq!(got, payload, "the bytes are unchanged");
+        assert_eq!(reader.reads(), 0, "the socket was never asked");
+    }
+
+    #[test]
+    fn a_window_drains_a_crlf_split_across_reads() {
+        struct Segments {
+            pieces: std::vec::IntoIter<&'static [u8]>,
+        }
+        impl Read for Segments {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let Some(piece) = self.pieces.next() else {
+                    return Ok(0);
+                };
+                let n = piece.len().min(buf.len());
+                buf[..n].copy_from_slice(&piece[..n]);
+                Ok(n)
+            }
+        }
+
+        let mut reader = Reader {
+            read: Segments {
+                pieces: vec![b"4\r\nping\r".as_slice(), b"\n4\r\npong\r\n0\r\n\r\n"].into_iter(),
+            },
+            prefix: Vec::new(),
+            at: 0,
+            left: 0,
+            ended: false,
+            reads: 0,
+            pending_head: false,
+            chunk: Chunk::Body,
+        };
+        let mut got = Vec::new();
+        loop {
+            let window = crate::proxy::WindowRead::read_window(&mut reader).expect("reads");
+            if window.is_empty() {
+                break;
+            }
+            for &(start, len) in window.parts() {
+                got.extend_from_slice(&window.bytes()[start..start + len]);
+            }
+        }
+        assert_eq!(got, b"pingpong");
     }
 
     /// The record arm takes the buffer its own head read filled, head octets and all: what rode behind the delimiter is handed over inside it, not copied into a second owner.

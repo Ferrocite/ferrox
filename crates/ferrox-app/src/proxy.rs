@@ -9478,7 +9478,7 @@ fn dial_vless_rung(
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
             reader.set_poll(Some(RELAY_POLL));
-            crate::proxy::relay_sink_drained(reader, &writer, client);
+            crate::proxy::relay_sink_xhttp(reader, &writer, client);
             true
         }
         Rung::Raw => {
@@ -14107,7 +14107,7 @@ fn dial_trojan_rung(
             }
             note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             reader.set_poll(Some(RELAY_POLL));
-            crate::proxy::relay_sink_drained(reader, &writer, client);
+            crate::proxy::relay_sink_xhttp(reader, &writer, client);
             true
         }
     }
@@ -17097,7 +17097,7 @@ fn serve_trojan_xhttp(stream: Connection, key: &[[u8; 56]], path: &str, freedom:
         return;
     };
     reader.set_poll(Some(RELAY_POLL));
-    crate::proxy::relay_sink_drained(reader, &writer, &uplink);
+    crate::proxy::relay_sink_xhttp(reader, &writer, &uplink);
 }
 
 fn serve_trojan_httpheader(stream: Connection, key: &[[u8; 56]], path: &str, freedom: bool) {
@@ -24524,6 +24524,24 @@ where
     W: CarrierSink,
 {
     relay_ordered::<crate::ws::WsReader<R>, W, _, _, CLOSE_BEFORE_JOIN, false>(
+        reader,
+        writer,
+        peer,
+        |_| {},
+        |_| false,
+    )
+}
+
+pub(crate) fn relay_sink_xhttp<R, W>(
+    reader: crate::xhttp::Reader<R>,
+    writer: &W,
+    peer: &Connection,
+) -> Option<Arc<RelayFinish>>
+where
+    R: Read + Send + 'static,
+    W: CarrierSink,
+{
+    relay_ordered::<crate::xhttp::Reader<R>, W, _, _, CLOSE_AFTER_JOIN, false>(
         reader,
         writer,
         peer,
