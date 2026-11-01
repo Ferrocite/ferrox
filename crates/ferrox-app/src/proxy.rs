@@ -36616,9 +36616,14 @@ mod tests {
         {
             thread::sleep(Duration::from_millis(1));
         }
+        // The shape is the proof, not the clock: a driven read opens the session and never reads it.
         assert!(
-            read_entered.load(Ordering::Acquire) || opened.load(Ordering::Acquire),
-            "the Vision read never started"
+            opened.load(Ordering::Acquire),
+            "the served Vision link did not take the driven shape"
+        );
+        assert!(
+            !read_entered.load(Ordering::Acquire),
+            "the served Vision link read the session instead of the transport"
         );
         release.send(()).expect("releases the echo");
         let wrote = holds(&sealed, Duration::from_secs(2));
@@ -36627,11 +36632,106 @@ mod tests {
             holds(&ended, Duration::from_secs(2)),
             "the relay never ended"
         );
-        relay.join().expect("joins");
+        join_thread_within(relay, Duration::from_secs(5), "served Vision relay");
         assert!(
             wrote,
             "the echo's write waited on the read parked in the session"
         );
+    }
+
+    struct Undrivable {
+        entered: Arc<AtomicBool>,
+        opened: Arc<AtomicBool>,
+        wrote: Arc<AtomicBool>,
+        release: std::sync::mpsc::Receiver<()>,
+    }
+
+    impl Read for Undrivable {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            self.entered.store(true, Ordering::Release);
+            let _ = self.release.recv();
+            Ok(0)
+        }
+    }
+
+    impl Write for Undrivable {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.wrote.store(true, Ordering::Release);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl ferrox_core::tls::RecordAlignment for Undrivable {}
+
+    impl Drivable for Undrivable {
+        fn transport(&self) -> Option<Connection> {
+            None
+        }
+    }
+
+    impl CipherOpen for Undrivable {
+        fn open(&mut self, ciphertext: &[u8], _buf: &mut [u8]) -> std::io::Result<(usize, usize)> {
+            self.opened.store(true, Ordering::Release);
+            Ok((0, ciphertext.len()))
+        }
+
+        fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+            self.wrote.store(true, Ordering::Release);
+            out.extend_from_slice(plaintext);
+            Ok(plaintext.len())
+        }
+    }
+
+    /// An undrivable session keeps the shared shape: the read enters the session with no open behind it, and the echo still crosses.
+    #[test]
+    fn a_served_vision_without_a_transport_keeps_the_shared_lock() {
+        let entered = Arc::new(AtomicBool::new(false));
+        let opened = Arc::new(AtomicBool::new(false));
+        let wrote = Arc::new(AtomicBool::new(false));
+        let (release, gated) = std::sync::mpsc::channel();
+        let ended = Arc::new(AtomicBool::new(false));
+        let closed = Arc::clone(&ended);
+        let close: Arc<dyn Fn() + Send + Sync> =
+            Arc::new(move || closed.store(true, Ordering::Release));
+        let session = Undrivable {
+            entered: Arc::clone(&entered),
+            opened: Arc::clone(&opened),
+            wrote: Arc::clone(&wrote),
+            release: gated,
+        };
+        let (ready, hold) = std::sync::mpsc::channel();
+        ready.send(()).expect("arms the echo");
+        let relay = thread::spawn(move || {
+            relay_vision(
+                session,
+                None,
+                &[0u8; 16],
+                Half::shared(EchoOnce { hold, sent: false }),
+                &close,
+            );
+        });
+        assert!(
+            holds(&entered, Duration::from_secs(5)),
+            "the undrivable session was never read"
+        );
+        assert!(
+            !opened.load(Ordering::Acquire),
+            "the undrivable session took the driven shape"
+        );
+        release.send(()).expect("releases the read");
+        assert!(
+            holds(&wrote, Duration::from_secs(2)),
+            "the fallback never relayed the echo"
+        );
+        assert!(
+            holds(&ended, Duration::from_secs(2)),
+            "the fallback never ended"
+        );
+        join_thread_within(relay, Duration::from_secs(5), "served Vision fallback");
     }
 
     fn tls_over_carrier(
