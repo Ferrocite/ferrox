@@ -180,3 +180,11 @@ vision::Linkferrox_app::vision::tests::Fake::pump 26240 vision::tests::the_frame
 # before them; the reads, wire bytes, leading-zero refusal and the resolver path
 # for a real name are unchanged.
 proxy::decode_trojan_request 1170 proxy::tests::the_trojan_header_costs_two_reads_not_seven
+
+# Blessed 73251 by grpc-common-varint: the probe's one-byte varints and sub-128
+# envelope lengths now take a straight path instead of the loop; the same row
+# read 86563 on the same base, so the loops took 13312 (15.4%) out. The
+# two-byte envelope path the 16375-byte payload uses is the same straight form,
+# but this probe's messages do not walk it. The messages, offsets, prefixes and
+# bytes are unchanged.
+grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else 73251 grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
