@@ -790,9 +790,9 @@ impl Channel {
                 }
                 recv.pending_adjust += (end - start) as u64;
                 if recv.pending_adjust >= WINDOW_ADJUST_AT {
-                    adjust = recv.pending_adjust;
+                    adjust += recv.pending_adjust;
+                    recv.local_window += recv.pending_adjust;
                     recv.pending_adjust = 0;
-                    recv.local_window += adjust;
                 }
                 break recv.chunks.pop_front();
             }
@@ -836,16 +836,54 @@ impl Channel {
         }
     }
 
-    /// A chunk already queued, for a writer that coalesces the packets it has.
-    pub(crate) fn try_next_chunk(&mut self) -> Option<ChannelChunk> {
-        let (chunk, adjust) = self.take_chunk();
-        self.adjust(adjust);
-        chunk
+    /// Move every queued chunk up to `limit` under one receive lock.
+    pub(crate) fn drain_chunks(&self, batch: &mut Vec<ChannelChunk>, limit: usize) {
+        let mut adjust = 0u64;
+        {
+            let mut recv = lock(&self.state.recv);
+            while batch.len() < limit {
+                let Some((start, end)) = recv.chunks.front().map(|front| (front.start, front.end))
+                else {
+                    break;
+                };
+                if start >= end {
+                    let spent = recv
+                        .chunks
+                        .pop_front()
+                        .unwrap_or_else(|| unreachable!("the front chunk is the one just named"));
+                    recycle(&self.state.pool, spent.buffer);
+                    continue;
+                }
+                recv.pending_adjust += (end - start) as u64;
+                if recv.pending_adjust >= WINDOW_ADJUST_AT {
+                    adjust += recv.pending_adjust;
+                    recv.local_window += recv.pending_adjust;
+                    recv.pending_adjust = 0;
+                }
+                let chunk = recv
+                    .chunks
+                    .pop_front()
+                    .unwrap_or_else(|| unreachable!("the front chunk is the one just named"));
+                batch.push(ChannelChunk {
+                    buffer: chunk.buffer,
+                    start: chunk.start,
+                    end: chunk.end,
+                });
+            }
+        }
+        if adjust != 0 {
+            self.adjust(adjust);
+        }
     }
 
-    /// Hand a consumed chunk's allocation back to the packet pool.
-    pub(crate) fn recycle_chunk(&self, chunk: ChannelChunk) {
-        recycle(&self.state.pool, chunk.buffer);
+    /// Hand consumed chunks back to the packet pool under one lock.
+    pub(crate) fn recycle_chunks(&self, chunks: impl Iterator<Item = ChannelChunk>) {
+        let mut pool = lock(&self.state.pool);
+        for chunk in chunks {
+            if pool.len() < PACKET_POOL {
+                pool.push(chunk.buffer);
+            }
+        }
     }
 }
 
@@ -867,9 +905,9 @@ impl Read for Channel {
                     chunk.start = start;
                     recv.pending_adjust += u64::try_from(take).unwrap_or(0);
                     if recv.pending_adjust >= WINDOW_ADJUST_AT {
-                        adjust = recv.pending_adjust;
+                        adjust += recv.pending_adjust;
+                        recv.local_window += recv.pending_adjust;
                         recv.pending_adjust = 0;
-                        recv.local_window += adjust;
                     }
                     if spent {
                         let chunk = recv.chunks.pop_front().unwrap_or_else(|| {
@@ -1456,7 +1494,11 @@ impl HmacKey {
 
 fn write_vectored_all(io: &mut TcpStream, mut slices: &mut [IoSlice<'_>]) -> io::Result<()> {
     while !slices.is_empty() {
-        let written = io.write_vectored(slices)?;
+        let written = match io.write_vectored(slices) {
+            Ok(written) => written,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
         if written == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::WriteZero,
@@ -2430,6 +2472,18 @@ mod tests {
     }
 
     #[test]
+    fn a_batch_drains_and_recycles_under_one_lock() {
+        let payloads: Vec<&[u8]> = (0..40).map(|_| &b"x"[..]).collect();
+        let channel = test_channel_with_chunks(&payloads);
+        let pool = Arc::clone(&channel.session.pool);
+        let mut batch = Vec::new();
+        channel.drain_chunks(&mut batch, 32);
+        assert_eq!(batch.len(), 32);
+        channel.recycle_chunks(batch.drain(..));
+        assert_eq!(lock(&pool).len(), 32);
+    }
+
+    #[test]
     fn a_channel_chunk_is_the_packet_allocation() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
@@ -2484,7 +2538,7 @@ mod tests {
         let chunk = channel.next_chunk().expect("chunk").expect("payload");
         assert_eq!(chunk.data(), b"hello");
         assert_eq!(chunk.data().as_ptr(), pointer.wrapping_add(8));
-        channel.recycle_chunk(chunk);
+        channel.recycle_chunks(std::iter::once(chunk));
         let buffer = lock(&pool).pop().expect("the packet buffer came back");
         assert_eq!(buffer.as_ptr(), pointer);
         assert_eq!(buffer.capacity(), capacity);

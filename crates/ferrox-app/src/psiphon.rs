@@ -29,7 +29,29 @@ const UDPGW_FLAG_IPV6: u8 = 8;
 const UDPGW_MAX_PAYLOAD: usize = 32_768;
 const UDPGW_MAX_MESSAGE: usize = 32_768 + 23;
 const MAX_LIST_BYTES: u64 = 16 * 1024 * 1024;
-const RELAY_BUFFER: usize = 32 * 1024;
+const RELAY_BUFFER: usize = 64 * 1024;
+const RELAY_BATCH: usize = 32;
+const FRONTED_VARIANTS: usize = 256;
+const FRONTED_SERVERS: usize = 512;
+const BUILTIN_CDN_EDGES: &[[u8; 4]] = &[
+    [23, 215, 0, 206],
+    [23, 215, 0, 203],
+    [23, 212, 250, 91],
+    [23, 212, 250, 78],
+    [23, 12, 147, 13],
+    [23, 12, 147, 29],
+    [23, 73, 207, 8],
+    [23, 73, 207, 15],
+    [92, 123, 102, 43],
+];
+const BUILTIN_CDN_SNIS: &[&str] = &[
+    "a248.e.akamai.net",
+    "a.akamaized.net",
+    "a.akamaized-staging.net",
+    "a.akamaihd.net",
+    "a.akamaihd-staging.net",
+    "www.akamai.com",
+];
 const MAX_REQUEST: usize = 16 * 1024;
 const DIAL_ATTEMPTS: usize = 64;
 const DIAL_WORKERS: usize = 10;
@@ -77,7 +99,8 @@ struct Settings {
     initial_protocols: Vec<String>,
     fronted: bool,
     cdn_ips: Vec<String>,
-    cdn_sni: Option<String>,
+    cdn_snis: Vec<String>,
+    fronted_overrides: Vec<FrontedOverride>,
     initial_count: usize,
     pool: usize,
     latency: f64,
@@ -101,6 +124,14 @@ struct Settings {
     proxy_user: Option<String>,
     proxy_pass: Option<String>,
     raw: Option<Json>,
+}
+
+#[derive(Debug, Clone)]
+struct FrontedOverride {
+    dials: Vec<String>,
+    snis: Vec<String>,
+    disable_sni: bool,
+    alpn: Vec<Vec<u8>>,
 }
 
 #[allow(clippy::missing_fields_in_debug)]
@@ -806,8 +837,7 @@ fn trace_flow(channel: &Channel) {
 /// The download half writes each received packet straight from the SSH buffer,
 /// coalescing the packets already queued into one vectored call.
 fn pump_channel(channel: &mut Channel, sink: &mut impl Write) {
-    const BATCH: usize = 32;
-    let mut batch: Vec<ChannelChunk> = Vec::with_capacity(BATCH);
+    let mut batch: Vec<ChannelChunk> = Vec::with_capacity(RELAY_BATCH);
     loop {
         if let Ok(Some(chunk)) = channel.next_chunk() {
             batch.push(chunk);
@@ -817,12 +847,7 @@ fn pump_channel(channel: &mut Channel, sink: &mut impl Write) {
             }
             return;
         }
-        while batch.len() < BATCH {
-            let Some(chunk) = channel.try_next_chunk() else {
-                break;
-            };
-            batch.push(chunk);
-        }
+        channel.drain_chunks(&mut batch, RELAY_BATCH);
         if !flush_chunks(channel, sink, &mut batch) {
             return;
         }
@@ -830,14 +855,12 @@ fn pump_channel(channel: &mut Channel, sink: &mut impl Write) {
 }
 
 fn flush_chunks(channel: &Channel, sink: &mut impl Write, batch: &mut Vec<ChannelChunk>) -> bool {
-    let mut slices: Vec<IoSlice<'_>> = batch
-        .iter()
-        .map(|chunk| IoSlice::new(chunk.data()))
-        .collect();
-    let wrote = write_all_vectored(sink, &mut slices).is_ok();
-    for chunk in batch.drain(..) {
-        channel.recycle_chunk(chunk);
+    let mut slices = [IoSlice::new(&[]); RELAY_BATCH];
+    for (slot, chunk) in slices.iter_mut().zip(batch.iter()) {
+        *slot = IoSlice::new(chunk.data());
     }
+    let wrote = write_all_vectored(sink, &mut slices[..batch.len()]).is_ok();
+    channel.recycle_chunks(batch.drain(..));
     wrote
 }
 
@@ -1112,8 +1135,99 @@ impl Settings {
                 false
             }
         };
-        let cdn_ips = string_list(settings, "cdnIps");
-        let cdn_sni = text(settings, "cdnSni").filter(|sni| !sni.is_empty());
+        let mut cdn_ips: Vec<String> = string_list(settings, "cdnIps")
+            .into_iter()
+            .flat_map(|raw| expand_cidr(&raw))
+            .collect();
+        let mut cdn_snis = string_list(settings, "cdnSni");
+        let mut fronted_overrides = Vec::new();
+        if let Some(items) = settings
+            .and_then(|settings| settings.get("FrontedMeekDialOverrides"))
+            .and_then(Json::as_arr)
+        {
+            for item in items {
+                let dials = string_list_in(item, "DialAddresses");
+                let snis = string_list_in(item, "SNIServerName");
+                if dials.is_empty() && snis.is_empty() {
+                    continue;
+                }
+                fronted_overrides.push(FrontedOverride {
+                    dials,
+                    snis,
+                    disable_sni: bool_in(item, "DisableSNI"),
+                    alpn: string_list_in(item, "ALPNProtocols")
+                        .into_iter()
+                        .map(String::into_bytes)
+                        .collect(),
+                });
+            }
+        }
+        if let Some(spec) = settings
+            .and_then(|settings| settings.get("FrontedMeekCDNScanSpec"))
+            .or_else(|| settings.and_then(|settings| settings.get("frontedMeekCDNScanSpec")))
+        {
+            for ip in string_list_in(spec, "IPCandidates")
+                .into_iter()
+                .flat_map(|raw| expand_cidr(&raw))
+            {
+                push_unique(&mut cdn_ips, ip);
+            }
+            for sni in string_list_in(spec, "SNIServerNames") {
+                push_unique(&mut cdn_snis, sni);
+            }
+        }
+        let cdn_sets: Vec<String> = string_list(settings, "FrontedMeekCDNScanBuiltInSets")
+            .into_iter()
+            .chain(string_list(settings, "cdnSets"))
+            .collect();
+        let builtin_scan = flag(
+            settings,
+            "FrontedMeekCDNScanUseBuiltInSpec",
+            "AETHER_PSIPHON_CDN_BUILTIN",
+        ) || cdn_sets.iter().any(|set| {
+            matches!(
+                set.to_ascii_lowercase().as_str(),
+                "builtin" | "legacy" | "fronted-meek" | "akamai"
+            )
+        });
+        if builtin_scan {
+            for edge in BUILTIN_CDN_EDGES {
+                push_unique(&mut cdn_ips, format!("{}:443", Ipv4Addr::from(*edge)));
+            }
+            for sni in BUILTIN_CDN_SNIS {
+                push_unique(&mut cdn_snis, (*sni).to_owned());
+            }
+        }
+        if cdn_sets
+            .iter()
+            .any(|set| set.eq_ignore_ascii_case("fastly"))
+        {
+            fronted_overrides.push(FrontedOverride {
+                dials: vec!["pypi.org".to_owned()],
+                snis: vec!["pypi.org".to_owned()],
+                disable_sni: false,
+                alpn: vec![b"http/1.1".to_vec()],
+            });
+        }
+        if decimal(settings, "FrontedMeekDialOverridesProbability")
+            .is_some_and(|probability| probability <= 0.0)
+        {
+            fronted_overrides.clear();
+        }
+        if cdn_ips.len() > FRONTED_VARIANTS {
+            eprintln!(
+                "psiphon: {} cdn IP candidates exceed {FRONTED_VARIANTS}; dropping the rest",
+                cdn_ips.len()
+            );
+            cdn_ips.truncate(FRONTED_VARIANTS);
+        }
+        if cdn_snis.len() > FRONTED_VARIANTS {
+            eprintln!(
+                "psiphon: {} cdn SNI candidates exceed {FRONTED_VARIANTS}; dropping the rest",
+                cdn_snis.len()
+            );
+            cdn_snis.truncate(FRONTED_VARIANTS);
+        }
         let proxy = text(settings, "upstreamProxy")
             .or_else(|| text(settings, "upstream"))
             .or_else(|| text(settings, "UpstreamProxyURL"))
@@ -1253,7 +1367,8 @@ impl Settings {
             initial_protocols,
             fronted,
             cdn_ips,
-            cdn_sni,
+            cdn_snis,
+            fronted_overrides,
             initial_count,
             pool,
             latency,
@@ -1463,6 +1578,12 @@ fn warn_ignored(settings: Option<&Json>) {
         "cdnIps",
         "cdnSni",
         "cdnSets",
+        "FrontedMeekDialOverrides",
+        "FrontedMeekDialOverridesProbability",
+        "FrontedMeekCDNScanSpec",
+        "frontedMeekCDNScanSpec",
+        "FrontedMeekCDNScanUseBuiltInSpec",
+        "FrontedMeekCDNScanBuiltInSets",
         "LimitRelayBufferSizes",
         "NetworkLatencyMultiplier",
         "InitialLimitTunnelProtocols",
@@ -1812,24 +1933,229 @@ fn target_protocol_filter(settings: &Settings) -> (&[String], &'static str, Opti
     )
 }
 
-fn apply_fronting_overrides(servers: &mut [Server], settings: &Settings) {
-    if settings.cdn_ips.is_empty() && settings.cdn_sni.is_none() {
+fn apply_fronting_overrides(servers: &mut Vec<Server>, settings: &Settings) {
+    if settings.cdn_ips.is_empty()
+        && settings.cdn_snis.is_empty()
+        && settings.fronted_overrides.is_empty()
+    {
         return;
     }
-    for (index, server) in servers.iter_mut().enumerate() {
-        let Some(meek) = server.meek.as_mut() else {
+    let mut groups: Vec<Vec<Server>> = Vec::with_capacity(servers.len());
+    for server in servers.drain(..) {
+        let Some(meek) = server.meek.as_ref() else {
+            groups.push(vec![server]);
             continue;
         };
-        if !settings.cdn_ips.is_empty() {
-            let (dial, port) =
-                split_fronting_address(&settings.cdn_ips[index % settings.cdn_ips.len()]);
-            meek.dial = dial;
-            meek.port = port;
-            meek.sni = meek.dial.clone();
+        let mut group = Vec::with_capacity(FRONTED_VARIANTS.min(16));
+        let mut variants = 0;
+        if settings.cdn_ips.is_empty() && settings.cdn_snis.is_empty() {
+            group.push(server.clone());
+            variants += 1;
         }
-        if let Some(sni) = &settings.cdn_sni {
-            meek.sni.clone_from(sni);
+        for fronted in &settings.fronted_overrides {
+            let dials: Vec<(String, u16)> = if fronted.dials.is_empty() {
+                vec![(meek.dial.clone(), meek.port)]
+            } else {
+                fronted
+                    .dials
+                    .iter()
+                    .map(|raw| split_fronting_address(raw))
+                    .collect()
+            };
+            add_fronted_variants(
+                &server,
+                &dials,
+                &fronted.snis,
+                fronted.disable_sni,
+                &fronted.alpn,
+                fronted.dials.is_empty(),
+                &mut group,
+                &mut variants,
+            );
         }
+        if !settings.cdn_ips.is_empty() || !settings.cdn_snis.is_empty() {
+            let dials: Vec<(String, u16)> = if settings.cdn_ips.is_empty() {
+                vec![(meek.dial.clone(), meek.port)]
+            } else {
+                settings
+                    .cdn_ips
+                    .iter()
+                    .map(|raw| split_fronting_address(raw))
+                    .collect()
+            };
+            add_fronted_variants(
+                &server,
+                &dials,
+                &settings.cdn_snis,
+                meek.disable_sni,
+                &[],
+                settings.cdn_ips.is_empty(),
+                &mut group,
+                &mut variants,
+            );
+        }
+        groups.push(group);
+    }
+    let mut expanded = Vec::new();
+    let mut fronted = 0;
+    let depth = groups.iter().map(Vec::len).max().unwrap_or(0);
+    for index in 0..depth {
+        for group in &groups {
+            let Some(server) = group.get(index) else {
+                continue;
+            };
+            if server.meek.is_some() {
+                if fronted >= FRONTED_SERVERS {
+                    continue;
+                }
+                fronted += 1;
+            }
+            expanded.push(server.clone());
+        }
+    }
+    *servers = expanded;
+}
+
+#[allow(clippy::too_many_arguments)]
+fn add_fronted_variants(
+    server: &Server,
+    dials: &[(String, u16)],
+    snis: &[String],
+    disable_sni: bool,
+    alpn: &[Vec<u8>],
+    keep_candidates: bool,
+    expanded: &mut Vec<Server>,
+    variants: &mut usize,
+) {
+    if snis.is_empty() || disable_sni {
+        for (dial, port) in dials {
+            if !push_fronted_variant(
+                server,
+                dial,
+                *port,
+                dial,
+                disable_sni,
+                alpn,
+                keep_candidates,
+                expanded,
+                variants,
+            ) {
+                return;
+            }
+        }
+        return;
+    }
+    for (dial, port) in dials {
+        for sni in snis {
+            if !push_fronted_variant(
+                server,
+                dial,
+                *port,
+                sni,
+                disable_sni,
+                alpn,
+                keep_candidates,
+                expanded,
+                variants,
+            ) {
+                return;
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_fronted_variant(
+    server: &Server,
+    dial: &str,
+    port: u16,
+    sni: &str,
+    disable_sni: bool,
+    alpn: &[Vec<u8>],
+    keep_candidates: bool,
+    expanded: &mut Vec<Server>,
+    variants: &mut usize,
+) -> bool {
+    if *variants >= FRONTED_VARIANTS {
+        return false;
+    }
+    let mut variant = server.clone();
+    let meek = variant
+        .meek
+        .as_mut()
+        .expect("a fronted server carries a meek front");
+    dial.clone_into(&mut meek.dial);
+    meek.port = port;
+    if disable_sni {
+        meek.sni.clear();
+    } else {
+        sni.clone_into(&mut meek.sni);
+    }
+    meek.disable_sni = disable_sni;
+    if !keep_candidates {
+        meek.fronts = vec![(dial.to_owned(), port)];
+        let host = meek.host.clone();
+        meek.hosts = vec![host];
+    }
+    if !alpn.is_empty() {
+        meek.alpn = alpn.to_vec();
+    }
+    expanded.push(variant);
+    *variants += 1;
+    true
+}
+
+fn expand_cidr(raw: &str) -> Vec<String> {
+    let Some((address, prefix)) = raw.split_once('/') else {
+        return vec![raw.to_owned()];
+    };
+    let (Ok(address), Ok(prefix)) = (address.parse::<Ipv4Addr>(), prefix.parse::<u8>()) else {
+        return vec![raw.to_owned()];
+    };
+    if prefix > 32 {
+        return vec![raw.to_owned()];
+    }
+    let host_bits = u32::from(32 - prefix);
+    let count = 1u64 << host_bits;
+    let mask = if host_bits == 32 {
+        0
+    } else {
+        u32::MAX << host_bits
+    };
+    let base = u32::from(address) & mask;
+    let take = count.min(FRONTED_VARIANTS as u64);
+    if count > take {
+        eprintln!("psiphon: CIDR {raw} expands to {count} addresses; keeping {take}");
+    }
+    (0..take)
+        .map(|offset| {
+            let ip = Ipv4Addr::from(base.wrapping_add(u32::try_from(offset).unwrap_or(0)));
+            format!("{ip}:443")
+        })
+        .collect()
+}
+
+fn push_unique(list: &mut Vec<String>, item: String) {
+    if !list.iter().any(|existing| existing == &item) {
+        list.push(item);
+    }
+}
+
+fn bool_in(item: &Json, key: &str) -> bool {
+    item.get(key).and_then(Json::as_bool).unwrap_or(false)
+}
+
+fn string_list_in(item: &Json, key: &str) -> Vec<String> {
+    match item.get(key) {
+        Some(Json::Arr(items)) => items
+            .iter()
+            .filter_map(Json::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        Some(Json::Str(text)) => split_list(text),
+        _ => Vec::new(),
     }
 }
 
@@ -2026,32 +2352,76 @@ fn fronted_meek(entry: &Json) -> Option<crate::psiphon_meek::Meek> {
         .and_then(Json::as_str)
         .filter(|key| !key.is_empty())?
         .to_owned();
-    let raw = entry
+    let addresses: Vec<String> = entry
         .get("meekFrontingAddresses")
         .and_then(Json::as_arr)
-        .and_then(|addresses| addresses.first())
-        .and_then(Json::as_str)
+        .map(|addresses| {
+            addresses
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::trim)
+                .filter(|address| !address.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let raw = addresses
+        .first()
+        .map(String::as_str)
         .or_else(|| entry.get("meekFrontingDomain").and_then(Json::as_str))?
         .to_owned();
     let (dial, port) = split_fronting_address(&raw);
-    let host = entry
+    let mut fronts: Vec<(String, u16)> = addresses
+        .iter()
+        .map(|address| split_fronting_address(address))
+        .collect();
+    if fronts.is_empty() {
+        fronts.push((dial.clone(), port));
+    }
+    let hosts: Vec<String> = entry
         .get("meekFrontingHosts")
         .and_then(Json::as_arr)
-        .and_then(|hosts| hosts.first())
-        .and_then(Json::as_str)
-        .or_else(|| entry.get("meekFrontingHost").and_then(Json::as_str))
-        .or_else(|| entry.get("meekFrontingDomain").and_then(Json::as_str))
+        .map(|hosts| {
+            hosts
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::trim)
+                .filter(|host| !host.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let host = hosts
+        .first()
+        .cloned()
+        .or_else(|| {
+            entry
+                .get("meekFrontingHost")
+                .and_then(Json::as_str)
+                .map(str::to_owned)
+        })
+        .or_else(|| {
+            entry
+                .get("meekFrontingDomain")
+                .and_then(Json::as_str)
+                .map(str::to_owned)
+        })
         .filter(|host| !host.is_empty())
-        .unwrap_or(&dial)
-        .to_owned();
-    if entry
+        .unwrap_or_else(|| dial.clone());
+    let hosts = if hosts.is_empty() {
+        vec![host.clone()]
+    } else {
+        hosts
+    };
+    let disable_sni = entry
         .get("meekFrontingDisableSNI")
         .and_then(Json::as_bool)
-        .unwrap_or(false)
-    {
-        eprintln!("psiphon: meekFrontingDisableSNI is not carried; dialling with SNI {dial}");
-    }
-    let sni = dial.clone();
+        .unwrap_or(false);
+    let sni = if disable_sni {
+        String::new()
+    } else {
+        dial.clone()
+    };
     Some(crate::psiphon_meek::Meek {
         dial,
         port,
@@ -2059,6 +2429,10 @@ fn fronted_meek(entry: &Json) -> Option<crate::psiphon_meek::Meek> {
         sni,
         public_key,
         obfuscated_key,
+        disable_sni,
+        alpn: Vec::new(),
+        fronts,
+        hosts,
     })
 }
 
@@ -2761,7 +3135,7 @@ mod tests {
 
     #[test]
     fn a_fronted_entry_carries_its_cdn_config() {
-        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshObfuscatedPort":443,"sshObfuscatedKey":"k","sshHostKey":"AAAA","capabilities":["SSH","OSSH","FRONTED-MEEK-OSSH"],"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front.example:8443"],"meekFrontingHost":"cdn.example"}"#;
+        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshObfuscatedPort":443,"sshObfuscatedKey":"k","sshHostKey":"AAAA","capabilities":["SSH","OSSH","FRONTED-MEEK-OSSH"],"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front.example:8443","192.0.2.2:443"],"meekFrontingHosts":["cdn.example","cdn2.example"]}"#;
         let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
         let server = decode_entry(&encoded).expect("entry");
         let meek = server.meek.expect("fronted");
@@ -2770,6 +3144,279 @@ mod tests {
         assert_eq!(meek.host, "cdn.example");
         assert_eq!(meek.sni, "front.example");
         assert_eq!(meek.obfuscated_key, "mk");
+        assert_eq!(meek.fronts.len(), 2);
+        assert_eq!(meek.hosts, vec!["cdn.example", "cdn2.example"]);
+    }
+
+    #[test]
+    fn fronted_overrides_add_dial_and_sni_candidates() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{
+                    "FrontedMeekDialOverrides": [{
+                        "DialAddresses": ["edge.example:8443", "192.0.2.9:443"],
+                        "SNIServerName": "sni.example",
+                        "DisableSNI": false,
+                        "ALPNProtocols": ["http/1.1"]
+                    }],
+                    "FrontedMeekCDNScanSpec": {
+                        "IPCandidates": ["198.51.100.7:443"],
+                        "SNIServerNames": ["scan.example"]
+                    }
+                }"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(
+            settings.fronted_overrides[0].dials,
+            vec!["edge.example:8443", "192.0.2.9:443"]
+        );
+        assert!(settings.cdn_ips.iter().any(|ip| ip == "198.51.100.7:443"));
+        assert!(settings.cdn_snis.iter().any(|sni| sni == "scan.example"));
+        assert_eq!(settings.fronted_overrides[0].snis, vec!["sni.example"]);
+        assert_eq!(settings.fronted_overrides.len(), 1);
+        assert!(!settings.fronted_overrides[0].disable_sni);
+        assert_eq!(
+            settings.fronted_overrides[0].alpn,
+            vec![b"http/1.1".to_vec()]
+        );
+
+        let mut server = test_server(true);
+        server.meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 443,
+            host: "cdn.example".to_owned(),
+            sni: "front.example".to_owned(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
+        });
+        let mut servers = vec![server];
+        apply_fronting_overrides(&mut servers, &settings);
+        assert!(servers.iter().any(|server| {
+            let meek = server.meek.as_ref().expect("fronted");
+            meek.dial == "edge.example"
+                && meek.port == 8443
+                && meek.sni == "sni.example"
+                && !meek.disable_sni
+        }));
+        assert!(servers.iter().any(|server| {
+            let meek = server.meek.as_ref().expect("fronted");
+            meek.dial == "198.51.100.7" && meek.sni == "scan.example"
+        }));
+    }
+
+    #[test]
+    fn an_sni_only_override_keeps_the_entry_candidates() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"FrontedMeekDialOverrides":[{"SNIServerName":"sni.example"}]}"#)
+                .expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(true);
+        server.meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 443,
+            host: "cdn.example".to_owned(),
+            sni: "front.example".to_owned(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![
+                ("front.example".to_owned(), 443),
+                ("backup.example".to_owned(), 8443),
+            ],
+            hosts: vec!["cdn.example".to_owned(), "cdn2.example".to_owned()],
+        });
+        let mut servers = vec![server];
+        apply_fronting_overrides(&mut servers, &settings);
+        let meek = servers
+            .iter()
+            .filter_map(|server| server.meek.as_ref())
+            .find(|meek| meek.sni == "sni.example")
+            .expect("sni candidate");
+        assert_eq!(meek.dial, "front.example");
+        assert_eq!(
+            meek.fronts,
+            vec![
+                ("front.example".to_owned(), 443),
+                ("backup.example".to_owned(), 8443)
+            ]
+        );
+        assert_eq!(
+            meek.hosts,
+            vec!["cdn.example".to_owned(), "cdn2.example".to_owned()]
+        );
+    }
+
+    #[test]
+    fn a_scan_keeps_the_entry_sni_setting() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"FrontedMeekCDNScanSpec":{"IPCandidates":["192.0.2.9:443"],"SNIServerNames":["a.example","b.example"]}}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(true);
+        server.meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 443,
+            host: "cdn.example".to_owned(),
+            sni: "front.example".to_owned(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: true,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
+        });
+        let mut servers = vec![server];
+        apply_fronting_overrides(&mut servers, &settings);
+        assert_eq!(servers.len(), 1);
+        assert!(servers
+            .iter()
+            .filter_map(|server| server.meek.as_ref())
+            .all(|meek| meek.disable_sni));
+    }
+
+    #[test]
+    fn fronted_variants_round_robin_across_servers() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"cdnIps":["192.0.2.0/24"]}"#).expect("settings"),
+        ))
+        .expect("settings");
+        let mut servers = Vec::new();
+        for index in 0..3 {
+            let mut server = test_server(true);
+            server.meek = Some(crate::psiphon_meek::Meek {
+                dial: "front.example".to_owned(),
+                port: 443,
+                host: format!("cdn{index}.example"),
+                sni: "front.example".to_owned(),
+                public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+                obfuscated_key: "mk".to_owned(),
+                disable_sni: false,
+                alpn: Vec::new(),
+                fronts: vec![("front.example".to_owned(), 443)],
+                hosts: vec![format!("cdn{index}.example")],
+            });
+            servers.push(server);
+        }
+        apply_fronting_overrides(&mut servers, &settings);
+        assert_eq!(servers.len(), FRONTED_SERVERS);
+        for index in 0..3 {
+            let host = format!("cdn{index}.example");
+            let count = servers
+                .iter()
+                .filter_map(|server| server.meek.as_ref())
+                .filter(|meek| meek.host == host)
+                .count();
+            assert!(count > 100, "server {index} got {count} variants");
+        }
+    }
+
+    #[test]
+    fn an_override_survives_a_full_scan() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{
+                    "cdnIps": ["192.0.2.0/24"],
+                    "FrontedMeekDialOverrides": [{
+                        "DialAddresses": ["edge.example:8443"],
+                        "SNIServerName": "sni.example"
+                    }]
+                }"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(true);
+        server.meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 443,
+            host: "cdn.example".to_owned(),
+            sni: "front.example".to_owned(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
+        });
+        let mut servers = vec![server];
+        apply_fronting_overrides(&mut servers, &settings);
+        assert!(servers.iter().any(|server| {
+            let meek = server.meek.as_ref().expect("fronted");
+            meek.dial == "edge.example" && meek.sni == "sni.example"
+        }));
+    }
+
+    #[test]
+    fn the_builtin_scan_set_adds_fronting_candidates() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"FrontedMeekCDNScanUseBuiltInSpec":true}"#).expect("settings"),
+        ))
+        .expect("settings");
+        let first = format!("{}:443", Ipv4Addr::from(BUILTIN_CDN_EDGES[0]));
+        assert!(settings.cdn_ips.iter().any(|ip| ip == &first));
+        assert!(settings
+            .cdn_snis
+            .iter()
+            .any(|sni| sni == BUILTIN_CDN_SNIS[0]));
+    }
+
+    #[test]
+    fn the_fastly_set_adds_its_override() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"cdnSets":["fastly"]}"#).expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.fronted_overrides.len(), 1);
+        assert_eq!(settings.fronted_overrides[0].dials, vec!["pypi.org"]);
+        assert_eq!(settings.fronted_overrides[0].snis, vec!["pypi.org"]);
+        assert_eq!(
+            settings.fronted_overrides[0].alpn,
+            vec![b"http/1.1".to_vec()]
+        );
+    }
+
+    #[test]
+    fn a_disable_sni_override_clears_the_name() {
+        let settings = Settings::from_json(Some(
+            &json::parse(
+                r#"{"FrontedMeekDialOverrides":[{"DialAddresses":["192.0.2.9:443"],"DisableSNI":true}]}"#,
+            )
+            .expect("settings"),
+        ))
+        .expect("settings");
+        let mut server = test_server(true);
+        server.meek = Some(crate::psiphon_meek::Meek {
+            dial: "front.example".to_owned(),
+            port: 443,
+            host: "cdn.example".to_owned(),
+            sni: "front.example".to_owned(),
+            public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
+            obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
+        });
+        let mut servers = vec![server];
+        apply_fronting_overrides(&mut servers, &settings);
+        let meek = servers
+            .iter()
+            .filter_map(|server| server.meek.as_ref())
+            .find(|meek| meek.dial == "192.0.2.9")
+            .expect("override candidate");
+        assert_eq!(meek.sni, "");
+        assert!(meek.disable_sni);
     }
 
     #[test]
@@ -2789,6 +3436,10 @@ mod tests {
             sni: "front.example".to_owned(),
             public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
         });
         let selected = select_protocols(vec![test_server(false), fronted], &[], &[], 0, true);
         assert_eq!(selected.len(), 1);
@@ -2804,6 +3455,10 @@ mod tests {
             sni: "front.example".to_owned(),
             public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_owned(),
             obfuscated_key: "mk".to_owned(),
+            disable_sni: false,
+            alpn: Vec::new(),
+            fronts: vec![("front.example".to_owned(), 443)],
+            hosts: vec!["cdn.example".to_owned()],
         };
         let mut direct = test_server(true);
         direct.meek = Some(meek());
@@ -2814,6 +3469,19 @@ mod tests {
         assert_eq!(selected.len(), 1);
         assert!(selected[0].direct);
         assert!(selected[0].meek.is_none());
+    }
+
+    #[test]
+    fn a_cidr_candidate_expands_to_its_first_256_addresses() {
+        let candidates = expand_cidr("198.51.100.0/24");
+        assert_eq!(candidates.len(), 256);
+        assert_eq!(candidates[0], "198.51.100.0:443");
+        assert_eq!(candidates[255], "198.51.100.255:443");
+        assert_eq!(expand_cidr("198.51.100.7/32"), vec!["198.51.100.7:443"]);
+        assert_eq!(
+            expand_cidr("front.example:8443"),
+            vec!["front.example:8443"]
+        );
     }
 
     #[test]
