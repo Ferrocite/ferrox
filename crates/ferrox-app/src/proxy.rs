@@ -4201,14 +4201,14 @@ impl std::io::Read for HandshakeDeadline<'_> {
 }
 
 /// An owned carried reader under the handshake clock: the frame reader sleeps through poll timeouts, so this claims the poll and ends the read at the deadline instead.
-struct HandshakeRead<R> {
+pub(crate) struct HandshakeRead<R> {
     inner: R,
     until: Option<Instant>,
     step: Option<RelayStep>,
 }
 
 impl<R: Read> HandshakeRead<R> {
-    fn new(inner: R, budget: Duration) -> Self {
+    pub(crate) fn new(inner: R, budget: Duration) -> Self {
         Self {
             inner,
             until: Some(Instant::now() + budget),
@@ -4216,11 +4216,11 @@ impl<R: Read> HandshakeRead<R> {
         }
     }
 
-    fn rearm(&mut self, budget: Duration) {
+    pub(crate) fn rearm(&mut self, budget: Duration) {
         self.until = Some(Instant::now() + budget);
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.until = None;
         self.step = None;
     }
@@ -4916,10 +4916,12 @@ fn serve_sealed_split_with<R, W, C>(
     );
     after_decode(reader.get_mut());
     let Some((got, flow, cmd, target)) = decoded else {
+        closer();
         return;
     };
     let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
         crate::accesslog::record(None, false, &target, None, "invalid user", "");
+        closer();
         return;
     };
     crate::accesslog::record(None, true, &target, None, "", &user.email);
@@ -4944,12 +4946,14 @@ fn serve_sealed_split_with<R, W, C>(
         return;
     }
     if !freedom || !vless_flow_ok(user, flow, cmd, true) {
+        closer();
         return;
     }
     let meter = crate::stats::user(&user.email, user.level);
     match cmd {
         2 => {
             if writer.write_all(&[0, 0]).is_err() {
+                closer();
                 return;
             }
             let reader = MeteredIo {
@@ -4967,6 +4971,7 @@ fn serve_sealed_split_with<R, W, C>(
         }
         3 => {
             if writer.write_all(&[0, 0]).is_err() {
+                closer();
                 return;
             }
             let writer = MeteredIo {
@@ -4981,12 +4986,14 @@ fn serve_sealed_split_with<R, W, C>(
         }
         1 => {
             let Some(uplink) = dial_or_report(&target) else {
+                closer();
                 return;
             };
             let uplink = uplink
                 .with_meter(crate::stats::user(&user.email, user.level).reversed())
                 .with_policy(Some(crate::policy::flow(user.level)));
             if writer.write_all(&[0, 0]).is_err() {
+                closer();
                 return;
             }
             let close = close_with_uplink(&closer, &uplink);
@@ -4997,7 +5004,7 @@ fn serve_sealed_split_with<R, W, C>(
             }
             relay_split(reader, writer, &uplink, &close);
         }
-        _ => {}
+        _ => closer(),
     }
 }
 
@@ -5148,9 +5155,13 @@ fn relay_split<R, W>(
         forward_ended.store(true, Ordering::Relaxed);
     });
     let mut buf = RelayBuf::with_window(window);
+    let mut upload_done = false;
     loop {
         match sealed_read.read(buf.as_mut()) {
-            Ok(0) => break,
+            Ok(0) => {
+                upload_done = true;
+                break;
+            }
             Ok(n) => {
                 if plain_write.write_all(buf.filled(n)).is_err() {
                     break;
@@ -5164,10 +5175,18 @@ fn relay_split<R, W>(
             Err(_) => break,
         }
     }
-    let _ = plain_write.shutdown(Shutdown::Both);
-    close();
-    ended.store(true, Ordering::Relaxed);
+    // The request body ending is a half-close: only the downlink's own end may finish the body its peer is still reading.
+    let _ = plain_write.shutdown(if upload_done {
+        Shutdown::Write
+    } else {
+        Shutdown::Both
+    });
+    if !upload_done {
+        close();
+        ended.store(true, Ordering::Relaxed);
+    }
     let _ = done.join();
+    close();
 }
 
 fn relay_sealed<S: Read + Write + Send + 'static>(

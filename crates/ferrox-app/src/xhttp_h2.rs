@@ -414,7 +414,7 @@ impl Read for H2StreamReader {
                 self.conn.replenish(self.id, n);
                 return Ok(n);
             }
-            if st.ended {
+            if st.ended || st.finished {
                 drop(st);
                 self.conn.forget_upload(self.id);
                 return Ok(0);
@@ -432,7 +432,7 @@ impl Read for H2StreamReader {
                         .state
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
-                    !st.body.is_empty() || st.ended || st.dead
+                    !st.body.is_empty() || st.ended || st.finished || st.dead
                 }) {
                     self.conn.forget_upload(self.id);
                     return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
@@ -1004,6 +1004,7 @@ impl H2Conn {
             };
             let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
             st.finished = true;
+            state.cv.notify_all();
             (state.responded.load(Ordering::SeqCst), st.ended)
         };
         if responded {
@@ -1604,6 +1605,8 @@ fn serve_stream(
     };
     let close = writer.clone();
     let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.finish());
+    // The engine handshake reads the request body under the handshake clock: a silent peer cannot park a worker for the stall, and a poll-sized read is retried rather than failed.
+    let reader = crate::proxy::HandshakeRead::new(reader, crate::budgets::handshake());
     crate::proxy::serve_sealed_carried_with(
         reader,
         writer,
@@ -1612,8 +1615,8 @@ fn serve_stream(
         &decryption,
         close,
         |_| {},
-        |_| {},
-        |_| {},
+        |reader| reader.rearm(crate::budgets::handshake()),
+        |reader| reader.disarm(),
     );
 }
 
