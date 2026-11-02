@@ -1261,9 +1261,8 @@ fn rung_of(carrier: &Carrier) -> Option<Rung> {
 fn stream_params(carrier: &Carrier) -> Option<(&str, u32)> {
     match carrier {
         Carrier::Ws { path, ed } => Some((path, *ed)),
-        Carrier::HttpUpgrade { path, .. } => Some((path, 0)),
         Carrier::Grpc(settings) => Some((settings.path.as_str(), 0)),
-        Carrier::HttpHeader { path } => Some((path, 0)),
+        Carrier::HttpUpgrade { path, .. } | Carrier::HttpHeader { path } => Some((path, 0)),
         Carrier::Xhttp { settings, .. } => Some((settings.path.as_str(), 0)),
         _ => None,
     }
@@ -13994,7 +13993,6 @@ fn dial_vmess_httpupgrade(
 ) -> bool {
     let rung = attempt.rung;
     let path = attempt.path;
-    let ed = attempt.ed;
     let Some((request, send, recv, response_key, response_iv, auth)) = crate::vmess::client_request(
         &vmess.id,
         vmess.cipher,
