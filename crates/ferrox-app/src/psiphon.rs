@@ -1845,7 +1845,7 @@ pub(crate) fn tactics(settings: Option<&Json>) -> Result<crate::psiphon_tactics:
 fn compartment32(text: &str, what: &str) -> Result<[u8; 32], String> {
     ferrox_core::b64::decode(text.as_bytes())
         .and_then(|bytes| bytes.try_into().ok())
-        .ok_or_else(|| format!("psiphon broker: {what} {text:?} is not 32 base64 bytes"))
+        .ok_or_else(|| format!("psiphon broker: {what} is not 32 base64 bytes"))
 }
 
 /// Send a client offer to the first broker the tactics payload names.
