@@ -8937,7 +8937,7 @@ fn spill_lane_step<R, W>(
     from: &Half<R>,
     to: &Half<W>,
     buffer: &mut RelayBuf,
-    ended: &RelayFinish,
+    ended: &Arc<RelayFinish>,
 ) -> Next
 where
     R: Read,
@@ -8953,6 +8953,7 @@ where
             if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                 Next::Done
             } else {
+                note_wait_finish(ended);
                 Next::Idle
             }
         }
@@ -9092,6 +9093,33 @@ pub(crate) fn take_wait_fd() -> Option<std::os::fd::RawFd> {
 #[cfg(unix)]
 pub(crate) fn forget_wait_fd() {
     WAIT_FD.with(|slot| slot.set(None));
+}
+
+#[cfg(unix)]
+thread_local! {
+    /// The flow a timed-out relay step belongs to: its sibling's end wakes the lane instead of a clock.
+    static WAIT_FINISH: std::cell::RefCell<Option<std::sync::Arc<RelayFinish>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Names the flow a timed-out step will park on, so ending the sibling can wake it directly.
+pub(crate) fn note_wait_finish(finish: &std::sync::Arc<RelayFinish>) {
+    #[cfg(unix)]
+    if relay_step_owns_poll() {
+        WAIT_FINISH.with(|slot| *slot.borrow_mut() = Some(std::sync::Arc::clone(finish)));
+    }
+    #[cfg(not(unix))]
+    let _ = finish;
+}
+
+#[cfg(unix)]
+pub(crate) fn take_wait_finish() -> Option<std::sync::Arc<RelayFinish>> {
+    WAIT_FINISH.with(|slot| slot.borrow_mut().take())
+}
+
+#[cfg(unix)]
+pub(crate) fn forget_wait_finish() {
+    WAIT_FINISH.with(|slot| slot.borrow_mut().take());
 }
 
 /// Scoped claim, so a step that returns or panics leaves the thread as it found it.
@@ -9775,6 +9803,9 @@ fn kcp_relay_metered(
                 }
                 Err(_) => Next::Done,
             };
+            if next == Next::Idle {
+                note_wait_finish(&forward);
+            }
             if next == Next::Done {
                 up.close();
             }
@@ -23175,7 +23206,10 @@ pub(crate) mod lane_pool {
     impl Lane {
         fn run(&mut self) -> Next {
             #[cfg(unix)]
-            crate::proxy::forget_wait_fd();
+            {
+                crate::proxy::forget_wait_fd();
+                crate::proxy::forget_wait_finish();
+            }
             if self.relay {
                 let _step = crate::proxy::RelayStep::enter();
                 (self.step)()
@@ -23191,6 +23225,14 @@ pub(crate) mod lane_pool {
         }
     }
 
+    /// The deadline a readiness park armed, or that it armed none because its sibling still lives.
+    #[cfg(all(test, unix))]
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    enum ReadyClock {
+        None,
+        At(std::time::Instant),
+    }
+
     struct Pool {
         ready: Mutex<VecDeque<Lane>>,
         parked: Mutex<Parked>,
@@ -23204,9 +23246,9 @@ pub(crate) mod lane_pool {
         /// Setup workers retire when the queue is empty, so their threads do not sit beside the relay lanes during a transfer.
         idle_exit: bool,
         /// Lanes whose source is a socket wait here; one reaper polls every descriptor and requeues
-        /// the lane that has bytes or whose check falls due.
+        /// the lane that has bytes, whose sibling ends, or whose grace falls due.
         #[cfg(unix)]
-        waiting: Mutex<Vec<Waiting>>,
+        waiting: Mutex<Vec<std::sync::Arc<ReadySlot>>>,
         #[cfg(unix)]
         wake: Option<WakePipe>,
         #[cfg(unix)]
@@ -23216,6 +23258,11 @@ pub(crate) mod lane_pool {
         ready_parks: std::sync::atomic::AtomicUsize,
         #[cfg(all(test, unix))]
         timer_parks: std::sync::atomic::AtomicUsize,
+        /// The deadline the last readiness park armed; `None` is a lane whose sibling has not ended.
+        #[cfg(all(test, unix))]
+        last_ready_due: Mutex<Option<ReadyClock>>,
+        #[cfg(all(test, unix))]
+        ended_wakes: std::sync::atomic::AtomicUsize,
         #[cfg(test)]
         stop: std::sync::atomic::AtomicBool,
         #[cfg(test)]
@@ -23229,13 +23276,61 @@ pub(crate) mod lane_pool {
         waking: bool,
     }
 
-    /// A lane parked on a socket: the descriptor wakes it when the peer writes, and the due keeps the
-    /// relay's end check inside its budget when nothing ever does.
+    /// A lane parked on a socket. The descriptor wakes it when the peer writes, its sibling's end
+    /// wakes it when it does not, and `due` is the grace a sibling's end leaves for the last reply.
     #[cfg(unix)]
-    struct Waiting {
-        due: std::time::Instant,
+    pub(crate) struct ReadySlot {
+        due: std::sync::OnceLock<Option<std::time::Instant>>,
         fd: std::os::fd::RawFd,
-        lane: Lane,
+        finish: Option<std::sync::Arc<crate::proxy::RelayFinish>>,
+        lane: Mutex<Option<Lane>>,
+        pool: std::sync::Weak<Pool>,
+    }
+
+    #[cfg(unix)]
+    impl ReadySlot {
+        fn due(&self) -> Option<std::time::Instant> {
+            self.due.get().copied().flatten()
+        }
+
+        fn is_empty(&self) -> bool {
+            self.lane
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_none()
+        }
+
+        fn take_lane(&self) -> Option<Lane> {
+            self.lane
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take()
+        }
+
+        fn put_lane(&self, lane: Lane) {
+            *self.lane.lock().unwrap_or_else(PoisonError::into_inner) = Some(lane);
+        }
+
+        /// The sibling ended: hand this lane back now, and wake the reaper so it drops the empty slot.
+        pub(crate) fn wake_ended(&self) {
+            let Some(lane) = self.take_lane() else {
+                return;
+            };
+            let Some(pool) = self.pool.upgrade() else {
+                return;
+            };
+            #[cfg(all(test, unix))]
+            pool.ended_wakes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            {
+                let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
+                ready.push_back(lane);
+            }
+            pool.notify.notify_all();
+            if let Some(wake) = pool.wake.as_ref() {
+                wake.post();
+            }
+        }
     }
 
     /// The descriptor a parker writes to wake the reaper for a lane the reaper has not seen yet.
@@ -23369,6 +23464,10 @@ pub(crate) mod lane_pool {
             ready_parks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(test, unix))]
             timer_parks: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(all(test, unix))]
+            last_ready_due: Mutex::new(None),
+            #[cfg(all(test, unix))]
+            ended_wakes: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             stop: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -23596,11 +23695,35 @@ pub(crate) mod lane_pool {
         if pool.wake.is_none() || stopping(pool) || !start_reaper(pool) {
             return Err(lane);
         }
-        let due = std::time::Instant::now() + crate::budgets::RELAY_RESPONSE_IDLE;
+        let slot = std::sync::Arc::new(ReadySlot {
+            due: std::sync::OnceLock::new(),
+            fd,
+            finish: crate::proxy::take_wait_finish(),
+            lane: Mutex::new(None),
+            pool: std::sync::Arc::downgrade(pool),
+        });
+        slot.put_lane(lane);
+        // Watch before reading the end, so a racing end either wakes this slot or leaves the grace it arms.
+        let ended = slot.finish.as_ref().map(|flow| flow.watch_park(&slot));
+        // A flow with a living sibling arms no clock; no sibling, or one already ended, keeps the check.
+        let due = match ended {
+            None => Some(std::time::Instant::now() + crate::budgets::RELAY_RESPONSE_IDLE),
+            Some(None) => None,
+            Some(Some(at)) => Some(at + crate::budgets::RELAY_RESPONSE_IDLE),
+        };
+        let _ = slot.due.set(due);
+        #[cfg(all(test, unix))]
+        {
+            *pool
+                .last_ready_due
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) =
+                Some(due.map_or(ReadyClock::None, ReadyClock::At));
+        }
         pool.waiting
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(Waiting { due, fd, lane });
+            .push(slot);
         if let Some(wake) = pool.wake.as_ref() {
             wake.post();
         }
@@ -23634,7 +23757,7 @@ pub(crate) mod lane_pool {
 
     #[cfg(unix)]
     fn reaper_loop(pool: &std::sync::Weak<Pool>) {
-        let mut waits: Vec<Waiting> = Vec::new();
+        let mut slots: Vec<std::sync::Arc<ReadySlot>> = Vec::new();
         loop {
             let Some(pool) = pool.upgrade() else {
                 return;
@@ -23647,9 +23770,11 @@ pub(crate) mod lane_pool {
             };
             {
                 let mut fresh = pool.waiting.lock().unwrap_or_else(PoisonError::into_inner);
-                waits.append(&mut fresh);
+                slots.append(&mut fresh);
             }
-            if waits.is_empty() {
+            // A sibling's end hands its lane back from another thread; drop the slot it emptied.
+            slots.retain(|slot| !slot.is_empty());
+            if slots.is_empty() {
                 let mut row = libc::pollfd {
                     fd: wake.read,
                     events: libc::POLLIN,
@@ -23659,23 +23784,28 @@ pub(crate) mod lane_pool {
                 wake.drain();
                 continue;
             }
+            // No armed deadline means no clock: the lanes wait for their descriptor or their sibling's end.
             let now = std::time::Instant::now();
-            let due = waits.iter().map(|wait| wait.due).min().unwrap_or(now);
-            let left = due.saturating_duration_since(now);
-            let timeout = if left.is_zero() {
-                0
-            } else {
-                libc::c_int::try_from(left.as_millis().max(1)).unwrap_or(libc::c_int::MAX)
+            let timeout = match slots.iter().filter_map(|slot| slot.due()).min() {
+                None => -1,
+                Some(due) => {
+                    let left = due.saturating_duration_since(now);
+                    if left.is_zero() {
+                        0
+                    } else {
+                        libc::c_int::try_from(left.as_millis().max(1)).unwrap_or(libc::c_int::MAX)
+                    }
+                }
             };
-            let mut rows: Vec<libc::pollfd> = Vec::with_capacity(waits.len() + 1);
+            let mut rows: Vec<libc::pollfd> = Vec::with_capacity(slots.len() + 1);
             rows.push(libc::pollfd {
                 fd: wake.read,
                 events: libc::POLLIN,
                 revents: 0,
             });
-            for wait in &waits {
+            for slot in &slots {
                 rows.push(libc::pollfd {
-                    fd: wait.fd,
+                    fd: slot.fd,
                     events: libc::POLLIN,
                     revents: 0,
                 });
@@ -23689,15 +23819,21 @@ pub(crate) mod lane_pool {
             wake.drain();
             let now = std::time::Instant::now();
             let mut ready = Vec::new();
-            let mut kept = Vec::with_capacity(waits.len());
-            for (index, wait) in waits.drain(..).enumerate() {
-                if rows[index + 1].revents != 0 || wait.due <= now {
-                    ready.push(wait.lane);
-                } else {
-                    kept.push(wait);
+            let mut kept = Vec::with_capacity(slots.len());
+            for (index, slot) in slots.drain(..).enumerate() {
+                if rows[index + 1].revents != 0 || slot.due().is_some_and(|due| due <= now) {
+                    let Some(lane) = slot.take_lane() else {
+                        continue;
+                    };
+                    if let Some(flow) = slot.finish.as_ref() {
+                        flow.unwatch_park(&slot);
+                    }
+                    ready.push(lane);
+                } else if !slot.is_empty() {
+                    kept.push(slot);
                 }
             }
-            waits = kept;
+            slots = kept;
             if !ready.is_empty() {
                 let mut queue = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
                 queue.extend(ready);
@@ -24122,6 +24258,107 @@ pub(crate) mod lane_pool {
             );
         }
 
+        /// A lane whose sibling still lives has no clock: ending the sibling wakes it, and only
+        /// then does the response-idle grace arm.
+        #[cfg(unix)]
+        #[test]
+        fn a_parked_lane_waits_for_its_sibling_not_the_clock() {
+            use std::io::Read as _;
+
+            let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+            let address = front.local_addr().expect("addr");
+            let _peer = crate::conn::Connection::connect(address).expect("connects");
+            let (served, _) = front.accept().expect("accepts");
+            served
+                .set_read_timeout(Some(Duration::from_millis(1)))
+                .expect("arms the read clock");
+            let flow = crate::proxy::RelayFinish::new(false, Arc::new(|| {}), None);
+            let step_flow = Arc::clone(&flow);
+            let done_flow = Arc::clone(&flow);
+            let completed = Arc::new(AtomicUsize::new(0));
+            let done = Arc::clone(&completed);
+            let mut source = Some(served);
+            let mut window = [0u8; 64];
+            let pool = TestPool(spawn_pool());
+            submit_to(
+                &pool,
+                Box::new(move || {
+                    let source = source.as_mut().expect("the lane keeps its source");
+                    match source.read(&mut window) {
+                        Err(error) if crate::proxy::is_timeout(&error) => {
+                            if step_flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                                Next::Done
+                            } else {
+                                crate::proxy::note_wait_finish(&step_flow);
+                                Next::Idle
+                            }
+                        }
+                        _ => Next::Done,
+                    }
+                }),
+                Box::new(move || {
+                    done_flow.lane_done();
+                    done.fetch_add(1, Ordering::Relaxed);
+                }),
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while pool.last_ready_due.lock().unwrap().is_none() && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(
+                *pool.last_ready_due.lock().unwrap(),
+                Some(ReadyClock::None),
+                "a lane whose sibling still lives armed a clock"
+            );
+            assert_eq!(pool.ended_wakes.load(Ordering::Relaxed), 0);
+            // A full response-idle window with no sibling end must cost the reaper no wake at all.
+            thread::sleep(Duration::from_millis(1200));
+            assert_eq!(
+                pool.ready_parks.load(Ordering::Relaxed),
+                1,
+                "the reaper woke a lane whose sibling still lives"
+            );
+            assert_eq!(completed.load(Ordering::Relaxed), 0);
+            submit_to(
+                &pool,
+                Box::new(|| Next::Done),
+                Box::new(crate::proxy::stream_lane_done(&flow)),
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while pool.ended_wakes.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(2));
+            }
+            assert_eq!(
+                pool.ended_wakes.load(Ordering::Relaxed),
+                1,
+                "the sibling's end never woke the parked lane"
+            );
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Some(ReadyClock::At(due)) = *pool.last_ready_due.lock().unwrap() {
+                    assert!(
+                        due > Instant::now(),
+                        "the woken lane kept a grace that had already run out"
+                    );
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "the woken lane never re-armed the response-idle grace"
+                );
+                thread::sleep(Duration::from_millis(2));
+            }
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while completed.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert_eq!(
+                completed.load(Ordering::Relaxed),
+                1,
+                "the parked lane outlived its grace"
+            );
+        }
+
         /// The accept path's handshake is a setup lane: its waits are bounded by the handshake
         /// budget, so it must not claim the relay clock a framed reader hands timeouts back to.
         #[test]
@@ -24378,6 +24615,9 @@ pub(crate) struct RelayFinish {
     left: AtomicU32,
     ended: AtomicBool,
     ended_at: Mutex<Option<std::time::Instant>>,
+    /// Lanes parked on the peer's read, so ending this flow hands its sibling back at once.
+    #[cfg(unix)]
+    parked: Mutex<Vec<std::sync::Weak<lane_pool::ReadySlot>>>,
     closed: AtomicBool,
     close_first: bool,
     close: Arc<dyn Fn() + Send + Sync>,
@@ -24398,6 +24638,8 @@ impl RelayFinish {
             left: AtomicU32::new(2),
             ended: AtomicBool::new(false),
             ended_at: Mutex::new(None),
+            #[cfg(unix)]
+            parked: Mutex::new(Vec::new()),
             closed: AtomicBool::new(false),
             close_first,
             close,
@@ -24419,6 +24661,45 @@ impl RelayFinish {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(std::time::Instant::now());
         self.ended.store(true, Ordering::Relaxed);
+        #[cfg(unix)]
+        {
+            let parked = std::mem::take(
+                &mut *self
+                    .parked
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            for slot in parked.into_iter().filter_map(|slot| slot.upgrade()) {
+                slot.wake_ended();
+            }
+        }
+    }
+
+    /// Registers a parked sibling and returns the end it must outlive, under the same hand as
+    /// `mark_ended` so a race lands either on the wake or on the armed grace.
+    #[cfg(unix)]
+    pub(crate) fn watch_park(
+        &self,
+        slot: &std::sync::Arc<lane_pool::ReadySlot>,
+    ) -> Option<std::time::Instant> {
+        let mut parked = self
+            .parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        parked.push(std::sync::Arc::downgrade(slot));
+        *self
+            .ended_at
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn unwatch_park(&self, slot: &std::sync::Arc<lane_pool::ReadySlot>) {
+        let weak = std::sync::Arc::downgrade(slot);
+        self.parked
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|parked| !parked.ptr_eq(&weak));
     }
 
     /// True once the sibling ended and `idle` has run since: a lane waits for the last reply that follows its sibling's end, then hands its thread back.
@@ -24498,7 +24779,7 @@ fn stream_lane_step<R, W>(
     from: &Half<R>,
     to: &Half<W>,
     buffer: &mut RelayBuf,
-    ended: &RelayFinish,
+    ended: &Arc<RelayFinish>,
 ) -> Next
 where
     R: Read,
@@ -24511,6 +24792,7 @@ where
             if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                 Next::Done
             } else {
+                note_wait_finish(ended);
                 Next::Idle
             }
         }
@@ -25468,6 +25750,9 @@ where
             let next = forward_finished(read, &mut buffer, &uplink, &mut at, || {
                 forward_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE)
             });
+            if next == Next::Idle {
+                note_wait_finish(&forward_flow);
+            }
             if next != Next::Done {
                 return next;
             }
@@ -25649,6 +25934,9 @@ pub(crate) fn relay_carried<R: Read + Send + 'static>(
                 }
                 _ => Next::Done,
             };
+            if next == Next::Idle {
+                note_wait_finish(&forward_flow);
+            }
             if next == Next::Done {
                 let _ = uplink.shutdown(Shutdown::Write);
             }
@@ -25683,6 +25971,9 @@ pub(crate) fn relay_carried<R: Read + Send + 'static>(
                 }
                 _ => Next::Done,
             };
+            if next == Next::Idle {
+                note_wait_finish(&upload_flow);
+            }
             if next == Next::Done {
                 // Half-close this direction's write only: `Both` would abort the sibling clone's still-open read and drop a pending download.
                 let _ = peer_write.shutdown(Shutdown::Write);

@@ -1646,6 +1646,9 @@ where
                 &forward_close,
                 &forward_flow,
             );
+            if next == Next::Idle {
+                crate::proxy::note_wait_finish(&forward_flow);
+            }
             if next == Next::Done {
                 if clean {
                     // A clean target EOF leaves the upload direction writing to this socket.
@@ -1670,7 +1673,7 @@ where
     let backward_close = std::sync::Arc::clone(close);
     crate::proxy::lane_pool::submit(
         Box::new(move || {
-            backward_step(
+            let next = backward_step(
                 &mut reader,
                 &mut answer,
                 &mut recv,
@@ -1678,7 +1681,11 @@ where
                 &backward_close,
                 &backward_flow,
                 &mut first,
-            )
+            );
+            if next == Next::Idle {
+                crate::proxy::note_wait_finish(&backward_flow);
+            }
+            next
         }),
         Box::new(crate::proxy::stream_lane_done(&flow)),
     );
@@ -1764,7 +1771,15 @@ fn backward_step<R: Read>(
     if let Some(waiting) = answer.as_mut() {
         match waiting.step(reader.carrier()) {
             AnswerStep::Done => *answer = None,
-            AnswerStep::Idle => return Next::Idle,
+            AnswerStep::Idle => {
+                // Parks past the grace are due at once, so a pending answer spends the grace here.
+                if !flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                    return Next::Idle;
+                }
+                close();
+                let _ = out.shutdown(Shutdown::Both);
+                return Next::Done;
+            }
             AnswerStep::Failed => {
                 close();
                 let _ = out.shutdown(Shutdown::Both);
