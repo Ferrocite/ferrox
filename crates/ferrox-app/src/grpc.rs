@@ -1239,18 +1239,17 @@ impl GrpcWriter {
     /// never half-sent and retried.
     /// The largest `MultiHunk` the peer can pay for in one take: its starting stream window, and
     /// the connection's own 65_535-byte opening window when this layer owns both.
-    fn multi_cap(&self) -> usize {
+    fn multi_cap(&self) -> u64 {
         let cap = *self
             .shared
             .init
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let cap = if self.shared.muxed {
+        if self.shared.muxed {
             cap
         } else {
             cap.min(65_535)
-        };
-        usize::try_from(cap).unwrap_or(usize::MAX)
+        }
     }
 
     fn try_multi_group<'a>(
@@ -3245,13 +3244,13 @@ mod tests {
         let data: Vec<u8> = (0..2 * HUNK).map(|i| (i % 251) as u8).collect();
         writer.write_all(&data).expect("writes the read");
         drop(writer);
-        let writes = seen.lock().expect("writes");
-        let wire: Vec<u8> = writes
+        let recorded = seen.lock().expect("writes");
+        let bytes: Vec<u8> = recorded
             .iter()
             .flat_map(|write| write.iter().copied())
             .collect();
-        let wire = wire.strip_prefix(MAGIC).unwrap_or(wire.as_slice());
-        let body = data_body(wire);
+        let bytes = bytes.strip_prefix(MAGIC).unwrap_or(bytes.as_slice());
+        let body = data_body(bytes);
         assert_eq!(
             message_count(&body),
             1,
