@@ -33,6 +33,11 @@ const DATA_FRAMES_PER_WRITE: usize = 8;
 
 const NO_PART: &[u8] = &[];
 
+/// One credit is one 26-byte write holding both `WINDOW_UPDATE` frames, the largest control frame queued, and a batch is one write.
+const CREDIT_FRAME: usize = 26;
+const CONTROL_MAX: usize = CREDIT_FRAME;
+const CONTROL_BATCH: usize = 8;
+
 /// A window's DATA frames held apart rather than staged together: each nine-byte head in its own
 /// slot and every payload still the caller's own slice, so one flush is one write whose bytes are
 /// the same frames written one at a time.
@@ -207,8 +212,126 @@ impl H2Stream {
     }
 }
 
+/// Control frames are written by their own thread: a `WINDOW_UPDATE` or ACK produced while
+/// reading must never wait on a data write the peer has not drained, or two bulk directions
+/// hold each other's reader.
+enum Control {
+    Inline,
+    Threaded(Arc<ControlQueue>),
+}
+
+/// The most control frames an unread peer may park before the connection ends: a peer that
+/// sends PINGs or empty SETTINGS while withholding reads put one element on the queue per
+/// inbound frame, so the backlog has to be bounded rather than grown.
+const CONTROL_QUEUE_MAX: usize = 1024;
+
+type SharedWriter = Arc<Mutex<Box<dyn crate::proxy::FrameWrite + Send>>>;
+
+struct ControlQueue {
+    frames: Mutex<VecDeque<(u8, [u8; CONTROL_MAX])>>,
+    go: Condvar,
+    stop: AtomicBool,
+    /// Set by the worker when its own write fails, so the connection it serves ends with it
+    /// instead of admitting frames no one will ever drain.
+    dead: Arc<AtomicBool>,
+}
+
+impl Control {
+    fn threaded(write: SharedWriter, dead: Arc<AtomicBool>) -> Self {
+        let queue = Arc::new(ControlQueue {
+            frames: Mutex::new(VecDeque::new()),
+            go: Condvar::new(),
+            stop: AtomicBool::new(false),
+            dead,
+        });
+        let worker = Arc::clone(&queue);
+        let spawned = std::thread::Builder::new()
+            .name("ferrox-h2-control".into())
+            .spawn(move || {
+                let mut batch = [0u8; CONTROL_MAX * CONTROL_BATCH];
+                loop {
+                    let total = {
+                        let mut queue =
+                            worker.frames.lock().unwrap_or_else(PoisonError::into_inner);
+                        while queue.is_empty() && !worker.stop.load(Ordering::SeqCst) {
+                            queue = worker
+                                .go
+                                .wait(queue)
+                                .unwrap_or_else(PoisonError::into_inner);
+                        }
+                        if worker.stop.load(Ordering::SeqCst) {
+                            return;
+                        }
+                        let mut used = 0;
+                        let mut total = 0;
+                        while used < CONTROL_BATCH {
+                            let Some((len, frame)) = queue.pop_front() else {
+                                break;
+                            };
+                            let at = total;
+                            batch[at..at + len as usize].copy_from_slice(&frame[..len as usize]);
+                            total += len as usize;
+                            used += 1;
+                        }
+                        total
+                    };
+                    let Ok(mut out) = write.lock() else {
+                        worker.dead.store(true, Ordering::SeqCst);
+                        return;
+                    };
+                    if !out.write_slices(&[&batch[..total]]) {
+                        worker.dead.store(true, Ordering::SeqCst);
+                        return;
+                    }
+                }
+            });
+        if spawned.is_ok() {
+            Control::Threaded(queue)
+        } else {
+            Control::Inline
+        }
+    }
+
+    /// Queue one frame, or answer `false` when the connection can no longer carry it: the
+    /// worker is gone, or the peer has let `CONTROL_QUEUE_MAX` frames sit unread. A caller
+    /// that gets `false` ends the connection rather than drop a credit on a live one.
+    fn send(&self, len: usize, frame: [u8; CONTROL_MAX]) -> bool {
+        match self {
+            Control::Inline => true,
+            Control::Threaded(queue) => {
+                if queue.dead.load(Ordering::SeqCst) || queue.stop.load(Ordering::SeqCst) {
+                    return false;
+                }
+                let mut frames = queue.frames.lock().unwrap_or_else(PoisonError::into_inner);
+                if frames.len() >= CONTROL_QUEUE_MAX {
+                    return false;
+                }
+                frames.push_back((len as u8, frame));
+                drop(frames);
+                queue.go.notify_one();
+                true
+            }
+        }
+    }
+
+    fn stop(&self) {
+        match self {
+            Control::Inline => {}
+            Control::Threaded(queue) => {
+                // The worker checks `stop` under `frames`, so it is stored under that guard and the notify follows: a bare store can land between the check and the wait.
+                {
+                    let _frames = queue.frames.lock().unwrap_or_else(PoisonError::into_inner);
+                    queue.stop.store(true, Ordering::SeqCst);
+                }
+                queue.go.notify_all();
+            }
+        }
+    }
+}
+
 pub(crate) struct H2Conn {
-    write: Mutex<Box<dyn crate::proxy::FrameWrite + Send>>,
+    write: SharedWriter,
+    control: Control,
     streams: Mutex<HashMap<u32, Arc<H2Stream>>>,
     sessions: Mutex<HashSet<String>>,
     session_of: Mutex<HashMap<u32, String>>,
@@ -218,7 +341,7 @@ pub(crate) struct H2Conn {
     decoder: Mutex<Decoder>,
     max_frame: Mutex<usize>,
     peer_initial: Mutex<u64>,
-    dead: AtomicBool,
+    dead: Arc<AtomicBool>,
     goaway: AtomicBool,
     refused: AtomicBool,
     /// The client half's transport: a client pumps frames on demand from its reader or a writer
@@ -231,6 +354,12 @@ pub(crate) struct H2Conn {
 impl std::fmt::Debug for H2Conn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("H2Conn").finish_non_exhaustive()
+    }
+}
+
+impl Drop for H2Conn {
+    fn drop(&mut self) {
+        self.control.stop();
     }
 }
 
@@ -492,6 +621,27 @@ impl H2Conn {
             return false;
         }
         true
+    }
+
+    /// An ACK the read path owes the peer: queued, so a blocked data write cannot park the reader.
+    fn send_control(&self, kind: u8, flags: u8, id: u32, body: &[u8]) -> bool {
+        if body.len() + 9 > CONTROL_MAX {
+            return false;
+        }
+        let mut frame = [0u8; CONTROL_MAX];
+        frame[..9].copy_from_slice(&frame_head(body.len(), kind, flags, id));
+        frame[9..9 + body.len()].copy_from_slice(body);
+        match &self.control {
+            Control::Inline => self.frame(kind, flags, id, body),
+            Control::Threaded(_) => {
+                if self.control.send(9 + body.len(), frame) {
+                    true
+                } else {
+                    self.dead.store(true, Ordering::SeqCst);
+                    false
+                }
+            }
+        }
     }
 
     /// Refuse the connection: the GOAWAY goes out now, and `refused` remembers that the peer still has to be given the window to read it.
@@ -796,11 +946,20 @@ impl H2Conn {
         out[18..22].copy_from_slice(&stream.to_be_bytes());
         out[22..26].copy_from_slice(&increment);
         // Consuming inbound bytes grants the peer more credit; our own send windows rise only from the peer's WINDOW_UPDATE, so crediting them here would let a bulk send outrun the window the peer gave and trip its flow control.
-        let Ok(mut write) = self.write.lock() else {
-            return;
-        };
-        if !write.write_slices(&[&out]) {
-            self.dead.store(true, Ordering::SeqCst);
+        match &self.control {
+            Control::Inline => {
+                let Ok(mut write) = self.write.lock() else {
+                    return;
+                };
+                if !write.write_slices(&[&out]) {
+                    self.dead.store(true, Ordering::SeqCst);
+                }
+            }
+            Control::Threaded(_) => {
+                if !self.control.send(CREDIT_FRAME, out) {
+                    self.dead.store(true, Ordering::SeqCst);
+                }
+            }
         }
     }
 
@@ -1029,7 +1188,7 @@ impl H2Conn {
                 self.wake.notify_all();
             }
         }
-        let _ = self.frame(T_SETTINGS, F_ACK, 0, &[]);
+        let _ = self.send_control(T_SETTINGS, F_ACK, 0, &[]);
     }
 }
 
@@ -1168,8 +1327,11 @@ pub(crate) fn connect_split<
     settings: &XhttpSettings,
     scheme: &str,
 ) -> Option<(H2StreamReader, crate::xhttp::XhttpWriter)> {
+    let dead = Arc::new(AtomicBool::new(false));
+    let write: SharedWriter = Arc::new(Mutex::new(Box::new(write)));
     let conn = Arc::new(H2Conn {
-        write: Mutex::new(Box::new(write)),
+        control: Control::threaded(Arc::clone(&write), Arc::clone(&dead)),
+        write,
         streams: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashSet::new()),
         session_of: Mutex::new(HashMap::new()),
@@ -1179,7 +1341,7 @@ pub(crate) fn connect_split<
         decoder: Mutex::new(Decoder::default()),
         max_frame: Mutex::new(16_384),
         peer_initial: Mutex::new(65_535),
-        dead: AtomicBool::new(false),
+        dead,
         goaway: AtomicBool::new(false),
         refused: AtomicBool::new(false),
         client_read: Some(Mutex::new(Box::new(read))),
@@ -1753,8 +1915,11 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                 let Some(write) = self.write.take() else {
                     return self.end();
                 };
+                let dead = Arc::new(AtomicBool::new(false));
+                let write: SharedWriter = Arc::new(Mutex::new(Box::new(write)));
                 let conn = Arc::new(H2Conn {
-                    write: Mutex::new(Box::new(write)),
+                    control: Control::threaded(Arc::clone(&write), Arc::clone(&dead)),
+                    write,
                     streams: Mutex::new(HashMap::new()),
                     sessions: Mutex::new(HashSet::new()),
                     session_of: Mutex::new(HashMap::new()),
@@ -1764,7 +1929,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     decoder: Mutex::new(Decoder::default()),
                     max_frame: Mutex::new(16_384),
                     peer_initial: Mutex::new(65_535),
-                    dead: AtomicBool::new(false),
+                    dead,
                     goaway: AtomicBool::new(false),
                     refused: AtomicBool::new(false),
                     client_read: None,
@@ -1892,7 +2057,7 @@ fn control_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: &[u8]) -> O
         }
         T_PING => {
             if flags & F_ACK == 0 && body.len() == 8 {
-                conn.frame(T_PING, F_ACK, 0, body);
+                conn.send_control(T_PING, F_ACK, 0, body);
             }
             Some(true)
         }
@@ -3128,14 +3293,17 @@ mod tests {
     }
 
     /// A connection with no streams and no peer: only what a call writes can be seen.
-    fn bare_conn() -> (Arc<H2Conn>, Arc<Mutex<Vec<u8>>>, Arc<AtomicUsize>) {
-        let written = Arc::new(Mutex::new(Vec::new()));
-        let slices = Arc::new(AtomicUsize::new(0));
-        let conn = Arc::new(H2Conn {
-            write: Mutex::new(Box::new(Counted {
-                written: Arc::clone(&written),
-                slices: Arc::clone(&slices),
-            })),
+    fn conn_with(write: Box<dyn crate::proxy::FrameWrite + Send>, threaded: bool) -> Arc<H2Conn> {
+        let write: SharedWriter = Arc::new(Mutex::new(write));
+        let dead = Arc::new(AtomicBool::new(false));
+        let control = if threaded {
+            Control::threaded(Arc::clone(&write), Arc::clone(&dead))
+        } else {
+            Control::Inline
+        };
+        Arc::new(H2Conn {
+            write,
+            control,
             streams: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashSet::new()),
             session_of: Mutex::new(HashMap::new()),
@@ -3145,13 +3313,25 @@ mod tests {
             decoder: Mutex::new(Decoder::default()),
             max_frame: Mutex::new(16_384),
             peer_initial: Mutex::new(65_535),
-            dead: AtomicBool::new(false),
+            dead,
             goaway: AtomicBool::new(false),
             refused: AtomicBool::new(false),
             client_read: None,
             raw: None,
             decryption: None,
-        });
+        })
+    }
+
+    fn bare_conn() -> (Arc<H2Conn>, Arc<Mutex<Vec<u8>>>, Arc<AtomicUsize>) {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let slices = Arc::new(AtomicUsize::new(0));
+        let conn = conn_with(
+            Box::new(Counted {
+                written: Arc::clone(&written),
+                slices: Arc::clone(&slices),
+            }),
+            false,
+        );
         (conn, written, slices)
     }
 
@@ -3285,6 +3465,188 @@ mod tests {
                 "both windows rise by the bytes consumed"
             );
             at += 13;
+        }
+    }
+
+    /// A writer whose first `write_slices` holds the lock until the test releases it, so a second
+    /// credit proves it queued instead of waiting behind a data write the peer has not drained.
+    struct Blocked {
+        written: Arc<Mutex<Vec<u8>>>,
+        entered: Arc<(Mutex<bool>, Condvar)>,
+        release: Arc<(Mutex<bool>, Condvar)>,
+        first: AtomicBool,
+    }
+
+    impl Write for Blocked {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Blocked {
+        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+            if !self.first.swap(true, Ordering::SeqCst) {
+                *self
+                    .entered
+                    .0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner) = true;
+                self.entered.1.notify_all();
+                let mut released = self
+                    .release
+                    .0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
+                while !*released {
+                    released = self
+                        .release
+                        .1
+                        .wait(released)
+                        .unwrap_or_else(PoisonError::into_inner);
+                }
+            }
+            parts.iter().all(|part| self.write_all(part).is_ok())
+        }
+    }
+
+    #[test]
+    fn a_credit_never_waits_on_a_blocked_data_write() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let conn = conn_with(
+            Box::new(Blocked {
+                written: Arc::clone(&written),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                first: AtomicBool::new(false),
+            }),
+            true,
+        );
+        conn.replenish(1, 16);
+        let mut in_write = entered.0.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*in_write {
+            in_write = entered
+                .1
+                .wait(in_write)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(in_write);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let sender_conn = Arc::clone(&conn);
+        thread::spawn(move || {
+            sender_conn.replenish(2, 16);
+            let _ = sender.send(());
+        });
+        assert_eq!(
+            receiver.recv_timeout(Duration::from_secs(2)),
+            Ok(()),
+            "a credit queued behind a data write instead of waiting for its lock"
+        );
+        *release.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        release.1.notify_all();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let len = written.lock().unwrap_or_else(PoisonError::into_inner).len();
+            if len == 52 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queued credit is written once the data write drains"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A writer that cannot carry a byte: the control worker's first batch fails.
+    struct Broken;
+
+    impl Write for Broken {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Broken {
+        fn write_slices(&mut self, _parts: &[&[u8]]) -> bool {
+            false
+        }
+    }
+
+    /// A peer that answers every inbound frame with a control frame and stops reading parks one
+    /// queue element per frame in the process; the backlog is capped and the connection ends, so
+    /// the memory a peer can hold is a constant rather than the length of its stream.
+    #[test]
+    fn a_control_flood_ends_the_connection_at_the_cap() {
+        const CAP: usize = 1024;
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let conn = conn_with(
+            Box::new(Blocked {
+                written,
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                first: AtomicBool::new(false),
+            }),
+            true,
+        );
+        conn.replenish(1, 16);
+        let mut in_write = entered.0.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*in_write {
+            in_write = entered
+                .1
+                .wait(in_write)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(in_write);
+        let mut queued = 0;
+        while !conn.dead.load(Ordering::SeqCst) && queued <= CAP + CONTROL_BATCH + 2 {
+            conn.replenish(2, 16);
+            queued += 1;
+        }
+        assert!(
+            conn.dead.load(Ordering::SeqCst),
+            "a flooded control queue ended the connection instead of growing without a bound; {queued} frames were attempted"
+        );
+        assert!(
+            queued >= CAP,
+            "the queue admitted its cap before refusing: {queued}"
+        );
+        assert!(
+            queued <= CAP + CONTROL_BATCH + 2,
+            "the queue refuses within one batch of its cap: {queued}"
+        );
+        *release.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        release.1.notify_all();
+    }
+
+    /// A worker whose own write fails ends the connection with it: before the change it exited
+    /// alone and `replenish` kept queueing frames nobody would drain.
+    #[test]
+    fn a_failed_control_write_ends_the_connection() {
+        let conn = conn_with(Box::new(Broken), true);
+        conn.replenish(1, 16);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !conn.dead.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a failed control write marks the connection dead"
+            );
+            thread::sleep(Duration::from_millis(5));
         }
     }
 
