@@ -3843,18 +3843,7 @@ fn serve_vless(
             );
         }
         Carrier::Xhttp { settings, .. } => {
-            let Ok(read) = stream.try_clone() else {
-                return;
-            };
-            serve_xhttp_stream(
-                read,
-                stream,
-                settings,
-                users,
-                freedom,
-                decryption,
-                |read, timeout| read.set_read_timeout(timeout).is_ok(),
-            );
+            serve_vless_xhttp(stream, settings, users, freedom, decryption);
         }
         Carrier::HttpHeader { path } => {
             serve_vless_httpheader(stream, users, path, freedom, decryption.cloned().as_deref());
@@ -7507,17 +7496,15 @@ fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static>(
 #[cfg(test)]
 pub(crate) static H2_DIAL_WITNESS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+/// The 24-byte preface a carrier's first read carries, put back in front of the connection, and
+/// whether it names HTTP/2: `None` when the handshake budget ran out before the connection spoke.
+fn sniff_xhttp<R: Read>(
     mut read: R,
-    write: W,
-    settings: &crate::xhttp::XhttpSettings,
-    users: &[VlessUser],
-    freedom: bool,
-    decryption: Option<&Arc<ferrox_core::vless_encryption::Server>>,
+    sealed: bool,
     mut arm: impl FnMut(&R, Option<Duration>) -> bool,
-) {
+) -> Option<(crate::xhttp::ChainReader<R>, bool)> {
     if !arm(&read, Some(budgets::handshake())) {
-        return;
+        return None;
     }
     let until = Instant::now() + budgets::handshake();
     let mut magic = [0u8; 24];
@@ -7534,19 +7521,30 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
             Err(_) => break,
         }
     }
-    let _ = arm(
-        &read,
-        if decryption.is_some() {
-            Some(RELAY_POLL)
-        } else {
-            None
-        },
-    );
+    let _ = arm(&read, if sealed { Some(RELAY_POLL) } else { None });
     if at < magic.len() && Instant::now() >= until {
-        return;
+        return None;
     }
-    let chained = crate::xhttp::ChainReader::new(magic[..at].to_vec(), read);
-    if at == magic.len() && magic == *crate::h2::MAGIC {
+    let h2 = at == magic.len() && magic == *crate::h2::MAGIC;
+    Some((
+        crate::xhttp::ChainReader::new(magic[..at].to_vec(), read),
+        h2,
+    ))
+}
+
+fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    users: &[VlessUser],
+    freedom: bool,
+    decryption: Option<&Arc<ferrox_core::vless_encryption::Server>>,
+    arm: impl FnMut(&R, Option<Duration>) -> bool,
+) {
+    let Some((chained, h2)) = sniff_xhttp(read, decryption.is_some(), arm) else {
+        return;
+    };
+    if h2 {
         #[cfg(test)]
         if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
             paths.push(settings.path.clone());
@@ -7567,6 +7565,47 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
         users,
         freedom,
         decryption.cloned().as_deref(),
+    );
+}
+
+/// A plaintext xHTTP connection: once the preface names HTTP/2 the demux becomes a lane parked on
+/// the socket, so a peer that never opens a stream costs a pool slot instead of the setup worker.
+fn serve_vless_xhttp(
+    stream: Connection,
+    settings: &crate::xhttp::XhttpSettings,
+    users: &[VlessUser],
+    freedom: bool,
+    decryption: Option<&Arc<ferrox_core::vless_encryption::Server>>,
+) {
+    let Ok(read) = stream.try_clone() else {
+        return;
+    };
+    let arm = |read: &Connection, timeout| read.set_read_timeout(timeout).is_ok();
+    // A sealed session's demux reads through a decryption the pool cannot poll, so it keeps the worker.
+    if decryption.is_some() {
+        return serve_xhttp_stream(read, stream, settings, users, freedom, decryption, arm);
+    }
+    let Some((chained, h2)) = sniff_xhttp(read, false, arm) else {
+        return;
+    };
+    if !h2 {
+        return serve_session_xhttp(chained, stream, settings, users, freedom, None);
+    }
+    #[cfg(test)]
+    if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
+        paths.push(settings.path.clone());
+    }
+    let _ = stream.set_read_timeout(Some(RELAY_POLL));
+    let mut step = crate::xhttp_h2::h2_xhttp_lane(chained, stream, settings, users, freedom, None);
+    let sniffing = crate::sniff::current();
+    let access = crate::accesslog::snapshot();
+    lane_pool::submit(
+        Box::new(move || {
+            crate::sniff::install_current(sniffing.clone());
+            let _flow = crate::accesslog::install_snapshot(access.clone());
+            step()
+        }),
+        Box::new(|| {}),
     );
 }
 
@@ -33580,6 +33619,79 @@ mod tests {
         assert!(
             grown < 2,
             "eight muxed connections grew the process by {grown} threads past the pools' caps and the one reaper: a demux thread per connection"
+        );
+    }
+
+    /// A plaintext xHTTP connection that sends the H2 preface and no stream hands its demux to a
+    /// lane: the setup workers that took the first eight still reach the ninth handshake.
+    #[test]
+    fn a_plaintext_h2_preface_releases_its_setup_worker() {
+        let id = [0x2Bu8; 16];
+        let users: Arc<[VlessUser]> = Arc::from(one_vless_user(&id));
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let settings = xhttp_settings("/p");
+        let queued = Arc::new(AtomicUsize::new(0));
+        let accepting = {
+            let users = Arc::clone(&users);
+            let queued = Arc::clone(&queued);
+            thread::spawn(move || {
+                for _ in 0..8 {
+                    let (stream, _) = front.accept().expect("accepts");
+                    let carrier = Carrier::Xhttp {
+                        settings: settings.clone(),
+                    };
+                    let users = Arc::clone(&users);
+                    let mut stream = Some(stream);
+                    lane_pool::submit_setup(
+                        Box::new(move || {
+                            if let Some(stream) = stream.take() {
+                                serve_vless(stream, &users, &carrier, true, None, None);
+                            }
+                            lane_pool::Next::Done
+                        }),
+                        Box::new(|| {}),
+                    );
+                    queued.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let mut peers: Vec<_> = (0..8)
+            .map(|_| Connection::connect(addr).expect("connects"))
+            .collect();
+        for peer in &mut peers {
+            peer.write_all(crate::h2::MAGIC)
+                .expect("writes the preface");
+            peer.flush().expect("flushes");
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        while queued.load(Ordering::SeqCst) < 8 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            queued.load(Ordering::SeqCst),
+            8,
+            "the accept loop did not hand every connection to a setup lane"
+        );
+        let ran = Arc::new(AtomicBool::new(false));
+        let witness = Arc::clone(&ran);
+        lane_pool::submit_setup(
+            Box::new(move || {
+                witness.store(true, Ordering::SeqCst);
+                lane_pool::Next::Done
+            }),
+            Box::new(|| {}),
+        );
+        let until = Instant::now() + Duration::from_secs(10);
+        while !ran.load(Ordering::SeqCst) && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let released = ran.load(Ordering::SeqCst);
+        drop(peers);
+        accepting.join().expect("joins");
+        assert!(
+            released,
+            "eight idle H2 connections held every setup worker: the ninth lane never ran"
         );
     }
 

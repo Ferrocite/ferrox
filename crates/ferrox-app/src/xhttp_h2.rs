@@ -2,8 +2,9 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
 
 use crate::h2::{
     block_encode, frame_head, write_frame, Decoder, E_FRAME_SIZE, E_PROTOCOL, E_REFUSED, F_ACK,
@@ -235,6 +236,9 @@ struct ControlQueue {
     frames: Mutex<VecDeque<(u8, [u8; CONTROL_MAX])>>,
     go: Condvar,
     stop: AtomicBool,
+    /// Frames queued or taken into a batch and not yet written: the shutdown grace starts from zero
+    /// here, so it begins after the last refusal is on the wire rather than before it.
+    pending: AtomicUsize,
     /// Set by the worker when its own write fails, so the connection it serves ends with it
     /// instead of admitting frames no one will ever drain.
     dead: Arc<AtomicBool>,
@@ -246,6 +250,7 @@ impl Control {
             frames: Mutex::new(VecDeque::new()),
             go: Condvar::new(),
             stop: AtomicBool::new(false),
+            pending: AtomicUsize::new(0),
             dead,
         });
         let worker = Arc::clone(&queue);
@@ -254,17 +259,20 @@ impl Control {
             .spawn(move || {
                 let mut batch = [0u8; CONTROL_MAX * CONTROL_BATCH];
                 loop {
-                    let total = {
+                    let (total, used) = {
                         let mut queue =
                             worker.frames.lock().unwrap_or_else(PoisonError::into_inner);
-                        while queue.is_empty() && !worker.stop.load(Ordering::SeqCst) {
+                        loop {
+                            if !queue.is_empty() {
+                                break;
+                            }
+                            if worker.stop.load(Ordering::SeqCst) {
+                                return;
+                            }
                             queue = worker
                                 .go
                                 .wait(queue)
                                 .unwrap_or_else(PoisonError::into_inner);
-                        }
-                        if worker.stop.load(Ordering::SeqCst) {
-                            return;
                         }
                         let mut used = 0;
                         let mut total = 0;
@@ -277,7 +285,7 @@ impl Control {
                             total += len as usize;
                             used += 1;
                         }
-                        total
+                        (total, used)
                     };
                     let Ok(mut out) = write.lock() else {
                         worker.dead.store(true, Ordering::SeqCst);
@@ -287,6 +295,7 @@ impl Control {
                         worker.dead.store(true, Ordering::SeqCst);
                         return;
                     }
+                    worker.pending.fetch_sub(used, Ordering::SeqCst);
                 }
             });
         if spawned.is_ok() {
@@ -311,10 +320,30 @@ impl Control {
                     return false;
                 }
                 frames.push_back((len as u8, frame));
+                queue.pending.fetch_add(1, Ordering::SeqCst);
                 drop(frames);
                 queue.go.notify_one();
                 true
             }
+        }
+    }
+
+    /// Waits for the queue and every batch already taken from it to be written, up to `grace`.
+    /// `false` is a peer that is not reading, so the shutdown has the deadline, not the write.
+    fn drained(&self, grace: Duration) -> bool {
+        let Control::Threaded(queue) = self else {
+            return true;
+        };
+        let until = std::time::Instant::now() + grace;
+        loop {
+            let pending = queue.pending.load(Ordering::SeqCst);
+            if pending == 0 {
+                return true;
+            }
+            if queue.dead.load(Ordering::SeqCst) || std::time::Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 
@@ -656,7 +685,8 @@ impl H2Conn {
         self.refused.store(true, Ordering::SeqCst);
         let mut goaway = [0u8; 8];
         goaway[4..].copy_from_slice(&code.to_be_bytes());
-        self.frame(T_GOAWAY, 0, 0, &goaway);
+        // Queued: the GOAWAY is the demux's answer, so it must not wait on a write the peer has not read.
+        let _ = self.send_control(T_GOAWAY, 0, 0, &goaway);
     }
 
     fn send_data(&self, stream: u32, mut payload: &[u8]) -> bool {
@@ -1062,7 +1092,8 @@ impl H2Conn {
         }
         self.wake.notify_all();
         self.end_session_of(stream);
-        let _ = self.frame(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
+        // Queued: a refusal is the demux's answer, so it must not wait on a write the peer has not read.
+        let _ = self.send_control(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
     }
 
     fn kill(&self) {
@@ -1830,6 +1861,27 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
     serve_h2_service(read, write, &service, decryption);
 }
 
+/// The plaintext xHTTP/2 demux as a lane step: a connection waiting for its peer's next frame
+/// parks its socket with the pool, so it does not hold the worker that accepted it.
+pub(crate) fn h2_xhttp_lane<
+    R: Read + Send + 'static,
+    W: crate::proxy::FrameWrite + Send + 'static,
+>(
+    read: R,
+    write: W,
+    settings: &XhttpSettings,
+    users: &[VlessUser],
+    freedom: bool,
+    decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+) -> impl FnMut() -> crate::proxy::lane_pool::Next + Send + 'static {
+    let service = XhttpService {
+        settings: settings.clone(),
+        users: Arc::from(users),
+        freedom,
+    };
+    h2_lane(read, write, service, decryption, None)
+}
+
 pub(crate) fn serve_h2_service<
     R: Read + Send + 'static,
     W: crate::proxy::FrameWrite + Send + 'static,
@@ -2081,10 +2133,19 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
     fn end(&mut self) -> Stepped {
         if let Some(conn) = self.conn.take() {
             if conn.refused.load(Ordering::SeqCst) {
-                // Closing while the peer's bytes sit unread aborts the connection, and the RST can swallow the GOAWAY written microseconds earlier; the grace is the window the peer takes it in.
-                std::thread::sleep(crate::budgets::goaway_grace());
+                // Closing while the peer's bytes sit unread aborts the connection, and the RST can swallow the GOAWAY a moment earlier; the grace is the window the peer takes it in, counted from the last queued refusal rather than before it, and spent off the lane.
+                let closing = Arc::clone(&conn);
+                let spawned = std::thread::Builder::new().spawn(move || {
+                    let _ = closing.control.drained(crate::budgets::goaway_grace());
+                    closing.kill();
+                });
+                if spawned.is_err() {
+                    // No thread can wait out the grace, so release the parked streams and sessions now.
+                    conn.kill();
+                }
+            } else {
+                conn.kill();
             }
-            conn.kill();
             conn.wake.notify_all();
         }
         Stepped::Done
@@ -3855,6 +3916,123 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    type BlockedConn = (
+        Arc<H2Conn>,
+        Arc<Mutex<Vec<u8>>>,
+        Arc<(Mutex<bool>, Condvar)>,
+    );
+
+    /// A connection whose one write is parked mid-frame, with the credit already queued, so a
+    /// connection-level frame proves whether it queues or waits for the peer to drain.
+    fn blocked_conn() -> BlockedConn {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let conn = conn_with(
+            Box::new(Blocked {
+                written: Arc::clone(&written),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                first: AtomicBool::new(false),
+            }),
+            true,
+        );
+        conn.replenish(1, 16);
+        let mut in_write = entered.0.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*in_write {
+            in_write = entered
+                .1
+                .wait(in_write)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(in_write);
+        (conn, written, release)
+    }
+
+    /// The demux answers a frame batch only after the peer's write drains: a refused stream's reset
+    /// and a refused connection's GOAWAY are queued, so neither waits behind the parked write.
+    #[test]
+    fn a_refusal_leaves_the_demux_without_a_write() {
+        let (conn, written, release) = blocked_conn();
+        let (reset, reset_ran) = std::sync::mpsc::channel();
+        let resetter = Arc::clone(&conn);
+        thread::spawn(move || {
+            resetter.reset_stream(2);
+            let _ = reset.send(());
+        });
+        let (refuse, refuse_ran) = std::sync::mpsc::channel();
+        let refuser = Arc::clone(&conn);
+        thread::spawn(move || {
+            refuser.refuse(E_PROTOCOL);
+            let _ = refuse.send(());
+        });
+        assert_eq!(
+            reset_ran.recv_timeout(Duration::from_secs(2)),
+            Ok(()),
+            "a refused stream waited for the peer to drain the write it already owed"
+        );
+        assert_eq!(
+            refuse_ran.recv_timeout(Duration::from_secs(2)),
+            Ok(()),
+            "a refused connection waited for the peer to drain the write it already owed"
+        );
+        *release.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        release.1.notify_all();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let len = written.lock().unwrap_or_else(PoisonError::into_inner).len();
+            if len == 56 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queued refusals are written once the parked write drains"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// A shutdown that stops the control worker still writes the GOAWAY queued before it: the peer
+    /// receives the refusal instead of a bare close when the block lifts after the grace.
+    #[test]
+    fn a_queued_goaway_survives_the_worker_stopping() {
+        let (conn, written, release) = blocked_conn();
+        conn.refuse(E_PROTOCOL);
+        conn.control.stop();
+        *release.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        release.1.notify_all();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let len = written.lock().unwrap_or_else(PoisonError::into_inner).len();
+            if len == 43 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker stopped with the GOAWAY still queued, so the peer never saw it"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The refusal grace is counted from the last write, not before it: a parked peer does not count
+    /// as drained, and the queue reads empty once its block lifts.
+    #[test]
+    fn the_goaway_grace_starts_when_the_queue_drains() {
+        let (conn, _written, release) = blocked_conn();
+        conn.refuse(E_PROTOCOL);
+        assert!(
+            !conn.control.drained(Duration::from_millis(20)),
+            "a parked write is not a drained queue"
+        );
+        *release.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        release.1.notify_all();
+        assert!(
+            conn.control.drained(Duration::from_secs(2)),
+            "the queue drains once the peer takes the writes"
+        );
     }
 
     /// A writer that cannot carry a byte: the control worker's first batch fails.
