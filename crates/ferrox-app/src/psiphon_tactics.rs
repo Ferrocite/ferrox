@@ -122,8 +122,9 @@ fn open_preamble(keyword: &[u8], reply: &mut [u8]) -> Result<usize, String> {
         .try_into()
         .map_err(|_| "psiphon tactics: response seed".to_owned())?;
     let mut stream = Rc4::new(&derive_key(&seed, keyword, b"client_to_server"));
-    stream.apply(&mut reply[SEED_LENGTH..header_len]);
-    let header = &reply[SEED_LENGTH..header_len];
+    let mut header = [0u8; 8];
+    header.copy_from_slice(&reply[SEED_LENGTH..header_len]);
+    stream.apply(&mut header);
     if header[..4] != MAGIC.to_be_bytes()[..] {
         return Err("psiphon tactics: response magic".to_owned());
     }
@@ -132,6 +133,7 @@ fn open_preamble(keyword: &[u8], reply: &mut [u8]) -> Result<usize, String> {
         .checked_add(padding)
         .filter(|start| *start <= reply.len())
         .ok_or_else(|| "psiphon tactics: response padding".to_owned())?;
+    reply[SEED_LENGTH..header_len].copy_from_slice(&header);
     stream.apply(&mut reply[header_len..body]);
     stream.apply(&mut reply[body..]);
     Ok(body)
@@ -405,6 +407,31 @@ mod tests {
         let (at, counts) = ferrox_core::alloc_count::measure(|| open_preamble(keyword, &mut reply));
         assert_eq!(&reply[at.expect("preamble")..], b"box");
         assert_eq!(counts.allocs, 0, "the reply is decrypted where it lies");
+    }
+
+    #[test]
+    fn a_rejected_preamble_leaves_the_reply_untouched() {
+        let keyword = b"key";
+        let mut client = Obfuscator::new(keyword, MAX_PADDING).expect("obfuscator");
+        let mut forged = client.preamble.clone();
+        forged.extend_from_slice(b"box");
+        forged[SEED_LENGTH] ^= 0xFF;
+        let before = forged.clone();
+        assert!(open_preamble(keyword, &mut forged).is_err());
+        assert_eq!(forged, before, "a bad magic leaves the reply as it was");
+
+        let seed = [0u8; SEED_LENGTH];
+        let mut stream = Rc4::new(&derive_key(&seed, keyword, b"client_to_server"));
+        let mut header = [0u8; 8];
+        header[..4].copy_from_slice(&MAGIC.to_be_bytes());
+        header[4..].copy_from_slice(&u32::MAX.to_be_bytes());
+        stream.apply(&mut header);
+        let mut overlong = seed.to_vec();
+        overlong.extend_from_slice(&[0u8; 32]);
+        overlong[SEED_LENGTH..SEED_LENGTH + 8].copy_from_slice(&header);
+        let before = overlong.clone();
+        assert!(open_preamble(keyword, &mut overlong).is_err());
+        assert_eq!(overlong, before, "bad padding leaves the reply as it was");
     }
 
     #[test]
