@@ -3878,6 +3878,82 @@ mod tests {
         }
     }
 
+    type BlockedConn = (
+        Arc<H2Conn>,
+        Arc<Mutex<Vec<u8>>>,
+        Arc<(Mutex<bool>, Condvar)>,
+    );
+
+    /// A connection whose one write is parked mid-frame, with the credit already queued, so a
+    /// connection-level frame proves whether it queues or waits for the peer to drain.
+    fn blocked_conn() -> BlockedConn {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let conn = conn_with(
+            Box::new(Blocked {
+                written: Arc::clone(&written),
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                first: AtomicBool::new(false),
+            }),
+            true,
+        );
+        conn.replenish(1, 16);
+        let mut in_write = entered.0.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*in_write {
+            in_write = entered
+                .1
+                .wait(in_write)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(in_write);
+        (conn, written, release)
+    }
+
+    /// The demux answers a frame batch only after the peer's write drains: a refused stream's reset
+    /// and a refused connection's GOAWAY are queued, so neither waits behind the parked write.
+    #[test]
+    fn a_refusal_leaves_the_demux_without_a_write() {
+        let (conn, written, release) = blocked_conn();
+        let (reset, reset_ran) = std::sync::mpsc::channel();
+        let resetter = Arc::clone(&conn);
+        thread::spawn(move || {
+            resetter.reset_stream(2);
+            let _ = reset.send(());
+        });
+        let (refuse, refuse_ran) = std::sync::mpsc::channel();
+        let refuser = Arc::clone(&conn);
+        thread::spawn(move || {
+            refuser.refuse(E_PROTOCOL);
+            let _ = refuse.send(());
+        });
+        assert_eq!(
+            reset_ran.recv_timeout(Duration::from_secs(2)),
+            Ok(()),
+            "a refused stream waited for the peer to drain the write it already owed"
+        );
+        assert_eq!(
+            refuse_ran.recv_timeout(Duration::from_secs(2)),
+            Ok(()),
+            "a refused connection waited for the peer to drain the write it already owed"
+        );
+        *release.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        release.1.notify_all();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let len = written.lock().unwrap_or_else(PoisonError::into_inner).len();
+            if len == 56 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the queued refusals are written once the parked write drains"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// A writer that cannot carry a byte: the control worker's first batch fails.
     struct Broken;
 
