@@ -104,6 +104,9 @@ impl ClientIdentity {
             ]
         };
         let listed = if offered.is_empty() {
+            if !tls13 {
+                return None;
+            }
             defaults
         } else {
             offered
@@ -650,10 +653,11 @@ impl<S: Stream> Session<S> {
         let Some(identity) = &self.client_cert else {
             return Ok(());
         };
-        if let Some(verify) = identity.verify12(offered, &self.transcript) {
-            self.send_plain(HANDSHAKE, &verify, [0x03, 0x03])?;
-            self.transcript.extend_from_slice(&verify);
-        }
+        let verify = identity
+            .verify12(offered, &self.transcript)
+            .ok_or_else(|| TlsError::BadCertificate("client certificate proof".to_owned()))?;
+        self.send_plain(HANDSHAKE, &verify, [0x03, 0x03])?;
+        self.transcript.extend_from_slice(&verify);
         Ok(())
     }
 
@@ -1674,20 +1678,34 @@ fn certificate_request13(body: &[u8]) -> Result<(Vec<u8>, Vec<u16>), TlsError> {
     Ok((context, signature_schemes(extensions)?))
 }
 
-/// A TLS 1.2 `CertificateRequest`: the signature schemes it offers, read past the certificate-type
-/// list in front of them.
+/// A TLS 1.2 `CertificateRequest`: the signature schemes it offers for the certificate types it
+/// names, as Go filters them, and the protocol's own list when it names no schemes.
 fn certificate_request12(body: &[u8]) -> Result<Vec<u16>, TlsError> {
     let truncated = || TlsError::Other("truncated CertificateRequest".to_owned());
-    let (&len, rest) = body.split_first().ok_or_else(truncated)?;
-    let rest = rest.get(usize::from(len)..).ok_or_else(truncated)?;
-    let (&[high, low], rest) = rest.split_first_chunk::<2>().ok_or_else(truncated)?;
-    let len = usize::from(u16::from_be_bytes([high, low]));
-    let rest = rest.get(..len).ok_or_else(truncated)?;
-    Ok(rest
+    let (&types, rest) = body.split_first().ok_or_else(truncated)?;
+    let types = rest.get(..usize::from(types)).ok_or_else(truncated)?;
+    let rest = &rest[types.len()..];
+    let listed = match rest.split_first_chunk::<2>() {
+        Some((&[high, low], rest)) => {
+            let len = usize::from(u16::from_be_bytes([high, low]));
+            rest.get(..len).ok_or_else(truncated)?
+        }
+        None => &[
+            0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x08, 0x07, 0x04, 0x01, 0x05, 0x01, 0x06, 0x01,
+        ][..],
+    };
+    let rsa = types.contains(&0x01);
+    let ecdsa = types.contains(&0x40);
+    Ok(listed
         .as_chunks::<2>()
         .0
         .iter()
         .map(|pair| u16::from_be_bytes(*pair))
+        .filter(|scheme| match *scheme {
+            0x0401 | 0x0501 | 0x0601 | 0x0804 | 0x0805 | 0x0806 => rsa,
+            0x0403 | 0x0503 | 0x0603 | 0x0807 => ecdsa,
+            _ => false,
+        })
         .collect())
 }
 
@@ -2980,4 +2998,23 @@ mod tests {
     }
 
     impl RecordAlignment for Tap {}
+
+    #[test]
+    fn a_tls12_request_keeps_only_the_schemes_its_certificate_types_allow() {
+        let body = [2, 0x01, 0x40, 0, 4, 0x04, 0x03, 0x04, 0x01];
+        assert_eq!(
+            certificate_request12(&body).expect("a request"),
+            [0x0403, 0x0401]
+        );
+        let rsa_only = [1, 0x01, 0, 4, 0x04, 0x03, 0x04, 0x01];
+        assert_eq!(
+            certificate_request12(&rsa_only).expect("a request"),
+            [0x0401]
+        );
+        let none = [0, 0, 4, 0x04, 0x03, 0x04, 0x01];
+        assert_eq!(
+            certificate_request12(&none).expect("a request"),
+            Vec::<u16>::new()
+        );
+    }
 }
