@@ -613,20 +613,33 @@ pub(crate) fn reality_mldsa(node: &Json, server: bool) -> Result<bool, String> {
     } else {
         ("mldsa65Verify", 1952)
     };
-    let Some(text) = reality
-        .get(field)
-        .and_then(Json::as_str)
-        .filter(|text| !text.is_empty())
-    else {
-        return Ok(false);
+    let text = match reality.get(field) {
+        Some(Json::Str(text)) if !text.is_empty() => text,
+        Some(Json::Str(_)) | None => return Ok(false),
+        Some(_) => return Err(format!(r#""{field}" is not a string"#)),
     };
-    if server && reality.get("privateKey").and_then(Json::as_str) == Some(text) {
-        return Err(format!(
-            r#""mldsa65Seed" and "privateKey" can not be the same value: {text}"#
-        ));
+    if server {
+        if let Some(private) = reality.get("privateKey").and_then(Json::as_str) {
+            let decode = |value: &str| {
+                let unwrapped: String = value
+                    .chars()
+                    .filter(|ch| !matches!(*ch, '\r' | '\n'))
+                    .collect();
+                key32(unwrapped.as_str())
+            };
+            if let Some(private) = decode(private) {
+                if Some(private) == decode(text) {
+                    return Err(
+                        r#""mldsa65Seed" and "privateKey" can not be the same value"#.to_owned(),
+                    );
+                }
+            }
+        }
     }
     if b64url_len(text) != Some(length) {
-        return Err(format!(r#"invalid "{field}": {text}"#));
+        return Err(format!(
+            r#"invalid "{field}": it does not decode to {length} bytes"#
+        ));
     }
     eprintln!(
         r#"reality: "{field}" is checked, and the ML-DSA-65 binding it names is not carried"#
@@ -2830,14 +2843,28 @@ mod tests {
         );
         assert_eq!(
             reality_mldsa(&server(&format!(r#","mldsa65Seed":"{private}""#)), true),
-            Err(format!(
-                r#""mldsa65Seed" and "privateKey" can not be the same value: {private}"#
-            ))
+            Err(r#""mldsa65Seed" and "privateKey" can not be the same value"#.to_owned())
+        );
+        // A CR/LF-wrapped spelling decodes to the same 32 bytes, so the alias check compares bytes.
+        assert_eq!(
+            reality_mldsa(
+                &server(&format!(
+                    r#","mldsa65Seed":"{}\r\n{}""#,
+                    &private[..21],
+                    &private[21..]
+                )),
+                true
+            ),
+            Err(r#""mldsa65Seed" and "privateKey" can not be the same value"#.to_owned())
+        );
+        assert_eq!(
+            reality_mldsa(&server(r#","mldsa65Seed":7"#), true),
+            Err(r#""mldsa65Seed" is not a string"#.to_owned())
         );
         let short = "A".repeat(42);
         assert_eq!(
             reality_mldsa(&server(&format!(r#","mldsa65Seed":"{short}""#)), true),
-            Err(format!(r#"invalid "mldsa65Seed": {short}"#))
+            Err(r#"invalid "mldsa65Seed": it does not decode to 32 bytes"#.to_owned())
         );
         let verify = "A".repeat(2603);
         assert_eq!(
@@ -2846,7 +2873,7 @@ mod tests {
         );
         assert_eq!(
             reality_mldsa(&client(&format!(r#","mldsa65Verify":"{seed}""#)), false),
-            Err(format!(r#"invalid "mldsa65Verify": {seed}"#))
+            Err(r#"invalid "mldsa65Verify": it does not decode to 1952 bytes"#.to_owned())
         );
         let tls = crate::json::parse(
             r#"{"streamSettings":{"security":"tls","tlsSettings":{"mldsa65Seed":"x"}}}"#,
