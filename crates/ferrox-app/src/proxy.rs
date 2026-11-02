@@ -14493,6 +14493,11 @@ fn tls_xhttp<S: Dialed, D: Dialed>(
     settings: &crate::xhttp::XhttpSettings,
     h2: bool,
 ) -> Option<(Box<dyn Read + Send>, crate::xhttp::XhttpWriter)> {
+    // A TLS peer that selected h2 expects the preface; `decideHTTPVersion` (dialer.go:82) takes the negotiated protocol, not the offer.
+    let h2 = h2
+        || session
+            .alpn()
+            .is_some_and(|alpn| alpn.eq_ignore_ascii_case(b"h2"));
     let (reader, writer, raw) = session.into_halves()?;
     if settings.mode == crate::xhttp::XhttpMode::StreamOne {
         if h2 {
