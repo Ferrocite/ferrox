@@ -4056,7 +4056,7 @@ pub(crate) fn serve_grpc_muxed(
     if !writer.send(&[0, 0]) {
         return;
     }
-    relay_sink_drained_with(
+    relay_sink_drained_queued(
         reader,
         &writer,
         &uplink,
@@ -25211,19 +25211,31 @@ impl<'a> Window<'a> {
 
 pub(crate) trait WindowRead: Read {
     fn read_window(&mut self) -> std::io::Result<Window<'_>>;
+
+    /// Whether a poll timeout is a lane the pool must park, rather than one that has to keep reading
+    /// because the sibling's window credit arrives on it.
+    fn parks_on_timeout(&self) -> bool {
+        false
+    }
 }
 
 /// A `Read` reader behind the window trait: its window is the buffer it just filled.
 pub(crate) struct Copied<R> {
     inner: R,
     buffer: RelayBuf,
+    parks: bool,
 }
 
 impl<R> Copied<R> {
     fn new(inner: R) -> Self {
+        Self::with_park(inner, false)
+    }
+
+    fn with_park(inner: R, parks: bool) -> Self {
         Self {
             inner,
             buffer: RelayBuf::new(),
+            parks,
         }
     }
 }
@@ -25238,6 +25250,10 @@ impl<R: Read> WindowRead for Copied<R> {
     fn read_window(&mut self) -> std::io::Result<Window<'_>> {
         let n = self.inner.read(self.buffer.as_mut())?;
         Ok(Window::one(self.buffer.filled(n)))
+    }
+
+    fn parks_on_timeout(&self) -> bool {
+        self.parks
     }
 }
 
@@ -25559,8 +25575,15 @@ where
                     echo_trace("relay bwd eof");
                     (Next::Done, false)
                 }
-                // A carrier read that times out is not an idle socket to park: the frame that grants the sibling's window arrives on this read, so the lane takes another turn at once rather than a quantum later.
-                Err(error) if is_timeout(&error) => (Next::More, true),
+                // A socket carrier read that times out takes another turn at once, because the frame granting the sibling's window arrives on it; a queued body parks instead, since its demux reads that frame.
+                Err(error) if is_timeout(&error) => (
+                    if reader.parks_on_timeout() {
+                        Next::Idle
+                    } else {
+                        Next::More
+                    },
+                    true,
+                ),
                 Err(error) => {
                     echo_trace(&format!("relay bwd read err {error:?}"));
                     (Next::Done, false)
@@ -25623,7 +25646,42 @@ pub(crate) fn relay_sink_drained_with<R, W, F, E>(
     writer: &W,
     peer: &Connection,
     on_reader_done: F,
+    request_ended: E,
+) -> Option<Arc<RelayFinish>>
+where
+    R: Read + Send + 'static,
+    W: CarrierSink,
+    F: FnOnce(&mut R) + Send + 'static,
+    E: FnMut(&mut R) -> bool + Send + 'static,
+{
+    relay_sink_poll(reader, writer, peer, on_reader_done, request_ended, false)
+}
+
+/// The same relay over a reader whose bytes wait in a queue another thread fills: a poll timeout
+/// parks the lane instead of keeping a worker reading a socket that carries no credit for it.
+pub(crate) fn relay_sink_drained_queued<R, W, F, E>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+    on_reader_done: F,
+    request_ended: E,
+) -> Option<Arc<RelayFinish>>
+where
+    R: Read + Send + 'static,
+    W: CarrierSink,
+    F: FnOnce(&mut R) + Send + 'static,
+    E: FnMut(&mut R) -> bool + Send + 'static,
+{
+    relay_sink_poll(reader, writer, peer, on_reader_done, request_ended, true)
+}
+
+fn relay_sink_poll<R, W, F, E>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+    on_reader_done: F,
     mut request_ended: E,
+    parks: bool,
 ) -> Option<Arc<RelayFinish>>
 where
     R: Read + Send + 'static,
@@ -25632,7 +25690,7 @@ where
     E: FnMut(&mut R) -> bool + Send + 'static,
 {
     relay_ordered::<Copied<R>, W, _, _, CLOSE_AFTER_JOIN, true>(
-        Copied::new(reader),
+        Copied::with_park(reader, parks),
         writer,
         peer,
         move |reader: &mut Copied<R>| on_reader_done(&mut reader.inner),
