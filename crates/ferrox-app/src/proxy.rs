@@ -2207,14 +2207,15 @@ impl Runtime {
 
     /// Force a balancer's pick; an empty target hands it back to the strategy. A forced target that
     /// a server inbound's rules can reach must still dial direct, so a non-direct pick is refused and
-    /// the previous one restored rather than leaving a proven table pointing elsewhere.
+    /// the previous one restored rather than leaving a proven table pointing elsewhere. The write
+    /// lock serializes overrides and keeps a pick from seeing a target before its proof.
     pub(crate) fn override_balancer(&self, tag: &str, target: &str) -> Result<(), String> {
         let Some(route) = &self.route else {
             return Err("cannot find tag".to_owned());
         };
         let routing = route
             .routing
-            .read()
+            .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(balancer) = routing.balancer(tag) else {
             return Err("cannot find tag".to_owned());
