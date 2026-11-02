@@ -66,9 +66,15 @@ impl Tactics {
         obfuscator.obfuscate(&mut boxed);
         let mut body = obfuscator.preamble.clone();
         body.extend_from_slice(&boxed);
-        let reply = psiphon_meek::post(&keys.meek, "/", Some("tactics"), &body, timeout, proxy)?;
-        let reply = open_preamble(&keyword, &reply)?;
-        let plain = open(&keys.public_key, &ephemeral, &reply, RESPONSE_NONCE)?;
+        let mut reply =
+            psiphon_meek::post(&keys.meek, "/", Some("tactics"), &body, timeout, proxy)?;
+        let boxed = open_preamble(&keyword, &mut reply)?;
+        let plain = open(
+            &keys.public_key,
+            &ephemeral,
+            &reply[boxed..],
+            RESPONSE_NONCE,
+        )?;
         parse_payload(&plain)
     }
 }
@@ -105,29 +111,27 @@ impl Obfuscator {
     }
 }
 
-/// Strip the server's seed message and decrypt the boxed payload behind it.
-fn open_preamble(keyword: &[u8], reply: &[u8]) -> Result<Vec<u8>, String> {
+/// Strip the server's seed message and decrypt the boxed payload behind it, in place: the box
+/// starts at the returned offset.
+fn open_preamble(keyword: &[u8], reply: &mut [u8]) -> Result<usize, String> {
     let header_len = SEED_LENGTH + 8;
     if reply.len() < header_len {
         return Err("psiphon tactics: response is too short".to_owned());
     }
-    let seed = &reply[..SEED_LENGTH];
-    let mut stream = Rc4::new(&derive_key(seed, keyword, b"client_to_server"));
-    let mut header = reply[SEED_LENGTH..header_len].to_vec();
-    stream.apply(&mut header);
+    let seed: [u8; SEED_LENGTH] = reply[..SEED_LENGTH]
+        .try_into()
+        .map_err(|_| "psiphon tactics: response seed".to_owned())?;
+    let mut stream = Rc4::new(&derive_key(&seed, keyword, b"client_to_server"));
+    stream.apply(&mut reply[SEED_LENGTH..]);
+    let header = &reply[SEED_LENGTH..header_len];
     if header[..4] != MAGIC.to_be_bytes()[..] {
         return Err("psiphon tactics: response magic".to_owned());
     }
     let padding = u32::from_be_bytes(header[4..8].try_into().unwrap_or([0; 4])) as usize;
-    let body = header_len
+    header_len
         .checked_add(padding)
         .filter(|start| *start <= reply.len())
-        .ok_or_else(|| "psiphon tactics: response padding".to_owned())?;
-    let mut padding = reply[header_len..body].to_vec();
-    stream.apply(&mut padding);
-    let mut rest = reply[body..].to_vec();
-    stream.apply(&mut rest);
-    Ok(rest)
+        .ok_or_else(|| "psiphon tactics: response padding".to_owned())
 }
 
 /// Box the request with the server's tactics public key, prepending the
@@ -395,7 +399,9 @@ mod tests {
         client.obfuscate(&mut body);
         let mut reply = client.preamble.clone();
         reply.extend_from_slice(&body);
-        assert_eq!(open_preamble(keyword, &reply).expect("preamble"), b"box");
+        let (at, counts) = ferrox_core::alloc_count::measure(|| open_preamble(keyword, &mut reply));
+        assert_eq!(&reply[at.expect("preamble")..], b"box");
+        assert_eq!(counts.allocs, 0, "the reply is decrypted where it lies");
     }
 
     #[test]
