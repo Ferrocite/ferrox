@@ -328,8 +328,12 @@ def main(argv=None):
                 engine.get("runs")
                 for engine in cell.get("engines", [])
             )
+            throughput = (
+                cell.get("workload", {}).get("traffic")
+                in ("upload", "download", "full-duplex")
+            )
             check(
-                not ran or cell.get("harness_ceilings_mib_s"),
+                not ran or cell.get("harness_ceilings_mib_s") or not throughput,
                 f"{scenario['id']}: engines ran but no harness ceiling was recorded",
             )
     check_spread(results_doc)

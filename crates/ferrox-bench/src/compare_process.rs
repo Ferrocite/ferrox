@@ -58,6 +58,12 @@ impl Workload {
         (self.iterations * self.payload_size) as u64
     }
 
+    /// The one-hop ceiling is a TCP generator, so it bounds only the traffic that
+    /// is a TCP stream: a UDP or latency cell has no stream to compare it against.
+    fn measures_ceiling(&self) -> bool {
+        matches!(self.traffic.as_str(), "upload" | "download" | "full-duplex")
+    }
+
     fn total_bytes(&self) -> u64 {
         let flows = self.connections as u64;
         let datagrams = self.iterations as u64;
@@ -1201,7 +1207,7 @@ pub fn run(
     let (names, skipped) = participant_names(engines, workload);
 
     'measures: for repeat in 1..=repeats {
-        if measure_ceiling {
+        if measure_ceiling && workload.measures_ceiling() {
             if let Ok(ceiling) = parity::harness_ceiling(
                 workload.connections,
                 workload.payload_size,

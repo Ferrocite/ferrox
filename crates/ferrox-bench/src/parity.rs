@@ -2793,11 +2793,17 @@ fn emit(
     expect: u64,
 ) -> Option<String> {
     let _ = index;
-    let mut buffer = Vec::with_capacity(DOWNLOAD_CHUNK);
-    while buffer.len() < DOWNLOAD_CHUNK {
-        buffer.extend_from_slice(pattern);
+    if pattern.is_empty() {
+        return Some("the sink has no pattern to emit".to_owned());
     }
-    buffer.truncate(DOWNLOAD_CHUNK);
+    // A whole number of periods keeps the phase across the chunk boundary.
+    let block = if pattern.len() >= DOWNLOAD_CHUNK {
+        pattern.to_vec()
+    } else {
+        let len = (DOWNLOAD_CHUNK / pattern.len()) * pattern.len();
+        pattern.iter().copied().cycle().take(len).collect()
+    };
+    let buffer = block;
     let mut sent = 0u64;
     while sent < expect {
         let take =
@@ -4053,6 +4059,26 @@ mod tests {
         assert!(peer.is_ok(), "{peer:?}");
         assert_eq!(stopped, None, "both directions completed");
         assert_eq!((sent, received), (bytes, bytes), "every byte moved");
+    }
+
+    /// A pattern shorter than the write chunk must keep its phase past 64 KiB.
+    #[test]
+    fn a_ceiling_emit_keeps_phase_past_the_chunk() {
+        let Ok(listener) = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)) else {
+            return;
+        };
+        let addr = listener.local_addr().expect("has an address");
+        let pattern = Arc::new(bulk_pattern_template(1200));
+        let bytes = 2 * DOWNLOAD_CHUNK as u64 + 736;
+        let sink_pattern = Arc::clone(&pattern);
+        let sink = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("the reader connects");
+            emit(stream, &sink_pattern, 0, bytes)
+        });
+        let mut reader = TcpStream::connect(addr).expect("connects to the sink");
+        let read = read_validated(&mut reader, &pattern, bytes).expect("the stream is the pattern");
+        assert_eq!(read, bytes);
+        assert!(sink.join().expect("the sink finishes").is_none());
     }
 
     #[test]
