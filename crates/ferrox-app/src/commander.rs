@@ -563,6 +563,10 @@ impl Api {
 
     /// Append or replace the live rule table; the reference answers a bare status, so does this.
     fn add_rule(&self, request: &[u8]) -> Result<Vec<u8>, (u32, String)> {
+        let _mutation = self
+            .mutation
+            .lock()
+            .map_err(|_| (13, "commander state is unavailable".to_owned()))?;
         let (rules, append) =
             crate::xray_pb::add_rule_request(request).map_err(|reason| (2, reason))?;
         self.runtime()?
@@ -710,6 +714,9 @@ impl Api {
                     format!("inbound `{tag}` listener at {address} did not close"),
                 ));
             }
+        }
+        if let Ok(runtime) = self.runtime() {
+            runtime.forget_server_inbound(&tag);
         }
         Ok(Vec::new())
     }
