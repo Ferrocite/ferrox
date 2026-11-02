@@ -31643,6 +31643,42 @@ mod tests {
         assert_eq!(served, 0, "the dynamic inbound is refused, not served");
     }
 
+    #[test]
+    fn a_dynamic_server_inbound_is_proved_before_a_later_rule_is_published() {
+        let root = crate::json::parse(
+            r#"{"outbounds":[{"tag":"direct","protocol":"freedom"},{"tag":"blocked","protocol":"blackhole"}],"routing":{"rules":[{"type":"field","ruleTag":"seed","inboundTag":["other"],"outboundTag":"blocked"}]}}"#,
+        )
+        .expect("parses");
+        let routing = crate::router::Routing::parse_in(&root, Vec::new())
+            .expect("parses")
+            .expect("routing");
+        let portals = Arc::new(crate::reverse::Portals::default());
+        let shared = route_shared(&root, routing, &portals, None).expect("shared");
+        let port = free_port();
+        let dynamic = crate::json::parse(&format!(
+            r#"{{"inbounds":[{{"tag":"dyn","protocol":"vless","listen":"127.0.0.1","port":{port},"settings":{{"clients":[{{"id":"{ID}"}}]}}}}]}}"#
+        ))
+        .expect("parses");
+        let runtime = Runtime::new(None, Some(Arc::clone(&shared)), false, Arc::clone(&portals));
+        let api = crate::commander::Api::new(crate::commander::ApiConfig::default());
+        let seed = crate::xray_pb::Seed::default();
+        assert_eq!(
+            serve_dynamic_inbounds(&runtime, &dynamic, &seed, &api),
+            1,
+            "the dynamic vless inbound is served direct"
+        );
+        let rules = crate::json::parse(
+            r#"[{"type":"field","inboundTag":["dyn"],"outboundTag":"blocked"}]"#,
+        )
+        .expect("parses");
+        assert_eq!(
+            runtime.add_rules(rules.as_arr().expect("rules"), true),
+            Err("a rule for inbound dyn targets `blocked`, which the server inbound serves direct"
+                .to_owned()),
+            "the rule that sends the dynamic inbound to a blackhole is refused"
+        );
+    }
+
     /// A `process` rule follows the socket the client really holds: the peer a PROXY header named
     /// belongs to no local process and must not borrow this one, while routing still reads it.
     #[cfg(target_os = "linux")]
