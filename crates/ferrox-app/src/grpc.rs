@@ -1057,50 +1057,92 @@ impl GrpcWriter {
         batch.flush_blocking(&self.shared)
     }
 
-    /// The blocking writer's `MultiHunk` path: the same groups as `try_send_multi`, retried from the
-    /// last completed group when the peer's window has no room for the next one.
+    /// The blocking writer's `MultiHunk` path: the same groups as `try_send_multi`, but a message's
+    /// whole window is taken before its first frame and a transport that cannot take the batch is
+    /// drained before the retry.
     fn send_multi(&self, data: &[u8], payload: usize) -> bool {
-        let mut at = 0;
-        while at < data.len() {
-            match self.try_send_multi(&data[at..], payload) {
-                crate::proxy::Push::Took(took) if took > 0 && took <= data.len() - at => at += took,
-                crate::proxy::Push::Parked => {
-                    if !self.wait_credit() {
-                        return false;
-                    }
+        let cap = self.multi_cap();
+        let wide = usize::try_from(cap).unwrap_or(usize::MAX);
+        let payload = payload.min(wide.saturating_sub(16).max(1));
+        let mut batch = Gather::new();
+        let mut lengths = [0usize; FRAMES_PER_WRITE];
+        let mut count = 0usize;
+        let mut group_start = 0usize;
+        let mut payload_len = 0usize;
+        let mut prefix_len = 5usize;
+        for piece in data.chunks(payload) {
+            let add = 1 + varint_len(piece.len() as u64);
+            let total = prefix_len + add + payload_len + piece.len();
+            if count > 0 && (count == FRAMES_PER_WRITE || total as u64 > cap) {
+                if !self.send_multi_group(
+                    &data[group_start..group_start + payload_len],
+                    &lengths[..count],
+                    &mut batch,
+                ) {
+                    return false;
                 }
-                crate::proxy::Push::Took(_) | crate::proxy::Push::Lost => return false,
+                group_start += payload_len;
+                payload_len = 0;
+                count = 0;
+                prefix_len = 5;
             }
+            lengths[count] = piece.len();
+            count += 1;
+            payload_len += piece.len();
+            prefix_len += add;
         }
-        true
+        if count > 0
+            && !self.send_multi_group(
+                &data[group_start..group_start + payload_len],
+                &lengths[..count],
+                &mut batch,
+            )
+        {
+            return false;
+        }
+        batch.flush_blocking(&self.shared)
     }
 
-    /// Waits for the peer to move either window, or gives up at the relay stall.
-    fn wait_credit(&self) -> bool {
-        let deadline = Instant::now() + crate::budgets::relay_stall();
-        let mut send = self
-            .shared
-            .send
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        loop {
-            if self.shared.dead.load(Ordering::SeqCst) {
-                return false;
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left.is_zero() {
-                return false;
-            }
-            let (guard, waited) = self
-                .shared
-                .wake
-                .wait_timeout(send, left.min(crate::budgets::RELAY_POLL))
-                .unwrap_or_else(PoisonError::into_inner);
-            send = guard;
-            if !waited.timed_out() {
-                return true;
-            }
+    /// Adds one `MultiHunk` message to a blocking batch: its window is taken whole before its first
+    /// frame, and a batch the transport refuses is drained and paid for again by `flush_blocking`.
+    fn send_multi_group<'a>(
+        &self,
+        payload: &'a [u8],
+        lengths: &[usize],
+        batch: &mut Gather<'a>,
+    ) -> bool {
+        let inner: usize = lengths
+            .iter()
+            .map(|&len| 1 + varint_len(len as u64) + len)
+            .sum();
+        let total = 5 + inner;
+        if batch.used + lengths.len() > FRAMES_PER_WRITE && !batch.flush_blocking(&self.shared) {
+            return false;
         }
+        if !self.credit(batch, total as u64) {
+            return false;
+        }
+        let mut prefix = [0u8; 16];
+        let mut offset = 0;
+        for (at, &len) in lengths.iter().enumerate() {
+            let mut end = 0;
+            if at == 0 {
+                prefix[0] = 0;
+                prefix[1..5].copy_from_slice(&(inner as u32).to_be_bytes());
+                end = 5;
+            }
+            prefix[end] = 0x0A;
+            end += 1;
+            end += write_varint(&mut prefix[end..], len as u64);
+            batch.add(
+                self.stream,
+                0,
+                &prefix[..end],
+                &payload[offset..offset + len],
+            );
+            offset += len;
+        }
+        true
     }
 
     /// The same frames as `send`, but a window the peer has not granted parks the bytes instead of
@@ -3255,6 +3297,63 @@ mod tests {
         assert!(
             body.len() > HUNK,
             "the message carries more than one element"
+        );
+    }
+
+    /// A transport whose first offer is refused because its paced tail is full: the blocking writer
+    /// must settle that tail and retry the same group, not wait for a peer credit it already has.
+    #[test]
+    fn a_multi_mode_dial_writer_drains_a_full_tail_before_retrying() {
+        struct Paced {
+            refused: bool,
+            got: Arc<Mutex<Vec<u8>>>,
+        }
+        impl std::io::Write for Paced {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.got.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::proxy::FrameWrite for Paced {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                matches!(self.offer_slices(parts), Accepted::All)
+            }
+            fn offer_slices(&mut self, parts: &[&[u8]]) -> Accepted {
+                if self.refused {
+                    self.refused = false;
+                    return Accepted::Full;
+                }
+                let mut got = self.got.lock().unwrap();
+                for part in parts {
+                    got.extend_from_slice(part);
+                }
+                Accepted::All
+            }
+            fn settle(&mut self) -> Settle {
+                Settle::Clear
+            }
+        }
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let writer = multi_writer_over(
+            Paced {
+                refused: true,
+                got: Arc::clone(&got),
+            },
+            HUNK,
+            65_535,
+            65_535,
+        );
+        let data: Vec<u8> = (0..2 * HUNK).map(|i| (i % 251) as u8).collect();
+        assert!(writer.send(&data), "the drain leaves the retry its group");
+        let body = data_body(&got.lock().unwrap());
+        let elements: Vec<&[u8]> = data.chunks(message_payload(HUNK - 1)).collect();
+        assert_eq!(
+            body,
+            multi_message(&elements),
+            "the retry repeats no element"
         );
     }
 
