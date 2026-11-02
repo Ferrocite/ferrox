@@ -303,16 +303,15 @@ impl Reply {
     }
 }
 
-/// Exact request bytes, no defaults: challenge and API send different agents and accepts, so callers write them.
-#[must_use]
-pub(crate) fn request(
+/// Place the request line, `Host`, the caller's fields and the declared length of the body that follows.
+fn request_head_into(
+    out: &mut Vec<u8>,
     method: &str,
     host: &str,
     path: &str,
     headers: &[(&str, &str)],
-    body: &[u8],
-) -> Vec<u8> {
-    let mut out = Vec::with_capacity(256 + body.len());
+    body_len: usize,
+) {
     out.extend_from_slice(method.as_bytes());
     out.push(b' ');
     out.extend_from_slice(path.as_bytes());
@@ -328,7 +327,7 @@ pub(crate) fn request(
     out.extend_from_slice(b"Content-Length: ");
     let mut digits = [0u8; 20];
     let mut at = digits.len();
-    let mut left = body.len();
+    let mut left = body_len;
     loop {
         at -= 1;
         digits[at] = b'0' + u8::try_from(left % 10).unwrap_or(0);
@@ -339,6 +338,33 @@ pub(crate) fn request(
     }
     out.extend_from_slice(&digits[at..]);
     out.extend_from_slice(b"\r\n\r\n");
+}
+
+/// The request head alone, for a writer that takes the body beside it instead of after it.
+#[must_use]
+pub(crate) fn request_head(
+    method: &str,
+    host: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body_len: usize,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256);
+    request_head_into(&mut out, method, host, path, headers, body_len);
+    out
+}
+
+/// Exact request bytes, no defaults: challenge and API send different agents and accepts, so callers write them.
+#[must_use]
+pub(crate) fn request(
+    method: &str,
+    host: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(256 + body.len());
+    request_head_into(&mut out, method, host, path, headers, body.len());
     out.extend_from_slice(body);
     out
 }
@@ -1111,6 +1137,48 @@ mod tests {
         assert!(text.contains("\r\nAccept: application/json\r\n"));
         assert!(text.contains("\r\nX-A: 1\r\n"));
         assert!(text.ends_with("\r\nContent-Length: 2\r\n\r\n{}"));
+    }
+
+    /// The head beside its body is the one request, at every length the decimal count reaches.
+    #[test]
+    fn a_head_and_its_body_are_the_whole_request() {
+        for len in [0usize, 1, 9, 10, 99, 100, 127, 128, 16_383, 16_384, 65_535] {
+            let body = vec![0xa5u8; len];
+            let whole = request("POST", "cdn.example", "/", &[("X-A", "1")], &body);
+            let head = request_head("POST", "cdn.example", "/", &[("X-A", "1")], body.len());
+            let mut beside = head.clone();
+            beside.extend_from_slice(&body);
+            assert_eq!(beside, whole, "{len} octets");
+            assert!(
+                head.capacity() < 512,
+                "a {len}-octet body is not staged in the head: {} bytes of room",
+                head.capacity()
+            );
+        }
+    }
+
+    /// The staged request buys a buffer the body's size; the head beside it buys only the head.
+    #[test]
+    fn the_head_beside_the_body_does_not_allocate_the_body() {
+        let body = vec![0x5au8; 64 * 1024];
+        let (staged, staged_counts) = ferrox_core::alloc_count::measure(|| {
+            request("POST", "cdn.example", "/", &[("X-A", "1")], &body)
+        });
+        let (head, head_counts) = ferrox_core::alloc_count::measure(|| {
+            request_head("POST", "cdn.example", "/", &[("X-A", "1")], body.len())
+        });
+        assert!(staged.len() > body.len());
+        assert!(
+            staged_counts.bytes >= body.len(),
+            "the staged request copies the body: {} bytes",
+            staged_counts.bytes
+        );
+        assert!(
+            head_counts.bytes < 1024,
+            "the head is not the body's size: {} bytes",
+            head_counts.bytes
+        );
+        assert!(head.len() < staged.len());
     }
 
     #[test]

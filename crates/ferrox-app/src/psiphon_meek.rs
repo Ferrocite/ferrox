@@ -4,7 +4,7 @@
 use crate::psiphon_ssh::{derive_key, random, Proxy, Rc4, MAGIC, SEED_LENGTH};
 use crypto_box::aead::{Aead, OsRng};
 use crypto_box::{PublicKey, SalsaBox, SecretKey};
-use ferrox_core::tls::{ClientSession, TlsConfig, TlsProvider as _};
+use ferrox_core::tls::{ClientSession, RecordAlignment as _, TlsConfig, TlsProvider as _};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, TcpListener, TcpStream, ToSocketAddrs};
 use std::time::Duration;
@@ -162,6 +162,15 @@ impl Write for MeekStream {
 }
 
 impl MeekStream {
+    /// The head and the caller's body in one completion: one TLS record, and the body is never
+    /// staged in a request buffer first.
+    fn write_parts(&mut self, parts: &[&[u8]]) -> std::io::Result<()> {
+        match self {
+            Self::Plain(stream) => crate::proxy::write_all_parts::<2>(stream, parts),
+            Self::Tls(stream) => stream.write_all_slices(parts),
+        }
+    }
+
     /// Whether the peer closed the stream.
     fn peer_closed(&self) -> bool {
         let stream = match self {
@@ -343,14 +352,19 @@ impl MeekHttp {
         if let Some(cookie) = cookie.as_deref() {
             headers.push(("Cookie", cookie));
         }
-        let request =
-            crate::foxy_account::request("POST", &self.meek.host, self.path, &headers, body);
+        let head = crate::foxy_account::request_head(
+            "POST",
+            &self.meek.host,
+            self.path,
+            &headers,
+            body.len(),
+        );
         let stream = self
             .stream
             .as_mut()
             .ok_or_else(|| "psiphon meek has no connection".to_owned())?;
         stream
-            .write_all(&request)
+            .write_parts(&[&head, body])
             .and_then(|()| stream.flush())
             .map_err(|error| format!("psiphon meek request: {error}"))?;
         let reply = crate::foxy_account::read_reply(stream)
@@ -467,6 +481,37 @@ mod tests {
     fn the_cookie_name_is_one_letter() {
         let (name, _) = make_cookie(&entry(), None).expect("cookie");
         assert_eq!(name.len(), 1);
+    }
+
+    /// A head and the caller's body reach the socket as the one request the staged buffer built.
+    #[test]
+    fn the_head_and_body_are_the_request_the_staging_buffer_built() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("binds");
+        let address = listener.local_addr().expect("address");
+        let body = vec![0x5au8; 4096];
+        let head = crate::foxy_account::request_head(
+            "POST",
+            "cdn.example",
+            "/",
+            &[("X-A", "1")],
+            body.len(),
+        );
+        let want = crate::foxy_account::request("POST", "cdn.example", "/", &[("X-A", "1")], &body);
+        let total = want.len();
+        let reader = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().expect("accepts");
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut got = vec![0u8; total];
+            socket.read_exact(&mut got).expect("reads");
+            got
+        });
+        let stream = TcpStream::connect(address).expect("connects");
+        let mut meek = MeekStream::Plain(stream);
+        meek.write_parts(&[&head, &body]).expect("writes");
+        meek.flush().expect("flushes");
+        assert_eq!(reader.join().expect("joins"), want);
     }
 
     #[test]
