@@ -1771,7 +1771,15 @@ fn backward_step<R: Read>(
     if let Some(waiting) = answer.as_mut() {
         match waiting.step(reader.carrier()) {
             AnswerStep::Done => *answer = None,
-            AnswerStep::Idle => return Next::Idle,
+            AnswerStep::Idle => {
+                // Parks past the grace are due at once, so a pending answer spends the grace here.
+                if !flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                    return Next::Idle;
+                }
+                close();
+                let _ = out.shutdown(Shutdown::Both);
+                return Next::Done;
+            }
             AnswerStep::Failed => {
                 close();
                 let _ = out.shutdown(Shutdown::Both);
