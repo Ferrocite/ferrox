@@ -999,6 +999,10 @@ impl SendThrough {
             return Some(base);
         }
         let mut raw = [0u8; 16];
+        #[cfg(test)]
+        if FAIL_ENTROPY.with(std::cell::Cell::get) {
+            return None;
+        }
         getrandom::fill(&mut raw).ok()?;
         Some(match base {
             IpAddr::V4(base) => {
@@ -1023,6 +1027,16 @@ impl SendThrough {
             }
         })
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_ENTROPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn resolve_source(send: Option<SendThrough>) -> Result<Option<IpAddr>, std::io::Error> {
+    Ok(send.and_then(SendThrough::address))
 }
 
 thread_local! {
@@ -57712,6 +57726,21 @@ mod tests {
         assert_eq!(
             parse_send_through(&bad),
             Err("unable to send through: 198.18.0.0/33".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_cidr_without_entropy_does_not_dial_unbound() {
+        let source = SendThrough::Cidr {
+            base: "198.18.0.0".parse().expect("ip"),
+            prefix: 15,
+        };
+        FAIL_ENTROPY.with(|flag| flag.set(true));
+        let resolved = resolve_source(Some(source));
+        FAIL_ENTROPY.with(|flag| flag.set(false));
+        assert!(
+            resolved.is_err(),
+            "entropy failure must not become an unbound dial"
         );
     }
 
