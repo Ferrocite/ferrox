@@ -1220,8 +1220,8 @@ impl GrpcWriter {
 
     /// The most bytes one relay read should hand this writer: a multi-mode write reads no more than
     /// the credit the peer has left, so the read leaves as one `MultiHunk` the peer can pay for
-    /// rather than one it parks on. The envelope and tags of a `64 KiB` read cost at most `64`
-    /// bytes; a read that fits one element costs at most `8`.
+    /// rather than one it parks on. The envelope and tags of a four-element `64 KiB` read cost at
+    /// most `64` bytes; a read that fits one element costs at most `16`.
     pub(crate) fn read_window(&self) -> Option<usize> {
         if !self.multi {
             return None;
@@ -1237,7 +1237,7 @@ impl GrpcWriter {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let available = (*init).min(send.conn).min(send.stream);
-        let margin = if available > 16_375 { 64 } else { 8 };
+        let margin = if available > 16_375 { 64 } else { 16 };
         let limit = usize::try_from(available).unwrap_or(usize::MAX);
         Some(
             limit
@@ -3557,18 +3557,40 @@ mod tests {
         assert_eq!(writer.read_window(), Some(65_471));
     }
 
-    /// A small peer window is still usable, and the next read follows the credit the first write
-    /// left instead of asking for a full window the peer has not granted yet.
+    /// A small peer window is still usable: the relay's read fits one message, and the next read
+    /// follows the credit the first write left instead of asking for a window it has not granted.
     #[test]
     fn a_multi_read_fits_a_small_window_and_follows_credit() {
         let peer = Arc::new(Mutex::new(Peer::default()));
         let writer = multi_writer_over(Recorder(Arc::clone(&peer)), HUNK, 10_000, 1_000_000);
-        assert_eq!(writer.read_window(), Some(9_992));
+        let len = writer
+            .read_window()
+            .expect("multi mode limits the relay read");
+        assert_eq!(len, 9_984);
         assert!(matches!(
-            writer.try_send(&vec![0u8; 8_000]),
+            writer.try_send(&vec![0u8; len]),
+            crate::proxy::Push::Took(n) if n == len
+        ));
+        let peer = peer.lock().unwrap();
+        assert_eq!(peer.writes.len(), 1, "one write for a relay read");
+        assert_eq!(
+            message_count(&peer.writes[0][9..]),
+            1,
+            "one message, not two"
+        );
+        drop(peer);
+
+        let next = multi_writer_over(
+            Recorder(Arc::new(Mutex::new(Peer::default()))),
+            HUNK,
+            10_000,
+            1_000_000,
+        );
+        assert!(matches!(
+            next.try_send(&vec![0u8; 8_000]),
             crate::proxy::Push::Took(8_000)
         ));
-        assert_eq!(writer.read_window(), Some(1_984));
+        assert_eq!(next.read_window(), Some(1_976));
     }
 
     /// A multi write splits at the connection window even when the stream starts larger, so the

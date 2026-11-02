@@ -35175,6 +35175,27 @@ mod tests {
         );
     }
 
+    /// A promoted limited buffer reads a full `64 KiB` source in two reads, `65_471` then `65`,
+    /// where the unlimited window reads it in one: the extra read is what keeps one message whole.
+    #[test]
+    fn a_limited_relay_buffer_reads_a_64kib_source_in_two() {
+        let mut buffer = RelayBuf::with_limit(65_471);
+        buffer.as_mut().fill(0);
+        let _ = buffer.filled(RELAY_SMALL_BUFFER);
+        let source = vec![7u8; RELAY_BUFFER];
+        let mut at = 0usize;
+        let mut reads = 0usize;
+        while at < source.len() {
+            let n = (&source[at..]).read(buffer.as_mut()).expect("reads");
+            assert!(n > 0, "the source ended before the window");
+            at += n;
+            reads += 1;
+            let _ = buffer.filled(n);
+        }
+        assert_eq!(at, RELAY_BUFFER);
+        assert_eq!(reads, 2);
+    }
+
     #[test]
     fn a_promoted_buffer_returns_the_bytes_that_were_read() {
         let mut buffer = RelayBuf::new();
