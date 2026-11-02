@@ -1301,6 +1301,50 @@ pub(crate) fn test_bind(addr: impl std::net::ToSocketAddrs) -> io::Result<Listen
     std::net::TcpListener::bind(addr).map(Listener::Tcp)
 }
 
+/// A census or a budget the suite arms is process-wide state a parallel test can move under a
+/// reader: run the test in a child that carries only it, so the number is the test's.
+#[cfg(test)]
+pub(crate) fn in_a_quiet_process(name: &str) -> bool {
+    if std::env::var_os("FERROX_QUIET_PROCESS").is_some() {
+        return true;
+    }
+    let exe = std::env::current_exe().expect("the test binary");
+    let output = std::process::Command::new(exe)
+        .args(["--exact", name, "--test-threads=1", "--nocapture"])
+        .env("FERROX_QUIET_PROCESS", "1")
+        .output()
+        .expect("re-runs the test in a quiet process");
+    assert!(
+        output.status.success(),
+        "{name} failed in its quiet process:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
+/// The tasks `/proc/self/task` lists, for a caller already inside a quiet process.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn live_threads() -> usize {
+    std::fs::read_dir("/proc/self/task").map_or(0, std::iter::Iterator::count)
+}
+
+/// The tasks running under one name: a delta over the whole table moves with the harness, while
+/// the named count is the claim.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn threads_named(name: &str) -> usize {
+    let mut count = 0;
+    for entry in std::fs::read_dir("/proc/self/task")
+        .expect("reads the task table")
+        .flatten()
+    {
+        if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) {
+            count += usize::from(comm.trim() == name);
+        }
+    }
+    count
+}
+
 #[cfg(test)]
 impl Listener {
     /// The single accept a fixture that dials one client needs; the std `accept` shape, mapped

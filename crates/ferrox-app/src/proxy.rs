@@ -32500,43 +32500,18 @@ mod tests {
             .expect("the polling leg ends on its sibling's finish");
     }
 
-    #[cfg(target_os = "linux")]
-    fn live_threads() -> usize {
-        std::fs::read_dir("/proc/self/task").map_or(0, std::iter::Iterator::count)
-    }
-
-    /// A live-thread census only means something when nothing else in the suite is spawning: run it
-    /// in a child process that carries this one test, so the count is the flow's, not the harness's.
-    #[cfg(target_os = "linux")]
-    fn census_in_a_quiet_process(name: &str) -> bool {
-        if std::env::var_os("FERROX_THREAD_CENSUS_CHILD").is_some() {
-            return true;
-        }
-        let exe = std::env::current_exe().expect("the test binary");
-        let output = std::process::Command::new(exe)
-            .args(["--exact", name, "--test-threads=1", "--nocapture"])
-            .env("FERROX_THREAD_CENSUS_CHILD", "1")
-            .output()
-            .expect("re-runs the census in a quiet process");
-        assert!(
-            output.status.success(),
-            "{name} failed in its quiet process:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        false
-    }
-
     /// A wrapped flow is a direction pair, not a pair of threads: the peak the matrix reads is
     /// the fixed lanes plus the accept loop, so a regression that buys a thread per flow shows up
     /// here as growth proportional to the connection count.
     #[cfg(target_os = "linux")]
     #[test]
     fn wrapped_flows_share_a_fixed_set_of_lanes() {
-        if !census_in_a_quiet_process("proxy::tests::wrapped_flows_share_a_fixed_set_of_lanes") {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::wrapped_flows_share_a_fixed_set_of_lanes",
+        ) {
             return;
         }
-        let before = live_threads();
+        let before = crate::conn::live_threads();
         let flows = 24usize;
         let mut stops = Vec::new();
         for _ in 0..flows {
@@ -32552,7 +32527,7 @@ mod tests {
             relay_shared(Half::socket(client), Half::socket(peer), &close);
         }
         thread::sleep(Duration::from_millis(50));
-        let grown = live_threads().saturating_sub(before);
+        let grown = crate::conn::live_threads().saturating_sub(before);
         for (client, peer) in stops {
             let _ = client.shutdown(Shutdown::Both);
             let _ = peer.shutdown(Shutdown::Both);
@@ -32574,7 +32549,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn carried_handshakes_share_the_lane_pool() {
-        if !census_in_a_quiet_process("proxy::tests::carried_handshakes_share_the_lane_pool") {
+        if !crate::conn::in_a_quiet_process("proxy::tests::carried_handshakes_share_the_lane_pool")
+        {
             return;
         }
         let probe = crate::conn::test_bind("127.0.0.1:0").expect("binds");
@@ -32589,7 +32565,7 @@ mod tests {
             decryption: None,
         };
         let stop = std::sync::Arc::new(Stop::new());
-        let before = live_threads();
+        let before = crate::conn::live_threads();
         let serving = {
             let address = address.clone();
             let stop = std::sync::Arc::clone(&stop);
@@ -32610,7 +32586,7 @@ mod tests {
             })
             .collect();
         thread::sleep(Duration::from_millis(100));
-        let grown = live_threads().saturating_sub(before);
+        let grown = crate::conn::live_threads().saturating_sub(before);
         let lanes = lane_pool::setup_workers();
         assert!(lanes >= 1, "the setup lane count is the bound: {lanes}");
         assert!(
@@ -40260,6 +40236,11 @@ mod tests {
     /// The vmess listener reads its stream settings: a tls inbound answers the handshake before any carrier.
     #[test]
     fn a_vmess_inbound_that_declares_tls_answers_every_carrier() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::a_vmess_inbound_that_declares_tls_answers_every_carrier",
+        ) {
+            return;
+        }
         let (cert, key, client) = tls_cert_json();
         let cases = [
             ("raw", r#""network": "tcp""#),
@@ -40347,14 +40328,14 @@ mod tests {
                 .expect("timeout");
             sock.write_all(b"ping").expect("writes");
             let start = Instant::now();
+            let patience = budgets::handshake() + Duration::from_secs(5);
             let mut back = [0u8; 4];
             let mut at = 0;
             while at < back.len() {
                 match sock.read(&mut back[at..]) {
                     Ok(0) => panic!("{tag} over tls closed before echoing"),
                     Ok(n) => at += n,
-                    Err(error)
-                        if is_timeout(&error) && start.elapsed() < Duration::from_secs(10) => {}
+                    Err(error) if is_timeout(&error) && start.elapsed() < patience => {}
                     Err(error) => panic!("{tag} over tls did not echo: {error:?}"),
                 }
             }
