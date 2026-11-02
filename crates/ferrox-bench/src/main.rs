@@ -69,6 +69,8 @@ struct Args {
     connections: usize,
     payload_size: usize,
     iterations: usize,
+    duration_ms: u64,
+    tcp_latency_iterations: usize,
     traffic: String,
     outbound_config: String,
     outbound_configs: Vec<(String, String)>,
@@ -113,6 +115,17 @@ fn flag_count(args: &mut impl Iterator<Item = String>, flag: &str) -> usize {
     }
 }
 
+fn flag_number(args: &mut impl Iterator<Item = String>, flag: &str) -> u64 {
+    let raw = flag_value(args, flag);
+    match raw.parse::<u64>() {
+        Ok(n) => n,
+        Err(_) => {
+            eprintln!("{flag} needs a whole number, got `{raw}`");
+            std::process::exit(2);
+        }
+    }
+}
+
 fn push_labeled_shape(
     into: &mut Vec<(String, String)>,
     flag: &str,
@@ -143,6 +156,8 @@ fn parse_args() -> Args {
     let mut connections = DEFAULT_CONNECTIONS;
     let mut payload_size = DEFAULT_PAYLOAD_SIZE;
     let mut iterations = DEFAULT_ITERATIONS;
+    let mut duration_ms = 0u64;
+    let mut tcp_latency_iterations = 0usize;
     let mut traffic = String::from("download");
     let mut outbound_config = String::new();
     let mut outbound_configs: Vec<(String, String)> = Vec::new();
@@ -195,6 +210,10 @@ fn parse_args() -> Args {
             "--connections" => connections = flag_count(&mut args, "--connections"),
             "--payload-size" => payload_size = flag_count(&mut args, "--payload-size"),
             "--iterations" => iterations = flag_count(&mut args, "--iterations"),
+            "--duration-ms" => duration_ms = flag_number(&mut args, "--duration-ms"),
+            "--tcp-latency-iterations" => {
+                tcp_latency_iterations = flag_count(&mut args, "--tcp-latency-iterations");
+            }
             "--traffic" => traffic = flag_value(&mut args, "--traffic"),
             "--outbound-config-for" => push_labeled_shape(
                 &mut outbound_configs,
@@ -253,6 +272,8 @@ fn parse_args() -> Args {
         connections,
         payload_size,
         iterations,
+        duration_ms,
+        tcp_latency_iterations,
         traffic,
         outbound_config,
         outbound_configs,
@@ -791,6 +812,8 @@ fn gate5_section(args: &Args) -> Result<Gate5, String> {
         connections: args.connections,
         iterations: args.iterations,
         payload_size: args.payload_size,
+        duration_ms: args.duration_ms,
+        tcp_latency_iterations: args.tcp_latency_iterations,
         warmup: false,
         outbound_config: args.outbound_config.clone(),
         outbound_configs: args.outbound_configs.clone(),

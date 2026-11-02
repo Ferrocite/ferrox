@@ -14,10 +14,11 @@ two only a shipped binary has: ZeroNet's throughput / CPU / idle+peak memory
 throughput / CPU / latency / memory / tunnel charts map to throughput,
 cpu-per-gib, memory-rss, setup-latency, coverage and ceiling here; binary
 size and cold start are ours, because nobody else charts what ships. Idle
-RSS, per-packet latency and setup rate have no chart yet: the harness
-refuses held-open flows, measures throughput rather than latency, and times
-setup stages without rating them, so those cells are empty with the reason
-in matrix.md rather than plotted from nothing.
+and held-open cells plot RSS, threads, total CPU and wall time instead of a
+throughput that does not exist; UDP and TCP round-trip cells plot the latency
+quartiles beside them. Setup stages are timed without being rated, so those
+cells stay empty with the reason in matrix.md rather than plotted from
+nothing.
 
 Bars are medians of each cell's repeats. Whiskers are 95% bootstrap intervals
 of that engine's own repeats (seeded); the Rust intervals in `cell.json` are
@@ -65,6 +66,22 @@ plt.rcParams.update(
 PANELS = (
     ("throughput_mib_s", "throughput", "MiB/s", 1.0, "higher"),
     ("cpu_millis_per_gib", "CPU per GiB", "ms/GiB", 1.0, "lower"),
+    ("rss_mib", "peak RSS", "MiB", 1.0, "lower"),
+    ("threads_peak", "peak threads", "threads", 1.0, "lower"),
+    ("startup_seconds", "cold start", "s", 1.0, "lower"),
+    ("kernel_calls_per_gib", "kernel asks", "calls/MiB", 1.0 / 1024.0, "lower"),
+)
+WORKLOAD_PANELS = (
+    ("rss_mib", "peak RSS", "MiB", 1.0, "lower"),
+    ("threads_peak", "peak threads", "threads", 1.0, "lower"),
+    ("cpu_millis", "CPU total", "ms", 1.0, "lower"),
+    ("startup_seconds", "cold start", "s", 1.0, "lower"),
+    ("wall_seconds", "wall time", "s", 1.0, "lower"),
+    ("kernel_calls_per_gib", "kernel asks", "calls/MiB", 1.0 / 1024.0, "lower"),
+)
+LATENCY_PANELS = (
+    ("latency_us", "round trip", "ms", 1.0 / 1000.0, "lower"),
+    ("cpu_millis", "CPU total", "ms", 1.0, "lower"),
     ("rss_mib", "peak RSS", "MiB", 1.0, "lower"),
     ("threads_peak", "peak threads", "threads", 1.0, "lower"),
     ("startup_seconds", "cold start", "s", 1.0, "lower"),
@@ -447,10 +464,27 @@ def setup_medians(cell, engine, setup_index, stage):
     return setup_index.get(scenario, {}).get(engine, {}).get(stage, [])
 
 
+def latency_values(cell, engine):
+    """Per-repeat median round-trip times, microseconds, where the cell measured them."""
+    for entry in cell.get("engines", []):
+        if entry.get("name") == engine:
+            out = []
+            for run in entry.get("runs", []):
+                value = run.get("latency_us")
+                if isinstance(value, dict):
+                    median = value.get("median")
+                    if isinstance(median, (int, float)):
+                        out.append(median)
+            return out
+    return []
+
+
 def panel_samples(cell, engine, key, scale, setup_index):
     """One panel's per-repeat values, scaled into the unit the panel prints."""
-    if key.endswith("_us"):
+    if key in ("total_us", "tcp_connect_us", "socks_setup_us"):
         values = setup_medians(cell, engine, setup_index, key)
+    elif key == "latency_us":
+        values = latency_values(cell, engine)
     else:
         values = run_values(cell, engine, key)
     return [value * scale for value in values if isinstance(value, (int, float))]
@@ -461,12 +495,23 @@ def metric_label(value, unit):
     if unit == "threads":
         return f"{value:.0f}"
     if unit == "s":
-        return f"{value:.2f} s"
+        return f"{value:.2f}"
     if unit == "calls/MiB":
-        return f"{value:.1f} calls/MiB" if value < 10 else f"{value:.0f} calls/MiB"
+        return f"{value:.1f}" if value < 10 else f"{compact(value)}"
     if unit == "MiB/s":
-        return f"{value:,.0f} MiB/s"
-    return f"{value:.1f} {unit}"
+        return f"{compact(value)}"
+    if unit == "ms":
+        return f"{value:.1f}"
+    return f"{value:.1f}"
+
+
+def compact(value):
+    """A short number for a bar label: 1.2k rather than 1,234, and 3.4M rather than 3,400,000."""
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return f"{value:.0f}"
 
 
 def scenario_server(scenario):
@@ -491,7 +536,14 @@ def scenario_family_chart(base, group, path, foot, setup_index):
     variation, which is where a split xray-core cell becomes visible.
     """
     setup = "setup" in base
-    panels = SETUP_PANELS if setup else PANELS
+    if setup:
+        panels = SETUP_PANELS
+    elif any(word in base for word in ("idle", "reconnect", "held")):
+        panels = WORKLOAD_PANELS
+    elif "latency" in base or "-udp-" in base or base.endswith("-udp"):
+        panels = LATENCY_PANELS
+    else:
+        panels = PANELS
     by_server = {scenario_server(scenario): scenario for scenario in group}
     cells_by_server = {
         scenario_server(scenario): group[scenario] for scenario in group
@@ -515,7 +567,7 @@ def scenario_family_chart(base, group, path, foot, setup_index):
     fig, axes = plt.subplots(
         2,
         columns,
-        figsize=(16.0 if setup else 19.0, 9.2 if setup else 10.4),
+        figsize=(12.4 if setup else 13.6, 8.8 if setup else 9.6),
         sharey=True,
     )
     fig.subplots_adjust(
@@ -632,8 +684,9 @@ def scenario_family_chart(base, group, path, foot, setup_index):
                     tick,
                     metric_label(value, unit),
                     va="center",
-                    fontsize=7.0 if len(rows) > 6 else 7.5,
-                    color="#333333",
+                    fontsize=8.0 if len(rows) > 8 else 9.0,
+                    color="#222222",
+                    bbox={"facecolor": "white", "edgecolor": "none", "pad": 0.6, "alpha": 0.85},
                 )
             else:
                 ax.text(
@@ -641,14 +694,14 @@ def scenario_family_chart(base, group, path, foot, setup_index):
                     tick,
                     "not measured",
                     va="center",
-                    fontsize=6.8,
+                    fontsize=8.0,
                     color="#999999",
                 )
         if reference:
             ax.axvline(reference, color="#8A8A8A", linestyle=(0, (3, 2)), linewidth=0.9)
         ax.set_xlim(0, span * 1.28)
-        ax.set_xlabel(unit, fontsize=8, labelpad=2)
-        ax.set_title(title, fontsize=10, loc="left", pad=6)
+        ax.set_xlabel(unit, fontsize=9, labelpad=2)
+        ax.set_title(title, fontsize=11, loc="left", pad=6)
         finish(ax, index)
 
     if not setup:
@@ -660,9 +713,9 @@ def scenario_family_chart(base, group, path, foot, setup_index):
             samples = run_values(cell, engine, "throughput_mib_s") if cell else []
             if not samples:
                 distribution.text(0, tick, "not measured", va="center",
-                                  fontsize=6.8, color="#999999")
+                                  fontsize=8, color="#999999")
                 spread_panel.text(0, tick, "not measured", va="center",
-                                  fontsize=6.8, color="#999999")
+                                  fontsize=8, color="#999999")
                 continue
             state = benchstats.spread(samples)
             span = max(span, max(samples))
@@ -724,12 +777,12 @@ def scenario_family_chart(base, group, path, foot, setup_index):
             linestyle=(0, (3, 2)),
             linewidth=0.9,
         )
-        distribution.set_xlabel("MiB/s", fontsize=8, labelpad=2)
-        distribution.set_title("throughput repeats", fontsize=10, loc="left", pad=6)
+        distribution.set_xlabel("MiB/s", fontsize=9, labelpad=2)
+        distribution.set_title("throughput repeats", fontsize=11, loc="left", pad=6)
         finish(distribution, len(panels))
         spread_panel.set_xlim(0, max(15.0, cv_max * 1.25))
-        spread_panel.set_xlabel("coefficient of variation", fontsize=8, labelpad=2)
-        spread_panel.set_title("throughput spread", fontsize=10, loc="left", pad=6)
+        spread_panel.set_xlabel("coefficient of variation", fontsize=9, labelpad=2)
+        spread_panel.set_title("throughput spread", fontsize=11, loc="left", pad=6)
         finish(spread_panel, len(panels) + 1)
 
     fig.suptitle(
@@ -737,7 +790,7 @@ def scenario_family_chart(base, group, path, foot, setup_index):
         x=0.011,
         y=0.972,
         ha="left",
-        fontsize=15,
+        fontsize=14,
         fontweight="bold",
         color="#222222",
     )
@@ -747,8 +800,8 @@ def scenario_family_chart(base, group, path, foot, setup_index):
         "Medians of each cell's repeats; whiskers are 95% bootstrap intervals. "
         "Later servers are lighter. "
         + ("Lower is better." if setup else "Lower is better except throughput."),
-        fontsize=8,
-        color="#666666",
+        fontsize=9,
+        color="#555555",
         ha="left",
     )
     handles = [
@@ -773,26 +826,20 @@ def scenario_family_chart(base, group, path, foot, setup_index):
         frameon=False,
         fontsize=8,
     )
-    fig.text(0.011, 0.018, foot, ha="left", fontsize=7, color="#777777")
-    fig.savefig(path, dpi=160, bbox_inches="tight")
+    fig.text(0.011, 0.018, foot, ha="left", fontsize=8, color="#666666")
+    fig.savefig(path, dpi=130, bbox_inches="tight")
     plt.close(fig)
     return path
 
 def coverage_table(results):
     """Markdown coverage grid: pass, fail, or the reason for a gap."""
-    engines = [
-        name
-        for name in ENGINE_ORDER
-        if any(name in scenario.get("medians", {}) or any(
-            failure.get("engine") == name for failure in scenario.get("failures", [])
-        ) for scenario in results.get("scenarios", []))
-    ]
+    engines = table_engines(results)
     lines = [
         "| scenario | server | " + " | ".join(engines) + " |",
         "| -------- | ------ | " + " | ".join(["---"] * len(engines)) + " |",
     ]
     reasons = []
-    for scenario in results.get("scenarios", []):
+    for scenario in scenario_order(results):
         marks = []
         for engine in engines:
             if engine in scenario.get("medians", {}):
@@ -923,6 +970,9 @@ def assemble(cells_dir, meta):
                 samples = run_values(cell, name, metric)
                 if samples:
                     values[metric] = benchstats.median(samples)
+            latency = latency_values(cell, name)
+            if latency:
+                values["latency_us"] = benchstats.median(latency)
             if values:
                 medians[name] = values
                 samples = run_values(cell, name, "throughput_mib_s")
@@ -1047,20 +1097,84 @@ def leg_tables(results):
     return "\n".join(rows) + ("\n\nLeg gaps (below the 0.85 harness bound):\n\n" + "\n".join(f"- {line}" for line in gap_lines) if gap_lines else "")
 
 
-def throughput_table(results):
-    """Scenario-by-engine medians, the same table the README and bundle carry."""
-    engines = [name for name in ENGINE_ORDER if any(
-        name in scenario.get("medians", {}) for scenario in results.get("scenarios", [])
-    )]
-    lines = [
-        "| scenario | server | " + " | ".join(engines) + " | verdict |",
-        "| -------- | ------ | " + " | ".join(["--------"] * len(engines)) + " | ------- |",
-    ]
+def scenario_order(results):
+    """Scenarios by test name, then reference server first: the reader scans alphabetically."""
+    return sorted(
+        results.get("scenarios", []),
+        key=lambda scenario: (
+            scenario.get("base") or scenario.get("id", ""),
+            {"xray-core": 0, "ferrox": 1}.get(scenario.get("server") or "", 2),
+            scenario.get("server") or "",
+        ),
+    )
+
+
+def table_engines(results):
+    """Every engine that appears anywhere for this run, skipped ones included."""
+    seen = set()
     for scenario in results.get("scenarios", []):
+        seen.update(name for name in scenario.get("medians", {}) if name)
+        seen.update(item.get("engine") for item in scenario.get("skipped", []) if item.get("engine"))
+        seen.update(item.get("engine") for item in scenario.get("failures", []) if item.get("engine"))
+    ordered = [name for name in ENGINE_ORDER if name in seen]
+    return ordered + sorted(seen - set(ordered))
+
+
+def engine_cell(scenario, engine):
+    """One engine's throughput cell, its absence named rather than left blank."""
+    values = scenario.get("medians", {}).get(engine) or {}
+    if values.get("throughput_mib_s") is not None:
+        return values["throughput_mib_s"], "measured"
+    for skipped in scenario.get("skipped", []):
+        if skipped.get("engine") == engine:
+            return None, "not impl."
+    for failure in scenario.get("failures", []):
+        if failure.get("engine") == engine:
+            return None, "failed"
+    return None, "\u2014"
+
+
+def throughput_table(results):
+    """Scenario-by-engine medians, the leader in every row in bold, and ferrox's own rank."""
+    engines = table_engines(results)
+    lines = [
+        "| scenario | server | " + " | ".join(engines) + " | leader | ferrox / best | verdict |",
+        "| -------- | ------ | " + " | ".join(["--------"] * len(engines)) + " | ------ | ------------ | ------- |",
+    ]
+    positioned = 0
+    leading = 0
+    for scenario in scenario_order(results):
         if "setup" in scenario.get("id", ""):
             continue
         medians = scenario.get("medians", {})
-        cells = [format_median(medians.get(engine, {}).get("throughput_mib_s")) for engine in engines]
+        measured = {
+            engine: medians[engine]["throughput_mib_s"]
+            for engine in engines
+            if engine in medians and medians[engine].get("throughput_mib_s") is not None
+        }
+        best = max(measured.values()) if measured else None
+        cells = []
+        for engine in engines:
+            value = measured.get(engine)
+            label = format_median(value)
+            if value is not None and best and best > 0 and value == best:
+                label = f"**{label}**"
+            elif engine not in measured:
+                label = engine_cell(scenario, engine)[1]
+            cells.append(label)
+        leader = "\u2014"
+        ferrox_ratio = "\u2014"
+        if best and best > 0:
+            leader_engines = [engine for engine, value in measured.items() if value == best]
+            leader = ", ".join(
+                f"**{engine}**" if engine == "ferrox" else engine for engine in leader_engines
+            )
+            if "ferrox" in measured:
+                ratio = measured["ferrox"] / best
+                ferrox_ratio = f"**{ratio:.2f}x**" if ratio >= 0.999 else f"{ratio:.2f}x"
+                positioned += 1
+                if "ferrox" in leader_engines:
+                    leading += 1
         verdicts = [
             row["verdict"]
             for row in scenario.get("rows", [])
@@ -1068,20 +1182,36 @@ def throughput_table(results):
         ]
         verdict = verdicts[0] if verdicts else "unproven"
         base, server = scenario_name(scenario)
-        lines.append(f"| `{base}` | {server} | " + " | ".join(cells) + f" | {verdict} |")
-    return "\n".join(lines)
+        lines.append(
+            f"| `{base}` | {server} | " + " | ".join(cells)
+            + f" | {leader} | {ferrox_ratio} | {verdict} |"
+        )
+    intro = (
+        f"Ferrox leads {leading} of {positioned} priced rows. A row is priced only when it "
+        "moved bytes; idle, held-open and reconnect cells carry no throughput and are judged "
+        "on cost below. Bold is the best median in that row across every engine, not only the "
+        "reference."
+    )
+    return intro + "\n\n" + "\n".join(lines)
 
 
 def cost_table(results):
-    """CPU, RSS, thread and startup medians per scenario and engine."""
-    engines = [name for name in ENGINE_ORDER if any(
-        name in scenario.get("medians", {}) for scenario in results.get("scenarios", [])
-    )]
+    """CPU, RSS, thread and startup medians per scenario and engine, best in each row bold."""
+    engines = table_engines(results)
+    metrics = (
+        ("cpu_millis_per_gib", "cpu"),
+        ("rss_mib", "rss"),
+        ("threads_peak", "threads"),
+        ("startup_seconds", "start"),
+        ("latency_us", "latency"),
+        ("kernel_calls_per_gib", "kernel"),
+    )
     lines = [
-        "| scenario | server | engine | cpu | rss | threads | start | kernel |",
-        "| -------- | ------ | ------ | --- | --- | ------- | ----- | ------ |",
+        "| scenario | server | engine | cpu | rss | threads | start | latency | kernel |",
+        "| -------- | ------ | ------ | --- | --- | ------- | ----- | ------- | ------ |",
     ]
-    for scenario in results.get("scenarios", []):
+    rows = []
+    for scenario in scenario_order(results):
         if "setup" in scenario.get("id", ""):
             continue
         base, server = scenario_name(scenario)
@@ -1089,14 +1219,25 @@ def cost_table(results):
             values = scenario.get("medians", {}).get(engine, {})
             if not values:
                 continue
-            lines.append(
-                f"| `{base}` | {server} | {engine} | "
-                f"{format_cost(values.get('cpu_millis_per_gib'))} | "
-                f"{format_cost(values.get('rss_mib'))} | "
-                f"{format_cost(values.get('threads_peak'))} | "
-                f"{format_cost(values.get('startup_seconds'))} | "
-                f"{format_cost(values.get('kernel_calls_per_gib'))} |"
+            rows.append((base, server, engine, values))
+    minima = {}
+    for base, server, _engine, values in rows:
+        for metric, _label in metrics:
+            value = values.get(metric)
+            if value is None:
+                continue
+            minima[(base, server, metric)] = min(
+                minima.get((base, server, metric), value), value
             )
+    for base, server, engine, values in rows:
+        cells = []
+        for metric, _label in metrics:
+            value = values.get(metric)
+            label = format_cost(value)
+            if value is not None and minima.get((base, server, metric)) == value:
+                label = f"**{label}**"
+            cells.append(label)
+        lines.append(f"| `{base}` | {server} | {engine} | " + " | ".join(cells) + " |")
     return "\n".join(lines)
 
 
@@ -1107,6 +1248,7 @@ TABLE_METRICS = (
     ("threads_peak", "threads", "threads"),
     ("startup_seconds", "startup", "s"),
     ("kernel_calls_per_gib", "kernel", "calls/MiB"),
+    ("latency_us", "latency", "us"),
     ("transfer_seconds", "transfer", "s"),
 )
 
@@ -1554,6 +1696,11 @@ def main(argv=None):
     write_table_files(input_dir, results)
 
     bulk = sorted(s for s in cells if "setup" not in s)
+    priced = sorted(
+        s
+        for s in bulk
+        if not any(word in s for word in ("idle", "reconnect", "held"))
+    )
     families = {}
     for scenario, cell in cells.items():
         families.setdefault(scenario.partition("--srv-")[0], {})[scenario] = cell
@@ -1570,7 +1717,7 @@ def main(argv=None):
             made.append(chart)
     made += [
         metric_chart(
-            bulk, cells, "cpu_millis_per_gib", "cpu", "ms/GiB",
+            priced, cells, "cpu_millis_per_gib", "cpu", "ms/GiB",
             "CPU per GiB (median over cells, lower is better)",
             str(charts_dir / "cpu-per-gib.png"), foot,
         ),
@@ -1583,7 +1730,7 @@ def main(argv=None):
         startup_chart(
             sorted(cells), cells, str(charts_dir / "startup.png"), foot
         ),
-        ceiling_chart(bulk, cells, str(charts_dir / "ceiling.png"), foot),
+        ceiling_chart(priced, cells, str(charts_dir / "ceiling.png"), foot),
         setup_chart(cells, setup_index, str(charts_dir / "setup-latency.png"), foot),
         binary_size_chart(meta, str(charts_dir / "binary-size.png"), foot),
     ]

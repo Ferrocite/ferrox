@@ -12,10 +12,12 @@ fn caveat() -> String {
          > comparable at all, but it sees no allocation counts: those stay \
          > in-process and exact, in gates 2 and 4. A CPU delta under {n} ms reads \
          > as `0`, so a `0` in that column means \"below the kernel's resolution\", \
-         > not \"free\". Only the `SOCKS` path is measured: `TUN`, DNS, geodata \
-         > routing, and the `REALITY`/Vision TLS paths are the pinned harness's \
-         > workloads and are **not** covered here — `docs/methodology.md` lists \
-         > each one as `not_covered` with its reason, rather than leaving it out.\n",
+         > not \"free\". Only the `SOCKS` path is measured: `TUN`, fake DNS and \
+         > geodata routing are the pinned harness's workloads and are **not** \
+         > covered here, while idle, held-open, reconnect, UDP echo, TCP \
+         > round-trip latency, routed tables, `REALITY`/Vision TLS and the \
+         > `xhttp` modes each have their own cell. `docs/benchmarks/matrix.md` \
+         > names every remaining gap rather than leaving it out.\n",
         n = parity::cpu_resolution_floor_millis()
     )
 }
@@ -38,6 +40,10 @@ pub struct Workload {
     pub connections: usize,
     pub iterations: usize,
     pub payload_size: usize,
+    /// Wall time an idle or held-open workload keeps the engine up, in milliseconds.
+    pub duration_ms: u64,
+    /// Round trips a `tcp-latency` workload measures.
+    pub tcp_latency_iterations: usize,
     pub warmup: bool,
     pub outbound_config: String,
     pub outbound_configs: Vec<(String, String)>,
@@ -53,11 +59,27 @@ impl Workload {
     }
 
     fn total_bytes(&self) -> u64 {
-        let directions = match self.traffic.as_str() {
-            "full-duplex" => 2u64,
-            _ => 1,
-        };
-        (self.flow_bytes() * self.connections as u64).saturating_mul(directions)
+        let flows = self.connections as u64;
+        let datagrams = self.iterations as u64;
+        let latency = self.tcp_latency_iterations as u64;
+        let payload = self.payload_size as u64;
+        match self.traffic.as_str() {
+            "idle" | "held-open" | "reconnect" => 0,
+            "udp" => flows
+                .saturating_mul(datagrams)
+                .saturating_mul(payload)
+                .saturating_mul(2),
+            "tcp-latency" => flows
+                .saturating_mul(latency)
+                .saturating_mul(payload)
+                .saturating_mul(2),
+            "mixed" => flows.saturating_mul(
+                self.flow_bytes()
+                    .saturating_add(datagrams.saturating_mul(payload).saturating_mul(2)),
+            ),
+            "full-duplex" => (self.flow_bytes() * flows).saturating_mul(2),
+            _ => self.flow_bytes() * flows,
+        }
     }
 
     fn config_for(&self, engine: &Engine) -> String {
@@ -88,6 +110,11 @@ impl Workload {
         root.insert("connections", Json::Num(self.connections as f64));
         root.insert("iterations", Json::Num(self.iterations as f64));
         root.insert("payload_size", Json::Num(self.payload_size as f64));
+        root.insert("duration_ms", Json::Num(self.duration_ms as f64));
+        root.insert(
+            "tcp_latency_iterations",
+            Json::Num(self.tcp_latency_iterations as f64),
+        );
         root.insert("output", Json::Str(output.display().to_string()));
         root.insert("warmup", Json::Bool(self.warmup));
         root.to_string()
@@ -152,6 +179,7 @@ fn run_cell_json(run: &Run) -> Json {
         io.map_or(Json::Null, |(_, bytes)| Json::Num(bytes)),
     );
     cell.insert("rss_mib", Json::Num(run.rss_mib()));
+    cell.insert("cpu_millis", Json::Num(run.outcome.cpu_millis as f64));
     cell.insert(
         "threads_peak",
         match run.outcome.threads_peak {
@@ -165,6 +193,10 @@ fn run_cell_json(run: &Run) -> Json {
         Json::Num(run.outcome.transfer.as_secs_f64()),
     );
     cell.insert("wall_seconds", Json::Num(run.outcome.wall.as_secs_f64()));
+    cell.insert(
+        "latency_us",
+        parity::optional_quartiles_json(run.outcome.latency_us),
+    );
     cell.insert(
         "cpu_user_millis",
         run.outcome
@@ -253,6 +285,26 @@ impl Comparison {
                 value: run.rss_mib(),
             })
             .collect()
+    }
+
+    /// Median round-trip microseconds, one per repeat, or nothing when any repeat lacks them.
+    fn latency_cells(&self, engine: &str) -> Vec<Cell> {
+        let runs = self.runs(engine);
+        let cells = runs
+            .iter()
+            .enumerate()
+            .filter_map(|(i, run)| {
+                run.outcome.latency_us.map(|q| Cell {
+                    run_index: i + 1,
+                    value: q.median as f64,
+                })
+            })
+            .collect::<Vec<_>>();
+        if cells.len() == runs.len() {
+            cells
+        } else {
+            Vec::new()
+        }
     }
 
     /// The kernel's counts, per GiB, or nothing at all when any run of the engine lacks them — a
@@ -381,7 +433,10 @@ impl Comparison {
                 let gates = Some(candidate) == self.gated;
                 let priced =
                     prices_per_gib(self.runs(candidate)) && prices_per_gib(self.runs(reference));
-                [
+                let latency = self.latency_cells(candidate).len() == self.runs(candidate).len()
+                    && self.latency_cells(reference).len() == self.runs(reference).len()
+                    && !self.runs(candidate).is_empty();
+                let mut specs = vec![
                     (
                         format!("throughput ({candidate} vs {reference})"),
                         Direction::Higher,
@@ -390,7 +445,7 @@ impl Comparison {
                             &self.throughput_cells(reference),
                             Direction::Higher,
                         )),
-                        true,
+                        self.workload.total_bytes() > 0 && self.workload.traffic != "tcp-latency",
                         true,
                     ),
                     (
@@ -441,26 +496,40 @@ impl Comparison {
                         false,
                         true,
                     ),
-                ]
-                .into_iter()
-                .map(move |(label, direction, interval, gates_row, priced_row)| {
-                    let row = if gates && gates_row {
-                        if priced_row {
-                            stats::Row::gating(label.clone(), direction, interval)
+                ];
+                if latency {
+                    specs.push((
+                        format!("round trip ({candidate} vs {reference}, lower is better)"),
+                        Direction::Lower,
+                        stats::bootstrap_ci(&stats::paired_ratios(
+                            &self.latency_cells(candidate),
+                            &self.latency_cells(reference),
+                            Direction::Lower,
+                        )),
+                        self.workload.traffic == "tcp-latency",
+                        true,
+                    ));
+                }
+                specs
+                    .into_iter()
+                    .map(move |(label, direction, interval, gates_row, priced_row)| {
+                        let row = if gates && gates_row {
+                            if priced_row {
+                                stats::Row::gating(label.clone(), direction, interval)
+                            } else {
+                                stats::Row::reported_unpriced(label.clone(), direction, interval)
+                            }
                         } else {
-                            stats::Row::reported_unpriced(label.clone(), direction, interval)
+                            stats::Row::reported(label.clone(), direction, interval)
+                        };
+                        if label.starts_with("throughput")
+                            && self.throughput_uncertain_because_of_the_runner(interval)
+                        {
+                            stats::Row::runner_blamed(row)
+                        } else {
+                            row
                         }
-                    } else {
-                        stats::Row::reported(label.clone(), direction, interval)
-                    };
-                    if label.starts_with("throughput")
-                        && self.throughput_uncertain_because_of_the_runner(interval)
-                    {
-                        stats::Row::runner_blamed(row)
-                    } else {
-                        row
-                    }
-                })
+                    })
             })
             .collect()
     }
@@ -1767,6 +1836,8 @@ mod tests {
             connections: 1,
             iterations: 16,
             payload_size: 1024,
+            duration_ms: 0,
+            tcp_latency_iterations: 0,
             warmup: false,
             outbound_config: String::new(),
             outbound_configs: Vec::new(),
@@ -2121,7 +2192,8 @@ mod tests {
             let Some(id) = rest.split(' ').next() else {
                 continue;
             };
-            if id.split('-').count() >= 2 && !id.contains(['/', '"']) {
+            // A `$proto` row is a template from `matrix_protocols`, not a literal id.
+            if id.split('-').count() >= 2 && !id.contains(['/', '"', '$']) {
                 ids.push(id.to_owned());
             }
         }
