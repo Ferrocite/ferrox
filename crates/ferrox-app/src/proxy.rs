@@ -31701,7 +31701,7 @@ mod tests {
             r#"{"inbounds":[{"tag":"dyn","protocol":"vless","listen":"127.0.0.1","port":0,"settings":{"clients":[{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}}]}"#,
         )
         .expect("parses");
-        let runtime = Runtime::new(None, Some(Arc::clone(&shared)), false, Arc::clone(&portals));
+        let runtime = Runtime::new(None, Some(Arc::clone(&shared)), true, Arc::clone(&portals));
         let api = crate::commander::Api::new(crate::commander::ApiConfig::default());
         let seed = crate::xray_pb::Seed::default();
         assert_eq!(
