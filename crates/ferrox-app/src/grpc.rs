@@ -3345,7 +3345,7 @@ mod tests {
             crate::proxy::Push::Took(n) if n > 0
         ));
         let peer = peer.lock().unwrap();
-        let body = data_body(&peer.writes[0]).to_vec();
+        let body = data_body(&peer.writes[0]);
         let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
         assert!(5 + len <= 64, "the message fits the peer's window");
     }
