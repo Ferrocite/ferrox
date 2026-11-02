@@ -152,13 +152,26 @@ fn karatsuba2(h: uint8x16_t, m: uint8x16_t, l: uint8x16_t) -> (uint8x16_t, uint8
 }
 
 #[inline(always)]
-fn encrypt8(rk: &[uint8x16_t; 11], s: &mut [uint8x16_t; 8]) {
+fn round8(k: uint8x16_t, s: &mut [uint8x16_t; 8]) {
     unsafe {
-        for k in &rk[..9] {
-            for lane in s.iter_mut() {
-                *lane = vaesmcq_u8(vaeseq_u8(*lane, *k));
-            }
+        for lane in s.iter_mut() {
+            *lane = vaesmcq_u8(vaeseq_u8(*lane, k));
         }
+    }
+}
+
+#[inline(always)]
+fn encrypt8(rk: &[uint8x16_t; 11], s: &mut [uint8x16_t; 8]) {
+    round8(rk[0], s);
+    round8(rk[1], s);
+    round8(rk[2], s);
+    round8(rk[3], s);
+    round8(rk[4], s);
+    round8(rk[5], s);
+    round8(rk[6], s);
+    round8(rk[7], s);
+    round8(rk[8], s);
+    unsafe {
         for lane in s.iter_mut() {
             *lane = veorq_u8(vaeseq_u8(*lane, rk[9]), rk[10]);
         }
@@ -167,12 +180,20 @@ fn encrypt8(rk: &[uint8x16_t; 11], s: &mut [uint8x16_t; 8]) {
 
 #[inline(always)]
 fn encrypt8_256(rk: &[uint8x16_t; 15], s: &mut [uint8x16_t; 8]) {
+    round8(rk[0], s);
+    round8(rk[1], s);
+    round8(rk[2], s);
+    round8(rk[3], s);
+    round8(rk[4], s);
+    round8(rk[5], s);
+    round8(rk[6], s);
+    round8(rk[7], s);
+    round8(rk[8], s);
+    round8(rk[9], s);
+    round8(rk[10], s);
+    round8(rk[11], s);
+    round8(rk[12], s);
     unsafe {
-        for k in &rk[..13] {
-            for lane in s.iter_mut() {
-                *lane = vaesmcq_u8(vaeseq_u8(*lane, *k));
-            }
-        }
         for lane in s.iter_mut() {
             *lane = veorq_u8(vaeseq_u8(*lane, rk[13]), rk[14]);
         }
@@ -640,10 +661,7 @@ impl Engine {
             mask,
         );
 
-        let mut diff = 0u8;
-        for (a, b) in want.iter().zip(tag.iter()) {
-            diff |= a ^ b;
-        }
+        let diff = u128::from_ne_bytes(want) ^ u128::from_ne_bytes(*tag);
         if diff != 0 {
             return None;
         }
@@ -791,10 +809,7 @@ impl Engine256 {
             buf.len() as u64,
             mask,
         );
-        let mut diff = 0u8;
-        for (a, b) in want.iter().zip(tag.iter()) {
-            diff |= a ^ b;
-        }
+        let diff = u128::from_ne_bytes(want) ^ u128::from_ne_bytes(*tag);
         if diff != 0 {
             return None;
         }
