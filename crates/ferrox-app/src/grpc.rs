@@ -2033,7 +2033,7 @@ impl crate::xhttp_h2::H2Service for GrpcService {
         let users = Arc::clone(&self.users);
         let freedom = self.freedom;
         let opened = Arc::clone(&self.opened);
-        crate::budgets::spawn(move || {
+        crate::proxy::lane_pool::submit_stream_setup(move || {
             crate::proxy::serve_grpc_muxed(reader, writer, &users, freedom, &opened);
         });
     }
