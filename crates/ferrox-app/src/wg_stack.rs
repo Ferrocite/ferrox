@@ -1378,10 +1378,16 @@ fn lane_source_port(
     Some(port)
 }
 
+/// Whether a lane has outlived its peer or its idle budget.
+fn lane_over(associate: Option<&Connection>, quiet: StdInstant) -> bool {
+    associate.is_some_and(crate::proxy::peer_left) || quiet.elapsed() >= crate::budgets::udp_idle()
+}
+
 /// A client datagram lane: every frame the local SOCKS5 front writes becomes an
 /// inner UDP packet, and the reply the tunnel returns is framed back to the last
 /// app that spoke. Each name gets its own inner source port, so a reply pins
 /// only the name that raced it, and the relay port serves a literal address.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
     relay: &UdpSocket,
     config: &DeviceConfig,
@@ -1474,11 +1480,15 @@ pub(crate) fn client_udp<T: Clone + Into<ToTunnel>>(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                if associate.is_some_and(crate::proxy::peer_left)
-                    || quiet.elapsed() >= crate::budgets::udp_idle()
-                {
+                if lane_over(associate, quiet) {
                     break;
                 }
+            }
+            Err(error) if crate::proxy::is_udp_gone(&error) => {
+                if lane_over(associate, quiet) {
+                    break;
+                }
+                std::thread::sleep(LANE_TICK);
             }
             Err(_) => break,
         }
@@ -2784,7 +2794,12 @@ mod client_tests {
         let mut raced = Vec::new();
         let mut other_port = 0;
         for _ in 0..2 {
-            let inner = packets.recv_timeout(LANE_WAIT).expect("inner");
+            let inner = packets.recv_timeout(LANE_WAIT).unwrap_or_else(|error| {
+                let alive = routes
+                    .lock()
+                    .is_ok_and(|table| table.contains_key(&source_port));
+                panic!("inner: {error} (lane alive: {alive})");
+            });
             let datagram = udp_from_packet(&inner).expect("packet");
             assert_eq!(datagram.destination_port, 54);
             other_port = datagram.source_port;
