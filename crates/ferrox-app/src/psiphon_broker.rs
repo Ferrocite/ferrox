@@ -1129,7 +1129,7 @@ mod tests {
             assert_eq!(get_uvarint(&out).map(|(seen, _)| seen), Some(value));
         }
         // Nine and ten octets are past the one-load window; the loop is the same answer there.
-        for value in [u64::MAX, u64::MAX / 3, 1 << 63, (1 << 56) - 1] {
+        for value in [u64::MAX, u64::MAX / 3, 1 << 63, 1 << 56] {
             let mut out = Vec::new();
             put_uvarint(&mut out, value);
             assert!(out.len() >= 9, "{value:#x} is a wide varint");
