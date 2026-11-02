@@ -4050,14 +4050,10 @@ mod tests {
         client
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("arms");
-        let deadline = Instant::now() + Duration::from_secs(10);
         let mut refused = false;
         while !refused {
-            assert!(
-                Instant::now() < deadline,
-                "the refused stream was never reset"
-            );
-            let (len, kind, _flags, sid) = crate::h2::read_head(&mut client).expect("a frame");
+            let (len, kind, _flags, sid) = crate::h2::read_head_bounded(&mut client)
+                .expect("the refused stream was never reset");
             let mut body = vec![0u8; len];
             client.read_exact(&mut body).expect("body");
             if kind == T_RST {
