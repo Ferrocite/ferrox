@@ -3298,6 +3298,7 @@ mod tests {
                 FlowResult {
                     bytes_sent: 0,
                     bytes_received: 0,
+                    latency_us: Vec::new(),
                     window: None,
                     setup: Setup::default(),
                     stopped: None,
@@ -3307,6 +3308,7 @@ mod tests {
         let landed = std::thread::spawn(|| FlowResult {
             bytes_sent: 4096,
             bytes_received: 0,
+            latency_us: Vec::new(),
             window: None,
             setup: Setup::default(),
             stopped: None,
@@ -3336,6 +3338,7 @@ mod tests {
         let first = std::thread::spawn(|| FlowResult {
             bytes_sent: 3,
             bytes_received: 0,
+            latency_us: Vec::new(),
             window: None,
             setup: Setup {
                 total_us: 11,
@@ -3346,6 +3349,7 @@ mod tests {
         let second = std::thread::spawn(|| FlowResult {
             bytes_sent: 0,
             bytes_received: 5,
+            latency_us: Vec::new(),
             window: None,
             setup: Setup {
                 total_us: 22,
@@ -3443,7 +3447,7 @@ mod tests {
     fn rejects_every_out_of_bounds_count() {
         for (field, value) in [
             ("connections", "0"),
-            ("connections", "17"),
+            ("connections", "65"),
             ("iterations", "0"),
             ("iterations", "262145"),
             ("payload_size", "0"),
@@ -3721,6 +3725,7 @@ mod tests {
         let moved = |windows: Vec<Duration>| Moved {
             sent: expected / 2,
             received: expected / 2,
+            latency_us: Vec::new(),
             window: Some((Instant::now(), Instant::now())),
             flow_windows: windows,
             setup: Vec::new(),
