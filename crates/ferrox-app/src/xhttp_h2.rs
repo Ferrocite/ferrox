@@ -1159,7 +1159,7 @@ impl H2Conn {
 /// A client owns one reader thread so a writer waiting for credit never holds the transport the
 /// frame carrying that credit must arrive on; the weak handle lets the session close under it.
 fn client_pump<R: Read>(mut read: R, weak: &std::sync::Weak<H2Conn>) {
-    while let Some((len, kind, flags, sid)) = read_head_retry(&mut read) {
+    while let Some((len, kind, flags, sid, started)) = read_head_retry(&mut read) {
         if len > MAX_RECV_FRAME {
             if let Some(conn) = weak.upgrade() {
                 conn.refuse(E_FRAME_SIZE);
@@ -1167,7 +1167,7 @@ fn client_pump<R: Read>(mut read: R, weak: &std::sync::Weak<H2Conn>) {
             break;
         }
         let mut body = crate::proxy::unfilled(len);
-        if read_exact_retry(&mut read, &mut body).is_err() {
+        if read_exact_retry(&mut read, &mut body, Some(started)).is_err() {
             break;
         }
         let alive = {
@@ -1201,15 +1201,25 @@ fn send_preface(conn: &H2Conn) -> bool {
         && conn.frame(T_WINDOW, 0, 0, &CONN_WINDOW_TOP_UP.to_be_bytes())
 }
 
-fn read_exact_retry(stream: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<()> {
-    let started = std::time::Instant::now();
+/// An idle connection may wait between frames for as long as it is kept, so the stall clock starts
+/// on a frame's first byte and bounds the rest of that frame, never the silence before it.
+fn read_exact_retry(
+    stream: &mut dyn Read,
+    buf: &mut [u8],
+    started: Option<std::time::Instant>,
+) -> std::io::Result<Option<std::time::Instant>> {
+    let mut started = started;
     let mut at = 0;
     while at < buf.len() {
         match stream.read(&mut buf[at..]) {
             Ok(0) => return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof)),
-            Ok(n) => at += n,
+            Ok(n) => {
+                at += n;
+                started.get_or_insert_with(std::time::Instant::now);
+            }
             Err(error) if crate::proxy::is_timeout(&error) => {
-                if started.elapsed() >= crate::budgets::relay_stall() {
+                if started.is_some_and(|started| started.elapsed() >= crate::budgets::relay_stall())
+                {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::TimedOut,
                         "h2 frame stalled",
@@ -1222,17 +1232,18 @@ fn read_exact_retry(stream: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<()
             Err(error) => return Err(error),
         }
     }
-    Ok(())
+    Ok(started)
 }
 
-fn read_head_retry(stream: &mut dyn Read) -> Option<(usize, u8, u8, u32)> {
+fn read_head_retry(stream: &mut dyn Read) -> Option<(usize, u8, u8, u32, std::time::Instant)> {
     let mut head = [0u8; 9];
-    read_exact_retry(stream, &mut head).ok()?;
+    let started = read_exact_retry(stream, &mut head, None).ok()??;
     Some((
         usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]),
         head[3],
         head[4],
         u32::from_be_bytes([head[5], head[6], head[7], head[8]]) & 0x7FFF_FFFF,
+        started,
     ))
 }
 
@@ -3924,6 +3935,59 @@ mod tests {
             let frames = len.div_ceil(16_384);
             assert!(slices.load(Ordering::SeqCst) <= frames);
         }
+    }
+
+    /// A connection kept for a later stream may sit idle between frames: only a frame that has
+    /// started is bounded by the stall, so silence between frames must not end the session.
+    #[test]
+    fn an_idle_gap_between_frames_does_not_end_the_connection() {
+        struct Quiet {
+            polls: usize,
+        }
+        impl Read for Quiet {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.polls > 0 {
+                    self.polls -= 1;
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                buf[..9].copy_from_slice(&[0, 0, 0, T_PING, 0, 0, 0, 0, 0]);
+                Ok(9)
+            }
+        }
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(50)),
+            ..Default::default()
+        });
+        let mut quiet = Quiet { polls: 100 };
+        let head = read_head_retry(&mut quiet);
+        crate::budgets::clear();
+        assert!(head.is_some(), "an idle gap ended the connection");
+    }
+
+    /// Once a frame starts, a peer that never finishes it still ends at the stall.
+    #[test]
+    fn a_frame_that_stops_mid_body_ends_at_the_stall() {
+        struct Half {
+            started: bool,
+        }
+        impl Read for Half {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.started {
+                    return Err(std::io::ErrorKind::WouldBlock.into());
+                }
+                self.started = true;
+                buf[..4].copy_from_slice(&[0, 0, 4, T_PING]);
+                Ok(4)
+            }
+        }
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(50)),
+            ..Default::default()
+        });
+        let mut half = Half { started: false };
+        let head = read_head_retry(&mut half);
+        crate::budgets::clear();
+        assert!(head.is_none(), "a partial frame never ended at the stall");
     }
 
     /// A lane step hands its thread back at the poll; only a wait outside a lane takes the stall.
