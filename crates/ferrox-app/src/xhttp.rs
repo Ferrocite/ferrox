@@ -1926,6 +1926,11 @@ impl SessionReader {
     }
 }
 
+/// A poll grain is the reader's own wake-up, not a socket deadline, so it ends no session.
+fn poll_grain(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock && error.raw_os_error().is_none()
+}
+
 impl Read for SessionReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         loop {
@@ -1952,6 +1957,7 @@ impl Read for SessionReader {
                         drop(st);
                         Ok(n)
                     }
+                    Err(e) if poll_grain(&e) => Err(e),
                     Err(e) => {
                         st.ended = true;
                         self.session.cv.notify_all();
@@ -4899,6 +4905,45 @@ mod tests {
             "ending the session wakes the post"
         );
         worker.join().expect("joins");
+    }
+
+    /// A poll grain from the upload keeps the session open; a socket deadline still ends it.
+    #[test]
+    fn a_poll_grain_keeps_the_session_and_a_deadline_ends_it() {
+        struct Once(bool, std::io::ErrorKind);
+        impl Read for Once {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.0 {
+                    self.0 = true;
+                    return Err(std::io::Error::from(self.1));
+                }
+                buf[..2].copy_from_slice(b"hi");
+                Ok(2)
+            }
+        }
+        let session = get_or_create_session("poll-grain-upload");
+        session.set_upload(Box::new(Once(false, std::io::ErrorKind::WouldBlock)));
+        let mut reader = SessionReader::new(Arc::clone(&session), "poll-grain-upload".to_owned());
+        let mut buf = [0u8; 8];
+        let error = reader.read(&mut buf).expect_err("the poll grain");
+        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(
+            !session.state.lock().expect("session lock").ended,
+            "a poll grain ended the session"
+        );
+        assert_eq!(reader.read(&mut buf).expect("the upload resumes"), 2);
+        assert_eq!(&buf[..2], b"hi");
+        end_session("poll-grain-upload");
+
+        let ended = get_or_create_session("deadline-upload");
+        ended.set_upload(Box::new(Once(false, std::io::ErrorKind::TimedOut)));
+        let mut reader = SessionReader::new(Arc::clone(&ended), "deadline-upload".to_owned());
+        assert!(reader.read(&mut buf).is_err());
+        assert!(
+            ended.state.lock().expect("session lock").ended,
+            "a socket deadline left the session open"
+        );
+        end_session("deadline-upload");
     }
 
     /// Both parks — the uplink's `wait_ended` and the downlink's `Read::read` — wait on `session.cv`, and until a carrier owned the session the only thing that ever notified it was a `SessionReader`'s Drop. A client that opened one half and died left the other half's thread parked for the life of the process.
