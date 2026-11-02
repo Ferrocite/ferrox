@@ -23104,7 +23104,7 @@ fn serve_udp_stream<R, W>(
         match udp.recv(&mut buf) {
             Ok(n) => {
                 grace = None;
-                let _ = awaiting.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                let _ = awaiting.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                     Some(left.saturating_sub(1))
                 });
                 if poll != RELAY_POLL {
