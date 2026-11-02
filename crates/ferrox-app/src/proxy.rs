@@ -42167,7 +42167,9 @@ mod tests {
                 stream,
                 &one_vless_user(&id),
                 true,
-                &Carrier::Xhttp { settings },
+                &Carrier::Xhttp {
+                    settings: settings.clone(),
+                },
                 &server_config,
                 None,
                 None,
