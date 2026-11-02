@@ -187,7 +187,7 @@ pub(crate) struct H2StreamReader {
     /// How much of the front frame this reader has taken: the frame is popped when it is spent,
     /// so a short read leaves the tail where the loop put it instead of moving it to the base.
     at: usize,
-    /// The last byte's arrival, so a lane's polls still end an idle body at the stall.
+    /// The start of the current idle stretch, so a lane's polls still end a body at the stall.
     idle_since: Option<std::time::Instant>,
 }
 
