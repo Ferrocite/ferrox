@@ -180,20 +180,12 @@ fn encrypt8(rk: &[uint8x16_t; 11], s: &mut [uint8x16_t; 8]) {
 
 #[inline(always)]
 fn encrypt8_256(rk: &[uint8x16_t; 15], s: &mut [uint8x16_t; 8]) {
-    round8(rk[0], s);
-    round8(rk[1], s);
-    round8(rk[2], s);
-    round8(rk[3], s);
-    round8(rk[4], s);
-    round8(rk[5], s);
-    round8(rk[6], s);
-    round8(rk[7], s);
-    round8(rk[8], s);
-    round8(rk[9], s);
-    round8(rk[10], s);
-    round8(rk[11], s);
-    round8(rk[12], s);
     unsafe {
+        for k in &rk[..13] {
+            for lane in s.iter_mut() {
+                *lane = vaesmcq_u8(vaeseq_u8(*lane, *k));
+            }
+        }
         for lane in s.iter_mut() {
             *lane = veorq_u8(vaeseq_u8(*lane, rk[13]), rk[14]);
         }
