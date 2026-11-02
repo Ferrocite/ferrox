@@ -31860,14 +31860,15 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         peer.read_exact(&mut got).expect("reads the echo");
         assert_eq!(&got, payload);
-        let snapshot = crate::stats::snapshot();
-        let traffic = snapshot
+        // The counters are metered on the relay threads, so join the session before reading them.
+        drop(peer);
+        serving.join().expect("serves");
+        let traffic = crate::stats::snapshot();
+        let traffic = traffic
             .user
             .get("sealed@example")
             .expect("the sealed session counts the user's traffic");
         assert!(traffic.uplink > 0 && traffic.downlink > 0);
-        drop(peer);
-        serving.join().expect("serves");
         crate::stats::clear();
     }
 
@@ -35808,7 +35809,7 @@ mod tests {
             },
         );
         let (mut user, dialled) = dial_pair(&pair);
-        let payload: Vec<u8> = (0..200_000u32)
+        let payload: Vec<u8> = (0..4_000_000u32)
             .map(|index| (index as u8).wrapping_mul(37).wrapping_add(11))
             .collect();
         let back = echo_bulk(&mut user, &payload);
