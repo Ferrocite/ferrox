@@ -21,12 +21,20 @@ pub(crate) struct Keys {
     pub(crate) meek: Meek,
 }
 
+/// One fronting address a broker spec names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Fronting {
+    pub(crate) host: String,
+    pub(crate) addresses: Vec<String>,
+    pub(crate) disable_sni: bool,
+}
+
 /// One in-proxy broker a tactics payload names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Broker {
     pub(crate) public_key: String,
     pub(crate) root_secret: String,
-    pub(crate) hosts: Vec<String>,
+    pub(crate) fronts: Vec<Fronting>,
 }
 
 /// The parts of a tactics payload this lane reads.
@@ -275,21 +283,39 @@ fn broker(spec: &Json) -> Option<Broker> {
         .and_then(Json::as_str)
         .filter(|secret| !secret.is_empty())?
         .to_owned();
-    let hosts = spec
+    let fronts = spec
         .get("BrokerFrontingSpecs")
         .and_then(Json::as_arr)
-        .map(|specs| {
-            specs
-                .iter()
-                .filter_map(|spec| spec.get("Host").and_then(Json::as_str))
-                .map(str::to_owned)
-                .collect()
-        })
+        .map(|specs| specs.iter().filter_map(fronting).collect())
         .unwrap_or_default();
     Some(Broker {
         public_key,
         root_secret,
-        hosts,
+        fronts,
+    })
+}
+
+fn fronting(spec: &Json) -> Option<Fronting> {
+    let host = spec.get("Host").and_then(Json::as_str)?.to_owned();
+    let addresses = spec
+        .get("Addresses")
+        .and_then(Json::as_arr)
+        .map(|addresses| {
+            addresses
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let disable_sni = spec
+        .get("DisableSNI")
+        .and_then(Json::as_bool)
+        .unwrap_or(false);
+    Some(Fronting {
+        host,
+        addresses,
+        disable_sni,
     })
 }
 
@@ -383,7 +409,11 @@ mod tests {
             vec![Broker {
                 public_key: "pk".to_owned(),
                 root_secret: "rs".to_owned(),
-                hosts: vec!["broker.example".to_owned()],
+                fronts: vec![Fronting {
+                    host: "broker.example".to_owned(),
+                    addresses: Vec::new(),
+                    disable_sni: false,
+                }],
             }]
         );
         assert_eq!(tactics.compartments, vec!["c1".to_owned(), "c2".to_owned()]);
