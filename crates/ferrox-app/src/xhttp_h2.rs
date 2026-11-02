@@ -1595,6 +1595,13 @@ enum Stepped {
     Done,
 }
 
+/// How one buffer fill ended.
+enum Filled {
+    Full,
+    Idle,
+    End,
+}
+
 #[derive(Clone, Copy)]
 enum Phase {
     Magic,
@@ -1612,10 +1619,14 @@ struct Frames<R, W> {
     write: Option<W>,
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
     conn: Option<Arc<H2Conn>>,
-    buf: Vec<u8>,
-    have: usize,
+    magic: [u8; MAGIC.len()],
+    magic_have: usize,
+    head: [u8; 9],
+    head_have: usize,
+    body: Vec<u8>,
+    body_have: usize,
+    frame: (u8, u8, u32),
     phase: Phase,
-    head: (u8, u8, u32),
     frag: Option<(u32, Vec<u8>, bool)>,
 }
 
@@ -1637,43 +1648,55 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
             write: Some(write),
             decryption,
             conn: None,
-            buf: vec![0u8; MAGIC.len()],
-            have: 0,
+            magic: [0u8; MAGIC.len()],
+            magic_have: 0,
+            head: [0u8; 9],
+            head_have: 0,
+            body: Vec::new(),
+            body_have: 0,
+            frame: (0, 0, 0),
             phase: Phase::Magic,
-            head: (0, 0, 0),
             frag: None,
         }
     }
 
     /// The handshake clock: silence before the first request is decoded ends at `until`, and the
     /// first decoded request puts the clock away for the life of the connection.
-    fn expired(&mut self) -> bool {
-        if self
-            .opened
+    fn expired(
+        until: &mut Option<std::time::Instant>,
+        opened: &mut Option<Arc<std::sync::atomic::AtomicBool>>,
+    ) -> bool {
+        if opened
             .as_ref()
             .is_some_and(|opened| opened.load(Ordering::Relaxed))
         {
-            self.until = None;
-            self.opened = None;
+            *until = None;
+            *opened = None;
             return false;
         }
-        self.until
-            .is_some_and(|until| std::time::Instant::now() >= until)
+        until.is_some_and(|until| std::time::Instant::now() >= until)
     }
 
-    fn step(&mut self, service: &dyn H2Service, block: bool) -> Stepped {
-        while self.have < self.buf.len() {
-            if self.expired() {
-                return self.end();
+    fn fill(
+        read: &mut R,
+        until: &mut Option<std::time::Instant>,
+        opened: &mut Option<Arc<std::sync::atomic::AtomicBool>>,
+        buf: &mut [u8],
+        have: &mut usize,
+        block: bool,
+    ) -> Filled {
+        while *have < buf.len() {
+            if Self::expired(until, opened) {
+                return Filled::End;
             }
-            match self.read.read(&mut self.buf[self.have..]) {
-                Ok(0) => return self.end(),
-                Ok(filled) => self.have += filled,
+            match read.read(&mut buf[*have..]) {
+                Ok(0) => return Filled::End,
+                Ok(filled) => *have += filled,
                 Err(error) if crate::proxy::is_timeout(&error) => {
                     if !block {
-                        return Stepped::Idle;
+                        return Filled::Idle;
                     }
-                    if let Some(until) = self.until {
+                    if let Some(until) = *until {
                         std::thread::sleep(
                             until
                                 .saturating_duration_since(std::time::Instant::now())
@@ -1681,12 +1704,47 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                         );
                     }
                 }
-                Err(_) => return self.end(),
+                Err(_) => return Filled::End,
             }
+        }
+        Filled::Full
+    }
+
+    fn step(&mut self, service: &dyn H2Service, block: bool) -> Stepped {
+        let filled = match self.phase {
+            Phase::Magic => Self::fill(
+                &mut self.read,
+                &mut self.until,
+                &mut self.opened,
+                &mut self.magic,
+                &mut self.magic_have,
+                block,
+            ),
+            Phase::Head => Self::fill(
+                &mut self.read,
+                &mut self.until,
+                &mut self.opened,
+                &mut self.head,
+                &mut self.head_have,
+                block,
+            ),
+            Phase::Body => Self::fill(
+                &mut self.read,
+                &mut self.until,
+                &mut self.opened,
+                &mut self.body,
+                &mut self.body_have,
+                block,
+            ),
+        };
+        match filled {
+            Filled::Idle => return Stepped::Idle,
+            Filled::End => return self.end(),
+            Filled::Full => {}
         }
         match self.phase {
             Phase::Magic => {
-                if self.buf[..] != MAGIC[..] {
+                if self.magic[..] != MAGIC[..] {
                     return self.end();
                 }
                 let Some(write) = self.write.take() else {
@@ -1719,15 +1777,17 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                 }
                 conn.frame(T_WINDOW, 0, 0, &CONN_WINDOW_TOP_UP.to_be_bytes());
                 self.conn = Some(conn);
-                self.next(Phase::Head, 9);
+                self.head_have = 0;
+                self.phase = Phase::Head;
             }
             Phase::Head => {
-                let len = usize::from(self.buf[0]) << 16
-                    | usize::from(self.buf[1]) << 8
-                    | usize::from(self.buf[2]);
-                let (kind, flags) = (self.buf[3], self.buf[4]);
-                let sid = u32::from_be_bytes([self.buf[5], self.buf[6], self.buf[7], self.buf[8]])
-                    & 0x7FFF_FFFF;
+                let len = usize::from(self.head[0]) << 16
+                    | usize::from(self.head[1]) << 8
+                    | usize::from(self.head[2]);
+                let (kind, flags) = (self.head[3], self.head[4]);
+                let sid =
+                    u32::from_be_bytes([self.head[5], self.head[6], self.head[7], self.head[8]])
+                        & 0x7FFF_FFFF;
                 if len > MAX_RECV_FRAME {
                     // A frame past the default SETTINGS_MAX_FRAME_SIZE is a connection error (RFC 7540 6.9.1): refuse it before reserving its length or blocking on a body that may never arrive.
                     if let Some(conn) = &self.conn {
@@ -1735,28 +1795,25 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     }
                     return self.end();
                 }
-                self.head = (kind, flags, sid);
-                self.next(Phase::Body, len);
+                self.body = crate::proxy::unfilled(len);
+                self.body_have = 0;
+                self.frame = (kind, flags, sid);
+                self.phase = Phase::Body;
             }
             Phase::Body => {
-                let (kind, flags, sid) = self.head;
+                let (kind, flags, sid) = self.frame;
                 let Some(conn) = &self.conn else {
                     return self.end();
                 };
-                let body = std::mem::take(&mut self.buf);
+                let body = std::mem::take(&mut self.body);
                 if !pump_frame(conn, service, kind, flags, sid, body, &mut self.frag) {
                     return self.end();
                 }
-                self.next(Phase::Head, 9);
+                self.head_have = 0;
+                self.phase = Phase::Head;
             }
         }
         Stepped::More
-    }
-
-    fn next(&mut self, phase: Phase, len: usize) {
-        self.buf = crate::proxy::unfilled(len);
-        self.have = 0;
-        self.phase = phase;
     }
 
     fn end(&mut self) -> Stepped {
