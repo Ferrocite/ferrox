@@ -261,7 +261,7 @@ struct Reading {
 }
 
 #[derive(Clone, Copy)]
-enum Answer {
+pub(crate) enum Answer {
     None,
     Pending { head: [u8; 2], filled: u8 },
 }
