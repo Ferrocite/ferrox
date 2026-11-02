@@ -2708,6 +2708,36 @@ mod tests {
     }
 
     #[test]
+    fn the_varint_length_over_every_boundary() {
+        let mut acc = 0usize;
+        for _ in 0..1024 {
+            for bits in 0..64 {
+                acc += varint_len((1u64 << bits) - 1) + varint_len(1u64 << bits);
+            }
+        }
+        std::hint::black_box(acc);
+    }
+
+    #[test]
+    fn the_varint_shift_loop_over_every_boundary() {
+        fn shift_len(mut value: u64) -> usize {
+            let mut len = 1;
+            while value >= 0x80 {
+                value >>= 7;
+                len += 1;
+            }
+            len
+        }
+        let mut acc = 0usize;
+        for _ in 0..1024 {
+            for bits in 0..64 {
+                acc += shift_len((1u64 << bits) - 1) + shift_len(1u64 << bits);
+            }
+        }
+        std::hint::black_box(acc);
+    }
+
+    #[test]
     fn huffman_matches_the_rfc_example() {
         let coded = [
             0xF1, 0xE3, 0xC2, 0xE5, 0xF2, 0x3A, 0x6B, 0xA0, 0xAB, 0x90, 0xF4, 0xFF,
