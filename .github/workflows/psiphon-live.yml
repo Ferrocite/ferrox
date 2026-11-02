@@ -34,6 +34,14 @@ on:
         description: tunnels each implementation keeps; blank is one
         required: false
         default: ""
+      protocol:
+        description: direct SSH/OSSH or CDN fronted meek
+        required: false
+        type: choice
+        options:
+          - direct
+          - cdn
+        default: direct
 
 concurrency:
   group: psiphon-live-${{ github.ref }}
@@ -126,6 +134,7 @@ jobs:
         env:
           PSIPHON_REGION: ${{ inputs.region }}
           PSIPHON_POOL: ${{ inputs.pool }}
+          PSIPHON_PROTOCOL: ${{ inputs.protocol }}
         run: |
           BIN=target/release/ferrox-app
           if [ -f "$BIN.exe" ]; then BIN="$BIN.exe"; fi
@@ -225,7 +234,7 @@ jobs:
             echo "::error::pool must be an integer from 1 to 32, got '$PSIPHON_POOL'"
             exit 1
           fi
-          PSIPHON_REGION="$PSIPHON_REGION" STATE="$RUNNER_TEMP/psiphon-state" python3 - <<'PY'
+          PSIPHON_REGION="$PSIPHON_REGION" PSIPHON_PROTOCOL="$PSIPHON_PROTOCOL" STATE="$RUNNER_TEMP/psiphon-state" python3 - <<'PY'
           import json, os
           settings = {
               "listen": "127.0.0.1:1821",
@@ -237,6 +246,8 @@ jobs:
               settings["region"] = os.environ["PSIPHON_REGION"]
           if os.environ.get("PSIPHON_POOL"):
               settings["TunnelPoolSize"] = int(os.environ["PSIPHON_POOL"])
+          if os.environ.get("PSIPHON_PROTOCOL") == "cdn":
+              settings["protocolSelection"] = "cdn_fronting"
           document = {
               "inbounds": [
                   {"protocol": "socks", "listen": "127.0.0.1", "port": 10808},
@@ -334,6 +345,11 @@ jobs:
           else
           printf 'native ready 0 %s 0\n' "$((SECONDS - READY_AT))" >> psiphon-legs.tsv
           sample_process "native ready" "$LANE_PID"
+          if [ "${PSIPHON_PROTOCOL:-direct}" = cdn ] && ! grep -Eq \
+            'tunnel up via \S+ (FRONTED-MEEK-OSSH|FRONTED-MEEK-HTTP-OSSH)' psiphon-live.log; then
+            echo "::error::the CDN leg established no fronted tunnel" >&2
+            FAILED="$FAILED native(cdn)"
+          fi
           trace_front socks 10808 "native socks" || FAILED="$FAILED native(socks trace)"
           fetch_mb socks 10808 psiphon-socks.bin "native socks" || FAILED="$FAILED native(socks)"
           trace_front http 10819 "native http" || FAILED="$FAILED native(http trace)"
