@@ -673,18 +673,19 @@ impl Response {
         let invalid = || std::io::Error::from(std::io::ErrorKind::InvalidData);
         let first = u16::try_from(n).map_err(|_| invalid())?;
         let key_len = self.request_salt.len();
-        let mut fixed = [0u8; 1 + 8 + 32 + 2];
-        fixed[0] = 1;
-        fixed[1..9].copy_from_slice(&now_secs().to_be_bytes());
-        fixed[9..9 + key_len].copy_from_slice(&self.request_salt);
-        fixed[9 + key_len..11 + key_len].copy_from_slice(&first.to_be_bytes());
-        let mut fixed_wire = [0u8; 1 + 8 + 32 + 2 + TAG_LEN];
-        fixed_wire[..11 + key_len].copy_from_slice(&fixed[..11 + key_len]);
+        // xray reads salt and the fixed header in one read, so they leave as one segment: a carrier that frames per write left that read one record short.
+        let mut head = [0u8; 32 + 11 + 32 + TAG_LEN];
+        head[..key_len].copy_from_slice(&self.server_salt);
+        head[key_len] = 1;
+        head[key_len + 1..key_len + 9].copy_from_slice(&now_secs().to_be_bytes());
+        head[key_len + 9..key_len + 9 + key_len].copy_from_slice(&self.request_salt);
+        head[key_len + 9 + key_len..key_len + 11 + key_len].copy_from_slice(&first.to_be_bytes());
         let tag = self
             .send
-            .seal_piece_in_place(&mut fixed_wire[..11 + key_len])
+            .seal_piece_in_place(&mut head[key_len..key_len + 11 + key_len])
             .ok_or_else(invalid)?;
-        fixed_wire[11 + key_len..11 + key_len + TAG_LEN].copy_from_slice(&tag);
+        head[key_len + 11 + key_len..key_len + 11 + key_len + TAG_LEN].copy_from_slice(&tag);
+        let head = &head[..key_len + 11 + key_len + TAG_LEN];
         let payload_wire = if n == 0 {
             &[][..]
         } else {
@@ -697,14 +698,7 @@ impl Response {
             &buf[SEAL_HEAD..end + TAG_LEN]
         };
         self.first_owed = false;
-        crate::proxy::write_all_parts::<3>(
-            out,
-            &[
-                self.server_salt.as_slice(),
-                &fixed_wire[..11 + key_len + TAG_LEN],
-                payload_wire,
-            ],
-        )
+        crate::proxy::write_all_parts::<2>(out, &[head, payload_wire])
     }
 }
 
@@ -2451,6 +2445,49 @@ mod tests {
         let got = cipher.open_in_place(&mut chunk).expect("opens first");
         assert_eq!(&chunk[..got], b"first");
         let _ = s;
+    }
+
+    /// A carrier that frames per write: TLS seals one record and a WebSocket one frame per call, so
+    /// the default vectored write — the first non-empty segment only — is its whole contract.
+    struct Framed(Vec<Vec<u8>>);
+    impl Write for Framed {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.push(buf.to_vec());
+            Ok(buf.len())
+        }
+        fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+            let Some(first) = bufs.iter().find(|piece| !piece.is_empty()) else {
+                return Ok(0);
+            };
+            self.0.push(first.to_vec());
+            Ok(first.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_response_salt_and_fixed_header_leave_in_one_write() {
+        for method in [Method::Aes128Gcm, Method::Aes256Gcm] {
+            let key_len = method.key_len();
+            let psk = vec![0x33u8; key_len];
+            let request_salt = vec![0x44u8; key_len];
+            let server_salt = vec![0x55u8; key_len];
+            let send = Cipher::from_psk(method, &psk, &server_salt).expect("derives");
+            let mut response = Response::new(send, server_salt.clone(), request_salt);
+            let mut buf = [0u8; SEAL_HEAD + 4];
+            buf[SEAL_HEAD..].copy_from_slice(b"data");
+            let mut out = Framed(Vec::new());
+            response.seal_first(&mut buf, 4, &mut out).expect("seals");
+            let head_len = key_len + 11 + key_len + TAG_LEN;
+            assert_eq!(
+                out.0.first().map(Vec::len),
+                Some(head_len),
+                "xray reads salt and the fixed header in one read; a split record leaves it short"
+            );
+            assert_eq!(&out.0[0][..key_len], &server_salt[..]);
+        }
     }
 
     #[test]
