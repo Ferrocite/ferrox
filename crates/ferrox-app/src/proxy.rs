@@ -9157,6 +9157,7 @@ where
                 Next::Done
             } else {
                 note_wait_finish(ended);
+                buffer.release();
                 Next::Idle
             }
         }
@@ -10011,6 +10012,7 @@ fn kcp_relay_metered(
                     if forward.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                         Next::Done
                     } else {
+                        buffer.release();
                         Next::Idle
                     }
                 }
@@ -10051,6 +10053,7 @@ fn kcp_relay_metered(
                     if backward.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                         Next::Done
                     } else {
+                        buffer.release();
                         Next::Idle
                     }
                 }
@@ -23519,12 +23522,35 @@ impl RelayBuf {
 
     #[must_use]
     pub fn as_mut(&mut self) -> &mut [u8] {
+        self.ensure();
         &mut self.bytes[..self.window]
+    }
+
+    /// Returns the window to the pool while a lane is parked: a parked direction breaks its wait at
+    /// the read clock, and the bytes it would read are not there, so it can hold no allocation. The
+    /// next step takes one again, and `held` is the witness that the park kept none.
+    pub fn release(&mut self) {
+        if self.bytes.len() == RELAY_SMALL_BUFFER || self.bytes.len() == RELAY_BUFFER {
+            give_relay_window(std::mem::take(&mut self.bytes));
+        }
+    }
+
+    fn ensure(&mut self) {
+        if self.bytes.len() >= self.window {
+            return;
+        }
+        let mut bytes = take_relay_window(self.window).unwrap_or_else(|| vec![0u8; self.window]);
+        let have = self.bytes.len();
+        bytes[..have].copy_from_slice(&self.bytes[..have]);
+        let mut old = std::mem::replace(&mut self.bytes, bytes);
+        old.truncate(have);
+        give_relay_window(old);
     }
 
     /// The buffer leaves the type; every later read is prefix-bounded like `open_chunk`'s or `poll_copy`'s, so bytes a read did not report are never sent.
     #[must_use]
     pub fn into_vec(mut self) -> Vec<u8> {
+        self.ensure();
         self.bytes.truncate(self.window);
         std::mem::take(&mut self.bytes)
     }
@@ -23532,6 +23558,7 @@ impl RelayBuf {
     /// A read that filled the window promotes at once, and a leg whose reads are all short promotes once it has moved a whole window: `recv` returns what is queued rather than what was asked, so a busy leg would otherwise stay at 16 KiB for the life of the flow.
     #[must_use]
     pub fn filled(&mut self, n: usize) -> &[u8] {
+        self.ensure();
         self.moved = self.moved.saturating_add(n);
         if self.window < self.promote_to && (n == self.window || self.moved >= self.promote_to) {
             self.window = self.promote_to;
@@ -23564,6 +23591,12 @@ impl RelayBuf {
     #[must_use]
     pub fn size(&self) -> usize {
         self.window
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub fn held(&self) -> usize {
+        self.bytes.len()
     }
 }
 
@@ -23663,6 +23696,11 @@ pub(crate) mod lane_pool {
         wake: Option<WakePipe>,
         #[cfg(unix)]
         reaper: Mutex<Option<std::thread::JoinHandle<()>>>,
+        /// Slots whose sibling ended, named so the reaper drops them without scanning the parked set.
+        #[cfg(unix)]
+        retired: Mutex<Vec<u64>>,
+        #[cfg(unix)]
+        next_slot: std::sync::atomic::AtomicU64,
         /// Which park branch a lane took: a readiness park is a descriptor wait, a timer park is the clock.
         #[cfg(all(test, unix))]
         ready_parks: std::sync::atomic::AtomicUsize,
@@ -23690,6 +23728,7 @@ pub(crate) mod lane_pool {
     /// wakes it when it does not, and `due` is the grace a sibling's end leaves for the last reply.
     #[cfg(unix)]
     pub(crate) struct ReadySlot {
+        id: u64,
         due: std::sync::OnceLock<Option<std::time::Instant>>,
         fd: std::os::fd::RawFd,
         finish: Option<std::sync::Arc<crate::proxy::RelayFinish>>,
@@ -23732,6 +23771,9 @@ pub(crate) mod lane_pool {
             #[cfg(all(test, unix))]
             pool.ended_wakes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Ok(mut retired) = pool.retired.lock() {
+                retired.push(self.id);
+            }
             {
                 let mut ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
                 ready.push_back(lane);
@@ -23870,6 +23912,10 @@ pub(crate) mod lane_pool {
             wake: WakePipe::new(),
             #[cfg(unix)]
             reaper: Mutex::new(None),
+            #[cfg(unix)]
+            retired: Mutex::new(Vec::new()),
+            #[cfg(unix)]
+            next_slot: std::sync::atomic::AtomicU64::new(0),
             #[cfg(all(test, unix))]
             ready_parks: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(test, unix))]
@@ -24106,6 +24152,9 @@ pub(crate) mod lane_pool {
             return Err(lane);
         }
         let slot = std::sync::Arc::new(ReadySlot {
+            id: pool
+                .next_slot
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             due: std::sync::OnceLock::new(),
             fd,
             finish: crate::proxy::take_wait_finish(),
@@ -24154,10 +24203,16 @@ pub(crate) mod lane_pool {
         if stopping(pool) {
             return false;
         }
+        let Some(wake) = pool.wake.as_ref() else {
+            return false;
+        };
+        let Some(reactor) = Reactor::new(wake.read) else {
+            return false;
+        };
         let weak = std::sync::Arc::downgrade(pool);
         let Ok(handle) = thread::Builder::new()
             .name("ferrox-relay-ready".into())
-            .spawn(move || reaper_loop(&weak))
+            .spawn(move || reaper_loop(&weak, reactor))
         else {
             return false;
         };
@@ -24165,9 +24220,351 @@ pub(crate) mod lane_pool {
         true
     }
 
+    /// A parked lane's descriptor wait. The epoll/kqueue shape returns only the descriptors that
+    /// are ready, so a wake costs the set's ready lines instead of rebuilding a row per parked lane.
     #[cfg(unix)]
-    fn reaper_loop(pool: &std::sync::Weak<Pool>) {
-        let mut slots: Vec<std::sync::Arc<ReadySlot>> = Vec::new();
+    struct Reactor {
+        #[cfg(target_os = "linux")]
+        ep: libc::c_int,
+        #[cfg(target_os = "macos")]
+        kq: libc::c_int,
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        wake: libc::c_int,
+        fds: std::collections::HashMap<libc::c_int, Vec<u64>>,
+        slots: std::collections::HashMap<u64, std::sync::Arc<ReadySlot>>,
+        due: std::collections::BinaryHeap<std::cmp::Reverse<(std::time::Instant, u64)>>,
+        #[cfg(target_os = "linux")]
+        events: Vec<libc::epoll_event>,
+        #[cfg(target_os = "macos")]
+        events: Vec<libc::kevent>,
+    }
+
+    #[cfg(unix)]
+    impl Reactor {
+        #[cfg(target_os = "linux")]
+        fn new(wake: libc::c_int) -> Option<Self> {
+            let ep = unsafe { libc::epoll_create1(libc::EPOLL_CLOEXEC) };
+            if ep < 0 {
+                return None;
+            }
+            let mut reactor = Self {
+                ep,
+                fds: std::collections::HashMap::new(),
+                slots: std::collections::HashMap::new(),
+                due: std::collections::BinaryHeap::new(),
+                events: Vec::new(),
+            };
+            reactor
+                .events
+                .resize(64, libc::epoll_event { events: 0, u64: 0 });
+            if !reactor.add(wake) {
+                return None;
+            }
+            Some(reactor)
+        }
+
+        #[cfg(target_os = "macos")]
+        fn new(wake: libc::c_int) -> Option<Self> {
+            let kq = unsafe { libc::kqueue() };
+            if kq < 0 {
+                return None;
+            }
+            let mut reactor = Self {
+                kq,
+                fds: std::collections::HashMap::new(),
+                slots: std::collections::HashMap::new(),
+                due: std::collections::BinaryHeap::new(),
+                events: Vec::new(),
+            };
+            reactor.events.resize(
+                64,
+                libc::kevent {
+                    ident: 0,
+                    filter: 0,
+                    flags: 0,
+                    fflags: 0,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                },
+            );
+            if !reactor.add(wake) {
+                return None;
+            }
+            Some(reactor)
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        fn new(wake: libc::c_int) -> Option<Self> {
+            Some(Self {
+                wake,
+                fds: std::collections::HashMap::new(),
+                slots: std::collections::HashMap::new(),
+                due: std::collections::BinaryHeap::new(),
+            })
+        }
+
+        #[cfg(target_os = "linux")]
+        fn add(&mut self, fd: libc::c_int) -> bool {
+            let mut row = libc::epoll_event {
+                events: u32::try_from(libc::EPOLLIN).unwrap_or(u32::MAX),
+                u64: u64::try_from(fd).unwrap_or(u64::MAX),
+            };
+            let added = unsafe {
+                libc::epoll_ctl(
+                    self.ep,
+                    libc::EPOLL_CTL_ADD,
+                    fd,
+                    std::ptr::from_mut(&mut row),
+                )
+            };
+            if added == 0 {
+                return true;
+            }
+            std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST)
+        }
+
+        #[cfg(target_os = "linux")]
+        fn del(&mut self, fd: libc::c_int) {
+            unsafe {
+                libc::epoll_ctl(self.ep, libc::EPOLL_CTL_DEL, fd, std::ptr::null_mut());
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        fn change(&self, fd: libc::c_int, flags: u16) -> bool {
+            let change = libc::kevent {
+                ident: usize::try_from(fd).unwrap_or(usize::MAX),
+                filter: libc::EVFILT_READ,
+                flags,
+                fflags: 0,
+                data: 0,
+                udata: std::ptr::null_mut(),
+            };
+            unsafe {
+                libc::kevent(
+                    self.kq,
+                    std::ptr::from_ref(&change),
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                ) == 0
+            }
+        }
+
+        #[cfg(target_os = "macos")]
+        fn add(&mut self, fd: libc::c_int) -> bool {
+            self.change(fd, libc::EV_ADD | libc::EV_ENABLE)
+        }
+
+        #[cfg(target_os = "macos")]
+        fn del(&mut self, fd: libc::c_int) {
+            self.change(fd, libc::EV_DELETE);
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        fn add(&mut self, _: libc::c_int) -> bool {
+            true
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        fn del(&mut self, _: libc::c_int) {}
+
+        #[cfg(target_os = "linux")]
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<libc::c_int> {
+            let millis =
+                libc::c_int::try_from(timeout.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
+            let count = unsafe {
+                libc::epoll_wait(
+                    self.ep,
+                    self.events.as_mut_ptr(),
+                    libc::c_int::try_from(self.events.len()).unwrap_or(libc::c_int::MAX),
+                    millis,
+                )
+            };
+            if count <= 0 {
+                return Vec::new();
+            }
+            self.events[..usize::try_from(count).unwrap_or(0)]
+                .iter()
+                .map(|event| libc::c_int::try_from(event.u64).unwrap_or(libc::c_int::MAX))
+                .collect()
+        }
+
+        #[cfg(target_os = "macos")]
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<libc::c_int> {
+            let seconds = libc::time_t::try_from(timeout.as_secs()).unwrap_or(libc::time_t::MAX);
+            let nanos = i64::from(timeout.subsec_nanos());
+            let span = libc::timespec {
+                tv_sec: seconds,
+                tv_nsec: nanos,
+            };
+            let count = unsafe {
+                libc::kevent(
+                    self.kq,
+                    std::ptr::null(),
+                    0,
+                    self.events.as_mut_ptr(),
+                    libc::c_int::try_from(self.events.len()).unwrap_or(libc::c_int::MAX),
+                    std::ptr::from_ref(&span),
+                )
+            };
+            if count <= 0 {
+                return Vec::new();
+            }
+            self.events[..usize::try_from(count).unwrap_or(0)]
+                .iter()
+                .map(|event| libc::c_int::try_from(event.ident).unwrap_or(libc::c_int::MAX))
+                .collect()
+        }
+
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        fn wait(&mut self, timeout: std::time::Duration) -> Vec<libc::c_int> {
+            let millis =
+                libc::c_int::try_from(timeout.as_millis().max(1)).unwrap_or(libc::c_int::MAX);
+            let mut rows = Vec::with_capacity(self.fds.len() + 1);
+            rows.push(libc::pollfd {
+                fd: self.wake,
+                events: libc::POLLIN,
+                revents: 0,
+            });
+            for fd in self.fds.keys() {
+                rows.push(libc::pollfd {
+                    fd: *fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                });
+            }
+            let polled = unsafe {
+                libc::poll(
+                    rows.as_mut_ptr(),
+                    libc::nfds_t::try_from(rows.len()).unwrap_or(libc::nfds_t::MAX),
+                    millis,
+                )
+            };
+            if polled <= 0 {
+                return Vec::new();
+            }
+            rows.iter()
+                .filter(|row| row.revents != 0)
+                .map(|row| row.fd)
+                .collect()
+        }
+
+        /// Registers a fresh slot, or hands it back when its descriptor cannot be watched. The first
+        /// slot on a descriptor adds it; the last one removes it.
+        fn park(&mut self, slot: std::sync::Arc<ReadySlot>) -> Option<std::sync::Arc<ReadySlot>> {
+            if slot.is_empty() {
+                return None;
+            }
+            if let Some(due) = slot.due() {
+                self.due.push(std::cmp::Reverse((due, slot.id)));
+            }
+            let fd = slot.fd;
+            // A stale id can outlive its closed descriptor, so a reused number is added again.
+            if !self.add(fd) {
+                return Some(slot);
+            }
+            self.fds.entry(fd).or_default().push(slot.id);
+            self.slots.insert(slot.id, slot);
+            None
+        }
+
+        fn retire(&mut self, id: u64) {
+            let Some(slot) = self.slots.remove(&id) else {
+                return;
+            };
+            let fd = slot.fd;
+            let mut last = false;
+            if let Some(ids) = self.fds.get_mut(&fd) {
+                ids.retain(|known| *known != id);
+                last = ids.is_empty();
+            }
+            if last {
+                self.fds.remove(&fd);
+                self.del(fd);
+            }
+        }
+
+        /// Hands every slot on a ready descriptor back to the queue. Level-triggered, so a lane that
+        /// parks again after leaving a partial frame re-arms and fires at once.
+        fn wake(&mut self, fd: libc::c_int, ready: &mut Vec<Lane>) {
+            let Some(ids) = self.fds.remove(&fd) else {
+                return;
+            };
+            self.del(fd);
+            for id in ids {
+                let Some(slot) = self.slots.remove(&id) else {
+                    continue;
+                };
+                let Some(lane) = slot.take_lane() else {
+                    continue;
+                };
+                if let Some(flow) = slot.finish.as_ref() {
+                    flow.unwatch_park(&slot);
+                }
+                ready.push(lane);
+            }
+        }
+
+        fn wake_due(&mut self, now: std::time::Instant, ready: &mut Vec<Lane>) {
+            while let Some(std::cmp::Reverse((at, id))) = self.due.peek().copied() {
+                if at > now {
+                    break;
+                }
+                self.due.pop();
+                let Some(slot) = self.slots.remove(&id) else {
+                    continue;
+                };
+                self.retire_fd(&slot);
+                let Some(lane) = slot.take_lane() else {
+                    continue;
+                };
+                if let Some(flow) = slot.finish.as_ref() {
+                    flow.unwatch_park(&slot);
+                }
+                ready.push(lane);
+            }
+        }
+
+        fn retire_fd(&mut self, slot: &ReadySlot) {
+            let fd = slot.fd;
+            let mut empty = false;
+            if let Some(ids) = self.fds.get_mut(&fd) {
+                ids.retain(|known| *known != slot.id);
+                empty = ids.is_empty();
+            }
+            if empty {
+                self.fds.remove(&fd);
+                self.del(fd);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for Reactor {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.ep);
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for Reactor {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.kq);
+            }
+        }
+    }
+
+    // `kevent.udata` is written only by the kernel into this thread's own output buffer, never read here.
+    #[cfg(target_os = "macos")]
+    unsafe impl Send for Reactor {}
+
+    #[cfg(unix)]
+    fn reaper_loop(pool: &std::sync::Weak<Pool>, mut reactor: Reactor) {
         loop {
             let Some(pool) = pool.upgrade() else {
                 return;
@@ -24178,72 +24575,51 @@ pub(crate) mod lane_pool {
             let Some(wake) = pool.wake.as_ref() else {
                 return;
             };
+            let retired =
+                std::mem::take(&mut *pool.retired.lock().unwrap_or_else(PoisonError::into_inner));
+            for id in retired {
+                reactor.retire(id);
+            }
+            let mut fresh = Vec::new();
             {
-                let mut fresh = pool.waiting.lock().unwrap_or_else(PoisonError::into_inner);
-                slots.append(&mut fresh);
+                let mut waiting = pool.waiting.lock().unwrap_or_else(PoisonError::into_inner);
+                fresh.append(&mut waiting);
             }
-            // A sibling's end hands its lane back from another thread; drop the slot it emptied.
-            slots.retain(|slot| !slot.is_empty());
-            if slots.is_empty() {
-                let mut row = libc::pollfd {
-                    fd: wake.read,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                unsafe { libc::poll(std::ptr::from_mut(&mut row), 1, 1000) };
-                wake.drain();
-                continue;
-            }
-            // No armed deadline means no clock: the lanes wait for their descriptor or their sibling's end.
-            let now = std::time::Instant::now();
-            let timeout = match slots.iter().filter_map(|slot| slot.due()).min() {
-                None => -1,
-                Some(due) => {
-                    let left = due.saturating_duration_since(now);
-                    if left.is_zero() {
-                        0
-                    } else {
-                        libc::c_int::try_from(left.as_millis().max(1)).unwrap_or(libc::c_int::MAX)
-                    }
-                }
-            };
-            let mut rows: Vec<libc::pollfd> = Vec::with_capacity(slots.len() + 1);
-            rows.push(libc::pollfd {
-                fd: wake.read,
-                events: libc::POLLIN,
-                revents: 0,
-            });
-            for slot in &slots {
-                rows.push(libc::pollfd {
-                    fd: slot.fd,
-                    events: libc::POLLIN,
-                    revents: 0,
-                });
-            }
-            let polled =
-                unsafe { libc::poll(rows.as_mut_ptr(), rows.len() as libc::nfds_t, timeout) };
-            if polled < 0 {
-                // An interrupted wait changed nothing: the same lanes stay parked.
-                continue;
-            }
-            wake.drain();
-            let now = std::time::Instant::now();
             let mut ready = Vec::new();
-            let mut kept = Vec::with_capacity(slots.len());
-            for (index, slot) in slots.drain(..).enumerate() {
-                if rows[index + 1].revents != 0 || slot.due().is_some_and(|due| due <= now) {
-                    let Some(lane) = slot.take_lane() else {
-                        continue;
-                    };
-                    if let Some(flow) = slot.finish.as_ref() {
-                        flow.unwatch_park(&slot);
-                    }
-                    ready.push(lane);
-                } else if !slot.is_empty() {
-                    kept.push(slot);
+            for slot in fresh {
+                let Some(slot) = reactor.park(slot) else {
+                    continue;
+                };
+                let Some(lane) = slot.take_lane() else {
+                    continue;
+                };
+                if let Some(flow) = slot.finish.as_ref() {
+                    flow.unwatch_park(&slot);
+                }
+                ready.push(lane);
+            }
+            let now = std::time::Instant::now();
+            // Only a slot that has left is stale; a parked one keeps its deadline or the lane waits forever.
+            while let Some(std::cmp::Reverse((_, id))) = reactor.due.peek().copied() {
+                if reactor.slots.contains_key(&id) {
+                    break;
+                }
+                reactor.due.pop();
+            }
+            let timeout = match reactor.due.peek().copied() {
+                Some(std::cmp::Reverse((at, _))) if at > now => at - now,
+                Some(_) => std::time::Duration::ZERO,
+                None => std::time::Duration::from_secs(1),
+            };
+            let ready_fds = reactor.wait(timeout);
+            for fd in ready_fds {
+                if fd == wake.read {
+                    wake.drain();
+                } else {
+                    reactor.wake(fd, &mut ready);
                 }
             }
-            slots = kept;
+            reactor.wake_due(std::time::Instant::now(), &mut ready);
             if !ready.is_empty() {
                 let mut queue = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
                 queue.extend(ready);
@@ -24666,6 +25042,68 @@ pub(crate) mod lane_pool {
                 1,
                 "the peer's byte never woke the parked lane"
             );
+        }
+
+        /// A descriptor number the kernel dropped, then reused, is registered again: the stale id
+        /// left in the parked set cannot keep the new socket out of the interest set.
+        #[cfg(unix)]
+        #[test]
+        fn a_reused_descriptor_is_registered_again() {
+            use std::io::Write as _;
+            use std::os::fd::AsRawFd;
+
+            let (_peer_a, watched_a) = std::os::unix::net::UnixStream::pair().expect("pair");
+            let fd = watched_a.as_raw_fd();
+            let (mut peer_b, watched_b) = std::os::unix::net::UnixStream::pair().expect("pair");
+            let wake = WakePipe::new().expect("wake pipe");
+            let mut reactor = Reactor::new(wake.read).expect("reactor");
+            let pool = TestPool(spawn_pool());
+            let slot = |id: u64, fd: libc::c_int| {
+                let slot = std::sync::Arc::new(ReadySlot {
+                    id,
+                    due: std::sync::OnceLock::new(),
+                    fd,
+                    finish: None,
+                    lane: Mutex::new(None),
+                    pool: std::sync::Arc::downgrade(&pool),
+                });
+                slot.put_lane(Lane {
+                    step: Box::new(|| Next::Done),
+                    complete: Some(Box::new(|| {})),
+                    idle: 0,
+                    relay: true,
+                });
+                slot
+            };
+            assert!(
+                reactor.park(slot(1, fd)).is_none(),
+                "the first park was refused"
+            );
+            drop(watched_a);
+            let reused = unsafe { libc::dup2(watched_b.as_raw_fd(), fd) };
+            assert_eq!(reused, fd, "the new socket took the same number");
+            drop(watched_b);
+            assert!(
+                reactor.park(slot(2, fd)).is_none(),
+                "the reused descriptor was refused"
+            );
+            peer_b.write_all(b"x").expect("writes");
+            let ready = reactor.wait(Duration::from_millis(200));
+            assert_eq!(
+                ready,
+                vec![fd],
+                "the reused descriptor stayed out of the interest set"
+            );
+            let mut lanes = Vec::new();
+            reactor.wake(fd, &mut lanes);
+            assert_eq!(
+                lanes.len(),
+                2,
+                "the reused descriptor woke neither parked lane"
+            );
+            unsafe {
+                libc::close(fd);
+            }
         }
 
         /// A lane whose sibling still lives has no clock: ending the sibling wakes it, and only
@@ -25203,6 +25641,7 @@ where
                 Next::Done
             } else {
                 note_wait_finish(ended);
+                buffer.release();
                 Next::Idle
             }
         }
@@ -26111,6 +26550,8 @@ fn forward_finished(
             if give_up() {
                 Next::Done
             } else {
+                debug_assert_eq!(at.pending, 0, "an idle forward still owed bytes");
+                buffer.release();
                 Next::Idle
             }
         }
@@ -26407,6 +26848,7 @@ pub(crate) fn relay_carried<R: Read + Send + 'static>(
                     if forward_flow.ended_and_idle(budgets::RELAY_RESPONSE_IDLE) {
                         Next::Done
                     } else {
+                        buffer.release();
                         Next::Idle
                     }
                 }
@@ -26444,6 +26886,7 @@ pub(crate) fn relay_carried<R: Read + Send + 'static>(
                     if upload_flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                         Next::Done
                     } else {
+                        buffer.release();
                         Next::Idle
                     }
                 }
@@ -34860,6 +35303,25 @@ mod tests {
         });
         assert_eq!(counts.zeroed, 0, "the promotion is zeroed: {counts:?}");
         assert_eq!(buffer.size(), RELAY_BUFFER, "the promotion kept its window");
+    }
+
+    /// A park hands the window back and the next step takes one again: the parked direction holds no
+    /// bytes, and the reacquired window is the same allocation at the same capacity.
+    #[test]
+    fn a_parked_relay_window_holds_no_bytes() {
+        let mut buffer = RelayBuf::with_len(RELAY_BUFFER);
+        let base = buffer.as_mut().as_ptr();
+        let capacity = buffer.capacity();
+        buffer.release();
+        assert_eq!(buffer.held(), 0, "a parked lane kept its window");
+        let again = buffer.as_mut().as_ptr();
+        assert_eq!(buffer.held(), RELAY_BUFFER, "the next step got no window");
+        assert_eq!(
+            buffer.capacity(),
+            capacity,
+            "the reacquired window reallocated"
+        );
+        assert_eq!(again, base, "the reacquired window is a new allocation");
     }
 
     /// A window between the quanta is exactly what its flow asked for: the pool keeps a 16 KiB flow at 16 KiB rather than handing it a 64 KiB allocation it may never fill.
