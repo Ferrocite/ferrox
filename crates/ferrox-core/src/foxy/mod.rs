@@ -1495,6 +1495,54 @@ mod tests {
         }
     }
 
+    /// The growing scan: one head arriving eight octets at a time is weighed once at each seam and stops at the first `Some`, the shape every caller uses, and the same eleven asks fold to the whole-buffer answer.
+    #[test]
+    fn a_growing_head_is_walked_once() {
+        const HEAD: &[u8] = b"HTTP/1.1 200 Connection established\r\nProxy-Agent: ferrox\r\nX-Trace: 0123456789abcdef\r\n\r\n";
+        let mut scanned = 0;
+        let mut fold: u32 = 0;
+        let mut end = 0;
+        loop {
+            end = (end + 8).min(HEAD.len());
+            let got = head_end_grown(std::hint::black_box(&HEAD[..end]), &mut scanned);
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(end as u32)
+                .wrapping_add(got.map_or(0, |at| at as u32 + 1));
+            if got.is_some() || end == HEAD.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            fold, 0x6761_e083,
+            "one head in eleven pieces, folded after each ask"
+        );
+        assert_eq!(scanned, HEAD.len());
+    }
+
+    /// The rewalk the growing scan replaced, kept as this run's other frame: the same eleven asks each weigh the whole prefix through `head_end`, the same pinned fold, so the pair prices the resume without a second CI run being trusted to agree with the first.
+    #[test]
+    fn a_growing_head_rewalked_costs_the_old_pass() {
+        const HEAD: &[u8] = b"HTTP/1.1 200 Connection established\r\nProxy-Agent: ferrox\r\nX-Trace: 0123456789abcdef\r\n\r\n";
+        let mut fold: u32 = 0;
+        let mut end = 0;
+        loop {
+            end = (end + 8).min(HEAD.len());
+            let got = head_end(std::hint::black_box(&HEAD[..end]));
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(end as u32)
+                .wrapping_add(got.map_or(0, |at| at as u32 + 1));
+            if got.is_some() || end == HEAD.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            fold, 0x6761_e083,
+            "the same eleven asks, each over the whole prefix"
+        );
+    }
+
     /// The mask equation a window runs is the four-byte weigh: bit `j` of the answer is set exactly
     /// when the four octets at `j` are the terminator, for every start the window can hold, and no
     /// start past the thirteen it proves is ever claimed. This is the half of the scan a kernel
