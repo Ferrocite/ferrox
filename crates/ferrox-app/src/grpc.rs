@@ -1045,6 +1045,9 @@ impl GrpcWriter {
         let max = self.max_frame();
         // Four frames of the 16 KiB the peer advertises are one byte over the default 65_535-byte stream window, so the fourth waits for a credit; a body one byte under the frame fits all four.
         let payload = message_payload(max.saturating_sub(1)).max(1);
+        if self.multi {
+            return self.send_multi(data, payload);
+        }
         let mut batch = Gather::new();
         for piece in data.chunks(payload) {
             if !self.message(piece, max, false, &mut batch) {
@@ -1052,6 +1055,52 @@ impl GrpcWriter {
             }
         }
         batch.flush_blocking(&self.shared)
+    }
+
+    /// The blocking writer's `MultiHunk` path: the same groups as `try_send_multi`, retried from the
+    /// last completed group when the peer's window has no room for the next one.
+    fn send_multi(&self, data: &[u8], payload: usize) -> bool {
+        let mut at = 0;
+        while at < data.len() {
+            match self.try_send_multi(&data[at..], payload) {
+                crate::proxy::Push::Took(took) if took > 0 && took <= data.len() - at => at += took,
+                crate::proxy::Push::Parked => {
+                    if !self.wait_credit() {
+                        return false;
+                    }
+                }
+                crate::proxy::Push::Took(_) | crate::proxy::Push::Lost => return false,
+            }
+        }
+        true
+    }
+
+    /// Waits for the peer to move either window, or gives up at the relay stall.
+    fn wait_credit(&self) -> bool {
+        let deadline = Instant::now() + crate::budgets::relay_stall();
+        let mut send = self
+            .shared
+            .send
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        loop {
+            if self.shared.dead.load(Ordering::SeqCst) {
+                return false;
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return false;
+            }
+            let (guard, waited) = self
+                .shared
+                .wake
+                .wait_timeout(send, left.min(crate::budgets::RELAY_POLL))
+                .unwrap_or_else(PoisonError::into_inner);
+            send = guard;
+            if !waited.timed_out() {
+                return true;
+            }
+        }
     }
 
     /// The same frames as `send`, but a window the peer has not granted parks the bytes instead of
@@ -1141,11 +1190,9 @@ impl GrpcWriter {
         let mut payload_len = 0usize;
         let mut prefix_len = 5usize;
         // A group larger than the peer's starting window can never be paid for; cap it there.
-        let cap = *self
-            .shared
-            .init
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let cap = self.multi_cap();
+        let wide = usize::try_from(cap).unwrap_or(usize::MAX);
+        let payload = payload.min(wide.saturating_sub(16).max(1));
         for piece in data.chunks(payload) {
             let add = 1 + varint_len(piece.len() as u64);
             let total = prefix_len + add + payload_len + piece.len();
@@ -1190,6 +1237,22 @@ impl GrpcWriter {
     /// Adds one `MultiHunk` message to the batch, flushing first when the batch cannot hold all its
     /// frames; the window for the whole message is taken before its first frame, so a message is
     /// never half-sent and retried.
+    /// The largest `MultiHunk` the peer can pay for in one take: its starting stream window, and
+    /// the connection's own 65_535-byte opening window when this layer owns both.
+    fn multi_cap(&self) -> usize {
+        let cap = *self
+            .shared
+            .init
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let cap = if self.shared.muxed {
+            cap
+        } else {
+            cap.min(65_535)
+        };
+        usize::try_from(cap).unwrap_or(usize::MAX)
+    }
+
     fn try_multi_group<'a>(
         &self,
         payload: &'a [u8],
@@ -3187,7 +3250,7 @@ mod tests {
             .iter()
             .flat_map(|write| write.iter().copied())
             .collect();
-        let wire = wire.strip_prefix(MAGIC).unwrap_or(&wire);
+        let wire = wire.strip_prefix(MAGIC).unwrap_or(wire.as_slice());
         let body = data_body(wire);
         assert_eq!(
             message_count(&body),
@@ -3269,6 +3332,23 @@ mod tests {
         }
         assert_eq!(seen, end, "every byte reached the writer");
         assert_eq!(data.capacity(), capacity, "the caller's buffer grew");
+    }
+
+    /// A peer whose starting window is smaller than one frame: the writer cuts its elements to
+    /// fit that window instead of forming a message the peer can never pay for.
+    #[test]
+    fn a_multi_writer_fits_an_element_to_the_starting_window() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = multi_writer_over(Recorder(Arc::clone(&peer)), HUNK, 64, 64);
+        let data: Vec<u8> = (0..200).map(|i| (i % 251) as u8).collect();
+        assert!(matches!(
+            writer.try_send(&data),
+            crate::proxy::Push::Took(n) if n > 0
+        ));
+        let peer = peer.lock().unwrap();
+        let body = data_body(&peer.writes[0]).to_vec();
+        let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+        assert!(5 + len <= 64, "the message fits the peer's window");
     }
 
     /// The same batch driven over a real socket, where the only thing a loopback test can assert is
