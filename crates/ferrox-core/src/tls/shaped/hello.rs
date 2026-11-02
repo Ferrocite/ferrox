@@ -1160,7 +1160,7 @@ mod tests {
         );
         let inner_random = hello.ech_inner_random().expect("inner random");
         let retry = hello
-            .retry(crate::tls::shaped::keys::X25519, None)
+            .retry(crate::tls::shaped::keys::P256, None)
             .expect("retries");
         assert!(retry.ech_inner().is_some(), "a retry re-seals the offer");
         assert_eq!(
@@ -1175,6 +1175,34 @@ mod tests {
             .expect("ech extension");
         assert_eq!(retry_ech[10], 0, "a retry carries no encapsulation");
         assert_eq!(retry_ech[11], 0, "a retry carries no encapsulation");
+    }
+
+    #[test]
+    fn a_retry_outside_the_configured_groups_is_refused() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello = Hello::build(profile, "example.com", &[], false, &[keys::X25519])
+            .expect("a shaped dial hello");
+        assert!(
+            hello.retry(keys::P256, None).is_err(),
+            "a retry for a group curvePreferences does not name"
+        );
+    }
+
+    #[test]
+    fn a_retry_for_a_group_the_first_hello_sent_is_refused() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello =
+            Hello::build(profile, "example.com", &[], false, &[]).expect("a shaped dial hello");
+        assert!(
+            hello.retry(keys::X25519, None).is_err(),
+            "a retry for a group the first hello already sent"
+        );
     }
 
     fn invariant(kind: u16) -> bool {
@@ -1329,7 +1357,7 @@ mod tests {
         let mut hello = Hello::build(profile, "example.com", &[b"http/1.1".to_vec()], true, &[])
             .expect("a shaped dial hello");
         let retry = hello
-            .retry(keys::X25519, Some(&[7, 6, 5]))
+            .retry(keys::P256, Some(&[7, 6, 5]))
             .expect("a retry hello");
         let exts = extensions(&retry.msg[4..]);
         let cookie = exts
