@@ -319,8 +319,7 @@ mod tests {
                 start = at + ch.len_utf8();
             } else if ch.is_whitespace() {
                 out.push_str(&value[start..at]);
-                let _ =
-                    std::fmt::Write::write_fmt(&mut out, format_args!("\\u{{{:x}}}", ch as u32));
+                let _ = std::fmt::Write::write_fmt(out, format_args!("\\u{{{:x}}}", ch as u32));
                 start = at + ch.len_utf8();
             }
         }
