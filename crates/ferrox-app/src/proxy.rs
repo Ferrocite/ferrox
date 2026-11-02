@@ -493,8 +493,9 @@ fn serve_inbounds_counted(
                         }
                     }
                     "shadowsocks" => {
-                        serve_shadowsocks_inbound(address, inbound, freedom);
-                        inbounds += 1;
+                        if serve_shadowsocks_inbound(address, inbound, freedom) {
+                            inbounds += 1;
+                        }
                     }
                     "hysteria" => {
                         if serve_hysteria_inbound(address, inbound, freedom, label) {
@@ -12093,7 +12094,7 @@ fn inbound_ss_networks(inbound: &Json) -> (bool, bool) {
     (tcp, udp)
 }
 
-fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
+fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
     let password = inbound_ss_password(inbound);
     let account = inbound_account(inbound);
     let method = inbound_method(inbound);
@@ -12105,7 +12106,10 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
     if matches!(carrier, Carrier::Raw(_))
         && serve_ss_relay_inbound(address, inbound, &accounts.password, &accounts.method)
     {
-        return;
+        return true;
+    }
+    if !tcp && !udp {
+        return false;
     }
     if tcp {
         match carrier {
@@ -12188,6 +12192,7 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) {
             }
         });
     }
+    true
 }
 
 /// Open the TUN device and spawn the packet handler. Returns true when the device opens.
@@ -42595,6 +42600,18 @@ mod tests {
         drop(sock);
         let _ = pump.join();
         conn.close();
+    }
+
+    #[test]
+    fn a_shadowsocks_inbound_that_names_no_network_opens_nothing() {
+        let inbound = crate::json::parse(
+            r#"{"protocol":"shadowsocks","port":0,"settings":{"network":[],"password":"an-example-shared-password","method":"aes-256-gcm"}}"#,
+        )
+        .expect("parses");
+        assert!(
+            !serve_shadowsocks_inbound("127.0.0.1:0", &inbound, true),
+            "a network list with neither tcp nor udp opens no listener"
+        );
     }
 
     /// The dial half of the same row: a shadowsocks outbound that declares tls writes its request inside the session, not ahead of it.
