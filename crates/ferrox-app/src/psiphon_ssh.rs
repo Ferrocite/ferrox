@@ -79,13 +79,14 @@ pub(crate) struct Server {
     pub(crate) region: Option<String>,
     pub(crate) direct: bool,
     pub(crate) meek: Option<crate::psiphon_meek::Meek>,
+    pub(crate) unfronted_meek: Option<crate::psiphon_meek::Meek>,
 }
 
 impl Server {
-    /// The OSSH shape when the entry carries an obfuscated port and key, plain SSH otherwise.
+    /// The obfuscated shape when the entry carries an OSSH key or a meek front, plain SSH otherwise.
     #[must_use]
     pub(crate) fn obfuscated(&self) -> bool {
-        self.obfuscation_key.is_some()
+        self.obfuscation_key.is_some() || self.meek.is_some()
     }
 }
 
@@ -424,6 +425,10 @@ pub(crate) struct Identity<'a> {
     pub(crate) propagation: &'a str,
     pub(crate) platform: &'a str,
     pub(crate) version: &'a str,
+    pub(crate) egress_region: Option<&'a str>,
+    pub(crate) device_region: Option<&'a str>,
+    pub(crate) device_location: Option<&'a str>,
+    pub(crate) client_features: &'a [String],
 }
 
 impl Session {
@@ -480,13 +485,16 @@ impl Session {
             identity.sponsor,
         )?;
         // A Psiphon server refuses every port forward until this handshake completes.
-        let relay_protocol = if server.meek.is_some() {
-            "FRONTED-MEEK-OSSH"
-        } else if server.obfuscation_key.is_some() {
-            "OSSH"
-        } else {
-            "SSH"
-        };
+        let relay_protocol = server.meek.as_ref().map_or_else(
+            || {
+                if server.obfuscation_key.is_some() {
+                    "OSSH"
+                } else {
+                    "SSH"
+                }
+            },
+            |meek| tunnel_protocol_base(meek.protocol),
+        );
         handshake(&mut output, &mut input, relay_protocol, identity)?;
         control
             .set_read_timeout(None)
@@ -503,7 +511,7 @@ impl Session {
             socket,
             opened_at: Instant::now(),
             server: format!("{}:{}", server.host, server.port),
-            protocol: if server.obfuscated() { "OSSH" } else { "SSH" },
+            protocol: relay_protocol,
         });
         let read_inner = Arc::clone(&inner);
         std::thread::Builder::new()
@@ -735,6 +743,7 @@ impl ChannelState {
     }
 }
 
+/// Return a packet buffer to the shared pool.
 fn recycle(pool: &Mutex<Vec<Vec<u8>>>, buffer: Vec<u8>) {
     let mut pool = lock(pool);
     if pool.len() < PACKET_POOL {
@@ -1095,6 +1104,7 @@ pub(crate) fn derive_key(seed: &[u8], keyword: &[u8], iv: &[u8]) -> [u8; KEY_LEN
     key
 }
 
+#[derive(Clone)]
 pub(crate) struct Rc4 {
     s: [u8; 256],
     i: u8,
@@ -1198,9 +1208,12 @@ struct PacketReader {
     block: usize,
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
     spare: Option<Vec<u8>>,
+    /// Bytes a banner read took past its newline, still obfuscated until `recv` applies the keystream.
+    pending: Vec<u8>,
 }
 
 impl PacketWriter {
+    /// Wrap a socket with optional obfuscation and packet crypto.
     fn new(
         io: TcpStream,
         obfuscation: Option<Rc4>,
@@ -1220,6 +1233,7 @@ impl PacketWriter {
         }
     }
 
+    /// Start packet crypto after the key exchange.
     fn activate(&mut self, key: [u8; 16], iv: [u8; 16], mac: [u8; 32]) {
         self.cipher = Some(AesCtr::new(&key.into(), &iv.into()));
         self.mac = Some(HmacKey::new(&mac));
@@ -1337,6 +1351,7 @@ impl PacketWriter {
 }
 
 impl PacketReader {
+    /// Wrap a socket with optional obfuscation, packet crypto, and a recycle pool.
     fn new(
         io: TcpStream,
         obfuscation: Option<Rc4>,
@@ -1354,9 +1369,11 @@ impl PacketReader {
             block,
             pool,
             spare: None,
+            pending: Vec::new(),
         }
     }
 
+    /// Start packet crypto after the key exchange.
     fn activate(&mut self, key: [u8; 16], iv: [u8; 16], mac: [u8; 32]) {
         self.cipher = Some(AesCtr::new(&key.into(), &iv.into()));
         self.mac = Some(HmacKey::new(&mac));
@@ -1368,12 +1385,22 @@ impl PacketReader {
         self.obfuscation = None;
     }
 
+    /// Return a packet buffer to the reader or its shared pool.
     fn recycle(&mut self, buffer: Vec<u8>) {
         if self.spare.is_none() {
             self.spare = Some(buffer);
         } else {
             recycle(&self.pool, buffer);
         }
+    }
+
+    /// Move bytes a banner read took past its newline into the front of `out`, so the packet that
+    /// arrived in the same read is not read again from the socket.
+    fn take_pending(&mut self, out: &mut [u8]) -> usize {
+        let taken = self.pending.len().min(out.len());
+        out[..taken].copy_from_slice(&self.pending[..taken]);
+        self.pending.drain(..taken);
+        taken
     }
 
     /// Read one packet into a pooled buffer; the caller hands it back or moves it to a channel.
@@ -1386,7 +1413,10 @@ impl PacketReader {
         if buffer.len() < PACKET_CHUNK {
             buffer.resize(PACKET_CHUNK, 0);
         }
-        self.io.read_exact(&mut buffer[..self.block])?;
+        let taken = self.take_pending(&mut buffer[..self.block]);
+        if taken < self.block {
+            self.io.read_exact(&mut buffer[taken..self.block])?;
+        }
         if let Some(obfuscation) = self.obfuscation.as_mut() {
             obfuscation.apply(&mut buffer[..self.block]);
         }
@@ -1409,7 +1439,11 @@ impl PacketReader {
         if buffer.len() < framed {
             buffer.resize(framed, 0);
         }
-        self.io.read_exact(&mut buffer[self.block..framed])?;
+        let taken = self.take_pending(&mut buffer[self.block..framed]);
+        if taken < framed - self.block {
+            self.io
+                .read_exact(&mut buffer[self.block + taken..framed])?;
+        }
         if let Some(obfuscation) = self.obfuscation.as_mut() {
             obfuscation.apply(&mut buffer[self.block..total]);
         }
@@ -1444,6 +1478,7 @@ struct HmacKey {
 }
 
 impl HmacKey {
+    /// Build the inner and outer SHA-256 states for one key.
     fn new(key: &[u8]) -> Self {
         let mut block = [0u8; 64];
         if key.len() > 64 {
@@ -1540,33 +1575,55 @@ fn write_all(writer: &mut PacketWriter, bytes: &[u8]) -> Result<(), String> {
         .map_err(|error| format!("psiphon ssh write: {error}"))
 }
 
+/// Read the server banner, retaining bytes read past its newline.
 fn read_identification(reader: &mut PacketReader, banner: &mut Vec<u8>) -> Result<Vec<u8>, String> {
+    let mut chunk = [0u8; 512];
+    let mut raw = [0u8; 512];
+    banner.clear();
     loop {
-        banner.clear();
-        loop {
-            let mut byte = [0u8; 1];
-            match reader.io.read(&mut byte) {
-                Ok(0) => return Err("psiphon ssh closed before its banner".to_owned()),
-                Ok(_) => {
-                    if let Some(obfuscation) = reader.obfuscation.as_mut() {
-                        obfuscation.apply(&mut byte);
-                    }
-                    if byte[0] == b'\n' {
-                        break;
-                    }
-                    if byte[0] != b'\r' {
-                        banner.push(byte[0]);
+        let read = match reader.io.read(&mut chunk) {
+            Ok(0) => return Err("psiphon ssh closed before its banner".to_owned()),
+            Ok(read) => read,
+            Err(error) => return Err(format!("psiphon ssh banner: {error}")),
+        };
+        raw[..read].copy_from_slice(&chunk[..read]);
+        let saved = reader.obfuscation.clone();
+        if let Some(obfuscation) = reader.obfuscation.as_mut() {
+            obfuscation.apply(&mut chunk[..read]);
+        }
+        let mut start = 0;
+        while start < read {
+            let Some(offset) = chunk[start..read].iter().position(|byte| *byte == b'\n') else {
+                for &byte in &chunk[start..read] {
+                    if byte != b'\r' {
+                        banner.push(byte);
                     }
                     // The reference server writes padding lines up to 512 characters, 1024 with CRLF.
                     if banner.len() >= MAX_IDENTIFICATION {
                         return Err("psiphon ssh banner too long".to_owned());
                     }
                 }
-                Err(error) => return Err(format!("psiphon ssh banner: {error}")),
+                break;
+            };
+            let end = start + offset;
+            for &byte in &chunk[start..end] {
+                if byte != b'\r' {
+                    banner.push(byte);
+                }
+                if banner.len() >= MAX_IDENTIFICATION {
+                    return Err("psiphon ssh banner too long".to_owned());
+                }
             }
-        }
-        if banner.starts_with(b"SSH-") {
-            return Ok(banner.clone());
+            if banner.starts_with(b"SSH-") {
+                if let Some(mut saved) = saved {
+                    saved.apply(&mut chunk[..=end]);
+                    reader.obfuscation = Some(saved);
+                }
+                reader.pending.extend_from_slice(&raw[end + 1..read]);
+                return Ok(banner.clone());
+            }
+            banner.clear();
+            start = end + 1;
         }
     }
 }
@@ -1873,6 +1930,7 @@ fn service(writer: &mut PacketWriter, reader: &mut PacketReader) -> Result<(), S
 
 const MSG_EXT_INFO: u8 = 7;
 
+/// Authenticate the relay and open the session channel.
 fn authenticate(
     writer: &mut PacketWriter,
     reader: &mut PacketReader,
@@ -1910,6 +1968,48 @@ fn authenticate(
     }
 }
 
+/// The base tunnel protocol a CDN variant reports to the server.
+fn tunnel_protocol_base(protocol: &'static str) -> &'static str {
+    match protocol {
+        "FRONTED-MEEK-CDN-OSSH" => "FRONTED-MEEK-OSSH",
+        "FRONTED-MEEK-CDN-HTTP-OSSH" => "FRONTED-MEEK-HTTP-OSSH",
+        _ => protocol,
+    }
+}
+
+/// The JSON body of the SSH Psiphon handshake.
+fn handshake_body(relay_protocol: &str, identity: &Identity<'_>) -> String {
+    let mut body = format!(
+        r#"{{"propagation_channel_id":"{}","sponsor_id":"{}","client_version":"{}","client_platform":"{}","relay_protocol":"{}""#,
+        json_escape(identity.propagation),
+        json_escape(identity.sponsor),
+        json_escape(identity.version),
+        json_escape(identity.platform),
+        json_escape(relay_protocol)
+    );
+    if let Some(region) = identity.egress_region {
+        let _ = write!(body, r#","egress_region":"{}""#, json_escape(region));
+    }
+    if let Some(region) = identity.device_region {
+        let _ = write!(body, r#","device_region":"{}""#, json_escape(region));
+    }
+    if let Some(location) = identity.device_location {
+        let _ = write!(body, r#","device_location":"{}""#, json_escape(location));
+    }
+    if !identity.client_features.is_empty() {
+        body.push_str(r#","client_features":["#);
+        for (index, feature) in identity.client_features.iter().enumerate() {
+            if index > 0 {
+                body.push(',');
+            }
+            let _ = write!(body, "\"{}\"", json_escape(feature));
+        }
+        body.push(']');
+    }
+    body.push('}');
+    body
+}
+
 /// The SSH API handshake every Psiphon server requires before it permits a port forward.
 fn handshake(
     writer: &mut PacketWriter,
@@ -1917,14 +2017,7 @@ fn handshake(
     relay_protocol: &str,
     identity: &Identity<'_>,
 ) -> Result<(), String> {
-    let body = format!(
-        r#"{{"propagation_channel_id":"{}","sponsor_id":"{}","client_version":"{}","client_platform":"{}","relay_protocol":"{}"}}"#,
-        json_escape(identity.propagation),
-        json_escape(identity.sponsor),
-        json_escape(identity.version),
-        json_escape(identity.platform),
-        relay_protocol
-    );
+    let body = handshake_body(relay_protocol, identity);
     let mut request = vec![MSG_GLOBAL_REQUEST];
     put_str(&mut request, b"psiphon-handshake");
     request.push(1);
@@ -2333,6 +2426,54 @@ mod tests {
         let packet = reader.recv().expect("packet");
         assert_eq!(packet.kind(), Some(MSG_IGNORE));
         assert_eq!(packet.body().len(), 1);
+    }
+
+    #[test]
+    fn a_banner_read_keeps_the_packet_that_shared_its_syscall() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let mut peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
+        let (socket, _) = listener.accept().expect("accept");
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"notice\r\nSSH-2.0-test\r\n");
+        wire.extend_from_slice(&6u32.to_be_bytes());
+        wire.push(4);
+        wire.push(MSG_IGNORE);
+        wire.extend_from_slice(&[0u8; 4]);
+        peer.write_all(&wire).expect("write");
+        let pool = Arc::new(Mutex::new(Vec::new()));
+        let mut reader = PacketReader::new(socket, None, None, None, pool);
+        let mut banner = Vec::new();
+        assert_eq!(
+            read_identification(&mut reader, &mut banner).expect("banner"),
+            b"SSH-2.0-test"
+        );
+        let packet = reader.recv().expect("packet");
+        assert_eq!(packet.kind(), Some(MSG_IGNORE));
+    }
+
+    #[test]
+    fn an_obfuscated_banner_keeps_the_packet_keystream_in_step() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
+        let mut peer = TcpStream::connect(listener.local_addr().expect("address")).expect("peer");
+        let (socket, _) = listener.accept().expect("accept");
+        let mut wire = Vec::new();
+        wire.extend_from_slice(b"notice\r\nSSH-2.0-test\r\n");
+        wire.extend_from_slice(&6u32.to_be_bytes());
+        wire.push(4);
+        wire.push(MSG_IGNORE);
+        wire.extend_from_slice(&[0u8; 4]);
+        let key = b"banner-key";
+        Rc4::new(key).apply(&mut wire);
+        peer.write_all(&wire).expect("write");
+        let pool = Arc::new(Mutex::new(Vec::new()));
+        let mut reader = PacketReader::new(socket, Some(Rc4::new(key)), None, None, pool);
+        let mut banner = Vec::new();
+        assert_eq!(
+            read_identification(&mut reader, &mut banner).expect("banner"),
+            b"SSH-2.0-test"
+        );
+        let packet = reader.recv().expect("packet");
+        assert_eq!(packet.kind(), Some(MSG_IGNORE));
     }
 
     #[test]
@@ -2816,6 +2957,61 @@ mod tests {
                 "{error}"
             ),
         }
+    }
+
+    #[test]
+    fn a_cdn_tunnel_protocol_hands_its_base_name() {
+        assert_eq!(
+            tunnel_protocol_base("FRONTED-MEEK-CDN-OSSH"),
+            "FRONTED-MEEK-OSSH"
+        );
+        assert_eq!(
+            tunnel_protocol_base("FRONTED-MEEK-CDN-HTTP-OSSH"),
+            "FRONTED-MEEK-HTTP-OSSH"
+        );
+        assert_eq!(
+            tunnel_protocol_base("UNFRONTED-MEEK-HTTPS-OSSH"),
+            "UNFRONTED-MEEK-HTTPS-OSSH"
+        );
+    }
+
+    #[test]
+    fn the_handshake_carries_device_identity() {
+        let features = vec!["coarse-location".to_owned(), "unsafe\"feature".to_owned()];
+        let identity = Identity {
+            session_id: "session",
+            sponsor: "sponsor",
+            propagation: "propagation",
+            platform: "Android",
+            version: "453",
+            egress_region: Some("IR"),
+            device_region: Some("IR"),
+            device_location: Some("w3g"),
+            client_features: &features,
+        };
+        assert_eq!(
+            handshake_body("UNFRONTED-MEEK-HTTPS-OSSH", &identity),
+            r#"{"propagation_channel_id":"propagation","sponsor_id":"sponsor","client_version":"453","client_platform":"Android","relay_protocol":"UNFRONTED-MEEK-HTTPS-OSSH","egress_region":"IR","device_region":"IR","device_location":"w3g","client_features":["coarse-location","unsafe\"feature"]}"#
+        );
+    }
+
+    #[test]
+    fn the_handshake_omits_absent_device_identity() {
+        let identity = Identity {
+            session_id: "session",
+            sponsor: "sponsor",
+            propagation: "propagation",
+            platform: "Android",
+            version: "453",
+            egress_region: None,
+            device_region: None,
+            device_location: None,
+            client_features: &[],
+        };
+        assert_eq!(
+            handshake_body("SSH", &identity),
+            r#"{"propagation_channel_id":"propagation","sponsor_id":"sponsor","client_version":"453","client_platform":"Android","relay_protocol":"SSH"}"#
+        );
     }
 
     #[test]
