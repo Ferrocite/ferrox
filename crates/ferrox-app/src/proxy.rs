@@ -24316,12 +24316,16 @@ pub(crate) mod lane_pool {
         if pool.pending.is_some_and(|pending| ready.len() >= pending) {
             return Err(lane);
         }
+        ready.push_back(lane);
         if pool.workers.load(Relaxed) == 0 {
+            // The last worker retired while this lock was held: no thread will take the queue, so the caller runs it.
+            let orphaned: Vec<Lane> = ready.drain(..).collect();
             drop(ready);
-            run_to_end(lane);
+            for lane in orphaned {
+                run_to_end(lane);
+            }
             return Ok(());
         }
-        ready.push_back(lane);
         drop(ready);
         pool.notify.notify_one();
         Ok(())
