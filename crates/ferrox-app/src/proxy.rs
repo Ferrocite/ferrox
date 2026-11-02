@@ -32922,9 +32922,12 @@ mod tests {
             for _ in 0..8 {
                 let (stream, _) = front.accept().expect("accepts");
                 let carrier = carrier.clone();
+                let mut stream = Some(stream);
                 lane_pool::submit_setup(
                     Box::new(move || {
-                        serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
+                        if let Some(stream) = stream.take() {
+                            serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
+                        }
                         lane_pool::Next::Done
                     }),
                     Box::new(|| {}),

@@ -6,9 +6,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, PoisonError};
 
 use crate::h2::{
-    block_encode, frame_head, read_head, write_frame, Decoder, E_FRAME_SIZE, E_PROTOCOL, E_REFUSED,
-    F_ACK, F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_FRAME, S_WINDOW,
-    T_CONT, T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW,
+    block_encode, frame_head, write_frame, Decoder, E_FRAME_SIZE, E_PROTOCOL, E_REFUSED, F_ACK,
+    F_END, F_END_HEADERS, F_PADDED, F_PRIORITY, HEAD_CAP, MAGIC, S_MAX_FRAME, S_WINDOW, T_CONT,
+    T_DATA, T_GOAWAY, T_HEADERS, T_PING, T_RST, T_SETTINGS, T_WINDOW, WINDOW,
 };
 use crate::proxy::{VlessUser, VlessUsers};
 use crate::xhttp::XhttpSettings;
@@ -1637,10 +1637,8 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
         decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
         until: Option<(std::time::Instant, Arc<std::sync::atomic::AtomicBool>)>,
     ) -> Self {
-        let (until, opened) = match until {
-            Some((until, opened)) => (Some(until), Some(opened)),
-            None => (None, None),
-        };
+        let (until, opened) =
+            until.map_or((None, None), |(until, opened)| (Some(until), Some(opened)));
         Self {
             read,
             until,
@@ -1738,10 +1736,15 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
             ),
         };
         match filled {
-            Filled::Idle => return Stepped::Idle,
-            Filled::End => return self.end(),
-            Filled::Full => {}
+            Filled::Idle => Stepped::Idle,
+            Filled::End => self.end(),
+            Filled::Full => self.advance(service),
         }
+    }
+
+    /// The frame whose buffers are full: answer a preface, size the body a head names, or hand a body
+    /// to the service and go back to the next head.
+    fn advance(&mut self, service: &dyn H2Service) -> Stepped {
         match self.phase {
             Phase::Magic => {
                 if self.magic[..] != MAGIC[..] {
@@ -2088,7 +2091,7 @@ fn pump_frame(
 mod tests {
     use super::*;
     use crate::conn::{test_bind, Connection};
-    use crate::h2::MAGIC;
+    use crate::h2::{read_head, MAGIC};
     use std::net::SocketAddr;
     use std::sync::atomic::AtomicUsize;
     use std::thread;
