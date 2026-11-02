@@ -566,6 +566,10 @@ impl Comparison {
         root.insert("workload", workload);
         root.insert("machine", Json::Str(self.machine.clone()));
         root.insert(
+            "cpu_resolution_floor_millis",
+            Json::Num(parity::cpu_resolution_floor_millis() as f64),
+        );
+        root.insert(
             "reference",
             self.reference()
                 .map_or(Json::Null, |name| Json::Str(name.to_owned())),
