@@ -1424,6 +1424,7 @@ fn recv_endpoint(socket: SocketAddr, ipv6: bool) -> SocketAddr {
 mod tests {
     use super::*;
     use std::net::TcpListener;
+    use std::thread;
 
     fn sent(events: &[Event]) -> Vec<u8> {
         events
@@ -1576,8 +1577,21 @@ mod tests {
             let mut buf = [0u8; 512];
             let mut seen = 0;
             loop {
-                let Ok((n, from)) = dns.recv_from(&mut buf) else {
-                    return;
+                let (n, from) = match dns.recv_from(&mut buf) {
+                    Ok(received) => received,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::Interrupted
+                                | std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::ConnectionReset
+                                | std::io::ErrorKind::ConnectionRefused
+                        ) =>
+                    {
+                        continue;
+                    }
+                    Err(_) => return,
                 };
                 seen += 1;
                 // Simulated loss: drop the first query so the resolver's DNS_RETRY resend is answered.
@@ -1604,21 +1618,20 @@ mod tests {
         let echo = TcpListener::bind("127.0.0.1:0").expect("echo");
         let echo_address = echo.local_addr().expect("echo address");
         std::thread::spawn(move || {
-            let Ok((mut stream, _)) = echo.accept() else {
-                return;
-            };
-            let mut buf = [0u8; 1024];
-            let mut seen = 0;
-            loop {
-                let Ok(n) = stream.read(&mut buf) else {
+            for _ in 0..2 {
+                let Ok((mut stream, _)) = echo.accept() else {
                     return;
                 };
-                if n == 0 || stream.write_all(&buf[..n]).is_err() {
-                    return;
-                }
-                seen += n;
-                if seen >= 9 {
-                    return;
+                let mut buf = [0u8; 1024];
+                let mut seen = 0;
+                while let Ok(n) = stream.read(&mut buf) {
+                    if n == 0 || stream.write_all(&buf[..n]).is_err() {
+                        break;
+                    }
+                    seen += n;
+                    if seen >= 9 {
+                        break;
+                    }
                 }
             }
         });
@@ -1667,6 +1680,20 @@ mod tests {
             dns: vec!["127.0.0.1".parse().unwrap()],
         };
         let wireguard = WireGuardOut::with_dns_port(client, dns_address.port()).expect("outbound");
+        let cross = |asked: Destination| {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("pair");
+            let tun = std::net::TcpStream::connect(listener.local_addr().expect("pair address"))
+                .expect("connect");
+            let (mut app, _) = listener.accept().expect("accept");
+            app.set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("timeout");
+            wireguard.serve_tcp(Connection::from(tun), &asked, b"head");
+            app.write_all(b"hello").expect("write");
+            let mut received = [0u8; 9];
+            app.read_exact(&mut received).expect("read");
+            assert_eq!(&received, b"headhello");
+        };
+        cross(Destination::Address(echo_address));
         assert_eq!(
             wireguard.resolve("example.test", 7),
             vec![
@@ -1677,22 +1704,10 @@ mod tests {
         answer
             .recv_timeout(Duration::from_secs(5))
             .expect("the resolver asked the tunnel's DNS server");
-
-        let listener = TcpListener::bind("127.0.0.1:0").expect("pair");
-        let tun = std::net::TcpStream::connect(listener.local_addr().expect("pair address"))
-            .expect("connect");
-        let (mut app, _) = listener.accept().expect("accept");
-        app.set_read_timeout(Some(Duration::from_secs(10)))
-            .expect("timeout");
-        wireguard.serve_tcp(
-            Connection::from(tun),
-            &Destination::Name("example.test".to_owned(), echo_address.port()),
-            b"head",
-        );
-        app.write_all(b"hello").expect("write");
-        let mut received = [0u8; 9];
-        app.read_exact(&mut received).expect("read");
-        assert_eq!(&received, b"headhello");
+        cross(Destination::Name(
+            "example.test".to_owned(),
+            echo_address.port(),
+        ));
     }
 
     #[test]
@@ -1720,6 +1735,91 @@ mod tests {
         let entry = cache.get("missing.example").expect("negative entry");
         assert_eq!(entry.addrs, Vec::<IpAddr>::new());
         assert!(entry.until > Instant::now());
+    }
+
+    /// The retry is driven by the route itself, not a wall clock over a socket: the first query is
+    /// dropped and the second is answered, so the count of sends is exact.
+    #[test]
+    fn a_lost_query_is_sent_again() {
+        let config = DeviceConfig {
+            secret: [0; 32],
+            addresses: vec!["10.0.0.2".parse().unwrap()],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0; 3],
+            is_client: Some(true),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
+        let (to_tunnel, packets) = mpsc::channel();
+        let routes: UdpRoutes = Arc::default();
+        let out = WireGuardOut {
+            config: Arc::new(config),
+            flows: mpsc::channel().0,
+            to_tunnel,
+            routes: Arc::clone(&routes),
+            stop: Arc::new(AtomicBool::new(false)),
+            dns_servers: Vec::new(),
+            dns_port: 53,
+            dns_port_next: AtomicU16::new(0),
+            dns_id: AtomicU16::new(0),
+            resolved: Mutex::new(HashMap::new()),
+            #[cfg(target_os = "linux")]
+            kernel: None,
+        };
+        let (sent, sends) = mpsc::channel();
+        thread::scope(|scope| {
+            let routes = Arc::clone(&routes);
+            scope.spawn(move || {
+                let mut count = 0;
+                while let Ok(packet) = packets.recv_timeout(Duration::from_secs(10)) {
+                    count += 1;
+                    if count == 1 {
+                        continue;
+                    }
+                    let Some(datagram) = udp_from_packet(&packet[WG_HEADER_SIZE..]) else {
+                        continue;
+                    };
+                    let Some(question) = ferrox_core::dns::parse_query(datagram.payload) else {
+                        continue;
+                    };
+                    let Some(reply) =
+                        ferrox_core::dns::ip_answer(&question, 0, 60, &[vec![192, 0, 2, 1]])
+                    else {
+                        continue;
+                    };
+                    let mut inner = Vec::new();
+                    assert!(udp_datagram(
+                        &UdpDatagram {
+                            source: datagram.destination,
+                            destination: datagram.source,
+                            source_port: datagram.destination_port,
+                            destination_port: datagram.source_port,
+                            payload: &reply,
+                        },
+                        &mut inner,
+                    ));
+                    let table = routes.lock().expect("routes");
+                    table
+                        .get(&datagram.source_port)
+                        .expect("the exchange reserved a route")
+                        .send(inner)
+                        .expect("the answer reaches the route");
+                    let _ = sent.send(count);
+                    return;
+                }
+            });
+            assert_eq!(
+                out.exchange(
+                    "10.0.0.2".parse().expect("source"),
+                    "127.0.0.1".parse().expect("server"),
+                    "example.test.",
+                    1,
+                ),
+                Some((vec!["192.0.2.1".parse().expect("address")], 60))
+            );
+            assert_eq!(sends.recv().expect("the answer was sent"), 2);
+        });
     }
 
     /// The DNS half of the truncated-answer witness: UDP answers the question with the truncation bit set, TCP answers the same one in full on the same port, and both keep serving while the question is asked again until the returned guard is dropped.

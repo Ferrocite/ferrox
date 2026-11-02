@@ -6926,6 +6926,12 @@ fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
                         return;
                     }
                 }
+                Err(error) if is_udp_gone(&error) => {
+                    thread::sleep(RELAY_POLL);
+                    if done.load(Ordering::Relaxed) {
+                        return;
+                    }
+                }
                 Err(_) => return,
             }
         }
@@ -9163,6 +9169,16 @@ pub(crate) fn read_into_tail(
 
 pub(crate) fn is_timeout(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::Interrupted || ferrox_core::tls::TlsError::is_timeout(error)
+}
+
+/// A UDP socket reports a peer's ICMP as a reset on Windows; that is one lost datagram, not the lane's end.
+pub(crate) fn is_udp_gone(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionAborted
+    )
 }
 
 /// A timeout that waits on the socket: an interrupted read is retried, not parked on the descriptor.
@@ -17295,7 +17311,13 @@ fn pump_trojan_replies(
             }
             Some(write_trojan_datagram(stream, &src, &buf[..n], head))
         }
-        Err(error) if is_timeout(&error) || error.kind() == std::io::ErrorKind::WouldBlock => None,
+        Err(error)
+            if is_timeout(&error)
+                || error.kind() == std::io::ErrorKind::WouldBlock
+                || is_udp_gone(&error) =>
+        {
+            None
+        }
         Err(_) => Some(false),
     }
 }
@@ -20059,6 +20081,11 @@ fn dokodemo_udp_door(
                 legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
                 continue;
             }
+            Err(error) if is_udp_gone(&error) => {
+                thread::sleep(UDP_POLL);
+                legs.retain(|_, (_, _, alive)| alive.load(Ordering::Relaxed));
+                continue;
+            }
             Err(_) => return,
         };
         if n == 0 {
@@ -20587,7 +20614,10 @@ fn serve_socks_udp_client(
                     break;
                 }
             }
-            Err(error) if is_timeout(&error) => {
+            Err(error) if is_timeout(&error) || is_udp_gone(&error) => {
+                if is_udp_gone(&error) {
+                    thread::sleep(UDP_POLL);
+                }
                 if peer_left(&control)
                     || associate.is_some_and(peer_left)
                     || idle_for(&activity) >= idle
@@ -20674,6 +20704,13 @@ fn serve_udp_answer(
         let (n, _) = match receiver.recv_from(&mut buf) {
             Ok(read) => read,
             Err(error) if is_timeout(&error) => continue,
+            Err(error) if is_udp_gone(&error) => {
+                thread::sleep(UDP_POLL);
+                if done.load(Ordering::Relaxed) {
+                    break;
+                }
+                continue;
+            }
             Err(_) => break,
         };
         let Some((from, payload)) = parse_socks_udp(&buf[..n]) else {
@@ -20743,7 +20780,7 @@ fn serve_socks_udp_freedom(
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
+                ) || is_udp_gone(&error) =>
             {
                 let now = replies.load(Ordering::Relaxed);
                 if now == seen {
@@ -31714,6 +31751,7 @@ mod tests {
     /// the VLESS header and the echoed payload all cross the encryption engine.
     #[cfg(unix)]
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn an_encrypted_vless_raw_session_echoes_over_loopback() {
         use std::os::unix::net::UnixStream;
 
@@ -31803,15 +31841,26 @@ mod tests {
         });
         let payload = b"hello through the sealed raw session";
         peer.write_all(payload).expect("writes");
+        let mut lease = None;
+        for _ in 0..500 {
+            lease = crate::stats::snapshot()
+                .online
+                .get("sealed@example")
+                .copied();
+            if lease == Some(1) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            lease,
+            Some(1),
+            "the authenticated sealed session holds the user's online lease"
+        );
         let mut got = vec![0u8; payload.len()];
         peer.read_exact(&mut got).expect("reads the echo");
         assert_eq!(&got, payload);
         let snapshot = crate::stats::snapshot();
-        assert_eq!(
-            snapshot.online.get("sealed@example"),
-            Some(&1),
-            "the authenticated sealed session holds the user's online lease"
-        );
         let traffic = snapshot
             .user
             .get("sealed@example")
@@ -32634,9 +32683,15 @@ mod tests {
                 }
             })
             .collect();
-        thread::sleep(Duration::from_millis(100));
+        let until = Instant::now() + Duration::from_secs(3);
+        let lanes = loop {
+            let lanes = lane_pool::setup_workers();
+            if lanes >= 1 || Instant::now() >= until {
+                break lanes;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
         let grown = crate::conn::live_threads().saturating_sub(before);
-        let lanes = lane_pool::setup_workers();
         assert!(lanes >= 1, "the setup lane count is the bound: {lanes}");
         assert!(
             lanes <= lane_pool::SETUP_LANES,
