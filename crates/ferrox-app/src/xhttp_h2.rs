@@ -3652,6 +3652,27 @@ mod tests {
         }
     }
 
+    /// A control send that fails ends the read loop: its caller sees `false`, kills the
+    /// connection and wakes the parked streams, instead of dispatching frames nothing can answer.
+    #[test]
+    fn a_failed_control_send_ends_the_read_loop() {
+        struct Silent;
+        impl H2Service for Silent {
+            fn open(&self, _conn: &Arc<H2Conn>, _sid: u32, _block: &[u8], _end_stream: bool) {}
+        }
+        let conn = conn_with(Box::new(NullWrite), true);
+        conn.dead.store(true, Ordering::SeqCst);
+        let mut frag = None;
+        assert!(
+            !pump_frame(&conn, &Silent, T_PING, 0, 0, vec![0u8; 8], &mut frag),
+            "a PING whose ACK cannot be sent ends the read loop"
+        );
+        assert!(
+            !pump_frame(&conn, &Silent, T_SETTINGS, 0, 0, Vec::new(), &mut frag),
+            "a SETTINGS whose ACK cannot be sent ends the read loop"
+        );
+    }
+
     /// A connection with one stream and all the credit it needs: the frame writer is the only
     /// observer of how many calls a downlink window costs.
     fn streaming_conn(total: usize) -> (Arc<H2Conn>, Arc<Mutex<Vec<u8>>>, Arc<AtomicUsize>) {
