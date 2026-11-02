@@ -70,6 +70,19 @@ pub(crate) fn connect(
     Ok(local)
 }
 
+/// Send one request over a fresh fronted stream and return its response body.
+pub(crate) fn post(
+    meek: &Meek,
+    path: &'static str,
+    endpoint: Option<&'static str>,
+    body: &[u8],
+    timeout: Duration,
+    proxy: Option<&Proxy>,
+) -> Result<Vec<u8>, String> {
+    let mut http = MeekHttp::new(meek.clone(), proxy.cloned(), timeout, path, endpoint)?;
+    http.round_trip(body)
+}
+
 fn relay(
     mut local: TcpStream,
     meek: &Meek,
@@ -79,7 +92,7 @@ fn relay(
     local
         .set_write_timeout(Some(timeout))
         .map_err(|error| format!("psiphon meek socket: {error}"))?;
-    let mut http = MeekHttp::new(meek.clone(), proxy.cloned(), timeout)?;
+    let mut http = MeekHttp::new(meek.clone(), proxy.cloned(), timeout, "/", None)?;
     let mut buffer = vec![0u8; MAX_PAYLOAD];
     let mut interval = POLL;
     loop {
@@ -170,6 +183,7 @@ struct MeekHttp {
     meek: Meek,
     proxy: Option<Proxy>,
     timeout: Duration,
+    path: &'static str,
     stream: Option<MeekStream>,
     cookie_name: String,
     cookie_value: String,
@@ -179,12 +193,19 @@ struct MeekHttp {
 
 impl MeekHttp {
     /// Build a meek HTTP client from an entry and optional proxy.
-    fn new(meek: Meek, proxy: Option<Proxy>, timeout: Duration) -> Result<Self, String> {
-        let (cookie_name, cookie_value) = make_cookie(&meek)?;
+    fn new(
+        meek: Meek,
+        proxy: Option<Proxy>,
+        timeout: Duration,
+        path: &'static str,
+        endpoint: Option<&'static str>,
+    ) -> Result<Self, String> {
+        let (cookie_name, cookie_value) = make_cookie(&meek, endpoint)?;
         Ok(Self {
             meek,
             proxy,
             timeout,
+            path,
             stream: None,
             cookie_name,
             cookie_value,
@@ -300,7 +321,8 @@ impl MeekHttp {
             ("Accept", "*/*"),
             ("Connection", "keep-alive"),
         ];
-        let request = crate::foxy_account::request("POST", &self.meek.host, "/", &headers, body);
+        let request =
+            crate::foxy_account::request("POST", &self.meek.host, self.path, &headers, body);
         let stream = self
             .stream
             .as_mut()
@@ -341,7 +363,7 @@ fn cookie_protocol(protocol: &str) -> String {
 }
 
 /// Build the cookie header for a meek request.
-fn make_cookie(meek: &Meek) -> Result<(String, String), String> {
+fn make_cookie(meek: &Meek, endpoint: Option<&str>) -> Result<(String, String), String> {
     let key = ferrox_core::b64::decode(meek.public_key.as_bytes())
         .ok_or_else(|| "psiphon meek cookie key is not base64".to_owned())?;
     let key = PublicKey::from_slice(&key)
@@ -351,7 +373,14 @@ fn make_cookie(meek: &Meek) -> Result<(String, String), String> {
     let ephemeral = secret.public_key();
     let boxed = SalsaBox::new(&key, &secret);
     let nonce = crypto_box::aead::Nonce::<SalsaBox>::from_slice(&[0u8; 24]);
-    let plaintext = format!(r#"{{"v":4,"t":"{}"}}"#, cookie_protocol(meek.protocol));
+    let plaintext = match endpoint {
+        Some(endpoint) => format!(
+            r#"{{"v":4,"t":"{}","e":"{}"}}"#,
+            cookie_protocol(meek.protocol),
+            endpoint
+        ),
+        None => format!(r#"{{"v":4,"t":"{}"}}"#, cookie_protocol(meek.protocol)),
+    };
     let sealed = boxed
         .encrypt(nonce, plaintext.as_bytes())
         .map_err(|_| "psiphon meek cookie encryption".to_owned())?;
@@ -404,7 +433,7 @@ mod tests {
 
     #[test]
     fn a_cookie_carries_a_seed_then_an_encrypted_payload() {
-        let (name, value) = make_cookie(&entry()).expect("cookie");
+        let (name, value) = make_cookie(&entry(), None).expect("cookie");
         assert!(name.as_bytes()[0].is_ascii_uppercase());
         let bytes = ferrox_core::b64::decode(value.as_bytes()).expect("base64");
         assert!(bytes.len() > SEED_LENGTH + 8 + MIN_COOKIE_PADDING + 32);
@@ -412,7 +441,7 @@ mod tests {
 
     #[test]
     fn the_cookie_name_is_one_letter() {
-        let (name, _) = make_cookie(&entry()).expect("cookie");
+        let (name, _) = make_cookie(&entry(), None).expect("cookie");
         assert_eq!(name.len(), 1);
     }
 

@@ -80,6 +80,7 @@ pub(crate) struct Server {
     pub(crate) direct: bool,
     pub(crate) meek: Option<crate::psiphon_meek::Meek>,
     pub(crate) unfronted_meek: Option<crate::psiphon_meek::Meek>,
+    pub(crate) tactics: Option<crate::psiphon_tactics::Keys>,
 }
 
 impl Server {
