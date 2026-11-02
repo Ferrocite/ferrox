@@ -1314,11 +1314,16 @@ pub(crate) fn in_a_quiet_process(name: &str) -> bool {
         .env("FERROX_QUIET_PROCESS", "1")
         .output()
         .expect("re-runs the test in a quiet process");
+    let ran = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
         "{name} failed in its quiet process:\n{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
+        ran,
         String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        ran.contains("1 passed"),
+        "{name} ran no test in its quiet process, so the name is wrong and the gate is a no-op:\n{ran}"
     );
     false
 }
