@@ -1155,7 +1155,7 @@ impl H2Conn {
 }
 
 impl H2Conn {
-    fn apply_settings(&self, body: &[u8]) {
+    fn apply_settings(&self, body: &[u8]) -> bool {
         let mut at = 0;
         while at + 6 <= body.len() {
             let id = u16::from_be_bytes([body[at], body[at + 1]]);
@@ -1190,7 +1190,7 @@ impl H2Conn {
                 self.wake.notify_all();
             }
         }
-        let _ = self.send_control(T_SETTINGS, F_ACK, 0, &[]);
+        self.send_control(T_SETTINGS, F_ACK, 0, &[])
     }
 }
 
@@ -2049,17 +2049,14 @@ fn cut_padded_data(body: &mut Vec<u8>, pad: usize) -> usize {
 fn control_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: &[u8]) -> Option<bool> {
     match kind {
         T_SETTINGS => {
-            if flags & F_ACK == 0 {
-                if !body.len().is_multiple_of(6) {
-                    return Some(false);
-                }
-                conn.apply_settings(body);
+            if flags & F_ACK == 0 && (!body.len().is_multiple_of(6) || !conn.apply_settings(body)) {
+                return Some(false);
             }
             Some(true)
         }
         T_PING => {
             if flags & F_ACK == 0 && body.len() == 8 {
-                conn.send_control(T_PING, F_ACK, 0, body);
+                return Some(conn.send_control(T_PING, F_ACK, 0, body));
             }
             Some(true)
         }
