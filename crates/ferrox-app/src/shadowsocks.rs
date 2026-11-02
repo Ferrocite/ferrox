@@ -311,48 +311,6 @@ pub(crate) fn serve_httpupgrade(
     serve_accepted(accepted, reader, writer, close, meter);
 }
 
-/// The carrier's answer held back until a blocking peek finds the first byte of the request packet, so a dial that waits for the `101` before it writes is never answered: only a dial that puts the packet on the wire with the `GET` finishes.
-#[cfg(test)]
-pub(crate) fn serve_httpupgrade_answering_after_the_request(
-    stream: Connection,
-    users: &[SsUser],
-    _path: &str,
-    freedom: bool,
-) {
-    let mut read = stream;
-    let Ok(write) = read.try_clone() else {
-        return;
-    };
-    let mut write = write;
-    if crate::proxy::read_http_head(
-        &mut read,
-        crate::httpupgrade::HEAD_LIMIT,
-        crate::budgets::head_arrival(),
-    )
-    .is_none()
-    {
-        return;
-    }
-    // A blocking peek waits for the first byte of the request packet without taking it, so nothing is answered until the packet has arrived.
-    let mut probe = [0u8; 1];
-    if read.peek(&mut probe).is_err() {
-        return;
-    }
-    if write.write_all(crate::httpupgrade::SWITCH).is_err() {
-        return;
-    }
-    let Some((accepted, meter)) = accept_on(&mut read, &mut write, users, freedom) else {
-        return;
-    };
-    let Ok(closer) = write.try_clone() else {
-        return;
-    };
-    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-        let _ = closer.shutdown(Shutdown::Both);
-    });
-    serve_accepted(accepted, read, write, close, meter);
-}
-
 #[cfg(test)]
 pub(crate) fn serve_grpc(stream: Connection, users: &[SsUser], path: &str, freedom: bool) {
     serve_grpc_with(
@@ -2704,28 +2662,16 @@ mod tests {
         )
         .expect("carries");
         round_trip(&mut reader, &mut writer, &target);
-        // What the dial does on this carrier: the request packet is sealed before the connect, so `ed=0` leaves it whole after the answer and a budget puts it on the wire with the `GET`.
+        // What the dial does on this carrier: the request packet is sealed before the connect, so it leaves whole after the answer.
         let (packet, send, recv) = sealed(&target);
         let (mut reader, mut writer) = crate::httpupgrade::connect(
             tunnel(serve_httpupgrade_without_host, "/ss-upgrade"),
             "127.0.0.1",
             "/ss-upgrade",
-            0,
             &packet,
             &[],
         )
         .expect("carries");
-        answers(&mut reader, &mut writer, send, recv);
-        let (packet, send, recv) = sealed(&target);
-        let (mut reader, mut writer) = crate::httpupgrade::connect(
-            tunnel(serve_httpupgrade_without_host, "/ss-upgrade"),
-            "127.0.0.1",
-            "/ss-upgrade",
-            64,
-            &packet,
-            &[],
-        )
-        .expect("rides ahead of the answer");
         answers(&mut reader, &mut writer, send, recv);
         let (mut reader, mut writer) = crate::grpc::connect(
             tunnel(serve_grpc, "/TunnelService/Tun"),

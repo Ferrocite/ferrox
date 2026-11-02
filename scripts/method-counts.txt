@@ -184,10 +184,9 @@ carrier-websocket fresh-key-allocations-per-dial 0 ferrox-app-ws::tests::the_key
 carrier-httpupgrade ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-httpupgrade framing-bytes-after-the-101 0 ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback
 carrier-httpupgrade user-space-copies-per-byte-relayed 1 ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback
-carrier-httpupgrade write-calls-per-early-dial 1 ferrox-app-httpupgrade::tests::the_early_data_rides_in_one_write_with_the_request
+carrier-httpupgrade writes-per-upgraded-dial 2 ferrox-app-httpupgrade::tests::the_payload_leaves_after_the_request_in_its_own_write
 carrier-httpupgrade request-reallocations-per-dial 0 ferrox-app-httpupgrade::tests::the_request_buffer_holds_its_capacity_over_a_dial_cycle
-carrier-httpupgrade round-trips-per-early-dial 0 ferrox-app-httpupgrade::tests::an_over_budget_payload_rides_ahead_of_a_lazy_answer
-carrier-httpupgrade round-trips-per-shadowsocks-dial 0 ferrox-app-proxy::tests::socks_dials_ss_over_httpupgrade_with_early_data_to_echo
+carrier-httpupgrade round-trips-per-upgraded-dial 1 ferrox-app-httpupgrade::tests::a_payload_waits_for_a_switch_that_dropped_what_rode_behind_it
 carrier-httpupgrade head-reads-per-window 1 ferrox-app-httpupgrade::tests::a_head_costs_one_read_per_window
 carrier-httpupgrade head-tail-allocations 0 ferrox-app-httpupgrade::tests::the_record_head_hands_over_the_buffer_it_filled
 carrier-httpupgrade inner-reads-per-pipelined-prefix 0 ferrox-app-httpupgrade::tests::the_pipelined_prefix_reaches_the_reader_without_a_socket_read
@@ -202,7 +201,7 @@ carrier-httpupgrade sweep-served-answers-that-differ 0 ferrox-app-httpupgrade::t
 carrier-httpupgrade sweep-tails-the-reference-dropped 2 ferrox-app-httpupgrade::tests::sweep::the_served_sweep_agrees_with_the_reference_on_every_head
 carrier-httpupgrade sweep-dialled-cases 9 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
 carrier-httpupgrade sweep-dialled-verdicts-that-differ 2 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
-carrier-httpupgrade sweep-dialled-payload-orders-that-differ 0 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
+carrier-httpupgrade sweep-dialled-payload-orders-that-differ 1 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
 carrier-httpupgrade sweep-dialled-payload-bytes-that-differ 0 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
 carrier-httpupgrade sweep-request-header-lines-the-reference-adds-per-dial 3 ferrox-app-httpupgrade::tests::sweep::the_dialled_sweep_agrees_with_the_reference_on_every_answer
 carrier-xdrive ops-retired-instructions UNBLESSED scripts/count-ops.sh

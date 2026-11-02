@@ -120,7 +120,7 @@ serve case-1 /tunnel oracle.example - same GET /tunnel HTTP/1.1\r\nHost: oracle.
 serve noupgrade-1 /tunnel oracle.example - same GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nConnection: Upgrade\r\n\r\n
 serve noconn-1 /tunnel oracle.example - same GET /tunnel HTTP/1.1\r\nHost: oracle.example\r\nUpgrade: websocket\r\n\r\n
 client ok-1 0 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 0 r HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
-client ok-ride-1 2048 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 8 r HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
+client ok-ride-1 2048 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 8 o+r HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
 client hold-1 0 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 8 r HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
 client reason-1 0 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 0 v+r HTTP/1.1 101 UPGRADED\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
 client bare-1 0 /tunnel oracle.example AQIDBAUGBwgJCgsMDQ4PEC== 0 v+r HTTP/1.1 101\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n
