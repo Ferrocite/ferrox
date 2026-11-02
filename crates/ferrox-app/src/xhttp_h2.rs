@@ -2540,6 +2540,15 @@ mod tests {
         id: [u8; 16],
         takes: usize,
     ) -> (SocketAddr, thread::JoinHandle<()>) {
+        serve_one_with(settings, id, takes, None)
+    }
+
+    fn serve_one_with(
+        settings: XhttpSettings,
+        id: [u8; 16],
+        takes: usize,
+        decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+    ) -> (SocketAddr, thread::JoinHandle<()>) {
         let front = test_bind("127.0.0.1:0").expect("binds");
         let addr = front.local_addr().expect("addr");
         let handle = crate::budgets::spawn(move || {
@@ -2549,6 +2558,7 @@ mod tests {
                     continue;
                 };
                 let settings = settings.clone();
+                let decryption = decryption.clone();
                 crate::budgets::spawn(move || {
                     serve_h2(
                         read,
@@ -2556,7 +2566,7 @@ mod tests {
                         &settings,
                         &crate::proxy::one_user(id),
                         true,
-                        None,
+                        decryption,
                     );
                 });
             }
@@ -3262,6 +3272,97 @@ mod tests {
         assert_eq!(client.response_head(bad_seq), 500);
         drop(client);
         server.join().expect("joins");
+    }
+
+    /// A downlink that finishes leaves no body to deliver: the upload reader parked on the same
+    /// stream must end with it, not hold its worker until the relay stall expires.
+    #[test]
+    fn a_finished_downlink_wakes_its_upload_reader() {
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_secs(30)),
+            ..Default::default()
+        });
+        let (conn, _written, _slices) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                finished: false,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(65_535),
+            responded: AtomicBool::new(true),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+        let mut reader = H2StreamReader {
+            conn: Arc::clone(&conn),
+            stream: state,
+            id: 1,
+            at: 0,
+            idle_since: None,
+        };
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let parked = crate::budgets::spawn(move || {
+            let mut byte = [0u8; 1];
+            let _ = sender.send(reader.read(&mut byte).map_err(|error| error.kind()));
+        });
+        thread::sleep(Duration::from_millis(50));
+        conn.end_stream(1);
+        let verdict = receiver.recv_timeout(Duration::from_secs(2));
+        crate::budgets::clear();
+        assert_eq!(
+            verdict,
+            Ok(Ok(0)),
+            "a finished downlink left its upload reader parked for the stall"
+        );
+        parked.join().expect("the reader returns");
+    }
+
+    /// A sealed handshake reads a body no peer has to finish: it runs under the handshake clock,
+    /// so a silent peer cannot hold the stream for the relay stall.
+    #[test]
+    fn a_sealed_handshake_is_bounded_by_its_clock() {
+        crate::budgets::apply(&crate::config::Budgets {
+            handshake: Some(Duration::from_millis(200)),
+            relay_stall: Some(Duration::from_secs(2)),
+            ..Default::default()
+        });
+        let (_encryption, decryption) =
+            ferrox_core::vless_encryption::generate_pair(false, "native", "1rtt", "600s");
+        let server = ferrox_core::vless_encryption::Server::new(
+            ferrox_core::vless_encryption::ServerConfig::parse(&decryption).expect("server config"),
+        );
+        let (addr, handle) =
+            serve_one_with(test_settings("stream-one"), [0xaau8; 16], 1, Some(server));
+        let mut client = H2Client::connect(addr);
+        let only = client.headers(
+            "POST",
+            "/up/",
+            &[
+                ("referer", padding().as_str()),
+                ("content-type", "application/grpc"),
+            ],
+            false,
+        );
+        assert_eq!(client.response_head(only), 200, "the stream is accepted");
+        let began = std::time::Instant::now();
+        let (kind, flags, _, _) = client.next_frame(only, |kind| matches!(kind, T_DATA | T_RST));
+        let took = began.elapsed();
+        crate::budgets::clear();
+        assert!(
+            kind == T_RST || (kind == T_DATA && flags & F_END != 0),
+            "the stalled handshake must end its stream, got kind {kind} flags {flags}"
+        );
+        assert!(
+            took < Duration::from_secs(1),
+            "the handshake clock did not end the stream: {took:?}"
+        );
+        drop(client);
+        let _ = handle;
     }
 
     /// The writer a credit is read by: it answers with the bytes it was handed, so the number of writes it took is exact — over a loopback socket the same shape moves with the scheduler.

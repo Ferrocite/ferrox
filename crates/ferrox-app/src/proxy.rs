@@ -62397,6 +62397,98 @@ mod reverse_tests {
         );
     }
 
+    /// A sealed request this inbound refuses still owes the peer an end of stream: an H2 response
+    /// that is neither finished nor reset leaves the client waiting for an answer that can never
+    /// come, so every refusal path runs the closer.
+    #[test]
+    fn a_refused_sealed_request_finishes_the_response() {
+        use ferrox_core::vless_encryption::{
+            generate_pair, Client, ClientConfig, Server, ServerConfig,
+        };
+        let (encryption, decryption) = generate_pair(false, "native", "1rtt", "600s");
+        let server = Server::new(ServerConfig::parse(&decryption).expect("server config"));
+        let users = one_user([7u8; 16]);
+        let (client_side, server_side) = crate::reverse::loopback_pair().expect("pair");
+        let writer = server_side.try_clone().expect("split");
+        client_side
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let (sender, closed) = std::sync::mpsc::channel();
+        let closer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = sender.send(());
+        });
+        let lane = thread::spawn(move || {
+            serve_sealed_carried_with(
+                server_side,
+                writer,
+                &users,
+                true,
+                &server,
+                closer,
+                |_| {},
+                |_| {},
+                |_| {},
+            );
+        });
+        let client = Client::new(ClientConfig::parse(&encryption).expect("client config"));
+        let mut stream = client.handshake(client_side).expect("client handshake");
+        let target = Destination::Address("127.0.0.1:9".parse().expect("address"));
+        let mut bytes = [0u8; VLESS_DIAL_HEADER_MAX];
+        let len = write_vless_header(&[9u8; 16], 1, &target, false, &mut bytes).expect("header");
+        stream.write_all(&bytes[..len]).expect("request");
+        stream.flush().expect("flush");
+        assert_eq!(
+            closed.recv_timeout(Duration::from_secs(2)),
+            Ok(()),
+            "a refused sealed request left its response unfinished"
+        );
+        lane.join().expect("lane");
+    }
+
+    /// The request body ending is a half-close, not the end of the call: the target still answers,
+    /// and its response has to reach the peer instead of dying with the uplink.
+    #[test]
+    fn a_request_body_ending_leaves_the_response_relayed() {
+        struct UploadEnded;
+        impl Read for UploadEnded {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        struct Keep(Arc<Mutex<Vec<u8>>>);
+        impl Write for Keep {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (plain, target) = crate::reverse::loopback_pair().expect("pair");
+        let answering = thread::spawn(move || {
+            let mut target = target;
+            let mut body = Vec::new();
+            let _ = target.read_to_end(&mut body);
+            let _ = target.write_all(b"done");
+        });
+        let relayed = Arc::new(Mutex::new(Vec::new()));
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        relay_split(UploadEnded, Keep(Arc::clone(&relayed)), &plain, &close);
+        assert_eq!(
+            relayed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[..],
+            b"done"[..],
+            "the response was dropped with the half-closed request body"
+        );
+        answering.join().expect("the target answers");
+    }
+
     fn portal_echo(payload: &[u8]) {
         let echo = crate::conn::Listener::bind(&crate::conn::Target::Ip(
             "127.0.0.1:0".parse().expect("address"),
