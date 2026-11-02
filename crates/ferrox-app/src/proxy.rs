@@ -14525,6 +14525,11 @@ fn tls_xhttp<S: Dialed, D: Dialed>(
     settings: &crate::xhttp::XhttpSettings,
     h2: bool,
 ) -> Option<(Box<dyn Read + Send>, crate::xhttp::XhttpWriter)> {
+    // A TLS peer that selected h2 expects the preface; `decideHTTPVersion` (dialer.go:82) takes the negotiated protocol, not the offer.
+    let h2 = h2
+        || session
+            .alpn()
+            .is_some_and(|alpn| alpn.eq_ignore_ascii_case(b"h2"));
     let (reader, writer, raw) = session.into_halves()?;
     if settings.mode == crate::xhttp::XhttpMode::StreamOne {
         if h2 {
@@ -42427,6 +42432,77 @@ mod tests {
                 )
             },
             tls_xhttp_accept,
+        );
+    }
+
+    #[test]
+    fn tls_xhttp_dials_h2_when_alpn_negotiates_it() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        const WITNESS: &str = "/tls-alpn-h2";
+        let (server_config, mut client_config) = carried_tls_configs();
+        let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
+            alpn: vec![b"h2".to_vec()],
+            ..(*server_config).clone()
+        });
+        client_config.alpn = vec![b"h2".to_vec()].into();
+        let id = [0x49u8; 16];
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds echo");
+        let echo_addr: SocketAddr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 4];
+            stream.read_exact(&mut buf).expect("reads");
+            stream.write_all(&buf).expect("echoes");
+        });
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let settings = xhttp_settings(WITNESS);
+        let server_settings = settings.clone();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &one_vless_user(&id),
+                true,
+                &Carrier::Xhttp {
+                    settings: server_settings,
+                },
+                &server_config,
+                None,
+                None,
+            );
+        });
+        let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let session = dial_tls_session(&server, &client_config, None).expect("dialled");
+        assert_eq!(
+            session.alpn(),
+            Some(&b"h2"[..]),
+            "the handshake negotiates h2"
+        );
+        let header = vless_header(&id, 1, &Destination::from(echo_addr));
+        let (mut reader, writer) = tls_xhttp(
+            &server,
+            session,
+            || None::<ferrox_core::tls::ClientSession<crate::conn::Connection>>,
+            "127.0.0.1",
+            &settings,
+            false,
+        )
+        .expect("dials xhttp");
+        assert!(writer.send(&header), "sends the vless header");
+        read_vless_response(&mut reader).expect("answers");
+        assert!(writer.send(b"ping"), "relays");
+        let mut back = [0u8; 4];
+        reader.read_exact(&mut back).expect("echoes");
+        assert_eq!(&back, b"ping");
+        assert!(
+            H2_DIAL_WITNESS
+                .lock()
+                .expect("witness lock")
+                .iter()
+                .any(|path| path == WITNESS),
+            "an ALPN-negotiated h2 session must open with the H2 preface"
         );
     }
 
