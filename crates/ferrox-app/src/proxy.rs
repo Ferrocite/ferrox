@@ -62433,7 +62433,7 @@ mod reverse_tests {
             .set_read_timeout(Some(Duration::from_secs(5)))
             .expect("client read timeout");
         let (sender, closed) = std::sync::mpsc::channel();
-        let closer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let release: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             let _ = sender.send(());
         });
         let lane = thread::spawn(move || {
@@ -62443,7 +62443,7 @@ mod reverse_tests {
                 &users,
                 true,
                 &server,
-                closer,
+                release,
                 |_| {},
                 |_| {},
                 |_| {},

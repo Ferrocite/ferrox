@@ -193,11 +193,14 @@ pub(crate) struct H2Stream {
     responded: AtomicBool,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct StreamState {
     body: VecDeque<Vec<u8>>,
     ended: bool,
     /// The response `END_STREAM` has gone out: a stream retires once both halves are done.
     finished: bool,
+    /// The upload reader left at a finished response while the client still holds the request open.
+    abandoned: bool,
     dead: bool,
 }
 
@@ -415,6 +418,7 @@ impl Read for H2StreamReader {
                 return Ok(n);
             }
             if st.ended || st.finished {
+                st.abandoned = !st.ended;
                 drop(st);
                 self.conn.forget_upload(self.id);
                 return Ok(0);
@@ -1356,6 +1360,7 @@ pub(crate) fn connect_split<
             body: VecDeque::new(),
             ended: false,
             finished: false,
+            abandoned: false,
             dead: false,
         }),
         cv: Condvar::new(),
@@ -1390,7 +1395,7 @@ pub(crate) fn connect_split<
         (":scheme".to_owned(), scheme.to_owned()),
         (":authority".to_owned(), host.to_owned()),
     ];
-    for (name, value) in crate::xhttp::dial_fields(host, settings) {
+    for (mut name, value) in crate::xhttp::dial_fields(host, settings) {
         if name.starts_with(':')
             || hop_by_hop(&name)
             || name.eq_ignore_ascii_case("host")
@@ -1399,7 +1404,6 @@ pub(crate) fn connect_split<
         {
             continue;
         }
-        let mut name = name;
         name.make_ascii_lowercase();
         fields.push((name, value));
     }
@@ -1468,6 +1472,7 @@ impl H2Conn {
                 body: VecDeque::new(),
                 ended: end_stream,
                 finished: false,
+                abandoned: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -1616,7 +1621,7 @@ fn serve_stream(
         close,
         |_| {},
         |reader| reader.rearm(crate::budgets::handshake()),
-        |reader| reader.disarm(),
+        crate::proxy::HandshakeRead::disarm,
     );
 }
 
@@ -1671,6 +1676,7 @@ fn open_stream(
             body: VecDeque::new(),
             ended: end_stream,
             finished: false,
+            abandoned: false,
             dead: false,
         }),
         cv: Condvar::new(),
@@ -2224,19 +2230,26 @@ fn pump_frame(
                 return true;
             };
             drop(streams);
-            let finished = {
+            let (finished, abandoned) = {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
                 let finished = st.finished;
-                if !st.dead {
+                let abandoned = st.abandoned;
+                if !abandoned && !st.dead {
                     st.body.push_back(body);
                     if flags & F_END != 0 {
                         st.ended = true;
                     }
                 }
                 state.cv.notify_all();
-                finished && flags & F_END != 0
+                (finished, abandoned)
             };
-            if finished {
+            if abandoned {
+                if flags & F_END != 0 {
+                    conn.retire(sid);
+                }
+                return true;
+            }
+            if finished && flags & F_END != 0 {
                 conn.retire(sid);
             }
             conn.replenish(sid, wire_len);
@@ -2639,6 +2652,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                abandoned: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -2726,6 +2740,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                abandoned: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -3219,6 +3234,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                abandoned: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -3291,6 +3307,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                abandoned: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -3323,6 +3340,86 @@ mod tests {
             "a finished downlink left its upload reader parked for the stall"
         );
         parked.join().expect("the reader returns");
+    }
+
+    /// The reader leaving at a finished response must stop the queue and the credit with it: the
+    /// stream stays open in the client's eyes, so what it sends after that is bounded by the window.
+    #[test]
+    fn a_data_after_the_upload_reader_left_is_dropped_and_uncredited() {
+        let (conn, written, slices) = bare_conn();
+        let settings = XhttpSettings::stream_one();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                finished: true,
+                abandoned: false,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(65_535),
+            responded: AtomicBool::new(true),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+        let mut reader = H2StreamReader {
+            conn: Arc::clone(&conn),
+            stream: Arc::clone(&state),
+            id: 1,
+            at: 0,
+            idle_since: None,
+        };
+        assert_eq!(reader.read(&mut [0u8; 8]).expect("eof"), 0);
+        let mut frag: Option<(u32, Vec<u8>, bool)> = None;
+        for _ in 0..3 {
+            assert!(pump_frame(
+                &conn,
+                &test_service(&settings),
+                T_DATA,
+                0,
+                1,
+                vec![b'x'; 16],
+                &mut frag
+            ));
+        }
+        {
+            let st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+            assert!(
+                st.body.is_empty(),
+                "no chunk is queued for a reader that left"
+            );
+        }
+        assert_eq!(
+            slices.load(Ordering::SeqCst),
+            0,
+            "no credit for dropped data"
+        );
+        assert!(
+            written
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "the dropped data writes nothing"
+        );
+        assert!(pump_frame(
+            &conn,
+            &test_service(&settings),
+            T_DATA,
+            F_END,
+            1,
+            Vec::new(),
+            &mut frag
+        ));
+        assert!(
+            conn.streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&1)
+                .is_none(),
+            "the request ending retires the stream"
+        );
     }
 
     /// A sealed handshake reads a body no peer has to finish: it runs under the handshake clock,
@@ -3783,6 +3880,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                abandoned: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -3943,6 +4041,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                abandoned: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -3984,6 +4083,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: true,
                 finished: false,
+                abandoned: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -4043,6 +4143,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                abandoned: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -4166,6 +4267,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                abandoned: false,
                 dead: false,
             }),
             cv: Condvar::new(),
