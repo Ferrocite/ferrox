@@ -28901,7 +28901,7 @@ fn ss_accounts(
             Vec::new(),
         )
     };
-    // A 2022 inbound whose users[] array does not line up with its password's PSK tail leaves one side unmatched; warn once and serve the shorter list so no identity is looked up past its PSK. A password that does not parse is the handshake's failure to surface, not this check's.
+    // A 2022 inbound whose users[] array does not line up with its password's PSK tail leaves one side unmatched; warn once, then give every PSK an identity so a flow is never left unattributed. A password that does not parse is the handshake's failure to surface, not this check's.
     if let Some(parsed) = parsed {
         if let Some(list) =
             ferrox_core::shadowsocks2022::parse_psk_list(&password, parsed.key_len())
@@ -28909,10 +28909,15 @@ fn ss_accounts(
             let psks = list.len().saturating_sub(1);
             if identities.len() != psks {
                 eprintln!(
-                    "shadowsocks 2022 inbound on {address}: {} users for {psks} client psks, using the shorter list",
+                    "shadowsocks 2022 inbound on {address}: {} users for {psks} client psks, naming the rest after the inbound",
                     identities.len()
                 );
-                identities.truncate(psks);
+                if identities.len() > psks {
+                    identities.truncate(psks);
+                } else {
+                    let unnamed = inbound_tag(inbound).unwrap_or_else(|| address.to_owned());
+                    identities.resize(psks, (unnamed, 0));
+                }
             }
         }
     }
@@ -59222,6 +59227,34 @@ end
                 ("bob@example".to_owned(), 0u32),
             ],
             "carol has no PSK to match, so the fix drops her rather than serve a mismatched identity"
+        );
+    }
+
+    /// A 2022 inbound whose `users` array names fewer users than its password has client PSKs still
+    /// names every PSK: the unnamed tail counts against the inbound rather than going unattributed.
+    #[test]
+    fn a_2022_users_array_shorter_than_the_client_psks_names_the_tail_after_the_inbound() {
+        use base64::Engine as _;
+        let key = |b: u8| base64::engine::general_purpose::STANDARD.encode(vec![b; 32]);
+        let password = format!("{}:{}:{}", key(1), key(2), key(3));
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks", "tag": "ss-in", "settings": {{"method": "2022-blake3-aes-256-gcm", "password": "{password}", "users": [
+                {{"email": "alice@example", "level": 2}}]}}}}"#
+        ))
+        .expect("parses");
+        let accounts = ss_accounts(
+            &inbound,
+            "127.0.0.1:0",
+            password.clone(),
+            "2022-blake3-aes-256-gcm".to_owned(),
+        );
+        assert_eq!(
+            accounts.identities.as_slice(),
+            &[
+                ("alice@example".to_owned(), 2u32),
+                ("ss-in".to_owned(), 0u32)
+            ],
+            "the second PSK has no user entry, so its traffic belongs to the inbound"
         );
     }
 
