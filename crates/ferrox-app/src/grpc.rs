@@ -1864,6 +1864,7 @@ fn mux_stream(
     let writer = GrpcWriter {
         shared: write,
         stream: sid,
+        multi: method == Method::MultiHunk,
     };
     (reader, writer)
 }
