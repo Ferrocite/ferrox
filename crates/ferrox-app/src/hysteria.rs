@@ -1082,6 +1082,7 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
                     if forward.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                         Next::Done
                     } else {
+                        buffer.release();
                         Next::Idle
                     }
                 }
@@ -1122,6 +1123,7 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
                     if backward.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                         Next::Done
                     } else {
+                        buffer.release();
                         Next::Idle
                     }
                 }
