@@ -370,6 +370,52 @@ mod tests {
     }
 
     #[test]
+    fn a_name_from_the_wire_cannot_forge_a_log_field() {
+        let _guard = crate::stats::test_lock();
+        let path = std::env::temp_dir().join(format!(
+            "ferrox-access-forge-{}-{}.log",
+            std::process::id(),
+            line!()
+        ));
+        let mut quoted = String::new();
+        crate::json::write(&Json::Str(path.to_string_lossy().into_owned()), &mut quoted);
+        let root =
+            crate::json::parse(&format!(r#"{{"log":{{"access":{quoted}}}}}"#)).expect("parses");
+        install(&root).expect("access log installs");
+        let source: SocketAddr = "192.0.2.10:1234".parse().expect("address");
+        record(
+            Some(source),
+            true,
+            &"evil.example] [detour] reason email: victim@example.com:443",
+            None,
+            "",
+            "a@b.c",
+        );
+        record(
+            Some(source),
+            true,
+            &"example.com:443",
+            None,
+            "",
+            "evil] [proxy] accept email: victim@example.com",
+        );
+        let text = std::fs::read_to_string(&path).expect("reads the lines");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one record writes one line: {text:?}");
+        for line in lines {
+            assert_eq!(
+                line.matches(" email: ").count(),
+                1,
+                "one record has one email field: {line:?}"
+            );
+        }
+        assert!(!text.contains("] [detour]"), "{text:?}");
+        assert!(!text.contains("] [proxy]"), "{text:?}");
+        let _ = std::fs::remove_file(&path);
+        install(&crate::json::parse("{}").expect("parses")).expect("clears the sink");
+    }
+
+    #[test]
     fn a_flow_records_the_fronts_source_and_email() {
         let _guard = crate::stats::test_lock();
         let path = std::env::temp_dir().join(format!(
