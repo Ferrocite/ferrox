@@ -808,13 +808,11 @@ fn record(kind: u8, payload: &Value) -> Result<Vec<u8>, String> {
     if length > 0xffff {
         return Err("psiphon broker: record is too long".to_owned());
     }
+    // The length is at most three octets, so its window is the stack the record already holds.
     let mut length_bytes = [0u8; 10];
-    let mut length_buffer = Vec::new();
-    put_uvarint(&mut length_buffer, length as u64);
-    length_bytes[..length_buffer.len()].copy_from_slice(&length_buffer);
-    out[length_at..length_at + length_buffer.len()]
-        .copy_from_slice(&length_bytes[..length_buffer.len()]);
-    out.drain(length_at + length_buffer.len()..length_at + 10);
+    let length_len = put_uvarint_into(&mut length_bytes, length as u64);
+    out[length_at..length_at + length_len].copy_from_slice(&length_bytes[..length_len]);
+    out.drain(length_at + length_len..length_at + 10);
     Ok(out)
 }
 
@@ -839,15 +837,40 @@ fn decode_record(payload: &[u8]) -> Result<Record, String> {
     })
 }
 
-fn put_uvarint(out: &mut Vec<u8>, mut value: u64) {
+fn put_uvarint(out: &mut Vec<u8>, value: u64) {
+    let mut bytes = [0u8; 10];
+    let len = put_uvarint_into(&mut bytes, value);
+    out.extend_from_slice(&bytes[..len]);
+}
+
+fn put_uvarint_into(out: &mut [u8], mut value: u64) -> usize {
+    let mut at = 0;
     while value >= 0x80 {
-        out.push((value as u8) | 0x80);
+        out[at] = (value as u8) | 0x80;
         value >>= 7;
+        at += 1;
     }
-    out.push(value as u8);
+    out[at] = value as u8;
+    at + 1
 }
 
 fn get_uvarint(bytes: &[u8]) -> Option<(u64, &[u8])> {
+    // A varint ending inside eight octets is one load: the first clear high bit ends it, and three shift-masks fold the seven-bit fields; nine or ten octets fall to the byte loop.
+    if let Some(chunk) = bytes.first_chunk::<8>() {
+        let word = u64::from_le_bytes(*chunk);
+        let stop = !word & 0x8080_8080_8080_8080;
+        if stop != 0 {
+            let take = (stop.trailing_zeros() / 8) as usize + 1;
+            let mut value = word & 0x7f7f_7f7f_7f7f_7f7f;
+            value = (value & 0x007f_007f_007f_007f) | ((value & 0x7f00_7f00_7f00_7f00) >> 1);
+            value = (value & 0x0000_3fff_0000_3fff) | ((value & 0x3fff_0000_3fff_0000) >> 2);
+            value = (value & 0x0000_0000_0fff_ffff) | ((value & 0x0fff_ffff_0000_0000) >> 4);
+            if take < 8 {
+                value &= (1u64 << (7 * take)) - 1;
+            }
+            return Some((value, &bytes[take..]));
+        }
+    }
     let mut value = 0u64;
     let mut shift = 0;
     for (index, byte) in bytes.iter().enumerate() {
@@ -900,26 +923,26 @@ fn encode_into(value: &Value, out: &mut Vec<u8>) {
             }
         }
         Value::Map(entries) => {
-            let mut encoded: Vec<(Vec<u8>, Vec<u8>)> = entries
-                .iter()
-                .map(|(key, value)| {
-                    let mut key_bytes = Vec::new();
-                    encode_into(key, &mut key_bytes);
-                    let mut value_bytes = Vec::new();
-                    encode_into(value, &mut value_bytes);
-                    (key_bytes, value_bytes)
-                })
-                .collect();
-            encoded.sort_by(|left, right| {
-                left.0
+            // One scratch and one offset table replace two buffers per pair; canonical order is the key's own encoding, shorter first then byte order.
+            let mut scratch = Vec::new();
+            let mut ranges: Vec<(usize, usize, usize)> = Vec::with_capacity(entries.len());
+            for (key, value) in entries {
+                let start = scratch.len();
+                encode_into(key, &mut scratch);
+                let middle = scratch.len();
+                encode_into(value, &mut scratch);
+                ranges.push((start, middle, scratch.len()));
+            }
+            ranges.sort_by(|left, right| {
+                scratch[left.0..left.1]
                     .len()
-                    .cmp(&right.0.len())
-                    .then_with(|| left.0.cmp(&right.0))
+                    .cmp(&scratch[right.0..right.1].len())
+                    .then_with(|| scratch[left.0..left.1].cmp(&scratch[right.0..right.1]))
             });
-            encode_head(5, encoded.len() as u64, out);
-            for (key, value) in encoded {
-                out.extend_from_slice(&key);
-                out.extend_from_slice(&value);
+            encode_head(5, ranges.len() as u64, out);
+            for (start, middle, end) in ranges {
+                out.extend_from_slice(&scratch[start..middle]);
+                out.extend_from_slice(&scratch[middle..end]);
             }
         }
         Value::Bool(false) => out.push(0xf4),
@@ -1057,6 +1080,236 @@ mod tests {
         assert_eq!(
             encode(&value),
             vec![0xa3, 0x01, 0x02, 0x18, 0x18, 0x01, 0x62, 0x61, 0x61, 0x03,]
+        );
+    }
+
+    /// The reference decode the one-load read is measured against: the byte loop the encoder was
+    /// written beside, kept here so the pair answers on the same bytes.
+    fn reference_uvarint(bytes: &[u8]) -> Option<(u64, usize)> {
+        let mut value = 0u64;
+        let mut shift = 0;
+        for (index, byte) in bytes.iter().enumerate() {
+            if shift >= 64 {
+                return None;
+            }
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Some((value, index + 1));
+            }
+            shift += 7;
+        }
+        None
+    }
+
+    #[test]
+    fn every_uvarint_width_decodes_like_the_byte_loop() {
+        let mut values = vec![
+            0u64,
+            1,
+            127,
+            128,
+            300,
+            0x3fff,
+            0x4000,
+            0xffff_ffff,
+            u64::MAX,
+        ];
+        for shift in 0..64 {
+            values.push(1u64 << shift);
+            values.push((1u64 << shift) - 1);
+        }
+        for value in values {
+            let mut out = Vec::new();
+            put_uvarint(&mut out, value);
+            assert_eq!(
+                get_uvarint(&out),
+                reference_uvarint(&out).map(|(seen, used)| (seen, &out[used..])),
+                "{value:#x} decodes to the loop's value and length"
+            );
+            assert_eq!(get_uvarint(&out).map(|(seen, _)| seen), Some(value));
+        }
+        // Nine and ten octets are past the one-load window; the loop is the same answer there.
+        for value in [u64::MAX, u64::MAX / 3, 1 << 63, 1 << 56] {
+            let mut out = Vec::new();
+            put_uvarint(&mut out, value);
+            assert!(out.len() >= 9, "{value:#x} is a wide varint");
+            assert_eq!(get_uvarint(&out).map(|(seen, _)| seen), Some(value));
+        }
+        // A terminator past the tenth octet needs more than a u64, so both frames refuse it.
+        let mut over = vec![0x80u8; 10];
+        over.push(0);
+        assert_eq!(get_uvarint(&over).map(|(seen, _)| seen), None);
+        assert_eq!(reference_uvarint(&over).map(|(seen, _)| seen), None);
+        // Every byte value at a one-, two- and seven-octet terminator, against the loop.
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let len = usize::try_from(state % 12).expect("a length below twelve");
+            let mut bytes = Vec::with_capacity(len);
+            for _ in 0..len {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                bytes.push(match state % 5 {
+                    0 => 0x00,
+                    1 => 0x01,
+                    2 => 0x7f,
+                    3 => 0x80,
+                    _ => 0xff,
+                });
+            }
+            assert_eq!(
+                get_uvarint(&bytes),
+                reference_uvarint(&bytes).map(|(seen, used)| (seen, &bytes[used..])),
+                "{bytes:02x?}"
+            );
+        }
+    }
+
+    /// A map wide enough to show the per-pair form's two buffers per entry, mixing key kinds so
+    /// the canonical order has length ties to break.
+    fn wide_map() -> Value {
+        let mut entries = Vec::new();
+        for index in 0u64..64 {
+            let key = match index % 4 {
+                0 => Value::UInt(index),
+                1 => Value::Text(format!("k{index:02}")),
+                2 => Value::Bytes(vec![u8::try_from(index).expect("below 64"); 3]),
+                _ => Value::UInt(u64::MAX - index),
+            };
+            entries.push((key, Value::UInt(index)));
+        }
+        Value::Map(entries)
+    }
+
+    /// The per-pair encoder the scratch replaced, kept as this run's other frame: the same map
+    /// through the old shape, so both allocation counts come from one run.
+    fn encode_per_pair(value: &Value) -> Vec<u8> {
+        let Value::Map(entries) = value else {
+            unreachable!("the frame is a map");
+        };
+        let mut encoded: Vec<(Vec<u8>, Vec<u8>)> = entries
+            .iter()
+            .map(|(key, item)| {
+                let mut key_bytes = Vec::new();
+                encode_into(key, &mut key_bytes);
+                let mut value_bytes = Vec::new();
+                encode_into(item, &mut value_bytes);
+                (key_bytes, value_bytes)
+            })
+            .collect();
+        encoded.sort_by(|left, right| {
+            left.0
+                .len()
+                .cmp(&right.0.len())
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let mut out = Vec::new();
+        encode_head(5, encoded.len() as u64, &mut out);
+        for (key, item) in encoded {
+            out.extend_from_slice(&key);
+            out.extend_from_slice(&item);
+        }
+        out
+    }
+
+    /// Canonical order is the key's own encoding, and the encoder's pair buffers are a bounded
+    /// table now: a map allocates fewer buffers than it has pairs, where the per-pair form took two.
+    #[test]
+    fn a_map_encodes_through_one_scratch() {
+        let value = wide_map();
+        let entries = match &value {
+            Value::Map(entries) => entries.len(),
+            _ => unreachable!("the case is a map"),
+        };
+        assert_eq!(
+            encode(&value),
+            encode_per_pair(&value),
+            "the canonical bytes are the per-pair ones"
+        );
+        let (_, counts) = ferrox_core::alloc_count::measure(|| encode(&value));
+        assert!(
+            counts.allocs < entries,
+            "a {entries}-pair map in {} allocations",
+            counts.allocs
+        );
+    }
+
+    /// The frame the scratch replaced: the same map, two buffers per pair, measured beside it.
+    #[test]
+    fn the_per_pair_encoder_costs_two_buffers_a_pair() {
+        let value = wide_map();
+        let entries = match &value {
+            Value::Map(entries) => entries.len(),
+            _ => unreachable!("the case is a map"),
+        };
+        let (_, counts) = ferrox_core::alloc_count::measure(|| encode_per_pair(&value));
+        assert!(
+            counts.allocs >= 2 * entries,
+            "the per-pair form bought {} buffers for {entries} pairs",
+            counts.allocs
+        );
+    }
+
+    /// The length-buffer record the stack window replaced, kept as this run's other frame.
+    fn record_per_length_buffer(kind: u8, payload: &Value) -> Result<Vec<u8>, String> {
+        let mut out = Vec::with_capacity(512);
+        out.push(RECORD_VERSION);
+        out.push(kind);
+        let length_at = out.len();
+        out.resize(length_at + 10, 0);
+        encode_into(payload, &mut out);
+        let length = out.len() - length_at - 10;
+        if length > 0xffff {
+            return Err("psiphon broker: record is too long".to_owned());
+        }
+        let mut length_buffer = Vec::new();
+        let mut value = length as u64;
+        while value >= 0x80 {
+            length_buffer.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        length_buffer.push(value as u8);
+        out[length_at..length_at + length_buffer.len()].copy_from_slice(&length_buffer);
+        out.drain(length_at + length_buffer.len()..length_at + 10);
+        Ok(out)
+    }
+
+    /// A record's length lives in the stack window it already reserved, not in a heap `Vec` built
+    /// for a varint of at most three octets.
+    #[test]
+    fn a_record_writes_its_length_without_a_buffer() {
+        let body = Value::Bytes(vec![0u8; 4096]);
+        let (bytes, counts) = ferrox_core::alloc_count::measure(|| {
+            record(CLIENT_OFFER_REQUEST, &body).expect("a record")
+        });
+        assert!(bytes.len() > 4096);
+        assert!(
+            counts.allocs <= 2,
+            "the record and its one growth, not a length buffer: {}",
+            counts.allocs
+        );
+    }
+
+    /// The frame the stack window replaced: the same record through a heap length buffer, measured
+    /// beside the stack one, and both written to the same bytes.
+    #[test]
+    fn the_length_buffer_costs_an_extra_allocation() {
+        let body = Value::Bytes(vec![0u8; 4096]);
+        let (old_bytes, old) = ferrox_core::alloc_count::measure(|| {
+            record_per_length_buffer(CLIENT_OFFER_REQUEST, &body).expect("a record")
+        });
+        let (new_bytes, new) = ferrox_core::alloc_count::measure(|| {
+            record(CLIENT_OFFER_REQUEST, &body).expect("a record")
+        });
+        assert_eq!(new_bytes, old_bytes, "the record is the same bytes");
+        assert!(
+            old.allocs > new.allocs,
+            "a heap length buffer bought {} allocations over {}",
+            old.allocs,
+            new.allocs
         );
     }
 
