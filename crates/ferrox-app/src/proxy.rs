@@ -15092,6 +15092,30 @@ fn driven_halves<S>(session: S, grain: Duration) -> Result<Half<DrivenHalf<S, Co
 where
     S: Drivable + CipherOpen + ferrox_core::tls::RecordAlignment + Send + Sized + 'static,
 {
+    driven_halves_with(session, grain, None)
+}
+
+/// A dial that has not read the VLESS answer yet: the reader strips it on the read that
+/// first sees it, so an upload-only flow relays while the server withholds `[0, 0]`.
+fn driven_halves_answering<S>(
+    session: S,
+    grain: Duration,
+    refused: Arc<dyn Fn() + Send + Sync>,
+) -> Result<Half<DrivenHalf<S, Connection>>, S>
+where
+    S: Drivable + CipherOpen + ferrox_core::tls::RecordAlignment + Send + Sized + 'static,
+{
+    driven_halves_with(session, grain, Some(refused))
+}
+
+fn driven_halves_with<S>(
+    session: S,
+    grain: Duration,
+    refused: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> Result<Half<DrivenHalf<S, Connection>>, S>
+where
+    S: Drivable + CipherOpen + ferrox_core::tls::RecordAlignment + Send + Sized + 'static,
+{
     let Some(cipher) = session.transport() else {
         return Err(session);
     };
@@ -15106,10 +15130,11 @@ where
     let session = Arc::new(Mutex::new(session));
     let cipher = Arc::new(Mutex::new(cipher));
     let out = Arc::new(Mutex::new(Sealed::new(out)));
-    Ok(Half::split(
-        DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher), Arc::clone(&out)),
-        DrivenHalf::new(session, cipher, out),
-    ))
+    let mut reader = DrivenHalf::new(Arc::clone(&session), Arc::clone(&cipher), Arc::clone(&out));
+    if let Some(refused) = refused {
+        reader.expecting_answer(Some(refused));
+    }
+    Ok(Half::split(reader, DrivenHalf::new(session, cipher, out)))
 }
 
 /// The ciphertext side a Vision link reads: a plain outer TLS stops at the byte after the
@@ -15312,6 +15337,12 @@ struct DrivenHalf<S, R> {
     queued: bool,
     /// The session reported the peer's close: no later read asks the transport again.
     closed: bool,
+    /// The client strips the VLESS answer before the first payload byte, on the read that
+    /// first sees it: a server may withhold `[0, 0]` until it has downstream bytes.
+    answer: crate::vision::Answer,
+    /// Reports a refused or truncated answer once, so the dial keeps the accounting the
+    /// eager read used to.
+    refused: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl<S, R> Clone for DrivenHalf<S, R> {
@@ -15325,6 +15356,8 @@ impl<S, R> Clone for DrivenHalf<S, R> {
             pending_end: self.pending_end,
             queued: self.queued,
             closed: self.closed,
+            answer: self.answer,
+            refused: self.refused.clone(),
         }
     }
 }
@@ -15343,6 +15376,25 @@ impl<S, R> DrivenHalf<S, R> {
             // The answer read may have left plaintext in the session, so the first read asks it first.
             queued: true,
             closed: false,
+            answer: crate::vision::Answer::None,
+            refused: None,
+        }
+    }
+
+    /// The reader strips the VLESS answer before its first payload byte, on the read that
+    /// first sees it; the server's half never carries one.
+    fn expecting_answer(&mut self, refused: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.answer = crate::vision::Answer::Pending {
+            head: [0; 2],
+            filled: 0,
+        };
+        self.refused = refused;
+    }
+
+    /// Reports a terminal answer failure at most once, and never after the answer validated.
+    fn refuse(&mut self) {
+        if let Some(refused) = self.refused.take() {
+            refused();
         }
     }
 }
@@ -15425,6 +15477,35 @@ impl<S: CipherOpen, R: Read> DrivenHalf<S, R> {
 
 impl<S: CipherOpen, R: Read> Read for DrivenHalf<S, R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let crate::vision::Answer::Pending { head, filled } = self.answer {
+            let mut head = head;
+            let mut filled = usize::from(filled);
+            while filled < 2 {
+                match self.read_unmetered(&mut head[filled..]) {
+                    Ok(0) => {
+                        self.refuse();
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                    }
+                    Ok(n) => filled += n,
+                    Err(error) => {
+                        self.answer = crate::vision::Answer::Pending {
+                            head,
+                            filled: filled as u8,
+                        };
+                        if !is_timeout(&error) {
+                            self.refuse();
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            if ferrox_core::vless::VlessLink::decode_response_header(&head).is_err() {
+                self.refuse();
+                return Err(std::io::Error::other("vless answer refused"));
+            }
+            self.answer = crate::vision::Answer::None;
+            self.refused = None;
+        }
         self.read_unmetered(buf)
     }
 }
@@ -15751,13 +15832,6 @@ fn dial_vless_tls(
                         Failure::new(Stage::RequestSent, Kind::Dropped),
                     );
                 }
-                // A server may hold its answer until it has payload, and a TLS session cannot split, so the pump and the answer wait share the session behind one lock.
-                let Some(session) = pump_tls_answer(client, session) else {
-                    return note_dial_failure(
-                        server,
-                        Failure::new(Stage::RequestSent, Kind::Dropped),
-                    );
-                };
                 let Ok(downstream) = client.try_clone() else {
                     return;
                 };
@@ -15765,9 +15839,18 @@ fn dial_vless_tls(
                     return;
                 }
                 let close = shutdown_pair(downstream.try_clone().ok(), None);
+                let refused = {
+                    let server = *server;
+                    Arc::new(move || {
+                        note_dial_failure(&server, Failure::new(Stage::RequestSent, Kind::Dropped));
+                    }) as Arc<dyn Fn() + Send + Sync>
+                };
                 // The relay reads the session's transport itself: the idle leg's wait holds no lock, so it takes the relay grain itself.
-                if let Ok(half) = driven_halves(session, RELAY_POLL) {
-                    relay_shared(Half::socket(downstream), half, &close);
+                match driven_halves_answering(session, RELAY_POLL, refused) {
+                    Ok(half) => relay_shared_late(Half::socket(downstream), half, &close),
+                    Err(_) => {
+                        note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+                    }
                 }
                 return;
             }
@@ -15803,42 +15886,6 @@ fn dial_vless_tls(
             false,
         ),
     }
-}
-
-/// Pumps the app's bytes through a TLS session while the answer is read, then hands the session back: a server that withholds its response until it sees payload cannot be allowed to stall the opening write.
-fn pump_tls_answer(
-    client: &Connection,
-    session: ferrox_core::tls::ClientSession<Connection>,
-) -> Option<ferrox_core::tls::ClientSession<Connection>> {
-    let Ok(out) = session.get_ref().try_clone() else {
-        return None;
-    };
-    let shared = Arc::new(Mutex::new(session));
-    let out = Arc::new(Mutex::new(Sealed::new(out)));
-    let mut reader: TlsHalf<_, Connection> = TlsHalf {
-        session: Arc::clone(&shared),
-        out: Arc::clone(&out),
-        driven: None,
-        sleep_on_timeout: true,
-    };
-    let pump = Pump::over_now(client, {
-        let mut writer: TlsHalf<_, Connection> = TlsHalf {
-            session: Arc::clone(&shared),
-            out: Arc::clone(&out),
-            driven: None,
-            sleep_on_timeout: true,
-        };
-        move |bytes| writer.write_all(bytes).is_ok()
-    });
-    let answered = read_vless_response(&mut reader).is_some();
-    let _ = pump.end();
-    if !answered {
-        return None;
-    }
-    drop(reader);
-    Arc::into_inner(shared)
-        .map(Mutex::into_inner)
-        .and_then(Result::ok)
 }
 
 type VisionTlsLink = Half<
@@ -39815,6 +39862,77 @@ mod tests {
         finished
             .recv_timeout(Duration::from_secs(5))
             .expect("the relay ends when the upload ends");
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn vless_tls_hands_an_unanswered_upload_to_the_relay() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x4Fu8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let (uploaded, seen) = std::sync::mpsc::channel();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let Some((got, flow, cmd, _target)) = decode_request(&mut tls) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(flow, Flow::None);
+            assert_eq!(cmd, 1);
+            let mut first = [0u8; 4];
+            tls.read_exact(&mut first).expect("reads the upload");
+            assert_eq!(&first, b"ping");
+            let _ = uploaded.send(());
+            // Never answer `[0, 0]` and keep the connection open: an upload-only flow leaves no downstream byte to flush it with.
+            let mut rest = [0u8; 64];
+            let _ = tls.read(&mut rest);
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let (done, finished) = std::sync::mpsc::channel();
+        let relay = crate::budgets::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: false,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(client_config)),
+                flow: String::new(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+            dial_vless_tls(
+                &client,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+            );
+            let _ = done.send(());
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.write_all(b"ping").expect("writes");
+        seen.recv_timeout(Duration::from_secs(2))
+            .expect("the server reads the upload");
+        finished
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the dial hands the relay back while the server withholds its answer");
+        drop(sock);
         relay.join().expect("joins");
         server.join().expect("joins");
     }
