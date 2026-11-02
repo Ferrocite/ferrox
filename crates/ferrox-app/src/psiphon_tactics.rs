@@ -122,16 +122,19 @@ fn open_preamble(keyword: &[u8], reply: &mut [u8]) -> Result<usize, String> {
         .try_into()
         .map_err(|_| "psiphon tactics: response seed".to_owned())?;
     let mut stream = Rc4::new(&derive_key(&seed, keyword, b"client_to_server"));
-    stream.apply(&mut reply[SEED_LENGTH..]);
+    stream.apply(&mut reply[SEED_LENGTH..header_len]);
     let header = &reply[SEED_LENGTH..header_len];
     if header[..4] != MAGIC.to_be_bytes()[..] {
         return Err("psiphon tactics: response magic".to_owned());
     }
     let padding = u32::from_be_bytes(header[4..8].try_into().unwrap_or([0; 4])) as usize;
-    header_len
+    let body = header_len
         .checked_add(padding)
         .filter(|start| *start <= reply.len())
-        .ok_or_else(|| "psiphon tactics: response padding".to_owned())
+        .ok_or_else(|| "psiphon tactics: response padding".to_owned())?;
+    stream.apply(&mut reply[header_len..body]);
+    stream.apply(&mut reply[body..]);
+    Ok(body)
 }
 
 /// Box the request with the server's tactics public key, prepending the
