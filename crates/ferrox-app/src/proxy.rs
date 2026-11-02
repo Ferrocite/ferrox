@@ -12062,7 +12062,7 @@ fn serve_ss_relay_inbound(address: &str, inbound: &Json, password: &str, method:
             crate::shadowsocks2022::serve_udp_relay(&clients, parsed, &udp_psk, &udp_dests);
         });
     }
-    true
+    tcp || (udp && !parsed.is_chacha())
 }
 
 /// The networks a shadowsocks inbound opens, from a `tcp,udp` string or an array: a list that names neither opens none, and an absent list opens both, the superset of the reference's tcp default.
