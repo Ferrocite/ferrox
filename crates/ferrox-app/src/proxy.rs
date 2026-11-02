@@ -10717,7 +10717,7 @@ fn dial_ss_kcp(
             return;
         };
         if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
-            let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+            let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
                 &mut session,
                 &ss.password,
                 &ss.method,
@@ -10730,7 +10730,7 @@ fn dial_ss_kcp(
             crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
             return;
         }
-        let Some((send, recv)) = crate::shadowsocks::client_send_handshake(
+        let Ok((send, recv)) = crate::shadowsocks::client_send_handshake(
             &mut session,
             &ss.password,
             &ss.method,
@@ -10745,7 +10745,7 @@ fn dial_ss_kcp(
     }
     let mut writer = KcpIo::new(Arc::clone(conn));
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
-        let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
             &mut writer,
             &ss.password,
             &ss.method,
@@ -10757,7 +10757,7 @@ fn dial_ss_kcp(
         crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
         return;
     }
-    let Some((send, recv)) =
+    let Ok((send, recv)) =
         crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
     else {
         return;
@@ -10951,7 +10951,7 @@ fn dial_ss_xdrive(client: &Connection, ss: &ShadowsocksOut, target: &Destination
     };
     let mut writer = session.clone();
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
-        let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
             &mut writer,
             &ss.password,
             &ss.method,
@@ -10963,7 +10963,7 @@ fn dial_ss_xdrive(client: &Connection, ss: &ShadowsocksOut, target: &Destination
         crate::shadowsocks2022::pump_relay_carried(client, session, writer, &close, send, recv);
         return;
     }
-    let Some((send, recv)) =
+    let Ok((send, recv)) =
         crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
     else {
         return;
@@ -13590,7 +13590,8 @@ fn open_ss_mux(ss: &ShadowsocksOut) -> Option<MuxUplink> {
     };
     let mut write = write;
     let (send, recv) =
-        crate::shadowsocks::client_send_handshake(&mut *write, &ss.password, &ss.method, &target)?;
+        crate::shadowsocks::client_send_handshake(&mut *write, &ss.password, &ss.method, &target)
+            .ok()?;
     Some(MuxUplink {
         read: Box::new(crate::shadowsocks::SsMuxReader::new(read, recv)),
         write: Box::new(crate::shadowsocks::SsMuxWriter::new(write, send)),
@@ -16762,7 +16763,7 @@ fn dial_ss_headed(
         return !Failure::new(Stage::SocketConnected, Kind::Unreachable).worth_retrying();
     };
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
-        let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
             &mut writer,
             &ss.password,
             &ss.method,
@@ -16779,7 +16780,7 @@ fn dial_ss_headed(
         crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
         return true;
     }
-    let Some((send, recv)) =
+    let Ok((send, recv)) =
         crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
     else {
         return !Failure::new(Stage::RequestSent, Kind::Dropped).worth_retrying();
@@ -16843,7 +16844,7 @@ where
     W: Write + Send + 'static,
 {
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
-        let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
             &mut writer,
             &ss.password,
             &ss.method,
@@ -16855,7 +16856,7 @@ where
         crate::shadowsocks2022::pump_relay_carried(client, reader, writer, close, send, recv);
         return true;
     }
-    let Some((send, recv)) =
+    let Ok((send, recv)) =
         crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
     else {
         close();
@@ -17001,7 +17002,7 @@ fn dial_ss_rung(
             }
             let mut uplink = uplink;
             if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
-                let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+                let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
                     &mut uplink,
                     &ss.password,
                     &ss.method,
@@ -17013,7 +17014,7 @@ fn dial_ss_rung(
                 crate::shadowsocks2022::pump_relay(client, &uplink, send, recv);
                 return true;
             }
-            let Some((send, recv)) = crate::shadowsocks::client_send_handshake(
+            let Ok((send, recv)) = crate::shadowsocks::client_send_handshake(
                 &mut uplink,
                 &ss.password,
                 &ss.method,
@@ -17053,7 +17054,7 @@ fn dial_ss_ws(
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
-        let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
             &mut writer,
             &ss.password,
             &ss.method,
@@ -17068,7 +17069,7 @@ fn dial_ss_ws(
         crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
         return true;
     }
-    let Some((send, recv)) =
+    let Ok((send, recv)) =
         crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
     else {
         return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
@@ -17095,13 +17096,14 @@ fn dial_ss_httpupgrade(
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
-        let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+        let (send, recv) = match crate::shadowsocks2022::client_send_handshake(
             &mut writer,
             &ss.password,
             &ss.method,
             target,
-        ) else {
-            return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Local);
+        ) {
+            Ok(pair) => pair,
+            Err(kind) => return climb_or_hold(ladder, rung, Stage::RequestSent, kind),
         };
         note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
         let Ok(closer) = writer.try_clone() else {
@@ -17113,10 +17115,14 @@ fn dial_ss_httpupgrade(
         crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
         return true;
     }
-    let Some((send, recv)) =
-        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
-    else {
-        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Local);
+    let (send, recv) = match crate::shadowsocks::client_send_handshake(
+        &mut writer,
+        &ss.password,
+        &ss.method,
+        target,
+    ) {
+        Ok(pair) => pair,
+        Err(kind) => return climb_or_hold(ladder, rung, Stage::RequestSent, kind),
     };
     note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
     let Ok(closer) = writer.try_clone() else {
@@ -17147,7 +17153,7 @@ fn dial_ss_grpc(
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
-        let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
             &mut writer,
             &ss.password,
             &ss.method,
@@ -17162,7 +17168,7 @@ fn dial_ss_grpc(
         crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
         return true;
     }
-    let Some((send, recv)) =
+    let Ok((send, recv)) =
         crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
     else {
         return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
@@ -17187,7 +17193,7 @@ fn dial_ss_xhttp(
         return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
     };
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
-        let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
+        let Ok((send, recv)) = crate::shadowsocks2022::client_send_handshake(
             &mut writer,
             &ss.password,
             &ss.method,
@@ -17202,7 +17208,7 @@ fn dial_ss_xhttp(
         crate::shadowsocks2022::pump_relay_carried(client, reader, writer, &close, send, recv);
         return true;
     }
-    let Some((send, recv)) =
+    let Ok((send, recv)) =
         crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
     else {
         return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Dropped);
@@ -46179,7 +46185,7 @@ mod tests {
                 "aes-128-gcm",
                 &target
             )
-            .is_some(),
+            .is_ok(),
             "a client seals its own handshake"
         );
         dialed_rx
@@ -46195,7 +46201,7 @@ mod tests {
             "aes-256-gcm",
             &target
         )
-        .is_some());
+        .is_ok());
         let mut byte = [0u8; 1];
         assert_eq!(
             stranger.read(&mut byte).unwrap_or(0),
