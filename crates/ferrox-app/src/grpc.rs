@@ -1218,6 +1218,34 @@ impl GrpcWriter {
         }
     }
 
+    /// The most bytes one relay read should hand this writer: a multi-mode write reads no more than
+    /// the credit the peer has left, so the read leaves as one `MultiHunk` the peer can pay for
+    /// rather than one it parks on. The envelope and tags of a four-element `64 KiB` read cost at
+    /// most `64` bytes; a read that fits one element costs at most `16`.
+    pub(crate) fn read_window(&self) -> Option<usize> {
+        if !self.multi {
+            return None;
+        }
+        let init = self
+            .shared
+            .init
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let send = self
+            .shared
+            .send
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let available = (*init).min(send.conn).min(send.stream);
+        let margin = if available > 16_375 { 64 } else { 16 };
+        let limit = usize::try_from(available).unwrap_or(usize::MAX);
+        Some(
+            limit
+                .saturating_sub(margin)
+                .clamp(1, crate::proxy::RELAY_BUFFER),
+        )
+    }
+
     /// The same offer as `try_send`, but a `MultiHunk` batch: consecutive elements are gathered
     /// into one gRPC message, and a message is never split across a retry — a group is only added
     /// to a batch that has room for all its frames, and the window for the whole message is taken
@@ -1231,8 +1259,20 @@ impl GrpcWriter {
         let mut group_start = 0usize;
         let mut payload_len = 0usize;
         let mut prefix_len = 5usize;
-        // A group larger than the peer's starting window can never be paid for; cap it there.
-        let cap = self.multi_cap();
+        // A group larger than the live credit would park before it sent a byte; cap it there.
+        let cap = {
+            let init = self
+                .shared
+                .init
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let send = self
+                .shared
+                .send
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            (*init).min(send.conn).min(send.stream)
+        };
         let wide = usize::try_from(cap).unwrap_or(usize::MAX);
         let payload = payload.min(wide.saturating_sub(16).max(1));
         for piece in data.chunks(payload) {
@@ -1303,7 +1343,9 @@ impl GrpcWriter {
             .map(|&len| 1 + varint_len(len as u64) + len)
             .sum();
         let total = 5 + inner;
-        if batch.used + lengths.len() > FRAMES_PER_WRITE {
+        if batch.used + lengths.len() > FRAMES_PER_WRITE
+            || (batch.used > 0 && batch.credit + total as u64 > self.send_room())
+        {
             if let Some(stop) = Self::flush_held(&self.shared, batch, flushed, held) {
                 return Some(stop);
             }
@@ -2596,6 +2638,10 @@ impl crate::proxy::CarrierSink for GrpcWriter {
         self.try_send(bytes)
     }
     #[inline]
+    fn read_window(&self) -> Option<usize> {
+        GrpcWriter::read_window(self)
+    }
+    #[inline]
     fn settle(&self) -> Settle {
         self.settle()
     }
@@ -3452,6 +3498,112 @@ mod tests {
         }
         assert_eq!(seen, end, "every byte reached the writer");
         assert_eq!(data.capacity(), capacity, "the caller's buffer grew");
+    }
+
+    /// A read at the peer's own starting window is one message: the relay asks the writer for the
+    /// most it can frame, so the last bytes of a `64 KiB` read are not a second message that has to
+    /// wait for a credit after the first one emptied the window.
+    #[test]
+    fn a_multi_relay_read_at_the_peer_window_is_one_message() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = multi_writer_over(Recorder(Arc::clone(&peer)), HUNK, 65_535, 65_535);
+        let len = writer
+            .read_window()
+            .expect("multi mode limits the relay read");
+        assert_eq!(len, 65_471, "the window less the envelope and tags");
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let base = data.as_ptr() as usize;
+        let capacity = data.capacity();
+        assert!(matches!(
+            writer.try_send(&data),
+            crate::proxy::Push::Took(n) if n == data.len()
+        ));
+        let peer = peer.lock().unwrap();
+        assert_eq!(peer.writes.len(), 1, "one write for a relay read");
+        let elements: Vec<&[u8]> = data.chunks(message_payload(HUNK - 1)).collect();
+        let want = multi_message(&elements);
+        let mut body = Vec::new();
+        let mut at = 0;
+        while at < peer.writes[0].len() {
+            let head = &peer.writes[0][at..at + 9];
+            let len = usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
+            assert_eq!(head[3], T_DATA);
+            at += 9;
+            body.extend_from_slice(&peer.writes[0][at..at + len]);
+            at += len;
+        }
+        assert_eq!(body, want, "the read is one MultiHunk message");
+        assert_eq!(message_count(&body), 1, "one message, not two");
+        let end = base + data.len();
+        let mut seen = base;
+        for &(start, len) in &peer.parts {
+            if start < base || start >= end {
+                continue;
+            }
+            assert_eq!(start, seen, "a payload run starts where the last one ended");
+            assert!(start + len <= end, "a run leaves the caller's buffer");
+            seen = start + len;
+        }
+        assert_eq!(seen, end, "every byte reached the writer");
+        assert_eq!(data.capacity(), capacity, "the caller's buffer grew");
+    }
+
+    /// A peer may advertise a stream window above the connection window it starts with. The relay
+    /// must read at the smaller grant, or every write parks on a message the peer never pays for.
+    #[test]
+    fn a_multi_relay_read_never_asks_past_the_connection_window() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = multi_writer_over(Recorder(Arc::clone(&peer)), HUNK, 65_535, 1_000_000);
+        assert_eq!(writer.read_window(), Some(65_471));
+    }
+
+    /// A small peer window is still usable: the relay's read fits one message, and the next read
+    /// follows the credit the first write left instead of asking for a window it has not granted.
+    #[test]
+    fn a_multi_read_fits_a_small_window_and_follows_credit() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = multi_writer_over(Recorder(Arc::clone(&peer)), HUNK, 10_000, 1_000_000);
+        let len = writer
+            .read_window()
+            .expect("multi mode limits the relay read");
+        assert_eq!(len, 9_984);
+        assert!(matches!(
+            writer.try_send(&vec![0u8; len]),
+            crate::proxy::Push::Took(n) if n == len
+        ));
+        let peer = peer.lock().unwrap();
+        assert_eq!(peer.writes.len(), 1, "one write for a relay read");
+        assert_eq!(
+            message_count(&peer.writes[0][9..]),
+            1,
+            "one message, not two"
+        );
+        drop(peer);
+
+        let next = multi_writer_over(
+            Recorder(Arc::new(Mutex::new(Peer::default()))),
+            HUNK,
+            10_000,
+            1_000_000,
+        );
+        assert!(matches!(
+            next.try_send(&vec![0u8; 8_000]),
+            crate::proxy::Push::Took(8_000)
+        ));
+        assert_eq!(next.read_window(), Some(1_976));
+    }
+
+    /// A multi write splits at the connection window even when the stream starts larger, so the
+    /// first group leaves and the rest parks instead of waiting on credit the peer never grants.
+    #[test]
+    fn a_multi_write_splits_at_the_connection_window() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = multi_writer_over(Recorder(Arc::clone(&peer)), HUNK, 65_535, 1_000_000);
+        let data = vec![0u8; 65_536];
+        assert!(matches!(
+            writer.try_send(&data),
+            crate::proxy::Push::Took(65_500)
+        ));
     }
 
     /// A peer whose starting window is smaller than one frame: the writer cuts its elements to

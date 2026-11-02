@@ -23458,6 +23458,7 @@ fn shared_relay_pool(quantum: usize) -> &'static Mutex<Vec<Vec<u8>>> {
 pub(crate) struct RelayBuf {
     bytes: Vec<u8>,
     window: usize,
+    limit: usize,
     moved: usize,
     promote_to: usize,
 }
@@ -23480,6 +23481,7 @@ impl RelayBuf {
         Self {
             bytes,
             window: len,
+            limit: usize::MAX,
             moved: 0,
             promote_to: RELAY_BUFFER,
         }
@@ -23493,10 +23495,27 @@ impl RelayBuf {
         buf
     }
 
+    /// A promoting buffer whose reads never ask for more than `limit`: the window still grows to
+    /// the pooled `RELAY_BUFFER`, so the allocation is shared, but `as_mut` hands back the prefix
+    /// the carrier can frame as one message.
+    #[must_use]
+    pub fn with_limit(limit: usize) -> Self {
+        let limit = limit.clamp(1, RELAY_BUFFER);
+        let mut buf = Self::with_len(limit.min(RELAY_SMALL_BUFFER));
+        buf.limit = limit;
+        buf
+    }
+
+    /// Move the cap to the credit the peer has left; promotion stays with `filled`, so a short
+    /// transfer keeps the small window instead of copying it up before the first read.
+    pub fn set_limit(&mut self, limit: usize) {
+        self.limit = limit.clamp(1, RELAY_BUFFER);
+    }
+
     #[must_use]
     pub fn as_mut(&mut self) -> &mut [u8] {
         self.ensure();
-        &mut self.bytes[..self.window]
+        &mut self.bytes[..self.window.min(self.limit)]
     }
 
     /// Returns the window to the pool while a lane is parked: a parked direction breaks its wait at
@@ -23524,7 +23543,7 @@ impl RelayBuf {
     #[must_use]
     pub fn into_vec(mut self) -> Vec<u8> {
         self.ensure();
-        self.bytes.truncate(self.window);
+        self.bytes.truncate(self.window.min(self.limit));
         std::mem::take(&mut self.bytes)
     }
 
@@ -26081,6 +26100,11 @@ pub(crate) trait CarrierSink: Clone + Send + 'static {
     fn settle(&self) -> Settle {
         Settle::Clear
     }
+    /// The most bytes one relay read should hand this carrier, so a write stays one framed message
+    /// the peer's window can pay for; `None` keeps the relay's own window.
+    fn read_window(&self) -> Option<usize> {
+        None
+    }
     /// Sleeps out a parked turn; a carrier whose room arrives on a peer wake returns early instead.
     fn wait_for_room(&self, turn: std::time::Duration) {
         std::thread::sleep(turn);
@@ -26603,7 +26627,9 @@ where
     let uplink = writer.clone();
     let forward_flow = Arc::clone(&flow);
     let mut peer_read = peer_read;
-    let mut buffer = RelayBuf::new();
+    let mut buffer = uplink
+        .read_window()
+        .map_or_else(RelayBuf::new, RelayBuf::with_limit);
     let mut at = Forward::new();
     lane_pool::submit(
         Box::new(move || {
@@ -26612,6 +26638,9 @@ where
             }
             if let Some(next) = forward_flush(&buffer, &uplink, &mut at) {
                 return next;
+            }
+            if let Some(limit) = uplink.read_window() {
+                buffer.set_limit(limit);
             }
             let read = {
                 census!("carrier-read", crate::census::handle(&peer_read), read_arm);
@@ -35126,6 +35155,45 @@ mod tests {
 
         assert_eq!(buffer.filled(1).len(), 1);
         assert_eq!(buffer.size(), RELAY_BUFFER);
+    }
+
+    /// A carrier that frames one message per read asks the relay for a window it can pay for; the
+    /// limit survives promotion, so a full read never offers past it.
+    #[test]
+    fn a_limited_relay_buffer_never_asks_past_its_limit() {
+        let limit = 65_471;
+        let mut buffer = RelayBuf::with_limit(limit);
+        assert_eq!(buffer.as_mut().len(), RELAY_SMALL_BUFFER);
+        buffer.as_mut().fill(0);
+        assert_eq!(buffer.filled(RELAY_SMALL_BUFFER).len(), RELAY_SMALL_BUFFER);
+        assert_eq!(buffer.size(), RELAY_BUFFER, "the pool still backs it");
+        assert_eq!(buffer.as_mut().len(), limit, "a full read is capped");
+        assert_eq!(
+            buffer.into_vec().len(),
+            limit,
+            "the handed-off buffer is capped"
+        );
+    }
+
+    /// A promoted limited buffer reads a full `64 KiB` source in two reads, `65_471` then `65`,
+    /// where the unlimited window reads it in one: the extra read is what keeps one message whole.
+    #[test]
+    fn a_limited_relay_buffer_reads_a_64kib_source_in_two() {
+        let mut buffer = RelayBuf::with_limit(65_471);
+        buffer.as_mut().fill(0);
+        let _ = buffer.filled(RELAY_SMALL_BUFFER);
+        let source = vec![7u8; RELAY_BUFFER];
+        let mut at = 0usize;
+        let mut reads = 0usize;
+        while at < source.len() {
+            let n = (&source[at..]).read(buffer.as_mut()).expect("reads");
+            assert!(n > 0, "the source ended before the window");
+            at += n;
+            reads += 1;
+            let _ = buffer.filled(n);
+        }
+        assert_eq!(at, RELAY_BUFFER);
+        assert_eq!(reads, 2);
     }
 
     #[test]
