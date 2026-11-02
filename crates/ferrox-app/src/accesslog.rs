@@ -204,18 +204,28 @@ pub(crate) fn record(
     let _ = writer.flush();
 }
 
-/// A line holds one entry: a path, tag or account that carries a control byte is escaped, not
-/// written through, so nothing a peer names can start a second record.
+/// A field holds one token: a path, tag or account that carries a control byte, whitespace or a
+/// bracket is escaped, not written through, so nothing a peer names can start a second field or record.
 fn push_escaped(out: &mut String, value: &str) {
     let mut start = 0;
     for (at, ch) in value.char_indices() {
-        if ch == '\\' {
+        let escaped = match ch {
+            '\\' => Some("\\\\"),
+            '[' => Some("\\["),
+            ']' => Some("\\]"),
+            _ => None,
+        };
+        if let Some(escaped) = escaped {
             out.push_str(&value[start..at]);
-            out.push_str("\\\\");
+            out.push_str(escaped);
             start = at + 1;
         } else if ch.is_control() {
             out.push_str(&value[start..at]);
             out.extend(ch.escape_default());
+            start = at + ch.len_utf8();
+        } else if ch.is_whitespace() {
+            out.push_str(&value[start..at]);
+            let _ = std::fmt::Write::write_fmt(out, format_args!("\\u{{{:x}}}", ch as u32));
             start = at + ch.len_utf8();
         }
     }
