@@ -38181,6 +38181,7 @@ mod tests {
             ech_config_list: None,
             websocket: false,
             master_key_log: None,
+            client_cert: None,
         };
         (server, client)
     }
@@ -38209,6 +38210,7 @@ mod tests {
             ech_config_list: None,
             websocket: false,
             master_key_log: None,
+            client_cert: None,
         };
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
@@ -52670,6 +52672,7 @@ mod tests {
             ech_config_list: None,
             websocket: false,
             master_key_log: None,
+            client_cert: None,
         };
         let mut session =
             ferrox_core::tls::connect(&config, Connection::Tcp(client)).expect("connects");

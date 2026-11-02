@@ -255,6 +255,7 @@ impl Webhook {
                 ech_config_list: None,
                 websocket: false,
                 master_key_log: None,
+                client_cert: None,
             };
             let mut session = ferrox_core::tls::RustlsProvider::connect(&config, connection)
                 .map_err(|error| error.to_string())?;

@@ -335,6 +335,7 @@ fn tls_config(dial: &FoxyDial) -> ferrox_core::tls::TlsConfig {
         ech_config_list: None,
         websocket: false,
         master_key_log: None,
+        client_cert: None,
     }
 }
 

@@ -56,6 +56,10 @@ pub struct TlsConfig {
     /// The `masterKeyLog` file every handshake of this config appends its traffic secrets to, or
     /// `None` to log none, the ordinary case.
     pub master_key_log: Option<std::sync::Arc<MasterKeyLog>>,
+    /// The client identity a dial presents when the server sends `CertificateRequest`: the
+    /// `tlsSettings.certificates` entry that names a key. xray builds that pair but its client
+    /// never sends it, so this is the sing-box client certificate an outbound opts into.
+    pub client_cert: Option<std::sync::Arc<CertEntry>>,
 }
 
 /// Whether a client build can offer a group a config named: the shaped hello draws its own key
@@ -325,6 +329,25 @@ pub struct CertEntry {
     /// The files a path-backed entry was read from and the interval xray's ticker re-reads
     /// them at; `None` for an inline entry, which has nothing to re-read.
     pub reload: Option<CertReload>,
+}
+
+impl PartialEq for CertEntry {
+    /// The bytes two entries serve, which a reload ticker can change; the reader function is the
+    /// same resolution for every entry, so its address carries no difference.
+    fn eq(&self, other: &Self) -> bool {
+        self.cert_chain == other.cert_chain
+            && self.key_der == other.key_der
+            && self.key_kind == other.key_kind
+            && match (&self.reload, &other.reload) {
+                (None, None) => true,
+                (Some(ours), Some(theirs)) => {
+                    ours.certificate == theirs.certificate
+                        && ours.key == theirs.key
+                        && ours.interval == theirs.interval
+                }
+                _ => false,
+            }
+    }
 }
 
 /// xray's hot-reload ticker: `ocspStapling` seconds when the block names it, 3600 otherwise.
