@@ -614,9 +614,8 @@ pub(crate) fn reality_mldsa(node: &Json, server: bool) -> Result<bool, String> {
         ("mldsa65Verify", 1952)
     };
     let text = match reality.get(field) {
-        None => return Ok(false),
         Some(Json::Str(text)) if !text.is_empty() => text,
-        Some(Json::Str(_)) => return Ok(false),
+        Some(Json::Str(_)) | None => return Ok(false),
         Some(_) => return Err(format!(r#""{field}" is not a string"#)),
     };
     if server {
@@ -626,7 +625,7 @@ pub(crate) fn reality_mldsa(node: &Json, server: bool) -> Result<bool, String> {
                     .chars()
                     .filter(|ch| !matches!(*ch, '\r' | '\n'))
                     .collect();
-                key32(&unwrapped)
+                key32(unwrapped.as_str())
             };
             if let Some(private) = decode(private) {
                 if Some(private) == decode(text) {
