@@ -38,6 +38,7 @@ smoltcp = { version = "0.14", default-features = false, features = ["std", "medi
 crypto_box = "0.9"
 snow = "0.10"
 curve25519-dalek = "4"
+str0m = { version = "0.24", default-features = false, features = ["aws-lc-rs"] }
 
 [dev-dependencies]
 chacha20poly1305 = "0.11"

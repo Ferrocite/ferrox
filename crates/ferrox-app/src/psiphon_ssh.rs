@@ -2,6 +2,7 @@
 //! the OSSH seed message, curve25519 key exchange, AES-128-CTR with
 //! HMAC-SHA-256, password auth, and `direct-tcpip` channels.
 
+use crate::psiphon_webrtc::{Conduit, Relay, WebRtcStream};
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use ring::signature;
 use sha1::Sha1;
@@ -65,6 +66,84 @@ const MSG_CHANNEL_CLOSE: u8 = 97;
 const MSG_CHANNEL_REQUEST: u8 = 98;
 const MSG_CHANNEL_SUCCESS: u8 = 99;
 const MSG_CHANNEL_FAILURE: u8 = 100;
+
+/// One transport below SSH: a TCP socket or an in-proxy WebRTC data channel.
+pub(crate) enum Stream {
+    Tcp(TcpStream),
+    WebRtc(WebRtcStream),
+}
+
+impl From<TcpStream> for Stream {
+    fn from(socket: TcpStream) -> Self {
+        Self::Tcp(socket)
+    }
+}
+
+impl Stream {
+    fn try_clone(&self) -> io::Result<Self> {
+        match self {
+            Self::Tcp(socket) => socket.try_clone().map(Self::Tcp),
+            Self::WebRtc(stream) => Ok(Self::WebRtc(stream.clone())),
+        }
+    }
+
+    fn set_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket
+                .set_read_timeout(timeout)
+                .and_then(|()| socket.set_write_timeout(timeout)),
+            Self::WebRtc(stream) => {
+                stream.set_timeout(timeout);
+                Ok(())
+            }
+        }
+    }
+
+    fn shutdown(&self) -> io::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.shutdown(Shutdown::Both),
+            Self::WebRtc(stream) => {
+                stream.shutdown();
+                Ok(())
+            }
+        }
+    }
+}
+
+impl Read for Stream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(socket) => socket.read(buf),
+            Self::WebRtc(stream) => stream.read(buf),
+        }
+    }
+}
+
+impl Write for Stream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(socket) => socket.write(buf),
+            Self::WebRtc(stream) => stream.write(buf),
+        }
+    }
+
+    fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
+        match self {
+            Self::Tcp(socket) => socket.write_vectored(bufs),
+            Self::WebRtc(stream) => {
+                let parts: Vec<&[u8]> = bufs.iter().map(|buf| &buf[..]).collect();
+                stream.write_parts(&parts)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.flush(),
+            Self::WebRtc(stream) => stream.flush(),
+        }
+    }
+}
 
 /// The parts of a signed server entry this transport dials.
 #[derive(Debug, Clone)]
@@ -361,7 +440,8 @@ struct Inner {
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
     next_channel: AtomicU32,
     closed: AtomicBool,
-    socket: TcpStream,
+    socket: Stream,
+    relay: Mutex<Option<Relay>>,
     opened_at: Instant,
     server: String,
     protocol: &'static str,
@@ -440,29 +520,52 @@ impl Session {
         identity: &Identity<'_>,
         timeout: Duration,
         proxy: Option<&Proxy>,
+        conduit: Option<&Conduit>,
     ) -> Result<Self, String> {
-        let address = SocketAddr::new(server.address, server.port);
-        let socket = match &server.meek {
-            Some(meek) => crate::psiphon_meek::connect(meek, timeout, proxy)?,
-            None => match proxy {
-                Some(proxy) => proxy
-                    .connect(address, timeout)
-                    .map_err(|error| format!("psiphon ssh proxy {}: {error}", proxy.display()))?,
-                None => TcpStream::connect_timeout(&address, timeout)
-                    .map_err(|error| format!("psiphon ssh {}: {error}", server.host))?,
-            },
-        };
-        socket
-            .set_read_timeout(Some(timeout))
-            .and_then(|()| socket.set_write_timeout(Some(timeout)))
-            .and_then(|()| socket.set_nodelay(true))
-            .map_err(|error| format!("psiphon ssh socket: {error}"))?;
+        let (stream, mut relay, protocol, relay_protocol) =
+            if let (Some(conduit), Some(destination)) = (conduit, server.inproxy.as_ref()) {
+                let (stream, relay) = conduit.open(server.address, destination, identity)?;
+                (
+                    Stream::WebRtc(stream),
+                    Some(relay),
+                    destination.protocol,
+                    destination.base_protocol(),
+                )
+            } else {
+                let address = SocketAddr::new(server.address, server.port);
+                let socket = match &server.meek {
+                    Some(meek) => crate::psiphon_meek::connect(meek, timeout, proxy)?,
+                    None => match proxy {
+                        Some(proxy) => proxy.connect(address, timeout).map_err(|error| {
+                            format!("psiphon ssh proxy {}: {error}", proxy.display())
+                        })?,
+                        None => TcpStream::connect_timeout(&address, timeout)
+                            .map_err(|error| format!("psiphon ssh {}: {error}", server.host))?,
+                    },
+                };
+                socket
+                    .set_read_timeout(Some(timeout))
+                    .and_then(|()| socket.set_write_timeout(Some(timeout)))
+                    .and_then(|()| socket.set_nodelay(true))
+                    .map_err(|error| format!("psiphon ssh socket: {error}"))?;
+                let protocol = server.meek.as_ref().map_or_else(
+                    || {
+                        if server.obfuscation_key.is_some() {
+                            "OSSH"
+                        } else {
+                            "SSH"
+                        }
+                    },
+                    |meek| tunnel_protocol_base(meek.protocol),
+                );
+                (Stream::Tcp(socket), None, protocol, protocol)
+            };
 
-        let control = socket
+        let control = stream
             .try_clone()
             .map_err(|error| format!("psiphon ssh socket clone: {error}"))?;
         let pool = Arc::new(Mutex::new(Vec::new()));
-        let (mut output, mut input) = split(socket, server, Arc::clone(&pool))?;
+        let (mut output, mut input) = split(stream, server, Arc::clone(&pool))?;
         // An OSSH server reads the seed before it writes anything, so the client line goes first.
         let our_version = b"SSH-2.0-OpenSSH_9.6";
         write_all(&mut output, b"SSH-2.0-OpenSSH_9.6\r\n")?;
@@ -487,33 +590,28 @@ impl Session {
             identity.sponsor,
         )?;
         // A Psiphon server refuses every port forward until this handshake completes.
-        let relay_protocol = server.meek.as_ref().map_or_else(
-            || {
-                if server.obfuscation_key.is_some() {
-                    "OSSH"
-                } else {
-                    "SSH"
-                }
-            },
-            |meek| tunnel_protocol_base(meek.protocol),
-        );
-        handshake(&mut output, &mut input, relay_protocol, identity)?;
+        handshake(
+            &mut output,
+            &mut input,
+            relay_protocol,
+            identity,
+            &mut relay,
+        )?;
         control
-            .set_read_timeout(None)
-            .and_then(|()| control.set_write_timeout(None))
+            .set_timeout(None)
             .map_err(|error| format!("psiphon ssh socket: {error}"))?;
 
-        let socket = control;
         let inner = Arc::new(Inner {
             writer: Mutex::new(output),
             channels: Mutex::new(HashMap::new()),
             pool,
             next_channel: AtomicU32::new(1),
             closed: AtomicBool::new(false),
-            socket,
+            socket: control,
+            relay: Mutex::new(relay),
             opened_at: Instant::now(),
             server: format!("{}:{}", server.host, server.port),
-            protocol: relay_protocol,
+            protocol,
         });
         let read_inner = Arc::clone(&inner);
         std::thread::Builder::new()
@@ -665,11 +763,16 @@ impl Inner {
         }
     }
 
+    fn relay_round_trip(&self, payload: &[u8]) -> Result<Vec<u8>, String> {
+        let mut relay = lock(&self.relay);
+        relay_round_trip(&mut relay, payload)
+    }
+
     fn close(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let _ = self.socket.shutdown(Shutdown::Both);
+        let _ = self.socket.shutdown();
         let channels: Vec<Arc<ChannelState>> = lock(&self.channels)
             .drain()
             .map(|(_, state)| state)
@@ -1041,15 +1144,23 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn split(
-    socket: TcpStream,
+    socket: Stream,
     server: &Server,
     pool: Arc<Mutex<Vec<Vec<u8>>>>,
 ) -> Result<(PacketWriter, PacketReader), String> {
     let write = socket
         .try_clone()
         .map_err(|error| format!("psiphon ssh socket clone: {error}"))?;
-    if server.obfuscated() {
-        let key = server.obfuscation_key.as_deref().unwrap_or_default();
+    let obfuscated = match server.inproxy.as_ref() {
+        Some(destination) => destination.base_protocol().contains("OSSH"),
+        None => server.obfuscated(),
+    };
+    if obfuscated {
+        let key = server
+            .obfuscation_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| "psiphon ssh: obfuscated entry has no key".to_owned())?;
         let seed = random::<SEED_LENGTH>();
         let client = Rc4::new(&derive_key(&seed, key.as_bytes(), b"client_to_server"));
         let remote = Rc4::new(&derive_key(&seed, key.as_bytes(), b"server_to_client"));
@@ -1170,7 +1281,7 @@ impl Entropy {
 }
 
 struct PacketWriter {
-    io: TcpStream,
+    io: Stream,
     obfuscation: Option<Rc4>,
     cipher: Option<AesCtr>,
     mac: Option<HmacKey>,
@@ -1202,7 +1313,7 @@ impl Packet {
 }
 
 struct PacketReader {
-    io: TcpStream,
+    io: Stream,
     obfuscation: Option<Rc4>,
     cipher: Option<AesCtr>,
     mac: Option<HmacKey>,
@@ -1217,11 +1328,12 @@ struct PacketReader {
 impl PacketWriter {
     /// Wrap a socket with optional obfuscation and packet crypto.
     fn new(
-        io: TcpStream,
+        io: impl Into<Stream>,
         obfuscation: Option<Rc4>,
         cipher: Option<AesCtr>,
         mac: Option<[u8; 32]>,
     ) -> Self {
+        let io = io.into();
         let block = if cipher.is_some() { 16 } else { 8 };
         Self {
             io,
@@ -1355,12 +1467,13 @@ impl PacketWriter {
 impl PacketReader {
     /// Wrap a socket with optional obfuscation, packet crypto, and a recycle pool.
     fn new(
-        io: TcpStream,
+        io: impl Into<Stream>,
         obfuscation: Option<Rc4>,
         cipher: Option<AesCtr>,
         mac: Option<[u8; 32]>,
         pool: Arc<Mutex<Vec<Vec<u8>>>>,
     ) -> Self {
+        let io = io.into();
         let block = if cipher.is_some() { 16 } else { 8 };
         Self {
             io,
@@ -1529,7 +1642,7 @@ impl HmacKey {
     }
 }
 
-fn write_vectored_all(io: &mut TcpStream, mut slices: &mut [IoSlice<'_>]) -> io::Result<()> {
+fn write_vectored_all(io: &mut Stream, mut slices: &mut [IoSlice<'_>]) -> io::Result<()> {
     while !slices.is_empty() {
         let written = match io.write_vectored(slices) {
             Ok(written) => written,
@@ -1980,7 +2093,7 @@ fn tunnel_protocol_base(protocol: &'static str) -> &'static str {
 }
 
 /// The JSON body of the SSH Psiphon handshake.
-fn handshake_body(relay_protocol: &str, identity: &Identity<'_>) -> String {
+fn handshake_body(relay_protocol: &str, identity: &Identity<'_>, relay: Option<&Relay>) -> String {
     let mut body = format!(
         r#"{{"propagation_channel_id":"{}","sponsor_id":"{}","client_version":"{}","client_platform":"{}","relay_protocol":"{}""#,
         json_escape(identity.propagation),
@@ -1997,6 +2110,16 @@ fn handshake_body(relay_protocol: &str, identity: &Identity<'_>) -> String {
     }
     if let Some(location) = identity.device_location {
         let _ = write!(body, r#","device_location":"{}""#, json_escape(location));
+    }
+    if let Some(relay) = relay {
+        let connection_id = ferrox_core::b64::encode(relay.connection_id());
+        let packet = ferrox_core::b64::encode(relay.initial());
+        let _ = write!(
+            body,
+            r#","inproxy_connection_id":"{}","inproxy_relay_packet":"{}""#,
+            connection_id.trim_end_matches('='),
+            packet.trim_end_matches('=')
+        );
     }
     if !identity.client_features.is_empty() {
         body.push_str(r#","client_features":["#);
@@ -2018,8 +2141,9 @@ fn handshake(
     reader: &mut PacketReader,
     relay_protocol: &str,
     identity: &Identity<'_>,
+    relay: &mut Option<Relay>,
 ) -> Result<(), String> {
-    let body = handshake_body(relay_protocol, identity);
+    let body = handshake_body(relay_protocol, identity, relay.as_ref());
     let mut request = vec![MSG_GLOBAL_REQUEST];
     put_str(&mut request, b"psiphon-handshake");
     request.push(1);
@@ -2034,13 +2158,48 @@ fn handshake(
             Some(MSG_REQUEST_FAILURE) => {
                 return Err("psiphon ssh refused the tunnel handshake".to_owned());
             }
-            Some(MSG_EXT_INFO | MSG_IGNORE | MSG_DEBUG | MSG_GLOBAL_REQUEST) => {}
+            Some(MSG_GLOBAL_REQUEST) => {
+                let mut at = 0;
+                let name = take_str(packet.body(), &mut at);
+                let want_reply = packet.body().get(at).copied().unwrap_or(0);
+                let reply = if name == Some(b"psiphon-inproxy-relay") {
+                    relay_round_trip(relay, packet.body().get(at + 1..).unwrap_or(&[]))
+                } else {
+                    Err("psiphon ssh unexpected handshake request".to_owned())
+                };
+                match reply {
+                    Ok(payload) if want_reply != 0 => {
+                        let mut reply = vec![MSG_REQUEST_SUCCESS];
+                        reply.extend_from_slice(&payload);
+                        writer
+                            .send(&reply)
+                            .map_err(|error| format!("psiphon ssh relay reply: {error}"))?;
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        if want_reply != 0 {
+                            let _ = writer.send(&[MSG_REQUEST_FAILURE]);
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            Some(MSG_EXT_INFO | MSG_IGNORE | MSG_DEBUG) => {}
             Some(other) => {
                 return Err(format!("psiphon ssh expected handshake reply, got {other}"))
             }
             None => return Err("psiphon ssh empty packet".to_owned()),
         }
     }
+}
+
+fn relay_round_trip(relay: &mut Option<Relay>, payload: &[u8]) -> Result<Vec<u8>, String> {
+    let packet = crate::psiphon_broker::relay_request_packet(payload)?;
+    let relay = relay
+        .as_mut()
+        .ok_or_else(|| "psiphon ssh: no in-proxy relay".to_owned())?;
+    let next = relay.relay(&packet)?;
+    Ok(crate::psiphon_broker::relay_response(&next))
 }
 
 fn json_escape(text: &str) -> String {
@@ -2215,10 +2374,26 @@ fn dispatch(inner: &Arc<Inner>, packet: Packet) -> Dispatch {
         }
         MSG_GLOBAL_REQUEST => {
             let mut at = 0;
-            let Some(_) = take_str(body, &mut at) else {
+            let Some(name) = take_str(body, &mut at) else {
                 return Dispatch::Stop;
             };
-            if body.get(at).copied().unwrap_or(0) != 0 {
+            let want_reply = body.get(at).copied().unwrap_or(0);
+            if name == b"psiphon-inproxy-relay" {
+                match inner.relay_round_trip(body.get(at + 1..).unwrap_or(&[])) {
+                    Ok(payload) if want_reply != 0 => {
+                        let mut reply = vec![MSG_REQUEST_SUCCESS];
+                        reply.extend_from_slice(&payload);
+                        let _ = inner.send(&reply);
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        if want_reply != 0 {
+                            let _ = inner.send(&[MSG_REQUEST_FAILURE]);
+                        }
+                        return Dispatch::Stop;
+                    }
+                }
+            } else if want_reply != 0 {
                 let _ = inner.send(&[MSG_REQUEST_FAILURE]);
             }
             Dispatch::Recycle(packet.buffer)
@@ -2315,7 +2490,8 @@ pub(crate) fn test_channel_with_chunks(payloads: &[&[u8]]) -> Channel {
         pool: Arc::clone(&pool),
         next_channel: AtomicU32::new(1),
         closed: AtomicBool::new(false),
-        socket: peer,
+        socket: Stream::Tcp(peer),
+        relay: Mutex::new(None),
         opened_at: Instant::now(),
         server: "test".to_owned(),
         protocol: "SSH",
@@ -2573,7 +2749,8 @@ mod tests {
             pool: Arc::clone(&pool),
             next_channel: AtomicU32::new(1),
             closed: AtomicBool::new(false),
-            socket: peer,
+            socket: Stream::Tcp(peer),
+            relay: Mutex::new(None),
             opened_at: Instant::now(),
             server: "test".to_owned(),
             protocol: "SSH",
@@ -2643,7 +2820,8 @@ mod tests {
             pool: Arc::clone(&pool),
             next_channel: AtomicU32::new(1),
             closed: AtomicBool::new(false),
-            socket: peer,
+            socket: Stream::Tcp(peer),
+            relay: Mutex::new(None),
             opened_at: Instant::now(),
             server: "test".to_owned(),
             protocol: "SSH",
@@ -2704,7 +2882,8 @@ mod tests {
             pool: Arc::clone(&pool),
             next_channel: AtomicU32::new(2),
             closed: AtomicBool::new(false),
-            socket: peer,
+            socket: Stream::Tcp(peer),
+            relay: Mutex::new(None),
             opened_at: Instant::now(),
             server: "test".to_owned(),
             protocol: "SSH",
@@ -2790,7 +2969,8 @@ mod tests {
             pool: Arc::clone(&pool),
             next_channel: AtomicU32::new(2),
             closed: AtomicBool::new(false),
-            socket: peer,
+            socket: Stream::Tcp(peer),
+            relay: Mutex::new(None),
             opened_at: Instant::now(),
             server: "test".to_owned(),
             protocol: "SSH",
@@ -2871,7 +3051,8 @@ mod tests {
             pool: Arc::new(Mutex::new(Vec::new())),
             next_channel: AtomicU32::new(1),
             closed: AtomicBool::new(false),
-            socket: peer,
+            socket: Stream::Tcp(peer),
+            relay: Mutex::new(None),
             opened_at: Instant::now(),
             server: "test".to_owned(),
             protocol: "SSH",
@@ -2908,7 +3089,8 @@ mod tests {
             pool: Arc::clone(&pool),
             next_channel: AtomicU32::new(2),
             closed: AtomicBool::new(false),
-            socket: peer,
+            socket: Stream::Tcp(peer),
+            relay: Mutex::new(None),
             opened_at: Instant::now(),
             server: "test".to_owned(),
             protocol: "SSH",
@@ -2992,7 +3174,7 @@ mod tests {
             client_features: &features,
         };
         assert_eq!(
-            handshake_body("UNFRONTED-MEEK-HTTPS-OSSH", &identity),
+            handshake_body("UNFRONTED-MEEK-HTTPS-OSSH", &identity, None),
             r#"{"propagation_channel_id":"propagation","sponsor_id":"sponsor","client_version":"453","client_platform":"Android","relay_protocol":"UNFRONTED-MEEK-HTTPS-OSSH","egress_region":"IR","device_region":"IR","device_location":"w3g","client_features":["coarse-location","unsafe\"feature"]}"#
         );
     }
@@ -3011,7 +3193,7 @@ mod tests {
             client_features: &[],
         };
         assert_eq!(
-            handshake_body("SSH", &identity),
+            handshake_body("SSH", &identity, None),
             r#"{"propagation_channel_id":"propagation","sponsor_id":"sponsor","client_version":"453","client_platform":"Android","relay_protocol":"SSH"}"#
         );
     }

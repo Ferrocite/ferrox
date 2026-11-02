@@ -51,6 +51,7 @@ mod psiphon_broker;
 mod psiphon_meek;
 mod psiphon_ssh;
 mod psiphon_tactics;
+mod psiphon_webrtc;
 mod quic;
 mod reverse;
 mod router;
@@ -125,7 +126,7 @@ fn usage() -> ! {
         "  ferrox-app psiphon-tactics -c <config.json>   fetch tactics and print broker specs"
     );
     eprintln!(
-        "  ferrox-app psiphon-broker -c <config.json> --sdp <file>  send a client offer to the first broker"
+        "  ferrox-app psiphon-broker -c <config.json> [--sdp <file>]  send a client offer to the first broker"
     );
     std::process::exit(2);
 }
@@ -439,7 +440,7 @@ fn cmd_psiphon_broker<I: Iterator<Item = String>>(args: &mut I) {
             _ => usage(),
         }
     }
-    if path.is_empty() || sdp_path.is_empty() {
+    if path.is_empty() {
         usage();
     }
     let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
@@ -459,11 +460,15 @@ fn cmd_psiphon_broker<I: Iterator<Item = String>>(args: &mut I) {
             })
         })
         .and_then(|outbound| outbound.get("settings"));
-    let sdp = std::fs::read_to_string(&sdp_path).unwrap_or_else(|error| {
-        eprintln!("psiphon-broker: {sdp_path}: {error}");
-        std::process::exit(1);
-    });
-    match psiphon::broker_offer(settings, &sdp) {
+    let sdp = if sdp_path.is_empty() {
+        None
+    } else {
+        Some(std::fs::read_to_string(&sdp_path).unwrap_or_else(|error| {
+            eprintln!("psiphon-broker: {sdp_path}: {error}");
+            std::process::exit(1);
+        }))
+    };
+    match psiphon::broker_offer(settings, sdp.as_deref()) {
         Ok(offer) => {
             println!("limited\t{}", offer.limited);
             println!("no_match\t{}", offer.no_match);
