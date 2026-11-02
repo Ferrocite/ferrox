@@ -207,6 +207,10 @@ pub(crate) fn record(
 /// A field holds one token: a path, tag or account that carries a control byte, whitespace or a
 /// bracket is escaped, not written through, so nothing a peer names can start a second field or record.
 fn push_escaped(out: &mut String, value: &str) {
+    if value.is_ascii() {
+        push_escaped_ascii(out, value);
+        return;
+    }
     let mut start = 0;
     for (at, ch) in value.char_indices() {
         let escaped = match ch {
@@ -230,6 +234,32 @@ fn push_escaped(out: &mut String, value: &str) {
         }
     }
     out.push_str(&value[start..]);
+}
+
+/// The ASCII half of `push_escaped`: a byte scan finds the next escape and the clean runs between
+/// them are copied whole, so a field the peer named in ASCII never decodes a code point.
+fn push_escaped_ascii(out: &mut String, value: &str) {
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    while let Some(at) = bytes[start..].iter().position(|&byte| ascii_escaped(byte)) {
+        let at = start + at;
+        out.push_str(&value[start..at]);
+        match bytes[at] {
+            b'\\' => out.push_str("\\\\"),
+            b'[' => out.push_str("\\["),
+            b']' => out.push_str("\\]"),
+            b' ' => out.push_str("\\u{20}"),
+            control => out.extend((control as char).escape_default()),
+        }
+        start = at + 1;
+    }
+    out.push_str(&value[start..]);
+}
+
+/// The ASCII bytes `push_escaped` writes differently: controls, space, and the three punctuation
+/// marks that delimit a field.
+fn ascii_escaped(byte: u8) -> bool {
+    byte <= b' ' || byte == 0x7f || matches!(byte, b'\\' | b'[' | b']')
 }
 
 /// The destination is a `Display`, so its bytes are escaped as they are written rather than materialised into a second string first.
@@ -257,6 +287,68 @@ fn address(address: SocketAddr, masked: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn escaped(value: &str) -> String {
+        let mut out = String::new();
+        push_escaped(&mut out, value);
+        out
+    }
+
+    fn reference(value: &str) -> String {
+        let mut out = String::new();
+        let mut start = 0;
+        for (at, ch) in value.char_indices() {
+            let escaped = match ch {
+                '\\' => Some("\\\\"),
+                '[' => Some("\\["),
+                ']' => Some("\\]"),
+                _ => None,
+            };
+            if let Some(escaped) = escaped {
+                out.push_str(&value[start..at]);
+                out.push_str(escaped);
+                start = at + 1;
+            } else if ch.is_control() {
+                out.push_str(&value[start..at]);
+                out.extend(ch.escape_default());
+                start = at + ch.len_utf8();
+            } else if ch.is_whitespace() {
+                out.push_str(&value[start..at]);
+                let _ =
+                    std::fmt::Write::write_fmt(&mut out, format_args!("\\u{{{:x}}}", ch as u32));
+                start = at + ch.len_utf8();
+            }
+        }
+        out.push_str(&value[start..]);
+        out
+    }
+
+    #[test]
+    fn the_ascii_scan_escapes_exactly_as_the_codepoint_path() {
+        let mut corpus = String::new();
+        for byte in 0u8..=0x7f {
+            corpus.push(byte as char);
+        }
+        corpus.push_str("caf\u{e9} \u{a0}\u{2000}\u{2028}\u{3000}\u{1f600}");
+        for value in [
+            "",
+            "example.com:443",
+            "a b\tc\nd\\e[f]g",
+            corpus.as_str(),
+            "\u{7f}\u{1b}[31m",
+            "\u{85}\u{9f}",
+        ] {
+            assert_eq!(escaped(value), reference(value), "{value:?}");
+        }
+        for first in 0u8..=0x7f {
+            for second in [0u8, b'a', b' ', b'\\', b'[', b']', 0x7f, 0x1b, b'\n'] {
+                let mut value = String::new();
+                value.push(first as char);
+                value.push(second as char);
+                assert_eq!(escaped(&value), reference(&value), "{value:?}");
+            }
+        }
+    }
 
     #[test]
     fn a_clean_field_is_escaped_without_a_second_buffer() {

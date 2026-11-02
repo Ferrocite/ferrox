@@ -1590,14 +1590,9 @@ fn message_payload(max_frame: usize) -> usize {
     }
 }
 
-/// The number of bytes a protobuf varint takes for `value`.
-fn varint_len(mut value: u64) -> usize {
-    let mut len = 1;
-    while value >= 0x80 {
-        value >>= 7;
-        len += 1;
-    }
-    len
+/// The number of bytes a protobuf varint takes for `value`: seven bits per byte, never fewer than one.
+fn varint_len(value: u64) -> usize {
+    ((64 - value.leading_zeros() as usize + 6) / 7).max(1)
 }
 
 /// Writes the envelope and `Hunk` tag for `data_len` into `out`, returning the prefix length.
@@ -2689,6 +2684,28 @@ mod tests {
     const HUNK: usize = 16 * 1024;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn varint_len_matches_the_written_length_at_every_boundary() {
+        for bits in 0..64 {
+            for value in [(1u64 << bits) - 1, 1u64 << bits] {
+                let mut bytes = [0u8; 10];
+                assert_eq!(
+                    varint_len(value),
+                    write_varint(&mut bytes, value),
+                    "{value}"
+                );
+            }
+        }
+        for value in [0, u64::MAX] {
+            let mut bytes = [0u8; 10];
+            assert_eq!(
+                varint_len(value),
+                write_varint(&mut bytes, value),
+                "{value}"
+            );
+        }
+    }
 
     #[test]
     fn huffman_matches_the_rfc_example() {
