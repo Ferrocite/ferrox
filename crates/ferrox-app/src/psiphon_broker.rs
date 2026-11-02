@@ -1168,10 +1168,9 @@ mod tests {
         }
     }
 
-    /// Canonical order is the key's own encoding, and the encoder's pair buffers are a bounded
-    /// table now: a map allocates fewer buffers than it has pairs, where the per-pair form took two.
-    #[test]
-    fn a_map_encodes_through_one_scratch() {
+    /// A map wide enough to show the per-pair form's two buffers per entry, mixing key kinds so
+    /// the canonical order has length ties to break.
+    fn wide_map() -> Value {
         let mut entries = Vec::new();
         for index in 0u64..64 {
             let key = match index % 4 {
@@ -1182,9 +1181,16 @@ mod tests {
             };
             entries.push((key, Value::UInt(index)));
         }
-        let value = Value::Map(entries.clone());
-        let encoded = encode(&value);
-        let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = entries
+        Value::Map(entries)
+    }
+
+    /// The per-pair encoder the scratch replaced, kept as this run's other frame: the same map
+    /// through the old shape, so both allocation counts come from one run.
+    fn encode_per_pair(value: &Value) -> Vec<u8> {
+        let Value::Map(entries) = value else {
+            unreachable!("the frame is a map");
+        };
+        let mut encoded: Vec<(Vec<u8>, Vec<u8>)> = entries
             .iter()
             .map(|(key, item)| {
                 let mut key_bytes = Vec::new();
@@ -1194,26 +1200,81 @@ mod tests {
                 (key_bytes, value_bytes)
             })
             .collect();
-        pairs.sort_by(|left, right| {
+        encoded.sort_by(|left, right| {
             left.0
                 .len()
                 .cmp(&right.0.len())
                 .then_with(|| left.0.cmp(&right.0))
         });
-        let mut want = Vec::new();
-        encode_head(5, pairs.len() as u64, &mut want);
-        for (key, item) in pairs {
-            want.extend_from_slice(&key);
-            want.extend_from_slice(&item);
+        let mut out = Vec::new();
+        encode_head(5, encoded.len() as u64, &mut out);
+        for (key, item) in encoded {
+            out.extend_from_slice(&key);
+            out.extend_from_slice(&item);
         }
-        assert_eq!(encoded, want, "the canonical bytes are the per-pair ones");
+        out
+    }
+
+    /// Canonical order is the key's own encoding, and the encoder's pair buffers are a bounded
+    /// table now: a map allocates fewer buffers than it has pairs, where the per-pair form took two.
+    #[test]
+    fn a_map_encodes_through_one_scratch() {
+        let value = wide_map();
+        let entries = match &value {
+            Value::Map(entries) => entries.len(),
+            _ => unreachable!("the case is a map"),
+        };
+        assert_eq!(
+            encode(&value),
+            encode_per_pair(&value),
+            "the canonical bytes are the per-pair ones"
+        );
         let (_, counts) = ferrox_core::alloc_count::measure(|| encode(&value));
         assert!(
-            counts.allocs < entries.len(),
-            "a {}-pair map in {} allocations",
-            entries.len(),
+            counts.allocs < entries,
+            "a {entries}-pair map in {} allocations",
             counts.allocs
         );
+    }
+
+    /// The frame the scratch replaced: the same map, two buffers per pair, measured beside it.
+    #[test]
+    fn the_per_pair_encoder_costs_two_buffers_a_pair() {
+        let value = wide_map();
+        let entries = match &value {
+            Value::Map(entries) => entries.len(),
+            _ => unreachable!("the case is a map"),
+        };
+        let (_, counts) = ferrox_core::alloc_count::measure(|| encode_per_pair(&value));
+        assert!(
+            counts.allocs >= 2 * entries,
+            "the per-pair form bought {} buffers for {entries} pairs",
+            counts.allocs
+        );
+    }
+
+    /// The length-buffer record the stack window replaced, kept as this run's other frame.
+    fn record_per_length_buffer(kind: u8, payload: &Value) -> Result<Vec<u8>, String> {
+        let mut out = Vec::with_capacity(512);
+        out.push(RECORD_VERSION);
+        out.push(kind);
+        let length_at = out.len();
+        out.resize(length_at + 10, 0);
+        encode_into(payload, &mut out);
+        let length = out.len() - length_at - 10;
+        if length > 0xffff {
+            return Err("psiphon broker: record is too long".to_owned());
+        }
+        let mut length_buffer = Vec::new();
+        let mut value = length as u64;
+        while value >= 0x80 {
+            length_buffer.push((value as u8) | 0x80);
+            value >>= 7;
+        }
+        length_buffer.push(value as u8);
+        out[length_at..length_at + length_buffer.len()].copy_from_slice(&length_buffer);
+        out.drain(length_at + length_buffer.len()..length_at + 10);
+        Ok(out)
     }
 
     /// A record's length lives in the stack window it already reserved, not in a heap `Vec` built
@@ -1229,6 +1290,26 @@ mod tests {
             counts.allocs <= 2,
             "the record and its one growth, not a length buffer: {}",
             counts.allocs
+        );
+    }
+
+    /// The frame the stack window replaced: the same record through a heap length buffer, measured
+    /// beside the stack one, and both written to the same bytes.
+    #[test]
+    fn the_length_buffer_costs_an_extra_allocation() {
+        let body = Value::Bytes(vec![0u8; 4096]);
+        let (old_bytes, old) = ferrox_core::alloc_count::measure(|| {
+            record_per_length_buffer(CLIENT_OFFER_REQUEST, &body).expect("a record")
+        });
+        let (new_bytes, new) = ferrox_core::alloc_count::measure(|| {
+            record(CLIENT_OFFER_REQUEST, &body).expect("a record")
+        });
+        assert_eq!(new_bytes, old_bytes, "the record is the same bytes");
+        assert!(
+            old.allocs > new.allocs,
+            "a heap length buffer bought {} allocations over {}",
+            old.allocs,
+            new.allocs
         );
     }
 
