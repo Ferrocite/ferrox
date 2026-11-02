@@ -656,7 +656,8 @@ impl H2Conn {
         self.refused.store(true, Ordering::SeqCst);
         let mut goaway = [0u8; 8];
         goaway[4..].copy_from_slice(&code.to_be_bytes());
-        self.frame(T_GOAWAY, 0, 0, &goaway);
+        // Queued: the GOAWAY is the demux's answer, so it must not wait on a write the peer has not read.
+        let _ = self.send_control(T_GOAWAY, 0, 0, &goaway);
     }
 
     fn send_data(&self, stream: u32, mut payload: &[u8]) -> bool {
@@ -1062,7 +1063,8 @@ impl H2Conn {
         }
         self.wake.notify_all();
         self.end_session_of(stream);
-        let _ = self.frame(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
+        // Queued: a refusal is the demux's answer, so it must not wait on a write the peer has not read.
+        let _ = self.send_control(T_RST, 0, stream, &E_REFUSED.to_be_bytes());
     }
 
     fn kill(&self) {
