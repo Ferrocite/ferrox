@@ -1180,6 +1180,7 @@ fn remeasure_disturbed<T>(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn measure_once(
     request: &Request,
     config_arg: ConfigArg,
@@ -1733,6 +1734,7 @@ impl SinkThread {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn spawn_flows(
     request: &Request,
     engine: SocketAddr,
@@ -1745,30 +1747,45 @@ fn spawn_flows(
     match request.traffic {
         Traffic::Idle => return handles,
         Traffic::HeldOpen => {
-            for index in 0..request.connections {
+            for (index, target) in tcp_targets
+                .iter()
+                .copied()
+                .enumerate()
+                .take(request.connections)
+            {
                 let plan = HoldPlan {
                     engine,
-                    target: tcp_targets[index],
+                    target,
                     duration: request.duration,
                 };
                 handles.push(std::thread::spawn(move || run_hold_flow(&plan, index)));
             }
         }
         Traffic::Reconnect => {
-            for index in 0..request.connections {
+            for (index, target) in tcp_targets
+                .iter()
+                .copied()
+                .enumerate()
+                .take(request.connections)
+            {
                 let plan = ReconnectPlan {
                     engine,
-                    target: tcp_targets[index],
+                    target,
                     iterations: request.iterations,
                 };
                 handles.push(std::thread::spawn(move || run_reconnect_flow(&plan, index)));
             }
         }
         Traffic::TcpLatency => {
-            for index in 0..request.connections {
+            for (index, target) in tcp_targets
+                .iter()
+                .copied()
+                .enumerate()
+                .take(request.connections)
+            {
                 let plan = LatencyPlan {
                     engine,
-                    target: tcp_targets[index],
+                    target,
                     iterations: request.tcp_latency_iterations,
                     pattern: rotate(&template, index, request.connections),
                     index,
@@ -1778,10 +1795,15 @@ fn spawn_flows(
             }
         }
         Traffic::Udp => {
-            for index in 0..request.connections {
+            for (index, target) in udp_targets
+                .iter()
+                .copied()
+                .enumerate()
+                .take(request.connections)
+            {
                 let plan = UdpPlan {
                     engine,
-                    target: udp_targets[index],
+                    target,
                     iterations: request.iterations,
                     pattern: rotate(&template, index, request.connections),
                     index,
@@ -1815,13 +1837,18 @@ fn spawn_flows(
             }
         }
         Traffic::Upload | Traffic::Download | Traffic::FullDuplex => {
-            for index in 0..request.connections {
+            for (index, target) in tcp_targets
+                .iter()
+                .copied()
+                .enumerate()
+                .take(request.connections)
+            {
                 let plan = FlowPlan {
                     bytes: request.flow_bytes(),
                     pattern: rotate(&template, index, request.connections),
                     traffic: request.traffic,
                     engine,
-                    target: tcp_targets[index],
+                    target,
                     index,
                     desync: Arc::clone(desync),
                     abort: Arc::new(AtomicBool::new(false)),
@@ -1983,8 +2010,10 @@ fn socks_tunnel(engine: SocketAddr, target: SocketAddr) -> Result<(TcpStream, Se
     apply_flow_timeouts(&stream);
     #[cfg(target_vendor = "apple")]
     bound_flow_send(&stream).map_err(|e| format!("could not bound the flow's send window: {e}"))?;
-    let mut setup = Setup::default();
-    setup.tcp_connect_us = t0.elapsed().as_micros();
+    let mut setup = Setup {
+        tcp_connect_us: t0.elapsed().as_micros(),
+        ..Setup::default()
+    };
 
     let t1 = Instant::now();
     socks_greet(&mut stream)?;
@@ -2117,8 +2146,10 @@ fn socks_udp_associate(engine: SocketAddr) -> Result<(TcpStream, SocketAddr, Set
         .map_err(|e| format!("could not connect to the engine at {engine}: {e}"))?;
     let _ = control.set_nodelay(true);
     apply_flow_timeouts(&control);
-    let mut setup = Setup::default();
-    setup.tcp_connect_us = t0.elapsed().as_micros();
+    let mut setup = Setup {
+        tcp_connect_us: t0.elapsed().as_micros(),
+        ..Setup::default()
+    };
     let t1 = Instant::now();
     socks_greet(&mut control)?;
     setup.socks_method_us = t1.elapsed().as_micros();
@@ -2157,7 +2188,7 @@ fn socks_udp_associate(engine: SocketAddr) -> Result<(TcpStream, SocketAddr, Set
             } else {
                 SocketAddr::from((ip, port))
             };
-            return Ok((control, relay, setup));
+            Ok((control, relay, setup))
         }
         4 => {
             control
@@ -2177,13 +2208,11 @@ fn socks_udp_associate(engine: SocketAddr) -> Result<(TcpStream, SocketAddr, Set
             } else {
                 SocketAddr::from((ip, port))
             };
-            return Ok((control, relay, setup));
+            Ok((control, relay, setup))
         }
-        other => {
-            return Err(format!(
-                "the udp associate reply has address type {other}, not ipv4 or ipv6"
-            ))
-        }
+        other => Err(format!(
+            "the udp associate reply has address type {other}, not ipv4 or ipv6"
+        )),
     }
 }
 
@@ -2614,7 +2643,7 @@ fn spawn_sink(
                         continue;
                     }
                     if hold {
-                        hold_stream(stream, &listener_done);
+                        hold_stream(&stream, &listener_done);
                         return;
                     }
                     if latency {
@@ -2639,7 +2668,7 @@ fn spawn_sink(
         }
         for socket in udp_sockets {
             let thread_done = Arc::clone(&done);
-            handles.push(std::thread::spawn(move || serve_udp(socket, &thread_done)));
+            handles.push(std::thread::spawn(move || serve_udp(&socket, &thread_done)));
         }
         for handle in handles {
             let _ = handle.join();
@@ -2652,7 +2681,7 @@ fn spawn_sink(
     })
 }
 
-fn hold_stream(stream: TcpStream, done: &AtomicBool) {
+fn hold_stream(stream: &TcpStream, done: &AtomicBool) {
     while !done.load(Ordering::Relaxed) {
         std::thread::sleep(Duration::from_millis(20));
     }
@@ -2675,7 +2704,7 @@ fn echo_stream(mut stream: TcpStream, done: &AtomicBool) {
     }
 }
 
-fn serve_udp(socket: UdpSocket, done: &AtomicBool) {
+fn serve_udp(socket: &UdpSocket, done: &AtomicBool) {
     let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
     let mut buffer = vec![0u8; 65_536 + 64];
     while !done.load(Ordering::Relaxed) {

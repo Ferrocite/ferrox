@@ -419,6 +419,7 @@ impl Comparison {
         })
     }
 
+    #[allow(clippy::too_many_lines)]
     fn rows(&self) -> Vec<stats::Row> {
         let Some(reference) = self.reference() else {
             return Vec::new();
