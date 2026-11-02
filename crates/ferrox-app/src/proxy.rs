@@ -8855,7 +8855,7 @@ fn relay_stream<A: Read + Write + Send + 'static, B: Read + Write + Send + 'stat
     b: Half<B>,
     close: &Arc<dyn Fn() + Send + Sync>,
 ) {
-    relay_stream_handoff(a, b, close, None).wait();
+    relay_stream_handoff(a, b, close, None, true).wait();
 }
 
 /// The relay a served or dialled flow hands to the fixed lanes and returns from: the caller's
@@ -8865,7 +8865,17 @@ fn relay_shared<A: Read + Write + Send + 'static, B: Read + Write + Send + 'stat
     b: Half<B>,
     close: &Arc<dyn Fn() + Send + Sync>,
 ) {
-    let _ = relay_stream_handoff(a, b, close, None);
+    let _ = relay_stream_handoff(a, b, close, None, true);
+}
+
+/// A flow whose first lane may end while the other still owes a reply: the close waits for
+/// both lanes, so a client half-close does not discard a late answer.
+fn relay_shared_late<A: Read + Write + Send + 'static, B: Read + Write + Send + 'static>(
+    a: Half<A>,
+    b: Half<B>,
+    close: &Arc<dyn Fn() + Send + Sync>,
+) {
+    let _ = relay_stream_handoff(a, b, close, None, false);
 }
 
 /// The same hand-off with work that belongs after both directions ended, such as a QUIC stream's FIN.
@@ -8875,7 +8885,7 @@ fn relay_shared_then<A: Read + Write + Send + 'static, B: Read + Write + Send + 
     close: &Arc<dyn Fn() + Send + Sync>,
     then: impl FnOnce() + Send + 'static,
 ) {
-    let _ = relay_stream_handoff(a, b, close, Some(Box::new(then)));
+    let _ = relay_stream_handoff(a, b, close, Some(Box::new(then)), true);
 }
 
 /// A socket the relay spills an end through: the front's own close ends within the pump
@@ -15666,11 +15676,17 @@ fn dial_vless_tls(
                 }
                 return;
             }
-            // A server may hold its answer until it has payload to send, so the upload runs through the pump while this leg waits, as on every other carrier; a TLS session cannot split, so both legs share it behind one lock until the pump's owner joins and hands it back.
+            // The link strips the answer on the read that first sees it, so an upload-only flow relays even when the server withholds `[0, 0]` until downstream bytes.
             if session.write_all(&header).is_err() {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            let Some(half) = pump_vision_answer(client, session, &vless.id) else {
+            let refused = {
+                let server = *server;
+                Arc::new(move || {
+                    note_dial_failure(&server, Failure::new(Stage::RequestSent, Kind::Dropped));
+                }) as Arc<dyn Fn() + Send + Sync>
+            };
+            let Some(half) = vision_answer_link(session, &vless.id, refused) else {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             };
             let Ok(downstream) = client.try_clone() else {
@@ -15680,7 +15696,7 @@ fn dial_vless_tls(
                 return;
             }
             let close = shutdown_pair(downstream.try_clone().ok(), None);
-            relay_shared(Half::socket(downstream), half, &close);
+            relay_shared_late(Half::socket(downstream), half, &close);
         }
         _ => ride_carrier(
             server,
@@ -15736,11 +15752,13 @@ type VisionTlsLink = Half<
     >,
 >;
 
-/// The Vision answer wait, framed: the pump writes through the writer `Link` the relay keeps, so the first upload is a Vision frame rather than raw TLS content, and the link's UUID and filter state survive the handoff. The pair is split from the start so the relay's read and write never share a lock across the transport wait.
-fn pump_vision_answer(
-    client: &Connection,
+/// The Vision link, split before the first frame: the reader strips the VLESS answer on the
+/// read that first sees it, so an upload-only flow relays while a server that withholds
+/// `[0, 0]` until downstream bytes has no upload leg waiting for it.
+fn vision_answer_link(
     session: ferrox_core::tls::ClientSession<Connection>,
     id: &[u8; 16],
+    refused: Arc<dyn Fn() + Send + Sync>,
 ) -> Option<VisionTlsLink> {
     let Ok(out) = session.get_ref().try_clone() else {
         return None;
@@ -15762,12 +15780,6 @@ fn pump_vision_answer(
     };
     let shared = Arc::new(Mutex::new(session));
     let out = Arc::new(Mutex::new(Sealed::new(out)));
-    let mut answer: TlsHalf<_, Connection> = TlsHalf {
-        session: Arc::clone(&shared),
-        out: Arc::clone(&out),
-        driven: None,
-        sleep_on_timeout: true,
-    };
     let reader = TlsHalf {
         session: Arc::clone(&shared),
         out: Arc::clone(&out),
@@ -15786,25 +15798,9 @@ fn pump_vision_answer(
         driven: None,
         sleep_on_timeout: false,
     };
-    let (reader, writer) =
+    let (mut reader, writer) =
         crate::vision::Link::split(reader, writer, Some(raw_read), Some(raw_write), id);
-    let link = Arc::new(Mutex::new(writer));
-    let pump = Pump::over_now(client, {
-        let link = Arc::clone(&link);
-        move |bytes| {
-            let Ok(mut link) = link.lock() else {
-                return false;
-            };
-            link.write_all(bytes).is_ok()
-        }
-    });
-    let answered = read_vless_response(&mut answer).is_some();
-    let _ = pump.end();
-    if !answered {
-        return None;
-    }
-    drop(answer);
-    let writer = Arc::into_inner(link).and_then(|link| link.into_inner().ok())?;
+    reader.expecting_answer(Some(refused));
     Some(Half::split(reader, writer))
 }
 
@@ -24820,10 +24816,11 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
     b: Half<B>,
     close: &Arc<dyn Fn() + Send + Sync>,
     finish: Option<Box<dyn FnOnce() + Send>>,
+    close_first: bool,
 ) -> Arc<RelayFinish> {
     let a = Arc::new(a);
     let b = Arc::new(b);
-    let flow = RelayFinish::new(true, Arc::clone(close), finish);
+    let flow = RelayFinish::new(close_first, Arc::clone(close), finish);
     let (up_a, up_b, up_flow) = (Arc::clone(&a), Arc::clone(&b), Arc::clone(&flow));
     let mut forward = RelayBuf::new();
     lane_pool::submit(
@@ -39591,6 +39588,103 @@ mod tests {
             framed,
             "the first write did not reach the server as a Vision frame"
         );
+    }
+
+    #[test]
+    fn vless_vision_relays_an_upload_a_server_never_answers() {
+        use ferrox_core::tls::TlsProvider as _;
+
+        let (server_config, client_config) = carried_tls_configs();
+        let id = [0x4Fu8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let mut tls = ferrox_core::tls::accept(&server_config, stream).expect("accepts");
+            tls.handshake().expect("handshakes");
+            let Some((got, flow, cmd, _target)) = decode_request(&mut tls) else {
+                panic!("reads a vless header");
+            };
+            assert_eq!(got, id);
+            assert_eq!(flow, Flow::Vision);
+            assert_eq!(cmd, 1);
+            let mut link = crate::vision::Link::new(tls, None, &id);
+            let mut first = [0u8; 4];
+            link.read_exact(&mut first).expect("reads the upload");
+            assert_eq!(&first, b"ping");
+            // Never answer `[0, 0]`: an upload-only flow leaves no downstream byte to flush it with.
+            let mut rest = [0u8; 64];
+            let _ = link.read(&mut rest);
+        });
+        let downstream = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let dport = downstream.local_addr().expect("addr").port();
+        let server_addr: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let (done, finished) = std::sync::mpsc::channel();
+        let relay = crate::budgets::spawn(move || {
+            let (client, _) = downstream.accept().expect("accepts");
+            let vless = VlessOut {
+                address: "127.0.0.1".to_owned(),
+                port,
+                id,
+                carrier: Carrier::Raw(Chain::default()),
+                host: String::new(),
+                mux: false,
+                quic_roots: None,
+                quic_ech: None,
+                hysteria_roots: None,
+                tls: Some(Arc::new(client_config)),
+                flow: ferrox_core::vless::VISION_FLOW.to_owned(),
+                reality: None,
+                headers: Vec::new(),
+                heartbeat: 0,
+                encryption: None,
+            };
+            let target: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+            dial_vless_tls(
+                &client,
+                &server_addr,
+                &vless,
+                Some(&Destination::from(target)),
+            );
+            let _ = done.send(());
+        });
+        let mut sock = Connection::connect(("127.0.0.1", dport)).expect("connects");
+        sock.write_all(b"ping").expect("writes");
+        drop(sock);
+        finished
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the relay ends when the upload ends");
+        relay.join().expect("joins");
+        server.join().expect("joins");
+    }
+
+    #[test]
+    fn a_late_reply_survives_the_client_half_close() {
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let mut app = Connection::connect(front.local_addr().expect("addr")).expect("connects");
+        let relay_side = front.accept().expect("accepts").0;
+        let back = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let mut server = Connection::connect(back.local_addr().expect("addr")).expect("connects");
+        let server_side = back.accept().expect("accepts").0;
+        relay_side.set_read_timeout(Some(RELAY_POLL)).expect("arms");
+        server_side
+            .set_read_timeout(Some(RELAY_POLL))
+            .expect("arms");
+        let close = shutdown_pair(app.try_clone().ok(), server.try_clone().ok());
+        relay_shared_late(Half::socket(relay_side), Half::socket(server_side), &close);
+
+        app.write_all(b"ping").expect("writes");
+        app.shutdown(Shutdown::Write).expect("half-closes");
+        let mut got = [0u8; 4];
+        server.read_exact(&mut got).expect("reads the request");
+        assert_eq!(&got, b"ping");
+        server.write_all(b"pong").expect("answers late");
+        app.set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("arms");
+        app.read_exact(&mut got)
+            .expect("reads the reply after the upload ended");
+        assert_eq!(&got, b"pong");
+        drop(server);
     }
 
     #[test]

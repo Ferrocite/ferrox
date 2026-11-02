@@ -251,6 +251,19 @@ struct Reading {
     raw: bool,
     /// The budget only falls, so once it reaches zero no later read asks the cell again.
     spent: bool,
+    /// The client strips the VLESS answer before the first frame, on the read that
+    /// first sees it: a server may withhold `[0, 0]` until it has downstream bytes,
+    /// and the relay's upload must not wait for the download to find it.
+    answer: Answer,
+    /// Reports a refused or truncated answer once, so the dial keeps the accounting the
+    /// eager read used to.
+    refused: Option<Arc<dyn Fn() + Send + Sync>>,
+}
+
+#[derive(Clone, Copy)]
+enum Answer {
+    None,
+    Pending { head: [u8; 2], filled: u8 },
 }
 
 struct Writing {
@@ -311,6 +324,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 padding: true,
                 raw: false,
                 spent: false,
+                answer: Answer::None,
+                refused: None,
             },
             write: Writing {
                 padding: true,
@@ -318,6 +333,23 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 raw: false,
             },
             tls: TlsCell::Owned(Tls::new()),
+        }
+    }
+
+    /// The reader strips the VLESS answer before its first frame, on the read that first
+    /// sees it; the server's half never carries one.
+    pub(crate) fn expecting_answer(&mut self, refused: Option<Arc<dyn Fn() + Send + Sync>>) {
+        self.read.answer = Answer::Pending {
+            head: [0; 2],
+            filled: 0,
+        };
+        self.read.refused = refused;
+    }
+
+    /// Reports a terminal answer failure at most once, and never after the answer validated.
+    fn refuse(&mut self) {
+        if let Some(refused) = self.read.refused.take() {
+            refused();
         }
     }
 
@@ -363,6 +395,8 @@ impl<S: Read + Write + RecordAlignment> Link<S> {
                 padding: true,
                 raw: false,
                 spent: false,
+                answer: Answer::None,
+                refused: None,
             },
             write: Writing {
                 padding: true,
@@ -465,6 +499,35 @@ impl<S: Read + Write + RecordAlignment> Read for Link<S> {
     /// The content the walk hands this caller buffer is one filter unit: it joins the
     /// feeding spread through the run, and the machine spends at the unit's end.
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if let Answer::Pending { head, filled } = self.read.answer {
+            let mut head = head;
+            let mut filled = usize::from(filled);
+            while filled < 2 {
+                match self.session.read(&mut head[filled..]) {
+                    Ok(0) => {
+                        self.refuse();
+                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                    }
+                    Ok(n) => filled += n,
+                    Err(error) => {
+                        self.read.answer = Answer::Pending {
+                            head,
+                            filled: filled as u8,
+                        };
+                        if !crate::proxy::is_timeout(&error) {
+                            self.refuse();
+                        }
+                        return Err(error);
+                    }
+                }
+            }
+            if ferrox_core::vless::VlessLink::decode_response_header(&head).is_err() {
+                self.refuse();
+                return Err(std::io::Error::other("vless answer refused"));
+            }
+            self.read.answer = Answer::None;
+            self.read.refused = None;
+        }
         let tls = if self.read.spent {
             None
         } else {
@@ -1082,6 +1145,32 @@ mod tests {
         out.extend_from_slice(content);
         out.resize(out.len() + padding, 0);
         out
+    }
+
+    #[test]
+    fn a_client_link_strips_the_answer_before_the_first_frame() {
+        let mut input = vec![0u8, 0u8];
+        input.extend(frame(true, 0, b"hello", 40));
+        let mut link = Link::new(Fake::new(&input), None, &UUID);
+        link.expecting_answer(None);
+        let mut out = Vec::new();
+        link.read_to_end(&mut out).expect("reads");
+        assert_eq!(out, b"hello");
+    }
+
+    #[test]
+    fn a_client_link_reports_a_refused_answer_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let refusals = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&refusals);
+        let mut link = Link::new(Fake::new(b"ab"), None, &UUID);
+        link.expecting_answer(Some(Arc::new(move || {
+            counted.fetch_add(1, Ordering::Relaxed);
+        })));
+        let mut out = [0u8; 8];
+        assert!(link.read(&mut out).is_err());
+        assert!(link.read(&mut out).is_err());
+        assert_eq!(refusals.load(Ordering::Relaxed), 1);
     }
 
     #[test]
