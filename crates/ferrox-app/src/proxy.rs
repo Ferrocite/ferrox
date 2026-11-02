@@ -4201,14 +4201,14 @@ impl std::io::Read for HandshakeDeadline<'_> {
 }
 
 /// An owned carried reader under the handshake clock: the frame reader sleeps through poll timeouts, so this claims the poll and ends the read at the deadline instead.
-struct HandshakeRead<R> {
+pub(crate) struct HandshakeRead<R> {
     inner: R,
     until: Option<Instant>,
     step: Option<RelayStep>,
 }
 
 impl<R: Read> HandshakeRead<R> {
-    fn new(inner: R, budget: Duration) -> Self {
+    pub(crate) fn new(inner: R, budget: Duration) -> Self {
         Self {
             inner,
             until: Some(Instant::now() + budget),
@@ -4216,11 +4216,11 @@ impl<R: Read> HandshakeRead<R> {
         }
     }
 
-    fn rearm(&mut self, budget: Duration) {
+    pub(crate) fn rearm(&mut self, budget: Duration) {
         self.until = Some(Instant::now() + budget);
     }
 
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.until = None;
         self.step = None;
     }
@@ -4916,10 +4916,12 @@ fn serve_sealed_split_with<R, W, C>(
     );
     after_decode(reader.get_mut());
     let Some((got, flow, cmd, target)) = decoded else {
+        closer();
         return;
     };
     let Some(user) = users.iter().find(|user| same_vless_user(&user.id, &got)) else {
         crate::accesslog::record(None, false, &target, None, "invalid user", "");
+        closer();
         return;
     };
     crate::accesslog::record(None, true, &target, None, "", &user.email);
@@ -4944,12 +4946,14 @@ fn serve_sealed_split_with<R, W, C>(
         return;
     }
     if !freedom || !vless_flow_ok(user, flow, cmd, true) {
+        closer();
         return;
     }
     let meter = crate::stats::user(&user.email, user.level);
     match cmd {
         2 => {
             if writer.write_all(&[0, 0]).is_err() {
+                closer();
                 return;
             }
             let reader = MeteredIo {
@@ -4967,6 +4971,7 @@ fn serve_sealed_split_with<R, W, C>(
         }
         3 => {
             if writer.write_all(&[0, 0]).is_err() {
+                closer();
                 return;
             }
             let writer = MeteredIo {
@@ -4981,12 +4986,14 @@ fn serve_sealed_split_with<R, W, C>(
         }
         1 => {
             let Some(uplink) = dial_or_report(&target) else {
+                closer();
                 return;
             };
             let uplink = uplink
                 .with_meter(crate::stats::user(&user.email, user.level).reversed())
                 .with_policy(Some(crate::policy::flow(user.level)));
             if writer.write_all(&[0, 0]).is_err() {
+                closer();
                 return;
             }
             let close = close_with_uplink(&closer, &uplink);
@@ -4997,7 +5004,7 @@ fn serve_sealed_split_with<R, W, C>(
             }
             relay_split(reader, writer, &uplink, &close);
         }
-        _ => {}
+        _ => closer(),
     }
 }
 
@@ -5148,9 +5155,13 @@ fn relay_split<R, W>(
         forward_ended.store(true, Ordering::Relaxed);
     });
     let mut buf = RelayBuf::with_window(window);
+    let mut upload_done = false;
     loop {
         match sealed_read.read(buf.as_mut()) {
-            Ok(0) => break,
+            Ok(0) => {
+                upload_done = true;
+                break;
+            }
             Ok(n) => {
                 if plain_write.write_all(buf.filled(n)).is_err() {
                     break;
@@ -5164,10 +5175,18 @@ fn relay_split<R, W>(
             Err(_) => break,
         }
     }
-    let _ = plain_write.shutdown(Shutdown::Both);
-    close();
-    ended.store(true, Ordering::Relaxed);
+    // The request body ending is a half-close: only the downlink's own end may finish the body its peer is still reading.
+    let _ = plain_write.shutdown(if upload_done {
+        Shutdown::Write
+    } else {
+        Shutdown::Both
+    });
+    if !upload_done {
+        close();
+        ended.store(true, Ordering::Relaxed);
+    }
     let _ = done.join();
+    close();
 }
 
 fn relay_sealed<S: Read + Write + Send + 'static>(
@@ -62395,6 +62414,98 @@ mod reverse_tests {
             portal.pick().is_some(),
             "the portal attached the reverse session"
         );
+    }
+
+    /// A sealed request this inbound refuses still owes the peer an end of stream: an H2 response
+    /// that is neither finished nor reset leaves the client waiting for an answer that can never
+    /// come, so every refusal path runs the closer.
+    #[test]
+    fn a_refused_sealed_request_finishes_the_response() {
+        use ferrox_core::vless_encryption::{
+            generate_pair, Client, ClientConfig, Server, ServerConfig,
+        };
+        let (encryption, decryption) = generate_pair(false, "native", "1rtt", "600s");
+        let server = Server::new(ServerConfig::parse(&decryption).expect("server config"));
+        let users = one_user([7u8; 16]);
+        let (client_side, server_side) = crate::reverse::loopback_pair().expect("pair");
+        let writer = server_side.try_clone().expect("split");
+        client_side
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("client read timeout");
+        let (sender, closed) = std::sync::mpsc::channel();
+        let release: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let _ = sender.send(());
+        });
+        let lane = thread::spawn(move || {
+            serve_sealed_carried_with(
+                server_side,
+                writer,
+                &users,
+                true,
+                &server,
+                release,
+                |_| {},
+                |_| {},
+                |_| {},
+            );
+        });
+        let client = Client::new(ClientConfig::parse(&encryption).expect("client config"));
+        let mut stream = client.handshake(client_side).expect("client handshake");
+        let target = Destination::Address("127.0.0.1:9".parse().expect("address"));
+        let mut bytes = [0u8; VLESS_DIAL_HEADER_MAX];
+        let len = write_vless_header(&[9u8; 16], 1, &target, false, &mut bytes).expect("header");
+        stream.write_all(&bytes[..len]).expect("request");
+        stream.flush().expect("flush");
+        assert_eq!(
+            closed.recv_timeout(Duration::from_secs(2)),
+            Ok(()),
+            "a refused sealed request left its response unfinished"
+        );
+        lane.join().expect("lane");
+    }
+
+    /// The request body ending is a half-close, not the end of the call: the target still answers,
+    /// and its response has to reach the peer instead of dying with the uplink.
+    #[test]
+    fn a_request_body_ending_leaves_the_response_relayed() {
+        struct UploadEnded;
+        impl Read for UploadEnded {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Ok(0)
+            }
+        }
+        struct Keep(Arc<Mutex<Vec<u8>>>);
+        impl Write for Keep {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let (plain, target) = crate::reverse::loopback_pair().expect("pair");
+        let answering = thread::spawn(move || {
+            let mut target = target;
+            let mut body = Vec::new();
+            let _ = target.read_to_end(&mut body);
+            let _ = target.write_all(b"done");
+        });
+        let relayed = Arc::new(Mutex::new(Vec::new()));
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        relay_split(UploadEnded, Keep(Arc::clone(&relayed)), &plain, &close);
+        assert_eq!(
+            relayed
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)[..],
+            b"done"[..],
+            "the response was dropped with the half-closed request body"
+        );
+        answering.join().expect("the target answers");
     }
 
     fn portal_echo(payload: &[u8]) {
