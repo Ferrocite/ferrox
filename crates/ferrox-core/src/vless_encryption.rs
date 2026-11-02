@@ -4,7 +4,7 @@ use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
 
 use aes::Aes256;
-use chacha20poly1305::aead::AeadInPlace as _;
+use chacha20poly1305::aead::AeadInOut as _;
 use ctr::cipher::{KeyIvInit as _, StreamCipher as _};
 use ml_kem::kem::{Decapsulate as _, Kem as _, Key as MlKemKey};
 use ml_kem::KeyExport as _;
@@ -125,10 +125,10 @@ impl Aead {
             Cipher::Aes(cipher) => cipher.seal_in_place(&nonce, aad, &mut out[start..]),
             Cipher::ChaCha(cipher) => {
                 let tag = cipher
-                    .encrypt_in_place_detached(
-                        chacha20poly1305::Nonce::from_slice(&nonce),
+                    .encrypt_inout_detached(
+                        &chacha20poly1305::Nonce::try_from(&nonce[..]).expect("length"),
                         aad,
-                        &mut out[start..],
+                        (&mut out[start..]).into(),
                     )
                     .expect("AEAD seal cannot fail for these sizes");
                 let mut bytes = [0u8; TAG_LEN];
@@ -163,11 +163,11 @@ impl Aead {
                 }
             }
             Cipher::ChaCha(cipher) => cipher
-                .decrypt_in_place_detached(
-                    chacha20poly1305::Nonce::from_slice(&nonce),
+                .decrypt_inout_detached(
+                    &chacha20poly1305::Nonce::try_from(&nonce[..]).expect("length"),
                     aad,
-                    body,
-                    chacha20poly1305::Tag::from_slice(&tag_bytes),
+                    (&mut body[..]).into(),
+                    &chacha20poly1305::Tag::try_from(&tag_bytes[..]).expect("length"),
                 )
                 .map_err(|_| invalid("VLESS encryption record failed authentication"))?,
         }

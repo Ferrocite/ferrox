@@ -790,7 +790,7 @@ impl Api {
             inbounds: vec![(tag.clone(), raw.to_vec())],
             ..Default::default()
         };
-        let (served, _) = crate::proxy::serve_dynamic_inbounds(&runtime, &root, &seed, self);
+        let served = crate::proxy::serve_dynamic_inbounds(&runtime, &root, &seed, self);
         if served == 0 {
             return Err((2, format!("inbound `{tag}` could not be served")));
         }

@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use aes_gcm::aead::AeadInPlace as _;
+use aes_gcm::aead::AeadInOut as _;
 use aes_gcm::KeyInit as _;
 
 use ferrox_core::aesgcm::{Aes128Gcm, Aes256Gcm};
@@ -70,7 +70,11 @@ fn check_and_time(len: usize, plain: &[u8], windows: &mut Vec<Window>) -> Row {
     let tag_ours = ours.seal_in_place(&nonce, aad, &mut sealed_ours);
     let mut sealed_ref = plain.to_vec();
     let tag_ref: [u8; 16] = reference
-        .encrypt_in_place_detached(aes_gcm::Nonce::from_slice(&nonce), aad, &mut sealed_ref)
+        .encrypt_inout_detached(
+            &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
+            aad,
+            (&mut sealed_ref[..]).into(),
+        )
         .expect("seals")
         .into();
     assert_eq!(sealed_ours, sealed_ref, "{len}: the same ciphertext");
@@ -90,17 +94,17 @@ fn check_and_time(len: usize, plain: &[u8], windows: &mut Vec<Window>) -> Row {
     let mut ref_buf = plain.to_vec();
     let mut reference_run = || {
         let tag = reference
-            .encrypt_in_place_detached(
-                aes_gcm::Nonce::from_slice(std::hint::black_box(&nonce)),
+            .encrypt_inout_detached(
+                &aes_gcm::Nonce::try_from(&std::hint::black_box(&nonce)[..]).expect("length"),
                 aad,
-                std::hint::black_box(&mut ref_buf),
+                (&mut std::hint::black_box(&mut ref_buf)[..]).into(),
             )
             .expect("seals");
         reference
-            .decrypt_in_place_detached(
-                aes_gcm::Nonce::from_slice(&nonce),
+            .decrypt_inout_detached(
+                &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
                 aad,
-                std::hint::black_box(&mut ref_buf),
+                (&mut std::hint::black_box(&mut ref_buf)[..]).into(),
                 &tag,
             )
             .expect("opens");
@@ -139,7 +143,11 @@ fn check_and_time_256(len: usize, plain: &[u8], _windows: &mut Vec<Window>) -> R
     let tag_ours = ours.seal_in_place(&nonce, aad, &mut sealed_ours);
     let mut sealed_ref = plain.to_vec();
     let tag_ref: [u8; 16] = reference
-        .encrypt_in_place_detached(aes_gcm::Nonce::from_slice(&nonce), aad, &mut sealed_ref)
+        .encrypt_inout_detached(
+            &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
+            aad,
+            (&mut sealed_ref[..]).into(),
+        )
         .expect("seals")
         .into();
     assert_eq!(sealed_ours, sealed_ref, "{len}: the same ciphertext");
@@ -157,17 +165,17 @@ fn check_and_time_256(len: usize, plain: &[u8], _windows: &mut Vec<Window>) -> R
     let mut ref_buf = plain.to_vec();
     let mut reference_run = || {
         let tag = reference
-            .encrypt_in_place_detached(
-                aes_gcm::Nonce::from_slice(std::hint::black_box(&nonce)),
+            .encrypt_inout_detached(
+                &aes_gcm::Nonce::try_from(&std::hint::black_box(&nonce)[..]).expect("length"),
                 aad,
-                std::hint::black_box(&mut ref_buf),
+                (&mut std::hint::black_box(&mut ref_buf)[..]).into(),
             )
             .expect("seals");
         reference
-            .decrypt_in_place_detached(
-                aes_gcm::Nonce::from_slice(&nonce),
+            .decrypt_inout_detached(
+                &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
                 aad,
-                std::hint::black_box(&mut ref_buf),
+                (&mut std::hint::black_box(&mut ref_buf)[..]).into(),
                 &tag,
             )
             .expect("opens");

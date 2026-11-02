@@ -1559,7 +1559,7 @@ mod tests {
         use poly1305::universal_hash::KeyInit as _;
 
         fn theirs(key: &[u8; 32], data: &[u8]) -> [u8; 16] {
-            let k: &poly1305::Key = poly1305::Key::from_slice(&key[..]);
+            let k: &poly1305::Key = &poly1305::Key::try_from(&key[..]).expect("length");
             poly1305::Poly1305::new(k).compute_unpadded(data).into()
         }
 
@@ -1734,7 +1734,7 @@ mod tests {
         use poly1305::universal_hash::KeyInit as _;
 
         fn theirs(key: &[u8; 32], data: &[u8]) -> [u8; 16] {
-            let k: &poly1305::Key = poly1305::Key::from_slice(&key[..]);
+            let k: &poly1305::Key = &poly1305::Key::try_from(&key[..]).expect("length");
             poly1305::Poly1305::new(k).compute_unpadded(data).into()
         }
 

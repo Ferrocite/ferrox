@@ -13,14 +13,14 @@ workspace = true
 bench-reference = []
 
 [dependencies]
-aes = "0.8"
-aes-gcm = "0.10"
+aes = "0.9"
+aes-gcm = "0.11"
 blake2 = "0.11"
 blake3 = "1"
 getrandom = "0.4"
 hkdf = "0.13"
-chacha20 = "0.9"
-chacha20poly1305 = "0.10"
+chacha20 = "0.10"
+chacha20poly1305 = "0.11"
 md5 = "0.8"
 ring = "0.17"
 rustls = { workspace = true, features = ["std", "ring", "tls12"] }
@@ -31,11 +31,11 @@ shake = "0.1"
 x25519-dalek = { version = "3", features = ["static_secrets"] }
 ml-kem = { version = "0.3.3", features = ["getrandom"] }
 base64 = "0.23"
-boring = "5.3"
+boring = "5.4"
 rand = "0.10"
-ctr = "0.9"
+ctr = "0.10"
 zeroize = "1"
 des = "0.9"
 
 [dev-dependencies]
-poly1305 = "0.8"
+poly1305 = "0.9"

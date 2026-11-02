@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::cipher::{BlockCipherEncrypt, KeyInit};
 use aes_gcm::aead::{Aead, Payload};
 use aes_gcm::{Aes128Gcm, Nonce};
 use hkdf::Hkdf;
@@ -647,7 +647,7 @@ fn sniff_quic(mut bytes: &[u8]) -> Option<String> {
         let secret = hkdf_label(prk.as_slice(), "client in", 32)?;
         let hp_key = hkdf_label(&secret, &format!("{} hp", spec.label), 16)?;
         let mut header = bytes[..packet_end].to_vec();
-        let mut block = aes::Block::clone_from_slice(sample);
+        let mut block = aes::Block::try_from(sample).expect("length");
         aes::Aes128::new_from_slice(&hp_key)
             .ok()?
             .encrypt_block(&mut block);
@@ -667,7 +667,7 @@ fn sniff_quic(mut bytes: &[u8]) -> Option<String> {
         let cipher = Aes128Gcm::new_from_slice(&key).ok()?;
         let plain = cipher
             .decrypt(
-                Nonce::from_slice(&nonce),
+                &Nonce::try_from(&nonce[..]).expect("length"),
                 Payload {
                     msg: &header[at + packet_number_len..],
                     aad: &header[..at + packet_number_len],

@@ -352,7 +352,7 @@ pub fn consume_reply(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chacha20poly1305::aead::AeadInPlace as _;
+    use chacha20poly1305::aead::AeadInOut as _;
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce, XChaCha20Poly1305, XNonce};
 
     const KEY: &[u8; 32] = b"01234567890123456789012345678901";
@@ -383,7 +383,11 @@ mod tests {
             let n = nonce(counter);
             let mut want = plain.clone();
             let want_tag = reference
-                .encrypt_in_place_detached(Nonce::from_slice(&n), b"", &mut want)
+                .encrypt_inout_detached(
+                    &Nonce::try_from(&n[..]).expect("length"),
+                    b"",
+                    (&mut want[..]).into(),
+                )
                 .expect("seals");
             assert_eq!(
                 &buf[HEADER_SIZE..HEADER_SIZE + len],
@@ -573,7 +577,11 @@ mod tests {
         let reference = XChaCha20Poly1305::new_from_slice(&enc_key).expect("key");
         let mut want = cookie.to_vec();
         let want_tag = reference
-            .encrypt_in_place_detached(XNonce::from_slice(&nonce_bytes), mac1, &mut want)
+            .encrypt_inout_detached(
+                &XNonce::try_from(&nonce_bytes[..]).expect("length"),
+                mac1,
+                (&mut want[..]).into(),
+            )
             .expect("seals");
         assert_eq!(&reply[32..48], &want[..], "the encrypted cookie");
         assert_eq!(&reply[48..64], &want_tag[..], "the reply tag");

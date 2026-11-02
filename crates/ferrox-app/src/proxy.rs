@@ -253,7 +253,7 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         install_dns_route(route.clone(), outbound.as_ref());
         start_bridges(root, outbound.as_ref(), route.as_ref());
     }
-    let (inbounds, hysteria_served) = serve_inbounds_counted(
+    let inbounds = serve_inbounds_counted(
         label,
         root,
         outbound.as_ref(),
@@ -275,9 +275,12 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
         println!("Configuration OK.");
         std::process::exit(0);
     }
-    if hysteria_served {
-        // The readiness token the pinned interop harness scans the server log for; not this binary's name.
-        println!("ferrox-app serving; harness readiness token: core: Xray 26.7.28 started");
+    if ["XRAY_VLESS_FULL_BINARY", "XRAY_HYSTERIA_BINARY"]
+        .iter()
+        .any(|seam| std::env::var_os(seam).is_some())
+    {
+        // The startup record both pinned interop harnesses scan the server log for; not this binary's name.
+        println!("ferrox-app serving; harness readiness token: core: Xray 26.10.21 started");
     }
     loop {
         thread::park();
@@ -396,10 +399,10 @@ fn serve_inbounds_counted(
     api: Option<&crate::commander::Api>,
     seed: Option<&crate::xray_pb::Seed>,
     test: bool,
-) -> (usize, bool) {
+) -> usize {
     let routed =
         |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
-    let (mut inbounds, mut hysteria_served) = (0, false);
+    let mut inbounds = 0;
     let mut vmess_tables: HashMap<String, crate::vmess::UsersRef> = HashMap::new();
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
         for inbound in list {
@@ -496,7 +499,6 @@ fn serve_inbounds_counted(
                     "hysteria" => {
                         if serve_hysteria_inbound(address, inbound, freedom, label) {
                             inbounds += 1;
-                            hysteria_served = true;
                         }
                     }
                     "socks" | "http" | "mixed" => {
@@ -603,7 +605,7 @@ fn serve_inbounds_counted(
             }
         }
     }
-    (inbounds, hysteria_served)
+    inbounds
 }
 
 fn register_inbound_sniffing(inbound: &Json, label: &str, addresses: &[String]) {
@@ -624,7 +626,7 @@ fn serve_inbounds(
     portals: &crate::reverse::Portals,
     api: Option<&std::sync::Arc<crate::commander::Api>>,
     seed: Option<&crate::xray_pb::Seed>,
-) -> (usize, bool) {
+) -> usize {
     serve_inbounds_counted(
         label,
         root,
@@ -2254,7 +2256,7 @@ pub(crate) fn serve_dynamic_inbounds(
     root: &Json,
     seed: &crate::xray_pb::Seed,
     api: &crate::commander::Api,
-) -> (usize, bool) {
+) -> usize {
     serve_inbounds_counted(
         "commander",
         root,
@@ -30739,7 +30741,7 @@ mod tests {
         let runtime = Runtime::new(None, Some(Arc::clone(&shared)), false, Arc::clone(&portals));
         let api = crate::commander::Api::new(crate::commander::ApiConfig::default());
         let seed = crate::xray_pb::Seed::default();
-        let (served, _) = serve_dynamic_inbounds(&runtime, &dynamic, &seed, &api);
+        let served = serve_dynamic_inbounds(&runtime, &dynamic, &seed, &api);
         assert_eq!(served, 0, "the dynamic inbound is refused, not served");
     }
 
@@ -42146,7 +42148,7 @@ mod tests {
             r#"{{"inbounds":[{{"protocol":"vmess","listen":"127.0.0.1","port":{port},"settings":{{"clients":[{{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}}]}},"streamSettings":{{"network":"tcp","security":"tls","tlsSettings":{{"certificates":[{{"certificateFile":"{cert}","keyFile":"{key}"}}]}}}}}}]}}"#
         );
         let root = crate::json::parse(&text).expect("parses");
-        let (opened, _) = serve_inbounds(
+        let opened = serve_inbounds(
             "test",
             &root,
             Some(&freedom()),
@@ -54029,7 +54031,7 @@ mod tests {
             r#"{{"inbounds":[{{"protocol":"dokodemo-door","listen":"127.0.0.1","port":{door},"settings":{{"network":"tcp","address":"127.0.0.1","port":{other},"portMap":{{"{door}":"127.0.0.1:{echo}"}}}}}}]}}"#
         );
         let root = crate::json::parse(&text).expect("parses");
-        let (opened, _) = serve_inbounds(
+        let opened = serve_inbounds(
             "test",
             &root,
             Some(&freedom()),
@@ -54072,7 +54074,7 @@ mod tests {
             r#"{{"inbounds":[{{"protocol":"dokodemo-door","listen":"127.0.0.1","port":{door},"settings":{{"network":"tcp","address":"127.0.0.1","port":{echo},"portMap":{{"1337":"127.0.0.1:80"}}}}}}]}}"#
         );
         let root = crate::json::parse(&text).expect("parses");
-        let (opened, _) = serve_inbounds(
+        let opened = serve_inbounds(
             "test",
             &root,
             Some(&freedom()),
@@ -54103,7 +54105,7 @@ mod tests {
             r#"{{"inbounds":[{{"protocol":"tunnel","listen":"127.0.0.1","port":{port},"settings":{{"network":"tcp","address":"127.0.0.1","port":{echo}}}}}]}}"#
         );
         let root = crate::json::parse(&text).expect("parses");
-        let (opened, _) = serve_inbounds(
+        let opened = serve_inbounds(
             "test",
             &root,
             Some(&freedom()),
@@ -54416,7 +54418,7 @@ mod tests {
             r#"{{"inbounds":[{{"protocol":"http","listen":"127.0.0.1","port":{port},"settings":{settings}}}]}}"#
         );
         let root = crate::json::parse(&text).expect("parses");
-        let (opened, _) = serve_inbounds(
+        let opened = serve_inbounds(
             "test",
             &root,
             Some(&freedom()),
@@ -54439,7 +54441,7 @@ mod tests {
             r#"{{"inbounds":[{{"protocol":"socks","listen":"127.0.0.1","port":{port},"settings":{settings}}}]}}"#
         );
         let root = crate::json::parse(&text).expect("parses");
-        let (opened, _) = serve_inbounds(
+        let opened = serve_inbounds(
             "test",
             &root,
             Some(&freedom()),

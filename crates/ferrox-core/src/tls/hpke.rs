@@ -60,7 +60,10 @@ impl Aead {
                 let cipher = Aes128Gcm::new_from_slice(key)
                     .map_err(|_| general("hpke: aes-128-gcm key length"))?;
                 cipher
-                    .encrypt(aes_gcm::Nonce::from_slice(nonce), payload)
+                    .encrypt(
+                        &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
+                        payload,
+                    )
                     .map_err(|_| general("hpke: aes-128-gcm seal"))
             }
             Self::Aes256Gcm => {
@@ -68,7 +71,10 @@ impl Aead {
                 let cipher = Aes256Gcm::new_from_slice(key)
                     .map_err(|_| general("hpke: aes-256-gcm key length"))?;
                 cipher
-                    .encrypt(aes_gcm::Nonce::from_slice(nonce), payload)
+                    .encrypt(
+                        &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
+                        payload,
+                    )
                     .map_err(|_| general("hpke: aes-256-gcm seal"))
             }
             Self::ChaCha20Poly1305 => {
@@ -76,7 +82,10 @@ impl Aead {
                 let cipher = ChaCha20Poly1305::new_from_slice(key)
                     .map_err(|_| general("hpke: chacha20poly1305 key length"))?;
                 cipher
-                    .encrypt(chacha20poly1305::Nonce::from_slice(nonce), payload)
+                    .encrypt(
+                        &chacha20poly1305::Nonce::try_from(&nonce[..]).expect("length"),
+                        payload,
+                    )
                     .map_err(|_| general("hpke: chacha20poly1305 seal"))
             }
         }
@@ -99,7 +108,10 @@ impl Aead {
                 let cipher = Aes128Gcm::new_from_slice(key)
                     .map_err(|_| general("hpke: aes-128-gcm key length"))?;
                 cipher
-                    .decrypt(aes_gcm::Nonce::from_slice(nonce), payload)
+                    .decrypt(
+                        &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
+                        payload,
+                    )
                     .map_err(|_| general("hpke: aes-128-gcm open"))
             }
             Self::Aes256Gcm => {
@@ -107,7 +119,10 @@ impl Aead {
                 let cipher = Aes256Gcm::new_from_slice(key)
                     .map_err(|_| general("hpke: aes-256-gcm key length"))?;
                 cipher
-                    .decrypt(aes_gcm::Nonce::from_slice(nonce), payload)
+                    .decrypt(
+                        &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
+                        payload,
+                    )
                     .map_err(|_| general("hpke: aes-256-gcm open"))
             }
             Self::ChaCha20Poly1305 => {
@@ -115,7 +130,10 @@ impl Aead {
                 let cipher = ChaCha20Poly1305::new_from_slice(key)
                     .map_err(|_| general("hpke: chacha20poly1305 key length"))?;
                 cipher
-                    .decrypt(chacha20poly1305::Nonce::from_slice(nonce), payload)
+                    .decrypt(
+                        &chacha20poly1305::Nonce::try_from(&nonce[..]).expect("length"),
+                        payload,
+                    )
                     .map_err(|_| general("hpke: chacha20poly1305 open"))
             }
         }

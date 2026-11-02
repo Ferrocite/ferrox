@@ -108,7 +108,7 @@ pub fn user_hash(psk: &[u8]) -> [u8; BLOCK_LEN] {
 
 #[must_use]
 pub fn block_encrypt(key: &[u8], block: &[u8; BLOCK_LEN]) -> Option<[u8; BLOCK_LEN]> {
-    use aes::cipher::{BlockEncrypt, KeyInit};
+    use aes::cipher::{BlockCipherEncrypt, KeyInit};
     let mut out = (*block).into();
     match key.len() {
         16 => aes::Aes128::new_from_slice(key)
@@ -124,7 +124,7 @@ pub fn block_encrypt(key: &[u8], block: &[u8; BLOCK_LEN]) -> Option<[u8; BLOCK_L
 
 #[must_use]
 pub fn block_decrypt(key: &[u8], block: &[u8; BLOCK_LEN]) -> Option<[u8; BLOCK_LEN]> {
-    use aes::cipher::{BlockDecrypt, KeyInit};
+    use aes::cipher::{BlockCipherDecrypt, KeyInit};
     let mut out = (*block).into();
     match key.len() {
         16 => aes::Aes128::new_from_slice(key)
@@ -490,7 +490,7 @@ impl std::fmt::Debug for SlidingWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::aead::AeadInPlace as _;
+    use aes_gcm::aead::AeadInOut as _;
     use aes_gcm::KeyInit as _;
 
     #[test]
@@ -584,7 +584,11 @@ mod tests {
         let (ct, tag) = wire.split_at(4);
         let mut want = b"ping".to_vec();
         let want_tag = reference
-            .encrypt_in_place_detached(aes_gcm::Nonce::from_slice(&[0u8; 12]), b"", &mut want)
+            .encrypt_inout_detached(
+                &aes_gcm::Nonce::try_from(&[0u8; 12][..]).expect("length"),
+                b"",
+                (&mut want[..]).into(),
+            )
             .expect("seals");
         assert_eq!(ct, &want[..]);
         assert_eq!(tag, &want_tag[..]);
@@ -598,7 +602,11 @@ mod tests {
         let (ct, tag) = wire.split_at(4);
         let mut want = b"ping".to_vec();
         let want_tag = reference
-            .encrypt_in_place_detached(aes_gcm::Nonce::from_slice(&[0u8; 12]), b"", &mut want)
+            .encrypt_inout_detached(
+                &aes_gcm::Nonce::try_from(&[0u8; 12][..]).expect("length"),
+                b"",
+                (&mut want[..]).into(),
+            )
             .expect("seals");
         assert_eq!(ct, &want[..]);
         assert_eq!(tag, &want_tag[..]);
@@ -617,7 +625,11 @@ mod tests {
             let (ct, tag) = wire.split_at(len);
             let mut want = plain.clone();
             let want_tag = reference
-                .encrypt_in_place_detached(XNonce::from_slice(&nonce), b"", &mut want)
+                .encrypt_inout_detached(
+                    &XNonce::try_from(&nonce[..]).expect("length"),
+                    b"",
+                    (&mut want[..]).into(),
+                )
                 .expect("seals");
             assert_eq!(ct, &want[..], "len {len}");
             assert_eq!(tag, &want_tag[..], "len {len}");
