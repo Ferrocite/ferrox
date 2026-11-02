@@ -194,4 +194,7 @@ grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else 73251 g
 # The sniff probe's frame in the app binary. UNBLESSED until ops.yml prints it:
 # the row closes the page's open count, and the pooled probe buffer is what the
 # first measured value must be read against.
-ferrox_app::sniff::Sniffing::inspect UNBLESSED
+ferrox_app::sniff::Sniffing::inspect UNBLESSED sniff::tests::the_probe_buffer_is_the_worker_threads_not_the_flows
+ferrox_app::sniff::Sniffing::probe_tcp UNBLESSED sniff::tests::the_probe_buffer_is_the_worker_threads_not_the_flows
+ferrox_app::sniff::Sniffing::sniff_bytes UNBLESSED sniff::tests::the_probe_buffer_is_the_worker_threads_not_the_flows
+ferrox_app::sniff::sniff_http UNBLESSED sniff::tests::reads_http_host_and_tls_sni
