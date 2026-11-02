@@ -4068,7 +4068,7 @@ pub(crate) fn serve_grpc_muxed(
     let Some((got, flow, cmd, target)) = under_handshake(&mut reader, |read| {
         decode_request_gated(
             read,
-            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
             resolve_endpoint,
         )
     }) else {
@@ -4086,7 +4086,7 @@ pub(crate) fn serve_grpc_muxed(
         reverse_carried(ask, reader, writer, Arc::new(move || closer.close()));
         return;
     }
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         reader.abort();
         return;
     }
