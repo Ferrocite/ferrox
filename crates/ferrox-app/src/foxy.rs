@@ -377,13 +377,14 @@ fn hop_connect(stream: &mut Connection, host: &str, port: u16) -> Result<(), Fai
     .map_err(|_| Failure::Io)?;
     let mut head = [0u8; HOP_HEAD];
     let mut have = 0usize;
+    let mut scanned = 0usize;
     loop {
         let seen = stream.peek(&mut head[have..]).map_err(|_| Failure::Io)?;
         if seen == 0 {
             return Err(Failure::Io);
         }
         let filled = have + seen;
-        let Some(end) = foxy::head_end(&head[..filled]) else {
+        let Some(end) = foxy::head_end_grown(&head[..filled], &mut scanned) else {
             if filled == head.len() {
                 return Err(Failure::Io);
             }
@@ -598,8 +599,9 @@ fn long_head<S: Read>(
     let mut head = Vec::with_capacity(walked.len() * 2);
     head.extend_from_slice(walked);
     let mut window = [0u8; HEAD_WINDOW];
+    let mut scanned = head.len();
     loop {
-        if let Some(end) = foxy::head_end(&head) {
+        if let Some(end) = foxy::head_end_grown(&head, &mut scanned) {
             let block = &head[..end + 4];
             let status = foxy::connect_status(block)?;
             if is_refused_target(block, status, refused_target) {

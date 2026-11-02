@@ -118,6 +118,14 @@ pub fn head_end(head: &[u8]) -> Option<usize> {
     }
 }
 
+/// Where a head that keeps arriving ends, for a reader that has already walked `scanned` octets of `bytes`: a terminator straddles the seam by at most three octets, so only those and what follows are weighed, and the call records the new length for the next ask. Ask again only after `None`: the first `Some` is the offset `head_end` gives on the buffer as it stood then, and a later ask resumes past it into the body.
+#[must_use]
+pub fn head_end_grown(bytes: &[u8], scanned: &mut usize) -> Option<usize> {
+    let from = bytes.len().min(*scanned).saturating_sub(3);
+    *scanned = bytes.len();
+    head_end(&bytes[from..]).map(|at| from + at)
+}
+
 /// The starts one window proves: bit `j` is `\r` at `j`, `\n` at `j+1`, `\r` at `j+2`, `\n` at `j+3`. The pair mask is the window's answer to "is a two-octet word here", and a terminator is that word at `j` and again at `j+2`, so the four-octet weigh is one shift and one and. The window's last three starts are never claimed: the shift that pairs a `\n` with the `\r` before it brings a zero in at the top, and the fourth octet of those starts is the first octet the window does not hold.
 #[cfg(any(target_arch = "x86_64", test))]
 #[inline]
@@ -1449,6 +1457,41 @@ mod tests {
                     .chain([len / 2, len / 2 + 1])
                     .chain(len.saturating_sub(9)..len),
             );
+        }
+    }
+
+    /// `head_end_grown` resumes the tree's one scan across a seam instead of walking the buffer again: at every pair of arrival points it answers what the whole-buffer walk answers, or the same `None`, and a terminator finishing in the three octets after a cut is still found.
+    #[test]
+    fn the_resumed_scan_answers_the_whole_buffer_walk_at_every_seam() {
+        let cases: [&[u8]; 4] = [
+            b"\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nbody",
+            b"HTTP/1.1 200 OK\r\nX-Fill: 012345678901234567890123456789\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX: y\r\n",
+        ];
+        for case in cases {
+            let want = head_end(case);
+            for first in 0..=case.len() {
+                for second in first..=case.len() {
+                    let mut scanned = 0;
+                    let mut got = head_end_grown(&case[..first], &mut scanned);
+                    if got.is_none() {
+                        got = head_end_grown(&case[..second], &mut scanned);
+                    }
+                    if got.is_none() {
+                        got = head_end_grown(case, &mut scanned);
+                    }
+                    assert_eq!(got, want, "{first} {second} {case:?}");
+                }
+            }
+        }
+        // The seam is three octets wide: a terminator finishing one octet past each cut is found.
+        let head = b"HTTP/1.1 200 OK\r\nA: b\r\n\r\n";
+        let at = head_end(head).expect("a terminator");
+        for cut in at..=at + 3 {
+            let mut scanned = 0;
+            assert_eq!(head_end_grown(&head[..cut], &mut scanned), None);
+            assert_eq!(head_end_grown(head, &mut scanned), Some(at));
         }
     }
 

@@ -449,8 +449,10 @@ impl H2StreamWriter {
 impl Write for H2StreamWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         if !self.headed {
+            let prior = self.head.len();
             self.head.extend_from_slice(buf);
-            if let Some(at) = ferrox_core::foxy::head_end(&self.head) {
+            let mut scanned = prior;
+            if let Some(at) = ferrox_core::foxy::head_end_grown(&self.head, &mut scanned) {
                 let mut head = std::mem::take(&mut self.head);
                 if !self.emit_headers(&mut head[..at + 4]) {
                     return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
