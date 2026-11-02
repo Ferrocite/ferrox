@@ -588,6 +588,11 @@ fn serve_inbounds_counted(
                     _ => eprintln!("unsupported inbound protocol `{protocol}` in {label}"),
                 }
             }
+            if !prove && inbounds > before && dials_direct_inbound(protocol) {
+                if let Some(shared) = route {
+                    shared.record_server_inbound(handler_tag.clone());
+                }
+            }
             let handler_users = vmess_users;
             if let Some(stop) = &handler_stop {
                 stop.expect_listeners(handler_stops.len());
@@ -1937,8 +1942,9 @@ struct RouteShared {
     balancers: Arc<HashMap<String, Vec<String>>>,
     /// Each balancer's fallback, so the server-route proof resolves every tag it can pick without the table's lock.
     balancer_fallbacks: HashMap<String, String>,
-    /// Every server inbound's tag, so an `AddRule` proves the same direct dial the start did.
-    server_inbounds: Vec<Option<String>>,
+    /// Every server inbound's tag, including one the management API added, so an `AddRule` proves
+    /// the same direct dial the start did.
+    server_inbounds: Mutex<Vec<Option<String>>>,
     observatory: Option<Arc<crate::observatory::Observatory>>,
     /// The script router, kept outside the routing lock: a script callback re-enters the table.
     script_router: Option<Arc<crate::router_script::ScriptRouter>>,
@@ -1961,6 +1967,26 @@ struct RouteShared {
 }
 
 impl RouteShared {
+    /// Remember a direct-dial server inbound the management API added, so a later rule that can
+    /// reach it is proved against the lane it really serves.
+    fn record_server_inbound(&self, tag: Option<String>) {
+        let mut inbounds = self
+            .server_inbounds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !inbounds.contains(&tag) {
+            inbounds.push(tag);
+        }
+    }
+
+    /// Forget a server inbound whose listener the management API stopped.
+    fn forget_server_inbound(&self, tag: &str) {
+        self.server_inbounds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|inbound| inbound.as_deref() != Some(tag));
+    }
+
     /// Register an outbound the management API added. A tag a rule already names, or the default,
     /// is a duplicate until it was removed; a removed tag can be added again, as in the reference.
     fn add_outbound(&self, tag: &str, out: Outbound) -> Result<(), String> {
@@ -2155,8 +2181,12 @@ impl Runtime {
         let known =
             |tag: &str| route.tagged.contains_key(tag) || Some(tag) == route.default_tag.as_deref();
         let direct = |named: &str| direct_tag(route, named);
-        let proofs: Vec<crate::router::ServerProof<'_>> = route
+        let server_inbounds = route
             .server_inbounds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let proofs: Vec<crate::router::ServerProof<'_>> = server_inbounds
             .iter()
             .map(|inbound| server_proof(route, inbound.as_deref(), &direct))
             .collect();
@@ -2165,6 +2195,14 @@ impl Runtime {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .add_rules(rules, append, known, &proofs)
+    }
+
+    /// Drop a server inbound the management API stopped, so a later rule is not proved against a
+    /// lane nothing serves any more.
+    pub(crate) fn forget_server_inbound(&self, tag: &str) {
+        if let Some(route) = &self.route {
+            route.forget_server_inbound(tag);
+        }
     }
 
     /// Drop every rule carrying `tag`, for `RoutingService.RemoveRule`.
@@ -2238,7 +2276,12 @@ impl Runtime {
         balancer.force(target);
         if !target.is_empty() {
             let direct = |named: &str| direct_tag(route, named);
-            for inbound in &route.server_inbounds {
+            let server_inbounds = route
+                .server_inbounds
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            for inbound in &server_inbounds {
                 if let Err(reason) =
                     routing.server_routes(&server_proof(route, inbound.as_deref(), &direct))
                 {
@@ -2963,7 +3006,7 @@ fn route_shared_with_api(
         tagged,
         balancers,
         balancer_fallbacks,
-        server_inbounds,
+        server_inbounds: Mutex::new(server_inbounds),
         observatory,
         script_router,
         script,

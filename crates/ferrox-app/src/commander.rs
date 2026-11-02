@@ -711,6 +711,9 @@ impl Api {
                 ));
             }
         }
+        if let Ok(runtime) = self.runtime() {
+            runtime.forget_server_inbound(&tag);
+        }
         Ok(Vec::new())
     }
 
