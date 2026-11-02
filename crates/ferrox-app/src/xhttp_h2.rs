@@ -225,6 +225,8 @@ enum Control {
 /// inbound frame, so the backlog has to be bounded rather than grown.
 const CONTROL_QUEUE_MAX: usize = 1024;
 
+type SharedWriter = Arc<Mutex<Box<dyn crate::proxy::FrameWrite + Send>>>;
+
 struct ControlQueue {
     frames: Mutex<VecDeque<(u8, [u8; CONTROL_MAX])>>,
     go: Condvar,
@@ -235,10 +237,7 @@ struct ControlQueue {
 }
 
 impl Control {
-    fn threaded(
-        write: Arc<Mutex<Box<dyn crate::proxy::FrameWrite + Send>>>,
-        dead: Arc<AtomicBool>,
-    ) -> Self {
+    fn threaded(write: SharedWriter, dead: Arc<AtomicBool>) -> Self {
         let queue = Arc::new(ControlQueue {
             frames: Mutex::new(VecDeque::new()),
             go: Condvar::new(),
@@ -331,7 +330,7 @@ impl Control {
 }
 
 pub(crate) struct H2Conn {
-    write: Arc<Mutex<Box<dyn crate::proxy::FrameWrite + Send>>>,
+    write: SharedWriter,
     control: Control,
     streams: Mutex<HashMap<u32, Arc<H2Stream>>>,
     sessions: Mutex<HashSet<String>>,
@@ -1328,9 +1327,8 @@ pub(crate) fn connect_split<
     settings: &XhttpSettings,
     scheme: &str,
 ) -> Option<(H2StreamReader, crate::xhttp::XhttpWriter)> {
-    let write: Arc<Mutex<Box<dyn crate::proxy::FrameWrite + Send>>> =
-        Arc::new(Mutex::new(Box::new(write)));
     let dead = Arc::new(AtomicBool::new(false));
+    let write: SharedWriter = Arc::new(Mutex::new(Box::new(write)));
     let conn = Arc::new(H2Conn {
         control: Control::threaded(Arc::clone(&write), Arc::clone(&dead)),
         write,
@@ -1917,9 +1915,8 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                 let Some(write) = self.write.take() else {
                     return self.end();
                 };
-                let write: Arc<Mutex<Box<dyn crate::proxy::FrameWrite + Send>>> =
-                    Arc::new(Mutex::new(Box::new(write)));
                 let dead = Arc::new(AtomicBool::new(false));
+                let write: SharedWriter = Arc::new(Mutex::new(Box::new(write)));
                 let conn = Arc::new(H2Conn {
                     control: Control::threaded(Arc::clone(&write), Arc::clone(&dead)),
                     write,
@@ -3297,8 +3294,7 @@ mod tests {
 
     /// A connection with no streams and no peer: only what a call writes can be seen.
     fn conn_with(write: Box<dyn crate::proxy::FrameWrite + Send>, threaded: bool) -> Arc<H2Conn> {
-        let write: Arc<Mutex<Box<dyn crate::proxy::FrameWrite + Send>>> =
-            Arc::new(Mutex::new(write));
+        let write: SharedWriter = Arc::new(Mutex::new(write));
         let dead = Arc::new(AtomicBool::new(false));
         let control = if threaded {
             Control::threaded(Arc::clone(&write), Arc::clone(&dead))
