@@ -33583,6 +33583,79 @@ mod tests {
         );
     }
 
+    /// A plaintext xHTTP connection that sends the H2 preface and no stream hands its demux to a
+    /// lane: the setup workers that took the first eight still reach the ninth handshake.
+    #[test]
+    fn a_plaintext_h2_preface_releases_its_setup_worker() {
+        let id = [0x2Bu8; 16];
+        let users: Arc<[VlessUser]> = Arc::from(one_vless_user(&id));
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let settings = xhttp_settings("/p");
+        let queued = Arc::new(AtomicUsize::new(0));
+        let accepting = {
+            let users = Arc::clone(&users);
+            let queued = Arc::clone(&queued);
+            thread::spawn(move || {
+                for _ in 0..8 {
+                    let (stream, _) = front.accept().expect("accepts");
+                    let carrier = Carrier::Xhttp {
+                        settings: settings.clone(),
+                    };
+                    let users = Arc::clone(&users);
+                    let mut stream = Some(stream);
+                    lane_pool::submit_setup(
+                        Box::new(move || {
+                            if let Some(stream) = stream.take() {
+                                serve_vless(stream, &users, &carrier, true, None, None);
+                            }
+                            lane_pool::Next::Done
+                        }),
+                        Box::new(|| {}),
+                    );
+                    queued.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        };
+        let mut peers: Vec<_> = (0..8)
+            .map(|_| Connection::connect(addr).expect("connects"))
+            .collect();
+        for peer in &mut peers {
+            peer.write_all(crate::h2::MAGIC)
+                .expect("writes the preface");
+            peer.flush().expect("flushes");
+        }
+        let until = Instant::now() + Duration::from_secs(10);
+        while queued.load(Ordering::SeqCst) < 8 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(
+            queued.load(Ordering::SeqCst),
+            8,
+            "the accept loop did not hand every connection to a setup lane"
+        );
+        let ran = Arc::new(AtomicBool::new(false));
+        let witness = Arc::clone(&ran);
+        lane_pool::submit_setup(
+            Box::new(move || {
+                witness.store(true, Ordering::SeqCst);
+                lane_pool::Next::Done
+            }),
+            Box::new(|| {}),
+        );
+        let until = Instant::now() + Duration::from_secs(10);
+        while !ran.load(Ordering::SeqCst) && Instant::now() < until {
+            thread::sleep(Duration::from_millis(1));
+        }
+        let released = ran.load(Ordering::SeqCst);
+        drop(peers);
+        accepting.join().expect("joins");
+        assert!(
+            released,
+            "eight idle H2 connections held every setup worker: the ninth lane never ran"
+        );
+    }
+
     /// A carriered accept hands its handshake to the lane pool, so an eight-flow cell grows the
     /// process by the setup lanes and their borrow ceiling, not by connections.
     #[cfg(target_os = "linux")]
