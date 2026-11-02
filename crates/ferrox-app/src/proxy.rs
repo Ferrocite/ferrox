@@ -14827,6 +14827,10 @@ fn tls_xhttp<S: Dialed, D: Dialed>(
         || session
             .alpn()
             .is_some_and(|alpn| alpn.eq_ignore_ascii_case(b"h2"));
+    // This tree's H2 client is stream-one: a dual-session mode cannot ride a connection the peer agreed to speak h2 on, and an H1 head is not a fallback it accepted.
+    if h2 && settings.mode != crate::xhttp::XhttpMode::StreamOne {
+        return tls_unreachable(server);
+    }
     let (reader, writer, raw) = session.into_halves()?;
     if settings.mode == crate::xhttp::XhttpMode::StreamOne {
         if h2 {
@@ -43973,6 +43977,63 @@ mod tests {
                 .iter()
                 .any(|path| path == WITNESS),
             "an ALPN-negotiated h2 session must open with the H2 preface"
+        );
+    }
+
+    /// A dual-session mode on a connection that negotiated h2 is refused before its downlink is
+    /// dialled: this tree's H2 client is stream-one, and the peer never agreed to an H1 head.
+    #[test]
+    fn a_dual_session_xhttp_refuses_a_negotiated_h2_connection() {
+        let (server_config, mut client_config) = carried_tls_configs();
+        let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
+            alpn: vec![b"h2".to_vec()],
+            ..(*server_config).clone()
+        });
+        client_config.alpn = vec![b"h2".to_vec()].into();
+        let id = [0x4Au8; 16];
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let settings = xhttp_settings_mode("/dual-h2", crate::xhttp::XhttpMode::StreamUp);
+        let server_settings = settings.clone();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &one_vless_user(&id),
+                true,
+                &Carrier::Xhttp {
+                    settings: server_settings,
+                },
+                &server_config,
+                None,
+                None,
+            );
+        });
+        let server: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+        let session = dial_tls_session(&server, &client_config, None).expect("dialled");
+        assert_eq!(
+            session.alpn(),
+            Some(&b"h2"[..]),
+            "the handshake negotiates h2"
+        );
+        let second = Arc::new(AtomicUsize::new(0));
+        let dialled = Arc::clone(&second);
+        let out = tls_xhttp(
+            &server,
+            session,
+            move || {
+                dialled.fetch_add(1, Ordering::SeqCst);
+                None::<ferrox_core::tls::ClientSession<crate::conn::Connection>>
+            },
+            "127.0.0.1",
+            &settings,
+            false,
+        );
+        assert!(out.is_none(), "a dual-session h2 dial is refused");
+        assert_eq!(
+            second.load(Ordering::SeqCst),
+            0,
+            "the downlink session is not dialled for a shape this client cannot carry"
         );
     }
 
