@@ -117,12 +117,11 @@ fn flag_count(args: &mut impl Iterator<Item = String>, flag: &str) -> usize {
 
 fn flag_number(args: &mut impl Iterator<Item = String>, flag: &str) -> u64 {
     let raw = flag_value(args, flag);
-    match raw.parse::<u64>() {
-        Ok(n) => n,
-        Err(_) => {
-            eprintln!("{flag} needs a whole number, got `{raw}`");
-            std::process::exit(2);
-        }
+    if let Ok(n) = raw.parse::<u64>() {
+        n
+    } else {
+        eprintln!("{flag} needs a whole number, got `{raw}`");
+        std::process::exit(2);
     }
 }
 
