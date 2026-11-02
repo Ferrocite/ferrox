@@ -1214,6 +1214,7 @@ impl GrpcWriter {
         take_window(&self.shared, need, true)
     }
 
+    /// Writes one message, splitting it only when it exceeds `max` bytes.
     fn message<'a>(&self, data: &'a [u8], max: usize, end: bool, batch: &mut Gather<'a>) -> bool {
         let mut prefix = [0u8; 16];
         let plen = frame_prefix(data.len(), &mut prefix);
@@ -1298,6 +1299,7 @@ fn message_payload(max_frame: usize) -> usize {
     }
 }
 
+/// The number of bytes a protobuf varint takes for `value`.
 fn varint_len(mut value: u64) -> usize {
     let mut len = 1;
     while value >= 0x80 {
@@ -1307,6 +1309,7 @@ fn varint_len(mut value: u64) -> usize {
     len
 }
 
+/// Writes the envelope and `Hunk` tag for `data_len` into `out`, returning the prefix length.
 #[inline]
 fn frame_prefix(data_len: usize, out: &mut [u8; 16]) -> usize {
     let (at, inner) = if data_len < 0x80 {
@@ -1347,6 +1350,7 @@ fn push_varint(out: &mut Vec<u8>, mut value: u64) {
     out.push(value as u8);
 }
 
+/// Reads one protobuf varint at `at`, advancing the cursor.
 #[inline]
 fn read_varint(msg: &[u8], at: &mut usize) -> Option<u64> {
     let first = *msg.get(*at)?;
