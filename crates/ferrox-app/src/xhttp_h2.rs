@@ -38,7 +38,8 @@ const NO_PART: &[u8] = &[];
 /// the same frames written one at a time.
 struct DataBatch<'a> {
     heads: [[u8; 9]; DATA_FRAMES_PER_WRITE],
-    bodies: [&'a [u8]; DATA_FRAMES_PER_WRITE],
+    bodies: [[&'a [u8]; 4]; DATA_FRAMES_PER_WRITE],
+    counts: [u8; DATA_FRAMES_PER_WRITE],
     used: usize,
 }
 
@@ -46,7 +47,8 @@ impl<'a> DataBatch<'a> {
     fn new() -> Self {
         Self {
             heads: [[0u8; 9]; DATA_FRAMES_PER_WRITE],
-            bodies: [NO_PART; DATA_FRAMES_PER_WRITE],
+            bodies: [[NO_PART; 4]; DATA_FRAMES_PER_WRITE],
+            counts: [0; DATA_FRAMES_PER_WRITE],
             used: 0,
         }
     }
@@ -56,30 +58,55 @@ impl<'a> DataBatch<'a> {
     }
 
     fn add(&mut self, stream: u32, payload: &'a [u8]) {
-        self.heads[self.used] = frame_head(payload.len(), T_DATA, 0, stream);
-        self.bodies[self.used] = payload;
+        self.add_parts(stream, &[payload]);
+    }
+
+    fn add_parts(&mut self, stream: u32, parts: &[&'a [u8]]) {
+        if parts.is_empty() || parts.len() > self.bodies[self.used].len() {
+            return;
+        }
+        let len: usize = parts.iter().map(|part| part.len()).sum();
+        self.heads[self.used] = frame_head(len, T_DATA, 0, stream);
+        self.bodies[self.used][..parts.len()].copy_from_slice(parts);
+        self.counts[self.used] = parts.len() as u8;
         self.used += 1;
     }
 
     fn flush(&mut self, conn: &H2Conn) -> bool {
+        let Ok(mut write) = conn.write.lock() else {
+            return false;
+        };
+        self.flush_locked(conn, &mut **write)
+    }
+
+    /// The same bytes into a write half the caller already holds: a lane takes the lock without
+    /// waiting, so a busy writer parks the lane instead of stacking workers behind the mutex.
+    fn flush_locked(
+        &mut self,
+        conn: &H2Conn,
+        write: &mut (dyn crate::proxy::FrameWrite + Send),
+    ) -> bool {
         if self.used == 0 {
             return true;
         }
-        let mut parts: [&[u8]; 2 * DATA_FRAMES_PER_WRITE] = [NO_PART; 2 * DATA_FRAMES_PER_WRITE];
+        let mut parts: [&[u8]; 5 * DATA_FRAMES_PER_WRITE] = [NO_PART; 5 * DATA_FRAMES_PER_WRITE];
         let mut pieces = 0;
-        for (head, body) in self.heads[..self.used]
-            .iter()
-            .zip(self.bodies[..self.used].iter().copied())
-        {
-            parts[pieces] = head;
+        for at in 0..self.used {
+            parts[pieces] = &self.heads[at];
             pieces += 1;
-            if !body.is_empty() {
-                parts[pieces] = body;
-                pieces += 1;
+            for body in &self.bodies[at][..self.counts[at] as usize] {
+                if !body.is_empty() {
+                    parts[pieces] = body;
+                    pieces += 1;
+                }
             }
         }
         self.used = 0;
-        conn.write_batch(&parts[..pieces])
+        if !write.write_slices(&parts[..pieces]) {
+            conn.dead.store(true, Ordering::SeqCst);
+            return false;
+        }
+        true
     }
 }
 
@@ -112,6 +139,30 @@ impl H2StreamOut {
         self.conn.send_data(self.stream, payload)
     }
 
+    /// The same offer for bodies built from several slices: each group is one frame, its parts
+    /// written side by side, so a gRPC envelope and its payload stay one message in one frame.
+    pub(crate) fn batch_parts(&self, groups: &[&[&[u8]]]) -> bool {
+        self.conn.send_grouped(self.stream, groups)
+    }
+
+    /// The non-blocking offer: the whole batch or nothing, so a lane that finds no window parks
+    /// instead of holding the worker the peer's credit is read on.
+    pub(crate) fn try_batch_parts(&self, groups: &[&[&[u8]]]) -> Option<bool> {
+        self.conn.try_send_grouped(self.stream, groups)
+    }
+
+    pub(crate) fn room(&self) -> u64 {
+        self.conn.room(self.stream)
+    }
+
+    pub(crate) fn wait_room(&self, turn: std::time::Duration) {
+        self.conn.wait_room(self.stream, turn);
+    }
+
+    pub(crate) fn settle(&self) -> crate::proxy::Settle {
+        self.conn.settle()
+    }
+
     pub(crate) fn bind_session(&self, sid: &str) {
         self.conn.bind_session(sid, self.stream, true);
     }
@@ -130,7 +181,7 @@ impl H2StreamOut {
     }
 }
 
-struct H2Stream {
+pub(crate) struct H2Stream {
     state: Mutex<StreamState>,
     cv: Condvar,
     send_window: Mutex<u64>,
@@ -140,6 +191,8 @@ struct H2Stream {
 struct StreamState {
     body: VecDeque<Vec<u8>>,
     ended: bool,
+    /// The response `END_STREAM` has gone out: a stream retires once both halves are done.
+    finished: bool,
     dead: bool,
 }
 
@@ -154,7 +207,7 @@ impl H2Stream {
     }
 }
 
-struct H2Conn {
+pub(crate) struct H2Conn {
     write: Mutex<Box<dyn crate::proxy::FrameWrite + Send>>,
     streams: Mutex<HashMap<u32, Arc<H2Stream>>>,
     sessions: Mutex<HashSet<String>>,
@@ -190,6 +243,22 @@ pub(crate) struct H2StreamReader {
     at: usize,
     /// The start of the current idle stretch, so a lane's polls still end a body at the stall.
     idle_since: Option<std::time::Instant>,
+}
+
+impl H2StreamReader {
+    /// The request is abandoned with its body still open: an `RST_STREAM` frees the table entry and
+    /// the queued chunks, where dropping the handles would leave both for the connection's life.
+    pub(crate) fn abort(&self) {
+        self.reset_handle()();
+    }
+
+    /// The same reset carried past a handoff: a relay that fails to start has already taken the
+    /// reader, so only this holds the stream it has to free.
+    pub(crate) fn reset_handle(&self) -> impl FnOnce() + Send + 'static {
+        let conn = Arc::clone(&self.conn);
+        let id = self.id;
+        move || conn.reset(id)
+    }
 }
 
 impl Read for H2StreamReader {
@@ -274,7 +343,7 @@ impl Read for H2StreamReader {
     }
 }
 
-struct H2StreamWriter {
+pub(crate) struct H2StreamWriter {
     conn: Arc<H2Conn>,
     stream: u32,
     head: Vec<u8>,
@@ -425,17 +494,6 @@ impl H2Conn {
         true
     }
 
-    fn write_batch(&self, parts: &[&[u8]]) -> bool {
-        let Ok(mut write) = self.write.lock() else {
-            return false;
-        };
-        if !write.write_slices(parts) {
-            self.dead.store(true, Ordering::SeqCst);
-            return false;
-        }
-        true
-    }
-
     /// Refuse the connection: the GOAWAY goes out now, and `refused` remembers that the peer still has to be given the window to read it.
     fn refuse(&self, code: u32) {
         self.refused.store(true, Ordering::SeqCst);
@@ -474,6 +532,184 @@ impl H2Conn {
             payload = &payload[chunk..];
         }
         batch.flush(self)
+    }
+
+    fn send_grouped(&self, stream: u32, groups: &[&[&[u8]]]) -> bool {
+        let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .cloned()
+        else {
+            return false;
+        };
+        let max = *self
+            .max_frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut batch = DataBatch::new();
+        for group in groups {
+            let mut need: usize = group.iter().map(|part| part.len()).sum();
+            if need == 0 || group.len() > 4 {
+                continue;
+            }
+            let mut index = 0;
+            let mut offset = 0;
+            while need > 0 {
+                let want = need.min(max);
+                let Some(chunk) = self.credit(&state, want as u64, &mut batch) else {
+                    return false;
+                };
+                if batch.full() && !batch.flush(self) {
+                    return false;
+                }
+                let mut parts: [&[u8]; 4] = [&[]; 4];
+                let mut used = 0;
+                let mut left = chunk;
+                while left > 0 && index < group.len() {
+                    let part = &group[index][offset..];
+                    if part.len() <= left {
+                        parts[used] = part;
+                        used += 1;
+                        left -= part.len();
+                        index += 1;
+                        offset = 0;
+                    } else {
+                        parts[used] = &part[..left];
+                        used += 1;
+                        offset += left;
+                        left = 0;
+                    }
+                }
+                batch.add_parts(stream, &parts[..used]);
+                need -= chunk;
+            }
+        }
+        batch.flush(self)
+    }
+
+    /// The whole batch off the two windows or none of it: a lane that offered bytes no window
+    /// covers parks and retries, so a blocked sender never holds the worker its peer's credit runs on.
+    fn try_send_grouped(&self, stream: u32, groups: &[&[&[u8]]]) -> Option<bool> {
+        let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .cloned()
+        else {
+            return Some(false);
+        };
+        let total: u64 = groups
+            .iter()
+            .filter(|group| group.len() <= 4)
+            .map(|group| group.iter().map(|part| part.len() as u64).sum::<u64>())
+            .sum();
+        if total == 0 {
+            return Some(true);
+        }
+        let Ok(mut write) = self.write.try_lock() else {
+            return None;
+        };
+        let (Ok(mut conn), Ok(mut window)) =
+            (self.send_conn.try_lock(), state.send_window.try_lock())
+        else {
+            return None;
+        };
+        if *conn < total || *window < total {
+            return None;
+        }
+        *conn -= total;
+        *window -= total;
+        let max = *self
+            .max_frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut batch = DataBatch::new();
+        for group in groups {
+            let mut need: usize = group.iter().map(|part| part.len()).sum();
+            if need == 0 || group.len() > 4 {
+                continue;
+            }
+            let mut index = 0;
+            let mut offset = 0;
+            while need > 0 {
+                let chunk = need.min(max);
+                if batch.full() && !batch.flush_locked(self, &mut **write) {
+                    return Some(false);
+                }
+                let mut parts: [&[u8]; 4] = [&[]; 4];
+                let mut used = 0;
+                let mut left = chunk;
+                while left > 0 && index < group.len() {
+                    let part = &group[index][offset..];
+                    if part.len() <= left {
+                        parts[used] = part;
+                        used += 1;
+                        left -= part.len();
+                        index += 1;
+                        offset = 0;
+                    } else {
+                        parts[used] = &part[..left];
+                        used += 1;
+                        offset += left;
+                        left = 0;
+                    }
+                }
+                batch.add_parts(stream, &parts[..used]);
+                need -= chunk;
+            }
+        }
+        Some(batch.flush_locked(self, &mut **write))
+    }
+
+    /// Drains a writer that kept a paced tail for a peer that had not read: the lane settles it,
+    /// so an `END_STREAM` behind that tail is not left waiting for a write nobody offers.
+    fn settle(&self) -> crate::proxy::Settle {
+        let Ok(mut write) = self.write.lock() else {
+            return crate::proxy::Settle::Lost;
+        };
+        write.settle()
+    }
+
+    fn room(&self, stream: u32) -> u64 {
+        let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .cloned()
+        else {
+            return 0;
+        };
+        let conn = *self
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let window = *state
+            .send_window
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        conn.min(window)
+    }
+
+    /// The caller already knows its batch does not fit, so any wait here is the poll it would pay
+    /// anyway; holding the connection window across it is what keeps the grant and the wake atomic.
+    fn wait_room(&self, stream: u32, turn: std::time::Duration) {
+        if !self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&stream)
+        {
+            return;
+        }
+        let conn = self
+            .send_conn
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let _ = self.wake.wait_timeout(conn, turn);
     }
 
     /// Take what the two windows allow, waiting only after the frames already reserved have reached the peer.
@@ -598,16 +834,39 @@ impl H2Conn {
     }
 
     fn end_stream(&self, stream: u32) {
-        let responded = self
+        let (responded, ended) = {
+            let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(state) = streams.get(&stream) else {
+                drop(streams);
+                self.reset_stream(stream);
+                return;
+            };
+            let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+            st.finished = true;
+            (state.responded.load(Ordering::SeqCst), st.ended)
+        };
+        if responded {
+            let _ = self.frame(T_DATA, F_END, stream, &[]);
+            if ended {
+                self.retire(stream);
+            }
+        } else {
+            self.reset_stream(stream);
+        }
+    }
+
+    /// Both halves have ended, so the table frees the id: keeping it would refuse every call past
+    /// `MAX_STREAMS` on a connection that is otherwise healthy.
+    fn retire(&self, stream: u32) {
+        let removed = self
             .streams
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .get(&stream)
-            .is_some_and(|s| s.responded.load(Ordering::SeqCst));
-        if responded {
-            let _ = self.frame(T_DATA, F_END, stream, &[]);
-        } else {
-            self.reset_stream(stream);
+            .remove(&stream)
+            .is_some();
+        if removed {
+            self.forget_upload(stream);
+            self.end_session_of(stream);
         }
     }
 
@@ -931,6 +1190,7 @@ pub(crate) fn connect_split<
         state: Mutex::new(StreamState {
             body: VecDeque::new(),
             ended: false,
+            finished: false,
             dead: false,
         }),
         cv: Condvar::new(),
@@ -1008,6 +1268,145 @@ pub(crate) fn connect_split<
         },
         writer,
     ))
+}
+
+/// What a connection does with a request stream: xHTTP synthesises its H1 head and reuses the H1
+/// dispatch, gRPC opens the message reader and writer over the same demux.
+pub(crate) trait H2Service: Send + Sync {
+    fn open(&self, conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool);
+}
+
+impl H2Conn {
+    pub(crate) fn decode_block(&self, block: &[u8], mut field: impl FnMut(&[u8], &[u8])) -> bool {
+        self.decoder
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .decode(block, &mut field)
+            .is_some()
+    }
+
+    pub(crate) fn open(
+        self: &Arc<Self>,
+        sid: u32,
+        end_stream: bool,
+    ) -> Option<(H2StreamReader, H2StreamWriter, H2StreamOut)> {
+        if self.goaway.load(Ordering::SeqCst) {
+            self.reset_stream(sid);
+            return None;
+        }
+        let initial = *self
+            .peer_initial
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: end_stream,
+                finished: false,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(initial),
+            responded: AtomicBool::new(false),
+        });
+        {
+            let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+            if streams.len() >= MAX_STREAMS as usize || streams.contains_key(&sid) {
+                drop(streams);
+                self.reset_stream(sid);
+                return None;
+            }
+            streams.insert(sid, Arc::clone(&state));
+        }
+        Some((
+            H2StreamReader {
+                conn: Arc::clone(self),
+                stream: Arc::clone(&state),
+                id: sid,
+                at: 0,
+                idle_since: None,
+            },
+            H2StreamWriter {
+                conn: Arc::clone(self),
+                stream: sid,
+                head: Vec::new(),
+                headed: false,
+            },
+            H2StreamOut {
+                conn: Arc::clone(self),
+                stream: sid,
+                owner: None,
+            },
+        ))
+    }
+
+    pub(crate) fn respond(&self, sid: u32, fields: &[(&str, &str)]) -> bool {
+        let block = block_encode(fields);
+        let max = *self
+            .max_frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let mut at = 0;
+        loop {
+            let end = (at + max).min(block.len());
+            let flags = if end == block.len() { F_END_HEADERS } else { 0 };
+            let kind = if at == 0 { T_HEADERS } else { T_CONT };
+            if !self.frame(kind, flags, sid, &block[at..end]) {
+                return false;
+            }
+            at = end;
+            if at >= block.len() {
+                break;
+            }
+        }
+        if let Some(state) = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&sid)
+        {
+            state.responded.store(true, Ordering::SeqCst);
+        }
+        true
+    }
+
+    pub(crate) fn max_frame_now(&self) -> usize {
+        *self
+            .max_frame
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn peer_window(&self) -> u64 {
+        *self
+            .peer_initial
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    pub(crate) fn reset(&self, sid: u32) {
+        self.reset_stream(sid);
+    }
+}
+
+struct XhttpService {
+    settings: XhttpSettings,
+    users: VlessUsers,
+    freedom: bool,
+}
+
+impl H2Service for XhttpService {
+    fn open(&self, conn: &Arc<H2Conn>, sid: u32, block: &[u8], end_stream: bool) {
+        open_stream(
+            conn,
+            &self.settings,
+            &self.users,
+            self.freedom,
+            sid,
+            block,
+            end_stream,
+        );
+    }
 }
 
 fn synth_head(method: &[u8], target: &[u8], lines: &[u8], end_stream: bool) -> Vec<u8> {
@@ -1104,6 +1503,7 @@ fn open_stream(
         state: Mutex::new(StreamState {
             body: VecDeque::new(),
             ended: end_stream,
+            finished: false,
             dead: false,
         }),
         cv: Condvar::new(),
@@ -1159,14 +1559,82 @@ fn open_stream(
 }
 
 pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + Send + 'static>(
-    mut read: R,
+    read: R,
     write: W,
     settings: &XhttpSettings,
     users: &[VlessUser],
     freedom: bool,
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
 ) {
-    let users: VlessUsers = Arc::from(users);
+    let service = XhttpService {
+        settings: settings.clone(),
+        users: Arc::from(users),
+        freedom,
+    };
+    serve_h2_service(read, write, &service, decryption);
+}
+
+pub(crate) fn serve_h2_service<
+    R: Read + Send + 'static,
+    W: crate::proxy::FrameWrite + Send + 'static,
+    S: H2Service,
+>(
+    read: R,
+    write: W,
+    service: &S,
+    decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+) {
+    serve_h2_service_until(read, write, service, decryption, None);
+}
+
+/// A reader whose silence before the first request is decoded ends at `until` rather than parking
+/// the accept thread: a timeout is retried here, so the outer `read_exact` sees only data or a hard
+/// end, and once the first stream's opening request is decoded the clock is put away.
+struct Bounded<R> {
+    inner: R,
+    until: Option<(std::time::Instant, Arc<std::sync::atomic::AtomicBool>)>,
+}
+
+impl<R: Read> Read for Bounded<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            let Some((until, opened)) = &self.until else {
+                return self.inner.read(buf);
+            };
+            if opened.load(Ordering::Relaxed) {
+                self.until = None;
+                return self.inner.read(buf);
+            }
+            let now = std::time::Instant::now();
+            if now >= *until {
+                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+            }
+            match self.inner.read(buf) {
+                Err(error) if crate::proxy::is_timeout(&error) => {
+                    std::thread::sleep(
+                        until
+                            .saturating_duration_since(now)
+                            .min(crate::budgets::RELAY_POLL),
+                    );
+                }
+                other => return other,
+            }
+        }
+    }
+}
+
+pub(crate) fn serve_h2_service_until<
+    R: Read + Send + 'static,
+    W: crate::proxy::FrameWrite + Send + 'static,
+    S: H2Service,
+>(
+    read: R,
+    write: W,
+    service: &S,
+    decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+    until: Option<(std::time::Instant, Arc<std::sync::atomic::AtomicBool>)>,
+) {
+    let mut read = Bounded { inner: read, until };
     let mut magic = [0u8; 24];
     if crate::proxy::read_exact(&mut read, &mut magic).is_err() || magic != *MAGIC {
         return;
@@ -1196,7 +1664,7 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
         return;
     }
     conn.frame(T_WINDOW, 0, 0, &CONN_WINDOW_TOP_UP.to_be_bytes());
-    let mut frag: Option<(u32, Vec<u8>)> = None;
+    let mut frag: Option<(u32, Vec<u8>, bool)> = None;
     while let Some((len, kind, flags, sid)) = read_head(&mut read) {
         if len > MAX_RECV_FRAME {
             // A frame past the default SETTINGS_MAX_FRAME_SIZE is a connection error (RFC 7540 6.9.1): refuse it before reserving its length or blocking on a body that may never arrive.
@@ -1207,9 +1675,7 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
         if crate::proxy::read_exact(&mut read, &mut body).is_err() {
             break;
         }
-        if !pump_frame(
-            &conn, settings, &users, freedom, kind, flags, sid, body, &mut frag,
-        ) {
+        if !pump_frame(&conn, service, kind, flags, sid, body, &mut frag) {
             break;
         }
     }
@@ -1322,14 +1788,12 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
 )]
 fn pump_frame(
     conn: &Arc<H2Conn>,
-    settings: &XhttpSettings,
-    users: &VlessUsers,
-    freedom: bool,
+    service: &dyn H2Service,
     kind: u8,
     flags: u8,
     sid: u32,
-    body: Vec<u8>,
-    frag: &mut Option<(u32, Vec<u8>)>,
+    mut body: Vec<u8>,
+    frag: &mut Option<(u32, Vec<u8>, bool)>,
 ) -> bool {
     if let Some(alive) = control_frame(conn, kind, flags, sid, &body) {
         return alive;
@@ -1370,16 +1834,16 @@ fn pump_frame(
                 {
                     return true;
                 }
-                open_stream(conn, settings, users, freedom, sid, &block, end_stream);
+                service.open(conn, sid, &block, end_stream);
             } else {
-                *frag = Some((sid, block));
+                *frag = Some((sid, block, end_stream));
             }
             true
         }
         T_CONT => {
-            if let Some((pending, mut gathered)) = frag.take() {
+            if let Some((pending, mut gathered, end_stream)) = frag.take() {
                 if pending != sid {
-                    *frag = Some((pending, gathered));
+                    *frag = Some((pending, gathered, end_stream));
                     return true;
                 }
                 // A header block reassembled past the implementation limit is a connection error (RFC 7540 4.3): refuse before growing it, so endless CONTINUATION frames cannot accumulate without bound.
@@ -1389,14 +1853,47 @@ fn pump_frame(
                 }
                 gathered.extend_from_slice(&body);
                 if flags & F_END_HEADERS != 0 {
-                    open_stream(conn, settings, users, freedom, sid, &gathered, false);
+                    service.open(conn, sid, &gathered, end_stream);
                 } else {
-                    *frag = Some((sid, gathered));
+                    *frag = Some((sid, gathered, end_stream));
                 }
             }
             true
         }
-        T_DATA => queue_data(conn, flags, sid, body),
+        T_DATA => {
+            // The credit is the frame's wire length, taken before the in-place cut that makes the frame's own buffer the queued chunk: flow control counts the whole DATA payload, the Pad Length octet and the Padding included (RFC 7540 6.9), as the reference's take of `f.Length` does.
+            let wire_len = body.len();
+            if flags & F_PADDED != 0 {
+                let Some(&pad) = body.first() else {
+                    return true;
+                };
+                cut_padded_data(&mut body, pad as usize);
+            }
+            let streams = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(state) = streams.get(&sid).cloned() else {
+                drop(streams);
+                conn.replenish(sid, wire_len);
+                return true;
+            };
+            drop(streams);
+            let finished = {
+                let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+                let finished = st.finished;
+                if !st.dead {
+                    st.body.push_back(body);
+                    if flags & F_END != 0 {
+                        st.ended = true;
+                    }
+                }
+                state.cv.notify_all();
+                finished && flags & F_END != 0
+            };
+            if finished {
+                conn.retire(sid);
+            }
+            conn.replenish(sid, wire_len);
+            true
+        }
         T_RST => {
             conn.reset_stream(sid);
             true
@@ -1418,6 +1915,14 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::thread;
     use std::time::Duration;
+
+    fn test_service(settings: &XhttpSettings) -> XhttpService {
+        XhttpService {
+            settings: settings.clone(),
+            users: crate::proxy::one_user([0u8; 16]),
+            freedom: true,
+        }
+    }
 
     struct H2Client {
         stream: Connection,
@@ -1769,12 +2274,13 @@ mod tests {
     fn a_received_frame_is_queued_as_the_buffer_the_loop_read_it_into() {
         let (conn, _, _) = bare_conn();
         let settings = XhttpSettings::stream_one();
-        let mut frag: Option<(u32, Vec<u8>)> = None;
+        let mut frag: Option<(u32, Vec<u8>, bool)> = None;
 
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: false,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -1789,9 +2295,7 @@ mod tests {
         let base = body.as_ptr();
         assert!(pump_frame(
             &conn,
-            &settings,
-            &crate::proxy::one_user([0u8; 16]),
-            true,
+            &test_service(&settings),
             T_DATA,
             0,
             1,
@@ -1814,9 +2318,7 @@ mod tests {
         let base = frame.as_ptr();
         assert!(pump_frame(
             &conn,
-            &settings,
-            &crate::proxy::one_user([0u8; 16]),
-            true,
+            &test_service(&settings),
             T_DATA,
             F_PADDED,
             1,
@@ -1844,9 +2346,7 @@ mod tests {
         let base = block.as_ptr();
         assert!(pump_frame(
             &conn,
-            &settings,
-            &crate::proxy::one_user([0u8; 16]),
-            true,
+            &test_service(&settings),
             T_HEADERS,
             0,
             3,
@@ -1867,6 +2367,7 @@ mod tests {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: false,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -2359,6 +2860,7 @@ mod tests {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: false,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -2472,6 +2974,102 @@ mod tests {
         (conn, written, slices)
     }
 
+    /// `END_STREAM` arrives on the `HEADERS` frame that opens a block, not on the last
+    /// `CONTINUATION` that completes it: the flag has to ride the assembly, or a header-only
+    /// request opens with a body it never has and its entry is never retired.
+    #[test]
+    fn an_end_stream_header_block_keeps_its_flag_across_a_continuation() {
+        struct Record(Arc<Mutex<Vec<(u32, bool)>>>);
+        impl H2Service for Record {
+            fn open(&self, _conn: &Arc<H2Conn>, sid: u32, _block: &[u8], end_stream: bool) {
+                self.0
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .push((sid, end_stream));
+            }
+        }
+        let (conn, _, _) = bare_conn();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let service = Record(Arc::clone(&seen));
+        let mut frag = None;
+        assert!(pump_frame(
+            &conn,
+            &service,
+            T_HEADERS,
+            F_END,
+            1,
+            b"\x88".to_vec(),
+            &mut frag
+        ));
+        assert!(pump_frame(
+            &conn,
+            &service,
+            T_CONT,
+            F_END_HEADERS,
+            1,
+            b"\x84".to_vec(),
+            &mut frag
+        ));
+        assert_eq!(
+            *seen.lock().unwrap_or_else(PoisonError::into_inner),
+            vec![(1, true)]
+        );
+    }
+
+    /// A request given up before its body ends resets the stream: the table entry and the chunks
+    /// queued on it go, and the peer is told with an `RST_STREAM` instead of a half-closed call that
+    /// would hold the entry for the connection's life.
+    #[test]
+    fn aborting_an_open_stream_resets_it_and_frees_its_entry() {
+        let (conn, written, _) = bare_conn();
+        let (reader, _writer, _out) = conn.open(3, false).expect("opens");
+        assert!(conn
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&3));
+        reader.abort();
+        assert!(!conn
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(&3));
+        let bytes = written.lock().unwrap_or_else(PoisonError::into_inner);
+        assert_eq!(
+            bytes[3], T_RST,
+            "the peer is not told the stream is refused"
+        );
+        assert_eq!(
+            u32::from_be_bytes(bytes[5..9].try_into().unwrap()),
+            3,
+            "the reset names another stream"
+        );
+    }
+
+    /// A finished call gives its id back: two hundred sequential calls on one connection must not
+    /// hit the table's cap, which is what a completed stream left behind would do.
+    #[test]
+    fn a_completed_stream_frees_its_id() {
+        let (conn, _, _) = bare_conn();
+        for round in 0..2u32 {
+            for sid in 1..=MAX_STREAMS {
+                let sid = sid + round * MAX_STREAMS;
+                let Some((_reader, _writer, out)) = conn.open(sid, true) else {
+                    panic!("stream {sid} was refused after {} completed", sid - 1);
+                };
+                assert!(conn.respond(sid, &[(":status", "200")]));
+                out.end();
+            }
+        }
+        assert!(
+            conn.streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .is_empty(),
+            "every completed stream left the table"
+        );
+    }
+
     /// One credit is both `WINDOW_UPDATE`s: the pair differs only by stream id, so it goes out as one 26-byte write under one lock, where two `frame()` calls were two locks and two records on the wire for the same bytes.
     #[test]
     fn a_credit_grants_both_windows_in_one_write() {
@@ -2517,6 +3115,7 @@ mod tests {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: false,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -2676,6 +3275,7 @@ mod tests {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: false,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -2716,6 +3316,7 @@ mod tests {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: true,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -2774,6 +3375,7 @@ mod tests {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: false,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -2891,11 +3493,12 @@ mod tests {
     fn a_padded_data_credit_counts_the_whole_wire_payload() {
         let (conn, written, slices) = bare_conn();
         let settings = XhttpSettings::stream_one();
-        let mut frag: Option<(u32, Vec<u8>)> = None;
+        let mut frag: Option<(u32, Vec<u8>, bool)> = None;
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
                 ended: false,
+                finished: false,
                 dead: false,
             }),
             cv: Condvar::new(),
@@ -2910,9 +3513,7 @@ mod tests {
         // A live stream: pad byte 2, payload 6, pad tail 2 — nine octets on the wire, six into the queue.
         assert!(pump_frame(
             &conn,
-            &settings,
-            &crate::proxy::one_user([0u8; 16]),
-            true,
+            &test_service(&settings),
             T_DATA,
             F_PADDED,
             1,
@@ -2937,9 +3538,7 @@ mod tests {
         slices.store(0, Ordering::SeqCst);
         assert!(pump_frame(
             &conn,
-            &settings,
-            &crate::proxy::one_user([0u8; 16]),
-            true,
+            &test_service(&settings),
             T_DATA,
             F_PADDED,
             1,
@@ -2956,9 +3555,7 @@ mod tests {
         slices.store(0, Ordering::SeqCst);
         assert!(pump_frame(
             &conn,
-            &settings,
-            &crate::proxy::one_user([0u8; 16]),
-            true,
+            &test_service(&settings),
             T_DATA,
             F_PADDED,
             9,
@@ -2975,9 +3572,7 @@ mod tests {
         slices.store(0, Ordering::SeqCst);
         assert!(pump_frame(
             &conn,
-            &settings,
-            &crate::proxy::one_user([0u8; 16]),
-            true,
+            &test_service(&settings),
             T_DATA,
             0,
             1,
