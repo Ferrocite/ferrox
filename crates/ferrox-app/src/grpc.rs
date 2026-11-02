@@ -1592,7 +1592,7 @@ fn message_payload(max_frame: usize) -> usize {
 
 /// The number of bytes a protobuf varint takes for `value`: seven bits per byte, never fewer than one.
 fn varint_len(value: u64) -> usize {
-    ((64 - value.leading_zeros() as usize + 6) / 7).max(1)
+    (64 - value.leading_zeros() as usize).div_ceil(7).max(1)
 }
 
 /// Writes the envelope and `Hunk` tag for `data_len` into `out`, returning the prefix length.
