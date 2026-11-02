@@ -106,8 +106,11 @@ fn through_tunnel<T: Read + Write>(tunnel: &mut T, host: &str, path: &str) -> Op
     tunnel.flush().ok()?;
     let mut head = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
+    let mut scanned = 0usize;
     let deadline = Instant::now() + READ;
-    while !head.windows(4).any(|pair| pair == b"\r\n\r\n") && Instant::now() < deadline {
+    while ferrox_core::foxy::head_end_grown(&head, &mut scanned).is_none()
+        && Instant::now() < deadline
+    {
         match tunnel.read(&mut chunk) {
             Ok(0) | Err(_) => break,
             Ok(read) => head.extend_from_slice(&chunk[..read]),

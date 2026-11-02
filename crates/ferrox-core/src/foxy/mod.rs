@@ -118,6 +118,14 @@ pub fn head_end(head: &[u8]) -> Option<usize> {
     }
 }
 
+/// Where a head that keeps arriving ends, for a reader that has already walked `scanned` octets of `bytes`: a terminator straddles the seam by at most three octets, so only those and what follows are weighed, and the call records the new length for the next ask. Ask again only after `None`: the first `Some` is the offset `head_end` gives on the buffer as it stood then, and a later ask resumes past it into the body.
+#[must_use]
+pub fn head_end_grown(bytes: &[u8], scanned: &mut usize) -> Option<usize> {
+    let from = bytes.len().min(*scanned).saturating_sub(3);
+    *scanned = bytes.len();
+    head_end(&bytes[from..]).map(|at| from + at)
+}
+
 /// The starts one window proves: bit `j` is `\r` at `j`, `\n` at `j+1`, `\r` at `j+2`, `\n` at `j+3`. The pair mask is the window's answer to "is a two-octet word here", and a terminator is that word at `j` and again at `j+2`, so the four-octet weigh is one shift and one and. The window's last three starts are never claimed: the shift that pairs a `\n` with the `\r` before it brings a zero in at the top, and the fourth octet of those starts is the first octet the window does not hold.
 #[cfg(any(target_arch = "x86_64", test))]
 #[inline]
@@ -1450,6 +1458,99 @@ mod tests {
                     .chain(len.saturating_sub(9)..len),
             );
         }
+    }
+
+    /// `head_end_grown` resumes the tree's one scan across a seam instead of walking the buffer again: at every pair of arrival points it answers what the whole-buffer walk answers, or the same `None`, and a terminator finishing in the three octets after a cut is still found.
+    #[test]
+    fn the_resumed_scan_answers_the_whole_buffer_walk_at_every_seam() {
+        let cases: [&[u8]; 4] = [
+            b"\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\nbody",
+            b"HTTP/1.1 200 OK\r\nX-Fill: 012345678901234567890123456789\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX: y\r\n",
+        ];
+        for case in cases {
+            let want = head_end(case);
+            for first in 0..=case.len() {
+                for second in first..=case.len() {
+                    let mut scanned = 0;
+                    let mut got = head_end_grown(&case[..first], &mut scanned);
+                    if got.is_none() {
+                        got = head_end_grown(&case[..second], &mut scanned);
+                    }
+                    if got.is_none() {
+                        got = head_end_grown(case, &mut scanned);
+                    }
+                    assert_eq!(got, want, "{first} {second} {case:?}");
+                }
+            }
+        }
+        // The seam is three octets wide: a terminator finishing one octet past each cut is found.
+        let head = b"HTTP/1.1 200 OK\r\nA: b\r\n\r\n";
+        let at = head_end(head).expect("a terminator");
+        for cut in at..=at + 3 {
+            let mut scanned = 0;
+            assert_eq!(head_end_grown(&head[..cut], &mut scanned), None);
+            assert_eq!(head_end_grown(head, &mut scanned), Some(at));
+        }
+    }
+
+    /// A head the size of a served request, arriving in sixty-four-octet pieces.
+    fn a_long_head() -> Vec<u8> {
+        let mut head = b"HTTP/1.1 200 Connection established\r\n".to_vec();
+        while head.len() + 4 < 4096 {
+            head.extend_from_slice(b"X-Fill: 0123456789abcdef0123456789abcdef\r\n");
+        }
+        head.extend_from_slice(b"\r\n");
+        head
+    }
+
+    /// The growing scan: a 4 KiB head arriving sixty-four octets at a time is weighed once at each seam and stops at the first `Some`, the shape every caller uses, and the same sixty-five asks fold to the whole-buffer answer.
+    #[test]
+    fn a_growing_head_is_walked_once() {
+        let head = a_long_head();
+        let mut scanned = 0;
+        let mut fold: u32 = 0;
+        let mut end = 0;
+        loop {
+            end = (end + 64).min(head.len());
+            let got = head_end_grown(std::hint::black_box(&head[..end]), &mut scanned);
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(end as u32)
+                .wrapping_add(got.map_or(0, |at| at as u32 + 1));
+            if got.is_some() || end == head.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            fold, 0x6e10_181f,
+            "one head in sixty-five pieces, folded after each ask"
+        );
+        assert_eq!(scanned, head.len());
+    }
+
+    /// The rewalk the growing scan replaced, kept as this run's other frame: the same sixty-five asks each weigh the whole prefix through `head_end`, the same pinned fold, so the pair prices the resume without a second CI run being trusted to agree with the first.
+    #[test]
+    fn a_growing_head_rewalked_costs_the_old_pass() {
+        let head = a_long_head();
+        let mut fold: u32 = 0;
+        let mut end = 0;
+        loop {
+            end = (end + 64).min(head.len());
+            let got = head_end(std::hint::black_box(&head[..end]));
+            fold = fold
+                .wrapping_mul(31)
+                .wrapping_add(end as u32)
+                .wrapping_add(got.map_or(0, |at| at as u32 + 1));
+            if got.is_some() || end == head.len() {
+                break;
+            }
+        }
+        assert_eq!(
+            fold, 0x6e10_181f,
+            "the same sixty-five asks, each over the whole prefix"
+        );
     }
 
     /// The mask equation a window runs is the four-byte weigh: bit `j` of the answer is set exactly

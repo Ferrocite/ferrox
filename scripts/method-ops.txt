@@ -102,6 +102,13 @@ carrier-foxy  foxy::hpack::tests::the_huffman_probe_costs_the_decode_and_nothing
 carrier-foxy  foxy::tests::the_head_walk_costs_the_scan_and_nothing_else  ferrox_core::foxy::head_end
 carrier-foxy  foxy::tests::the_head_walk_costs_the_scan_and_nothing_else  ferrox_core::foxy::tests::the_head_walk_costs_the_scan_and_nothing_else
 carrier-foxy  foxy::tests::the_serial_terminator_walk_costs_the_same_answer  ferrox_core::foxy::tests::the_serial_terminator_walk_costs_the_same_answer
+# The growing scan and the whole-prefix rewalk it replaced, both over the same
+# head in eleven pieces: one ops job reports both frames, and only their
+# difference is a claim about the resume.
+carrier-foxy  foxy::tests::a_growing_head_is_walked_once  ferrox_core::foxy::head_end
+carrier-foxy  foxy::tests::a_growing_head_is_walked_once  ferrox_core::foxy::tests::a_growing_head_is_walked_once
+carrier-foxy  foxy::tests::a_growing_head_rewalked_costs_the_old_pass  ferrox_core::foxy::tests::a_growing_head_rewalked_costs_the_old_pass
+carrier-foxy  foxy::tests::a_growing_head_rewalked_costs_the_old_pass  ferrox_core::foxy::head_end
 carrier-foxy  foxy::connectip::tests::the_word_sum_costs_the_words_it_reads  ferrox_core::foxy::connectip::word_sum
 carrier-foxy  foxy::connectip::tests::the_word_sum_costs_the_words_it_reads  ferrox_core::foxy::connectip::tests::the_word_sum_costs_the_words_it_reads
 carrier-foxy  foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer  ferrox_core::foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer

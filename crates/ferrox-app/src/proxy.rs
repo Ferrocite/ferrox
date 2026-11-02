@@ -20151,6 +20151,13 @@ fn exit_agrees(pin: &str, seen: &str) -> bool {
         || seen == pin.to_ascii_uppercase()
 }
 
+/// Whether the trace grew a blank line, walking the octets since the last ask rather than the whole buffer.
+fn grew_blank_line(head: &[u8], scanned: &mut usize) -> bool {
+    let from = head.len().min(*scanned).saturating_sub(1);
+    *scanned = head.len();
+    head[from..].windows(2).any(|pair| pair == b"\n\n")
+}
+
 /// Asks a tunnel where it really exits: one plaintext trace GET, then the `loc` off the reply. `None` when no probe is configured or the trace did not answer — the caller reads that as "no verdict," never as agreement.
 fn foxy_exit_country<T: Read + Write>(tunnel: &mut T, foxy: &FoxyOut) -> Option<String> {
     let probe = foxy.exit_probe.as_deref()?;
@@ -20161,10 +20168,16 @@ fn foxy_exit_country<T: Read + Write>(tunnel: &mut T, foxy: &FoxyOut) -> Option<
     }
     let mut head = Vec::with_capacity(1024);
     let mut chunk = [0u8; 512];
-    while !head.windows(2).any(|pair| pair == b"\n\n") && head.len() < 4096 {
+    let mut scanned = 0usize;
+    loop {
         match tunnel.read(&mut chunk) {
             Ok(0) | Err(_) => break,
-            Ok(read) => head.extend_from_slice(&chunk[..read]),
+            Ok(read) => {
+                head.extend_from_slice(&chunk[..read]);
+                if grew_blank_line(&head, &mut scanned) || head.len() >= 4096 {
+                    break;
+                }
+            }
         }
     }
     crate::foxy::exit_country(&head)

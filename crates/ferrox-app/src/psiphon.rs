@@ -940,26 +940,24 @@ fn serve_http(mut client: TcpStream, inner: &Arc<Inner>) {
     let _ = client.set_write_timeout(Some(Duration::from_secs(30)));
     let mut head = [0u8; MAX_REQUEST];
     let mut filled = 0;
-    while filled < head.len() {
+    let mut scanned = 0;
+    let end = loop {
+        if filled == head.len() {
+            break None;
+        }
         match client.read(&mut head[filled..]) {
             Ok(0) => return,
             Ok(read) => {
                 filled += read;
-                if head[..filled]
-                    .windows(4)
-                    .any(|window| window == b"\r\n\r\n")
-                {
-                    break;
+                if let Some(at) = ferrox_core::foxy::head_end_grown(&head[..filled], &mut scanned) {
+                    break Some(at);
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(_) => return,
         }
-    }
-    let Some(end) = head[..filled]
-        .windows(4)
-        .position(|window| window == b"\r\n\r\n")
-    else {
+    };
+    let Some(end) = end else {
         let _ = client.write_all(b"HTTP/1.1 431 Request Header Fields Too Large\r\n\r\n");
         return;
     };

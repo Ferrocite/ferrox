@@ -885,7 +885,8 @@ mod tests {
             let (mut stream, _) = listener.accept().expect("accepts");
             let mut head = Vec::new();
             let mut buf = [0u8; 256];
-            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut scanned = 0usize;
+            while ferrox_core::foxy::head_end_grown(&head, &mut scanned).is_none() {
                 let read = stream.read(&mut buf).expect("reads");
                 if read == 0 {
                     break;
@@ -935,7 +936,8 @@ mod tests {
             };
             let mut head = Vec::new();
             let mut buf = [0u8; 256];
-            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut scanned = 0usize;
+            while ferrox_core::foxy::head_end_grown(&head, &mut scanned).is_none() {
                 let read = stream.read(&mut buf).expect("reads");
                 if read == 0 {
                     break;
@@ -1063,7 +1065,8 @@ mod tests {
             let (mut stream, _) = listener.accept().expect("accepts");
             let mut head = Vec::new();
             let mut buf = [0u8; 256];
-            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+            let mut scanned = 0usize;
+            while ferrox_core::foxy::head_end_grown(&head, &mut scanned).is_none() {
                 let read = stream.read(&mut buf).expect("reads");
                 if read == 0 {
                     break;
