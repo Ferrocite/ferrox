@@ -428,6 +428,7 @@ impl<R: Read> Reader<R> {
 pub(crate) struct XhttpWriter {
     shared: Arc<Shared>,
     h2: OnceLock<crate::xhttp_h2::H2StreamOut>,
+    lease: Option<Arc<crate::xmux::Lease>>,
 }
 
 /// A carrier byte stream the packet frame also reads, so a POST's answer is consumed before the next shares the connection.
@@ -745,6 +746,7 @@ impl XhttpWriter {
                 finished: AtomicBool::new(false),
             }),
             h2: OnceLock::new(),
+            lease: None,
         }
     }
     fn packets<W: crate::proxy::FrameWrite + Read + Send + 'static>(
@@ -778,7 +780,11 @@ impl XhttpWriter {
                 finished: AtomicBool::new(false),
             }),
             h2: OnceLock::new(),
+            lease: None,
         }
+    }
+    pub(crate) fn hold(&mut self, lease: Arc<crate::xmux::Lease>) {
+        self.lease = Some(lease);
     }
     pub(crate) fn set_h2(&self, out: crate::xhttp_h2::H2StreamOut) {
         let _ = self.h2.set(out);
@@ -874,6 +880,7 @@ fn split_halves<R: Read, W: crate::proxy::FrameWrite + 'static>(
             finished: AtomicBool::new(false),
         }),
         h2: OnceLock::new(),
+        lease: None,
     };
     (reader, writer)
 }
@@ -959,8 +966,8 @@ pub(crate) enum PadMethod {
     Tokenish,
 }
 
-/// The `xmux` bounds a `stream-up` session is dialled out of (`transport_method.go:299`): the reference
-/// grows a connection pool from them, and this tree reads and checks them but keeps no pool.
+/// The `xmux` bounds (`transport_method.go:299`): the reference grows an H2 connection pool from them,
+/// and `xmux::Manager` steers the REALITY stream-one pool by the same six fields.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) struct Xmux {
     pub max_concurrency: (i32, i32),
