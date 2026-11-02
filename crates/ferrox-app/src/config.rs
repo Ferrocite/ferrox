@@ -613,20 +613,34 @@ pub(crate) fn reality_mldsa(node: &Json, server: bool) -> Result<bool, String> {
     } else {
         ("mldsa65Verify", 1952)
     };
-    let Some(text) = reality
-        .get(field)
-        .and_then(Json::as_str)
-        .filter(|text| !text.is_empty())
-    else {
-        return Ok(false);
+    let text = match reality.get(field) {
+        None => return Ok(false),
+        Some(Json::Str(text)) if !text.is_empty() => text,
+        Some(Json::Str(_)) => return Ok(false),
+        Some(_) => return Err(format!(r#""{field}" is not a string"#)),
     };
-    if server && reality.get("privateKey").and_then(Json::as_str) == Some(text) {
-        return Err(format!(
-            r#""mldsa65Seed" and "privateKey" can not be the same value: {text}"#
-        ));
+    if server {
+        if let Some(private) = reality.get("privateKey").and_then(Json::as_str) {
+            let decode = |value: &str| {
+                let unwrapped: String = value
+                    .chars()
+                    .filter(|ch| !matches!(*ch, '\r' | '\n'))
+                    .collect();
+                key32(&unwrapped)
+            };
+            if let Some(private) = decode(private) {
+                if Some(private) == decode(text) {
+                    return Err(
+                        r#""mldsa65Seed" and "privateKey" can not be the same value"#.to_owned(),
+                    );
+                }
+            }
+        }
     }
     if b64url_len(text) != Some(length) {
-        return Err(format!(r#"invalid "{field}": {text}"#));
+        return Err(format!(
+            r#"invalid "{field}": it does not decode to {length} bytes"#
+        ));
     }
     eprintln!(
         r#"reality: "{field}" is checked, and the ML-DSA-65 binding it names is not carried"#

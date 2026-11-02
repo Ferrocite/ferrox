@@ -1362,7 +1362,7 @@ impl RealityFields {
             ));
         }
         if self.client {
-            const SERVER: [&str; 10] = [
+            const SERVER: [&str; 11] = [
                 "dest",
                 "xver",
                 "serverNames",
@@ -1373,6 +1373,7 @@ impl RealityFields {
                 "limitFallbackUpload",
                 "limitFallbackDownload",
                 "privateKey",
+                "mldsa65Seed",
             ];
             // A client's `show` is the reference's one handshake-debug print, which this tree's dial trace already names; the pair goes nowhere.
             pairs.retain(|(name, _)| *name != "show");
