@@ -2758,6 +2758,89 @@ mod tests {
         }
     }
 
+    /// A writer that cannot carry a byte: the control worker's first batch fails.
+    struct Broken;
+
+    impl Write for Broken {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl crate::proxy::FrameWrite for Broken {
+        fn write_slices(&mut self, _parts: &[&[u8]]) -> bool {
+            false
+        }
+    }
+
+    /// A peer that answers every inbound frame with a control frame and stops reading parks one
+    /// queue element per frame in the process; the backlog is capped and the connection ends, so
+    /// the memory a peer can hold is a constant rather than the length of its stream.
+    #[test]
+    fn a_control_flood_ends_the_connection_at_the_cap() {
+        const CAP: usize = 1024;
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let entered = Arc::new((Mutex::new(false), Condvar::new()));
+        let release = Arc::new((Mutex::new(false), Condvar::new()));
+        let conn = conn_with(
+            Box::new(Blocked {
+                written,
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+                first: AtomicBool::new(false),
+            }),
+            true,
+        );
+        conn.replenish(1, 16);
+        let mut in_write = entered.0.lock().unwrap_or_else(PoisonError::into_inner);
+        while !*in_write {
+            in_write = entered
+                .1
+                .wait(in_write)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        drop(in_write);
+        let mut queued = 0;
+        while !conn.dead.load(Ordering::SeqCst) && queued <= CAP + CONTROL_BATCH + 2 {
+            conn.replenish(2, 16);
+            queued += 1;
+        }
+        assert!(
+            conn.dead.load(Ordering::SeqCst),
+            "a flooded control queue ended the connection instead of growing without a bound; {queued} frames were attempted"
+        );
+        assert!(
+            queued >= CAP,
+            "the queue admitted its cap before refusing: {queued}"
+        );
+        assert!(
+            queued <= CAP + CONTROL_BATCH + 2,
+            "the queue refuses within one batch of its cap: {queued}"
+        );
+        *release.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        release.1.notify_all();
+    }
+
+    /// A worker whose own write fails ends the connection with it: before the change it exited
+    /// alone and `replenish` kept queueing frames nobody would drain.
+    #[test]
+    fn a_failed_control_write_ends_the_connection() {
+        let conn = conn_with(Box::new(Broken), true);
+        conn.replenish(1, 16);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while !conn.dead.load(Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a failed control write marks the connection dead"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// A connection with one stream and all the credit it needs: the frame writer is the only
     /// observer of how many calls a downlink window costs.
     fn streaming_conn(total: usize) -> (Arc<H2Conn>, Arc<Mutex<Vec<u8>>>, Arc<AtomicUsize>) {
