@@ -356,7 +356,7 @@ fn accept_on(
         (list[0].clone(), 0)
     } else {
         if method.is_chacha() {
-            return Err(Kind::Local);
+            return None;
         }
         let mut salt_probe = vec![0u8; method.key_len()];
         read_exact(reader, &mut salt_probe).ok()?;
@@ -625,7 +625,7 @@ pub(crate) fn client_send_handshake(
     staging.extend_from_slice(&salt);
     if list.len() > 1 {
         if method.is_chacha() {
-            return None;
+            return Err(Kind::Local);
         }
         for i in 0..list.len() - 1 {
             let eih = shadowsocks2022::encrypt_eih(method, &list[i], &salt, &list[i + 1])
