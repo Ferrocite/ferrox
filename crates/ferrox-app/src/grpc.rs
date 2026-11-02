@@ -3160,6 +3160,60 @@ mod tests {
         assert_eq!(data.capacity(), capacity, "the caller's buffer grew");
     }
 
+    /// The regression witness: a multi-mode writer over the dial path leaves one message for a
+    /// 32 KiB relay read, not one `Hunk` per element. A `Hunk` can carry at most `16_375` bytes,
+    /// so two messages here mean the writer did not gather the batch; the test is red on the
+    /// one-`Hunk`-per-element writer.
+    #[test]
+    fn a_multi_mode_dial_writer_gathers_the_read_into_one_message() {
+        let settings = GrpcSettings {
+            multi_mode: true,
+            ..GrpcSettings::default()
+        };
+        let calls = Calls::default();
+        let seen = Arc::clone(&calls.0);
+        let (_, mut writer) = connect_split_with(
+            std::io::Cursor::new(Vec::new()),
+            calls,
+            "127.0.0.1",
+            &settings,
+        )
+        .expect("dials");
+        let data: Vec<u8> = (0..2 * HUNK).map(|i| (i % 251) as u8).collect();
+        writer.write_all(&data).expect("writes the read");
+        drop(writer);
+        let writes = seen.lock().expect("writes");
+        let wire: Vec<u8> = writes
+            .iter()
+            .skip(2)
+            .flat_map(|write| write.iter().copied())
+            .collect();
+        let bodies = data_bodies(&wire);
+        assert_eq!(bodies.len(), 1, "one MultiHunk message for a 32 KiB read");
+        assert!(
+            bodies[0].len() > HUNK,
+            "the message carries more than one element"
+        );
+    }
+
+    /// The DATA bodies in a concatenation of HTTP/2 frames, in order.
+    fn data_bodies(mut wire: &[u8]) -> Vec<&[u8]> {
+        let mut bodies = Vec::new();
+        while wire.len() >= 9 {
+            let len = ((wire[0] as usize) << 16) | ((wire[1] as usize) << 8) | wire[2] as usize;
+            let kind = wire[3];
+            let body = &wire[9..];
+            if body.len() < len {
+                break;
+            }
+            if kind == T_DATA {
+                bodies.push(&body[..len]);
+            }
+            wire = &body[len..];
+        }
+        bodies
+    }
+
     /// The multi-mode witness: one relay read leaves as the batch the peer's default window can
     /// pay for — two `MultiHunk` messages, four elements and the remainder, instead of five
     /// `Hunk`s — split into DATA frames at the peer's frame size, and every payload run is still
