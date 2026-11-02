@@ -4791,7 +4791,6 @@ fn serve_sealed_raw<
                     &target,
                     Vec::new(),
                     &close,
-                    End::UplinkClose,
                 );
             });
         }
@@ -4963,14 +4962,7 @@ fn serve_sealed_split_with<R, W, C>(
             };
             let close = Arc::clone(&closer);
             spawn_carried(move || {
-                serve_udp_stream(
-                    reader,
-                    writer,
-                    &target,
-                    Vec::new(),
-                    &close,
-                    End::UplinkClose,
-                );
+                serve_udp_stream(reader, writer, &target, Vec::new(), &close);
             });
         }
         3 => {
@@ -7130,14 +7122,7 @@ fn serve_vless_quic(
                 stream.close();
                 return;
             }
-            serve_udp_stream(
-                stream.clone(),
-                stream,
-                &target,
-                Vec::new(),
-                &close,
-                End::UplinkClose,
-            );
+            serve_udp_stream(stream.clone(), stream, &target, Vec::new(), &close);
         }
         3 => {
             if stream.write_all(&[0, 0]).is_err() {
@@ -7224,7 +7209,7 @@ fn serve_vless_quic_sealed(
                 inner: writer,
                 meter,
             };
-            serve_udp_stream(reader, writer, &target, Vec::new(), &close, End::ReplyIdle);
+            serve_udp_stream(reader, writer, &target, Vec::new(), &close);
         }
         3 => {
             if sealed.write_all(&[0, 0]).is_err() {
@@ -7586,7 +7571,7 @@ pub(crate) fn serve_session_xhttp_with(
         }
         echo_trace("session xhttp udp association");
         spawn_carried(move || {
-            serve_udp_stream(creader, writer, &target, Vec::new(), &close, End::ReplyIdle);
+            serve_udp_stream(creader, writer, &target, Vec::new(), &close);
         });
         return;
     }
@@ -22182,8 +22167,15 @@ fn serve_socks_udp_vless(relay: &UdpSocket, vless: &VlessOut) {
         if let Ok(mut slot) = source.lock() {
             *slot = Some(src);
         }
+        // A reader that ended carries no more replies, so its socket is discarded before this datagram rather than dropping the answer.
         let redial = match &uplink {
-            Some(up) => up.target != dest,
+            Some(up) => {
+                up.target != dest
+                    || !matches!(
+                        up.done.try_recv(),
+                        Err(std::sync::mpsc::TryRecvError::Empty)
+                    )
+            }
             None => true,
         };
         if redial {
@@ -23056,14 +23048,7 @@ fn serve_vless_udp(mut stream: Connection, target: &SocketAddr, carried: Vec<u8>
     if stream.write_all(&[0, 0]).is_err() {
         return;
     }
-    serve_udp_stream(read, stream, target, carried, &close, End::UplinkClose);
-}
-
-/// What ends a datagram association: the uplink closing, once its answers are in, or a reply socket quiet for the idle deadline, when the uplink is only the request body.
-#[derive(Clone, Copy)]
-enum End {
-    UplinkClose,
-    ReplyIdle,
+    serve_udp_stream(read, stream, target, carried, &close);
 }
 
 fn serve_udp_stream<R, W>(
@@ -23072,7 +23057,6 @@ fn serve_udp_stream<R, W>(
     target: &SocketAddr,
     carried: Vec<u8>,
     close: &Arc<dyn Fn() + Send + Sync>,
-    end: End,
 ) where
     R: Read + Send + 'static,
     W: Write + Send + 'static,
@@ -23096,11 +23080,16 @@ fn serve_udp_stream<R, W>(
     };
     let done = Arc::new(AtomicBool::new(false));
     let done_in = Arc::clone(&done);
+    // Datagrams the target still owes an answer to: the association ends when the uplink is spent and none are left.
+    let awaiting = Arc::new(AtomicUsize::new(0));
+    let awaiting_in = Arc::clone(&awaiting);
     let forward = move || {
         let mut reader = std::io::Cursor::new(carried).chain(reader);
         let mut buf = udp_buffer();
         while let Some(n) = read_udp_datagram(&mut reader, &mut buf) {
+            awaiting_in.fetch_add(1, Ordering::Relaxed);
             if udp_send.send(&buf[..n]).is_err() {
+                awaiting_in.fetch_sub(1, Ordering::Relaxed);
                 break;
             }
         }
@@ -23110,9 +23099,14 @@ fn serve_udp_stream<R, W>(
     let mut buf = udp_buffer();
     // Poll fast after traffic, so a finished association leaves at once, and back off to a second.
     let mut poll = RELAY_POLL;
+    let mut grace: Option<Instant> = None;
     loop {
         match udp.recv(&mut buf) {
             Ok(n) => {
+                grace = None;
+                let _ = awaiting.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                    Some(left.saturating_sub(1))
+                });
                 if poll != RELAY_POLL {
                     poll = RELAY_POLL;
                     if udp.set_read_timeout(Some(poll)).is_err() {
@@ -23128,18 +23122,23 @@ fn serve_udp_stream<R, W>(
             }
             Err(error) if is_timeout(&error) => {
                 if done.load(Ordering::Relaxed) {
-                    if matches!(end, End::UplinkClose) {
+                    if awaiting.load(Ordering::Relaxed) == 0 {
                         break;
                     }
-                    let idle = budgets::udp_idle();
-                    if poll < idle {
-                        poll = idle;
+                    // An answer still owed the client that left may be in flight: wait one reply-idle window for it.
+                    let deadline = *grace.get_or_insert_with(|| {
+                        Instant::now() + crate::budgets::RELAY_RESPONSE_IDLE
+                    });
+                    if Instant::now() >= deadline {
+                        break;
+                    }
+                    if poll < crate::budgets::RELAY_RESPONSE_IDLE {
+                        poll = crate::budgets::RELAY_RESPONSE_IDLE;
                         if udp.set_read_timeout(Some(poll)).is_err() {
                             break;
                         }
-                        continue;
                     }
-                    break;
+                    continue;
                 }
                 let next = poll
                     .saturating_mul(2)
@@ -42472,7 +42471,6 @@ mod tests {
                 &target,
                 Vec::new(),
                 &close,
-                End::UplinkClose,
             );
         });
         join_thread_within(
@@ -42482,6 +42480,54 @@ mod tests {
         );
         let bytes = bytes.lock().expect("sink");
         assert_eq!(&bytes[2..], b"ping", "the echo reached the writer");
+    }
+
+    /// An answer still owed when the uplink ends reaches the client: the association used to close
+    /// on the first poll after the forward leg, before a delayed target had spoken.
+    #[test]
+    fn a_delayed_answer_survives_the_uplink_closing() {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            let Ok((n, from)) = echo.recv_from(&mut buf) else {
+                return;
+            };
+            thread::sleep(Duration::from_millis(100));
+            let _ = echo.send_to(&buf[..n], from);
+        });
+        let bytes = Arc::new(Mutex::new(Vec::new()));
+        let sink_bytes = Arc::clone(&bytes);
+        let session = thread::spawn(move || {
+            struct Sink(Arc<Mutex<Vec<u8>>>);
+            impl Write for Sink {
+                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                    self.0.lock().expect("sink").extend_from_slice(buf);
+                    Ok(buf.len())
+                }
+                fn flush(&mut self) -> std::io::Result<()> {
+                    Ok(())
+                }
+            }
+            let mut wire = Vec::new();
+            wire.extend_from_slice(&4u16.to_be_bytes());
+            wire.extend_from_slice(b"ping");
+            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+            serve_udp_stream(
+                std::io::Cursor::new(wire),
+                Sink(sink_bytes),
+                &echo_addr,
+                Vec::new(),
+                &close,
+            );
+        });
+        join_thread_within(
+            session,
+            Duration::from_secs(5),
+            "the delayed UDP association",
+        );
+        let bytes = bytes.lock().expect("sink");
+        assert_eq!(&bytes[2..], b"ping", "the late echo reached the writer");
     }
 
     fn vmess_udp_over(
@@ -44599,6 +44645,81 @@ mod tests {
         client.send_to(frame, relay_addr).expect("sends");
         let mut buf = udp_buffer();
         let (n, _) = client.recv_from(&mut buf).expect("the echo returns");
+        let (_, payload) = parse_socks_udp(&buf[..n]).expect("a socks frame");
+        assert_eq!(payload, b"ping");
+        join_thread_within(serving, Duration::from_secs(5), "the SOCKS UDP front");
+        join_thread_within(answering, Duration::from_secs(5), "the answering server");
+    }
+
+    /// A response reader that dies is discarded before the next datagram: the association used to
+    /// keep writing into a socket whose answers could no longer arrive.
+    #[test]
+    fn a_dead_uplink_reader_is_redialled_before_the_next_datagram() {
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let echo = udp_echo_port();
+        let target: SocketAddr = format!("127.0.0.1:{echo}").parse().expect("addr");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let header = vless_header(&id, 2, &Destination::from(target));
+        let answering = thread::spawn(move || {
+            let (mut first, _) = listener.accept().expect("accepts");
+            first
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut request = vec![0u8; header.len()];
+            let _ = read_exact(&mut first, &mut request);
+            drop(first);
+            let (mut second, _) = listener.accept().expect("accepts");
+            second
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut request = vec![0u8; header.len()];
+            if read_exact(&mut second, &mut request).is_err() {
+                return;
+            }
+            let mut buf = udp_buffer();
+            let Some(n) = read_udp_datagram(&mut second, &mut buf) else {
+                return;
+            };
+            second.write_all(&[0, 0]).expect("the reply header");
+            assert!(write_udp_datagram(&mut second, &buf[..n]));
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        relay
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let relay_addr = relay.local_addr().expect("addr");
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: false,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let serving = thread::spawn(move || serve_socks_udp_vless(&relay, &vless));
+        let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("timeout");
+        let mut lost = Vec::new();
+        let first = socks_udp_frame(&mut lost, None, &target, b"lost");
+        client.send_to(first, relay_addr).expect("sends");
+        thread::sleep(Duration::from_millis(300));
+        let mut head = Vec::new();
+        let frame = socks_udp_frame(&mut head, None, &target, b"ping");
+        client.send_to(frame, relay_addr).expect("sends");
+        let mut buf = udp_buffer();
+        let (n, _) = client.recv_from(&mut buf).expect("the redial echoes");
         let (_, payload) = parse_socks_udp(&buf[..n]).expect("a socks frame");
         assert_eq!(payload, b"ping");
         join_thread_within(serving, Duration::from_secs(5), "the SOCKS UDP front");
