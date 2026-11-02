@@ -1234,24 +1234,20 @@ impl GrpcWriter {
         }
     }
 
-    /// Adds one `MultiHunk` message to the batch, flushing first when the batch cannot hold all its
-    /// frames; the window for the whole message is taken before its first frame, so a message is
-    /// never half-sent and retried.
     /// The largest `MultiHunk` the peer can pay for in one take: its starting stream window, and
-    /// the connection's own 65_535-byte opening window when this layer owns both.
+    /// the connection's own 65_535-byte opening window.
     fn multi_cap(&self) -> u64 {
         let cap = *self
             .shared
             .init
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if self.shared.muxed {
-            cap
-        } else {
-            cap.min(65_535)
-        }
+        cap.min(65_535)
     }
 
+    /// Adds one `MultiHunk` message to the batch, flushing first when the batch cannot hold all its
+    /// frames; the window for the whole message is taken before its first frame, so a message is
+    /// never half-sent and retried.
     fn try_multi_group<'a>(
         &self,
         payload: &'a [u8],
