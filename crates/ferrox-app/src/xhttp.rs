@@ -208,6 +208,12 @@ impl<R: Read> ChainReader<R> {
     }
 }
 
+impl<R: crate::proxy::RelayPoll> crate::proxy::RelayPoll for ChainReader<R> {
+    fn arm_relay_poll(&mut self) {
+        self.read.arm_relay_poll();
+    }
+}
+
 impl<R: Read> Read for ChainReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.at < self.prefix.len() {

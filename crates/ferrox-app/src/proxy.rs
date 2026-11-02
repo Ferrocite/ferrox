@@ -4252,6 +4252,12 @@ pub(crate) struct HandshakeRead<R> {
     step: Option<RelayStep>,
 }
 
+impl<R: RelayPoll> RelayPoll for HandshakeRead<R> {
+    fn arm_relay_poll(&mut self) {
+        self.inner.arm_relay_poll();
+    }
+}
+
 impl<R: Read> HandshakeRead<R> {
     pub(crate) fn new(inner: R, budget: Duration) -> Self {
         Self {
@@ -4415,6 +4421,22 @@ impl RelayPoll for Connection {
 
 impl RelayPoll for Box<dyn Read + Send> {
     /// Every boxed carrier here is a `TlsHalf` chain whose cipher `session_halves` armed before the split.
+    fn arm_relay_poll(&mut self) {}
+}
+
+impl<T> RelayPoll for std::io::Cursor<T> {
+    /// Memory never holds the relay quantum, so a step reads it to the end in one turn.
+    fn arm_relay_poll(&mut self) {}
+}
+
+impl<R: RelayPoll> RelayPoll for ferrox_core::vless_encryption::EncryptedReader<R> {
+    fn arm_relay_poll(&mut self) {
+        self.get_mut().arm_relay_poll();
+    }
+}
+
+impl RelayPoll for crate::quic::QuicStream {
+    /// The stream read arms its own quantum and reports the idle itself.
     fn arm_relay_poll(&mut self) {}
 }
 
@@ -4602,7 +4624,7 @@ fn vless_raw_reply<D, R>(
         return;
     }
     if cmd == 2 {
-        spawn_carried(move || serve_vless_udp(stream, &target, carried));
+        serve_vless_udp(stream, &target, carried);
         return;
     }
     if cmd == 3 {
@@ -4877,7 +4899,7 @@ fn serve_sealed_carried<R, W>(
     decryption: &ferrox_core::vless_encryption::Server,
     close: Arc<dyn Fn() + Send + Sync>,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + RelayPoll,
     W: Write + Send + 'static,
 {
     serve_sealed_carried_with(
@@ -4905,7 +4927,7 @@ pub(crate) fn serve_sealed_carried_with<R, W, A, B, C>(
     after_handshake: B,
     after_decode: C,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + RelayPoll,
     W: Write + Send + 'static,
     A: FnOnce(&mut R),
     B: FnOnce(&mut R),
@@ -4937,7 +4959,7 @@ fn serve_sealed_split_with<R, W, C>(
     closer: Arc<dyn Fn() + Send + Sync>,
     after_decode: C,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + RelayPoll,
     W: Write + Send + 'static,
     C: FnOnce(&mut R),
 {
@@ -5361,6 +5383,11 @@ impl<S: Read + Write> Write for SealedHalf<S> {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+impl<S: Read + Write> RelayPoll for SealedHalf<S> {
+    /// The carrier under the seal was armed before the handshake, so the read inherits the relay quantum.
+    fn arm_relay_poll(&mut self) {}
 }
 
 /// The reference's first read is one `Read` into an 8 KiB buffer; its route scans that buffer
@@ -7449,7 +7476,7 @@ fn serve_vless_reality_inbound(
     true
 }
 
-fn serve_session_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
+fn serve_session_ws<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'static>(
     read: R,
     write: W,
     path: &str,
@@ -7505,7 +7532,7 @@ fn serve_session_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     relay_sink_ws(creader, &cwriter, &uplink);
 }
 
-fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static>(
+fn serve_session_xhttp<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'static>(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
@@ -7576,7 +7603,7 @@ fn sniff_xhttp<R: Read>(
     ))
 }
 
-fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+fn serve_xhttp_stream<R: Read + Send + 'static + RelayPoll, W: FrameWrite + Send + 'static>(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
@@ -7704,7 +7731,10 @@ pub(crate) fn serve_session_xhttp_with(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve_session_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(
+fn serve_session_httpupgrade<
+    R: Read + Send + 'static + RelayPoll,
+    W: Write + Clone + Send + 'static,
+>(
     read: R,
     write: W,
     raw: Connection,
@@ -7763,7 +7793,10 @@ fn serve_session_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send +
     }
 }
 
-fn serve_session_httpheader<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(
+fn serve_session_httpheader<
+    R: Read + Send + 'static + RelayPoll,
+    W: Write + Clone + Send + 'static,
+>(
     read: R,
     write: W,
     raw: Connection,
@@ -7810,7 +7843,7 @@ fn serve_session_httpheader<R: Read + Send + 'static, W: Write + Clone + Send + 
     relay_sink(creader, &sink, &uplink, |_| {});
 }
 
-fn serve_session_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
+fn serve_session_grpc<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'static>(
     read: R,
     mut write: W,
     settings: &crate::config::GrpcSettings,
@@ -23215,16 +23248,94 @@ fn serve_vless_udp(mut stream: Connection, target: &SocketAddr, carried: Vec<u8>
     serve_udp_stream(read, stream, target, carried, &close);
 }
 
-fn serve_udp_stream<R, W>(
+/// Frames the association's datagrams out of the client stream one at a time: a relay step that
+/// finds no bytes hands the wait back to the lane instead of parking in the read.
+struct UdpFrames<R> {
     reader: R,
+    carried: Vec<u8>,
+    carried_at: usize,
+    head: [u8; 2],
+    head_len: usize,
+    payload: Vec<u8>,
+    filled: usize,
+}
+
+impl<R: Read> UdpFrames<R> {
+    fn new(carried: Vec<u8>, reader: R) -> Self {
+        Self {
+            reader,
+            carried,
+            carried_at: 0,
+            head: [0; 2],
+            head_len: 0,
+            payload: udp_buffer(),
+            filled: 0,
+        }
+    }
+
+    fn take(&mut self) -> std::io::Result<usize> {
+        while self.head_len < 2 {
+            let want = self.head_len;
+            let n = read_frame_bytes(
+                &mut self.reader,
+                &self.carried,
+                &mut self.carried_at,
+                &mut self.head[want..],
+            )?;
+            if n == 0 {
+                return Ok(0);
+            }
+            self.head_len += n;
+        }
+        let len = usize::from(u16::from_be_bytes(self.head));
+        if len == 0 || len > self.payload.len() {
+            return Ok(0);
+        }
+        while self.filled < len {
+            let n = read_frame_bytes(
+                &mut self.reader,
+                &self.carried,
+                &mut self.carried_at,
+                &mut self.payload[self.filled..len],
+            )?;
+            if n == 0 {
+                return Ok(0);
+            }
+            self.filled += n;
+        }
+        self.head_len = 0;
+        self.filled = 0;
+        Ok(len)
+    }
+}
+
+fn read_frame_bytes<R: Read>(
+    reader: &mut R,
+    carried: &[u8],
+    carried_at: &mut usize,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    if *carried_at < carried.len() {
+        let n = (carried.len() - *carried_at).min(buf.len());
+        buf[..n].copy_from_slice(&carried[*carried_at..*carried_at + n]);
+        *carried_at += n;
+        return Ok(n);
+    }
+    reader.read(buf)
+}
+
+fn serve_udp_stream<R, W>(
+    mut reader: R,
     mut writer: W,
     target: &SocketAddr,
     carried: Vec<u8>,
     close: &Arc<dyn Fn() + Send + Sync>,
-) where
-    R: Read + Send + 'static,
+) -> Arc<RelayFinish>
+where
+    R: Read + Send + 'static + RelayPoll,
     W: Write + Send + 'static,
 {
+    let flow = RelayFinish::new(false, Arc::clone(close), None);
     let bind = if target.is_ipv6() {
         "[::]:0"
     } else {
@@ -23232,94 +23343,80 @@ fn serve_udp_stream<R, W>(
     };
     let Ok(udp) = UdpSocket::bind(bind) else {
         close();
-        return;
+        return flow;
     };
     if udp.connect(target).is_err() || udp.set_read_timeout(Some(RELAY_POLL)).is_err() {
         close();
-        return;
+        return flow;
     }
     let Ok(udp_send) = udp.try_clone() else {
         close();
-        return;
+        return flow;
     };
-    let done = Arc::new(AtomicBool::new(false));
-    let done_in = Arc::clone(&done);
+    reader.arm_relay_poll();
     // Datagrams the target still owes an answer to: the association ends when the uplink is spent and none are left.
     let awaiting = Arc::new(AtomicUsize::new(0));
-    let awaiting_in = Arc::clone(&awaiting);
-    let forward = move || {
-        let mut reader = std::io::Cursor::new(carried).chain(reader);
-        let mut buf = udp_buffer();
-        while let Some(n) = read_udp_datagram(&mut reader, &mut buf) {
-            awaiting_in.fetch_add(1, Ordering::Relaxed);
-            if udp_send.send(&buf[..n]).is_err() {
-                awaiting_in.fetch_sub(1, Ordering::Relaxed);
-                break;
+    let mut input = UdpFrames::new(carried, reader);
+    let up = udp_send;
+    let owed = Arc::clone(&awaiting);
+    let forward_finish = Arc::clone(&flow);
+    lane_pool::submit(
+        Box::new(move || {
+            let n = match input.take() {
+                Ok(0) => return Next::Done,
+                Ok(n) => n,
+                Err(error) if is_timeout(&error) => return Next::Idle,
+                Err(_) => return Next::Done,
+            };
+            owed.fetch_add(1, Ordering::Relaxed);
+            if up.send(&input.payload[..n]).is_err() {
+                owed.fetch_sub(1, Ordering::Relaxed);
+                return Next::Done;
             }
-        }
-        done_in.store(true, Ordering::Relaxed);
-    };
-    let replied = RelayPool::run_once(forward);
+            Next::More
+        }),
+        Box::new(move || {
+            forward_finish.mark_ended();
+            forward_finish.lane_done();
+        }),
+    );
+    let reply_finish = Arc::clone(&flow);
+    let parked = Arc::clone(&reply_finish);
+    let reply_done = Arc::clone(&reply_finish);
+    let down = udp;
     let mut buf = udp_buffer();
-    // Poll fast after traffic, so a finished association leaves at once, and back off to a second.
-    let mut poll = RELAY_POLL;
-    let mut grace: Option<Instant> = None;
-    loop {
-        match udp.recv(&mut buf) {
+    lane_pool::submit(
+        Box::new(move || match down.recv(&mut buf) {
             Ok(n) => {
-                grace = None;
                 let _ = awaiting.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                     Some(left.saturating_sub(1))
                 });
-                if poll != RELAY_POLL {
-                    poll = RELAY_POLL;
-                    if udp.set_read_timeout(Some(poll)).is_err() {
-                        break;
-                    }
+                if n > 0 && !write_udp_datagram(&mut writer, &buf[..n]) {
+                    return Next::Done;
                 }
-                if n == 0 {
-                    continue;
-                }
-                if !write_udp_datagram(&mut writer, &buf[..n]) {
-                    break;
-                }
+                Next::More
             }
             Err(error) if is_timeout(&error) => {
-                if done.load(Ordering::Relaxed) {
-                    if awaiting.load(Ordering::Relaxed) == 0 {
-                        break;
-                    }
-                    // An answer still owed the client that left may be in flight: wait one reply-idle window for it.
-                    let deadline = *grace.get_or_insert_with(|| {
-                        Instant::now() + crate::budgets::RELAY_RESPONSE_IDLE
-                    });
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    if poll < crate::budgets::RELAY_RESPONSE_IDLE {
-                        poll = crate::budgets::RELAY_RESPONSE_IDLE;
-                        if udp.set_read_timeout(Some(poll)).is_err() {
-                            break;
-                        }
-                    }
-                    continue;
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd as _;
+                    note_wait_fd(down.as_raw_fd());
+                    note_wait_finish(&parked);
                 }
-                let next = poll
-                    .saturating_mul(2)
-                    .min(crate::budgets::RELAY_RESPONSE_IDLE);
-                if next != poll {
-                    poll = next;
-                    if udp.set_read_timeout(Some(poll)).is_err() {
-                        break;
-                    }
+                if reply_finish.ended()
+                    && (awaiting.load(Ordering::Relaxed) == 0
+                        || reply_finish.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE))
+                {
+                    Next::Done
+                } else {
+                    Next::Idle
                 }
             }
-            Err(_) => break,
-        }
-    }
-    done.store(true, Ordering::Relaxed);
-    close();
-    join(&replied);
+            Err(_) => Next::Done,
+        }),
+        Box::new(move || reply_done.lane_done()),
+    );
+    flow
 }
 
 pub(crate) fn pump_vmess_udp<R, W>(
@@ -43355,63 +43452,69 @@ mod tests {
         handle.join().expect("the thread finishes");
     }
 
+    /// A writer that records the association's framed replies.
+    struct UdpSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for UdpSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("sink").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Waits for a pooled association to hand its last lane back.
+    fn wait_for_flow(flow: &Arc<RelayFinish>, budget: Duration, what: &str) {
+        let (done, wait) = std::sync::mpsc::channel();
+        flow.then(move || {
+            let _ = done.send(());
+        });
+        wait.recv_timeout(budget)
+            .unwrap_or_else(|_| panic!("{what} outlived its {budget:?} budget"));
+    }
+
+    /// An echo that answers one poll late, so a caller that relays the association itself is
+    /// still inside the call when the answer arrives.
+    fn delayed_echo_port(delay: Duration) -> u16 {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let Ok((read, from)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                thread::sleep(delay);
+                if echo.send_to(&buf[..read], from).is_err() {
+                    return;
+                }
+            }
+        });
+        port
+    }
+
     /// A one-datagram association leaves when its uplink ends: the reply loop used to park its
     /// thread on the 120 s idle deadline after the forward leg had already finished.
     #[test]
     fn a_finished_udp_association_leaves_without_the_idle_deadline() {
         let echo = udp_echo_port();
         let target: SocketAddr = format!("127.0.0.1:{echo}").parse().expect("addr");
-        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
         let bytes = Arc::new(Mutex::new(Vec::new()));
-        let sink_bytes = Arc::clone(&bytes);
-        let session = thread::spawn(move || {
-            struct OneDatagram {
-                wire: std::io::Cursor<Vec<u8>>,
-                answered: std::sync::mpsc::Receiver<()>,
-            }
-            impl Read for OneDatagram {
-                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                    let read = self.wire.read(buf)?;
-                    if read == 0 {
-                        let _ = self.answered.recv();
-                    }
-                    Ok(read)
-                }
-            }
-            struct Sink {
-                bytes: Arc<Mutex<Vec<u8>>>,
-                answered: std::sync::mpsc::Sender<()>,
-            }
-            impl Write for Sink {
-                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                    self.bytes.lock().expect("sink").extend_from_slice(buf);
-                    let _ = self.answered.send(());
-                    Ok(buf.len())
-                }
-                fn flush(&mut self) -> std::io::Result<()> {
-                    Ok(())
-                }
-            }
-            let mut wire = Vec::new();
-            wire.extend_from_slice(&4u16.to_be_bytes());
-            wire.extend_from_slice(b"ping");
-            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-            serve_udp_stream(
-                OneDatagram {
-                    wire: std::io::Cursor::new(wire),
-                    answered: answer_rx,
-                },
-                Sink {
-                    bytes: sink_bytes,
-                    answered: answer_tx,
-                },
-                &target,
-                Vec::new(),
-                &close,
-            );
-        });
-        join_thread_within(
-            session,
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&4u16.to_be_bytes());
+        wire.extend_from_slice(b"ping");
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let flow = serve_udp_stream(
+            std::io::Cursor::new(wire),
+            UdpSink(Arc::clone(&bytes)),
+            &target,
+            Vec::new(),
+            &close,
+        );
+        wait_for_flow(
+            &flow,
             Duration::from_secs(5),
             "the finished UDP association",
         );
@@ -43434,37 +43537,53 @@ mod tests {
             let _ = echo.send_to(&buf[..n], from);
         });
         let bytes = Arc::new(Mutex::new(Vec::new()));
-        let sink_bytes = Arc::clone(&bytes);
-        let session = thread::spawn(move || {
-            struct Sink(Arc<Mutex<Vec<u8>>>);
-            impl Write for Sink {
-                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                    self.0.lock().expect("sink").extend_from_slice(buf);
-                    Ok(buf.len())
-                }
-                fn flush(&mut self) -> std::io::Result<()> {
-                    Ok(())
-                }
-            }
-            let mut wire = Vec::new();
-            wire.extend_from_slice(&4u16.to_be_bytes());
-            wire.extend_from_slice(b"ping");
-            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-            serve_udp_stream(
-                std::io::Cursor::new(wire),
-                Sink(sink_bytes),
-                &echo_addr,
-                Vec::new(),
-                &close,
-            );
-        });
-        join_thread_within(
-            session,
-            Duration::from_secs(5),
-            "the delayed UDP association",
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&4u16.to_be_bytes());
+        wire.extend_from_slice(b"ping");
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let flow = serve_udp_stream(
+            std::io::Cursor::new(wire),
+            UdpSink(Arc::clone(&bytes)),
+            &echo_addr,
+            Vec::new(),
+            &close,
         );
+        wait_for_flow(&flow, Duration::from_secs(5), "the delayed UDP association");
         let bytes = bytes.lock().expect("sink");
         assert_eq!(&bytes[2..], b"ping", "the late echo reached the writer");
+    }
+
+    /// The association runs on the relay lanes, not the caller's thread: a one-datagram call must
+    /// hand its thread back before the target answers, or every association costs one.
+    #[test]
+    fn a_udp_association_does_not_hold_its_callers_thread() {
+        let echo = delayed_echo_port(Duration::from_millis(400));
+        let target: SocketAddr = format!("127.0.0.1:{echo}").parse().expect("addr");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the association");
+        let port = listener.local_addr().expect("addr").port();
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let (server, _) = listener.accept().expect("accepts");
+        let mut carried = Vec::new();
+        carried.extend_from_slice(&4u16.to_be_bytes());
+        carried.extend_from_slice(b"ping");
+        let (called, call) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            serve_vless_udp(server, &target, carried);
+            let _ = called.send(());
+        });
+        call.recv_timeout(Duration::from_millis(200))
+            .expect("the association held its caller thread");
+        let mut head = [0u8; 2];
+        client.read_exact(&mut head).expect("the reply head");
+        assert_eq!(head, [0, 0], "the association accepted the command");
+        let mut len = [0u8; 2];
+        client.read_exact(&mut len).expect("the reply length");
+        let mut answer = vec![0u8; usize::from(u16::from_be_bytes(len))];
+        client.read_exact(&mut answer).expect("the late echo");
+        assert_eq!(answer, b"ping", "the echo reached the client");
     }
 
     fn vmess_udp_over(
