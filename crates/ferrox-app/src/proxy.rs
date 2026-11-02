@@ -23381,6 +23381,7 @@ where
         }),
     );
     let reply_finish = Arc::clone(&flow);
+    #[cfg(unix)]
     let parked = Arc::clone(&reply_finish);
     let reply_done = Arc::clone(&reply_finish);
     let down = udp;
