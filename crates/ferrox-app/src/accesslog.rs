@@ -296,6 +296,11 @@ mod tests {
 
     fn reference(value: &str) -> String {
         let mut out = String::new();
+        reference_into(&mut out, value);
+        out
+    }
+
+    fn reference_into(out: &mut String, value: &str) {
         let mut start = 0;
         for (at, ch) in value.char_indices() {
             let escaped = match ch {
@@ -320,7 +325,6 @@ mod tests {
             }
         }
         out.push_str(&value[start..]);
-        out
     }
 
     #[test]
@@ -348,6 +352,36 @@ mod tests {
                 assert_eq!(escaped(&value), reference(&value), "{value:?}");
             }
         }
+    }
+
+    fn bulk_field() -> String {
+        "example.com:443/some/really/long/path?q=value&x=1#fragment".repeat(64)
+    }
+
+    #[test]
+    fn the_ascii_scan_over_a_bulk_field() {
+        let field = bulk_field();
+        let mut out = String::with_capacity(field.len());
+        let mut acc = 0usize;
+        for _ in 0..64 {
+            out.clear();
+            push_escaped(&mut out, &field);
+            acc += out.len();
+        }
+        std::hint::black_box(acc);
+    }
+
+    #[test]
+    fn the_codepoint_walk_over_a_bulk_field() {
+        let field = bulk_field();
+        let mut out = String::with_capacity(field.len());
+        let mut acc = 0usize;
+        for _ in 0..64 {
+            out.clear();
+            reference_into(&mut out, &field);
+            acc += out.len();
+        }
+        std::hint::black_box(acc);
     }
 
     #[test]
