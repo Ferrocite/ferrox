@@ -412,7 +412,7 @@ mod tests {
     #[test]
     fn a_rejected_preamble_leaves_the_reply_untouched() {
         let keyword = b"key";
-        let mut client = Obfuscator::new(keyword, MAX_PADDING).expect("obfuscator");
+        let client = Obfuscator::new(keyword, MAX_PADDING).expect("obfuscator");
         let mut forged = client.preamble.clone();
         forged.extend_from_slice(b"box");
         forged[SEED_LENGTH] ^= 0xFF;
