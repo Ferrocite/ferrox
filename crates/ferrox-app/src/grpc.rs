@@ -4036,4 +4036,59 @@ mod tests {
         drop(client);
         server.join().expect("joins");
     }
+
+    #[test]
+    fn a_refused_reverse_request_resets_its_stream() {
+        let id = [7u8; 16];
+        let users = [crate::proxy::VlessUser {
+            id,
+            flow: ferrox_core::vless::Flow::None,
+            email: String::new(),
+            level: 0,
+            reverse: None,
+        }];
+        let settings = GrpcSettings::path("/TunnelService/Tun");
+        let opened = Arc::new(AtomicBool::new(false));
+        let service = GrpcService::new(&settings, &users, true, opened);
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            let write = stream.try_clone().expect("clones");
+            crate::xhttp_h2::serve_h2_service(stream, write, &service, None);
+        });
+        let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
+        client.write_all(MAGIC).expect("preface");
+        assert!(write_frame(&mut client, T_SETTINGS, 0, 0, &[]));
+        let head = block_encode(&[
+            (":method", "POST"),
+            (":path", "/TunnelService/Tun"),
+            ("content-type", "application/grpc"),
+        ]);
+        assert!(write_frame(&mut client, T_HEADERS, F_END_HEADERS, 1, &head));
+        assert!(write_frame(
+            &mut client,
+            T_DATA,
+            0,
+            1,
+            &message(&crate::proxy::vless_reverse_header(&id))
+        ));
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("arms");
+        let mut refused = false;
+        while !refused {
+            let (len, kind, _flags, sid) = crate::h2::read_head_bounded(&mut client)
+                .expect("the refused stream was never reset");
+            let mut body = vec![0u8; len];
+            client.read_exact(&mut body).expect("body");
+            if kind == T_RST {
+                assert_eq!(sid, 1);
+                assert_eq!(body[..4], E_REFUSED.to_be_bytes());
+                refused = true;
+            }
+        }
+        drop(client);
+        server.join().expect("joins");
+    }
 }
