@@ -28901,7 +28901,7 @@ fn ss_accounts(
             Vec::new(),
         )
     };
-    // A 2022 inbound whose users[] array does not line up with its password's PSK tail leaves one side unmatched; warn once and serve the shorter list so no identity is looked up past its PSK. A password that does not parse is the handshake's failure to surface, not this check's.
+    // A 2022 inbound whose users[] array does not line up with its password's PSK tail leaves one side unmatched; warn once, then give every PSK an identity so a flow is never left unattributed. A password that does not parse is the handshake's failure to surface, not this check's.
     if let Some(parsed) = parsed {
         if let Some(list) =
             ferrox_core::shadowsocks2022::parse_psk_list(&password, parsed.key_len())
@@ -28909,10 +28909,15 @@ fn ss_accounts(
             let psks = list.len().saturating_sub(1);
             if identities.len() != psks {
                 eprintln!(
-                    "shadowsocks 2022 inbound on {address}: {} users for {psks} client psks, using the shorter list",
+                    "shadowsocks 2022 inbound on {address}: {} users for {psks} client psks, naming the rest after the inbound",
                     identities.len()
                 );
-                identities.truncate(psks);
+                if identities.len() > psks {
+                    identities.truncate(psks);
+                } else {
+                    let unnamed = inbound_tag(inbound).unwrap_or_else(|| address.to_owned());
+                    identities.resize(psks, (unnamed, 0));
+                }
             }
         }
     }
