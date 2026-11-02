@@ -1838,8 +1838,50 @@ pub(crate) fn regions(settings: Option<&Json>) -> Result<Vec<(String, usize)>, S
     Ok(counts.into_iter().collect())
 }
 
+/// Fetch tactics from the first entry that advertises the untunneled capability.
+pub(crate) fn tactics(settings: Option<&Json>) -> Result<crate::psiphon_tactics::Tactics, String> {
+    let settings = Settings::from_json(settings)?;
+    let servers = load_tactics_entries(&settings)?;
+    let server = servers
+        .iter()
+        .find(|server| server.tactics.is_some())
+        .ok_or_else(|| "psiphon: the server list holds no tactics entry".to_owned())?;
+    let session_id = hex(&random::<16>());
+    let identity = Identity {
+        session_id: &session_id,
+        sponsor: &settings.sponsor,
+        propagation: &settings.propagation,
+        platform: &settings.platform,
+        version: &settings.client_version,
+        egress_region: settings.region.as_deref(),
+        device_region: settings.device_region.as_deref(),
+        device_location: settings.device_location.as_deref(),
+        client_features: &settings.client_features,
+    };
+    crate::psiphon_tactics::Tactics::fetch(
+        server,
+        &identity,
+        settings.ready,
+        settings.proxy.as_ref(),
+    )
+}
+
 fn load_entries(settings: &Settings) -> Result<Vec<Server>, String> {
-    let mut servers = load_all_entries(settings)?;
+    let servers = load_all_entries(settings)?;
+    Ok(filter_region(servers, settings))
+}
+
+fn load_tactics_entries(settings: &Settings) -> Result<Vec<Server>, String> {
+    let servers = load_source_entries(settings, false)?;
+    let mut servers = filter_region(servers, settings);
+    apply_tactics_overrides(&mut servers, settings);
+    if servers.is_empty() {
+        return Err("psiphon: no usable server entries".to_owned());
+    }
+    Ok(servers)
+}
+
+fn filter_region(mut servers: Vec<Server>, settings: &Settings) -> Vec<Server> {
     if let Some(region) = settings.region.as_deref() {
         let regional: Vec<Server> = servers
             .iter()
@@ -1852,35 +1894,59 @@ fn load_entries(settings: &Settings) -> Result<Vec<Server>, String> {
             servers = regional;
         }
     }
-    Ok(servers)
+    servers
 }
 
 fn load_all_entries(settings: &Settings) -> Result<Vec<Server>, String> {
+    let servers = load_source_entries(settings, true)?;
+    let servers: Vec<Server> = servers
+        .into_iter()
+        .filter(|server| server.direct || server.meek.is_some() || server.unfronted_meek.is_some())
+        .collect();
+    let mut servers = if settings.target.is_some() {
+        servers
+    } else {
+        select_protocols(
+            servers,
+            &settings.protocols,
+            &settings.initial_protocols,
+            settings.initial_count,
+            settings.fronted,
+        )
+    };
+    apply_fronting_overrides(&mut servers, settings);
+    if servers.is_empty() {
+        return Err("psiphon: no usable server entries".to_owned());
+    }
+    Ok(servers)
+}
+
+fn load_source_entries(settings: &Settings, target_limits: bool) -> Result<Vec<Server>, String> {
     if let Some(target) = settings.target.as_deref() {
         let Some(mut server) = decode_entry(target.trim()) else {
             return Err("psiphon: TargetServerEntry is not a valid server entry".to_owned());
         };
-        let (limits, label, filter) = target_protocol_filter(settings);
-        if let Some(shape) = filter {
-            let named_meek = limits.iter().any(|protocol| is_meek_protocol(protocol));
-            if !named_meek && server.direct {
-                server.meek = None;
-                server.unfronted_meek = None;
-            }
-            if !matches_limit(&server, shape, named_meek, limits) {
-                let protocol = server.meek.as_ref().map_or_else(
-                    || if server.obfuscated() { "OSSH" } else { "SSH" },
-                    |meek| meek.protocol,
-                );
-                return Err(format!(
-                    "psiphon: TargetServerEntry is {protocol} but {label} ({}) leaves it out",
-                    limits.join(",")
-                ));
+        if target_limits {
+            let (limits, label, filter) = target_protocol_filter(settings);
+            if let Some(shape) = filter {
+                let named_meek = limits.iter().any(|protocol| is_meek_protocol(protocol));
+                if !named_meek && server.direct {
+                    server.meek = None;
+                    server.unfronted_meek = None;
+                }
+                if !matches_limit(&server, shape, named_meek, limits) {
+                    let protocol = server.meek.as_ref().map_or_else(
+                        || if server.obfuscated() { "OSSH" } else { "SSH" },
+                        |meek| meek.protocol,
+                    );
+                    return Err(format!(
+                        "psiphon: TargetServerEntry is {protocol} but {label} ({}) leaves it out",
+                        limits.join(",")
+                    ));
+                }
             }
         }
-        let mut servers = vec![server];
-        apply_fronting_overrides(&mut servers, settings);
-        return Ok(servers);
+        return Ok(vec![server]);
     }
     let mut servers = Vec::new();
     let mut seen = HashSet::new();
@@ -1905,17 +1971,6 @@ fn load_all_entries(settings: &Settings) -> Result<Vec<Server>, String> {
         if let Ok(text) = std::fs::read_to_string(cache_path(settings)) {
             absorb(&text, &mut servers, &mut seen);
         }
-    }
-    servers = select_protocols(
-        servers,
-        &settings.protocols,
-        &settings.initial_protocols,
-        settings.initial_count,
-        settings.fronted,
-    );
-    apply_fronting_overrides(&mut servers, settings);
-    if servers.is_empty() {
-        return Err("psiphon: no usable server entries".to_owned());
     }
     Ok(servers)
 }
@@ -2033,7 +2088,37 @@ fn target_protocol_filter(settings: &Settings) -> (&[String], &'static str, Opti
 }
 
 /// Apply configured fronting addresses and SNI names to matching servers.
+#[derive(Clone, Copy)]
+enum Front {
+    Tunnel,
+    Tactics,
+}
+
+impl Front {
+    fn of(self, server: &Server) -> Option<&crate::psiphon_meek::Meek> {
+        match self {
+            Front::Tunnel => server.meek.as_ref(),
+            Front::Tactics => server.tactics.as_ref().map(|tactics| &tactics.meek),
+        }
+    }
+
+    fn present(self, server: &Server) -> bool {
+        match self {
+            Front::Tunnel => server.meek.is_some(),
+            Front::Tactics => server.tactics.is_some(),
+        }
+    }
+}
+
 fn apply_fronting_overrides(servers: &mut Vec<Server>, settings: &Settings) {
+    expand_fronted(servers, settings, Front::Tunnel);
+}
+
+fn apply_tactics_overrides(servers: &mut Vec<Server>, settings: &Settings) {
+    expand_fronted(servers, settings, Front::Tactics);
+}
+
+fn expand_fronted(servers: &mut Vec<Server>, settings: &Settings, front: Front) {
     if settings.cdn_ips.is_empty()
         && settings.cdn_snis.is_empty()
         && settings.fronted_overrides.is_empty()
@@ -2042,7 +2127,7 @@ fn apply_fronting_overrides(servers: &mut Vec<Server>, settings: &Settings) {
     }
     let mut groups: Vec<Vec<Server>> = Vec::with_capacity(servers.len());
     for server in servers.drain(..) {
-        let Some(meek) = server.meek.as_ref() else {
+        let Some(meek) = front.of(&server) else {
             groups.push(vec![server]);
             continue;
         };
@@ -2073,6 +2158,7 @@ fn apply_fronting_overrides(servers: &mut Vec<Server>, settings: &Settings) {
                 fronted.disable_sni,
                 &fronted.alpn,
                 fronted.dials.is_empty(),
+                front,
                 &mut group,
                 &mut variants,
             );
@@ -2094,6 +2180,7 @@ fn apply_fronting_overrides(servers: &mut Vec<Server>, settings: &Settings) {
                 meek.disable_sni,
                 &[],
                 settings.cdn_ips.is_empty(),
+                front,
                 &mut group,
                 &mut variants,
             );
@@ -2108,7 +2195,7 @@ fn apply_fronting_overrides(servers: &mut Vec<Server>, settings: &Settings) {
             let Some(server) = group.get(index) else {
                 continue;
             };
-            if server.meek.is_some() {
+            if front.present(server) {
                 if fronted >= FRONTED_SERVERS {
                     continue;
                 }
@@ -2128,6 +2215,7 @@ fn add_fronted_variants(
     disable_sni: bool,
     alpn: &[Vec<u8>],
     keep_candidates: bool,
+    front: Front,
     expanded: &mut Vec<Server>,
     variants: &mut usize,
 ) {
@@ -2141,6 +2229,7 @@ fn add_fronted_variants(
                 disable_sni,
                 alpn,
                 keep_candidates,
+                front,
                 expanded,
                 variants,
             ) {
@@ -2159,6 +2248,7 @@ fn add_fronted_variants(
                 disable_sni,
                 alpn,
                 keep_candidates,
+                front,
                 expanded,
                 variants,
             ) {
@@ -2177,6 +2267,7 @@ fn push_fronted_variant(
     disable_sni: bool,
     alpn: &[Vec<u8>],
     keep_candidates: bool,
+    front: Front,
     expanded: &mut Vec<Server>,
     variants: &mut usize,
 ) -> bool {
@@ -2184,10 +2275,19 @@ fn push_fronted_variant(
         return false;
     }
     let mut variant = server.clone();
-    let meek = variant
-        .meek
-        .as_mut()
-        .expect("a fronted server carries a meek front");
+    let meek = match front {
+        Front::Tunnel => variant
+            .meek
+            .as_mut()
+            .expect("a fronted server carries a meek front"),
+        Front::Tactics => {
+            &mut variant
+                .tactics
+                .as_mut()
+                .expect("a tactics server carries a tactics front")
+                .meek
+        }
+    };
     dial.clone_into(&mut meek.dial);
     meek.port = port;
     if disable_sni {
@@ -2427,11 +2527,12 @@ fn decode_entry(line: &str) -> Option<Server> {
         .and_then(Json::as_port)
         .filter(|port| *port > 0);
     let protocol = meek_protocol(&entry);
+    let tactics_capable = tactics_capability(&entry);
     let direct = obfuscated_port.is_some() || ssh_port.is_some();
     let (port, obfuscation_key) = match (obfuscated_port, ssh_port) {
         (Some(port), _) if obfuscated_key.is_some() => (port, obfuscated_key),
         (_, Some(port)) => (port, None),
-        _ if protocol.is_some() => {
+        _ if protocol.is_some() || tactics_capable => {
             let port = entry
                 .get("meekServerPort")
                 .and_then(Json::as_port)
@@ -2459,7 +2560,8 @@ fn decode_entry(line: &str) -> Option<Server> {
     if meek.is_none() {
         meek = unfronted_meek.take();
     }
-    if !direct && meek.is_none() && unfronted_meek.is_none() {
+    let tactics = tactics_entry(&entry, &host);
+    if !direct && meek.is_none() && unfronted_meek.is_none() && tactics.is_none() {
         return None;
     }
     Some(Server {
@@ -2474,6 +2576,43 @@ fn decode_entry(line: &str) -> Option<Server> {
         direct,
         meek,
         unfronted_meek,
+        tactics,
+    })
+}
+
+/// Whether an entry advertises the untunneled tactics capability.
+fn tactics_capability(entry: &Json) -> bool {
+    entry
+        .get("capabilities")
+        .and_then(Json::as_arr)
+        .is_some_and(|capabilities| {
+            capabilities
+                .iter()
+                .filter_map(Json::as_str)
+                .any(|name| name == "FRONTED-MEEK-TACTICS")
+        })
+}
+
+/// The keys and front a `FRONTED-MEEK-TACTICS` entry needs for a tactics request.
+fn tactics_entry(entry: &Json, host: &str) -> Option<crate::psiphon_tactics::Keys> {
+    if !tactics_capability(entry) {
+        return None;
+    }
+    let public_key = entry
+        .get("tacticsRequestPublicKey")
+        .and_then(Json::as_str)
+        .filter(|key| !key.is_empty())?
+        .to_owned();
+    let obfuscated_key = entry
+        .get("tacticsRequestObfuscatedKey")
+        .and_then(Json::as_str)
+        .filter(|key| !key.is_empty())?
+        .to_owned();
+    let meek = meek_entry(entry, host, "FRONTED-MEEK-OSSH")?;
+    Some(crate::psiphon_tactics::Keys {
+        public_key,
+        obfuscated_key,
+        meek,
     })
 }
 
@@ -2627,8 +2766,8 @@ fn meek_entry(
     let raw = addresses
         .first()
         .map(String::as_str)
-        .or_else(|| entry.get("meekFrontingDomain").and_then(Json::as_str))?
-        .to_owned();
+        .or_else(|| entry.get("meekFrontingDomain").and_then(Json::as_str))
+        .map_or_else(|| host.clone(), str::to_owned);
     let (dial, port) = split_fronting_address_with(&raw, default_port);
     let mut fronts: Vec<(String, u16)> = addresses
         .iter()
@@ -3932,6 +4071,7 @@ mod tests {
             direct: true,
             meek: None,
             unfronted_meek: None,
+            tactics: None,
         }
     }
 
@@ -3953,6 +4093,60 @@ mod tests {
             false,
         );
         assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn a_tactics_entry_keeps_its_keys_and_front() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK-TACTICS"],"tacticsRequestPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","tacticsRequestObfuscatedKey":"dGFjdGljcw==","meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["203.0.113.9"],"meekFrontingHosts":["front.example"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("tactics");
+        let keys = server.tactics.expect("tactics keys");
+        assert_eq!(
+            keys.public_key,
+            "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+        );
+        assert_eq!(keys.obfuscated_key, "dGFjdGljcw==");
+        assert_eq!(keys.meek.dial, "203.0.113.9");
+        assert_eq!(keys.meek.host, "front.example");
+        assert_eq!(keys.meek.sni, "203.0.113.9");
+        assert_eq!(keys.meek.port, 443);
+    }
+
+    #[test]
+    fn a_tactics_only_entry_survives_default_settings() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK-TACTICS"],"tacticsRequestPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","tacticsRequestObfuscatedKey":"dGFjdGljcw==","meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingHosts":["front.example"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let settings = Settings::from_json(Some(
+            &json::parse(&format!(
+                r#"{{"TargetServerEntry":"{encoded}","LimitTunnelProtocols":["SSH"]}}"#
+            ))
+            .expect("json"),
+        ))
+        .expect("settings");
+        let servers = load_tactics_entries(&settings).expect("tactics entries");
+        assert!(servers[0].tactics.is_some());
+        assert!(load_entries(&settings).is_err());
+    }
+
+    #[test]
+    fn a_fronting_override_reaches_the_tactics_front() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK-TACTICS","UNFRONTED-MEEK"],"tacticsRequestPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","tacticsRequestObfuscatedKey":"dGFjdGljcw==","meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingHosts":["front.example"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let settings = Settings::from_json(Some(
+            &json::parse(&format!(
+                r#"{{"TargetServerEntry":"{encoded}","cdnIps":["198.51.100.7"],"cdnSni":["edge.example"]}}"#
+            ))
+            .expect("json"),
+        ))
+        .expect("settings");
+        let servers = load_tactics_entries(&settings).expect("tactics entries");
+        let keys = servers[0].tactics.as_ref().expect("tactics keys");
+        assert_eq!(keys.meek.dial, "198.51.100.7");
+        assert_eq!(keys.meek.sni, "edge.example");
+        assert_eq!(
+            servers[0].meek.as_ref().expect("tunnel front").dial,
+            "192.0.2.1"
+        );
     }
 
     #[test]
@@ -4490,6 +4684,7 @@ mod tests {
                 direct: true,
                 meek: None,
                 unfronted_meek: None,
+                tactics: None,
             })
             .collect();
         let began = Instant::now();
@@ -4527,6 +4722,7 @@ mod tests {
                 direct: true,
                 meek: None,
                 unfronted_meek: None,
+                tactics: None,
             })
             .collect();
         let began = Instant::now();
