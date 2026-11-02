@@ -17,6 +17,8 @@ const SESSION_PACKET: u8 = 1;
 const SESSION_ROUND_TRIP: u8 = 2;
 const CLIENT_OFFER_REQUEST: u8 = 7;
 const CLIENT_OFFER_RESPONSE: u8 = 8;
+const CLIENT_RELAYED_PACKET_REQUEST: u8 = 9;
+const CLIENT_RELAYED_PACKET_RESPONSE: u8 = 10;
 const BROKER_PATH: &str = "/inproxy-broker";
 const PROLOGUE_VERSION: u64 = 1;
 const LATEST_PROTOCOL_VERSION: u64 = 2;
@@ -97,7 +99,17 @@ struct Record {
 pub(crate) struct Destination {
     pub(crate) address: String,
     pub(crate) network_protocol: u64,
+    pub(crate) protocol: &'static str,
     pub(crate) packed_server_entry: Vec<u8>,
+}
+
+impl Destination {
+    /// The tunnel protocol without the in-proxy WebRTC hop.
+    pub(crate) fn base_protocol(&self) -> &'static str {
+        self.protocol
+            .strip_prefix("INPROXY-WEBRTC-")
+            .unwrap_or(self.protocol)
+    }
 }
 
 /// The in-proxy destination a signed server entry names.
@@ -109,20 +121,23 @@ pub(crate) fn destination(entry: &Json, host: &str) -> Option<Destination> {
             .filter_map(Json::as_str)
             .any(|capability| capability == name)
     };
-    let (port, network_protocol) = if has("INPROXY-WEBRTC-OSSH") {
+    let (port, network_protocol, protocol) = if has("INPROXY-WEBRTC-OSSH") {
         (
             entry.get("inproxyOSSHPort").and_then(Json::as_port),
             NetworkProtocol::Tcp,
+            "INPROXY-WEBRTC-OSSH",
         )
     } else if has("INPROXY-WEBRTC-SSH") {
         (
             entry.get("inproxySSHPort").and_then(Json::as_port),
             NetworkProtocol::Tcp,
+            "INPROXY-WEBRTC-SSH",
         )
     } else if has("INPROXY-WEBRTC-QUIC-OSSH") {
         (
             entry.get("inproxyQUICPort").and_then(Json::as_port),
             NetworkProtocol::Udp,
+            "INPROXY-WEBRTC-QUIC-OSSH",
         )
     } else {
         return None;
@@ -136,6 +151,7 @@ pub(crate) fn destination(entry: &Json, host: &str) -> Option<Destination> {
     Some(Destination {
         address,
         network_protocol: network_protocol as u64,
+        protocol,
         packed_server_entry: pack_server_entry(entry)?,
     })
 }
@@ -220,7 +236,7 @@ pub(crate) struct Offer {
 }
 
 /// Anything that carries one opaque broker round trip.
-pub(crate) trait Transport {
+pub(crate) trait Transport: Send {
     fn round_trip(&mut self, body: &[u8]) -> Result<Vec<u8>, String>;
 }
 
@@ -336,6 +352,33 @@ impl Client {
             ));
         }
         Ok(parse_offer(&response.value))
+    }
+
+    /// Relay one server packet to the broker and return the broker's next
+    /// packet to the server, empty when the exchange is complete.
+    pub(crate) fn relay_packet(
+        &mut self,
+        connection_id: &[u8],
+        packet: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        let request = Value::Map(vec![
+            (Value::UInt(1), Value::Bytes(connection_id.to_vec())),
+            (Value::UInt(2), Value::Bytes(packet.to_vec())),
+        ]);
+        let reply = self.session_request(&record(CLIENT_RELAYED_PACKET_REQUEST, &request)?)?;
+        let response = decode_record(&reply)?;
+        if response.kind != CLIENT_RELAYED_PACKET_RESPONSE {
+            return Err(format!(
+                "psiphon broker: relayed packet response is record {}",
+                response.kind
+            ));
+        }
+        match response.value.get(1) {
+            None => Ok(Vec::new()),
+            Some(value) => value.bytes().map(<[u8]>::to_vec).ok_or_else(|| {
+                "psiphon broker: relayed packet response field 1 is not bytes".to_owned()
+            }),
+        }
     }
 
     /// Wrap a record in a session round trip, establishing the session with
@@ -1058,6 +1101,30 @@ fn decode_depth(bytes: &[u8], depth: usize) -> Option<(Value, usize)> {
     }
 }
 
+/// Decode an SSH global request body into the packet the broker must relay.
+pub(crate) fn relay_request_packet(payload: &[u8]) -> Result<Vec<u8>, String> {
+    let (value, _) =
+        decode(payload).ok_or_else(|| "psiphon broker: relay request is not CBOR".to_owned())?;
+    match value.get(1) {
+        None => Ok(Vec::new()),
+        Some(value) => value
+            .bytes()
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| "psiphon broker: relay request field 1 is not bytes".to_owned()),
+    }
+}
+
+/// Encode the SSH success payload that carries the broker's next packet.
+pub(crate) fn relay_response(packet: &[u8]) -> Vec<u8> {
+    if packet.is_empty() {
+        return encode(&Value::Map(Vec::new()));
+    }
+    encode(&Value::Map(vec![(
+        Value::UInt(1),
+        Value::Bytes(packet.to_vec()),
+    )]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1066,6 +1133,7 @@ mod tests {
         Destination {
             address: "192.0.2.1:443".to_owned(),
             network_protocol: 0,
+            protocol: "INPROXY-WEBRTC-OSSH",
             packed_server_entry: vec![0xa0],
         }
     }
@@ -1310,6 +1378,25 @@ mod tests {
             "a heap length buffer bought {} allocations over {}",
             old.allocs,
             new.allocs
+        );
+    }
+
+    #[test]
+    fn a_relayed_packet_request_carries_its_connection_and_bytes() {
+        let request = Value::Map(vec![
+            (Value::UInt(1), Value::Bytes(vec![2; 32])),
+            (Value::UInt(2), Value::Bytes(vec![3; 4])),
+        ]);
+        let encoded = record(CLIENT_RELAYED_PACKET_REQUEST, &request).expect("record");
+        let decoded = decode_record(&encoded).expect("record");
+        assert_eq!(decoded.kind, CLIENT_RELAYED_PACKET_REQUEST);
+        assert_eq!(
+            decoded.value.get(1).and_then(Value::bytes),
+            Some(&[2u8; 32][..])
+        );
+        assert_eq!(
+            decoded.value.get(2).and_then(Value::bytes),
+            Some(&[3u8; 4][..])
         );
     }
 

@@ -87,8 +87,10 @@ struct Inner {
     endpoint: SocketAddr,
     http_endpoint: Option<SocketAddr>,
     udpgw: Mutex<Option<Arc<UdpGateway>>>,
+    conduit: Mutex<Option<Arc<crate::psiphon_webrtc::Conduit>>>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 struct Settings {
     state: PathBuf,
     listen: SocketAddr,
@@ -118,6 +120,12 @@ struct Settings {
     device_location: Option<String>,
     client_features: Vec<String>,
     compartment: String,
+    conduit: bool,
+    conduit_mode: ConduitMode,
+    conduit_timeout: Duration,
+    conduit_protocols: Vec<String>,
+    reject_censored: bool,
+    reject_countries: Vec<String>,
     relay_buffer: usize,
     server_lists: Vec<String>,
     server_lists_explicit: bool,
@@ -129,6 +137,13 @@ struct Settings {
     proxy_user: Option<String>,
     proxy_pass: Option<String>,
     raw: Option<Json>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConduitMode {
+    Auto,
+    Public,
+    Shirokhorshid,
 }
 
 #[derive(Debug, Clone)]
@@ -156,7 +171,10 @@ impl PsiphonOut {
     pub(crate) fn new(settings: Option<&Json>) -> Result<Self, String> {
         let settings = Settings::from_json(settings)?;
         warn_ignored(settings.raw.as_ref());
-        if settings.compartment != PRIVATE_COMPARTMENT_ID {
+        if settings.reject_censored || !settings.reject_countries.is_empty() {
+            eprintln!("psiphon: broker proxy country filtering is not applied by this lane");
+        }
+        if settings.compartment != PRIVATE_COMPARTMENT_ID && !settings.conduit {
             eprintln!(
                 "psiphon: a custom compartment is set, but this transport dials SSH/OSSH only"
             );
@@ -195,6 +213,7 @@ impl PsiphonOut {
             endpoint,
             http_endpoint,
             udpgw: Mutex::new(None),
+            conduit: Mutex::new(None),
         });
         // The edge binds before a tunnel exists, so a refusal is retried, never a lane that exits.
         let weak = Arc::downgrade(&inner);
@@ -232,7 +251,10 @@ impl PsiphonOut {
     pub(crate) fn validate(settings: Option<&Json>) -> Result<Self, String> {
         let settings = Settings::from_json(settings)?;
         warn_ignored(settings.raw.as_ref());
-        if settings.compartment != PRIVATE_COMPARTMENT_ID {
+        if settings.reject_censored || !settings.reject_countries.is_empty() {
+            eprintln!("psiphon: broker proxy country filtering is not applied by this lane");
+        }
+        if settings.compartment != PRIVATE_COMPARTMENT_ID && !settings.conduit {
             eprintln!(
                 "psiphon: a custom compartment is set, but this transport dials SSH/OSSH only"
             );
@@ -363,7 +385,13 @@ impl Inner {
         }
         let deadline = Instant::now() + self.settings.ready;
         let limit = entries.len().min(DIAL_ATTEMPTS);
-        let timeout = self.settings.dial_timeout();
+        let conduit_timeout = self.settings.conduit_timeout;
+        let dial_timeout = self.settings.dial_timeout();
+        let timeout = if self.settings.conduit {
+            conduit_timeout
+        } else {
+            dial_timeout
+        };
         let mut last = String::new();
         let mut offset = 0;
         while offset < limit {
@@ -414,7 +442,24 @@ impl Inner {
             let device_location = self.settings.device_location.clone();
             let client_features = self.settings.client_features.clone();
             let proxy = self.settings.proxy.clone();
+            let conduit =
+                if self.settings.conduit && batch.iter().any(|server| server.inproxy.is_some()) {
+                    match self.conduit() {
+                        Ok(conduit) => Some(conduit),
+                        Err(error) => {
+                            eprintln!("psiphon: conduit unavailable: {error}");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
             let attempt = move |server: &Server| {
+                let timeout = if conduit.is_some() && server.inproxy.is_some() {
+                    conduit_timeout
+                } else {
+                    dial_timeout
+                };
                 let identity = Identity {
                     session_id: &session_id,
                     sponsor: &sponsor,
@@ -426,7 +471,13 @@ impl Inner {
                     device_location: device_location.as_deref(),
                     client_features: &client_features,
                 };
-                Session::connect(server, &identity, timeout, proxy.as_ref())
+                Session::connect(
+                    server,
+                    &identity,
+                    timeout,
+                    proxy.as_ref(),
+                    conduit.as_deref(),
+                )
             };
             match race(batch, attempt, budget, stagger, lead) {
                 Ok(session) => {
@@ -456,6 +507,52 @@ impl Inner {
             }
         }
         Err(format!("psiphon: no server accepted the tunnel: {last}"))
+    }
+
+    /// Build the broker conduit once from the tactics payload and selected compartments.
+    fn conduit(&self) -> Result<Arc<crate::psiphon_webrtc::Conduit>, String> {
+        if let Some(conduit) = lock(&self.conduit).clone() {
+            return Ok(conduit);
+        }
+        if self.settings.proxy.is_some() {
+            return Err(
+                "psiphon conduit: UpstreamProxyURL cannot carry the required direct UDP".to_owned(),
+            );
+        }
+        if self.settings.reject_censored || !self.settings.reject_countries.is_empty() {
+            return Err("psiphon conduit: proxy-country filtering is not applied".to_owned());
+        }
+        let servers = load_tactics_entries(&self.settings)?;
+        let tactics = fetch_tactics_from(&self.settings, &servers)?;
+        let broker = tactics
+            .brokers
+            .first()
+            .ok_or_else(|| "psiphon conduit: tactics names no broker".to_owned())?;
+        let fronts = broker_fronts(broker);
+        let common = decode_compartments(&tactics.compartments)?;
+        let personal = decode_compartment(&self.settings.compartment)?;
+        let (common, personal) = match self.settings.conduit_mode {
+            ConduitMode::Public => (common, Vec::new()),
+            ConduitMode::Shirokhorshid => (Vec::new(), vec![personal]),
+            ConduitMode::Auto => (common, vec![personal]),
+        };
+        if common.is_empty() && personal.is_empty() {
+            return Err("psiphon conduit: no compartments".to_owned());
+        }
+        let conduit = Arc::new(crate::psiphon_webrtc::Conduit::new(
+            crate::psiphon_broker::Broker {
+                public_key: broker.public_key.clone(),
+                root_secret: broker.root_secret.clone(),
+            },
+            fronts,
+            common,
+            personal,
+            tactics.stun_servers.clone(),
+            self.settings.conduit_protocols.clone(),
+            self.settings.conduit_timeout,
+        ));
+        *lock(&self.conduit) = Some(Arc::clone(&conduit));
+        Ok(conduit)
     }
 
     fn udp(&self) -> Result<Arc<UdpGateway>, String> {
@@ -1129,23 +1226,53 @@ impl Settings {
             );
         }
         let cdn_profile = text(settings, "cdnProfile").map(|profile| profile.to_ascii_lowercase());
-        let fronted = match text(settings, "protocolSelection")
+        let selection = text(settings, "protocolSelection")
             .map(|selection| selection.to_ascii_lowercase())
-            .as_deref()
-        {
-            Some("auto" | "direct") => false,
+            .or_else(|| {
+                text(settings, "protocol_selection").map(|value| value.to_ascii_lowercase())
+            });
+        let conduit = selection.as_deref() == Some("conduit");
+        let fronted = match selection.as_deref() {
             None => matches!(cdn_profile.as_deref(), Some("fronted")),
             Some("cdn_fronting" | "fronted" | "fronted-meek" | "cdn") => true,
-            Some("conduit") => {
-                eprintln!(
-                    "psiphon: protocolSelection conduit needs volunteer relays; using SSH/OSSH"
-                );
-                false
-            }
+            Some("auto" | "direct" | "conduit") => false,
             Some(other) => {
                 eprintln!("psiphon: protocolSelection {other:?} is not a known mode");
                 false
             }
+        };
+        let conduit_mode = match text(settings, "conduitMode")
+            .or_else(|| text(settings, "conduit_mode"))
+            .map(|mode| mode.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("public") => ConduitMode::Public,
+            Some("shirokhorshid") => ConduitMode::Shirokhorshid,
+            Some("auto") | None => ConduitMode::Auto,
+            Some(other) => {
+                eprintln!("psiphon: conduitMode {other:?} is not a known mode");
+                ConduitMode::Auto
+            }
+        };
+        let conduit_timeout = Duration::from_secs(
+            number(settings, "conduitTimeout")
+                .or_else(|| number(settings, "conduit_timeout"))
+                .unwrap_or(180)
+                .clamp(10, 600),
+        );
+        let mut conduit_protocols = string_list(settings, "ConduitTunnelProtocols");
+        if conduit_protocols.is_empty() {
+            conduit_protocols = string_list(settings, "conduitTunnelProtocols");
+        }
+        if conduit_protocols.is_empty() {
+            conduit_protocols = string_list(settings, "CONDUIT_TUNNEL_PROTOCOLS");
+        }
+        let reject_countries = {
+            let mut countries = string_list(settings, "InproxyRejectProxyCountryCodes");
+            if countries.is_empty() {
+                countries = string_list(settings, "rejectProxyCountryCodes");
+            }
+            countries
         };
         let mut cdn_ips: Vec<String> = string_list(settings, "cdnIps")
             .into_iter()
@@ -1405,6 +1532,16 @@ impl Settings {
             device_location,
             client_features,
             compartment,
+            conduit,
+            conduit_mode,
+            conduit_timeout,
+            conduit_protocols,
+            reject_censored: flag(
+                settings,
+                "rejectCensoredCountryProxies",
+                "AETHER_PSIPHON_REJECT_CENSORED_PROXIES",
+            ),
+            reject_countries,
             relay_buffer,
             server_lists,
             server_lists_explicit,
@@ -1534,102 +1671,116 @@ fn custom_headers(settings: Option<&Json>) -> Vec<(String, String)> {
         .collect()
 }
 
+const KNOWN_SETTINGS: &[&str] = &[
+    "listen",
+    "shareProxyOnNetwork",
+    "shareProxyOnNetworkSocksPort",
+    "region",
+    "egressRegion",
+    "readySeconds",
+    "serverList",
+    "serverEntries",
+    "state",
+    "dataRootDirectory",
+    "dataDirectory",
+    "serverListURL",
+    "serverListURLs",
+    "serverListUrls",
+    "remoteServerListURLs",
+    "RemoteServerListURLs",
+    "RemoteServerListUrl",
+    "remoteServerListUrl",
+    "serverListSignaturePublicKey",
+    "remoteServerListSignaturePublicKey",
+    "RemoteServerListSignaturePublicKey",
+    "DisableRemoteServerListFetcher",
+    "LocalSocksProxyPort",
+    "ListenInterface",
+    "LocalHttpProxyPort",
+    "shareProxyOnNetworkHttpPort",
+    "DisableLocalHTTPProxy",
+    "EgressRegion",
+    "DataRootDirectory",
+    "SponsorId",
+    "SponsorID",
+    "sponsorId",
+    "localProxyUsername",
+    "shareProxyOnNetworkUsername",
+    "localProxyPassword",
+    "shareProxyOnNetworkPassword",
+    "disableTunnels",
+    "upstreamProxy",
+    "upstream",
+    "UpstreamProxyURL",
+    "protocolSelection",
+    "beastMode",
+    "AggressiveEstablishment",
+    "aggressiveEstablishment",
+    "TunnelPoolSize",
+    "tunnelPoolSize",
+    "ConnectionWorkerPoolSize",
+    "ConnectionWorkerPoolMaxSize",
+    "DisableConnectionWorkerPool",
+    "EstablishTunnelTimeoutSeconds",
+    "EstablishTunnelPausePeriodSeconds",
+    "EstablishTunnelServerAffinityGracePeriodMilliseconds",
+    "StaggerConnectionWorkersMilliseconds",
+    "PropagationChannelId",
+    "ClientPlatform",
+    "ClientVersion",
+    "DeviceRegion",
+    "deviceRegion",
+    "DeviceLocation",
+    "deviceLocation",
+    "ClientFeatures",
+    "InproxyClientPersonalCompartmentID",
+    "inproxyClientPersonalCompartmentID",
+    "inproxyCompartment",
+    "protocol_selection",
+    "conduitMode",
+    "conduit_mode",
+    "conduitTimeout",
+    "conduit_timeout",
+    "ConduitTunnelProtocols",
+    "conduitTunnelProtocols",
+    "CONDUIT_TUNNEL_PROTOCOLS",
+    "rejectCensoredCountryProxies",
+    "InproxyRejectProxyCountryCodes",
+    "rejectProxyCountryCodes",
+    "GeoIPDatabasePath",
+    "cdnProfile",
+    "cdnIps",
+    "cdnSni",
+    "cdnSets",
+    "FrontedMeekDialOverrides",
+    "FrontedMeekDialOverridesProbability",
+    "FrontedMeekCDNScanSpec",
+    "frontedMeekCDNScanSpec",
+    "FrontedMeekCDNScanUseBuiltInSpec",
+    "FrontedMeekCDNScanBuiltInSets",
+    "LimitRelayBufferSizes",
+    "NetworkLatencyMultiplier",
+    "InitialLimitTunnelProtocols",
+    "InitialLimitTunnelProtocolsCandidateCount",
+    "LimitTunnelProtocols",
+    "limitTunnelProtocols",
+    "TunnelProtocol",
+    "tunnelProtocol",
+    "tunnelProtocols",
+    "TargetServerEntry",
+    "CustomHeaders",
+    "customHeaders",
+];
+
 /// Report settings fields this lane does not consume.
 fn warn_ignored(settings: Option<&Json>) {
     let Some(Json::Obj(fields)) = settings else {
         return;
     };
-    let known = [
-        "listen",
-        "shareProxyOnNetwork",
-        "shareProxyOnNetworkSocksPort",
-        "region",
-        "egressRegion",
-        "readySeconds",
-        "serverList",
-        "serverEntries",
-        "state",
-        "dataRootDirectory",
-        "dataDirectory",
-        "serverListURL",
-        "serverListURLs",
-        "serverListUrls",
-        "remoteServerListURLs",
-        "RemoteServerListURLs",
-        "RemoteServerListUrl",
-        "remoteServerListUrl",
-        "serverListSignaturePublicKey",
-        "remoteServerListSignaturePublicKey",
-        "RemoteServerListSignaturePublicKey",
-        "DisableRemoteServerListFetcher",
-        "LocalSocksProxyPort",
-        "ListenInterface",
-        "LocalHttpProxyPort",
-        "shareProxyOnNetworkHttpPort",
-        "DisableLocalHTTPProxy",
-        "EgressRegion",
-        "DataRootDirectory",
-        "SponsorId",
-        "SponsorID",
-        "sponsorId",
-        "localProxyUsername",
-        "shareProxyOnNetworkUsername",
-        "localProxyPassword",
-        "shareProxyOnNetworkPassword",
-        "disableTunnels",
-        "upstreamProxy",
-        "upstream",
-        "UpstreamProxyURL",
-        "protocolSelection",
-        "beastMode",
-        "AggressiveEstablishment",
-        "aggressiveEstablishment",
-        "TunnelPoolSize",
-        "tunnelPoolSize",
-        "ConnectionWorkerPoolSize",
-        "ConnectionWorkerPoolMaxSize",
-        "DisableConnectionWorkerPool",
-        "EstablishTunnelTimeoutSeconds",
-        "EstablishTunnelPausePeriodSeconds",
-        "EstablishTunnelServerAffinityGracePeriodMilliseconds",
-        "StaggerConnectionWorkersMilliseconds",
-        "PropagationChannelId",
-        "ClientPlatform",
-        "ClientVersion",
-        "DeviceRegion",
-        "deviceRegion",
-        "DeviceLocation",
-        "deviceLocation",
-        "ClientFeatures",
-        "InproxyClientPersonalCompartmentID",
-        "inproxyClientPersonalCompartmentID",
-        "inproxyCompartment",
-        "cdnProfile",
-        "cdnIps",
-        "cdnSni",
-        "cdnSets",
-        "FrontedMeekDialOverrides",
-        "FrontedMeekDialOverridesProbability",
-        "FrontedMeekCDNScanSpec",
-        "frontedMeekCDNScanSpec",
-        "FrontedMeekCDNScanUseBuiltInSpec",
-        "FrontedMeekCDNScanBuiltInSets",
-        "LimitRelayBufferSizes",
-        "NetworkLatencyMultiplier",
-        "InitialLimitTunnelProtocols",
-        "InitialLimitTunnelProtocolsCandidateCount",
-        "LimitTunnelProtocols",
-        "limitTunnelProtocols",
-        "TunnelProtocol",
-        "tunnelProtocol",
-        "tunnelProtocols",
-        "TargetServerEntry",
-        "CustomHeaders",
-        "customHeaders",
-    ];
+
     let ignored: Vec<&str> = fields
         .iter()
-        .filter(|(key, _)| !known.contains(&key.as_str()))
+        .filter(|(key, _)| !KNOWN_SETTINGS.contains(&key.as_str()))
         .map(|(key, _)| key.as_str())
         .collect();
     if !ignored.is_empty() {
@@ -1848,12 +1999,42 @@ fn compartment32(text: &str, what: &str) -> Result<[u8; 32], String> {
         .ok_or_else(|| format!("psiphon broker: {what} is not 32 base64 bytes"))
 }
 
+/// Create the local offer unless the caller supplied SDP.
+fn webrtc_offer(
+    address: IpAddr,
+    stun_servers: &[String],
+    sdp: Option<&str>,
+    timeout: std::time::Duration,
+) -> Result<(Option<crate::psiphon_webrtc::WebRtc>, String), String> {
+    if let Some(sdp) = sdp {
+        return Ok((None, sdp.to_owned()));
+    }
+    let (webrtc, sdp) = crate::psiphon_webrtc::WebRtc::offer(address, stun_servers, timeout)?;
+    Ok((Some(webrtc), sdp))
+}
+
+/// Apply the broker's answer and open the channel.
+fn webrtc_conduit(
+    webrtc: &mut crate::psiphon_webrtc::WebRtc,
+    offer: &crate::psiphon_broker::Offer,
+    timeout: std::time::Duration,
+) -> Result<(), String> {
+    if offer.answer_sdp.is_empty() {
+        return Ok(());
+    }
+    webrtc.answer(&offer.answer_sdp)?;
+    webrtc.await_channel(timeout)
+}
+
 /// Send a client offer to the first broker the tactics payload names.
 pub(crate) fn broker_offer(
     settings: Option<&Json>,
-    sdp: &str,
+    sdp: Option<&str>,
 ) -> Result<crate::psiphon_broker::Offer, String> {
     let settings = Settings::from_json(settings)?;
+    if settings.proxy.is_some() && sdp.is_none() {
+        eprintln!("psiphon broker: generated WebRTC uses direct UDP; the proxy carries only broker requests");
+    }
     let servers = load_tactics_entries(&settings)?;
     let tactics = fetch_tactics_from(&settings, &servers)?;
     let broker = tactics
@@ -1892,6 +2073,9 @@ pub(crate) fn broker_offer(
     }
     let mut why = String::new();
     for front in &fronts {
+        let timeout = settings.ready.max(std::time::Duration::from_secs(20));
+        let (mut webrtc, generated) =
+            webrtc_offer(server.address, &tactics.stun_servers, sdp, timeout)?;
         let mut client = match crate::psiphon_broker::Client::connect(
             crate::psiphon_broker::Broker {
                 public_key: broker.public_key.clone(),
@@ -1911,10 +2095,18 @@ pub(crate) fn broker_offer(
             destination,
             &compartments,
             &[personal],
-            sdp,
+            &generated,
             &crate::psiphon_broker::Metrics::from_identity(&identity),
         ) {
-            Ok(offer) => return Ok(offer),
+            Ok(offer) => {
+                if let Some(webrtc) = webrtc.as_mut() {
+                    if let Err(error) = webrtc_conduit(webrtc, &offer, timeout) {
+                        why = error;
+                        continue;
+                    }
+                }
+                return Ok(offer);
+            }
             Err(error) => why = error,
         }
     }
@@ -1952,6 +2144,21 @@ fn fetch_tactics_from(
         settings.ready,
         settings.proxy.as_ref(),
     )
+}
+
+/// Decode every tactics compartment without echoing a value.
+fn decode_compartments(compartments: &[String]) -> Result<Vec<[u8; 32]>, String> {
+    compartments
+        .iter()
+        .map(|compartment| decode_compartment(compartment))
+        .collect()
+}
+
+/// Decode one compartment without echoing a value.
+fn decode_compartment(compartment: &str) -> Result<[u8; 32], String> {
+    ferrox_core::b64::decode(compartment.as_bytes())
+        .and_then(|compartment| compartment.try_into().ok())
+        .ok_or_else(|| "psiphon: compartment is not 32 base64 bytes".to_owned())
 }
 
 fn broker_fronts(broker: &crate::psiphon_tactics::Broker) -> Vec<crate::psiphon_broker::Front> {
@@ -2039,10 +2246,15 @@ fn filter_region(mut servers: Vec<Server>, settings: &Settings) -> Vec<Server> {
 }
 
 fn load_all_entries(settings: &Settings) -> Result<Vec<Server>, String> {
-    let servers = load_source_entries(settings, true, false)?;
+    let servers = load_source_entries(settings, true, settings.conduit)?;
     let servers: Vec<Server> = servers
         .into_iter()
-        .filter(|server| server.direct || server.meek.is_some() || server.unfronted_meek.is_some())
+        .filter(|server| {
+            server.direct
+                || server.meek.is_some()
+                || server.unfronted_meek.is_some()
+                || (settings.conduit && server.inproxy.is_some())
+        })
         .collect();
     let mut servers = if settings.target.is_some() {
         servers
@@ -2533,6 +2745,11 @@ fn select_protocols(
     } else {
         servers.retain_mut(|server| {
             if server.direct {
+                server.meek = None;
+                server.unfronted_meek = None;
+                return true;
+            }
+            if server.inproxy.is_some() {
                 server.meek = None;
                 server.unfronted_meek = None;
                 return true;
@@ -3678,6 +3895,14 @@ mod tests {
     }
 
     #[test]
+    fn a_tactics_compartment_that_does_not_decode_is_not_echoed() {
+        let secret = "not/a/compartment";
+        let error = decode_compartment(secret).expect_err("a bad compartment");
+        assert_eq!(error, "psiphon: compartment is not 32 base64 bytes");
+        assert!(!error.contains(secret));
+    }
+
+    #[test]
     fn a_personal_compartment_that_does_not_decode_is_not_echoed() {
         let secret = "not/a/compartment";
         let error = compartment32(secret, "personal compartment").expect_err("a bad compartment");
@@ -4782,6 +5007,7 @@ mod tests {
             endpoint: SocketAddr::from(([127, 0, 0, 1], 0)),
             http_endpoint: None,
             udpgw: Mutex::new(None),
+            conduit: Mutex::new(None),
         };
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("addr");
@@ -4826,6 +5052,7 @@ mod tests {
             endpoint: SocketAddr::from(([127, 0, 0, 1], 0)),
             http_endpoint: None,
             udpgw: Mutex::new(None),
+            conduit: Mutex::new(None),
         };
         let listener = TcpListener::bind("127.0.0.1:0").expect("listener");
         let addr = listener.local_addr().expect("addr");

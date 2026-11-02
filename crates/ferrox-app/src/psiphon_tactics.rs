@@ -44,6 +44,7 @@ pub(crate) struct Tactics {
     pub(crate) ttl: String,
     pub(crate) brokers: Vec<Broker>,
     pub(crate) compartments: Vec<String>,
+    pub(crate) stun_servers: Vec<String>,
 }
 
 impl Tactics {
@@ -250,6 +251,7 @@ fn parse_payload(payload: &[u8]) -> Result<Tactics, String> {
             ttl: String::new(),
             brokers: Vec::new(),
             compartments: Vec::new(),
+            stun_servers: Vec::new(),
         });
     };
     let ttl = tactics
@@ -273,11 +275,29 @@ fn parse_payload(payload: &[u8]) -> Result<Tactics, String> {
                 .collect()
         })
         .unwrap_or_default();
+    let stun_servers = parameters
+        .and_then(|parameters| {
+            parameters
+                .get("InproxyClientSTUNServerAddresses")
+                .or_else(|| parameters.get("InproxyClientSTUNServerAddressesRFC5780"))
+                .or_else(|| parameters.get("InproxySTUNServerAddresses"))
+                .or_else(|| parameters.get("InproxySTUNServerAddressesRFC5780"))
+        })
+        .and_then(Json::as_arr)
+        .map(|addresses| {
+            addresses
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
     Ok(Tactics {
         tag,
         ttl,
         brokers,
         compartments,
+        stun_servers,
     })
 }
 
@@ -436,7 +456,7 @@ mod tests {
 
     #[test]
     fn a_payload_names_the_brokers_and_compartments() {
-        let text = br#"{"Tag":"tag","Tactics":{"TTL":"1h","Parameters":{"InproxyBrokerSpecs":[{"BrokerPublicKey":"pk","BrokerRootObfuscationSecret":"rs","BrokerFrontingSpecs":[{"Host":"broker.example"}]}],"InproxyCommonCompartmentIDs":["c1","c2"]}}}"#;
+        let text = br#"{"Tag":"tag","Tactics":{"TTL":"1h","Parameters":{"InproxyBrokerSpecs":[{"BrokerPublicKey":"pk","BrokerRootObfuscationSecret":"rs","BrokerFrontingSpecs":[{"Host":"broker.example"}]}],"InproxyCommonCompartmentIDs":["c1","c2"],"InproxyClientSTUNServerAddresses":["192.0.2.10"]}}}"#;
         let tactics = parse_payload(text).expect("payload");
         assert_eq!(tactics.tag, "tag");
         assert_eq!(tactics.ttl, "1h");
@@ -453,6 +473,7 @@ mod tests {
             }]
         );
         assert_eq!(tactics.compartments, vec!["c1".to_owned(), "c2".to_owned()]);
+        assert_eq!(tactics.stun_servers, vec!["192.0.2.10".to_owned()]);
     }
 
     #[test]
