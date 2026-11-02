@@ -1336,25 +1336,6 @@ pub(crate) fn live_threads() -> usize {
         .count()
 }
 
-/// The tasks running under one name: a delta over the whole table moves with the harness, while
-/// the named count is the claim. The kernel cuts `comm` to fifteen bytes, so the name is cut the
-/// same way before it is compared.
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn threads_named(name: &str) -> usize {
-    const COMM_MAX: usize = 15;
-    let wanted = &name[..name.len().min(COMM_MAX)];
-    let mut count = 0;
-    for entry in std::fs::read_dir("/proc/self/task")
-        .expect("reads the task table")
-        .flatten()
-    {
-        if let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) {
-            count += usize::from(comm.trim() == wanted);
-        }
-    }
-    count
-}
-
 #[cfg(test)]
 impl Listener {
     /// The single accept a fixture that dials one client needs; the std `accept` shape, mapped

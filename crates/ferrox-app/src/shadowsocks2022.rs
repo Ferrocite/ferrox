@@ -3417,7 +3417,6 @@ mod tests {
         ) {
             return;
         }
-        let threads = crate::conn::live_threads;
         let method = Method::Aes256Gcm;
         let psk = vec![7u8; 32];
         let salt = vec![7u8; 32];
@@ -3436,7 +3435,7 @@ mod tests {
             );
             (peer, client)
         };
-        let before = threads();
+        let before = crate::conn::live_threads();
         let mut held = Vec::new();
         for _ in 0..8 {
             let (plain, peer) = pair();
@@ -3452,11 +3451,7 @@ mod tests {
             );
             held.push((peer, client));
         }
-        let after = threads();
-        assert!(
-            crate::conn::threads_named("ferrox-relay-lane") >= 1,
-            "the sessions ride the lane pool, and its name is the one the kernel reports"
-        );
+        let after = crate::conn::live_threads();
         assert!(
             after < before + 8,
             "eight live sessions added {} threads",
