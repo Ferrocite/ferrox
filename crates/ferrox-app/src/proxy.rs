@@ -42161,6 +42161,7 @@ mod tests {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let settings = xhttp_settings(WITNESS);
+        let server_settings = settings.clone();
         thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             serve_vless_tls(
@@ -42168,7 +42169,7 @@ mod tests {
                 &one_vless_user(&id),
                 true,
                 &Carrier::Xhttp {
-                    settings: settings.clone(),
+                    settings: server_settings,
                 },
                 &server_config,
                 None,
