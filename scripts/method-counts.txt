@@ -601,7 +601,7 @@ security-ech quic-lanes-that-fall-back-without-an-offer 1 ferrox-app-quic::tests
 security-ech heap-buffers-for-an-ech-cover 1 ferrox-core-tls::shaped::hello::tests::an_ech_cover_is_written_into_one_buffer
 
 # --- engine sniffing --------------------------------------------------------
-engine-sniffing-http-tls-quic-fakedns ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-sniffing-http-tls-quic-fakedns ops-retired-instructions 35898 scripts/count-ops.sh
 engine-sniffing-http-tls-quic-fakedns http-host-and-tls-sni-recognized 2 ferrox-app-sniff::tests::reads_http_host_and_tls_sni
 engine-sniffing-http-tls-quic-fakedns quic-initial-sni-recognized 1 ferrox-app-sniff::tests::reads_a_quic_initial_sni
 engine-sniffing-http-tls-quic-fakedns bittorrent-and-utp-recognized 2 ferrox-app-sniff::tests::reads_bittorrent_and_utp
