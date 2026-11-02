@@ -108,6 +108,7 @@ carrier-foxy  foxy::tests::the_serial_terminator_walk_costs_the_same_answer  fer
 carrier-foxy  foxy::tests::a_growing_head_is_walked_once  ferrox_core::foxy::head_end
 carrier-foxy  foxy::tests::a_growing_head_is_walked_once  ferrox_core::foxy::tests::a_growing_head_is_walked_once
 carrier-foxy  foxy::tests::a_growing_head_rewalked_costs_the_old_pass  ferrox_core::foxy::tests::a_growing_head_rewalked_costs_the_old_pass
+carrier-foxy  foxy::tests::a_growing_head_rewalked_costs_the_old_pass  ferrox_core::foxy::head_end
 carrier-foxy  foxy::connectip::tests::the_word_sum_costs_the_words_it_reads  ferrox_core::foxy::connectip::word_sum
 carrier-foxy  foxy::connectip::tests::the_word_sum_costs_the_words_it_reads  ferrox_core::foxy::connectip::tests::the_word_sum_costs_the_words_it_reads
 carrier-foxy  foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer  ferrox_core::foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer

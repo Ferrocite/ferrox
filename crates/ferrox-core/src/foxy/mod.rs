@@ -1495,51 +1495,61 @@ mod tests {
         }
     }
 
-    /// The growing scan: one head arriving eight octets at a time is weighed once at each seam and stops at the first `Some`, the shape every caller uses, and the same eleven asks fold to the whole-buffer answer.
+    /// A head the size of a served request, arriving in sixty-four-octet pieces.
+    fn a_long_head() -> Vec<u8> {
+        let mut head = b"HTTP/1.1 200 Connection established\r\n".to_vec();
+        while head.len() + 4 < 4096 {
+            head.extend_from_slice(b"X-Fill: 0123456789abcdef0123456789abcdef\r\n");
+        }
+        head.extend_from_slice(b"\r\n");
+        head
+    }
+
+    /// The growing scan: a 4 KiB head arriving sixty-four octets at a time is weighed once at each seam and stops at the first `Some`, the shape every caller uses, and the same sixty-five asks fold to the whole-buffer answer.
     #[test]
     fn a_growing_head_is_walked_once() {
-        const HEAD: &[u8] = b"HTTP/1.1 200 Connection established\r\nProxy-Agent: ferrox\r\nX-Trace: 0123456789abcdef\r\n\r\n";
+        let head = a_long_head();
         let mut scanned = 0;
         let mut fold: u32 = 0;
         let mut end = 0;
         loop {
-            end = (end + 8).min(HEAD.len());
-            let got = head_end_grown(std::hint::black_box(&HEAD[..end]), &mut scanned);
+            end = (end + 64).min(head.len());
+            let got = head_end_grown(std::hint::black_box(&head[..end]), &mut scanned);
             fold = fold
                 .wrapping_mul(31)
                 .wrapping_add(end as u32)
                 .wrapping_add(got.map_or(0, |at| at as u32 + 1));
-            if got.is_some() || end == HEAD.len() {
+            if got.is_some() || end == head.len() {
                 break;
             }
         }
         assert_eq!(
-            fold, 0x6761_e083,
-            "one head in eleven pieces, folded after each ask"
+            fold, 0x6e10_181f,
+            "one head in sixty-five pieces, folded after each ask"
         );
-        assert_eq!(scanned, HEAD.len());
+        assert_eq!(scanned, head.len());
     }
 
-    /// The rewalk the growing scan replaced, kept as this run's other frame: the same eleven asks each weigh the whole prefix through `head_end`, the same pinned fold, so the pair prices the resume without a second CI run being trusted to agree with the first.
+    /// The rewalk the growing scan replaced, kept as this run's other frame: the same sixty-five asks each weigh the whole prefix through `head_end`, the same pinned fold, so the pair prices the resume without a second CI run being trusted to agree with the first.
     #[test]
     fn a_growing_head_rewalked_costs_the_old_pass() {
-        const HEAD: &[u8] = b"HTTP/1.1 200 Connection established\r\nProxy-Agent: ferrox\r\nX-Trace: 0123456789abcdef\r\n\r\n";
+        let head = a_long_head();
         let mut fold: u32 = 0;
         let mut end = 0;
         loop {
-            end = (end + 8).min(HEAD.len());
-            let got = head_end(std::hint::black_box(&HEAD[..end]));
+            end = (end + 64).min(head.len());
+            let got = head_end(std::hint::black_box(&head[..end]));
             fold = fold
                 .wrapping_mul(31)
                 .wrapping_add(end as u32)
                 .wrapping_add(got.map_or(0, |at| at as u32 + 1));
-            if got.is_some() || end == HEAD.len() {
+            if got.is_some() || end == head.len() {
                 break;
             }
         }
         assert_eq!(
-            fold, 0x6761_e083,
-            "the same eleven asks, each over the whole prefix"
+            fold, 0x6e10_181f,
+            "the same sixty-five asks, each over the whole prefix"
         );
     }
 
