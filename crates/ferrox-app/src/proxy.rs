@@ -15815,6 +15815,70 @@ where
 
 /// The carrier lanes a dialled session rides, shared by the `TLS` and `REALITY` client dials: split the sealed session into a carrier's reader and writer, read the answer, then run the plain relay. `Raw` is the caller's and is left untouched here.
 #[allow(clippy::too_many_lines)]
+/// What a VLESS xHTTP session does once its stream exists, whether the stream was just dialled or
+/// taken from the `xmux` pool.
+fn relay_vless_xhttp_session<R: Read + Send + 'static>(
+    server: &SocketAddr,
+    client: &Connection,
+    vless: &VlessOut,
+    header: &[u8],
+    reader: R,
+    writer: crate::xhttp::XhttpWriter,
+) {
+    if vless.encryption.is_some() {
+        let close = writer.clone();
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.finish());
+        if dial_sealed_carried(client, vless, header, reader, writer, &close) {
+            return;
+        }
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    }
+    if !writer.send(header) {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    }
+    relay_sink_drained(ReplyReader::new(reader), &writer, client);
+}
+
+/// Opens one pooled stream and relays it; false when the entry could not carry the request.
+fn pooled_xhttp_reply(
+    server: &SocketAddr,
+    client: &Connection,
+    vless: &VlessOut,
+    settings: &crate::xhttp::XhttpSettings,
+    header: &[u8],
+    lease: crate::xmux::Lease,
+) -> bool {
+    let Some((reader, writer)) = lease.conn().open(&vless.host, settings, "https", false) else {
+        lease.retire();
+        return false;
+    };
+    let mut writer = writer;
+    writer.hold(Arc::new(lease));
+    relay_vless_xhttp_session(server, client, vless, header, reader, writer);
+    true
+}
+
+/// The key a REALITY xHTTP session shares its pool under: the reference keys on the destination and
+/// the stream settings (`dialer.go:63`), and two outbounds with different REALITY clients must not
+/// share a connection either.
+fn reality_xmux(
+    server: &SocketAddr,
+    vless: &VlessOut,
+    reality: &Arc<ferrox_core::tls::RealityClientConfig>,
+    settings: &crate::xhttp::XhttpSettings,
+) -> Arc<crate::xmux::Manager> {
+    let key = crate::xmux::Key {
+        server: *server,
+        host: vless.host.clone(),
+        path: settings.path.clone(),
+        query: settings.query.clone(),
+        h2: true,
+        identity: Arc::as_ptr(reality) as usize,
+    };
+    crate::xmux::manager(key, settings.xmux)
+}
+
+#[allow(clippy::too_many_lines)]
 fn ride_carrier<S: Dialed, D: Dialed>(
     server: &SocketAddr,
     session: S,
@@ -15900,18 +15964,7 @@ fn ride_carrier<S: Dialed, D: Dialed>(
             else {
                 return;
             };
-            if vless.encryption.is_some() {
-                let close = writer.clone();
-                let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.finish());
-                if dial_sealed_carried(client, vless, header, reader, writer, &close) {
-                    return;
-                }
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            if !writer.send(header) {
-                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-            }
-            relay_sink_drained(ReplyReader::new(reader), &writer, client);
+            relay_vless_xhttp_session(server, client, vless, header, reader, writer);
         }
         Carrier::HttpHeader { path } => {
             let Some((reader, sink)) =
@@ -16208,6 +16261,22 @@ fn dial_vless_reality(
     let Some(cfg) = vless.reality.as_deref() else {
         return;
     };
+    let Some(reality) = vless.reality.as_ref() else {
+        return;
+    };
+    let Some(header) = vless_request_header(vless, target) else {
+        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+    };
+    // REALITY always dials HTTP/2 (`decideHTTPVersion`, dialer.go:82), so this dial can take a pool entry without a handshake.
+    if let Carrier::Xhttp { settings } = &vless.carrier {
+        let pool = reality_xmux(server, vless, reality, settings);
+        if let Some(lease) = pool.existing() {
+            if pooled_xhttp_reply(server, client, vless, settings, &header, lease) {
+                return;
+            }
+            return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+        }
+    }
     let uplink = match dial(server) {
         Ok(uplink) => uplink.with_mask(vless.carrier.tcp_mask()),
         Err(failure) => return note_dial_failure(server, failure),
@@ -16240,9 +16309,6 @@ fn dial_vless_reality(
     if raw.set_read_timeout(Some(SESSION_POLL)).is_err() {
         return note_dial_failure(server, Failure::new(Stage::SocketConnected, Kind::Local));
     }
-    let Some(header) = vless_request_header(vless, target) else {
-        return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
-    };
     match &vless.carrier {
         Carrier::Raw(_) => {
             if let Some(encryption) = &vless.encryption {
@@ -16345,6 +16411,19 @@ fn dial_vless_reality(
                         relay_shared(Half::socket(downstream), rearmed, &close);
                     }
                 }
+            }
+        }
+        Carrier::Xhttp { settings } => {
+            let pool = reality_xmux(server, vless, reality, settings);
+            let lease = pool.lease(|| {
+                let (reader, writer, raw) = session.into_halves()?;
+                crate::xhttp_h2::H2Client::new(reader, writer, Some(raw))
+            });
+            let Some(lease) = lease else {
+                return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            };
+            if !pooled_xhttp_reply(server, client, vless, settings, &header, lease) {
+                note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
         }
         _ => ride_carrier(
@@ -36722,7 +36801,8 @@ mod tests {
         drop(user);
         dialled.join().expect("joins");
         pair.echo.join().expect("joins");
-        pair.front.join().expect("joins");
+        // The pooled H2 transport outlives the session by design, so the hub's accept loop stays parked.
+        drop(pair.front);
     }
 
     /// The reference chooses HTTP/2 for every REALITY xHTTP session (`decideHTTPVersion`, dialer.go:82), so the preface is the contract: an H1 head never carries this path.
@@ -36745,7 +36825,8 @@ mod tests {
         drop(user);
         dialled.join().expect("joins");
         pair.echo.join().expect("joins");
-        pair.front.join().expect("joins");
+        // The pooled H2 transport outlives the session by design, so the hub's accept loop stays parked.
+        drop(pair.front);
         assert!(
             H2_DIAL_WITNESS
                 .lock()
@@ -36753,6 +36834,106 @@ mod tests {
                 .iter()
                 .any(|path| path == WITNESS),
             "the REALITY xHTTP dial did not open with the H2 preface"
+        );
+    }
+
+    /// `maxConnections: 1` is the reference's multiplexing shape: the second session opens a stream on
+    /// the connection the first one dialled (`getHTTPClient` → `GetXmuxClient`, mux.go:73), so the
+    /// server counts one transport for two flows.
+    #[test]
+    fn two_reality_xhttp_sessions_share_one_pooled_connection() {
+        const WITNESS: &str = "/h2-pool-witness";
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let echo_addr = echo.local_addr().expect("addr");
+        let _echo = thread::spawn(move || loop {
+            let Ok((mut stream, _)) = echo.accept() else {
+                return;
+            };
+            thread::spawn(move || {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stream.read(&mut buf) {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => {
+                            if stream.write_all(&buf[..n]).is_err() {
+                                return;
+                            }
+                        }
+                    }
+                }
+            });
+        });
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        let users = [VlessUser {
+            id,
+            flow: Flow::None,
+            email: String::new(),
+            level: 0,
+            reverse: None,
+        }];
+        let mut settings = xhttp_settings(WITNESS);
+        settings.xmux = Some(crate::xhttp::Xmux {
+            max_connections: (1, 1),
+            ..crate::xhttp::Xmux::default()
+        });
+        let carrier = Carrier::Xhttp { settings };
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let server_addr = front.local_addr().expect("addr");
+        let server_config = reality_server_config();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let seen = Arc::clone(&accepted);
+        thread::spawn(move || loop {
+            let Ok((stream, _)) = front.accept() else {
+                return;
+            };
+            seen.fetch_add(1, Ordering::SeqCst);
+            let carrier = carrier.clone();
+            let server_config = server_config.clone();
+            let users = users.clone();
+            thread::spawn(move || {
+                serve_vless_reality(stream, &users, true, &carrier, &server_config, None, None);
+            });
+        });
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let json = reality_network_json_with_log(
+            server_addr.port(),
+            &b64url(&public),
+            "",
+            "xhttp",
+            None,
+            Some(WITNESS),
+        )
+        .replace(
+            &format!(r#""xhttpSettings": {{"path": "{WITNESS}"}}"#),
+            &format!(
+                r#""xhttpSettings": {{"path": "{WITNESS}", "xmux": {{"maxConnections": "1"}}}}"#
+            ),
+        );
+        let root = crate::json::parse(&json).expect("parses");
+        let outbound = find_outbound(&root)
+            .expect("a REALITY outbound")
+            .expect("the config names one");
+        let pair = RealityPair {
+            outbound,
+            server: server_addr,
+            target: echo_addr,
+            echo: thread::spawn(|| ()),
+            front: thread::spawn(|| ()),
+        };
+        for _ in 0..2 {
+            let (mut user, dialled) = dial_pair(&pair);
+            let payload: Vec<u8> = (0..4096u32)
+                .map(|index| (index as u8).wrapping_mul(7).wrapping_add(5))
+                .collect();
+            assert_eq!(echo_bulk(&mut user, &payload), payload);
+            drop(user);
+            dialled.join().expect("joins");
+        }
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            1,
+            "the second REALITY xHTTP session dialled its own transport instead of reusing the pool"
         );
     }
 

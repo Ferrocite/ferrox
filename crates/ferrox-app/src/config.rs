@@ -2580,10 +2580,14 @@ fn header_line(line: &str) -> Option<(String, String)> {
 pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, String) {
     let settings = outbound.get("streamSettings");
     let carrier = stream_carrier(settings);
-    // The reference dials a stream-up session out of an `xmux` pool; this tree keeps none, so the bounds are read and named rather than applied.
-    if let Carrier::Xhttp { settings } = &carrier {
-        if settings.xmux.is_some() {
-            eprintln!("xhttp: \"xmux\" bounds are checked, and this tree keeps no connection pool, so they are not applied");
+    // Only a REALITY stream-one session knows it dials H2 before the handshake, so only that arm is pooled here.
+    if let Carrier::Xhttp { settings: xhttp } = &carrier {
+        let reality = settings
+            .and_then(|node| node.get("security"))
+            .and_then(Json::as_str)
+            == Some("reality");
+        if xhttp.xmux.is_some() && !reality {
+            eprintln!("xhttp: \"xmux\" bounds are checked, and this tree pools only a REALITY stream-one session, so an H1 or TLS-h2 dial keeps its own connection");
         }
     }
     let key = match &carrier {
