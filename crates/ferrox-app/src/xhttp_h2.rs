@@ -1155,7 +1155,7 @@ impl H2Conn {
 }
 
 impl H2Conn {
-    fn apply_settings(&self, body: &[u8]) {
+    fn apply_settings(&self, body: &[u8]) -> bool {
         let mut at = 0;
         while at + 6 <= body.len() {
             let id = u16::from_be_bytes([body[at], body[at + 1]]);
@@ -1190,7 +1190,7 @@ impl H2Conn {
                 self.wake.notify_all();
             }
         }
-        let _ = self.send_control(T_SETTINGS, F_ACK, 0, &[]);
+        self.send_control(T_SETTINGS, F_ACK, 0, &[])
     }
 }
 
@@ -2049,17 +2049,14 @@ fn cut_padded_data(body: &mut Vec<u8>, pad: usize) -> usize {
 fn control_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: &[u8]) -> Option<bool> {
     match kind {
         T_SETTINGS => {
-            if flags & F_ACK == 0 {
-                if !body.len().is_multiple_of(6) {
-                    return Some(false);
-                }
-                conn.apply_settings(body);
+            if flags & F_ACK == 0 && (!body.len().is_multiple_of(6) || !conn.apply_settings(body)) {
+                return Some(false);
             }
             Some(true)
         }
         T_PING => {
             if flags & F_ACK == 0 && body.len() == 8 {
-                conn.send_control(T_PING, F_ACK, 0, body);
+                return Some(conn.send_control(T_PING, F_ACK, 0, body));
             }
             Some(true)
         }
@@ -3650,6 +3647,27 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A control send that fails ends the read loop: its caller sees `false`, kills the
+    /// connection and wakes the parked streams, instead of dispatching frames nothing can answer.
+    #[test]
+    fn a_failed_control_send_ends_the_read_loop() {
+        struct Silent;
+        impl H2Service for Silent {
+            fn open(&self, _conn: &Arc<H2Conn>, _sid: u32, _block: &[u8], _end_stream: bool) {}
+        }
+        let conn = conn_with(Box::new(NullWrite), true);
+        conn.dead.store(true, Ordering::SeqCst);
+        let mut frag = None;
+        assert!(
+            !pump_frame(&conn, &Silent, T_PING, 0, 0, vec![0u8; 8], &mut frag),
+            "a PING whose ACK cannot be sent ends the read loop"
+        );
+        assert!(
+            !pump_frame(&conn, &Silent, T_SETTINGS, 0, 0, Vec::new(), &mut frag),
+            "a SETTINGS whose ACK cannot be sent ends the read loop"
+        );
     }
 
     /// A connection with one stream and all the credit it needs: the frame writer is the only
