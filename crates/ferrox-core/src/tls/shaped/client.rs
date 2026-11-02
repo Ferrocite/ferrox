@@ -67,6 +67,67 @@ pub struct Session<S: Stream> {
     reply: Vec<u8>,
     out: Vec<u8>,
     key_log: Option<Arc<dyn rustls::KeyLog>>,
+    client_cert: Option<ClientIdentity>,
+}
+
+/// The identity a shaped dial presents when a server asks: the chain in presentation order and the
+/// signing key its DER names, resolved once per session so the answer costs one signature.
+struct ClientIdentity {
+    chain: Vec<Vec<u8>>,
+    key: Arc<dyn rustls::sign::SigningKey>,
+}
+
+impl ClientIdentity {
+    fn new(entry: &crate::tls::CertEntry) -> Result<Self, TlsError> {
+        let key = rustls::crypto::ring::sign::any_supported_type(
+            &crate::tls::rustls_backend::key_of(entry),
+        )
+        .map_err(|e| TlsError::BadCertificate(format!("client key: {e}")))?;
+        Ok(Self {
+            chain: entry.cert_chain.clone(),
+            key,
+        })
+    }
+
+    /// The signer for a scheme the server offered, or `None` when the key cannot speak one.
+    fn signer<'a>(
+        &'a self,
+        offered: &[u16],
+        tls13: bool,
+    ) -> Option<Box<dyn rustls::sign::Signer + 'a>> {
+        use rustls::SignatureScheme as S;
+        let defaults: &[u16] = if tls13 {
+            &[0x0403, 0x0503, 0x0807, 0x0804, 0x0805, 0x0806]
+        } else {
+            &[
+                0x0403, 0x0503, 0x0603, 0x0807, 0x0401, 0x0501, 0x0601, 0x0804, 0x0805, 0x0806,
+            ]
+        };
+        let listed = if offered.is_empty() {
+            if !tls13 {
+                return None;
+            }
+            defaults
+        } else {
+            offered
+        };
+        let schemes: Vec<S> = listed
+            .iter()
+            .map(|id| S::from(*id))
+            .filter(|scheme| {
+                !tls13
+                    || !matches!(
+                        scheme,
+                        S::RSA_PKCS1_SHA1
+                            | S::RSA_PKCS1_SHA256
+                            | S::RSA_PKCS1_SHA384
+                            | S::RSA_PKCS1_SHA512
+                            | S::ECDSA_SHA1_Legacy
+                    )
+            })
+            .collect();
+        self.key.choose_scheme(&schemes)
+    }
 }
 
 impl<S: Stream> std::fmt::Debug for Session<S> {
@@ -101,6 +162,11 @@ impl<S: Stream> Session<S> {
         let verifier = crate::tls::rustls_backend::verifier(cfg)?;
         let mut session = Self::with_hello(profile, cfg.server_name.clone(), verifier, hello, io)?;
         session.set_key_log(cfg.master_key_log.clone());
+        session.client_cert = cfg
+            .client_cert
+            .as_deref()
+            .map(ClientIdentity::new)
+            .transpose()?;
         Ok(session)
     }
 
@@ -151,6 +217,7 @@ impl<S: Stream> Session<S> {
             reply: Vec::new(),
             out: Vec::new(),
             key_log: None,
+            client_cert: None,
         })
     }
 
@@ -373,7 +440,7 @@ impl<S: Stream> Session<S> {
         let mut asked = None;
         let mut msg = self.next_handshake()?;
         if msg[0] == 13 {
-            asked = Some(request_context(&msg[4..])?);
+            asked = Some(certificate_request13(&msg[4..])?);
             self.transcript.extend_from_slice(&msg);
             msg = self.next_expect(11)?;
         } else if msg[0] != 11 {
@@ -407,11 +474,18 @@ impl<S: Stream> Session<S> {
         self.read_key = Some(Direction::tls13(suite, &server_ap));
         self.write_key = Some(Direction::tls13(suite, &client_hs));
 
-        if let Some(context) = &asked {
-            // The empty chain answers the request, and its bytes count in our own Finished hash.
-            let answer = certificate_answer13(context);
-            self.send_encrypted(HANDSHAKE, &answer)?;
-            self.transcript.extend_from_slice(&answer);
+        if let Some((context, offered)) = &asked {
+            // The answer's bytes count in our own Finished hash, whether it carries a chain or not.
+            let (certificate, verify) = match &self.client_cert {
+                Some(identity) => identity.flight13(context, offered, &self.transcript, hash),
+                None => (certificate_answer13(context), None),
+            };
+            self.send_encrypted(HANDSHAKE, &certificate)?;
+            self.transcript.extend_from_slice(&certificate);
+            if let Some(verify) = &verify {
+                self.send_encrypted(HANDSHAKE, verify)?;
+                self.transcript.extend_from_slice(verify);
+            }
         }
 
         let verify = kdf::verify_data(hash, &kdf::finished_key(hash, &client_hs), &self.transcript);
@@ -450,8 +524,10 @@ impl<S: Stream> Session<S> {
             Some((group, peer))
         };
         let mut msg = self.next_handshake()?;
-        let asked = msg[0] == 13;
-        if asked {
+        let asked = (msg[0] == 13)
+            .then(|| certificate_request12(&msg[4..]))
+            .transpose()?;
+        if asked.is_some() {
             self.transcript.extend_from_slice(&msg);
             msg = self.next_handshake()?;
         }
@@ -459,11 +535,9 @@ impl<S: Stream> Session<S> {
             return Err(unexpected(msg[0]));
         }
         self.transcript.extend_from_slice(&msg);
-        if asked {
-            // The empty certificate a client-auth request draws hashes after the flight's ServerHelloDone.
-            let empty = certificate_empty();
-            self.send_plain(HANDSHAKE, &empty, [0x03, 0x03])?;
-            self.transcript.extend_from_slice(&empty);
+        let mut presenting = false;
+        if let Some(offered) = &asked {
+            presenting = self.send_certificate12(offered)?;
         }
 
         let (pre_master, exchange) = match share {
@@ -490,6 +564,14 @@ impl<S: Stream> Session<S> {
         // RFC 7627 hashes the ClientKeyExchange into the EMS transcript, as Go does after writing it.
         let hash = suite.hash();
         let session_hash = sh.ems.then(|| hash.hash(&self.transcript));
+
+        // The certificate's proof follows the key exchange, over the transcript that now holds both.
+        if presenting {
+            if let Some(offered) = &asked {
+                self.send_client_verify12(offered)?;
+            }
+        }
+
         let (master, directions) = super::tls12::keys(
             suite,
             &pre_master,
@@ -548,6 +630,34 @@ impl<S: Stream> Session<S> {
         out.extend_from_slice(&(body.len() as u16).to_be_bytes());
         out.extend_from_slice(body);
         self.io.write_all(&out)?;
+        Ok(())
+    }
+
+    /// The TLS 1.2 certificate a client-auth request draws, sent after the flight's `ServerHelloDone`:
+    /// the configured chain, or the empty one when the key cannot sign for a scheme the server names.
+    fn send_certificate12(&mut self, offered: &[u16]) -> Result<bool, TlsError> {
+        let certificate = self.client_cert.as_ref().and_then(|identity| {
+            identity
+                .signer(offered, false)
+                .map(|_| certificate_chain(&identity.chain, None))
+        });
+        let presenting = certificate.is_some();
+        let certificate = certificate.unwrap_or_else(certificate_empty);
+        self.send_plain(HANDSHAKE, &certificate, [0x03, 0x03])?;
+        self.transcript.extend_from_slice(&certificate);
+        Ok(presenting)
+    }
+
+    /// The TLS 1.2 proof of the certificate, over the transcript that now holds the key exchange too.
+    fn send_client_verify12(&mut self, offered: &[u16]) -> Result<(), TlsError> {
+        let Some(identity) = &self.client_cert else {
+            return Ok(());
+        };
+        let verify = identity
+            .verify12(offered, &self.transcript)
+            .ok_or_else(|| TlsError::BadCertificate("client certificate proof".to_owned()))?;
+        self.send_plain(HANDSHAKE, &verify, [0x03, 0x03])?;
+        self.transcript.extend_from_slice(&verify);
         Ok(())
     }
 
@@ -1517,15 +1627,140 @@ fn certificate_empty() -> Vec<u8> {
     message(11, &[0, 0, 0])
 }
 
-/// The `certificate_request_context` of a TLS 1.3 `CertificateRequest`, the bytes its answer echoes.
-fn request_context(body: &[u8]) -> Result<Vec<u8>, TlsError> {
+impl ClientIdentity {
+    /// The TLS 1.3 answer to a `CertificateRequest`: the chain, then the `CertificateVerify` that
+    /// binds it to the key. The empty chain answers when the key cannot sign for an offered scheme.
+    fn flight13(
+        &self,
+        context: &[u8],
+        offered: &[u16],
+        transcript: &[u8],
+        hash: Hash,
+    ) -> (Vec<u8>, Option<Vec<u8>>) {
+        let Some(signer) = self.signer(offered, true) else {
+            return (certificate_answer13(context), None);
+        };
+        let certificate = certificate_chain(&self.chain, Some(context));
+        let mut to_sign = Vec::with_capacity(64 + 34 + hash.len());
+        to_sign.extend_from_slice(&[0x20; 64]);
+        to_sign.extend_from_slice(b"TLS 1.3, client CertificateVerify");
+        to_sign.push(0);
+        let mut hashed = transcript.to_vec();
+        hashed.extend_from_slice(&certificate);
+        to_sign.extend_from_slice(&hash.hash(&hashed));
+        let Ok(signature) = signer.sign(&to_sign) else {
+            return (certificate_answer13(context), None);
+        };
+        let verify = signature_message(u16::from(signer.scheme()), &signature);
+        (certificate, Some(verify))
+    }
+
+    /// The TLS 1.2 `CertificateVerify` over the transcript that already holds the certificate and
+    /// the key exchange, or `None` when the key cannot sign for an offered scheme.
+    fn verify12(&self, offered: &[u16], transcript: &[u8]) -> Option<Vec<u8>> {
+        let signer = self.signer(offered, false)?;
+        let signature = signer.sign(transcript).ok()?;
+        Some(signature_message(u16::from(signer.scheme()), &signature))
+    }
+}
+
+/// A TLS 1.3 `CertificateRequest`: its context, which the answer echoes, and the signature schemes
+/// it offers, empty when the request names none.
+fn certificate_request13(body: &[u8]) -> Result<(Vec<u8>, Vec<u16>), TlsError> {
     let truncated = || TlsError::Other("truncated CertificateRequest".to_owned());
     let (&len, rest) = body.split_first().ok_or_else(truncated)?;
     let len = usize::from(len);
-    if rest.len() < len {
-        return Err(truncated());
+    let rest = rest.get(len..).ok_or_else(truncated)?;
+    let context = body[1..=len].to_vec();
+    let (&[high, low], extensions) = rest.split_first_chunk::<2>().ok_or_else(truncated)?;
+    let len = usize::from(u16::from_be_bytes([high, low]));
+    let extensions = extensions.get(..len).ok_or_else(truncated)?;
+    Ok((context, signature_schemes(extensions)?))
+}
+
+/// A TLS 1.2 `CertificateRequest`: the signature schemes it offers for the certificate types it
+/// names, as Go filters them, and the protocol's own list when it names no schemes.
+fn certificate_request12(body: &[u8]) -> Result<Vec<u16>, TlsError> {
+    let truncated = || TlsError::Other("truncated CertificateRequest".to_owned());
+    let (&types, rest) = body.split_first().ok_or_else(truncated)?;
+    let types = rest.get(..usize::from(types)).ok_or_else(truncated)?;
+    let rest = &rest[types.len()..];
+    let listed = match rest.split_first_chunk::<2>() {
+        Some((&[high, low], rest)) => {
+            let len = usize::from(u16::from_be_bytes([high, low]));
+            rest.get(..len).ok_or_else(truncated)?
+        }
+        None => &[
+            0x04, 0x03, 0x05, 0x03, 0x06, 0x03, 0x08, 0x07, 0x04, 0x01, 0x05, 0x01, 0x06, 0x01,
+        ][..],
+    };
+    let rsa = types.contains(&0x01);
+    let ecdsa = types.contains(&0x40);
+    Ok(listed
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_be_bytes(*pair))
+        .filter(|scheme| match *scheme {
+            0x0401 | 0x0501 | 0x0601 | 0x0804 | 0x0805 | 0x0806 => rsa,
+            0x0403 | 0x0503 | 0x0603 | 0x0807 => ecdsa,
+            _ => false,
+        })
+        .collect())
+}
+
+/// The `signature_algorithms` extension inside a TLS 1.3 `CertificateRequest`'s extension list.
+fn signature_schemes(extensions: &[u8]) -> Result<Vec<u16>, TlsError> {
+    let truncated = || TlsError::Other("truncated CertificateRequest".to_owned());
+    let mut at = 0;
+    while at + 4 <= extensions.len() {
+        let kind = u16::from_be_bytes([extensions[at], extensions[at + 1]]);
+        let len = usize::from(u16::from_be_bytes([extensions[at + 2], extensions[at + 3]]));
+        let body = extensions.get(at + 4..at + 4 + len).ok_or_else(truncated)?;
+        if kind == 13 {
+            let (&[high, low], listed) = body.split_first_chunk::<2>().ok_or_else(truncated)?;
+            let len = usize::from(u16::from_be_bytes([high, low]));
+            let listed = listed.get(..len).ok_or_else(truncated)?;
+            return Ok(listed
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|pair| u16::from_be_bytes(*pair))
+                .collect());
+        }
+        at += 4 + len;
     }
-    Ok(rest[..len].to_vec())
+    Ok(Vec::new())
+}
+
+/// A `Certificate` message: the TLS 1.3 request context when the caller names one, then the chain
+/// in presentation order, each entry length-prefixed by three bytes.
+fn certificate_chain(chain: &[Vec<u8>], context: Option<&[u8]>) -> Vec<u8> {
+    let extensions = usize::from(context.is_some()) * 2;
+    let listed: usize = chain.iter().map(|der| 3 + der.len() + extensions).sum();
+    let mut body = Vec::with_capacity(1 + context.map_or(0, <[u8]>::len) + 3 + listed);
+    if let Some(context) = context {
+        body.push(context.len() as u8);
+        body.extend_from_slice(context);
+    }
+    body.extend_from_slice(&(listed as u32).to_be_bytes()[1..]);
+    for der in chain {
+        body.extend_from_slice(&(der.len() as u32).to_be_bytes()[1..]);
+        body.extend_from_slice(der);
+        if context.is_some() {
+            body.extend_from_slice(&[0, 0]);
+        }
+    }
+    message(11, &body)
+}
+
+/// A `CertificateVerify` or `Certificate` message body: the scheme, then the signature it names.
+fn signature_message(scheme: u16, signature: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(4 + signature.len());
+    body.extend_from_slice(&scheme.to_be_bytes());
+    body.extend_from_slice(&(signature.len() as u16).to_be_bytes());
+    body.extend_from_slice(signature);
+    message(15, &body)
 }
 
 /// The TLS 1.3 answer to a `CertificateRequest` when `TlsConfig` carries no client certificate: the
@@ -1847,6 +2082,7 @@ mod tests {
             reply: Vec::new(),
             out: Vec::new(),
             key_log: None,
+            client_cert: None,
         }
     }
 
@@ -2762,4 +2998,23 @@ mod tests {
     }
 
     impl RecordAlignment for Tap {}
+
+    #[test]
+    fn a_tls12_request_keeps_only_the_schemes_its_certificate_types_allow() {
+        let body = [2, 0x01, 0x40, 0, 4, 0x04, 0x03, 0x04, 0x01];
+        assert_eq!(
+            certificate_request12(&body).expect("a request"),
+            [0x0403, 0x0401]
+        );
+        let rsa_only = [1, 0x01, 0, 4, 0x04, 0x03, 0x04, 0x01];
+        assert_eq!(
+            certificate_request12(&rsa_only).expect("a request"),
+            [0x0401]
+        );
+        let none = [0, 0, 4, 0x04, 0x03, 0x04, 0x01];
+        assert_eq!(
+            certificate_request12(&none).expect("a request"),
+            Vec::<u16>::new()
+        );
+    }
 }

@@ -933,6 +933,51 @@ fn tls_named_anchors(tls: Option<&Json>) -> Result<Vec<Vec<u8>>, String> {
     Ok(anchors)
 }
 
+/// The client identity an outbound presents when the server asks: the first `certificates` entry
+/// that names a key and is not an authority entry. xray builds that pair but its client never sends
+/// one, so a config that names it here opts into the sing-box client-certificate behaviour.
+fn tls_client_cert(tls: Option<&Json>) -> Result<Option<Arc<ferrox_core::tls::CertEntry>>, String> {
+    let entries = tls
+        .and_then(|s| s.get("certificates"))
+        .and_then(Json::as_arr)
+        .unwrap_or_default();
+    for entry in entries {
+        let usage = entry
+            .get("usage")
+            .and_then(Json::as_str)
+            .unwrap_or("encipherment");
+        if !usage.eq_ignore_ascii_case("encipherment") {
+            continue;
+        }
+        let key = match entry
+            .get("keyFile")
+            .and_then(Json::as_str)
+            .filter(|path| !path.is_empty())
+        {
+            Some(path) => read_cert_file(path)
+                .ok_or_else(|| format!("tlsSettings keyFile `{path}` cannot be read"))?,
+            None => match inline_pem(entry, "key") {
+                Some(key) => key,
+                None => continue,
+            },
+        };
+        let certificate = match entry
+            .get("certificateFile")
+            .and_then(Json::as_str)
+            .filter(|path| !path.is_empty())
+        {
+            Some(path) => read_cert_file(path)
+                .ok_or_else(|| format!("tlsSettings certificateFile `{path}` cannot be read"))?,
+            None => inline_pem(entry, "certificate")
+                .ok_or("tlsSettings certificate entry names a key but no certificate")?,
+        };
+        let parsed = ferrox_core::tls::parse_pem_entry(&certificate, &key)
+            .map_err(|e| format!("tlsSettings client certificate: {e}"))?;
+        return Ok(Some(Arc::new(parsed)));
+    }
+    Ok(None)
+}
+
 /// The names `verifyPeerCertByName` checks the peer chain against instead of the SNI: a comma
 /// list, trimmed, empty entries skipped the way the reference's config build does.
 fn tls_verify_names(settings: Option<&Json>) -> std::sync::Arc<[String]> {
@@ -1236,6 +1281,7 @@ pub(crate) fn outbound_tls(
             Some("ws" | "httpupgrade")
         ),
         master_key_log: tls_master_key_log(tls),
+        client_cert: tls_client_cert(tls)?,
     }))
 }
 
@@ -3570,6 +3616,58 @@ mod tests {
             !missing,
             "with no anchor at all the same listener is refused"
         );
+    }
+
+    #[test]
+    fn an_outbound_reads_the_client_certificate_its_entry_names() {
+        let (_ca_pem, leaf) = ca_and_leaf("tls.test");
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("ferrox-client-cert-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("creates");
+        let cert = dir.join("client.pem");
+        let key = dir.join("client.key");
+        std::fs::write(&cert, leaf.cert.pem()).expect("the client cert");
+        std::fs::write(&key, leaf.signing_key.serialize_pem()).expect("the client key");
+        let outbound = |extra: &str| {
+            crate::json::parse(&format!(
+                r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "tls.test", "certificates": [{{"certificateFile": {}, "keyFile": {}{extra}}}]}}}}}}"#,
+                json_path(&cert),
+                json_path(&key)
+            ))
+            .expect("parses")
+        };
+        let tls = outbound_tls(&outbound(""), "127.0.0.1").expect("builds");
+        let identity = tls.client_cert.as_ref().expect("a client identity");
+        assert_eq!(
+            identity.cert_chain,
+            crate::quic::parse_ca_pem(leaf.cert.pem().as_bytes()),
+            "the identity is the chain the entry names"
+        );
+        assert_eq!(
+            identity.key_der,
+            leaf.signing_key.serialize_der(),
+            "the identity signs with the key the entry names"
+        );
+        let issuing =
+            outbound_tls(&outbound(r#", "usage": "issue""#), "127.0.0.1").expect("builds");
+        assert!(
+            issuing.client_cert.is_none(),
+            "an issuing authority is not a client identity"
+        );
+        let missing = crate::json::parse(&format!(
+            r#"{{"streamSettings": {{"security": "tls", "tlsSettings": {{"serverName": "tls.test", "certificates": [{{"certificateFile": {}, "keyFile": "/no-such-dir/client.key"}}]}}}}}}"#,
+            json_path(&cert)
+        ))
+        .expect("parses");
+        assert!(
+            outbound_tls(&missing, "127.0.0.1").is_err(),
+            "a key file the config names but cannot read refuses the build, as xray's does"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

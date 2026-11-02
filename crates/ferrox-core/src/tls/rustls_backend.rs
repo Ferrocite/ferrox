@@ -537,6 +537,8 @@ struct ConfigKey {
     ech: Option<std::sync::Arc<[u8]>>,
     /// The `masterKeyLog` handle rustls bakes into the config: two configs naming different files must not share a build, so the handle's identity is what the key holds.
     master_key_log: Option<Arc<super::MasterKeyLog>>,
+    /// The client identity rustls bakes into the config's resolver, swapped by value when the bytes differ.
+    client_cert: Option<Arc<super::CertEntry>>,
 }
 
 impl PartialEq for ConfigKey {
@@ -549,6 +551,11 @@ impl PartialEq for ConfigKey {
             && match (&self.master_key_log, &other.master_key_log) {
                 (None, None) => true,
                 (Some(ours), Some(theirs)) => Arc::ptr_eq(ours, theirs),
+                _ => false,
+            }
+            && match (&self.client_cert, &other.client_cert) {
+                (None, None) => true,
+                (Some(ours), Some(theirs)) => Arc::ptr_eq(ours, theirs) || ours == theirs,
                 _ => false,
             }
     }
@@ -578,9 +585,20 @@ fn build_config(cfg: &TlsConfig, built: &Material) -> Result<rustls::ClientConfi
             .with_safe_default_protocol_versions()
             .map_err(|e| TlsError::Other(format!("rustls protocol versions: {e}")))?,
     };
-    let mut config = builder
-        .with_root_certificates(Arc::clone(&built.roots))
-        .with_no_client_auth();
+    let roots = builder.with_root_certificates(Arc::clone(&built.roots));
+    let mut config = match &cfg.client_cert {
+        Some(entry) => {
+            let chain = entry
+                .cert_chain
+                .iter()
+                .map(|der| rustls::pki_types::CertificateDer::from(der.clone()))
+                .collect();
+            roots
+                .with_client_auth_cert(chain, key_of(entry))
+                .map_err(|e| TlsError::BadCertificate(format!("client certificate: {e}")))?
+        }
+        None => roots.with_no_client_auth(),
+    };
     config.alpn_protocols.clear();
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
     // xray hands Go an empty session cache unless the config names one, so a stock dial keeps no ticket by default.
@@ -676,6 +694,7 @@ fn client_config(cfg: &TlsConfig) -> Result<Arc<rustls::ClientConfig>, TlsError>
         resumption: cfg.resumption,
         ech: cfg.ech_config_list.clone(),
         master_key_log: cfg.master_key_log.clone(),
+        client_cert: cfg.client_cert.clone(),
     };
     let all = CONFIGS.get_or_init(Default::default);
     let mut kept = all.lock().expect("one build at a time");
@@ -1335,7 +1354,7 @@ fn chain_of(chain: Vec<Vec<u8>>) -> Vec<rustls::pki_types::CertificateDer<'stati
 }
 
 /// The signing key a served identity holds, in the shape its DER names.
-fn key_of(entry: &super::CertEntry) -> rustls::pki_types::PrivateKeyDer<'static> {
+pub(crate) fn key_of(entry: &super::CertEntry) -> rustls::pki_types::PrivateKeyDer<'static> {
     use super::ServerKeyKind as Kind;
     match entry.key_kind {
         Kind::Pkcs8 => rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -2090,6 +2109,7 @@ mod tests {
             ech_config_list: None,
             websocket: false,
             master_key_log: None,
+            client_cert: None,
         }
     }
 
@@ -2391,6 +2411,128 @@ mod tests {
         session.read_exact(&mut buf).expect("reads");
         assert_eq!(&buf, b"ping");
         server.join().expect("joins");
+    }
+
+    fn client_identity() -> Arc<crate::tls::CertEntry> {
+        Arc::new(
+            crate::tls::parse_pem_entry(
+                &anchor_pem("CERTIFICATE", ANCHOR),
+                &anchor_pem("PRIVATE KEY", ANCHOR_KEY),
+            )
+            .expect("the fixture is one identity"),
+        )
+    }
+
+    /// A listener that demands a client certificate and answers one echo: the peer leaf it
+    /// verified, or none when the dial presented no chain.
+    fn serve_requiring_client_cert(listener: &TcpListener, tls12: bool) -> Vec<u8> {
+        let mut roots = RootStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(ANCHOR.to_vec()))
+            .expect("client root");
+        let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
+            Arc::new(roots),
+            provider(),
+        )
+        .build()
+        .expect("client verifier");
+        let cert = rustls::pki_types::CertificateDer::from(ANCHOR.to_vec());
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(ANCHOR_KEY.to_vec()),
+        );
+        let versions: &[&'static rustls::SupportedProtocolVersion] = if tls12 {
+            &[&rustls::version::TLS12]
+        } else {
+            &[&rustls::version::TLS13]
+        };
+        let mut config = rustls::ServerConfig::builder_with_provider(provider())
+            .with_protocol_versions(versions)
+            .expect("server versions")
+            .with_client_cert_verifier(verifier)
+            .with_single_cert(vec![cert], key)
+            .expect("server cert");
+        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let (mut stream, _) = listener.accept().expect("accepts");
+        let mut conn = rustls::ServerConnection::new(Arc::new(config)).expect("server session");
+        {
+            let mut tls = rustls::Stream::new(&mut conn, &mut stream);
+            let mut buf = [0u8; 4];
+            tls.read_exact(&mut buf)
+                .unwrap_or_else(|e| panic!("server read: {e:?}"));
+            tls.write_all(&buf).expect("writes");
+            tls.flush().expect("flushes");
+        }
+        conn.peer_certificates()
+            .and_then(|chain| chain.first().map(|leaf| leaf.as_ref().to_vec()))
+            .unwrap_or_default()
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_shaped_tls13_dial_presents_a_configured_client_certificate() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || serve_requiring_client_cert(&listener, false));
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut cfg = client("tls.test", &[]);
+        cfg.fingerprint = Some(crate::tls::Fingerprint::default());
+        cfg.client_cert = Some(client_identity());
+        let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+        session.handshake().expect("handshakes");
+        session.write_all(b"ping").expect("writes");
+        session.flush().expect("flushes");
+        let mut buf = [0u8; 4];
+        session.read_exact(&mut buf).expect("reads");
+        assert_eq!(&buf, b"ping");
+        assert_eq!(server.join().expect("joins"), ANCHOR);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_shaped_tls12_dial_presents_a_configured_client_certificate() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || serve_requiring_client_cert(&listener, true));
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut cfg = client("tls.test", &[]);
+        cfg.fingerprint = Some(crate::tls::Fingerprint::default());
+        cfg.client_cert = Some(client_identity());
+        let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+        session.handshake().expect("handshakes");
+        session.write_all(b"ping").expect("writes");
+        session.flush().expect("flushes");
+        let mut buf = [0u8; 4];
+        session.read_exact(&mut buf).expect("reads");
+        assert_eq!(&buf, b"ping");
+        assert_eq!(server.join().expect("joins"), ANCHOR);
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn a_stock_dial_presents_a_configured_client_certificate() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server = thread::spawn(move || serve_requiring_client_cert(&listener, false));
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut cfg = client("tls.test", &[]);
+        cfg.client_cert = Some(client_identity());
+        let mut session = crate::tls::connect(&cfg, stream).expect("dials");
+        session.handshake().expect("handshakes");
+        session.write_all(b"ping").expect("writes");
+        session.flush().expect("flushes");
+        let mut buf = [0u8; 4];
+        session.read_exact(&mut buf).expect("reads");
+        assert_eq!(&buf, b"ping");
+        assert_eq!(server.join().expect("joins"), ANCHOR);
     }
 
     #[cfg_attr(

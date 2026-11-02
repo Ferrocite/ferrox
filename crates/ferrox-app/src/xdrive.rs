@@ -251,6 +251,7 @@ fn transport_tls(stream: &Json, security: &str) -> Option<Arc<TlsConfig>> {
             ech_config_list: None,
             websocket: false,
             master_key_log: None,
+            client_cert: None,
         })
     })
 }

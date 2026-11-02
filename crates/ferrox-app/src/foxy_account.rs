@@ -534,6 +534,7 @@ impl Endpoint {
             ech_config_list: None,
             websocket: false,
             master_key_log: None,
+            client_cert: None,
         }
     }
 
