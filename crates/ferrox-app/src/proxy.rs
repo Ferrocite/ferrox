@@ -42181,9 +42181,15 @@ mod tests {
             "the handshake negotiates h2"
         );
         let header = vless_header(&id, 1, &Destination::from(echo_addr));
-        let (mut reader, writer) =
-            tls_xhttp(&server, session, || None, "127.0.0.1", &settings, false)
-                .expect("dials xhttp");
+        let (mut reader, writer) = tls_xhttp(
+            &server,
+            session,
+            || None::<ferrox_core::tls::ClientSession<crate::conn::Connection>>,
+            "127.0.0.1",
+            &settings,
+            false,
+        )
+        .expect("dials xhttp");
         assert!(writer.send(&header), "sends the vless header");
         read_vless_response(&mut reader).expect("answers");
         assert!(writer.send(b"ping"), "relays");
