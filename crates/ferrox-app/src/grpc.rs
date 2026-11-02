@@ -3185,33 +3185,37 @@ mod tests {
         let writes = seen.lock().expect("writes");
         let wire: Vec<u8> = writes
             .iter()
-            .skip(2)
             .flat_map(|write| write.iter().copied())
             .collect();
-        let bodies = data_bodies(&wire);
-        assert_eq!(bodies.len(), 1, "one MultiHunk message for a 32 KiB read");
+        let wire = wire.strip_prefix(MAGIC).unwrap_or(&wire);
+        let body = data_body(wire);
+        assert_eq!(
+            message_count(&body),
+            1,
+            "one MultiHunk message for a 32 KiB read"
+        );
         assert!(
-            bodies[0].len() > HUNK,
+            body.len() > HUNK,
             "the message carries more than one element"
         );
     }
 
-    /// The DATA bodies in a concatenation of HTTP/2 frames, in order.
-    fn data_bodies(mut wire: &[u8]) -> Vec<&[u8]> {
-        let mut bodies = Vec::new();
+    /// The DATA bodies in a concatenation of HTTP/2 frames, with the client preface already gone.
+    fn data_body(mut wire: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
         while wire.len() >= 9 {
             let len = ((wire[0] as usize) << 16) | ((wire[1] as usize) << 8) | wire[2] as usize;
             let kind = wire[3];
-            let body = &wire[9..];
-            if body.len() < len {
+            let rest = &wire[9..];
+            if rest.len() < len {
                 break;
             }
             if kind == T_DATA {
-                bodies.push(&body[..len]);
+                body.extend_from_slice(&rest[..len]);
             }
-            wire = &body[len..];
+            wire = &rest[len..];
         }
-        bodies
+        body
     }
 
     /// The multi-mode witness: one relay read leaves as the batch the peer's default window can
