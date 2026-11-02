@@ -3799,18 +3799,33 @@ fn serve_vless(
     carrier: &Carrier,
     freedom: bool,
     fallbacks: Option<&[Fallback]>,
-    decryption: Option<&ferrox_core::vless_encryption::Server>,
+    decryption: Option<&Arc<ferrox_core::vless_encryption::Server>>,
 ) {
     match carrier {
         Carrier::Raw(_) => match decryption {
             Some(decryption) => serve_vless_encrypted_raw(stream, users, freedom, decryption),
             None => serve_vless_raw(stream, users, freedom, fallbacks),
         },
-        Carrier::Ws { path, .. } => serve_vless_ws(stream, users, path, freedom, decryption),
-        Carrier::HttpUpgrade { path, host, .. } => {
-            serve_vless_httpupgrade(stream, users, path, host, freedom, decryption);
+        Carrier::Ws { path, .. } => {
+            serve_vless_ws(stream, users, path, freedom, decryption.map(|d| d.as_ref()))
         }
-        Carrier::Grpc(settings) => serve_vless_grpc(stream, users, settings, freedom, decryption),
+        Carrier::HttpUpgrade { path, host, .. } => {
+            serve_vless_httpupgrade(
+                stream,
+                users,
+                path,
+                host,
+                freedom,
+                decryption.map(|d| d.as_ref()),
+            );
+        }
+        Carrier::Grpc(settings) => serve_vless_grpc(
+            stream,
+            users,
+            settings,
+            freedom,
+            decryption.map(|d| d.as_ref()),
+        ),
         Carrier::Xhttp { settings, .. } => {
             let Ok(read) = stream.try_clone() else {
                 return;
@@ -3826,7 +3841,7 @@ fn serve_vless(
             );
         }
         Carrier::HttpHeader { path } => {
-            serve_vless_httpheader(stream, users, path, freedom, decryption);
+            serve_vless_httpheader(stream, users, path, freedom, decryption.map(|d| d.as_ref()));
         }
         refused_carriers!() => {}
     }
@@ -4760,7 +4775,7 @@ fn serve_sealed_carried<R, W>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve_sealed_carried_with<R, W, A, B, C>(
+pub(crate) fn serve_sealed_carried_with<R, W, A, B, C>(
     mut reader: R,
     writer: W,
     users: &[VlessUser],
@@ -7387,7 +7402,7 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
     settings: &crate::xhttp::XhttpSettings,
     users: &[VlessUser],
     freedom: bool,
-    decryption: Option<&ferrox_core::vless_encryption::Server>,
+    decryption: Option<&Arc<ferrox_core::vless_encryption::Server>>,
     mut arm: impl FnMut(&R, Option<Duration>) -> bool,
 ) {
     if !arm(&read, Some(budgets::handshake())) {
@@ -7425,13 +7440,23 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
         if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
             paths.push(settings.path.clone());
         }
-        if decryption.is_some() {
-            eprintln!("vless: decryption over h2 is not served yet");
-            return;
-        }
-        return crate::xhttp_h2::serve_h2(chained, write, settings, users, freedom);
+        return crate::xhttp_h2::serve_h2(
+            chained,
+            write,
+            settings,
+            users,
+            freedom,
+            decryption.cloned(),
+        );
     }
-    serve_session_xhttp(chained, write, settings, users, freedom, decryption);
+    serve_session_xhttp(
+        chained,
+        write,
+        settings,
+        users,
+        freedom,
+        decryption.map(|d| d.as_ref()),
+    );
 }
 
 pub(crate) fn serve_session_xhttp_with(
@@ -7663,7 +7688,7 @@ fn serve_vless_tls(
     carrier: &Carrier,
     server: &ferrox_core::tls::TlsServerConfig,
     fallbacks: Option<&[Fallback]>,
-    decryption: Option<&ferrox_core::vless_encryption::Server>,
+    decryption: Option<&Arc<ferrox_core::vless_encryption::Server>>,
 ) {
     if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
@@ -7695,7 +7720,14 @@ fn serve_vless_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_ws(reader, writer, path, users, freedom, decryption);
+            serve_session_ws(
+                reader,
+                writer,
+                path,
+                users,
+                freedom,
+                decryption.map(|d| d.as_ref()),
+            );
         }
         Carrier::Xhttp { settings, .. } => {
             let Ok(out) = stream.try_clone() else { return };
@@ -7720,7 +7752,16 @@ fn serve_vless_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_httpupgrade(reader, writer, raw, path, host, users, freedom, decryption);
+            serve_session_httpupgrade(
+                reader,
+                writer,
+                raw,
+                path,
+                host,
+                users,
+                freedom,
+                decryption.map(|d| d.as_ref()),
+            );
         }
         Carrier::HttpHeader { path } => {
             let Ok(raw) = stream.try_clone() else { return };
@@ -7729,7 +7770,15 @@ fn serve_vless_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_httpheader(reader, writer, raw, path, users, freedom, decryption);
+            serve_session_httpheader(
+                reader,
+                writer,
+                raw,
+                path,
+                users,
+                freedom,
+                decryption.map(|d| d.as_ref()),
+            );
         }
         Carrier::Grpc(settings) => {
             let Ok(out) = stream.try_clone() else { return };
@@ -7737,7 +7786,14 @@ fn serve_vless_tls(
                 return;
             };
             let (reader, writer) = session_halves(session, out);
-            serve_session_grpc(reader, writer, settings, users, freedom, decryption);
+            serve_session_grpc(
+                reader,
+                writer,
+                settings,
+                users,
+                freedom,
+                decryption.map(|d| d.as_ref()),
+            );
         }
         refused_carriers!() => {}
     }
@@ -7918,7 +7974,7 @@ fn serve_vless_reality(
     carrier: &Carrier,
     server: &ferrox_core::tls::RealityServerConfig,
     fallbacks: Option<&[Fallback]>,
-    decryption: Option<&ferrox_core::vless_encryption::Server>,
+    decryption: Option<&Arc<ferrox_core::vless_encryption::Server>>,
 ) {
     if stream.set_read_timeout(Some(RELAY_POLL)).is_err() {
         return;
@@ -7936,7 +7992,7 @@ fn serve_vless_reality(
                 freedom,
                 server,
                 fallbacks,
-                decryption,
+                decryption.map(|d| d.as_ref()),
             );
         }
         Carrier::Ws { path, .. } => {
@@ -7946,7 +8002,14 @@ fn serve_vless_reality(
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_session_ws(reader, writer, path, users, freedom, decryption);
+                serve_session_ws(
+                    reader,
+                    writer,
+                    path,
+                    users,
+                    freedom,
+                    decryption.map(|d| d.as_ref()),
+                );
             });
         }
         Carrier::Xhttp { settings, .. } => {
@@ -7976,7 +8039,14 @@ fn serve_vless_reality(
                 }
                 let (reader, writer) = session_halves(session, out);
                 serve_session_httpupgrade(
-                    reader, writer, raw, path, host, users, freedom, decryption,
+                    reader,
+                    writer,
+                    raw,
+                    path,
+                    host,
+                    users,
+                    freedom,
+                    decryption.map(|d| d.as_ref()),
                 );
             });
         }
@@ -7988,7 +8058,15 @@ fn serve_vless_reality(
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_session_httpheader(reader, writer, raw, path, users, freedom, decryption);
+                serve_session_httpheader(
+                    reader,
+                    writer,
+                    raw,
+                    path,
+                    users,
+                    freedom,
+                    decryption.map(|d| d.as_ref()),
+                );
             });
         }
         Carrier::Grpc(settings) => {
@@ -7998,7 +8076,14 @@ fn serve_vless_reality(
                     return;
                 }
                 let (reader, writer) = session_halves(session, out);
-                serve_session_grpc(reader, writer, settings, users, freedom, decryption);
+                serve_session_grpc(
+                    reader,
+                    writer,
+                    settings,
+                    users,
+                    freedom,
+                    decryption.map(|d| d.as_ref()),
+                );
             });
         }
         refused_carriers!() => {}
@@ -16030,8 +16115,8 @@ fn dial_vless_reality(
             vless,
             &header,
             client,
-            // A sealed header is not served over H2 yet, so that pairing keeps H1.
-            vless.encryption.is_none(),
+            // REALITY always dials HTTP/2 (`decideHTTPVersion`, dialer.go:82); the sealed header rides the stream body.
+            true,
         ),
     }
 }
@@ -35041,6 +35126,96 @@ mod tests {
         peer.read_exact(&mut got).expect("reads the echo");
         assert_eq!(&got, payload);
         let _ = client;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_encrypted_vless_reality_xhttp_session_dials_h2() {
+        use std::os::unix::net::UnixStream;
+
+        const WITNESS: &str = "/sealed-h2-dial";
+        let (client_string, server_string) =
+            ferrox_core::vless_encryption::generate_pair(true, "native", "1rtt", "600");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"vless","settings":{{"decryption":"{server_string}"}}}}"#
+        ))
+        .expect("parses");
+        let decryption = crate::config::server_decryption(&inbound)
+            .expect("decryption")
+            .expect("engine");
+
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds the echo");
+        let echo_addr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            let (mut stream, _) = echo.accept().expect("accepts");
+            let mut buf = [0u8; 1024];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => stream.write_all(&buf[..n]).expect("echoes"),
+                }
+            }
+        });
+
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the server");
+        let server_addr = listener.local_addr().expect("addr");
+        let server_config = reality_server_config();
+        let id = uuid_bytes(REALITY_TEST_ID).expect("id");
+        let settings = xhttp_settings(WITNESS);
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_reality(
+                stream,
+                &[VlessUser {
+                    id,
+                    flow: Flow::None,
+                    email: String::new(),
+                    level: 0,
+                    reverse: None,
+                }],
+                true,
+                &Carrier::Xhttp { settings },
+                &server_config,
+                None,
+                Some(&decryption),
+            );
+        });
+
+        let public =
+            x25519_dalek::x25519(REALITY_TEST_PRIVATE, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let root = crate::json::parse(&format!(
+            r#"{{"outbounds":[{{"protocol":"vless","settings":{{"vnext":[{{"address":"127.0.0.1","port":{},"users":[{{"id":"{REALITY_TEST_ID}","encryption":"{client_string}"}}]}}]}},"streamSettings":{{"network":"xhttp","security":"reality","realitySettings":{{"serverName":"{REALITY_TEST_SNI}","publicKey":"{}","shortId":"{REALITY_TEST_SHORT}","fingerprint":"chrome"}},"xhttpSettings":{{"path":"{WITNESS}"}}}}}}]}}"#,
+            server_addr.port(),
+            b64url(&public),
+        ))
+        .expect("parses");
+        let vless = find_vless_outbound(&root).expect("a REALITY outbound");
+        assert!(vless.encryption.is_some(), "the account names the engine");
+
+        let (app, mut peer) = UnixStream::pair().expect("pair");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        thread::spawn(move || {
+            dial_vless_reality(
+                &Connection::from(app),
+                &server_addr,
+                &vless,
+                Some(&Destination::from(echo_addr)),
+            );
+        });
+        let payload = b"sealed reality over h2";
+        peer.write_all(payload).expect("writes");
+        let mut got = vec![0u8; payload.len()];
+        peer.read_exact(&mut got).expect("reads the echo");
+        assert_eq!(&got, payload);
+        assert!(
+            H2_DIAL_WITNESS
+                .lock()
+                .expect("witness lock")
+                .iter()
+                .any(|path| path == WITNESS),
+            "the sealed REALITY xHTTP dial did not open with the H2 preface"
+        );
     }
 
     #[test]
@@ -60519,7 +60694,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             &carrier,
             freedom,
             fallbacks.as_deref(),
-            decryption.as_deref(),
+            decryption.as_ref(),
         ),
         Role::VlessTls {
             users,
@@ -60535,7 +60710,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             &carrier,
             &server,
             fallbacks.as_deref(),
-            decryption.as_deref(),
+            decryption.as_ref(),
         ),
         Role::VlessReality {
             users,
@@ -60551,7 +60726,7 @@ fn dispatch(stream: Connection, role: Role, account: Option<&InboundAccount>) {
             &carrier,
             &server,
             fallbacks.as_deref(),
-            decryption.as_deref(),
+            decryption.as_ref(),
         ),
         Role::Trojan {
             keys,

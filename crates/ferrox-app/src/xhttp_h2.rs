@@ -172,6 +172,7 @@ struct H2Conn {
     /// waiting for credit, so one thread owns the session and no parser thread outlives it.
     client_read: Option<Mutex<Box<dyn Read + Send>>>,
     raw: Option<Arc<crate::conn::Connection>>,
+    decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
 }
 
 impl std::fmt::Debug for H2Conn {
@@ -884,6 +885,7 @@ pub(crate) fn connect_split<
         refused: AtomicBool::new(false),
         client_read: Some(Mutex::new(Box::new(read))),
         raw: Some(raw),
+        decryption: None,
     });
     let state = Arc::new(H2Stream {
         state: Mutex::new(StreamState {
@@ -1068,6 +1070,7 @@ fn open_stream(
     };
     let settings = settings.clone();
     let users = Arc::clone(users);
+    let decryption = conn.decryption.clone();
     crate::budgets::spawn(move || {
         match crate::xhttp::accept_core(
             &head,
@@ -1078,7 +1081,23 @@ fn open_stream(
             Some(h2out.clone()),
         ) {
             crate::xhttp::Served::Session(ureader, xwriter) => {
-                crate::proxy::serve_session_xhttp_with(ureader, &xwriter, &users, freedom);
+                if let Some(decryption) = decryption {
+                    let close = xwriter.clone();
+                    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.finish());
+                    crate::proxy::serve_sealed_carried_with(
+                        ureader,
+                        xwriter,
+                        &users,
+                        freedom,
+                        &decryption,
+                        close,
+                        |_| {},
+                        |_| {},
+                        |_| {},
+                    );
+                } else {
+                    crate::proxy::serve_session_xhttp_with(ureader, &xwriter, &users, freedom);
+                }
             }
             _ => h2out.end(),
         }
@@ -1091,6 +1110,7 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
     settings: &XhttpSettings,
     users: &[VlessUser],
     freedom: bool,
+    decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
 ) {
     let users: VlessUsers = Arc::from(users);
     let mut magic = [0u8; 24];
@@ -1113,6 +1133,7 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
         refused: AtomicBool::new(false),
         client_read: None,
         raw: None,
+        decryption,
     });
     let mut initial = Vec::with_capacity(12);
     initial.extend_from_slice(&S_WINDOW.to_be_bytes());
@@ -1625,7 +1646,14 @@ mod tests {
                 };
                 let settings = settings.clone();
                 crate::budgets::spawn(move || {
-                    serve_h2(read, stream, &settings, &crate::proxy::one_user(id), true);
+                    serve_h2(
+                        read,
+                        stream,
+                        &settings,
+                        &crate::proxy::one_user(id),
+                        true,
+                        None,
+                    );
                 });
             }
         });
@@ -1677,6 +1705,7 @@ mod tests {
                 &XhttpSettings::stream_one(),
                 &crate::proxy::one_user([0u8; 16]),
                 true,
+                None,
             );
         });
         assert_eq!(counts.zeroed, 0, "no frame body is zeroed");
@@ -2367,6 +2396,7 @@ mod tests {
             refused: AtomicBool::new(false),
             client_read: None,
             raw: None,
+            decryption: None,
         });
         (conn, written, slices)
     }
