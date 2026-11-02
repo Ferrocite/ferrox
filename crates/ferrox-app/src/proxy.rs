@@ -3990,7 +3990,7 @@ fn serve_vless_grpc(
             return;
         };
         let _ = stream.set_read_timeout(Some(RELAY_POLL));
-        return crate::grpc::serve_muxed(
+        return crate::grpc::serve_muxed_conn(
             stream,
             crate::grpc::Tail::new(Box::new(write)),
             settings,
@@ -32865,6 +32865,83 @@ mod tests {
         assert!(
             grown < flows,
             "{flows} wrapped flows grew the process by {grown} threads: a thread per flow"
+        );
+    }
+
+    /// A plaintext muxed gRPC connection is demuxed by a lane parked on its socket, so an
+    /// eight-connection cell grows the process by the reaper, not by a thread per connection.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn muxed_grpc_connections_share_the_lane_pool() {
+        if !crate::conn::in_a_quiet_process(
+            "proxy::tests::muxed_grpc_connections_share_the_lane_pool",
+        ) {
+            return;
+        }
+        // Hold every lane and setup worker once so the pools' growth lands in the baseline, not in the measured window.
+        let hold = Arc::new(AtomicBool::new(true));
+        for _ in 0..lane_pool::RELAY_LANES * 2 {
+            let hold = Arc::clone(&hold);
+            lane_pool::submit(
+                Box::new(move || {
+                    while hold.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    lane_pool::Next::Done
+                }),
+                Box::new(|| {}),
+            );
+        }
+        for _ in 0..lane_pool::SETUP_LANES + 1 {
+            let hold = Arc::clone(&hold);
+            lane_pool::submit_setup(
+                Box::new(move || {
+                    while hold.load(Ordering::Relaxed) {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    lane_pool::Next::Done
+                }),
+                Box::new(|| {}),
+            );
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < until
+            && (lane_pool::workers() < lane_pool::RELAY_LANES
+                || lane_pool::setup_workers() < lane_pool::SETUP_LANES)
+        {
+            thread::sleep(Duration::from_millis(1));
+        }
+        hold.store(false, Ordering::Relaxed);
+        thread::sleep(Duration::from_millis(100));
+
+        let id = [0x2Bu8; 16];
+        let front = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let addr = front.local_addr().expect("addr");
+        let carrier = Carrier::Grpc(crate::config::GrpcSettings::path("/p"));
+        let serving = thread::spawn(move || {
+            for _ in 0..8 {
+                let (stream, _) = front.accept().expect("accepts");
+                let carrier = carrier.clone();
+                lane_pool::submit_setup(
+                    Box::new(move || {
+                        serve_vless(stream, &one_vless_user(&id), &carrier, true, None, None);
+                        lane_pool::Next::Done
+                    }),
+                    Box::new(|| {}),
+                );
+            }
+        });
+        let before = crate::conn::live_threads();
+        let peers: Vec<_> = (0..8)
+            .map(|_| Connection::connect(addr).expect("connects"))
+            .collect();
+        thread::sleep(Duration::from_millis(300));
+        let grown = crate::conn::live_threads().saturating_sub(before);
+        drop(peers);
+        serving.join().expect("joins");
+        assert!(
+            grown < 3,
+            "eight muxed connections grew the process by {grown} threads: a demux thread per connection"
         );
     }
 

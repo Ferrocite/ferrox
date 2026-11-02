@@ -1821,10 +1821,36 @@ pub(crate) fn serve_muxed<R: Read + Send + 'static, W: FrameWrite + Send + 'stat
     let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let service = GrpcService::new(settings, users, freedom, Arc::clone(&opened));
     let until = std::time::Instant::now() + crate::budgets::handshake();
-    // The demux loop owns the connection until its peer ends it, so it takes a thread of its own rather than a setup lane for the connection's life.
+    // A sealed session's reader has no socket for the pool to poll, so this demux keeps a thread; the plaintext one parks on the socket instead.
     crate::proxy::spawn_carried(move || {
         crate::xhttp_h2::serve_h2_service_until(read, write, &service, None, Some((until, opened)));
     });
+}
+
+/// A plaintext muxed connection's demux as a relay lane: a connection waiting for its peer's next
+/// frame parks on the socket's readiness, so eight of them add lanes, not threads.
+pub(crate) fn serve_muxed_conn(
+    read: Connection,
+    write: Tail,
+    settings: &GrpcSettings,
+    users: &[crate::proxy::VlessUser],
+    freedom: bool,
+) {
+    let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let service = GrpcService::new(settings, users, freedom, Arc::clone(&opened));
+    let until = std::time::Instant::now() + crate::budgets::handshake();
+    let mut step = crate::xhttp_h2::h2_lane(read, write, service, None, Some((until, opened)));
+    // A lane runs on whichever worker is free, so the accept thread's sniffing and access-log target are installed into each step.
+    let sniffing = crate::sniff::current();
+    let access = crate::accesslog::snapshot();
+    crate::proxy::lane_pool::submit(
+        Box::new(move || {
+            crate::sniff::install_current(sniffing.clone());
+            let _flow = crate::accesslog::install_snapshot(access.clone());
+            step()
+        }),
+        Box::new(|| {}),
+    );
 }
 
 #[cfg(test)]
