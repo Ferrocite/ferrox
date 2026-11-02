@@ -167,18 +167,30 @@ enum Control {
     Threaded(Arc<ControlQueue>),
 }
 
+/// The most control frames an unread peer may park before the connection ends: a peer that
+/// sends PINGs or empty SETTINGS while withholding reads put one element on the queue per
+/// inbound frame, so the backlog has to be bounded rather than grown.
+const CONTROL_QUEUE_MAX: usize = 1024;
+
 struct ControlQueue {
     frames: Mutex<VecDeque<(u8, [u8; CONTROL_MAX])>>,
     go: Condvar,
     stop: AtomicBool,
+    /// Set by the worker when its own write fails, so the connection it serves ends with it
+    /// instead of admitting frames no one will ever drain.
+    dead: Arc<AtomicBool>,
 }
 
 impl Control {
-    fn threaded(write: Arc<Mutex<Box<dyn crate::proxy::FrameWrite + Send>>>) -> Self {
+    fn threaded(
+        write: Arc<Mutex<Box<dyn crate::proxy::FrameWrite + Send>>>,
+        dead: Arc<AtomicBool>,
+    ) -> Self {
         let queue = Arc::new(ControlQueue {
             frames: Mutex::new(VecDeque::new()),
             go: Condvar::new(),
             stop: AtomicBool::new(false),
+            dead,
         });
         let worker = Arc::clone(&queue);
         let spawned = std::thread::Builder::new()
@@ -212,9 +224,11 @@ impl Control {
                         total
                     };
                     let Ok(mut out) = write.lock() else {
+                        worker.dead.store(true, Ordering::SeqCst);
                         return;
                     };
                     if !out.write_slices(&[&batch[..total]]) {
+                        worker.dead.store(true, Ordering::SeqCst);
                         return;
                     }
                 }
@@ -226,19 +240,24 @@ impl Control {
         }
     }
 
-    fn send(&self, len: usize, frame: [u8; CONTROL_MAX]) {
+    /// Queue one frame, or answer `false` when the connection can no longer carry it: the
+    /// worker is gone, or the peer has let `CONTROL_QUEUE_MAX` frames sit unread. A caller
+    /// that gets `false` ends the connection rather than drop a credit on a live one.
+    fn send(&self, len: usize, frame: [u8; CONTROL_MAX]) -> bool {
         match self {
-            Control::Inline => {}
+            Control::Inline => true,
             Control::Threaded(queue) => {
-                if queue.stop.load(Ordering::SeqCst) {
-                    return;
+                if queue.dead.load(Ordering::SeqCst) || queue.stop.load(Ordering::SeqCst) {
+                    return false;
                 }
-                queue
-                    .frames
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .push_back((len as u8, frame));
+                let mut frames = queue.frames.lock().unwrap_or_else(PoisonError::into_inner);
+                if frames.len() >= CONTROL_QUEUE_MAX {
+                    return false;
+                }
+                frames.push_back((len as u8, frame));
+                drop(frames);
                 queue.go.notify_one();
+                true
             }
         }
     }
@@ -247,7 +266,11 @@ impl Control {
         match self {
             Control::Inline => {}
             Control::Threaded(queue) => {
-                queue.stop.store(true, Ordering::SeqCst);
+                // The worker checks `stop` under `frames`, so it is stored under that guard and the notify follows: a bare store can land between the check and the wait.
+                {
+                    let _frames = queue.frames.lock().unwrap_or_else(PoisonError::into_inner);
+                    queue.stop.store(true, Ordering::SeqCst);
+                }
                 queue.go.notify_all();
             }
         }
@@ -266,7 +289,7 @@ struct H2Conn {
     decoder: Mutex<Decoder>,
     max_frame: Mutex<usize>,
     peer_initial: Mutex<u64>,
-    dead: AtomicBool,
+    dead: Arc<AtomicBool>,
     goaway: AtomicBool,
     refused: AtomicBool,
     /// The client half's transport: a client pumps frames on demand from its reader or a writer
@@ -543,8 +566,12 @@ impl H2Conn {
         match &self.control {
             Control::Inline => self.frame(kind, flags, id, body),
             Control::Threaded(_) => {
-                self.control.send(9 + body.len(), frame);
-                true
+                if self.control.send(9 + body.len(), frame) {
+                    true
+                } else {
+                    self.dead.store(true, Ordering::SeqCst);
+                    false
+                }
             }
         }
     }
@@ -693,7 +720,11 @@ impl H2Conn {
                     self.dead.store(true, Ordering::SeqCst);
                 }
             }
-            Control::Threaded(_) => self.control.send(CREDIT_FRAME, out),
+            Control::Threaded(_) => {
+                if !self.control.send(CREDIT_FRAME, out) {
+                    self.dead.store(true, Ordering::SeqCst);
+                }
+            }
         }
     }
 
@@ -1040,8 +1071,9 @@ pub(crate) fn connect_split<
 ) -> Option<(H2StreamReader, crate::xhttp::XhttpWriter)> {
     let write: Arc<Mutex<Box<dyn crate::proxy::FrameWrite + Send>>> =
         Arc::new(Mutex::new(Box::new(write)));
+    let dead = Arc::new(AtomicBool::new(false));
     let conn = Arc::new(H2Conn {
-        control: Control::threaded(Arc::clone(&write)),
+        control: Control::threaded(Arc::clone(&write), Arc::clone(&dead)),
         write,
         streams: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashSet::new()),
@@ -1052,7 +1084,7 @@ pub(crate) fn connect_split<
         decoder: Mutex::new(Decoder::default()),
         max_frame: Mutex::new(16_384),
         peer_initial: Mutex::new(65_535),
-        dead: AtomicBool::new(false),
+        dead,
         goaway: AtomicBool::new(false),
         refused: AtomicBool::new(false),
         client_read: Some(Mutex::new(Box::new(read))),
@@ -1305,8 +1337,9 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
     }
     let write: Arc<Mutex<Box<dyn crate::proxy::FrameWrite + Send>>> =
         Arc::new(Mutex::new(Box::new(write)));
+    let dead = Arc::new(AtomicBool::new(false));
     let conn = Arc::new(H2Conn {
-        control: Control::threaded(Arc::clone(&write)),
+        control: Control::threaded(Arc::clone(&write), Arc::clone(&dead)),
         write,
         streams: Mutex::new(HashMap::new()),
         sessions: Mutex::new(HashSet::new()),
@@ -1317,7 +1350,7 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
         decoder: Mutex::new(Decoder::default()),
         max_frame: Mutex::new(16_384),
         peer_initial: Mutex::new(65_535),
-        dead: AtomicBool::new(false),
+        dead,
         goaway: AtomicBool::new(false),
         refused: AtomicBool::new(false),
         client_read: None,
@@ -2583,8 +2616,9 @@ mod tests {
     fn conn_with(write: Box<dyn crate::proxy::FrameWrite + Send>, threaded: bool) -> Arc<H2Conn> {
         let write: Arc<Mutex<Box<dyn crate::proxy::FrameWrite + Send>>> =
             Arc::new(Mutex::new(write));
+        let dead = Arc::new(AtomicBool::new(false));
         let control = if threaded {
-            Control::threaded(Arc::clone(&write))
+            Control::threaded(Arc::clone(&write), Arc::clone(&dead))
         } else {
             Control::Inline
         };
@@ -2600,7 +2634,7 @@ mod tests {
             decoder: Mutex::new(Decoder::default()),
             max_frame: Mutex::new(16_384),
             peer_initial: Mutex::new(65_535),
-            dead: AtomicBool::new(false),
+            dead,
             goaway: AtomicBool::new(false),
             refused: AtomicBool::new(false),
             client_read: None,
