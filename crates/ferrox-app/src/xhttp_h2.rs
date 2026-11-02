@@ -985,6 +985,34 @@ fn synth_head(method: &[u8], target: &[u8], lines: &[u8], end_stream: bool) -> V
     head
 }
 
+/// A served stream carries the sealed session in its body when the inbound names an engine: the
+/// engine handshake runs above the carrier framing, exactly as it does over H1.
+fn serve_stream(
+    reader: Box<dyn Read + Send>,
+    writer: crate::xhttp::XhttpWriter,
+    users: &VlessUsers,
+    freedom: bool,
+    decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+) {
+    let Some(decryption) = decryption else {
+        crate::proxy::serve_session_xhttp_with(reader, &writer, users, freedom);
+        return;
+    };
+    let close = writer.clone();
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.finish());
+    crate::proxy::serve_sealed_carried_with(
+        reader,
+        writer,
+        users,
+        freedom,
+        &decryption,
+        close,
+        |_| {},
+        |_| {},
+        |_| {},
+    );
+}
+
 fn open_stream(
     conn: &Arc<H2Conn>,
     settings: &XhttpSettings,
@@ -1081,23 +1109,7 @@ fn open_stream(
             Some(h2out.clone()),
         ) {
             crate::xhttp::Served::Session(ureader, xwriter) => {
-                if let Some(decryption) = decryption {
-                    let close = xwriter.clone();
-                    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || close.finish());
-                    crate::proxy::serve_sealed_carried_with(
-                        ureader,
-                        xwriter,
-                        &users,
-                        freedom,
-                        &decryption,
-                        close,
-                        |_| {},
-                        |_| {},
-                        |_| {},
-                    );
-                } else {
-                    crate::proxy::serve_session_xhttp_with(ureader, &xwriter, &users, freedom);
-                }
+                serve_stream(ureader, xwriter, &users, freedom, decryption);
             }
             _ => h2out.end(),
         }

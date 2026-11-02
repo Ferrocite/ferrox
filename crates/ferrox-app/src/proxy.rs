@@ -3807,7 +3807,7 @@ fn serve_vless(
             None => serve_vless_raw(stream, users, freedom, fallbacks),
         },
         Carrier::Ws { path, .. } => {
-            serve_vless_ws(stream, users, path, freedom, decryption.map(|d| d.as_ref()))
+            serve_vless_ws(stream, users, path, freedom, decryption.cloned().as_deref());
         }
         Carrier::HttpUpgrade { path, host, .. } => {
             serve_vless_httpupgrade(
@@ -3816,16 +3816,18 @@ fn serve_vless(
                 path,
                 host,
                 freedom,
-                decryption.map(|d| d.as_ref()),
+                decryption.cloned().as_deref(),
             );
         }
-        Carrier::Grpc(settings) => serve_vless_grpc(
-            stream,
-            users,
-            settings,
-            freedom,
-            decryption.map(|d| d.as_ref()),
-        ),
+        Carrier::Grpc(settings) => {
+            serve_vless_grpc(
+                stream,
+                users,
+                settings,
+                freedom,
+                decryption.cloned().as_deref(),
+            );
+        }
         Carrier::Xhttp { settings, .. } => {
             let Ok(read) = stream.try_clone() else {
                 return;
@@ -3841,7 +3843,7 @@ fn serve_vless(
             );
         }
         Carrier::HttpHeader { path } => {
-            serve_vless_httpheader(stream, users, path, freedom, decryption.map(|d| d.as_ref()));
+            serve_vless_httpheader(stream, users, path, freedom, decryption.cloned().as_deref());
         }
         refused_carriers!() => {}
     }
@@ -7455,7 +7457,7 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
         settings,
         users,
         freedom,
-        decryption.map(|d| d.as_ref()),
+        decryption.cloned().as_deref(),
     );
 }
 
@@ -7681,6 +7683,10 @@ fn accept_tls_session(
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per carrier; splitting would scatter the dispatch"
+)]
 fn serve_vless_tls(
     stream: Connection,
     users: &[VlessUser],
@@ -7726,7 +7732,7 @@ fn serve_vless_tls(
                 path,
                 users,
                 freedom,
-                decryption.map(|d| d.as_ref()),
+                decryption.cloned().as_deref(),
             );
         }
         Carrier::Xhttp { settings, .. } => {
@@ -7760,7 +7766,7 @@ fn serve_vless_tls(
                 host,
                 users,
                 freedom,
-                decryption.map(|d| d.as_ref()),
+                decryption.cloned().as_deref(),
             );
         }
         Carrier::HttpHeader { path } => {
@@ -7777,7 +7783,7 @@ fn serve_vless_tls(
                 path,
                 users,
                 freedom,
-                decryption.map(|d| d.as_ref()),
+                decryption.cloned().as_deref(),
             );
         }
         Carrier::Grpc(settings) => {
@@ -7792,7 +7798,7 @@ fn serve_vless_tls(
                 settings,
                 users,
                 freedom,
-                decryption.map(|d| d.as_ref()),
+                decryption.cloned().as_deref(),
             );
         }
         refused_carriers!() => {}
@@ -7967,6 +7973,10 @@ fn lane_flow(
     crate::accesslog::flow(source, email, level)
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "one arm per carrier; splitting would scatter the dispatch"
+)]
 fn serve_vless_reality(
     stream: Connection,
     users: &[VlessUser],
@@ -7992,7 +8002,7 @@ fn serve_vless_reality(
                 freedom,
                 server,
                 fallbacks,
-                decryption.map(|d| d.as_ref()),
+                decryption.cloned().as_deref(),
             );
         }
         Carrier::Ws { path, .. } => {
@@ -8008,7 +8018,7 @@ fn serve_vless_reality(
                     path,
                     users,
                     freedom,
-                    decryption.map(|d| d.as_ref()),
+                    decryption.cloned().as_deref(),
                 );
             });
         }
@@ -8046,7 +8056,7 @@ fn serve_vless_reality(
                     host,
                     users,
                     freedom,
-                    decryption.map(|d| d.as_ref()),
+                    decryption.cloned().as_deref(),
                 );
             });
         }
@@ -8065,7 +8075,7 @@ fn serve_vless_reality(
                     path,
                     users,
                     freedom,
-                    decryption.map(|d| d.as_ref()),
+                    decryption.cloned().as_deref(),
                 );
             });
         }
@@ -8082,7 +8092,7 @@ fn serve_vless_reality(
                     settings,
                     users,
                     freedom,
-                    decryption.map(|d| d.as_ref()),
+                    decryption.cloned().as_deref(),
                 );
             });
         }
