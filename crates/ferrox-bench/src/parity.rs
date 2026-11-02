@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,7 +90,13 @@ impl Dialect {
         }
     }
 
-    fn socks_inbound(self, listen: Ipv4Addr, port: u16, allow_unauthenticated_lan: bool) -> Json {
+    fn socks_inbound(
+        self,
+        listen: Ipv4Addr,
+        port: u16,
+        allow_unauthenticated_lan: bool,
+        udp: bool,
+    ) -> Json {
         let mut inbound = Json::object();
         match self {
             Self::Xray => {
@@ -120,7 +126,7 @@ impl Dialect {
         }
         let mut settings = Json::object();
         settings.insert("auth", Json::Str("noauth".into()));
-        settings.insert("udp", Json::Bool(false));
+        settings.insert("udp", Json::Bool(udp));
         match self {
             Self::Xray => {
                 if allow_unauthenticated_lan {
@@ -169,7 +175,7 @@ impl Dialect {
     }
 }
 
-const ACCEPTED_FIELDS: [&str; 13] = [
+const ACCEPTED_FIELDS: [&str; 14] = [
     "binary",
     "config",
     "path",
@@ -183,6 +189,7 @@ const ACCEPTED_FIELDS: [&str; 13] = [
     "idle_connections",
     "client_env",
     "tcp_latency_iterations",
+    "duration_ms",
 ];
 
 const KIB: f64 = 1024.0;
@@ -213,6 +220,18 @@ pub enum Traffic {
     Upload,
     Download,
     FullDuplex,
+    /// The engine is held up with the configured `duration_ms` and no flow is opened: the resident set it reaches is what an idle proxy costs.
+    Idle,
+    /// `connections` SOCKS flows are opened and left parked for `duration_ms` with nothing written, the shape a warning-free tunnel holds.
+    HeldOpen,
+    /// `connections` workers each open and close `iterations` SOCKS flows, measuring the cost of a connection rather than a byte.
+    Reconnect,
+    /// One SOCKS UDP association per flow, `iterations` echoed datagrams of `payload_size` each.
+    Udp,
+    /// `connections` TCP download flows and `connections` UDP echo flows run at once: the carrier multiplexes both under one tunnel.
+    Mixed,
+    /// `tcp_latency_iterations` request/response round trips of `payload_size` each on one flow.
+    TcpLatency,
 }
 
 impl Traffic {
@@ -221,6 +240,12 @@ impl Traffic {
             "upload" => Ok(Self::Upload),
             "download" => Ok(Self::Download),
             "full-duplex" => Ok(Self::FullDuplex),
+            "idle" => Ok(Self::Idle),
+            "held-open" => Ok(Self::HeldOpen),
+            "reconnect" => Ok(Self::Reconnect),
+            "udp" => Ok(Self::Udp),
+            "mixed" => Ok(Self::Mixed),
+            "tcp-latency" => Ok(Self::TcpLatency),
             other => Err(Error::Invalid(format!("unknown traffic `{other}`"))),
         }
     }
@@ -230,6 +255,12 @@ impl Traffic {
             Self::Upload => "upload",
             Self::Download => "download",
             Self::FullDuplex => "full-duplex",
+            Self::Idle => "idle",
+            Self::HeldOpen => "held-open",
+            Self::Reconnect => "reconnect",
+            Self::Udp => "udp",
+            Self::Mixed => "mixed",
+            Self::TcpLatency => "tcp-latency",
         }
     }
 
@@ -239,6 +270,24 @@ impl Traffic {
 
     const fn downlink(self) -> bool {
         matches!(self, Self::Download | Self::FullDuplex)
+    }
+
+    /// Whether the workload moves validated TCP bytes, which is what the sink's pattern and the transfer accounting describe.
+    const fn tcp_bytes(self) -> bool {
+        matches!(self, Self::Upload | Self::Download | Self::FullDuplex)
+    }
+
+    /// Whether the run opens a TCP sink listener per flow.
+    const fn tcp_sink(self) -> bool {
+        !matches!(self, Self::Idle | Self::Udp)
+    }
+
+    const fn udp(self) -> bool {
+        matches!(self, Self::Udp | Self::Mixed)
+    }
+
+    const fn holds(self) -> bool {
+        matches!(self, Self::Idle | Self::HeldOpen)
     }
 }
 
@@ -251,6 +300,8 @@ pub struct Request {
     pub connections: usize,
     pub iterations: usize,
     pub payload_size: usize,
+    pub duration: Duration,
+    pub tcp_latency_iterations: usize,
     pub output: PathBuf,
     pub warmup: bool,
     pub idle_connections: usize,
@@ -409,6 +460,15 @@ impl Request {
             connections: count("connections")?,
             iterations: count("iterations")?,
             payload_size: count("payload_size")?,
+            duration: Duration::from_millis(
+                root.get("duration_ms")
+                    .and_then(Json::as_num)
+                    .map_or(0, |n| n.max(0.0) as u64),
+            ),
+            tcp_latency_iterations: root
+                .get("tcp_latency_iterations")
+                .and_then(Json::as_num)
+                .map_or(0, |n| n.max(0.0) as usize),
             output: PathBuf::from(string("output")?),
             warmup: matches!(root.get("warmup").and_then(Json::as_bool), Some(true)),
             idle_connections: root
@@ -451,9 +511,10 @@ impl Request {
                     .into(),
             ));
         }
-        if !(1..=16).contains(&self.connections) {
+        let flow_cap = if self.traffic.holds() { 1024 } else { 64 };
+        if !(1..=flow_cap).contains(&self.connections) {
             return Err(Error::Invalid(format!(
-                "connections {} is outside 1..=16",
+                "connections {} is outside 1..={flow_cap}",
                 self.connections
             )));
         }
@@ -468,6 +529,33 @@ impl Request {
                 "payload_size {} is outside 1..=65536",
                 self.payload_size
             )));
+        }
+        if self.traffic.holds() && self.duration.is_zero() {
+            return Err(Error::Invalid(format!(
+                "traffic `{}` needs a non-zero `duration_ms`",
+                self.traffic.as_str()
+            )));
+        }
+        if self.duration > RUN_TIMEOUT {
+            return Err(Error::Invalid(format!(
+                "duration_ms {} is above the {} s run cap",
+                self.duration.as_millis(),
+                RUN_TIMEOUT.as_secs()
+            )));
+        }
+        if self.traffic == Traffic::TcpLatency {
+            if !(1..=MAX_ITERATIONS).contains(&self.tcp_latency_iterations) {
+                return Err(Error::Invalid(format!(
+                    "tcp_latency_iterations {} is outside 1..={MAX_ITERATIONS}",
+                    self.tcp_latency_iterations
+                )));
+            }
+            if self.payload_size > 65_536 {
+                return Err(Error::Invalid(format!(
+                    "payload_size {} is outside 1..=65536",
+                    self.payload_size
+                )));
+            }
         }
         if self.flow_bytes() > MAX_FLOW_BYTES {
             return Err(Error::Invalid(format!(
@@ -502,11 +590,35 @@ impl Request {
     }
 
     pub fn total_bytes(&self) -> u64 {
-        let per_flow = self.flow_bytes();
-        let directions = u64::from(self.traffic.uplink()) + u64::from(self.traffic.downlink());
-        per_flow
-            .saturating_mul(u64::try_from(self.connections).unwrap_or(0))
-            .saturating_mul(directions)
+        let flows = u64::try_from(self.connections).unwrap_or(0);
+        let datagrams = u64::try_from(self.iterations).unwrap_or(0);
+        let latency = u64::try_from(self.tcp_latency_iterations).unwrap_or(0);
+        let payload = u64::try_from(self.payload_size).unwrap_or(0);
+        match self.traffic {
+            Traffic::Idle | Traffic::HeldOpen | Traffic::Reconnect => 0,
+            Traffic::Udp | Traffic::TcpLatency => {
+                let round_trips = if self.traffic == Traffic::Udp {
+                    datagrams
+                } else {
+                    latency
+                };
+                flows
+                    .saturating_mul(round_trips)
+                    .saturating_mul(payload)
+                    .saturating_mul(2)
+            }
+            Traffic::Mixed => flows.saturating_mul(
+                self.flow_bytes()
+                    .saturating_add(datagrams.saturating_mul(payload).saturating_mul(2)),
+            ),
+            Traffic::Upload | Traffic::Download | Traffic::FullDuplex => {
+                let directions =
+                    u64::from(self.traffic.uplink()) + u64::from(self.traffic.downlink());
+                self.flow_bytes()
+                    .saturating_mul(flows)
+                    .saturating_mul(directions)
+            }
+        }
     }
 }
 
@@ -583,6 +695,8 @@ pub struct Outcome {
     pub io: Option<ps::Io>,
     pub startup_cpu_millis: u64,
     pub startup_seconds: f64,
+    /// Round-trip times for a latency workload; `None` where the run measured throughput instead.
+    pub latency_us: Option<Quartiles>,
     pub samples: Vec<(Phase, ps::Sample)>,
     /// The server process for this repeat, where the driver was given its pid.
     pub server: Option<Server>,
@@ -757,7 +871,7 @@ impl Run {
         root.insert("engine_binary", Json::Str(self.engine.clone()));
         root.insert("engine_sha256", Json::Str(self.engine_sha256.clone()));
         root.insert("setup", setup);
-        root.insert("latency_us", Json::Null);
+        root.insert("latency_us", optional_quartiles_json(o.latency_us));
         root.insert("tun_fd_buffers", Json::Null);
         root.insert("samples", Json::Arr(samples));
         root.insert("server", self.server_json());
@@ -816,7 +930,7 @@ fn io_json(io: Option<ps::Io>) -> Json {
     })
 }
 
-fn optional_quartiles_json(q: Option<Quartiles>) -> Json {
+pub(crate) fn optional_quartiles_json(q: Option<Quartiles>) -> Json {
     q.map_or(Json::Null, quartiles_json)
 }
 
@@ -894,6 +1008,27 @@ fn allocate_port_range(count: usize) -> Result<Vec<TcpListener>, Error> {
         listeners.push(TcpListener::bind((ip, 0)).map_err(io("allocating a sink port"))?);
     }
     Ok(listeners)
+}
+
+fn allocate_udp_range(count: usize) -> Result<Vec<UdpSocket>, Error> {
+    let ip = local_non_loopback_ipv4()?;
+    let mut sockets = Vec::with_capacity(count);
+    for _ in 0..count {
+        sockets.push(UdpSocket::bind((ip, 0)).map_err(io("allocating a UDP sink port"))?);
+    }
+    Ok(sockets)
+}
+
+fn udp_ports_of(sockets: &[UdpSocket]) -> Result<Vec<u16>, Error> {
+    sockets
+        .iter()
+        .map(|socket| {
+            Ok(socket
+                .local_addr()
+                .map_err(io("reading a bound UDP port"))?
+                .port())
+        })
+        .collect()
 }
 
 fn bound_port(listener: &TcpListener) -> Result<u16, Error> {
@@ -1053,9 +1188,22 @@ fn measure_once(
     server_pid: Option<u32>,
 ) -> Result<Run, Error> {
     let ip = local_non_loopback_ipv4()?;
-    let sink = allocate_port_range(request.connections)?;
-    let sink_ports = ports_of(&sink)?;
-    let targets = sink_targets(ip, &sink_ports);
+    let tcp_sink = if request.traffic.tcp_sink() {
+        allocate_port_range(request.connections)?
+    } else {
+        Vec::new()
+    };
+    let udp_sink = if request.traffic.udp() {
+        allocate_udp_range(request.connections)?
+    } else {
+        Vec::new()
+    };
+    let tcp_ports = ports_of(&tcp_sink)?;
+    let udp_ports = udp_ports_of(&udp_sink)?;
+    let mut sink_ports = tcp_ports.clone();
+    sink_ports.extend(&udp_ports);
+    let tcp_targets = sink_targets(ip, &tcp_ports);
+    let udp_targets = sink_targets(ip, &udp_ports);
     let probe = allocate_port_excluding(ip, &sink_ports)?;
     let engine_port = bound_port(&probe)?;
 
@@ -1065,13 +1213,14 @@ fn measure_once(
     let stdout_path = request.output.join("stdout.log");
 
     let desync: Desync = Arc::new(std::sync::Mutex::new(None));
-    let sink_thread = spawn_sink(sink, request, &desync)?;
+    let sink_thread = spawn_sink(tcp_sink, udp_sink, request, &desync)?;
     let config_text = inject_inbound(
         &request.config,
         ip,
         engine_port,
         dialect,
         allow_unauthenticated_lan,
+        request.traffic.udp(),
     )?;
     std::fs::write(&config_path, &config_text).map_err(io("writing the engine config"))?;
 
@@ -1105,8 +1254,13 @@ fn measure_once(
     }
 
     let server = server_pid.map(ServerSampler::start).transpose()?;
-    let (flows, sampler_thread, stop, rx) = start_traffic(pid, request, socks, &targets, &desync);
+    let (flows, sampler_thread, stop, rx) =
+        start_traffic(pid, request, socks, &tcp_targets, &udp_targets, &desync);
     let wall = Instant::now();
+    // An idle run opens no flow, so the hold itself is the workload and the fan-in has nothing to wait on.
+    if request.traffic == Traffic::Idle {
+        std::thread::sleep(request.duration);
+    }
     // The cap is enforced inside the fan-in: a stalled flow blocks `read`, so a post-hoc check here could never fire. A stall past the cap produced no number to bank, so `measure` re-measures it inside the budget rather than banking a workload fault.
     let moved = collect_flows(flows, &stop, wall + RUN_TIMEOUT)?;
     let wall_elapsed = wall.elapsed();
@@ -1147,6 +1301,7 @@ fn measure_once(
             io: summary.io,
             startup_cpu_millis,
             startup_seconds,
+            latency_us: summary.latency_us,
             samples,
             server,
         },
@@ -1290,6 +1445,7 @@ struct Summary {
     threads_peak: Option<u64>,
     io: Option<ps::Io>,
     transfer: Duration,
+    latency_us: Option<Quartiles>,
 }
 
 fn summarise(samples: &[(Phase, ps::Sample)], moved: &Moved, startup_cpu_millis: u64) -> Summary {
@@ -1322,6 +1478,7 @@ fn summarise(samples: &[(Phase, ps::Sample)], moved: &Moved, startup_cpu_millis:
         transfer: moved
             .window
             .map_or(Duration::ZERO, |(a, b)| b.saturating_duration_since(a)),
+        latency_us: Run::quartiles(&moved.latency_us),
     }
 }
 
@@ -1359,14 +1516,15 @@ fn start_traffic(
     pid: u32,
     request: &Request,
     engine: SocketAddr,
-    targets: &[SocketAddr],
+    tcp_targets: &[SocketAddr],
+    udp_targets: &[SocketAddr],
     desync: &Desync,
 ) -> TrafficPhase {
     let stop = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<(Phase, ps::Sample)>();
     let sampler_thread = spawn_sampler(pid, Arc::clone(&stop), tx);
     (
-        spawn_flows(request, engine, targets, desync),
+        spawn_flows(request, engine, tcp_targets, udp_targets, desync),
         sampler_thread,
         stop,
         rx,
@@ -1379,6 +1537,7 @@ struct Moved {
     window: Option<(Instant, Instant)>,
     flow_windows: Vec<Duration>,
     setup: Vec<Setup>,
+    latency_us: Vec<u128>,
     stopped: Option<String>,
     all_stopped: Vec<String>,
 }
@@ -1394,6 +1553,7 @@ fn collect_flows(
         window: None,
         flow_windows: Vec::new(),
         setup: Vec::new(),
+        latency_us: Vec::new(),
         stopped: None,
         all_stopped: Vec::new(),
     };
@@ -1415,6 +1575,7 @@ fn collect_flows(
         moved.sent += result.bytes_sent;
         moved.received += result.bytes_received;
         moved.setup.push(result.setup);
+        moved.latency_us.extend(result.latency_us);
         if let Some(reason) = result.stopped {
             moved.stopped.get_or_insert(reason.clone());
             moved.all_stopped.push(reason);
@@ -1523,7 +1684,21 @@ struct FlowResult {
     bytes_received: u64,
     window: Option<(Instant, Instant)>,
     setup: Setup,
+    latency_us: Vec<u128>,
     stopped: Option<String>,
+}
+
+impl FlowResult {
+    fn empty() -> Self {
+        Self {
+            bytes_sent: 0,
+            bytes_received: 0,
+            window: None,
+            setup: Setup::default(),
+            latency_us: Vec::new(),
+            stopped: None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1561,25 +1736,131 @@ impl SinkThread {
 fn spawn_flows(
     request: &Request,
     engine: SocketAddr,
-    targets: &[SocketAddr],
+    tcp_targets: &[SocketAddr],
+    udp_targets: &[SocketAddr],
     desync: &Desync,
 ) -> Vec<JoinHandle<FlowResult>> {
     let template = bulk_pattern_template(request.payload_size);
-    (0..request.connections)
-        .map(|index| {
-            let plan = FlowPlan {
-                bytes: request.flow_bytes(),
-                pattern: rotate(&template, index, request.connections),
-                traffic: request.traffic,
-                engine,
-                target: targets[index],
-                index,
-                desync: Arc::clone(desync),
-                abort: Arc::new(AtomicBool::new(false)),
-            };
-            std::thread::spawn(move || run_flow(&plan))
-        })
-        .collect()
+    let mut handles = Vec::new();
+    match request.traffic {
+        Traffic::Idle => return handles,
+        Traffic::HeldOpen => {
+            for index in 0..request.connections {
+                let plan = HoldPlan {
+                    engine,
+                    target: tcp_targets[index],
+                    duration: request.duration,
+                };
+                handles.push(std::thread::spawn(move || run_hold_flow(&plan, index)));
+            }
+        }
+        Traffic::Reconnect => {
+            for index in 0..request.connections {
+                let plan = ReconnectPlan {
+                    engine,
+                    target: tcp_targets[index],
+                    iterations: request.iterations,
+                };
+                handles.push(std::thread::spawn(move || run_reconnect_flow(&plan, index)));
+            }
+        }
+        Traffic::TcpLatency => {
+            for index in 0..request.connections {
+                let plan = LatencyPlan {
+                    engine,
+                    target: tcp_targets[index],
+                    iterations: request.tcp_latency_iterations,
+                    pattern: rotate(&template, index, request.connections),
+                    index,
+                    desync: Arc::clone(desync),
+                };
+                handles.push(std::thread::spawn(move || run_latency_flow(&plan)));
+            }
+        }
+        Traffic::Udp => {
+            for index in 0..request.connections {
+                let plan = UdpPlan {
+                    engine,
+                    target: udp_targets[index],
+                    iterations: request.iterations,
+                    pattern: rotate(&template, index, request.connections),
+                    index,
+                    desync: Arc::clone(desync),
+                };
+                handles.push(std::thread::spawn(move || run_udp_flow(&plan)));
+            }
+        }
+        Traffic::Mixed => {
+            for index in 0..request.connections {
+                let tcp = FlowPlan {
+                    bytes: request.flow_bytes(),
+                    pattern: rotate(&template, index, request.connections),
+                    traffic: Traffic::Download,
+                    engine,
+                    target: tcp_targets[index],
+                    index,
+                    desync: Arc::clone(desync),
+                    abort: Arc::new(AtomicBool::new(false)),
+                };
+                handles.push(std::thread::spawn(move || run_flow(&tcp)));
+                let udp = UdpPlan {
+                    engine,
+                    target: udp_targets[index],
+                    iterations: request.iterations,
+                    pattern: rotate(&template, index, request.connections),
+                    index: request.connections + index,
+                    desync: Arc::clone(desync),
+                };
+                handles.push(std::thread::spawn(move || run_udp_flow(&udp)));
+            }
+        }
+        Traffic::Upload | Traffic::Download | Traffic::FullDuplex => {
+            for index in 0..request.connections {
+                let plan = FlowPlan {
+                    bytes: request.flow_bytes(),
+                    pattern: rotate(&template, index, request.connections),
+                    traffic: request.traffic,
+                    engine,
+                    target: tcp_targets[index],
+                    index,
+                    desync: Arc::clone(desync),
+                    abort: Arc::new(AtomicBool::new(false)),
+                };
+                handles.push(std::thread::spawn(move || run_flow(&plan)));
+            }
+        }
+    }
+    handles
+}
+
+struct HoldPlan {
+    engine: SocketAddr,
+    target: SocketAddr,
+    duration: Duration,
+}
+
+struct ReconnectPlan {
+    engine: SocketAddr,
+    target: SocketAddr,
+    iterations: usize,
+}
+
+struct LatencyPlan {
+    engine: SocketAddr,
+    target: SocketAddr,
+    iterations: usize,
+    pattern: Vec<u8>,
+    index: usize,
+    desync: Desync,
+}
+
+struct UdpPlan {
+    engine: SocketAddr,
+    target: SocketAddr,
+    iterations: usize,
+    pattern: Vec<u8>,
+    index: usize,
+    desync: Desync,
 }
 
 fn rotate(template: &[u8], index: usize, flows: usize) -> Vec<u8> {
@@ -1615,13 +1896,7 @@ fn apply_flow_timeouts(stream: &TcpStream) {
 }
 
 fn run_flow(plan: &FlowPlan) -> FlowResult {
-    let mut result = FlowResult {
-        bytes_sent: 0,
-        bytes_received: 0,
-        window: None,
-        setup: Setup::default(),
-        stopped: None,
-    };
+    let mut result = FlowResult::empty();
 
     let t0 = Instant::now();
     let Ok(mut stream) = TcpStream::connect_timeout(&plan.engine, Duration::from_secs(10)) else {
@@ -1695,6 +1970,335 @@ fn run_flow(plan: &FlowPlan) -> FlowResult {
         result.window = Some((window_start, Instant::now()));
     }
     let _ = stream.shutdown(Shutdown::Both);
+    result
+}
+
+/// The SOCKS greeting and CONNECT every workload but the idle one shares, with the setup split the
+/// result reports. The caller owns the payload.
+fn socks_tunnel(engine: SocketAddr, target: SocketAddr) -> Result<(TcpStream, Setup), String> {
+    let t0 = Instant::now();
+    let mut stream = TcpStream::connect_timeout(&engine, Duration::from_secs(10))
+        .map_err(|e| format!("could not connect to the engine at {engine}: {e}"))?;
+    let _ = stream.set_nodelay(true);
+    apply_flow_timeouts(&stream);
+    #[cfg(target_vendor = "apple")]
+    bound_flow_send(&stream).map_err(|e| format!("could not bound the flow's send window: {e}"))?;
+    let mut setup = Setup::default();
+    setup.tcp_connect_us = t0.elapsed().as_micros();
+
+    let t1 = Instant::now();
+    socks_greet(&mut stream)?;
+    setup.socks_method_us = t1.elapsed().as_micros();
+
+    let t2 = Instant::now();
+    let mut connect = vec![5, 1, 0];
+    let reply_len = match target.ip() {
+        std::net::IpAddr::V4(v4) => {
+            connect.push(1);
+            connect.extend_from_slice(&v4.octets());
+            10
+        }
+        std::net::IpAddr::V6(v6) => {
+            connect.push(4);
+            connect.extend_from_slice(&v6.octets());
+            22
+        }
+    };
+    connect.extend_from_slice(&target.port().to_be_bytes());
+    stream
+        .write_all(&connect)
+        .map_err(|e| format!("socks connect write failed: {e}"))?;
+    let mut reply = vec![0u8; reply_len];
+    stream
+        .read_exact(&mut reply)
+        .map_err(|e| format!("socks connect read failed: {e}"))?;
+    if reply[1] != 0 {
+        return Err(format!(
+            "the engine refused the socks connect with reply code {}; the sink is at {target}",
+            reply[1]
+        ));
+    }
+    setup.socks_connect_us = t2.elapsed().as_micros();
+    setup.socks_setup_us = t1.elapsed().as_micros();
+    setup.total_us = t0.elapsed().as_micros();
+    Ok((stream, setup))
+}
+
+fn add_setup(total: &mut Setup, one: Setup) {
+    total.tcp_connect_us = total.tcp_connect_us.saturating_add(one.tcp_connect_us);
+    total.socks_method_us = total.socks_method_us.saturating_add(one.socks_method_us);
+    total.socks_connect_us = total.socks_connect_us.saturating_add(one.socks_connect_us);
+    total.socks_setup_us = total.socks_setup_us.saturating_add(one.socks_setup_us);
+    total.total_us = total.total_us.saturating_add(one.total_us);
+}
+
+fn run_hold_flow(plan: &HoldPlan, index: usize) -> FlowResult {
+    let mut result = FlowResult::empty();
+    match socks_tunnel(plan.engine, plan.target) {
+        Ok((stream, setup)) => {
+            result.setup = setup;
+            std::thread::sleep(plan.duration);
+            let _ = stream.shutdown(Shutdown::Both);
+        }
+        Err(reason) => result.stopped = Some(format!("flow {index}: {reason}")),
+    }
+    result
+}
+
+fn run_reconnect_flow(plan: &ReconnectPlan, index: usize) -> FlowResult {
+    let mut result = FlowResult::empty();
+    for _ in 0..plan.iterations {
+        match socks_tunnel(plan.engine, plan.target) {
+            Ok((stream, setup)) => {
+                add_setup(&mut result.setup, setup);
+                let _ = stream.shutdown(Shutdown::Both);
+            }
+            Err(reason) => {
+                result.stopped = Some(format!("flow {index}: {reason}"));
+                break;
+            }
+        }
+    }
+    result
+}
+
+fn run_latency_flow(plan: &LatencyPlan) -> FlowResult {
+    let mut result = FlowResult::empty();
+    let (mut stream, setup) = match socks_tunnel(plan.engine, plan.target) {
+        Ok(opened) => opened,
+        Err(reason) => {
+            result.stopped = Some(format!("flow {}: {reason}", plan.index));
+            return result;
+        }
+    };
+    result.setup = setup;
+    let mut echo = vec![0u8; plan.pattern.len()];
+    let window_start = Instant::now();
+    for _ in 0..plan.iterations {
+        let started = Instant::now();
+        if let Err(e) = stream.write_all(&plan.pattern) {
+            result.stopped = Some(format!("flow {} upload: {e}", plan.index));
+            break;
+        }
+        if let Err(e) = stream.read_exact(&mut echo) {
+            result.stopped = Some(format!("flow {} echo read: {e}", plan.index));
+            break;
+        }
+        if let Some(at) = pattern_mismatch(&plan.pattern, 0, &echo) {
+            note_desync(
+                &plan.desync,
+                Forged {
+                    flow: plan.index,
+                    offset: at as u64,
+                    side: "echo",
+                    detail: format!("byte {at} of a {} B round trip", echo.len()),
+                },
+            );
+            result.stopped = Some(format!(
+                "flow {} round trip desynced at byte {at}",
+                plan.index
+            ));
+            break;
+        }
+        result.latency_us.push(started.elapsed().as_micros());
+        result.bytes_sent += plan.pattern.len() as u64;
+        result.bytes_received += echo.len() as u64;
+    }
+    if result.stopped.is_none() {
+        result.window = Some((window_start, Instant::now()));
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+    result
+}
+
+fn socks_udp_associate(engine: SocketAddr) -> Result<(TcpStream, SocketAddr, Setup), String> {
+    let t0 = Instant::now();
+    let mut control = TcpStream::connect_timeout(&engine, Duration::from_secs(10))
+        .map_err(|e| format!("could not connect to the engine at {engine}: {e}"))?;
+    let _ = control.set_nodelay(true);
+    apply_flow_timeouts(&control);
+    let mut setup = Setup::default();
+    setup.tcp_connect_us = t0.elapsed().as_micros();
+    let t1 = Instant::now();
+    socks_greet(&mut control)?;
+    setup.socks_method_us = t1.elapsed().as_micros();
+    let t2 = Instant::now();
+    control
+        .write_all(&[5, 3, 0, 1, 0, 0, 0, 0, 0, 0])
+        .map_err(|e| format!("udp associate write failed: {e}"))?;
+    let mut head = [0u8; 4];
+    control
+        .read_exact(&mut head)
+        .map_err(|e| format!("udp associate read failed: {e}"))?;
+    if head[1] != 0 {
+        return Err(format!(
+            "the engine refused the socks udp associate with reply code {}",
+            head[1]
+        ));
+    }
+    let mut addr = [0u8; 16];
+    let port;
+    match head[3] {
+        1 => {
+            control
+                .read_exact(&mut addr[..4])
+                .map_err(|e| format!("udp associate address read failed: {e}"))?;
+            let mut tail = [0u8; 2];
+            control
+                .read_exact(&mut tail)
+                .map_err(|e| format!("udp associate port read failed: {e}"))?;
+            port = u16::from_be_bytes(tail);
+            let ip = std::net::Ipv4Addr::new(addr[0], addr[1], addr[2], addr[3]);
+            setup.socks_connect_us = t2.elapsed().as_micros();
+            setup.socks_setup_us = t1.elapsed().as_micros();
+            setup.total_us = t0.elapsed().as_micros();
+            let relay = if ip.is_unspecified() {
+                SocketAddr::from((engine.ip(), port))
+            } else {
+                SocketAddr::from((ip, port))
+            };
+            return Ok((control, relay, setup));
+        }
+        4 => {
+            control
+                .read_exact(&mut addr)
+                .map_err(|e| format!("udp associate address read failed: {e}"))?;
+            let mut tail = [0u8; 2];
+            control
+                .read_exact(&mut tail)
+                .map_err(|e| format!("udp associate port read failed: {e}"))?;
+            port = u16::from_be_bytes(tail);
+            let ip = std::net::Ipv6Addr::from(addr);
+            setup.socks_connect_us = t2.elapsed().as_micros();
+            setup.socks_setup_us = t1.elapsed().as_micros();
+            setup.total_us = t0.elapsed().as_micros();
+            let relay = if ip.is_unspecified() {
+                SocketAddr::from((engine.ip(), port))
+            } else {
+                SocketAddr::from((ip, port))
+            };
+            return Ok((control, relay, setup));
+        }
+        other => {
+            return Err(format!(
+                "the udp associate reply has address type {other}, not ipv4 or ipv6"
+            ))
+        }
+    }
+}
+
+/// The SOCKS UDP request head: RSV, FRAG, ATYP, DST.ADDR, DST.PORT.
+fn udp_frame(target: SocketAddr, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len() + 22);
+    out.extend_from_slice(&[0, 0, 0]);
+    match target {
+        SocketAddr::V4(v4) => {
+            out.push(1);
+            out.extend_from_slice(&v4.ip().octets());
+        }
+        SocketAddr::V6(v6) => {
+            out.push(4);
+            out.extend_from_slice(&v6.ip().octets());
+        }
+    }
+    out.extend_from_slice(&target.port().to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// The payload after the SOCKS UDP reply head, or `None` for a datagram shorter than its own header.
+fn udp_payload(datagram: &[u8]) -> Option<&[u8]> {
+    if datagram.len() < 4 {
+        return None;
+    }
+    let rest = &datagram[3..];
+    let offset = match rest[0] {
+        1 => 1 + 4 + 2,
+        4 => 1 + 16 + 2,
+        3 => {
+            let len = usize::from(*rest.get(1)?);
+            1 + 1 + len + 2
+        }
+        _ => return None,
+    };
+    datagram.get(4 + offset - 1..)
+}
+
+fn run_udp_flow(plan: &UdpPlan) -> FlowResult {
+    let mut result = FlowResult::empty();
+    let (control, relay, setup) = match socks_udp_associate(plan.engine) {
+        Ok(opened) => opened,
+        Err(reason) => {
+            result.stopped = Some(format!("flow {}: {reason}", plan.index));
+            return result;
+        }
+    };
+    result.setup = setup;
+    let socket = match UdpSocket::bind((plan.engine.ip(), 0)) {
+        Ok(socket) => socket,
+        Err(e) => {
+            result.stopped = Some(format!("flow {} udp bind: {e}", plan.index));
+            return result;
+        }
+    };
+    if let Err(e) = socket.connect(relay) {
+        result.stopped = Some(format!("flow {} udp connect to {relay}: {e}", plan.index));
+        return result;
+    }
+    let _ = socket.set_read_timeout(Some(FLOW_IO_TIMEOUT));
+    let _ = socket.set_write_timeout(Some(FLOW_IO_TIMEOUT));
+    let frame = udp_frame(plan.target, &plan.pattern);
+    let mut reply = vec![0u8; plan.pattern.len() + 32];
+    let window_start = Instant::now();
+    for _ in 0..plan.iterations {
+        let started = Instant::now();
+        if let Err(e) = socket.send(&frame) {
+            result.stopped = Some(format!("flow {} udp send: {e}", plan.index));
+            break;
+        }
+        let n = match socket.recv(&mut reply) {
+            Ok(n) => n,
+            Err(e) => {
+                result.stopped = Some(format!("flow {} udp echo: {e}", plan.index));
+                break;
+            }
+        };
+        let Some(body) = udp_payload(&reply[..n]) else {
+            result.stopped = Some(format!(
+                "flow {} udp echo carried no payload in {n} bytes",
+                plan.index
+            ));
+            break;
+        };
+        if body != plan.pattern.as_slice() {
+            let at = body
+                .iter()
+                .zip(&plan.pattern)
+                .position(|(got, want)| got != want)
+                .unwrap_or_else(|| body.len().min(plan.pattern.len()));
+            note_desync(
+                &plan.desync,
+                Forged {
+                    flow: plan.index,
+                    offset: at as u64,
+                    side: "udp echo",
+                    detail: format!("byte {at} of a {} B datagram", plan.pattern.len()),
+                },
+            );
+            result.stopped = Some(format!(
+                "flow {} udp echo desynced at byte {at}",
+                plan.index
+            ));
+            break;
+        }
+        result.latency_us.push(started.elapsed().as_micros());
+        result.bytes_sent += plan.pattern.len() as u64;
+        result.bytes_received += body.len() as u64;
+    }
+    if result.stopped.is_none() {
+        result.window = Some((window_start, Instant::now()));
+    }
+    let _ = control.shutdown(Shutdown::Both);
     result
 }
 
@@ -1945,6 +2549,7 @@ impl FlowPlan {
 
 fn spawn_sink(
     listeners: Vec<TcpListener>,
+    udp_sockets: Vec<UdpSocket>,
     request: &Request,
     desync: &Desync,
 ) -> Result<SinkThread, Error> {
@@ -1955,15 +2560,18 @@ fn spawn_sink(
     }
     let pattern = Arc::new(bulk_pattern_template(request.payload_size));
     let flows = request.connections;
-    let upload_bytes = if request.traffic.uplink() {
+    let reconnect = request.traffic == Traffic::Reconnect;
+    let hold = request.traffic == Traffic::HeldOpen;
+    let latency = request.traffic == Traffic::TcpLatency;
+    let upload_bytes = if request.traffic.tcp_bytes() && request.traffic.uplink() {
         request.flow_bytes()
     } else {
         0
     };
-    let download_bytes = if request.traffic.downlink() {
-        request.flow_bytes()
-    } else {
-        0
+    let download_bytes = match request.traffic {
+        Traffic::Mixed => request.flow_bytes(),
+        t if t.tcp_bytes() && t.downlink() => request.flow_bytes(),
+        _ => 0,
     };
     let reasons = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let accept_reasons = Arc::clone(&reasons);
@@ -1972,7 +2580,7 @@ fn spawn_sink(
     let sink_done = Arc::clone(&done);
     let accept = std::thread::spawn(move || {
         let done = sink_done;
-        let mut handles = Vec::with_capacity(listeners.len());
+        let mut handles = Vec::with_capacity(listeners.len() + udp_sockets.len());
         for (index, listener) in listeners.into_iter().enumerate() {
             let flow = Arc::new(rotate(&pattern, index, flows));
             let sink_reasons = Arc::clone(&accept_reasons);
@@ -1980,39 +2588,58 @@ fn spawn_sink(
             let thread_done = Arc::clone(&done);
             handles.push(std::thread::spawn(move || {
                 let listener_done = thread_done;
-                let (stream, _) = loop {
-                    if listener_done.load(Ordering::Relaxed) {
+                loop {
+                    let (stream, _) = loop {
+                        if listener_done.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        match listener.accept() {
+                            Ok(pair) => break pair,
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(20));
+                            }
+                            Err(_) => return,
+                        }
+                    };
+                    if stream.set_nonblocking(false).is_err() {
                         return;
                     }
-                    match listener.accept() {
-                        Ok(pair) => break pair,
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            std::thread::sleep(Duration::from_millis(20));
+                    apply_flow_timeouts(&stream);
+                    #[cfg(target_vendor = "apple")]
+                    if bound_flow_send(&stream).is_err() {
+                        return;
+                    }
+                    if reconnect {
+                        drop(stream);
+                        continue;
+                    }
+                    if hold {
+                        hold_stream(stream, &listener_done);
+                        return;
+                    }
+                    if latency {
+                        echo_stream(stream, &listener_done);
+                        return;
+                    }
+                    if let Some(reason) = serve_flow(
+                        stream,
+                        &flow,
+                        index,
+                        upload_bytes,
+                        download_bytes,
+                        &sink_desync,
+                    ) {
+                        if let Ok(mut slot) = sink_reasons.lock() {
+                            slot.push(reason);
                         }
-                        Err(_) => return,
                     }
-                };
-                if stream.set_nonblocking(false).is_err() {
                     return;
-                }
-                apply_flow_timeouts(&stream);
-                #[cfg(target_vendor = "apple")]
-                if bound_flow_send(&stream).is_err() {
-                    return;
-                }
-                if let Some(reason) = serve_flow(
-                    stream,
-                    &flow,
-                    index,
-                    upload_bytes,
-                    download_bytes,
-                    &sink_desync,
-                ) {
-                    if let Ok(mut slot) = sink_reasons.lock() {
-                        slot.push(reason);
-                    }
                 }
             }));
+        }
+        for socket in udp_sockets {
+            let thread_done = Arc::clone(&done);
+            handles.push(std::thread::spawn(move || serve_udp(socket, &thread_done)));
         }
         for handle in handles {
             let _ = handle.join();
@@ -2023,6 +2650,47 @@ fn spawn_sink(
         reasons,
         done,
     })
+}
+
+fn hold_stream(stream: TcpStream, done: &AtomicBool) {
+    while !done.load(Ordering::Relaxed) {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
+fn echo_stream(mut stream: TcpStream, done: &AtomicBool) {
+    let mut buffer = vec![0u8; DOWNLOAD_CHUNK];
+    while !done.load(Ordering::Relaxed) {
+        match stream.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => {
+                if stream.write_all(&buffer[..n]).is_err() {
+                    break;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+}
+
+fn serve_udp(socket: UdpSocket, done: &AtomicBool) {
+    let _ = socket.set_read_timeout(Some(Duration::from_millis(50)));
+    let mut buffer = vec![0u8; 65_536 + 64];
+    while !done.load(Ordering::Relaxed) {
+        match socket.recv_from(&mut buffer) {
+            Ok((n, from)) => {
+                let _ = socket.send_to(&buffer[..n], from);
+            }
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+    }
 }
 
 fn serve_flow(
@@ -2169,10 +2837,11 @@ pub fn inject_inbound(
     port: u16,
     dialect: Dialect,
     allow_unauthenticated_lan: bool,
+    udp: bool,
 ) -> Result<String, Error> {
     let mut root = json::parse(config)
         .map_err(|e| Error::Invalid(format!("config is not valid json: {e}")))?;
-    let inbound = dialect.socks_inbound(listen, port, allow_unauthenticated_lan);
+    let inbound = dialect.socks_inbound(listen, port, allow_unauthenticated_lan, udp);
 
     let mut list = match root.get("inbounds") {
         Some(Json::Arr(existing)) => existing.clone(),
@@ -3528,6 +4197,7 @@ mod tests {
             1080,
             Dialect::Xray,
             false,
+            false,
         )
         .expect("injectable");
         let root = json::parse(&out).expect("valid json");
@@ -3578,6 +4248,7 @@ mod tests {
             1080,
             Dialect::Xray,
             true,
+            false,
         )
         .expect("injectable");
         let root = json::parse(&out).expect("valid json");
@@ -3598,8 +4269,15 @@ mod tests {
     fn each_dialect_writes_the_fields_that_engine_actually_reads() {
         for dialect in [Dialect::Xray, Dialect::SingBox, Dialect::Leaf] {
             let base = dialect.base_config().to_string().expect("serialises");
-            let out = inject_inbound(&base, Ipv4Addr::new(192, 0, 2, 7), 1080, dialect, false)
-                .expect("injectable");
+            let out = inject_inbound(
+                &base,
+                Ipv4Addr::new(192, 0, 2, 7),
+                1080,
+                dialect,
+                false,
+                false,
+            )
+            .expect("injectable");
             let root = json::parse(&out).expect("valid json");
             let outbound = &root
                 .get("outbounds")
@@ -3695,6 +4373,7 @@ mod tests {
             1,
             Dialect::Xray,
             false,
+            false,
         )
         .expect("injectable");
         let root = json::parse(&out).expect("valid json");
@@ -3713,6 +4392,7 @@ mod tests {
             Ipv4Addr::LOCALHOST,
             1,
             Dialect::Xray,
+            false,
             false,
         )
         .is_err());

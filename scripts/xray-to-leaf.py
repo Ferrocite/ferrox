@@ -125,6 +125,14 @@ def _protocol_layer(source):
             "method": server["method"],
             "password": server["password"],
         }
+    elif protocol == "socks":
+        server = _first(settings.get("servers"), "`servers`")
+        layer = {"address": server["address"], "port": server["port"]}
+        users = server.get("users")
+        if users:
+            user = _first(users, "`servers[0].users`")
+            layer["username"] = user.get("user", "")
+            layer["password"] = user.get("pass", "")
     else:
         raise ValueError(f"leaf at this pin has no `{protocol}` client here")
 

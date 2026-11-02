@@ -956,9 +956,11 @@ def cmd_selftest(args: argparse.Namespace) -> int:
         print(f"selftest: {'ok  ' if ok else 'FAIL'} {label}")
     plan = build_plan(root, ["crates/ferrox-app/src/vmess.rs"])
     vmess_cells = [
-        "vmess-raw-down-8", "vmess-tls-ws-down-8", "vmess-raw-up-1",
-        "vmess-raw-duplex-8", "vmess-tls-ws-up-1", "vmess-tls-ws-duplex-8",
-        "vmess-tls-raw-down-8", "vmess-tls-raw-up-1", "vmess-tls-raw-duplex-8",
+        "vmess-raw-down-8", "vmess-tls-ws-down-8", "vmess-raw-down-64",
+        "vmess-raw-up-1", "vmess-raw-duplex-8", "vmess-tls-ws-up-1",
+        "vmess-tls-ws-duplex-8", "vmess-tls-raw-down-8", "vmess-tls-raw-up-1",
+        "vmess-tls-raw-duplex-8", "vmess-tls-ws-ed-down-8", "vmess-raw-udp-8",
+        "vmess-raw-idle-100", "vmess-raw-tcp-latency-1",
     ]
     ok = plan["scenarios"] == vmess_cells and len(plan["rows"]) == 7 \
         and "vmess_over_raw_tcp_matches_the_oracle" in plan["suites"].get("zeronet", "") \
@@ -970,7 +972,7 @@ def cmd_selftest(args: argparse.Namespace) -> int:
           f"else ({len(plan['scenarios'])} cell(s), {len(plan['rows'])} row(s), "
           f"suites {sorted(plan['suites'])})")
     shared = build_plan(root, ["crates/ferrox-core/src/record.rs"])
-    ok = len(shared["rows"]) == 4 and len(shared["scenarios"]) == 16 \
+    ok = len(shared["rows"]) == 4 and len(shared["scenarios"]) == 37 \
         and "trojan_over_raw_tcp_matches_the_oracle" in shared["suites"]["zeronet"] \
         and shared["go_packages"] == ["./common/crypto/..."]
     failed += 0 if ok else 1

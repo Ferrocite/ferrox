@@ -79,7 +79,13 @@ matrix_engine_skip_reason() {
     printf '%s\n' "leaf at this pin only sends VLESS with the Vision flow, which this scenario does not configure"
     return 0
   fi
+  if [[ "$engine" == sing-box && "$id" == shadowsocks* && "$id" != shadowsocks-raw-* && "$id" != shadowsocks2022-raw-* ]]; then
+    printf '%s\n' "sing-box at this pin has no stream layer on a Shadowsocks outbound"
+    return 0
+  fi
   case "$engine:$id" in
+    sing-box:*-quic-*)
+      printf '%s\n' "sing-box at this pin has no QUIC transport" ;;
     sing-box:*-xhttp-*|sing-box:*-kcp-*)
       printf '%s\n' "sing-box at this pin has no xhttp or KCP transport" ;;
     sing-box:*-hysteria-*)
@@ -104,6 +110,8 @@ matrix_engine_skip_reason() {
       printf '%s\n' "leaf at this pin has no gRPC transport" ;;
     leaf:*-httpupgrade-*)
       printf '%s\n' "leaf at this pin has no HTTPUpgrade transport" ;;
+    leaf:http-*)
+      printf '%s\n' "leaf at this pin has no HTTP proxy outbound" ;;
     leaf:shadowsocks2022-*)
       printf '%s\n' "leaf at this pin has no Shadowsocks 2022" ;;
     xray-core-rust:wireguard-*|zeronet:wireguard-*|xray-rust:wireguard-*|leaf:wireguard-*)
@@ -131,6 +139,23 @@ server_config() {
  "outbounds": [{$2}, {"tag": "direct", "protocol": "freedom", "settings": {"finalRules": [{"action": "allow"}]}}],
  "routing": {"rules": [{"type": "field", "inboundTag": ["harness-socks"], "outboundTag": "proxy"}, $routes]}}
 EOF
+}
+
+# A routed cell pays for the table it walks: a thousand rules that do not match, then the one that
+# sends the sink's own address direct. The bytes on the wire are the raw lane's; the CPU is not.
+routed_server_config() {
+  server_config "$1" "$2" "$3" "${4:-}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+d.setdefault("routing", {}).setdefault("rules", []).extend(
+    {"type": "field", "domain": [f"no-route-{i}.test"], "outboundTag": "direct"}
+    for i in range(1000)
+)
+d["routing"]["rules"].append(
+    {"type": "field", "ip": ["127.0.0.1/32"], "outboundTag": "direct"}
+)
+print(json.dumps(d, separators=(",", ":")))
+'
 }
 
 # REALITY's server dials `dest` for the certificate it presents, so the fixture gives it a live
@@ -283,8 +308,8 @@ reality_server_settings() {
 }
 
 reality_client_settings() {
-  local network="$1" carrier="$2"
-  echo "\"streamSettings\": {\"network\": \"$network\"$carrier, \"security\": \"reality\", \"realitySettings\": {\"serverName\": \"carrier.test\", \"fingerprint\": \"chrome\", \"publicKey\": \"$(matrix_reality_public)\", \"shortId\": \"0123456789abcdef\"}}"
+  local network="$1" carrier="$2" fingerprint="${3:-chrome}"
+  echo "\"streamSettings\": {\"network\": \"$network\"$carrier, \"security\": \"reality\", \"realitySettings\": {\"serverName\": \"carrier.test\", \"fingerprint\": \"$fingerprint\", \"publicKey\": \"$(matrix_reality_public)\", \"shortId\": \"0123456789abcdef\"}}"
 }
 
 kcp_settings() {
@@ -323,6 +348,91 @@ masque_client_settings() {
 
 httpupgrade_settings() {
   echo '"streamSettings": {"network": "httpupgrade", "httpupgradeSettings": {"path": "/tunnel", "host": "carrier.test"}}'
+}
+
+# Early data is a query parameter on the carrier's path: the client writes the first `ed` bytes
+# before the upgrade completes and the server holds them until the session is bound.
+ws_ed_settings() {
+  echo '"streamSettings": {"network": "ws", "wsSettings": {"path": "/tunnel?ed=2048"}}'
+}
+
+tls_ws_ed_server_settings() {
+  local dir
+  dir="$(matrix_tls_dir)"
+  echo "\"streamSettings\": {\"network\": \"ws\", \"wsSettings\": {\"path\": \"/tunnel?ed=2048\"}, \"security\": \"tls\", \"tlsSettings\": {\"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\"}]}}"
+}
+
+tls_ws_ed_client_settings() {
+  local dir pin
+  dir="$(matrix_tls_dir)"
+  pin="$(matrix_tls_pin "$dir/cert.pem")"
+  echo "\"streamSettings\": {\"network\": \"ws\", \"wsSettings\": {\"path\": \"/tunnel?ed=2048\"}, \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
+}
+
+httpupgrade_ed_settings() {
+  echo '"streamSettings": {"network": "httpupgrade", "httpupgradeSettings": {"path": "/tunnel?ed=2048", "host": "carrier.test"}}'
+}
+
+tls_httpupgrade_server_settings() {
+  local dir
+  dir="$(matrix_tls_dir)"
+  echo "\"streamSettings\": {\"network\": \"httpupgrade\", \"httpupgradeSettings\": {\"path\": \"/tunnel\", \"host\": \"carrier.test\"}, \"security\": \"tls\", \"tlsSettings\": {\"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\"}]}}"
+}
+
+tls_httpupgrade_client_settings() {
+  local dir pin
+  dir="$(matrix_tls_dir)"
+  pin="$(matrix_tls_pin "$dir/cert.pem")"
+  echo "\"streamSettings\": {\"network\": \"httpupgrade\", \"httpupgradeSettings\": {\"path\": \"/tunnel\", \"host\": \"carrier.test\"}, \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
+}
+
+tls_httpupgrade_ed_server_settings() {
+  local dir
+  dir="$(matrix_tls_dir)"
+  echo "\"streamSettings\": {\"network\": \"httpupgrade\", \"httpupgradeSettings\": {\"path\": \"/tunnel?ed=2048\", \"host\": \"carrier.test\"}, \"security\": \"tls\", \"tlsSettings\": {\"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\"}]}}"
+}
+
+tls_httpupgrade_ed_client_settings() {
+  local dir pin
+  dir="$(matrix_tls_dir)"
+  pin="$(matrix_tls_pin "$dir/cert.pem")"
+  echo "\"streamSettings\": {\"network\": \"httpupgrade\", \"httpupgradeSettings\": {\"path\": \"/tunnel?ed=2048\", \"host\": \"carrier.test\"}, \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
+}
+
+grpc_multi_settings() {
+  echo '"streamSettings": {"network": "grpc", "grpcSettings": {"serviceName": "TunnelService", "multiMode": true}}'
+}
+
+tls_grpc_multi_server_settings() {
+  local dir
+  dir="$(matrix_tls_dir)"
+  echo "\"streamSettings\": {\"network\": \"grpc\", \"grpcSettings\": {\"serviceName\": \"TunnelService\", \"multiMode\": true}, \"security\": \"tls\", \"tlsSettings\": {\"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\"}]}}"
+}
+
+tls_grpc_multi_client_settings() {
+  local dir pin
+  dir="$(matrix_tls_dir)"
+  pin="$(matrix_tls_pin "$dir/cert.pem")"
+  echo "\"streamSettings\": {\"network\": \"grpc\", \"grpcSettings\": {\"serviceName\": \"TunnelService\", \"multiMode\": true}, \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
+}
+
+xhttp_h1_settings() {
+  local mode="$1"
+  echo "\"streamSettings\": {\"network\": \"xhttp\", \"xhttpSettings\": {\"path\": \"/share\", \"mode\": \"$mode\"}}"
+}
+
+# xHTTP over TLS: the ALPN is what decides H1 from H2; the carrier's own mode stays independent.
+tls_xhttp_server_settings() {
+  local mode="$1" alpn="$2" dir
+  dir="$(matrix_tls_dir)"
+  echo "\"streamSettings\": {\"network\": \"xhttp\", \"xhttpSettings\": {\"path\": \"/share\", \"mode\": \"$mode\"}, \"security\": \"tls\", \"tlsSettings\": {\"alpn\": [\"$alpn\"], \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"keyFile\": \"$dir/key.pem\"}]}}"
+}
+
+tls_xhttp_client_settings() {
+  local mode="$1" alpn="$2" dir pin
+  dir="$(matrix_tls_dir)"
+  pin="$(matrix_tls_pin "$dir/cert.pem")"
+  echo "\"streamSettings\": {\"network\": \"xhttp\", \"xhttpSettings\": {\"path\": \"/share\", \"mode\": \"$mode\"}, \"security\": \"tls\", \"tlsSettings\": {\"serverName\": \"carrier.test\", \"alpn\": [\"$alpn\"], \"caCertFile\": \"$dir/cert.pem\", \"pinnedPeerCertSha256\": \"$pin\", \"certificates\": [{\"certificateFile\": \"$dir/cert.pem\", \"usage\": \"verify\"}]}}"
 }
 
 hysteria_server_settings() {
@@ -380,6 +490,118 @@ stream_json() {
   esac
 }
 
+# VMess, Trojan and both Shadowsocks dialects share one carrier surface. The carrier token is
+# read from the scenario id, so a protocol adds a carrier with one case arm rather than one per
+# protocol, and the scenario list can grow without the config table growing with it.
+carrier_of() {
+  case "$1" in
+    *-tls-httpupgrade-ed-*) echo tls-httpupgrade-ed ;;
+    *-tls-httpupgrade-*) echo tls-httpupgrade ;;
+    *-httpupgrade-ed-*) echo httpupgrade-ed ;;
+    *-httpupgrade-*) echo httpupgrade ;;
+    *-tls-ws-ed-*) echo tls-ws-ed ;;
+    *-ws-ed-*) echo ws-ed ;;
+    *-tls-ws-*) echo tls-ws ;;
+    *-ws-*) echo ws ;;
+    *-tls-grpc-multi-*) echo tls-grpc-multi ;;
+    *-grpc-multi-*) echo grpc-multi ;;
+    *-tls-grpc-*) echo tls-grpc ;;
+    *-grpc-*) echo grpc ;;
+    *-tls-xhttp-h2-*) echo tls-xhttp-h2 ;;
+    *-tls-xhttp-h1-*) echo tls-xhttp-h1 ;;
+    *-xhttp-streamone-*) echo xhttp-streamone ;;
+    *-xhttp-streamup-*) echo xhttp-streamup ;;
+    *-xhttp-packets-*) echo xhttp-packets ;;
+    *-xhttp-*) echo xhttp ;;
+    *-reality-raw-*) echo reality-raw ;;
+    *-tls-raw-*) echo tls-raw ;;
+    *-kcp-*) echo kcp ;;
+    *-quic-*) echo quic ;;
+    *-hysteria-*) echo hysteria ;;
+    *-raw-*) echo raw ;;
+    *) return 1 ;;
+  esac
+}
+
+carrier_server_stream() {
+  carrier_stream "$1" server
+}
+
+carrier_stream() {
+  local carrier="$1" role="$2"
+  case "$carrier" in
+    raw) stream_json tcp ;;
+    tls-raw) if [[ "$role" == server ]]; then tls_server_settings; else tls_client_settings; fi ;;
+    ws) stream_json ws ;;
+    tls-ws) if [[ "$role" == server ]]; then tls_ws_server_settings; else tls_ws_client_settings; fi ;;
+    ws-ed) ws_ed_settings ;;
+    tls-ws-ed) if [[ "$role" == server ]]; then tls_ws_ed_server_settings; else tls_ws_ed_client_settings; fi ;;
+    httpupgrade) httpupgrade_settings ;;
+    tls-httpupgrade) if [[ "$role" == server ]]; then tls_httpupgrade_server_settings; else tls_httpupgrade_client_settings; fi ;;
+    httpupgrade-ed) httpupgrade_ed_settings ;;
+    tls-httpupgrade-ed) if [[ "$role" == server ]]; then tls_httpupgrade_ed_server_settings; else tls_httpupgrade_ed_client_settings; fi ;;
+    grpc) stream_json grpc ;;
+    tls-grpc) if [[ "$role" == server ]]; then tls_grpc_server_settings; else tls_grpc_client_settings; fi ;;
+    grpc-multi) grpc_multi_settings ;;
+    tls-grpc-multi) if [[ "$role" == server ]]; then tls_grpc_multi_server_settings; else tls_grpc_multi_client_settings; fi ;;
+    xhttp) stream_json xhttp ;;
+    tls-xhttp-h1) if [[ "$role" == server ]]; then tls_xhttp_server_settings auto http/1.1; else tls_xhttp_client_settings auto http/1.1; fi ;;
+    tls-xhttp-h2) if [[ "$role" == server ]]; then tls_xhttp_server_settings auto h2; else tls_xhttp_client_settings auto h2; fi ;;
+    xhttp-streamone) xhttp_h1_settings stream-one ;;
+    xhttp-streamup) xhttp_h1_settings stream-up ;;
+    xhttp-packets) xhttp_h1_settings packet-up ;;
+    kcp) kcp_settings ;;
+    quic) if [[ "$role" == server ]]; then quic_server_settings; else quic_client_settings; fi ;;
+    hysteria) if [[ "$role" == server ]]; then hysteria_server_settings; else hysteria_client_settings; fi ;;
+    *) echo "::error::unknown carrier $carrier" >&2; return 1 ;;
+  esac
+}
+
+vmess_server() { echo "\"protocol\": \"vmess\", \"settings\": {\"clients\": [{\"id\": \"$UUID\"}]}"; }
+vmess_client() { echo "\"tag\": \"proxy\", \"protocol\": \"vmess\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $1, \"users\": [{\"id\": \"$UUID\", \"security\": \"auto\"}]}]}" ; }
+trojan_server() { echo "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}"; }
+trojan_client() { echo "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $1, \"password\": \"$PASSWORD\"}]}"; }
+shadowsocks_server() { echo "\"protocol\": \"shadowsocks\", \"settings\": {\"method\": \"aes-256-gcm\", \"password\": \"$SS_PASSWORD\", \"network\": \"tcp\"}"; }
+shadowsocks_client() { echo "\"tag\": \"proxy\", \"protocol\": \"shadowsocks\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $1, \"method\": \"aes-256-gcm\", \"password\": \"$SS_PASSWORD\"}]}"; }
+shadowsocks2022_server() { echo "\"protocol\": \"shadowsocks\", \"settings\": {\"method\": \"2022-blake3-aes-128-gcm\", \"password\": \"$SS2022_PASSWORD\", \"network\": \"tcp\"}"; }
+shadowsocks2022_client() { echo "\"tag\": \"proxy\", \"protocol\": \"shadowsocks\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $1, \"method\": \"2022-blake3-aes-128-gcm\", \"password\": \"$SS2022_PASSWORD\"}]}"; }
+
+# One function per protocol family; the carrier decides the stream layer, so no protocol needs a
+# case arm per carrier.
+protocol_scenario() {
+  local proto="$1" carrier="$2" port="$3" cover="${4:-}" srv cli srv_stream cli_stream cover_json=""
+  case "$proto" in
+    vmess) srv="$(vmess_server)"; cli="$(vmess_client "$port")" ;;
+    trojan) srv="$(trojan_server)"; cli="$(trojan_client "$port")" ;;
+    shadowsocks) srv="$(shadowsocks_server)"; cli="$(shadowsocks_client "$port")" ;;
+    shadowsocks2022) srv="$(shadowsocks2022_server)"; cli="$(shadowsocks2022_client "$port")" ;;
+    *) echo "::error::unknown protocol $proto" >&2; return 1 ;;
+  esac
+  if [[ "$carrier" == reality-raw ]]; then
+    srv_stream="$(reality_server_settings tcp "")"
+    cli_stream="$(reality_client_settings tcp "")"
+    if [[ -n "$cover" ]]; then cover_json="$(cover_inbound "$cover")"; fi
+  else
+    srv_stream="$(carrier_server_stream "$carrier")" || return 1
+    cli_stream="$(carrier_stream "$carrier" client)" || return 1
+  fi
+  server_config "$srv, $srv_stream" "$cli, $cli_stream" "$port" "$cover_json"
+}
+
+dispatch_protocol() {
+  local proto="$1" id="$2" port="$3" cover="${4:-}" carrier
+  carrier="$(carrier_of "$id")" || {
+    echo "::error::$id names no carrier this matrix knows" >&2
+    return 1
+  }
+  protocol_scenario "$proto" "$carrier" "$port" "$cover"
+}
+
+socks_server() { echo "\"protocol\": \"socks\", \"settings\": {\"auth\": \"noauth\", \"udp\": true}"; }
+socks_client() { echo "\"tag\": \"proxy\", \"protocol\": \"socks\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $1}]}"; }
+http_server() { echo "\"protocol\": \"http\", \"settings\": {}"; }
+http_client() { echo "\"tag\": \"proxy\", \"protocol\": \"http\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $1}]}"; }
+
 scenario_config() {
   local port="$2" cover="${3:-}" cover_json=""
   if [[ -n "$cover" ]]; then cover_json="$(cover_inbound "$cover")"; fi
@@ -388,6 +610,19 @@ scenario_config() {
     vless-encryption-raw-*) server_config "$(vless_server_encryption ', "streamSettings": {"network": "tcp"}')" "$(vless_client_encryption ', "streamSettings": {"network": "tcp"}' "$port")" "$port" ;;
     vless-encryption-tls-raw-*) server_config "$(vless_server_encryption ", $(tls_server_settings)")" "$(vless_client_encryption ", $(tls_client_settings)" "$port")" "$port" ;;
     vless-encryption-reality-raw-*) server_config "$(vless_server_encryption ", $(reality_server_settings tcp "")")" "$(vless_client_encryption ", $(reality_client_settings tcp "")" "$port")" "$port" "$cover_json" ;;
+    vless-tls-ws-ed-*) server_config "$(vless_server ", $(tls_ws_ed_server_settings)")" "$(vless_client ", $(tls_ws_ed_client_settings)" "$port")" "$port" ;;
+    vless-ws-ed-*) server_config "$(vless_server ", $(ws_ed_settings)")" "$(vless_client ", $(ws_ed_settings)" "$port")" "$port" ;;
+    vless-tls-httpupgrade-ed-*) server_config "$(vless_server ", $(tls_httpupgrade_ed_server_settings)")" "$(vless_client ", $(tls_httpupgrade_ed_client_settings)" "$port")" "$port" ;;
+    vless-tls-httpupgrade-*) server_config "$(vless_server ", $(tls_httpupgrade_server_settings)")" "$(vless_client ", $(tls_httpupgrade_client_settings)" "$port")" "$port" ;;
+    vless-httpupgrade-ed-*) server_config "$(vless_server ", $(httpupgrade_ed_settings)")" "$(vless_client ", $(httpupgrade_ed_settings)" "$port")" "$port" ;;
+    vless-tls-grpc-multi-*) server_config "$(vless_server ", $(tls_grpc_multi_server_settings)")" "$(vless_client ", $(tls_grpc_multi_client_settings)" "$port")" "$port" ;;
+    vless-grpc-multi-*) server_config "$(vless_server ", $(grpc_multi_settings)")" "$(vless_client ", $(grpc_multi_settings)" "$port")" "$port" ;;
+    vless-tls-xhttp-h2-*) server_config "$(vless_server ", $(tls_xhttp_server_settings auto h2)")" "$(vless_client ", $(tls_xhttp_client_settings auto h2)" "$port")" "$port" ;;
+    vless-tls-xhttp-h1-*) server_config "$(vless_server ", $(tls_xhttp_server_settings auto http/1.1)")" "$(vless_client ", $(tls_xhttp_client_settings auto http/1.1)" "$port")" "$port" ;;
+    vless-xhttp-streamup-*) server_config "$(vless_server ", $(xhttp_h1_settings stream-up)")" "$(vless_client ", $(xhttp_h1_settings stream-up)" "$port")" "$port" ;;
+    vless-xhttp-streamone-*) server_config "$(vless_server ", $(xhttp_h1_settings stream-one)")" "$(vless_client ", $(xhttp_h1_settings stream-one)" "$port")" "$port" ;;
+    vless-xhttp-packets-*) server_config "$(vless_server ", $(xhttp_h1_settings packet-up)")" "$(vless_client ", $(xhttp_h1_settings packet-up)" "$port")" "$port" ;;
+    vless-raw-routed-*) routed_server_config "$(vless_server ', "streamSettings": {"network": "tcp"}')" "$(vless_client ', "streamSettings": {"network": "tcp"}' "$port")" "$port" ;;
     vless-tls-raw-*) server_config "$(vless_server ", $(tls_server_settings)")" "$(vless_client ", $(tls_client_settings)" "$port")" "$port" ;;
     vless-ws-*) server_config "$(vless_server ", $(stream_json ws)")" "$(vless_client ", $(stream_json ws)" "$port")" "$port" ;;
     vless-grpc-*) server_config "$(vless_server ", $(stream_json grpc)")" "$(vless_client ", $(stream_json grpc)" "$port")" "$port" ;;
@@ -404,8 +639,15 @@ scenario_config() {
     vless-reality-raw-*) server_config "$(vless_server ", $(reality_server_settings tcp "")")" "$(vless_client ", $(reality_client_settings tcp "")" "$port")" "$port" "$cover_json" ;;
     vless-reality-grpc-*) server_config "$(vless_server ", $(reality_server_settings grpc ', "grpcSettings": {"serviceName": "TunnelService"}')")" "$(vless_client ", $(reality_client_settings grpc ', "grpcSettings": {"serviceName": "TunnelService"}')" "$port")" "$port" "$cover_json" ;;
     vless-reality-xhttp-*) server_config "$(vless_server ", $(reality_server_settings xhttp ', "xhttpSettings": {"path": "/share"}')")" "$(vless_client ", $(reality_client_settings xhttp ', "xhttpSettings": {"path": "/share"}')" "$port")" "$port" "$cover_json" ;;
-    vless-vision-tls-raw-*) server_config "$(vless_server_vision ", $(tls_server_settings)")" "$(vless_client_vision ", $(tls_client_settings)" "$port")" "$port" ;;
-    vless-vision-reality-raw-*) server_config "$(vless_server_vision ", $(reality_server_settings tcp "")")" "$(vless_client_vision ", $(reality_client_settings tcp "")" "$port")" "$port" "$cover_json" ;;
+    vless-vision-reality-edge-*) server_config "$(vless_server_vision ", $(reality_server_settings tcp "")")" "$(vless_client_vision ", $(reality_client_settings tcp "" edge)" "$port")" "$port" "$cover_json" ;;
+    vless-vision-reality-ios-*) server_config "$(vless_server_vision ", $(reality_server_settings tcp "")")" "$(vless_client_vision ", $(reality_client_settings tcp "" ios)" "$port")" "$port" "$cover_json" ;;
+    vless-vision-reality-android-*) server_config "$(vless_server_vision ", $(reality_server_settings tcp "")")" "$(vless_client_vision ", $(reality_client_settings tcp "" android)" "$port")" "$port" "$cover_json" ;;
+    vless-vision-reality-random-*) server_config "$(vless_server_vision ", $(reality_server_settings tcp "")")" "$(vless_client_vision ", $(reality_client_settings tcp "" random)" "$port")" "$port" "$cover_json" ;;
+    vless-vision-reality-randomized-*) server_config "$(vless_server_vision ", $(reality_server_settings tcp "")")" "$(vless_client_vision ", $(reality_client_settings tcp "" randomized)" "$port")" "$port" "$cover_json" ;;
+    vless-vision-reality-firefox-*) server_config "$(vless_server_vision ", $(reality_server_settings tcp "")")" "$(vless_client_vision ", $(reality_client_settings tcp "" firefox)" "$port")" "$port" "$cover_json" ;;
+    vless-vision-reality-safari-*) server_config "$(vless_server_vision ", $(reality_server_settings tcp "")")" "$(vless_client_vision ", $(reality_client_settings tcp "" safari)" "$port")" "$port" "$cover_json" ;;
+    vless-vision-tls-*) server_config "$(vless_server_vision ", $(tls_server_settings)")" "$(vless_client_vision ", $(tls_client_settings)" "$port")" "$port" ;;
+    vless-vision-reality-*) server_config "$(vless_server_vision ", $(reality_server_settings tcp "")")" "$(vless_client_vision ", $(reality_client_settings tcp "")" "$port")" "$port" "$cover_json" ;;
     vless-quic-*) server_config "$(vless_server ", $(quic_server_settings)")" "$(vless_client ", $(quic_client_settings)" "$port")" "$port" ;;
     vless-kcp-*) server_config "$(vless_server ", $(kcp_settings)")" "$(vless_client ", $(kcp_settings)" "$port")" "$port" ;;
     vless-hysteria-*) server_config "$(vless_server ", $(hysteria_server_settings)")" "$(vless_client ", $(hysteria_client_settings)" "$port")" "$port" ;;
@@ -415,6 +657,12 @@ scenario_config() {
     vmess-tls-ws-*) server_config "\"protocol\": \"vmess\", \"settings\": {\"clients\": [{\"id\": \"$UUID\"}]}, $(tls_ws_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"vmess\", \"settings\": {\"vnext\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"users\": [{\"id\": \"$UUID\", \"security\": \"auto\"}]}]}, $(tls_ws_client_settings)" "$port" ;;
     trojan-tls-ws-*) server_config "\"protocol\": \"trojan\", \"settings\": {\"clients\": [{\"password\": \"$PASSWORD\"}]}, $(tls_ws_server_settings)" "\"tag\": \"proxy\", \"protocol\": \"trojan\", \"settings\": {\"servers\": [{\"address\": \"127.0.0.1\", \"port\": $port, \"password\": \"$PASSWORD\"}]}, $(tls_ws_client_settings)" "$port" ;;
     masque-*) server_config "$(masque_server_settings)" "$(masque_client_settings "$port")" "$port" ;;
+    socks-raw-*) server_config "$(socks_server)" "$(socks_client "$port")" "$port" ;;
+    http-raw-*) server_config "$(http_server)" "$(http_client "$port")" "$port" ;;
+    vmess-*) dispatch_protocol vmess "$1" "$port" "$cover" ;;
+    trojan-*) dispatch_protocol trojan "$1" "$port" "$cover" ;;
+    shadowsocks2022-*) dispatch_protocol shadowsocks2022 "$1" "$port" "$cover" ;;
+    shadowsocks-*) dispatch_protocol shadowsocks "$1" "$port" "$cover" ;;
     *) echo "::error::unknown scenario $1" >&2; return 1 ;;
   esac
 }
@@ -422,6 +670,42 @@ scenario_config() {
 MIB=1024
 KIb=$((1024 * MIB))
 GIB=$((1024 * 1024))
+
+# Every carrier a stream-based proxy protocol can ride in this tree. The grid is protocol by
+# carrier, so a carrier added here is measured for VMess, Trojan and both Shadowsocks dialects
+# without another list. QUIC is absent: xray-core removed the transport at its pin and sing-box
+# cannot serve these protocols, so a QUIC row would have no reference; the VLESS QUIC cell keeps
+# its sing-box control. `full` dedupes against the older hand-written rows.
+matrix_carriers() {
+  printf '%s\n' \
+    raw tls-raw ws tls-ws ws-ed tls-ws-ed \
+    httpupgrade tls-httpupgrade httpupgrade-ed tls-httpupgrade-ed \
+    grpc tls-grpc grpc-multi tls-grpc-multi \
+    xhttp tls-xhttp-h1 tls-xhttp-h2 xhttp-streamone xhttp-streamup xhttp-packets \
+    kcp hysteria reality-raw
+}
+
+matrix_protocols() {
+  printf '%s\n' vmess trojan shadowsocks shadowsocks2022
+}
+
+carrier_matrix() {
+  local proto carrier
+  for proto in $(matrix_protocols); do
+    for carrier in $(matrix_carriers); do
+      echo "$proto-$carrier-down-8 download 8 256 65536"
+    done
+  done
+  for proto in $(matrix_protocols); do
+    for carrier in raw tls-raw ws tls-ws grpc tls-grpc; do
+      echo "$proto-$carrier-up-1 upload 1 2048 65536"
+      echo "$proto-$carrier-duplex-8 full-duplex 8 128 65536"
+    done
+    echo "$proto-raw-udp-8 udp 8 64 1200 0"
+    echo "$proto-raw-idle-100 held-open 100 1 1 10000"
+    echo "$proto-raw-tcp-latency-1 tcp-latency 1 1000 64 0"
+  done
+}
 
 standard_scenarios() {
   echo "vless-raw-down-1 download 1 2048 65536"
@@ -460,9 +744,59 @@ standard_scenarios() {
   echo "vmess-tls-ws-down-8 download 8 256 65536"
   echo "trojan-tls-ws-down-8 download 8 256 65536"
   echo "masque-down-8 download 8 256 65536"
+  echo "vless-ws-ed-down-8 download 8 256 65536"
+  echo "vless-tls-ws-ed-down-8 download 8 256 65536"
+  echo "vless-httpupgrade-ed-down-8 download 8 256 65536"
+  echo "vless-tls-httpupgrade-down-8 download 8 256 65536"
+  echo "vless-tls-httpupgrade-ed-down-8 download 8 256 65536"
+  echo "vless-grpc-multi-down-8 download 8 256 65536"
+  echo "vless-tls-grpc-multi-down-8 download 8 256 65536"
+  echo "vless-tls-xhttp-h1-down-8 download 8 256 65536"
+  echo "vless-tls-xhttp-h2-down-8 download 8 256 65536"
+  echo "vless-xhttp-streamone-down-8 download 8 256 65536"
+  echo "vless-xhttp-streamup-down-8 download 8 256 65536"
+  echo "vless-xhttp-packets-down-8 download 8 256 65536"
+  echo "vless-grpc-bulk-down-1 download 1 2048 65536"
+  echo "vless-vision-reality-bulk-down-1 download 1 2048 65536"
+  echo "vless-vision-reality-firefox-down-8 download 8 256 65536"
+  echo "vless-vision-reality-safari-down-8 download 8 256 65536"
+  echo "vless-vision-reality-edge-down-8 download 8 256 65536"
+  echo "vless-vision-reality-ios-down-8 download 8 256 65536"
+  echo "vless-vision-reality-android-down-8 download 8 256 65536"
+  echo "vless-vision-reality-random-down-8 download 8 256 65536"
+  echo "vless-vision-reality-randomized-down-8 download 8 256 65536"
+  echo "vless-raw-routed-down-8 download 8 256 65536"
+  echo "vless-raw-idle idle 1 1 1 10000"
+  echo "vless-raw-idle-100 held-open 100 1 1 10000"
+  echo "vless-raw-idle-1000 held-open 1000 1 1 10000"
+  echo "vless-raw-reconnect-16 reconnect 16 32 1 0"
+  echo "vless-raw-udp-8 udp 8 64 1200 0"
+  echo "vless-raw-mixed-8 mixed 8 16 1200 0"
+  echo "vless-vision-reality-udp-8 udp 8 64 1200 0"
+  echo "vless-raw-tcp-latency-1 tcp-latency 1 1000 64 0"
+  echo "vmess-grpc-down-8 download 8 256 65536"
+  echo "vmess-tls-grpc-down-8 download 8 256 65536"
+  echo "vmess-httpupgrade-down-8 download 8 256 65536"
+  echo "vmess-tls-httpupgrade-down-8 download 8 256 65536"
+  echo "vmess-xhttp-down-8 download 8 256 65536"
+  echo "vmess-tls-xhttp-h2-down-8 download 8 256 65536"
+  echo "vmess-reality-raw-down-8 download 8 256 65536"
+  echo "trojan-grpc-down-8 download 8 256 65536"
+  echo "trojan-tls-grpc-down-8 download 8 256 65536"
+  echo "trojan-httpupgrade-down-8 download 8 256 65536"
+  echo "trojan-tls-xhttp-h2-down-8 download 8 256 65536"
+  echo "trojan-reality-raw-down-8 download 8 256 65536"
+  echo "shadowsocks-tls-raw-down-8 download 8 256 65536"
+  echo "shadowsocks-ws-down-8 download 8 256 65536"
+  echo "shadowsocks-grpc-down-8 download 8 256 65536"
+  echo "shadowsocks2022-tls-raw-down-8 download 8 256 65536"
+  echo "shadowsocks2022-ws-down-8 download 8 256 65536"
+  echo "socks-raw-down-8 download 8 256 65536"
+  echo "http-raw-down-8 download 8 256 65536"
 }
 
 scenarios() {
+  {
   case "${1:-$tier}" in
     smoke) echo "vless-raw-down-1 download 1 2048 65536" ;;
     standard) standard_scenarios ;;
@@ -472,6 +806,11 @@ scenarios() {
       echo "vless-ws-down-16 download 16 128 65536"
       echo "vless-raw-duplex-16 full-duplex 16 64 65536"
       echo "vless-tls-raw-duplex-16 full-duplex 16 64 65536"
+      echo "vless-raw-down-64 download 64 64 65536"
+      echo "vless-tls-raw-down-64 download 64 64 65536"
+      echo "vless-raw-duplex-64 full-duplex 64 64 65536"
+      echo "vmess-raw-down-64 download 64 64 65536"
+      echo "trojan-raw-down-64 download 64 64 65536"
       echo "vmess-raw-up-1 upload 1 2048 65536"
       echo "vmess-raw-duplex-8 full-duplex 8 128 65536"
       echo "trojan-raw-up-1 upload 1 2048 65536"
@@ -515,6 +854,8 @@ scenarios() {
       echo "trojan-tls-raw-duplex-8 full-duplex 8 128 65536"
       echo "trojan-tls-ws-up-1 upload 1 2048 65536"
       echo "trojan-tls-ws-duplex-8 full-duplex 8 128 65536"
+      carrier_matrix
       ;;
   esac
+  } | awk '!seen[$1]++'
 }
