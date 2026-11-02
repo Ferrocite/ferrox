@@ -1646,6 +1646,9 @@ where
                 &forward_close,
                 &forward_flow,
             );
+            if next == Next::Idle {
+                crate::proxy::note_wait_finish(&forward_flow);
+            }
             if next == Next::Done {
                 if clean {
                     // A clean target EOF leaves the upload direction writing to this socket.
@@ -1670,7 +1673,7 @@ where
     let backward_close = std::sync::Arc::clone(close);
     crate::proxy::lane_pool::submit(
         Box::new(move || {
-            backward_step(
+            let next = backward_step(
                 &mut reader,
                 &mut answer,
                 &mut recv,
@@ -1678,7 +1681,11 @@ where
                 &backward_close,
                 &backward_flow,
                 &mut first,
-            )
+            );
+            if next == Next::Idle {
+                crate::proxy::note_wait_finish(&backward_flow);
+            }
+            next
         }),
         Box::new(crate::proxy::stream_lane_done(&flow)),
     );

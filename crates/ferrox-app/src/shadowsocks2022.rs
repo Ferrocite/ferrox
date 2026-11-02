@@ -804,13 +804,17 @@ fn pump_relay_carried_inner<R, W>(
     let up_flow = std::sync::Arc::clone(&flow);
     crate::proxy::lane_pool::submit(
         Box::new(move || {
-            uplink_step(
+            let next = uplink_step(
                 &mut plain_read,
                 buf.as_mut(),
                 &mut outbound,
                 &mut writer,
                 &up_flow,
-            )
+            );
+            if next == crate::proxy::lane_pool::Next::Idle {
+                crate::proxy::note_wait_finish(&up_flow);
+            }
+            next
         }),
         Box::new(crate::proxy::stream_lane_done(&flow)),
     );
@@ -819,7 +823,13 @@ fn pump_relay_carried_inner<R, W>(
     let mut link = Downlink::new(reader, recv);
     let down_flow = std::sync::Arc::clone(&flow);
     crate::proxy::lane_pool::submit(
-        Box::new(move || link.step(&mut plain_write, Some(&down_flow))),
+        Box::new(move || {
+            let next = link.step(&mut plain_write, Some(&down_flow));
+            if next == crate::proxy::lane_pool::Next::Idle {
+                crate::proxy::note_wait_finish(&down_flow);
+            }
+            next
+        }),
         Box::new(crate::proxy::stream_lane_done(&flow)),
     );
 }

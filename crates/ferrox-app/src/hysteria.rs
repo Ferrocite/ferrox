@@ -1087,6 +1087,9 @@ pub(crate) fn relay(tcp: &Connection, flow: &Flow) {
                 }
                 Err(_) => Next::Done,
             };
+            if next == Next::Idle {
+                crate::proxy::note_wait_finish(&forward);
+            }
             if next == Next::Done {
                 up.close();
             }
