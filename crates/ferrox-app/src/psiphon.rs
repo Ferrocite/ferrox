@@ -1857,15 +1857,17 @@ fn load_entries(settings: &Settings) -> Result<Vec<Server>, String> {
 
 fn load_all_entries(settings: &Settings) -> Result<Vec<Server>, String> {
     if let Some(target) = settings.target.as_deref() {
-        let Some(server) = decode_entry(target.trim()) else {
+        let Some(mut server) = decode_entry(target.trim()) else {
             return Err("psiphon: TargetServerEntry is not a valid server entry".to_owned());
         };
         let (limits, label, filter) = target_protocol_filter(settings);
         if let Some(shape) = filter {
             let named_meek = limits.iter().any(|protocol| is_meek_protocol(protocol));
-            if !matches_shape(&server, shape)
-                || (named_meek && !matches_meek_protocol(&server, limits))
-            {
+            if !named_meek && server.direct {
+                server.meek = None;
+                server.unfronted_meek = None;
+            }
+            if !matches_limit(&server, shape, named_meek, limits) {
                 let protocol = server.meek.as_ref().map_or_else(
                     || if server.obfuscated() { "OSSH" } else { "SSH" },
                     |meek| meek.protocol,
@@ -1969,6 +1971,31 @@ fn protocol_base(protocol: &str) -> String {
 /// Whether a protocol names a meek transport.
 fn is_meek_protocol(protocol: &str) -> bool {
     protocol.starts_with("FRONTED-MEEK") || protocol.starts_with("UNFRONTED-MEEK")
+}
+
+/// Whether a server is allowed by a limit that names no meek transport.
+fn matches_direct_limit(server: &Server, (plain, obfuscated): (bool, bool)) -> bool {
+    server.direct
+        && server.meek.is_none()
+        && if server.obfuscation_key.is_some() {
+            obfuscated
+        } else {
+            plain
+        }
+}
+
+/// Whether a server is allowed by a limit, with a direct-only limit dropping every meek entry.
+fn matches_limit(
+    server: &Server,
+    filter: (bool, bool),
+    meek_named: bool,
+    protocols: &[String],
+) -> bool {
+    if meek_named {
+        matches_shape(server, filter) && matches_meek_protocol(server, protocols)
+    } else {
+        matches_direct_limit(server, filter)
+    }
 }
 
 /// Whether a server's meek protocol is named by the limit.
@@ -2292,8 +2319,9 @@ fn select_protocols(
     for (index, server) in servers.iter().enumerate() {
         if initial_active
             && selected.len() < initial_count
-            && initial.is_some_and(|filter| matches_shape(server, filter))
-            && (!initial_meek || matches_meek_protocol(server, initial_protocols))
+            && initial.is_some_and(|filter| {
+                matches_limit(server, filter, initial_meek, initial_protocols)
+            })
         {
             selected.push(index);
         } else {
@@ -2302,10 +2330,7 @@ fn select_protocols(
     }
     selected.extend(rest.into_iter().filter(|index| {
         let server = &servers[*index];
-        normal.is_none_or(|filter| {
-            matches_shape(server, filter)
-                && (!normal_meek || matches_meek_protocol(server, protocols))
-        })
+        normal.is_none_or(|filter| matches_limit(server, filter, normal_meek, protocols))
     }));
     if selected.is_empty() {
         if normal.is_some() {
@@ -3931,6 +3956,26 @@ mod tests {
     }
 
     #[test]
+    fn a_direct_limit_drops_an_unfronted_meek_server() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["UNFRONTED-MEEK-HTTPS"],"meekServerPort":8443,"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk"}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("unfronted");
+        let selected = select_protocols(vec![server], &["OSSH".to_owned()], &[], 0, false);
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn a_direct_limit_keeps_a_direct_entry_that_also_has_meek() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshHostKey":"AAAA","capabilities":["SSH","FRONTED-MEEK"],"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front.example"],"meekFrontingHosts":["cdn.example"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("dual");
+        let selected = select_protocols(vec![server], &["SSH".to_owned()], &[], 0, false);
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].meek.is_none());
+        assert_eq!(selected[0].port, 22);
+    }
+
+    #[test]
     fn a_protocol_limit_keeps_only_the_named_ssh_shape() {
         let servers = || vec![test_server(false), test_server(true)];
         let shapes = |selected: Vec<Server>| {
@@ -4081,6 +4126,29 @@ mod tests {
             .expect("mixed limit names OSSH");
         assert_eq!(selected.len(), 1);
         assert!(selected[0].obfuscated());
+    }
+
+    #[test]
+    fn a_target_meek_is_refused_by_a_direct_limit() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["UNFRONTED-MEEK-HTTPS"],"meekServerPort":8443,"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk"}"#;
+        let target = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let text = format!(r#"{{"TargetServerEntry":"{target}","LimitTunnelProtocols":["OSSH"]}}"#);
+        let settings =
+            Settings::from_json(Some(&json::parse(&text).expect("settings"))).expect("settings");
+        assert!(load_entries(&settings).is_err());
+    }
+
+    #[test]
+    fn a_target_with_both_uses_its_direct_shape() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshHostKey":"AAAA","capabilities":["SSH","FRONTED-MEEK"],"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front.example"],"meekFrontingHosts":["cdn.example"]}"#;
+        let target = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let text = format!(r#"{{"TargetServerEntry":"{target}","LimitTunnelProtocols":["SSH"]}}"#);
+        let settings =
+            Settings::from_json(Some(&json::parse(&text).expect("settings"))).expect("settings");
+        let selected = load_entries(&settings).expect("plain SSH is named");
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].meek.is_none());
+        assert!(!selected[0].obfuscated());
     }
 
     #[test]
