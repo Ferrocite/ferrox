@@ -226,7 +226,9 @@ def check_charts(charts_dir, results):
     scenarios = results.get("scenarios", [])
     bulk = any("setup" not in scenario.get("id", "") for scenario in scenarios)
     wanted = list(ALWAYS_CHARTS) if bulk else ["startup.png", "binary-size.png"]
-    if not any(scenario.get("ceilings_mib_s") for scenario in scenarios):
+    if "ceiling.png" in wanted and not any(
+        scenario.get("ceilings_mib_s") for scenario in scenarios
+    ):
         wanted.remove("ceiling.png")
     if any("setup" in scenario.get("id", "") for scenario in scenarios):
         wanted.append(SETUP_CHART)
