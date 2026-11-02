@@ -7586,7 +7586,7 @@ pub(crate) fn serve_session_xhttp_with(
         }
         echo_trace("session xhttp udp association");
         spawn_carried(move || {
-            serve_udp_stream(creader, writer, &target, Vec::new(), &close, End::ReplyIdle)
+            serve_udp_stream(creader, writer, &target, Vec::new(), &close, End::ReplyIdle);
         });
         return;
     }
@@ -12187,64 +12187,63 @@ fn dial_udp_uplink(
     let server = resolve_outbound(&vless.address, vless.port)?;
     let mask = vless.carrier.tcp_mask();
     let header = vless_header(&vless.id, 2, &Destination::from(*dest));
-    let (read, write, close): UdpCarriedParts = if let Carrier::Raw(_) = &vless.carrier {
-        if vless.reality.is_some() {
-            return None;
-        }
-        let uplink = dial_or_report(&server)?.with_mask(mask);
-        if let Some(encryption) = &vless.encryption {
-            let close = connection_closer(&uplink);
-            let mut sealed = match encryption.handshake(uplink) {
-                Ok(sealed) => sealed,
-                Err(error) => {
-                    eprintln!("vless: encryption handshake failed: {error}");
-                    return None;
-                }
-            };
-            sealed.write_all(&header).ok()?;
-            read_vless_response(&mut sealed)?;
-            let (reader, writer) = sealed.into_split()?;
-            (Box::new(reader), Box::new(writer), close)
+    let (read, write, close, deferred): (Box<dyn Read + Send>, Box<dyn Write + Send>, _, bool) =
+        if let Carrier::Raw(_) = &vless.carrier {
+            if vless.reality.is_some() {
+                return None;
+            }
+            let uplink = dial_or_report(&server)?.with_mask(mask);
+            if let Some(encryption) = &vless.encryption {
+                let close = connection_closer(&uplink);
+                let mut sealed = match encryption.handshake(uplink) {
+                    Ok(sealed) => sealed,
+                    Err(error) => {
+                        eprintln!("vless: encryption handshake failed: {error}");
+                        return None;
+                    }
+                };
+                sealed.write_all(&header).ok()?;
+                let (reader, writer) = sealed.into_split()?;
+                (Box::new(reader), Box::new(writer), close, true)
+            } else {
+                let mut uplink = uplink;
+                uplink.write_all(&header).ok()?;
+                let read = uplink.try_clone().ok()?;
+                let close = connection_closer(&uplink);
+                (Box::new(read), Box::new(uplink), close, true)
+            }
         } else {
-            let mut uplink = uplink;
-            uplink.write_all(&header).ok()?;
-            read_vless_response(&mut uplink)?;
-            let read = uplink.try_clone().ok()?;
-            let close = connection_closer(&uplink);
-            (Box::new(read), Box::new(uplink), close)
-        }
-    } else {
-        // An association rides the same xHTTP session a flow would, and the handshake's ALPN picks the head.
-        if vless.reality.is_some() || vless.encryption.is_some() {
-            return None;
-        }
-        let (mut read, write, close) = match &vless.tls {
-            Some(cfg) => udp_carried_session(
-                dial_tls_session(&server, cfg, mask)?,
-                || dial_tls_session(&server, cfg, mask),
-                &vless.host,
-                &vless.carrier,
-                &vless.headers,
-                vless.heartbeat,
-                &header,
-            )?,
-            None => udp_plain_carried(
-                dial_or_report(&server)?.with_mask(mask),
-                &vless.host,
-                &vless.carrier,
-                &vless.headers,
-                vless.heartbeat,
-                &header,
-            )?,
+            // An association rides the same xHTTP session a flow would, and the handshake's ALPN picks the head.
+            if vless.reality.is_some() || vless.encryption.is_some() {
+                return None;
+            }
+            let (mut read, write, close) = match &vless.tls {
+                Some(cfg) => udp_carried_session(
+                    dial_tls_session(&server, cfg, mask)?,
+                    || dial_tls_session(&server, cfg, mask),
+                    &vless.host,
+                    &vless.carrier,
+                    &vless.headers,
+                    vless.heartbeat,
+                    &header,
+                )?,
+                None => udp_plain_carried(
+                    dial_or_report(&server)?.with_mask(mask),
+                    &vless.host,
+                    &vless.carrier,
+                    &vless.headers,
+                    vless.heartbeat,
+                    &header,
+                )?,
+            };
+            // The reply is the association's acceptance; a datagram read here would eat it.
+            read_vless_response(&mut *read)?;
+            (read, write, close, false)
         };
-        // The reply is the association's acceptance; a datagram read here would eat it.
-        read_vless_response(&mut *read)?;
-        (read, write, close)
-    };
     let Ok(udp_send) = relay.try_clone() else {
         return None;
     };
-    let done = spawn_udp_uplink_reader(read, udp_send, source, *dest);
+    let done = spawn_udp_uplink_reader(read, udp_send, source, *dest, deferred);
     Some(UdpUplink {
         write,
         close,
@@ -12366,7 +12365,7 @@ fn dial_quic_udp_uplink(
         pooled.cancel();
         return None;
     };
-    let done = spawn_udp_uplink_reader(read, udp_send, source, *dest);
+    let done = spawn_udp_uplink_reader(read, udp_send, source, *dest, false);
     let close_stream = pooled.stream_handle();
     let pooled = Mutex::new(Some(pooled));
     let close = Arc::new(move || {
@@ -12381,14 +12380,19 @@ fn dial_quic_udp_uplink(
     })
 }
 
+/// `answer` is true when the response header is still unread by the dial, as on the raw carrier whose server may hold it until the first datagram; the xhttp and QUIC carriers read it before dialing returns and pass false.
 fn spawn_udp_uplink_reader(
     read: Box<dyn Read + Send>,
     udp: UdpSocket,
     source: Arc<Mutex<Option<SocketAddr>>>,
     target: SocketAddr,
+    answer: bool,
 ) -> RelayEnd {
     RelayPool::global().run(move || {
         let mut read = read;
+        if answer && read_vless_response(&mut read).is_none() {
+            return;
+        }
         let mut buf = udp_buffer();
         let mut reply = Vec::with_capacity(UDP_BUF);
         while let Some(n) = read_udp_datagram(&mut read, &mut buf) {
@@ -44538,6 +44542,67 @@ mod tests {
         let mut buf = vec![0u8; UDP_BUF];
         assert_eq!(read_udp_datagram(&mut stream, &mut buf), Some(4));
         assert_eq!(&buf[..4], b"ping");
+    }
+
+    #[test]
+    fn a_udp_client_sends_its_first_datagram_before_the_reply_header() {
+        let id = uuid_bytes("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee").expect("id");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let dest: SocketAddr = "127.0.0.1:9".parse().expect("addr");
+        let header = vless_header(&id, 2, &Destination::from(dest));
+        let answering = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
+            let mut request = vec![0u8; header.len()];
+            if read_exact(&mut stream, &mut request).is_err() {
+                return;
+            }
+            let mut buf = udp_buffer();
+            let Some(n) = read_udp_datagram(&mut stream, &mut buf) else {
+                return;
+            };
+            stream.write_all(&[0, 0]).expect("the reply header");
+            assert!(write_udp_datagram(&mut stream, &buf[..n]));
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        relay
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .expect("timeout");
+        let relay_addr = relay.local_addr().expect("addr");
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Raw(Chain::default()),
+            host: String::new(),
+            mux: false,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: None,
+            flow: String::new(),
+            reality: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+            encryption: None,
+        };
+        let serving = thread::spawn(move || serve_socks_udp_vless(&relay, &vless));
+        let client = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .expect("timeout");
+        let mut head = Vec::new();
+        let frame = socks_udp_frame(&mut head, None, &dest, b"ping");
+        client.send_to(frame, relay_addr).expect("sends");
+        let mut buf = udp_buffer();
+        let (n, _) = client.recv_from(&mut buf).expect("the echo returns");
+        let (_, payload) = parse_socks_udp(&buf[..n]).expect("a socks frame");
+        assert_eq!(payload, b"ping");
+        join_thread_within(serving, Duration::from_secs(5), "the SOCKS UDP front");
+        join_thread_within(answering, Duration::from_secs(5), "the answering server");
     }
 
     #[test]
