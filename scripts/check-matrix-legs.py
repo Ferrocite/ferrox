@@ -467,7 +467,7 @@ def write_fixture(cells, server, cpu, threads, throughput, ceiling=None):
     scenario = f"{base}--srv-{server}"
     runs = []
     for _ in range(3):
-        run = {"throughput_mib_s": throughput}
+        run = {"throughput_mib_s": throughput, "bytes_moved": 8 * 1024 ** 3}
         if cpu is not None:
             run["server"] = {
                 "cpu_millis_per_gib": cpu,
