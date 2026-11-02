@@ -13331,6 +13331,10 @@ fn udp_carried_session<S: Dialed>(
                 };
                 return Some((reader, Box::new(writer), Arc::new(close)));
             }
+            // This tree's H2 client is stream-one; a packet-up session on a connection that negotiated h2 is not one this dialer can carry, and an H1 head is not a fallback the peer agreed to.
+            if h2 {
+                return None;
+            }
             // The GET downlink dials its own session: one transport per direction, both under one session id (`dialer.go:411`).
             let (down, down_write, down_raw) = second()?.into_halves()?;
             let (reader, writer) =
