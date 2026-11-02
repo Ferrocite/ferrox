@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::Aes128Gcm;
 use sha2::{Digest as _, Sha256};
 
@@ -258,7 +258,11 @@ fn the_scripted_core_matches_the_pinned_go() {
                 let plain = unhex(parts[3]);
                 let mut body = plain.clone();
                 let tag = cipher
-                    .encrypt_in_place_detached(aes_gcm::Nonce::from_slice(&nonce), &[], &mut body)
+                    .encrypt_inout_detached(
+                        &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
+                        &[],
+                        (&mut body[..]).into(),
+                    )
                     .expect("seals");
                 let mut wire = nonce;
                 wire.extend_from_slice(&body);

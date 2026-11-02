@@ -665,7 +665,7 @@ impl Chain for Aes {
 impl Aes {
     /// Up to `PAR` blocks through the backend in one call, the short tail inside the same call.
     fn permutation(&self, typed: &mut [Typed; PAR], count: usize) {
-        use aes::cipher::BlockDecrypt;
+        use aes::cipher::BlockCipherDecrypt;
         match self {
             Self::Aes128(key) => key.decrypt_blocks(&mut typed[..count]),
             Self::Aes256(key) => key.decrypt_blocks(&mut typed[..count]),
@@ -675,7 +675,7 @@ impl Aes {
 
 /// The forward CBC chain of one key width, so the key's arm is chosen once per record and no branch
 /// stands between the blocks of a write that must chain each ciphertext into the next.
-fn forward<C: aes::cipher::BlockEncrypt<BlockSize = aes::cipher::consts::U16>>(
+fn forward<C: aes::cipher::BlockCipherEncrypt<BlockSize = aes::cipher::consts::U16>>(
     cipher: &C,
     iv: &[u8],
     body: &mut [u8],

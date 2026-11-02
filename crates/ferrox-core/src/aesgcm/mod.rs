@@ -558,10 +558,14 @@ impl Aes128Gcm {
             #[cfg(target_arch = "aarch64")]
             Inner::Arm(e) => unsafe { e.seal(nonce, aad, buf) },
             Inner::Crate(c) => {
-                use aes_gcm::aead::AeadInPlace as _;
-                c.encrypt_in_place_detached(aes_gcm::Nonce::from_slice(nonce), aad, buf)
-                    .expect("the length limits above are the crate's own refusal conditions")
-                    .into()
+                use aes_gcm::aead::AeadInOut as _;
+                c.encrypt_inout_detached(
+                    &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
+                    aad,
+                    (&mut buf[..]).into(),
+                )
+                .expect("the length limits above are the crate's own refusal conditions")
+                .into()
             }
         }
     }
@@ -616,12 +620,12 @@ impl Aes128Gcm {
             #[cfg(target_arch = "aarch64")]
             Inner::Arm(e) => unsafe { e.open(nonce, aad, buf, tag) },
             Inner::Crate(c) => {
-                use aes_gcm::aead::AeadInPlace as _;
-                c.decrypt_in_place_detached(
-                    aes_gcm::Nonce::from_slice(nonce),
+                use aes_gcm::aead::AeadInOut as _;
+                c.decrypt_inout_detached(
+                    &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
                     aad,
-                    buf,
-                    aes_gcm::Tag::from_slice(tag),
+                    (&mut buf[..]).into(),
+                    &aes_gcm::Tag::try_from(&tag[..]).expect("length"),
                 )
                 .ok()?;
                 Some(buf.len())
@@ -902,10 +906,14 @@ impl Aes256Gcm {
             #[cfg(target_arch = "aarch64")]
             Inner256::Arm(e) => unsafe { e.seal(nonce, aad, buf) },
             Inner256::Crate(c) => {
-                use aes_gcm::aead::AeadInPlace as _;
-                c.encrypt_in_place_detached(aes_gcm::Nonce::from_slice(nonce), aad, buf)
-                    .expect("the length limits above are the crate's own refusal conditions")
-                    .into()
+                use aes_gcm::aead::AeadInOut as _;
+                c.encrypt_inout_detached(
+                    &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
+                    aad,
+                    (&mut buf[..]).into(),
+                )
+                .expect("the length limits above are the crate's own refusal conditions")
+                .into()
             }
         }
     }
@@ -934,12 +942,12 @@ impl Aes256Gcm {
             #[cfg(target_arch = "aarch64")]
             Inner256::Arm(e) => unsafe { e.open(nonce, aad, buf, tag) },
             Inner256::Crate(c) => {
-                use aes_gcm::aead::AeadInPlace as _;
-                c.decrypt_in_place_detached(
-                    aes_gcm::Nonce::from_slice(nonce),
+                use aes_gcm::aead::AeadInOut as _;
+                c.decrypt_inout_detached(
+                    &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
                     aad,
-                    buf,
-                    aes_gcm::Tag::from_slice(tag),
+                    (&mut buf[..]).into(),
+                    &aes_gcm::Tag::try_from(&tag[..]).expect("length"),
                 )
                 .ok()?;
                 Some(buf.len())
@@ -965,13 +973,17 @@ fn sweep_lengths() -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::aead::AeadInPlace as _;
+    use aes_gcm::aead::AeadInOut as _;
     use aes_gcm::KeyInit as _;
 
     fn crate_seal(key: &[u8; 16], nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         aes_gcm::Aes128Gcm::new_from_slice(key)
             .expect("key")
-            .encrypt_in_place_detached(aes_gcm::Nonce::from_slice(nonce), aad, buf)
+            .encrypt_inout_detached(
+                &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
+                aad,
+                (&mut buf[..]).into(),
+            )
             .expect("seals")
             .into()
     }
@@ -1094,11 +1106,11 @@ mod tests {
                         assert!(
                             aes_gcm::Aes128Gcm::new_from_slice(key)
                                 .expect("key")
-                                .decrypt_in_place_detached(
-                                    aes_gcm::Nonce::from_slice(&nonce),
+                                .decrypt_inout_detached(
+                                    &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
                                     &aad,
-                                    &mut crate_opened,
-                                    aes_gcm::Tag::from_slice(&tag),
+                                    (&mut crate_opened[..]).into(),
+                                    &aes_gcm::Tag::try_from(&tag[..]).expect("length"),
                                 )
                                 .is_ok(),
                             "the crate opens ours at len {len}"
@@ -1255,13 +1267,17 @@ mod tests {
 #[cfg(test)]
 mod tests_aes256 {
     use super::*;
-    use aes_gcm::aead::AeadInPlace as _;
+    use aes_gcm::aead::AeadInOut as _;
     use aes_gcm::KeyInit as _;
 
     fn crate_seal256(key: &[u8; 32], nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         aes_gcm::Aes256Gcm::new_from_slice(key)
             .expect("key")
-            .encrypt_in_place_detached(aes_gcm::Nonce::from_slice(nonce), aad, buf)
+            .encrypt_inout_detached(
+                &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
+                aad,
+                (&mut buf[..]).into(),
+            )
             .expect("seals")
             .into()
     }
@@ -1315,11 +1331,11 @@ mod tests_aes256 {
                         assert!(
                             aes_gcm::Aes256Gcm::new_from_slice(key)
                                 .expect("key")
-                                .decrypt_in_place_detached(
-                                    aes_gcm::Nonce::from_slice(&nonce),
+                                .decrypt_inout_detached(
+                                    &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
                                     &aad,
-                                    &mut crate_opened,
-                                    aes_gcm::Tag::from_slice(&tag),
+                                    (&mut crate_opened[..]).into(),
+                                    &aes_gcm::Tag::try_from(&tag[..]).expect("length"),
                                 )
                                 .is_ok(),
                             "the crate opens ours at len {len}"

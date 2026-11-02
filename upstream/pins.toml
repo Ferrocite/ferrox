@@ -1,6 +1,6 @@
 [sources.xray-core]
 repo          = "https://github.com/XTLS/Xray-core"
-rev           = "1b1647cd9ddf0abc34b981d4611fc03bcac1ca74"
+rev           = "7c8dbcb4bbec7f80d16070069e0b2f7bf3aca62c"
 always        = true
 default_branch = "main"
 path          = "common/crypto"
@@ -13,7 +13,7 @@ note          = "Xray-core at this pin. The unit tests are in-process with no se
 
 [sources.sing-box]
 repo          = "https://github.com/SagerNet/sing-box"
-rev           = "dfb80349bf5779ec0a3f834c9ec2794345bff8f0"
+rev           = "e5d91fa79f6319d5de940d6c81d81f0fe53b9476"
 always        = true
 default_branch = "testing"
 path          = "protocol/shadowsocks"
@@ -33,7 +33,7 @@ note          = "hand-rolled ChaCha20 in the WireGuard data path"
 
 [sources.amnezia-client]
 repo          = "https://github.com/amnezia-vpn/amnezia-client"
-rev           = "02838a94d5600bdc4ba9f898d8735cbe7d2f2cdc"
+rev           = "7f9b7db482b8b1662b7466937e578008cbcb716e"
 topics        = "amnezia, junk packet, header protection"
 default_branch = "dev"
 path          = "common/crypto"
@@ -43,7 +43,7 @@ note          = "the C++ Amnezia core; the second implementation of the same wir
 
 [sources.xray-rust]
 repo          = "https://github.com/aimalygin/xray-rust"
-rev           = "5834b86d8063bd27788c04b7c7364a7fdb1cecd1"
+rev           = "75457fe68298fd345a5fe4ff1afbe22b15a97687"
 topics        = "interop, balancer, round robin, proxy chain"
 default_branch = "main"
 path          = "crates"
@@ -55,7 +55,7 @@ note          = "Rust VLESS core; 24 of local_xray_interop_tests.rs's 29 interop
 
 [sources.xray-rust-hysteria]
 repo          = "https://github.com/aimalygin/xray-rust"
-rev           = "5834b86d8063bd27788c04b7c7364a7fdb1cecd1"
+rev           = "75457fe68298fd345a5fe4ff1afbe22b15a97687"
 topics        = "hysteria"
 default_branch = "main"
 path          = "crates"
@@ -67,7 +67,7 @@ note          = "the same core's Hysteria v2 client against ferrox-app's `protoc
 
 [sources.xray-core-rust]
 repo          = "https://github.com/Be90nia/xray-core-rust"
-rev           = "06251b00f0cdbe0a535d7f3e299f2e4f5459f541"
+rev           = "ceb6a4879aa63920d1d4ff7ed0d4d4c5bd167905"
 bench_release = "v26.10.11-rust.1"
 always        = true
 default_branch = "master"
@@ -78,7 +78,7 @@ note          = "a Rust rewrite of xray-core, read as a third same-language impl
 
 [sources.pattng]
 repo          = "https://github.com/patterniha/PattNG"
-rev           = "89c760cee27051ac7b6c391d376e528adfdc8a0c"
+rev           = "e7a52cfc94389ca4ef1cb10e9595a9dba5cb0564"
 topics        = "ciphersuites, unsafe fingerprint, plaintext to public"
 default_branch = "my-releases"
 path          = "V2rayNG"
@@ -101,7 +101,7 @@ note          = "MIT Zray core; 9 oracle tests run against ferrox-app via ZRAY_X
 
 [sources.mqvpn]
 repo          = "https://github.com/mp0rta/mqvpn"
-rev           = "baf46e88dd209a8f3bda5f980a6b749e763983be"
+rev           = "e19018f1a87918ac29c77eb136e1d1aeff12dcee"
 topics        = "masque, connect-ip, multipath, scheduler, wlb, minrtt, reinjection, backup_fec, hybrid tcp"
 default_branch = "main"
 path          = "src"
@@ -111,7 +111,7 @@ note          = "MASQUE CONNECT-IP (RFC 9484) over Multipath QUIC; WLB/minrtt/ba
 
 [sources.aether]
 repo          = "https://github.com/CluvexStudio/Aether"
-rev           = "577a4c8dd18b08ddfdc3ad28a92e356d68cfa27c"
+rev           = "d58f9d568083129ce2c767c85054021eb3ee6a38"
 topics        = "masque, warp, gool, mim, psiphon, lyrebird, obfs4, snowflake, webtunnel, meek, onionmasq, arti"
 default_branch = "main"
 path          = "aether"
@@ -121,7 +121,7 @@ note          = "open-source Rust WARP core (AGPL-3.0): MASQUE over HTTP/3 and H
 
 [sources.psiphon-tunnel-core]
 repo          = "https://github.com/CluvexStudio/psiphon-tunnel-core"
-rev           = "83aa73b9b982e7421e00117f5b0c5aceb5dda452"
+rev           = "2956a96b56fe09b99e72a8eb4bed3e79d29e3543"
 topics        = "psiphon, tunnel, console client"
 default_branch = "shirokhorshid"
 path          = "ConsoleClient"
@@ -141,7 +141,7 @@ note          = "the GPLv3 Windows GUI and its bundled console engine, read only
 
 [sources.zeptun]
 repo          = "https://github.com/Noisemux/zeptun"
-rev           = "321766b45eb5028246c0f4835ec0c97aabe1125c"
+rev           = "85ef1daa0754444db9ed93b70d3dcee034892e84"
 topics        = "tun2socks, tun, fake-ip, offload"
 default_branch = "main"
 path          = "src"
@@ -151,7 +151,7 @@ note          = "Zig tun2socks engine (MIT): TUN to TCP/UDP/ICMP via SOCKS5/dire
 
 [sources.slipstream]
 repo          = "https://github.com/EndPositive/slipstream"
-rev           = "397850b16e70a52513269134b2c7b9aa13a56745"
+rev           = "e158a681f1cc5cb000a92274371e67237d2a6493"
 topics        = "dns covert, qname, txt, multi-resolver, port-53, dcubic, bbr"
 default_branch = "main"
 path          = "src"
@@ -161,7 +161,7 @@ note          = "DNS covert channel over QUIC multipath (picoquic); TCP-over-DNS
 
 [sources.quiche]
 repo          = "https://github.com/cloudflare/quiche"
-rev           = "acf560f2e4a3d9254a1b668a50af0e114c84fe6f"
+rev           = "ba8c528cc928aed643c0311d523b649c2235a428"
 topics        = "quic, http/3, h3, masque, hysteria, tuic, multipath, 0-rtt"
 default_branch = "master"
 path          = "quiche"
@@ -181,7 +181,7 @@ note          = "Rust proxy framework (Apache-2.0), the same-language line the e
 
 [sources.lxbox]
 repo          = "https://github.com/Leadaxe/LxBox"
-rev           = "0137f1f624889c6d08bfae6a7ab4aca336b16449"
+rev           = "36b67fc2b1cb31171cda5faa09ad64a66dd8fb93"
 default_branch = "main"
 path          = "app"
 test_enabled  = false

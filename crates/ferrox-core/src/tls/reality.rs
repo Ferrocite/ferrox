@@ -6,7 +6,7 @@ use super::{Stream, TlsError, TlsProvider};
 use crate::tls::rustls_backend::RustlsServerProvider;
 #[cfg(test)]
 use aes_gcm::aead::Payload;
-use aes_gcm::aead::{Aead as _, AeadInPlace as _, KeyInit as _};
+use aes_gcm::aead::{Aead as _, AeadInOut as _, KeyInit as _};
 use ring::signature::KeyPair as _;
 
 const GROUP_X25519: u16 = 0x001d;
@@ -728,11 +728,11 @@ fn authenticate(
     tag.copy_from_slice(&ciphertext[16..]);
     body[at..at + len].fill(0);
     let cipher = aes_gcm::Aes256Gcm::new_from_slice(&auth_key).ok()?;
-    let decryption = cipher.decrypt_in_place_detached(
-        aes_gcm::Nonce::from_slice(&hello.random[20..]),
+    let decryption = cipher.decrypt_inout_detached(
+        &aes_gcm::Nonce::try_from(&hello.random[20..]).expect("length"),
         body,
-        &mut opened,
-        aes_gcm::Tag::from_slice(&tag),
+        (&mut opened[..]).into(),
+        &aes_gcm::Tag::try_from(&tag[..]).expect("length"),
     );
     // The splice and the replay both read the buffer after, so the blob goes back.
     body[at..at + len].copy_from_slice(&ciphertext);
@@ -1241,7 +1241,7 @@ fn seal_session_id(
         .expect("a 32-byte auth key is always a valid AES-256 key");
     let sealed = cipher
         .encrypt(
-            aes_gcm::Nonce::from_slice(&random[20..]),
+            &aes_gcm::Nonce::try_from(&random[20..]).expect("length"),
             aes_gcm::aead::Payload {
                 msg: &session_plaintext(version, now, short_id),
                 aad,
@@ -1525,7 +1525,7 @@ mod tests {
         let sealed = aes_gcm::Aes256Gcm::new_from_slice(&auth_key)
             .unwrap()
             .encrypt(
-                aes_gcm::Nonce::from_slice(&random[20..]),
+                &aes_gcm::Nonce::try_from(&random[20..]).expect("length"),
                 Payload {
                     msg: &plain,
                     aad: body,

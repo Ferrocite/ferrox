@@ -108,7 +108,7 @@ pub fn chacha20_poly1305_tag(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chacha20poly1305::aead::AeadInPlace as _;
+    use chacha20poly1305::aead::AeadInOut as _;
     use chacha20poly1305::{ChaCha20Poly1305, KeyInit, Nonce};
 
     /// Sweep lengths: each natively, the same boundaries as a Miri sample that interprets every byte.
@@ -213,7 +213,11 @@ mod tests {
                             let cipher = ChaCha20Poly1305::new_from_slice(key).expect("key");
                             let mut ct = plain.clone();
                             let want_tag = cipher
-                                .encrypt_in_place_detached(Nonce::from_slice(&nonce), &aad, &mut ct)
+                                .encrypt_inout_detached(
+                                    &Nonce::try_from(&nonce[..]).expect("length"),
+                                    &aad,
+                                    (&mut ct[..]).into(),
+                                )
                                 .expect("seals");
                             let want_tag: [u8; 16] = want_tag.into();
                             assert_eq!(
@@ -269,11 +273,11 @@ mod tests {
                             let cipher = ChaCha20Poly1305::new_from_slice(key).expect("key");
                             let mut ct = sealed.clone();
                             cipher
-                                .decrypt_in_place_detached(
-                                    Nonce::from_slice(&nonce),
+                                .decrypt_inout_detached(
+                                    &Nonce::try_from(&nonce[..]).expect("length"),
                                     &aad,
-                                    &mut ct,
-                                    (&tag).into(),
+                                    (&mut ct[..]).into(),
+                                    &chacha20poly1305::Tag::try_from(&tag[..]).expect("length"),
                                 )
                                 .expect("the crate opens what it sealed");
                             ct

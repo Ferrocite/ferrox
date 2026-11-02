@@ -11,8 +11,8 @@ description = "ZeroNet-compatible application built on the released ferrox-core 
 workspace = true
 
 [dependencies]
-aes = "0.8"
-aes-gcm = "0.10"
+aes = "0.9"
+aes-gcm = "0.11"
 aho-corasick = "1"
 ferrox-core = { workspace = true }
 getrandom = "0.4"
@@ -20,11 +20,11 @@ hkdf = "0.13"
 quiche = "0.30"
 libc = "0.2"
 md5 = "0.8"
-mlua = { version = "0.11", features = ["lua51", "vendored", "send"] }
+mlua = { version = "0.12", features = ["lua51", "vendored", "send"] }
 regex = "1"
 ring = "0.17"
 base64 = "0.23"
-ctr = "0.9"
+ctr = "0.10"
 flate2 = "1"
 rustls-native-certs = "0.8"
 sha1 = "0.11"
@@ -38,7 +38,7 @@ smoltcp = { version = "0.14", default-features = false, features = ["std", "medi
 crypto_box = "0.9"
 
 [dev-dependencies]
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 rcgen = "0.14"
 
 [target.'cfg(not(target_os = "windows"))'.dependencies]

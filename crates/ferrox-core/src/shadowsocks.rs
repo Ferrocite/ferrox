@@ -384,7 +384,7 @@ impl MasterKey {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_gcm::aead::AeadInPlace as _;
+    use aes_gcm::aead::AeadInOut as _;
     use aes_gcm::KeyInit as _;
     use aes_gcm::{Aes128Gcm, Aes256Gcm};
 
@@ -516,7 +516,11 @@ mod tests {
         let mut narrow = b"ping".to_vec();
         Aes128Gcm::new_from_slice(&narrow_key)
             .expect("takes 16 bytes")
-            .encrypt_in_place_detached(aes_gcm::Nonce::from_slice(&[0u8; 12]), b"", &mut narrow)
+            .encrypt_inout_detached(
+                &aes_gcm::Nonce::try_from(&[0u8; 12][..]).expect("length"),
+                b"",
+                (&mut narrow[..]).into(),
+            )
             .expect("seals");
         assert_eq!(mine[..4], narrow[..4], "this is the 16-byte schedule");
 
@@ -524,7 +528,11 @@ mod tests {
         let mut widened = b"ping".to_vec();
         Aes256Gcm::new_from_slice(&other.key)
             .expect("takes 32 bytes")
-            .encrypt_in_place_detached(aes_gcm::Nonce::from_slice(&[0u8; 12]), b"", &mut widened)
+            .encrypt_inout_detached(
+                &aes_gcm::Nonce::try_from(&[0u8; 12][..]).expect("length"),
+                b"",
+                (&mut widened[..]).into(),
+            )
             .expect("seals");
         assert_ne!(
             mine[..4],
@@ -980,10 +988,10 @@ mod tests {
                 let (ct, tag) = wire.split_at(len);
                 let mut want_ct = plain.clone();
                 let want_tag = reference
-                    .encrypt_in_place_detached(
-                        XNonce::from_slice(&[0u8; XNONCE_LEN]),
+                    .encrypt_inout_detached(
+                        &XNonce::try_from(&[0u8; XNONCE_LEN][..]).expect("length"),
                         b"",
-                        &mut want_ct,
+                        (&mut want_ct[..]).into(),
                     )
                     .expect("seals");
                 assert_eq!(ct, &want_ct[..], "ciphertext len {len}");

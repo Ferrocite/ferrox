@@ -306,15 +306,13 @@ impl AuthKey {
     }
 
     fn seal(&self, block: &mut [u8; 16]) {
-        use aes::cipher::BlockEncrypt as _;
-        let cell = aes::cipher::generic_array::GenericArray::from_mut_slice(block.as_mut_slice());
-        self.0.encrypt_block(cell);
+        use aes::cipher::BlockCipherEncrypt as _;
+        self.0.encrypt_block(block.into());
     }
 
     fn open(&self, block: &mut [u8; 16]) {
-        use aes::cipher::BlockDecrypt as _;
-        let cell = aes::cipher::generic_array::GenericArray::from_mut_slice(block.as_mut_slice());
-        self.0.decrypt_block(cell);
+        use aes::cipher::BlockCipherDecrypt as _;
+        self.0.decrypt_block(block.into());
     }
 }
 
@@ -342,12 +340,16 @@ fn cached_keys(uuid: &[u8; 16]) -> CachedUserKeys {
 }
 
 fn seal_header(key: &[u8; 16], nonce: &[u8; 12], plain: &[u8], aad: &[u8]) -> Option<Vec<u8>> {
-    use aes_gcm::aead::AeadInPlace as _;
+    use aes_gcm::aead::AeadInOut as _;
     use aes_gcm::KeyInit as _;
     let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).ok()?;
     let mut body = plain.to_vec();
     let tag = cipher
-        .encrypt_in_place_detached(aes_gcm::Nonce::from_slice(nonce), aad, &mut body)
+        .encrypt_inout_detached(
+            &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
+            aad,
+            (&mut body[..]).into(),
+        )
         .ok()?;
     body.extend_from_slice(&tag);
     Some(body)
@@ -360,18 +362,18 @@ fn open_header_into<'a>(
     aad: &[u8],
     out: &'a mut [u8],
 ) -> Option<&'a [u8]> {
-    use aes_gcm::aead::AeadInPlace as _;
+    use aes_gcm::aead::AeadInOut as _;
     use aes_gcm::KeyInit as _;
     let split = sealed.len().checked_sub(TAG_LEN)?;
     let body = out.get_mut(..split)?;
     body.copy_from_slice(&sealed[..split]);
     let cipher = aes_gcm::Aes128Gcm::new_from_slice(key).ok()?;
     cipher
-        .decrypt_in_place_detached(
-            aes_gcm::Nonce::from_slice(nonce),
+        .decrypt_inout_detached(
+            &aes_gcm::Nonce::try_from(&nonce[..]).expect("length"),
             aad,
-            body,
-            aes_gcm::Tag::from_slice(&sealed[split..]),
+            (&mut body[..]).into(),
+            &aes_gcm::Tag::try_from(&sealed[split..]).expect("length"),
         )
         .ok()?;
     Some(body)
@@ -4195,7 +4197,7 @@ mod tests {
 
     #[test]
     fn the_chacha_data_frames_are_the_crate_it_replaced() {
-        use chacha20poly1305::aead::AeadInPlace;
+        use chacha20poly1305::aead::AeadInOut;
         use chacha20poly1305::{ChaCha20Poly1305, KeyInit as _, Nonce};
 
         let data_key = [0x3cu8; 16];
@@ -4236,7 +4238,11 @@ mod tests {
 
                 let mut want = plain.clone();
                 let want_tag = cipher
-                    .encrypt_in_place_detached(Nonce::from_slice(&want_nonce), b"", &mut want)
+                    .encrypt_inout_detached(
+                        &Nonce::try_from(&want_nonce[..]).expect("length"),
+                        b"",
+                        (&mut want[..]).into(),
+                    )
                     .expect("crate seals");
                 assert_eq!(
                     ours,

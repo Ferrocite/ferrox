@@ -68,7 +68,7 @@ What was **not** removed: the retry costs one extra connection when a server rej
 | ECH config list, DNS query, cache and `echServerKeys` TLV | `upstream/xray-core/transport/internet/tls/ech.go` |
 | retry-on-rejection client | `upstream/sing-box/common/tls/client.go` |
 | quiche's ECH setter | `upstream/quiche/quiche/src/lib.rs` |
-| BoringSSL retry-config rule | `~/.cargo/registry/src/*/boring-sys-5.3.0/deps/boringssl/ssl/encrypted_client_hello.cc` |
+| BoringSSL retry-config rule | `~/.cargo/registry/src/*/boring-sys-5.4.0/deps/boringssl/ssl/encrypted_client_hello.cc` |
 | rustls rejection payload | `~/.cargo/registry/src/*/rustls-0.23.46/src/error.rs` |
 
 ## CI scope

@@ -25,7 +25,7 @@
 //! manager performs with its per-connection buffer.
 
 use crate::hysteria::{Salamander, SALAMANDER_SALT};
-use aes_gcm::aead::{AeadInPlace, KeyInit};
+use aes_gcm::aead::{AeadInOut, KeyInit};
 use aes_gcm::{Aes128Gcm, Nonce, Tag};
 use sha2::{Digest as _, Sha256};
 
@@ -370,10 +370,10 @@ impl Encoder {
                         return None; // no entropy: drop the frame, never send a reused nonce
                     }
                     let (nonce_view, pt) = self.scratch[nonce_at..total].split_at_mut(12);
-                    let Ok(tag) = aes.cipher.encrypt_in_place_detached(
-                        Nonce::from_slice(nonce_view),
+                    let Ok(tag) = aes.cipher.encrypt_inout_detached(
+                        &Nonce::try_from(&nonce_view[..]).expect("length"),
                         &[],
-                        pt,
+                        (&mut pt[..]).into(),
                     ) else {
                         return None; // in-place encryption of a fresh buffer cannot fail; keep it total
                     };
@@ -503,11 +503,11 @@ fn decode_aes<'a>(buf: &'a mut [u8], cipher: &Aes128Gcm) -> Option<&'a mut [u8]>
     let (body, tail) = buf.split_at_mut(split);
     let (nonce_view, pt) = body.split_at_mut(12);
     cipher
-        .decrypt_in_place_detached(
-            Nonce::from_slice(nonce_view),
+        .decrypt_inout_detached(
+            &Nonce::try_from(&nonce_view[..]).expect("length"),
             &[],
-            &mut pt[..],
-            Tag::from_slice(tail),
+            (&mut pt[..]).into(),
+            &Tag::try_from(&tail[..]).expect("length"),
         )
         .ok()?;
     Some(pt)
