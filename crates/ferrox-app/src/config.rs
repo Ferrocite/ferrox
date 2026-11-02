@@ -2582,11 +2582,12 @@ pub(crate) fn outbound_carrier(outbound: &Json, address: &str) -> (Carrier, Stri
     let carrier = stream_carrier(settings);
     // Only a REALITY stream-one session knows it dials H2 before the handshake, so only that arm is pooled here.
     if let Carrier::Xhttp { settings: xhttp } = &carrier {
-        let reality = settings
+        let reality_stream_one = settings
             .and_then(|node| node.get("security"))
             .and_then(Json::as_str)
-            == Some("reality");
-        if xhttp.xmux.is_some() && !reality {
+            == Some("reality")
+            && xhttp.mode == crate::xhttp::XhttpMode::StreamOne;
+        if xhttp.xmux.is_some() && !reality_stream_one {
             eprintln!("xhttp: \"xmux\" bounds are checked, and this tree pools only a REALITY stream-one session, so an H1 or TLS-h2 dial keeps its own connection");
         }
     }

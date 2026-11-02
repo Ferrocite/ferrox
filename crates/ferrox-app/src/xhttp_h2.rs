@@ -974,6 +974,19 @@ impl H2Conn {
     /// here would discard the answer the peer has not written yet.
     fn finish_stream(&self, stream: u32) {
         let _ = self.frame(T_DATA, F_END, stream, &[]);
+        let ended = self
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&stream)
+            .map(|state| {
+                let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+                st.finished = true;
+                st.ended
+            });
+        if ended == Some(true) {
+            self.retire(stream);
+        }
     }
 
     pub(crate) fn close_client(&self) {
@@ -1276,24 +1289,31 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
     }
     match kind {
         T_HEADERS => {
-            if sid == 1 {
-                let streams = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
-                if let Some(state) = streams.get(&sid) {
-                    state.responded.store(true, Ordering::SeqCst);
+            let state = conn
+                .streams
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get(&sid)
+                .cloned();
+            if let Some(state) = state {
+                state.responded.store(true, Ordering::SeqCst);
+                let done = {
+                    let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
                     if flags & F_END != 0 {
-                        let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
                         st.ended = true;
-                        state.cv.notify_all();
                     }
+                    state.cv.notify_all();
+                    st.ended && st.finished
+                };
+                if done {
+                    conn.retire(sid);
                 }
             }
             true
         }
         T_DATA => queue_data(conn, flags, sid, body),
         T_RST => {
-            if sid == 1 {
-                conn.fail_stream(sid);
-            }
+            conn.fail_stream(sid);
             true
         }
         T_GOAWAY => {
@@ -1401,6 +1421,11 @@ impl H2Client {
         owned: bool,
     ) -> Option<(H2StreamReader, crate::xhttp::XhttpWriter)> {
         let sid = self.next.fetch_add(2, Ordering::SeqCst);
+        let initial = *self
+            .conn
+            .peer_initial
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let state = Arc::new(H2Stream {
             state: Mutex::new(StreamState {
                 body: VecDeque::new(),
@@ -1410,7 +1435,7 @@ impl H2Client {
                 dead: false,
             }),
             cv: Condvar::new(),
-            send_window: Mutex::new(65_535),
+            send_window: Mutex::new(initial),
             responded: AtomicBool::new(false),
         });
         {
@@ -2179,7 +2204,7 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
         return true;
     };
     drop(streams);
-    {
+    let done = {
         let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
         if !st.dead {
             st.body.push_back(body);
@@ -2188,8 +2213,12 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
             }
         }
         state.cv.notify_all();
-    }
+        st.ended && st.finished
+    };
     conn.replenish(sid, wire_len);
+    if done {
+        conn.retire(sid);
+    }
     true
 }
 

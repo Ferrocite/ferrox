@@ -30,7 +30,7 @@ pub(crate) struct Key {
     pub(crate) path: String,
     pub(crate) query: String,
     pub(crate) h2: bool,
-    pub(crate) identity: usize,
+    pub(crate) identity: (String, [u8; 32], [u8; 8], String),
 }
 
 pub(crate) struct Manager {

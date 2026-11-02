@@ -15873,7 +15873,12 @@ fn reality_xmux(
         path: settings.path.clone(),
         query: settings.query.clone(),
         h2: true,
-        identity: Arc::as_ptr(reality) as usize,
+        identity: (
+            reality.server_name.clone(),
+            reality.public_key,
+            reality.short_id,
+            reality.fingerprint.clone(),
+        ),
     };
     crate::xmux::manager(key, settings.xmux)
 }
