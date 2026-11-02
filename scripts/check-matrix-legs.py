@@ -80,6 +80,38 @@ def median_ceiling(cell):
     return statistics.median(samples) if samples else None
 
 
+GIB_BYTES = 1024.0 ** 3
+
+
+def server_cpu_span_millis(cell, engine):
+    """The server process's cpu span implied by its per-GiB rate, or None."""
+    spans = []
+    for entry in cell.get("engines", []):
+        if entry.get("name") != engine:
+            continue
+        for run in entry.get("runs", []):
+            server = run.get("server")
+            per_gib = server.get("cpu_millis_per_gib") if isinstance(server, dict) else None
+            moved = run.get("bytes_moved")
+            if (
+                isinstance(per_gib, (int, float))
+                and isinstance(moved, (int, float))
+                and moved > 0
+                and per_gib >= 0
+            ):
+                spans.append(per_gib * moved / GIB_BYTES)
+    return statistics.median(spans) if spans else None
+
+
+def server_cpu_is_priced(cell):
+    """A server per-GiB row gates only when one tick is under the tolerance."""
+    resolution = cell.get("cpu_resolution_floor_millis", 10)
+    if not isinstance(resolution, (int, float)) or resolution <= 0:
+        resolution = 10
+    span = server_cpu_span_millis(cell, REFERENCE)
+    return span is not None and span * 0.05 >= resolution
+
+
 def cells_by_scenario(cells_dir):
     """(base scenario, server) -> cell document."""
     grouped = {}
@@ -264,6 +296,7 @@ def server_cost_holes(base, reference, server_cell, cpu_threshold, threads_thres
     holes = []
     ref_cpu = median_server_metric(reference, REFERENCE, "cpu_millis_per_gib")
     fer_cpu = median_server_metric(server_cell, REFERENCE, "cpu_millis_per_gib")
+    priced = server_cpu_is_priced(reference) and server_cpu_is_priced(server_cell)
     if ref_cpu is None or fer_cpu is None:
         holes.append({
             "base": base,
@@ -272,6 +305,8 @@ def server_cost_holes(base, reference, server_cell, cpu_threshold, threads_thres
             "text": f"{base}: server CPU was not sampled on both legs; "
                     f"the server cost has no measurement, so it cannot be gated",
         })
+    elif not priced:
+        pass
     elif ref_cpu > 0:
         ratio = fer_cpu / ref_cpu
         if ratio > cpu_threshold:
