@@ -207,10 +207,11 @@ pub(crate) fn record(
 /// A field holds one token: a path, tag or account that carries a control byte, whitespace or a
 /// bracket is escaped, not written through, so nothing a peer names can start a second field or record.
 fn push_escaped(out: &mut String, value: &str) {
-    if value.is_ascii() {
-        push_escaped_ascii(out, value);
+    let base = out.len();
+    if push_escaped_ascii(out, value) {
         return;
     }
+    out.truncate(base);
     let mut start = 0;
     for (at, ch) in value.char_indices() {
         let escaped = match ch {
@@ -236,13 +237,20 @@ fn push_escaped(out: &mut String, value: &str) {
     out.push_str(&value[start..]);
 }
 
-/// The ASCII half of `push_escaped`: a byte scan finds the next escape and the clean runs between
-/// them are copied whole, so a field the peer named in ASCII never decodes a code point.
-fn push_escaped_ascii(out: &mut String, value: &str) {
+/// The ASCII half of `push_escaped`: one scan finds the next escape and the clean runs between them
+/// are copied whole, so a field the peer named in ASCII never decodes a code point. A byte off the
+/// ASCII range stops it, and the caller retries the whole field by code point.
+fn push_escaped_ascii(out: &mut String, value: &str) -> bool {
     let bytes = value.as_bytes();
     let mut start = 0;
-    while let Some(at) = bytes[start..].iter().position(|&byte| ascii_escaped(byte)) {
+    while let Some(at) = bytes[start..]
+        .iter()
+        .position(|&byte| ascii_escaped(byte) || byte & 0x80 != 0)
+    {
         let at = start + at;
+        if bytes[at] & 0x80 != 0 {
+            return false;
+        }
         out.push_str(&value[start..at]);
         match bytes[at] {
             b'\\' => out.push_str("\\\\"),
@@ -254,6 +262,7 @@ fn push_escaped_ascii(out: &mut String, value: &str) {
         start = at + 1;
     }
     out.push_str(&value[start..]);
+    true
 }
 
 /// The ASCII bytes `push_escaped` writes differently: controls, space, and the three punctuation
