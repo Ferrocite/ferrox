@@ -28914,16 +28914,24 @@ fn ss_accounts(
             ferrox_core::shadowsocks2022::parse_psk_list(&password, parsed.key_len())
         {
             let psks = list.len().saturating_sub(1);
-            if identities.len() != psks {
+            let users = identities.len();
+            if users > psks {
                 eprintln!(
-                    "shadowsocks 2022 inbound on {address}: {} users for {psks} client psks, naming the rest after the inbound",
-                    identities.len()
+                    "shadowsocks 2022 inbound on {address}: {users} users for {psks} client psks, dropping {} users",
+                    users - psks
                 );
-                if identities.len() > psks {
-                    identities.truncate(psks);
-                } else {
-                    let unnamed = inbound_tag(inbound).unwrap_or_else(|| address.to_owned());
-                    identities.resize(psks, (unnamed, 0));
+                identities.truncate(psks);
+            } else if users < psks {
+                eprintln!(
+                    "shadowsocks 2022 inbound on {address}: {users} users for {psks} client psks, naming the rest after the inbound"
+                );
+                let base = inbound_tag(inbound).unwrap_or_else(|| address.to_owned());
+                while identities.len() < psks {
+                    let mut name = format!("{base}#{}", identities.len());
+                    while identities.iter().any(|(email, _)| *email == name) {
+                        name.push('#');
+                    }
+                    identities.push((name, 0));
                 }
             }
         }
@@ -59352,9 +59360,37 @@ end
             accounts.identities.as_slice(),
             &[
                 ("alice@example".to_owned(), 2u32),
-                ("ss-in".to_owned(), 0u32)
+                ("ss-in#1".to_owned(), 0u32)
             ],
             "the second PSK has no user entry, so its traffic belongs to the inbound"
+        );
+    }
+
+    /// A fallback name derived from an inbound's tag must not collide with a configured user's
+    /// email: two accounts sharing a name would share one meter and one access-log identity.
+    #[test]
+    fn a_2022_fallback_identity_does_not_collide_with_a_configured_user() {
+        use base64::Engine as _;
+        let key = |b: u8| base64::engine::general_purpose::STANDARD.encode(vec![b; 32]);
+        let password = format!("{}:{}:{}", key(1), key(2), key(3));
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks", "tag": "alice@example", "settings": {{"method": "2022-blake3-aes-256-gcm", "password": "{password}", "users": [
+                {{"email": "alice@example", "level": 2}}]}}}}"#
+        ))
+        .expect("parses");
+        let accounts = ss_accounts(
+            &inbound,
+            "127.0.0.1:0",
+            password.clone(),
+            "2022-blake3-aes-256-gcm".to_owned(),
+        );
+        assert_eq!(
+            accounts.identities.as_slice(),
+            &[
+                ("alice@example".to_owned(), 2u32),
+                ("alice@example#1".to_owned(), 0u32)
+            ],
+            "the unnamed PSK needs a name of its own, not the configured user's"
         );
     }
 
