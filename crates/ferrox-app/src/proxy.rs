@@ -40234,6 +40234,10 @@ mod tests {
     }
 
     /// The vmess listener reads its stream settings: a tls inbound answers the handshake before any carrier.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one block per carrier table row; splitting hides that they share the dial and read"
+    )]
     #[test]
     fn a_vmess_inbound_that_declares_tls_answers_every_carrier() {
         if !crate::conn::in_a_quiet_process(

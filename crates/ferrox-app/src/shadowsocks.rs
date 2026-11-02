@@ -3559,11 +3559,6 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_live_session_costs_no_thread() {
-        if !crate::conn::in_a_quiet_process("shadowsocks::tests::a_live_session_costs_no_thread") {
-            return;
-        }
-        let threads = crate::conn::live_threads;
-        let lane_workers = || crate::conn::threads_named("ferrox-relay-lane");
         fn pair() -> (Connection, Connection) {
             let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
             let port = listener.local_addr().expect("addr").port();
@@ -3571,6 +3566,11 @@ mod tests {
             let (accepted, _) = listener.accept().expect("accepts");
             (dialled, accepted)
         }
+        if !crate::conn::in_a_quiet_process("shadowsocks::tests::a_live_session_costs_no_thread") {
+            return;
+        }
+        let threads = crate::conn::live_threads;
+        let lane_workers = || crate::conn::threads_named("ferrox-relay-lane");
         let method = Method::Aes256Gcm;
         let salt = [7u8; SALT_LEN];
         let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(|| {});
