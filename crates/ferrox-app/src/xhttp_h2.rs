@@ -1587,39 +1587,188 @@ pub(crate) fn serve_h2_service<
     serve_h2_service_until(read, write, service, decryption, None);
 }
 
-/// A reader whose silence before the first request is decoded ends at `until` rather than parking
-/// the accept thread: a timeout is retried here, so the outer `read_exact` sees only data or a hard
-/// end, and once the first stream's opening request is decoded the clock is put away.
-struct Bounded<R> {
-    inner: R,
-    until: Option<(std::time::Instant, Arc<std::sync::atomic::AtomicBool>)>,
+/// What one call of `Frames::step` settled on: another frame is ready, the socket is quiet until the
+/// peer speaks again, or the connection is over.
+enum Stepped {
+    More,
+    Idle,
+    Done,
 }
 
-impl<R: Read> Read for Bounded<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        loop {
-            let Some((until, opened)) = &self.until else {
-                return self.inner.read(buf);
-            };
-            if opened.load(Ordering::Relaxed) {
-                self.until = None;
-                return self.inner.read(buf);
+#[derive(Clone, Copy)]
+enum Phase {
+    Magic,
+    Head,
+    Body,
+}
+
+/// The preface, frame heads and bodies with their own buffers, so the demux can be handed back to a
+/// lane between frames instead of holding a thread until the peer ends the connection. `block` keeps
+/// the accept path's sleeping read; the lane path returns `Idle` and lets the pool park on the socket.
+struct Frames<R, W> {
+    read: R,
+    until: Option<std::time::Instant>,
+    opened: Option<Arc<std::sync::atomic::AtomicBool>>,
+    write: Option<W>,
+    decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+    conn: Option<Arc<H2Conn>>,
+    buf: Vec<u8>,
+    have: usize,
+    phase: Phase,
+    head: (u8, u8, u32),
+    frag: Option<(u32, Vec<u8>, bool)>,
+}
+
+impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
+    fn new(
+        read: R,
+        write: W,
+        decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+        until: Option<(std::time::Instant, Arc<std::sync::atomic::AtomicBool>)>,
+    ) -> Self {
+        let (until, opened) = match until {
+            Some((until, opened)) => (Some(until), Some(opened)),
+            None => (None, None),
+        };
+        Self {
+            read,
+            until,
+            opened,
+            write: Some(write),
+            decryption,
+            conn: None,
+            buf: vec![0u8; MAGIC.len()],
+            have: 0,
+            phase: Phase::Magic,
+            head: (0, 0, 0),
+            frag: None,
+        }
+    }
+
+    /// The handshake clock: silence before the first request is decoded ends at `until`, and the
+    /// first decoded request puts the clock away for the life of the connection.
+    fn expired(&mut self) -> bool {
+        if self
+            .opened
+            .as_ref()
+            .is_some_and(|opened| opened.load(Ordering::Relaxed))
+        {
+            self.until = None;
+            self.opened = None;
+            return false;
+        }
+        self.until
+            .is_some_and(|until| std::time::Instant::now() >= until)
+    }
+
+    fn step(&mut self, service: &dyn H2Service, block: bool) -> Stepped {
+        while self.have < self.buf.len() {
+            if self.expired() {
+                return self.end();
             }
-            let now = std::time::Instant::now();
-            if now >= *until {
-                return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
-            }
-            match self.inner.read(buf) {
+            match self.read.read(&mut self.buf[self.have..]) {
+                Ok(0) => return self.end(),
+                Ok(filled) => self.have += filled,
                 Err(error) if crate::proxy::is_timeout(&error) => {
-                    std::thread::sleep(
-                        until
-                            .saturating_duration_since(now)
-                            .min(crate::budgets::RELAY_POLL),
-                    );
+                    if !block {
+                        return Stepped::Idle;
+                    }
+                    if let Some(until) = self.until {
+                        std::thread::sleep(
+                            until
+                                .saturating_duration_since(std::time::Instant::now())
+                                .min(crate::budgets::RELAY_POLL),
+                        );
+                    }
                 }
-                other => return other,
+                Err(_) => return self.end(),
             }
         }
+        match self.phase {
+            Phase::Magic => {
+                if self.buf[..] != MAGIC[..] {
+                    return self.end();
+                }
+                let Some(write) = self.write.take() else {
+                    return self.end();
+                };
+                let conn = Arc::new(H2Conn {
+                    write: Mutex::new(Box::new(write)),
+                    streams: Mutex::new(HashMap::new()),
+                    sessions: Mutex::new(HashSet::new()),
+                    session_of: Mutex::new(HashMap::new()),
+                    upload_of: Mutex::new(HashMap::new()),
+                    send_conn: Mutex::new(65_535),
+                    wake: Condvar::new(),
+                    decoder: Mutex::new(Decoder::default()),
+                    max_frame: Mutex::new(16_384),
+                    peer_initial: Mutex::new(65_535),
+                    dead: AtomicBool::new(false),
+                    goaway: AtomicBool::new(false),
+                    refused: AtomicBool::new(false),
+                    client_read: None,
+                    raw: None,
+                    decryption: self.decryption.take(),
+                });
+                let mut initial = Vec::with_capacity(12);
+                initial.extend_from_slice(&S_WINDOW.to_be_bytes());
+                initial.extend_from_slice(&WINDOW.to_be_bytes());
+                if !conn.frame(T_SETTINGS, 0, 0, &initial) {
+                    self.conn = Some(conn);
+                    return self.end();
+                }
+                conn.frame(T_WINDOW, 0, 0, &CONN_WINDOW_TOP_UP.to_be_bytes());
+                self.conn = Some(conn);
+                self.next(Phase::Head, 9);
+            }
+            Phase::Head => {
+                let len = usize::from(self.buf[0]) << 16
+                    | usize::from(self.buf[1]) << 8
+                    | usize::from(self.buf[2]);
+                let (kind, flags) = (self.buf[3], self.buf[4]);
+                let sid = u32::from_be_bytes([self.buf[5], self.buf[6], self.buf[7], self.buf[8]])
+                    & 0x7FFF_FFFF;
+                if len > MAX_RECV_FRAME {
+                    // A frame past the default SETTINGS_MAX_FRAME_SIZE is a connection error (RFC 7540 6.9.1): refuse it before reserving its length or blocking on a body that may never arrive.
+                    if let Some(conn) = &self.conn {
+                        conn.refuse(E_FRAME_SIZE);
+                    }
+                    return self.end();
+                }
+                self.head = (kind, flags, sid);
+                self.next(Phase::Body, len);
+            }
+            Phase::Body => {
+                let (kind, flags, sid) = self.head;
+                let Some(conn) = &self.conn else {
+                    return self.end();
+                };
+                let body = std::mem::take(&mut self.buf);
+                if !pump_frame(conn, service, kind, flags, sid, body, &mut self.frag) {
+                    return self.end();
+                }
+                self.next(Phase::Head, 9);
+            }
+        }
+        Stepped::More
+    }
+
+    fn next(&mut self, phase: Phase, len: usize) {
+        self.buf = crate::proxy::unfilled(len);
+        self.have = 0;
+        self.phase = phase;
+    }
+
+    fn end(&mut self) -> Stepped {
+        if let Some(conn) = self.conn.take() {
+            if conn.refused.load(Ordering::SeqCst) {
+                // Closing while the peer's bytes sit unread aborts the connection, and the RST can swallow the GOAWAY written microseconds earlier; the grace is the window the peer takes it in.
+                std::thread::sleep(crate::budgets::goaway_grace());
+            }
+            conn.kill();
+            conn.wake.notify_all();
+        }
+        Stepped::Done
     }
 }
 
@@ -1634,57 +1783,29 @@ pub(crate) fn serve_h2_service_until<
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
     until: Option<(std::time::Instant, Arc<std::sync::atomic::AtomicBool>)>,
 ) {
-    let mut read = Bounded { inner: read, until };
-    let mut magic = [0u8; 24];
-    if crate::proxy::read_exact(&mut read, &mut magic).is_err() || magic != *MAGIC {
-        return;
+    let mut frames = Frames::new(read, write, decryption, until);
+    while !matches!(frames.step(service, true), Stepped::Done) {}
+}
+
+/// The same demux as a lane step: a quiet socket costs a parked readiness slot, not a thread for the
+/// connection's life. The caller submits it and carries its own per-thread context into each step.
+pub(crate) fn h2_lane<
+    R: Read + Send + 'static,
+    W: crate::proxy::FrameWrite + Send + 'static,
+    S: H2Service + 'static,
+>(
+    read: R,
+    write: W,
+    service: S,
+    decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+    until: Option<(std::time::Instant, Arc<std::sync::atomic::AtomicBool>)>,
+) -> impl FnMut() -> crate::proxy::lane_pool::Next + Send + 'static {
+    let mut frames = Frames::new(read, write, decryption, until);
+    move || match frames.step(&service, false) {
+        Stepped::More => crate::proxy::lane_pool::Next::More,
+        Stepped::Idle => crate::proxy::lane_pool::Next::Idle,
+        Stepped::Done => crate::proxy::lane_pool::Next::Done,
     }
-    let conn = Arc::new(H2Conn {
-        write: Mutex::new(Box::new(write)),
-        streams: Mutex::new(HashMap::new()),
-        sessions: Mutex::new(HashSet::new()),
-        session_of: Mutex::new(HashMap::new()),
-        upload_of: Mutex::new(HashMap::new()),
-        send_conn: Mutex::new(65_535),
-        wake: Condvar::new(),
-        decoder: Mutex::new(Decoder::default()),
-        max_frame: Mutex::new(16_384),
-        peer_initial: Mutex::new(65_535),
-        dead: AtomicBool::new(false),
-        goaway: AtomicBool::new(false),
-        refused: AtomicBool::new(false),
-        client_read: None,
-        raw: None,
-        decryption,
-    });
-    let mut initial = Vec::with_capacity(12);
-    initial.extend_from_slice(&S_WINDOW.to_be_bytes());
-    initial.extend_from_slice(&WINDOW.to_be_bytes());
-    if !conn.frame(T_SETTINGS, 0, 0, &initial) {
-        return;
-    }
-    conn.frame(T_WINDOW, 0, 0, &CONN_WINDOW_TOP_UP.to_be_bytes());
-    let mut frag: Option<(u32, Vec<u8>, bool)> = None;
-    while let Some((len, kind, flags, sid)) = read_head(&mut read) {
-        if len > MAX_RECV_FRAME {
-            // A frame past the default SETTINGS_MAX_FRAME_SIZE is a connection error (RFC 7540 6.9.1): refuse it before reserving its length or blocking on a body that may never arrive.
-            conn.refuse(E_FRAME_SIZE);
-            break;
-        }
-        let mut body = crate::proxy::unfilled(len);
-        if crate::proxy::read_exact(&mut read, &mut body).is_err() {
-            break;
-        }
-        if !pump_frame(&conn, service, kind, flags, sid, body, &mut frag) {
-            break;
-        }
-    }
-    if conn.refused.load(Ordering::SeqCst) {
-        // Closing while the peer's bytes sit unread aborts the connection, and the RST can swallow the GOAWAY written microseconds earlier; the grace is the window the peer takes it in.
-        std::thread::sleep(crate::budgets::goaway_grace());
-    }
-    conn.kill();
-    conn.wake.notify_all();
 }
 
 /// Cuts a padded DATA frame's own buffer to `[payload]` in place — the pad-length byte skipped, the padding tail dropped — and returns the payload length, `0` when the pad swallows the payload. The allocation survives truncated, where a slice-to-`Vec` would have copied the payload out; the saturation matches the borrow-checked reference at every pad length.
