@@ -1841,7 +1841,106 @@ pub(crate) fn regions(settings: Option<&Json>) -> Result<Vec<(String, usize)>, S
 /// Fetch tactics from the first entry that advertises the untunneled capability.
 pub(crate) fn tactics(settings: Option<&Json>) -> Result<crate::psiphon_tactics::Tactics, String> {
     let settings = Settings::from_json(settings)?;
+    fetch_tactics(&settings)
+}
+
+/// Send a client offer to the first broker the tactics payload names.
+pub(crate) fn broker_offer(
+    settings: Option<&Json>,
+    sdp: &str,
+) -> Result<crate::psiphon_broker::Offer, String> {
+    let settings = Settings::from_json(settings)?;
     let servers = load_tactics_entries(&settings)?;
+    let tactics = fetch_tactics_from(&settings, &servers)?;
+    let broker = tactics
+        .brokers
+        .first()
+        .ok_or_else(|| "psiphon broker: tactics names no broker".to_owned())?;
+    let server = servers
+        .iter()
+        .find(|server| server.inproxy.is_some())
+        .ok_or_else(|| "psiphon broker: no in-proxy destination".to_owned())?;
+    let destination = server
+        .inproxy
+        .as_ref()
+        .ok_or_else(|| "psiphon broker: no in-proxy destination".to_owned())?;
+    let compartments: Vec<[u8; 32]> = tactics
+        .compartments
+        .iter()
+        .map(|compartment| {
+            ferrox_core::b64::decode(compartment.as_bytes())
+                .and_then(|compartment| compartment.try_into().ok())
+                .ok_or_else(|| {
+                    format!(
+                        "psiphon broker: tactics compartment {compartment:?} is not 32 base64 bytes"
+                    )
+                })
+        })
+        .collect::<Result<_, _>>()?;
+    let personal: [u8; 32] = ferrox_core::b64::decode(settings.compartment.as_bytes())
+        .and_then(|compartment| compartment.try_into().ok())
+        .ok_or_else(|| {
+            format!(
+                "psiphon broker: personal compartment {:?} is not 32 base64 bytes",
+                settings.compartment
+            )
+        })?;
+    let session_id = hex(&random::<16>());
+    let identity = Identity {
+        session_id: &session_id,
+        sponsor: &settings.sponsor,
+        propagation: &settings.propagation,
+        platform: &settings.platform,
+        version: &settings.client_version,
+        egress_region: settings.region.as_deref(),
+        device_region: settings.device_region.as_deref(),
+        device_location: settings.device_location.as_deref(),
+        client_features: &settings.client_features,
+    };
+    let fronts = broker_fronts(broker);
+    if fronts.is_empty() {
+        return Err("psiphon broker: no fronting host".to_owned());
+    }
+    let mut why = String::new();
+    for front in &fronts {
+        let mut client = match crate::psiphon_broker::Client::connect(
+            crate::psiphon_broker::Broker {
+                public_key: broker.public_key.clone(),
+                root_secret: broker.root_secret.clone(),
+            },
+            front,
+            settings.ready,
+            settings.proxy.as_ref(),
+        ) {
+            Ok(client) => client,
+            Err(error) => {
+                why = error;
+                continue;
+            }
+        };
+        match client.client_offer(
+            destination,
+            &compartments,
+            &[personal],
+            sdp,
+            &crate::psiphon_broker::Metrics::from_identity(&identity),
+        ) {
+            Ok(offer) => return Ok(offer),
+            Err(error) => why = error,
+        }
+    }
+    Err(why)
+}
+
+fn fetch_tactics(settings: &Settings) -> Result<crate::psiphon_tactics::Tactics, String> {
+    let servers = load_tactics_entries(settings)?;
+    fetch_tactics_from(settings, &servers)
+}
+
+fn fetch_tactics_from(
+    settings: &Settings,
+    servers: &[Server],
+) -> Result<crate::psiphon_tactics::Tactics, String> {
     let server = servers
         .iter()
         .find(|server| server.tactics.is_some())
@@ -1866,13 +1965,66 @@ pub(crate) fn tactics(settings: Option<&Json>) -> Result<crate::psiphon_tactics:
     )
 }
 
+fn broker_fronts(broker: &crate::psiphon_tactics::Broker) -> Vec<crate::psiphon_broker::Front> {
+    let mut fronts = Vec::new();
+    for front in &broker.fronts {
+        let addresses = if front.addresses.is_empty() {
+            vec![front.host.clone()]
+        } else {
+            front.addresses.clone()
+        };
+        for address in addresses {
+            let Some((dial, port)) = split_dial(&address) else {
+                eprintln!("psiphon broker: cannot dial {address}");
+                continue;
+            };
+            let candidate = crate::psiphon_broker::Front {
+                host: front.host.clone(),
+                dial,
+                port,
+                disable_sni: front.disable_sni,
+            };
+            if !fronts
+                .iter()
+                .any(|existing: &crate::psiphon_broker::Front| {
+                    existing.host == candidate.host
+                        && existing.dial == candidate.dial
+                        && existing.port == candidate.port
+                })
+            {
+                fronts.push(candidate);
+            }
+        }
+    }
+    fronts
+}
+
+fn split_dial(address: &str) -> Option<(String, u16)> {
+    let address = address.trim_matches(|ch| ch == '^' || ch == '$');
+    if let Some(rest) = address.strip_prefix('[') {
+        let (host, tail) = rest.split_once(']')?;
+        let port = tail.strip_prefix(':').and_then(|port| port.parse().ok());
+        return Some((host.to_owned(), port.unwrap_or(443)));
+    }
+    if address.contains(['\\', '(', ')', '|', '+', '*', '?', '{', '}']) {
+        return None;
+    }
+    if address.matches(':').count() > 1 {
+        return Some((address.to_owned(), 443));
+    }
+    match address.rsplit_once(':') {
+        Some((host, port)) => Some((host.to_owned(), port.parse().ok()?)),
+        None => Some((address.to_owned(), 443)),
+    }
+}
+
 fn load_entries(settings: &Settings) -> Result<Vec<Server>, String> {
     let servers = load_all_entries(settings)?;
     Ok(filter_region(servers, settings))
 }
 
 fn load_tactics_entries(settings: &Settings) -> Result<Vec<Server>, String> {
-    let servers = load_source_entries(settings, false)?;
+    let servers = load_source_entries(settings, false, true)?;
     let mut servers = filter_region(servers, settings);
     apply_tactics_overrides(&mut servers, settings);
     if servers.is_empty() {
@@ -1898,7 +2050,7 @@ fn filter_region(mut servers: Vec<Server>, settings: &Settings) -> Vec<Server> {
 }
 
 fn load_all_entries(settings: &Settings) -> Result<Vec<Server>, String> {
-    let servers = load_source_entries(settings, true)?;
+    let servers = load_source_entries(settings, true, false)?;
     let servers: Vec<Server> = servers
         .into_iter()
         .filter(|server| server.direct || server.meek.is_some() || server.unfronted_meek.is_some())
@@ -1921,9 +2073,13 @@ fn load_all_entries(settings: &Settings) -> Result<Vec<Server>, String> {
     Ok(servers)
 }
 
-fn load_source_entries(settings: &Settings, target_limits: bool) -> Result<Vec<Server>, String> {
+fn load_source_entries(
+    settings: &Settings,
+    target_limits: bool,
+    include_inproxy: bool,
+) -> Result<Vec<Server>, String> {
     if let Some(target) = settings.target.as_deref() {
-        let Some(mut server) = decode_entry(target.trim()) else {
+        let Some(mut server) = decode_entry_with(target.trim(), include_inproxy) else {
             return Err("psiphon: TargetServerEntry is not a valid server entry".to_owned());
         };
         if target_limits {
@@ -1952,7 +2108,7 @@ fn load_source_entries(settings: &Settings, target_limits: bool) -> Result<Vec<S
     let mut seen = HashSet::new();
     if let Some(path) = settings.entries.as_deref() {
         match std::fs::read_to_string(path) {
-            Ok(text) => absorb(&text, &mut servers, &mut seen),
+            Ok(text) => absorb(&text, &mut servers, &mut seen, include_inproxy),
             Err(error) => eprintln!("psiphon: server entries {}: {error}", path.display()),
         }
     }
@@ -1961,7 +2117,7 @@ fn load_source_entries(settings: &Settings, target_limits: bool) -> Result<Vec<S
     for url in settings.server_lists.iter().filter(|_| fetch_remote) {
         match fetch_list(url, &settings.server_list_key, &settings.headers) {
             Ok(text) => {
-                absorb(&text, &mut servers, &mut seen);
+                absorb(&text, &mut servers, &mut seen, include_inproxy);
                 save_cache(settings, &text);
             }
             Err(why) => eprintln!("psiphon: {why}"),
@@ -1969,7 +2125,7 @@ fn load_source_entries(settings: &Settings, target_limits: bool) -> Result<Vec<S
     }
     if servers.is_empty() && state_is_ours(&settings.state) {
         if let Ok(text) = std::fs::read_to_string(cache_path(settings)) {
-            absorb(&text, &mut servers, &mut seen);
+            absorb(&text, &mut servers, &mut seen, include_inproxy);
         }
     }
     Ok(servers)
@@ -2476,13 +2632,18 @@ fn save_cache(settings: &Settings, text: &str) {
     }
 }
 
-fn absorb(text: &str, servers: &mut Vec<Server>, seen: &mut HashSet<(IpAddr, u16)>) {
+fn absorb(
+    text: &str,
+    servers: &mut Vec<Server>,
+    seen: &mut HashSet<(IpAddr, u16)>,
+    include_inproxy: bool,
+) {
     for line in text.lines() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        if let Some(server) = decode_entry(line) {
+        if let Some(server) = decode_entry_with(line, include_inproxy) {
             if seen.insert((server.address, server.port)) {
                 servers.push(server);
             }
@@ -2490,8 +2651,23 @@ fn absorb(text: &str, servers: &mut Vec<Server>, seen: &mut HashSet<(IpAddr, u16
     }
 }
 
-/// Decode one base64 server-list entry into a dialable server.
+/// Decode one base64 server-list entry for the tunnel race.
+#[cfg(test)]
 fn decode_entry(line: &str) -> Option<Server> {
+    decode_entry_with(line, false)
+}
+
+/// The port an in-proxy destination names.
+fn destination_port(destination: &crate::psiphon_broker::Destination) -> u16 {
+    destination
+        .address
+        .rsplit_once(':')
+        .and_then(|(_, port)| port.parse().ok())
+        .unwrap_or(443)
+}
+
+/// Decode one base64 server-list entry, optionally keeping an in-proxy-only one.
+fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
     let decoded = hex_decode(line)?;
     let parts: Vec<&[u8]> = decoded.splitn(5, |byte| *byte == b' ').collect();
     if parts.len() != 5 {
@@ -2529,6 +2705,8 @@ fn decode_entry(line: &str) -> Option<Server> {
     let protocol = meek_protocol(&entry);
     let tactics_capable = tactics_capability(&entry);
     let direct = obfuscated_port.is_some() || ssh_port.is_some();
+    let inproxy = crate::psiphon_broker::destination(&entry, &host);
+    let inproxy_port = inproxy.as_ref().map_or(0, destination_port);
     let (port, obfuscation_key) = match (obfuscated_port, ssh_port) {
         (Some(port), _) if obfuscated_key.is_some() => (port, obfuscated_key),
         (_, Some(port)) => (port, None),
@@ -2546,6 +2724,7 @@ fn decode_entry(line: &str) -> Option<Server> {
                 });
             (port, obfuscated_key)
         }
+        _ if include_inproxy && inproxy.is_some() => (inproxy_port, obfuscated_key),
         _ => return None,
     };
     let region = entry
@@ -2561,7 +2740,12 @@ fn decode_entry(line: &str) -> Option<Server> {
         meek = unfronted_meek.take();
     }
     let tactics = tactics_entry(&entry, &host);
-    if !direct && meek.is_none() && unfronted_meek.is_none() && tactics.is_none() {
+    if !direct
+        && meek.is_none()
+        && unfronted_meek.is_none()
+        && tactics.is_none()
+        && inproxy.is_none()
+    {
         return None;
     }
     Some(Server {
@@ -2577,6 +2761,7 @@ fn decode_entry(line: &str) -> Option<Server> {
         meek,
         unfronted_meek,
         tactics,
+        inproxy,
     })
 }
 
@@ -3493,6 +3678,17 @@ mod tests {
     }
 
     #[test]
+    fn an_inproxy_only_entry_keeps_its_destination() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["INPROXY-WEBRTC-OSSH"],"inproxyOSSHPort":443,"signature":"AA=="}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        assert!(decode_entry(&encoded).is_none());
+        let server = decode_entry_with(&encoded, true).expect("entry");
+        assert_eq!(server.port, 443);
+        let destination = server.inproxy.expect("destination");
+        assert_eq!(destination.address, "192.0.2.1:443");
+    }
+
+    #[test]
     fn regions_count_entries_by_code() {
         let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshHostKey":"AAAA","region":"US"}"#;
         let target = hex(format!("0 0 0 0 {entry}").as_bytes());
@@ -4072,6 +4268,7 @@ mod tests {
             meek: None,
             unfronted_meek: None,
             tactics: None,
+            inproxy: None,
         }
     }
 
@@ -4685,6 +4882,7 @@ mod tests {
                 meek: None,
                 unfronted_meek: None,
                 tactics: None,
+                inproxy: None,
             })
             .collect();
         let began = Instant::now();
@@ -4723,6 +4921,7 @@ mod tests {
                 meek: None,
                 unfronted_meek: None,
                 tactics: None,
+                inproxy: None,
             })
             .collect();
         let began = Instant::now();

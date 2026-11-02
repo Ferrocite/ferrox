@@ -47,6 +47,7 @@ mod policy;
 mod process;
 mod proxy;
 mod psiphon;
+mod psiphon_broker;
 mod psiphon_meek;
 mod psiphon_ssh;
 mod psiphon_tactics;
@@ -122,6 +123,9 @@ fn usage() -> ! {
     );
     eprintln!(
         "  ferrox-app psiphon-tactics -c <config.json>   fetch tactics and print broker specs"
+    );
+    eprintln!(
+        "  ferrox-app psiphon-broker -c <config.json> --sdp <file>  send a client offer to the first broker"
     );
     std::process::exit(2);
 }
@@ -394,12 +398,83 @@ fn cmd_psiphon_tactics<I: Iterator<Item = String>>(args: &mut I) {
                     "broker\t{}\t{}\t{}",
                     broker.public_key,
                     broker.root_secret,
-                    broker.hosts.join(",")
+                    broker
+                        .fronts
+                        .iter()
+                        .map(|front| front.host.as_str())
+                        .collect::<Vec<_>>()
+                        .join(",")
                 );
             }
             for compartment in tactics.compartments {
                 println!("compartment\t{compartment}");
             }
+        }
+        Err(why) => {
+            eprintln!("{why}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_psiphon_broker<I: Iterator<Item = String>>(args: &mut I) {
+    let mut path = String::new();
+    let mut sdp_path = String::new();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-c" | "-config" | "--config" => {
+                path = args.next().unwrap_or_else(|| usage());
+            }
+            other if other.starts_with("--config=") => {
+                path.clear();
+                path.push_str(&other["--config=".len()..]);
+            }
+            "--sdp" => {
+                sdp_path = args.next().unwrap_or_else(|| usage());
+            }
+            other if other.starts_with("--sdp=") => {
+                sdp_path.clear();
+                sdp_path.push_str(&other["--sdp=".len()..]);
+            }
+            _ => usage(),
+        }
+    }
+    if path.is_empty() || sdp_path.is_empty() {
+        usage();
+    }
+    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+        eprintln!("psiphon-broker: {path}: {error}");
+        std::process::exit(1);
+    });
+    let root = json::parse(&text).unwrap_or_else(|error| {
+        eprintln!("psiphon-broker: {error}");
+        std::process::exit(1);
+    });
+    let settings = root
+        .get("outbounds")
+        .and_then(json::Json::as_arr)
+        .and_then(|outbounds| {
+            outbounds.iter().find(|outbound| {
+                outbound.get("protocol").and_then(json::Json::as_str) == Some("psiphon")
+            })
+        })
+        .and_then(|outbound| outbound.get("settings"));
+    let sdp = std::fs::read_to_string(&sdp_path).unwrap_or_else(|error| {
+        eprintln!("psiphon-broker: {sdp_path}: {error}");
+        std::process::exit(1);
+    });
+    match psiphon::broker_offer(settings, &sdp) {
+        Ok(offer) => {
+            println!("limited\t{}", offer.limited);
+            println!("no_match\t{}", offer.no_match);
+            println!("must_upgrade\t{}", offer.must_upgrade);
+            println!("connection_id_len\t{}", offer.connection_id.len());
+            println!("protocol_version\t{}", offer.protocol_version);
+            println!("answer_sdp\t{}", offer.answer_sdp);
+            println!(
+                "relay_packet_to_server\t{}",
+                offer.relay_packet_to_server.len()
+            );
         }
         Err(why) => {
             eprintln!("{why}");
@@ -491,6 +566,7 @@ fn main() {
         }
         "psiphon-regions" => cmd_psiphon_regions(&mut args),
         "psiphon-tactics" => cmd_psiphon_tactics(&mut args),
+        "psiphon-broker" => cmd_psiphon_broker(&mut args),
         "x25519" => {
             if args.next().is_some() {
                 usage();
