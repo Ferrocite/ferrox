@@ -347,9 +347,6 @@ pub(crate) struct H2Conn {
     dead: Arc<AtomicBool>,
     goaway: AtomicBool,
     refused: AtomicBool,
-    /// The client half's transport: a client pumps frames on demand from its reader or a writer
-    /// waiting for credit, so one thread owns the session and no parser thread outlives it.
-    client_read: Option<Mutex<Box<dyn Read + Send>>>,
     raw: Option<Arc<crate::conn::Connection>>,
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
 }
@@ -427,21 +424,6 @@ impl Read for H2StreamReader {
                 drop(st);
                 self.conn.forget_upload(self.id);
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
-            }
-            if self.conn.client_read.is_some() {
-                drop(st);
-                if !self.conn.pump_read(|| {
-                    let st = self
-                        .stream
-                        .state
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    !st.body.is_empty() || st.ended || st.finished || st.dead
-                }) {
-                    self.conn.forget_upload(self.id);
-                    return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
-                }
-                continue;
             }
             // A lane step owns its thread for one poll; a body idle for the whole stall still ends.
             if crate::proxy::relay_step_owns_poll() {
@@ -906,31 +888,6 @@ impl H2Conn {
             if !blocking || stream.gone() {
                 return None;
             }
-            if self.client_read.is_some() {
-                // A client's credit arrives on its reader's transport, so a parked writer pumps it itself.
-                drop(conn);
-                if !self.pump_read(|| {
-                    if self.dead.load(Ordering::SeqCst) || stream.gone() {
-                        return true;
-                    }
-                    let conn = self
-                        .send_conn
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    let window = stream
-                        .send_window
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner);
-                    *conn > 0 && *window > 0
-                }) {
-                    return None;
-                }
-                conn = self
-                    .send_conn
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                continue;
-            }
             let (guard, waited) = self
                 .wake
                 .wait_timeout(conn, crate::budgets::relay_stall())
@@ -1199,37 +1156,49 @@ impl H2Conn {
     }
 }
 
-impl H2Conn {
-    /// A client's frames arrive on the same transport its reader consumes: one frame is parsed on
-    /// demand, so a read and a credit-starved write both make progress without a parser thread.
-    fn pump_read(&self, ready: impl FnOnce() -> bool) -> bool {
-        let Some(read) = self.client_read.as_ref() else {
-            return false;
-        };
-        let mut read = read.lock().unwrap_or_else(PoisonError::into_inner);
-        if ready() {
-            return true;
-        }
-        let Some((len, kind, flags, sid)) = read_head_retry(&mut **read) else {
-            self.dead.store(true, Ordering::SeqCst);
-            return false;
-        };
+/// A client owns one reader thread so a writer waiting for credit never holds the transport the
+/// frame carrying that credit must arrive on; the weak handle lets the session close under it.
+fn client_pump<R: Read>(mut read: R, weak: &std::sync::Weak<H2Conn>) {
+    while let Some((len, kind, flags, sid)) = read_head_retry(&mut read) {
         if len > MAX_RECV_FRAME {
-            self.dead.store(true, Ordering::SeqCst);
-            return false;
+            if let Some(conn) = weak.upgrade() {
+                conn.refuse(E_FRAME_SIZE);
+            }
+            break;
         }
         let mut body = crate::proxy::unfilled(len);
-        if read_exact_retry(&mut **read, &mut body).is_err() {
-            self.dead.store(true, Ordering::SeqCst);
-            return false;
+        if read_exact_retry(&mut read, &mut body).is_err() {
+            break;
         }
-        // Dispatch under the lock so a later frame cannot overtake an earlier one on the wire.
-        let alive = client_frame(self, kind, flags, sid, body);
+        let alive = {
+            let Some(conn) = weak.upgrade() else {
+                return;
+            };
+            !conn.dead.load(Ordering::SeqCst) && client_frame(&conn, kind, flags, sid, body)
+        };
         if !alive {
-            self.dead.store(true, Ordering::SeqCst);
+            break;
         }
-        alive
     }
+    if let Some(conn) = weak.upgrade() {
+        conn.kill();
+    }
+}
+
+fn spawn_client_pump<R: Read + Send + 'static>(read: R, conn: &Arc<H2Conn>) -> bool {
+    let weak = Arc::downgrade(conn);
+    std::thread::Builder::new()
+        .name("ferrox-h2-client".into())
+        .spawn(move || client_pump(read, &weak))
+        .is_ok()
+}
+
+fn send_preface(conn: &H2Conn) -> bool {
+    let mut initial = Vec::with_capacity(12);
+    initial.extend_from_slice(&S_WINDOW.to_be_bytes());
+    initial.extend_from_slice(&WINDOW.to_be_bytes());
+    conn.frame(T_SETTINGS, 0, 0, &initial)
+        && conn.frame(T_WINDOW, 0, 0, &CONN_WINDOW_TOP_UP.to_be_bytes())
 }
 
 fn read_exact_retry(stream: &mut dyn Read, buf: &mut [u8]) -> std::io::Result<()> {
@@ -1351,7 +1320,6 @@ pub(crate) fn connect_split<
         dead,
         goaway: AtomicBool::new(false),
         refused: AtomicBool::new(false),
-        client_read: Some(Mutex::new(Box::new(read))),
         raw: Some(raw),
         decryption: None,
     });
@@ -1378,13 +1346,7 @@ pub(crate) fn connect_split<
             return None;
         }
     }
-    let mut initial = Vec::with_capacity(12);
-    initial.extend_from_slice(&S_WINDOW.to_be_bytes());
-    initial.extend_from_slice(&WINDOW.to_be_bytes());
-    if !conn.frame(T_SETTINGS, 0, 0, &initial) {
-        return None;
-    }
-    if !conn.frame(T_WINDOW, 0, 0, &CONN_WINDOW_TOP_UP.to_be_bytes()) {
+    if !send_preface(&conn) {
         return None;
     }
 
@@ -1417,7 +1379,9 @@ pub(crate) fn connect_split<
     if !conn.frame(T_HEADERS, F_END_HEADERS, 1, &block) {
         return None;
     }
-
+    if !spawn_client_pump(read, &conn) {
+        return None;
+    }
     let out = H2StreamOut {
         conn: Arc::clone(&conn),
         stream: 1,
@@ -1943,18 +1907,13 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                     dead,
                     goaway: AtomicBool::new(false),
                     refused: AtomicBool::new(false),
-                    client_read: None,
                     raw: None,
                     decryption: self.decryption.take(),
                 });
-                let mut initial = Vec::with_capacity(12);
-                initial.extend_from_slice(&S_WINDOW.to_be_bytes());
-                initial.extend_from_slice(&WINDOW.to_be_bytes());
-                if !conn.frame(T_SETTINGS, 0, 0, &initial) {
+                if !send_preface(&conn) {
                     self.conn = Some(conn);
                     return self.end();
                 }
-                conn.frame(T_WINDOW, 0, 0, &CONN_WINDOW_TOP_UP.to_be_bytes());
                 self.conn = Some(conn);
                 self.head_have = 0;
                 self.phase = Phase::Head;
@@ -2079,24 +2038,34 @@ fn control_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: &[u8]) -> O
                 return Some(true);
             }
             if sid == 0 {
-                let mut conn_window = conn
+                let mut window = conn
                     .send_conn
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner);
-                *conn_window = conn_window.saturating_add(inc).min((1 << 31) - 1);
-            } else if let Some(state) = conn
-                .streams
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .get(&sid)
-            {
-                let mut window = state
-                    .send_window
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
                 *window = window.saturating_add(inc).min((1 << 31) - 1);
+                conn.wake.notify_all();
+            } else {
+                let state = conn
+                    .streams
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .get(&sid)
+                    .cloned();
+                if let Some(state) = state {
+                    {
+                        let mut window = state
+                            .send_window
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        *window = window.saturating_add(inc).min((1 << 31) - 1);
+                    }
+                    let _paired = conn
+                        .send_conn
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    conn.wake.notify_all();
+                }
             }
-            conn.wake.notify_all();
             Some(true)
         }
         _ => None,
@@ -3516,7 +3485,6 @@ mod tests {
             dead,
             goaway: AtomicBool::new(false),
             refused: AtomicBool::new(false),
-            client_read: None,
             raw: None,
             decryption: None,
         })
