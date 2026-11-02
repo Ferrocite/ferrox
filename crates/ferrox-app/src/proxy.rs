@@ -32892,7 +32892,7 @@ mod tests {
                 Box::new(|| {}),
             );
         }
-        for _ in 0..lane_pool::SETUP_LANES + 1 {
+        for _ in 0..=lane_pool::SETUP_LANES {
             let hold = Arc::clone(&hold);
             lane_pool::submit_setup(
                 Box::new(move || {
