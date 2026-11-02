@@ -3956,6 +3956,29 @@ mod tests {
         }
     }
 
+    /// A shutdown that stops the control worker still writes the GOAWAY queued before it: the peer
+    /// receives the refusal instead of a bare close when the block lifts after the grace.
+    #[test]
+    fn a_queued_goaway_survives_the_worker_stopping() {
+        let (conn, written, release) = blocked_conn();
+        conn.refuse(E_PROTOCOL);
+        conn.control.stop();
+        *release.0.lock().unwrap_or_else(PoisonError::into_inner) = true;
+        release.1.notify_all();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            let len = written.lock().unwrap_or_else(PoisonError::into_inner).len();
+            if len == 43 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the worker stopped with the GOAWAY still queued, so the peer never saw it"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     /// A writer that cannot carry a byte: the control worker's first batch fails.
     struct Broken;
 
