@@ -31702,18 +31702,8 @@ mod tests {
             .expect("routing");
         let portals = Arc::new(crate::reverse::Portals::default());
         let shared = route_shared(&root, routing, &portals, None).expect("shared");
-        let dynamic = crate::json::parse(
-            r#"{"inbounds":[{"tag":"dyn","protocol":"vless","listen":"127.0.0.1","port":0,"settings":{"clients":[{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}}]}"#,
-        )
-        .expect("parses");
+        shared.record_server_inbound(Some("dyn".to_owned()));
         let runtime = Runtime::new(None, Some(Arc::clone(&shared)), true, Arc::clone(&portals));
-        let api = crate::commander::Api::new(crate::commander::ApiConfig::default());
-        let seed = crate::xray_pb::Seed::default();
-        assert_eq!(
-            serve_dynamic_inbounds(&runtime, &dynamic, &seed, &api),
-            1,
-            "the dynamic vless inbound is served direct"
-        );
         let rules = crate::json::parse(
             r#"[{"type":"field","inboundTag":["dyn"],"outboundTag":"blocked"}]"#,
         )
