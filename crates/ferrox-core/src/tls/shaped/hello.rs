@@ -251,6 +251,16 @@ impl Hello {
     /// The second hello a `HelloRetryRequest` asks for: one fresh share for the group
     /// the server named, and its cookie echoed when one came.
     pub(crate) fn retry(&mut self, group: u16, cookie: Option<&[u8]>) -> Result<Self, TlsError> {
+        if !self.offers(group) {
+            return Err(TlsError::Other(format!(
+                "server asked for an unoffered retry group {group:#06x}"
+            )));
+        }
+        if self.shares.iter().any(|share| share.group == group) {
+            return Err(TlsError::Other(format!(
+                "server asked for a retry group the hello already sent {group:#06x}"
+            )));
+        }
         let shares = keys::generate(&[group], false).map_err(TlsError::Other)?;
         let (msg, offer) = match self.offer.take() {
             Some(mut offer) => (
@@ -303,6 +313,18 @@ impl Hello {
             .map(|share| share.data.as_slice())
     }
 
+    /// Whether the first hello advertised a group: a configured list replaces the profile's.
+    fn offers(&self, group: u16) -> bool {
+        match &self.groups {
+            Some(groups) => groups.contains(&group),
+            None => self
+                .profile
+                .exts
+                .iter()
+                .any(|ext| matches!(&ext.body, Body::Groups(groups) if groups.contains(&group))),
+        }
+    }
+
     /// The ECDHE point and secret for a TLS 1.2 `ClientKeyExchange` on a curve the hello committed
     /// no `key_share` to, drawn only when that curve is in the hello's advertised groups.
     pub(crate) fn ephemeral(
@@ -310,14 +332,7 @@ impl Hello {
         group: u16,
         peer: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
-        let advertised =
-            match &self.groups {
-                Some(groups) => groups.contains(&group),
-                None => self.profile.exts.iter().any(
-                    |ext| matches!(&ext.body, Body::Groups(groups) if groups.contains(&group)),
-                ),
-            };
-        if !advertised {
+        if !self.offers(group) {
             return Err(TlsError::NoSharedCipher);
         }
         let mut pool = keys::generate(&[group], false).map_err(TlsError::Other)?;
