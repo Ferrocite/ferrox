@@ -31654,10 +31654,9 @@ mod tests {
             .expect("routing");
         let portals = Arc::new(crate::reverse::Portals::default());
         let shared = route_shared(&root, routing, &portals, None).expect("shared");
-        let port = free_port();
-        let dynamic = crate::json::parse(&format!(
-            r#"{{"inbounds":[{{"tag":"dyn","protocol":"vless","listen":"127.0.0.1","port":{port},"settings":{{"clients":[{{"id":"{ID}"}}]}}}}]}}"#
-        ))
+        let dynamic = crate::json::parse(
+            r#"{"inbounds":[{"tag":"dyn","protocol":"vless","listen":"127.0.0.1","port":0,"settings":{"clients":[{"id":"aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}}]}"#,
+        )
         .expect("parses");
         let runtime = Runtime::new(None, Some(Arc::clone(&shared)), false, Arc::clone(&portals));
         let api = crate::commander::Api::new(crate::commander::ApiConfig::default());
@@ -31673,8 +31672,10 @@ mod tests {
         .expect("parses");
         assert_eq!(
             runtime.add_rules(rules.as_arr().expect("rules"), true),
-            Err("a rule for inbound dyn targets `blocked`, which the server inbound serves direct"
-                .to_owned()),
+            Err(
+                "a rule for inbound dyn targets `blocked`, which the server inbound serves direct"
+                    .to_owned()
+            ),
             "the rule that sends the dynamic inbound to a blackhole is refused"
         );
     }
