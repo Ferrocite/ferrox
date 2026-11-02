@@ -71,7 +71,7 @@ fn ghash_group8(hp: &[(P, P); 4], state: uint8x16_t, pairs: [P; 4]) -> uint8x16_
 }
 
 #[inline(always)]
-fn ctr8v_p(template: uint8x16_t, ctr: u32) -> [[uint8x16_t; 4]; 2] {
+fn ctr8v_p(template: uint8x16_t, ctr: u32) -> [uint8x16_t; 8] {
     let c0 = template.ctr_add(ctr).ctr_swap();
     let c1 = template.ctr_add(ctr + 1).ctr_swap();
     let c2 = template.ctr_add(ctr + 2).ctr_swap();
@@ -80,7 +80,7 @@ fn ctr8v_p(template: uint8x16_t, ctr: u32) -> [[uint8x16_t; 4]; 2] {
     let c5 = template.ctr_add(ctr + 5).ctr_swap();
     let c6 = template.ctr_add(ctr + 6).ctr_swap();
     let c7 = template.ctr_add(ctr + 7).ctr_swap();
-    [[c0, c1, c2, c3], [c4, c5, c6, c7]]
+    [c0, c1, c2, c3, c4, c5, c6, c7]
 }
 
 #[inline(always)]
@@ -148,6 +148,34 @@ fn karatsuba2(h: uint8x16_t, m: uint8x16_t, l: uint8x16_t) -> (uint8x16_t, uint8
         let x01 = vextq_u8::<8>(vextq_u8::<8>(l, l), t);
         let x23 = vextq_u8::<8>(t, vextq_u8::<8>(h, h));
         (x23, x01)
+    }
+}
+
+#[inline(always)]
+fn encrypt8(rk: &[uint8x16_t; 11], s: &mut [uint8x16_t; 8]) {
+    unsafe {
+        for k in &rk[..9] {
+            for lane in s.iter_mut() {
+                *lane = vaesmcq_u8(vaeseq_u8(*lane, *k));
+            }
+        }
+        for lane in s.iter_mut() {
+            *lane = veorq_u8(vaeseq_u8(*lane, rk[9]), rk[10]);
+        }
+    }
+}
+
+#[inline(always)]
+fn encrypt8_256(rk: &[uint8x16_t; 15], s: &mut [uint8x16_t; 8]) {
+    unsafe {
+        for k in &rk[..13] {
+            for lane in s.iter_mut() {
+                *lane = vaesmcq_u8(vaeseq_u8(*lane, *k));
+            }
+        }
+        for lane in s.iter_mut() {
+            *lane = veorq_u8(vaeseq_u8(*lane, rk[13]), rk[14]);
+        }
     }
 }
 
@@ -293,12 +321,11 @@ fn ctr_ghash8(
     let done = groups.len() * 8;
     for g in groups.iter_mut() {
         let mut ks = ctr8v_p(template, ctr);
-        <uint8x16_t as Lanes>::encrypt4(rk, &mut ks[0]);
-        <uint8x16_t as Lanes>::encrypt4(rk, &mut ks[1]);
+        encrypt8(rk, &mut ks);
         let mut ct = load_pairs(g);
         for (i, pair) in ct.iter_mut().enumerate() {
-            pair.lo = <uint8x16_t as Lanes>::xor(ks[i / 2][i % 2 * 2], pair.lo);
-            pair.hi = <uint8x16_t as Lanes>::xor(ks[i / 2][i % 2 * 2 + 1], pair.hi);
+            pair.lo = <uint8x16_t as Lanes>::xor(ks[2 * i], pair.lo);
+            pair.hi = <uint8x16_t as Lanes>::xor(ks[2 * i + 1], pair.hi);
         }
         store_pairs(g, ct);
         state = ghash_group8(
@@ -339,12 +366,11 @@ fn ctr_ghash8_from(
     let done = dgroups.len() * 8;
     for (sg, dg) in sgroups.iter().zip(dgroups.iter_mut()) {
         let mut ks = ctr8v_p(template, ctr);
-        <uint8x16_t as Lanes>::encrypt4(rk, &mut ks[0]);
-        <uint8x16_t as Lanes>::encrypt4(rk, &mut ks[1]);
+        encrypt8(rk, &mut ks);
         let mut ct = load_pairs(sg);
         for (i, pair) in ct.iter_mut().enumerate() {
-            pair.lo = <uint8x16_t as Lanes>::xor(ks[i / 2][i % 2 * 2], pair.lo);
-            pair.hi = <uint8x16_t as Lanes>::xor(ks[i / 2][i % 2 * 2 + 1], pair.hi);
+            pair.lo = <uint8x16_t as Lanes>::xor(ks[2 * i], pair.lo);
+            pair.hi = <uint8x16_t as Lanes>::xor(ks[2 * i + 1], pair.hi);
         }
         store_pairs(dg, ct);
         state = ghash_group8(
@@ -399,14 +425,10 @@ fn ctr_only8(rk: &[uint8x16_t; 11], template: uint8x16_t, buf: &mut [u8], mut ct
     let done = groups.len() * 8;
     for g in groups.iter_mut() {
         let mut ks = ctr8v_p(template, ctr);
-        <uint8x16_t as Lanes>::encrypt4(rk, &mut ks[0]);
-        <uint8x16_t as Lanes>::encrypt4(rk, &mut ks[1]);
-        let mut ct = load_pairs(g);
-        for (i, pair) in ct.iter_mut().enumerate() {
-            pair.lo = <uint8x16_t as Lanes>::xor(pair.lo, ks[i / 2][i % 2 * 2]);
-            pair.hi = <uint8x16_t as Lanes>::xor(pair.hi, ks[i / 2][i % 2 * 2 + 1]);
+        encrypt8(rk, &mut ks);
+        for (blk, k) in g.iter_mut().zip(ks) {
+            <uint8x16_t as Lanes>::xor(<uint8x16_t as Lanes>::load(blk), k).store(blk);
         }
-        store_pairs(g, ct);
         ctr += 8;
     }
     super::ctr_only(rk, template, &mut buf[done * 16..], ctr);
@@ -437,12 +459,11 @@ fn ctr_ghash8_256(
     let done = groups.len() * 8;
     for g in groups.iter_mut() {
         let mut ks = ctr8v_p(template, ctr);
-        <uint8x16_t as Lanes>::encrypt4_256(rk, &mut ks[0]);
-        <uint8x16_t as Lanes>::encrypt4_256(rk, &mut ks[1]);
+        encrypt8_256(rk, &mut ks);
         let mut ct = load_pairs(g);
         for (i, pair) in ct.iter_mut().enumerate() {
-            pair.lo = <uint8x16_t as Lanes>::xor(ks[i / 2][i % 2 * 2], pair.lo);
-            pair.hi = <uint8x16_t as Lanes>::xor(ks[i / 2][i % 2 * 2 + 1], pair.hi);
+            pair.lo = <uint8x16_t as Lanes>::xor(ks[2 * i], pair.lo);
+            pair.hi = <uint8x16_t as Lanes>::xor(ks[2 * i + 1], pair.hi);
         }
         store_pairs(g, ct);
         state = ghash_group8(
@@ -467,14 +488,10 @@ fn ctr_only8_256(rk: &[uint8x16_t; 15], template: uint8x16_t, buf: &mut [u8], mu
     let done = groups.len() * 8;
     for g in groups.iter_mut() {
         let mut ks = ctr8v_p(template, ctr);
-        <uint8x16_t as Lanes>::encrypt4_256(rk, &mut ks[0]);
-        <uint8x16_t as Lanes>::encrypt4_256(rk, &mut ks[1]);
-        let mut ct = load_pairs(g);
-        for (i, pair) in ct.iter_mut().enumerate() {
-            pair.lo = <uint8x16_t as Lanes>::xor(pair.lo, ks[i / 2][i % 2 * 2]);
-            pair.hi = <uint8x16_t as Lanes>::xor(pair.hi, ks[i / 2][i % 2 * 2 + 1]);
+        encrypt8_256(rk, &mut ks);
+        for (blk, k) in g.iter_mut().zip(ks) {
+            <uint8x16_t as Lanes>::xor(<uint8x16_t as Lanes>::load(blk), k).store(blk);
         }
-        store_pairs(g, ct);
         ctr += 8;
     }
     super::ctr_only_256(rk, template, &mut buf[done * 16..], ctr);
