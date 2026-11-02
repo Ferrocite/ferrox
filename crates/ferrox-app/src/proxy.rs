@@ -277,7 +277,7 @@ fn serve_root(label: &str, root: &Json, seed: Option<&crate::xray_pb::Seed>, tes
     }
     if hysteria_served {
         // The readiness token the pinned interop harness scans the server log for; not this binary's name.
-        println!("ferrox-app serving; harness readiness token: core: Xray 26.7.28 started");
+        println!("ferrox-app serving; harness readiness token: core: Xray 26.10.21 started");
     }
     loop {
         thread::park();
