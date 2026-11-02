@@ -179,14 +179,13 @@ impl MeekStream {
     }
 }
 
-struct MeekHttp {
+pub(crate) struct MeekHttp {
     meek: Meek,
     proxy: Option<Proxy>,
     timeout: Duration,
     path: &'static str,
     stream: Option<MeekStream>,
-    cookie_name: String,
-    cookie_value: String,
+    cookie: Option<(String, String)>,
     front_index: usize,
     alpn_warned: bool,
 }
@@ -200,22 +199,40 @@ impl MeekHttp {
         path: &'static str,
         endpoint: Option<&'static str>,
     ) -> Result<Self, String> {
-        let (cookie_name, cookie_value) = make_cookie(&meek, endpoint)?;
+        let cookie = Some(make_cookie(&meek, endpoint)?);
         Ok(Self {
             meek,
             proxy,
             timeout,
             path,
             stream: None,
-            cookie_name,
-            cookie_value,
+            cookie,
             front_index: 0,
             alpn_warned: false,
         })
     }
 
+    /// Build a cookieless HTTP client for a plaintext broker endpoint.
+    pub(crate) fn new_plain(
+        meek: Meek,
+        proxy: Option<Proxy>,
+        timeout: Duration,
+        path: &'static str,
+    ) -> Self {
+        Self {
+            meek,
+            proxy,
+            timeout,
+            path,
+            stream: None,
+            cookie: None,
+            front_index: 0,
+            alpn_warned: false,
+        }
+    }
+
     /// Send one request body and return the response body.
-    fn round_trip(&mut self, body: &[u8]) -> Result<Vec<u8>, String> {
+    pub(crate) fn round_trip(&mut self, body: &[u8]) -> Result<Vec<u8>, String> {
         if self.stream.is_none() {
             self.open()?;
         }
@@ -313,14 +330,19 @@ impl MeekHttp {
             self.stream = None;
             self.open()?;
         }
-        let cookie = format!("{}={}", self.cookie_name, self.cookie_value);
-        let headers = [
+        let cookie = self
+            .cookie
+            .as_ref()
+            .map(|(name, value)| format!("{name}={value}"));
+        let mut headers = vec![
             ("Content-Type", "application/octet-stream"),
-            ("Cookie", cookie.as_str()),
             ("User-Agent", USER_AGENT),
             ("Accept", "*/*"),
             ("Connection", "keep-alive"),
         ];
+        if let Some(cookie) = cookie.as_deref() {
+            headers.push(("Cookie", cookie));
+        }
         let request =
             crate::foxy_account::request("POST", &self.meek.host, self.path, &headers, body);
         let stream = self
@@ -336,14 +358,16 @@ impl MeekHttp {
         if reply.status != 200 {
             return Err(format!("psiphon meek status {}", reply.status));
         }
-        for (name, value) in &reply.headers {
-            if !name.eq_ignore_ascii_case("set-cookie") {
-                continue;
-            }
-            let pair = value.split(';').next().unwrap_or(value);
-            if let Some((name, value)) = pair.split_once('=') {
-                if name.trim() == self.cookie_name {
-                    value.trim().clone_into(&mut self.cookie_value);
+        if let Some((cookie_name, cookie_value)) = self.cookie.as_mut() {
+            for (name, value) in &reply.headers {
+                if !name.eq_ignore_ascii_case("set-cookie") {
+                    continue;
+                }
+                let pair = value.split(';').next().unwrap_or(value);
+                if let Some((name, value)) = pair.split_once('=') {
+                    if name.trim() == cookie_name {
+                        value.trim().clone_into(cookie_value);
+                    }
                 }
             }
         }
