@@ -1580,7 +1580,6 @@ pub(crate) enum Carrier {
     HttpUpgrade {
         path: String,
         host: String,
-        ed: u32,
     },
     Grpc(GrpcSettings),
     Xhttp {
@@ -1707,7 +1706,6 @@ fn resolve_httpupgrade(settings: Option<&Json>, _: &str) -> Carrier {
     Carrier::HttpUpgrade {
         path: early.path,
         host,
-        ed: early.budget,
     }
 }
 

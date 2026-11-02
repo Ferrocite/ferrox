@@ -5,6 +5,7 @@ use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use ferrox_core::failure::Kind;
 use ferrox_core::shadowsocks2022::{self, Cipher, Method, BLOCK_LEN, MAX_CHUNK, TAG_LEN};
 
 use crate::budgets::RELAY_POLL;
@@ -610,12 +611,12 @@ pub(crate) fn client_send_handshake(
     password: &str,
     method: &str,
     target: &crate::proxy::Destination,
-) -> Option<(Cipher, Recv)> {
-    let method = Method::parse(method)?;
-    let list = psks(password, method)?;
-    let final_psk = list.last()?.clone();
+) -> Result<(Cipher, Recv), Kind> {
+    let method = Method::parse(method).ok_or(Kind::Local)?;
+    let list = psks(password, method).ok_or(Kind::Local)?;
+    let final_psk = list.last().ok_or(Kind::Local)?.clone();
     let key_len = method.key_len();
-    let salt = fresh_salt(key_len)?;
+    let salt = fresh_salt(key_len).ok_or(Kind::Local)?;
     let pad_len = padding_for(0);
     let variable_len = target.addr_len() + 2 + 2 + pad_len;
     let eih_count = list.len().saturating_sub(1);
@@ -624,27 +625,32 @@ pub(crate) fn client_send_handshake(
     staging.extend_from_slice(&salt);
     if list.len() > 1 {
         if method.is_chacha() {
-            return None;
+            return Err(Kind::Local);
         }
         for i in 0..list.len() - 1 {
-            let eih = shadowsocks2022::encrypt_eih(method, &list[i], &salt, &list[i + 1])?;
+            let eih = shadowsocks2022::encrypt_eih(method, &list[i], &salt, &list[i + 1])
+                .ok_or(Kind::Local)?;
             staging.extend_from_slice(&eih);
         }
     }
-    let mut send = Cipher::from_psk(method, &final_psk, &salt)?;
+    let mut send = Cipher::from_psk(method, &final_psk, &salt).ok_or(Kind::Local)?;
     let at = staging.len();
     staging.push(0);
     staging.extend_from_slice(&now_secs().to_be_bytes());
     staging.extend_from_slice(&(variable_len as u16).to_be_bytes());
-    send.seal_tail_in_place(&mut staging, at)?;
+    send.seal_tail_in_place(&mut staging, at)
+        .ok_or(Kind::Local)?;
     let at = staging.len();
     target.push_addr(&mut staging, 4, 3);
     staging.extend_from_slice(&target.port().to_be_bytes());
     staging.extend_from_slice(&(pad_len as u16).to_be_bytes());
     staging.resize(staging.len() + pad_len, 0);
-    send.seal_tail_in_place(&mut staging, at)?;
-    uplink.write_all(&staging).ok()?;
-    Some((send, Recv::Waiting(method, final_psk, salt)))
+    send.seal_tail_in_place(&mut staging, at)
+        .ok_or(Kind::Local)?;
+    uplink
+        .write_all(&staging)
+        .map_err(|error| Kind::of(&error))?;
+    Ok((send, Recv::Waiting(method, final_psk, salt)))
 }
 
 pub(crate) enum Recv {
@@ -2414,7 +2420,7 @@ mod tests {
         uplink
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
-        let Some((_send, recv)) = client_send_handshake(
+        let Ok((_send, recv)) = client_send_handshake(
             &mut uplink,
             &psk,
             name,
@@ -2542,6 +2548,28 @@ mod tests {
         );
     }
 
+    /// The seal now lands on the socket after the carrier's switch, so a write that fails there is the transport's, not the caller's: it must let the ladder climb instead of holding the rung.
+    #[test]
+    fn a_handshake_write_that_fails_after_the_switch_is_a_transport_kind() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let method = Method::Aes256Gcm;
+        let psk = psk_b64(method.key_len());
+        let target =
+            crate::proxy::Destination::from("127.0.0.1:1".parse::<SocketAddr>().expect("addr"));
+        assert!(matches!(
+            client_send_handshake(&mut Broken, &psk, "2022-blake3-aes-256-gcm", &target),
+            Err(Kind::Dropped)
+        ));
+    }
+
     #[test]
     fn a_client_handshake_leaves_in_one_write() {
         let method = Method::Aes256Gcm;
@@ -2645,7 +2673,7 @@ mod tests {
             uplink
                 .set_read_timeout(Some(Duration::from_secs(30)))
                 .expect("timeout");
-            let Some((mut send, recv)) = client_send_handshake(
+            let Ok((mut send, recv)) = client_send_handshake(
                 &mut uplink,
                 &psk,
                 name,
@@ -3190,7 +3218,7 @@ mod tests {
         uplink
             .set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
-        let Some((mut send, recv)) = client_send_handshake(
+        let Ok((mut send, recv)) = client_send_handshake(
             &mut uplink,
             &password,
             "2022-blake3-aes-256-gcm",

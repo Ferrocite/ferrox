@@ -3,6 +3,7 @@ use std::io::{IoSlice, IoSliceMut, Read, Write};
 use std::net::{Shutdown, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
+use ferrox_core::failure::Kind;
 use ferrox_core::shadowsocks::{
     rc4_md5_key, Cipher, MasterKey, Method, Rc4, LENGTH_LEN, MAX_CHUNK, TAG_LEN,
 };
@@ -309,48 +310,6 @@ pub(crate) fn serve_httpupgrade(
         let _ = closer.shutdown(Shutdown::Both);
     });
     serve_accepted(accepted, reader, writer, close, meter);
-}
-
-/// The carrier's answer held back until a blocking peek finds the first byte of the request packet, so a dial that waits for the `101` before it writes is never answered: only a dial that puts the packet on the wire with the `GET` finishes.
-#[cfg(test)]
-pub(crate) fn serve_httpupgrade_answering_after_the_request(
-    stream: Connection,
-    users: &[SsUser],
-    _path: &str,
-    freedom: bool,
-) {
-    let mut read = stream;
-    let Ok(write) = read.try_clone() else {
-        return;
-    };
-    let mut write = write;
-    if crate::proxy::read_http_head(
-        &mut read,
-        crate::httpupgrade::HEAD_LIMIT,
-        crate::budgets::head_arrival(),
-    )
-    .is_none()
-    {
-        return;
-    }
-    // A blocking peek waits for the first byte of the request packet without taking it, so nothing is answered until the packet has arrived.
-    let mut probe = [0u8; 1];
-    if read.peek(&mut probe).is_err() {
-        return;
-    }
-    if write.write_all(crate::httpupgrade::SWITCH).is_err() {
-        return;
-    }
-    let Some((accepted, meter)) = accept_on(&mut read, &mut write, users, freedom) else {
-        return;
-    };
-    let Ok(closer) = write.try_clone() else {
-        return;
-    };
-    let close: std::sync::Arc<dyn Fn() + Send + Sync> = std::sync::Arc::new(move || {
-        let _ = closer.shutdown(Shutdown::Both);
-    });
-    serve_accepted(accepted, read, write, close, meter);
 }
 
 #[cfg(test)]
@@ -819,35 +778,45 @@ pub(crate) fn client_send_handshake(
     password: &str,
     method: &str,
     target: &Destination,
-) -> Option<(Uplink, Recv)> {
-    let method = Method::parse(method)?;
+) -> Result<(Uplink, Recv), Kind> {
+    let method = Method::parse(method).ok_or(Kind::Local)?;
     let master = MasterKey::new(password, method.key_len());
     if method.is_stream() {
         let mut iv = [0u8; IV_LEN];
-        getrandom::fill(&mut iv).ok()?;
-        uplink.write_all(&iv).ok()?;
-        let key = rc4_md5_key(master.as_bytes(), &iv)?;
-        let mut send = Rc4::new(&key)?;
+        getrandom::fill(&mut iv).map_err(|_| Kind::Local)?;
+        uplink.write_all(&iv).map_err(|error| Kind::of(&error))?;
+        let key = rc4_md5_key(master.as_bytes(), &iv).ok_or(Kind::Local)?;
+        let mut send = Rc4::new(&key).ok_or(Kind::Local)?;
         let mut addr = Vec::with_capacity(2 + target.addr_len());
         target.push_addr(&mut addr, 4, 3);
         addr.extend_from_slice(&target.port().to_be_bytes());
         send.crypt(&mut addr);
-        uplink.write_all(&addr).ok()?;
-        return Some((Uplink::Stream(send), Recv::StreamWaiting(master)));
+        uplink.write_all(&addr).map_err(|error| Kind::of(&error))?;
+        return Ok((Uplink::Stream(send), Recv::StreamWaiting(master)));
     }
     let salt_len = method.key_len();
     let mut salt = [0u8; SALT_LEN];
-    getrandom::fill(&mut salt[..salt_len]).ok()?;
-    uplink.write_all(&salt[..salt_len]).ok()?;
-    let mut send = Uplink::Aead(Cipher::from_master_key(method, &master, &salt[..salt_len])?);
+    getrandom::fill(&mut salt[..salt_len]).map_err(|_| Kind::Local)?;
+    uplink
+        .write_all(&salt[..salt_len])
+        .map_err(|error| Kind::of(&error))?;
+    let mut send = Uplink::Aead(
+        Cipher::from_master_key(method, &master, &salt[..salt_len]).ok_or(Kind::Local)?,
+    );
     let mut addr = Vec::with_capacity(2 + target.addr_len());
     target.push_addr(&mut addr, 4, 3);
     addr.extend_from_slice(&target.port().to_be_bytes());
     let n = addr.len();
     let mut buf = crate::proxy::unfilled(SEAL_HEAD + n + TAG_LEN);
     buf[SEAL_HEAD..SEAL_HEAD + n].copy_from_slice(&addr);
-    seal_all(&mut send, &mut buf, n, uplink).ok()?;
-    Some((send, Recv::Waiting(method, master)))
+    seal_all(&mut send, &mut buf, n, uplink).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::InvalidData {
+            Kind::Local
+        } else {
+            Kind::of(&error)
+        }
+    })?;
+    Ok((send, Recv::Waiting(method, master)))
 }
 
 #[allow(
@@ -2065,7 +2034,7 @@ mod tests {
             uplink
                 .set_read_timeout(Some(std::time::Duration::from_secs(30)))
                 .expect("timeout");
-            let Some((mut send, recv)) = client_send_handshake(
+            let Ok((mut send, recv)) = client_send_handshake(
                 &mut uplink,
                 "an-example-shared-password",
                 name,
@@ -2144,7 +2113,7 @@ mod tests {
                     name,
                     &Destination::from(target)
                 )
-                .is_none(),
+                .is_err(),
                 "{name}: refused"
             );
         }
@@ -2182,7 +2151,7 @@ mod tests {
         uplink
             .set_read_timeout(Some(std::time::Duration::from_secs(30)))
             .expect("timeout");
-        let Some((mut send, recv)) = client_send_handshake(
+        let Ok((mut send, recv)) = client_send_handshake(
             &mut uplink,
             "an-example-shared-password",
             "rc4-md5",
@@ -2239,7 +2208,7 @@ mod tests {
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, mut writer) =
             crate::ws::connect(stream, "127.0.0.1", "/ss-ws", 0, &[], &[], 0).expect("carries");
-        let Some((mut send, recv)) = client_send_handshake(
+        let Ok((mut send, recv)) = client_send_handshake(
             &mut writer,
             "an-example-shared-password",
             "rc4-md5",
@@ -2635,6 +2604,30 @@ mod tests {
         port
     }
 
+    /// The seal now lands on the socket after the carrier's switch, so a write that fails there is the transport's, not the caller's: it must let the ladder climb instead of holding the rung.
+    #[test]
+    fn a_handshake_write_that_fails_after_the_switch_is_a_transport_kind() {
+        struct Broken;
+        impl Write for Broken {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let target = Destination::from("127.0.0.1:1".parse::<SocketAddr>().expect("addr"));
+        assert!(matches!(
+            client_send_handshake(
+                &mut Broken,
+                "an-example-shared-password",
+                "aes-256-gcm",
+                &target
+            ),
+            Err(Kind::Dropped)
+        ));
+    }
+
     #[test]
     #[allow(clippy::too_many_lines)]
     fn carried_transports_relay_an_echo() {
@@ -2660,7 +2653,7 @@ mod tests {
             assert_eq!(back, &b"ping"[..]);
         }
         fn round_trip(reader: &mut dyn Read, writer: &mut dyn Write, target: &Destination) {
-            let Some((send, recv)) = client_send_handshake(writer, PASSWORD, METHOD, target) else {
+            let Ok((send, recv)) = client_send_handshake(writer, PASSWORD, METHOD, target) else {
                 panic!("handshake refused");
             };
             answers(reader, writer, send, recv);
@@ -2684,7 +2677,7 @@ mod tests {
         }
         fn sealed(target: &Destination) -> (Vec<u8>, Uplink, Recv) {
             let mut packet = Vec::new();
-            let Some((send, recv)) = client_send_handshake(&mut packet, PASSWORD, METHOD, target)
+            let Ok((send, recv)) = client_send_handshake(&mut packet, PASSWORD, METHOD, target)
             else {
                 panic!("handshake refused");
             };
@@ -2704,28 +2697,16 @@ mod tests {
         )
         .expect("carries");
         round_trip(&mut reader, &mut writer, &target);
-        // What the dial does on this carrier: the request packet is sealed before the connect, so `ed=0` leaves it whole after the answer and a budget puts it on the wire with the `GET`.
+        // What the dial does on this carrier: the request packet is sealed before the connect, so it leaves whole after the answer.
         let (packet, send, recv) = sealed(&target);
         let (mut reader, mut writer) = crate::httpupgrade::connect(
             tunnel(serve_httpupgrade_without_host, "/ss-upgrade"),
             "127.0.0.1",
             "/ss-upgrade",
-            0,
             &packet,
             &[],
         )
         .expect("carries");
-        answers(&mut reader, &mut writer, send, recv);
-        let (packet, send, recv) = sealed(&target);
-        let (mut reader, mut writer) = crate::httpupgrade::connect(
-            tunnel(serve_httpupgrade_without_host, "/ss-upgrade"),
-            "127.0.0.1",
-            "/ss-upgrade",
-            64,
-            &packet,
-            &[],
-        )
-        .expect("rides ahead of the answer");
         answers(&mut reader, &mut writer, send, recv);
         let (mut reader, mut writer) = crate::grpc::connect(
             tunnel(serve_grpc, "/TunnelService/Tun"),

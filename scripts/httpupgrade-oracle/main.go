@@ -167,7 +167,7 @@ func emitCases(w io.Writer) {
 	// refuses, with the budget that decides whether the payload rides.
 	client(w, "ok-1", 0, "/tunnel", "oracle.example", "AQIDBAUGBwgJCgsMDQ4PEC==", 0, "r",
 		`HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n`)
-	client(w, "ok-ride-1", 2048, "/tunnel", "oracle.example", "AQIDBAUGBwgJCgsMDQ4PEC==", 8, "r",
+	client(w, "ok-ride-1", 2048, "/tunnel", "oracle.example", "AQIDBAUGBwgJCgsMDQ4PEC==", 8, "o+r",
 		`HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n`)
 	client(w, "hold-1", 0, "/tunnel", "oracle.example", "AQIDBAUGBwgJCgsMDQ4PEC==", 8, "r",
 		`HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n`)

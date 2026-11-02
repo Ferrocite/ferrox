@@ -316,18 +316,11 @@ thread_local! {
     static REQUEST: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
-/// `Ed` is a flag, not a length: any non-zero budget rides, whatever the payload's size, and only `ed=0` holds it back.
-fn rides(budget: u32, first: &[u8]) -> bool {
-    budget != 0 && !first.is_empty()
-}
-
-// One call when the payload rides ahead of the `101` — what `?ed` buys — so the socket packs request and payload into one `writev` and the session coalesces them into one record, where a write per part left two of each; and the request staged in the thread's own buffer, because `66 + host + path` is a shape a dialling thread repeats, so the allocator is entered on the first dial and never again.
-fn send_request<W: crate::proxy::FrameWrite>(
+// The request staged in the thread's own buffer, because `66 + host + path` is a shape a dialling thread repeats, so the allocator is entered on the first dial and never again.
+fn send_request<W: Write>(
     write: &mut W,
     host: &str,
     path: &str,
-    early: bool,
-    first: &[u8],
     headers: &[(String, String)],
 ) -> Option<()> {
     const BEFORE_PATH: &str = "GET ";
@@ -352,11 +345,7 @@ fn send_request<W: crate::proxy::FrameWrite>(
         }
         crate::headers::write_masked(&mut request, headers, crate::headers::WS);
         request.extend_from_slice(AFTER_HEADERS.as_bytes());
-        let bytes = request.as_slice();
-        if early {
-            return write.write_slices(&[bytes, first]).then_some(());
-        }
-        write.write_all(bytes).ok()
+        write.write_all(request.as_slice()).ok()
     })
 }
 
@@ -364,20 +353,18 @@ pub(crate) fn connect(
     stream: Connection,
     host: &str,
     path: &str,
-    budget: u32,
     first: &[u8],
     headers: &[(String, String)],
 ) -> Option<(UpReader, Connection)> {
     let mut read = stream;
-    let early = rides(budget, first);
-    send_request(&mut read, host, path, early, first, headers)?;
+    send_request(&mut read, host, path, headers)?;
     let (head, at) = read_head(&mut read)?;
     check_response(&head[..at])?;
     let Ok(write) = read.try_clone() else {
         return None;
     };
     let mut write = write;
-    if !early && !first.is_empty() {
+    if !first.is_empty() {
         write.write_all(first).ok()?;
     }
     Some((
@@ -424,20 +411,18 @@ fn check_response(head: &[u8]) -> Option<()> {
 }
 
 // The same connect over halves that cannot peek: the kept read takes what rode in behind the `101`.
-pub(crate) fn connect_split<R: Read, W: crate::proxy::FrameWrite>(
+pub(crate) fn connect_split<R: Read, W: Write>(
     mut read: R,
     mut write: W,
     host: &str,
     path: &str,
-    budget: u32,
     first: &[u8],
     headers: &[(String, String)],
 ) -> Option<(UpReader<R>, W)> {
-    let early = rides(budget, first);
-    send_request(&mut write, host, path, early, first, headers)?;
+    send_request(&mut write, host, path, headers)?;
     let (head, at) = read_upgrade_head(&mut read, HEAD_LIMIT)?;
     check_response(&head[..at])?;
-    if !early && !first.is_empty() {
+    if !first.is_empty() {
         write.write_all(first).ok()?;
     }
     Some((
@@ -471,7 +456,7 @@ mod tests {
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, mut write) =
-            connect(stream, "oracle.example", "/tunnel", 0, &[], &[]).expect("upgrades");
+            connect(stream, "oracle.example", "/tunnel", &[], &[]).expect("upgrades");
         write.write_all(b"ping").expect("writes");
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).expect("reads");
@@ -498,7 +483,7 @@ mod tests {
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let headers = vec![("X-Custom".to_owned(), "1".to_owned())];
-        connect(stream, "oracle.example", "/tunnel", 0, &[], &headers).expect("upgrades");
+        connect(stream, "oracle.example", "/tunnel", &[], &headers).expect("upgrades");
         server.join().expect("joins");
     }
 
@@ -873,8 +858,7 @@ mod tests {
                 .expect("answers with a bare line feed");
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
-        connect(stream, "oracle.example", "/tunnel", 0, &[], &[])
-            .expect("reads the bare-LF answer");
+        connect(stream, "oracle.example", "/tunnel", &[], &[]).expect("reads the bare-LF answer");
         server.join().expect("joins");
     }
 
@@ -889,7 +873,6 @@ mod tests {
             Recorder::default(),
             "oracle.example",
             "/tunnel",
-            0,
             &[],
             &[],
         )
@@ -907,7 +890,6 @@ mod tests {
             Recorder::default(),
             "oracle.example",
             "/tunnel",
-            0,
             &[],
             &[],
         )
@@ -947,31 +929,31 @@ mod tests {
         assert_eq!(reader.reads, 3, "one read per 512-octet window");
     }
 
-    /// A payload that fits the budget rides with the GET, so the server has it before the reader is even built and the caller sends nothing after.
+    /// The payload follows the switch in its own write: the request is what the server reads, and the caller's bytes arrive after the `101` it answers.
     #[test]
-    fn early_data_rides_ahead_of_the_switch() {
+    fn a_payload_follows_the_switch_then_reaches_the_target() {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
             let (stream, _) = listener.accept().expect("accepts");
             let (mut reader, mut write) = accept(stream, "/tunnel", "").expect("upgrades");
             let mut buf = [0u8; 4];
-            reader.read_exact(&mut buf).expect("reads early data");
+            reader.read_exact(&mut buf).expect("reads the payload");
             assert_eq!(&buf, b"ping");
             write.write_all(b"pong").expect("writes");
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let (mut reader, _write) =
-            connect(stream, "oracle.example", "/tunnel", 4, b"ping", &[]).expect("upgrades");
+            connect(stream, "oracle.example", "/tunnel", b"ping", &[]).expect("upgrades");
         let mut buf = [0u8; 4];
         reader.read_exact(&mut buf).expect("reads");
         assert_eq!(&buf, b"pong");
         server.join().expect("joins");
     }
 
-    /// The round trip the flag rule deletes, witnessed on a socket: this server answers only once it has read the payload, so a dial that waited for the `101` first stalls until `head_arrival()` and returns no upgrade.
+    /// xray's upgrade reader keeps only the head: whatever rides behind the request is read into its buffer and dropped, so a payload sent before the `101` never reaches the target. This server models that — it answers only after proving nothing rode behind the request.
     #[test]
-    fn an_over_budget_payload_rides_ahead_of_a_lazy_answer() {
+    fn a_payload_waits_for_a_switch_that_dropped_what_rode_behind_it() {
         let request = expected_request("oracle.example", "/tunnel");
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
@@ -980,47 +962,44 @@ mod tests {
             let mut head = vec![0u8; request.len()];
             stream.read_exact(&mut head).expect("reads the request");
             assert_eq!(head, request.as_bytes());
-            let mut payload = [0u8; 4];
             stream
-                .read_exact(&mut payload)
-                .expect("reads the payload before answering");
-            assert_eq!(&payload, b"ping");
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .expect("timeout");
+            let mut rode = [0u8; 1];
+            assert!(
+                stream.read(&mut rode).is_err(),
+                "the payload rode behind the request and would have been dropped"
+            );
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
             stream.write_all(SWITCH).expect("answers");
+            let mut payload = [0u8; 4];
+            stream.read_exact(&mut payload).expect("reads the payload");
+            assert_eq!(&payload, b"ping");
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
-        // `budget` is one short of the payload, so the old length rule held it back; the flag rides it.
         let (_reader, _write) =
-            connect(stream, "oracle.example", "/tunnel", 3, b"ping", &[]).expect("rides ahead");
+            connect(stream, "oracle.example", "/tunnel", b"ping", &[]).expect("upgrades");
         server.join().expect("joins");
     }
 
-    /// Counts calls and part pointers as well as bytes, so "one write" is observed rather than inferred: a `Vec` sink cannot tell one `write_slices` call from two `write_all`s.
+    /// Remembers each plain write and every read against it, so both "the payload is its own write" and the order it leaves in are observed rather than inferred.
     #[derive(Default)]
     struct Recorder {
-        calls: Vec<Vec<(usize, Vec<u8>)>>,
         plain: Vec<Vec<u8>>,
+        events: Vec<u8>,
     }
 
     impl Write for Recorder {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.events.push(1);
             self.plain.push(buf.to_vec());
             Ok(buf.len())
         }
 
         fn flush(&mut self) -> std::io::Result<()> {
             Ok(())
-        }
-    }
-
-    impl crate::proxy::FrameWrite for Recorder {
-        fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
-            self.calls.push(
-                parts
-                    .iter()
-                    .map(|part| (part.as_ptr() as usize, part.to_vec()))
-                    .collect(),
-            );
-            true
         }
     }
 
@@ -1055,92 +1034,39 @@ mod tests {
         );
     }
 
-    /// The early payload rides as the request's second write part: one call, which the socket packs into one `writev` and the session coalesces into one record, and the part is the caller's own buffer.
+    /// The payload leaves after the request in its own write, never vectored behind it: xray's upgrade reader drops anything that rode in the request's record.
     #[test]
-    fn the_early_data_rides_in_one_write_with_the_request() {
+    fn the_payload_leaves_after_the_request_in_its_own_write() {
         let first = *b"ping";
         let (_reader, write) = connect_split(
             std::io::Cursor::new(SWITCH.to_vec()),
             Recorder::default(),
             "oracle.example",
             "/tunnel",
-            4,
             &first,
             &[],
         )
         .expect("upgrades");
-        assert_eq!(
-            write.calls.len(),
-            1,
-            "request and payload left in {} calls",
-            write.calls.len()
-        );
-        assert!(write.plain.is_empty(), "the request went out plain");
-        let parts = &write.calls[0];
-        assert_eq!(parts.len(), 2, "the request and the payload");
-        assert_eq!(
-            parts[0].1,
-            expected_request("oracle.example", "/tunnel").as_bytes()
-        );
-        assert_eq!(parts[1].1, b"ping");
-        assert_eq!(
-            parts[0].0,
-            REQUEST.with(|cell| cell.borrow().as_ptr() as usize),
-            "the staged request was copied into the write instead of handed over"
-        );
-        assert_eq!(
-            parts[1].0,
-            first.as_ptr() as usize,
-            "the payload was copied instead of handed over by pointer"
-        );
-    }
-
-    /// `ed=0` is the one hold: the request leaves alone, in its own write, and the payload follows in a second one; nothing is vectored.
-    #[test]
-    fn ed_zero_holds_the_payload_behind_in_one_write_each() {
-        let first = *b"ping";
-        let (_reader, write) = connect_split(
-            std::io::Cursor::new(SWITCH.to_vec()),
-            Recorder::default(),
-            "oracle.example",
-            "/tunnel",
-            0,
-            &first,
-            &[],
-        )
-        .expect("upgrades");
-        assert!(write.calls.is_empty(), "a held-back payload was vectored");
         assert_eq!(write.plain.len(), 2, "the request and then the payload");
         assert_eq!(
             write.plain[0],
             expected_request("oracle.example", "/tunnel").as_bytes()
         );
         assert_eq!(write.plain[1], b"ping");
-    }
-
-    #[test]
-    fn an_early_data_budget_leaves_the_request_unchanged() {
-        for budget in [0u32, 1, 2048, 4_294_967_295] {
-            let configured =
-                ferrox_core::transport::EarlyData::split(&format!("/interop-upgrade?ed={budget}"));
-            assert_eq!(configured.budget, budget);
-            // No payload to ride, so every budget leaves the same single write.
-            let (_reader, write) = connect_split(
-                std::io::Cursor::new(SWITCH.to_vec()),
-                Recorder::default(),
-                "oracle.example",
-                &configured.path,
-                budget,
-                b"",
-                &[],
-            )
-            .expect("upgrades");
-            assert_eq!(
-                write.plain,
-                [expected_request("oracle.example", "/interop-upgrade").into_bytes()],
-                "{budget}"
-            );
-        }
+        let (_reader, write) = connect_split(
+            std::io::Cursor::new(SWITCH.to_vec()),
+            Recorder::default(),
+            "oracle.example",
+            "/tunnel",
+            &[],
+            &[],
+        )
+        .expect("upgrades");
+        assert_eq!(
+            write.plain.len(),
+            1,
+            "a dial without a payload writes the request alone"
+        );
     }
 
     /// Steady traffic on one dialling thread: the five pieces push into the thread's own buffer and the write drains it, round after round. `format!` entered the allocator on every dial and grew again past 66 bytes of host plus path; here the first dial's allocation is the last, so the buffer's identity and capacity hold for all the rest.
@@ -1159,7 +1085,7 @@ mod tests {
         for round in 0..dials.len() * 3 {
             let (host, path) = dials[round % dials.len()];
             let mut write = Recorder::default();
-            send_request(&mut write, host, path, false, b"", &[]).expect("sends");
+            send_request(&mut write, host, path, &[]).expect("sends");
             assert_eq!(write.plain.len(), 1, "round {round}: one write");
             assert_eq!(
                 write.plain[0],
@@ -1194,7 +1120,7 @@ mod tests {
     }
 
     #[test]
-    fn a_configured_budget_serves_the_bare_path() {
+    fn a_stripped_path_answers_the_upgrade() {
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
         let server = thread::spawn(move || {
@@ -1209,15 +1135,8 @@ mod tests {
         });
         let stream = Connection::connect(("127.0.0.1", port)).expect("connects");
         let configured = ferrox_core::transport::EarlyData::split("/interop-upgrade?ed=2048");
-        let (_reader, _write) = connect(
-            stream,
-            "oracle.example",
-            &configured.path,
-            configured.budget,
-            b"first",
-            &[],
-        )
-        .expect("upgrades");
+        let (_reader, _write) =
+            connect(stream, "oracle.example", &configured.path, b"first", &[]).expect("upgrades");
         server.join().expect("joins");
     }
 
@@ -1342,7 +1261,6 @@ mod tests {
             path: String,
             host: String,
             key: String,
-            budget: u32,
             size: usize,
             pad: usize,
             tail: String,
@@ -1365,7 +1283,6 @@ mod tests {
                     path: String::new(),
                     host: String::new(),
                     key: String::new(),
-                    budget: 0,
                     size: 0,
                 }
             }
@@ -1383,17 +1300,17 @@ mod tests {
                     pad: 0,
                     end: String::new(),
                     key: String::new(),
-                    budget: 0,
                     size: 0,
                 }
             }
 
-            /// `client <label> <ed> <path> <host> <key> <payload> <expect> <answer>`
+            /// `client <label> <ed> <path> <host> <key> <payload> <expect> <answer>`, where the `ed` token is ignored: this dial never rides.
             fn client(rest: &str) -> Self {
                 let mut parts = rest.splitn(8, ' ');
+                let label = parts.next().expect("a label").to_owned();
+                let _ed = parts.next().expect("an ed token");
                 Case {
-                    label: parts.next().expect("a label").to_owned(),
-                    budget: parts.next().expect("a budget").parse().expect("a budget"),
+                    label,
                     path: parts.next().expect("a path").to_owned(),
                     host: parts.next().expect("a host").to_owned(),
                     key: parts.next().expect("a key").to_owned(),
@@ -1574,11 +1491,9 @@ mod tests {
 
         impl Write for Shared {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .expect("the recorder is not poisoned")
-                    .plain
-                    .push(buf.to_vec());
+                let mut recorder = self.0.lock().expect("the recorder is not poisoned");
+                recorder.events.push(1);
+                recorder.plain.push(buf.to_vec());
                 Ok(buf.len())
             }
 
@@ -1587,19 +1502,21 @@ mod tests {
             }
         }
 
-        impl crate::proxy::FrameWrite for Shared {
-            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
-                self.0
+        /// Puts the answer's own reads in the recorder's event log, so the order the payload left in is measured against them.
+        struct Watched<R> {
+            inner: R,
+            recorder: Shared,
+        }
+
+        impl<R: Read> Read for Watched<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.recorder
+                    .0
                     .lock()
                     .expect("the recorder is not poisoned")
-                    .calls
-                    .push(
-                        parts
-                            .iter()
-                            .map(|part| (part.as_ptr() as usize, part.to_vec()))
-                            .collect(),
-                    );
-                true
+                    .events
+                    .push(0);
+                self.inner.read(buf)
             }
         }
 
@@ -1728,19 +1645,21 @@ mod tests {
             request_lines: usize,
         }
 
-        /// One dialled case: the verdict on the answer, the order the early data
-        /// rides in, the bytes of that payload, and the request the reference wrote.
+        /// One dialled case: the verdict on the answer, the order the payload leaves
+        /// in, the bytes of that payload, and the request the reference wrote.
         fn client_case(case: &Case, fields: &[String]) -> Dialled {
             let label = &case.label;
             let answer = unescape(&case.text);
             let payload: Vec<u8> = (0..case.size).map(|at| 0xa0 + at as u8).collect();
             let recorder = Shared::default();
             let outcome = connect_split(
-                std::io::Cursor::new(answer),
+                Watched {
+                    inner: std::io::Cursor::new(answer),
+                    recorder: recorder.clone(),
+                },
                 recorder.clone(),
                 &case.host,
                 &case.path,
-                case.budget,
                 &payload,
                 &[],
             );
@@ -1759,8 +1678,19 @@ mod tests {
                 );
                 measured.verdict_differs = 1;
             }
-            // The order: a payload that rides went out with the request, one held back after the answer.
-            let tree_order = if write.calls.is_empty() { "A" } else { "P" };
+            // The order: the payload's own write against the first read of the answer.
+            let first_read = write.events.iter().position(|&event| event == 0);
+            let payload_write = write
+                .events
+                .iter()
+                .enumerate()
+                .filter(|(_, &event)| event == 1)
+                .nth(1)
+                .map(|(at, _)| at);
+            let tree_order = match (first_read, payload_write) {
+                (Some(read), Some(written)) if written < read => "P",
+                _ => "A",
+            };
             if fields[1] != tree_order {
                 assert!(
                     case.expect.contains(&Divergence::Order),
@@ -1768,22 +1698,11 @@ mod tests {
                 );
                 measured.order_differs = 1;
             }
-            let tree_payload = if write.calls.is_empty() {
-                write.plain.get(1).cloned().unwrap_or_default()
-            } else {
-                write.calls[0]
-                    .get(1)
-                    .map(|(_, part)| part.clone())
-                    .unwrap_or_default()
-            };
+            let tree_payload = write.plain.get(1).cloned().unwrap_or_default();
             if hex(&tree_payload) != fields[2] {
                 measured.payload_differs = 1;
             }
-            let request = if write.calls.is_empty() {
-                write.plain.first().cloned().unwrap_or_default()
-            } else {
-                write.calls[0][0].1.clone()
-            };
+            let request = write.plain.first().cloned().unwrap_or_default();
             let reference = unhex(&fields[3]);
             if case.expect.contains(&Divergence::Request) {
                 let mut rest = Vec::new();
@@ -1927,7 +1846,7 @@ mod tests {
             assert_eq!(dropped, 2, "the tails the reference dropped");
         }
 
-        /// The dialled sweep: the verdict on the answer, the order the early data rides
+        /// The dialled sweep: the verdict on the answer, the order the payload leaves
         /// in, the bytes of that payload, and the request the reference wrote.
         #[test]
         fn the_dialled_sweep_agrees_with_the_reference_on_every_answer() {
@@ -1958,7 +1877,10 @@ mod tests {
                 verdicts_differing, 2,
                 "the verdicts the two sides give differently"
             );
-            assert_eq!(orders_differing, 0, "the orders that differ");
+            assert_eq!(
+                orders_differing, 1,
+                "the one reference ride this dial no longer takes"
+            );
             assert_eq!(payloads_differing, 0, "the payloads that differ");
             assert_eq!(request_lines, 3, "the request lines the reference adds");
         }
