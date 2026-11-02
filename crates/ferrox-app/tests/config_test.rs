@@ -176,6 +176,10 @@ fn test_refuses_a_reality_seed_that_names_the_private_key() {
         stderr.contains(r#""mldsa65Seed" and "privateKey" can not be the same value"#),
         "the refusal carries the reference's spelling: {stderr}"
     );
+    assert!(
+        !stderr.contains("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+        "the refusal does not echo the private key: {stderr}"
+    );
     let _ = std::fs::remove_file(&path);
 }
 

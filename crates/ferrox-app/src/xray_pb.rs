@@ -5601,6 +5601,36 @@ mod tests {
     }
 
     #[test]
+    fn a_client_reality_config_refuses_the_servers_mldsa_seed() {
+        let reality = message(&[bytes_field(11, &[0x9f; 32]), bytes_field(24, &[])]);
+        let type_name = "xray.transport.internet.reality.Config";
+        let endpoint = message(&[
+            bytes_field(1, &bytes_field(1, &[127, 0, 0, 1])),
+            varint_field(2, 443),
+            bytes_field(3, &vless_user(&vless_account(b"a", None, Some(b"none")))),
+        ]);
+        let outbound = message(&[
+            bytes_field(
+                2,
+                &typed(
+                    "xray.app.proxyman.SenderConfig",
+                    &bytes_field(2, &tcp_stream(type_name, &reality)),
+                ),
+            ),
+            bytes_field(
+                3,
+                &typed(
+                    "xray.proxy.vless.outbound.Config",
+                    &bytes_field(1, &endpoint),
+                ),
+            ),
+        ]);
+        let error = to_json(&config(&dokodemo(5000, &[varint_field(7, 2)]), &outbound))
+            .expect_err("a client reality config names no server seed");
+        assert!(error.contains("mldsa65Seed"), "{error}");
+    }
+
+    #[test]
     fn a_named_security_without_settings_is_the_zero_value() {
         let mut receiver = receiver(5000, None);
         receiver.extend(bytes_field(

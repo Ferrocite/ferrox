@@ -2830,14 +2830,28 @@ mod tests {
         );
         assert_eq!(
             reality_mldsa(&server(&format!(r#","mldsa65Seed":"{private}""#)), true),
-            Err(format!(
-                r#""mldsa65Seed" and "privateKey" can not be the same value: {private}"#
-            ))
+            Err(r#""mldsa65Seed" and "privateKey" can not be the same value"#.to_owned())
+        );
+        // A CR/LF-wrapped spelling decodes to the same 32 bytes, so the alias check compares bytes.
+        assert_eq!(
+            reality_mldsa(
+                &server(&format!(
+                    r#","mldsa65Seed":"{}\r\n{}""#,
+                    &private[..21],
+                    &private[21..]
+                )),
+                true
+            ),
+            Err(r#""mldsa65Seed" and "privateKey" can not be the same value"#.to_owned())
+        );
+        assert_eq!(
+            reality_mldsa(&server(r#","mldsa65Seed":7"#), true),
+            Err(r#""mldsa65Seed" is not a string"#.to_owned())
         );
         let short = "A".repeat(42);
         assert_eq!(
             reality_mldsa(&server(&format!(r#","mldsa65Seed":"{short}""#)), true),
-            Err(format!(r#"invalid "mldsa65Seed": {short}"#))
+            Err(r#"invalid "mldsa65Seed": it does not decode to 32 bytes"#.to_owned())
         );
         let verify = "A".repeat(2603);
         assert_eq!(
@@ -2846,7 +2860,7 @@ mod tests {
         );
         assert_eq!(
             reality_mldsa(&client(&format!(r#","mldsa65Verify":"{seed}""#)), false),
-            Err(format!(r#"invalid "mldsa65Verify": {seed}"#))
+            Err(r#"invalid "mldsa65Verify": it does not decode to 1952 bytes"#.to_owned())
         );
         let tls = crate::json::parse(
             r#"{"streamSettings":{"security":"tls","tlsSettings":{"mldsa65Seed":"x"}}}"#,
