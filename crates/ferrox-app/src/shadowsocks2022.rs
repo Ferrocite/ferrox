@@ -2476,8 +2476,8 @@ mod tests {
             let server_salt = vec![0x55u8; key_len];
             let send = Cipher::from_psk(method, &psk, &server_salt).expect("derives");
             let mut response = Response::new(send, server_salt.clone(), request_salt);
-            let mut buf = [0u8; SEAL_HEAD + 4];
-            buf[SEAL_HEAD..].copy_from_slice(b"data");
+            let mut buf = [0u8; SEAL_HEAD + 4 + TAG_LEN];
+            buf[SEAL_HEAD..SEAL_HEAD + 4].copy_from_slice(b"data");
             let mut out = Framed(Vec::new());
             response.seal_first(&mut buf, 4, &mut out).expect("seals");
             let head_len = key_len + 11 + key_len + TAG_LEN;
