@@ -4619,10 +4619,8 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_live_vmess_session_costs_no_thread() {
-        fn threads() -> usize {
-            std::fs::read_dir("/proc/self/task")
-                .expect("reads the task table")
-                .count()
+        if !crate::conn::in_a_quiet_process("vmess::tests::a_live_vmess_session_costs_no_thread") {
+            return;
         }
         let key = [0x91u8; 16];
         let iv = [0x92u8; 16];
@@ -4641,7 +4639,7 @@ mod tests {
             drop(client);
             flow.wait();
         }
-        let before = threads();
+        let before = crate::conn::live_threads();
         let mut held = Vec::new();
         for _ in 0..8 {
             let (plain, peer) = socket_pair();
@@ -4653,7 +4651,7 @@ mod tests {
                 .expect("clones the plain socket");
             held.push((flow, peer, client));
         }
-        let after = threads();
+        let after = crate::conn::live_threads();
         assert!(
             after - before < 8,
             "eight live sessions added {} threads",

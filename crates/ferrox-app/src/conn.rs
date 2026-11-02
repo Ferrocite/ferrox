@@ -1301,6 +1301,41 @@ pub(crate) fn test_bind(addr: impl std::net::ToSocketAddrs) -> io::Result<Listen
     std::net::TcpListener::bind(addr).map(Listener::Tcp)
 }
 
+/// A census or a budget the suite arms is process-wide state a parallel test can move under a
+/// reader: run the test in a child that carries only it, so the number is the test's.
+#[cfg(test)]
+pub(crate) fn in_a_quiet_process(name: &str) -> bool {
+    if std::env::var_os("FERROX_QUIET_PROCESS").is_some() {
+        return true;
+    }
+    let exe = std::env::current_exe().expect("the test binary");
+    let output = std::process::Command::new(exe)
+        .args(["--exact", name, "--test-threads=1", "--nocapture"])
+        .env("FERROX_QUIET_PROCESS", "1")
+        .output()
+        .expect("re-runs the test in a quiet process");
+    let ran = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "{name} failed in its quiet process:\n{}\n{}",
+        ran,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        ran.contains("1 passed"),
+        "{name} ran no test in its quiet process, so the name is wrong and the gate is a no-op:\n{ran}"
+    );
+    false
+}
+
+/// The tasks `/proc/self/task` lists, for a caller already inside a quiet process.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn live_threads() -> usize {
+    std::fs::read_dir("/proc/self/task")
+        .expect("reads the task table")
+        .count()
+}
+
 #[cfg(test)]
 impl Listener {
     /// The single accept a fixture that dials one client needs; the std `accept` shape, mapped
