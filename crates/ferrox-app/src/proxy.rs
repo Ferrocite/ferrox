@@ -59358,6 +59358,34 @@ end
         );
     }
 
+    /// A fallback name derived from an inbound's tag must not collide with a configured user's
+    /// email: two accounts sharing a name would share one meter and one access-log identity.
+    #[test]
+    fn a_2022_fallback_identity_does_not_collide_with_a_configured_user() {
+        use base64::Engine as _;
+        let key = |b: u8| base64::engine::general_purpose::STANDARD.encode(vec![b; 32]);
+        let password = format!("{}:{}:{}", key(1), key(2), key(3));
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol": "shadowsocks", "tag": "alice@example", "settings": {{"method": "2022-blake3-aes-256-gcm", "password": "{password}", "users": [
+                {{"email": "alice@example", "level": 2}}]}}}}"#
+        ))
+        .expect("parses");
+        let accounts = ss_accounts(
+            &inbound,
+            "127.0.0.1:0",
+            password.clone(),
+            "2022-blake3-aes-256-gcm".to_owned(),
+        );
+        assert_eq!(
+            accounts.identities.as_slice(),
+            &[
+                ("alice@example".to_owned(), 2u32),
+                ("alice@example#1".to_owned(), 0u32)
+            ],
+            "the unnamed PSK needs a name of its own, not the configured user's"
+        );
+    }
+
     /// A 2022 single-password inbound names no users array, so its identities list stays empty and the flow reads the inbound's own default.
     #[test]
     fn a_2022_single_password_inbound_carries_no_per_user_identity() {
