@@ -1849,6 +1849,7 @@ pub(crate) fn serve_h2_service_until<
 
 /// The same demux as a lane step: a quiet socket costs a parked readiness slot, not a thread for the
 /// connection's life. The caller submits it and carries its own per-thread context into each step.
+#[allow(dead_code)]
 pub(crate) fn h2_lane<
     R: Read + Send + 'static,
     W: crate::proxy::FrameWrite + Send + 'static,
