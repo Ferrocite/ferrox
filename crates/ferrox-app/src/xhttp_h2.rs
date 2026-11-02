@@ -258,10 +258,13 @@ impl Read for H2StreamReader {
                 self.conn.forget_upload(self.id);
                 return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
             }
-            let grain = if self.poll {
-                crate::budgets::RELAY_POLL
-            } else {
+            let grain = if !self.poll {
                 crate::budgets::relay_stall()
+            } else if crate::proxy::relay_step_owns_poll() {
+                drop(st);
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            } else {
+                crate::budgets::RELAY_POLL
             };
             let (next, wait) = self
                 .stream
