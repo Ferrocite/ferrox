@@ -641,7 +641,7 @@ impl Api {
         let target = request_str(request, 2).unwrap_or_default();
         self.runtime()?
             .override_balancer(&tag, &target)
-            .map_err(|reason| (2, reason.to_owned()))?;
+            .map_err(|reason| (2, reason))?;
         Ok(Vec::new())
     }
 
@@ -2053,6 +2053,26 @@ mod tests {
         }
     }"#;
 
+    const SERVER_ROUTED: &str = r#"{
+        "inbounds": [
+            {"tag": "server", "protocol": "vless", "port": 443,
+             "settings": {"clients": [{"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"}]}}
+        ],
+        "outbounds": [
+            {"tag": "direct", "protocol": "freedom"},
+            {"tag": "edge-a", "protocol": "freedom"},
+            {"tag": "edge-b", "protocol": "freedom"},
+            {"tag": "blocked", "protocol": "blackhole"}
+        ],
+        "routing": {
+            "rules": [
+                {"type": "field", "ruleTag": "pool", "network": "tcp", "balancerTag": "pool"}
+            ],
+            "balancers": [{"tag": "pool", "selector": ["edge-"],
+                           "strategy": {"type": "random", "settings": {}}}]
+        }
+    }"#;
+
     fn routing_api(root: &crate::json::Json) -> Arc<Api> {
         let api = Api::new(ApiConfig {
             tag: "api".to_owned(),
@@ -2625,6 +2645,42 @@ mod tests {
         assert_eq!(
             api.dispatch(&format!("{path}/OverrideBalancerTarget"), &unknown),
             Err((2, "cannot find tag".to_owned()))
+        );
+    }
+
+    #[test]
+    fn overriding_a_server_balancer_to_a_non_direct_target_is_refused_and_reverted() {
+        let root = crate::json::parse(SERVER_ROUTED).expect("parses");
+        let api = routing_api(&root);
+        let path = "/xray.app.router.command.RoutingService";
+        let force = |target: &str| {
+            let mut request = Vec::new();
+            field_str(&mut request, 1, "pool");
+            field_str(&mut request, 2, target);
+            request
+        };
+        assert_eq!(
+            api.dispatch(&format!("{path}/OverrideBalancerTarget"), &force("edge-b")),
+            Ok(Vec::new()),
+            "a direct target a server inbound can reach is still allowed"
+        );
+        let refusal = api
+            .dispatch(&format!("{path}/OverrideBalancerTarget"), &force("blocked"))
+            .expect_err("a non-direct target on a server route is refused");
+        assert_eq!(refusal.0, 2);
+        assert!(refusal.1.contains("pool"), "{}", refusal.1);
+
+        let mut request = Vec::new();
+        field_str(&mut request, 1, "pool");
+        let answer = api
+            .dispatch(&format!("{path}/GetBalancerInfo"), &request)
+            .expect("answers");
+        let override_info =
+            request_bytes(request_bytes(&answer, 1).expect("balancer"), 5).expect("override info");
+        assert_eq!(
+            request_str(override_info, 2).as_deref(),
+            Some("edge-b"),
+            "the refused target is reverted to the previous one"
         );
     }
 

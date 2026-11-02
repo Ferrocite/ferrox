@@ -1206,15 +1206,17 @@ impl Routing {
             }
             rules.push(rule);
         }
+        let forced = |tag: &str| self.forced_tag(tag);
         for proof in proofs {
             if append {
                 Self::server_routes_over(
                     self.script.is_some(),
                     self.rules.iter().chain(rules.iter()),
                     proof,
+                    &forced,
                 )?;
             } else {
-                Self::server_routes_over(self.script.is_some(), rules.iter(), proof)?;
+                Self::server_routes_over(self.script.is_some(), rules.iter(), proof, &forced)?;
             }
         }
         if append {
@@ -1477,13 +1479,21 @@ impl Routing {
     /// Proves a server inbound's fixed direct dial is what the rules would pick anyway. A rule that
     /// could match and points elsewhere refuses the start, because this tree serves that inbound direct.
     pub(crate) fn server_routes(&self, proof: &ServerProof<'_>) -> Result<(), String> {
-        Self::server_routes_over(self.script.is_some(), self.rules.iter(), proof)
+        let forced = |tag: &str| self.forced_tag(tag);
+        Self::server_routes_over(self.script.is_some(), self.rules.iter(), proof, &forced)
+    }
+
+    /// The tag `OverrideBalancerTarget` forced on a balancer, when one is active.
+    fn forced_tag(&self, tag: &str) -> Option<String> {
+        let forced = self.balancer(tag)?.forced();
+        (!forced.is_empty()).then_some(forced)
     }
 
     fn server_routes_over<'r>(
         script: bool,
         rules: impl Iterator<Item = &'r Rule>,
         proof: &ServerProof<'_>,
+        forced: &dyn Fn(&str) -> Option<String>,
     ) -> Result<(), String> {
         let ServerProof {
             inbound,
@@ -1516,7 +1526,7 @@ impl Routing {
                         .map(String::as_str)
                         .chain(fallbacks.get(&rule.target).map(String::as_str))
                         .all(direct)
-                })
+                }) && forced(&rule.target).is_none_or(|tag| direct(&tag))
             } else {
                 direct(&rule.target)
             };
