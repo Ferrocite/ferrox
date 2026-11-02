@@ -448,7 +448,7 @@ done
 ((${#servers[@]})) || fail "no server engine: the grid needs ferrox or xray-core"
 echo "servers: ${servers[*]}" >>"$out/commands.sh"
 
-while read -r id traffic connections iterations payload; do
+while read -r id traffic connections iterations payload duration_ms; do
   [[ -n "$id" ]] || continue
   if ! scenario_kept "$id"; then
     echo "# $id: skipped by --only/--exclude" >>"$out/commands.sh"
@@ -586,6 +586,8 @@ while read -r id traffic connections iterations payload; do
     if RUST_BACKTRACE=full "$bench_bin" "${engine_args[@]}" \
       --traffic "$traffic" --connections "$connections" \
       --iterations "$iterations" --payload-size "$payload" \
+      --duration-ms "${duration_ms:-0}" \
+      --tcp-latency-iterations "$iterations" \
       --repeats "$repeats" \
       --server-pid "$server_pid" \
       --keep-going \

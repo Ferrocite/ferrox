@@ -282,6 +282,17 @@ def convert(document):
         outbound["server_port"] = server["port"]
         outbound["method"] = server["method"]
         outbound["password"] = server["password"]
+    elif protocol in ("socks", "http"):
+        server = _first(settings.get("servers"), "`servers`")
+        outbound["server"] = server["address"]
+        outbound["server_port"] = server["port"]
+        if protocol == "socks":
+            outbound["version"] = "5"
+        users = server.get("users")
+        if users:
+            user = _first(users, "`servers[0].users`")
+            outbound["username"] = user.get("user", "")
+            outbound["password"] = user.get("pass", "")
     elif protocol == "hysteria":
         if settings.get("version") != 1:
             raise ValueError("sing-box at this pin carries only Hysteria v1 here")

@@ -88,115 +88,209 @@ The coverage holes with no number — a client that cannot use a ferrox server a
 xray-core-rust reads 0 in hysteria and reality-grpc on both servers. The
 remaining untested lanes, including UDP, more than 16 flows and carriers
 without a cell, stay in #384, #387 and #388 rather than being inferred from
-these rows. `sing-box` is absent from `vless-xhttp-down-8`,
-`vless-reality-xhttp-down-8`, `vless-kcp-down-8`, `vless-hysteria-down-8` and
-the three `vless-encryption-*` scenarios because its pinned dialect has no such
-transport and no VLESS `encryption` field.
+these rows. `sing-box` is absent from the `xhttp`, `kcp`, `quic` and
+`vless-hysteria` cells and the three `vless-encryption-*` scenarios because its
+pinned dialect has no such transport and no VLESS `encryption` field. It also
+carries no stream layer on a Shadowsocks outbound, so the Shadowsocks and
+Shadowsocks 2022 cells with a transport are skipped rather than failed; the raw
+cells keep it.
 
 ## Every standard configuration
 
-The standard tier measures these 74 configurations: one row per scenario and server. The standalone Hysteria v1 and VLESS-over-QUIC rows run the ferrox and sing-box servers; the WireGuard rows run all three. The full tier adds the 16-flow cells (`vless-raw-down-16`, `vless-raw-duplex-16`, `vless-tls-raw-duplex-16`, `vless-ws-down-16`), the missing up/duplex lanes for every method that had only a down lane, plus `vmess-tls-raw`, the v1 up and duplex lanes, and the userspace and kernel WireGuard up and duplex lanes: 83 scenarios and 172 configurations. The full tier is dispatched manually on `ubuntu-latest`, `ubuntu-24.04-arm` and `macos-15`; `windows-latest` is available by `workflow_dispatch`, because 83 scenarios across four runners is more than one matrix job may hold. The nightly standard tier runs on `ubuntu-latest` only, because a ratio is read inside one cell and four runners were measuring the same ratio four times. The matrix never runs on a pull request.
+The standard tier measures these 172 configurations: one row per scenario and server. The standalone Hysteria v1 and VLESS-over-QUIC rows run the ferrox and sing-box servers; the WireGuard rows run all three. The full tier adds the 16-flow cells (`vless-raw-down-16`, `vless-raw-duplex-16`, `vless-tls-raw-duplex-16`, `vless-ws-down-16`), the missing up/duplex lanes for every method that had only a down lane, plus `vmess-tls-raw`, the v1 up and duplex lanes, and the userspace and kernel WireGuard up and duplex lanes, the 64-flow lanes, and every protocol by carrier in the full grid: 248 scenarios and 502 configurations. The full tier is dispatched manually on `ubuntu-latest`, `ubuntu-24.04-arm` and `macos-15`; `windows-latest` is available by `workflow_dispatch`, because 248 scenarios across four runners is more than one matrix job may hold. The nightly standard tier runs on `ubuntu-latest` only, because a ratio is read inside one cell and four runners were measuring the same ratio four times. The matrix never runs on a pull request.
 
 | scenario | server | measured |
 | --- | --- | --- |
-| `vless-raw-down-1` | ferrox | yes |
-| `vless-raw-down-1` | xray-core | yes |
-| `vless-raw-down-8` | ferrox | yes |
-| `vless-raw-down-8` | xray-core | yes |
-| `vless-raw-up-1` | ferrox | yes |
-| `vless-raw-up-1` | xray-core | yes |
-| `vless-raw-duplex-8` | ferrox | yes |
-| `vless-raw-duplex-8` | xray-core | yes |
-| `vless-ws-down-8` | ferrox | yes |
-| `vless-ws-down-8` | xray-core | yes |
-| `vless-grpc-down-8` | ferrox | yes |
-| `vless-grpc-down-8` | xray-core | yes |
-| `vless-xhttp-down-8` | ferrox | yes |
-| `vless-xhttp-down-8` | xray-core | yes |
-| `vmess-raw-down-8` | ferrox | yes |
-| `vmess-raw-down-8` | xray-core | yes |
-| `trojan-raw-down-8` | ferrox | yes |
-| `trojan-raw-down-8` | xray-core | yes |
+| `http-raw-down-8` | ferrox | yes |
+| `http-raw-down-8` | xray-core | yes |
+| `hysteria-v1-down-8` | ferrox | yes |
+| `hysteria-v1-down-8` | sing-box | yes |
+| `masque-down-8` | ferrox | yes |
+| `masque-down-8` | xray-core | yes |
+| `shadowsocks-grpc-down-8` | ferrox | yes |
+| `shadowsocks-grpc-down-8` | xray-core | yes |
 | `shadowsocks-raw-down-8` | ferrox | yes |
 | `shadowsocks-raw-down-8` | xray-core | yes |
-| `vless-raw-setup-1k` | ferrox | yes |
-| `vless-raw-setup-1k` | xray-core | yes |
-| `vless-encryption-raw-down-8` | ferrox | yes |
-| `vless-encryption-raw-down-8` | xray-core | yes |
-| `vless-tls-raw-down-8` | ferrox | yes |
-| `vless-tls-raw-down-8` | xray-core | yes |
-| `vless-encryption-tls-raw-down-8` | ferrox | yes |
-| `vless-encryption-tls-raw-down-8` | xray-core | yes |
-| `vless-tls-raw-up-1` | ferrox | yes |
-| `vless-tls-raw-up-1` | xray-core | yes |
-| `vless-tls-raw-duplex-8` | ferrox | yes |
-| `vless-tls-raw-duplex-8` | xray-core | yes |
-| `vless-tls-ws-down-8` | ferrox | yes |
-| `vless-tls-ws-down-8` | xray-core | yes |
+| `shadowsocks-tls-raw-down-8` | ferrox | yes |
+| `shadowsocks-tls-raw-down-8` | xray-core | yes |
+| `shadowsocks-ws-down-8` | ferrox | yes |
+| `shadowsocks-ws-down-8` | xray-core | yes |
+| `shadowsocks2022-raw-down-8` | ferrox | yes |
+| `shadowsocks2022-raw-down-8` | xray-core | yes |
+| `shadowsocks2022-tls-raw-down-8` | ferrox | yes |
+| `shadowsocks2022-tls-raw-down-8` | xray-core | yes |
+| `shadowsocks2022-ws-down-8` | ferrox | yes |
+| `shadowsocks2022-ws-down-8` | xray-core | yes |
+| `socks-raw-down-8` | ferrox | yes |
+| `socks-raw-down-8` | xray-core | yes |
+| `trojan-grpc-down-8` | ferrox | yes |
+| `trojan-grpc-down-8` | xray-core | yes |
+| `trojan-httpupgrade-down-8` | ferrox | yes |
+| `trojan-httpupgrade-down-8` | xray-core | yes |
+| `trojan-raw-down-8` | ferrox | yes |
+| `trojan-raw-down-8` | xray-core | yes |
+| `trojan-reality-raw-down-8` | ferrox | yes |
+| `trojan-reality-raw-down-8` | xray-core | yes |
+| `trojan-tls-grpc-down-8` | ferrox | yes |
+| `trojan-tls-grpc-down-8` | xray-core | yes |
 | `trojan-tls-raw-down-8` | ferrox | yes |
 | `trojan-tls-raw-down-8` | xray-core | yes |
-| `vless-httpupgrade-down-8` | ferrox | yes |
-| `vless-httpupgrade-down-8` | xray-core | yes |
-| `vless-tls-grpc-down-8` | ferrox | yes |
-| `vless-tls-grpc-down-8` | xray-core | yes |
-| `vless-reality-raw-down-8` | ferrox | yes |
-| `vless-reality-raw-down-8` | xray-core | yes |
+| `trojan-tls-ws-down-8` | ferrox | yes |
+| `trojan-tls-ws-down-8` | xray-core | yes |
+| `trojan-tls-xhttp-h2-down-8` | ferrox | yes |
+| `trojan-tls-xhttp-h2-down-8` | xray-core | yes |
+| `vless-encryption-raw-down-8` | ferrox | yes |
+| `vless-encryption-raw-down-8` | xray-core | yes |
 | `vless-encryption-reality-raw-down-8` | ferrox | yes |
 | `vless-encryption-reality-raw-down-8` | xray-core | yes |
-| `vless-reality-grpc-down-8` | ferrox | yes |
-| `vless-reality-grpc-down-8` | xray-core | yes |
-| `vless-reality-xhttp-down-8` | ferrox | yes |
-| `vless-reality-xhttp-down-8` | xray-core | yes |
-| `vless-vision-tls-raw-down-8` | ferrox | yes |
-| `vless-vision-tls-raw-down-8` | xray-core | yes |
-| `vless-vision-reality-raw-down-8` | ferrox | yes |
-| `vless-vision-reality-raw-down-8` | xray-core | yes |
+| `vless-encryption-tls-raw-down-8` | ferrox | yes |
+| `vless-encryption-tls-raw-down-8` | xray-core | yes |
+| `vless-grpc-bulk-down-1` | ferrox | yes |
+| `vless-grpc-bulk-down-1` | xray-core | yes |
+| `vless-grpc-down-8` | ferrox | yes |
+| `vless-grpc-down-8` | xray-core | yes |
+| `vless-grpc-multi-down-8` | ferrox | yes |
+| `vless-grpc-multi-down-8` | xray-core | yes |
+| `vless-httpupgrade-down-8` | ferrox | yes |
+| `vless-httpupgrade-down-8` | xray-core | yes |
+| `vless-httpupgrade-ed-down-8` | ferrox | yes |
+| `vless-httpupgrade-ed-down-8` | xray-core | yes |
+| `vless-hysteria-down-8` | ferrox | yes |
+| `vless-hysteria-down-8` | xray-core | yes |
 | `vless-kcp-down-8` | ferrox | yes |
 | `vless-kcp-down-8` | xray-core | yes |
 | `vless-quic-down-8` | ferrox | yes |
 | `vless-quic-down-8` | sing-box | yes |
-| `vless-hysteria-down-8` | ferrox | yes |
-| `vless-hysteria-down-8` | xray-core | yes |
-| `hysteria-v1-down-8` | ferrox | yes |
-| `hysteria-v1-down-8` | sing-box | yes |
-| `wireguard-raw-down-8` | ferrox | yes |
-| `wireguard-raw-down-8` | xray-core | yes |
-| `wireguard-raw-down-8` | sing-box | yes |
+| `vless-raw-down-1` | ferrox | yes |
+| `vless-raw-down-1` | xray-core | yes |
+| `vless-raw-down-8` | ferrox | yes |
+| `vless-raw-down-8` | xray-core | yes |
+| `vless-raw-duplex-8` | ferrox | yes |
+| `vless-raw-duplex-8` | xray-core | yes |
+| `vless-raw-idle` | ferrox | yes |
+| `vless-raw-idle` | xray-core | yes |
+| `vless-raw-idle-100` | ferrox | yes |
+| `vless-raw-idle-100` | xray-core | yes |
+| `vless-raw-idle-1000` | ferrox | yes |
+| `vless-raw-idle-1000` | xray-core | yes |
+| `vless-raw-mixed-8` | ferrox | yes |
+| `vless-raw-mixed-8` | xray-core | yes |
+| `vless-raw-reconnect-16` | ferrox | yes |
+| `vless-raw-reconnect-16` | xray-core | yes |
+| `vless-raw-routed-down-8` | ferrox | yes |
+| `vless-raw-routed-down-8` | xray-core | yes |
+| `vless-raw-setup-1k` | ferrox | yes |
+| `vless-raw-setup-1k` | xray-core | yes |
+| `vless-raw-tcp-latency-1` | ferrox | yes |
+| `vless-raw-tcp-latency-1` | xray-core | yes |
+| `vless-raw-udp-8` | ferrox | yes |
+| `vless-raw-udp-8` | xray-core | yes |
+| `vless-raw-up-1` | ferrox | yes |
+| `vless-raw-up-1` | xray-core | yes |
+| `vless-reality-grpc-down-8` | ferrox | yes |
+| `vless-reality-grpc-down-8` | xray-core | yes |
+| `vless-reality-raw-down-8` | ferrox | yes |
+| `vless-reality-raw-down-8` | xray-core | yes |
+| `vless-reality-xhttp-down-8` | ferrox | yes |
+| `vless-reality-xhttp-down-8` | xray-core | yes |
+| `vless-tls-grpc-down-8` | ferrox | yes |
+| `vless-tls-grpc-down-8` | xray-core | yes |
+| `vless-tls-grpc-multi-down-8` | ferrox | yes |
+| `vless-tls-grpc-multi-down-8` | xray-core | yes |
+| `vless-tls-httpupgrade-down-8` | ferrox | yes |
+| `vless-tls-httpupgrade-down-8` | xray-core | yes |
+| `vless-tls-httpupgrade-ed-down-8` | ferrox | yes |
+| `vless-tls-httpupgrade-ed-down-8` | xray-core | yes |
+| `vless-tls-raw-down-8` | ferrox | yes |
+| `vless-tls-raw-down-8` | xray-core | yes |
+| `vless-tls-raw-duplex-8` | ferrox | yes |
+| `vless-tls-raw-duplex-8` | xray-core | yes |
+| `vless-tls-raw-up-1` | ferrox | yes |
+| `vless-tls-raw-up-1` | xray-core | yes |
+| `vless-tls-ws-down-8` | ferrox | yes |
+| `vless-tls-ws-down-8` | xray-core | yes |
+| `vless-tls-ws-ed-down-8` | ferrox | yes |
+| `vless-tls-ws-ed-down-8` | xray-core | yes |
+| `vless-tls-xhttp-h1-down-8` | ferrox | yes |
+| `vless-tls-xhttp-h1-down-8` | xray-core | yes |
+| `vless-tls-xhttp-h2-down-8` | ferrox | yes |
+| `vless-tls-xhttp-h2-down-8` | xray-core | yes |
+| `vless-vision-reality-android-down-8` | ferrox | yes |
+| `vless-vision-reality-android-down-8` | xray-core | yes |
+| `vless-vision-reality-bulk-down-1` | ferrox | yes |
+| `vless-vision-reality-bulk-down-1` | xray-core | yes |
+| `vless-vision-reality-edge-down-8` | ferrox | yes |
+| `vless-vision-reality-edge-down-8` | xray-core | yes |
+| `vless-vision-reality-firefox-down-8` | ferrox | yes |
+| `vless-vision-reality-firefox-down-8` | xray-core | yes |
+| `vless-vision-reality-ios-down-8` | ferrox | yes |
+| `vless-vision-reality-ios-down-8` | xray-core | yes |
+| `vless-vision-reality-random-down-8` | ferrox | yes |
+| `vless-vision-reality-random-down-8` | xray-core | yes |
+| `vless-vision-reality-randomized-down-8` | ferrox | yes |
+| `vless-vision-reality-randomized-down-8` | xray-core | yes |
+| `vless-vision-reality-raw-down-8` | ferrox | yes |
+| `vless-vision-reality-raw-down-8` | xray-core | yes |
+| `vless-vision-reality-safari-down-8` | ferrox | yes |
+| `vless-vision-reality-safari-down-8` | xray-core | yes |
+| `vless-vision-reality-udp-8` | ferrox | yes |
+| `vless-vision-reality-udp-8` | xray-core | yes |
+| `vless-vision-tls-raw-down-8` | ferrox | yes |
+| `vless-vision-tls-raw-down-8` | xray-core | yes |
+| `vless-ws-down-8` | ferrox | yes |
+| `vless-ws-down-8` | xray-core | yes |
+| `vless-ws-ed-down-8` | ferrox | yes |
+| `vless-ws-ed-down-8` | xray-core | yes |
+| `vless-xhttp-down-8` | ferrox | yes |
+| `vless-xhttp-down-8` | xray-core | yes |
+| `vless-xhttp-packets-down-8` | ferrox | yes |
+| `vless-xhttp-packets-down-8` | xray-core | yes |
+| `vless-xhttp-streamone-down-8` | ferrox | yes |
+| `vless-xhttp-streamone-down-8` | xray-core | yes |
+| `vless-xhttp-streamup-down-8` | ferrox | yes |
+| `vless-xhttp-streamup-down-8` | xray-core | yes |
+| `vmess-grpc-down-8` | ferrox | yes |
+| `vmess-grpc-down-8` | xray-core | yes |
+| `vmess-httpupgrade-down-8` | ferrox | yes |
+| `vmess-httpupgrade-down-8` | xray-core | yes |
+| `vmess-raw-down-8` | ferrox | yes |
+| `vmess-raw-down-8` | xray-core | yes |
+| `vmess-reality-raw-down-8` | ferrox | yes |
+| `vmess-reality-raw-down-8` | xray-core | yes |
+| `vmess-tls-grpc-down-8` | ferrox | yes |
+| `vmess-tls-grpc-down-8` | xray-core | yes |
+| `vmess-tls-httpupgrade-down-8` | ferrox | yes |
+| `vmess-tls-httpupgrade-down-8` | xray-core | yes |
+| `vmess-tls-ws-down-8` | ferrox | yes |
+| `vmess-tls-ws-down-8` | xray-core | yes |
+| `vmess-tls-xhttp-h2-down-8` | ferrox | yes |
+| `vmess-tls-xhttp-h2-down-8` | xray-core | yes |
+| `vmess-xhttp-down-8` | ferrox | yes |
+| `vmess-xhttp-down-8` | xray-core | yes |
 | `wireguard-kernel-raw-down-8` | ferrox | yes |
 | `wireguard-kernel-raw-down-8` | xray-core | yes |
 | `wireguard-kernel-raw-down-8` | sing-box | yes |
-| `masque-down-8` | ferrox | yes |
-| `masque-down-8` | xray-core | yes |
-| `shadowsocks2022-raw-down-8` | ferrox | yes |
-| `shadowsocks2022-raw-down-8` | xray-core | yes |
-| `vmess-tls-ws-down-8` | ferrox | yes |
-| `vmess-tls-ws-down-8` | xray-core | yes |
-| `trojan-tls-ws-down-8` | ferrox | yes |
-| `trojan-tls-ws-down-8` | xray-core | yes |
+| `wireguard-raw-down-8` | ferrox | yes |
+| `wireguard-raw-down-8` | xray-core | yes |
+| `wireguard-raw-down-8` | sing-box | yes |
 
 ## Not measured yet
 
-These are the ways a config can name a method that no cell measures in the
-standard tier. A row here is a known gap in the harness or a full-tier-only
-lane, not a claim that the method works.
+These are the ways a config can name a method that no cell measures. A row here
+is a known gap in the harness, a feature this tree does not implement, or a
+peer-only protocol, not a claim that the method works.
 
 | method | carrier or security | direction | status |
 | --- | --- | --- | --- |
-| vless | raw with mux | down, up | no scenario; mux is read, not measured |
-| vless | tls raw with mux | down, up | no scenario |
-| vless | ws 16 flows | down | full tier only |
-| vless | raw 16 flows | down, duplex | full tier only |
-| vless | tls raw 16 flows | duplex | full tier only |
-| vmess | plain ws | down, up, duplex | no scenario; only `vmess-tls-ws` exists |
-| vmess | grpc, xhttp, httpupgrade, kcp, hysteria, reality | down | no scenario |
-| trojan | grpc, xhttp, httpupgrade, kcp, hysteria, reality | down | no scenario |
-| shadowsocks | tls, ws, grpc, xhttp, httpupgrade, kcp, hysteria | down | no scenario; raw up/duplex are full tier |
-| shadowsocks2022 | tls, ws, grpc, xhttp, httpupgrade, kcp, hysteria | down | no scenario; raw up/duplex are full tier |
-| httpupgrade | tls | down, up | no scenario; only `vless-httpupgrade` |
-| hysteria | v1 | up, duplex | full tier only; the standard tier measures down, and the v1 byte and loopback gates are `carrier-hysteria.md` |
-| any | udp dns through the socks front | request/response | no scenario |
-| any | ipv6 target | down | no scenario |
-| any | more than 16 flows | down | no scenario |
+| vless | raw with mux (`xmux`) | down, up | no cell; the engine reads the bounds but keeps no pool, and an xray-core config that enables mux is a drop-in gap ([#353](https://github.com/Ferrocite/ferrox/issues/353)) |
+| any | TUN, TUN UDP, fake DNS, stale flows | down, request/response | no cell; `ferrox-app` serves no TUN device ([#619](https://github.com/Ferrocite/ferrox/issues/619)) |
+| vless | xhttp over HTTP/3 | down | no cell; the engine dials h1 and h2 only, and the peers ship h3 (P0 coverage issue) |
+| sing-box | TUIC, AnyTLS, Hysteria2, Naive, ShadowTLS, Snell, SSH, OpenVPN, OpenConnect, Tor, Tailscale | down | no cell; sing-box-only protocols with no ferrox or xray-core client ([#603](https://github.com/Ferrocite/ferrox/issues/603), [#604](https://github.com/Ferrocite/ferrox/issues/604), P0 coverage issue) |
+| any | UDP DNS through the SOCKS front | request/response | no cell; UDP echo is measured, resolver replies are not |
+| any | IPv6 target | down | no cell |
+| vless | uTLS fingerprints beyond chrome, firefox, safari, edge, ios, android, random and randomized | down | no cell |
+| xray-core | QUIC transport | down | removed at this pin; the VLESS-over-QUIC cell runs ferrox and sing-box |
+| any | upstream servers, CDN fronts and the Psiphon network | down | no cell; these need the live network, so they run in the CI-only live lane |
 
 <!-- benchmark-matrix:start -->
 <!-- benchmark-matrix:end -->
