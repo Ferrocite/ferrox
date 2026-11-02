@@ -989,22 +989,22 @@ enum SendThrough {
 
 impl SendThrough {
     /// The source one dial binds; a CIDR rolls a host in its subnet as `ParseRandomIP` does.
-    fn address(self) -> Option<IpAddr> {
+    fn address(self) -> Result<IpAddr, std::io::Error> {
         let (base, prefix) = match self {
-            Self::Address(address) => return Some(address),
+            Self::Address(address) => return Ok(address),
             Self::Cidr { base, prefix } => (base, prefix),
         };
         let bits = if base.is_ipv4() { 32 } else { 128 };
         if prefix == bits {
-            return Some(base);
+            return Ok(base);
         }
         let mut raw = [0u8; 16];
         #[cfg(test)]
         if FAIL_ENTROPY.with(std::cell::Cell::get) {
-            return None;
+            return Err(std::io::Error::other("no entropy"));
         }
-        getrandom::fill(&mut raw).ok()?;
-        Some(match base {
+        getrandom::fill(&mut raw).map_err(std::io::Error::other)?;
+        Ok(match base {
             IpAddr::V4(base) => {
                 let mask = if prefix == 0 {
                     0
@@ -1034,9 +1034,8 @@ thread_local! {
     static FAIL_ENTROPY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
 fn resolve_source(send: Option<SendThrough>) -> Result<Option<IpAddr>, std::io::Error> {
-    Ok(send.and_then(SendThrough::address))
+    send.map(SendThrough::address).transpose()
 }
 
 thread_local! {
@@ -1205,9 +1204,8 @@ fn dial_from(
 
 fn dial(target: &SocketAddr) -> Result<Connection, Failure> {
     // The seam's one dial entry: a named source or option builds the socket before the same budget, and neither is the TCP dial unchanged.
-    let source = SEND_THROUGH
-        .with(std::cell::Cell::get)
-        .and_then(SendThrough::address);
+    let source = resolve_source(SEND_THROUGH.with(std::cell::Cell::get))
+        .map_err(|_| Failure::new(Stage::SocketConnected, Kind::Local))?;
     let sockopts = DIAL_SOCKOPTS.with(|cell| cell.borrow().clone());
     let stream = match (source, sockopts) {
         (None, None) => crate::conn::connect(&crate::conn::Target::Ip(*target), budgets::dial())
@@ -21021,8 +21019,10 @@ fn serve_socks_udp_freedom(
             let _ = uplinks[&dest].0.send(payload);
             continue;
         }
-        let Some(up) = datagram_uplink(dest, send_through.and_then(SendThrough::address), sockopts)
-        else {
+        let Ok(local) = resolve_source(send_through) else {
+            continue;
+        };
+        let Some(up) = datagram_uplink(dest, local, sockopts) else {
             continue;
         };
         let Ok(writer) = up.try_clone() else {
@@ -57783,7 +57783,10 @@ mod tests {
         let source = SEND_THROUGH
             .with(std::cell::Cell::get)
             .expect("the lane carries a source");
-        assert_eq!(source.address(), Some("127.0.0.2".parse().expect("ip")));
+        assert_eq!(
+            source.address().expect("an address"),
+            "127.0.0.2".parse::<IpAddr>().expect("ip")
+        );
         let _guard = SendThroughGuard::enter(SEND_THROUGH.with(std::cell::Cell::take));
         // Linux owns all of 127/8 on loopback, so the bind is witnessed where a 127.0.0.2 source routes.
         #[cfg(target_os = "linux")]
@@ -58007,7 +58010,10 @@ mod tests {
         let source = SEND_THROUGH
             .with(std::cell::Cell::get)
             .expect("the datagram lane carries a source");
-        assert_eq!(source.address(), Some("127.0.0.2".parse().expect("ip")));
+        assert_eq!(
+            source.address().expect("an address"),
+            "127.0.0.2".parse::<IpAddr>().expect("ip")
+        );
         // Linux owns all of 127/8 on loopback, so the bind is witnessed where a 127.0.0.2 source routes.
         #[cfg(target_os = "linux")]
         {
