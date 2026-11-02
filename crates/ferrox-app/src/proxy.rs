@@ -24654,6 +24654,22 @@ pub(crate) mod lane_pool {
         submit_to(&pool(), step, complete);
     }
 
+    /// A muxed stream's handshake: queued behind the accept path's setup lanes instead of taking a
+    /// thread of its own for every stream the peer opens.
+    pub(crate) fn submit_stream_setup(body: impl FnOnce() + Send + 'static) {
+        let mut body = Some(body);
+        let step: Step = Box::new(move || {
+            if let Some(body) = body.take() {
+                body();
+            }
+            Next::Done
+        });
+        let setup = setup_pool();
+        if let Err(lane) = submit_to_with(&setup, step, Box::new(|| {}), false) {
+            thread::spawn(move || run_to_end(lane));
+        }
+    }
+
     /// A setup lane: the accept path's handshake and dispatch, run once on a pooled worker. It does
     /// not enter `RelayStep`, because its waits are bounded by the handshake budget, not the relay clock.
     /// A queue that is full runs the lane on its own thread rather than refusing the connection.
@@ -24718,12 +24734,16 @@ pub(crate) mod lane_pool {
         if pool.pending.is_some_and(|pending| ready.len() >= pending) {
             return Err(lane);
         }
+        ready.push_back(lane);
         if pool.workers.load(Relaxed) == 0 {
+            // The last worker retired while this lock was held: no thread will take the queue, so the caller runs it.
+            let orphaned: Vec<Lane> = ready.drain(..).collect();
             drop(ready);
-            run_to_end(lane);
+            for lane in orphaned {
+                run_to_end(lane);
+            }
             return Ok(());
         }
-        ready.push_back(lane);
         drop(ready);
         pool.notify.notify_one();
         Ok(())

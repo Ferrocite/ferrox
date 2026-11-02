@@ -14,6 +14,8 @@ vless-kcp-down-8|server-threads|2.10|696
 vless-raw-down-16|server-threads|1.44|696
 vless-raw-up-1|client|0.78|486
 vless-raw-up-1|server|0.78|486|ceiling
+vless-grpc-multi-down-8|server-threads|1.08|1172
+vless-tls-grpc-multi-down-8|server-threads|1.07|1172
 vless-reality-grpc-down-8|server-threads|1.67|696
 vless-reality-raw-down-8|server-threads|1.54|696
 vless-reality-xhttp-down-8|server-cpu|0.00|668

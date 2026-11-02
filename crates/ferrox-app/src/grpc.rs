@@ -258,6 +258,7 @@ struct Pending {
 pub(crate) struct GrpcWriter {
     shared: Arc<Shared>,
     stream: u32,
+    multi: bool,
 }
 
 impl GrpcReader<Connection> {
@@ -909,8 +910,8 @@ impl<R: Read> Read for GrpcReader<R> {
 /// no other.
 const FRAMES_PER_WRITE: usize = 8;
 
-/// A gathered frame's own bytes: its nine-byte head and the envelope prefix it carries, which is at
-/// most the `16` bytes `frame_prefix` can fill.
+/// A gathered frame's own bytes: its nine-byte head and the envelope prefix it carries, at most the
+/// `16` bytes `frame_prefix` can fill.
 const SLOT: usize = 9 + 16;
 
 /// The frame that has not been added to a batch yet, and the part slot of a list still empty.
@@ -1044,6 +1045,9 @@ impl GrpcWriter {
         let max = self.max_frame();
         // Four frames of the 16 KiB the peer advertises are one byte over the default 65_535-byte stream window, so the fourth waits for a credit; a body one byte under the frame fits all four.
         let payload = message_payload(max.saturating_sub(1)).max(1);
+        if self.multi {
+            return self.send_multi(data, payload);
+        }
         let mut batch = Gather::new();
         for piece in data.chunks(payload) {
             if !self.message(piece, max, false, &mut batch) {
@@ -1051,6 +1055,94 @@ impl GrpcWriter {
             }
         }
         batch.flush_blocking(&self.shared)
+    }
+
+    /// The blocking writer's `MultiHunk` path: the same groups as `try_send_multi`, but a message's
+    /// whole window is taken before its first frame and a transport that cannot take the batch is
+    /// drained before the retry.
+    fn send_multi(&self, data: &[u8], payload: usize) -> bool {
+        let cap = self.multi_cap();
+        let wide = usize::try_from(cap).unwrap_or(usize::MAX);
+        let payload = payload.min(wide.saturating_sub(16).max(1));
+        let mut batch = Gather::new();
+        let mut lengths = [0usize; FRAMES_PER_WRITE];
+        let mut count = 0usize;
+        let mut group_start = 0usize;
+        let mut payload_len = 0usize;
+        let mut prefix_len = 5usize;
+        for piece in data.chunks(payload) {
+            let add = 1 + varint_len(piece.len() as u64);
+            let total = prefix_len + add + payload_len + piece.len();
+            if count > 0 && (count == FRAMES_PER_WRITE || total as u64 > cap) {
+                if !self.send_multi_group(
+                    &data[group_start..group_start + payload_len],
+                    &lengths[..count],
+                    &mut batch,
+                ) {
+                    return false;
+                }
+                group_start += payload_len;
+                payload_len = 0;
+                count = 0;
+                prefix_len = 5;
+            }
+            lengths[count] = piece.len();
+            count += 1;
+            payload_len += piece.len();
+            prefix_len += add;
+        }
+        if count > 0
+            && !self.send_multi_group(
+                &data[group_start..group_start + payload_len],
+                &lengths[..count],
+                &mut batch,
+            )
+        {
+            return false;
+        }
+        batch.flush_blocking(&self.shared)
+    }
+
+    /// Adds one `MultiHunk` message to a blocking batch: its window is taken whole before its first
+    /// frame, and a batch the transport refuses is drained and paid for again by `flush_blocking`.
+    fn send_multi_group<'a>(
+        &self,
+        payload: &'a [u8],
+        lengths: &[usize],
+        batch: &mut Gather<'a>,
+    ) -> bool {
+        let inner: usize = lengths
+            .iter()
+            .map(|&len| 1 + varint_len(len as u64) + len)
+            .sum();
+        let total = 5 + inner;
+        if batch.used + lengths.len() > FRAMES_PER_WRITE && !batch.flush_blocking(&self.shared) {
+            return false;
+        }
+        if !self.credit(batch, total as u64) {
+            return false;
+        }
+        let mut prefix = [0u8; 16];
+        let mut offset = 0;
+        for (at, &len) in lengths.iter().enumerate() {
+            let mut end = 0;
+            if at == 0 {
+                prefix[0] = 0;
+                prefix[1..5].copy_from_slice(&(inner as u32).to_be_bytes());
+                end = 5;
+            }
+            prefix[end] = 0x0A;
+            end += 1;
+            end += write_varint(&mut prefix[end..], len as u64);
+            batch.add(
+                self.stream,
+                0,
+                &prefix[..end],
+                &payload[offset..offset + len],
+            );
+            offset += len;
+        }
+        true
     }
 
     /// The same frames as `send`, but a window the peer has not granted parks the bytes instead of
@@ -1071,6 +1163,9 @@ impl GrpcWriter {
             };
         }
         let payload = message_payload(max.saturating_sub(1)).max(1);
+        if self.multi {
+            return self.try_send_multi(data, payload);
+        }
         let mut batch = Gather::new();
         let mut flushed = 0usize;
         let mut held = 0usize;
@@ -1121,6 +1216,126 @@ impl GrpcWriter {
             Accepted::Full => Self::took_or_parked(flushed),
             Accepted::Lost => crate::proxy::Push::Lost,
         }
+    }
+
+    /// The same offer as `try_send`, but a `MultiHunk` batch: consecutive elements are gathered
+    /// into one gRPC message, and a message is never split across a retry — a group is only added
+    /// to a batch that has room for all its frames, and the window for the whole message is taken
+    /// before its first frame.
+    fn try_send_multi(&self, data: &[u8], payload: usize) -> crate::proxy::Push {
+        let mut batch = Gather::new();
+        let mut flushed = 0usize;
+        let mut held = 0usize;
+        let mut lengths = [0usize; FRAMES_PER_WRITE];
+        let mut count = 0usize;
+        let mut group_start = 0usize;
+        let mut payload_len = 0usize;
+        let mut prefix_len = 5usize;
+        // A group larger than the peer's starting window can never be paid for; cap it there.
+        let cap = self.multi_cap();
+        let wide = usize::try_from(cap).unwrap_or(usize::MAX);
+        let payload = payload.min(wide.saturating_sub(16).max(1));
+        for piece in data.chunks(payload) {
+            let add = 1 + varint_len(piece.len() as u64);
+            let total = prefix_len + add + payload_len + piece.len();
+            if count > 0 && (count == FRAMES_PER_WRITE || total as u64 > cap) {
+                if let Some(stop) = self.try_multi_group(
+                    &data[group_start..group_start + payload_len],
+                    &lengths[..count],
+                    &mut batch,
+                    &mut flushed,
+                    &mut held,
+                ) {
+                    return stop;
+                }
+                group_start += payload_len;
+                payload_len = 0;
+                count = 0;
+                prefix_len = 5;
+            }
+            lengths[count] = piece.len();
+            count += 1;
+            payload_len += piece.len();
+            prefix_len += add;
+        }
+        if count > 0 {
+            if let Some(stop) = self.try_multi_group(
+                &data[group_start..group_start + payload_len],
+                &lengths[..count],
+                &mut batch,
+                &mut flushed,
+                &mut held,
+            ) {
+                return stop;
+            }
+        }
+        match batch.flush(&self.shared) {
+            Accepted::All => Self::took_or_parked(flushed + held),
+            Accepted::Full => Self::took_or_parked(flushed),
+            Accepted::Lost => crate::proxy::Push::Lost,
+        }
+    }
+
+    /// The largest `MultiHunk` the peer can pay for in one take: its starting stream window, and
+    /// the connection's own 65_535-byte opening window.
+    fn multi_cap(&self) -> u64 {
+        let cap = *self
+            .shared
+            .init
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        cap.min(65_535)
+    }
+
+    /// Adds one `MultiHunk` message to the batch, flushing first when the batch cannot hold all its
+    /// frames; the window for the whole message is taken before its first frame, so a message is
+    /// never half-sent and retried.
+    fn try_multi_group<'a>(
+        &self,
+        payload: &'a [u8],
+        lengths: &[usize],
+        batch: &mut Gather<'a>,
+        flushed: &mut usize,
+        held: &mut usize,
+    ) -> Option<crate::proxy::Push> {
+        let inner: usize = lengths
+            .iter()
+            .map(|&len| 1 + varint_len(len as u64) + len)
+            .sum();
+        let total = 5 + inner;
+        if batch.used + lengths.len() > FRAMES_PER_WRITE {
+            if let Some(stop) = Self::flush_held(&self.shared, batch, flushed, held) {
+                return Some(stop);
+            }
+        }
+        if !take_window(&self.shared, total as u64, false) {
+            if let Some(stop) = Self::flush_held(&self.shared, batch, flushed, held) {
+                return Some(stop);
+            }
+            return Some(Self::took_or_parked(*flushed));
+        }
+        let mut prefix = [0u8; 16];
+        let mut offset = 0;
+        for (at, &len) in lengths.iter().enumerate() {
+            let mut end = 0;
+            if at == 0 {
+                prefix[0] = 0;
+                prefix[1..5].copy_from_slice(&(inner as u32).to_be_bytes());
+                end = 5;
+            }
+            prefix[end] = 0x0A;
+            end += 1;
+            end += write_varint(&mut prefix[end..], len as u64);
+            batch.add(
+                self.stream,
+                0,
+                &prefix[..end],
+                &payload[offset..offset + len],
+            );
+            offset += len;
+        }
+        *held += payload.len();
+        None
     }
 
     fn flush_held(
@@ -1373,6 +1588,18 @@ fn frame_prefix(data_len: usize, out: &mut [u8; 16]) -> usize {
     out[1..5].copy_from_slice(&inner.to_be_bytes());
     out[5] = 0x0A;
     at
+}
+
+/// Writes `value` as a protobuf varint into `out`, returning its length.
+fn write_varint(out: &mut [u8], mut value: u64) -> usize {
+    let mut at = 0;
+    while value >= 0x80 {
+        out[at] = (value as u8 & 0x7F) | 0x80;
+        value >>= 7;
+        at += 1;
+    }
+    out[at] = value as u8;
+    at + 1
 }
 
 #[cfg(test)]
@@ -1737,6 +1964,7 @@ fn mux_stream(
     let writer = GrpcWriter {
         shared: write,
         stream: sid,
+        multi: method == Method::MultiHunk,
     };
     (reader, writer)
 }
@@ -1805,7 +2033,7 @@ impl crate::xhttp_h2::H2Service for GrpcService {
         let users = Arc::clone(&self.users);
         let freedom = self.freedom;
         let opened = Arc::clone(&self.opened);
-        crate::budgets::spawn(move || {
+        crate::proxy::lane_pool::submit_stream_setup(move || {
             crate::proxy::serve_grpc_muxed(reader, writer, &users, freedom, &opened);
         });
     }
@@ -2184,6 +2412,7 @@ pub(crate) fn accept_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>(
     let writer = GrpcWriter {
         shared,
         stream: reader.stream,
+        multi: reader.method == Method::MultiHunk,
     };
     start_keepalive(Arc::clone(&writer.shared), settings);
     Some((reader, writer))
@@ -2273,7 +2502,14 @@ pub(crate) fn connect_split_with<R: Read, W: crate::proxy::FrameWrite + 'static>
         reader.method = Method::MultiHunk;
     }
     start_keepalive(Arc::clone(&shared), settings);
-    Some((reader, GrpcWriter { shared, stream: 1 }))
+    Some((
+        reader,
+        GrpcWriter {
+            shared,
+            stream: 1,
+            multi: settings.multi_mode,
+        },
+    ))
 }
 
 fn preface(initial_window: u32) -> Vec<u8> {
@@ -2648,11 +2884,31 @@ mod tests {
     ) -> GrpcWriter {
         let shared = new_shared(Box::new(write) as Box<dyn crate::proxy::FrameWrite + Send>);
         *shared.max_frame.lock().unwrap() = max_frame;
+        *shared.init.lock().unwrap() = window;
         let mut send = shared.send.lock().unwrap();
         send.conn = window;
         send.stream = window;
         drop(send);
-        GrpcWriter { shared, stream: 1 }
+        GrpcWriter {
+            shared,
+            stream: 1,
+            multi: false,
+        }
+    }
+
+    /// The same writer over the same sink, but sending a `MultiHunk` batch rather than one `Hunk`;
+    /// `cap` is the window the peer started with, which a group may not exceed even when later
+    /// grants have made the live window larger.
+    fn multi_writer_over<W: crate::proxy::FrameWrite + 'static>(
+        write: W,
+        max_frame: usize,
+        window: u64,
+        cap: u64,
+    ) -> GrpcWriter {
+        let mut writer = writer_over(write, max_frame, window);
+        writer.multi = true;
+        *writer.shared.init.lock().unwrap() = cap;
+        writer
     }
 
     /// The frames a write leaves as at the frame size this lane advertises: one whole message in
@@ -2686,6 +2942,17 @@ mod tests {
         out.extend_from_slice(&(body.len() as u32).to_be_bytes());
         out.extend_from_slice(&body);
         out
+    }
+
+    /// The number of gRPC messages in a concatenation of them.
+    fn message_count(mut body: &[u8]) -> usize {
+        let mut count = 0;
+        while !body.is_empty() {
+            let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+            body = &body[5 + len..];
+            count += 1;
+        }
+        count
     }
 
     /// The served side of a call over a scripted wire: the preface, the HEADERS that open it, then its DATA frames.
@@ -2984,6 +3251,7 @@ mod tests {
             .map(|i| (i % 251) as u8)
             .collect();
         let hunks = data.len().div_ceil(message_payload(HUNK - 1));
+        assert_eq!(hunks, 5, "five Hunk messages for this relay read");
         let base = data.as_ptr() as usize;
         let capacity = data.capacity();
         let peer = Arc::new(Mutex::new(Peer::default()));
@@ -3016,6 +3284,191 @@ mod tests {
         }
         assert_eq!(at, end, "every byte reached the writer");
         assert_eq!(data.capacity(), capacity, "the caller's buffer grew");
+    }
+
+    /// The regression witness: a multi-mode writer over the dial path leaves one message for a
+    /// 32 KiB relay read, not one `Hunk` per element. A `Hunk` can carry at most `16_375` bytes,
+    /// so two messages here mean the writer did not gather the batch; the test is red on the
+    /// one-`Hunk`-per-element writer.
+    #[test]
+    fn a_multi_mode_dial_writer_gathers_the_read_into_one_message() {
+        let settings = GrpcSettings {
+            multi_mode: true,
+            ..GrpcSettings::default()
+        };
+        let calls = Calls::default();
+        let seen = Arc::clone(&calls.0);
+        let (_, mut writer) = connect_split_with(
+            std::io::Cursor::new(Vec::new()),
+            calls,
+            "127.0.0.1",
+            &settings,
+        )
+        .expect("dials");
+        let data: Vec<u8> = (0..2 * HUNK).map(|i| (i % 251) as u8).collect();
+        writer.write_all(&data).expect("writes the read");
+        drop(writer);
+        let recorded = seen.lock().expect("writes");
+        let bytes: Vec<u8> = recorded
+            .iter()
+            .flat_map(|write| write.iter().copied())
+            .collect();
+        let bytes = bytes.strip_prefix(MAGIC).unwrap_or(bytes.as_slice());
+        let body = data_body(bytes);
+        assert_eq!(
+            message_count(&body),
+            1,
+            "one MultiHunk message for a 32 KiB read"
+        );
+        assert!(
+            body.len() > HUNK,
+            "the message carries more than one element"
+        );
+    }
+
+    /// A transport whose first offer is refused because its paced tail is full: the blocking writer
+    /// must settle that tail and retry the same group, not wait for a peer credit it already has.
+    #[test]
+    fn a_multi_mode_dial_writer_drains_a_full_tail_before_retrying() {
+        struct Paced {
+            refused: bool,
+            got: Arc<Mutex<Vec<u8>>>,
+        }
+        impl std::io::Write for Paced {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.got.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl crate::proxy::FrameWrite for Paced {
+            fn write_slices(&mut self, parts: &[&[u8]]) -> bool {
+                matches!(self.offer_slices(parts), Accepted::All)
+            }
+            fn offer_slices(&mut self, parts: &[&[u8]]) -> Accepted {
+                if self.refused {
+                    self.refused = false;
+                    return Accepted::Full;
+                }
+                let mut got = self.got.lock().unwrap();
+                for part in parts {
+                    got.extend_from_slice(part);
+                }
+                Accepted::All
+            }
+            fn settle(&mut self) -> Settle {
+                Settle::Clear
+            }
+        }
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let writer = multi_writer_over(
+            Paced {
+                refused: true,
+                got: Arc::clone(&got),
+            },
+            HUNK,
+            65_535,
+            65_535,
+        );
+        let data: Vec<u8> = (0..2 * HUNK).map(|i| (i % 251) as u8).collect();
+        assert!(writer.send(&data), "the drain leaves the retry its group");
+        let body = data_body(&got.lock().unwrap());
+        let elements: Vec<&[u8]> = data.chunks(message_payload(HUNK - 1)).collect();
+        assert_eq!(
+            body,
+            multi_message(&elements),
+            "the retry repeats no element"
+        );
+    }
+
+    /// The DATA bodies in a concatenation of HTTP/2 frames, with the client preface already gone.
+    fn data_body(mut wire: &[u8]) -> Vec<u8> {
+        let mut body = Vec::new();
+        while wire.len() >= 9 {
+            let len = ((wire[0] as usize) << 16) | ((wire[1] as usize) << 8) | wire[2] as usize;
+            let kind = wire[3];
+            let rest = &wire[9..];
+            if rest.len() < len {
+                break;
+            }
+            if kind == T_DATA {
+                body.extend_from_slice(&rest[..len]);
+            }
+            wire = &rest[len..];
+        }
+        body
+    }
+
+    /// The multi-mode witness: one relay read leaves as the batch the peer's default window can
+    /// pay for — two `MultiHunk` messages, four elements and the remainder, instead of five
+    /// `Hunk`s — split into DATA frames at the peer's frame size, and every payload run is still
+    /// the caller's own bytes.
+    #[test]
+    fn a_multi_relay_read_batches_the_window_it_can_pay_for() {
+        let data: Vec<u8> = (0..FRAMES_PER_WRITE / 2 * HUNK)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let base = data.as_ptr() as usize;
+        let capacity = data.capacity();
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = multi_writer_over(Recorder(Arc::clone(&peer)), HUNK, 65_560, 65_535);
+        assert!(matches!(
+            writer.try_send(&data),
+            crate::proxy::Push::Took(n) if n == data.len()
+        ));
+        let peer = peer.lock().unwrap();
+        assert_eq!(peer.writes.len(), 1, "one write for a relay read");
+        let elements: Vec<&[u8]> = data.chunks(message_payload(HUNK - 1)).collect();
+        let split = 4;
+        let want = [
+            multi_message(&elements[..split]),
+            multi_message(&elements[split..]),
+        ]
+        .concat();
+        let mut body = Vec::new();
+        let mut at = 0;
+        while at < peer.writes[0].len() {
+            let head = &peer.writes[0][at..at + 9];
+            let len = usize::from(head[0]) << 16 | usize::from(head[1]) << 8 | usize::from(head[2]);
+            assert_eq!(head[3], T_DATA);
+            assert_eq!(u32::from_be_bytes(head[5..9].try_into().unwrap()), 1);
+            at += 9;
+            body.extend_from_slice(&peer.writes[0][at..at + len]);
+            at += len;
+        }
+        assert_eq!(body, want, "two MultiHunk messages at the default window");
+        assert_eq!(message_count(&body), 2, "two messages, not five");
+        let end = base + data.len();
+        let mut seen = base;
+        for &(start, len) in &peer.parts {
+            if start < base || start >= end {
+                continue;
+            }
+            assert_eq!(start, seen, "a payload run starts where the last one ended");
+            assert!(start + len <= end, "a run leaves the caller's buffer");
+            seen = start + len;
+        }
+        assert_eq!(seen, end, "every byte reached the writer");
+        assert_eq!(data.capacity(), capacity, "the caller's buffer grew");
+    }
+
+    /// A peer whose starting window is smaller than one frame: the writer cuts its elements to
+    /// fit that window instead of forming a message the peer can never pay for.
+    #[test]
+    fn a_multi_writer_fits_an_element_to_the_starting_window() {
+        let peer = Arc::new(Mutex::new(Peer::default()));
+        let writer = multi_writer_over(Recorder(Arc::clone(&peer)), HUNK, 64, 64);
+        let data: Vec<u8> = (0..200).map(|i| (i % 251) as u8).collect();
+        assert!(matches!(
+            writer.try_send(&data),
+            crate::proxy::Push::Took(n) if n > 0
+        ));
+        let peer = peer.lock().unwrap();
+        let body = data_body(&peer.writes[0]);
+        let len = u32::from_be_bytes(body[1..5].try_into().unwrap()) as usize;
+        assert!(5 + len <= 64, "the message fits the peer's window");
     }
 
     /// The same batch driven over a real socket, where the only thing a loopback test can assert is
@@ -3795,7 +4248,11 @@ mod tests {
                         pong: AtomicU64::new(0),
                         muxed: false,
                     });
-                    let writer = GrpcWriter { shared, stream: 1 };
+                    let writer = GrpcWriter {
+                        shared,
+                        stream: 1,
+                        multi: false,
+                    };
                     let mut batch = Gather::new();
                     assert!(
                         writer.message(&data, max, true, &mut batch),
