@@ -19,6 +19,7 @@ const SNIFF_LIMIT: usize = 32 * 1024;
 static CONFIGS: OnceLock<Mutex<HashMap<String, Arc<Sniffing>>>> = OnceLock::new();
 thread_local! {
     static CURRENT: std::cell::RefCell<Option<Arc<Sniffing>>> = const { std::cell::RefCell::new(None) };
+    static PROBE: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 pub(crate) fn register(address: &str, config: Option<Arc<Sniffing>>) {
@@ -113,12 +114,29 @@ impl Sniffing {
         if self.metadata_only {
             return (None, Vec::new());
         }
+        PROBE.with(|probe| {
+            let mut buffer = probe.borrow_mut();
+            if buffer.len() < SNIFF_LIMIT {
+                buffer.resize(SNIFF_LIMIT, 0);
+            }
+            self.probe_tcp(asked, client, want_attrs, &mut buffer)
+        })
+    }
+
+    /// The probe's wait: one buffer the worker thread keeps, filled by `peek` and read only up to
+    /// what it filled, so a flow neither allocates nor zeroes one.
+    fn probe_tcp(
+        &self,
+        asked: &Destination,
+        client: &crate::conn::Connection,
+        want_attrs: bool,
+        buffer: &mut [u8],
+    ) -> (Option<Sniffed>, Vec<(String, String)>) {
         let _ = client.set_read_timeout(Some(SNIFF_WAIT));
-        let mut buffer = vec![0u8; SNIFF_LIMIT];
         let mut attrs = Vec::new();
         let deadline = Instant::now() + SNIFF_WAIT;
         let found = loop {
-            match client.peek(&mut buffer) {
+            match client.peek(buffer) {
                 Ok(0) => break None,
                 Ok(n) => {
                     if let Some(found) =
@@ -875,6 +893,66 @@ mod tests {
             )
             .unwrap();
         assert!(!found.override_destination);
+    }
+
+    fn probe_once(sniffing: &Sniffing, request: &'static [u8]) -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("addr");
+        let writer = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().expect("accepts");
+            std::io::Write::write_all(&mut peer, request).expect("writes");
+        });
+        let client =
+            crate::conn::Connection::from(std::net::TcpStream::connect(address).expect("connects"));
+        let asked = Destination::Address("127.0.0.1:80".parse().expect("address"));
+        let (found, _) = sniffing.inspect(&asked, Network::Tcp, &client, false);
+        writer.join().expect("joins");
+        found.expect("sniffs").domain
+    }
+
+    #[test]
+    fn the_probe_buffer_is_the_worker_threads_not_the_flows() {
+        let value = crate::json::parse(r#"{"enabled":true,"destOverride":["http"]}"#).unwrap();
+        let sniffing = parse(Some(&value)).unwrap().unwrap();
+        assert_eq!(
+            probe_once(&sniffing, b"GET / HTTP/1.1\r\nHost: one.test\r\n\r\n"),
+            "one.test"
+        );
+        let (base, capacity) = PROBE.with(|probe| {
+            let probe = probe.borrow();
+            (probe.as_ptr(), probe.capacity())
+        });
+        assert_eq!(capacity, SNIFF_LIMIT);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("addr");
+        let writer = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().expect("accepts");
+            std::io::Write::write_all(&mut peer, b"GET / HTTP/1.1\r\nHost: two.test\r\n\r\n")
+                .expect("writes");
+        });
+        let client =
+            crate::conn::Connection::from(std::net::TcpStream::connect(address).expect("connects"));
+        let asked = Destination::Address("127.0.0.1:80".parse().expect("address"));
+        let (found, counts) = ferrox_core::alloc_count::measure(|| {
+            let found = sniffing
+                .inspect(&asked, Network::Tcp, &client, false)
+                .0
+                .expect("sniffs");
+            found.domain
+        });
+        writer.join().expect("joins");
+        assert_eq!(found, "two.test");
+        assert_eq!(counts.zeroed, 0, "the probe buffer is not zeroed again");
+        assert!(
+            counts.allocs <= 1,
+            "only the domain is allocated, not the buffer: {counts:?}"
+        );
+        PROBE.with(|probe| {
+            let probe = probe.borrow();
+            assert_eq!(probe.as_ptr(), base, "the same buffer, on the same thread");
+            assert_eq!(probe.capacity(), capacity, "and it did not grow");
+        });
     }
 
     #[test]
