@@ -12123,7 +12123,7 @@ fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) -> bo
                     &account.email,
                     account.level,
                 ) {
-                    return;
+                    return false;
                 }
             }
             Carrier::Xdrive { settings } => {
