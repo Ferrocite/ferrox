@@ -32943,8 +32943,8 @@ mod tests {
         drop(peers);
         serving.join().expect("joins");
         assert!(
-            grown < 3,
-            "eight muxed connections grew the process by {grown} threads: a demux thread per connection"
+            grown < 2,
+            "eight muxed connections grew the process by {grown} threads past the pools' caps and the one reaper: a demux thread per connection"
         );
     }
 
