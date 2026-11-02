@@ -3843,18 +3843,7 @@ fn serve_vless(
             );
         }
         Carrier::Xhttp { settings, .. } => {
-            let Ok(read) = stream.try_clone() else {
-                return;
-            };
-            serve_xhttp_stream(
-                read,
-                stream,
-                settings,
-                users,
-                freedom,
-                decryption,
-                |read, timeout| read.set_read_timeout(timeout).is_ok(),
-            );
+            serve_vless_xhttp(stream, settings, users, freedom, decryption);
         }
         Carrier::HttpHeader { path } => {
             serve_vless_httpheader(stream, users, path, freedom, decryption.cloned().as_deref());
@@ -7507,17 +7496,15 @@ fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static>(
 #[cfg(test)]
 pub(crate) static H2_DIAL_WITNESS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
-fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+/// The 24-byte preface a carrier's first read carries, put back in front of the connection, and
+/// whether it names HTTP/2: `None` when the handshake budget ran out before the connection spoke.
+fn sniff_xhttp<R: Read>(
     mut read: R,
-    write: W,
-    settings: &crate::xhttp::XhttpSettings,
-    users: &[VlessUser],
-    freedom: bool,
-    decryption: Option<&Arc<ferrox_core::vless_encryption::Server>>,
+    sealed: bool,
     mut arm: impl FnMut(&R, Option<Duration>) -> bool,
-) {
+) -> Option<(crate::xhttp::ChainReader<R>, bool)> {
     if !arm(&read, Some(budgets::handshake())) {
-        return;
+        return None;
     }
     let until = Instant::now() + budgets::handshake();
     let mut magic = [0u8; 24];
@@ -7534,19 +7521,30 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
             Err(_) => break,
         }
     }
-    let _ = arm(
-        &read,
-        if decryption.is_some() {
-            Some(RELAY_POLL)
-        } else {
-            None
-        },
-    );
+    let _ = arm(&read, if sealed { Some(RELAY_POLL) } else { None });
     if at < magic.len() && Instant::now() >= until {
-        return;
+        return None;
     }
-    let chained = crate::xhttp::ChainReader::new(magic[..at].to_vec(), read);
-    if at == magic.len() && magic == *crate::h2::MAGIC {
+    let h2 = at == magic.len() && magic == *crate::h2::MAGIC;
+    Some((
+        crate::xhttp::ChainReader::new(magic[..at].to_vec(), read),
+        h2,
+    ))
+}
+
+fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+    read: R,
+    write: W,
+    settings: &crate::xhttp::XhttpSettings,
+    users: &[VlessUser],
+    freedom: bool,
+    decryption: Option<&Arc<ferrox_core::vless_encryption::Server>>,
+    arm: impl FnMut(&R, Option<Duration>) -> bool,
+) {
+    let Some((chained, h2)) = sniff_xhttp(read, decryption.is_some(), arm) else {
+        return;
+    };
+    if h2 {
         #[cfg(test)]
         if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
             paths.push(settings.path.clone());
@@ -7567,6 +7565,47 @@ fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
         users,
         freedom,
         decryption.cloned().as_deref(),
+    );
+}
+
+/// A plaintext xHTTP connection: once the preface names HTTP/2 the demux becomes a lane parked on
+/// the socket, so a peer that never opens a stream costs a pool slot instead of the setup worker.
+fn serve_vless_xhttp(
+    stream: Connection,
+    settings: &crate::xhttp::XhttpSettings,
+    users: &[VlessUser],
+    freedom: bool,
+    decryption: Option<&Arc<ferrox_core::vless_encryption::Server>>,
+) {
+    let Ok(read) = stream.try_clone() else {
+        return;
+    };
+    let arm = |read: &Connection, timeout| read.set_read_timeout(timeout).is_ok();
+    // A sealed session's demux reads through a decryption the pool cannot poll, so it keeps the worker.
+    if decryption.is_some() {
+        return serve_xhttp_stream(read, stream, settings, users, freedom, decryption, arm);
+    }
+    let Some((chained, h2)) = sniff_xhttp(read, false, arm) else {
+        return;
+    };
+    if !h2 {
+        return serve_session_xhttp(chained, stream, settings, users, freedom, None);
+    }
+    #[cfg(test)]
+    if let Ok(mut paths) = H2_DIAL_WITNESS.lock() {
+        paths.push(settings.path.clone());
+    }
+    let _ = stream.set_read_timeout(Some(RELAY_POLL));
+    let mut step = crate::xhttp_h2::h2_xhttp_lane(chained, stream, settings, users, freedom, None);
+    let sniffing = crate::sniff::current();
+    let access = crate::accesslog::snapshot();
+    lane_pool::submit(
+        Box::new(move || {
+            crate::sniff::install_current(sniffing.clone());
+            let _flow = crate::accesslog::install_snapshot(access.clone());
+            step()
+        }),
+        Box::new(|| {}),
     );
 }
 

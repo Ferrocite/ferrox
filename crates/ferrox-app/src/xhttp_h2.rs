@@ -1830,6 +1830,27 @@ pub(crate) fn serve_h2<R: Read + Send + 'static, W: crate::proxy::FrameWrite + S
     serve_h2_service(read, write, &service, decryption);
 }
 
+/// The plaintext xHTTP/2 demux as a lane step: a connection waiting for its peer's next frame
+/// parks its socket with the pool, so it does not hold the worker that accepted it.
+pub(crate) fn h2_xhttp_lane<
+    R: Read + Send + 'static,
+    W: crate::proxy::FrameWrite + Send + 'static,
+>(
+    read: R,
+    write: W,
+    settings: &XhttpSettings,
+    users: &[VlessUser],
+    freedom: bool,
+    decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
+) -> impl FnMut() -> crate::proxy::lane_pool::Next + Send + 'static {
+    let service = XhttpService {
+        settings: settings.clone(),
+        users: Arc::from(users),
+        freedom,
+    };
+    h2_lane(read, write, service, decryption, None)
+}
+
 pub(crate) fn serve_h2_service<
     R: Read + Send + 'static,
     W: crate::proxy::FrameWrite + Send + 'static,
