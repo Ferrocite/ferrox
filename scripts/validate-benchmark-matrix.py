@@ -219,12 +219,17 @@ def check_manifest(results_dir, results):
 def check_charts(charts_dir, results):
     """Every chart the bundle should hold exists and is non-empty.
 
-    The setup chart exists only when a setup scenario ran: requiring it
-    unconditionally would fail every tier that does not measure setup.
+    The setup chart exists only when a setup scenario ran, and the ceiling
+    chart only when a cell measured a harness ceiling: a filtered run of
+    UDP-only cells records none, so requiring it unconditionally would fail.
     """
     scenarios = results.get("scenarios", [])
     bulk = any("setup" not in scenario.get("id", "") for scenario in scenarios)
     wanted = list(ALWAYS_CHARTS) if bulk else ["startup.png", "binary-size.png"]
+    if "ceiling.png" in wanted and not any(
+        scenario.get("ceilings_mib_s") for scenario in scenarios
+    ):
+        wanted.remove("ceiling.png")
     if any("setup" in scenario.get("id", "") for scenario in scenarios):
         wanted.append(SETUP_CHART)
     for name in wanted:
