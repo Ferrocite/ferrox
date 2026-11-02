@@ -3898,7 +3898,7 @@ fn serve_vless_ws(
     let Some((got, flow, cmd, target)) = under_handshake(&mut reader, |read| {
         decode_request_gated(
             read,
-            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
             resolve_endpoint,
         )
     }) else {
@@ -3910,7 +3910,7 @@ fn serve_vless_ws(
         reverse_carried(ask, reader, writer, Arc::new(move || closer_writer.close()));
         return;
     }
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -3952,7 +3952,7 @@ fn serve_vless_httpupgrade(
     reader.set_poll(Some(RELAY_POLL));
     let decoded = decode_request_bounded_gated(
         &mut reader,
-        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
         resolve_endpoint,
     );
     reader.set_poll(None);
@@ -3965,7 +3965,7 @@ fn serve_vless_httpupgrade(
         reverse_carried(ask, reader, write, closer);
         return;
     }
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -4024,7 +4024,7 @@ fn serve_vless_grpc(
     let Some((got, flow, cmd, target)) = under_handshake(&mut reader, |read| {
         decode_request_gated(
             read,
-            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
             resolve_endpoint,
         )
     }) else {
@@ -4036,7 +4036,7 @@ fn serve_vless_grpc(
         reverse_carried(ask, reader, writer, Arc::new(move || closer_writer.close()));
         return;
     }
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -4068,7 +4068,7 @@ pub(crate) fn serve_grpc_muxed(
     let Some((got, flow, cmd, target)) = under_handshake(&mut reader, |read| {
         decode_request_gated(
             read,
-            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
             resolve_endpoint,
         )
     }) else {
@@ -4086,7 +4086,7 @@ pub(crate) fn serve_grpc_muxed(
         reverse_carried(ask, reader, writer, Arc::new(move || closer.close()));
         return;
     }
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         reader.abort();
         return;
     }
@@ -4140,7 +4140,7 @@ fn serve_vless_httpheader(
     reader.set_poll(Some(RELAY_POLL));
     let decoded = decode_request_bounded_gated(
         &mut reader,
-        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
         resolve_endpoint,
     );
     reader.set_poll(None);
@@ -4153,7 +4153,7 @@ fn serve_vless_httpheader(
         reverse_carried(ask, reader, write, closer);
         return;
     }
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -7416,7 +7416,7 @@ fn serve_session_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
     let decoded = decode_request_gated(
         &mut creader,
-        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
         resolve_endpoint,
     );
     creader.set_handshake_budget(None);
@@ -7424,7 +7424,7 @@ fn serve_session_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
         echo_trace("session ws vless decode refused");
         return;
     };
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         echo_trace("session ws vless id or cmd refused");
         return;
     }
@@ -7548,16 +7548,29 @@ pub(crate) fn serve_session_xhttp_with(
     // Every refusal ends the carrier's stream: a session that answers nothing leaves its reader parked on a reply that will never come.
     let Some((got, flow, cmd, target)) = decode_request_gated(
         &mut creader,
-        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, true),
         resolve_endpoint,
     ) else {
         echo_trace("session xhttp vless decode refused");
         cwriter.finish();
         return;
     };
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &got, flow, cmd, freedom, true) {
         echo_trace("session xhttp vless id or cmd refused");
         cwriter.finish();
+        return;
+    }
+    if cmd == 2 {
+        let closer = cwriter.clone();
+        let writer = cwriter.clone();
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || closer.finish());
+        if !cwriter.send(&[0, 0]) {
+            echo_trace("session xhttp vless response refused");
+            cwriter.finish();
+            return;
+        }
+        echo_trace("session xhttp udp association");
+        spawn_carried(move || serve_udp_stream(creader, writer, &target, Vec::new(), &close));
         return;
     }
     let Some(uplink) = dial_or_report(&target) else {
@@ -7599,7 +7612,7 @@ fn serve_session_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send +
     let mut creader = creader;
     let decoded = decode_request_bounded_gated(
         &mut creader,
-        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
         resolve_endpoint,
     );
     let Some((got, flow, cmd, target)) = decoded else {
@@ -7607,7 +7620,7 @@ fn serve_session_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send +
         crate::httpupgrade::quiet(&raw);
         return;
     };
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         echo_trace("session httpupgrade vless id or cmd refused");
         crate::httpupgrade::quiet(&raw);
         return;
@@ -7654,14 +7667,14 @@ fn serve_session_httpheader<R: Read + Send + 'static, W: Write + Clone + Send + 
     let mut creader = creader;
     let decoded = decode_request_bounded_gated(
         &mut creader,
-        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
         resolve_endpoint,
     );
     let Some((got, flow, cmd, target)) = decoded else {
         echo_trace("session httpheader vless decode refused");
         return;
     };
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         echo_trace("session httpheader vless id or cmd refused");
         return;
     }
@@ -7717,7 +7730,7 @@ fn serve_session_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     creader.set_handshake_budget(Some(Instant::now() + budgets::handshake()));
     let decoded = decode_request_gated(
         &mut creader,
-        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
         resolve_endpoint,
     );
     creader.set_handshake_budget(None);
@@ -7725,7 +7738,7 @@ fn serve_session_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
         echo_trace("session grpc vless decode refused");
         return;
     };
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         echo_trace("session grpc vless id or cmd refused");
         return;
     }
@@ -10996,13 +11009,13 @@ fn serve_xdrive_loop(
 fn serve_vless_xdrive(mut session: crate::xdrive::Conn, users: &[VlessUser], freedom: bool) {
     let Some((got, flow, cmd, target)) = decode_request_bounded_gated(
         &mut session,
-        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+        |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom, false),
         resolve_endpoint,
     ) else {
         return;
     };
     // A mux or reverse header names no destination, so the gate above never saw it.
-    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+    if !vless_user_allows(users, &got, flow, cmd, freedom, false) {
         return;
     }
     let Some(user) = users.iter().find(|user| {
@@ -12151,16 +12164,17 @@ fn dial_udp_uplink(
     if matches!(vless.carrier, Carrier::Quic) {
         return dial_quic_udp_uplink(vless, dest, relay, source);
     }
-    if !matches!(vless.carrier, Carrier::Raw(_)) {
-        return None;
-    }
-    if vless.reality.is_some() {
+    if !matches!(vless.carrier, Carrier::Raw(_) | Carrier::Xhttp { .. }) {
         return None;
     }
     let server = resolve_outbound(&vless.address, vless.port)?;
-    let uplink = dial_or_report(&server)?.with_mask(vless.carrier.tcp_mask());
+    let mask = vless.carrier.tcp_mask();
     let header = vless_header(&vless.id, 2, &Destination::from(*dest));
-    let (write, read, close): (Box<dyn Write + Send>, Box<dyn Read + Send>, _) =
+    let (read, write, close): UdpCarriedParts = if let Carrier::Raw(_) = &vless.carrier {
+        if vless.reality.is_some() {
+            return None;
+        }
+        let uplink = dial_or_report(&server)?.with_mask(mask);
         if let Some(encryption) = &vless.encryption {
             let close = connection_closer(&uplink);
             let mut sealed = match encryption.handshake(uplink) {
@@ -12173,15 +12187,43 @@ fn dial_udp_uplink(
             sealed.write_all(&header).ok()?;
             read_vless_response(&mut sealed)?;
             let (reader, writer) = sealed.into_split()?;
-            (Box::new(writer), Box::new(reader), close)
+            (Box::new(reader), Box::new(writer), close)
         } else {
             let mut uplink = uplink;
             uplink.write_all(&header).ok()?;
             read_vless_response(&mut uplink)?;
             let read = uplink.try_clone().ok()?;
             let close = connection_closer(&uplink);
-            (Box::new(uplink), Box::new(read), close)
+            (Box::new(read), Box::new(uplink), close)
+        }
+    } else {
+        // An association rides the same xHTTP session a flow would, and the handshake's ALPN picks the head.
+        if vless.reality.is_some() || vless.encryption.is_some() {
+            return None;
+        }
+        let (mut read, write, close) = match &vless.tls {
+            Some(cfg) => udp_carried_session(
+                dial_tls_session(&server, cfg, mask)?,
+                || dial_tls_session(&server, cfg, mask),
+                &vless.host,
+                &vless.carrier,
+                &vless.headers,
+                vless.heartbeat,
+                &header,
+            )?,
+            None => udp_plain_carried(
+                dial_or_report(&server)?.with_mask(mask),
+                &vless.host,
+                &vless.carrier,
+                &vless.headers,
+                vless.heartbeat,
+                &header,
+            )?,
         };
+        // The reply is the association's acceptance; a datagram read here would eat it.
+        read_vless_response(&mut *read)?;
+        (read, write, close)
+    };
     let Ok(udp_send) = relay.try_clone() else {
         return None;
     };
@@ -12864,8 +12906,8 @@ where
 }
 
 struct TrojanUdpUplink {
-    write: Box<dyn Write>,
-    close: Box<dyn Fn() + Send>,
+    write: Box<dyn Write + Send>,
+    close: Arc<dyn Fn() + Send + Sync>,
     done: RelayEnd,
 }
 
@@ -12917,7 +12959,11 @@ impl<'a> TrojanUdpLane<'a> {
 }
 
 /// The reader, writer and teardown of an association carried inside one carrier session.
-type TrojanUdpParts = (Box<dyn Read + Send>, Box<dyn Write>, Box<dyn Fn() + Send>);
+type UdpCarriedParts = (
+    Box<dyn Read + Send>,
+    Box<dyn Write + Send>,
+    Arc<dyn Fn() + Send + Sync>,
+);
 
 /// The carriers an association rides: the stream carriers frame the datagrams, and KCP carries them over its own session.
 fn trojan_udp_carried(carrier: &Carrier) -> bool {
@@ -12974,7 +13020,7 @@ fn dial_trojan_udp_uplink(
     let udp_send = relay.try_clone().ok()?;
     let mask = trojan.carrier.tcp_mask();
     // The association rides whatever the outbound names: a terminated session splits into the reader and writer the pump needs, and the header goes inside it.
-    let (read, write, close): TrojanUdpParts = match (
+    let (read, write, close): UdpCarriedParts = match (
         &trojan.carrier,
         trojan.reality.as_deref(),
         trojan.tls.as_deref(),
@@ -12990,7 +13036,7 @@ fn dial_trojan_udp_uplink(
             let close = move || {
                 let _ = socket.shutdown(Shutdown::Both);
             };
-            (Box::new(half.clone()), Box::new(half), Box::new(close))
+            (Box::new(half.clone()), Box::new(half), Arc::new(close))
         }
         (Carrier::Raw(_), None, Some(cfg)) => {
             let mut session = dial_tls_session(&server, cfg, mask)?;
@@ -13004,7 +13050,7 @@ fn dial_trojan_udp_uplink(
             let close = move || {
                 let _ = socket.shutdown(Shutdown::Both);
             };
-            (Box::new(half.clone()), Box::new(half), Box::new(close))
+            (Box::new(half.clone()), Box::new(half), Arc::new(close))
         }
         (Carrier::Kcp(_), Some(cfg), _) => {
             let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
@@ -13014,7 +13060,7 @@ fn dial_trojan_udp_uplink(
             }
             let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
             let close = move || conn.close();
-            (Box::new(read), Box::new(write), Box::new(close))
+            (Box::new(read), Box::new(write), Arc::new(close))
         }
         (Carrier::Kcp(_), None, Some(cfg)) => {
             let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
@@ -13024,7 +13070,7 @@ fn dial_trojan_udp_uplink(
             }
             let (read, write) = session_halves(session, KcpIo::new(Arc::clone(&conn)));
             let close = move || conn.close();
-            (Box::new(read), Box::new(write), Box::new(close))
+            (Box::new(read), Box::new(write), Arc::new(close))
         }
         (Carrier::Raw(_), None, None) => {
             let mut uplink = dial_or_report(&server)?.with_mask(mask);
@@ -13034,7 +13080,7 @@ fn dial_trojan_udp_uplink(
             let close = move || {
                 let _ = uplink.shutdown(Shutdown::Both);
             };
-            (Box::new(read), Box::new(write), Box::new(close))
+            (Box::new(read), Box::new(write), Arc::new(close))
         }
         (Carrier::Kcp(_), None, None) => {
             let conn = kcp_dial_session(&trojan.carrier, &trojan.address, trojan.port)?;
@@ -13043,7 +13089,7 @@ fn dial_trojan_udp_uplink(
             }
             let (read, write, closed) = kcp_parts(&conn);
             let close = move || closed();
-            (Box::new(read), Box::new(write), Box::new(close))
+            (Box::new(read), Box::new(write), Arc::new(close))
         }
         (carrier, Some(cfg), _) => {
             let session = dial_reality_session(&server, cfg, mask)?;
@@ -13094,7 +13140,7 @@ fn dial_trojan_quic_udp_uplink(
     let done = spawn_trojan_uplink_reader(pooled.stream_handle(), udp_send, source);
     let close_stream = pooled.stream_handle();
     let pooled = Mutex::new(Some(pooled));
-    let close: Box<dyn Fn() + Send> = Box::new(move || {
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         close_stream.close();
         drop(pooled.lock().ok().and_then(|mut slot| slot.take()));
     });
@@ -13110,35 +13156,45 @@ fn trojan_udp_plain(
     carrier: &Carrier,
     trojan: &TrojanOut,
     header: &[u8],
-) -> Option<TrojanUdpParts> {
+) -> Option<UdpCarriedParts> {
+    udp_plain_carried(
+        uplink,
+        &trojan.host,
+        carrier,
+        &trojan.headers,
+        trojan.heartbeat,
+        header,
+    )
+}
+
+fn udp_plain_carried(
+    uplink: Connection,
+    host: &str,
+    carrier: &Carrier,
+    headers: &[(String, String)],
+    heartbeat: u32,
+    header: &[u8],
+) -> Option<UdpCarriedParts> {
     let raw = uplink.try_clone().ok()?;
-    let host = &trojan.host;
     match carrier {
         Carrier::Ws { path, ed } => {
-            let (reader, writer) = crate::ws::connect(
-                uplink,
-                host,
-                path,
-                *ed,
-                header,
-                &trojan.headers,
-                trojan.heartbeat,
-            )?;
+            let (reader, writer) =
+                crate::ws::connect(uplink, host, path, *ed, header, headers, heartbeat)?;
             let closer = writer.clone();
             let close = move || {
                 closer.close();
                 let _ = raw.shutdown(Shutdown::Both);
             };
-            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
         }
         Carrier::HttpUpgrade { path, ed, .. } => {
             let (reader, writer) =
-                crate::httpupgrade::connect(uplink, host, path, *ed, header, &trojan.headers)?;
+                crate::httpupgrade::connect(uplink, host, path, *ed, header, headers)?;
             let socket = writer.try_clone().ok()?;
             let close = move || {
                 let _ = socket.shutdown(Shutdown::Both);
             };
-            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
         }
         Carrier::Grpc(settings) => {
             let (reader, writer) = crate::grpc::connect_with(uplink, host, settings)?;
@@ -13150,7 +13206,7 @@ fn trojan_udp_plain(
                 closer.close();
                 let _ = raw.shutdown(Shutdown::Both);
             };
-            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
         }
         Carrier::Xhttp { .. } => {
             let (reader, writer) = xhttp_rung(uplink, host, carrier, "")?;
@@ -13162,17 +13218,16 @@ fn trojan_udp_plain(
                 closer.finish();
                 let _ = raw.shutdown(Shutdown::Both);
             };
-            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
         }
         Carrier::HttpHeader { path } => {
-            let (reader, mut writer) =
-                crate::httpheader::connect(uplink, host, path, &trojan.headers)?;
+            let (reader, mut writer) = crate::httpheader::connect(uplink, host, path, headers)?;
             writer.write_all(header).ok()?;
             let socket = writer.try_clone().ok()?;
             let close = move || {
                 let _ = socket.shutdown(Shutdown::Both);
             };
-            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
         }
         _ => None,
     }
@@ -13184,43 +13239,54 @@ fn trojan_udp_session<S: Dialed>(
     carrier: &Carrier,
     trojan: &TrojanOut,
     header: &[u8],
-) -> Option<TrojanUdpParts> {
-    let host = &trojan.host;
+) -> Option<UdpCarriedParts> {
+    udp_carried_session(
+        session,
+        second,
+        &trojan.host,
+        carrier,
+        &trojan.headers,
+        trojan.heartbeat,
+        header,
+    )
+}
+
+/// One association inside one carrier session: a terminated session splits into the halves the pump reads and writes, and the header goes inside it.
+#[allow(clippy::too_many_arguments)]
+fn udp_carried_session<S: Dialed>(
+    session: S,
+    second: impl FnOnce() -> Option<S>,
+    host: &str,
+    carrier: &Carrier,
+    headers: &[(String, String)],
+    heartbeat: u32,
+    header: &[u8],
+) -> Option<UdpCarriedParts> {
+    let h2 = session
+        .alpn()
+        .is_some_and(|alpn| alpn.eq_ignore_ascii_case(b"h2"));
     match carrier {
         Carrier::Ws { path, ed } => {
             let (reader, writer, raw) = session.into_halves()?;
             let (reader, writer) = crate::ws::connect_split(
-                reader,
-                writer,
-                host,
-                path,
-                *ed,
-                header,
-                &trojan.headers,
-                trojan.heartbeat,
+                reader, writer, host, path, *ed, header, headers, heartbeat,
             )?;
             let closer = writer.clone();
             let close = move || {
                 closer.close();
                 let _ = raw.shutdown(Shutdown::Both);
             };
-            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
         }
         Carrier::HttpUpgrade { path, ed, .. } => {
             let (reader, writer, raw) = session.into_halves()?;
             let (reader, writer) = crate::httpupgrade::connect_split(
-                reader,
-                writer,
-                host,
-                path,
-                *ed,
-                header,
-                &trojan.headers,
+                reader, writer, host, path, *ed, header, headers,
             )?;
             let close = move || {
                 let _ = raw.shutdown(Shutdown::Both);
             };
-            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
         }
         Carrier::Grpc(settings) => {
             let (reader, writer, raw) = session.into_halves()?;
@@ -13233,14 +13299,28 @@ fn trojan_udp_session<S: Dialed>(
                 closer.close();
                 let _ = raw.shutdown(Shutdown::Both);
             };
-            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
         }
         Carrier::Xhttp { settings } => {
             let (first, up, raw) = session.into_halves()?;
             if settings.mode == crate::xhttp::XhttpMode::StreamOne {
-                let head = crate::xhttp::dial_path(settings);
-                let (reader, writer) =
-                    crate::xhttp::connect_split(first, up, host, &head, &settings.headers)?;
+                // An ALPN-negotiated h2 session expects the preface; `decideHTTPVersion` (dialer.go:82) takes the negotiated protocol, not the offer.
+                let (reader, writer): (Box<dyn Read + Send>, crate::xhttp::XhttpWriter) = if h2 {
+                    let (reader, writer) = crate::xhttp_h2::connect_split(
+                        first,
+                        up,
+                        Arc::clone(&raw),
+                        host,
+                        settings,
+                        "https",
+                    )?;
+                    (Box::new(reader), writer)
+                } else {
+                    let head = crate::xhttp::dial_path(settings);
+                    let (reader, writer) =
+                        crate::xhttp::connect_split(first, up, host, &head, &settings.headers)?;
+                    (Box::new(reader), writer)
+                };
                 if !writer.send(header) {
                     return None;
                 }
@@ -13249,7 +13329,11 @@ fn trojan_udp_session<S: Dialed>(
                     closer.finish();
                     let _ = raw.shutdown(Shutdown::Both);
                 };
-                return Some((Box::new(reader), Box::new(writer), Box::new(close)));
+                return Some((reader, Box::new(writer), Arc::new(close)));
+            }
+            // This tree's H2 client is stream-one; a packet-up session on a connection that negotiated h2 is not one this dialer can carry, and an H1 head is not a fallback the peer agreed to.
+            if h2 {
+                return None;
             }
             // The GET downlink dials its own session: one transport per direction, both under one session id (`dialer.go:411`).
             let (down, down_write, down_raw) = second()?.into_halves()?;
@@ -13264,18 +13348,18 @@ fn trojan_udp_session<S: Dialed>(
                 let _ = raw.shutdown(Shutdown::Both);
                 let _ = down_raw.shutdown(Shutdown::Both);
             };
-            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
         }
         Carrier::HttpHeader { path } => {
             let (reader, writer, raw) = session.into_halves()?;
             let (reader, writer) =
-                crate::httpheader::connect_split(reader, writer, host, path, &trojan.headers)?;
+                crate::httpheader::connect_split(reader, writer, host, path, headers)?;
             let mut writer = writer;
             writer.write_all(header).ok()?;
             let close = move || {
                 let _ = raw.shutdown(Shutdown::Both);
             };
-            Some((Box::new(reader), Box::new(writer), Box::new(close)))
+            Some((Box::new(reader), Box::new(writer), Arc::new(close)))
         }
         _ => None,
     }
@@ -27985,6 +28069,7 @@ fn vless_user_allows(
     flow: Flow,
     cmd: u8,
     freedom: bool,
+    udp: bool,
 ) -> bool {
     if cmd == 4
         && users
@@ -27999,7 +28084,7 @@ fn vless_user_allows(
         }
     }
     freedom
-        && cmd == 1
+        && (cmd == 1 || (udp && cmd == 2))
         && users.iter().any(|user| {
             same_vless_user(&user.id, got)
                 && user.reverse.is_none()
@@ -40690,6 +40775,25 @@ mod tests {
     }
 
     fn assert_trojan_udp_echo_with(tag: &str, trojan: &TrojanOut, udp: &UdpSocket) {
+        let trojan = trojan.clone();
+        assert_udp_echo_association(tag, udp, move |relay| {
+            serve_socks_udp_trojan(relay, &trojan);
+        });
+    }
+
+    fn assert_vless_udp_echo_with(tag: &str, vless: &VlessOut, udp: &UdpSocket) {
+        let vless = vless.clone();
+        assert_udp_echo_association(tag, udp, move |relay| {
+            serve_socks_udp_vless(relay, &vless);
+        });
+    }
+
+    /// The socks side of a UDP association: an echo peer, the association served on its own relay socket, and two datagrams a quarter second apart.
+    fn assert_udp_echo_association(
+        tag: &str,
+        udp: &UdpSocket,
+        serve: impl FnOnce(&UdpSocket) + Send + 'static,
+    ) {
         let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let echo_port = echo.local_addr().expect("addr").port();
         thread::spawn(move || {
@@ -40700,11 +40804,10 @@ mod tests {
                 }
             }
         });
-        let trojan = trojan.clone();
         let relay = Arc::new(UdpSocket::bind("127.0.0.1:0").expect("binds"));
         let relay_addr = relay.local_addr().expect("addr");
         let served = Arc::clone(&relay);
-        thread::spawn(move || serve_socks_udp_trojan(&served, &trojan));
+        thread::spawn(move || serve(&served));
         udp.connect(relay_addr).expect("the association relay");
         udp.set_read_timeout(Some(Duration::from_secs(30)))
             .expect("timeout");
@@ -40714,7 +40817,7 @@ mod tests {
         for (index, payload) in payloads.iter().map(String::as_bytes).enumerate() {
             let datagram = socks_udp_frame(&mut frame, None, &target, payload);
             assert_eq!(
-                trojan_udp_answer(udp, datagram, payload, tag, index == 0),
+                socks_udp_answer(udp, datagram, payload, tag, index == 0),
                 target,
                 "{tag}"
             );
@@ -40724,7 +40827,7 @@ mod tests {
     }
 
     /// A stale frame can land on a reused relay port and a lane can drop its first datagram: resend the first, but send the second once so a new association cannot answer it.
-    fn trojan_udp_answer(
+    fn socks_udp_answer(
         udp: &UdpSocket,
         frame: &[u8],
         want: &[u8],
@@ -43083,6 +43186,79 @@ mod tests {
                 .iter()
                 .any(|path| path == WITNESS),
             "an ALPN-negotiated h2 session must open with the H2 preface"
+        );
+    }
+
+    /// An association rides xHTTP inside TLS through the H1 head, and the H1 head is what a session without ALPN names.
+    #[test]
+    fn a_vless_udp_association_crosses_xhttp_over_h1() {
+        assert_vless_udp_over_xhttp(false);
+    }
+
+    /// The same association over the H2 preface, chosen by what the handshake negotiated rather than by the carrier's name.
+    #[test]
+    fn a_vless_udp_association_crosses_xhttp_over_h2() {
+        assert_vless_udp_over_xhttp(true);
+    }
+
+    fn assert_vless_udp_over_xhttp(h2: bool) {
+        let tag = if h2 { "h2" } else { "h1" };
+        let (server_config, client_config) = carried_tls_configs();
+        let alpn = if h2 { vec![b"h2".to_vec()] } else { Vec::new() };
+        let server_config = Arc::new(ferrox_core::tls::TlsServerConfig {
+            alpn: alpn.clone(),
+            ..(*server_config).clone()
+        });
+        let mut client_config = client_config.clone();
+        client_config.alpn = alpn.into();
+        let id = [0x4Bu8; 16];
+        let path = format!("/udp-{tag}");
+        let settings = xhttp_settings(&path);
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let server_settings = settings.clone();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().expect("accepts");
+            serve_vless_tls(
+                stream,
+                &one_vless_user(&id),
+                true,
+                &Carrier::Xhttp {
+                    settings: server_settings,
+                },
+                &server_config,
+                None,
+                None,
+            );
+        });
+        let vless = VlessOut {
+            address: "127.0.0.1".to_owned(),
+            port,
+            id,
+            carrier: Carrier::Xhttp {
+                settings: settings.clone(),
+            },
+            host: "127.0.0.1".to_owned(),
+            headers: Vec::new(),
+            heartbeat: 0,
+            mux: false,
+            quic_roots: None,
+            quic_ech: None,
+            hysteria_roots: None,
+            tls: Some(Arc::new(client_config)),
+            flow: String::new(),
+            reality: None,
+            encryption: None,
+        };
+        let udp = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        assert_vless_udp_echo_with(tag, &vless, &udp);
+        let witness = H2_DIAL_WITNESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            witness.iter().any(|seen| seen == &path),
+            h2,
+            "{tag}: the preface is opened only when the handshake negotiated h2"
         );
     }
 
@@ -61272,8 +61448,15 @@ mod reverse_tests {
             reverse_ask(&forward, &[9u8; 16], Flow::None, 4),
             ReverseAsk::NotReverse
         ));
-        assert!(!vless_user_allows(&reverse, &id, Flow::None, 4, true));
-        assert!(vless_user_allows(&forward, &id, Flow::None, 1, true));
+        assert!(!vless_user_allows(
+            &reverse,
+            &id,
+            Flow::None,
+            4,
+            true,
+            false
+        ));
+        assert!(vless_user_allows(&forward, &id, Flow::None, 1, true, false));
     }
 
     /// A reverse account's command 4 attaches on a sealed raw session with no Freedom outbound:

@@ -74,6 +74,14 @@ graph TD
     R --> E["finish_stream: empty DATA with F_END"]
 ```
 
+## The UDP association over xHTTP
+
+A VLESS UDP association now rides the same stream-one session a flow does, on both ends. The hub's xHTTP session handler decodes the header, sees command `2`, answers the VLESS acceptance (`00 00`) on the carrier writer, and hands the rest of the stream to `serve_udp_stream`: one bound UDP socket to the target, the VLESS datagram framing (`len`, payload) over the carrier's own chunk or `DATA` framing, and the downlink written back the same way. The client's `dial_udp_uplink` stopped refusing every non-raw carrier for xHTTP: it dials the TLS session (or the plain one), takes the carrier split the flow path takes, writes and reads the association header, and only then starts the uplink pump. The head is chosen where the flow path chooses it — `udp_carried_session` reads the negotiated ALPN and takes `xhttp_h2::connect_split` for h2, `xhttp::connect_split` otherwise — so an association cannot pick a different protocol from the flow on the same outbound.
+
+The gates are `proxy::tests::a_vless_udp_association_crosses_xhttp_over_h1` and `..._over_h2`: a real `serve_vless_tls` hub (once without ALPN, once offering `h2`), the real `serve_socks_udp_vless` relay, and two datagrams a quarter second apart through the loopback echo. Both fail without the change — the client returns no uplink, so the association never answers — and the h2 row additionally asserts the server saw the preface on that row's unique path, so a negotiated h2 session that quietly fell back to H1 fails the gate.
+
+What is *not* claimed, named rather than rounded off: the `h2c` cleartext spelling still needs the confidentiality layer #593 asks for; ws, gRPC, httpupgrade and httpheader carry a trojan association here but VLESS keeps them refused, so an association on those carriers is still a missing row; REALITY associations are refused on both xHTTP and raw; sealed (`encryption`) associations are refused on xHTTP only, while raw carries them; and a packet-up session whose handshake negotiated h2 is refused instead of being sent an H1 head, because this tree's H2 client is stream-one only, the same limit `tls_xhttp` has. Counts do not move: the association frames datagrams through the writer the flow already uses, and every row in the table below measures that framing.
+
 ## Connection reuse
 
 A packet-up uplink is a sequence of `POST {sid}/{seq}` requests, and the reference hub is an `http.Server` that never closes the connection under it: `plain_ok` answers `Content-Length: 0` with `Connection: keep-alive`, and Go's transport puts the socket back in its idle pool and writes the *next* packet on it (`hub.go:561` only arms a 4 s timeout for the next head). Our hub answered the first POST, promised keep-alive in that very response, and then tore the connection down, because `accept_core` could only return a session or nothing.
