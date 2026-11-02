@@ -12,7 +12,10 @@
 #   ferrox-cli down | status | ports | tun | version
 #
 # In a release package this script sits beside the binary and runs it; in the
-# repository it runs what `cargo build --release` last produced.
+# repository it runs a local build: the release binary when one exists, else the
+# dev binary the test cycle already produces. A release build optimises every
+# dependency and links with thin LTO, so it costs minutes; a dev build is seconds.
+# FERROX_PROFILE=release (or FERROX_RELEASE=1) asks for the measured binary.
 #
 # The fronts are local proxies (SOCKS5, HTTP CONNECT, mixed). "VPN mode" here
 # means the macOS system proxy, because this binary has no utun device: TUN
@@ -30,17 +33,30 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Three homes for the binary, first hit wins: $FERROX_BIN names one outright; a
 # release package puts it next to this script; in the repository cargo writes
 # where build.target-dir says, not under $ROOT/target, so resolving the name is
-# the only way `up` runs the binary `cargo build --release` just built. It is
-# deferred: --help, down or a missing flag answers without waiting for cargo.
+# the only way `up` runs what the last build produced. A checkout can hold both
+# profiles, and the release binary is the measured one, so it wins; a tree whose
+# last build was a test still has a dev binary, and `up` uses it rather than pay
+# for an optimised link. FERROX_PROFILE names one. Resolution is deferred:
+# --help, down or a missing flag answers without waiting for cargo.
 BIN="${FERROX_BIN:-}"
 resolve_bin() {
   [ -n "$BIN" ] && return 0
-  local cand cargo_target
+  local cand dir cargo_target
+  local -a profiles
   for cand in "$SCRIPT_DIR/ferrox-app" "$SCRIPT_DIR/ferrox-app.exe"; do
     [ -x "$cand" ] && { BIN="$cand"; return 0; }
   done
   cargo_target="$(cd "$ROOT" && cargo metadata --format-version 1 --no-deps 2>/dev/null | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p' | head -1)"
-  BIN="${cargo_target:-$ROOT/target}/release/ferrox-app"
+  cargo_target="${cargo_target:-$ROOT/target}"
+  case "${FERROX_PROFILE:-release}" in
+    release) profiles=(release debug) ;;
+    debug) profiles=(debug release) ;;
+    *) die "FERROX_PROFILE must be debug or release, not '$FERROX_PROFILE'" ;;
+  esac
+  for dir in "${profiles[@]}"; do
+    [ -x "$cargo_target/$dir/ferrox-app" ] && { BIN="$cargo_target/$dir/ferrox-app"; return 0; }
+  done
+  BIN="$cargo_target/${profiles[0]}/ferrox-app"
 }
 CONF_DIR="${FERROX_CONF_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/ferrox}"
 # The system proxy is machine-wide, so its marker and the lane registry live
@@ -215,7 +231,7 @@ commands
   status     show the lane (--instance NAME for one of several), then its exit
   ports      print the port map and the macOS settings to type
   tun        what TUN mode would need, and why this binary refuses it
-  version    print the release binary's version
+  version    print the binary's version
 
 first run, then every run: the foxy lane signs in once and keeps the session in
 \$CONF_DIR/foxy-token.json (0600). The launches after it mint a pass from that grant,
@@ -349,7 +365,7 @@ fronts
   --debug                keep the lane's dial trace in the log (FOXY_DEBUG=1)
   --tun                  refused: this binary has no utun device
   -h, --help             this text
-  -V, --version          print the release binary's version
+  -V, --version          print the binary's version
 
 ports (defaults)
   SOCKS5         127.0.0.1:$SOCKS_PORT    curl --socks5-hostname, UDP-aware
@@ -2766,17 +2782,36 @@ fi
 # Only up, serve and version need the binary: down, status and login must
 # still work when it was never fetched.
 require_bin() {
+  local profile
   resolve_bin
   [ -x "$BIN" ] && return 0
-  # In a checkout the binary is a build, not a download: build it once rather
-  # than send the reader to a release page for a lane this tree already has.
+  # In a checkout the binary is a build, not a download. The release profile is
+  # the slow one: every dependency optimised, the app in one codegen unit, and a
+  # thin-LTO link (minutes cold, ~4 minutes after an app edit). The dev profile
+  # reuses the test cycle's warm dependencies and finishes in seconds, so `up`
+  # defaults to it; FERROX_PROFILE=release (or FERROX_RELEASE=1) builds the
+  # measured binary.
   if [ -f "$ROOT/Cargo.toml" ] && command -v cargo >/dev/null 2>&1; then
-    say "building ferrox-app (release, one time)..."
-    ( cd "$ROOT" && cargo build --locked --release -p ferrox-app ) >&2 || die "the build failed"
+    profile="${FERROX_PROFILE:-debug}"
+    [ "${FERROX_RELEASE:-0}" = 1 ] && profile=release
+    case "$profile" in
+      release)
+        say "building ferrox-app (release; minutes, not seconds)..."
+        ( cd "$ROOT" && cargo build --locked --release -p ferrox-app ) >&2 || die "the build failed" ;;
+      debug)
+        say "building ferrox-app (dev profile; seconds)..."
+        ( cd "$ROOT" && cargo build --locked -p ferrox-app ) >&2 || die "the build failed"
+        say "running the dev binary; FERROX_PROFILE=release builds the measured one." ;;
+      *) die "FERROX_PROFILE must be debug or release, not '$profile'" ;;
+    esac
+    # The first resolve parked BIN on the profile that was missing; a build that
+    # just created the other one has to be seen.
+    [ -n "${FERROX_BIN:-}" ] || BIN=""
+    resolve_bin
     [ -x "$BIN" ] || die "the build finished but $BIN is still missing"
     return 0
   fi
-  die "no binary at $BIN: unpack a release package beside this script (https://github.com/FerroxCo/ferrox/releases), or build one: cargo build --release -p ferrox-app"
+  die "no binary at $BIN: unpack a release package beside this script (https://github.com/FerroxCo/ferrox/releases), or build one: cargo build -p ferrox-app (add --release for the measured binary)"
 }
 
 case "$ACTION" in

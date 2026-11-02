@@ -13,6 +13,8 @@ Two things were built here, from the same release binary — a release package f
 | the Windows fallback | `ferrox-cli.sh` — Git Bash only, with Python 3 and curl on `PATH` |
 | the app | `dist/Ferrox.app` — the same CLI behind a double-click |
 
+In a source checkout `ferrox-cli.sh` uses the release binary when one exists, otherwise the dev binary the test build already produced, because a release link is minutes and a dev build is seconds. Set `FERROX_PROFILE=release` when you want the measured binary.
+
 On Windows the native launcher keeps config and account files under `%APPDATA%\ferrox` and pid/log/system-proxy state under `%LOCALAPPDATA%\ferrox`, owner-only through NTFS ACLs. Every `~/.config/ferrox` path on this page describes macOS and Linux.
 
 `ferrox-cli.sh`, this page and `README.md` are tracked so the release job can ship them; everything else under `dist/` — the bundle, its build script, any lane config — stays git-ignored, and so does every file that carries an account.

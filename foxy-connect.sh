@@ -28,7 +28,18 @@
 set -euo pipefail
 
 FERROX_ROOT="$(cd "$(dirname "$0")" && pwd)"
-BIN="${FERROX_BIN:-$FERROX_ROOT/target/release/ferrox-app}"
+# The measured binary wins when it exists; a tree that has only run tests still
+# has a dev binary, and paying for an optimised link before every trial is what
+# makes a one-line change feel like a rebuild of the world.
+if [ -n "${FERROX_BIN:-}" ]; then
+  BIN="$FERROX_BIN"
+elif [ -x "$FERROX_ROOT/ferrox-app" ]; then
+  BIN="$FERROX_ROOT/ferrox-app"
+elif [ -x "$FERROX_ROOT/target/release/ferrox-app" ]; then
+  BIN="$FERROX_ROOT/target/release/ferrox-app"
+else
+  BIN="$FERROX_ROOT/target/debug/ferrox-app"
+fi
 # Both live outside this repository: the account, the pass and the exit
 # country are the machine's business, never the tree's. Override with
 # FOXY_CONF_DIR and FOXY_CREDENTIALS when a shared ~/.config is not wanted.
@@ -329,8 +340,19 @@ fi
 
 # Everything after this point needs a lane, so the binary and the pass first.
 if [ "${FORCE_BUILD:-0}" = 1 ] || [ ! -x "$BIN" ]; then
-  echo "building ferrox-app (one time)..."
-  (cd "$FERROX_ROOT" && cargo build --locked --release --target-dir "$FERROX_ROOT/target" -p ferrox-app) >&2
+  [ -f "$FERROX_ROOT/Cargo.toml" ] || die "no binary at $BIN and no source tree to build one"
+  # The release profile optimises every dependency and links with thin LTO: a
+  # cold build is many minutes and an app edit is minutes more. The dev profile
+  # reuses the test cycle's warm dependencies and finishes in seconds.
+  if [ "${FERROX_PROFILE:-debug}" = release ] || [ "${FERROX_RELEASE:-0}" = 1 ]; then
+    echo "building ferrox-app (release; minutes, not seconds)..."
+    (cd "$FERROX_ROOT" && cargo build --locked --release --target-dir "$FERROX_ROOT/target" -p ferrox-app) >&2
+    BIN="$FERROX_ROOT/target/release/ferrox-app"
+  else
+    echo "building ferrox-app (dev profile; seconds)..."
+    (cd "$FERROX_ROOT" && cargo build --locked --target-dir "$FERROX_ROOT/target" -p ferrox-app) >&2
+    BIN="$FERROX_ROOT/target/debug/ferrox-app"
+  fi
 fi
 
 if [ -n "$CREDENTIALS" ] && [ -f "$CREDENTIALS" ]; then
