@@ -1842,6 +1842,12 @@ pub(crate) fn tactics(settings: Option<&Json>) -> Result<crate::psiphon_tactics:
     fetch_tactics(&settings)
 }
 
+fn compartment32(text: &str, what: &str) -> Result<[u8; 32], String> {
+    ferrox_core::b64::decode(text.as_bytes())
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| format!("psiphon broker: {what} is not 32 base64 bytes"))
+}
+
 /// Send a client offer to the first broker the tactics payload names.
 pub(crate) fn broker_offer(
     settings: Option<&Json>,
@@ -1865,24 +1871,9 @@ pub(crate) fn broker_offer(
     let compartments: Vec<[u8; 32]> = tactics
         .compartments
         .iter()
-        .map(|compartment| {
-            ferrox_core::b64::decode(compartment.as_bytes())
-                .and_then(|compartment| compartment.try_into().ok())
-                .ok_or_else(|| {
-                    format!(
-                        "psiphon broker: tactics compartment {compartment:?} is not 32 base64 bytes"
-                    )
-                })
-        })
+        .map(|compartment| compartment32(compartment, "tactics compartment"))
         .collect::<Result<_, _>>()?;
-    let personal: [u8; 32] = ferrox_core::b64::decode(settings.compartment.as_bytes())
-        .and_then(|compartment| compartment.try_into().ok())
-        .ok_or_else(|| {
-            format!(
-                "psiphon broker: personal compartment {:?} is not 32 base64 bytes",
-                settings.compartment
-            )
-        })?;
+    let personal: [u8; 32] = compartment32(&settings.compartment, "personal compartment")?;
     let session_id = hex(&random::<16>());
     let identity = Identity {
         session_id: &session_id,
@@ -3684,6 +3675,17 @@ mod tests {
         assert_eq!(server.port, 443);
         let destination = server.inproxy.expect("destination");
         assert_eq!(destination.address, "192.0.2.1:443");
+    }
+
+    #[test]
+    fn a_personal_compartment_that_does_not_decode_is_not_echoed() {
+        let secret = "not/a/compartment";
+        let error = compartment32(secret, "personal compartment").expect_err("a bad compartment");
+        assert_eq!(
+            error,
+            "psiphon broker: personal compartment is not 32 base64 bytes"
+        );
+        assert!(!error.contains(secret));
     }
 
     #[test]
