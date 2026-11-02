@@ -2588,6 +2588,30 @@ fn send_dial_head<W: crate::proxy::FrameWrite>(
     })
 }
 
+/// The regular fields a stream-one dial sends, in the H1 head's order: the configured set, the
+/// padded referer, and the body's type. H2 encodes the same fields as HEADERS.
+pub(crate) fn dial_fields(host: &str, settings: &XhttpSettings) -> Vec<(String, String)> {
+    let mut fields = Vec::new();
+    for line in crate::headers::masked(&settings.headers, crate::headers::FETCH).split("\r\n") {
+        if let Some((name, value)) = line.split_once(": ") {
+            fields.push((name.to_owned(), value.to_owned()));
+        }
+    }
+    fields.push((
+        "referer".to_owned(),
+        format!(
+            "http://{host}{}?x_padding={}",
+            settings.path,
+            referer_pad_value(settings)
+        ),
+    ));
+    fields.push((
+        "content-type".to_owned(),
+        "application/octet-stream".to_owned(),
+    ));
+    fields
+}
+
 // The reference's `appendToPath` (config.go:529): a segment lands under the trailing slash, never beside it.
 fn append_segment(path: &mut String, value: &str) {
     if !path.ends_with('/') {
