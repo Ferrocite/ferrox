@@ -237,6 +237,18 @@ impl Read for H2StreamReader {
                 }
                 continue;
             }
+            // A lane step owns its thread for one poll, so an unarrived body hands the lane back.
+            if crate::proxy::relay_step_owns_poll() {
+                let (_guard, wait) = self
+                    .stream
+                    .cv
+                    .wait_timeout(st, crate::budgets::RELAY_POLL)
+                    .unwrap_or_else(PoisonError::into_inner);
+                if wait.timed_out() {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                continue;
+            }
             let (next, wait) = self
                 .stream
                 .cv
@@ -271,6 +283,24 @@ fn hop_by_hop(name: &str) -> bool {
     .any(|hop| hop.eq_ignore_ascii_case(name))
 }
 
+/// HTTP/2 field names are lowercase (RFC 9113 8.2.1), so the canonical spelling is lowered in place.
+fn lower_field_names(head: &mut [u8]) {
+    let mut at = match head.windows(2).position(|w| w == b"\r\n") {
+        Some(end) => end + 2,
+        None => return,
+    };
+    while at < head.len() && !head[at..].starts_with(b"\r\n") {
+        let Some(colon) = head[at..].iter().position(|&b| b == b':') else {
+            return;
+        };
+        head[at..at + colon].make_ascii_lowercase();
+        at = match head[at + colon..].windows(2).position(|w| w == b"\r\n") {
+            Some(end) => at + colon + end + 2,
+            None => return,
+        };
+    }
+}
+
 /// A response head's fields, status first: one pass and one list, and a hop-by-hop name is
 /// recognised in place where the lowercase form it replaces allocated a `String` per line.
 fn response_fields(head: &str) -> Vec<(&str, &str)> {
@@ -300,7 +330,8 @@ fn response_fields(head: &str) -> Vec<(&str, &str)> {
 }
 
 impl H2StreamWriter {
-    fn emit_headers(&mut self, head: &[u8]) -> bool {
+    fn emit_headers(&mut self, head: &mut [u8]) -> bool {
+        lower_field_names(head);
         let text = std::str::from_utf8(head).unwrap_or_default();
         let headers = response_fields(text);
         let block = block_encode(&headers);
@@ -341,8 +372,8 @@ impl Write for H2StreamWriter {
         if !self.headed {
             self.head.extend_from_slice(buf);
             if let Some(at) = ferrox_core::foxy::head_end(&self.head) {
-                let head = std::mem::take(&mut self.head);
-                if !self.emit_headers(&head[..at + 4]) {
+                let mut head = std::mem::take(&mut self.head);
+                if !self.emit_headers(&mut head[..at + 4]) {
                     return Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe));
                 }
                 let body = &head[at + 4..];
@@ -1876,6 +1907,21 @@ mod tests {
     }
 
     #[test]
+    fn a_response_head_reaches_h2_with_lowercase_field_names() {
+        let mut head =
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nX-Padding: ab\r\n\r\n".to_vec();
+        let capacity = head.capacity();
+        let base = head.as_ptr();
+        lower_field_names(&mut head);
+        assert_eq!(
+            &head[..],
+            b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\nx-padding: ab\r\n\r\n"
+        );
+        assert_eq!(head.capacity(), capacity, "the head keeps its allocation");
+        assert_eq!(head.as_ptr(), base, "the head is lowered where it lies");
+    }
+
+    #[test]
     fn h2_stream_up_carries_bulk_both_ways() {
         let (echo_addr, echo) = echo_server();
         let (addr, server) = serve_one(test_settings("stream-up"), [0xaau8; 16], 1);
@@ -2491,6 +2537,36 @@ mod tests {
             let frames = len.div_ceil(16_384);
             assert!(slices.load(Ordering::SeqCst) <= frames);
         }
+    }
+
+    /// A lane step hands its thread back at the poll; only a wait outside a lane takes the stall.
+    #[test]
+    fn a_lane_read_hands_the_poll_back() {
+        let (conn, _written, _slices) = streaming_conn(0);
+        let stream = conn
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&1)
+            .cloned()
+            .expect("the stream");
+        let mut reader = H2StreamReader {
+            conn,
+            stream,
+            id: 1,
+            at: 0,
+        };
+        let mut buf = [0u8; 8];
+        let started = std::time::Instant::now();
+        let error = {
+            let _step = crate::proxy::RelayStep::enter();
+            reader.read(&mut buf).expect_err("no body arrived")
+        };
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a lane waits the poll, not the stall"
+        );
+        assert!(crate::proxy::is_timeout(&error), "{error:?}");
     }
 
     /// A sender the peer never credits gives up at the relay stall, so a downlink cannot park its thread on a window that never arrives.
