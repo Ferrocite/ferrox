@@ -3985,6 +3985,19 @@ fn serve_vless_grpc(
     freedom: bool,
     decryption: Option<&ferrox_core::vless_encryption::Server>,
 ) {
+    if decryption.is_none() {
+        let Ok(write) = stream.try_clone() else {
+            return;
+        };
+        let _ = stream.set_read_timeout(Some(RELAY_POLL));
+        return crate::grpc::serve_muxed(
+            stream,
+            crate::grpc::Tail::new(Box::new(write)),
+            settings,
+            users,
+            freedom,
+        );
+    }
     let Some((reader, writer)) = crate::grpc::accept_with(stream, settings) else {
         return;
     };
@@ -4040,6 +4053,63 @@ fn serve_vless_grpc(
         crate::grpc::mark_reader_dead,
         |reader| crate::grpc::request_ended(reader),
     );
+}
+
+/// The VLESS handler for one stream of a multiplexed gRPC connection: the demux has already
+/// answered the HTTP/2 head, so only the encrypted-VLESS handshake and the relay remain.
+pub(crate) fn serve_grpc_muxed(
+    mut reader: crate::grpc::GrpcReader<crate::grpc::BodyFrames>,
+    writer: crate::grpc::GrpcWriter,
+    users: &[VlessUser],
+    freedom: bool,
+    opened: &std::sync::atomic::AtomicBool,
+) {
+    reader.arm_mux_poll();
+    let Some((got, flow, cmd, target)) = under_handshake(&mut reader, |read| {
+        decode_request_gated(
+            read,
+            |id, flow, cmd, _, _| vless_user_allows(users, &id, flow, cmd, freedom),
+            resolve_endpoint,
+        )
+    }) else {
+        reader.abort();
+        return;
+    };
+    opened.store(true, std::sync::atomic::Ordering::Relaxed);
+    let ask = reverse_ask(users, &got, flow, cmd);
+    if matches!(&ask, ReverseAsk::Refused) {
+        reader.abort();
+        return;
+    }
+    if !matches!(&ask, ReverseAsk::NotReverse) {
+        let closer = writer.clone();
+        reverse_carried(ask, reader, writer, Arc::new(move || closer.close()));
+        return;
+    }
+    if !vless_user_allows(users, &got, flow, cmd, freedom) {
+        reader.abort();
+        return;
+    }
+    let Some(uplink) = dial_or_report(&target) else {
+        reader.abort();
+        return;
+    };
+    if !writer.send(&[0, 0]) {
+        reader.abort();
+        return;
+    }
+    let reset = reader.reset_handle();
+    if relay_sink_drained_queued(
+        reader,
+        &writer,
+        &uplink,
+        crate::grpc::mark_reader_dead,
+        |reader| crate::grpc::request_ended(reader),
+    )
+    .is_none()
+    {
+        reset();
+    }
 }
 
 fn serve_vless_httpheader(
@@ -7607,12 +7677,16 @@ fn serve_session_httpheader<R: Read + Send + 'static, W: Write + Clone + Send + 
 
 fn serve_session_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
     read: R,
-    write: W,
+    mut write: W,
     settings: &crate::config::GrpcSettings,
     users: &[VlessUser],
     freedom: bool,
     decryption: Option<&ferrox_core::vless_encryption::Server>,
 ) {
+    if decryption.is_none() {
+        write.arm_write(RELAY_POLL);
+        return crate::grpc::serve_muxed(read, write, settings, users, freedom);
+    }
     let Some((creader, cwriter)) = crate::grpc::accept_split_with(read, write, settings) else {
         echo_trace("session grpc accept refused");
         return;
@@ -25423,6 +25497,15 @@ pub(crate) trait FrameWrite: Write + Send {
         }
     }
 
+    /// Bytes the transport's own flow control will take without waiting; a writer that gates on a
+    /// peer window reports it so a batch is sized to what fits and a full window parks the lane.
+    fn room(&self) -> u64 {
+        u64::MAX
+    }
+
+    /// Blocks a caller that may wait until a window opens; a lane never reaches this, it parks.
+    fn wait_room(&self, _turn: Duration) {}
+
     /// Drains a paced tail without waiting; `Clear` when there is nothing left to write.
     fn settle(&mut self) -> Settle {
         Settle::Clear
@@ -25607,19 +25690,31 @@ impl<'a> Window<'a> {
 
 pub(crate) trait WindowRead: Read {
     fn read_window(&mut self) -> std::io::Result<Window<'_>>;
+
+    /// Whether a poll timeout is a lane the pool must park, rather than one that has to keep reading
+    /// because the sibling's window credit arrives on it.
+    fn parks_on_timeout(&self) -> bool {
+        false
+    }
 }
 
 /// A `Read` reader behind the window trait: its window is the buffer it just filled.
 pub(crate) struct Copied<R> {
     inner: R,
     buffer: RelayBuf,
+    parks: bool,
 }
 
 impl<R> Copied<R> {
     fn new(inner: R) -> Self {
+        Self::with_park(inner, false)
+    }
+
+    fn with_park(inner: R, parks: bool) -> Self {
         Self {
             inner,
             buffer: RelayBuf::new(),
+            parks,
         }
     }
 }
@@ -25634,6 +25729,10 @@ impl<R: Read> WindowRead for Copied<R> {
     fn read_window(&mut self) -> std::io::Result<Window<'_>> {
         let n = self.inner.read(self.buffer.as_mut())?;
         Ok(Window::one(self.buffer.filled(n)))
+    }
+
+    fn parks_on_timeout(&self) -> bool {
+        self.parks
     }
 }
 
@@ -25958,8 +26057,15 @@ where
                     echo_trace("relay bwd eof");
                     (Next::Done, false)
                 }
-                // A carrier read that times out is not an idle socket to park: the frame that grants the sibling's window arrives on this read, so the lane takes another turn at once rather than a quantum later.
-                Err(error) if is_timeout(&error) => (Next::More, true),
+                // A socket carrier read that times out takes another turn at once, because the frame granting the sibling's window arrives on it; a queued body parks instead, since its demux reads that frame.
+                Err(error) if is_timeout(&error) => (
+                    if reader.parks_on_timeout() {
+                        Next::Idle
+                    } else {
+                        Next::More
+                    },
+                    true,
+                ),
                 Err(error) => {
                     echo_trace(&format!("relay bwd read err {error:?}"));
                     (Next::Done, false)
@@ -26022,7 +26128,42 @@ pub(crate) fn relay_sink_drained_with<R, W, F, E>(
     writer: &W,
     peer: &Connection,
     on_reader_done: F,
+    request_ended: E,
+) -> Option<Arc<RelayFinish>>
+where
+    R: Read + Send + 'static,
+    W: CarrierSink,
+    F: FnOnce(&mut R) + Send + 'static,
+    E: FnMut(&mut R) -> bool + Send + 'static,
+{
+    relay_sink_poll(reader, writer, peer, on_reader_done, request_ended, false)
+}
+
+/// The same relay over a reader whose bytes wait in a queue another thread fills: a poll timeout
+/// parks the lane instead of keeping a worker reading a socket that carries no credit for it.
+pub(crate) fn relay_sink_drained_queued<R, W, F, E>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+    on_reader_done: F,
+    request_ended: E,
+) -> Option<Arc<RelayFinish>>
+where
+    R: Read + Send + 'static,
+    W: CarrierSink,
+    F: FnOnce(&mut R) + Send + 'static,
+    E: FnMut(&mut R) -> bool + Send + 'static,
+{
+    relay_sink_poll(reader, writer, peer, on_reader_done, request_ended, true)
+}
+
+fn relay_sink_poll<R, W, F, E>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+    on_reader_done: F,
     mut request_ended: E,
+    parks: bool,
 ) -> Option<Arc<RelayFinish>>
 where
     R: Read + Send + 'static,
@@ -26031,7 +26172,7 @@ where
     E: FnMut(&mut R) -> bool + Send + 'static,
 {
     relay_ordered::<Copied<R>, W, _, _, CLOSE_AFTER_JOIN, true>(
-        Copied::new(reader),
+        Copied::with_park(reader, parks),
         writer,
         peer,
         move |reader: &mut Copied<R>| on_reader_done(&mut reader.inner),
