@@ -182,8 +182,7 @@ static MANAGERS: Mutex<Option<HashMap<Key, Arc<Manager>>>> = Mutex::new(None);
 
 pub(crate) fn manager(key: Key, bounds: Option<Xmux>) -> Arc<Manager> {
     let mut managers = MANAGERS.lock().unwrap_or_else(PoisonError::into_inner);
-    // `transport_method.go:458` fills the defaults only for a wholly empty block, so an explicit
-    // `{}` takes them too rather than a pool that never grows and never retires.
+    // `transport_method.go:458` fills the defaults only for a wholly empty block, so `{}` takes them too.
     let bounds = bounds
         .filter(|bounds| *bounds != Xmux::default())
         .unwrap_or_else(defaults);

@@ -16274,7 +16274,7 @@ fn dial_vless_reality(
             if pooled_xhttp_reply(server, client, vless, settings, &header, lease) {
                 return;
             }
-            return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
+            // No request byte left on a dead entry, so the session can still dial its own.
         }
     }
     let uplink = match dial(server) {
