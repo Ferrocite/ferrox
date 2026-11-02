@@ -187,6 +187,8 @@ pub(crate) struct H2StreamReader {
     /// How much of the front frame this reader has taken: the frame is popped when it is spent,
     /// so a short read leaves the tail where the loop put it instead of moving it to the base.
     at: usize,
+    /// The last byte's arrival, so a lane's polls still end an idle body at the stall.
+    idle_since: Option<std::time::Instant>,
 }
 
 impl Read for H2StreamReader {
@@ -208,6 +210,7 @@ impl Read for H2StreamReader {
                     st.body.pop_front();
                     self.at = 0;
                 }
+                self.idle_since = None;
                 drop(st);
                 self.conn.replenish(self.id, n);
                 return Ok(n);
@@ -237,8 +240,14 @@ impl Read for H2StreamReader {
                 }
                 continue;
             }
-            // A lane step owns its thread for one poll, so an unarrived body hands the lane back.
+            // A lane step owns its thread for one poll; a body idle for the whole stall still ends.
             if crate::proxy::relay_step_owns_poll() {
+                let since = *self.idle_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= crate::budgets::relay_stall() {
+                    drop(st);
+                    self.conn.forget_upload(self.id);
+                    return Err(std::io::Error::other("h2 body stalled"));
+                }
                 let (_guard, wait) = self
                     .stream
                     .cv
@@ -993,6 +1002,7 @@ pub(crate) fn connect_split<
             stream: state,
             id: 1,
             at: 0,
+            idle_since: None,
         },
         writer,
     ))
@@ -1085,6 +1095,7 @@ fn open_stream(
         stream: Arc::clone(&state),
         id: sid,
         at: 0,
+        idle_since: None,
     };
     let h2out = H2StreamOut {
         conn: Arc::clone(conn),
@@ -1838,6 +1849,7 @@ mod tests {
             stream: Arc::clone(&state),
             id: 1,
             at: 0,
+            idle_since: None,
         };
         let mut first = [0u8; 16];
         assert_eq!(reader.read(&mut first).unwrap(), 16);
@@ -2333,6 +2345,7 @@ mod tests {
             stream: state,
             id: 2,
             at: 0,
+            idle_since: None,
         };
         let (sender, receiver) = std::sync::mpsc::channel();
         thread::spawn(move || {
@@ -2555,6 +2568,7 @@ mod tests {
             stream,
             id: 1,
             at: 0,
+            idle_since: None,
         };
         let mut buf = [0u8; 8];
         let started = std::time::Instant::now();
@@ -2567,6 +2581,45 @@ mod tests {
             "a lane waits the poll, not the stall"
         );
         assert!(crate::proxy::is_timeout(&error), "{error:?}");
+    }
+
+    /// A lane's polls hand the thread back, but an idle body still ends at the stall.
+    #[test]
+    fn a_lane_read_still_ends_at_the_stall() {
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(40)),
+            ..Default::default()
+        });
+        let (conn, _written, _slices) = streaming_conn(0);
+        let stream = conn
+            .streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&1)
+            .cloned()
+            .expect("the stream");
+        let mut reader = H2StreamReader {
+            conn,
+            stream,
+            id: 1,
+            at: 0,
+            idle_since: None,
+        };
+        let mut buf = [0u8; 8];
+        let error = {
+            let _step = crate::proxy::RelayStep::enter();
+            let mut polls = 0u32;
+            loop {
+                polls += 1;
+                assert!(polls < 500, "a lane read never ended at the stall");
+                match reader.read(&mut buf) {
+                    Err(error) if crate::proxy::is_timeout(&error) => {}
+                    other => break other.expect_err("no body arrived"),
+                }
+            }
+        };
+        crate::budgets::clear();
+        assert!(!crate::proxy::is_timeout(&error), "{error:?}");
     }
 
     /// A sender the peer never credits gives up at the relay stall, so a downlink cannot park its thread on a window that never arrives.
