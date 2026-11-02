@@ -75,13 +75,21 @@ load_gap_bases() {
   done < <(filed_gap_bases)
 }
 
+id_listed() {
+  local needle="$1" id
+  for id in $2; do
+    [[ "$id" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
 selftest_gaps() {
   local base ids unfiled filed unreached=0 failed=0
   load_gap_bases
   ((${#gap_bases[@]})) || { echo "selftest: scripts/leg-gaps.txt files no scenario bases" >&2; return 1; }
   ids="$(scenarios full | awk '{print $1}')"
   for base in "${gap_bases[@]}"; do
-    printf '%s\n' "$ids" | grep -qx "$base" || {
+    id_listed "$base" "$ids" || {
       echo "selftest: filed gap $base is not a full-tier scenario" >&2
       unreached=$((unreached + 1))
     }
@@ -129,7 +137,7 @@ if ((gaps)); then
   ids="$(tier_ids)"
   local base reached=0
   for base in "${gap_bases[@]}"; do
-    if printf '%s\n' "$ids" | grep -qx "$base"; then
+    if id_listed "$base" "$ids"; then
       reached=$((reached + 1))
     else
       echo "::warning::--gaps: $base is filed but not a $tier scenario; it is not measured here" >&2
