@@ -1385,6 +1385,7 @@ pub fn revalidate(result_path: &Path) -> Result<Run, Error> {
             bytes_sent: bytes_sent as u64,
             bytes_received: bytes_received as u64,
             transfer: std::time::Duration::from_secs_f64(seconds.max(0.0)),
+            latency_us: None,
             wall: std::time::Duration::from_secs_f64(
                 root.get("wall_seconds")
                     .and_then(Json::as_num)
@@ -1868,6 +1869,7 @@ mod tests {
                 bytes_sent: mibs * 1024 * 1024,
                 bytes_received: 0,
                 transfer: std::time::Duration::from_secs(1),
+                latency_us: None,
                 wall: std::time::Duration::from_secs(1),
                 setup: Vec::new(),
                 peak_rss_kib: rss_kib,
