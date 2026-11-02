@@ -184,7 +184,8 @@ carrier-websocket fresh-key-allocations-per-dial 0 ferrox-app-ws::tests::the_key
 carrier-httpupgrade ops-retired-instructions UNBLESSED scripts/count-ops.sh
 carrier-httpupgrade framing-bytes-after-the-101 0 ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback
 carrier-httpupgrade user-space-copies-per-byte-relayed 1 ferrox-app-httpupgrade::tests::upgrade_carries_an_echo_over_loopback
-carrier-httpupgrade writes-per-upgraded-dial 2 ferrox-app-httpupgrade::tests::the_payload_leaves_after_the_request_in_its_own_write
+carrier-httpupgrade writes-per-upgraded-dial-with-a-payload 2 ferrox-app-httpupgrade::tests::the_payload_leaves_after_the_request_in_its_own_write
+carrier-httpupgrade writes-per-upgraded-dial-without-a-payload 1 ferrox-app-httpupgrade::tests::the_payload_leaves_after_the_request_in_its_own_write
 carrier-httpupgrade request-reallocations-per-dial 0 ferrox-app-httpupgrade::tests::the_request_buffer_holds_its_capacity_over_a_dial_cycle
 carrier-httpupgrade round-trips-per-upgraded-dial 1 ferrox-app-httpupgrade::tests::a_payload_waits_for_a_switch_that_dropped_what_rode_behind_it
 carrier-httpupgrade head-reads-per-window 1 ferrox-app-httpupgrade::tests::a_head_costs_one_read_per_window

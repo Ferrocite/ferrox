@@ -17089,21 +17089,19 @@ fn dial_ss_httpupgrade(
     ladder: &Ladder,
 ) -> bool {
     let rung = attempt.rung;
-    // Sealed into a buffer rather than onto the socket, so the carrier writes the request packet with the `GET`: `?ed` takes the `101` off the round trip and `ed=0` still sends the whole handshake in one write.
-    let mut packet = Vec::new();
+    let Some((reader, mut writer)) =
+        crate::httpupgrade::connect(uplink, &ss.host, attempt.path, &[], &ss.headers)
+    else {
+        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+    };
     if ferrox_core::shadowsocks2022::Method::parse(&ss.method).is_some() {
         let Some((send, recv)) = crate::shadowsocks2022::client_send_handshake(
-            &mut packet,
+            &mut writer,
             &ss.password,
             &ss.method,
             target,
         ) else {
-            return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
-        };
-        let Some((reader, writer)) =
-            crate::httpupgrade::connect(uplink, &ss.host, attempt.path, &packet, &ss.headers)
-        else {
-            return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+            return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Local);
         };
         note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
         let Ok(closer) = writer.try_clone() else {
@@ -17116,14 +17114,9 @@ fn dial_ss_httpupgrade(
         return true;
     }
     let Some((send, recv)) =
-        crate::shadowsocks::client_send_handshake(&mut packet, &ss.password, &ss.method, target)
+        crate::shadowsocks::client_send_handshake(&mut writer, &ss.password, &ss.method, target)
     else {
-        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Local);
-    };
-    let Some((reader, writer)) =
-        crate::httpupgrade::connect(uplink, &ss.host, attempt.path, &packet, &ss.headers)
-    else {
-        return climb_or_hold(ladder, rung, Stage::SocketConnected, Kind::Unreachable);
+        return climb_or_hold(ladder, rung, Stage::RequestSent, Kind::Local);
     };
     note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
     let Ok(closer) = writer.try_clone() else {

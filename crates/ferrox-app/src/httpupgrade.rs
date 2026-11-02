@@ -970,6 +970,9 @@ mod tests {
                 stream.read(&mut rode).is_err(),
                 "the payload rode behind the request and would have been dropped"
             );
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("timeout");
             stream.write_all(SWITCH).expect("answers");
             let mut payload = [0u8; 4];
             stream.read_exact(&mut payload).expect("reads the payload");
@@ -981,14 +984,16 @@ mod tests {
         server.join().expect("joins");
     }
 
-    /// Remembers each plain write, so "the payload is its own write" is observed rather than inferred.
+    /// Remembers each plain write and every read against it, so both "the payload is its own write" and the order it leaves in are observed rather than inferred.
     #[derive(Default)]
     struct Recorder {
         plain: Vec<Vec<u8>>,
+        events: Vec<u8>,
     }
 
     impl Write for Recorder {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.events.push(1);
             self.plain.push(buf.to_vec());
             Ok(buf.len())
         }
@@ -1048,6 +1053,20 @@ mod tests {
             expected_request("oracle.example", "/tunnel").as_bytes()
         );
         assert_eq!(write.plain[1], b"ping");
+        let (_reader, write) = connect_split(
+            std::io::Cursor::new(SWITCH.to_vec()),
+            Recorder::default(),
+            "oracle.example",
+            "/tunnel",
+            &[],
+            &[],
+        )
+        .expect("upgrades");
+        assert_eq!(
+            write.plain.len(),
+            1,
+            "a dial without a payload writes the request alone"
+        );
     }
 
     /// Steady traffic on one dialling thread: the five pieces push into the thread's own buffer and the write drains it, round after round. `format!` entered the allocator on every dial and grew again past 66 bytes of host plus path; here the first dial's allocation is the last, so the buffer's identity and capacity hold for all the rest.
@@ -1472,16 +1491,32 @@ mod tests {
 
         impl Write for Shared {
             fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0
-                    .lock()
-                    .expect("the recorder is not poisoned")
-                    .plain
-                    .push(buf.to_vec());
+                let mut recorder = self.0.lock().expect("the recorder is not poisoned");
+                recorder.events.push(1);
+                recorder.plain.push(buf.to_vec());
                 Ok(buf.len())
             }
 
             fn flush(&mut self) -> std::io::Result<()> {
                 Ok(())
+            }
+        }
+
+        /// Puts the answer's own reads in the recorder's event log, so the order the payload left in is measured against them.
+        struct Watched<R> {
+            inner: R,
+            recorder: Shared,
+        }
+
+        impl<R: Read> Read for Watched<R> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.recorder
+                    .0
+                    .lock()
+                    .expect("the recorder is not poisoned")
+                    .events
+                    .push(0);
+                self.inner.read(buf)
             }
         }
 
@@ -1618,7 +1653,10 @@ mod tests {
             let payload: Vec<u8> = (0..case.size).map(|at| 0xa0 + at as u8).collect();
             let recorder = Shared::default();
             let outcome = connect_split(
-                std::io::Cursor::new(answer),
+                Watched {
+                    inner: std::io::Cursor::new(answer),
+                    recorder: recorder.clone(),
+                },
                 recorder.clone(),
                 &case.host,
                 &case.path,
@@ -1640,8 +1678,19 @@ mod tests {
                 );
                 measured.verdict_differs = 1;
             }
-            // The order: this dial holds the payload behind the answer, so it never reaches the socket first.
-            let tree_order = "A";
+            // The order: the payload's own write against the first read of the answer.
+            let first_read = write.events.iter().position(|&event| event == 0);
+            let payload_write = write
+                .events
+                .iter()
+                .enumerate()
+                .filter(|(_, &event)| event == 1)
+                .nth(1)
+                .map(|(at, _)| at);
+            let tree_order = match (first_read, payload_write) {
+                (Some(read), Some(written)) if written < read => "P",
+                _ => "A",
+            };
             if fields[1] != tree_order {
                 assert!(
                     case.expect.contains(&Divergence::Order),
