@@ -251,6 +251,16 @@ impl Hello {
     /// The second hello a `HelloRetryRequest` asks for: one fresh share for the group
     /// the server named, and its cookie echoed when one came.
     pub(crate) fn retry(&mut self, group: u16, cookie: Option<&[u8]>) -> Result<Self, TlsError> {
+        if !self.offers(group) {
+            return Err(TlsError::Other(format!(
+                "server asked for an unoffered retry group {group:#06x}"
+            )));
+        }
+        if self.shares.iter().any(|share| share.group == group) {
+            return Err(TlsError::Other(format!(
+                "server asked for a retry group the hello already sent {group:#06x}"
+            )));
+        }
         let shares = keys::generate(&[group], false).map_err(TlsError::Other)?;
         let (msg, offer) = match self.offer.take() {
             Some(mut offer) => (
@@ -303,6 +313,18 @@ impl Hello {
             .map(|share| share.data.as_slice())
     }
 
+    /// Whether the first hello advertised a group: a configured list replaces the profile's.
+    fn offers(&self, group: u16) -> bool {
+        match &self.groups {
+            Some(groups) => groups.contains(&group),
+            None => self
+                .profile
+                .exts
+                .iter()
+                .any(|ext| matches!(&ext.body, Body::Groups(groups) if groups.contains(&group))),
+        }
+    }
+
     /// The ECDHE point and secret for a TLS 1.2 `ClientKeyExchange` on a curve the hello committed
     /// no `key_share` to, drawn only when that curve is in the hello's advertised groups.
     pub(crate) fn ephemeral(
@@ -310,14 +332,7 @@ impl Hello {
         group: u16,
         peer: &[u8],
     ) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
-        let advertised =
-            match &self.groups {
-                Some(groups) => groups.contains(&group),
-                None => self.profile.exts.iter().any(
-                    |ext| matches!(&ext.body, Body::Groups(groups) if groups.contains(&group)),
-                ),
-            };
-        if !advertised {
+        if !self.offers(group) {
             return Err(TlsError::NoSharedCipher);
         }
         let mut pool = keys::generate(&[group], false).map_err(TlsError::Other)?;
@@ -1160,7 +1175,7 @@ mod tests {
         );
         let inner_random = hello.ech_inner_random().expect("inner random");
         let retry = hello
-            .retry(crate::tls::shaped::keys::X25519, None)
+            .retry(crate::tls::shaped::keys::P256, None)
             .expect("retries");
         assert!(retry.ech_inner().is_some(), "a retry re-seals the offer");
         assert_eq!(
@@ -1175,6 +1190,34 @@ mod tests {
             .expect("ech extension");
         assert_eq!(retry_ech[10], 0, "a retry carries no encapsulation");
         assert_eq!(retry_ech[11], 0, "a retry carries no encapsulation");
+    }
+
+    #[test]
+    fn a_retry_outside_the_configured_groups_is_refused() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello = Hello::build(profile, "example.com", &[], false, &[keys::X25519])
+            .expect("a shaped dial hello");
+        assert!(
+            hello.retry(keys::P256, None).is_err(),
+            "a retry for a group curvePreferences does not name"
+        );
+    }
+
+    #[test]
+    fn a_retry_for_a_group_the_first_hello_sent_is_refused() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let mut hello =
+            Hello::build(profile, "example.com", &[], false, &[]).expect("a shaped dial hello");
+        assert!(
+            hello.retry(keys::X25519, None).is_err(),
+            "a retry for a group the first hello already sent"
+        );
     }
 
     fn invariant(kind: u16) -> bool {
@@ -1329,7 +1372,7 @@ mod tests {
         let mut hello = Hello::build(profile, "example.com", &[b"http/1.1".to_vec()], true, &[])
             .expect("a shaped dial hello");
         let retry = hello
-            .retry(keys::X25519, Some(&[7, 6, 5]))
+            .retry(keys::P256, Some(&[7, 6, 5]))
             .expect("a retry hello");
         let exts = extensions(&retry.msg[4..]);
         let cookie = exts
