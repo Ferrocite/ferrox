@@ -266,7 +266,7 @@ Today exactly one method dials per hop. The chaining engine builds stacks as an 
 | 100 | simple-obfs (http/tls) | planned | sing-box `transport/simple-obfs/`; Leaf `proxy/obfs/` (http + tls shapes) |
 | 101 | SIP003 plugin manager | planned | sing-box `transport/sip003/`; LxBox `plugin`/`plugin_opts`; Leaf `OutboundSettings::Plugin` (an external transformer named by `path`+`args`) |
 | 102 | Mux variants smux/yamux/h2mux | planned | sing-box `common/mux/`; Leaf `proxy/amux`, `proxy/mptp` (multipath TCP beside the muxes). Tree has mux-cool (row 22) |
-| 103 | Hysteria2 multiport (`mport`/`server_ports`) | partial (with salamander/gecko, row 19) | sing-box `protocol/hysteria2/`; LxBox §5. Port-hop rotates among the expanded set; `gecko` obfs splits/masks long-header packets; a dial naming both port-hop and gecko is not carried at `connect` |
+| 103 | Hysteria2 multiport (`mport`/`server_ports`) | full (with salamander/gecko, row 19) | sing-box `protocol/hysteria2/`; LxBox §5. Port-hop rotates among the expanded set; `gecko` obfs splits/masks long-header packets; a dial naming both composes them — each padded fragment leaves through the hop's current socket and a split message reassembles across the ports it moved over |
 | 104 | carrier fronts as standalone stackable in/out objects | planned | Leaf `proxy/{tls,websocket,amux,quic,mptp}/` — each carrier is its own inbound and outbound protocol that chains to another by tag, not a `streamSettings` stanza inside one protocol's config; the same seat row 108's chain engine fills, and row 80's per-inbound tags read it |
 
 ### L — ZeroNet + LxBox superset

@@ -2,7 +2,7 @@ use crate::conn::Connection;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
-use std::net::{Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
+use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs as _, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -2242,11 +2242,12 @@ struct GeckoMessage {
 /// Expiry is swept lazily on the reader rather than by a background timer thread.
 pub(crate) struct Gecko {
     sock: UdpSocket,
+    hop: Option<Arc<Hopper>>,
     obfs: ferrox_core::hysteria::Salamander,
     min: usize,
     max: usize,
     msg: AtomicU64,
-    reassembly: Mutex<HashMap<(SocketAddr, u8), GeckoMessage>>,
+    reassembly: Mutex<HashMap<(IpAddr, u8), GeckoMessage>>,
 }
 
 impl Gecko {
@@ -2257,11 +2258,45 @@ impl Gecko {
     ) -> Self {
         Self {
             sock,
+            hop: None,
             obfs,
             min: usize::from(window.min_pkt),
             max: usize::from(window.max_pkt),
             msg: AtomicU64::new(0),
             reassembly: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// A gecko lane whose every frame leaves through the hop's current socket, so port-hopping and the fragmenting mask ride one dial.
+    fn hopped(
+        obfs: ferrox_core::hysteria::Salamander,
+        window: ferrox_core::hysteria::Gecko,
+        hop: Arc<Hopper>,
+    ) -> std::io::Result<Self> {
+        Ok(Self {
+            sock: hop.anchor.try_clone()?,
+            hop: Some(hop),
+            obfs,
+            min: usize::from(window.min_pkt),
+            max: usize::from(window.max_pkt),
+            msg: AtomicU64::new(0),
+            reassembly: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Write one wire datagram through the hop when this lane has one, else straight out of the socket it was built on.
+    fn send_wire(&self, buf: &[u8], to: SocketAddr) -> std::io::Result<usize> {
+        match self.hop.as_ref() {
+            Some(hop) => hop.send(buf, to, None),
+            None => self.sock.send_to(buf, to),
+        }
+    }
+
+    /// Read one wire datagram from the hop's current (and lingering) sockets, else from the fixed one.
+    fn recv_wire(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        match self.hop.as_ref() {
+            Some(hop) => hop.recv(buf, None),
+            None => self.sock.recv_from(buf),
         }
     }
 
@@ -2272,7 +2307,7 @@ impl Gecko {
             .obfs
             .seal_into(buf, wire.as_mut())
             .ok_or(invalid(std::io::ErrorKind::InvalidInput))?;
-        self.sock.send_to(&wire.as_mut()[..sealed], to)
+        self.send_wire(&wire.as_mut()[..sealed], to)
     }
 
     /// Split a long-header packet into `2..=8` chunks, each framed, padded to the
@@ -2321,7 +2356,7 @@ impl Gecko {
                 .obfs
                 .seal_into(&frame.as_mut()[..written], wire.as_mut())
                 .ok_or(invalid(std::io::ErrorKind::InvalidInput))?;
-            self.sock.send_to(&wire.as_mut()[..sealed], to)?;
+            self.send_wire(&wire.as_mut()[..sealed], to)?;
         }
         Ok(buf.len())
     }
@@ -2347,7 +2382,8 @@ impl Gecko {
     ) -> Option<Vec<u8>> {
         let total = usize::from(frame.total_chunks);
         let index = usize::from(frame.chunk_idx);
-        let key = (from, frame.msg_id);
+        // Keyed by address, not address-and-port: a hop opens a fresh socket per stay, so one split message can arrive from several source ports.
+        let key = (from.ip(), frame.msg_id);
         let now = Instant::now();
         let mut table = self.reassembly.lock().ok()?;
         table.retain(|_, message| message.until > now);
@@ -2355,7 +2391,7 @@ impl Gecko {
             if table.len() >= GECKO_MAX_MESSAGES {
                 return None;
             }
-            if table.keys().filter(|(source, _)| *source == from).count() >= GECKO_MAX_PER_SOURCE {
+            if table.keys().filter(|(source, _)| *source == key.0).count() >= GECKO_MAX_PER_SOURCE {
                 return None;
             }
             table.insert(
@@ -2392,7 +2428,7 @@ impl Gecko {
     fn recv(&self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
         loop {
             let mut wire = Unfilled::<{ GECKO_BUFFER + SALAMANDER_SALT }>::new();
-            let (found, from) = match self.sock.recv_from(wire.as_mut()) {
+            let (found, from) = match self.recv_wire(wire.as_mut()) {
                 Ok(read) => read,
                 Err(err)
                     if matches!(
@@ -2515,6 +2551,29 @@ impl Datagram {
             obfs: None,
             hop: None,
             gecko: Some(Arc::new(Gecko::new(handle, obfs, window))),
+            armed: Arc::default(),
+            held: Arc::default(),
+        })
+    }
+
+    /// A gecko dial that also hops its server port: every fragment is sealed, padded and written through the hop's current socket, so the two lanes compose instead of one dropping the other's bytes.
+    pub(crate) fn gecked_hopped(
+        server: SocketAddr,
+        ports: Vec<u16>,
+        interval_ms: (u64, u64),
+        bind: &'static str,
+        first: &UdpSocket,
+        obfs: ferrox_core::hysteria::Salamander,
+        window: ferrox_core::hysteria::Gecko,
+    ) -> std::io::Result<Self> {
+        clear_gro(first);
+        let hop = Arc::new(Hopper::open(server, ports, interval_ms, bind, first)?);
+        Ok(Self {
+            sock: first.try_clone()?,
+            relay: None,
+            obfs: None,
+            hop: Some(Arc::clone(&hop)),
+            gecko: Some(Arc::new(Gecko::hopped(obfs, window, hop)?)),
             armed: Arc::default(),
             held: Arc::default(),
         })
@@ -5018,6 +5077,99 @@ mod tests {
             datagrams >= 2,
             "a long header really split across datagrams, saw {datagrams}"
         );
+    }
+
+    /// A gecko dial that also hops: every fragment is a separate masked datagram,
+    /// the schedule moves between them (a zero stay), and the padded window survives
+    /// the hop — the witness that the fragmenter writes through the hop's socket
+    /// rather than a fixed one.
+    #[test]
+    fn a_hopped_gecko_dial_sends_its_fragments_over_more_than_one_port() {
+        let mut ports = Vec::new();
+        let mut listeners = Vec::new();
+        for _ in 0..4 {
+            let sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+            ports.push(sock.local_addr().expect("addr").port());
+            sock.set_read_timeout(Some(Duration::from_millis(50))).ok();
+            listeners.push(sock);
+        }
+        let server: SocketAddr = format!("127.0.0.1:{}", ports[0]).parse().expect("addr");
+        let first = UdpSocket::bind("0.0.0.0:0").expect("binds");
+        let writer = Datagram::gecked_hopped(
+            server,
+            ports.clone(),
+            (0, 0),
+            "0.0.0.0:0",
+            &first,
+            gecko_salamander(),
+            gecko_window(),
+        )
+        .expect("geckos over a hop");
+        let mut packet: Vec<u8> = vec![0xab; 900];
+        packet[0] = ferrox_core::hysteria::GECKO_FLAG;
+        writer.send_to(&packet, server).expect("sends");
+        let mut datagrams = 0usize;
+        let mut touched = std::collections::HashSet::new();
+        for listener in &listeners {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, _)) = listener.recv_from(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                datagrams += 1;
+                touched.insert(listener.local_addr().expect("addr").port());
+                assert!(
+                    (512..=1200).contains(&n),
+                    "a fragment is padded into its window, saw {n}"
+                );
+                let plain = n.min(packet.len());
+                assert_ne!(
+                    buf[..plain],
+                    packet[..plain],
+                    "a fragment left the socket inside its salamander mask"
+                );
+            }
+        }
+        assert!(
+            datagrams >= 2,
+            "a long header really split across datagrams, saw {datagrams}"
+        );
+        assert!(
+            touched.len() > 1,
+            "the fragments moved off the single dialed port"
+        );
+    }
+
+    /// A hopped gecko writer and a plain gecko reader agree on the bytes: every
+    /// fragment travels through the hop's send path, the reader reassembles, and the
+    /// packet comes back exactly — the witness that composing the two lanes did not
+    /// change a frame.
+    #[test]
+    fn a_hopped_gecko_dial_reassembles_at_a_plain_gecko_peer() {
+        let reader_sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let reader_addr = reader_sock.local_addr().expect("addr");
+        reader_sock
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .expect("timeout");
+        let reader =
+            Datagram::gecked(reader_sock, gecko_salamander(), gecko_window()).expect("geckos");
+        let first = UdpSocket::bind("0.0.0.0:0").expect("binds");
+        let writer = Datagram::gecked_hopped(
+            reader_addr,
+            vec![reader_addr.port()],
+            (0, 0),
+            "0.0.0.0:0",
+            &first,
+            gecko_salamander(),
+            gecko_window(),
+        )
+        .expect("geckos over a hop");
+        let mut packet: Vec<u8> = (0u16..900).map(|i| (i % 251) as u8).collect();
+        packet[0] |= ferrox_core::hysteria::GECKO_FLAG;
+        writer.send_to(&packet, reader_addr).expect("sends");
+        let mut buf = [0u8; 2048];
+        let (n, _) = reader.recv_from(&mut buf).expect("reassembles");
+        assert_eq!(&buf[..n], &packet[..], "the split packet rebuilt exactly");
     }
 
     /// A socket, its address and a connection that answers nothing: the pump's queue is what these witnesses read, so no peer and no handshake is needed to fill it.
