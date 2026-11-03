@@ -22616,8 +22616,9 @@ fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
     let room = crate::shadowsocks::SEAL_ROOM;
     let mut header = Vec::with_capacity(64);
     let mut ids = ferrox_core::mux::Ids::new(1);
-    // One mux flow per destination, opened by the first datagram and named on every later one.
-    let mut lanes: Vec<(SocketAddr, u16)> = Vec::new();
+    // The map answers a datagram's destination in one probe; `order` keeps insertion order for the teardown ends.
+    let mut lanes: HashMap<SocketAddr, u16> = HashMap::new();
+    let mut order: Vec<u16> = Vec::new();
     let mut skip: Option<SsUdpLane> = None;
     let mut skip_tried = false;
     let mut published: Option<SocketAddr> = None;
@@ -22663,12 +22664,13 @@ fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
             }
             Udp443::Allow => {}
         }
-        let (id, first) = if let Some((_, id)) = lanes.iter().find(|(known, _)| *known == dest) {
-            (*id, false)
-        } else {
-            let Ok(id) = ids.take() else { continue };
-            lanes.push((dest, id));
-            (id, true)
+        let (id, first) = match lanes.entry(dest) {
+            std::collections::hash_map::Entry::Occupied(known) => (*known.get(), false),
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                let Ok(id) = ids.take() else { continue };
+                order.push(id);
+                (*slot.insert(id), true)
+            }
         };
         let frame = ferrox_core::mux::Outgoing {
             id,
@@ -22686,7 +22688,7 @@ fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
             break;
         }
     }
-    for (_, id) in &lanes {
+    for id in &order {
         let end = ferrox_core::mux::Outgoing::bare(*id, ferrox_core::mux::Status::End, 0);
         resize_scratch(&mut header, end.frame_len(0));
         let written = end.encode_into(None, &mut header);
@@ -47322,6 +47324,98 @@ mod tests {
         let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
         assert_eq!(from.port(), echo_port);
         assert_eq!(payload, b"ping", "the mux frame's datagram echoes");
+    }
+
+    /// A repeated destination reuses its mux flow: both datagrams reach the echo from one server-side socket, on one session.
+    #[test]
+    fn an_ss_mux_datagram_finds_its_flow_without_scanning() {
+        let first = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let first_port = first.local_addr().expect("addr").port();
+        let first_sources = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&first_sources);
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, src)) = first.recv_from(&mut buf) {
+                if let Ok(mut sources) = record.lock() {
+                    sources.push(src);
+                }
+                if first.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let second = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let second_port = second.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; UDP_BUF];
+            while let Ok((n, src)) = second.recv_from(&mut buf) {
+                if second.send_to(&buf[..n], src).is_err() {
+                    return;
+                }
+            }
+        });
+        let users = crate::shadowsocks::account("an-example-shared-password", "aes-256-gcm");
+        let tunnel = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let tunnel_port = tunnel.local_addr().expect("addr").port();
+        let opens = Arc::new(AtomicU64::new(0));
+        let opened = Arc::clone(&opens);
+        thread::spawn(move || {
+            for stream in tunnel.incoming().flatten() {
+                opened.fetch_add(1, Ordering::Relaxed);
+                let users = users.clone();
+                thread::spawn(move || crate::shadowsocks::serve(stream, &users, true));
+            }
+        });
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let relay_addr = relay.local_addr().expect("addr");
+        let ss = ShadowsocksOut {
+            address: "127.0.0.1".to_owned(),
+            port: tunnel_port,
+            method: "aes-256-gcm".to_owned(),
+            password: "an-example-shared-password".to_owned(),
+            carrier: Carrier::Raw(Chain::default()),
+            host: "127.0.0.1".to_owned(),
+            mux: Mux {
+                tcp: true,
+                udp: true,
+                udp443: Udp443::Reject,
+            },
+            tls: None,
+            headers: Vec::new(),
+            heartbeat: 0,
+        };
+        thread::spawn(move || serve_socks_udp_shadowsocks(&relay, &ss));
+        let source = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        source
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("timeout");
+        for (port, word) in [
+            (first_port, b"one".as_slice()),
+            (second_port, b"two".as_slice()),
+            (first_port, b"again".as_slice()),
+        ] {
+            let target: SocketAddr = format!("127.0.0.1:{port}").parse().expect("addr");
+            let mut datagram = vec![0u8, 0, 0];
+            push_socks_addr(&mut datagram, &target);
+            datagram.extend_from_slice(word);
+            source.send_to(&datagram, relay_addr).expect("sends");
+            let mut back = vec![0u8; UDP_BUF];
+            let (n, _) = source.recv_from(&mut back).expect("echoes");
+            let (from, payload) = parse_socks_udp(&back[..n]).expect("splits");
+            assert_eq!(from.port(), port);
+            assert_eq!(payload, word);
+        }
+        let sources = first_sources.lock().expect("sources");
+        assert_eq!(sources.len(), 2, "the first destination received both datagrams");
+        assert_eq!(
+            sources[0], sources[1],
+            "the repeated destination opened a new flow"
+        );
+        assert_eq!(
+            opens.load(Ordering::Relaxed),
+            1,
+            "the association opened a second session"
+        );
     }
 
     /// xray's `xudpProxyUDP443` shapes port 443 alone, and only a reject or a skip changes what happens to it.
