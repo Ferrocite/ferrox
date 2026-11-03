@@ -79,7 +79,7 @@ jobs:
           ls -la profile profile/out/cells 2>/dev/null || true
           sampled=0
           for data in profile/*.perf.data; do
-            if perf report --stdio -i "$data" 2>/dev/null | grep -qE '^ +[0-9]+\.[0-9]+%'; then
+            if perf report --stdio -i "$data" 2>/dev/null | grep -E '^ +[0-9]+\.[0-9]+%' >/dev/null; then
               sampled=1
             fi
           done
