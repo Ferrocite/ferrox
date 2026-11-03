@@ -25436,7 +25436,10 @@ pub(crate) mod lane_pool {
             let pool = TestPool(spawn_pool());
             // The widest cell's eight flows are blocking reads; one is the accept thread's.
             let lanes = RELAY_LANES;
-            assert!(lanes >= 6, "the pool carries {lanes} lanes, below the cell's carriers");
+            assert!(
+                lanes >= 6,
+                "the pool carries {lanes} lanes, below the cell's carriers"
+            );
             let gate = Arc::new(Gate {
                 state: Mutex::new((0, false)),
                 wake: Condvar::new(),
