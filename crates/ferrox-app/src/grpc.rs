@@ -3263,9 +3263,35 @@ mod tests {
         }
     }
 
+    /// Records the base and length of every slice the relay's own write hands the sink, so a copy
+    /// into a staging buffer would show as a base outside the reader's message buffer.
+    #[derive(Default)]
+    struct RecordingSink {
+        runs: Vec<(usize, usize)>,
+    }
+
+    impl std::io::Write for RecordingSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.runs.push((buf.as_ptr() as usize, buf.len()));
+            Ok(buf.len())
+        }
+
+        fn write_vectored(&mut self, bufs: &[std::io::IoSlice<'_>]) -> std::io::Result<usize> {
+            for buf in bufs {
+                self.runs.push((buf.as_ptr() as usize, buf.len()));
+            }
+            Ok(bufs.iter().map(|buf| buf.len()).sum())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
     /// The witness for `carrier-grpc relay-window-copies-per-byte 0`: the window a carrier read gives
-    /// the relay is one run of the message buffer the reader already holds, so the relay writes the
-    /// downloaded body to the peer socket from that buffer instead of staging it a second time.
+    /// the relay is one run of the message buffer the reader already holds, and the relay's own write
+    /// path hands the sink that same run, so the downloaded body reaches the peer socket from the
+    /// reader's buffer instead of being staged a second time.
     #[test]
     fn a_relay_window_hands_the_payload_it_read_by_pointer() {
         let bodies: [&[u8]; 3] = [b"ping", b"pong", b"last"];
@@ -3277,6 +3303,7 @@ mod tests {
                 .collect::<Vec<_>>(),
         );
         let (mut steady_base, mut steady_capacity) = (0usize, 0usize);
+        let mut sink = RecordingSink::default();
         for (i, body) in bodies.iter().enumerate() {
             let base = {
                 let window = reader.read_window().expect("reads a window");
@@ -3286,12 +3313,29 @@ mod tests {
                     [(0, body.len())].as_slice(),
                     "payload {i} is one run"
                 );
+                sink.runs.clear();
+                crate::proxy::write_all_runs::<{ crate::proxy::WINDOW_PARTS }>(
+                    &mut sink,
+                    window.bytes(),
+                    window.parts(),
+                )
+                .expect("the relay's write carries the window");
+                assert_eq!(
+                    sink.runs.len(),
+                    1,
+                    "payload {i} reached the sink as one run"
+                );
                 window.bytes().as_ptr() as usize
             };
             let buffer = reader.msg.as_ptr() as usize;
             assert!(
                 base >= buffer && base + body.len() <= buffer + reader.msg.capacity(),
                 "payload {i} was staged outside the message buffer"
+            );
+            assert_eq!(
+                sink.runs[0],
+                (base, body.len()),
+                "payload {i} reached the sink as the window's own run"
             );
             if i == 0 {
                 steady_base = buffer;
