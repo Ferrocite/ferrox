@@ -476,6 +476,9 @@ pub(crate) fn client(
                 eprintln!("wireguard client: {error}");
             }
         }
+        if stack.poll(&mut buf) {
+            continue;
+        }
         match packets.recv_timeout(TICK) {
             Ok(packet) => {
                 receive_client(&mut stack, packet);
@@ -489,7 +492,6 @@ pub(crate) fn client(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
-        stack.poll(&mut buf);
     }
 }
 
@@ -525,6 +527,9 @@ pub(crate) fn server(
     let mut stack = ServerStack::new(&config, to_tunnel, out, headroom);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
+        if stack.poll(&mut buf) {
+            continue;
+        }
         match packets.recv_timeout(TICK) {
             Ok(packet) => {
                 stack.receive(packet);
@@ -538,7 +543,6 @@ pub(crate) fn server(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
-        stack.poll(&mut buf);
     }
 }
 
@@ -696,11 +700,12 @@ impl ClientStack {
         None
     }
 
-    fn poll(&mut self, buf: &mut [u8]) {
+    fn poll(&mut self, buf: &mut [u8]) -> bool {
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         let ready = self.readiness.sync(&self.flows);
         let mut retiring = std::mem::take(&mut self.retiring);
+        let mut moved = false;
         for (flow, &up_ready) in self.flows.iter_mut().zip(ready) {
             flow.adopt(
                 &mut self.sockets,
@@ -708,7 +713,7 @@ impl ClientStack {
                 &mut retiring,
                 &mut self.race_bytes,
             );
-            pump(flow, &mut self.sockets, buf, up_ready);
+            moved |= pump(flow, &mut self.sockets, buf, up_ready);
         }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         retire(
@@ -723,7 +728,7 @@ impl ClientStack {
                 break;
             };
             if self.to_tunnel.send(packet).is_err() {
-                return;
+                return moved;
             }
         }
         let mut retiring = std::mem::take(&mut self.retiring);
@@ -742,6 +747,7 @@ impl ClientStack {
             }
         });
         self.retiring = retiring;
+        moved || !self.device.tx.is_empty()
     }
 
     fn now(&self) -> Instant {
@@ -879,7 +885,7 @@ impl ServerStack {
         let _ = lane.uplink.send(out);
     }
 
-    fn poll(&mut self, buf: &mut [u8]) {
+    fn poll(&mut self, buf: &mut [u8]) -> bool {
         self.syn_ports.clear();
         for packet in &self.device.rx {
             if let Some(port) = tcp_syn_port(packet) {
@@ -894,8 +900,9 @@ impl ServerStack {
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.handoff();
         let ready = self.readiness.sync(&self.flows);
+        let mut moved = false;
         for (flow, &up_ready) in self.flows.iter_mut().zip(ready) {
-            pump(flow, &mut self.sockets, buf, up_ready);
+            moved |= pump(flow, &mut self.sockets, buf, up_ready);
         }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         for _ in 0..TX_BURST {
@@ -903,7 +910,7 @@ impl ServerStack {
                 break;
             };
             if self.to_tunnel.send(packet).is_err() {
-                return;
+                return moved;
             }
         }
         self.flows.retain(|flow| {
@@ -949,6 +956,7 @@ impl ServerStack {
                 lane.stop.store(true, Ordering::Relaxed);
             }
         }
+        moved || !self.device.tx.is_empty()
     }
 
     fn listen(&mut self, port: u16) {
@@ -1034,7 +1042,8 @@ impl ServerStack {
 /// Move bytes between one flow's local stream and its TCP socket. Every read and
 /// write is nonblocking, so a slow local peer parks only its own buffers.
 #[allow(clippy::too_many_lines)]
-fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: bool) {
+fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: bool) -> bool {
+    let mut moved = false;
     let socket = sockets.get_mut::<TcpSocket>(flow.handle);
     if matches!(socket.state(), State::Established | State::CloseWait) {
         flow.established = true;
@@ -1050,7 +1059,10 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
                 flow.down_eof = true;
                 break;
             }
-            Ok(n) => flow.pending_down_at += n,
+            Ok(n) => {
+                flow.pending_down_at += n;
+                moved = true;
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
             Err(_) => {
                 flow.done = true;
@@ -1068,6 +1080,7 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
         match socket.recv_slice(buf) {
             Ok(0) | Err(RecvError::InvalidState) => break,
             Ok(n) => {
+                moved = true;
                 let mut at = 0;
                 while at < n {
                     match flow.local.write(&buf[at..n]) {
@@ -1098,14 +1111,17 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
     if up_ready && !flow.up_pending() && !flow.up_eof && socket.can_send() {
         match flow.local.read(buf) {
             Ok(0) => flow.up_eof = true,
-            Ok(n) => match socket.send_slice(&buf[..n]) {
-                Ok(sent) if sent < n => flow.stage_up(&buf[sent..n]),
-                Ok(_) => {}
-                Err(SendError::InvalidState) => {
-                    flow.done = true;
-                    socket.abort();
+            Ok(n) => {
+                moved = true;
+                match socket.send_slice(&buf[..n]) {
+                    Ok(sent) if sent < n => flow.stage_up(&buf[sent..n]),
+                    Ok(_) => {}
+                    Err(SendError::InvalidState) => {
+                        flow.done = true;
+                        socket.abort();
+                    }
                 }
-            },
+            }
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(_) => {
                 flow.done = true;
@@ -1119,6 +1135,7 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
             Ok(0) => {}
             Ok(n) => {
                 flow.pending_up_at += n;
+                moved = true;
                 if !flow.up_pending() {
                     flow.pending_up.clear();
                     flow.pending_up_at = 0;
@@ -1145,6 +1162,7 @@ fn pump(flow: &mut Flow, sockets: &mut SocketSet<'_>, buf: &mut [u8], up_ready: 
     if flow.sent_fin && flow.down_eof && socket.state() == State::Closed {
         flow.done = true;
     }
+    moved
 }
 
 #[cfg(unix)]
@@ -2029,6 +2047,30 @@ mod tests {
         app.read_exact(&mut got)
             .expect("the local peer reads the reused download");
         assert_eq!(got, download, "a reused download arrives unchanged");
+    }
+
+    #[test]
+    fn a_ready_upload_keeps_the_stack_turning_until_it_is_drained() {
+        let (mut stack, _packets, mut app) = established_client();
+        app.set_nonblocking(true).expect("a nonblocking local peer");
+        let chunk = vec![b'u'; 64 * 1024];
+        let mut written = 0;
+        loop {
+            match app.write(&chunk) {
+                Ok(0) => break,
+                Ok(n) => written += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("the local peer writes: {error}"),
+            }
+        }
+        assert!(written > 0, "the local window holds an upload");
+        let mut buf = [0u8; 2048];
+        let mut turns = 0;
+        while stack.poll(&mut buf) {
+            turns += 1;
+            assert!(turns < 1024, "a ready upload drains");
+        }
+        assert!(turns > 0, "a ready upload kept the stack from parking");
     }
 
     #[test]
