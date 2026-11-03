@@ -63449,7 +63449,8 @@ mod reverse_tests {
         let dests: Vec<SocketAddr> = (0..3)
             .map(|_| {
                 let echo = UdpSocket::bind("127.0.0.1:0").expect("echo bind");
-                echo.set_read_timeout(Some(Duration::from_secs(5))).expect("echo timeout");
+                echo.set_read_timeout(Some(Duration::from_secs(5)))
+                    .expect("echo timeout");
                 let dest = echo.local_addr().expect("echo addr");
                 thread::spawn(move || {
                     let mut buf = [0u8; 512];
@@ -63482,7 +63483,11 @@ mod reverse_tests {
         while session.active_connections() == 0 && Instant::now() < deadline {
             thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(session.active_connections(), 1, "the portal control flow did not open");
+        assert_eq!(
+            session.active_connections(),
+            1,
+            "the portal control flow did not open"
+        );
 
         let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
         let relay_addr = relay.local_addr().expect("relay addr");
@@ -63490,7 +63495,9 @@ mod reverse_tests {
         thread::spawn(move || serve_socks_udp_portal(&relay, &served));
 
         let client = UdpSocket::bind("127.0.0.1:0").expect("client");
-        client.set_read_timeout(Some(Duration::from_secs(10))).expect("client timeout");
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("client timeout");
         let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
         let mut buf = [0u8; 512];
         for (known, payload, want) in exchanges {
@@ -63500,7 +63507,10 @@ mod reverse_tests {
             let (n, _) = client.recv_from(&mut buf).expect("reply");
             let (from, replied) = parse_socks_udp(&buf[..n]).expect("frame");
             assert_eq!(from, dest, "the reply named another destination");
-            assert_eq!(replied, want, "the reply did not come back for its destination");
+            assert_eq!(
+                replied, want,
+                "the reply did not come back for its destination"
+            );
         }
         assert_eq!(
             session.active_connections(),
