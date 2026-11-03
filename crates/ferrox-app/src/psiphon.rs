@@ -2848,6 +2848,9 @@ fn add_tls_variants(servers: &mut Vec<Server>) {
             variant.port = variant.tls_port.unwrap_or(variant.port);
             variant.meek = None;
             variant.unfronted_meek = None;
+            variant.inproxy = variant
+                .inproxy
+                .filter(|destination| destination.base_protocol() == "TLS-OSSH");
             variant.tactics = None;
             variant
         })
@@ -4652,6 +4655,46 @@ mod tests {
             false,
         );
         assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn a_tls_variant_drops_an_inproxy_destination_that_cannot_carry_tls() {
+        let mut capable = test_server(true);
+        capable.tls_port = Some(8443);
+        capable.inproxy = Some(crate::psiphon_broker::Destination {
+            address: "192.0.2.1:443".to_owned(),
+            network_protocol: 0,
+            protocol: "INPROXY-WEBRTC-OSSH",
+            packed_server_entry: Vec::new(),
+        });
+        let selected = select_protocols(
+            vec![capable.clone()],
+            &["TLS-OSSH".to_owned()],
+            &[],
+            0,
+            false,
+        );
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].tls);
+        assert!(
+            selected[0].inproxy.is_none(),
+            "a plain in-proxy destination must not bypass TLS"
+        );
+        let mut tls = capable;
+        tls.inproxy = Some(crate::psiphon_broker::Destination {
+            address: "192.0.2.1:8443".to_owned(),
+            network_protocol: 0,
+            protocol: "INPROXY-WEBRTC-TLS-OSSH",
+            packed_server_entry: Vec::new(),
+        });
+        let selected = select_protocols(vec![tls], &["TLS-OSSH".to_owned()], &[], 0, false);
+        assert_eq!(
+            selected[0]
+                .inproxy
+                .as_ref()
+                .map(|destination| destination.base_protocol()),
+            Some("TLS-OSSH")
+        );
     }
 
     #[test]
