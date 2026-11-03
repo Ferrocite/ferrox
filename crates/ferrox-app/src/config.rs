@@ -1282,6 +1282,7 @@ pub(crate) fn outbound_tls(
         ),
         master_key_log: tls_master_key_log(tls),
         client_cert: tls_client_cert(tls)?,
+        client_random: None,
     }))
 }
 

@@ -60,6 +60,10 @@ pub struct TlsConfig {
     /// `tlsSettings.certificates` entry that names a key. xray builds that pair but its client
     /// never sends it, so this is the sing-box client certificate an outbound opts into.
     pub client_cert: Option<std::sync::Arc<CertEntry>>,
+    /// The `ClientHello` random to send instead of a fresh one, for a protocol that authenticates
+    /// itself in that field (Psiphon TLS-OSSH). Only the shaped session can carry it; the stock
+    /// rustls builder draws its own and cannot be overridden.
+    pub client_random: Option<[u8; 32]>,
 }
 
 /// Whether a client build can offer a group a config named: the shaped hello draws its own key

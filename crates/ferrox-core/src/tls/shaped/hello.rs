@@ -58,12 +58,13 @@ impl Hello {
         alpn: &[Vec<u8>],
         websocket: bool,
         curves: &[u16],
+        client_random: Option<[u8; 32]>,
     ) -> Result<Self, TlsError> {
         // One draw for the whole hello: its random, its session id, five GREASE pairs.
         let mut seed = [0u8; 74];
         getrandom::fill(&mut seed).map_err(entropy)?;
         let (blocks, draws) = seed.as_chunks::<32>();
-        let (random, session_id) = (blocks[0], blocks[1]);
+        let (random, session_id) = (client_random.unwrap_or(blocks[0]), blocks[1]);
         let mut grease = [0u16; 5];
         for (slot, pair) in grease.iter_mut().zip(draws.as_chunks::<2>().0) {
             *slot = u16::from_le_bytes(*pair);
@@ -1002,6 +1003,19 @@ mod tests {
     }
 
     /// The extension TLVs of a `ClientHello` body, in wire order.
+    #[test]
+    fn a_supplied_client_random_is_the_hello_random() {
+        let profile = Fingerprint::resolve("chrome")
+            .expect("a preset name resolves")
+            .profile()
+            .expect("a shaped profile");
+        let random = [0x5a; 32];
+        let hello = Hello::build(profile, "example.com", &[], false, &[], Some(random))
+            .expect("a shaped dial hello");
+        assert_eq!(hello.random, random);
+        assert_eq!(&hello.msg[6..38], &random);
+    }
+
     fn extensions(body: &[u8]) -> Vec<&[u8]> {
         let at = 2 + 32;
         let mut at = at + 1 + usize::from(body[at]);
@@ -1071,7 +1085,8 @@ mod tests {
         )
         .expect("generates");
         let profile = Fingerprint::default().profile().expect("profile");
-        let mut hello = Hello::build(profile, "hidden.test", &[], false, &[]).expect("builds");
+        let mut hello =
+            Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
         hello.enable_ech(&list).expect("ech");
 
         let body = &hello.msg[4..];
@@ -1094,7 +1109,8 @@ mod tests {
     fn a_real_ech_offer_hides_the_inner_name_under_the_public_one() {
         let (list, keys) = crate::tls::ech::generate("public.test", 7).expect("generates");
         let profile = Fingerprint::default().profile().expect("profile");
-        let mut hello = Hello::build(profile, "hidden.test", &[], false, &[]).expect("builds");
+        let mut hello =
+            Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
         hello.enable_ech(&list).expect("ech");
 
         let body = &hello.msg[4..];
@@ -1198,7 +1214,7 @@ mod tests {
             .expect("a preset name resolves")
             .profile()
             .expect("a shaped profile");
-        let mut hello = Hello::build(profile, "example.com", &[], false, &[keys::X25519])
+        let mut hello = Hello::build(profile, "example.com", &[], false, &[keys::X25519], None)
             .expect("a shaped dial hello");
         assert!(
             hello.retry(keys::P256, None).is_err(),
@@ -1212,8 +1228,8 @@ mod tests {
             .expect("a preset name resolves")
             .profile()
             .expect("a shaped profile");
-        let mut hello =
-            Hello::build(profile, "example.com", &[], false, &[]).expect("a shaped dial hello");
+        let mut hello = Hello::build(profile, "example.com", &[], false, &[], None)
+            .expect("a shaped dial hello");
         assert!(
             hello.retry(keys::X25519, None).is_err(),
             "a retry for a group the first hello already sent"
@@ -1347,7 +1363,7 @@ mod tests {
         assert!(offered, "the preset's table names the protocol");
         assert!(!hello.offers_alpn(b"h2"), "and not one it omits");
         assert_eq!(counts.allocs, 0, "the table is walked in place: {counts:?}");
-        let dial = Hello::build(profile, "example.com", &[b"h2".to_vec()], true, &[])
+        let dial = Hello::build(profile, "example.com", &[b"h2".to_vec()], true, &[], None)
             .expect("a shaped dial hello");
         let (offered, counts) = crate::alloc_count::measure(|| dial.offers_alpn(b"http/1.1"));
         assert!(offered, "the carrier's forced list names the protocol");
@@ -1369,8 +1385,15 @@ mod tests {
             .expect("a preset name resolves")
             .profile()
             .expect("a shaped profile");
-        let mut hello = Hello::build(profile, "example.com", &[b"http/1.1".to_vec()], true, &[])
-            .expect("a shaped dial hello");
+        let mut hello = Hello::build(
+            profile,
+            "example.com",
+            &[b"http/1.1".to_vec()],
+            true,
+            &[],
+            None,
+        )
+        .expect("a shaped dial hello");
         let retry = hello
             .retry(keys::P256, Some(&[7, 6, 5]))
             .expect("a retry hello");
