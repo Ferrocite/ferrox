@@ -2104,6 +2104,7 @@ impl Hopper {
                 self.apply_timeout(&sock);
                 let linger = now + Duration::from_millis(HOP_LINGER);
                 let left = std::mem::replace(&mut state.current, Arc::new(sock));
+                let _ = left.set_nonblocking(true);
                 state.linger.retain(|(_, until)| *until > now);
                 if state.linger.len() >= HOP_LINGER_SOCKETS {
                     state.linger.remove(0);
@@ -2145,9 +2146,10 @@ impl Hopper {
     /// Read one datagram, advancing the schedule first so a reader sees the same
     /// rotation a writer would and the sockets just left still linger. The current
     /// flow is tried, then every socket a move left behind, newest first, until one
-    /// answers; a hopped reply source is turned back to the nominal server port. A
-    /// dry sweep is the same `WouldBlock` a plain socket returns, so the drive loop
-    /// keeps its no-packet path.
+    /// answers; a hopped reply source is turned back to the nominal server port. The
+    /// lingering sockets are read non-blocking, so a dry sweep costs no wait and only
+    /// the current flow is waited on, once. Its dry read is the same `WouldBlock` a
+    /// plain socket returns, so the drive loop keeps its no-packet path.
     fn recv(&self, buf: &mut [u8], obfs: Option<&Mask>) -> std::io::Result<(usize, SocketAddr)> {
         let (current, _) = self.current();
         let lingering: Vec<Arc<UdpSocket>> = match self.state.lock() {
