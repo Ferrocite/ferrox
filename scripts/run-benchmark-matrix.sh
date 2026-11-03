@@ -439,7 +439,8 @@ matrix_stop_server() {
   wait "$server_pid" 2>/dev/null || true
   server_pid=""
 }
-trap 'matrix_stop_server' EXIT INT TERM
+trap 'matrix_stop_server' EXIT
+trap 'matrix_stop_server; exit 124' INT TERM
 
 servers=()
 for want in ferrox xray-core sing-box; do
@@ -582,6 +583,14 @@ while read -r id traffic connections iterations payload duration_ms; do
     if matrix_udp_carrier "$id" && ! matrix_wait_udp 127.0.0.1 "$srvport"; then
       echo "::warning::$cell: $server has not bound udp/$srvport yet; the harness will say if it cannot carry" >&2
     fi
+    perf_pid=""
+    if [[ -n "${PROFILE_DIR:-}" && "$server" == "${PROFILE_SERVER:-ferrox}" ]]; then
+      mkdir -p "$PROFILE_DIR"
+      perf record -F 997 -g --call-graph dwarf -p "$server_pid" \
+        -o "$PROFILE_DIR/$cell.perf.data" -- sleep 600 &
+      perf_pid=$!
+      sleep 1
+    fi
     # `panic = "abort"` turns a panic into a bare `exit 134`; the backtrace names the frame the fault left behind.
     if RUST_BACKTRACE=full "$bench_bin" "${engine_args[@]}" \
       --traffic "$traffic" --connections "$connections" \
@@ -608,6 +617,10 @@ while read -r id traffic connections iterations payload duration_ms; do
         grep -rhE "panicked at|panic:|memory allocation|index out of bounds|attempt to .* zero|stack overflow" \
           "$celldir/runs" 2>/dev/null | sort -u | head -20 || true
       } >&2
+    fi
+    if [[ -n "$perf_pid" ]]; then
+      kill -INT "$perf_pid" 2>/dev/null || true
+      wait "$perf_pid" 2>/dev/null || true
     fi
     matrix_stop_server
     {

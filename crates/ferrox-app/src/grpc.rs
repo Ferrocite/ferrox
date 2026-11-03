@@ -1590,14 +1590,9 @@ fn message_payload(max_frame: usize) -> usize {
     }
 }
 
-/// The number of bytes a protobuf varint takes for `value`.
-fn varint_len(mut value: u64) -> usize {
-    let mut len = 1;
-    while value >= 0x80 {
-        value >>= 7;
-        len += 1;
-    }
-    len
+/// The number of bytes a protobuf varint takes for `value`: seven bits per byte, never fewer than one.
+fn varint_len(value: u64) -> usize {
+    (64 - value.leading_zeros() as usize).div_ceil(7).max(1)
 }
 
 /// Writes the envelope and `Hunk` tag for `data_len` into `out`, returning the prefix length.
@@ -2091,10 +2086,17 @@ pub(crate) fn serve_muxed<R: Read + Send + 'static, W: FrameWrite + Send + 'stat
     let opened = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let service = GrpcService::new(settings, users, freedom, Arc::clone(&opened));
     let until = std::time::Instant::now() + crate::budgets::handshake();
-    // A sealed session's reader has no socket for the pool to poll, so this demux keeps a thread; the plaintext one parks on the socket instead.
-    crate::proxy::spawn_carried(move || {
-        crate::xhttp_h2::serve_h2_service_until(read, write, &service, None, Some((until, opened)));
-    });
+    let mut step = crate::xhttp_h2::h2_lane(read, write, service, None, Some((until, opened)));
+    let sniffing = crate::sniff::current();
+    let access = crate::accesslog::snapshot();
+    crate::proxy::lane_pool::submit(
+        Box::new(move || {
+            crate::sniff::install_current(sniffing.clone());
+            let _flow = crate::accesslog::install_snapshot(access.clone());
+            step()
+        }),
+        Box::new(|| {}),
+    );
 }
 
 /// A plaintext muxed connection's demux as a relay lane: a connection waiting for its peer's next
@@ -2689,6 +2691,60 @@ mod tests {
     const HUNK: usize = 16 * 1024;
     use std::thread;
     use std::time::Duration;
+
+    #[test]
+    fn varint_len_matches_the_written_length_at_every_boundary() {
+        for bits in 0..64 {
+            for value in [(1u64 << bits) - 1, 1u64 << bits] {
+                let mut bytes = [0u8; 10];
+                assert_eq!(
+                    varint_len(value),
+                    write_varint(&mut bytes, value),
+                    "{value}"
+                );
+            }
+        }
+        for value in [0, u64::MAX] {
+            let mut bytes = [0u8; 10];
+            assert_eq!(
+                varint_len(value),
+                write_varint(&mut bytes, value),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_varint_length_over_every_boundary() {
+        let mut acc = 0usize;
+        for _ in 0..1024 {
+            for bits in 0..64 {
+                acc += varint_len(std::hint::black_box((1u64 << bits) - 1))
+                    + varint_len(std::hint::black_box(1u64 << bits));
+            }
+        }
+        std::hint::black_box(acc);
+    }
+
+    #[test]
+    fn the_varint_shift_loop_over_every_boundary() {
+        fn shift_len(mut value: u64) -> usize {
+            let mut len = 1;
+            while value >= 0x80 {
+                value >>= 7;
+                len += 1;
+            }
+            len
+        }
+        let mut acc = 0usize;
+        for _ in 0..1024 {
+            for bits in 0..64 {
+                acc += shift_len(std::hint::black_box((1u64 << bits) - 1))
+                    + shift_len(std::hint::black_box(1u64 << bits));
+            }
+        }
+        std::hint::black_box(acc);
+    }
 
     #[test]
     fn huffman_matches_the_rfc_example() {
@@ -4699,5 +4755,37 @@ mod tests {
         }
         drop(client);
         server.join().expect("joins");
+    }
+
+    /// A sealed connection's demux is a lane, not a thread: sixteen silent connections cost the pool's cap.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sealed_demux_rides_the_lane_pool() {
+        struct Silent;
+        impl Read for Silent {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
+            }
+        }
+        if !crate::conn::in_a_quiet_process("grpc::tests::a_sealed_demux_rides_the_lane_pool") {
+            return;
+        }
+        let settings = GrpcSettings::path("/p");
+        let before = crate::conn::live_threads();
+        for _ in 0..16 {
+            serve_muxed(Silent, NullSink, &settings, &[], true);
+        }
+        let until = Instant::now() + Duration::from_secs(5);
+        while crate::proxy::lane_pool::workers() == 0 && Instant::now() < until {
+            thread::sleep(Duration::from_millis(10));
+        }
+        let lanes = crate::proxy::lane_pool::workers();
+        assert!(lanes >= 1, "the sealed demux never reached the lane pool");
+        let grown = crate::conn::live_threads().saturating_sub(before);
+        assert!(
+            grown <= crate::proxy::lane_pool::RELAY_LANES,
+            "sixteen sealed demuxes grew the process by {grown} threads past the pool's {} lanes",
+            crate::proxy::lane_pool::RELAY_LANES
+        );
     }
 }

@@ -2,8 +2,6 @@ use crate::conn::{parse_target, Connection, Listener};
 use std::collections::{HashMap, HashSet};
 use std::io::{IoSlice, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
-#[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
@@ -4253,6 +4251,12 @@ pub(crate) struct HandshakeRead<R> {
     step: Option<RelayStep>,
 }
 
+impl<R: RelayPoll> RelayPoll for HandshakeRead<R> {
+    fn arm_relay_poll(&mut self) {
+        self.inner.arm_relay_poll();
+    }
+}
+
 impl<R: Read> HandshakeRead<R> {
     pub(crate) fn new(inner: R, budget: Duration) -> Self {
         Self {
@@ -4416,6 +4420,22 @@ impl RelayPoll for Connection {
 
 impl RelayPoll for Box<dyn Read + Send> {
     /// Every boxed carrier here is a `TlsHalf` chain whose cipher `session_halves` armed before the split.
+    fn arm_relay_poll(&mut self) {}
+}
+
+impl<T> RelayPoll for std::io::Cursor<T> {
+    /// Memory never holds the relay quantum, so a step reads it to the end in one turn.
+    fn arm_relay_poll(&mut self) {}
+}
+
+impl<R: RelayPoll> RelayPoll for ferrox_core::vless_encryption::EncryptedReader<R> {
+    fn arm_relay_poll(&mut self) {
+        self.get_mut().arm_relay_poll();
+    }
+}
+
+impl RelayPoll for crate::quic::QuicStream {
+    /// The stream read arms its own quantum and reports the idle itself.
     fn arm_relay_poll(&mut self) {}
 }
 
@@ -4603,7 +4623,7 @@ fn vless_raw_reply<D, R>(
         return;
     }
     if cmd == 2 {
-        spawn_carried(move || serve_vless_udp(stream, &target, carried));
+        serve_vless_udp(stream, &target, carried);
         return;
     }
     if cmd == 3 {
@@ -4878,7 +4898,7 @@ fn serve_sealed_carried<R, W>(
     decryption: &ferrox_core::vless_encryption::Server,
     close: Arc<dyn Fn() + Send + Sync>,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + RelayPoll,
     W: Write + Send + 'static,
 {
     serve_sealed_carried_with(
@@ -4906,7 +4926,7 @@ pub(crate) fn serve_sealed_carried_with<R, W, A, B, C>(
     after_handshake: B,
     after_decode: C,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + RelayPoll,
     W: Write + Send + 'static,
     A: FnOnce(&mut R),
     B: FnOnce(&mut R),
@@ -4938,7 +4958,7 @@ fn serve_sealed_split_with<R, W, C>(
     closer: Arc<dyn Fn() + Send + Sync>,
     after_decode: C,
 ) where
-    R: Read + Send + 'static,
+    R: Read + Send + 'static + RelayPoll,
     W: Write + Send + 'static,
     C: FnOnce(&mut R),
 {
@@ -5362,6 +5382,11 @@ impl<S: Read + Write> Write for SealedHalf<S> {
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
     }
+}
+
+impl<S: Read + Write> RelayPoll for SealedHalf<S> {
+    /// The carrier under the seal was armed before the handshake, so the read inherits the relay quantum.
+    fn arm_relay_poll(&mut self) {}
 }
 
 /// The reference's first read is one `Read` into an 8 KiB buffer; its route scans that buffer
@@ -6151,7 +6176,7 @@ fn dns_udp_with(
     let mut framed = Vec::with_capacity(3 + 1 + 4 + 2 + query.len());
     let frame = socks_udp_frame(&mut framed, None, &target, query);
     client.send(frame).ok()?;
-    let mut response = vec![0u8; ferrox_core::dns::MESSAGE_MAX + 32];
+    let mut response = unfilled(ferrox_core::dns::MESSAGE_MAX + 32);
     let read = client.recv(&mut response).ok()?;
     let (_, payload) = parse_socks_udp(&response[..read])?;
     Some(payload.to_vec())
@@ -7450,7 +7475,7 @@ fn serve_vless_reality_inbound(
     true
 }
 
-fn serve_session_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
+fn serve_session_ws<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'static>(
     read: R,
     write: W,
     path: &str,
@@ -7506,7 +7531,7 @@ fn serve_session_ws<R: Read + Send + 'static, W: FrameWrite + 'static>(
     relay_sink_ws(creader, &cwriter, &uplink);
 }
 
-fn serve_session_xhttp<R: Read + Send + 'static, W: FrameWrite + 'static>(
+fn serve_session_xhttp<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'static>(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
@@ -7577,7 +7602,7 @@ fn sniff_xhttp<R: Read>(
     ))
 }
 
-fn serve_xhttp_stream<R: Read + Send + 'static, W: FrameWrite + Send + 'static>(
+fn serve_xhttp_stream<R: Read + Send + 'static + RelayPoll, W: FrameWrite + Send + 'static>(
     read: R,
     write: W,
     settings: &crate::xhttp::XhttpSettings,
@@ -7705,7 +7730,10 @@ pub(crate) fn serve_session_xhttp_with(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve_session_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(
+fn serve_session_httpupgrade<
+    R: Read + Send + 'static + RelayPoll,
+    W: Write + Clone + Send + 'static,
+>(
     read: R,
     write: W,
     raw: Connection,
@@ -7764,7 +7792,10 @@ fn serve_session_httpupgrade<R: Read + Send + 'static, W: Write + Clone + Send +
     }
 }
 
-fn serve_session_httpheader<R: Read + Send + 'static, W: Write + Clone + Send + 'static>(
+fn serve_session_httpheader<
+    R: Read + Send + 'static + RelayPoll,
+    W: Write + Clone + Send + 'static,
+>(
     read: R,
     write: W,
     raw: Connection,
@@ -7811,7 +7842,7 @@ fn serve_session_httpheader<R: Read + Send + 'static, W: Write + Clone + Send + 
     relay_sink(creader, &sink, &uplink, |_| {});
 }
 
-fn serve_session_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
+fn serve_session_grpc<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'static>(
     read: R,
     mut write: W,
     settings: &crate::config::GrpcSettings,
@@ -15976,6 +16007,7 @@ fn reality_xmux(
             reality.short_id,
             reality.fingerprint.clone(),
         ),
+        log_sink: reality.key_log.as_ref().map(|log| log.path().to_owned()),
     };
     crate::xmux::manager(key, settings.xmux)
 }
@@ -21212,7 +21244,7 @@ fn read_dns_source<'a>(stream: &mut impl Read, body: &'a mut Vec<u8>) -> Option<
     if size > ferrox_core::dns::MESSAGE_MAX {
         return None;
     }
-    body.resize(size, 0);
+    resize_scratch(body, size);
     stream.read_exact(body).ok()?;
     Some(body)
 }
@@ -21988,7 +22020,9 @@ impl SsUdpLane {
         let Ok(mut guard) = self.sources.lock() else {
             return false;
         };
-        if !guard.contains_key(&src) {
+        let source = if let Some(source) = guard.get_mut(&src) {
+            source
+        } else {
             if guard.len() >= crate::shadowsocks::SS_UDP_SOURCES {
                 let now = Instant::now();
                 let idle = budgets::udp_idle();
@@ -22016,9 +22050,10 @@ impl SsUdpLane {
                     last: Instant::now(),
                 },
             );
-        }
-        let Some(source) = guard.get_mut(&src) else {
-            return true;
+            let Some(source) = guard.get_mut(&src) else {
+                return true;
+            };
+            source
         };
         source.last = Instant::now();
         if let Some(packet) = crate::shadowsocks::seal_datagram(
@@ -22958,9 +22993,157 @@ pub(crate) fn relay_handoff(client: &Connection, target: &Connection) {
         let _ends = poll_handoff(client_read, target_write, target_read, client_write);
         return;
     }
-    thread::spawn(move || {
-        relay_owned(client_read, target_write, target_read, client_write);
-    });
+    // A masked or metered flow rides the lane pool the UDP association already uses.
+    relay_lanes(client_read, target_write, target_read, client_write);
+}
+
+/// One direction of a TCP relay as a lane step: the descriptor pump's buffer and nonblocking
+/// shape, but the wait is handed back to the lane and the flow's sibling, not slept in.
+fn relay_lanes(
+    client_read: Connection,
+    target_write: Connection,
+    target_read: Connection,
+    client_write: Connection,
+) {
+    for connection in [&client_read, &target_read, &target_write, &client_write] {
+        let _ = connection.set_read_timeout(Some(RELAY_POLL));
+        let _ = connection.set_write_timeout(Some(RELAY_POLL));
+    }
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+    let flow = RelayFinish::new(false, close, None);
+    let first = Arc::clone(&flow);
+    let mut forward = TcpCopy::new(client_read, target_write);
+    lane_pool::submit(
+        Box::new(move || forward.step(&first)),
+        Box::new({
+            let flow = Arc::clone(&flow);
+            move || {
+                flow.mark_ended();
+                flow.lane_done();
+            }
+        }),
+    );
+    let second = Arc::clone(&flow);
+    let mut reply = TcpCopy::new(target_read, client_write);
+    lane_pool::submit(
+        Box::new(move || reply.step(&second)),
+        Box::new({
+            let flow = Arc::clone(&flow);
+            move || {
+                flow.mark_ended();
+                flow.lane_done();
+            }
+        }),
+    );
+}
+
+struct TcpCopy {
+    src: Connection,
+    dst: Connection,
+    bytes: Vec<u8>,
+    filled: usize,
+    off: usize,
+    eof: bool,
+    ended: bool,
+    stalled: Option<std::time::Instant>,
+}
+
+impl TcpCopy {
+    fn new(src: Connection, dst: Connection) -> Self {
+        Self {
+            src,
+            dst,
+            bytes: RelayBuf::with_len(RELAY_BUFFER).into_vec(),
+            filled: 0,
+            off: 0,
+            eof: false,
+            ended: false,
+            stalled: None,
+        }
+    }
+
+    fn step(&mut self, flow: &Arc<RelayFinish>) -> Next {
+        if self.ended {
+            return Next::Done;
+        }
+        while self.off < self.filled {
+            match self.dst.write(&self.bytes[self.off..self.filled]) {
+                Ok(0) => {
+                    self.end();
+                    return Next::Done;
+                }
+                Ok(n) => {
+                    self.off += n;
+                    self.stalled = None;
+                }
+                Err(error) if is_timeout(&error) => {
+                    let now = std::time::Instant::now();
+                    let since = *self.stalled.get_or_insert(now);
+                    if now.duration_since(since) >= crate::budgets::relay_stall() {
+                        self.abandon();
+                        return Next::Done;
+                    }
+                    return Next::Idle;
+                }
+                Err(_) => {
+                    self.end();
+                    return Next::Done;
+                }
+            }
+        }
+        self.off = 0;
+        self.filled = 0;
+        self.stalled = None;
+        if self.eof {
+            self.end();
+            return Next::Done;
+        }
+        match self.src.read(&mut self.bytes) {
+            Ok(0) => {
+                self.eof = true;
+                self.end();
+                Next::Done
+            }
+            Ok(n) => {
+                self.filled = n;
+                Next::More
+            }
+            Err(error) if is_timeout(&error) => {
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd as _;
+                    note_wait_fd(self.src.as_raw_fd());
+                    note_wait_finish(flow);
+                }
+                if flow.ended() && flow.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
+                    self.end();
+                    Next::Done
+                } else {
+                    Next::Idle
+                }
+            }
+            Err(_) => {
+                self.end();
+                Next::Done
+            }
+        }
+    }
+
+    fn end(&mut self) {
+        if self.ended {
+            return;
+        }
+        self.ended = true;
+        self.stalled = None;
+        let _ = self.dst.shutdown(Shutdown::Write);
+    }
+
+    fn abandon(&mut self) {
+        self.ended = true;
+        self.stalled = None;
+        let _ = self.src.shutdown(Shutdown::Both);
+        let _ = self.dst.shutdown(Shutdown::Both);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -22993,6 +23176,7 @@ fn poll_handoff(
     poll_copy::handoff(client_read, target_write, target_read, client_write)
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn relay_owned(
     mut client_read: Connection,
     mut target_write: Connection,
@@ -23000,11 +23184,11 @@ fn relay_owned(
     mut client_write: Connection,
 ) {
     let forward = move || {
-        copy_all(&mut client_read, &mut target_write);
+        copy_all_memcpy(&mut client_read, &mut target_write);
         let _ = target_write.shutdown(Shutdown::Write);
     };
     let done = RelayPool::global().run(forward);
-    copy_all(&mut target_read, &mut client_write);
+    copy_all_memcpy(&mut target_read, &mut client_write);
     let _ = client_write.shutdown(Shutdown::Write);
     join(&done);
 }
@@ -23221,16 +23405,94 @@ fn serve_vless_udp(mut stream: Connection, target: &SocketAddr, carried: Vec<u8>
     serve_udp_stream(read, stream, target, carried, &close);
 }
 
-fn serve_udp_stream<R, W>(
+/// Frames the association's datagrams out of the client stream one at a time: a relay step that
+/// finds no bytes hands the wait back to the lane instead of parking in the read.
+struct UdpFrames<R> {
     reader: R,
+    carried: Vec<u8>,
+    carried_at: usize,
+    head: [u8; 2],
+    head_len: usize,
+    payload: Vec<u8>,
+    filled: usize,
+}
+
+impl<R: Read> UdpFrames<R> {
+    fn new(carried: Vec<u8>, reader: R) -> Self {
+        Self {
+            reader,
+            carried,
+            carried_at: 0,
+            head: [0; 2],
+            head_len: 0,
+            payload: udp_buffer(),
+            filled: 0,
+        }
+    }
+
+    fn take(&mut self) -> std::io::Result<usize> {
+        while self.head_len < 2 {
+            let want = self.head_len;
+            let n = read_frame_bytes(
+                &mut self.reader,
+                &self.carried,
+                &mut self.carried_at,
+                &mut self.head[want..],
+            )?;
+            if n == 0 {
+                return Ok(0);
+            }
+            self.head_len += n;
+        }
+        let len = usize::from(u16::from_be_bytes(self.head));
+        if len == 0 || len > self.payload.len() {
+            return Ok(0);
+        }
+        while self.filled < len {
+            let n = read_frame_bytes(
+                &mut self.reader,
+                &self.carried,
+                &mut self.carried_at,
+                &mut self.payload[self.filled..len],
+            )?;
+            if n == 0 {
+                return Ok(0);
+            }
+            self.filled += n;
+        }
+        self.head_len = 0;
+        self.filled = 0;
+        Ok(len)
+    }
+}
+
+fn read_frame_bytes<R: Read>(
+    reader: &mut R,
+    carried: &[u8],
+    carried_at: &mut usize,
+    buf: &mut [u8],
+) -> std::io::Result<usize> {
+    if *carried_at < carried.len() {
+        let n = (carried.len() - *carried_at).min(buf.len());
+        buf[..n].copy_from_slice(&carried[*carried_at..*carried_at + n]);
+        *carried_at += n;
+        return Ok(n);
+    }
+    reader.read(buf)
+}
+
+fn serve_udp_stream<R, W>(
+    mut reader: R,
     mut writer: W,
     target: &SocketAddr,
     carried: Vec<u8>,
     close: &Arc<dyn Fn() + Send + Sync>,
-) where
-    R: Read + Send + 'static,
+) -> Arc<RelayFinish>
+where
+    R: Read + Send + 'static + RelayPoll,
     W: Write + Send + 'static,
 {
+    let flow = RelayFinish::new(false, Arc::clone(close), None);
     let bind = if target.is_ipv6() {
         "[::]:0"
     } else {
@@ -23238,94 +23500,81 @@ fn serve_udp_stream<R, W>(
     };
     let Ok(udp) = UdpSocket::bind(bind) else {
         close();
-        return;
+        return flow;
     };
     if udp.connect(target).is_err() || udp.set_read_timeout(Some(RELAY_POLL)).is_err() {
         close();
-        return;
+        return flow;
     }
     let Ok(udp_send) = udp.try_clone() else {
         close();
-        return;
+        return flow;
     };
-    let done = Arc::new(AtomicBool::new(false));
-    let done_in = Arc::clone(&done);
+    reader.arm_relay_poll();
     // Datagrams the target still owes an answer to: the association ends when the uplink is spent and none are left.
     let awaiting = Arc::new(AtomicUsize::new(0));
-    let awaiting_in = Arc::clone(&awaiting);
-    let forward = move || {
-        let mut reader = std::io::Cursor::new(carried).chain(reader);
-        let mut buf = udp_buffer();
-        while let Some(n) = read_udp_datagram(&mut reader, &mut buf) {
-            awaiting_in.fetch_add(1, Ordering::Relaxed);
-            if udp_send.send(&buf[..n]).is_err() {
-                awaiting_in.fetch_sub(1, Ordering::Relaxed);
-                break;
+    let mut input = UdpFrames::new(carried, reader);
+    let up = udp_send;
+    let owed = Arc::clone(&awaiting);
+    let forward_finish = Arc::clone(&flow);
+    lane_pool::submit(
+        Box::new(move || {
+            let n = match input.take() {
+                Ok(0) => return Next::Done,
+                Ok(n) => n,
+                Err(error) if is_timeout(&error) => return Next::Idle,
+                Err(_) => return Next::Done,
+            };
+            owed.fetch_add(1, Ordering::Relaxed);
+            if up.send(&input.payload[..n]).is_err() {
+                owed.fetch_sub(1, Ordering::Relaxed);
+                return Next::Done;
             }
-        }
-        done_in.store(true, Ordering::Relaxed);
-    };
-    let replied = RelayPool::run_once(forward);
+            Next::More
+        }),
+        Box::new(move || {
+            forward_finish.mark_ended();
+            forward_finish.lane_done();
+        }),
+    );
+    let reply_finish = Arc::clone(&flow);
+    #[cfg(unix)]
+    let parked = Arc::clone(&reply_finish);
+    let reply_done = Arc::clone(&reply_finish);
+    let down = udp;
     let mut buf = udp_buffer();
-    // Poll fast after traffic, so a finished association leaves at once, and back off to a second.
-    let mut poll = RELAY_POLL;
-    let mut grace: Option<Instant> = None;
-    loop {
-        match udp.recv(&mut buf) {
+    lane_pool::submit(
+        Box::new(move || match down.recv(&mut buf) {
             Ok(n) => {
-                grace = None;
                 let _ = awaiting.try_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
                     Some(left.saturating_sub(1))
                 });
-                if poll != RELAY_POLL {
-                    poll = RELAY_POLL;
-                    if udp.set_read_timeout(Some(poll)).is_err() {
-                        break;
-                    }
+                if n > 0 && !write_udp_datagram(&mut writer, &buf[..n]) {
+                    return Next::Done;
                 }
-                if n == 0 {
-                    continue;
-                }
-                if !write_udp_datagram(&mut writer, &buf[..n]) {
-                    break;
-                }
+                Next::More
             }
             Err(error) if is_timeout(&error) => {
-                if done.load(Ordering::Relaxed) {
-                    if awaiting.load(Ordering::Relaxed) == 0 {
-                        break;
-                    }
-                    // An answer still owed the client that left may be in flight: wait one reply-idle window for it.
-                    let deadline = *grace.get_or_insert_with(|| {
-                        Instant::now() + crate::budgets::RELAY_RESPONSE_IDLE
-                    });
-                    if Instant::now() >= deadline {
-                        break;
-                    }
-                    if poll < crate::budgets::RELAY_RESPONSE_IDLE {
-                        poll = crate::budgets::RELAY_RESPONSE_IDLE;
-                        if udp.set_read_timeout(Some(poll)).is_err() {
-                            break;
-                        }
-                    }
-                    continue;
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd as _;
+                    note_wait_fd(down.as_raw_fd());
+                    note_wait_finish(&parked);
                 }
-                let next = poll
-                    .saturating_mul(2)
-                    .min(crate::budgets::RELAY_RESPONSE_IDLE);
-                if next != poll {
-                    poll = next;
-                    if udp.set_read_timeout(Some(poll)).is_err() {
-                        break;
-                    }
+                if reply_finish.ended()
+                    && (awaiting.load(Ordering::Relaxed) == 0
+                        || reply_finish.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE))
+                {
+                    Next::Done
+                } else {
+                    Next::Idle
                 }
             }
-            Err(_) => break,
-        }
-    }
-    done.store(true, Ordering::Relaxed);
-    close();
-    join(&replied);
+            Err(_) => Next::Done,
+        }),
+        Box::new(move || reply_done.lane_done()),
+    );
+    flow
 }
 
 pub(crate) fn pump_vmess_udp<R, W>(
@@ -25876,11 +26125,6 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
     flow
 }
 
-#[cfg(not(target_os = "linux"))]
-fn copy_all(from: &mut Connection, to: &mut Connection) {
-    copy_all_memcpy(from, to);
-}
-
 #[inline]
 fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     // Once per leg, outside the byte loop: a budget read per buffer would price the copy.
@@ -25924,27 +26168,6 @@ fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
 }
 
 #[cfg(target_os = "linux")]
-fn copy_all(from: &mut Connection, to: &mut Connection) {
-    // A masked or metered leg cannot be fed by splice: the pipe would write the socket directly.
-    if to.masked() || to.metered() || from.metered() {
-        return copy_all_memcpy(from, to);
-    }
-    let Some(pipe) = SplicePipe::new() else {
-        return copy_all_memcpy(from, to);
-    };
-    loop {
-        match pipe.pull(from) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => {
-                if !pipe.push(to, n) {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
 struct SplicePipe {
     fds: [libc::c_int; 2],
     capacity: libc::size_t,
@@ -25968,59 +26191,6 @@ impl SplicePipe {
             eprintln!("ferrox-app: splice pipe {capacity} B");
         }
         Some(Self { fds, capacity })
-    }
-
-    fn pull(&self, from: &mut Connection) -> std::io::Result<usize> {
-        census!("relay-leg-read", crate::census::handle(from), None);
-        loop {
-            let n = unsafe {
-                libc::splice(
-                    from.as_raw_fd(),
-                    std::ptr::null_mut(),
-                    self.fds[1],
-                    std::ptr::null_mut(),
-                    self.capacity,
-                    0,
-                )
-            };
-            if n < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            return Ok(n as usize);
-        }
-    }
-
-    fn push(&self, to: &mut Connection, n: usize) -> bool {
-        census!("relay-leg-write", crate::census::handle(to), None);
-        let mut left = n;
-        while left > 0 {
-            let moved = unsafe {
-                libc::splice(
-                    self.fds[0],
-                    std::ptr::null_mut(),
-                    to.as_raw_fd(),
-                    std::ptr::null_mut(),
-                    left,
-                    0,
-                )
-            };
-            if moved < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return false;
-            }
-            if moved == 0 {
-                return false;
-            }
-            left -= moved as usize;
-        }
-        true
     }
 }
 
@@ -34581,36 +34751,6 @@ mod tests {
     }
 
     #[test]
-    fn the_splice_path_and_the_copying_path_move_the_same_bytes() {
-        fn round_trip(payload: &[u8], copy: fn(&mut Connection, &mut Connection)) -> Vec<u8> {
-            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-            let port = listener.local_addr().expect("addr").port();
-            let server = thread::spawn(move || {
-                let (mut stream, _) = listener.accept().expect("accepts");
-                let mut other = stream.try_clone().expect("clones");
-                copy(&mut stream, &mut other);
-            });
-            let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
-            client
-                .set_read_timeout(Some(Duration::from_secs(30)))
-                .expect("timeout");
-            client.write_all(payload).expect("writes");
-            client.shutdown(Shutdown::Write).expect("half closes");
-            let mut back = Vec::new();
-            client.read_to_end(&mut back).expect("reads");
-            let _ = server.join();
-            back
-        }
-
-        let payload: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
-        let spliced = round_trip(&payload, copy_all);
-        let copied = round_trip(&payload, copy_all_memcpy);
-        assert_eq!(spliced, payload, "the splice path must move every byte");
-        assert_eq!(copied, payload, "the copying path must move every byte");
-        assert_eq!(spliced, copied, "the two paths must agree");
-    }
-
-    #[test]
     fn both_sockets_of_a_connection_have_nagle_off() {
         let listener = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds");
         let port = listener.local_addr().expect("has an address").port();
@@ -34648,6 +34788,40 @@ mod tests {
             pipe.capacity <= DEFAULT_SPLICE_PIPE_BYTES.max(1) || pipe.capacity > 0,
             "a granted capacity is always positive and never invented"
         );
+    }
+
+    #[test]
+    fn a_metered_tcp_flow_relays_over_the_lane_pool() {
+        let front = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds the front");
+        let edge = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds the edge");
+        let mut client = Connection::connect(front.local_addr().expect("front address"))
+            .expect("connects the client");
+        let (accepted, _) = front.accept().expect("accepts the client");
+        let client_local = accepted.with_meter(crate::stats::counting());
+        let mut peer = Connection::connect(edge.local_addr().expect("edge address"))
+            .expect("connects the peer");
+        let (accepted, _) = edge.accept().expect("accepts the peer");
+        let target_local = accepted;
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("client timeout");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        let relay = thread::spawn(move || relay_handoff(&client_local, &target_local));
+        client.write_all(b"hello").expect("writes forward");
+        let mut got = [0u8; 5];
+        peer.read_exact(&mut got).expect("reads forward");
+        assert_eq!(&got, b"hello");
+        peer.write_all(b"world").expect("writes back");
+        client.read_exact(&mut got).expect("reads back");
+        assert_eq!(&got, b"world");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("finishes the client");
+        peer.shutdown(Shutdown::Write).expect("finishes the peer");
+        drop(client);
+        drop(peer);
+        relay.join().expect("the relay call returns");
     }
 
     #[test]
@@ -38649,6 +38823,7 @@ mod tests {
             websocket: false,
             master_key_log: None,
             client_cert: None,
+            client_random: None,
         };
         (server, client)
     }
@@ -38678,6 +38853,7 @@ mod tests {
             websocket: false,
             master_key_log: None,
             client_cert: None,
+            client_random: None,
         };
         let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
         let port = listener.local_addr().expect("addr").port();
@@ -42120,6 +42296,71 @@ mod tests {
         })
     }
 
+    /// The key-log sink is part of a pooled connection's identity: a second outbound naming another
+    /// `masterKeyLog` must not reuse a connection whose secrets went to the first file.
+    #[test]
+    fn a_reality_pool_partitions_by_its_key_log_sink() {
+        let server = SocketAddr::from(([127, 0, 0, 1], 443));
+        let vless = header_test_outbound();
+        let settings = xhttp_settings("/keylog");
+        let base = trojan_reality_client();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock")
+            .as_nanos();
+        let first_path = std::env::temp_dir().join(format!(
+            "ferrox-reality-pool-first-{}-{stamp}.log",
+            std::process::id()
+        ));
+        let second_path = std::env::temp_dir().join(format!(
+            "ferrox-reality-pool-second-{}-{stamp}.log",
+            std::process::id()
+        ));
+        let nested = std::env::temp_dir().join(format!(
+            "ferrox-reality-pool-nested-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&nested).expect("the nested directory");
+        let equivalent_path = nested
+            .join("..")
+            .join(first_path.file_name().expect("a file name"));
+        let mut first = (*base).clone();
+        first.key_log = Some(Arc::new(
+            ferrox_core::tls::MasterKeyLog::open(first_path.to_string_lossy().as_ref())
+                .expect("opens"),
+        ));
+        let mut second = (*base).clone();
+        second.key_log = Some(Arc::new(
+            ferrox_core::tls::MasterKeyLog::open(second_path.to_string_lossy().as_ref())
+                .expect("opens"),
+        ));
+        let mut equivalent = (*base).clone();
+        equivalent.key_log = Some(Arc::new(
+            ferrox_core::tls::MasterKeyLog::open(equivalent_path.to_string_lossy().as_ref())
+                .expect("opens"),
+        ));
+        let first = Arc::new(first);
+        let second = Arc::new(second);
+        let equivalent = Arc::new(equivalent);
+        let first_pool = reality_xmux(&server, &vless, &first, &settings);
+        let second_pool = reality_xmux(&server, &vless, &second, &settings);
+        let first_again = reality_xmux(&server, &vless, &equivalent, &settings);
+        drop(first);
+        drop(second);
+        drop(equivalent);
+        let _ = std::fs::remove_file(&first_path);
+        let _ = std::fs::remove_file(&second_path);
+        let _ = std::fs::remove_dir_all(&nested);
+        assert!(
+            !Arc::ptr_eq(&first_pool, &second_pool),
+            "two key-log sinks shared one pooled connection"
+        );
+        assert!(
+            Arc::ptr_eq(&first_pool, &first_again),
+            "equivalent key-log paths did not share a pool"
+        );
+    }
+
     /// A trojan listener that declares reality without an identity is refused by name: serving it as plaintext would be a silent downgrade.
     #[test]
     fn a_trojan_reality_inbound_without_identity_is_refused_not_downgraded() {
@@ -43406,63 +43647,69 @@ mod tests {
         handle.join().expect("the thread finishes");
     }
 
+    /// A writer that records the association's framed replies.
+    struct UdpSink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for UdpSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().expect("sink").extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Waits for a pooled association to hand its last lane back.
+    fn wait_for_flow(flow: &Arc<RelayFinish>, budget: Duration, what: &str) {
+        let (done, wait) = std::sync::mpsc::channel();
+        flow.then(move || {
+            let _ = done.send(());
+        });
+        wait.recv_timeout(budget)
+            .unwrap_or_else(|_| panic!("{what} outlived its {budget:?} budget"));
+    }
+
+    /// An echo that answers one poll late, so a caller that relays the association itself is
+    /// still inside the call when the answer arrives.
+    fn delayed_echo_port(delay: Duration) -> u16 {
+        let echo = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let port = echo.local_addr().expect("addr").port();
+        thread::spawn(move || {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                let Ok((read, from)) = echo.recv_from(&mut buf) else {
+                    return;
+                };
+                thread::sleep(delay);
+                if echo.send_to(&buf[..read], from).is_err() {
+                    return;
+                }
+            }
+        });
+        port
+    }
+
     /// A one-datagram association leaves when its uplink ends: the reply loop used to park its
     /// thread on the 120 s idle deadline after the forward leg had already finished.
     #[test]
     fn a_finished_udp_association_leaves_without_the_idle_deadline() {
         let echo = udp_echo_port();
         let target: SocketAddr = format!("127.0.0.1:{echo}").parse().expect("addr");
-        let (answer_tx, answer_rx) = std::sync::mpsc::channel();
         let bytes = Arc::new(Mutex::new(Vec::new()));
-        let sink_bytes = Arc::clone(&bytes);
-        let session = thread::spawn(move || {
-            struct OneDatagram {
-                wire: std::io::Cursor<Vec<u8>>,
-                answered: std::sync::mpsc::Receiver<()>,
-            }
-            impl Read for OneDatagram {
-                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-                    let read = self.wire.read(buf)?;
-                    if read == 0 {
-                        let _ = self.answered.recv();
-                    }
-                    Ok(read)
-                }
-            }
-            struct Sink {
-                bytes: Arc<Mutex<Vec<u8>>>,
-                answered: std::sync::mpsc::Sender<()>,
-            }
-            impl Write for Sink {
-                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                    self.bytes.lock().expect("sink").extend_from_slice(buf);
-                    let _ = self.answered.send(());
-                    Ok(buf.len())
-                }
-                fn flush(&mut self) -> std::io::Result<()> {
-                    Ok(())
-                }
-            }
-            let mut wire = Vec::new();
-            wire.extend_from_slice(&4u16.to_be_bytes());
-            wire.extend_from_slice(b"ping");
-            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-            serve_udp_stream(
-                OneDatagram {
-                    wire: std::io::Cursor::new(wire),
-                    answered: answer_rx,
-                },
-                Sink {
-                    bytes: sink_bytes,
-                    answered: answer_tx,
-                },
-                &target,
-                Vec::new(),
-                &close,
-            );
-        });
-        join_thread_within(
-            session,
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&4u16.to_be_bytes());
+        wire.extend_from_slice(b"ping");
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let flow = serve_udp_stream(
+            std::io::Cursor::new(wire),
+            UdpSink(Arc::clone(&bytes)),
+            &target,
+            Vec::new(),
+            &close,
+        );
+        wait_for_flow(
+            &flow,
             Duration::from_secs(5),
             "the finished UDP association",
         );
@@ -43485,37 +43732,53 @@ mod tests {
             let _ = echo.send_to(&buf[..n], from);
         });
         let bytes = Arc::new(Mutex::new(Vec::new()));
-        let sink_bytes = Arc::clone(&bytes);
-        let session = thread::spawn(move || {
-            struct Sink(Arc<Mutex<Vec<u8>>>);
-            impl Write for Sink {
-                fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                    self.0.lock().expect("sink").extend_from_slice(buf);
-                    Ok(buf.len())
-                }
-                fn flush(&mut self) -> std::io::Result<()> {
-                    Ok(())
-                }
-            }
-            let mut wire = Vec::new();
-            wire.extend_from_slice(&4u16.to_be_bytes());
-            wire.extend_from_slice(b"ping");
-            let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-            serve_udp_stream(
-                std::io::Cursor::new(wire),
-                Sink(sink_bytes),
-                &echo_addr,
-                Vec::new(),
-                &close,
-            );
-        });
-        join_thread_within(
-            session,
-            Duration::from_secs(5),
-            "the delayed UDP association",
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&4u16.to_be_bytes());
+        wire.extend_from_slice(b"ping");
+        let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let flow = serve_udp_stream(
+            std::io::Cursor::new(wire),
+            UdpSink(Arc::clone(&bytes)),
+            &echo_addr,
+            Vec::new(),
+            &close,
         );
+        wait_for_flow(&flow, Duration::from_secs(5), "the delayed UDP association");
         let bytes = bytes.lock().expect("sink");
         assert_eq!(&bytes[2..], b"ping", "the late echo reached the writer");
+    }
+
+    /// The association runs on the relay lanes, not the caller's thread: a one-datagram call must
+    /// hand its thread back before the target answers, or every association costs one.
+    #[test]
+    fn a_udp_association_does_not_hold_its_callers_thread() {
+        let echo = delayed_echo_port(Duration::from_millis(400));
+        let target: SocketAddr = format!("127.0.0.1:{echo}").parse().expect("addr");
+        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds the association");
+        let port = listener.local_addr().expect("addr").port();
+        let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("timeout");
+        let (server, _) = listener.accept().expect("accepts");
+        let mut carried = Vec::new();
+        carried.extend_from_slice(&4u16.to_be_bytes());
+        carried.extend_from_slice(b"ping");
+        let (called, call) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            serve_vless_udp(server, &target, carried);
+            let _ = called.send(());
+        });
+        call.recv_timeout(Duration::from_millis(200))
+            .expect("the association held its caller thread");
+        let mut head = [0u8; 2];
+        client.read_exact(&mut head).expect("the reply head");
+        assert_eq!(head, [0, 0], "the association accepted the command");
+        let mut len = [0u8; 2];
+        client.read_exact(&mut len).expect("the reply length");
+        let mut answer = vec![0u8; usize::from(u16::from_be_bytes(len))];
+        client.read_exact(&mut answer).expect("the late echo");
+        assert_eq!(answer, b"ping", "the echo reached the client");
     }
 
     fn vmess_udp_over(
@@ -49847,35 +50110,6 @@ mod tests {
         (widths, body)
     }
 
-    /// The splice lanes address the descriptor, so a leg that ends on a masked stream has to keep the
-    /// buffered copy: on linux this is the difference between cut records and one raw write.
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn a_masked_destination_is_not_fed_by_splice() {
-        let settings = crate::json::parse(FRAGMENT).expect("parses");
-        let carrier = stream_carrier(Some(&settings));
-        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let address = listener.local_addr().expect("address");
-        let source = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let mut feeder = Connection::connect(source.local_addr().expect("address")).expect("dials");
-        let (mut from, _) = source.accept().expect("accepts the feeder");
-        let mut to = Connection::connect(address)
-            .expect("connects")
-            .with_mask(carrier.tcp_mask());
-        let (mut peer, _) = listener.accept().expect("accepts");
-        let mut hello = vec![22, 3, 1];
-        hello.extend_from_slice(&300u16.to_be_bytes());
-        hello.extend((0..300).map(|i| i as u8));
-        feeder.write_all(&hello).expect("feeds");
-        feeder.shutdown(Shutdown::Write).expect("ends the source");
-        copy_all(&mut from, &mut to);
-        let mut wire = vec![0u8; hello.len() + 8 * 5];
-        peer.read_exact(&mut wire).expect("reads every record");
-        let (widths, body) = hello_records(&wire);
-        assert!(widths.len() > 1, "the chain cut the write, not the socket");
-        assert_eq!(body, hello[5..], "and the hello still arrives whole");
-    }
-
     /// A chain this tree cannot arm is refused by name, never dialled or served in the clear.
     #[test]
     fn a_tcp_mask_this_tree_cannot_arm_is_refused() {
@@ -53193,6 +53427,7 @@ mod tests {
             websocket: false,
             master_key_log: None,
             client_cert: None,
+            client_random: None,
         };
         let mut session =
             ferrox_core::tls::connect(&config, Connection::Tcp(client)).expect("connects");
@@ -60145,7 +60380,7 @@ mod poll_copy {
         off: usize,
         src_at_eof: bool,
         ended: bool,
-        /// The stall budget this direction was born with, as `copy_all` read it once per leg.
+        /// The stall budget this direction was born with, as the copying leg read it once per leg.
         stall_budget: Duration,
         /// The first write that found no room, cleared by the next byte the destination takes.
         stalled: Option<std::time::Instant>,
@@ -62279,6 +62514,25 @@ mod dns_lane_tests {
         );
         assert_eq!(body.as_ptr() as usize, base, "the buffer never moves");
         assert_eq!(body.capacity(), capacity, "nor grows for them");
+    }
+
+    /// A length-prefixed message lands in the lane's buffer without a zero pass: the read writes every
+    /// byte the length names, so only the two-byte head is taken from zeroed storage.
+    #[test]
+    fn a_stream_lane_message_does_not_zero_its_landing() {
+        let message = [0xa5u8; 48];
+        let mut wire = Vec::with_capacity(message.len() + 2);
+        wire.extend_from_slice(&(message.len() as u16).to_be_bytes());
+        wire.extend_from_slice(&message);
+        let mut stream = std::io::Cursor::new(wire);
+        let mut body = Vec::new();
+        let (read, counts) = ferrox_core::alloc_count::measure(|| {
+            read_dns_source(&mut stream, &mut body)
+                .expect("a message")
+                .to_vec()
+        });
+        assert_eq!(read, message);
+        assert_eq!(counts.zeroed, 0, "the body is written, not zero-filled");
     }
 
     #[test]

@@ -343,6 +343,17 @@ pub(crate) fn user(email: &str, level: u32) -> Meter {
     meter
 }
 
+/// A meter that counts on every flow, so a gate can observe the descriptor-level fast path a
+/// configured user stats policy forbids.
+#[cfg(test)]
+pub(crate) fn counting() -> Meter {
+    Meter {
+        read: vec![Arc::new(Counter::default())],
+        write: vec![Arc::new(Counter::default())],
+        online: None,
+    }
+}
+
 /// One tag's traffic, as the metrics app prints it.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct Traffic {

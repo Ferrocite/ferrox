@@ -789,6 +789,8 @@ front-healthcheck answer-bytes 85 ferrox-app-proxy::hc_tests::an_hc_answer_is_pr
 
 # --- Commander gRPC management API ----------------------------------------
 engine-api ops-retired-instructions UNBLESSED scripts/count-ops.sh
+engine-api syscalls-per-api-call UNBLESSED scripts/count-ops.sh
+engine-api seconds-per-api-call UNBLESSED CI bench.yml (no cell yet)
 
 # --- wireguard tunnel, both roles ---------------------------------------------
 wireguard ops-retired-instructions UNBLESSED scripts/count-ops.sh

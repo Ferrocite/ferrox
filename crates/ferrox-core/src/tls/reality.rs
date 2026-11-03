@@ -1112,8 +1112,14 @@ impl<S: Stream> RealityClientSession<S> {
                     cfg.fingerprint
                 ))
             })?;
-        let mut hello =
-            crate::tls::shaped::hello::Hello::build(profile, &cfg.server_name, &[], false, &[])?;
+        let mut hello = crate::tls::shaped::hello::Hello::build(
+            profile,
+            &cfg.server_name,
+            &[],
+            false,
+            &[],
+            None,
+        )?;
         let secret = hello.auth_secret().ok_or_else(|| {
             TlsError::Other("reality: the hello carries no X25519 share".to_owned())
         })?;
@@ -2625,7 +2631,8 @@ mod tests {
             .and_then(crate::tls::shaped::Fingerprint::profile)
             .expect("chrome is a parrot");
         let mut hello =
-            crate::tls::shaped::hello::Hello::build(profile, SNI, &[], false, &[]).expect("builds");
+            crate::tls::shaped::hello::Hello::build(profile, SNI, &[], false, &[], None)
+                .expect("builds");
         assert_eq!(
             &hello.msg[39..71],
             &hello.session_id[..],

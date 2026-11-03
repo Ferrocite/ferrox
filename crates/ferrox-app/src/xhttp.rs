@@ -208,6 +208,12 @@ impl<R: Read> ChainReader<R> {
     }
 }
 
+impl<R: crate::proxy::RelayPoll> crate::proxy::RelayPoll for ChainReader<R> {
+    fn arm_relay_poll(&mut self) {
+        self.read.arm_relay_poll();
+    }
+}
+
 impl<R: Read> Read for ChainReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if self.at < self.prefix.len() {
@@ -968,7 +974,7 @@ pub(crate) enum PadMethod {
 
 /// The `xmux` bounds (`transport_method.go:299`): the reference grows an H2 connection pool from them,
 /// and `xmux::Manager` steers the REALITY stream-one pool by the same six fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) struct Xmux {
     pub max_concurrency: (i32, i32),
     pub max_connections: (i32, i32),

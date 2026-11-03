@@ -664,6 +664,7 @@ fn probe(
             websocket: false,
             master_key_log: None,
             client_cert: None,
+            client_random: None,
         };
         let mut session = ferrox_core::tls::RustlsProvider::connect(&config, stream)
             .map_err(|error| error.to_string())?;

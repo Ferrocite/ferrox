@@ -112,8 +112,8 @@ impl Destination {
     }
 }
 
-/// The in-proxy destination a signed server entry names.
-pub(crate) fn destination(entry: &Json, host: &str) -> Option<Destination> {
+/// The in-proxy destination a signed server entry names for the requested TLS shape.
+pub(crate) fn destination(entry: &Json, host: &str, tls: bool) -> Option<Destination> {
     let capabilities = entry.get("capabilities").and_then(Json::as_arr)?;
     let has = |name: &str| {
         capabilities
@@ -121,19 +121,28 @@ pub(crate) fn destination(entry: &Json, host: &str) -> Option<Destination> {
             .filter_map(Json::as_str)
             .any(|capability| capability == name)
     };
-    let (port, network_protocol, protocol) = if has("INPROXY-WEBRTC-OSSH") {
+    let (port, network_protocol, protocol) = if !tls && has("INPROXY-WEBRTC-OSSH") {
         (
             entry.get("inproxyOSSHPort").and_then(Json::as_port),
             NetworkProtocol::Tcp,
             "INPROXY-WEBRTC-OSSH",
         )
-    } else if has("INPROXY-WEBRTC-SSH") {
+    } else if !tls && has("INPROXY-WEBRTC-SSH") {
         (
             entry.get("inproxySSHPort").and_then(Json::as_port),
             NetworkProtocol::Tcp,
             "INPROXY-WEBRTC-SSH",
         )
-    } else if has("INPROXY-WEBRTC-QUIC-OSSH") {
+    } else if tls && has("INPROXY-WEBRTC-TLS-OSSH") {
+        (
+            entry
+                .get("inproxyTlsOSSHPort")
+                .and_then(Json::as_port)
+                .or_else(|| entry.get("inproxyMeekPort").and_then(Json::as_port)),
+            NetworkProtocol::Tcp,
+            "INPROXY-WEBRTC-TLS-OSSH",
+        )
+    } else if !tls && has("INPROXY-WEBRTC-QUIC-OSSH") {
         (
             entry.get("inproxyQUICPort").and_then(Json::as_port),
             NetworkProtocol::Udp,

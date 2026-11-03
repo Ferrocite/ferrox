@@ -30,6 +30,7 @@ const STREAM_MESSAGE: usize = 16 * 1024;
 pub(crate) struct WebRtc {
     rtc: Rtc,
     socket: UdpSocket,
+    local: SocketAddr,
     pending: Option<SdpPendingOffer>,
     channel: ChannelId,
     open: bool,
@@ -54,7 +55,7 @@ impl WebRtc {
         let _ = rtc.add_local_candidate(host);
         let stun_timeout = timeout.min(Duration::from_secs(3));
         for server in stun_servers.iter().take(2) {
-            if let Ok(Some(mapped)) = stun_binding(&socket, server, stun_timeout) {
+            if let Ok(Some(mapped)) = stun_binding(&socket, local, server, stun_timeout) {
                 if let Ok(candidate) = Candidate::server_reflexive(mapped, local, "udp") {
                     let _ = rtc.add_local_candidate(candidate);
                 }
@@ -72,6 +73,7 @@ impl WebRtc {
             Self {
                 rtc,
                 socket,
+                local,
                 pending: Some(pending),
                 channel,
                 open: false,
@@ -208,10 +210,7 @@ impl WebRtc {
             .map_err(|error| format!("psiphon webrtc timeout: {error}"))?;
         match self.socket.recv_from(&mut self.buffer) {
             Ok((length, source)) => {
-                let destination = self
-                    .socket
-                    .local_addr()
-                    .map_err(|error| format!("psiphon webrtc local: {error}"))?;
+                let destination = self.local;
                 let input =
                     Receive::new(Protocol::Udp, source, destination, &self.buffer[..length])
                         .map_or_else(
@@ -272,13 +271,11 @@ fn bind_socket(destination: IpAddr) -> Result<UdpSocket, String> {
 /// Send one RFC 5389 binding request and return its mapped address.
 fn stun_binding(
     socket: &UdpSocket,
+    local: SocketAddr,
     server: &str,
     timeout: Duration,
 ) -> Result<Option<SocketAddr>, String> {
-    let ipv6 = socket
-        .local_addr()
-        .map_err(|error| format!("psiphon webrtc STUN local: {error}"))?
-        .is_ipv6();
+    let ipv6 = local.is_ipv6();
     let same_family = |address: &SocketAddr| address.is_ipv6() == ipv6;
     let resolved = if let Ok(address) = server.parse::<SocketAddr>() {
         Some(address).filter(same_family)
@@ -412,7 +409,8 @@ pub(crate) struct WebRtcStream {
     pending: Arc<Mutex<(Vec<u8>, usize)>>,
     stop: Arc<AtomicBool>,
     padding_sent: Arc<AtomicBool>,
-    timeout: Arc<Mutex<Option<Duration>>>,
+    read_timeout: Arc<Mutex<Option<Duration>>>,
+    write_timeout: Arc<Mutex<Option<Duration>>>,
 }
 
 impl Clone for WebRtcStream {
@@ -423,7 +421,8 @@ impl Clone for WebRtcStream {
             pending: Arc::clone(&self.pending),
             stop: Arc::clone(&self.stop),
             padding_sent: Arc::clone(&self.padding_sent),
-            timeout: Arc::clone(&self.timeout),
+            read_timeout: Arc::clone(&self.read_timeout),
+            write_timeout: Arc::clone(&self.write_timeout),
         }
     }
 }
@@ -446,13 +445,20 @@ impl WebRtcStream {
             pending: Arc::new(Mutex::new((Vec::new(), 0))),
             stop,
             padding_sent,
-            timeout: Arc::new(Mutex::new(Some(timeout))),
+            read_timeout: Arc::new(Mutex::new(Some(timeout))),
+            write_timeout: Arc::new(Mutex::new(Some(timeout))),
         })
     }
 
     /// Set or clear the read and write timeout.
     pub(crate) fn set_timeout(&self, timeout: Option<Duration>) {
-        *lock(&self.timeout) = timeout;
+        *lock(&self.read_timeout) = timeout;
+        *lock(&self.write_timeout) = timeout;
+    }
+
+    /// Set or clear only the read timeout, leaving the write deadline in place.
+    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) {
+        *lock(&self.read_timeout) = timeout;
     }
 
     /// End the driver and every clone of this stream.
@@ -477,7 +483,7 @@ impl Read for WebRtcStream {
             pending.0.clear();
             pending.1 = 0;
             let input = lock(&self.input);
-            let timeout = *lock(&self.timeout);
+            let timeout = *lock(&self.read_timeout);
             let received = match timeout {
                 Some(timeout) => input.recv_timeout(timeout),
                 None => input.recv().map_err(|_| RecvTimeoutError::Disconnected),
@@ -536,7 +542,7 @@ impl WebRtcStream {
 
     /// Queue one framed message, respecting the current write timeout.
     fn send(&self, message: Vec<u8>) -> io::Result<()> {
-        let timeout = *lock(&self.timeout);
+        let timeout = *lock(&self.write_timeout);
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         let mut message = message;
         loop {
@@ -735,7 +741,7 @@ impl Conduit {
         if self.fronts.is_empty() {
             return Err("psiphon conduit: no broker front".to_owned());
         }
-        if !matches!(destination.base_protocol(), "OSSH" | "SSH") {
+        if !matches!(destination.base_protocol(), "OSSH" | "SSH" | "TLS-OSSH") {
             return Err(format!(
                 "psiphon conduit: {} is not carried by this lane",
                 destination.protocol
