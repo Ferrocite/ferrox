@@ -32451,6 +32451,92 @@ mod tests {
         }
     }
 
+    /// A peer that drips ciphertext without completing a record must not hold the lane turn: the
+    /// read gives the worker back after a bounded number of opens that produced no plaintext, and
+    /// the bytes it did not turn into plaintext stay where the next read resumes them.
+    #[test]
+    fn a_dripping_record_yields_the_lane_and_resumes() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct Partial {
+            held: Vec<u8>,
+            emit: Arc<AtomicBool>,
+        }
+
+        impl CipherOpen for Partial {
+            fn open(
+                &mut self,
+                ciphertext: &[u8],
+                buf: &mut [u8],
+            ) -> std::io::Result<(usize, usize)> {
+                self.held.extend_from_slice(ciphertext);
+                if !self.emit.load(Ordering::Relaxed) {
+                    return Ok((0, ciphertext.len()));
+                }
+                let n = self.held.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.held[..n]);
+                self.held.drain(..n);
+                Ok((n, ciphertext.len()))
+            }
+
+            fn seal_into(&mut self, plaintext: &[u8], out: &mut Vec<u8>) -> std::io::Result<usize> {
+                out.extend_from_slice(plaintext);
+                Ok(plaintext.len())
+            }
+        }
+
+        /// One ciphertext byte a read, a fixed count of them, then the wire ends.
+        struct Drip {
+            left: usize,
+            reads: Arc<AtomicUsize>,
+        }
+
+        impl Read for Drip {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.reads.fetch_add(1, Ordering::Relaxed);
+                if self.left == 0 || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = b'c';
+                self.left -= 1;
+                Ok(1)
+            }
+        }
+
+        let emit = Arc::new(AtomicBool::new(false));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let session = Arc::new(Mutex::new(Partial {
+            held: Vec::new(),
+            emit: Arc::clone(&emit),
+        }));
+        let reader = Arc::new(Mutex::new(Drip {
+            left: 100_000,
+            reads: Arc::clone(&reads),
+        }));
+        let out = Arc::new(Mutex::new(Sealed::new(std::io::sink())));
+        let mut half = DrivenHalf::new(session, reader, out);
+        let mut buf = [0u8; 64];
+        let result = half.read(&mut buf);
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            32,
+            "a read that opened 32 records without plaintext handed the lane back"
+        );
+        assert!(
+            matches!(&result, Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "the read yielded instead of swallowing the wire, got {result:?}"
+        );
+
+        emit.store(true, Ordering::Relaxed);
+        let resumed = half.read(&mut buf).expect("resumes the record");
+        assert_eq!(resumed, 33, "the yielded bytes resume on the next read");
+        assert_eq!(
+            reads.load(Ordering::Relaxed),
+            33,
+            "the resume reads the wire once"
+        );
+    }
+
     /// A closed session that still holds plaintext delivers it: a read that filled the caller's
     /// window exactly must not turn the peer's close into an early end that drops what is queued.
     #[test]
