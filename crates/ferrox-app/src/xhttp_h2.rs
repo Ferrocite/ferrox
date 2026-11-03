@@ -3444,6 +3444,39 @@ mod tests {
         server.join().expect("joins");
     }
 
+    /// A client's request half ending is not its response ending: the connection is pooled and the
+    /// peer still owes an answer, so `finish` must not turn the read into EOF.
+    #[test]
+    fn a_finished_request_half_still_reads_the_response() {
+        let (conn, _written, _slices) = bare_conn();
+        let client = super::H2Client {
+            conn: Arc::clone(&conn),
+            next: AtomicU32::new(1),
+        };
+        let (mut reader, mut writer) = client
+            .open("example.org", &test_settings("stream-one"), "https", false)
+            .expect("the stream opens");
+        writer.write_all(b"request").expect("the request goes out");
+        writer.finish();
+        let answering = {
+            let conn = Arc::clone(&conn);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                let head = block_encode(&[(":status", "200")]);
+                client_frame(&conn, T_HEADERS, F_END_HEADERS, 1, head);
+                queue_data(&conn, F_END, 1, b"answer".to_vec());
+            })
+        };
+        let mut got = [0u8; 6];
+        let n = reader.read(&mut got).expect("the response reads");
+        answering.join().expect("the peer answers");
+        assert_eq!(
+            n, 6,
+            "the answer must not be lost when the request half ends"
+        );
+        assert_eq!(&got, b"answer");
+    }
+
     /// A downlink that finishes leaves no body to deliver: the upload reader parked on the same
     /// stream must end with it, not hold its worker until the relay stall expires.
     #[test]
