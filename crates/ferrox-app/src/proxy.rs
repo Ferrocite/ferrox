@@ -4438,6 +4438,11 @@ impl RelayPoll for crate::quic::QuicStream {
     fn arm_relay_poll(&mut self) {}
 }
 
+impl RelayPoll for Box<dyn WindowRead + Send> {
+    /// An xhttp server slot reads its own request body, whose socket the carrier armed before the split.
+    fn arm_relay_poll(&mut self) {}
+}
+
 impl<S> RelayPoll for TlsHalf<S> {
     /// `session_halves` armed the cipher before splitting, so a step already hands back its wait.
     fn arm_relay_poll(&mut self) {}
@@ -7678,8 +7683,8 @@ fn serve_vless_xhttp(
     );
 }
 
-pub(crate) fn serve_session_xhttp_with(
-    mut creader: Box<dyn Read + Send>,
+pub(crate) fn serve_session_xhttp_with<R: crate::proxy::WindowRead + Send + 'static>(
+    mut creader: R,
     cwriter: &crate::xhttp::XhttpWriter,
     users: &[VlessUser],
     freedom: bool,
@@ -7709,6 +7714,7 @@ pub(crate) fn serve_session_xhttp_with(
             return;
         }
         echo_trace("session xhttp udp association");
+        let creader: Box<dyn Read + Send> = Box::new(creader);
         spawn_carried(move || {
             serve_udp_stream(creader, writer, &target, Vec::new(), &close);
         });
@@ -7725,7 +7731,7 @@ pub(crate) fn serve_session_xhttp_with(
         return;
     }
     echo_trace("session xhttp relaying");
-    relay_sink_drained(creader, cwriter, &uplink);
+    relay_sink_xhttp_drained(creader, cwriter, &uplink);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -14939,7 +14945,7 @@ fn tls_xhttp<S: Dialed, D: Dialed>(
     host: &str,
     settings: &crate::xhttp::XhttpSettings,
     h2: bool,
-) -> Option<(Box<dyn Read + Send>, crate::xhttp::XhttpWriter)> {
+) -> Option<(Box<dyn WindowRead + Send>, crate::xhttp::XhttpWriter)> {
     // A TLS peer that selected h2 expects the preface; `decideHTTPVersion` (dialer.go:82) takes the negotiated protocol, not the offer.
     let h2 = h2
         || session
@@ -14954,18 +14960,18 @@ fn tls_xhttp<S: Dialed, D: Dialed>(
         if h2 {
             // REALITY always dials HTTP/2 (`decideHTTPVersion`, dialer.go:82), never an H1 head.
             return crate::xhttp_h2::connect_split(reader, writer, raw, host, settings, "https")
-                .map(|(reader, writer)| (Box::new(reader) as Box<dyn Read + Send>, writer))
+                .map(|(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer))
                 .or_else(|| tls_unreachable(server));
         }
         let head = crate::xhttp::dial_path(settings);
         return crate::xhttp::connect_split(reader, writer, host, &head, &settings.headers)
-            .map(|(reader, writer)| (Box::new(reader) as Box<dyn Read + Send>, writer))
+            .map(|(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer))
             .or_else(|| tls_unreachable(server));
     }
     // The GET downlink dials its own session: one transport per direction, both under one session id (`dialer.go:411`).
     let (down, down_write, _) = second()?.into_halves()?;
     crate::xhttp::connect_dual_split(down, down_write, writer, host, settings)
-        .map(|(reader, writer)| (Box::new(reader) as Box<dyn Read + Send>, writer))
+        .map(|(reader, writer)| (Box::new(reader) as Box<dyn WindowRead + Send>, writer))
         .or_else(|| tls_unreachable(server))
 }
 
@@ -15939,7 +15945,7 @@ where
 #[allow(clippy::too_many_lines)]
 /// What a VLESS xHTTP session does once its stream exists, whether the stream was just dialled or
 /// taken from the `xmux` pool.
-fn relay_vless_xhttp_session<R: Read + Send + 'static>(
+fn relay_vless_xhttp_session<R: WindowRead + Send + 'static>(
     server: &SocketAddr,
     client: &Connection,
     vless: &VlessOut,
@@ -15958,7 +15964,7 @@ fn relay_vless_xhttp_session<R: Read + Send + 'static>(
     if !writer.send(header) {
         return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
     }
-    relay_sink_drained(ReplyReader::new(reader), &writer, client);
+    relay_sink_xhttp_drained(ReplyReader::new(reader), &writer, client);
 }
 
 /// Opens one pooled stream and relays it; false when the entry could not carry the request.
@@ -16680,7 +16686,7 @@ fn dial_trojan_session<S, D>(
             if !writer.send(header) {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            relay_sink_drained(reader, &writer, client);
+            relay_sink_xhttp_drained(reader, &writer, client);
         }
         Carrier::HttpHeader { path } => {
             let Some((reader, mut sink)) =
@@ -26708,6 +26714,16 @@ pub(crate) trait WindowRead: Read {
     }
 }
 
+impl<T: WindowRead + ?Sized> WindowRead for Box<T> {
+    fn read_window(&mut self) -> std::io::Result<Window<'_>> {
+        (**self).read_window()
+    }
+
+    fn parks_on_timeout(&self) -> bool {
+        (**self).parks_on_timeout()
+    }
+}
+
 /// A `Read` reader behind the window trait: its window is the buffer it just filled.
 pub(crate) struct Copied<R> {
     inner: R,
@@ -26716,7 +26732,7 @@ pub(crate) struct Copied<R> {
 }
 
 impl<R> Copied<R> {
-    fn new(inner: R) -> Self {
+    pub(crate) fn new(inner: R) -> Self {
         Self::with_park(inner, false)
     }
 
@@ -26786,21 +26802,15 @@ where
 
 /// The plain-xhttp downlink as windows: a chunk's body stays in the reader's own buffer, so the relay writes it out without the `Copied` memcpy.
 pub(crate) fn relay_sink_xhttp_drained<R, W>(
-    reader: crate::xhttp::Reader<R>,
+    reader: R,
     writer: &W,
     peer: &Connection,
 ) -> Option<Arc<RelayFinish>>
 where
-    R: Read + Send + 'static,
+    R: WindowRead + Send + 'static,
     W: CarrierSink,
 {
-    relay_ordered::<crate::xhttp::Reader<R>, W, _, _, CLOSE_AFTER_JOIN, false>(
-        reader,
-        writer,
-        peer,
-        |_| {},
-        |_| false,
-    )
+    relay_ordered::<R, W, _, _, CLOSE_AFTER_JOIN, false>(reader, writer, peer, |_| {}, |_| false)
 }
 
 const CLOSE_BEFORE_JOIN: bool = true;
@@ -27819,30 +27829,46 @@ impl<R> ReplyReader<R> {
     }
 }
 
+impl<R: Read> ReplyReader<R> {
+    fn ensure_answered(&mut self) -> std::io::Result<()> {
+        while self.filled < 2 {
+            match self.inner.read(&mut self.head[usize::from(self.filled)..]) {
+                Ok(0) => {
+                    return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
+                }
+                Ok(n) => self.filled += n as u8,
+                Err(error) => return Err(error),
+            }
+        }
+        if ferrox_core::vless::VlessLink::decode_response_header(&self.head).is_err() {
+            return Err(std::io::Error::other("vless answer refused"));
+        }
+        if echo_trace_on() {
+            echo_trace("response ok");
+        }
+        self.answered = true;
+        Ok(())
+    }
+}
+
 impl<R: Read> Read for ReplyReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         if buf.is_empty() {
             return Ok(0);
         }
         if !self.answered {
-            while self.filled < 2 {
-                match self.inner.read(&mut self.head[usize::from(self.filled)..]) {
-                    Ok(0) => {
-                        return Err(std::io::Error::from(std::io::ErrorKind::UnexpectedEof));
-                    }
-                    Ok(n) => self.filled += n as u8,
-                    Err(error) => return Err(error),
-                }
-            }
-            if ferrox_core::vless::VlessLink::decode_response_header(&self.head).is_err() {
-                return Err(std::io::Error::other("vless answer refused"));
-            }
-            if echo_trace_on() {
-                echo_trace("response ok");
-            }
-            self.answered = true;
+            self.ensure_answered()?;
         }
         self.inner.read(buf)
+    }
+}
+
+impl<R: WindowRead> WindowRead for ReplyReader<R> {
+    fn read_window(&mut self) -> std::io::Result<Window<'_>> {
+        if !self.answered {
+            self.ensure_answered()?;
+        }
+        self.inner.read_window()
     }
 }
 

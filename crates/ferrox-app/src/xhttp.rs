@@ -1931,6 +1931,8 @@ struct SessionReader {
     id: String,
     cur: Vec<u8>,
     cur_at: usize,
+    upload: Option<Box<dyn Read + Send>>,
+    scratch: crate::proxy::RelayBuf,
 }
 
 impl SessionReader {
@@ -1940,7 +1942,32 @@ impl SessionReader {
             id,
             cur: Vec::new(),
             cur_at: 0,
+            upload: None,
+            scratch: crate::proxy::RelayBuf::new(),
         }
+    }
+
+    fn touch(&self) {
+        self.session.state.lock().expect("session lock").last_seen = std::time::Instant::now();
+    }
+
+    fn take_upload(&mut self) -> bool {
+        let mut st = self.session.state.lock().expect("session lock");
+        if st.ended {
+            self.upload = None;
+            return false;
+        }
+        if self.upload.is_none() {
+            self.upload = st.upload.take();
+        }
+        self.upload.is_some()
+    }
+
+    fn end_upload(&mut self) {
+        self.upload = None;
+        let mut st = self.session.state.lock().expect("session lock");
+        st.ended = true;
+        self.session.cv.notify_all();
     }
 }
 
@@ -1951,39 +1978,10 @@ fn poll_grain(error: &std::io::Error) -> bool {
 
 impl Read for SessionReader {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
         loop {
-            let upload = {
-                let mut st = self.session.state.lock().expect("session lock");
-                if st.ended {
-                    None
-                } else {
-                    st.upload.take()
-                }
-            };
-            if let Some(mut upload) = upload {
-                let got = upload.read(buf);
-                let mut st = self.session.state.lock().expect("session lock");
-                st.upload = Some(upload);
-                return match got {
-                    Ok(0) => {
-                        st.ended = true;
-                        self.session.cv.notify_all();
-                        Ok(0)
-                    }
-                    Ok(n) => {
-                        st.last_seen = std::time::Instant::now();
-                        drop(st);
-                        Ok(n)
-                    }
-                    Err(e) if poll_grain(&e) => Err(e),
-                    Err(e) => {
-                        st.ended = true;
-                        self.session.cv.notify_all();
-                        Err(e)
-                    }
-                };
-            }
-            let mut st = self.session.state.lock().expect("session lock");
             if self.cur_at < self.cur.len() {
                 let avail = &self.cur[self.cur_at..];
                 let n = avail.len().min(buf.len());
@@ -1993,9 +1991,28 @@ impl Read for SessionReader {
                     self.cur.clear();
                     self.cur_at = 0;
                 }
-                st.last_seen = std::time::Instant::now();
+                self.touch();
                 return Ok(n);
             }
+            if self.take_upload() {
+                let got = self.upload.as_mut().expect("upload").read(buf);
+                return match got {
+                    Ok(0) => {
+                        self.end_upload();
+                        Ok(0)
+                    }
+                    Ok(n) => {
+                        self.touch();
+                        Ok(n)
+                    }
+                    Err(e) if poll_grain(&e) => Err(e),
+                    Err(e) => {
+                        self.end_upload();
+                        Err(e)
+                    }
+                };
+            }
+            let mut st = self.session.state.lock().expect("session lock");
             if let Some(pkt) = {
                 let seq = st.next_seq;
                 st.packets.remove(&seq)
@@ -2024,6 +2041,66 @@ impl Read for SessionReader {
                 return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
             }
         }
+    }
+}
+
+impl crate::proxy::WindowRead for SessionReader {
+    fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+        loop {
+            if self.cur_at < self.cur.len() {
+                let start = self.cur_at;
+                self.cur_at = self.cur.len();
+                self.touch();
+                return Ok(crate::proxy::Window::one(&self.cur[start..]));
+            }
+            if self.take_upload() {
+                self.touch();
+                let got = {
+                    let upload = self.upload.as_mut().expect("upload");
+                    upload.read(self.scratch.as_mut())
+                };
+                return match got {
+                    Ok(0) => {
+                        self.end_upload();
+                        Ok(crate::proxy::Window::empty())
+                    }
+                    Ok(n) => Ok(crate::proxy::Window::one(self.scratch.filled(n))),
+                    Err(e) if poll_grain(&e) => Err(e),
+                    Err(e) => {
+                        self.end_upload();
+                        Err(e)
+                    }
+                };
+            }
+            let mut st = self.session.state.lock().expect("session lock");
+            if let Some(pkt) = {
+                let seq = st.next_seq;
+                st.packets.remove(&seq)
+            } {
+                st.next_seq += 1;
+                st.last_seen = std::time::Instant::now();
+                drop(st);
+                self.cur = pkt;
+                self.cur_at = self.cur.len();
+                return Ok(crate::proxy::Window::one(&self.cur));
+            }
+            if st.ended {
+                return Ok(crate::proxy::Window::empty());
+            }
+            let (guard, wait) = self
+                .session
+                .cv
+                .wait_timeout(st, crate::budgets::RELAY_POLL)
+                .expect("session lock");
+            st = guard;
+            if wait.timed_out() {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+        }
+    }
+
+    fn parks_on_timeout(&self) -> bool {
+        self.upload.is_none()
     }
 }
 
@@ -2201,7 +2278,7 @@ pub(crate) fn accept_split_with_settings<
     read: R,
     write: W,
     settings: &XhttpSettings,
-) -> Option<(Box<dyn Read + Send>, XhttpWriter)> {
+) -> Option<(Box<dyn crate::proxy::WindowRead + Send>, XhttpWriter)> {
     let mut read = ChainReader::new(Vec::new(), read);
     let mut write = write;
     loop {
@@ -2234,7 +2311,7 @@ fn writer_for<W: crate::proxy::FrameWrite + Send + 'static>(
 
 /// What one request leaves the connection to. `Session` hands both halves to a session that owns them for as long as the stream lives; `Again` gives them back, with the bytes that came with this request but belong to the next; `Closed` is the end of the connection.
 pub(crate) enum Served<R, W> {
-    Session(Box<dyn Read + Send>, XhttpWriter),
+    Session(Box<dyn crate::proxy::WindowRead + Send>, XhttpWriter),
     Again(R, W, Vec<u8>),
     Closed,
 }
@@ -2404,8 +2481,8 @@ pub(crate) fn accept_core<
                     return Served::Closed;
                 }
                 sse_ok(&mut write, settings, &padded);
-                let reader: Box<dyn Read + Send> = if h2.is_some() {
-                    Box::new(read)
+                let reader: Box<dyn crate::proxy::WindowRead + Send> = if h2.is_some() {
+                    Box::new(crate::proxy::Copied::new(read))
                 } else {
                     Box::new(Reader {
                         read,
@@ -5341,6 +5418,26 @@ mod tests {
             0,
             "a finished session ends its read"
         );
+
+        let session = Arc::new(Session {
+            state: Mutex::new(SessionState {
+                upload: None,
+                packets: BTreeMap::new(),
+                next_seq: 0,
+                ended: true,
+                downlink: false,
+                last_seen: std::time::Instant::now(),
+            }),
+            cv: Condvar::new(),
+            id: String::new(),
+        });
+        let mut reader = SessionReader::new(session, String::new());
+        reader.upload = Some(Box::new(Blocked));
+        assert_eq!(
+            reader.read(&mut byte).expect("ends"),
+            0,
+            "a retained upload ends when the session does"
+        );
     }
 
     /// A session with no upload and no packet must wake on the relay grain: a sibling that ended has no other way to end this leg.
@@ -5369,5 +5466,33 @@ mod tests {
             Ok(Err(std::io::ErrorKind::WouldBlock)),
             "the reader parked past the relay grain with no sibling wake"
         );
+    }
+
+    #[test]
+    fn a_packet_window_is_the_sessions_own_buffer() {
+        let session = Arc::new(Session {
+            state: Mutex::new(SessionState {
+                upload: None,
+                packets: BTreeMap::new(),
+                next_seq: 0,
+                ended: false,
+                downlink: false,
+                last_seen: std::time::Instant::now(),
+            }),
+            cv: Condvar::new(),
+            id: String::new(),
+        });
+        let packet: Vec<u8> = (0u8..64).collect();
+        let base = packet.as_ptr();
+        assert!(session.push_packet(0, packet, 8));
+        let mut reader = SessionReader::new(session, String::new());
+        let window = crate::proxy::WindowRead::read_window(&mut reader).unwrap();
+        assert_eq!(
+            window.bytes().as_ptr(),
+            base,
+            "the window is the packet's own allocation"
+        );
+        assert_eq!(window.bytes().len(), 64, "the whole packet is the window");
+        assert_eq!(window.parts(), &[(0, 64)]);
     }
 }
