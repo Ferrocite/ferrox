@@ -23176,11 +23176,11 @@ fn relay_owned(
     mut client_write: Connection,
 ) {
     let forward = move || {
-        copy_all(&mut client_read, &mut target_write);
+        copy_all_memcpy(&mut client_read, &mut target_write);
         let _ = target_write.shutdown(Shutdown::Write);
     };
     let done = RelayPool::global().run(forward);
-    copy_all(&mut target_read, &mut client_write);
+    copy_all_memcpy(&mut target_read, &mut client_write);
     let _ = client_write.shutdown(Shutdown::Write);
     join(&done);
 }
@@ -26117,11 +26117,6 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
     flow
 }
 
-#[cfg(not(target_os = "linux"))]
-fn copy_all(from: &mut Connection, to: &mut Connection) {
-    copy_all_memcpy(from, to);
-}
-
 #[inline]
 fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     // Once per leg, outside the byte loop: a budget read per buffer would price the copy.
@@ -26165,27 +26160,6 @@ fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
 }
 
 #[cfg(target_os = "linux")]
-fn copy_all(from: &mut Connection, to: &mut Connection) {
-    // A masked or metered leg cannot be fed by splice: the pipe would write the socket directly.
-    if to.masked() || to.metered() || from.metered() {
-        return copy_all_memcpy(from, to);
-    }
-    let Some(pipe) = SplicePipe::new() else {
-        return copy_all_memcpy(from, to);
-    };
-    loop {
-        match pipe.pull(from) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => {
-                if !pipe.push(to, n) {
-                    return;
-                }
-            }
-        }
-    }
-}
-
-#[cfg(target_os = "linux")]
 struct SplicePipe {
     fds: [libc::c_int; 2],
     capacity: libc::size_t,
@@ -26209,59 +26183,6 @@ impl SplicePipe {
             eprintln!("ferrox-app: splice pipe {capacity} B");
         }
         Some(Self { fds, capacity })
-    }
-
-    fn pull(&self, from: &mut Connection) -> std::io::Result<usize> {
-        census!("relay-leg-read", crate::census::handle(from), None);
-        loop {
-            let n = unsafe {
-                libc::splice(
-                    from.as_raw_fd(),
-                    std::ptr::null_mut(),
-                    self.fds[1],
-                    std::ptr::null_mut(),
-                    self.capacity,
-                    0,
-                )
-            };
-            if n < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            return Ok(n as usize);
-        }
-    }
-
-    fn push(&self, to: &mut Connection, n: usize) -> bool {
-        census!("relay-leg-write", crate::census::handle(to), None);
-        let mut left = n;
-        while left > 0 {
-            let moved = unsafe {
-                libc::splice(
-                    self.fds[0],
-                    std::ptr::null_mut(),
-                    to.as_raw_fd(),
-                    std::ptr::null_mut(),
-                    left,
-                    0,
-                )
-            };
-            if moved < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return false;
-            }
-            if moved == 0 {
-                return false;
-            }
-            left -= moved as usize;
-        }
-        true
     }
 }
 
@@ -34784,36 +34705,6 @@ mod tests {
             trojan_key("an-example-shared-password"),
             *b"73317e3bf920a459723610d27b71cadc07061d8f0d8587e041944896"
         );
-    }
-
-    #[test]
-    fn the_splice_path_and_the_copying_path_move_the_same_bytes() {
-        fn round_trip(payload: &[u8], copy: fn(&mut Connection, &mut Connection)) -> Vec<u8> {
-            let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-            let port = listener.local_addr().expect("addr").port();
-            let server = thread::spawn(move || {
-                let (mut stream, _) = listener.accept().expect("accepts");
-                let mut other = stream.try_clone().expect("clones");
-                copy(&mut stream, &mut other);
-            });
-            let mut client = Connection::connect(("127.0.0.1", port)).expect("connects");
-            client
-                .set_read_timeout(Some(Duration::from_secs(30)))
-                .expect("timeout");
-            client.write_all(payload).expect("writes");
-            client.shutdown(Shutdown::Write).expect("half closes");
-            let mut back = Vec::new();
-            client.read_to_end(&mut back).expect("reads");
-            let _ = server.join();
-            back
-        }
-
-        let payload: Vec<u8> = (0..(1 << 20)).map(|i| (i % 251) as u8).collect();
-        let spliced = round_trip(&payload, copy_all);
-        let copied = round_trip(&payload, copy_all_memcpy);
-        assert_eq!(spliced, payload, "the splice path must move every byte");
-        assert_eq!(copied, payload, "the copying path must move every byte");
-        assert_eq!(spliced, copied, "the two paths must agree");
     }
 
     #[test]
@@ -50164,35 +50055,6 @@ mod tests {
         (widths, body)
     }
 
-    /// The splice lanes address the descriptor, so a leg that ends on a masked stream has to keep the
-    /// buffered copy: on linux this is the difference between cut records and one raw write.
-    #[test]
-    #[cfg(target_os = "linux")]
-    fn a_masked_destination_is_not_fed_by_splice() {
-        let settings = crate::json::parse(FRAGMENT).expect("parses");
-        let carrier = stream_carrier(Some(&settings));
-        let listener = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let address = listener.local_addr().expect("address");
-        let source = crate::conn::test_bind("127.0.0.1:0").expect("binds");
-        let mut feeder = Connection::connect(source.local_addr().expect("address")).expect("dials");
-        let (mut from, _) = source.accept().expect("accepts the feeder");
-        let mut to = Connection::connect(address)
-            .expect("connects")
-            .with_mask(carrier.tcp_mask());
-        let (mut peer, _) = listener.accept().expect("accepts");
-        let mut hello = vec![22, 3, 1];
-        hello.extend_from_slice(&300u16.to_be_bytes());
-        hello.extend((0..300).map(|i| i as u8));
-        feeder.write_all(&hello).expect("feeds");
-        feeder.shutdown(Shutdown::Write).expect("ends the source");
-        copy_all(&mut from, &mut to);
-        let mut wire = vec![0u8; hello.len() + 8 * 5];
-        peer.read_exact(&mut wire).expect("reads every record");
-        let (widths, body) = hello_records(&wire);
-        assert!(widths.len() > 1, "the chain cut the write, not the socket");
-        assert_eq!(body, hello[5..], "and the hello still arrives whole");
-    }
-
     /// A chain this tree cannot arm is refused by name, never dialled or served in the clear.
     #[test]
     fn a_tcp_mask_this_tree_cannot_arm_is_refused() {
@@ -60408,7 +60270,7 @@ mod poll_copy {
         off: usize,
         src_at_eof: bool,
         ended: bool,
-        /// The stall budget this direction was born with, as `copy_all` read it once per leg.
+        /// The stall budget this direction was born with, as the copying leg read it once per leg.
         stall_budget: Duration,
         /// The first write that found no room, cleared by the next byte the destination takes.
         stalled: Option<std::time::Instant>,
