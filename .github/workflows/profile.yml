@@ -75,10 +75,17 @@ jobs:
         run: |
           PROFILE_DIR="$PWD/profile" ./scripts/run-benchmark-matrix.sh \
             --tier full --only "$CELL" --engines xray-core,ferrox \
-            --repeats 1 --no-build --out profile/out || true
+            --repeats 3 --no-build --out profile/out || true
           ls -la profile profile/out/cells 2>/dev/null || true
-          if ! compgen -G 'profile/*.perf.data' > /dev/null; then
-            echo "::error::no perf profile was produced" >&2
+          sampled=0
+          for data in profile/*.perf.data; do
+            if perf report --stdio -i "$data" 2>/dev/null | grep -qE '^ +[0-9]+\.[0-9]+%'; then
+              sampled=1
+            fi
+          done
+          if [[ "$sampled" == "0" ]]; then
+            echo "::error::no perf samples were produced" >&2
+            tail -40 profile/out/summary.txt 2>/dev/null || true
             exit 1
           fi
       - name: collapse the profiles
