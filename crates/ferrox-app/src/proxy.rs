@@ -42100,6 +42100,14 @@ mod tests {
             "ferrox-reality-pool-second-{}-{stamp}.log",
             std::process::id()
         ));
+        let nested = std::env::temp_dir().join(format!(
+            "ferrox-reality-pool-nested-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&nested).expect("the nested directory");
+        let equivalent_path = nested
+            .join("..")
+            .join(first_path.file_name().expect("a file name"));
         let mut first = (*base).clone();
         first.key_log = Some(Arc::new(
             ferrox_core::tls::MasterKeyLog::open(first_path.to_string_lossy().as_ref())
@@ -42110,20 +42118,31 @@ mod tests {
             ferrox_core::tls::MasterKeyLog::open(second_path.to_string_lossy().as_ref())
                 .expect("opens"),
         ));
+        let mut equivalent = (*base).clone();
+        equivalent.key_log = Some(Arc::new(
+            ferrox_core::tls::MasterKeyLog::open(equivalent_path.to_string_lossy().as_ref())
+                .expect("opens"),
+        ));
         let first = Arc::new(first);
         let second = Arc::new(second);
+        let equivalent = Arc::new(equivalent);
         let first_pool = reality_xmux(&server, &vless, &first, &settings);
         let second_pool = reality_xmux(&server, &vless, &second, &settings);
-        let first_again = reality_xmux(&server, &vless, &first, &settings);
+        let first_again = reality_xmux(&server, &vless, &equivalent, &settings);
         drop(first);
         drop(second);
+        drop(equivalent);
         let _ = std::fs::remove_file(&first_path);
         let _ = std::fs::remove_file(&second_path);
+        let _ = std::fs::remove_dir_all(&nested);
         assert!(
             !Arc::ptr_eq(&first_pool, &second_pool),
             "two key-log sinks shared one pooled connection"
         );
-        assert!(Arc::ptr_eq(&first_pool, &first_again));
+        assert!(
+            Arc::ptr_eq(&first_pool, &first_again),
+            "equivalent key-log paths did not share a pool"
+        );
     }
 
     /// A trojan listener that declares reality without an identity is refused by name: serving it as plaintext would be a silent downgrade.
