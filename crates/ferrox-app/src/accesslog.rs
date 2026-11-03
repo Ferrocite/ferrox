@@ -204,13 +204,98 @@ pub(crate) fn record(
     let _ = writer.flush();
 }
 
+const ONES: u64 = 0x0101_0101_0101_0101;
+const HIGHS: u64 = 0x8080_8080_8080_8080;
+
+/// Whether any lane of `word` is at or below `limit`; borrows only start in such a lane, so the answer is exact.
+fn at_or_below(word: u64, limit: u8) -> u64 {
+    let edge = ONES * (u64::from(limit) + 1);
+    word.wrapping_sub(edge) & !word & HIGHS
+}
+
+/// A high bit in every lane equal to `byte`.
+fn same_byte(word: u64, byte: u8) -> u64 {
+    let flipped = word ^ (ONES * u64::from(byte));
+    flipped.wrapping_sub(ONES) & !flipped & HIGHS
+}
+
+/// Whether an eight-byte window carries a byte `push_escaped` rewrites or a byte it must decode.
+fn needs_escape(word: u64) -> bool {
+    at_or_below(word, b' ')
+        | same_byte(word, 0x7f)
+        | same_byte(word, b'\\')
+        | same_byte(word, b'[')
+        | same_byte(word, b']')
+        | (word & HIGHS)
+        != 0
+}
+
 /// A field holds one token: a path, tag or account that carries a control byte, whitespace or a
 /// bracket is escaped, not written through, so nothing a peer names can start a second field or record.
 fn push_escaped(out: &mut String, value: &str) {
-    if value.is_ascii() {
-        push_escaped_ascii(out, value);
-        return;
+    let bytes = value.as_bytes();
+    let mut start = 0;
+    let mut at = 0;
+    while at + 8 <= bytes.len() {
+        let word = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        if needs_escape(word) {
+            let offset = (0..8)
+                .find(|&offset| {
+                    let byte = bytes[at + offset];
+                    byte & 0x80 != 0 || ascii_escaped(byte)
+                })
+                .unwrap_or(8);
+            if offset < 8 {
+                let pos = at + offset;
+                let byte = bytes[pos];
+                out.push_str(&value[start..pos]);
+                if byte & 0x80 != 0 {
+                    push_escaped_codepoints(out, &value[pos..]);
+                    return;
+                }
+                push_escape(out, byte);
+                start = pos + 1;
+                at = pos + 1;
+                continue;
+            }
+        }
+        at += 8;
     }
+    while at < bytes.len() {
+        let byte = bytes[at];
+        if byte & 0x80 != 0 {
+            out.push_str(&value[start..at]);
+            push_escaped_codepoints(out, &value[at..]);
+            return;
+        }
+        if ascii_escaped(byte) {
+            out.push_str(&value[start..at]);
+            push_escape(out, byte);
+            start = at + 1;
+        }
+        at += 1;
+    }
+    out.push_str(&value[start..]);
+}
+
+/// The ASCII bytes `push_escaped` writes differently: controls, space, and the three punctuation
+/// marks that delimit a field.
+fn ascii_escaped(byte: u8) -> bool {
+    byte <= b' ' || byte == 0x7f || matches!(byte, b'\\' | b'[' | b']')
+}
+
+fn push_escape(out: &mut String, byte: u8) {
+    match byte {
+        b'\\' => out.push_str("\\\\"),
+        b'[' => out.push_str("\\["),
+        b']' => out.push_str("\\]"),
+        b' ' => out.push_str("\\u{20}"),
+        control => out.extend((control as char).escape_default()),
+    }
+}
+
+/// The code-point half a byte outside ASCII hands the rest of the field to.
+fn push_escaped_codepoints(out: &mut String, value: &str) {
     let mut start = 0;
     for (at, ch) in value.char_indices() {
         let escaped = match ch {
@@ -234,32 +319,6 @@ fn push_escaped(out: &mut String, value: &str) {
         }
     }
     out.push_str(&value[start..]);
-}
-
-/// The ASCII half of `push_escaped`: a byte scan finds the next escape and the clean runs between
-/// them are copied whole, so a field the peer named in ASCII never decodes a code point.
-fn push_escaped_ascii(out: &mut String, value: &str) {
-    let bytes = value.as_bytes();
-    let mut start = 0;
-    while let Some(at) = bytes[start..].iter().position(|&byte| ascii_escaped(byte)) {
-        let at = start + at;
-        out.push_str(&value[start..at]);
-        match bytes[at] {
-            b'\\' => out.push_str("\\\\"),
-            b'[' => out.push_str("\\["),
-            b']' => out.push_str("\\]"),
-            b' ' => out.push_str("\\u{20}"),
-            control => out.extend((control as char).escape_default()),
-        }
-        start = at + 1;
-    }
-    out.push_str(&value[start..]);
-}
-
-/// The ASCII bytes `push_escaped` writes differently: controls, space, and the three punctuation
-/// marks that delimit a field.
-fn ascii_escaped(byte: u8) -> bool {
-    byte <= b' ' || byte == 0x7f || matches!(byte, b'\\' | b'[' | b']')
 }
 
 /// The destination is a `Display`, so its bytes are escaped as they are written rather than materialised into a second string first.
@@ -351,6 +410,31 @@ mod tests {
                 assert_eq!(escaped(&value), reference(&value), "{value:?}");
             }
         }
+        for lead in 0..16 {
+            for ch in ['\u{e9}', '\u{a0}', '\u{1f600}', '\u{7f}', '\\', ' ', '['] {
+                for tail in ["", "z", "[x]", " b", "\\", "\u{e9}", "\u{1f600}x"] {
+                    let value = format!("{}{ch}{tail}", "a".repeat(lead));
+                    assert_eq!(escaped(&value), reference(&value), "{value:?}");
+                }
+            }
+        }
+    }
+
+    /// The merged byte-position walk, kept as the number the word scan has to beat.
+    fn position_scan(out: &mut String, value: &str) {
+        if !value.is_ascii() {
+            reference_into(out, value);
+            return;
+        }
+        let bytes = value.as_bytes();
+        let mut start = 0;
+        while let Some(at) = bytes[start..].iter().position(|&byte| ascii_escaped(byte)) {
+            let at = start + at;
+            out.push_str(&value[start..at]);
+            push_escape(out, bytes[at]);
+            start = at + 1;
+        }
+        out.push_str(&value[start..]);
     }
 
     fn bulk_field() -> String {
@@ -359,6 +443,19 @@ mod tests {
 
     #[test]
     fn the_ascii_scan_over_a_bulk_field() {
+        let field = bulk_field();
+        let mut out = String::with_capacity(field.len());
+        let mut acc = 0usize;
+        for _ in 0..64 {
+            out.clear();
+            position_scan(&mut out, &field);
+            acc += out.len();
+        }
+        std::hint::black_box(acc);
+    }
+
+    #[test]
+    fn the_swar_scan_over_a_bulk_field() {
         let field = bulk_field();
         let mut out = String::with_capacity(field.len());
         let mut acc = 0usize;
