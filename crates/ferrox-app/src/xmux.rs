@@ -164,11 +164,7 @@ impl Manager {
             return None;
         }
         let at = pick(count);
-        entries
-            .iter()
-            .filter(|entry| open(entry))
-            .nth(at)
-            .cloned()
+        entries.iter().filter(|entry| open(entry)).nth(at).cloned()
     }
 }
 
