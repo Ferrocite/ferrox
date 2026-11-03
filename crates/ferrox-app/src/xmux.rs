@@ -178,7 +178,7 @@ fn hold(entry: Arc<Entry>) -> Lease {
     Lease { entry }
 }
 
-static MANAGERS: Mutex<Option<HashMap<Key, Arc<Manager>>>> = Mutex::new(None);
+static MANAGERS: Mutex<Option<HashMap<(Key, Xmux), Arc<Manager>>>> = Mutex::new(None);
 
 pub(crate) fn manager(key: Key, bounds: Option<Xmux>) -> Arc<Manager> {
     let mut managers = MANAGERS.lock().unwrap_or_else(PoisonError::into_inner);
@@ -187,7 +187,10 @@ pub(crate) fn manager(key: Key, bounds: Option<Xmux>) -> Arc<Manager> {
         .filter(|bounds| *bounds != Xmux::default())
         .unwrap_or_else(defaults);
     let map = managers.get_or_insert_with(HashMap::new);
-    Arc::clone(map.entry(key).or_insert_with(|| Manager::new(bounds)))
+    Arc::clone(
+        map.entry((key, bounds))
+            .or_insert_with(|| Manager::new(bounds)),
+    )
 }
 
 /// `crypto.RandBetween(from, to)`, inclusive, on the reference's closed range.
@@ -247,6 +250,39 @@ mod tests {
             seen.fetch_add(1, Ordering::SeqCst);
             client()
         })
+    }
+
+    #[test]
+    fn managers_partition_by_their_effective_bounds() {
+        let key = Key {
+            server: "127.0.0.1:443".parse().expect("an address"),
+            host: "bounds.example".to_owned(),
+            path: "/bounds".to_owned(),
+            query: String::new(),
+            h2: true,
+            identity: (
+                "bounds.example".to_owned(),
+                [1; 32],
+                [2; 8],
+                "chrome".to_owned(),
+            ),
+        };
+        let one = Xmux {
+            max_connections: (1, 1),
+            ..Xmux::default()
+        };
+        let two = Xmux {
+            max_connections: (2, 2),
+            ..Xmux::default()
+        };
+        let first = manager(key.clone(), Some(one));
+        let second = manager(key.clone(), Some(two));
+        let again = manager(key, Some(one));
+        assert!(
+            !Arc::ptr_eq(&first, &second),
+            "two outbounds with different connection caps shared one pool"
+        );
+        assert!(Arc::ptr_eq(&first, &again));
     }
 
     #[test]
