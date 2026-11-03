@@ -3325,18 +3325,17 @@ mod tests {
                     1,
                     "payload {i} reached the sink as one run"
                 );
-                let (run_base, run_len) = sink.runs[0];
-                let buffer = reader.msg.as_ptr() as usize;
-                assert!(
-                    run_base >= buffer && run_base + run_len <= buffer + reader.msg.capacity(),
-                    "payload {i} reached the sink outside the message buffer"
-                );
                 window.bytes().as_ptr() as usize
             };
             let buffer = reader.msg.as_ptr() as usize;
             assert!(
                 base >= buffer && base + body.len() <= buffer + reader.msg.capacity(),
                 "payload {i} was staged outside the message buffer"
+            );
+            let (run_base, run_len) = sink.runs[0];
+            assert!(
+                run_base >= buffer && run_base + run_len <= buffer + reader.msg.capacity(),
+                "payload {i} reached the sink outside the message buffer"
             );
             if i == 0 {
                 steady_base = buffer;
