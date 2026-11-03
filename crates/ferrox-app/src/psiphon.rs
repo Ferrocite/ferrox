@@ -2950,9 +2950,7 @@ fn entry_ports(entry: &Json) -> EntryPorts {
         .and_then(Json::as_port)
         .filter(|port| *port > 0)
         .or_else(|| {
-            if capability_protocol(entry, &[("TLS-OSSH", "TLS-OSSH")]).is_none() {
-                return None;
-            }
+            capability_protocol(entry, &[("TLS-OSSH", "TLS-OSSH")])?;
             entry
                 .get("meekServerPort")
                 .and_then(Json::as_port)
