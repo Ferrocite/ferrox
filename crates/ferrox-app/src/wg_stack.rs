@@ -476,23 +476,38 @@ pub(crate) fn client(
                 eprintln!("wireguard client: {error}");
             }
         }
-        if stack.poll(&mut buf) {
-            continue;
-        }
-        match packets.recv_timeout(TICK) {
-            Ok(packet) => {
-                receive_client(&mut stack, packet);
-                for _ in 1..RX_BURST {
-                    let Ok(packet) = packets.try_recv() else {
-                        break;
-                    };
-                    receive_client(&mut stack, packet);
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        if client_turn(&mut stack, &packets, &mut buf) {
+            return;
         }
     }
+}
+
+/// One client turn, or true once the tunnel is closed.
+fn client_turn(stack: &mut ClientStack, packets: &Packets, buf: &mut [u8]) -> bool {
+    let mut closed = false;
+    for _ in 0..RX_BURST {
+        match packets.try_recv() {
+            Ok(packet) => receive_client(stack, packet),
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    let progressed = stack.poll(buf);
+    if closed {
+        return true;
+    }
+    if progressed {
+        return false;
+    }
+    match packets.recv_timeout(TICK) {
+        Ok(packet) => receive_client(stack, packet),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return true,
+    }
+    false
 }
 
 /// Abort was already called; remove each socket once its poll has emitted the RST.
@@ -527,23 +542,38 @@ pub(crate) fn server(
     let mut stack = ServerStack::new(&config, to_tunnel, out, headroom);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        if stack.poll(&mut buf) {
-            continue;
-        }
-        match packets.recv_timeout(TICK) {
-            Ok(packet) => {
-                stack.receive(packet);
-                for _ in 1..RX_BURST {
-                    let Ok(packet) = packets.try_recv() else {
-                        break;
-                    };
-                    stack.receive(packet);
-                }
-            }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+        if server_turn(&mut stack, &packets, &mut buf) {
+            return;
         }
     }
+}
+
+/// One server turn, or true once the inbound is closed.
+fn server_turn(stack: &mut ServerStack, packets: &Packets, buf: &mut [u8]) -> bool {
+    let mut closed = false;
+    for _ in 0..RX_BURST {
+        match packets.try_recv() {
+            Ok(packet) => stack.receive(packet),
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                closed = true;
+                break;
+            }
+        }
+    }
+    let progressed = stack.poll(buf);
+    if closed {
+        return true;
+    }
+    if progressed {
+        return false;
+    }
+    match packets.recv_timeout(TICK) {
+        Ok(packet) => stack.receive(packet),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return true,
+    }
+    false
 }
 
 struct ClientStack {
@@ -2053,7 +2083,7 @@ mod tests {
     fn a_ready_upload_keeps_the_stack_turning_until_it_is_drained() {
         let (mut stack, _packets, mut app) = established_client();
         app.set_nonblocking(true).expect("a nonblocking local peer");
-        let chunk = vec![b'u'; 64 * 1024];
+        let chunk = [b'u'; 4096];
         let mut written = 0;
         loop {
             match app.write(&chunk) {
@@ -2071,6 +2101,69 @@ mod tests {
             assert!(turns < 1024, "a ready upload drains");
         }
         assert!(turns > 0, "a ready upload kept the stack from parking");
+        assert_eq!(
+            stack
+                .sockets
+                .get::<TcpSocket>(stack.flows[0].handle)
+                .send_queue(),
+            written,
+            "the stack read every byte the local peer wrote"
+        );
+    }
+
+    /// A turn that reports progress still takes the packets the tunnel queued.
+    #[test]
+    fn a_turn_takes_the_tunnel_packets_even_when_a_flow_progresses() {
+        let (_app, proxy) = loopback().expect("pair");
+        let config = device(&["10.0.0.2"], true);
+        let (to_tunnel, tunnel) = std::sync::mpsc::channel();
+        let mut stack = ClientStack::new(&config, to_tunnel, 0);
+        stack
+            .connect(ClientFlow {
+                client: proxy,
+                destinations: vec!["192.0.2.1:80".parse().expect("destination")],
+                prefix: Vec::new(),
+            })
+            .expect("connect");
+        let mut buf = [0u8; 2048];
+        stack.poll(&mut buf);
+        let syn = tunnel
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the client's SYN");
+        stack.device.push(syn_ack(&syn));
+        stack.poll(&mut buf);
+        assert_eq!(
+            stack
+                .sockets
+                .get::<TcpSocket>(stack.flows[0].handle)
+                .state(),
+            State::Established,
+            "the SYN-ACK establishes the flow"
+        );
+        while tunnel.try_recv().is_ok() {}
+
+        let (packets_tx, packets) = std::sync::mpsc::channel();
+        packets_tx
+            .send(Packet {
+                peer: [0u8; 32],
+                bytes: echo_v4([10, 0, 0, 1], [10, 0, 0, 2], b"ping"),
+            })
+            .expect("a queued echo");
+        stack.flows[0].stage_up(&[b'u'; 512]);
+        assert!(
+            !client_turn(&mut stack, &packets, &mut buf),
+            "a live tunnel keeps the client turning"
+        );
+        assert!(
+            !stack.flows[0].up_pending(),
+            "this turn's poll took the staged upload"
+        );
+        let mut answered = false;
+        while let Ok(packet) = tunnel.try_recv() {
+            answered |=
+                packet.get(9) == Some(&PROTOCOL_ICMP) && packet.get(IPV4_HEADER) == Some(&0);
+        }
+        assert!(answered, "progress on a flow left the tunnel's echo unread");
     }
 
     #[test]
