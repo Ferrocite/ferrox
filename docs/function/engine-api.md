@@ -60,13 +60,17 @@ graph TD
 | key | value | checked by |
 | --- | --- | --- |
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
+| syscalls-per-api-call | UNBLESSED | scripts/count-ops.sh |
+| seconds-per-api-call | UNBLESSED | CI bench.yml (no cell yet) |
 <!-- counts:end -->
 
 The framing, both content paths, the dynamic registry, the stats read/reset, the rotated-logger reopen, the observatory snapshot and the routing calls have workspace tests in `commander.rs`, `accesslog.rs`, `observatory.rs`, `proxy.rs`, `stats.rs`, `router.rs` and `vmess.rs`; the access log's field scan is measured by `ops.yml` as three open rows, the word scan and the byte scan against the codepoint baseline, and `the_ascii_scan_escapes_exactly_as_the_codepoint_path` holds the bytes equal, so the page itself still quotes no number.
 
 ## Time
 
-No duration is claimed. Benchmarks and the upstream Commander suite run in CI only; a local run measures the network path between the developer and the reference, not this code.
+`seconds-per-api-call` is `UNBLESSED`: no matrix cell isolates a commander call, and the upstream Commander suite runs in CI only. A local run measures the network path between the developer and the reference, not this code.
+
+No copy row is claimed. The allocation and copy counts a test here can see belong to the methods this page calls — the router's decision, the observatory sample, the access log's scan — and their pages carry those rows; no test in this tree observes the copies an API call itself makes, so a row with no checker that can see it would be prose dressed as a number.
 
 ## What is not removed
 
