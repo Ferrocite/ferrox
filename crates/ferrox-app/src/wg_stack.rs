@@ -2082,10 +2082,17 @@ mod tests {
     #[test]
     fn a_ready_upload_keeps_the_stack_turning_until_it_is_drained() {
         let (mut stack, _packets, mut app) = established_client();
-        let upload = [b'u'; 16 * 1024];
-        let written = app
-            .write(&upload)
-            .expect("the local window takes an upload");
+        app.set_nonblocking(true).expect("a nonblocking local peer");
+        let chunk = [b'u'; 4096];
+        let mut written = 0;
+        loop {
+            match app.write(&chunk) {
+                Ok(0) => break,
+                Ok(n) => written += n,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("the local peer writes: {error}"),
+            }
+        }
         assert!(written > 0, "the local window holds an upload");
         let mut buf = [0u8; 2048];
         let mut turns = 0;
