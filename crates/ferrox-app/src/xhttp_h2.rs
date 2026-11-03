@@ -2217,10 +2217,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
             if conn.refused.load(Ordering::SeqCst) {
                 // Closing while the peer's bytes sit unread aborts the connection, and the RST can swallow the GOAWAY a moment earlier; the grace is the window the peer takes it in, counted from the last queued refusal rather than before it, and spent off the lane.
                 let closing = Arc::clone(&conn);
-                let spawned = std::thread::Builder::new().spawn(move || {
-                    let _ = closing.control.drained(crate::budgets::goaway_grace());
-                    closing.kill();
-                });
+                let spawned = std::thread::Builder::new().spawn(move || finish_refusal(&closing));
                 if spawned.is_err() {
                     // No thread can wait out the grace, so release the parked streams and sessions now.
                     conn.kill();
@@ -2232,6 +2229,11 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
         }
         Stepped::Done
     }
+}
+
+fn finish_refusal(conn: &Arc<H2Conn>) {
+    let _ = conn.control.drained(crate::budgets::goaway_grace());
+    conn.kill();
 }
 
 pub(crate) fn serve_h2_service_until<
@@ -4340,6 +4342,23 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A drained refusal keeps the socket for the grace, so unread request bytes cannot reset the
+    /// connection before the peer reads the GOAWAY.
+    #[test]
+    fn a_drained_refusal_keeps_the_socket_for_the_grace() {
+        let (conn, _written, _slices) = bare_conn();
+        let started = std::time::Instant::now();
+        finish_refusal(&conn);
+        assert!(
+            started.elapsed() >= crate::budgets::goaway_grace(),
+            "the socket closed before the peer had the grace to read the GOAWAY"
+        );
+        assert!(
+            conn.dead.load(Ordering::SeqCst),
+            "the refusal left the connection live"
+        );
     }
 
     /// The refusal grace is counted from the last write, not before it: a parked peer does not count
