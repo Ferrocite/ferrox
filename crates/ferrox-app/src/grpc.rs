@@ -3332,10 +3332,10 @@ mod tests {
                 base >= buffer && base + body.len() <= buffer + reader.msg.capacity(),
                 "payload {i} was staged outside the message buffer"
             );
-            let (run_base, run_len) = sink.runs[0];
-            assert!(
-                run_base >= buffer && run_base + run_len <= buffer + reader.msg.capacity(),
-                "payload {i} reached the sink outside the message buffer"
+            assert_eq!(
+                sink.runs[0],
+                (base, body.len()),
+                "payload {i} reached the sink as the window's own run"
             );
             if i == 0 {
                 steady_base = buffer;
