@@ -73,6 +73,7 @@ pub fn curve_supported(group: u16, shaped: bool) -> bool {
 /// appended to one file so a capture of the session decrypts offline.
 #[derive(Debug)]
 pub struct MasterKeyLog {
+    path: String,
     state: std::sync::Mutex<(std::fs::File, Vec<u8>)>,
 }
 
@@ -87,14 +88,24 @@ impl MasterKeyLog {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
+        let file = options.open(path).ok()?;
         // 193 bytes is the longest line: a 30-byte label, a 32-byte random and a 48-byte SHA-384 secret.
         Some(Self {
-            state: std::sync::Mutex::new((options.open(path).ok()?, Vec::with_capacity(208))),
+            path: std::fs::canonicalize(path).map_or_else(
+                |_| path.to_owned(),
+                |path| path.to_string_lossy().into_owned(),
+            ),
+            state: std::sync::Mutex::new((file, Vec::with_capacity(208))),
         })
     }
 }
 
 impl MasterKeyLog {
+    /// The file this log appends its NSS lines to.
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+
     pub(crate) fn log_line(&self, line: &str) {
         use std::io::Write as _;
         let mut state = self
