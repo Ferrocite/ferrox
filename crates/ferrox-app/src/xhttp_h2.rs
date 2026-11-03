@@ -201,9 +201,26 @@ struct StreamState {
     ended: bool,
     /// The response `END_STREAM` has gone out: a stream retires once both halves are done.
     finished: bool,
+    /// The request half ended locally: the peer still owes the response, so it does not end the read.
+    request_ended: bool,
     /// The upload reader left at a finished response while the client still holds the request open.
     abandoned: bool,
     dead: bool,
+}
+
+impl StreamState {
+    /// Whether the reader has nothing left to take: the peer's `END_STREAM`, or our own half
+    /// ending on the side that reads requests. A client's request half ending still expects an
+    /// answer on the same stream.
+    fn read_ended(&self) -> bool {
+        self.ended || (self.finished && !self.request_ended)
+    }
+
+    /// Both halves are done, so the stream can retire: the peer's `END_STREAM` and the half this
+    /// side sent, whichever end it was.
+    fn both_ended(&self) -> bool {
+        self.ended && (self.finished || self.request_ended)
+    }
 }
 
 impl H2Stream {
@@ -447,7 +464,7 @@ impl Read for H2StreamReader {
                 self.conn.replenish(self.id, n);
                 return Ok(n);
             }
-            if st.ended || st.finished {
+            if st.read_ended() {
                 st.abandoned = !st.ended;
                 drop(st);
                 self.conn.forget_upload(self.id);
@@ -466,7 +483,7 @@ impl Read for H2StreamReader {
                         .state
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
-                    !st.body.is_empty() || st.ended || st.finished || st.dead
+                    !st.body.is_empty() || st.read_ended() || st.dead
                 }) {
                     self.conn.forget_upload(self.id);
                     return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
@@ -1011,7 +1028,7 @@ impl H2Conn {
             .get(&stream)
             .map(|state| {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
-                st.finished = true;
+                st.request_ended = true;
                 st.ended
             });
         if ended == Some(true) {
@@ -1334,7 +1351,7 @@ fn client_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: Vec<u8>) -> 
                         st.ended = true;
                     }
                     state.cv.notify_all();
-                    st.ended && st.finished
+                    st.both_ended()
                 };
                 if done {
                     conn.retire(sid);
@@ -1462,6 +1479,7 @@ impl H2Client {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                request_ended: false,
                 abandoned: false,
                 dead: false,
             }),
@@ -1584,6 +1602,7 @@ impl H2Conn {
                 body: VecDeque::new(),
                 ended: end_stream,
                 finished: false,
+                request_ended: false,
                 abandoned: false,
                 dead: false,
             }),
@@ -1789,6 +1808,7 @@ fn open_stream(
             body: VecDeque::new(),
             ended: end_stream,
             finished: false,
+            request_ended: false,
             abandoned: false,
             dead: false,
         }),
@@ -2274,7 +2294,7 @@ fn queue_data(conn: &H2Conn, flags: u8, sid: u32, mut body: Vec<u8>) -> bool {
             }
         }
         state.cv.notify_all();
-        st.ended && st.finished
+        st.both_ended()
     };
     conn.replenish(sid, wire_len);
     if done {
@@ -2380,7 +2400,7 @@ fn pump_frame(
             drop(streams);
             let (finished, abandoned) = {
                 let mut st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
-                let finished = st.finished;
+                let finished = st.finished || st.request_ended;
                 let abandoned = st.abandoned;
                 if !abandoned && !st.dead {
                     st.body.push_back(body);
@@ -2800,6 +2820,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                request_ended: false,
                 abandoned: false,
                 dead: false,
             }),
@@ -2888,6 +2909,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                request_ended: false,
                 abandoned: false,
                 dead: false,
             }),
@@ -3383,6 +3405,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                request_ended: false,
                 abandoned: false,
                 dead: false,
             }),
@@ -3444,6 +3467,39 @@ mod tests {
         server.join().expect("joins");
     }
 
+    /// A client's request half ending is not its response ending: the connection is pooled and the
+    /// peer still owes an answer, so `finish` must not turn the read into EOF.
+    #[test]
+    fn a_finished_request_half_still_reads_the_response() {
+        let (conn, _written, _slices) = bare_conn();
+        let client = super::H2Client {
+            conn: Arc::clone(&conn),
+            next: AtomicU32::new(1),
+        };
+        let (mut reader, mut writer) = client
+            .open("example.org", &test_settings("stream-one"), "https", false)
+            .expect("the stream opens");
+        writer.write_all(b"request").expect("the request goes out");
+        writer.finish();
+        let answering = {
+            let conn = Arc::clone(&conn);
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(50));
+                let head = block_encode(&[(":status", "200")]);
+                client_frame(&conn, T_HEADERS, F_END_HEADERS, 1, head);
+                queue_data(&conn, F_END, 1, b"answer".to_vec());
+            })
+        };
+        let mut got = [0u8; 6];
+        let n = reader.read(&mut got).expect("the response reads");
+        answering.join().expect("the peer answers");
+        assert_eq!(
+            n, 6,
+            "the answer must not be lost when the request half ends"
+        );
+        assert_eq!(&got, b"answer");
+    }
+
     /// A downlink that finishes leaves no body to deliver: the upload reader parked on the same
     /// stream must end with it, not hold its worker until the relay stall expires.
     #[test]
@@ -3458,6 +3514,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                request_ended: false,
                 abandoned: false,
                 dead: false,
             }),
@@ -3504,6 +3561,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: true,
+                request_ended: false,
                 abandoned: false,
                 dead: false,
             }),
@@ -4148,6 +4206,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                request_ended: false,
                 abandoned: false,
                 dead: false,
             }),
@@ -4309,6 +4368,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                request_ended: false,
                 abandoned: false,
                 dead: false,
             }),
@@ -4351,6 +4411,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: true,
                 finished: false,
+                request_ended: false,
                 abandoned: false,
                 dead: false,
             }),
@@ -4411,6 +4472,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                request_ended: false,
                 abandoned: false,
                 dead: false,
             }),
@@ -4535,6 +4597,7 @@ mod tests {
                 body: VecDeque::new(),
                 ended: false,
                 finished: false,
+                request_ended: false,
                 abandoned: false,
                 dead: false,
             }),
