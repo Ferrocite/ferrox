@@ -1763,6 +1763,7 @@ struct Session {
 
 struct SessionState {
     upload: Option<Box<dyn Read + Send>>,
+    upload_attached: bool,
     packets: BTreeMap<u64, Vec<u8>>,
     next_seq: u64,
     ended: bool,
@@ -1805,6 +1806,7 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
             Arc::new(Session {
                 state: Mutex::new(SessionState {
                     upload: None,
+                    upload_attached: false,
                     packets: BTreeMap::new(),
                     next_seq: 0,
                     ended: false,
@@ -1875,11 +1877,18 @@ fn bound_session(
 }
 
 impl Session {
-    fn set_upload(&self, reader: Box<dyn Read + Send>) {
+    /// One stream-up body per session, the reference's `uploadQueue.Push`: a second reader is
+    /// refused so the caller can answer 409 before its bytes are promised.
+    fn set_upload(&self, reader: Box<dyn Read + Send>) -> bool {
         let mut st = self.state.lock().expect("session lock");
+        if st.upload_attached || st.ended {
+            return false;
+        }
+        st.upload_attached = true;
         st.upload = Some(reader);
         st.last_seen = std::time::Instant::now();
         self.cv.notify_all();
+        true
     }
     fn push_packet(&self, seq: u64, payload: Vec<u8>, cap: usize) -> bool {
         let mut st = self.state.lock().expect("session lock");
@@ -2227,6 +2236,10 @@ fn emit_405(stream: &mut impl Write) {
         b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
 }
+fn emit_409(stream: &mut impl Write) {
+    let _ = stream
+        .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
 fn emit_413(stream: &mut impl Write) {
     let _ = stream.write_all(
         b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -2526,10 +2539,10 @@ pub(crate) fn accept_core<
                 return Served::Closed;
             }
             let session = bound_session(sid, h2.as_ref(), false);
-            if h2.is_some() {
-                session.set_upload(Box::new(read));
+            let upload: Box<dyn Read + Send> = if h2.is_some() {
+                Box::new(read)
             } else {
-                session.set_upload(Box::new(Reader {
+                Box::new(Reader {
                     read,
                     prefix,
                     at: 0,
@@ -2538,7 +2551,11 @@ pub(crate) fn accept_core<
                     reads: 0,
                     pending_head: false,
                     chunk: Chunk::Body,
-                }));
+                })
+            };
+            if !session.set_upload(upload) {
+                emit_409(&mut write);
+                return Served::Closed;
             }
             plain_ok(&mut write, settings, &padded);
             session.wait_ended();
@@ -5477,6 +5494,7 @@ mod tests {
         let session = Arc::new(Session {
             state: Mutex::new(SessionState {
                 upload: Some(Box::new(Blocked)),
+                upload_attached: false,
                 packets: BTreeMap::new(),
                 next_seq: 0,
                 ended: true,
@@ -5497,6 +5515,7 @@ mod tests {
         let session = Arc::new(Session {
             state: Mutex::new(SessionState {
                 upload: None,
+                upload_attached: false,
                 packets: BTreeMap::new(),
                 next_seq: 0,
                 ended: true,
@@ -5521,6 +5540,7 @@ mod tests {
         let session = Arc::new(Session {
             state: Mutex::new(SessionState {
                 upload: None,
+                upload_attached: false,
                 packets: BTreeMap::new(),
                 next_seq: 0,
                 ended: false,
@@ -5548,6 +5568,7 @@ mod tests {
         let session = Arc::new(Session {
             state: Mutex::new(SessionState {
                 upload: None,
+                upload_attached: false,
                 packets: BTreeMap::new(),
                 next_seq: 0,
                 ended: false,
