@@ -1999,14 +1999,21 @@ fn masked_read(
 /// lingers the same ten seconds; a datagram that misses both windows is a real loss.
 const HOP_LINGER: u64 = 10_000;
 
+/// How many sockets a move may leave readable behind itself. A gecko reply splits
+/// into at most eight datagrams and reading each one can move the schedule again, so
+/// sixteen outlives every fragment of one reply while a zero stay stays bounded.
+const HOP_LINGER_SOCKETS: usize = 16;
+
 /// The moving part of a hopped dial: the socket the current stay reads and writes
-/// through, the server port it is aimed at, when the stay ends, and — until its
-/// linger expires — the socket the stay just left, still read for its replies.
+/// through, the server port it is aimed at, when the stay ends, and — until their
+/// linger expires — the sockets earlier stays left, still read for their replies. A
+/// reply may split across datagrams, and each read of one moves the schedule, so one
+/// previous socket is not enough to drain it.
 struct HopState {
     current: Arc<UdpSocket>,
     port: u16,
     until: Instant,
-    previous: Option<(Arc<UdpSocket>, Instant)>,
+    linger: Vec<(Arc<UdpSocket>, Instant)>,
 }
 
 /// A client datagram socket that moves its server destination port among `ports`
@@ -2064,7 +2071,7 @@ impl Hopper {
                 current,
                 port,
                 until,
-                previous: None,
+                linger: Vec::new(),
             }),
         })
     }
@@ -2096,10 +2103,13 @@ impl Hopper {
             if let Ok(sock) = bind_datagram_plain(self.bind) {
                 self.apply_timeout(&sock);
                 let linger = now + Duration::from_millis(HOP_LINGER);
-                state.previous = Some((
-                    std::mem::replace(&mut state.current, Arc::new(sock)),
-                    linger,
-                ));
+                let left = std::mem::replace(&mut state.current, Arc::new(sock));
+                let _ = left.set_nonblocking(true);
+                state.linger.retain(|(_, until)| *until > now);
+                if state.linger.len() >= HOP_LINGER_SOCKETS {
+                    state.linger.remove(0);
+                }
+                state.linger.push((left, linger));
             }
             state.port = port;
             state.until = now + stay;
@@ -2134,26 +2144,28 @@ impl Hopper {
     }
 
     /// Read one datagram, advancing the schedule first so a reader sees the same
-    /// rotation a writer would and the socket just left still lingers. The current
-    /// flow is tried, then the lingering one; a hopped reply source is turned back to
-    /// the nominal server port. No data on either is the same `WouldBlock` a plain
-    /// socket returns, so the drive loop keeps its no-packet path.
+    /// rotation a writer would and the sockets just left still linger. The current
+    /// flow is tried, then every socket a move left behind, newest first, until one
+    /// answers; a hopped reply source is turned back to the nominal server port. The
+    /// lingering sockets are read non-blocking, so a dry sweep costs no wait and only
+    /// the current flow is waited on, once. Its dry read is the same `WouldBlock` a
+    /// plain socket returns, so the drive loop keeps its no-packet path.
     fn recv(&self, buf: &mut [u8], obfs: Option<&Mask>) -> std::io::Result<(usize, SocketAddr)> {
         let (current, _) = self.current();
-        let previous = match self.state.lock() {
+        let lingering: Vec<Arc<UdpSocket>> = match self.state.lock() {
             Ok(mut state) => {
-                if state
-                    .previous
-                    .as_ref()
-                    .is_some_and(|(_, linger)| Instant::now() >= *linger)
-                {
-                    state.previous = None;
-                }
-                state.previous.as_ref().map(|(sock, _)| Arc::clone(sock))
+                let now = Instant::now();
+                state.linger.retain(|(_, until)| *until > now);
+                state
+                    .linger
+                    .iter()
+                    .rev()
+                    .map(|(sock, _)| Arc::clone(sock))
+                    .collect()
             }
-            Err(_) => None,
+            Err(_) => Vec::new(),
         };
-        for sock in [Some(current), previous].into_iter().flatten() {
+        for sock in std::iter::once(current).chain(lingering) {
             match Self::read_into(&sock, buf, obfs) {
                 Ok((found, mut from)) => {
                     if from.ip() == self.server.ip()
@@ -5170,6 +5182,49 @@ mod tests {
         let mut buf = [0u8; 2048];
         let (n, _) = reader.recv_from(&mut buf).expect("reassembles");
         assert_eq!(&buf[..n], &packet[..], "the split packet rebuilt exactly");
+    }
+
+    /// A reply split across datagrams still reassembles when the hopped dial moves every
+    /// stay: the socket the fragments landed on stays readable while the plan rotates past
+    /// it, so the reply is drained instead of stranded.
+    #[test]
+    fn a_hopped_gecko_dial_reassembles_a_split_reply() {
+        let server_sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let server_addr = server_sock.local_addr().expect("addr");
+        server_sock
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .expect("timeout");
+        let server =
+            Datagram::gecked(server_sock, gecko_salamander(), gecko_window()).expect("geckos");
+        let first = UdpSocket::bind("0.0.0.0:0").expect("binds");
+        let client = Datagram::gecked_hopped(
+            server_addr,
+            vec![server_addr.port()],
+            (0, 0),
+            "0.0.0.0:0",
+            &first,
+            gecko_salamander(),
+            gecko_window(),
+        )
+        .expect("geckos over a hop");
+        client
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .expect("timeout");
+
+        // A short-header packet tells the server which hopped socket to answer on.
+        client.send_to(b"hello", server_addr).expect("sends");
+        let mut room = [0u8; 64];
+        let (_, from) = server
+            .recv_from(&mut room)
+            .expect("the server reads the dial");
+        // The answer is a long header, so the server splits it across several datagrams.
+        let mut reply: Vec<u8> = (0u16..900).map(|i| (i % 251) as u8).collect();
+        reply[0] |= ferrox_core::hysteria::GECKO_FLAG;
+        server.send_to(&reply, from).expect("sends the reply");
+
+        let mut buf = [0u8; 2048];
+        let (n, _) = client.recv_from(&mut buf).expect("reassembles the reply");
+        assert_eq!(&buf[..n], &reply[..], "the split reply rebuilt exactly");
     }
 
     /// A socket, its address and a connection that answers nothing: the pump's queue is what these witnesses read, so no peer and no handshake is needed to fill it.
