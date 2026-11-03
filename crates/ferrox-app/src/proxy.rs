@@ -23169,6 +23169,7 @@ fn poll_handoff(
     poll_copy::handoff(client_read, target_write, target_read, client_write)
 }
 
+#[cfg(any(not(target_os = "linux"), test))]
 fn relay_owned(
     mut client_read: Connection,
     mut target_write: Connection,
