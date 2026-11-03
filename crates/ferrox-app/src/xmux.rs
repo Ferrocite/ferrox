@@ -158,15 +158,17 @@ impl Manager {
             return None;
         }
         let limit = self.bounds.max_concurrency.1;
-        let open: Vec<Arc<Entry>> = entries
-            .iter()
-            .filter(|entry| limit <= 0 || entry.running() < limit as usize)
-            .cloned()
-            .collect();
-        if open.is_empty() {
+        let open = |entry: &Arc<Entry>| limit <= 0 || entry.running() < limit as usize;
+        let count = entries.iter().filter(|entry| open(entry)).count();
+        if count == 0 {
             return None;
         }
-        Some(Arc::clone(&open[pick(open.len())]))
+        let at = pick(count);
+        entries
+            .iter()
+            .filter(|entry| open(entry))
+            .nth(at)
+            .cloned()
     }
 }
 
@@ -373,6 +375,19 @@ mod tests {
         drop(manager.lease(&create).expect("a lease"));
         drop(manager.lease(&create).expect("a lease"));
         assert_eq!(dialed.load(Ordering::SeqCst), 2, "one request per client");
+    }
+
+    /// The choice counts the open entries and walks them again rather than collecting them, so the pick lands on the same entry without a vector.
+    #[test]
+    fn a_lease_chooses_without_allocating() {
+        let bounds = defaults();
+        let manager = Manager::new(bounds);
+        let entries: Vec<Arc<Entry>> = (0..3)
+            .map(|_| Arc::new(Entry::new(client().expect("a client"), &bounds)))
+            .collect();
+        let (chosen, counts) = ferrox_core::alloc_count::measure(|| manager.choose(&entries));
+        assert!(chosen.is_some(), "three open entries are a choice");
+        assert_eq!(counts.allocs, 0, "{counts:?}");
     }
 
     #[test]
