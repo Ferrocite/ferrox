@@ -386,6 +386,13 @@ json.dump(doc, open(sys.argv[2], "w"), indent=2)
 PY
 }
 
+# An MSYS pid is not a Windows pid: the sampler opens the process natively, so translate once.
+matrix_native_pid() {
+  local native
+  native=$(cat "/proc/$1/winpid" 2>/dev/null) && [ -n "$native" ] || native="$1"
+  printf '%s' "$native"
+}
+
 matrix_start_server() {
   local label="$1" bin="$2" config="$3" logdir="$4"
   local -a args=()
@@ -598,7 +605,7 @@ while read -r id traffic connections iterations payload duration_ms; do
       --duration-ms "${duration_ms:-0}" \
       --tcp-latency-iterations "$iterations" \
       --repeats "$repeats" \
-      --server-pid "$server_pid" \
+      --server-pid "$(matrix_native_pid "$server_pid")" \
       --keep-going \
       "${client_args[@]}" \
       --output-dir "$celldir/runs" \
