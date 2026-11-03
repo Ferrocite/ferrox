@@ -864,43 +864,66 @@ impl<R: Read> GrpcReader<R> {
     }
 }
 
-impl<R: Read> Read for GrpcReader<R> {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
+impl<R: Read> GrpcReader<R> {
+    /// Settles on the payload in hand, on the end, or on the lane's timeout: the range the caller may
+    /// take from the message buffer, so a window hands it on where it lies instead of staging it.
+    fn ready(&mut self) -> std::io::Result<Option<(usize, usize)>> {
         loop {
             if self.msg_at < self.pay_end {
-                let n = (self.pay_end - self.msg_at).min(buf.len());
-                buf[..n].copy_from_slice(&self.msg[self.msg_at..self.msg_at + n]);
-                self.msg_at += n;
-                return Ok(n);
+                return Ok(Some((self.msg_at, self.pay_end)));
             }
             // The next message may already be in the buffer behind the one just taken, and reading the socket first would block on it; that holds at END_STREAM too — the flag ends the frames, not the bytes.
             if self.decode().is_none() {
                 self.eof = true;
                 if self.remote_end && self.poll {
-                    return self.pump_after_end();
+                    self.pump_after_end()?;
                 }
-                return Ok(0);
+                return Ok(None);
             }
             if self.msg_at < self.pay_end {
                 continue;
             }
             if self.eof {
                 if self.remote_end && self.poll {
-                    return self.pump_after_end();
+                    self.pump_after_end()?;
                 }
-                return Ok(0);
+                return Ok(None);
             }
             if self.pump()?.is_none() {
                 self.eof = true;
                 if self.remote_end && self.poll {
-                    return self.pump_after_end();
+                    self.pump_after_end()?;
                 }
-                return Ok(0);
+                return Ok(None);
             }
         }
+    }
+}
+
+impl<R: Read> Read for GrpcReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let Some((at, end)) = self.ready()? else {
+            return Ok(0);
+        };
+        let n = (end - at).min(buf.len());
+        buf[..n].copy_from_slice(&self.msg[at..at + n]);
+        self.msg_at = at + n;
+        Ok(n)
+    }
+}
+
+impl<R: Read> crate::proxy::WindowRead for GrpcReader<R> {
+    /// The payload the one message buffer already holds, handed on where it lies: the relay writes it
+    /// to the peer socket as the reader's own slices, so no relay buffer stages it a second time.
+    fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+        let Some((at, end)) = self.ready()? else {
+            return Ok(crate::proxy::Window::one(&[]));
+        };
+        self.msg_at = end;
+        Ok(crate::proxy::Window::one(&self.msg[at..end]))
     }
 }
 
@@ -2686,6 +2709,7 @@ pub(crate) fn request_ended<R: Read>(reader: &GrpcReader<R>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proxy::WindowRead;
     use std::io::Write;
 
     const HUNK: usize = 16 * 1024;
@@ -3237,6 +3261,61 @@ mod tests {
             assert_eq!(got, want, "{name}");
             assert_eq!(reader.staged, 0, "{name} staged bytes for itself");
         }
+    }
+
+    /// The witness for `carrier-grpc relay-window-copies-per-byte 0`: the window a carrier read gives
+    /// the relay is one run of the message buffer the reader already holds, so the relay writes the
+    /// downloaded body to the peer socket from that buffer instead of staging it a second time.
+    #[test]
+    fn a_relay_window_hands_the_payload_it_read_by_pointer() {
+        let bodies: [&[u8]; 3] = [b"ping", b"pong", b"last"];
+        let mut reader = dial(
+            &bodies
+                .iter()
+                .enumerate()
+                .map(|(i, body)| (if i + 1 == bodies.len() { F_END } else { 0 }, message(body)))
+                .collect::<Vec<_>>(),
+        );
+        let (mut steady_base, mut steady_capacity) = (0usize, 0usize);
+        for (i, body) in bodies.iter().enumerate() {
+            let base = {
+                let window = reader.read_window().expect("reads a window");
+                assert_eq!(window.bytes(), *body, "payload {i}");
+                assert_eq!(
+                    window.parts(),
+                    [(0, body.len())].as_slice(),
+                    "payload {i} is one run"
+                );
+                window.bytes().as_ptr() as usize
+            };
+            let buffer = reader.msg.as_ptr() as usize;
+            assert!(
+                base >= buffer && base + body.len() <= buffer + reader.msg.capacity(),
+                "payload {i} was staged outside the message buffer"
+            );
+            if i == 0 {
+                steady_base = buffer;
+                steady_capacity = reader.msg.capacity();
+            } else {
+                assert_eq!(buffer, steady_base, "the message buffer moved");
+                assert_eq!(
+                    reader.msg.capacity(),
+                    steady_capacity,
+                    "the message buffer grew"
+                );
+            }
+        }
+        assert!(reader.read_window().expect("ends").is_empty());
+        assert_eq!(
+            reader.msg.as_ptr() as usize,
+            steady_base,
+            "the message buffer moved at the end"
+        );
+        assert_eq!(
+            reader.msg.capacity(),
+            steady_capacity,
+            "the message buffer grew at the end"
+        );
     }
 
     /// The witness for `carrier-grpc user-space-copies-per-byte-written 0`: the uplink hands the payload to the frame writer as one slice whose base is the caller's buffer, so a `writev` carries it unstaged — a round trip cannot see this, so pointer identity is the only witness.

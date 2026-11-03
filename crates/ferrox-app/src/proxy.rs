@@ -4090,7 +4090,7 @@ fn serve_vless_grpc(
         return;
     }
     reader.set_poll(Some(RELAY_POLL));
-    crate::proxy::relay_sink_drained_with(
+    crate::proxy::relay_sink_window_with(
         reader,
         &writer,
         &uplink,
@@ -7905,7 +7905,7 @@ fn serve_session_grpc<R: Read + Send + 'static + RelayPoll, W: FrameWrite + 'sta
         return;
     }
     echo_trace("session grpc relaying");
-    relay_sink_drained_with(
+    relay_sink_window_with(
         creader,
         &cwriter,
         &uplink,
@@ -9967,7 +9967,7 @@ fn dial_vless_rung(
             }
             note_success(ladder, rung, Stage::FirstByte, attempt.explicit);
             reader.set_poll(Some(RELAY_POLL));
-            crate::proxy::relay_sink_drained_with(
+            crate::proxy::relay_sink_window_with(
                 reader,
                 &writer,
                 client,
@@ -14680,7 +14680,7 @@ fn dial_trojan_rung(
             }
             note_success(ladder, rung, Stage::RequestSent, attempt.explicit);
             reader.set_poll(Some(RELAY_POLL));
-            crate::proxy::relay_sink_drained_with(
+            crate::proxy::relay_sink_window_with(
                 reader,
                 &writer,
                 client,
@@ -16675,7 +16675,7 @@ fn dial_trojan_session<S, D>(
             if !writer.send(header) {
                 return note_dial_failure(server, Failure::new(Stage::RequestSent, Kind::Dropped));
             }
-            relay_sink_drained_with(
+            relay_sink_window_with(
                 reader,
                 &writer,
                 client,
@@ -17803,7 +17803,7 @@ fn serve_trojan_grpc(
         return;
     };
     reader.set_poll(Some(RELAY_POLL));
-    crate::proxy::relay_sink_drained_with(
+    crate::proxy::relay_sink_window_with(
         reader,
         &writer,
         &uplink,
@@ -18658,7 +18658,7 @@ fn serve_session_trojan_grpc<R: Read + Send + 'static, W: FrameWrite + 'static>(
         return;
     };
     echo_trace("session grpc relaying");
-    relay_sink_drained_with(
+    relay_sink_window_with(
         creader,
         &cwriter,
         &uplink,
@@ -27188,6 +27188,30 @@ where
     relay_sink_poll(reader, writer, peer, on_reader_done, request_ended, false)
 }
 
+/// The same relay over a carrier that hands its payload out as a window: the download lane writes the
+/// reader's own slices to the peer, so no relay buffer copies the body a second time.
+pub(crate) fn relay_sink_window_with<R, W, F, E>(
+    reader: R,
+    writer: &W,
+    peer: &Connection,
+    on_reader_done: F,
+    request_ended: E,
+) -> Option<Arc<RelayFinish>>
+where
+    R: WindowRead + Send + 'static,
+    W: CarrierSink,
+    F: FnOnce(&mut R) + Send + 'static,
+    E: FnMut(&mut R) -> bool + Send + 'static,
+{
+    relay_ordered::<R, W, _, _, CLOSE_AFTER_JOIN, true>(
+        reader,
+        writer,
+        peer,
+        on_reader_done,
+        request_ended,
+    )
+}
+
 /// The same relay over a reader whose bytes wait in a queue another thread fills: a poll timeout
 /// parks the lane instead of keeping a worker reading a socket that carries no credit for it.
 pub(crate) fn relay_sink_drained_queued<R, W, F, E>(
@@ -35297,7 +35321,7 @@ mod tests {
                 crate::grpc::accept(stream, "/TunnelService/Tun").expect("serves");
             reader.set_poll(Some(RELAY_POLL));
             let uplink = Connection::connect(("127.0.0.1", target_port)).expect("dials");
-            let flow = relay_sink_drained_with(
+            let flow = relay_sink_window_with(
                 reader,
                 &writer,
                 &uplink,
@@ -35359,7 +35383,7 @@ mod tests {
                 crate::grpc::accept(stream, "/TunnelService/Tun").expect("serves");
             reader.set_poll(Some(RELAY_POLL));
             let uplink = Connection::connect(("127.0.0.1", target_port)).expect("dials");
-            let flow = relay_sink_drained_with(
+            let flow = relay_sink_window_with(
                 reader,
                 &writer,
                 &uplink,
