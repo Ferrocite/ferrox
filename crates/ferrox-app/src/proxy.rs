@@ -20845,14 +20845,13 @@ fn serve_socks_udp_split(
             Some(address) => Some(address),
             None => match lanes.entry(key) {
                 std::collections::hash_map::Entry::Occupied(entry) => Some(entry.get().address),
-                std::collections::hash_map::Entry::Vacant(entry) => {
-                    spawn_udp_lane(&out, local).map(|lane| {
+                std::collections::hash_map::Entry::Vacant(entry) => spawn_udp_lane(&out, local)
+                    .map(|lane| {
                         replies.insert(lane.address, entry.key().clone());
                         let address = lane.address;
                         entry.insert(lane);
                         address
-                    })
-                }
+                    }),
             },
         };
         if let Some(lane_address) = lane_address {
