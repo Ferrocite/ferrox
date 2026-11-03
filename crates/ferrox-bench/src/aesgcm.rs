@@ -240,7 +240,10 @@ pub(crate) fn report(rows: &[Row], windows: &[Window], engine_backend: &str) -> 
         "The crate both hot paths used to seal with, against the fused engine that\n\
          replaces it: the same arithmetic re-associated so four blocks share one\n\
          reduction, with the `CTR` pass fused into the `GHASH` pass so the message is\n\
-         read once. Every row asserts equal ciphertext and equal tag *before* either\n\
+         read once above 256 bytes; on the AES-128 path at or below 256 the two\n\
+         passes run separately so the AES and carry-less-multiply pipes overlap on\n\
+         a message already in cache.\n\
+         Every row asserts equal ciphertext and equal tag *before* either\n\
          side is timed, and the rows go to the same 0.95x bar as gates 3, 4, 7 and 8.\n\
          \n\
          | | |\n\

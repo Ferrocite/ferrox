@@ -329,6 +329,10 @@ fn ctr_ghash8(
     mut ctr: u32,
 ) -> uint8x16_t {
     let (h, hp) = (ghash.h(), ghash.hp());
+    if buf.len() <= 256 {
+        ctr_only8(rk, template, buf, ctr);
+        return ghash8(ghash, state, buf, tailq);
+    }
     let (blocks, _rest_bytes) = buf.as_chunks_mut::<16>();
     let (groups, _rest_blocks) = blocks.as_chunks_mut::<8>();
     let done = groups.len() * 8;
