@@ -2293,6 +2293,9 @@ fn load_source_entries(
                     && server.tls_port.is_some()
                     && (server.obfuscation_key.is_some() || server.tls_obfuscation_key.is_some())
                 {
+                    if !server.tls {
+                        server.inproxy = server.tls_inproxy.take();
+                    }
                     server.tls = true;
                     server.port = server.tls_port.unwrap_or(server.port);
                     if server.obfuscation_key.is_none() {
@@ -2855,9 +2858,7 @@ fn add_tls_variants(servers: &mut Vec<Server>) {
             variant.port = variant.tls_port.unwrap_or(variant.port);
             variant.meek = None;
             variant.unfronted_meek = None;
-            variant.inproxy = variant
-                .inproxy
-                .filter(|destination| destination.base_protocol() == "TLS-OSSH");
+            variant.inproxy = variant.tls_inproxy.take();
             variant.tactics = None;
             variant
         })
@@ -3012,8 +3013,12 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
     let direct = obfuscated_port.is_some()
         || ssh_port.is_some()
         || (tls_port.is_some() && obfuscated_key.is_some());
-    let inproxy = crate::psiphon_broker::destination(&entry, &host);
-    let inproxy_port = inproxy.as_ref().map_or(0, destination_port);
+    let inproxy = crate::psiphon_broker::destination(&entry, &host, false);
+    let tls_inproxy = crate::psiphon_broker::destination(&entry, &host, true);
+    let inproxy_port = inproxy
+        .as_ref()
+        .or(tls_inproxy.as_ref())
+        .map_or(0, destination_port);
     let (port, obfuscation_key, tls) = match (obfuscated_port, ssh_port) {
         (Some(port), _) if obfuscated_key.is_some() => (port, obfuscated_key, false),
         (_, Some(port)) => (port, None, false),
@@ -3034,8 +3039,18 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
                 });
             (port, obfuscated_key, false)
         }
-        _ if include_inproxy && inproxy.is_some() => (inproxy_port, obfuscated_key, false),
+        _ if include_inproxy && (inproxy.is_some() || tls_inproxy.is_some()) => {
+            (inproxy_port, obfuscated_key, false)
+        }
         _ => return None,
+    };
+    let (inproxy, tls_inproxy, tls) = if tls {
+        (tls_inproxy, None, true)
+    } else if inproxy.is_none() {
+        let tls = tls_inproxy.is_some();
+        (tls_inproxy, None, tls)
+    } else {
+        (inproxy, tls_inproxy, false)
     };
     let tls_obfuscation_key = if tls_port.is_some() && obfuscation_key.is_none() {
         tls_obfuscation_key
@@ -3081,6 +3096,7 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
         unfronted_meek,
         tactics,
         inproxy,
+        tls_inproxy,
     })
 }
 
@@ -4041,10 +4057,71 @@ mod tests {
     }
 
     #[test]
+    fn a_tls_variant_keeps_the_tls_destination_when_the_entry_names_both() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshObfuscatedPort":443,"sshObfuscatedKey":"k","tlsOSSHPort":8443,"sshHostKey":"AAAA","capabilities":["OSSH","TLS-OSSH","INPROXY-WEBRTC-OSSH","INPROXY-WEBRTC-TLS-OSSH"],"inproxyOSSHPort":443,"inproxyTlsOSSHPort":8443,"signature":"AA=="}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry_with(&encoded, true).expect("entry");
+        assert!(!server.tls);
+        let selected = select_protocols(vec![server], &["TLS-OSSH".to_owned()], &[], 0, false);
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].tls);
+        assert_eq!(
+            selected[0]
+                .inproxy
+                .as_ref()
+                .map(crate::psiphon_broker::Destination::base_protocol),
+            Some("TLS-OSSH")
+        );
+    }
+
+    #[test]
+    fn a_tls_base_entry_drops_a_plain_inproxy_destination() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshObfuscatedKey":"k","tlsOSSHPort":8443,"sshHostKey":"AAAA","capabilities":["INPROXY-WEBRTC-OSSH"],"inproxyOSSHPort":443,"signature":"AA=="}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry_with(&encoded, true).expect("entry");
+        assert!(server.tls);
+        assert!(
+            server.inproxy.is_none(),
+            "a TLS base entry must not keep a plain in-proxy destination"
+        );
+    }
+
+    #[test]
+    fn a_tls_base_entry_keeps_the_tls_destination() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshObfuscatedKey":"k","tlsOSSHPort":8443,"sshHostKey":"AAAA","capabilities":["INPROXY-WEBRTC-OSSH","INPROXY-WEBRTC-TLS-OSSH"],"inproxyOSSHPort":443,"inproxyTlsOSSHPort":8443,"signature":"AA=="}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry_with(&encoded, true).expect("entry");
+        assert!(server.tls);
+        assert_eq!(
+            server
+                .inproxy
+                .as_ref()
+                .map(crate::psiphon_broker::Destination::base_protocol),
+            Some("TLS-OSSH")
+        );
+    }
+
+    #[test]
+    fn a_non_tls_entry_prefers_quic_over_a_tls_destination() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","sshObfuscatedKey":"k","capabilities":["INPROXY-WEBRTC-TLS-OSSH","INPROXY-WEBRTC-QUIC-OSSH"],"inproxyTlsOSSHPort":8443,"inproxyQUICPort":443,"signature":"AA=="}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry_with(&encoded, true).expect("entry");
+        assert!(!server.tls);
+        assert_eq!(
+            server
+                .inproxy
+                .as_ref()
+                .map(crate::psiphon_broker::Destination::base_protocol),
+            Some("QUIC-OSSH")
+        );
+    }
+
+    #[test]
     fn an_inproxy_tls_destination_keeps_its_own_port() {
         let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","sshObfuscatedKey":"k","capabilities":["INPROXY-WEBRTC-TLS-OSSH"],"inproxyTlsOSSHPort":8443,"signature":"AA=="}"#;
         let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
         let server = decode_entry_with(&encoded, true).expect("entry");
+        assert!(server.tls);
         let destination = server.inproxy.expect("destination");
         assert_eq!(destination.protocol, "INPROXY-WEBRTC-TLS-OSSH");
         assert_eq!(destination.address, "192.0.2.1:8443");
@@ -4665,6 +4742,7 @@ mod tests {
             unfronted_meek: None,
             tactics: None,
             inproxy: None,
+            tls_inproxy: None,
         }
     }
 
@@ -4712,7 +4790,7 @@ mod tests {
             "a plain in-proxy destination must not bypass TLS"
         );
         let mut tls = capable;
-        tls.inproxy = Some(crate::psiphon_broker::Destination {
+        tls.tls_inproxy = Some(crate::psiphon_broker::Destination {
             address: "192.0.2.1:8443".to_owned(),
             network_protocol: 0,
             protocol: "INPROXY-WEBRTC-TLS-OSSH",
@@ -4940,6 +5018,26 @@ mod tests {
         let selected = load_entries(&settings("SSH")).expect("plain SSH is named");
         assert_eq!(selected.len(), 1);
         assert!(!selected[0].obfuscated());
+    }
+
+    #[test]
+    fn a_target_tls_limit_promotes_the_tls_destination() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshObfuscatedPort":443,"sshObfuscatedKey":"k","tlsOSSHPort":8443,"sshHostKey":"AAAA","capabilities":["OSSH","TLS-OSSH","INPROXY-WEBRTC-OSSH","INPROXY-WEBRTC-TLS-OSSH"],"inproxyOSSHPort":443,"inproxyTlsOSSHPort":8443,"signature":"AA=="}"#;
+        let target = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let text = format!(
+            r#"{{"protocolSelection":"conduit","TargetServerEntry":"{target}","LimitTunnelProtocols":["TLS-OSSH"]}}"#
+        );
+        let settings =
+            Settings::from_json(Some(&json::parse(&text).expect("settings"))).expect("settings");
+        let selected = load_entries(&settings).expect("TLS destination");
+        assert!(selected[0].tls);
+        assert_eq!(
+            selected[0]
+                .inproxy
+                .as_ref()
+                .map(crate::psiphon_broker::Destination::base_protocol),
+            Some("TLS-OSSH")
+        );
     }
 
     #[test]
@@ -5346,6 +5444,7 @@ mod tests {
                 unfronted_meek: None,
                 tactics: None,
                 inproxy: None,
+                tls_inproxy: None,
             })
             .collect();
         let began = Instant::now();
@@ -5389,6 +5488,7 @@ mod tests {
                 unfronted_meek: None,
                 tactics: None,
                 inproxy: None,
+                tls_inproxy: None,
             })
             .collect();
         let began = Instant::now();
