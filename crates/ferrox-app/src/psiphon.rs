@@ -2976,6 +2976,7 @@ fn entry_ports(entry: &Json) -> EntryPorts {
 }
 
 /// Decode one base64 server-list entry, optionally keeping an in-proxy-only one.
+#[allow(clippy::too_many_lines)]
 fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
     let decoded = hex_decode(line)?;
     let parts: Vec<&[u8]> = decoded.splitn(5, |byte| *byte == b' ').collect();
