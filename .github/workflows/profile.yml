@@ -73,7 +73,7 @@ jobs:
           CELL: ${{ inputs.cell }}
           PROFILE_SERVER: ${{ inputs.engine }}
         run: |
-          PROFILE_DIR="$PWD/profile" ./scripts/run-benchmark-matrix.sh \
+          PROFILE_DIR="$PWD/profile" timeout --kill-after=30s 1800 ./scripts/run-benchmark-matrix.sh \
             --tier full --only "$CELL" --engines xray-core,ferrox \
             --repeats 3 --no-build --out profile/out || true
           ls -la profile profile/out/cells 2>/dev/null || true
