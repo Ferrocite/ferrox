@@ -2717,6 +2717,56 @@ mod tests {
         }
     }
 
+    /// One ping through a freshly served connection, with the identity the password names.
+    fn echo_through(port: u16, password: &str, method: &str, target: SocketAddr) {
+        let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
+        uplink
+            .set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("timeout");
+        let (mut send, recv) = client_send_handshake(
+            &mut uplink,
+            password,
+            method,
+            &crate::proxy::Destination::from(target),
+        )
+        .expect("handshake");
+        let mut ping = [0u8; SEAL_HEAD + 4 + TAG_LEN];
+        ping[SEAL_HEAD..SEAL_HEAD + 4].copy_from_slice(b"ping");
+        seal_all(&mut send, &mut ping, 4, &mut uplink).expect("seals");
+        let (mut recv, folded) = match recv {
+            Recv::Ready(cipher) => (cipher, None),
+            Recv::Waiting(m, p, s) => {
+                let mut peer = vec![0u8; m.key_len()];
+                read_exact(&mut uplink, &mut peer).expect("salt");
+                let mut cipher = Cipher::from_psk(m, &p, &peer).expect("derives");
+                let fixed_len = 1 + 8 + m.key_len() + 2 + TAG_LEN;
+                let mut fixed = vec![0u8; fixed_len];
+                read_exact(&mut uplink, &mut fixed).expect("fixed");
+                cipher.open_in_place(&mut fixed).expect("opens");
+                let first = usize::from(u16::from_be_bytes([
+                    fixed[9 + m.key_len()],
+                    fixed[10 + m.key_len()],
+                ]));
+                let head = (first > 0).then(|| {
+                    let mut chunk = vec![0u8; first + TAG_LEN];
+                    read_exact(&mut uplink, &mut chunk).expect("first");
+                    let got = cipher.open_in_place(&mut chunk).expect("opens first");
+                    chunk[..got].to_vec()
+                });
+                let _ = s;
+                (cipher, head)
+            }
+        };
+        let mut buf = wire_buffer();
+        let back = match folded {
+            Some(head) => head,
+            None => open_chunk(&mut uplink, &mut recv, &mut buf)
+                .expect("opens body")
+                .to_vec(),
+        };
+        assert_eq!(back, b"ping"[..]);
+    }
+
     /// Served traffic meters the generated and configured identities apart, even when a foreign inbound reserves the name the generated one would have taken.
     #[test]
     fn served_multi_user_traffic_counts_the_generated_and_configured_identities_apart() {
@@ -2785,54 +2835,8 @@ mod tests {
         });
 
         for psk in [key(2), key(3)] {
-            let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
-            uplink
-                .set_read_timeout(Some(Duration::from_secs(20)))
-                .expect("timeout");
-            let (mut send, recv) = client_send_handshake(
-                &mut uplink,
-                &format!("{}:{psk}", key(1)),
-                method,
-                &crate::proxy::Destination::from(target),
-            )
-            .expect("handshake");
-            let mut ping = [0u8; SEAL_HEAD + 4 + TAG_LEN];
-            ping[SEAL_HEAD..SEAL_HEAD + 4].copy_from_slice(b"ping");
-            seal_all(&mut send, &mut ping, 4, &mut uplink).expect("seals");
-            let (mut recv, folded) = match recv {
-                Recv::Ready(cipher) => (cipher, None),
-                Recv::Waiting(m, p, s) => {
-                    let mut peer = vec![0u8; m.key_len()];
-                    read_exact(&mut uplink, &mut peer).expect("salt");
-                    let mut cipher = Cipher::from_psk(m, &p, &peer).expect("derives");
-                    let fixed_len = 1 + 8 + m.key_len() + 2 + TAG_LEN;
-                    let mut fixed = vec![0u8; fixed_len];
-                    read_exact(&mut uplink, &mut fixed).expect("fixed");
-                    cipher.open_in_place(&mut fixed).expect("opens");
-                    let first = usize::from(u16::from_be_bytes([
-                        fixed[9 + m.key_len()],
-                        fixed[10 + m.key_len()],
-                    ]));
-                    let head = (first > 0).then(|| {
-                        let mut chunk = vec![0u8; first + TAG_LEN];
-                        read_exact(&mut uplink, &mut chunk).expect("first");
-                        let got = cipher.open_in_place(&mut chunk).expect("opens first");
-                        chunk[..got].to_vec()
-                    });
-                    let _ = s;
-                    (cipher, head)
-                }
-            };
-            let mut buf = wire_buffer();
-            let back = match folded {
-                Some(head) => head,
-                None => open_chunk(&mut uplink, &mut recv, &mut buf)
-                    .expect("opens body")
-                    .to_vec(),
-            };
-            assert_eq!(back, b"ping"[..]);
+            echo_through(port, &format!("{}:{psk}", key(1)), method, target);
         }
-
         let snapshot = crate::stats::snapshot();
         assert_eq!(snapshot.user["alice@example"].uplink, 38);
         assert_eq!(snapshot.user["ss-in#1#"].uplink, 38);
