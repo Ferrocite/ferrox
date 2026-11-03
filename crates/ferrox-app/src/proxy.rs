@@ -15238,6 +15238,33 @@ impl<S, R> TlsHalf<S, R> {
 
 // The ciphertext one read of the transport carries: a record is at most sixteen kilobytes, so one read holds a whole record.
 const DRIVEN_CIPHERTEXT: usize = 32 * 1024;
+/// Record opens that may take ciphertext without yielding plaintext before a read hands the lane
+/// back: a peer that drips cannot hold the worker, and the state resumes on the next read.
+const DRIVEN_DRY_OPENS: usize = 32;
+
+/// Why a driven read handed its lane back mid-record: the next read resumes it, so a relay step
+/// that reads this has progress rather than an idle transport.
+#[derive(Debug)]
+struct DrivenYield;
+
+impl std::fmt::Display for DrivenYield {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("a TLS record is still arriving")
+    }
+}
+
+impl std::error::Error for DrivenYield {}
+
+fn driven_yield() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::WouldBlock, DrivenYield)
+}
+
+fn is_driven_yield(error: &std::io::Error) -> bool {
+    match error.get_ref() {
+        Some(inner) => inner.is::<DrivenYield>(),
+        None => false,
+    }
+}
 
 /// The transport handle a relay reader can take over: a read parked here holds no
 /// session lock. A session that reads its own transport answers `None`, and its
@@ -15731,6 +15758,7 @@ impl<S: CipherOpen, R: Read> DrivenHalf<S, R> {
             self.scratch = unfilled(DRIVEN_CIPHERTEXT);
         }
         let mut filled = 0usize;
+        let mut dry = 0usize;
         loop {
             if filled == buf.len() {
                 // The caller's window is full: the rest waits for the next read.
@@ -15776,11 +15804,24 @@ impl<S: CipherOpen, R: Read> DrivenHalf<S, R> {
             };
             self.pending_at += taken;
             filled += plain;
+            self.closed = self.closed || closed;
+            if plain == 0 && taken > 0 {
+                dry += 1;
+                if dry >= DRIVEN_DRY_OPENS {
+                    if filled > 0 {
+                        // Plaintext this read already carried is the progress the caller asked for.
+                        return Ok(filled);
+                    }
+                    // A record that takes ciphertext without plaintext cannot hold this read: the lane parks and the next turn resumes it.
+                    return Err(driven_yield());
+                }
+            } else {
+                dry = 0;
+            }
             if self.pending_at == self.pending_end {
                 // A read that filled its room may have left plaintext in the session; a short one took it all.
                 self.queued = plain == room;
             }
-            self.closed = self.closed || closed;
             if filled == buf.len() {
                 // The caller's window is full: what the session still holds waits for the next read rather than a transport wait it does not need.
                 return Ok(filled);
@@ -26100,6 +26141,8 @@ where
     match from.read_once(buffer.as_mut()) {
         Ok(0) => Next::Done,
         Ok(n) if to.write_once(buffer.filled(n)).is_ok() => Next::More,
+        // A record still arriving has progress behind it, so the step already spent its turn: the lane requeues rather than reading the yield as an idle peer.
+        Err(error) if is_driven_yield(&error) => Next::Retry,
         Err(error) if is_timeout(&error) => {
             if ended.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE) {
                 Next::Done
@@ -27106,6 +27149,8 @@ where
                     echo_trace("relay bwd eof");
                     (Next::Done, false)
                 }
+                // A record still arriving is not an idle peer: the reader stays open and the lane requeues.
+                Err(error) if is_driven_yield(&error) => (Next::Retry, false),
                 // A socket carrier read that times out takes another turn at once, because the frame granting the sibling's window arrives on it; a queued body parks instead, since its demux reads that frame.
                 Err(error) if is_timeout(&error) => (
                     if reader.parks_on_timeout() {
@@ -32534,6 +32579,38 @@ mod tests {
             reads.load(Ordering::Relaxed),
             33,
             "the resume reads the wire once"
+        );
+    }
+
+    /// A record that hands the lane back mid-read is progress, not an idle transport: even with
+    /// the sibling ended and its reply grace spent, the step retries instead of ending the flow.
+    #[test]
+    fn a_driven_yield_does_not_end_a_lane_after_its_sibling() {
+        struct Yielding;
+
+        impl Read for Yielding {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                Err(driven_yield())
+            }
+        }
+
+        let finish = RelayFinish::new(true, Arc::new(|| {}), None);
+        let past = std::time::Instant::now()
+            .checked_sub(crate::budgets::RELAY_RESPONSE_IDLE)
+            .and_then(|at| at.checked_sub(std::time::Duration::from_millis(1)))
+            .expect("a clock past the grace");
+        *finish.ended_at.lock().expect("ended") = Some(past);
+        assert!(
+            finish.ended_and_idle(crate::budgets::RELAY_RESPONSE_IDLE),
+            "the sibling ended past its reply grace"
+        );
+        let from = Half::split(Yielding, Yielding);
+        let to = Half::split(std::io::sink(), std::io::sink());
+        let mut buffer = RelayBuf::new();
+        assert_eq!(
+            stream_lane_step(&from, &to, &mut buffer, &finish),
+            lane_pool::Next::Retry,
+            "a yield is progress, not the end of the flow"
         );
     }
 
