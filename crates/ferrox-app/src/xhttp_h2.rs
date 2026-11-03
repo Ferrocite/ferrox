@@ -3459,6 +3459,171 @@ mod tests {
         assert_eq!(&got, b"answer");
     }
 
+    /// A read that owns a poll must not sleep in it: a lane that cannot finish a client frame hands
+    /// the thread back, and the bytes it did take are kept for the next turn.
+    #[test]
+    fn a_lane_step_hands_back_a_client_frame_it_cannot_finish() {
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(300)),
+            ..Default::default()
+        });
+        let (conn, state, _written) = reading_conn(Box::new(Silent));
+        let mut reader = H2StreamReader {
+            conn: Arc::clone(&conn),
+            stream: state,
+            id: 1,
+            at: 0,
+            idle_since: None,
+        };
+        let _step = crate::proxy::RelayStep::enter();
+        let began = std::time::Instant::now();
+        let mut buf = [0u8; 8];
+        let error = reader
+            .read(&mut buf)
+            .expect_err("the lane cannot finish the frame");
+        let took = began.elapsed();
+        crate::budgets::clear();
+        assert_eq!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock,
+            "a lane step yields the poll instead of reporting the stream dead"
+        );
+        assert!(
+            took < Duration::from_millis(150),
+            "the lane step slept {} ms waiting for the frame",
+            took.as_millis()
+        );
+    }
+
+    /// The frame the previous turn left half-read still completes, and its body arrives once: the
+    /// lane's yields must not lose the head or the bytes already taken.
+    #[test]
+    fn a_frame_split_across_lane_turns_arrives_whole() {
+        crate::budgets::apply(&crate::config::Budgets {
+            relay_stall: Some(Duration::from_millis(300)),
+            ..Default::default()
+        });
+        let mut frame = Vec::new();
+        write_frame(&mut frame, T_DATA, F_END, 1, b"answer");
+        let (conn, state, _written) = reading_conn(Box::new(Trickle {
+            bytes: frame,
+            at: 0,
+            tick: 0,
+            chunk: 3,
+        }));
+        let mut reader = H2StreamReader {
+            conn: Arc::clone(&conn),
+            stream: state,
+            id: 1,
+            at: 0,
+            idle_since: None,
+        };
+        let _step = crate::proxy::RelayStep::enter();
+        let mut got = Vec::new();
+        let mut turns = 0;
+        while got.is_empty() {
+            turns += 1;
+            assert!(turns < 64, "the frame never completed across lane turns");
+            let mut buf = [0u8; 16];
+            match reader.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(error) if crate::proxy::is_timeout(&error) => {}
+                Err(error) => panic!("the frame failed: {error}"),
+            }
+        }
+        crate::budgets::clear();
+        assert_eq!(
+            got, b"answer",
+            "the body the previous turns took is dropped"
+        );
+    }
+
+    /// A reader that times out on every call: nothing ever arrives on the peer's transport.
+    struct Silent;
+
+    impl Read for Silent {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+    }
+
+    /// Bytes that arrive a few at a time, with a timeout between every delivery, the way a TLS
+    /// record lands on a socket armed with the relay poll.
+    struct Trickle {
+        bytes: Vec<u8>,
+        at: usize,
+        tick: usize,
+        chunk: usize,
+    }
+
+    impl Read for Trickle {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.at >= self.bytes.len() {
+                return Ok(0);
+            }
+            self.tick += 1;
+            if self.tick % 2 == 1 {
+                return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+            }
+            let n = self.chunk.min(buf.len()).min(self.bytes.len() - self.at);
+            buf[..n].copy_from_slice(&self.bytes[self.at..self.at + n]);
+            self.at += n;
+            Ok(n)
+        }
+    }
+
+    /// A connection whose client transport is a script, with stream 1 in its table.
+    fn reading_conn(
+        read: Box<dyn Read + Send>,
+    ) -> (Arc<H2Conn>, Arc<H2Stream>, Arc<Mutex<Vec<u8>>>) {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let slices = Arc::new(AtomicUsize::new(0));
+        let write: SharedWriter = Arc::new(Mutex::new(Box::new(Counted {
+            written: Arc::clone(&written),
+            slices,
+        })
+            as Box<dyn crate::proxy::FrameWrite + Send>));
+        let dead = Arc::new(AtomicBool::new(false));
+        let conn = Arc::new(H2Conn {
+            write,
+            control: Control::Inline,
+            streams: Mutex::new(HashMap::new()),
+            sessions: Mutex::new(HashSet::new()),
+            session_of: Mutex::new(HashMap::new()),
+            upload_of: Mutex::new(HashMap::new()),
+            send_conn: Mutex::new(65_535),
+            wake: Condvar::new(),
+            decoder: Mutex::new(Decoder::default()),
+            max_frame: Mutex::new(16_384),
+            peer_initial: Mutex::new(65_535),
+            dead,
+            goaway: AtomicBool::new(false),
+            refused: AtomicBool::new(false),
+            client_read: Some(Mutex::new(read)),
+            raw: None,
+            decryption: None,
+        });
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                finished: false,
+                request_ended: false,
+                abandoned: false,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(65_535),
+            responded: AtomicBool::new(true),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+        (conn, state, written)
+    }
+
     /// A downlink that finishes leaves no body to deliver: the upload reader parked on the same
     /// stream must end with it, not hold its worker until the relay stall expires.
     #[test]
