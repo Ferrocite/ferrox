@@ -7066,14 +7066,15 @@ fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
     let wire = session.wire.clone();
     let id = Arc::clone(&session.id);
     let done = Arc::clone(&session.done);
-    Some(RelayPool::global().run(move || {
-        let mut buf = udp_buffer();
-        let mut staging = Vec::with_capacity(8192);
-        loop {
+    let (finished, end) = std::sync::mpsc::channel();
+    lane_pool::submit(
+        Box::new(move || {
+            let mut buf = udp_buffer();
+            let mut staging = Vec::with_capacity(8192);
             match read.recv_from(&mut buf) {
                 Ok((n, source)) => {
                     if done.load(Ordering::Relaxed) {
-                        return;
+                        return Next::Done;
                     }
                     let keep = ferrox_core::mux::Outgoing {
                         id: id.load(Ordering::Relaxed),
@@ -7083,24 +7084,37 @@ fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
                         global_id: None,
                     };
                     if !wire.write_frame(&mut staging, keep, Some(&buf[..n])) {
-                        return;
+                        return Next::Done;
                     }
+                    Next::More
                 }
                 Err(error) if is_timeout(&error) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::fd::AsRawFd as _;
+                        note_wait_fd(read.as_raw_fd());
+                    }
                     if done.load(Ordering::Relaxed) {
-                        return;
+                        Next::Done
+                    } else {
+                        Next::Idle
                     }
                 }
                 Err(error) if is_udp_gone(&error) => {
-                    thread::sleep(RELAY_POLL);
                     if done.load(Ordering::Relaxed) {
-                        return;
+                        Next::Done
+                    } else {
+                        Next::Idle
                     }
                 }
-                Err(_) => return,
+                Err(_) => Next::Done,
             }
-        }
-    }))
+        }),
+        Box::new(move || {
+            let _ = finished.send(Ok(()));
+        }),
+    );
+    Some(end)
 }
 
 /// The QUIC identity an inbound serves: QUIC mandates TLS, so anything without a certificate serves nothing.
@@ -24360,9 +24374,9 @@ pub(crate) mod lane_pool {
     /// The widest standard cell (eight connections) queues one download read per flow, and every
     /// one of them must sit in its read at once: a lane without a worker is a flow the peer's
     /// window cannot refill. This is the ceiling, not the shape: a worker starts when a lane is
-    /// queued and no worker is idle, so a one-flow cell holds two lanes. Seven leaves room for the
+    /// queued and no worker is idle, so a one-flow cell holds two lanes. Six leaves room for the
     /// accept path and the parking reaper under the reference's ten-thread server peak.
-    pub(crate) const RELAY_LANES: usize = 7;
+    pub(crate) const RELAY_LANES: usize = 6;
 
     /// Setup lanes are separate from relay lanes so a handshake parked in a read cannot take a
     /// relay worker with it. One keeps the setup peak under the reference's server threads.
