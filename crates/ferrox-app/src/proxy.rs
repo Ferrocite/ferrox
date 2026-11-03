@@ -20841,19 +20841,25 @@ fn serve_socks_udp_split(
         if matches!(&*out, Outbound::Block(_)) {
             continue;
         }
-        retire_finished_lane(&mut lanes, &mut replies, &key);
-        if !lanes.contains_key(&key) {
-            if let Some(lane) = spawn_udp_lane(&out, local) {
-                replies.insert(lane.address, key.clone());
-                lanes.insert(key.clone(), lane);
-            }
-        }
-        if let Some(lane) = lanes.get(&key) {
+        let lane_address = match retire_finished_lane(&mut lanes, &mut replies, &key) {
+            Some(address) => Some(address),
+            None => match lanes.entry(key) {
+                std::collections::hash_map::Entry::Occupied(entry) => Some(entry.get().address),
+                std::collections::hash_map::Entry::Vacant(entry) => spawn_udp_lane(&out, local)
+                    .map(|lane| {
+                        replies.insert(lane.address, entry.key().clone());
+                        let address = lane.address;
+                        entry.insert(lane);
+                        address
+                    }),
+            },
+        };
+        if let Some(lane_address) = lane_address {
             let frame = match dial {
                 Some(address) => socks_udp_frame(&mut frame, None, &address, payload),
                 None => &buf[..n],
             };
-            let _ = relay.send_to(frame, lane.address);
+            let _ = relay.send_to(frame, lane_address);
         }
     }
 }
@@ -20877,12 +20883,15 @@ fn retire_finished_lane(
     lanes: &mut HashMap<Option<String>, UdpLane>,
     replies: &mut HashMap<SocketAddr, Option<String>>,
     key: &Option<String>,
-) {
-    if lanes.get(key).is_some_and(|lane| lane.handle.is_finished()) {
-        if let Some(lane) = lanes.remove(key) {
-            replies.remove(&lane.address);
-        }
+) -> Option<SocketAddr> {
+    let lane = lanes.get(key)?;
+    if !lane.handle.is_finished() {
+        return Some(lane.address);
     }
+    if let Some(lane) = lanes.remove(key) {
+        replies.remove(&lane.address);
+    }
+    None
 }
 
 fn spawn_udp_lane(out: &Outbound, local: std::net::IpAddr) -> Option<UdpLane> {
@@ -59773,7 +59782,7 @@ end
         }
         let mut lanes = HashMap::from([(key.clone(), UdpLane { address, handle })]);
         let mut replies = HashMap::from([(address, key.clone())]);
-        retire_finished_lane(&mut lanes, &mut replies, &key);
+        let _ = retire_finished_lane(&mut lanes, &mut replies, &key);
         assert!(!lanes.contains_key(&key));
         assert!(!replies.contains_key(&address));
     }
