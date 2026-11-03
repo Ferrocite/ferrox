@@ -4044,6 +4044,40 @@ mod tests {
         (conn, written, slices)
     }
 
+    /// A SETTINGS payload whose length is not a multiple of six is a connection error
+    /// (RFC 9113 6.5), so the demux answers a FRAME_SIZE_ERROR GOAWAY instead of closing silently.
+    #[test]
+    fn a_settings_length_outside_sixes_is_refused_as_a_frame_size_error() {
+        struct Silent;
+        impl H2Service for Silent {
+            fn open(&self, _conn: &Arc<H2Conn>, _sid: u32, _block: &[u8], _end_stream: bool) {}
+        }
+        let (conn, written, _slices) = bare_conn();
+        let mut frag = None;
+        assert!(
+            !pump_frame(&conn, &Silent, T_SETTINGS, 0, 0, vec![0u8; 5], &mut frag),
+            "a malformed SETTINGS ends the read loop"
+        );
+        let out = written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let at = out
+            .windows(9)
+            .position(|frame| frame[3] == T_GOAWAY)
+            .expect("the connection answers with a GOAWAY");
+        assert_eq!(
+            &out[at + 4..at + 13],
+            &[0, 0, 0, 0, 0, 0, 0, 0, 0],
+            "a GOAWAY with an eight-byte body and no last stream id"
+        );
+        assert_eq!(
+            u32::from_be_bytes([out[at + 13], out[at + 14], out[at + 15], out[at + 16]]),
+            E_FRAME_SIZE,
+            "the refusal names FRAME_SIZE_ERROR"
+        );
+    }
+
     /// A SETTINGS window update must take the stream table before it publishes the new window:
     /// a stream inserted in between would take the new initial and then the delta again.
     #[test]
