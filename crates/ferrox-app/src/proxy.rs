@@ -2,8 +2,6 @@ use crate::conn::{parse_target, Connection, Listener};
 use std::collections::{HashMap, HashSet};
 use std::io::{IoSlice, Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, ToSocketAddrs, UdpSocket};
-#[cfg(target_os = "linux")]
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
