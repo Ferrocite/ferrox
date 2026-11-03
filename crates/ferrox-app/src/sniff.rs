@@ -910,6 +910,39 @@ mod tests {
         found.expect("sniffs").domain
     }
 
+    /// The documented instruction count is one pre-warmed inspection: the buffer is already the
+    /// worker thread's, so the row prices one probe rather than a probe and its warm-up.
+    #[test]
+    fn a_warm_probe_costs_the_documented_instructions() {
+        let value = crate::json::parse(r#"{"enabled":true,"destOverride":["http"]}"#).unwrap();
+        let sniffing = parse(Some(&value)).unwrap().unwrap();
+        PROBE.with(|probe| probe.borrow_mut().resize(SNIFF_LIMIT, 0));
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binds");
+        let address = listener.local_addr().expect("addr");
+        let writer = std::thread::spawn(move || {
+            let (mut peer, _) = listener.accept().expect("accepts");
+            std::io::Write::write_all(&mut peer, b"GET / HTTP/1.1\r\nHost: warm.test\r\n\r\n")
+                .expect("writes");
+        });
+        let client =
+            crate::conn::Connection::from(std::net::TcpStream::connect(address).expect("connects"));
+        writer.join().expect("joins");
+        let asked = Destination::Address("127.0.0.1:80".parse().expect("address"));
+        let (found, counts) = ferrox_core::alloc_count::measure(|| {
+            let found = sniffing
+                .inspect(&asked, Network::Tcp, &client, false)
+                .0
+                .expect("sniffs");
+            found.domain
+        });
+        assert_eq!(found, "warm.test");
+        assert!(
+            counts.allocs <= 1,
+            "a warm probe allocates the domain and nothing else: {counts:?}"
+        );
+    }
+
     #[test]
     fn the_probe_buffer_is_the_worker_threads_not_the_flows() {
         let value = crate::json::parse(r#"{"enabled":true,"destOverride":["http"]}"#).unwrap();
