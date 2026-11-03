@@ -439,7 +439,8 @@ matrix_stop_server() {
   wait "$server_pid" 2>/dev/null || true
   server_pid=""
 }
-trap 'matrix_stop_server' EXIT INT TERM
+trap 'matrix_stop_server' EXIT
+trap 'matrix_stop_server; exit 124' INT TERM
 
 servers=()
 for want in ferrox xray-core sing-box; do
