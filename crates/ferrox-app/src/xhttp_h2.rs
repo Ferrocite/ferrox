@@ -1973,6 +1973,8 @@ enum Filled {
     Full,
     Idle,
     End,
+    /// One bounded read moved bytes but the buffer is not full; a lane hands the worker back.
+    Partial,
 }
 
 #[derive(Clone, Copy)]
@@ -2001,6 +2003,7 @@ struct Frames<R, W> {
     frame: (u8, u8, u32),
     phase: Phase,
     frag: Option<(u32, Vec<u8>, bool)>,
+    bounded: bool,
 }
 
 impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
@@ -2009,6 +2012,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
         write: W,
         decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
         until: Option<(std::time::Instant, Arc<std::sync::atomic::AtomicBool>)>,
+        bounded: bool,
     ) -> Self {
         let (until, opened) =
             until.map_or((None, None), |(until, opened)| (Some(until), Some(opened)));
@@ -2028,6 +2032,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
             frame: (0, 0, 0),
             phase: Phase::Magic,
             frag: None,
+            bounded,
         }
     }
 
@@ -2055,6 +2060,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
         buf: &mut [u8],
         have: &mut usize,
         block: bool,
+        bounded: bool,
     ) -> Filled {
         while *have < buf.len() {
             if Self::expired(until, opened) {
@@ -2062,7 +2068,13 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
             }
             match read.read(&mut buf[*have..]) {
                 Ok(0) => return Filled::End,
-                Ok(filled) => *have += filled,
+                Ok(filled) => {
+                    *have += filled;
+                    if bounded && !block && *have < buf.len() {
+                        // A lane's turn is one read: a peer that keeps the bytes coming cannot hold the worker.
+                        return Filled::Partial;
+                    }
+                }
                 Err(error) if crate::proxy::is_timeout(&error) => {
                     if !block {
                         return Filled::Idle;
@@ -2090,6 +2102,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                 &mut self.magic,
                 &mut self.magic_have,
                 block,
+                self.bounded,
             ),
             Phase::Head => Self::fill(
                 &mut self.read,
@@ -2098,6 +2111,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                 &mut self.head,
                 &mut self.head_have,
                 block,
+                self.bounded,
             ),
             Phase::Body => Self::fill(
                 &mut self.read,
@@ -2106,11 +2120,13 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
                 &mut self.body,
                 &mut self.body_have,
                 block,
+                self.bounded,
             ),
         };
         match filled {
             Filled::Idle => Stepped::Idle,
             Filled::End => self.end(),
+            Filled::Partial => Stepped::More,
             Filled::Full => self.advance(service),
         }
     }
@@ -2229,7 +2245,7 @@ pub(crate) fn serve_h2_service_until<
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
     until: Option<(std::time::Instant, Arc<std::sync::atomic::AtomicBool>)>,
 ) {
-    let mut frames = Frames::new(read, write, decryption, until);
+    let mut frames = Frames::new(read, write, decryption, until, false);
     while !matches!(frames.step(service, true), Stepped::Done) {}
 }
 
@@ -2246,7 +2262,7 @@ pub(crate) fn h2_lane<
     decryption: Option<Arc<ferrox_core::vless_encryption::Server>>,
     until: Option<(std::time::Instant, Arc<std::sync::atomic::AtomicBool>)>,
 ) -> impl FnMut() -> crate::proxy::lane_pool::Next + Send + 'static {
-    let mut frames = Frames::new(read, write, decryption, until);
+    let mut frames = Frames::new(read, write, decryption, until, true);
     move || match frames.step(&service, false) {
         Stepped::More => crate::proxy::lane_pool::Next::More,
         Stepped::Idle => crate::proxy::lane_pool::Next::Idle,
@@ -4945,5 +4961,32 @@ mod tests {
                 "only a stream still open is declared chunked"
             );
         }
+    }
+
+    #[test]
+    fn a_bounded_demux_turn_stops_at_one_read() {
+        struct Trickle(Arc<AtomicUsize>);
+        impl Read for Trickle {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = 0;
+                Ok(1)
+            }
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let settings = XhttpSettings::stream_one();
+        let mut frames = Frames::new(Trickle(Arc::clone(&reads)), NullWrite, None, None, true);
+        assert!(matches!(
+            frames.step(&test_service(&settings), false),
+            Stepped::More
+        ));
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "a lane turn must return after one read"
+        );
     }
 }
