@@ -54,7 +54,6 @@ env:
   NO_PROXY: 127.0.0.1,localhost
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: "0"
-  PSIPHON_REFERENCE_REV: 83aa73b9b982e7421e00117f5b0c5aceb5dda452
 
 jobs:
   psiphon-live:
@@ -95,7 +94,8 @@ jobs:
         run: cargo build --locked --release -p ferrox-app
       - name: Build the pinned console client
         run: |
-          test "$(git -C upstream/psiphon-tunnel-core rev-parse HEAD)" = "$PSIPHON_REFERENCE_REV"
+          rev=$(python3 -c 'import tomllib; print(tomllib.load(open("upstream/pins.toml", "rb"))["sources"]["psiphon-tunnel-core"]["rev"])')
+          test "$(git -C upstream/psiphon-tunnel-core rev-parse HEAD)" = "$rev"
           (
             cd upstream/psiphon-tunnel-core/ConsoleClient
             go build -mod=vendor -trimpath -o "$GITHUB_WORKSPACE/psiphon-reference" .

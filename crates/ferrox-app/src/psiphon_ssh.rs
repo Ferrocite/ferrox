@@ -5,8 +5,7 @@
 use crate::psiphon_webrtc::{Conduit, Relay, WebRtcStream};
 use ctr::cipher::{KeyIvInit, StreamCipher};
 use ferrox_core::tls::{ClientSession, Fingerprint, TlsConfig, TlsProvider as _};
-use ring::signature;
-use sha1::Sha1;
+use ring::{digest, hmac, signature};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
@@ -14,7 +13,7 @@ use std::io::{self, IoSlice, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, Weak};
 use std::time::{Duration, Instant};
 use x25519_dalek::{x25519, X25519_BASEPOINT_BYTES};
 
@@ -30,8 +29,9 @@ const CHANNEL_PACKET: u32 = 32 * 1024;
 /// Channel ids are 0-based, so 0 is a server's first channel; this is the only value
 /// that never names one.
 const NO_CHANNEL: u32 = u32::MAX;
-const WINDOW_ADJUST_AT: u64 = 1024 * 1024;
+const WINDOW_ADJUST_AT: u64 = 64 * 1024;
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
+const KEEPALIVE_PERIOD: Duration = Duration::from_secs(30);
 const MAX_IDENTIFICATION: usize = 1024;
 const CLIENT_CAPABILITIES: &str = "server-requests";
 /// One channel packet plus its header, padding and tag; a larger peer packet
@@ -540,6 +540,7 @@ impl Session {
         timeout: Duration,
         proxy: Option<&Proxy>,
         conduit: Option<&Conduit>,
+        keepalive: bool,
     ) -> Result<Self, String> {
         let (stream, mut relay, protocol, relay_protocol) =
             if let (Some(conduit), Some(destination)) = (conduit, server.inproxy.as_ref()) {
@@ -618,6 +619,16 @@ impl Session {
             .name("psiphon-ssh".to_owned())
             .spawn(move || read_loop(read_inner, input))
             .map_err(|error| format!("psiphon ssh reader: {error}"))?;
+        if keepalive {
+            let keepalive_inner = Arc::downgrade(&inner);
+            if let Err(error) = std::thread::Builder::new()
+                .name("psiphon-ssh-keepalive".to_owned())
+                .spawn(move || ssh_keepalive(&keepalive_inner))
+            {
+                inner.close();
+                return Err(format!("psiphon ssh keepalive: {error}"));
+            }
+        }
         Ok(Self { inner })
     }
 
@@ -706,6 +717,33 @@ impl Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.inner.close();
+    }
+}
+
+/// Refresh NAT and tunnel liveness without asking for a reply, the way OpenSSH clients do.
+fn ssh_keepalive(inner: &Weak<Inner>) {
+    loop {
+        std::thread::sleep(KEEPALIVE_PERIOD);
+        let Some(inner) = inner.upgrade() else {
+            return;
+        };
+        if inner.closed.load(Ordering::Acquire) {
+            return;
+        }
+        let mut request = Vec::with_capacity(64);
+        request.push(MSG_GLOBAL_REQUEST);
+        put_str(&mut request, b"keepalive@openssh.com");
+        request.push(0);
+        let padding = random_padding();
+        let mut bytes = vec![0u8; padding];
+        if getrandom::fill(&mut bytes).is_err() {
+            return;
+        }
+        request.extend_from_slice(&bytes);
+        if inner.send(&request).is_err() {
+            inner.close();
+            return;
+        }
     }
 }
 
@@ -1243,6 +1281,9 @@ fn direct_socket(
 /// other one can, without a socket read waiting on the peer.
 const TLS_POLL: Duration = Duration::from_millis(1);
 const TLS_BUFFER: usize = 64 * 1024;
+/// Decrypted bytes moved before the upload side is polled once, so a full download
+/// does not pay the peer poll per TLS record while an interactive write still lands.
+const TLS_DRAIN: usize = 1024 * 1024;
 
 /// Wrap a stream in TLS and expose the decrypted bytes as a loopback TCP socket, so the SSH
 /// framing below keeps one transport shape. The reference dials TLS-OSSH this way and then adds
@@ -1300,9 +1341,25 @@ fn relay_tls(mut tls: ClientSession<Stream>, mut peer: TcpStream) -> io::Result<
     tls.get_ref().set_read_timeout(Some(TLS_POLL))?;
     peer.set_read_timeout(Some(TLS_POLL))?;
     peer.set_write_timeout(Some(IO_TIMEOUT))?;
+    peer.set_nodelay(true)?;
     let mut up = vec![0u8; TLS_BUFFER];
     let mut down = vec![0u8; TLS_BUFFER];
     loop {
+        // One peer poll per record capped a download at the poll interval; a bounded burst keeps upload responsive.
+        let mut moved = 0usize;
+        while moved < TLS_DRAIN {
+            match tls.read(&mut down) {
+                Ok(0) => return Ok(()),
+                Ok(read) => {
+                    if peer.write_all(&down[..read]).is_err() {
+                        return Ok(());
+                    }
+                    moved += read;
+                }
+                Err(error) if idle(&error) => break,
+                Err(_) => return Ok(()),
+            }
+        }
         match peer.read(&mut up) {
             Ok(0) => break,
             Ok(read) => {
@@ -1311,16 +1368,6 @@ fn relay_tls(mut tls: ClientSession<Stream>, mut peer: TcpStream) -> io::Result<
                     .and_then(|()| tls.flush())
                     .is_err()
                 {
-                    break;
-                }
-            }
-            Err(error) if idle(&error) => {}
-            Err(_) => break,
-        }
-        match tls.read(&mut down) {
-            Ok(0) => break,
-            Ok(read) => {
-                if peer.write_all(&down[..read]).is_err() {
                     break;
                 }
             }
@@ -1394,18 +1441,16 @@ pub(crate) fn random<const N: usize>() -> [u8; N] {
 }
 
 pub(crate) fn derive_key(seed: &[u8], keyword: &[u8], iv: &[u8]) -> [u8; KEY_LENGTH] {
-    let mut hasher = Sha1::new();
+    let mut hasher = digest::Context::new(&digest::SHA1_FOR_LEGACY_USE_ONLY);
     hasher.update(seed);
     hasher.update(keyword);
     hasher.update(iv);
-    let mut digest = hasher.finalize();
+    let mut digest = hasher.finish();
     for _ in 0..HASH_ITERATIONS {
-        let mut hasher = Sha1::new();
-        hasher.update(digest);
-        digest = hasher.finalize();
+        digest = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, digest.as_ref());
     }
     let mut key = [0u8; KEY_LENGTH];
-    key.copy_from_slice(&digest[..KEY_LENGTH]);
+    key.copy_from_slice(&digest.as_ref()[..KEY_LENGTH]);
     key
 }
 
@@ -1780,31 +1825,16 @@ impl PacketReader {
 
 #[derive(Clone)]
 struct HmacKey {
-    inner: Sha256,
-    outer: Sha256,
+    context: hmac::Context,
 }
 
 impl HmacKey {
-    /// Build the inner and outer SHA-256 states for one key.
+    /// Capture the keyed inner and outer SHA-256 states once; each tag clones them.
     fn new(key: &[u8]) -> Self {
-        let mut block = [0u8; 64];
-        if key.len() > 64 {
-            let digest = Sha256::digest(key);
-            block[..digest.len()].copy_from_slice(&digest);
-        } else {
-            block[..key.len()].copy_from_slice(key);
+        let key = hmac::Key::new(hmac::HMAC_SHA256, key);
+        Self {
+            context: hmac::Context::with_key(&key),
         }
-        let mut inner = Sha256::new();
-        let mut outer = Sha256::new();
-        let mut ipad = [0x36u8; 64];
-        let mut opad = [0x5cu8; 64];
-        for index in 0..64 {
-            ipad[index] ^= block[index];
-            opad[index] ^= block[index];
-        }
-        inner.update(ipad);
-        outer.update(opad);
-        Self { inner, outer }
     }
 
     fn tag(&self, sequence: u32, bytes: &[u8]) -> [u8; 32] {
@@ -1812,26 +1842,26 @@ impl HmacKey {
     }
 
     fn tag_parts(&self, sequence: u32, parts: &[&[u8]]) -> [u8; 32] {
-        let mut inner = self.inner.clone();
-        inner.update(sequence.to_be_bytes());
+        let mut context = self.context.clone();
+        context.update(&sequence.to_be_bytes());
         for part in parts {
-            inner.update(part);
+            context.update(part);
         }
-        self.finish(inner)
+        tag_bytes(context.sign())
     }
 
     #[cfg(test)]
     fn mac(&self, bytes: &[u8]) -> [u8; 32] {
-        let mut inner = self.inner.clone();
-        inner.update(bytes);
-        self.finish(inner)
+        let mut context = self.context.clone();
+        context.update(bytes);
+        tag_bytes(context.sign())
     }
+}
 
-    fn finish(&self, inner: Sha256) -> [u8; 32] {
-        let mut outer = self.outer.clone();
-        outer.update(inner.finalize());
-        outer.finalize().into()
-    }
+fn tag_bytes(tag: hmac::Tag) -> [u8; 32] {
+    let mut bytes = [0u8; 32];
+    bytes.copy_from_slice(tag.as_ref());
+    bytes
 }
 
 fn write_vectored_all(io: &mut Stream, mut slices: &mut [IoSlice<'_>]) -> io::Result<()> {
@@ -2740,8 +2770,13 @@ mod tests {
     #[test]
     fn obfuscation_key_is_sha1_repeated_then_truncated() {
         let key = derive_key(&[0u8; 16], b"key", b"client_to_server");
-        assert_eq!(key.len(), 16);
-        assert_ne!(key, [0u8; 16]);
+        assert_eq!(
+            key,
+            [
+                0x6f, 0xf2, 0x58, 0x8d, 0x20, 0x4c, 0x2a, 0x36, 0x59, 0x69, 0x29, 0x53, 0x23, 0x6a,
+                0xdc, 0x4f
+            ]
+        );
     }
 
     #[test]
