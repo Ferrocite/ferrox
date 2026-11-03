@@ -22,7 +22,8 @@ pub(crate) fn defaults() -> Xmux {
 }
 
 /// What identifies one manager: the destination and transport settings the reference keys its
-/// `globalDialerMap` on (`dialer.go:63`), plus the TLS identity a pooled connection authenticated.
+/// `globalDialerMap` on (`dialer.go:63`), plus the TLS identity a pooled connection authenticated
+/// and the key-log sink a new connection would write to.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub(crate) struct Key {
     pub(crate) server: SocketAddr,
@@ -31,6 +32,7 @@ pub(crate) struct Key {
     pub(crate) query: String,
     pub(crate) h2: bool,
     pub(crate) identity: (String, [u8; 32], [u8; 8], String),
+    pub(crate) key_log: Option<String>,
 }
 
 pub(crate) struct Manager {
@@ -268,6 +270,7 @@ mod tests {
                 [2; 8],
                 "chrome".to_owned(),
             ),
+            key_log: None,
         };
         let one = Xmux {
             max_connections: (1, 1),

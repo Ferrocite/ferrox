@@ -15970,6 +15970,7 @@ fn reality_xmux(
             reality.short_id,
             reality.fingerprint.clone(),
         ),
+        key_log: reality.key_log.as_ref().map(|log| log.path().to_owned()),
     };
     crate::xmux::manager(key, settings.xmux)
 }
@@ -42077,6 +42078,52 @@ mod tests {
             fingerprint: "chrome".to_owned(),
             key_log: None,
         })
+    }
+
+    /// The key-log sink is part of a pooled connection's identity: a second outbound naming another
+    /// `masterKeyLog` must not reuse a connection whose secrets went to the first file.
+    #[test]
+    fn a_reality_pool_partitions_by_its_key_log_sink() {
+        let server = SocketAddr::from(([127, 0, 0, 1], 443));
+        let vless = header_test_outbound();
+        let settings = xhttp_settings("/keylog");
+        let base = trojan_reality_client();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("the clock")
+            .as_nanos();
+        let first_path = std::env::temp_dir().join(format!(
+            "ferrox-reality-pool-first-{}-{stamp}.log",
+            std::process::id()
+        ));
+        let second_path = std::env::temp_dir().join(format!(
+            "ferrox-reality-pool-second-{}-{stamp}.log",
+            std::process::id()
+        ));
+        let mut first = (*base).clone();
+        first.key_log = Some(Arc::new(
+            ferrox_core::tls::MasterKeyLog::open(first_path.to_string_lossy().as_ref())
+                .expect("opens"),
+        ));
+        let mut second = (*base).clone();
+        second.key_log = Some(Arc::new(
+            ferrox_core::tls::MasterKeyLog::open(second_path.to_string_lossy().as_ref())
+                .expect("opens"),
+        ));
+        let first = Arc::new(first);
+        let second = Arc::new(second);
+        let first_pool = reality_xmux(&server, &vless, &first, &settings);
+        let second_pool = reality_xmux(&server, &vless, &second, &settings);
+        let first_again = reality_xmux(&server, &vless, &first, &settings);
+        drop(first);
+        drop(second);
+        let _ = std::fs::remove_file(&first_path);
+        let _ = std::fs::remove_file(&second_path);
+        assert!(
+            !Arc::ptr_eq(&first_pool, &second_pool),
+            "two key-log sinks shared one pooled connection"
+        );
+        assert!(Arc::ptr_eq(&first_pool, &first_again));
     }
 
     /// A trojan listener that declares reality without an identity is refused by name: serving it as plaintext would be a silent downgrade.
