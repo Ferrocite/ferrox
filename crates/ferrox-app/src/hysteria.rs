@@ -509,17 +509,7 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
         return None;
     };
     let obfs = hysteria::Salamander::new(&dial.config.obfs_password);
-    // A dial that both hops the port and geckos the framing is refused rather than quietly built with one of the two, since neither alone carries the other's bytes.
-    if dial.config.gecko.is_some()
-        && dial
-            .config
-            .hop
-            .as_ref()
-            .is_some_and(|hop| !hop.ranges.is_empty())
-    {
-        return None;
-    }
-    // A hop plan rotates the server port over a fresh socket per stay; salamander still seals each datagram, so only the destination and socket move, never a frame above.
+    // A hop plan rotates the server port over a fresh socket per stay; salamander still seals each datagram, so only the destination and socket move, never a frame above. A gecko plan fragments and pads before the hop writes, so both ride one dial.
     let sock = match dial
         .config
         .hop
@@ -532,15 +522,29 @@ pub(crate) fn connect(dial: &Dial) -> Option<Session> {
             } else {
                 "0.0.0.0:0"
             };
-            crate::quic::Datagram::hopped(
-                peer,
-                hop.ports(),
-                hop.interval_ms,
-                bind,
-                &sock,
-                obfs.map(crate::quic::Mask::Salamander),
-            )
-            .ok()?
+            match (obfs, dial.config.gecko) {
+                (Some(obfs), Some(window)) => crate::quic::Datagram::gecked_hopped(
+                    peer,
+                    hop.ports(),
+                    hop.interval_ms,
+                    bind,
+                    &sock,
+                    obfs,
+                    window,
+                )
+                .ok()?,
+                (obfs, None) => crate::quic::Datagram::hopped(
+                    peer,
+                    hop.ports(),
+                    hop.interval_ms,
+                    bind,
+                    &sock,
+                    obfs.map(crate::quic::Mask::Salamander),
+                )
+                .ok()?,
+                // Gecko is parsed only with a salamander password it can mask with, so this arm is unreachable from a config.
+                (None, Some(_)) => return None,
+            }
         }
         None => match (obfs, dial.config.gecko) {
             // A gecko dial fragments and pads its long-header packets, salamander still sealing each frame; a password too short to mask with is refused at parse, never here.
