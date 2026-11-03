@@ -15970,7 +15970,7 @@ fn reality_xmux(
             reality.short_id,
             reality.fingerprint.clone(),
         ),
-        key_log: reality.key_log.as_ref().map(|log| log.path().to_owned()),
+        log_sink: reality.key_log.as_ref().map(|log| log.path().to_owned()),
     };
     crate::xmux::manager(key, settings.xmux)
 }

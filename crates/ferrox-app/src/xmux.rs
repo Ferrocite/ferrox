@@ -32,7 +32,7 @@ pub(crate) struct Key {
     pub(crate) query: String,
     pub(crate) h2: bool,
     pub(crate) identity: (String, [u8; 32], [u8; 8], String),
-    pub(crate) key_log: Option<String>,
+    pub(crate) log_sink: Option<String>,
 }
 
 pub(crate) struct Manager {
@@ -270,7 +270,7 @@ mod tests {
                 [2; 8],
                 "chrome".to_owned(),
             ),
-            key_log: None,
+            log_sink: None,
         };
         let one = Xmux {
             max_connections: (1, 1),
