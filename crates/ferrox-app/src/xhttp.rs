@@ -968,7 +968,7 @@ pub(crate) enum PadMethod {
 
 /// The `xmux` bounds (`transport_method.go:299`): the reference grows an H2 connection pool from them,
 /// and `xmux::Manager` steers the REALITY stream-one pool by the same six fields.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub(crate) struct Xmux {
     pub max_concurrency: (i32, i32),
     pub max_connections: (i32, i32),
