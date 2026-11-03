@@ -20680,11 +20680,12 @@ fn serve_udp_lane_with(
 /// framed back to the client that sent the datagram.
 fn serve_socks_udp_portal(relay: &UdpSocket, portal: &crate::reverse::Portal) {
     struct Lane {
-        dest: SocketAddr,
         session: Arc<crate::reverse::Session>,
         id: u16,
     }
-    let mut lanes: Vec<Lane> = Vec::new();
+    // The map answers a datagram's key in one probe; `order` keeps insertion order for the teardown ends.
+    let mut lanes: HashMap<SocketAddr, Lane> = HashMap::new();
+    let mut order: Vec<SocketAddr> = Vec::new();
     let mut buf = udp_buffer();
     while let Ok((n, src)) = relay.recv_from(&mut buf) {
         let Some((dest, payload)) = parse_socks_udp(&buf[..n]) else {
@@ -20693,57 +20694,62 @@ fn serve_socks_udp_portal(relay: &UdpSocket, portal: &crate::reverse::Portal) {
         if payload.is_empty() {
             continue;
         }
-        if !lanes.iter().any(|lane| lane.dest == dest) {
-            let Some(session) = portal.pick() else {
-                eprintln!(
-                    "reverse: portal `{}` has no live session, so the datagram is dropped",
-                    portal.tag()
-                );
-                continue;
-            };
-            let target = ferrox_core::mux::Target {
-                network: ferrox_core::mux::Network::Udp,
-                port: dest.port(),
-                addr: match dest.ip() {
-                    std::net::IpAddr::V4(ip) => ferrox_core::addr::Addr::V4(ip.octets()),
-                    std::net::IpAddr::V6(ip) => ferrox_core::addr::Addr::V6(ip.octets()),
-                },
-            };
-            let Some((id, flow)) = session.open(target, ferrox_core::mux::DEFAULT_CAP as u32)
-            else {
-                continue;
-            };
-            let Ok(output) = relay.try_clone() else {
-                session.end(id);
-                continue;
-            };
-            let replies = session.clone();
-            let client_addr = src;
-            thread::spawn(move || {
-                let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
-                while let Ok((data, from)) = flow.down.recv() {
-                    // The header names the sender the bridge saw, so the datagram reads as coming from the address that answered.
-                    let frame = socks_udp_frame(&mut frame, None, &from.unwrap_or(dest), &data);
-                    if output.send_to(frame, client_addr).is_err() {
-                        break;
-                    }
+        let sent = {
+            let lane = match lanes.entry(dest) {
+                std::collections::hash_map::Entry::Occupied(lane) => lane.into_mut(),
+                std::collections::hash_map::Entry::Vacant(lane) => {
+                    let Some(session) = portal.pick() else {
+                        eprintln!(
+                            "reverse: portal `{}` has no live session, so the datagram is dropped",
+                            portal.tag()
+                        );
+                        continue;
+                    };
+                    let target = ferrox_core::mux::Target {
+                        network: ferrox_core::mux::Network::Udp,
+                        port: dest.port(),
+                        addr: match dest.ip() {
+                            std::net::IpAddr::V4(ip) => ferrox_core::addr::Addr::V4(ip.octets()),
+                            std::net::IpAddr::V6(ip) => ferrox_core::addr::Addr::V6(ip.octets()),
+                        },
+                    };
+                    let opened = session.open(target, ferrox_core::mux::DEFAULT_CAP as u32);
+                    let Some((id, flow)) = opened else {
+                        continue;
+                    };
+                    let Ok(output) = relay.try_clone() else {
+                        session.end(id);
+                        continue;
+                    };
+                    let replies = session.clone();
+                    let client_addr = src;
+                    thread::spawn(move || {
+                        let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+                        while let Ok((data, from)) = flow.down.recv() {
+                            // The header names the sender the bridge saw, so the datagram reads as coming from the address that answered.
+                            let sender = from.unwrap_or(dest);
+                            let frame = socks_udp_frame(&mut frame, None, &sender, &data);
+                            if output.send_to(frame, client_addr).is_err() {
+                                break;
+                            }
+                        }
+                        replies.end(id);
+                    });
+                    order.push(dest);
+                    lane.insert(Lane { session, id })
                 }
-                replies.end(id);
-            });
-            lanes.push(Lane { dest, session, id });
-        }
-        let Some(lane) = lanes.iter().find(|lane| lane.dest == dest) else {
-            continue;
+            };
+            lane.session.send(lane.id, payload)
         };
-        if !lane.session.send(lane.id, payload) {
-            let session = Arc::clone(&lane.session);
-            let id = lane.id;
-            session.end(id);
-            lanes.retain(|lane| lane.id != id);
+        if let Some(lane) = (!sent).then(|| lanes.remove(&dest)).flatten() {
+            lane.session.end(lane.id);
+            order.retain(|known| *known != dest);
         }
     }
-    for lane in lanes {
-        lane.session.end(lane.id);
+    for dest in order {
+        if let Some(lane) = lanes.get(&dest) {
+            lane.session.end(lane.id);
+        }
     }
 }
 
@@ -63428,6 +63434,79 @@ mod reverse_tests {
     fn a_sixteen_kib_downlink_is_echoed_whole() {
         let payload = vec![0x5a; 16 * 1024];
         portal_echo(&payload);
+    }
+
+    /// The scan and the lookup both allocate nothing, so the allocator cannot see this; the gate is
+    /// the session's own flow count: a repeated destination must reuse its lane, not add one.
+    #[test]
+    fn a_portal_datagram_finds_its_lane_without_scanning() {
+        let exchanges: [(usize, &[u8], &[u8]); 4] = [
+            (0, b"one", b"one"),
+            (1, b"two", b"two"),
+            (2, b"three", b"three"),
+            (0, b"again", b"again"),
+        ];
+        let dests: Vec<SocketAddr> = (0..3)
+            .map(|_| {
+                let echo = UdpSocket::bind("127.0.0.1:0").expect("echo bind");
+                echo.set_read_timeout(Some(Duration::from_secs(5))).expect("echo timeout");
+                let dest = echo.local_addr().expect("echo addr");
+                thread::spawn(move || {
+                    let mut buf = [0u8; 512];
+                    while let Ok((n, from)) = echo.recv_from(&mut buf) {
+                        if echo.send_to(&buf[..n], from).is_err() {
+                            return;
+                        }
+                    }
+                });
+                dest
+            })
+            .collect();
+
+        let (mut bridge_side, mut portal_side) = crate::reverse::loopback_pair().expect("pair");
+        portal_side.write_all(&[0, 0]).expect("portal reply");
+        let mut ack = [0u8; 2];
+        bridge_side.read_exact(&mut ack).expect("portal reply");
+        let portal_tunnel = crate::reverse::Tunnel::from_connection(&portal_side).expect("tunnel");
+
+        let worker = crate::reverse::WorkerState::new();
+        let wire =
+            MuxWire::Tunnel(crate::reverse::Tunnel::from_connection(&bridge_side).expect("tunnel"));
+        let dial: MuxDial = Arc::new(|_| None);
+        let udp: MuxUdpOk = Arc::new(|_| true);
+        thread::spawn(move || serve_mux_wire(&wire, &dial, &udp, Some(&worker), &[]));
+
+        let portal = crate::reverse::Portal::new("portal");
+        let session = portal.attach(portal_tunnel).expect("session");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.active_connections() == 0 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(session.active_connections(), 1, "the portal control flow did not open");
+
+        let relay = UdpSocket::bind("127.0.0.1:0").expect("relay");
+        let relay_addr = relay.local_addr().expect("relay addr");
+        let served = Arc::clone(&portal);
+        thread::spawn(move || serve_socks_udp_portal(&relay, &served));
+
+        let client = UdpSocket::bind("127.0.0.1:0").expect("client");
+        client.set_read_timeout(Some(Duration::from_secs(10))).expect("client timeout");
+        let mut frame = Vec::with_capacity(HEAD + UDP_BUF);
+        let mut buf = [0u8; 512];
+        for (known, payload, want) in exchanges {
+            let dest = dests[known];
+            let framed = socks_udp_frame(&mut frame, None, &dest, payload);
+            client.send_to(framed, relay_addr).expect("send");
+            let (n, _) = client.recv_from(&mut buf).expect("reply");
+            let (from, replied) = parse_socks_udp(&buf[..n]).expect("frame");
+            assert_eq!(from, dest, "the reply named another destination");
+            assert_eq!(replied, want, "the reply did not come back for its destination");
+        }
+        assert_eq!(
+            session.active_connections(),
+            4,
+            "the repeated destination opened a second flow instead of reusing its lane"
+        );
     }
 }
 
