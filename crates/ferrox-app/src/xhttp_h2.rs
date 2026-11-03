@@ -1049,6 +1049,36 @@ impl H2Conn {
         }
     }
 
+    /// Connection credit for bytes discarded on an abandoned stream: the shared window must rise or
+    /// the peer's later uploads on other streams stall, while the abandoned stream's own window
+    /// stays spent so its upload cannot grow.
+    fn replenish_connection(&self, n: usize) -> bool {
+        if n == 0 || n > u32::MAX as usize {
+            return true;
+        }
+        let mut out = CREDIT_TEMPLATE;
+        out[9..13].copy_from_slice(&(n as u32).to_be_bytes());
+        match &self.control {
+            Control::Inline => {
+                let Ok(mut write) = self.write.lock() else {
+                    return false;
+                };
+                if !write.write_slices(&[&out[..13]]) {
+                    self.dead.store(true, Ordering::SeqCst);
+                    return false;
+                }
+                true
+            }
+            Control::Threaded(_) => {
+                if !self.control.send(13, out) {
+                    self.dead.store(true, Ordering::SeqCst);
+                    return false;
+                }
+                true
+            }
+        }
+    }
+
     /// The client's request body ends on its own stream while the response keeps reading: an RST
     /// here would discard the answer the peer has not written yet.
     fn finish_stream(&self, stream: u32) {
@@ -2493,6 +2523,9 @@ fn pump_frame(
                 (finished, abandoned)
             };
             if abandoned {
+                if !conn.replenish_connection(wire_len) {
+                    return false;
+                }
                 if flags & F_END != 0 {
                     conn.retire(sid);
                 }
@@ -3797,8 +3830,9 @@ mod tests {
         parked.join().expect("the reader returns");
     }
 
-    /// The reader leaving at a finished response must stop the queue and the credit with it: the
-    /// stream stays open in the client's eyes, so what it sends after that is bounded by the window.
+    /// The reader leaving at a finished response must stop the queue and the stream's credit with
+    /// it: the stream stays open in the client's eyes, so what it sends after that is bounded by
+    /// the stream window, while the shared connection window keeps flowing for every other stream.
     #[test]
     fn a_data_after_the_upload_reader_left_is_dropped_and_uncredited() {
         let (conn, written, slices) = bare_conn();
@@ -3847,17 +3881,35 @@ mod tests {
                 "no chunk is queued for a reader that left"
             );
         }
+        let out = written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
         assert_eq!(
             slices.load(Ordering::SeqCst),
-            0,
-            "no credit for dropped data"
+            3,
+            "each dropped frame returns the connection's credit"
         );
-        assert!(
-            written
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .is_empty(),
-            "the dropped data writes nothing"
+        let (frames, _) = out.as_chunks::<13>();
+        let connection: Vec<u32> = frames
+            .iter()
+            .map(|frame| {
+                assert_eq!(
+                    frame[3], T_WINDOW,
+                    "only a window update answers a dropped frame"
+                );
+                assert_eq!(
+                    u32::from_be_bytes([frame[5], frame[6], frame[7], frame[8]]),
+                    0,
+                    "the stream's own window stays spent"
+                );
+                u32::from_be_bytes([frame[9], frame[10], frame[11], frame[12]])
+            })
+            .collect();
+        assert_eq!(
+            connection,
+            vec![16, 16, 16],
+            "the shared window rises by every dropped frame"
         );
         assert!(pump_frame(
             &conn,
@@ -4515,6 +4567,69 @@ mod tests {
             !pump_frame(&conn, &Silent, T_SETTINGS, 0, 0, Vec::new(), &mut frag),
             "a SETTINGS whose ACK cannot be sent ends the read loop"
         );
+    }
+
+    /// DATA the demux discards for an abandoned request still spends the shared receive window:
+    /// the connection credit must come back or later uploads on other streams stall, while the
+    /// stream's own window stays spent so the abandoned upload cannot grow.
+    #[test]
+    fn a_discarded_frame_returns_the_connection_window() {
+        let (conn, written, _slices) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                finished: true,
+                request_ended: false,
+                abandoned: true,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(65_535),
+            responded: AtomicBool::new(true),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+        written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+        let mut frag = None;
+        assert!(pump_frame(
+            &conn,
+            &test_service(&test_settings("stream-up")),
+            T_DATA,
+            0,
+            1,
+            vec![0u8; 5],
+            &mut frag
+        ));
+        let out = written
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let updates = |stream: u32| {
+            out.windows(13)
+                .filter(|frame| {
+                    frame[3] == T_WINDOW
+                        && u32::from_be_bytes([frame[5], frame[6], frame[7], frame[8]]) == stream
+                })
+                .map(|frame| u32::from_be_bytes([frame[9], frame[10], frame[11], frame[12]]))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            updates(0),
+            vec![5],
+            "the shared window rises by the bytes the demux discarded"
+        );
+        assert!(
+            updates(1).is_empty(),
+            "the abandoned stream keeps its own window spent"
+        );
+        let st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
+        assert!(st.body.is_empty(), "an abandoned request queues nothing");
     }
 
     /// A connection with one stream and all the credit it needs: the frame writer is the only
