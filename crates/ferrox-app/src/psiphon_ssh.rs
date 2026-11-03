@@ -169,6 +169,7 @@ pub(crate) struct Server {
     pub(crate) password: String,
     pub(crate) host_key: Vec<u8>,
     pub(crate) obfuscation_key: Option<String>,
+    pub(crate) tls_obfuscation_key: Option<String>,
     pub(crate) meek_obfuscated_key: Option<String>,
     pub(crate) region: Option<String>,
     pub(crate) direct: bool,

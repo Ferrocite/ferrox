@@ -2291,10 +2291,13 @@ fn load_source_entries(
                     && !shape.plain
                     && !shape.obfuscated
                     && server.tls_port.is_some()
-                    && server.obfuscation_key.is_some()
+                    && (server.obfuscation_key.is_some() || server.tls_obfuscation_key.is_some())
                 {
                     server.tls = true;
                     server.port = server.tls_port.unwrap_or(server.port);
+                    if server.obfuscation_key.is_none() {
+                        server.obfuscation_key = server.tls_obfuscation_key.take();
+                    }
                 }
                 if !named_meek && server.direct {
                     server.meek = None;
@@ -2840,10 +2843,14 @@ fn add_tls_variants(servers: &mut Vec<Server>) {
             !server.tls
                 && server.direct
                 && server.tls_port.is_some()
-                && server.obfuscation_key.is_some()
+                && (server.obfuscation_key.is_some() || server.tls_obfuscation_key.is_some())
         })
         .map(|server| {
             let mut variant = server.clone();
+            if variant.obfuscation_key.is_none() {
+                variant.obfuscation_key = variant.tls_obfuscation_key.clone();
+            }
+            variant.tls_obfuscation_key = None;
             variant.tls = true;
             variant.port = variant.tls_port.unwrap_or(variant.port);
             variant.meek = None;
@@ -2998,6 +3005,7 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
         ssh: ssh_port,
         tls: tls_port,
     } = entry_ports(&entry);
+    let tls_obfuscation_key = obfuscated_key.clone();
     let protocol = meek_protocol(&entry);
     let tactics_capable = tactics_capability(&entry);
     let direct = obfuscated_port.is_some()
@@ -3028,6 +3036,11 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
         _ if include_inproxy && inproxy.is_some() => (inproxy_port, obfuscated_key, false),
         _ => return None,
     };
+    let tls_obfuscation_key = if tls_port.is_some() && obfuscation_key.is_none() {
+        tls_obfuscation_key
+    } else {
+        None
+    };
     let region = entry
         .get("region")
         .and_then(Json::as_str)
@@ -3057,6 +3070,7 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
         password,
         host_key,
         obfuscation_key,
+        tls_obfuscation_key,
         meek_obfuscated_key,
         region,
         direct,
@@ -4011,6 +4025,21 @@ mod tests {
     }
 
     #[test]
+    fn a_plain_ssh_entry_keeps_its_key_for_the_tls_variant() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshObfuscatedKey":"k","sshHostKey":"AAAA","tlsOSSHPort":8443,"capabilities":["SSH","TLS-OSSH"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("entry");
+        assert_eq!(server.port, 22);
+        assert!(!server.tls);
+        assert!(!server.obfuscated());
+        let selected = select_protocols(vec![server], &["TLS-OSSH".to_owned()], &[], 0, false);
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].tls);
+        assert_eq!(selected[0].port, 8443);
+        assert!(selected[0].obfuscated());
+    }
+
+    #[test]
     fn an_inproxy_tls_destination_keeps_its_own_port() {
         let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","sshObfuscatedKey":"k","capabilities":["INPROXY-WEBRTC-TLS-OSSH"],"inproxyTlsOSSHPort":8443,"signature":"AA=="}"#;
         let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
@@ -4625,6 +4654,7 @@ mod tests {
             password: String::new(),
             host_key: Vec::new(),
             obfuscation_key: obfuscated.then(|| "k".to_owned()),
+            tls_obfuscation_key: None,
             meek_obfuscated_key: None,
             region: None,
             direct: true,
@@ -5305,6 +5335,7 @@ mod tests {
                 password: String::new(),
                 host_key: Vec::new(),
                 obfuscation_key: None,
+                tls_obfuscation_key: None,
                 meek_obfuscated_key: None,
                 region: None,
                 direct: true,
@@ -5347,6 +5378,7 @@ mod tests {
                 password: String::new(),
                 host_key: Vec::new(),
                 obfuscation_key: None,
+                tls_obfuscation_key: None,
                 meek_obfuscated_key: None,
                 region: None,
                 direct: true,
