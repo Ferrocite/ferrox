@@ -25732,6 +25732,26 @@ pub(crate) mod lane_pool {
             release_tx.send(()).expect("releases");
         }
 
+        /// A muxed stream's setup reads the request from the connection its caller demuxes, so a
+        /// setup lane the pool cannot take must be refused to the caller, never run on it.
+        #[test]
+        fn a_setup_lane_without_a_worker_stays_off_the_caller() {
+            let pool = TestPool(spawn_pool_with(0, None));
+            let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let ran_lane = Arc::clone(&ran);
+            let refused = submit_to_with(
+                &pool,
+                Box::new(move || {
+                    ran_lane.store(true, Ordering::SeqCst);
+                    Next::Done
+                }),
+                Box::new(|| {}),
+                false,
+            );
+            assert!(refused.is_err(), "a setup lane with no worker ran on its caller");
+            assert!(!ran.load(Ordering::SeqCst), "the setup body ran on the caller");
+        }
+
         /// A relay lane is the other shape: the framed reader hands its timeout back to the step.
         #[test]
         fn a_relay_lane_claims_the_relay_step() {
