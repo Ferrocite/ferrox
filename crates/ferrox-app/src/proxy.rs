@@ -23048,16 +23048,8 @@ pub(crate) fn relay_handoff(client: &Connection, target: &Connection) {
     let Ok(client_write) = client.try_clone() else {
         return;
     };
-    if !target_write.masked()
-        && !client_write.masked()
-        && !client_read.metered()
-        && !target_read.metered()
-        && poll_available()
-    {
-        let _ends = poll_handoff(client_read, target_write, target_read, client_write);
-        return;
-    }
-    // A masked or metered flow rides the lane pool the UDP association already uses.
+    // Every accepted flow rides the lane pool: a readiness worker beside it would add one thread
+    // per flow before the first UDP lane has started.
     relay_lanes(client_read, target_write, target_read, client_write);
 }
 
@@ -23220,17 +23212,17 @@ impl TcpCopy {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn poll_available() -> bool {
     poll_relay::available()
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(test, not(target_os = "linux")))]
 fn poll_available() -> bool {
     poll_copy::available()
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn poll_handoff(
     client_read: Connection,
     target_write: Connection,
@@ -23240,7 +23232,7 @@ fn poll_handoff(
     poll_relay::handoff(client_read, target_write, target_read, client_write)
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(test, not(target_os = "linux")))]
 fn poll_handoff(
     client_read: Connection,
     target_write: Connection,
@@ -24368,12 +24360,13 @@ pub(crate) mod lane_pool {
     /// The widest standard cell (eight connections) queues one download read per flow, and every
     /// one of them must sit in its read at once: a lane without a worker is a flow the peer's
     /// window cannot refill. This is the ceiling, not the shape: a worker starts when a lane is
-    /// queued and no worker is idle, so a one-flow cell holds two lanes.
-    pub(crate) const RELAY_LANES: usize = 8;
+    /// queued and no worker is idle, so a one-flow cell holds two lanes. Seven leaves room for the
+    /// accept path and the parking reaper under the reference's ten-thread server peak.
+    pub(crate) const RELAY_LANES: usize = 7;
 
     /// Setup lanes are separate from relay lanes so a handshake parked in a read cannot take a
-    /// relay worker with it. Two keep the setup peak under the reference's server threads.
-    pub(crate) const SETUP_LANES: usize = 2;
+    /// relay worker with it. One keeps the setup peak under the reference's server threads.
+    pub(crate) const SETUP_LANES: usize = 1;
 
     /// Accepted work past the setup workers waits in this queue; past it the handshake runs on its
     /// own thread, so a burst is slower, not refused.
@@ -26348,13 +26341,13 @@ fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 struct SplicePipe {
     fds: [libc::c_int; 2],
     capacity: libc::size_t,
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 impl SplicePipe {
     fn new() -> Option<Self> {
         let mut fds = [-1; 2];
@@ -26375,14 +26368,14 @@ impl SplicePipe {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 const SPLICE_PIPE_BYTES: usize = DEFAULT_SPLICE_PIPE_BYTES;
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 const DEFAULT_SPLICE_PIPE_BYTES: usize = 256 * 1024;
 
 /// The pipe's size, asked once: the environment is read at startup, and a relay that read it per pipe paid an environment lookup and a `String` for every connection it carried.
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn splice_pipe_bytes() -> libc::c_int {
     static ASKED: OnceLock<libc::c_int> = OnceLock::new();
     *ASKED.get_or_init(|| {
@@ -26395,7 +26388,7 @@ fn splice_pipe_bytes() -> libc::c_int {
     })
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 impl Drop for SplicePipe {
     fn drop(&mut self) {
         unsafe {
@@ -60696,6 +60689,7 @@ end
 /// cannot cross a pipe. A leg parks in `poll`, not in `read`, so the thread a flow costs is the
 /// worker that has work, not one per direction.
 #[cfg(not(target_os = "linux"))]
+#[cfg(test)]
 mod poll_copy {
     use super::{Connection, RelayBuf, RelayEnd, Shutdown};
     use std::io::{self, Read, Write};
@@ -61227,6 +61221,7 @@ mod poll_copy {
 }
 
 #[cfg(target_os = "linux")]
+#[cfg(test)]
 mod poll_relay {
     use super::{Connection, Shutdown, SplicePipe};
     use std::os::fd::AsRawFd;

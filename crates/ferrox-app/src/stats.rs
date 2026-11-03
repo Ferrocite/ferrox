@@ -88,6 +88,7 @@ impl Meter {
     }
 
     /// Whether this meter observes bytes, which is what forbids a descriptor-level fast path.
+    #[cfg(test)]
     pub(crate) fn counts(&self) -> bool {
         !self.read.is_empty() || !self.write.is_empty()
     }
