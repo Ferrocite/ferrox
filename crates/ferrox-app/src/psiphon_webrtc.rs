@@ -30,6 +30,7 @@ const STREAM_MESSAGE: usize = 16 * 1024;
 pub(crate) struct WebRtc {
     rtc: Rtc,
     socket: UdpSocket,
+    local: SocketAddr,
     pending: Option<SdpPendingOffer>,
     channel: ChannelId,
     open: bool,
@@ -54,7 +55,7 @@ impl WebRtc {
         let _ = rtc.add_local_candidate(host);
         let stun_timeout = timeout.min(Duration::from_secs(3));
         for server in stun_servers.iter().take(2) {
-            if let Ok(Some(mapped)) = stun_binding(&socket, server, stun_timeout) {
+            if let Ok(Some(mapped)) = stun_binding(&socket, local, server, stun_timeout) {
                 if let Ok(candidate) = Candidate::server_reflexive(mapped, local, "udp") {
                     let _ = rtc.add_local_candidate(candidate);
                 }
@@ -72,6 +73,7 @@ impl WebRtc {
             Self {
                 rtc,
                 socket,
+                local,
                 pending: Some(pending),
                 channel,
                 open: false,
@@ -208,10 +210,7 @@ impl WebRtc {
             .map_err(|error| format!("psiphon webrtc timeout: {error}"))?;
         match self.socket.recv_from(&mut self.buffer) {
             Ok((length, source)) => {
-                let destination = self
-                    .socket
-                    .local_addr()
-                    .map_err(|error| format!("psiphon webrtc local: {error}"))?;
+                let destination = self.local;
                 let input =
                     Receive::new(Protocol::Udp, source, destination, &self.buffer[..length])
                         .map_or_else(
@@ -272,13 +271,11 @@ fn bind_socket(destination: IpAddr) -> Result<UdpSocket, String> {
 /// Send one RFC 5389 binding request and return its mapped address.
 fn stun_binding(
     socket: &UdpSocket,
+    local: SocketAddr,
     server: &str,
     timeout: Duration,
 ) -> Result<Option<SocketAddr>, String> {
-    let ipv6 = socket
-        .local_addr()
-        .map_err(|error| format!("psiphon webrtc STUN local: {error}"))?
-        .is_ipv6();
+    let ipv6 = local.is_ipv6();
     let same_family = |address: &SocketAddr| address.is_ipv6() == ipv6;
     let resolved = if let Ok(address) = server.parse::<SocketAddr>() {
         Some(address).filter(same_family)

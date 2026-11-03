@@ -107,12 +107,13 @@ struct Settings {
     fronted_overrides: Vec<FrontedOverride>,
     initial_count: usize,
     pool: usize,
-    latency: f64,
+    latency: Latency,
     establish: Option<Duration>,
     workers: usize,
     stagger: Duration,
     pause: Duration,
     affinity_grace: Duration,
+    keepalive: bool,
     propagation: String,
     platform: String,
     client_version: String,
@@ -442,6 +443,7 @@ impl Inner {
             let device_location = self.settings.device_location.clone();
             let client_features = self.settings.client_features.clone();
             let proxy = self.settings.proxy.clone();
+            let keepalive = self.settings.keepalive;
             let conduit =
                 if self.settings.conduit && batch.iter().any(|server| server.inproxy.is_some()) {
                     match self.conduit() {
@@ -477,6 +479,7 @@ impl Inner {
                     timeout,
                     proxy.as_ref(),
                     conduit.as_deref(),
+                    keepalive,
                 )
             };
             match race(batch, attempt, budget, stagger, lead) {
@@ -1204,10 +1207,12 @@ impl Settings {
             server_lists.push(ferrox_core::psiphon::SERVER_LIST_URL.to_owned());
         }
         let proxy_user = text(settings, "localProxyUsername")
+            .or_else(|| text(settings, "LocalProxyUsername"))
             .or_else(|| text(settings, "shareProxyOnNetworkUsername"))
             .or_else(|| env("AETHER_PSIPHON_PROXY_USER"))
             .filter(|user| !user.is_empty());
         let proxy_pass = text(settings, "localProxyPassword")
+            .or_else(|| text(settings, "LocalProxyPassword"))
             .or_else(|| text(settings, "shareProxyOnNetworkPassword"))
             .or_else(|| env("AETHER_PSIPHON_PROXY_PASS"))
             .filter(|pass| !pass.is_empty());
@@ -1399,11 +1404,12 @@ impl Settings {
                 .unwrap_or(1)
                 .clamp(1, 32) as usize
         };
-        let latency = decimal(settings, "NetworkLatencyMultiplier")
-            .or_else(|| env("AETHER_PSIPHON_LATENCY").and_then(|value| value.parse().ok()))
-            .filter(|multiplier| *multiplier >= 1.0)
-            .unwrap_or(1.0)
-            .min(60.0);
+        let disable_timeouts = flag(
+            settings,
+            "DisableTimeouts",
+            "AETHER_PSIPHON_DISABLE_TIMEOUTS",
+        );
+        let latency = Latency::from_settings(settings, disable_timeouts);
         let establish = number(settings, "EstablishTunnelTimeoutSeconds")
             .map(|seconds| Duration::from_secs(seconds.clamp(1, 600)));
         let initial_protocols = protocol_list_named(settings, "InitialLimitTunnelProtocols");
@@ -1497,6 +1503,15 @@ impl Settings {
         } else {
             RELAY_BUFFER
         };
+        let keepalive = !flag(
+            settings,
+            "DisablePeriodicSshKeepAlive",
+            "AETHER_PSIPHON_DISABLE_KEEPALIVE",
+        ) && !flag(
+            settings,
+            "DisableKeepAlive",
+            "AETHER_PSIPHON_DISABLE_KEEPALIVE",
+        );
         Ok(Self {
             state: text(settings, "state")
                 .or_else(|| text(settings, "dataRootDirectory"))
@@ -1543,6 +1558,7 @@ impl Settings {
             ),
             reject_countries,
             relay_buffer,
+            keepalive,
             server_lists,
             server_lists_explicit,
             remote_fetch_disabled: flag(
@@ -1569,12 +1585,82 @@ impl Settings {
     }
 }
 
+#[derive(Clone, Copy)]
+struct Latency {
+    direct: f64,
+    min: f64,
+    max: f64,
+    lambda: f64,
+}
+
+impl Latency {
+    fn from_settings(settings: Option<&Json>, disable_timeouts: bool) -> Self {
+        let direct = decimal(settings, "NetworkLatencyMultiplier")
+            .or_else(|| env("AETHER_PSIPHON_LATENCY").and_then(|value| value.parse().ok()))
+            .filter(|multiplier| *multiplier > 0.0)
+            .map(|multiplier| multiplier.min(60.0));
+        if let Some(direct) = direct {
+            return Self {
+                direct,
+                min: direct,
+                max: direct,
+                lambda: 2.0,
+            };
+        }
+        let min = decimal(settings, "NetworkLatencyMultiplierMin")
+            .filter(|value| !value.is_nan())
+            .map(|value| value.clamp(1.0, 60.0));
+        let max = decimal(settings, "NetworkLatencyMultiplierMax")
+            .filter(|value| !value.is_nan())
+            .map(|value| value.clamp(1.0, 60.0));
+        let lambda = decimal(settings, "NetworkLatencyMultiplierLambda")
+            .or_else(|| env("AETHER_PSIPHON_LATENCY_LAMBDA").and_then(|value| value.parse().ok()))
+            .filter(|value| !value.is_nan())
+            .or_else(|| disable_timeouts.then_some(0.1))
+            .map(|value| value.clamp(0.001, 1e6));
+        if min.is_none() && max.is_none() && lambda.is_none() {
+            return Self {
+                direct: 1.0,
+                min: 1.0,
+                max: 1.0,
+                lambda: 2.0,
+            };
+        }
+        Self {
+            direct: 0.0,
+            min: min.unwrap_or(1.0),
+            max: max.unwrap_or(3.0),
+            lambda: lambda.unwrap_or(2.0),
+        }
+    }
+
+    fn multiplier(self) -> f64 {
+        if self.direct > 0.0 {
+            return self.direct;
+        }
+        if self.max <= self.min || self.lambda <= 0.0 {
+            return self.min;
+        }
+        let span = self.max - self.min;
+        for _ in 0..16 {
+            let mut bytes = [0u8; 4];
+            let _ = getrandom::fill(&mut bytes);
+            let uniform = f64::from(u32::from_le_bytes(bytes)) / 4_294_967_296.0;
+            let value = self.min - (1.0 - uniform).ln() / self.lambda * span;
+            if value <= self.max {
+                return value;
+            }
+        }
+        self.max
+    }
+}
+
 impl Settings {
     /// The reference scales every network budget by `NetworkLatencyMultiplier`.
     fn dial_timeout(&self) -> Duration {
         self.establish
             .unwrap_or(DIAL_TIMEOUT)
-            .mul_f64(self.latency)
+            .mul_f64(self.latency.multiplier())
             .min(Duration::from_secs(600))
     }
 }
@@ -1694,6 +1780,8 @@ const KNOWN_SETTINGS: &[&str] = &[
     "remoteServerListSignaturePublicKey",
     "RemoteServerListSignaturePublicKey",
     "DisableRemoteServerListFetcher",
+    "DisablePeriodicSshKeepAlive",
+    "DisableKeepAlive",
     "LocalSocksProxyPort",
     "ListenInterface",
     "LocalHttpProxyPort",
@@ -1705,9 +1793,12 @@ const KNOWN_SETTINGS: &[&str] = &[
     "SponsorID",
     "sponsorId",
     "localProxyUsername",
+    "LocalProxyUsername",
     "shareProxyOnNetworkUsername",
     "localProxyPassword",
+    "LocalProxyPassword",
     "shareProxyOnNetworkPassword",
+    "DisableTimeouts",
     "disableTunnels",
     "upstreamProxy",
     "upstream",
@@ -1760,6 +1851,9 @@ const KNOWN_SETTINGS: &[&str] = &[
     "FrontedMeekCDNScanBuiltInSets",
     "LimitRelayBufferSizes",
     "NetworkLatencyMultiplier",
+    "NetworkLatencyMultiplierMin",
+    "NetworkLatencyMultiplierMax",
+    "NetworkLatencyMultiplierLambda",
     "InitialLimitTunnelProtocols",
     "InitialLimitTunnelProtocolsCandidateCount",
     "LimitTunnelProtocols",
@@ -3046,7 +3140,7 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
     };
     let (inproxy, tls_inproxy, tls) = if tls {
         (tls_inproxy, None, true)
-    } else if inproxy.is_none() {
+    } else if inproxy.is_none() && !direct {
         let tls = tls_inproxy.is_some();
         (tls_inproxy, None, tls)
     } else {
@@ -4083,6 +4177,30 @@ mod tests {
         assert!(
             server.inproxy.is_none(),
             "a TLS base entry must not keep a plain in-proxy destination"
+        );
+    }
+
+    #[test]
+    fn a_plain_entry_keeps_its_port_and_moves_the_tls_destination_to_the_variant() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshObfuscatedPort":443,"sshObfuscatedKey":"k","tlsOSSHPort":8443,"sshHostKey":"AAAA","capabilities":["INPROXY-WEBRTC-TLS-OSSH"],"inproxyTlsOSSHPort":8443,"signature":"AA=="}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry_with(&encoded, true).expect("entry");
+        assert!(!server.tls);
+        assert_eq!(server.port, 443);
+        assert!(server.inproxy.is_none());
+        let mut servers = vec![server];
+        add_tls_variants(&mut servers);
+        let variant = servers
+            .iter()
+            .find(|server| server.tls)
+            .expect("TLS variant");
+        assert_eq!(variant.port, 8443);
+        assert_eq!(
+            variant
+                .inproxy
+                .as_ref()
+                .map(crate::psiphon_broker::Destination::base_protocol),
+            Some("TLS-OSSH")
         );
     }
 
@@ -5157,6 +5275,13 @@ mod tests {
         let settings = Settings::from_json(Some(&settings)).expect("settings");
         assert_eq!(settings.relay_buffer, 4 * 1024);
         assert_eq!(settings.stagger, Duration::from_millis(250));
+        assert!(settings.keepalive);
+        let quiet = json::parse(r#"{"DisablePeriodicSshKeepAlive":true}"#).expect("settings");
+        assert!(
+            !Settings::from_json(Some(&quiet))
+                .expect("settings")
+                .keepalive
+        );
     }
 
     #[test]
@@ -5270,7 +5395,34 @@ mod tests {
             Settings::from_json(Some(&settings))
                 .expect("settings")
                 .dial_timeout(),
-            DIAL_TIMEOUT
+            DIAL_TIMEOUT.mul_f64(0.5)
+        );
+        let settings = json::parse(r#"{"DisableTimeouts":true}"#).expect("settings");
+        let timeout = Settings::from_json(Some(&settings))
+            .expect("settings")
+            .dial_timeout();
+        assert!(timeout >= DIAL_TIMEOUT && timeout <= DIAL_TIMEOUT.mul_f64(3.0));
+        let settings = json::parse(r#"{"NetworkLatencyMultiplierLambda":0.1}"#).expect("settings");
+        let timeout = Settings::from_json(Some(&settings))
+            .expect("settings")
+            .dial_timeout();
+        assert!(timeout >= DIAL_TIMEOUT && timeout <= DIAL_TIMEOUT.mul_f64(3.0));
+        let settings =
+            json::parse(r#"{"NetworkLatencyMultiplierMin":2,"NetworkLatencyMultiplierMax":4}"#)
+                .expect("settings");
+        let timeout = Settings::from_json(Some(&settings))
+            .expect("settings")
+            .dial_timeout();
+        assert!(timeout >= DIAL_TIMEOUT.mul_f64(2.0) && timeout <= DIAL_TIMEOUT.mul_f64(4.0));
+        let settings = json::parse(
+            r#"{"NetworkLatencyMultiplier":2,"NetworkLatencyMultiplierMin":4,"NetworkLatencyMultiplierMax":4,"DisableTimeouts":true}"#,
+        )
+        .expect("settings");
+        assert_eq!(
+            Settings::from_json(Some(&settings))
+                .expect("settings")
+                .dial_timeout(),
+            DIAL_TIMEOUT.mul_f64(2.0)
         );
         let settings =
             json::parse(r#"{"EstablishTunnelTimeoutSeconds":30,"NetworkLatencyMultiplier":2}"#)
@@ -5399,6 +5551,17 @@ mod tests {
         let (mut server, _) = listener.accept().expect("accept");
         assert!(read_request(&mut server, &inner).is_none());
         client.join().expect("client");
+    }
+
+    #[test]
+    fn capitalised_proxy_credentials_match_the_platform_client() {
+        let settings = Settings::from_json(Some(
+            &json::parse(r#"{"LocalProxyUsername":"user","LocalProxyPassword":"pass"}"#)
+                .expect("settings"),
+        ))
+        .expect("settings");
+        assert_eq!(settings.proxy_user.as_deref(), Some("user"));
+        assert_eq!(settings.proxy_pass.as_deref(), Some("pass"));
     }
 
     #[test]
