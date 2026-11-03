@@ -4711,4 +4711,31 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_bounded_demux_turn_stops_at_one_read() {
+        struct Trickle(Arc<AtomicUsize>);
+        impl Read for Trickle {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = 0;
+                Ok(1)
+            }
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let settings = XhttpSettings::stream_one();
+        let mut frames = Frames::new(Trickle(Arc::clone(&reads)), NullWrite, None, None, true);
+        assert!(matches!(
+            frames.step(&test_service(&settings), false),
+            Stepped::More
+        ));
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "a lane turn must return after one read"
+        );
+    }
 }
