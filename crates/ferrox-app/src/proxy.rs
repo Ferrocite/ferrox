@@ -25492,7 +25492,7 @@ pub(crate) mod lane_pool {
         #[test]
         fn a_reused_descriptor_is_registered_again() {
             use std::io::Write as _;
-            use std::os::fd::AsRawFd;
+            use std::os::fd::{AsRawFd, IntoRawFd as _};
 
             let (_peer_a, watched_a) = std::os::unix::net::UnixStream::pair().expect("pair");
             let fd = watched_a.as_raw_fd();
@@ -25521,9 +25521,10 @@ pub(crate) mod lane_pool {
                 reactor.park(slot(1, fd)).is_none(),
                 "the first park was refused"
             );
-            drop(watched_a);
             let reused = unsafe { libc::dup2(watched_b.as_raw_fd(), fd) };
             assert_eq!(reused, fd, "the new socket took the same number");
+            // `dup2` replaced the number under `watched_a`, so releasing it must not close the new socket.
+            let _ = watched_a.into_raw_fd();
             drop(watched_b);
             assert!(
                 reactor.park(slot(2, fd)).is_none(),
