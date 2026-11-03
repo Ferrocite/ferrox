@@ -4692,7 +4692,7 @@ mod tests {
             selected[0]
                 .inproxy
                 .as_ref()
-                .map(|destination| destination.base_protocol()),
+                .map(crate::psiphon_broker::Destination::base_protocol),
             Some("TLS-OSSH")
         );
     }
