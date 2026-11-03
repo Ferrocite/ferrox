@@ -240,6 +240,7 @@ carrier-grpc multi-messages-per-relay-read 1 ferrox-app-grpc::tests::a_multi_rel
 carrier-grpc relay-reads-per-promoted-64KiB-window 2 ferrox-app-proxy::tests::a_limited_relay_buffer_reads_a_64kib_source_in_two
 carrier-grpc source-read-syscalls-per-promoted-64KiB-window 2 ferrox-app-proxy::tests::a_limited_relay_buffer_reads_a_64kib_source_in_two
 carrier-grpc payload-staging-copies-per-byte-read 0 ferrox-app-grpc::tests::a_body_never_lands_in_a_second_buffer
+carrier-grpc relay-window-copies-per-byte 0 ferrox-app-grpc::tests::a_relay_window_hands_the_payload_it_read_by_pointer
 carrier-grpc message-bytes-moved-per-padded-frame 0 ferrox-app-grpc::tests::a_padded_frame_opens_a_message_without_moving
 carrier-grpc credit-bytes 2097152 ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write
 carrier-grpc window-update-writes-per-credit 1 ferrox-app-grpc::tests::a_credit_grants_the_window_it_owes_in_one_write
