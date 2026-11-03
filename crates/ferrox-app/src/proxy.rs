@@ -25198,7 +25198,6 @@ pub(crate) mod lane_pool {
             let _ = grow(pool);
         }
         if pool.workers.load(Relaxed) == 0 {
-            drop(ready);
             if relay {
                 // A thread the process could not start still does the relay lane's work on the caller.
                 run_to_end(lane);
