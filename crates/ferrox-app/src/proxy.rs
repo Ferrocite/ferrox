@@ -404,6 +404,7 @@ fn serve_inbounds_counted(
         |inbound: &Json, source_known: bool| routed_out(outbound, route, inbound, source_known);
     let mut inbounds = 0;
     let mut vmess_tables: HashMap<String, crate::vmess::UsersRef> = HashMap::new();
+    let configured = configured_emails(root);
     if let Some(list) = root.get("inbounds").and_then(Json::as_arr) {
         for inbound in list {
             let protocol =
@@ -493,7 +494,7 @@ fn serve_inbounds_counted(
                         }
                     }
                     "shadowsocks" => {
-                        if serve_shadowsocks_inbound(address, inbound, freedom) {
+                        if serve_shadowsocks_inbound(address, inbound, freedom, &configured) {
                             inbounds += 1;
                         }
                     }
@@ -12133,13 +12134,18 @@ fn inbound_ss_networks(inbound: &Json) -> (bool, bool) {
     (tcp, udp)
 }
 
-fn serve_shadowsocks_inbound(address: &str, inbound: &Json, freedom: bool) -> bool {
+fn serve_shadowsocks_inbound(
+    address: &str,
+    inbound: &Json,
+    freedom: bool,
+    configured: &HashSet<String>,
+) -> bool {
     let password = inbound_ss_password(inbound);
     let account = inbound_account(inbound);
     let method = inbound_method(inbound);
     let carrier = inbound_carrier(inbound);
     let (tcp, udp) = inbound_ss_networks(inbound);
-    let accounts = ss_accounts(inbound, address, password, method);
+    let accounts = ss_accounts(inbound, address, password, method, configured);
     let udp_accounts = (udp && matches!(carrier, Carrier::Raw(_))).then(|| Arc::clone(&accounts));
     // The 2022 relay opens each listener the inbound's network list names, so a tcp-only relay binds no udp socket.
     if matches!(carrier, Carrier::Raw(_))
@@ -29059,12 +29065,38 @@ fn ss2022_identities(inbound: &Json) -> Vec<(String, u32)> {
         .unwrap_or_default()
 }
 
+/// Every email a configured user carries, across the whole config: a generated fallback name must
+/// not share a statistics key with any of them, not just with its own inbound's.
+fn configured_emails(root: &Json) -> HashSet<String> {
+    let mut emails = HashSet::new();
+    for inbound in root.get("inbounds").and_then(Json::as_arr).unwrap_or(&[]) {
+        let settings = inbound.get("settings");
+        for list in ["clients", "accounts", "users"] {
+            for row in settings
+                .and_then(|settings| settings.get(list))
+                .and_then(Json::as_arr)
+                .unwrap_or(&[])
+            {
+                if let Some(email) = row
+                    .get("email")
+                    .and_then(Json::as_str)
+                    .filter(|email| !email.is_empty())
+                {
+                    emails.insert(email.to_owned());
+                }
+            }
+        }
+    }
+    emails
+}
+
 /// An inbound's parsed accounts: 2022 reads its PSK list from the single password, everything else from the client list.
 fn ss_accounts(
     inbound: &Json,
     address: &str,
     password: String,
     method: String,
+    configured: &HashSet<String>,
 ) -> Arc<crate::shadowsocks::SsAccounts> {
     let parsed = ferrox_core::shadowsocks2022::Method::parse(&method);
     let is_2022 = parsed.is_some();
@@ -29099,7 +29131,9 @@ fn ss_accounts(
                 let base = inbound_tag(inbound).unwrap_or_else(|| address.to_owned());
                 while identities.len() < psks {
                     let mut name = format!("{base}#{}", identities.len());
-                    while identities.iter().any(|(email, _)| *email == name) {
+                    while identities.iter().any(|(email, _)| *email == name)
+                        || configured.contains(&name)
+                    {
                         name.push('#');
                     }
                     identities.push((name, 0));
@@ -42657,7 +42691,7 @@ mod tests {
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
         let address = format!("127.0.0.1:{port}");
-        serve_shadowsocks_inbound(&address, &inbound, true);
+        serve_shadowsocks_inbound(&address, &inbound, true, &std::collections::HashSet::new());
         let echo_port = echo_loop();
         let conn = ferrox_core::kcp::dial(
             format!("127.0.0.1:{port}").parse().expect("addr"),
@@ -42711,7 +42745,12 @@ mod tests {
         )
         .expect("parses");
         assert!(
-            !serve_shadowsocks_inbound("127.0.0.1:0", &inbound, true),
+            !serve_shadowsocks_inbound(
+                "127.0.0.1:0",
+                &inbound,
+                true,
+                &std::collections::HashSet::new()
+            ),
             "a network list with neither tcp nor udp opens no listener"
         );
     }
@@ -42729,7 +42768,12 @@ mod tests {
         let probe = UdpSocket::bind("127.0.0.1:0").expect("binds");
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
-        serve_shadowsocks_inbound(&format!("127.0.0.1:{port}"), &inbound, true);
+        serve_shadowsocks_inbound(
+            &format!("127.0.0.1:{port}"),
+            &inbound,
+            true,
+            &std::collections::HashSet::new(),
+        );
         let ss = ShadowsocksOut {
             address: "127.0.0.1".to_owned(),
             port,
@@ -42808,7 +42852,7 @@ mod tests {
             let port = probe.local_addr().expect("addr").port();
             drop(probe);
             let address = format!("127.0.0.1:{port}");
-            serve_shadowsocks_inbound(&address, &inbound, true);
+            serve_shadowsocks_inbound(&address, &inbound, true, &std::collections::HashSet::new());
             let waited = Instant::now();
             while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
                 assert!(
@@ -47029,7 +47073,7 @@ mod tests {
         let port = probe.local_addr().expect("addr").port();
         drop(probe);
         let address = format!("127.0.0.1:{port}");
-        serve_shadowsocks_inbound(&address, &inbound, true);
+        serve_shadowsocks_inbound(&address, &inbound, true, &std::collections::HashSet::new());
         thread::sleep(Duration::from_millis(100));
         assert!(
             std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
@@ -47091,7 +47135,7 @@ mod tests {
             })
             .expect("a free registered port");
         let address = format!("127.0.0.1:{port}");
-        serve_shadowsocks_inbound(&address, &inbound, true);
+        serve_shadowsocks_inbound(&address, &inbound, true, &std::collections::HashSet::new());
         thread::sleep(Duration::from_millis(50));
         assert!(
             std::net::TcpStream::connect(("127.0.0.1", port)).is_err(),
@@ -59682,6 +59726,7 @@ end
             "127.0.0.1:0",
             "master:alpha:bravo".to_owned(),
             "2022-blake3-aes-256-gcm".to_owned(),
+            &std::collections::HashSet::new(),
         );
         assert!(accounts.is_2022, "the method names a 2022 cipher");
         assert_eq!(
@@ -59712,6 +59757,7 @@ end
             "127.0.0.1:0",
             password.clone(),
             "2022-blake3-aes-256-gcm".to_owned(),
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             accounts.identities.as_slice(),
@@ -59740,6 +59786,7 @@ end
             "127.0.0.1:0",
             password.clone(),
             "2022-blake3-aes-256-gcm".to_owned(),
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             accounts.identities.as_slice(),
@@ -59768,6 +59815,7 @@ end
             "127.0.0.1:0",
             password.clone(),
             "2022-blake3-aes-256-gcm".to_owned(),
+            &std::collections::HashSet::new(),
         );
         assert_eq!(
             accounts.identities.as_slice(),
@@ -59777,6 +59825,55 @@ end
             ],
             "the unnamed PSK needs a name of its own, not the configured user's"
         );
+    }
+
+    /// A generated fallback name must not equal another inbound's configured email, whichever
+    /// inbound the config declares first: both would otherwise share one statistics key.
+    #[test]
+    fn a_generated_identity_avoids_another_inbounds_configured_email_in_either_order() {
+        use base64::Engine as _;
+        let key = |b: u8| base64::engine::general_purpose::STANDARD.encode(vec![b; 32]);
+        let password = format!("{}:{}:{}", key(1), key(2), key(3));
+        let named = format!(
+            r#"{{"protocol": "shadowsocks", "tag": "ss-in", "settings": {{"method": "2022-blake3-aes-256-gcm", "password": "{password}", "users": [{{"email": "alice@example"}}]}}}}"#
+        );
+        let other = r#"{"protocol": "socks", "settings": {"clients": [{"email": "ss-in#1"}]}}"#;
+        for list in [format!("[{named},{other}]"), format!("[{other},{named}]")] {
+            let root = crate::json::parse(&format!(r#"{{"inbounds":{list}}}"#)).expect("parses");
+            let reserved = configured_emails(&root);
+            let inbound = crate::json::parse(&named).expect("parses");
+            let accounts = ss_accounts(
+                &inbound,
+                "127.0.0.1:0",
+                password.clone(),
+                "2022-blake3-aes-256-gcm".to_owned(),
+                &reserved,
+            );
+            assert_eq!(
+                accounts.identities[1].0, "ss-in#1#",
+                "the unnamed PSK's name steps past the other inbound's configured user"
+            );
+        }
+    }
+
+    /// The renamed generated identity and the reserved configured email are separate statistics
+    /// keys, so their traffic never lands in one counter.
+    #[test]
+    fn a_generated_identity_and_a_reserved_email_count_separately() {
+        let _guard = crate::stats::test_lock();
+        crate::stats::clear();
+        let root = crate::json::parse(
+            r#"{"stats":{},"policy":{"levels":{"0":{"statsUserUplink":true}}}}"#,
+        )
+        .expect("parses");
+        crate::policy::install(&root).expect("policy installs");
+        crate::stats::install(&root).expect("stats installs");
+        crate::stats::user("ss-in#1#", 0).read(4);
+        crate::stats::user("ss-in#1", 0).read(7);
+        let snapshot = crate::stats::snapshot();
+        assert_eq!(snapshot.user["ss-in#1#"].uplink, 4);
+        assert_eq!(snapshot.user["ss-in#1"].uplink, 7);
+        crate::stats::clear();
     }
 
     /// A 2022 single-password inbound names no users array, so its identities list stays empty and the flow reads the inbound's own default.
@@ -59791,6 +59888,7 @@ end
             "127.0.0.1:0",
             "secret".to_owned(),
             "2022-blake3-aes-128-gcm".to_owned(),
+            &std::collections::HashSet::new(),
         );
         assert!(accounts.is_2022, "the method names a 2022 cipher");
         assert!(
