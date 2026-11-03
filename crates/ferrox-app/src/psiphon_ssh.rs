@@ -1172,8 +1172,8 @@ fn tls_passthrough_key(server: &Server) -> &str {
         .unwrap_or("")
 }
 
-/// The reference proves knowledge of the meek obfuscated key in the ClientHello random, which
-/// the server checks before it will speak TLS-OSSH; an invalid field is relayed to a decoy web
+/// The reference proves knowledge of the meek obfuscated key in the `ClientHello` random, which
+/// the server checks before it will speak `TLS-OSSH`; an invalid field is relayed to a decoy web
 /// site. The key is HKDF-derived from the 20-minute time period, and the message's second half
 /// is an HMAC over its nonce.
 fn tls_passthrough(key: &str) -> Result<[u8; 32], String> {
