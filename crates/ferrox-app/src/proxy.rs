@@ -20841,19 +20841,23 @@ fn serve_socks_udp_split(
         if matches!(&*out, Outbound::Block(_)) {
             continue;
         }
-        retire_finished_lane(&mut lanes, &mut replies, &key);
-        if !lanes.contains_key(&key) {
-            if let Some(lane) = spawn_udp_lane(&out, local) {
-                replies.insert(lane.address, key.clone());
-                lanes.insert(key.clone(), lane);
+        let lane_address = match retire_finished_lane(&mut lanes, &mut replies, key) {
+            std::collections::hash_map::Entry::Occupied(entry) => Some(entry.get().address),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                spawn_udp_lane(&out, local).map(|lane| {
+                    replies.insert(lane.address, entry.key().clone());
+                    let address = lane.address;
+                    entry.insert(lane);
+                    address
+                })
             }
-        }
-        if let Some(lane) = lanes.get(&key) {
+        };
+        if let Some(lane_address) = lane_address {
             let frame = match dial {
                 Some(address) => socks_udp_frame(&mut frame, None, &address, payload),
                 None => &buf[..n],
             };
-            let _ = relay.send_to(frame, lane.address);
+            let _ = relay.send_to(frame, lane_address);
         }
     }
 }
@@ -20872,15 +20876,24 @@ fn udp_bind_for(relay: SocketAddr) -> SocketAddr {
 
 /// A lane's loop ends on its own idle or a refused upstream; the key must not keep writing to the
 /// socket nobody reads, so a later datagram for that tag opens a fresh lane.
-#[allow(clippy::ref_option)] // the map is keyed by the optional tag itself
-fn retire_finished_lane(
-    lanes: &mut HashMap<Option<String>, UdpLane>,
+fn retire_finished_lane<'a>(
+    lanes: &'a mut HashMap<Option<String>, UdpLane>,
     replies: &mut HashMap<SocketAddr, Option<String>>,
-    key: &Option<String>,
-) {
-    if lanes.get(key).is_some_and(|lane| lane.handle.is_finished()) {
-        if let Some(lane) = lanes.remove(key) {
-            replies.remove(&lane.address);
+    key: Option<String>,
+) -> std::collections::hash_map::Entry<'a, Option<String>, UdpLane> {
+    match lanes.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => {
+            if entry.get().handle.is_finished() {
+                let key = entry.key().clone();
+                let old = entry.remove();
+                replies.remove(&old.address);
+                lanes.entry(key)
+            } else {
+                std::collections::hash_map::Entry::Occupied(entry)
+            }
+        }
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            std::collections::hash_map::Entry::Vacant(entry)
         }
     }
 }
@@ -59773,7 +59786,7 @@ end
         }
         let mut lanes = HashMap::from([(key.clone(), UdpLane { address, handle })]);
         let mut replies = HashMap::from([(address, key.clone())]);
-        retire_finished_lane(&mut lanes, &mut replies, &key);
+        retire_finished_lane(&mut lanes, &mut replies, key.clone());
         assert!(!lanes.contains_key(&key));
         assert!(!replies.contains_key(&address));
     }
