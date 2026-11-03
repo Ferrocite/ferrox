@@ -558,6 +558,7 @@ impl Packer {
 
     fn pump(&self) {
         let mut spare = Vec::new();
+        let mut answer = Vec::new();
         loop {
             let Ok(mut queue) = self.queue.lock() else {
                 self.failed.store(true, Ordering::SeqCst);
@@ -585,7 +586,7 @@ impl Packer {
                 self.failed.store(true, Ordering::SeqCst);
                 return;
             };
-            if !self.post(&mut **stream, &piece) {
+            if !self.post(&mut **stream, &piece, &mut answer) {
                 self.failed.store(true, Ordering::SeqCst);
                 self.cv.notify_all();
                 return;
@@ -595,7 +596,7 @@ impl Packer {
         }
     }
 
-    fn post(&self, stream: &mut dyn FrameStream, piece: &[u8]) -> bool {
+    fn post(&self, stream: &mut dyn FrameStream, piece: &[u8], answer: &mut Vec<u8>) -> bool {
         let Ok(mut last) = self.last.lock() else {
             return false;
         };
@@ -618,17 +619,21 @@ impl Packer {
             Some(body) => stream.write_slices(&[head.as_bytes(), body]),
             None => stream.write_all(head.as_bytes()).is_ok(),
         };
-        wrote && drain_answer(stream)
+        wrote && drain_answer(stream, answer)
     }
 }
 
 /// A packet-up POST answers 200 with no body; anything else is a dead upload.
-fn drain_answer(stream: &mut dyn Read) -> bool {
-    let Some((head, at)) =
-        crate::proxy::read_exact_head(stream, HEAD_LIMIT, crate::budgets::head_arrival())
-    else {
+fn drain_answer(stream: &mut dyn Read, head: &mut Vec<u8>) -> bool {
+    let Some((got, at)) = crate::proxy::read_exact_head_into(
+        stream,
+        HEAD_LIMIT,
+        crate::budgets::head_arrival(),
+        std::mem::take(head),
+    ) else {
         return false;
     };
+    *head = got;
     let Ok(text) = std::str::from_utf8(&head[..at]) else {
         return false;
     };
@@ -4420,6 +4425,27 @@ mod tests {
         assert_eq!(posts[1].1, batched, "the batched post carries both windows");
         assert!(posts[0].0.ends_with("/session/0"));
         assert!(posts[1].0.ends_with("/session/1"));
+    }
+
+    /// A packet-up answer is read into the upload lane's own window: the head of every POST returns to the same allocation rather than paying a fresh buffer the answer never keeps.
+    #[test]
+    fn a_packet_up_answer_is_read_without_allocating() {
+        let answer = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n";
+        let wires = [answer.as_slice(), answer.as_slice()];
+        let mut head = Vec::with_capacity(HEAD_LIMIT);
+        let capacity = head.capacity();
+        let (ok, counts) = ferrox_core::alloc_count::measure(|| {
+            wires
+                .into_iter()
+                .all(|wire| drain_answer(&mut std::io::Cursor::new(wire), &mut head))
+        });
+        assert!(ok, "both answers are 200");
+        assert_eq!(
+            (counts.allocs, counts.bytes, counts.zeroed),
+            (0, 0, 0),
+            "the lane reuses its answer window: {counts:?}"
+        );
+        assert_eq!(head.capacity(), capacity, "the answer window does not grow");
     }
 
     /// A full queue answers at once instead of waiting inside the lane the other flows share.

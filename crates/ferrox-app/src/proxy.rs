@@ -26321,16 +26321,25 @@ pub(crate) fn read_http_head_kept(
 /// The kept reader's first round and growth quantum: a common camouflage head fits one allocation, while the 8 KiB limit stays a limit rather than a per-handshake buffer.
 const HEAD_ROUND: usize = 2048;
 
-#[allow(
-    clippy::uninit_vec,
-    reason = "the reader fills the grown bytes, and every path that does not truncates them back"
-)]
 fn kept_head_rounds(
     stream: &mut dyn Read,
     limit: usize,
     budget: Duration,
 ) -> Option<(Vec<u8>, usize)> {
-    let mut head = Vec::with_capacity(HEAD_ROUND);
+    kept_head_into(stream, limit, budget, Vec::with_capacity(HEAD_ROUND))
+}
+
+#[allow(
+    clippy::uninit_vec,
+    reason = "the reader fills the grown bytes, and every path that does not truncates them back"
+)]
+fn kept_head_into(
+    stream: &mut dyn Read,
+    limit: usize,
+    budget: Duration,
+    mut head: Vec<u8>,
+) -> Option<(Vec<u8>, usize)> {
+    head.clear();
     let until = Instant::now() + budget;
     loop {
         if head.len() >= limit {
@@ -26421,6 +26430,16 @@ pub(crate) fn read_exact_head(
     budget: Duration,
 ) -> Option<(Vec<u8>, usize)> {
     kept_head_rounds(stream, limit, budget)
+}
+
+/// The same reader over a buffer the caller keeps: a lane that reads an answer per frame hands its own window back instead of paying a fresh allocation for every read.
+pub(crate) fn read_exact_head_into(
+    stream: &mut dyn Read,
+    limit: usize,
+    budget: Duration,
+    head: Vec<u8>,
+) -> Option<(Vec<u8>, usize)> {
+    kept_head_into(stream, limit, budget, head)
 }
 
 /// What a carrier did with a relay window: took a prefix, had no room and asked for the same bytes again, or ended the flow.
