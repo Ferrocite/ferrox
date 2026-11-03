@@ -256,6 +256,9 @@ struct ControlQueue {
     /// Frames queued or taken into a batch and not yet written: the shutdown grace starts from zero
     /// here, so it begins after the last refusal is on the wire rather than before it.
     pending: AtomicUsize,
+    /// The instant the queue last reached empty, so a waiter that wakes after the deadline can
+    /// still tell an in-deadline drain from a late one.
+    done: Mutex<Option<std::time::Instant>>,
     /// Set by the worker when its own write fails, so the connection it serves ends with it
     /// instead of admitting frames no one will ever drain.
     dead: Arc<AtomicBool>,
@@ -268,6 +271,7 @@ impl Control {
             go: Condvar::new(),
             stop: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
+            done: Mutex::new(None),
             dead,
         });
         let worker = Arc::clone(&queue);
@@ -313,6 +317,10 @@ impl Control {
                         return;
                     }
                     worker.pending.fetch_sub(used, Ordering::SeqCst);
+                    if worker.pending.load(Ordering::SeqCst) == 0 {
+                        *worker.done.lock().unwrap_or_else(PoisonError::into_inner) =
+                            Some(std::time::Instant::now());
+                    }
                 }
             });
         if spawned.is_ok() {
@@ -338,6 +346,7 @@ impl Control {
                 }
                 frames.push_back((len as u8, frame));
                 queue.pending.fetch_add(1, Ordering::SeqCst);
+                *queue.done.lock().unwrap_or_else(PoisonError::into_inner) = None;
                 drop(frames);
                 queue.go.notify_one();
                 true
@@ -346,19 +355,23 @@ impl Control {
     }
 
     /// Waits for the queue and every batch already taken from it to be written before `grace`; `true`
-    /// is a live drain inside that window, and `false` is a peer that is not reading or a queue that
-    /// died, so the shutdown has the deadline, not the write.
+    /// is a drain that completed inside that window, even when observed after it, and `false` is a
+    /// peer that is not reading or a queue that died, so the shutdown has the deadline, not the write.
     fn drained(&self, grace: Duration) -> bool {
         let Control::Threaded(queue) = self else {
             return true;
         };
         let until = std::time::Instant::now() + grace;
         loop {
-            if queue.dead.load(Ordering::SeqCst) || std::time::Instant::now() >= until {
+            if queue.dead.load(Ordering::SeqCst) {
                 return false;
             }
             if queue.pending.load(Ordering::SeqCst) == 0 {
-                return true;
+                let done = *queue.done.lock().unwrap_or_else(PoisonError::into_inner);
+                return done.map_or_else(|| std::time::Instant::now() <= until, |at| at <= until);
+            }
+            if std::time::Instant::now() >= until {
+                return false;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -4394,8 +4407,8 @@ mod tests {
             "the queue drains once the peer takes the writes"
         );
         assert!(
-            !conn.control.drained(Duration::ZERO),
-            "a queue drained past its deadline is not a live drain"
+            conn.control.drained(Duration::ZERO),
+            "a drain that completed before the call is still a live drain"
         );
     }
 
