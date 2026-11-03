@@ -2215,7 +2215,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
     fn end(&mut self) -> Stepped {
         if let Some(conn) = self.conn.take() {
             if conn.refused.load(Ordering::SeqCst) {
-                // Closing while the peer's bytes sit unread aborts the connection, and the RST can swallow the GOAWAY a moment earlier; the grace is the window the peer takes it in, counted from the last queued refusal rather than before it, and spent off the lane.
+                // Closing while the peer's bytes sit unread aborts the connection, and the RST can swallow the GOAWAY a moment earlier; the grace is held after the last write drains, so the peer has the window to read it, and spent off the lane.
                 let closing = Arc::clone(&conn);
                 let spawned = std::thread::Builder::new().spawn(move || finish_refusal(&closing));
                 if spawned.is_err() {
@@ -2232,7 +2232,10 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
 }
 
 fn finish_refusal(conn: &Arc<H2Conn>) {
-    let _ = conn.control.drained(crate::budgets::goaway_grace());
+    let grace = crate::budgets::goaway_grace();
+    if conn.control.drained(grace) {
+        std::thread::sleep(grace);
+    }
     conn.kill();
 }
 
