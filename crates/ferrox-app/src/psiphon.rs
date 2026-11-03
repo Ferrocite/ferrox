@@ -2387,7 +2387,7 @@ fn shape_filter(protocols: &[String], label: &str) -> Option<Shape> {
 }
 
 fn matches_shape(server: &Server, shape: Shape) -> bool {
-    if server.tls {
+    if server.tls && server.meek.is_none() {
         shape.tls
     } else if server.obfuscated() {
         shape.obfuscated
