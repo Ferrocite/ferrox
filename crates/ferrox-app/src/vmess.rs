@@ -18,7 +18,7 @@ const READ_PLAIN: usize = MAX_PLAIN * FRAMES_PER_WRITE;
 const MAX_WIRE: usize = MAX_PLAIN + TAG_LEN + 63;
 // Two batches per refill: the batch is still one write, but a carrier read can answer two.
 const WIRE_BATCHES: usize = 2;
-const WIRE_LEN: usize = (FRAMES_PER_WRITE * WIRE_BATCHES + 1) * (MAX_WIRE + HEADER_LEN);
+const WIRE_LEN: usize = (FRAMES_PER_WRITE * WIRE_BATCHES + 1) * (MAX_WIRE + SIZE_FIELD);
 const OPT_STREAM: u8 = 0x01;
 const OPT_MASK: u8 = 0x04;
 const OPT_PAD: u8 = 0x08;
@@ -4295,11 +4295,19 @@ mod tests {
 
     /// Frames sealed exactly as the write side seals them, with the plaintext they carry.
     fn frames(lens: &[usize]) -> (Vec<u8>, Vec<u8>, Flow) {
+        frames_with(lens, OPT_STREAM | OPT_MASK | OPT_PAD)
+    }
+
+    fn frames_with(lens: &[usize], options: u8) -> (Vec<u8>, Vec<u8>, Flow) {
         let key = [0x55u8; 16];
         let iv = [0x66u8; 16];
-        let options = OPT_STREAM | OPT_MASK | OPT_PAD;
         let mut send = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("sends");
-        let recv = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
+        let mut recv = Flow::fresh(Cipher::Chacha, &key, &iv, options, &iv).expect("recvs");
+        if options & OPT_AUTH_LEN != 0 {
+            let seal = || SizeAead::fresh(&key, Cipher::Chacha, &iv).expect("a size aead");
+            send.len_seal = Some(seal());
+            recv.len_seal = Some(seal());
+        }
         let mut pad = PadSource::fresh().expect("entropy");
         let mut sealed = Vec::new();
         let mut plain = Vec::new();
@@ -4363,24 +4371,30 @@ mod tests {
 
     #[test]
     fn a_batch_of_frames_leaves_the_pump_in_one_write() {
-        let (sealed, plain, mut recv) = frames(&vec![MAX_PLAIN; FRAMES_PER_WRITE * 2 + 1]);
-        let carrier = Sealed {
-            held: sealed,
-            at: 0,
-            grain: usize::MAX,
-            reads: 0,
-        };
-        let mut wire = Wire::new(carrier);
-        let (writes, got) = drain(&mut wire, &mut recv);
-        assert_eq!(
-            writes, 3,
-            "a batch takes at most FRAMES_PER_WRITE frames, so they leave as {FRAMES_PER_WRITE}, {FRAMES_PER_WRITE} and 1"
-        );
-        assert_eq!(got, plain, "and every byte of them, in order");
-        assert_eq!(
-            wire.carrier.reads, 2,
-            "the stream is read once, plus the read that finds its end"
-        );
+        for options in [
+            OPT_STREAM | OPT_MASK | OPT_PAD,
+            OPT_STREAM | OPT_MASK | OPT_PAD | OPT_AUTH_LEN,
+        ] {
+            let (sealed, plain, mut recv) =
+                frames_with(&vec![MAX_PLAIN; FRAMES_PER_WRITE * 2 + 1], options);
+            let carrier = Sealed {
+                held: sealed,
+                at: 0,
+                grain: usize::MAX,
+                reads: 0,
+            };
+            let mut wire = Wire::new(carrier);
+            let (writes, got) = drain(&mut wire, &mut recv);
+            assert_eq!(
+                writes, 3,
+                "a batch takes at most FRAMES_PER_WRITE frames, so they leave as {FRAMES_PER_WRITE}, {FRAMES_PER_WRITE} and 1"
+            );
+            assert_eq!(got, plain, "and every byte of them, in order");
+            assert_eq!(
+                wire.carrier.reads, 2,
+                "the stream is read once, plus the read that finds its end"
+            );
+        }
     }
 
     #[test]
