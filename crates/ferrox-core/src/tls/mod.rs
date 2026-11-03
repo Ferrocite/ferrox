@@ -91,9 +91,10 @@ impl MasterKeyLog {
         let file = options.open(path).ok()?;
         // 193 bytes is the longest line: a 30-byte label, a 32-byte random and a 48-byte SHA-384 secret.
         Some(Self {
-            path: std::fs::canonicalize(path)
-                .map(|path| path.to_string_lossy().into_owned())
-                .unwrap_or_else(|_| path.to_owned()),
+            path: std::fs::canonicalize(path).map_or_else(
+                |_| path.to_owned(),
+                |path| path.to_string_lossy().into_owned(),
+            ),
             state: std::sync::Mutex::new((file, Vec::with_capacity(208))),
         })
     }
