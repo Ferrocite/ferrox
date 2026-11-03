@@ -23028,6 +23028,11 @@ fn relay_lanes(
     target_read: Connection,
     client_write: Connection,
 ) {
+    // A pool with no worker would run forward inline before reply was queued, so use the owned copy.
+    if !lane_pool::start() {
+        relay_owned(client_read, target_write, target_read, client_write);
+        return;
+    }
     for connection in [&client_read, &target_read, &target_write, &client_write] {
         let _ = connection.set_read_timeout(Some(RELAY_POLL));
         let _ = connection.set_write_timeout(Some(RELAY_POLL));
@@ -23069,6 +23074,7 @@ struct TcpCopy {
     eof: bool,
     ended: bool,
     stalled: Option<std::time::Instant>,
+    stall: Duration,
 }
 
 impl TcpCopy {
@@ -23082,6 +23088,7 @@ impl TcpCopy {
             eof: false,
             ended: false,
             stalled: None,
+            stall: crate::budgets::relay_stall(),
         }
     }
 
@@ -23098,11 +23105,14 @@ impl TcpCopy {
                 Ok(n) => {
                     self.off += n;
                     self.stalled = None;
+                    if self.off < self.filled {
+                        return Next::Retry;
+                    }
                 }
                 Err(error) if is_timeout(&error) => {
                     let now = std::time::Instant::now();
                     let since = *self.stalled.get_or_insert(now);
-                    if now.duration_since(since) >= crate::budgets::relay_stall() {
+                    if now.duration_since(since) >= self.stall {
                         self.abandon();
                         return Next::Done;
                     }
@@ -23199,20 +23209,42 @@ fn poll_handoff(
     poll_copy::handoff(client_read, target_write, target_read, client_write)
 }
 
-#[cfg(any(not(target_os = "linux"), test))]
 fn relay_owned(
-    mut client_read: Connection,
-    mut target_write: Connection,
-    mut target_read: Connection,
-    mut client_write: Connection,
+    client_read: Connection,
+    target_write: Connection,
+    target_read: Connection,
+    client_write: Connection,
 ) {
-    let forward = move || {
-        copy_all_memcpy(&mut client_read, &mut target_write);
-        let _ = target_write.shutdown(Shutdown::Write);
-    };
-    let done = RelayPool::global().run(forward);
-    copy_all_memcpy(&mut target_read, &mut client_write);
-    let _ = client_write.shutdown(Shutdown::Write);
+    for connection in [&client_read, &target_read, &target_write, &client_write] {
+        let _ = connection.set_read_timeout(Some(RELAY_POLL));
+        let _ = connection.set_write_timeout(Some(RELAY_POLL));
+    }
+    let forward_stall = client_read
+        .policy()
+        .or_else(|| target_write.policy())
+        .and_then(|flow| flow.conn_idle())
+        .unwrap_or_else(crate::budgets::relay_stall);
+    let reply_stall = target_read
+        .policy()
+        .or_else(|| client_write.policy())
+        .and_then(|flow| flow.conn_idle())
+        .unwrap_or_else(crate::budgets::relay_stall);
+    let close: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+    let flow = RelayFinish::new(false, close, None);
+    let first = Arc::clone(&flow);
+    let mut forward = TcpCopy::new(client_read, target_write);
+    forward.stall = forward_stall;
+    let done = RelayPool::global().run(move || {
+        while forward.step(&first) != Next::Done {}
+        first.mark_ended();
+        first.lane_done();
+    });
+    let second = Arc::clone(&flow);
+    let mut reply = TcpCopy::new(target_read, client_write);
+    reply.stall = reply_stall;
+    while reply.step(&second) != Next::Done {}
+    second.mark_ended();
+    second.lane_done();
     join(&done);
 }
 
@@ -25141,6 +25173,18 @@ pub(crate) mod lane_pool {
         }
     }
 
+    /// Whether a worker can carry a submitted lane: one already lives, or the pool starts one.
+    /// False is the zero-worker case a relay must not enter, because `submit` would run the first
+    /// direction inline before its sibling was queued.
+    pub(crate) fn start() -> bool {
+        start_in(&pool())
+    }
+
+    fn start_in(pool: &std::sync::Arc<Pool>) -> bool {
+        use std::sync::atomic::Ordering::Relaxed;
+        pool.workers.load(Relaxed) > 0 || (!stopping(pool) && grow(pool))
+    }
+
     pub(crate) fn submit(step: Step, complete: Complete) {
         submit_to(&pool(), step, complete);
     }
@@ -25414,6 +25458,19 @@ pub(crate) mod lane_pool {
                 "{idle} idle lanes cycled {batches} park rounds in five seconds"
             );
             assert!(running.load(Ordering::Relaxed) >= idle);
+        }
+
+        /// A relay pair must know whether a worker can carry the first lane before it submits one:
+        /// a pool that cannot start a worker hands both directions back instead of running forward inline.
+        #[test]
+        fn a_pool_with_no_worker_room_is_refused_before_either_lane_runs() {
+            let full = TestPool(spawn_pool_full(0, None, false));
+            assert!(
+                !start_in(&full),
+                "a pool capped at zero workers cannot take half a relay pair"
+            );
+            let room = TestPool(spawn_pool_full(1, None, false));
+            assert!(start_in(&room), "a pool with room starts the worker");
         }
 
         /// A private pool's workers must not outlive the test that made them: repeated parallel
@@ -26205,6 +26262,7 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
     flow
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[inline]
 fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     // Once per leg, outside the byte loop: a budget read per buffer would price the copy.
@@ -34933,6 +34991,86 @@ mod tests {
         );
     }
 
+    /// A write that advances but cannot finish must hand its worker back: a trickling peer would
+    /// otherwise keep the direction on a shared lane until every byte it accepts arrives.
+    #[test]
+    #[cfg(unix)]
+    fn a_partial_write_hands_the_lane_back() {
+        use std::os::unix::io::AsRawFd;
+
+        let front = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds the front");
+        let edge = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds the edge");
+        let dst = Connection::connect(front.local_addr().expect("front address"))
+            .expect("connects the writer");
+        let (_peer, _) = front.accept().expect("accepts the writer");
+        let src = Connection::connect(edge.local_addr().expect("edge address"))
+            .expect("connects the reader");
+        let (_source, _) = edge.accept().expect("accepts the reader");
+        let want: libc::c_int = 4096;
+        // SAFETY: `want` outlives the call, and the size is its own.
+        let set = unsafe {
+            libc::setsockopt(
+                dst.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                std::ptr::addr_of!(want).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(set, 0, "SO_SNDBUF refused");
+        dst.set_nonblocking(true).expect("nonblocking writer");
+        src.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("source timeout");
+        let mut copy = TcpCopy::new(src, dst);
+        copy.filled = copy.bytes.len();
+        let flow = Arc::new(RelayFinish::new(false, Arc::new(|| {}), None));
+        assert_eq!(
+            copy.step(&flow),
+            Next::Retry,
+            "a partial write must hand the lane back instead of finishing the buffer inline"
+        );
+        assert!(
+            copy.off > 0 && copy.off < copy.filled,
+            "the witness needs a write that moved part of the buffer, not all of it"
+        );
+    }
+
+    /// The fallback used when no lane worker can start must not hold a caller after the
+    /// forward half is gone and the peer has nothing left to say.
+    #[test]
+    fn an_owned_fallback_ends_an_idle_sibling() {
+        let front = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds the front");
+        let edge = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds the edge");
+        let mut client = Connection::connect(front.local_addr().expect("front address"))
+            .expect("connects the client");
+        let (client_local, _) = front.accept().expect("accepts the client");
+        let mut peer = Connection::connect(edge.local_addr().expect("edge address"))
+            .expect("connects the peer");
+        let (target_local, _) = edge.accept().expect("accepts the peer");
+        let (ended, waited) = std::sync::mpsc::channel();
+        let relay = thread::spawn(move || {
+            relay_owned(
+                client_local.try_clone().expect("client read"),
+                target_local.try_clone().expect("target write"),
+                target_local.try_clone().expect("target read"),
+                client_local.try_clone().expect("client write"),
+            );
+            let _ = ended.send(());
+        });
+        client.write_all(b"x").expect("writes forward");
+        peer.set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("peer timeout");
+        let mut byte = [0u8; 1];
+        peer.read_exact(&mut byte).expect("reads forward");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("finishes the client");
+        waited
+            .recv_timeout(crate::budgets::RELAY_RESPONSE_IDLE + Duration::from_secs(5))
+            .expect("the owned relay ended its idle sibling");
+        relay.join().expect("the relay thread returns");
+    }
+
     #[test]
     fn a_metered_tcp_flow_relays_over_the_lane_pool() {
         let front = crate::conn::test_bind(("127.0.0.1", 0)).expect("binds the front");
@@ -34940,7 +35078,8 @@ mod tests {
         let mut client = Connection::connect(front.local_addr().expect("front address"))
             .expect("connects the client");
         let (accepted, _) = front.accept().expect("accepts the client");
-        let client_local = accepted.with_meter(crate::stats::counting());
+        let (meter, read, write) = crate::stats::counting();
+        let client_local = accepted.with_meter(meter);
         let mut peer = Connection::connect(edge.local_addr().expect("edge address"))
             .expect("connects the peer");
         let (accepted, _) = edge.accept().expect("accepts the peer");
@@ -34965,6 +35104,16 @@ mod tests {
         drop(client);
         drop(peer);
         relay.join().expect("the relay call returns");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while (read.value(), write.value()) != (5, 5) {
+            assert!(
+                Instant::now() < deadline,
+                "the relay counters saw {} read and {} written bytes",
+                read.value(),
+                write.value()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
     }
 
     #[test]
