@@ -7089,11 +7089,6 @@ fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
                     Next::More
                 }
                 Err(error) if is_timeout(&error) => {
-                    #[cfg(unix)]
-                    {
-                        use std::os::fd::AsRawFd as _;
-                        note_wait_fd(read.as_raw_fd());
-                    }
                     if done.load(Ordering::Relaxed) {
                         Next::Done
                     } else {
@@ -24387,7 +24382,7 @@ pub(crate) mod lane_pool {
     const SETUP_PENDING: usize = 8;
 
     /// Handshakes past the dedicated setup lanes may borrow a relay worker, so a burst keeps four
-    /// handshakes in flight without adding threads to the peak; two borrowed lanes leave six relay
+    /// handshakes in flight without adding threads to the peak; two borrowed lanes leave five relay
     /// workers for the flows behind them.
     const SETUP_BORROW_LANES: usize = 2;
 
