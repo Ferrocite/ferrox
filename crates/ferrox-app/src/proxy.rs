@@ -7066,50 +7066,91 @@ fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
     let wire = session.wire.clone();
     let id = Arc::clone(&session.id);
     let done = Arc::clone(&session.done);
-    let (finished, end) = std::sync::mpsc::channel();
-    lane_pool::submit(
-        Box::new(move || {
+    #[cfg(target_os = "linux")]
+    {
+        let (finished, end) = std::sync::mpsc::channel();
+        lane_pool::submit(
+            Box::new(move || {
+                let mut buf = udp_buffer();
+                let mut staging = Vec::with_capacity(8192);
+                match read.recv_from(&mut buf) {
+                    Ok((n, source)) => {
+                        if done.load(Ordering::Relaxed) {
+                            return Next::Done;
+                        }
+                        let keep = ferrox_core::mux::Outgoing {
+                            id: id.load(Ordering::Relaxed),
+                            status: ferrox_core::mux::Status::Keep,
+                            options: ferrox_core::mux::DATA,
+                            target: Some(mux_target_of(source)),
+                            global_id: None,
+                        };
+                        if !wire.write_frame(&mut staging, keep, Some(&buf[..n])) {
+                            return Next::Done;
+                        }
+                        Next::More
+                    }
+                    Err(error) if is_timeout(&error) => {
+                        if done.load(Ordering::Relaxed) {
+                            Next::Done
+                        } else {
+                            Next::Idle
+                        }
+                    }
+                    Err(error) if is_udp_gone(&error) => {
+                        if done.load(Ordering::Relaxed) {
+                            Next::Done
+                        } else {
+                            Next::Idle
+                        }
+                    }
+                    Err(_) => Next::Done,
+                }
+            }),
+            Box::new(move || {
+                let _ = finished.send(Ok(()));
+            }),
+        );
+        return Some(end);
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(RelayPool::global().run(move || {
             let mut buf = udp_buffer();
             let mut staging = Vec::with_capacity(8192);
-            match read.recv_from(&mut buf) {
-                Ok((n, source)) => {
-                    if done.load(Ordering::Relaxed) {
-                        return Next::Done;
+            loop {
+                match read.recv_from(&mut buf) {
+                    Ok((n, source)) => {
+                        if done.load(Ordering::Relaxed) {
+                            return;
+                        }
+                        let keep = ferrox_core::mux::Outgoing {
+                            id: id.load(Ordering::Relaxed),
+                            status: ferrox_core::mux::Status::Keep,
+                            options: ferrox_core::mux::DATA,
+                            target: Some(mux_target_of(source)),
+                            global_id: None,
+                        };
+                        if !wire.write_frame(&mut staging, keep, Some(&buf[..n])) {
+                            return;
+                        }
                     }
-                    let keep = ferrox_core::mux::Outgoing {
-                        id: id.load(Ordering::Relaxed),
-                        status: ferrox_core::mux::Status::Keep,
-                        options: ferrox_core::mux::DATA,
-                        target: Some(mux_target_of(source)),
-                        global_id: None,
-                    };
-                    if !wire.write_frame(&mut staging, keep, Some(&buf[..n])) {
-                        return Next::Done;
+                    Err(error) if is_timeout(&error) => {
+                        if done.load(Ordering::Relaxed) {
+                            return;
+                        }
                     }
-                    Next::More
+                    Err(error) if is_udp_gone(&error) => {
+                        thread::sleep(RELAY_POLL);
+                        if done.load(Ordering::Relaxed) {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
                 }
-                Err(error) if is_timeout(&error) => {
-                    if done.load(Ordering::Relaxed) {
-                        Next::Done
-                    } else {
-                        Next::Idle
-                    }
-                }
-                Err(error) if is_udp_gone(&error) => {
-                    if done.load(Ordering::Relaxed) {
-                        Next::Done
-                    } else {
-                        Next::Idle
-                    }
-                }
-                Err(_) => Next::Done,
             }
-        }),
-        Box::new(move || {
-            let _ = finished.send(Ok(()));
-        }),
-    );
-    Some(end)
+        }))
+    }
 }
 
 /// The QUIC identity an inbound serves: QUIC mandates TLS, so anything without a certificate serves nothing.
