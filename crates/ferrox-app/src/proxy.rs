@@ -6177,7 +6177,7 @@ fn dns_udp_with(
     let mut framed = Vec::with_capacity(3 + 1 + 4 + 2 + query.len());
     let frame = socks_udp_frame(&mut framed, None, &target, query);
     client.send(frame).ok()?;
-    let mut response = vec![0u8; ferrox_core::dns::MESSAGE_MAX + 32];
+    let mut response = unfilled(ferrox_core::dns::MESSAGE_MAX + 32);
     let read = client.recv(&mut response).ok()?;
     let (_, payload) = parse_socks_udp(&response[..read])?;
     Some(payload.to_vec())
@@ -21240,7 +21240,7 @@ fn read_dns_source<'a>(stream: &mut impl Read, body: &'a mut Vec<u8>) -> Option<
     if size > ferrox_core::dns::MESSAGE_MAX {
         return None;
     }
-    body.resize(size, 0);
+    resize_scratch(body, size);
     stream.read_exact(body).ok()?;
     Some(body)
 }
@@ -22016,7 +22016,9 @@ impl SsUdpLane {
         let Ok(mut guard) = self.sources.lock() else {
             return false;
         };
-        if !guard.contains_key(&src) {
+        let source = if let Some(source) = guard.get_mut(&src) {
+            source
+        } else {
             if guard.len() >= crate::shadowsocks::SS_UDP_SOURCES {
                 let now = Instant::now();
                 let idle = budgets::udp_idle();
@@ -22044,9 +22046,10 @@ impl SsUdpLane {
                     last: Instant::now(),
                 },
             );
-        }
-        let Some(source) = guard.get_mut(&src) else {
-            return true;
+            let Some(source) = guard.get_mut(&src) else {
+                return true;
+            };
+            source
         };
         source.last = Instant::now();
         if let Some(packet) = crate::shadowsocks::seal_datagram(
@@ -62363,6 +62366,25 @@ mod dns_lane_tests {
         );
         assert_eq!(body.as_ptr() as usize, base, "the buffer never moves");
         assert_eq!(body.capacity(), capacity, "nor grows for them");
+    }
+
+    /// A length-prefixed message lands in the lane's buffer without a zero pass: the read writes every
+    /// byte the length names, so only the two-byte head is taken from zeroed storage.
+    #[test]
+    fn a_stream_lane_message_does_not_zero_its_landing() {
+        let message = [0xa5u8; 48];
+        let mut wire = Vec::with_capacity(message.len() + 2);
+        wire.extend_from_slice(&(message.len() as u16).to_be_bytes());
+        wire.extend_from_slice(&message);
+        let mut stream = std::io::Cursor::new(wire);
+        let mut body = Vec::new();
+        let (read, counts) = ferrox_core::alloc_count::measure(|| {
+            read_dns_source(&mut stream, &mut body)
+                .expect("a message")
+                .to_vec()
+        });
+        assert_eq!(read, message);
+        assert_eq!(counts.zeroed, 0, "the body is written, not zero-filled");
     }
 
     #[test]
