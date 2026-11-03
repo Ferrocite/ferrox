@@ -955,7 +955,7 @@ pub(crate) fn serve_inbound(inbound: &Json, out: &Outbound, address: &str) -> Re
         .port();
     let _ = socket.set_read_timeout(Some(IO_TICK));
     let (packets_tx, packets_rx) = mpsc::channel();
-    let (to_tunnel, from_tunnel) = mpsc::channel();
+    let (to_tunnel, from_tunnel) = mpsc::sync_channel(TX_DRAIN);
     let io_config = config.clone();
     let io_packets = packets_tx.clone();
     std::thread::spawn(move || io(io_config, socket, from_tunnel, io_packets, None, None));

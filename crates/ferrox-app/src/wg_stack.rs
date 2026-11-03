@@ -16,7 +16,7 @@ use std::net::{IpAddr, Shutdown, SocketAddr, UdpSocket};
 #[cfg(unix)]
 use std::os::fd::AsRawFd as _;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender, SyncSender};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant as StdInstant};
 
@@ -434,6 +434,15 @@ impl ToTunnel {
             Self::Bounded(sender) => sender.send(packet),
         }
     }
+
+    fn try_send(&self, packet: Vec<u8>) -> Result<(), TrySendError<Vec<u8>>> {
+        match self {
+            Self::Unbounded(sender) => sender
+                .send(packet)
+                .map_err(|error| TrySendError::Disconnected(error.0)),
+            Self::Bounded(sender) => sender.try_send(packet),
+        }
+    }
 }
 
 impl From<Sender<Vec<u8>>> for ToTunnel {
@@ -476,20 +485,26 @@ pub(crate) fn client(
                 eprintln!("wireguard client: {error}");
             }
         }
-        match packets.recv_timeout(TICK) {
-            Ok(packet) => {
+        let mut received = false;
+        if let Ok(packet) = packets.try_recv() {
+            receive_client(&mut stack, packet);
+            received = true;
+            for _ in 1..RX_BURST {
+                let Ok(packet) = packets.try_recv() else {
+                    break;
+                };
                 receive_client(&mut stack, packet);
-                for _ in 1..RX_BURST {
-                    let Ok(packet) = packets.try_recv() else {
-                        break;
-                    };
-                    receive_client(&mut stack, packet);
-                }
             }
+        }
+        let more = stack.poll(&mut buf);
+        if received || more {
+            continue;
+        }
+        match packets.recv_timeout(TICK) {
+            Ok(packet) => receive_client(&mut stack, packet),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
-        stack.poll(&mut buf);
     }
 }
 
@@ -525,20 +540,26 @@ pub(crate) fn server(
     let mut stack = ServerStack::new(&config, to_tunnel, out, headroom);
     let mut buf = vec![0u8; 64 * 1024];
     loop {
-        match packets.recv_timeout(TICK) {
-            Ok(packet) => {
+        let mut received = false;
+        if let Ok(packet) = packets.try_recv() {
+            stack.receive(packet);
+            received = true;
+            for _ in 1..RX_BURST {
+                let Ok(packet) = packets.try_recv() else {
+                    break;
+                };
                 stack.receive(packet);
-                for _ in 1..RX_BURST {
-                    let Ok(packet) = packets.try_recv() else {
-                        break;
-                    };
-                    stack.receive(packet);
-                }
             }
+        }
+        let more = stack.poll(&mut buf);
+        if received || more {
+            continue;
+        }
+        match packets.recv_timeout(TICK) {
+            Ok(packet) => stack.receive(packet),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
         }
-        stack.poll(&mut buf);
     }
 }
 
@@ -696,7 +717,7 @@ impl ClientStack {
         None
     }
 
-    fn poll(&mut self, buf: &mut [u8]) {
+    fn poll(&mut self, buf: &mut [u8]) -> bool {
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         let ready = self.readiness.sync(&self.flows);
@@ -718,12 +739,18 @@ impl ClientStack {
             &mut self.race_bytes,
         );
         self.retiring = retiring;
+        let mut emitted = 0;
         for _ in 0..TX_BURST {
             let Some(packet) = self.device.tx.pop_front() else {
                 break;
             };
-            if self.to_tunnel.send(packet).is_err() {
-                return;
+            match self.to_tunnel.try_send(packet) {
+                Ok(()) => emitted += 1,
+                Err(TrySendError::Full(packet)) => {
+                    self.device.tx.push_front(packet);
+                    return false;
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
             }
         }
         let mut retiring = std::mem::take(&mut self.retiring);
@@ -742,6 +769,7 @@ impl ClientStack {
             }
         });
         self.retiring = retiring;
+        emitted == TX_BURST
     }
 
     fn now(&self) -> Instant {
@@ -879,7 +907,7 @@ impl ServerStack {
         let _ = lane.uplink.send(out);
     }
 
-    fn poll(&mut self, buf: &mut [u8]) {
+    fn poll(&mut self, buf: &mut [u8]) -> bool {
         self.syn_ports.clear();
         for packet in &self.device.rx {
             if let Some(port) = tcp_syn_port(packet) {
@@ -898,12 +926,18 @@ impl ServerStack {
             pump(flow, &mut self.sockets, buf, up_ready);
         }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+        let mut emitted = 0;
         for _ in 0..TX_BURST {
             let Some(packet) = self.device.tx.pop_front() else {
                 break;
             };
-            if self.to_tunnel.send(packet).is_err() {
-                return;
+            match self.to_tunnel.try_send(packet) {
+                Ok(()) => emitted += 1,
+                Err(TrySendError::Full(packet)) => {
+                    self.device.tx.push_front(packet);
+                    return false;
+                }
+                Err(TrySendError::Disconnected(_)) => return false,
             }
         }
         self.flows.retain(|flow| {
@@ -949,6 +983,7 @@ impl ServerStack {
                 lane.stop.store(true, Ordering::Relaxed);
             }
         }
+        emitted == TX_BURST
     }
 
     fn listen(&mut self, port: u16) {
@@ -1761,6 +1796,31 @@ mod tests {
         assert!(!stack.listeners.contains_key(&expired));
         stack.listen(10_000 + LISTENERS as u16 + 20);
         assert_eq!(stack.listeners.len(), LISTENERS);
+    }
+
+    /// A turn that filled the transmit burst must ask for the next turn at once; only a queue it emptied lets the loop block.
+    #[test]
+    fn a_capped_transmit_burst_reports_more_to_send() {
+        let config = DeviceConfig {
+            secret: [0u8; 32],
+            addresses: vec!["10.0.0.1".parse().unwrap()],
+            peers: Vec::new(),
+            mtu: 1420,
+            reserved: [0u8; 3],
+            is_client: Some(false),
+            no_kernel_tun: true,
+            dns: Vec::new(),
+        };
+        let (to_tunnel, packets) = std::sync::mpsc::channel();
+        let out = Outbound::Freedom(Arc::new(crate::proxy::FreedomOut::default()));
+        let mut stack = ServerStack::new(&config, to_tunnel, out, 0);
+        for _ in 0..=TX_BURST {
+            stack.device.tx.push_back(vec![0u8; 64]);
+        }
+        let mut buf = [0u8; 1024];
+        assert!(stack.poll(&mut buf), "a capped burst leaves a turn owed");
+        assert!(!stack.poll(&mut buf), "a drained queue owes nothing");
+        assert_eq!(packets.try_iter().count(), TX_BURST + 1);
     }
 
     fn checksum(bytes: &[u8]) -> u16 {
