@@ -484,14 +484,22 @@ pub(crate) fn client(
 
 /// One client turn, or true once the tunnel is closed.
 fn client_turn(stack: &mut ClientStack, packets: &Packets, buf: &mut [u8]) -> bool {
+    let mut closed = false;
     for _ in 0..RX_BURST {
         match packets.try_recv() {
             Ok(packet) => receive_client(stack, packet),
             Err(std::sync::mpsc::TryRecvError::Empty) => break,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => return true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                closed = true;
+                break;
+            }
         }
     }
-    if stack.poll(buf) {
+    let progressed = stack.poll(buf);
+    if closed {
+        return true;
+    }
+    if progressed {
         return false;
     }
     match packets.recv_timeout(TICK) {
@@ -542,14 +550,22 @@ pub(crate) fn server(
 
 /// One server turn, or true once the inbound is closed.
 fn server_turn(stack: &mut ServerStack, packets: &Packets, buf: &mut [u8]) -> bool {
+    let mut closed = false;
     for _ in 0..RX_BURST {
         match packets.try_recv() {
             Ok(packet) => stack.receive(packet),
             Err(std::sync::mpsc::TryRecvError::Empty) => break,
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => return true,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                closed = true;
+                break;
+            }
         }
     }
-    if stack.poll(buf) {
+    let progressed = stack.poll(buf);
+    if closed {
+        return true;
+    }
+    if progressed {
         return false;
     }
     match packets.recv_timeout(TICK) {
