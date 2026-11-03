@@ -3744,6 +3744,39 @@ mod tests {
         (conn, written, slices)
     }
 
+    /// A SETTINGS window update must not become visible before it can adjust the stream table:
+    /// a stream inserted in between would take the new initial window and then the delta again.
+    #[test]
+    fn a_settings_window_update_publishes_only_with_the_stream_table() {
+        let (conn, _written, _slices) = bare_conn();
+        let streams = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        let started = Arc::new(std::sync::Barrier::new(2));
+        let update = {
+            let conn = Arc::clone(&conn);
+            let started = Arc::clone(&started);
+            std::thread::spawn(move || {
+                started.wait();
+                let mut body = Vec::with_capacity(6);
+                body.extend_from_slice(&S_WINDOW.to_be_bytes());
+                body.extend_from_slice(&100_000u32.to_be_bytes());
+                conn.apply_settings(&body)
+            })
+        };
+        started.wait();
+        std::thread::sleep(Duration::from_millis(250));
+        let published = conn.peer_window() != 65_535;
+        drop(streams);
+        assert!(
+            update.join().expect("the settings thread"),
+            "the update is acked"
+        );
+        assert!(
+            !published,
+            "the window was published while the stream table was locked"
+        );
+        assert_eq!(conn.peer_window(), 100_000);
+    }
+
     /// `END_STREAM` arrives on the `HEADERS` frame that opens a block, not on the last
     /// `CONTINUATION` that completes it: the flag has to ride the assembly, or a header-only
     /// request opens with a body it never has and its entry is never retired.
