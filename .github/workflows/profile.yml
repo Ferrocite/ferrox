@@ -45,11 +45,15 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq linux-tools-common linux-tools-generic protobuf-compiler
-          perf="$(command -v perf || true)"
-          if [[ -z "$perf" ]]; then
-            perf="$(ls /usr/lib/linux-tools/*/perf 2>/dev/null | tail -1)"
-          fi
-          [[ -n "$perf" ]] || { echo "::error::no perf binary" >&2; exit 1; }
+          perf=""
+          for candidate in /usr/lib/linux-tools/*/perf "$(command -v perf || true)"; do
+            [[ -n "$candidate" && -x "$candidate" ]] || continue
+            if "$candidate" --version >/dev/null 2>&1; then
+              perf="$candidate"
+              break
+            fi
+          done
+          [[ -n "$perf" ]] || { echo "::error::no working perf binary" >&2; exit 1; }
           sudo ln -sf "$perf" /usr/local/bin/perf
           sudo sysctl -w kernel.perf_event_paranoid=-1
           perf --version
@@ -73,6 +77,10 @@ jobs:
             --tier full --only "$CELL" --engines xray-core,ferrox \
             --repeats 1 --no-build --out profile/out || true
           ls -la profile profile/out/cells 2>/dev/null || true
+          if ! compgen -G 'profile/*.perf.data' > /dev/null; then
+            echo "::error::no perf profile was produced" >&2
+            exit 1
+          fi
       - name: collapse the profiles
         shell: bash
         run: |
@@ -85,9 +93,11 @@ jobs:
             perf report --stdio --no-children -g none -i "$data" \
               --sort symbol --percent-limit 0.5 > "$base.symbols.txt" 2>&1 || true
             perf script -i "$data" 2>/dev/null \
-              | /tmp/FlameGraph/stackcollapse-perf.pl --all \
-              | /tmp/FlameGraph/flamegraph.pl --title "$(basename "$base")" > "$base.svg" || true
-            top="$(awk '/^ +[0-9]+\.[0-9]+%/{print $2; exit}' "$base.symbols.txt" 2>/dev/null || true)"
+              | /tmp/FlameGraph/stackcollapse-perf.pl --all > "$base.collapsed" || true
+            /tmp/FlameGraph/flamegraph.pl --title "$(basename "$base")" \
+              < "$base.collapsed" > "$base.svg" || true
+            top="$(awk '/^ +[0-9]+\.[0-9]+%/{sub(/^ +[0-9.]+% +\[.\] +/,""); print; exit}' \
+              "$base.symbols.txt" 2>/dev/null || true)"
             [[ -n "$top" ]] && perf annotate --stdio -i "$data" -s "$top" \
               > "$base.annotate.txt" 2>&1 || true
           done
