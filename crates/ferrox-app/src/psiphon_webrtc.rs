@@ -735,7 +735,7 @@ impl Conduit {
         if self.fronts.is_empty() {
             return Err("psiphon conduit: no broker front".to_owned());
         }
-        if !matches!(destination.base_protocol(), "OSSH" | "SSH") {
+        if !matches!(destination.base_protocol(), "OSSH" | "SSH" | "TLS-OSSH") {
             return Err(format!(
                 "psiphon conduit: {} is not carried by this lane",
                 destination.protocol

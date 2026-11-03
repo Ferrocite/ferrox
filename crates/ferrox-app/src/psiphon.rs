@@ -2287,6 +2287,15 @@ fn load_source_entries(
             let (limits, label, filter) = target_protocol_filter(settings);
             if let Some(shape) = filter {
                 let named_meek = limits.iter().any(|protocol| is_meek_protocol(protocol));
+                if shape.tls
+                    && !shape.plain
+                    && !shape.obfuscated
+                    && server.tls_port.is_some()
+                    && server.obfuscation_key.is_some()
+                {
+                    server.tls = true;
+                    server.port = server.tls_port.unwrap_or(server.port);
+                }
                 if !named_meek && server.direct {
                     server.meek = None;
                     server.unfronted_meek = None;
@@ -2332,17 +2341,28 @@ fn load_source_entries(
     Ok(servers)
 }
 
+#[derive(Clone, Copy)]
+struct Shape {
+    plain: bool,
+    obfuscated: bool,
+    tls: bool,
+}
+
 /// The shapes a protocol list names; `None` means the list asks for no restriction.
-fn shape_filter(protocols: &[String], label: &str) -> Option<(bool, bool)> {
+fn shape_filter(protocols: &[String], label: &str) -> Option<Shape> {
     if protocols.is_empty() {
         return None;
     }
-    let mut wants_plain = false;
-    let mut wants_obfuscated = false;
+    let mut shape = Shape {
+        plain: false,
+        obfuscated: false,
+        tls: false,
+    };
     let mut unsupported = Vec::new();
     for protocol in protocols {
         match protocol.as_str() {
-            "SSH" | "UNFRONTED-SSH" => wants_plain = true,
+            "SSH" | "UNFRONTED-SSH" => shape.plain = true,
+            "TLS-OSSH" => shape.tls = true,
             "OSSH"
             | "UNFRONTED-OSSH"
             | "UNFRONTED-MEEK-OSSH"
@@ -2351,7 +2371,7 @@ fn shape_filter(protocols: &[String], label: &str) -> Option<(bool, bool)> {
             | "FRONTED-MEEK-CDN-OSSH"
             | "FRONTED-MEEK-HTTP-OSSH"
             | "FRONTED-MEEK-CDN-HTTP-OSSH" => {
-                wants_obfuscated = true;
+                shape.obfuscated = true;
             }
             other => unsupported.push(other),
         }
@@ -2359,18 +2379,20 @@ fn shape_filter(protocols: &[String], label: &str) -> Option<(bool, bool)> {
     if !unsupported.is_empty() {
         eprintln!("psiphon: {label} ignores {}", unsupported.join(","));
     }
-    if !wants_plain && !wants_obfuscated {
+    if !shape.plain && !shape.obfuscated && !shape.tls {
         eprintln!("psiphon: {label} names no SSH or OSSH shape; using the whole list");
         return None;
     }
-    Some((wants_plain, wants_obfuscated))
+    Some(shape)
 }
 
-fn matches_shape(server: &Server, (plain, obfuscated): (bool, bool)) -> bool {
-    if server.obfuscated() {
-        obfuscated
+fn matches_shape(server: &Server, shape: Shape) -> bool {
+    if server.tls {
+        shape.tls
+    } else if server.obfuscated() {
+        shape.obfuscated
     } else {
-        plain
+        shape.plain
     }
 }
 
@@ -2386,23 +2408,12 @@ fn is_meek_protocol(protocol: &str) -> bool {
 }
 
 /// Whether a server is allowed by a limit that names no meek transport.
-fn matches_direct_limit(server: &Server, (plain, obfuscated): (bool, bool)) -> bool {
-    server.direct
-        && server.meek.is_none()
-        && if server.obfuscation_key.is_some() {
-            obfuscated
-        } else {
-            plain
-        }
+fn matches_direct_limit(server: &Server, shape: Shape) -> bool {
+    server.direct && server.meek.is_none() && matches_shape(server, shape)
 }
 
 /// Whether a server is allowed by a limit, with a direct-only limit dropping every meek entry.
-fn matches_limit(
-    server: &Server,
-    filter: (bool, bool),
-    meek_named: bool,
-    protocols: &[String],
-) -> bool {
+fn matches_limit(server: &Server, filter: Shape, meek_named: bool, protocols: &[String]) -> bool {
     if meek_named {
         matches_shape(server, filter) && matches_meek_protocol(server, protocols)
     } else {
@@ -2426,7 +2437,7 @@ fn matches_meek_protocol(server: &Server, protocols: &[String]) -> bool {
         .any(|protocol| is_meek_protocol(protocol) && protocol_base(protocol) == base)
 }
 
-fn target_protocol_filter(settings: &Settings) -> (&[String], &'static str, Option<(bool, bool)>) {
+fn target_protocol_filter(settings: &Settings) -> (&[String], &'static str, Option<Shape>) {
     if settings.initial_count > 0 && !settings.initial_protocols.is_empty() {
         let shape = shape_filter(&settings.initial_protocols, "InitialLimitTunnelProtocols");
         if shape.is_some() {
@@ -2770,6 +2781,28 @@ fn select_protocols(
     if normal.is_none() && !initial_active {
         return servers;
     }
+    let tls_named = normal.is_some_and(|shape| shape.tls)
+        || (initial_active && initial.is_some_and(|shape| shape.tls));
+    if tls_named {
+        let mut variants = Vec::new();
+        for server in &servers {
+            if server.tls
+                || !server.direct
+                || server.tls_port.is_none()
+                || server.obfuscation_key.is_none()
+            {
+                continue;
+            }
+            let mut variant = server.clone();
+            variant.tls = true;
+            variant.port = variant.tls_port.unwrap_or(variant.port);
+            variant.meek = None;
+            variant.unfronted_meek = None;
+            variant.tactics = None;
+            variants.push(variant);
+        }
+        servers.extend(variants);
+    }
     let normal_meek =
         normal.is_some() && protocols.iter().any(|protocol| is_meek_protocol(protocol));
     let initial_meek = initial_active
@@ -2904,18 +2937,42 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
         .and_then(Json::as_str)
         .map(str::to_owned)
         .filter(|key| !key.is_empty());
+    let meek_obfuscated_key = entry
+        .get("meekObfuscatedKey")
+        .and_then(Json::as_str)
+        .map(str::to_owned)
+        .filter(|key| !key.is_empty());
     let ssh_port = entry
         .get("sshPort")
         .and_then(Json::as_port)
         .filter(|port| *port > 0);
+    let tls_capable = capability_protocol(&entry, &[("TLS-OSSH", "TLS-OSSH")]).is_some();
+    let tls_port = entry
+        .get("tlsOSSHPort")
+        .and_then(Json::as_port)
+        .filter(|port| *port > 0)
+        .or_else(|| {
+            if !tls_capable {
+                return None;
+            }
+            entry
+                .get("meekServerPort")
+                .and_then(Json::as_port)
+                .filter(|port| *port > 0)
+        });
     let protocol = meek_protocol(&entry);
     let tactics_capable = tactics_capability(&entry);
-    let direct = obfuscated_port.is_some() || ssh_port.is_some();
+    let direct = obfuscated_port.is_some()
+        || ssh_port.is_some()
+        || (tls_port.is_some() && obfuscated_key.is_some());
     let inproxy = crate::psiphon_broker::destination(&entry, &host);
     let inproxy_port = inproxy.as_ref().map_or(0, destination_port);
-    let (port, obfuscation_key) = match (obfuscated_port, ssh_port) {
-        (Some(port), _) if obfuscated_key.is_some() => (port, obfuscated_key),
-        (_, Some(port)) => (port, None),
+    let (port, obfuscation_key, tls) = match (obfuscated_port, ssh_port) {
+        (Some(port), _) if obfuscated_key.is_some() => (port, obfuscated_key, false),
+        (_, Some(port)) => (port, None, false),
+        _ if tls_port.is_some() && obfuscated_key.is_some() => {
+            (tls_port.unwrap_or(0), obfuscated_key, true)
+        }
         _ if protocol.is_some() || tactics_capable => {
             let port = entry
                 .get("meekServerPort")
@@ -2928,9 +2985,9 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
                         443
                     }
                 });
-            (port, obfuscated_key)
+            (port, obfuscated_key, false)
         }
-        _ if include_inproxy && inproxy.is_some() => (inproxy_port, obfuscated_key),
+        _ if include_inproxy && inproxy.is_some() => (inproxy_port, obfuscated_key, false),
         _ => return None,
     };
     let region = entry
@@ -2962,8 +3019,11 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
         password,
         host_key,
         obfuscation_key,
+        meek_obfuscated_key,
         region,
         direct,
+        tls,
+        tls_port,
         meek,
         unfronted_meek,
         tactics,
@@ -3884,6 +3944,45 @@ mod tests {
     }
 
     #[test]
+    fn a_tls_ossh_only_entry_dials_its_own_port() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshObfuscatedKey":"k","sshHostKey":"AAAA","tlsOSSHPort":8443,"capabilities":["TLS-OSSH"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("entry");
+        assert!(server.tls);
+        assert_eq!(server.port, 8443);
+        assert_eq!(server.tls_port, Some(8443));
+    }
+
+    #[test]
+    fn a_tls_variant_is_added_only_when_the_limit_names_it() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshObfuscatedPort":443,"sshObfuscatedKey":"k","sshHostKey":"AAAA","tlsOSSHPort":8443,"capabilities":["OSSH","TLS-OSSH"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("entry");
+        assert!(!server.tls);
+        assert_eq!(server.port, 443);
+        let selected = select_protocols(
+            vec![server.clone()],
+            &["TLS-OSSH".to_owned()],
+            &[],
+            0,
+            false,
+        );
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].tls);
+        assert_eq!(selected[0].port, 8443);
+    }
+
+    #[test]
+    fn an_inproxy_tls_destination_keeps_its_own_port() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","sshObfuscatedKey":"k","capabilities":["INPROXY-WEBRTC-TLS-OSSH"],"inproxyTlsOSSHPort":8443,"signature":"AA=="}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry_with(&encoded, true).expect("entry");
+        let destination = server.inproxy.expect("destination");
+        assert_eq!(destination.protocol, "INPROXY-WEBRTC-TLS-OSSH");
+        assert_eq!(destination.address, "192.0.2.1:8443");
+    }
+
+    #[test]
     fn an_inproxy_only_entry_keeps_its_destination() {
         let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["INPROXY-WEBRTC-OSSH"],"inproxyOSSHPort":443,"signature":"AA=="}"#;
         let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
@@ -4488,8 +4587,11 @@ mod tests {
             password: String::new(),
             host_key: Vec::new(),
             obfuscation_key: obfuscated.then(|| "k".to_owned()),
+            meek_obfuscated_key: None,
             region: None,
             direct: true,
+            tls: false,
+            tls_port: None,
             meek: None,
             unfronted_meek: None,
             tactics: None,
@@ -4630,16 +4732,13 @@ mod tests {
             )),
             [false, true]
         );
-        assert_eq!(
-            shapes(select_protocols(
-                servers(),
-                &["TLS-OSSH".to_owned()],
-                &[],
-                0,
-                false
-            )),
-            [false, true]
-        );
+        assert!(select_protocols(servers(), &["TLS-OSSH".to_owned()], &[], 0, false).is_empty());
+        let mut capable = test_server(true);
+        capable.tls_port = Some(443);
+        let selected = select_protocols(vec![capable], &["TLS-OSSH".to_owned()], &[], 0, false);
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].tls);
+        assert_eq!(selected[0].port, 443);
     }
 
     #[test]
@@ -5104,8 +5203,11 @@ mod tests {
                 password: String::new(),
                 host_key: Vec::new(),
                 obfuscation_key: None,
+                meek_obfuscated_key: None,
                 region: None,
                 direct: true,
+                tls: false,
+                tls_port: None,
                 meek: None,
                 unfronted_meek: None,
                 tactics: None,
@@ -5143,8 +5245,11 @@ mod tests {
                 password: String::new(),
                 host_key: Vec::new(),
                 obfuscation_key: None,
+                meek_obfuscated_key: None,
                 region: None,
                 direct: true,
+                tls: false,
+                tls_port: None,
                 meek: None,
                 unfronted_meek: None,
                 tactics: None,

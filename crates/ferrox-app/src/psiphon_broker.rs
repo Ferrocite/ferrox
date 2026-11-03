@@ -133,6 +133,15 @@ pub(crate) fn destination(entry: &Json, host: &str) -> Option<Destination> {
             NetworkProtocol::Tcp,
             "INPROXY-WEBRTC-SSH",
         )
+    } else if has("INPROXY-WEBRTC-TLS-OSSH") {
+        (
+            entry
+                .get("inproxyTlsOSSHPort")
+                .and_then(Json::as_port)
+                .or_else(|| entry.get("inproxyMeekPort").and_then(Json::as_port)),
+            NetworkProtocol::Tcp,
+            "INPROXY-WEBRTC-TLS-OSSH",
+        )
     } else if has("INPROXY-WEBRTC-QUIC-OSSH") {
         (
             entry.get("inproxyQUICPort").and_then(Json::as_port),

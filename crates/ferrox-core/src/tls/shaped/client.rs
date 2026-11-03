@@ -155,6 +155,7 @@ impl<S: Stream> Session<S> {
             &cfg.alpn,
             cfg.websocket,
             &cfg.curves,
+            cfg.client_random,
         )?;
         if let Some(list) = &cfg.ech_config_list {
             hello.enable_ech(list)?;
@@ -2508,7 +2509,8 @@ mod tests {
 
     fn ech_session(list: &[u8], server: impl FnOnce(&Hello) -> Vec<u8>) -> Session<Server> {
         let profile = Fingerprint::default().profile().expect("profile");
-        let mut hello = Hello::build(profile, "hidden.test", &[], false, &[]).expect("builds");
+        let mut hello =
+            Hello::build(profile, "hidden.test", &[], false, &[], None).expect("builds");
         hello.enable_ech(list).expect("ech");
         let server = server(&hello);
         Session::with_hello(

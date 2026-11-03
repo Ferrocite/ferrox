@@ -4,13 +4,14 @@
 
 use crate::psiphon_webrtc::{Conduit, Relay, WebRtcStream};
 use ctr::cipher::{KeyIvInit, StreamCipher};
+use ferrox_core::tls::{ClientSession, Fingerprint, TlsConfig, TlsProvider as _};
 use ring::signature;
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, VecDeque};
 use std::fmt::Write as _;
 use std::io::{self, IoSlice, Read, Write};
-use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
@@ -78,6 +79,8 @@ impl From<TcpStream> for Stream {
         Self::Tcp(socket)
     }
 }
+
+impl ferrox_core::tls::RecordAlignment for Stream {}
 
 impl Stream {
     fn try_clone(&self) -> io::Result<Self> {
@@ -155,8 +158,11 @@ pub(crate) struct Server {
     pub(crate) password: String,
     pub(crate) host_key: Vec<u8>,
     pub(crate) obfuscation_key: Option<String>,
+    pub(crate) meek_obfuscated_key: Option<String>,
     pub(crate) region: Option<String>,
     pub(crate) direct: bool,
+    pub(crate) tls: bool,
+    pub(crate) tls_port: Option<u16>,
     pub(crate) meek: Option<crate::psiphon_meek::Meek>,
     pub(crate) unfronted_meek: Option<crate::psiphon_meek::Meek>,
     pub(crate) tactics: Option<crate::psiphon_tactics::Keys>,
@@ -525,40 +531,55 @@ impl Session {
         let (stream, mut relay, protocol, relay_protocol) =
             if let (Some(conduit), Some(destination)) = (conduit, server.inproxy.as_ref()) {
                 let (stream, relay) = conduit.open(server.address, destination, identity)?;
-                (
-                    Stream::WebRtc(stream),
-                    Some(relay),
-                    destination.protocol,
-                    destination.base_protocol(),
-                )
+                let base = destination.base_protocol();
+                let stream = if base == "TLS-OSSH" {
+                    tls_tunnel(
+                        Stream::WebRtc(stream),
+                        &server.host,
+                        tls_passthrough_key(server),
+                        timeout,
+                    )?
+                } else {
+                    Stream::WebRtc(stream)
+                };
+                (stream, Some(relay), destination.protocol, base)
             } else {
                 let address = SocketAddr::new(server.address, server.port);
+                let tls_direct = server.tls && server.meek.is_none();
                 let socket = match &server.meek {
                     Some(meek) => crate::psiphon_meek::connect(meek, timeout, proxy)?,
-                    None => match proxy {
-                        Some(proxy) => proxy.connect(address, timeout).map_err(|error| {
-                            format!("psiphon ssh proxy {}: {error}", proxy.display())
-                        })?,
-                        None => TcpStream::connect_timeout(&address, timeout)
-                            .map_err(|error| format!("psiphon ssh {}: {error}", server.host))?,
-                    },
+                    None => direct_socket(address, server, timeout, proxy)?,
                 };
                 socket
                     .set_read_timeout(Some(timeout))
                     .and_then(|()| socket.set_write_timeout(Some(timeout)))
                     .and_then(|()| socket.set_nodelay(true))
                     .map_err(|error| format!("psiphon ssh socket: {error}"))?;
-                let protocol = server.meek.as_ref().map_or_else(
-                    || {
-                        if server.obfuscation_key.is_some() {
-                            "OSSH"
-                        } else {
-                            "SSH"
-                        }
-                    },
-                    |meek| tunnel_protocol_base(meek.protocol),
-                );
-                (Stream::Tcp(socket), None, protocol, protocol)
+                let protocol = if tls_direct {
+                    "TLS-OSSH"
+                } else {
+                    server.meek.as_ref().map_or_else(
+                        || {
+                            if server.obfuscation_key.is_some() {
+                                "OSSH"
+                            } else {
+                                "SSH"
+                            }
+                        },
+                        |meek| tunnel_protocol_base(meek.protocol),
+                    )
+                };
+                let stream = if tls_direct {
+                    tls_tunnel(
+                        Stream::Tcp(socket),
+                        &server.host,
+                        tls_passthrough_key(server),
+                        timeout,
+                    )?
+                } else {
+                    Stream::Tcp(socket)
+                };
+                (stream, None, protocol, protocol)
             };
 
         let control = stream
@@ -1141,6 +1162,157 @@ impl Drop for Channel {
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn tls_passthrough_key(server: &Server) -> &str {
+    server
+        .meek_obfuscated_key
+        .as_deref()
+        .or(server.obfuscation_key.as_deref())
+        .unwrap_or("")
+}
+
+/// The reference proves knowledge of the meek obfuscated key in the ClientHello random, which
+/// the server checks before it will speak TLS-OSSH; an invalid field is relayed to a decoy web
+/// site. The key is HKDF-derived from the 20-minute time period, and the message's second half
+/// is an HMAC over its nonce.
+fn tls_passthrough(key: &str) -> Result<[u8; 32], String> {
+    let period = 20 * 60i64;
+    let rounded = (std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("psiphon tls clock: {error}"))?
+        .as_secs() as i64
+        + period / 2)
+        / period;
+    let mut salt = b"passthrough-obfuscation-key".to_vec();
+    salt.extend_from_slice(&rounded.to_le_bytes());
+    let hkdf = hkdf::Hkdf::<sha2::Sha256>::new(Some(salt.as_slice()), key.as_bytes());
+    let mut derived = [0u8; 32];
+    hkdf.expand(&[], &mut derived)
+        .map_err(|error| format!("psiphon tls passthrough key: {error}"))?;
+    let mut message = [0u8; 32];
+    getrandom::fill(&mut message[..16])
+        .map_err(|error| format!("psiphon tls passthrough nonce: {error}"))?;
+    let tag = ring::hmac::sign(
+        &ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &derived),
+        &message[..16],
+    );
+    message[16..].copy_from_slice(&tag.as_ref()[..16]);
+    Ok(message)
+}
+
+fn direct_socket(
+    address: SocketAddr,
+    server: &Server,
+    timeout: Duration,
+    proxy: Option<&Proxy>,
+) -> Result<TcpStream, String> {
+    match proxy {
+        Some(proxy) => proxy
+            .connect(address, timeout)
+            .map_err(|error| format!("psiphon ssh proxy {}: {error}", proxy.display())),
+        None => TcpStream::connect_timeout(&address, timeout)
+            .map_err(|error| format!("psiphon ssh {}: {error}", server.host)),
+    }
+}
+
+/// Poll interval for the loopback TLS relay: a direction with nothing to send yields so the
+/// other one can, without a socket read waiting on the peer.
+const TLS_POLL: Duration = Duration::from_millis(1);
+const TLS_BUFFER: usize = 64 * 1024;
+
+/// Wrap a stream in TLS and expose the decrypted bytes as a loopback TCP socket, so the SSH
+/// framing below keeps one transport shape. The reference dials TLS-OSSH this way and then adds
+/// the same OSSH seed layer; this relay removes the need for a second, concurrent TLS owner.
+fn tls_tunnel(
+    stream: Stream,
+    server_name: &str,
+    passthrough_key: &str,
+    timeout: Duration,
+) -> Result<Stream, String> {
+    stream
+        .set_timeout(Some(timeout))
+        .map_err(|error| format!("psiphon tls socket: {error}"))?;
+    // An IP literal omits SNI, matching the reference's default; a host name is sent as the SNI it is.
+    let name = server_name.to_owned();
+    let config = TlsConfig {
+        server_name: name.clone(),
+        roots: crate::quic::system_roots(),
+        insecure: true,
+        fingerprint: Some(Fingerprint::default()),
+        client_random: Some(tls_passthrough(passthrough_key)?),
+        ..TlsConfig::default()
+    };
+    let mut tls = ferrox_core::tls::connect(&config, stream)
+        .map_err(|error| format!("psiphon tls {name}: {error}"))?;
+    tls.handshake()
+        .map_err(|error| format!("psiphon tls handshake {name}: {error}"))?;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .map_err(|error| format!("psiphon tls listener: {error}"))?;
+    let address = listener
+        .local_addr()
+        .map_err(|error| format!("psiphon tls listener: {error}"))?;
+    let local = TcpStream::connect_timeout(&address, timeout)
+        .map_err(|error| format!("psiphon tls loopback: {error}"))?;
+    local
+        .set_nodelay(true)
+        .and_then(|()| local.set_read_timeout(Some(timeout)))
+        .and_then(|()| local.set_write_timeout(Some(timeout)))
+        .map_err(|error| format!("psiphon tls loopback: {error}"))?;
+    std::thread::Builder::new()
+        .name("psiphon-tls".to_owned())
+        .spawn(move || match listener.accept() {
+            Ok((peer, _)) => {
+                if let Err(error) = relay_tls(tls, peer) {
+                    eprintln!("psiphon: tls relay {name}: {error}");
+                }
+            }
+            Err(error) => eprintln!("psiphon: tls accept: {error}"),
+        })
+        .map_err(|error| format!("psiphon tls thread: {error}"))?;
+    Ok(Stream::Tcp(local))
+}
+
+fn relay_tls(mut tls: ClientSession<Stream>, mut peer: TcpStream) -> io::Result<()> {
+    tls.get_ref().set_timeout(Some(TLS_POLL))?;
+    peer.set_read_timeout(Some(TLS_POLL))?;
+    peer.set_write_timeout(Some(IO_TIMEOUT))?;
+    let mut up = vec![0u8; TLS_BUFFER];
+    let mut down = vec![0u8; TLS_BUFFER];
+    loop {
+        match peer.read(&mut up) {
+            Ok(0) => break,
+            Ok(read) => {
+                if tls
+                    .write_all(&up[..read])
+                    .and_then(|()| tls.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(error) if idle(&error) => {}
+            Err(_) => break,
+        }
+        match tls.read(&mut down) {
+            Ok(0) => break,
+            Ok(read) => {
+                if peer.write_all(&down[..read]).is_err() {
+                    break;
+                }
+            }
+            Err(error) if idle(&error) => {}
+            Err(_) => break,
+        }
+    }
+    Ok(())
+}
+
+fn idle(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+    )
 }
 
 fn split(
