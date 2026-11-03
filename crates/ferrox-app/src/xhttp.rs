@@ -1763,6 +1763,7 @@ struct Session {
 
 struct SessionState {
     upload: Option<Box<dyn Read + Send>>,
+    upload_attached: bool,
     packets: BTreeMap<u64, Vec<u8>>,
     next_seq: u64,
     ended: bool,
@@ -1805,6 +1806,7 @@ fn get_or_create_session(id: &str) -> Arc<Session> {
             Arc::new(Session {
                 state: Mutex::new(SessionState {
                     upload: None,
+                    upload_attached: false,
                     packets: BTreeMap::new(),
                     next_seq: 0,
                     ended: false,
@@ -1875,11 +1877,18 @@ fn bound_session(
 }
 
 impl Session {
-    fn set_upload(&self, reader: Box<dyn Read + Send>) {
+    /// One stream-up body per session, the reference's `uploadQueue.Push`: a second reader is
+    /// refused so the caller can answer 409 before its bytes are promised.
+    fn set_upload(&self, reader: Box<dyn Read + Send>) -> bool {
         let mut st = self.state.lock().expect("session lock");
+        if st.upload_attached || st.ended {
+            return false;
+        }
+        st.upload_attached = true;
         st.upload = Some(reader);
         st.last_seen = std::time::Instant::now();
         self.cv.notify_all();
+        true
     }
     fn push_packet(&self, seq: u64, payload: Vec<u8>, cap: usize) -> bool {
         let mut st = self.state.lock().expect("session lock");
@@ -2227,6 +2236,10 @@ fn emit_405(stream: &mut impl Write) {
         b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
     );
 }
+fn emit_409(stream: &mut impl Write) {
+    let _ = stream
+        .write_all(b"HTTP/1.1 409 Conflict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+}
 fn emit_413(stream: &mut impl Write) {
     let _ = stream.write_all(
         b"HTTP/1.1 413 Request Entity Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
@@ -2525,11 +2538,11 @@ pub(crate) fn accept_core<
                 emit_400(&mut write);
                 return Served::Closed;
             }
-            let session = bound_session(sid, h2.as_ref(), false);
-            if h2.is_some() {
-                session.set_upload(Box::new(read));
+            let session = bound_session(sid, None, false);
+            let upload: Box<dyn Read + Send> = if h2.is_some() {
+                Box::new(read)
             } else {
-                session.set_upload(Box::new(Reader {
+                Box::new(Reader {
                     read,
                     prefix,
                     at: 0,
@@ -2538,7 +2551,14 @@ pub(crate) fn accept_core<
                     reads: 0,
                     pending_head: false,
                     chunk: Chunk::Body,
-                }));
+                })
+            };
+            if !session.set_upload(upload) {
+                emit_409(&mut write);
+                return Served::Closed;
+            }
+            if let Some(h2) = h2.as_ref() {
+                h2.bind_upload(sid);
             }
             plain_ok(&mut write, settings, &padded);
             session.wait_ended();
@@ -4901,6 +4921,82 @@ mod tests {
         up.join().expect("joins the uplink service");
     }
 
+    /// A session takes one stream-up body, as the reference's upload queue does: a second POST is
+    /// answered 409 instead of 200, because a 200 promises bytes the reader never takes.
+    #[test]
+    fn a_second_stream_up_upload_is_refused_before_it_is_acknowledged() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "mode": "stream-up"}}}"#,
+        );
+        let listener = Arc::new(crate::conn::test_bind("127.0.0.1:0").expect("binds"));
+        let port = listener.local_addr().expect("addr").port();
+        let serve = move || {
+            let listener = Arc::clone(&listener);
+            let settings = settings.clone();
+            thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                let Ok(read) = stream.try_clone() else {
+                    return;
+                };
+                let (mut head, at) = crate::proxy::read_exact_head(
+                    &mut stream,
+                    HEAD_LIMIT,
+                    crate::budgets::head_arrival(),
+                )
+                .expect("head");
+                let prefix = head.split_off(at);
+                if let Served::Session(mut reader, writer) =
+                    accept_core(&head, prefix, read, stream, &settings, None)
+                {
+                    let mut drained = Vec::new();
+                    let _ = reader.read_to_end(&mut drained);
+                    writer.finish();
+                }
+            })
+        };
+
+        let referer = format!("http://127.0.0.1/share?x_padding={}", "X".repeat(500));
+        let first = serve();
+        let mut uplink =
+            Connection::connect(("127.0.0.1", port)).expect("connects the first uplink");
+        uplink
+            .write_all(
+                format!(
+                    "POST /share/twouploads HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\nTransfer-Encoding: chunked\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("writes the first POST");
+        let answered = head_text(&mut uplink);
+        assert!(
+            ok_status_text(&answered),
+            "the first upload was refused, wrote {answered:?}"
+        );
+
+        let second = serve();
+        let mut refused = Connection::connect(("127.0.0.1", port)).expect("connects the second");
+        refused
+            .write_all(
+                format!(
+                    "POST /share/twouploads HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\nTransfer-Encoding: chunked\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("writes the second POST");
+        let answer = head_text(&mut refused);
+        assert!(
+            answer.starts_with("HTTP/1.1 409"),
+            "a second stream-up upload was acknowledged, wrote {answer:?}"
+        );
+
+        uplink
+            .write_all(b"0\r\n\r\n")
+            .expect("ends the first upload");
+        end_session("twouploads");
+        first.join().expect("joins the first service");
+        second.join().expect("joins the second service");
+    }
+
     /// A packet-up session whose downlink never arrives holds its packets forever; a later bind must start fresh rather than read a sequence from a flow that already stalled.
     #[test]
     fn a_packet_up_session_with_no_downlink_is_replaced_after_the_stall() {
@@ -5402,6 +5498,7 @@ mod tests {
         let session = Arc::new(Session {
             state: Mutex::new(SessionState {
                 upload: Some(Box::new(Blocked)),
+                upload_attached: false,
                 packets: BTreeMap::new(),
                 next_seq: 0,
                 ended: true,
@@ -5422,6 +5519,7 @@ mod tests {
         let session = Arc::new(Session {
             state: Mutex::new(SessionState {
                 upload: None,
+                upload_attached: false,
                 packets: BTreeMap::new(),
                 next_seq: 0,
                 ended: true,
@@ -5446,6 +5544,7 @@ mod tests {
         let session = Arc::new(Session {
             state: Mutex::new(SessionState {
                 upload: None,
+                upload_attached: false,
                 packets: BTreeMap::new(),
                 next_seq: 0,
                 ended: false,
@@ -5473,6 +5572,7 @@ mod tests {
         let session = Arc::new(Session {
             state: Mutex::new(SessionState {
                 upload: None,
+                upload_attached: false,
                 packets: BTreeMap::new(),
                 next_seq: 0,
                 ended: false,
