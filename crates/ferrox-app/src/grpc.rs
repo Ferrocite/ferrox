@@ -2712,7 +2712,8 @@ mod tests {
         let mut acc = 0usize;
         for _ in 0..1024 {
             for bits in 0..64 {
-                acc += varint_len((1u64 << bits) - 1) + varint_len(1u64 << bits);
+                acc += varint_len(std::hint::black_box((1u64 << bits) - 1))
+                    + varint_len(std::hint::black_box(1u64 << bits));
             }
         }
         std::hint::black_box(acc);
@@ -2731,7 +2732,8 @@ mod tests {
         let mut acc = 0usize;
         for _ in 0..1024 {
             for bits in 0..64 {
-                acc += shift_len((1u64 << bits) - 1) + shift_len(1u64 << bits);
+                acc += shift_len(std::hint::black_box((1u64 << bits) - 1))
+                    + shift_len(std::hint::black_box(1u64 << bits));
             }
         }
         std::hint::black_box(acc);
