@@ -2538,7 +2538,7 @@ pub(crate) fn accept_core<
                 emit_400(&mut write);
                 return Served::Closed;
             }
-            let session = bound_session(sid, h2.as_ref(), false);
+            let session = bound_session(sid, None, false);
             let upload: Box<dyn Read + Send> = if h2.is_some() {
                 Box::new(read)
             } else {
@@ -2556,6 +2556,9 @@ pub(crate) fn accept_core<
             if !session.set_upload(upload) {
                 emit_409(&mut write);
                 return Served::Closed;
+            }
+            if let Some(h2) = h2.as_ref() {
+                h2.bind_upload(sid);
             }
             plain_ok(&mut write, settings, &padded);
             session.wait_ended();
@@ -4989,6 +4992,7 @@ mod tests {
         uplink
             .write_all(b"0\r\n\r\n")
             .expect("ends the first upload");
+        end_session("twouploads");
         first.join().expect("joins the first service");
         second.join().expect("joins the second service");
     }
