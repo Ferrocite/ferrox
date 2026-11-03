@@ -316,10 +316,11 @@ impl Control {
                         worker.dead.store(true, Ordering::SeqCst);
                         return;
                     }
+                    let completed = std::time::Instant::now();
                     worker.pending.fetch_sub(used, Ordering::SeqCst);
                     if worker.pending.load(Ordering::SeqCst) == 0 {
                         *worker.done.lock().unwrap_or_else(PoisonError::into_inner) =
-                            Some(std::time::Instant::now());
+                            Some(completed);
                     }
                 }
             });
