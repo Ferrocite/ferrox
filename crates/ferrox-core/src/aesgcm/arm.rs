@@ -71,16 +71,44 @@ fn ghash_group8(hp: &[(P, P); 4], state: uint8x16_t, pairs: [P; 4]) -> uint8x16_
 }
 
 #[inline(always)]
+fn ctr_lane(template: uint8x16_t, be: u32) -> uint8x16_t {
+    unsafe { vreinterpretq_u8_u32(vsetq_lane_u32::<3>(be, vreinterpretq_u32_u8(template))) }
+}
+
+#[inline(always)]
 fn ctr8v_p(template: uint8x16_t, ctr: u32) -> [[uint8x16_t; 4]; 2] {
-    let c0 = template.ctr_add(ctr).ctr_swap();
-    let c1 = template.ctr_add(ctr + 1).ctr_swap();
-    let c2 = template.ctr_add(ctr + 2).ctr_swap();
-    let c3 = template.ctr_add(ctr + 3).ctr_swap();
-    let c4 = template.ctr_add(ctr + 4).ctr_swap();
-    let c5 = template.ctr_add(ctr + 5).ctr_swap();
-    let c6 = template.ctr_add(ctr + 6).ctr_swap();
-    let c7 = template.ctr_add(ctr + 7).ctr_swap();
-    [[c0, c1, c2, c3], [c4, c5, c6, c7]]
+    if ctr & 0xff <= 0xf8 {
+        let b = ctr.to_be();
+        [
+            [
+                ctr_lane(template, b),
+                ctr_lane(template, b.wrapping_add(0x0100_0000)),
+                ctr_lane(template, b.wrapping_add(0x0200_0000)),
+                ctr_lane(template, b.wrapping_add(0x0300_0000)),
+            ],
+            [
+                ctr_lane(template, b.wrapping_add(0x0400_0000)),
+                ctr_lane(template, b.wrapping_add(0x0500_0000)),
+                ctr_lane(template, b.wrapping_add(0x0600_0000)),
+                ctr_lane(template, b.wrapping_add(0x0700_0000)),
+            ],
+        ]
+    } else {
+        [
+            [
+                template.ctr_be(ctr),
+                template.ctr_be(ctr + 1),
+                template.ctr_be(ctr + 2),
+                template.ctr_be(ctr + 3),
+            ],
+            [
+                template.ctr_be(ctr + 4),
+                template.ctr_be(ctr + 5),
+                template.ctr_be(ctr + 6),
+                template.ctr_be(ctr + 7),
+            ],
+        ]
+    }
 }
 
 #[inline(always)]
@@ -226,6 +254,11 @@ impl Lanes for uint8x16_t {
     fn ctr_swap(self) -> Self {
         const MASK: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 15, 14, 13, 12];
         unsafe { vqtbl1q_u8(self, vld1q_u8(MASK.as_ptr())) }
+    }
+
+    #[inline(always)]
+    fn ctr_be(self, n: u32) -> Self {
+        ctr_lane(self, n.to_be())
     }
 
     #[inline(always)]
@@ -545,7 +578,7 @@ impl Engine {
     #[target_feature(enable = "aes,neon")]
     pub(crate) unsafe fn seal(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         let template = super::counter_template::<uint8x16_t>(nonce);
-        let mask = <uint8x16_t as Lanes>::encrypt1v(&self.rk, template.ctr_add(1).ctr_swap());
+        let mask = <uint8x16_t as Lanes>::encrypt1v(&self.rk, template.ctr_be(1));
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -575,7 +608,7 @@ impl Engine {
     ) -> [u8; 16] {
         debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
         let template = super::counter_template::<uint8x16_t>(nonce);
-        let mask = <uint8x16_t as Lanes>::encrypt1v(&self.rk, template.ctr_add(1).ctr_swap());
+        let mask = <uint8x16_t as Lanes>::encrypt1v(&self.rk, template.ctr_be(1));
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -604,7 +637,7 @@ impl Engine {
         tag: &[u8; 16],
     ) -> Option<usize> {
         let template = super::counter_template::<uint8x16_t>(nonce);
-        let mask = <uint8x16_t as Lanes>::encrypt1v(&self.rk, template.ctr_add(1).ctr_swap());
+        let mask = <uint8x16_t as Lanes>::encrypt1v(&self.rk, template.ctr_be(1));
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -623,11 +656,7 @@ impl Engine {
             mask,
         );
 
-        let mut diff = 0u8;
-        for (a, b) in want.iter().zip(tag.iter()) {
-            diff |= a ^ b;
-        }
-        if diff != 0 {
+        if !super::tag_eq(&want, tag) {
             return None;
         }
 
@@ -727,7 +756,7 @@ impl Engine256 {
     #[target_feature(enable = "aes,neon")]
     pub(crate) unsafe fn seal(&self, nonce: &[u8; 12], aad: &[u8], buf: &mut [u8]) -> [u8; 16] {
         let template = super::counter_template::<uint8x16_t>(nonce);
-        let mask = <uint8x16_t as Lanes>::encrypt1v_256(&self.rk, template.ctr_add(1).ctr_swap());
+        let mask = <uint8x16_t as Lanes>::encrypt1v_256(&self.rk, template.ctr_be(1));
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -756,7 +785,7 @@ impl Engine256 {
         tag: &[u8; 16],
     ) -> Option<usize> {
         let template = super::counter_template::<uint8x16_t>(nonce);
-        let mask = <uint8x16_t as Lanes>::encrypt1v_256(&self.rk, template.ctr_add(1).ctr_swap());
+        let mask = <uint8x16_t as Lanes>::encrypt1v_256(&self.rk, template.ctr_be(1));
         let mut tailq = super::Tail::new();
         let state = super::ghash(
             &self.h,
@@ -774,11 +803,7 @@ impl Engine256 {
             buf.len() as u64,
             mask,
         );
-        let mut diff = 0u8;
-        for (a, b) in want.iter().zip(tag.iter()) {
-            diff |= a ^ b;
-        }
-        if diff != 0 {
+        if !super::tag_eq(&want, tag) {
             return None;
         }
         ctr_only8_256(&self.rk, template, buf, 2);

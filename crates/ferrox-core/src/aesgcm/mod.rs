@@ -20,6 +20,19 @@ pub(crate) trait Lanes: Copy {
     fn reduce(acc: [Self; 4]) -> Self;
     fn ctr_add(self, n: u32) -> Self;
     fn ctr_swap(self) -> Self;
+    #[inline(always)]
+    fn ctr_be(self, n: u32) -> Self {
+        self.ctr_add(n).ctr_swap()
+    }
+    #[inline(always)]
+    fn ctr4(self, n: u32) -> [Self; 4] {
+        [
+            self.ctr_be(n),
+            self.ctr_be(n + 1),
+            self.ctr_be(n + 2),
+            self.ctr_be(n + 3),
+        ]
+    }
     fn encrypt4(rk: &[Self; 11], s: &mut [Self; 4]);
     fn encrypt1v(rk: &[Self; 11], s: Self) -> Self;
     #[inline(always)]
@@ -69,14 +82,7 @@ fn mulx(block: &[u8; 16]) -> [u8; 16] {
 
 #[inline(always)]
 fn ctr4v<V: Lanes>(template: V, ctr: u32) -> [V; 4] {
-    let c = template.ctr_add(ctr);
-    let c0 = c.ctr_swap();
-    let c = c.ctr_add(1);
-    let c1 = c.ctr_swap();
-    let c = c.ctr_add(1);
-    let c2 = c.ctr_swap();
-    let c3 = c.ctr_add(1).ctr_swap();
-    [c0, c1, c2, c3]
+    template.ctr4(ctr)
 }
 
 #[inline(always)]
@@ -179,14 +185,14 @@ pub(crate) fn ctr_ghash<V: Lanes>(
         ctr += 4;
     }
     for blk in rest {
-        let ks1 = V::encrypt1v(rk, template.ctr_add(ctr).ctr_swap());
+        let ks1 = V::encrypt1v(rk, template.ctr_be(ctr));
         let ct1 = ks1.xor(V::load(blk));
         ct1.store(blk);
         tailq.push(ct1.bswap());
         ctr += 1;
     }
     if !tail.is_empty() {
-        let ks1 = V::encrypt1v(rk, template.ctr_add(ctr).ctr_swap());
+        let ks1 = V::encrypt1v(rk, template.ctr_be(ctr));
         let mut ksb = [0u8; 16];
         ks1.store(&mut ksb);
         let mut padded = [0u8; 16];
@@ -214,12 +220,12 @@ pub(crate) fn ctr_only<V: Lanes>(rk: &[V; 11], template: V, buf: &mut [u8], mut 
         ctr += 4;
     }
     for blk in rest {
-        let ks1 = V::encrypt1v(rk, template.ctr_add(ctr).ctr_swap());
+        let ks1 = V::encrypt1v(rk, template.ctr_be(ctr));
         ks1.xor(V::load(blk)).store(blk);
         ctr += 1;
     }
     if !tail.is_empty() {
-        let ks1 = V::encrypt1v(rk, template.ctr_add(ctr).ctr_swap());
+        let ks1 = V::encrypt1v(rk, template.ctr_be(ctr));
         let mut ksb = [0u8; 16];
         ks1.store(&mut ksb);
         for (xb, kb) in tail.iter_mut().zip(ksb.iter()) {
@@ -248,9 +254,13 @@ pub(crate) fn finish<V: Lanes>(
     tailq.push(V::load(&lens).bswap());
     let state = flush(hp, state, tailq);
     let mut tag = [0u8; 16];
-    state.xor(mask.bswap()).store(&mut tag);
-    tag.reverse();
+    state.bswap().xor(mask).store(&mut tag);
     tag
+}
+
+#[inline(always)]
+fn tag_eq(a: &[u8; 16], b: &[u8; 16]) -> bool {
+    u128::from_ne_bytes(*a) ^ u128::from_ne_bytes(*b) == 0
 }
 
 #[inline(always)]
@@ -270,7 +280,7 @@ pub(crate) fn seal_impl<V: Lanes>(
     buf: &mut [u8],
 ) -> [u8; 16] {
     let template = counter_template::<V>(nonce);
-    let mask = V::encrypt1v(rk, template.ctr_add(1).ctr_swap());
+    let mask = V::encrypt1v(rk, template.ctr_be(1));
     let mut tailq = Tail::new();
     let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
     let state = flush(h, state, &mut tailq);
@@ -332,14 +342,14 @@ pub(crate) fn ctr_ghash_from<V: Lanes>(
         ctr += 4;
     }
     for (sb, db) in srest.iter().zip(drest.iter_mut()) {
-        let ks1 = V::encrypt1v(rk, template.ctr_add(ctr).ctr_swap());
+        let ks1 = V::encrypt1v(rk, template.ctr_be(ctr));
         let ct1 = ks1.xor(V::load(sb));
         ct1.store(db);
         tailq.push(ct1.bswap());
         ctr += 1;
     }
     if !stail.is_empty() {
-        let ks1 = V::encrypt1v(rk, template.ctr_add(ctr).ctr_swap());
+        let ks1 = V::encrypt1v(rk, template.ctr_be(ctr));
         let mut ksb = [0u8; 16];
         ks1.store(&mut ksb);
         let mut padded = [0u8; 16];
@@ -370,7 +380,7 @@ pub(crate) fn seal_impl_from<V: Lanes>(
 ) -> [u8; 16] {
     debug_assert_eq!(src.len(), dst.len(), "one ciphertext for one plaintext");
     let template = counter_template::<V>(nonce);
-    let mask = V::encrypt1v(rk, template.ctr_add(1).ctr_swap());
+    let mask = V::encrypt1v(rk, template.ctr_be(1));
     let mut tailq = Tail::new();
     let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
     let state = flush(h, state, &mut tailq);
@@ -396,7 +406,7 @@ pub(crate) fn open_impl<V: Lanes>(
     tag: &[u8; 16],
 ) -> Option<usize> {
     let template = counter_template::<V>(nonce);
-    let mask = V::encrypt1v(rk, template.ctr_add(1).ctr_swap());
+    let mask = V::encrypt1v(rk, template.ctr_be(1));
     let mut tailq = Tail::new();
     let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
     let state = flush(h, state, &mut tailq);
@@ -410,11 +420,7 @@ pub(crate) fn open_impl<V: Lanes>(
         mask,
     );
 
-    let mut diff = 0u8;
-    for (a, b) in want.iter().zip(tag.iter()) {
-        diff |= a ^ b;
-    }
-    if diff != 0 {
+    if !tag_eq(&want, tag) {
         return None;
     }
 
@@ -685,14 +691,14 @@ pub(crate) fn ctr_ghash_256<V: Lanes>(
         ctr += 4;
     }
     for blk in rest {
-        let ks1 = V::encrypt1v_256(rk, template.ctr_add(ctr).ctr_swap());
+        let ks1 = V::encrypt1v_256(rk, template.ctr_be(ctr));
         let ct1 = ks1.xor(V::load(blk));
         ct1.store(blk);
         tailq.push(ct1.bswap());
         ctr += 1;
     }
     if !tail.is_empty() {
-        let ks1 = V::encrypt1v_256(rk, template.ctr_add(ctr).ctr_swap());
+        let ks1 = V::encrypt1v_256(rk, template.ctr_be(ctr));
         let mut ksb = [0u8; 16];
         ks1.store(&mut ksb);
         let mut padded = [0u8; 16];
@@ -720,12 +726,12 @@ pub(crate) fn ctr_only_256<V: Lanes>(rk: &[V; 15], template: V, buf: &mut [u8], 
         ctr += 4;
     }
     for blk in rest {
-        let ks1 = V::encrypt1v_256(rk, template.ctr_add(ctr).ctr_swap());
+        let ks1 = V::encrypt1v_256(rk, template.ctr_be(ctr));
         ks1.xor(V::load(blk)).store(blk);
         ctr += 1;
     }
     if !tail.is_empty() {
-        let ks1 = V::encrypt1v_256(rk, template.ctr_add(ctr).ctr_swap());
+        let ks1 = V::encrypt1v_256(rk, template.ctr_be(ctr));
         let mut ksb = [0u8; 16];
         ks1.store(&mut ksb);
         for (xb, kb) in tail.iter_mut().zip(ksb.iter()) {
@@ -744,7 +750,7 @@ pub(crate) fn seal_impl_256<V: Lanes>(
     buf: &mut [u8],
 ) -> [u8; 16] {
     let template = counter_template::<V>(nonce);
-    let mask = V::encrypt1v_256(rk, template.ctr_add(1).ctr_swap());
+    let mask = V::encrypt1v_256(rk, template.ctr_be(1));
     let mut tailq = Tail::new();
     let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
     let state = flush(h, state, &mut tailq);
@@ -770,7 +776,7 @@ pub(crate) fn open_impl_256<V: Lanes>(
     tag: &[u8; 16],
 ) -> Option<usize> {
     let template = counter_template::<V>(nonce);
-    let mask = V::encrypt1v_256(rk, template.ctr_add(1).ctr_swap());
+    let mask = V::encrypt1v_256(rk, template.ctr_be(1));
     let mut tailq = Tail::new();
     let state = ghash(h, V::load(&[0u8; 16]), aad, &mut tailq);
     let state = flush(h, state, &mut tailq);
@@ -783,11 +789,7 @@ pub(crate) fn open_impl_256<V: Lanes>(
         buf.len() as u64,
         mask,
     );
-    let mut diff = 0u8;
-    for (a, b) in want.iter().zip(tag.iter()) {
-        diff |= a ^ b;
-    }
-    if diff != 0 {
+    if !tag_eq(&want, tag) {
         return None;
     }
     ctr_only_256(rk, template, buf, 2);
