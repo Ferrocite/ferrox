@@ -4380,6 +4380,10 @@ mod tests {
             conn.control.drained(Duration::from_secs(2)),
             "the queue drains once the peer takes the writes"
         );
+        assert!(
+            !conn.control.drained(Duration::ZERO),
+            "a queue drained past its deadline is not a live drain"
+        );
     }
 
     /// A writer that cannot carry a byte: the control worker's first batch fails.
