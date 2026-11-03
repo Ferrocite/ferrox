@@ -130,7 +130,7 @@ impl Connection {
 
     /// Whether a write to this stream must pass the chain, which a descriptor-level fast path
     /// addressing the socket would skip. Reads, teardown and the census are unaffected by it.
-    #[cfg(test)]
+    #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) fn masked(&self) -> bool {
         match self {
             Connection::Masked(_) => true,
@@ -145,7 +145,7 @@ impl Connection {
     }
 
     /// Whether a descriptor-level fast path would skip the meter above this stream.
-    #[cfg(test)]
+    #[cfg(any(not(target_os = "linux"), test))]
     pub(crate) fn metered(&self) -> bool {
         match self {
             Connection::Metered(metered) => metered.meter.counts(),

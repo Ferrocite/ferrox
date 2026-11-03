@@ -23057,7 +23057,17 @@ pub(crate) fn relay_handoff(client: &Connection, target: &Connection) {
     let Ok(client_write) = client.try_clone() else {
         return;
     };
-    // Every accepted flow rides the lane pool; a readiness worker beside it would add one thread per flow.
+    #[cfg(not(target_os = "linux"))]
+    if !target_write.masked()
+        && !client_write.masked()
+        && !client_read.metered()
+        && !target_read.metered()
+        && poll_available()
+    {
+        let _ends = poll_handoff(client_read, target_write, target_read, client_write);
+        return;
+    }
+    // On Linux every accepted flow rides the lane pool; a readiness worker beside it would add a thread per flow.
     relay_lanes(client_read, target_write, target_read, client_write);
 }
 
@@ -23225,7 +23235,7 @@ fn poll_available() -> bool {
     poll_relay::available()
 }
 
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(not(target_os = "linux"))]
 fn poll_available() -> bool {
     poll_copy::available()
 }
@@ -23240,7 +23250,7 @@ fn poll_handoff(
     poll_relay::handoff(client_read, target_write, target_read, client_write)
 }
 
-#[cfg(all(test, not(target_os = "linux")))]
+#[cfg(not(target_os = "linux"))]
 fn poll_handoff(
     client_read: Connection,
     target_write: Connection,
@@ -26302,7 +26312,7 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
     flow
 }
 
-#[cfg(test)]
+#[cfg(any(not(target_os = "linux"), test))]
 #[inline]
 fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     // Once per leg, outside the byte loop: a budget read per buffer would price the copy.
@@ -60693,7 +60703,6 @@ end
 /// cannot cross a pipe. A leg parks in `poll`, not in `read`, so the thread a flow costs is the
 /// worker that has work, not one per direction.
 #[cfg(not(target_os = "linux"))]
-#[cfg(test)]
 mod poll_copy {
     use super::{Connection, RelayBuf, RelayEnd, Shutdown};
     use std::io::{self, Read, Write};
