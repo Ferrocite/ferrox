@@ -345,20 +345,20 @@ impl Control {
         }
     }
 
-    /// Waits for the queue and every batch already taken from it to be written, up to `grace`.
-    /// `false` is a peer that is not reading, so the shutdown has the deadline, not the write.
+    /// Waits for the queue and every batch already taken from it to be written before `grace`; `true`
+    /// is a live drain inside that window, and `false` is a peer that is not reading or a queue that
+    /// died, so the shutdown has the deadline, not the write.
     fn drained(&self, grace: Duration) -> bool {
         let Control::Threaded(queue) = self else {
             return true;
         };
         let until = std::time::Instant::now() + grace;
         loop {
-            let pending = queue.pending.load(Ordering::SeqCst);
-            if pending == 0 {
-                return true;
-            }
             if queue.dead.load(Ordering::SeqCst) || std::time::Instant::now() >= until {
                 return false;
+            }
+            if queue.pending.load(Ordering::SeqCst) == 0 {
+                return true;
             }
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -2233,7 +2233,7 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
 
 fn finish_refusal(conn: &Arc<H2Conn>) {
     let grace = crate::budgets::goaway_grace();
-    if conn.control.drained(grace) {
+    if conn.control.drained(grace) && !conn.dead.load(Ordering::SeqCst) {
         std::thread::sleep(grace);
     }
     conn.kill();
@@ -4345,6 +4345,19 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    /// A dead connection has no GOAWAY left to protect, so its refusal does not wait for the grace.
+    #[test]
+    fn a_dead_refusal_does_not_wait_for_the_grace() {
+        let (conn, _written, _slices) = bare_conn();
+        conn.dead.store(true, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        finish_refusal(&conn);
+        assert!(
+            started.elapsed() < crate::budgets::goaway_grace(),
+            "a dead connection waited for the GOAWAY grace"
+        );
     }
 
     /// A drained refusal keeps the socket for the grace, so unread request bytes cannot reset the
