@@ -78,10 +78,11 @@ shadowsocks-2022 udp-server-reply-client-session-bytes 8 ferrox-app-shadowsocks2
 vmess ops-retired-instructions UNBLESSED scripts/count-ops.sh
 vmess maximum-payload-per-frame 8192 ferrox-app-vmess::tests::frames_seal_to_stable_bytes
 vmess frames-per-write-syscall 16 ferrox-app-vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time
-vmess write-syscalls-per-128KiB-relay-read 1 ferrox-app-vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time
+vmess write-syscalls-per-128KiB-batch 1 ferrox-app-vmess::tests::a_batch_on_the_wire_is_the_frames_written_one_at_a_time
 vmess frame-buffer-allocations-per-relay-write 0 ferrox-app-vmess::tests::frames_reuse_the_callers_buffers
 vmess frames-per-plain-write 16 ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write
 vmess plain-write-syscalls-per-16-frame-batch 1 ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write
+vmess carrier-reads-per-two-max-batches 2 ferrox-app-vmess::tests::a_batch_of_frames_leaves_the_pump_in_one_write
 vmess pump-buffer-allocations-per-batch 0 ferrox-app-vmess::tests::the_pump_gathers_into_its_own_buffer_and_never_moves_it
 vmess first-frame-moves-per-batch 0 ferrox-app-vmess::tests::the_pump_gathers_into_its_own_buffer_and_never_moves_it
 vmess web-socket-staging-copies-per-batch 0 ferrox-app-vmess::tests::a_sealed_batch_reaches_a_web_socket_carrier_where_it_lies

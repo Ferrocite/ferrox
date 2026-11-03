@@ -16,7 +16,9 @@ const FRAMES_PER_WRITE: usize = 16;
 const READ_PLAIN: usize = MAX_PLAIN * FRAMES_PER_WRITE;
 // The widest frame we seal: a full payload, its tag, and the padding the mask draw allows.
 const MAX_WIRE: usize = MAX_PLAIN + TAG_LEN + 63;
-const WIRE_LEN: usize = (FRAMES_PER_WRITE + 1) * (MAX_WIRE + HEADER_LEN);
+// Two batches per refill: the batch is still one write, but a carrier read can answer two.
+const WIRE_BATCHES: usize = 2;
+const WIRE_LEN: usize = (FRAMES_PER_WRITE * WIRE_BATCHES + 1) * (MAX_WIRE + HEADER_LEN);
 const OPT_STREAM: u8 = 0x01;
 const OPT_MASK: u8 = 0x04;
 const OPT_PAD: u8 = 0x08;
@@ -4361,7 +4363,7 @@ mod tests {
 
     #[test]
     fn a_batch_of_frames_leaves_the_pump_in_one_write() {
-        let (sealed, plain, mut recv) = frames(&vec![1000; FRAMES_PER_WRITE * 2 + 1]);
+        let (sealed, plain, mut recv) = frames(&vec![MAX_PLAIN; FRAMES_PER_WRITE * 2 + 1]);
         let carrier = Sealed {
             held: sealed,
             at: 0,
