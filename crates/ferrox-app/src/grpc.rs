@@ -4761,14 +4761,14 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn a_sealed_demux_rides_the_lane_pool() {
-        if !crate::conn::in_a_quiet_process("grpc::tests::a_sealed_demux_rides_the_lane_pool") {
-            return;
-        }
         struct Silent;
         impl Read for Silent {
             fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
                 Err(std::io::Error::from(std::io::ErrorKind::TimedOut))
             }
+        }
+        if !crate::conn::in_a_quiet_process("grpc::tests::a_sealed_demux_rides_the_lane_pool") {
+            return;
         }
         let settings = GrpcSettings::path("/p");
         let before = crate::conn::live_threads();
