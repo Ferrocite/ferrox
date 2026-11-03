@@ -2072,13 +2072,16 @@ fn free_port(ip: IpAddr) -> Result<u16, String> {
 /// The region codes the signed list publishes and how many entries each carries.
 pub(crate) fn regions(settings: Option<&Json>) -> Result<Vec<(String, usize)>, String> {
     let settings = Settings::from_json(settings)?;
-    let mut counts = BTreeMap::new();
+    let mut counts: BTreeMap<String, HashSet<IpAddr>> = BTreeMap::new();
     for server in load_all_entries(&settings)? {
         if let Some(region) = server.region {
-            *counts.entry(region).or_insert(0) += 1;
+            counts.entry(region).or_default().insert(server.address);
         }
     }
-    Ok(counts.into_iter().collect())
+    Ok(counts
+        .into_iter()
+        .map(|(region, addresses)| (region, addresses.len()))
+        .collect())
 }
 
 /// Fetch tactics from the first entry that advertises the untunneled capability.
@@ -2381,9 +2384,11 @@ fn load_source_entries(
             let (limits, label, filter) = target_protocol_filter(settings);
             if let Some(shape) = filter {
                 let named_meek = limits.iter().any(|protocol| is_meek_protocol(protocol));
+                let shadowsocks_takes_over = shape.shadowsocks && server.shadowsocks.is_some();
                 if shape.tls
                     && !shape.plain
                     && !shape.obfuscated
+                    && !shadowsocks_takes_over
                     && server.tls_port.is_some()
                     && (server.obfuscation_key.is_some() || server.tls_obfuscation_key.is_some())
                 {
@@ -2400,9 +2405,22 @@ fn load_source_entries(
                     server.meek = None;
                     server.unfronted_meek = None;
                 }
+                if shape.shadowsocks && !matches_limit(&server, shape, named_meek, limits) {
+                    if let Some(variant) = server.shadowsocks_variant() {
+                        server = variant;
+                    }
+                }
                 if !matches_limit(&server, shape, named_meek, limits) {
                     let protocol = server.meek.as_ref().map_or_else(
-                        || if server.obfuscated() { "OSSH" } else { "SSH" },
+                        || {
+                            if server.ss {
+                                "SHADOWSOCKS-OSSH"
+                            } else if server.obfuscated() {
+                                "OSSH"
+                            } else {
+                                "SSH"
+                            }
+                        },
                         |meek| meek.protocol,
                     );
                     return Err(format!(
@@ -2442,10 +2460,12 @@ fn load_source_entries(
 }
 
 #[derive(Clone, Copy)]
+#[allow(clippy::struct_excessive_bools)]
 struct Shape {
     plain: bool,
     obfuscated: bool,
     tls: bool,
+    shadowsocks: bool,
 }
 
 /// The shapes a protocol list names; `None` means the list asks for no restriction.
@@ -2457,12 +2477,14 @@ fn shape_filter(protocols: &[String], label: &str) -> Option<Shape> {
         plain: false,
         obfuscated: false,
         tls: false,
+        shadowsocks: false,
     };
     let mut unsupported = Vec::new();
     for protocol in protocols {
         match protocol.as_str() {
             "SSH" | "UNFRONTED-SSH" => shape.plain = true,
             "TLS-OSSH" => shape.tls = true,
+            "SHADOWSOCKS-OSSH" => shape.shadowsocks = true,
             "OSSH"
             | "UNFRONTED-OSSH"
             | "UNFRONTED-MEEK-OSSH"
@@ -2479,7 +2501,7 @@ fn shape_filter(protocols: &[String], label: &str) -> Option<Shape> {
     if !unsupported.is_empty() {
         eprintln!("psiphon: {label} ignores {}", unsupported.join(","));
     }
-    if !shape.plain && !shape.obfuscated && !shape.tls {
+    if !shape.plain && !shape.obfuscated && !shape.tls && !shape.shadowsocks {
         eprintln!("psiphon: {label} names no SSH or OSSH shape; using the whole list");
         return None;
     }
@@ -2487,7 +2509,9 @@ fn shape_filter(protocols: &[String], label: &str) -> Option<Shape> {
 }
 
 fn matches_shape(server: &Server, shape: Shape) -> bool {
-    if server.tls && server.meek.is_none() {
+    if server.ss {
+        shape.shadowsocks
+    } else if server.tls && server.meek.is_none() {
         shape.tls
     } else if server.obfuscated() {
         shape.obfuscated
@@ -2524,6 +2548,11 @@ fn matches_limit(server: &Server, filter: Shape, meek_named: bool, protocols: &[
 /// Whether a server's meek protocol is named by the limit.
 fn matches_meek_protocol(server: &Server, protocols: &[String]) -> bool {
     let Some(meek) = &server.meek else {
+        if server.ss {
+            return protocols
+                .iter()
+                .any(|protocol| protocol.as_str() == "SHADOWSOCKS-OSSH");
+        }
         if server.tls {
             return protocols
                 .iter()
@@ -2845,11 +2874,19 @@ fn select_protocols(
     fronted: bool,
 ) -> Vec<Server> {
     let mut servers = servers;
+    let normal = shape_filter(protocols, "LimitTunnelProtocols");
+    let initial_active = initial_count > 0 && !initial_protocols.is_empty();
+    let initial = shape_filter(initial_protocols, "InitialLimitTunnelProtocols");
+    let shadowsocks_named = normal.is_some_and(|shape| shape.shadowsocks)
+        || (initial_active && initial.is_some_and(|shape| shape.shadowsocks));
     if fronted {
         let all = servers;
         let mut only: Vec<Server> = all
             .iter()
-            .filter(|server| server.meek.as_ref().is_some_and(|meek| meek.fronted))
+            .filter(|server| {
+                server.meek.as_ref().is_some_and(|meek| meek.fronted)
+                    || (shadowsocks_named && server.ss)
+            })
             .cloned()
             .collect();
         if only.is_empty() {
@@ -2880,9 +2917,6 @@ fn select_protocols(
             false
         });
     }
-    let normal = shape_filter(protocols, "LimitTunnelProtocols");
-    let initial_active = initial_count > 0 && !initial_protocols.is_empty();
-    let initial = shape_filter(initial_protocols, "InitialLimitTunnelProtocols");
     if normal.is_none() && !initial_active {
         return servers;
     }
@@ -2999,8 +3033,14 @@ fn absorb(
             continue;
         }
         if let Some(server) = decode_entry_with(line, include_inproxy) {
+            let variant = server.shadowsocks_variant();
             if seen.insert((server.address, server.port)) {
                 servers.push(server);
+            }
+            if let Some(variant) = variant {
+                if seen.insert((variant.address, variant.port)) {
+                    servers.push(variant);
+                }
             }
         }
     }
@@ -3102,6 +3142,22 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
         tls: tls_port,
     } = entry_ports(&entry);
     let tls_obfuscation_key = obfuscated_key.clone();
+    let shadowsocks = entry
+        .get("sshShadowsocksPort")
+        .and_then(Json::as_port)
+        .filter(|port| *port > 0)
+        .zip(
+            entry
+                .get("sshShadowsocksKey")
+                .and_then(Json::as_str)
+                .filter(|key| !key.is_empty())
+                .map(str::to_owned),
+        )
+        .map(|(port, key)| crate::psiphon_ssh::Shadowsocks {
+            port,
+            key,
+            obfuscation_key: obfuscated_key.clone(),
+        });
     let protocol = meek_protocol(&entry);
     let tactics_capable = tactics_capability(&entry);
     let direct = obfuscated_port.is_some()
@@ -3113,11 +3169,11 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
         .as_ref()
         .or(tls_inproxy.as_ref())
         .map_or(0, destination_port);
-    let (port, obfuscation_key, tls) = match (obfuscated_port, ssh_port) {
-        (Some(port), _) if obfuscated_key.is_some() => (port, obfuscated_key, false),
-        (_, Some(port)) => (port, None, false),
+    let (port, obfuscation_key, tls, ss) = match (obfuscated_port, ssh_port) {
+        (Some(port), _) if obfuscated_key.is_some() => (port, obfuscated_key, false, false),
+        (_, Some(port)) => (port, None, false, false),
         _ if tls_port.is_some() && obfuscated_key.is_some() => {
-            (tls_port.unwrap_or(0), obfuscated_key, true)
+            (tls_port.unwrap_or(0), obfuscated_key, true, false)
         }
         _ if protocol.is_some() || tactics_capable => {
             let port = entry
@@ -3131,13 +3187,18 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
                         443
                     }
                 });
-            (port, obfuscated_key, false)
+            (port, obfuscated_key, false, false)
         }
         _ if include_inproxy && (inproxy.is_some() || tls_inproxy.is_some()) => {
-            (inproxy_port, obfuscated_key, false)
+            (inproxy_port, obfuscated_key, false, false)
+        }
+        _ if shadowsocks.is_some() => {
+            let ss = shadowsocks.as_ref()?;
+            (ss.port, ss.obfuscation_key.clone(), false, true)
         }
         _ => return None,
     };
+    let direct = direct || ss;
     let (inproxy, tls_inproxy, tls) = if tls {
         (tls_inproxy, None, true)
     } else if inproxy.is_none() && !direct {
@@ -3186,6 +3247,8 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
         direct,
         tls,
         tls_port,
+        ss,
+        shadowsocks,
         meek,
         unfronted_meek,
         tactics,
@@ -4136,6 +4199,69 @@ mod tests {
     }
 
     #[test]
+    fn a_shadowsocks_entry_carries_its_port_key_and_obfuscation_key() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshObfuscatedKey":"o","sshShadowsocksPort":9000,"sshShadowsocksKey":"s","sshHostKey":"AAAA","capabilities":["SSH","SHADOWSOCKS-OSSH"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("entry");
+        assert_eq!(server.port, 22);
+        assert!(!server.ss);
+        let variant = server.shadowsocks_variant().expect("variant");
+        assert!(variant.ss);
+        assert!(variant.direct);
+        assert_eq!(variant.port, 9000);
+        assert_eq!(
+            variant.shadowsocks.as_ref().map(|ss| ss.key.as_str()),
+            Some("s")
+        );
+        assert_eq!(variant.obfuscation_key.as_deref(), Some("o"));
+        assert!(variant.obfuscated());
+    }
+
+    #[test]
+    fn a_shadowsocks_only_entry_dials_its_own_port() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshShadowsocksPort":9000,"sshShadowsocksKey":"s","sshHostKey":"AAAA","capabilities":["SHADOWSOCKS-OSSH"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("entry");
+        assert!(server.ss);
+        assert_eq!(server.port, 9000);
+        assert!(server.shadowsocks_variant().is_none());
+    }
+
+    #[test]
+    fn a_shadowsocks_sibling_leaves_a_meek_entry_on_its_own_port() {
+        let entry = r#"{"ipAddress":"192.0.2.1","meekServerPort":2050,"meekCookieEncryptionPublicKey":"c","meekObfuscatedKey":"m","sshShadowsocksPort":9000,"sshShadowsocksKey":"s","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK","SHADOWSOCKS-OSSH"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("entry");
+        assert!(!server.ss);
+        assert!(!server.direct);
+        assert_eq!(server.port, 2050);
+        assert!(server.meek.is_some());
+        let variant = server.shadowsocks_variant().expect("variant");
+        assert!(variant.ss);
+        assert!(variant.direct);
+        assert_eq!(variant.port, 9000);
+        assert!(variant.meek.is_none());
+    }
+
+    #[test]
+    fn a_shadowsocks_limit_selects_the_variant() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshObfuscatedKey":"o","sshShadowsocksPort":9000,"sshShadowsocksKey":"s","sshHostKey":"AAAA","capabilities":["SSH","SHADOWSOCKS-OSSH"]}"#;
+        let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let server = decode_entry(&encoded).expect("entry");
+        let variant = server.shadowsocks_variant().expect("variant");
+        let selected = select_protocols(
+            vec![server, variant],
+            &["SHADOWSOCKS-OSSH".to_owned()],
+            &[],
+            0,
+            false,
+        );
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].ss);
+        assert_eq!(selected[0].port, 9000);
+    }
+
+    #[test]
     fn a_plain_ssh_entry_keeps_its_key_for_the_tls_variant() {
         let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshObfuscatedKey":"k","sshHostKey":"AAAA","tlsOSSHPort":8443,"capabilities":["SSH","TLS-OSSH"]}"#;
         let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
@@ -4856,6 +4982,8 @@ mod tests {
             direct: true,
             tls: false,
             tls_port: None,
+            ss: false,
+            shadowsocks: None,
             meek: None,
             unfronted_meek: None,
             tactics: None,
@@ -5000,6 +5128,20 @@ mod tests {
             servers[0].meek.as_ref().expect("tunnel front").dial,
             "192.0.2.1"
         );
+    }
+
+    #[test]
+    fn a_fronted_filter_keeps_a_named_shadowsocks_sibling() {
+        let fronted = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK"],"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front.example"],"meekFrontingHosts":["cdn.example"]}"#;
+        let ssh = r#"{"ipAddress":"192.0.2.2","sshShadowsocksPort":9000,"sshShadowsocksKey":"s","sshHostKey":"AAAA","capabilities":["SHADOWSOCKS-OSSH"]}"#;
+        let servers = vec![
+            decode_entry(&hex(format!("0 0 0 0 {fronted}").as_bytes())).expect("fronted"),
+            decode_entry(&hex(format!("0 0 0 0 {ssh}").as_bytes())).expect("shadowsocks"),
+        ];
+        let selected = select_protocols(servers, &["SHADOWSOCKS-OSSH".to_owned()], &[], 0, true);
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].ss);
+        assert_eq!(selected[0].port, 9000);
     }
 
     #[test]
@@ -5159,6 +5301,20 @@ mod tests {
     }
 
     #[test]
+    fn a_target_tls_limit_promotes_when_no_shadowsocks_config_exists() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshObfuscatedPort":443,"sshObfuscatedKey":"k","tlsOSSHPort":8443,"sshHostKey":"AAAA","capabilities":["OSSH","TLS-OSSH"]}"#;
+        let target = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let text = format!(
+            r#"{{"TargetServerEntry":"{target}","LimitTunnelProtocols":["TLS-OSSH","SHADOWSOCKS-OSSH"]}}"#
+        );
+        let settings =
+            Settings::from_json(Some(&json::parse(&text).expect("settings"))).expect("settings");
+        let selected = load_entries(&settings).expect("TLS is named");
+        assert!(selected[0].tls);
+        assert_eq!(selected[0].port, 8443);
+    }
+
+    #[test]
     fn a_target_http_front_is_refused_by_an_https_limit() {
         let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK-HTTP"],"meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["front.example"],"meekFrontingHosts":["cdn.example"]}"#;
         let target = hex(format!("0 0 0 0 {entry}").as_bytes());
@@ -5200,6 +5356,26 @@ mod tests {
         let settings =
             Settings::from_json(Some(&json::parse(&text).expect("settings"))).expect("settings");
         assert!(load_entries(&settings).is_err());
+    }
+
+    #[test]
+    fn a_target_naming_both_shapes_keeps_the_base_entry() {
+        let entry = r#"{"ipAddress":"192.0.2.1","sshPort":22,"sshObfuscatedKey":"o","sshShadowsocksPort":9000,"sshShadowsocksKey":"s","sshHostKey":"AAAA","capabilities":["SSH","SHADOWSOCKS-OSSH"]}"#;
+        let target = hex(format!("0 0 0 0 {entry}").as_bytes());
+        let settings = |protocols| {
+            let text = format!(
+                r#"{{"TargetServerEntry":"{target}","LimitTunnelProtocols":[{protocols}]}}"#
+            );
+            Settings::from_json(Some(&json::parse(&text).expect("settings"))).expect("settings")
+        };
+        let both = load_entries(&settings(r#""SSH","SHADOWSOCKS-OSSH""#)).expect("both named");
+        assert_eq!(both.len(), 1);
+        assert!(!both[0].ss);
+        assert_eq!(both[0].port, 22);
+        let ss = load_entries(&settings(r#""SHADOWSOCKS-OSSH""#)).expect("SS named");
+        assert_eq!(ss.len(), 1);
+        assert!(ss[0].ss);
+        assert_eq!(ss[0].port, 9000);
     }
 
     #[test]
@@ -5603,6 +5779,8 @@ mod tests {
                 direct: true,
                 tls: false,
                 tls_port: None,
+                ss: false,
+                shadowsocks: None,
                 meek: None,
                 unfronted_meek: None,
                 tactics: None,
@@ -5647,6 +5825,8 @@ mod tests {
                 direct: true,
                 tls: false,
                 tls_port: None,
+                ss: false,
+                shadowsocks: None,
                 meek: None,
                 unfronted_meek: None,
                 tactics: None,

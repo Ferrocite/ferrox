@@ -49,6 +49,7 @@ mod proxy;
 mod psiphon;
 mod psiphon_broker;
 mod psiphon_meek;
+mod psiphon_shadowsocks;
 mod psiphon_ssh;
 mod psiphon_tactics;
 mod psiphon_webrtc;
