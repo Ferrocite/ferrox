@@ -7111,7 +7111,7 @@ fn spawn_mux_udp_reader(session: &Arc<UdpMux>) -> Option<RelayEnd> {
                 let _ = finished.send(Ok(()));
             }),
         );
-        return Some(end);
+        Some(end)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -24421,11 +24421,18 @@ pub(crate) mod lane_pool {
     /// window cannot refill. This is the ceiling, not the shape: a worker starts when a lane is
     /// queued and no worker is idle, so a one-flow cell holds two lanes. Six leaves room for the
     /// accept path and the parking reaper under the reference's ten-thread server peak.
+    #[cfg(target_os = "linux")]
     pub(crate) const RELAY_LANES: usize = 6;
+    /// The timer-parked hosts keep the wider set because their lanes wait without a descriptor.
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) const RELAY_LANES: usize = 8;
 
     /// Setup lanes are separate from relay lanes so a handshake parked in a read cannot take a
     /// relay worker with it. One keeps the setup peak under the reference's server threads.
+    #[cfg(target_os = "linux")]
     pub(crate) const SETUP_LANES: usize = 1;
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) const SETUP_LANES: usize = 2;
 
     /// Accepted work past the setup workers waits in this queue; past it the handshake runs on its
     /// own thread, so a burst is slower, not refused.
