@@ -2333,7 +2333,12 @@ fn cut_padded_data(body: &mut Vec<u8>, pad: usize) -> usize {
 fn control_frame(conn: &H2Conn, kind: u8, flags: u8, sid: u32, body: &[u8]) -> Option<bool> {
     match kind {
         T_SETTINGS => {
-            if flags & F_ACK == 0 && (!body.len().is_multiple_of(6) || !conn.apply_settings(body)) {
+            // A payload that is not a whole number of six-byte settings is a connection error, and the peer owes the reason before the close.
+            if flags & F_ACK == 0 && !body.len().is_multiple_of(6) {
+                conn.refuse(E_FRAME_SIZE);
+                return Some(false);
+            }
+            if flags & F_ACK == 0 && !conn.apply_settings(body) {
                 return Some(false);
             }
             Some(true)
@@ -4045,7 +4050,7 @@ mod tests {
     }
 
     /// A SETTINGS payload whose length is not a multiple of six is a connection error
-    /// (RFC 9113 6.5), so the demux answers a FRAME_SIZE_ERROR GOAWAY instead of closing silently.
+    /// (RFC 9113 6.5), so the demux answers a `FRAME_SIZE_ERROR` GOAWAY instead of closing silently.
     #[test]
     fn a_settings_length_outside_sixes_is_refused_as_a_frame_size_error() {
         struct Silent;
