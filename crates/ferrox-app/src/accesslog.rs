@@ -237,6 +237,14 @@ fn push_escaped(out: &mut String, value: &str) {
     let mut start = 0;
     let mut at = 0;
     while at + 8 <= bytes.len() {
+        if at + 16 <= bytes.len() {
+            let lo = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+            let hi = u64::from_le_bytes(bytes[at + 8..at + 16].try_into().unwrap());
+            if !needs_escape(lo) && !needs_escape(hi) {
+                at += 16;
+                continue;
+            }
+        }
         let word = u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
         if needs_escape(word) {
             let offset = (0..8)
@@ -417,6 +425,84 @@ mod tests {
                     assert_eq!(escaped(&value), reference(&value), "{value:?}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_sixteen_byte_window_escapes_like_the_byte_walk() {
+        fn oracle(value: &str) -> String {
+            let bytes = value.as_bytes();
+            let mut out = String::new();
+            let mut at = 0;
+            while at < bytes.len() {
+                let byte = bytes[at];
+                if byte & 0x80 != 0 {
+                    for ch in value[at..].chars() {
+                        match ch {
+                            '\\' => out.push_str("\\\\"),
+                            '[' => out.push_str("\\["),
+                            ']' => out.push_str("\\]"),
+                            _ if ch.is_control() => out.extend(ch.escape_default()),
+                            _ if ch.is_whitespace() => {
+                                let _ = std::fmt::Write::write_fmt(
+                                    &mut out,
+                                    format_args!("\\u{{{:x}}}", ch as u32),
+                                );
+                            }
+                            _ => out.push(ch),
+                        }
+                    }
+                    return out;
+                }
+                match byte {
+                    b'\\' => out.push_str("\\\\"),
+                    b'[' => out.push_str("\\["),
+                    b']' => out.push_str("\\]"),
+                    b' ' => out.push_str("\\u{20}"),
+                    0x7f => out.push_str("\\u{7f}"),
+                    0x00..=0x1f => out.extend((byte as char).escape_default()),
+                    _ => out.push(byte as char),
+                }
+                at += 1;
+            }
+            out
+        }
+        fn check(input: &str, expected: &str) {
+            assert_eq!(oracle(input), expected, "oracle {input:?}");
+            assert_eq!(escaped(input), expected, "escaped {input:?}");
+        }
+
+        let clean = "abcdefghijklmnopqrstuvwxyz0123456789ABCD";
+        assert_eq!(clean.len(), 40);
+        check(clean, clean);
+
+        let mut second = clean.as_bytes().to_vec();
+        second[9] = b'\\';
+        let input = String::from_utf8(second).expect("ascii");
+        check(&input, &format!("{}\\\\{}", &clean[..9], &clean[10..]));
+
+        let mut first = clean.as_bytes().to_vec();
+        first[0] = b' ';
+        check(
+            &String::from_utf8(first).expect("ascii"),
+            &format!("\\u{{20}}{}", &clean[1..]),
+        );
+
+        let mut brackets = clean.as_bytes().to_vec();
+        brackets[15] = b'[';
+        brackets[16] = b']';
+        brackets[17] = 0x7f;
+        check(
+            &String::from_utf8(brackets).expect("ascii"),
+            &format!("{}\\[\\]\\u{{7f}}{}", &clean[..15], &clean[18..]),
+        );
+
+        let input = format!("{}\u{80}", "a".repeat(15));
+        check(&input, &format!("{}\\u{{80}}", "a".repeat(15)));
+
+        for len in [15, 16, 17, 31, 32, 33] {
+            let input = "a".repeat(len);
+            check(&input, &input);
         }
     }
 
