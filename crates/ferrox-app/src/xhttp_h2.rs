@@ -256,6 +256,9 @@ struct ControlQueue {
     /// Frames queued or taken into a batch and not yet written: the shutdown grace starts from zero
     /// here, so it begins after the last refusal is on the wire rather than before it.
     pending: AtomicUsize,
+    /// The instant the queue last reached empty, so a waiter that wakes after the deadline can
+    /// still tell an in-deadline drain from a late one.
+    done: Mutex<Option<std::time::Instant>>,
     /// Set by the worker when its own write fails, so the connection it serves ends with it
     /// instead of admitting frames no one will ever drain.
     dead: Arc<AtomicBool>,
@@ -268,6 +271,7 @@ impl Control {
             go: Condvar::new(),
             stop: AtomicBool::new(false),
             pending: AtomicUsize::new(0),
+            done: Mutex::new(None),
             dead,
         });
         let worker = Arc::clone(&queue);
@@ -312,7 +316,12 @@ impl Control {
                         worker.dead.store(true, Ordering::SeqCst);
                         return;
                     }
+                    let completed = std::time::Instant::now();
                     worker.pending.fetch_sub(used, Ordering::SeqCst);
+                    if worker.pending.load(Ordering::SeqCst) == 0 {
+                        *worker.done.lock().unwrap_or_else(PoisonError::into_inner) =
+                            Some(completed);
+                    }
                 }
             });
         if spawned.is_ok() {
@@ -338,6 +347,7 @@ impl Control {
                 }
                 frames.push_back((len as u8, frame));
                 queue.pending.fetch_add(1, Ordering::SeqCst);
+                *queue.done.lock().unwrap_or_else(PoisonError::into_inner) = None;
                 drop(frames);
                 queue.go.notify_one();
                 true
@@ -345,19 +355,23 @@ impl Control {
         }
     }
 
-    /// Waits for the queue and every batch already taken from it to be written, up to `grace`.
-    /// `false` is a peer that is not reading, so the shutdown has the deadline, not the write.
+    /// Waits for the queue and every batch already taken from it to be written before `grace`; `true`
+    /// is a drain that completed inside that window, even when observed after it, and `false` is a
+    /// peer that is not reading or a queue that died, so the shutdown has the deadline, not the write.
     fn drained(&self, grace: Duration) -> bool {
         let Control::Threaded(queue) = self else {
             return true;
         };
         let until = std::time::Instant::now() + grace;
         loop {
-            let pending = queue.pending.load(Ordering::SeqCst);
-            if pending == 0 {
-                return true;
+            if queue.dead.load(Ordering::SeqCst) {
+                return false;
             }
-            if queue.dead.load(Ordering::SeqCst) || std::time::Instant::now() >= until {
+            if queue.pending.load(Ordering::SeqCst) == 0 {
+                let done = *queue.done.lock().unwrap_or_else(PoisonError::into_inner);
+                return done.map_or_else(|| std::time::Instant::now() <= until, |at| at <= until);
+            }
+            if std::time::Instant::now() >= until {
                 return false;
             }
             std::thread::sleep(Duration::from_millis(1));
@@ -2215,12 +2229,9 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
     fn end(&mut self) -> Stepped {
         if let Some(conn) = self.conn.take() {
             if conn.refused.load(Ordering::SeqCst) {
-                // Closing while the peer's bytes sit unread aborts the connection, and the RST can swallow the GOAWAY a moment earlier; the grace is the window the peer takes it in, counted from the last queued refusal rather than before it, and spent off the lane.
+                // Closing while the peer's bytes sit unread aborts the connection, and the RST can swallow the GOAWAY a moment earlier; the grace is held after the last write drains, so the peer has the window to read it, and spent off the lane.
                 let closing = Arc::clone(&conn);
-                let spawned = std::thread::Builder::new().spawn(move || {
-                    let _ = closing.control.drained(crate::budgets::goaway_grace());
-                    closing.kill();
-                });
+                let spawned = std::thread::Builder::new().spawn(move || finish_refusal(&closing));
                 if spawned.is_err() {
                     // No thread can wait out the grace, so release the parked streams and sessions now.
                     conn.kill();
@@ -2232,6 +2243,14 @@ impl<R: Read, W: crate::proxy::FrameWrite + Send + 'static> Frames<R, W> {
         }
         Stepped::Done
     }
+}
+
+fn finish_refusal(conn: &Arc<H2Conn>) {
+    let grace = crate::budgets::goaway_grace();
+    if conn.control.drained(grace) && !conn.dead.load(Ordering::SeqCst) {
+        std::thread::sleep(grace);
+    }
+    conn.kill();
 }
 
 pub(crate) fn serve_h2_service_until<
@@ -4342,6 +4361,36 @@ mod tests {
         }
     }
 
+    /// A dead connection has no GOAWAY left to protect, so its refusal does not wait for the grace.
+    #[test]
+    fn a_dead_refusal_does_not_wait_for_the_grace() {
+        let (conn, _written, _slices) = bare_conn();
+        conn.dead.store(true, Ordering::SeqCst);
+        let started = std::time::Instant::now();
+        finish_refusal(&conn);
+        assert!(
+            started.elapsed() < crate::budgets::goaway_grace(),
+            "a dead connection waited for the GOAWAY grace"
+        );
+    }
+
+    /// A drained refusal keeps the socket for the grace, so unread request bytes cannot reset the
+    /// connection before the peer reads the GOAWAY.
+    #[test]
+    fn a_drained_refusal_keeps_the_socket_for_the_grace() {
+        let (conn, _written, _slices) = bare_conn();
+        let started = std::time::Instant::now();
+        finish_refusal(&conn);
+        assert!(
+            started.elapsed() >= crate::budgets::goaway_grace(),
+            "the socket closed before the peer had the grace to read the GOAWAY"
+        );
+        assert!(
+            conn.dead.load(Ordering::SeqCst),
+            "the refusal left the connection live"
+        );
+    }
+
     /// The refusal grace is counted from the last write, not before it: a parked peer does not count
     /// as drained, and the queue reads empty once its block lifts.
     #[test]
@@ -4357,6 +4406,10 @@ mod tests {
         assert!(
             conn.control.drained(Duration::from_secs(2)),
             "the queue drains once the peer takes the writes"
+        );
+        assert!(
+            conn.control.drained(Duration::ZERO),
+            "a drain that completed before the call is still a live drain"
         );
     }
 
