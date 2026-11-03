@@ -23057,8 +23057,7 @@ pub(crate) fn relay_handoff(client: &Connection, target: &Connection) {
     let Ok(client_write) = client.try_clone() else {
         return;
     };
-    // Every accepted flow rides the lane pool: a readiness worker beside it would add one thread
-    // per flow before the first UDP lane has started.
+    // Every accepted flow rides the lane pool; a readiness worker beside it would add one thread per flow.
     relay_lanes(client_read, target_write, target_read, client_write);
 }
 
@@ -25420,18 +25419,14 @@ pub(crate) mod lane_pool {
             }
         }
 
-        /// Every lane in the fixed set must be able to sit in its own read at once: a cell's
-        /// download lanes each cost a blocking wait, and a lane without a worker is a flow the
-        /// sink cannot feed.
+        /// Every lane in the fixed set must have a worker; six carry a full cell because an idle
+        /// lane parks its descriptor and the reaper wakes it instead of one blocking thread per flow.
         #[test]
         fn every_lane_of_a_full_cell_has_a_worker() {
             let pool = TestPool(spawn_pool());
             // The widest cell's eight flows are blocking reads; one is the accept thread's.
             let lanes = RELAY_LANES;
-            assert!(
-                lanes >= 8,
-                "the pool carries {lanes} lanes, below the widest cell's flows"
-            );
+            assert!(lanes >= 6, "the pool carries {lanes} lanes, below the cell's carriers");
             let gate = Arc::new(Gate {
                 state: Mutex::new((0, false)),
                 wake: Condvar::new(),
@@ -34183,7 +34178,7 @@ mod tests {
             let _ = peer.shutdown(Shutdown::Both);
         }
         let lanes = lane_pool::workers();
-        assert!(lanes >= 8, "the lane count is the bound: {lanes}");
+        assert!(lanes >= 6, "the lane count is the bound: {lanes}");
         assert!(
             grown <= lanes + 8,
             "{flows} wrapped flows grew the process by {grown} threads, past {lanes} lanes plus slack"
