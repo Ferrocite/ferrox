@@ -25122,6 +25122,25 @@ pub(crate) mod lane_pool {
         }
     }
 
+    /// A setup lane the pool cannot take runs on its own thread; a thread that cannot start completes
+    /// the lane where it stands instead of panicking the caller or dropping the rest of its batch.
+    fn spawn_off_pool(lane: Lane) {
+        let slot = std::sync::Arc::new(Mutex::new(Some(lane)));
+        let body = std::sync::Arc::clone(&slot);
+        let spawned = thread::Builder::new()
+            .name("ferrox-setup-lane".into())
+            .spawn(move || {
+                if let Some(lane) = body.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                    run_to_end(lane);
+                }
+            });
+        if spawned.is_err() {
+            if let Some(mut lane) = slot.lock().unwrap_or_else(PoisonError::into_inner).take() {
+                lane.finish();
+            }
+        }
+    }
+
     pub(crate) fn submit(step: Step, complete: Complete) {
         submit_to(&pool(), step, complete);
     }
@@ -25138,7 +25157,7 @@ pub(crate) mod lane_pool {
         });
         let setup = setup_pool();
         if let Err(lane) = submit_to_with(&setup, step, Box::new(|| {}), false) {
-            thread::spawn(move || run_to_end(lane));
+            spawn_off_pool(lane);
         }
     }
 
@@ -25161,12 +25180,12 @@ pub(crate) mod lane_pool {
                 complete();
             });
             if let Err(lane) = submit_to_with(&pool(), step, complete, false) {
-                thread::spawn(move || run_to_end(lane));
+                spawn_off_pool(lane);
             }
             return;
         }
         if let Err(lane) = submit_to_with(&setup, step, complete, false) {
-            thread::spawn(move || run_to_end(lane));
+            spawn_off_pool(lane);
         }
     }
 
@@ -25222,7 +25241,7 @@ pub(crate) mod lane_pool {
             } else {
                 // A setup lane reads the body its caller demuxes, so it leaves the caller's thread.
                 for lane in orphaned {
-                    thread::spawn(move || run_to_end(lane));
+                    spawn_off_pool(lane);
                 }
             }
             return Ok(());
