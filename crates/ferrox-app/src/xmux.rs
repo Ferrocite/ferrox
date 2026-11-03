@@ -178,7 +178,9 @@ fn hold(entry: Arc<Entry>) -> Lease {
     Lease { entry }
 }
 
-static MANAGERS: Mutex<Option<HashMap<(Key, Xmux), Arc<Manager>>>> = Mutex::new(None);
+type Managers = HashMap<(Key, Xmux), Arc<Manager>>;
+
+static MANAGERS: Mutex<Option<Managers>> = Mutex::new(None);
 
 pub(crate) fn manager(key: Key, bounds: Option<Xmux>) -> Arc<Manager> {
     let mut managers = MANAGERS.lock().unwrap_or_else(PoisonError::into_inner);
