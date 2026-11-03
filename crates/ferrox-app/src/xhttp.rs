@@ -4901,6 +4901,81 @@ mod tests {
         up.join().expect("joins the uplink service");
     }
 
+    /// A session takes one stream-up body, as the reference's upload queue does: a second POST is
+    /// answered 409 instead of 200, because a 200 promises bytes the reader never takes.
+    #[test]
+    fn a_second_stream_up_upload_is_refused_before_it_is_acknowledged() {
+        let settings = settings_from(
+            r#"{"streamSettings": {"network": "xhttp", "xhttpSettings": {"path": "/share", "mode": "stream-up"}}}"#,
+        );
+        let listener = Arc::new(crate::conn::test_bind("127.0.0.1:0").expect("binds"));
+        let port = listener.local_addr().expect("addr").port();
+        let serve = move || {
+            let listener = Arc::clone(&listener);
+            let settings = settings.clone();
+            thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accepts");
+                let Ok(read) = stream.try_clone() else {
+                    return;
+                };
+                let (mut head, at) = crate::proxy::read_exact_head(
+                    &mut stream,
+                    HEAD_LIMIT,
+                    crate::budgets::head_arrival(),
+                )
+                .expect("head");
+                let prefix = head.split_off(at);
+                if let Served::Session(mut reader, writer) =
+                    accept_core(&head, prefix, read, stream, &settings, None)
+                {
+                    let mut drained = Vec::new();
+                    let _ = reader.read_to_end(&mut drained);
+                    writer.finish();
+                }
+            })
+        };
+
+        let referer = format!("http://127.0.0.1/share?x_padding={}", "X".repeat(500));
+        let first = serve();
+        let mut uplink =
+            Connection::connect(("127.0.0.1", port)).expect("connects the first uplink");
+        uplink
+            .write_all(
+                format!(
+                    "POST /share/twouploads HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\nTransfer-Encoding: chunked\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("writes the first POST");
+        let answered = head_text(&mut uplink);
+        assert!(
+            ok_status_text(&answered),
+            "the first upload was refused, wrote {answered:?}"
+        );
+
+        let second = serve();
+        let mut refused = Connection::connect(("127.0.0.1", port)).expect("connects the second");
+        refused
+            .write_all(
+                format!(
+                    "POST /share/twouploads HTTP/1.1\r\nHost: h\r\nReferer: {referer}\r\nTransfer-Encoding: chunked\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .expect("writes the second POST");
+        let answer = head_text(&mut refused);
+        assert!(
+            answer.starts_with("HTTP/1.1 409"),
+            "a second stream-up upload was acknowledged, wrote {answer:?}"
+        );
+
+        uplink
+            .write_all(b"0\r\n\r\n")
+            .expect("ends the first upload");
+        first.join().expect("joins the first service");
+        second.join().expect("joins the second service");
+    }
+
     /// A packet-up session whose downlink never arrives holds its packets forever; a later bind must start fresh rather than read a sequence from a flow that already stalled.
     #[test]
     fn a_packet_up_session_with_no_downlink_is_replaced_after_the_stall() {
