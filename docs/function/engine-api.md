@@ -62,7 +62,7 @@ graph TD
 | ops-retired-instructions | UNBLESSED | scripts/count-ops.sh |
 <!-- counts:end -->
 
-The framing, both content paths, the dynamic registry, the stats read/reset, the rotated-logger reopen, the observatory snapshot and the routing calls have workspace tests in `commander.rs`, `accesslog.rs`, `observatory.rs`, `proxy.rs`, `stats.rs`, `router.rs` and `vmess.rs`; the access log's field scan is now measured by `ops.yml` as two open rows, the ASCII scan against its codepoint baseline, and `the_ascii_scan_escapes_exactly_as_the_codepoint_path` holds the bytes equal, so the page itself still quotes no number.
+The framing, both content paths, the dynamic registry, the stats read/reset, the rotated-logger reopen, the observatory snapshot and the routing calls have workspace tests in `commander.rs`, `accesslog.rs`, `observatory.rs`, `proxy.rs`, `stats.rs`, `router.rs` and `vmess.rs`; the access log's field scan is measured by `ops.yml` as three open rows, the word scan and the byte scan against the codepoint baseline, and `the_ascii_scan_escapes_exactly_as_the_codepoint_path` holds the bytes equal, so the page itself still quotes no number.
 
 ## Time
 
