@@ -113,6 +113,10 @@ carrier-foxy  foxy::connectip::tests::the_word_sum_costs_the_words_it_reads  fer
 carrier-foxy  foxy::connectip::tests::the_word_sum_costs_the_words_it_reads  ferrox_core::foxy::connectip::tests::the_word_sum_costs_the_words_it_reads
 carrier-foxy  foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer  ferrox_core::foxy::connectip::tests::the_serial_word_sum_costs_the_same_answer
 carrier-grpc  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else  grpc::tests::the_envelope_and_the_hunk_cost_their_loops_and_nothing_else
+carrier-grpc  grpc::tests::the_varint_length_over_every_boundary  grpc::tests::the_varint_length_over_every_boundary
+carrier-grpc  grpc::tests::the_varint_shift_loop_over_every_boundary  grpc::tests::the_varint_shift_loop_over_every_boundary
+engine-api  accesslog::tests::the_ascii_scan_over_a_bulk_field  accesslog::tests::the_ascii_scan_over_a_bulk_field
+engine-api  accesslog::tests::the_codepoint_walk_over_a_bulk_field  accesslog::tests::the_codepoint_walk_over_a_bulk_field
 carrier-veepn  veepn::tests::the_domain_walk_costs_the_labels_and_nothing_else  ferrox_core::veepn::api_domain
 carrier-veepn  veepn::tests::the_domain_walk_costs_the_labels_and_nothing_else  ferrox_core::veepn::tests::the_domain_walk_costs_the_labels_and_nothing_else
 carrier-veepn  veepn::tests::the_pair_coder_costs_the_coder_and_nothing_else  ferrox_core::veepn::credential_into
