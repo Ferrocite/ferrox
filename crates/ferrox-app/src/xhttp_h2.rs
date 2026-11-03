@@ -1239,6 +1239,9 @@ impl H2Conn {
                     .clamp(16_384, 16_777_215);
             } else if id == S_WINDOW {
                 let value = u64::from(value.min((1 << 31) - 1));
+                // The stream table is the gate both sides take before they touch `peer_initial`:
+                // a snapshot and its insertion, or a delta and its adjustment, happen as one step.
+                let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
                 let mut previous = self
                     .peer_initial
                     .lock()
@@ -1246,7 +1249,6 @@ impl H2Conn {
                 let delta = value.saturating_sub(*previous);
                 *previous = value;
                 drop(previous);
-                let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
                 for state in streams.values() {
                     let mut window = state
                         .send_window
@@ -1254,10 +1256,40 @@ impl H2Conn {
                         .unwrap_or_else(PoisonError::into_inner);
                     *window = window.saturating_add(delta).min((1 << 31) - 1);
                 }
+                drop(streams);
                 self.wake.notify_all();
             }
         }
         self.send_control(T_SETTINGS, F_ACK, 0, &[])
+    }
+
+    /// Insert a stream with the initial window the peer has published so far. The stream table is
+    /// held across the snapshot and the insertion so a concurrent `S_WINDOW` update can neither
+    /// miss the new stream nor apply its delta to it twice.
+    fn attach_stream(&self, sid: u32, end_stream: bool) -> Option<Arc<H2Stream>> {
+        let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
+        if streams.len() >= MAX_STREAMS as usize || streams.contains_key(&sid) {
+            return None;
+        }
+        let initial = *self
+            .peer_initial
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: end_stream,
+                finished: false,
+                request_ended: false,
+                abandoned: false,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(initial),
+            responded: AtomicBool::new(false),
+        });
+        streams.insert(sid, Arc::clone(&state));
+        Some(state)
     }
 }
 
@@ -1469,35 +1501,7 @@ impl H2Client {
         owned: bool,
     ) -> Option<(H2StreamReader, crate::xhttp::XhttpWriter)> {
         let sid = self.next.fetch_add(2, Ordering::SeqCst);
-        let initial = *self
-            .conn
-            .peer_initial
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let state = Arc::new(H2Stream {
-            state: Mutex::new(StreamState {
-                body: VecDeque::new(),
-                ended: false,
-                finished: false,
-                request_ended: false,
-                abandoned: false,
-                dead: false,
-            }),
-            cv: Condvar::new(),
-            send_window: Mutex::new(initial),
-            responded: AtomicBool::new(false),
-        });
-        {
-            let mut streams = self
-                .conn
-                .streams
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            if streams.len() >= MAX_STREAMS as usize || streams.contains_key(&sid) {
-                return None;
-            }
-            streams.insert(sid, Arc::clone(&state));
-        }
+        let state = self.conn.attach_stream(sid, false)?;
         let block = request_block(host, settings, scheme);
         if !self.conn.frame(T_HEADERS, F_END_HEADERS, sid, &block) {
             self.conn.fail_stream(sid);
@@ -1593,32 +1597,13 @@ impl H2Conn {
             self.reset_stream(sid);
             return None;
         }
-        let initial = *self
-            .peer_initial
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let state = Arc::new(H2Stream {
-            state: Mutex::new(StreamState {
-                body: VecDeque::new(),
-                ended: end_stream,
-                finished: false,
-                request_ended: false,
-                abandoned: false,
-                dead: false,
-            }),
-            cv: Condvar::new(),
-            send_window: Mutex::new(initial),
-            responded: AtomicBool::new(false),
-        });
-        {
-            let mut streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
-            if streams.len() >= MAX_STREAMS as usize || streams.contains_key(&sid) {
-                drop(streams);
+        let state = match self.attach_stream(sid, end_stream) {
+            Some(state) => state,
+            None => {
                 self.reset_stream(sid);
                 return None;
             }
-            streams.insert(sid, Arc::clone(&state));
-        }
+        };
         Some((
             H2StreamReader {
                 conn: Arc::clone(self),
@@ -1799,32 +1784,13 @@ fn open_stream(
         conn.reset_stream(sid);
         return;
     }
-    let initial = *conn
-        .peer_initial
-        .lock()
-        .unwrap_or_else(PoisonError::into_inner);
-    let state = Arc::new(H2Stream {
-        state: Mutex::new(StreamState {
-            body: VecDeque::new(),
-            ended: end_stream,
-            finished: false,
-            request_ended: false,
-            abandoned: false,
-            dead: false,
-        }),
-        cv: Condvar::new(),
-        send_window: Mutex::new(initial),
-        responded: AtomicBool::new(false),
-    });
-    {
-        let mut streams = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
-        if streams.len() >= MAX_STREAMS as usize || streams.contains_key(&sid) {
-            drop(streams);
+    let state = match conn.attach_stream(sid, end_stream) {
+        Some(state) => state,
+        None => {
             conn.reset_stream(sid);
             return;
         }
-        streams.insert(sid, Arc::clone(&state));
-    }
+    };
     let head = synth_head(&method, &target, &lines, end_stream);
     let reader = H2StreamReader {
         conn: Arc::clone(conn),
