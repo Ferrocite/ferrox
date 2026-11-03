@@ -23817,6 +23817,8 @@ pub(crate) const RELAY_BUFFER: usize = 64 * 1024;
 
 pub(crate) const RELAY_SMALL_BUFFER: usize = 16 * 1024;
 
+const RELAY_RECORD: usize = 8 * 1024;
+
 /// One pool per window quantum; thread-local spares drain to the shared pool at thread exit.
 struct RelaySpare {
     small: Vec<Vec<u8>>,
@@ -26133,12 +26135,12 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
     let b = Arc::new(b);
     let flow = RelayFinish::new(close_first, Arc::clone(close), finish);
     let (up_a, up_b, up_flow) = (Arc::clone(&a), Arc::clone(&b), Arc::clone(&flow));
-    let mut forward = RelayBuf::new();
+    let mut forward = RelayBuf::with_limit(RELAY_RECORD);
     lane_pool::submit(
         Box::new(move || stream_lane_step(&up_a, &up_b, &mut forward, &up_flow)),
         Box::new(stream_lane_done(&flow)),
     );
-    let mut backward = RelayBuf::new();
+    let mut backward = RelayBuf::with_limit(RELAY_RECORD);
     let parked = Arc::clone(&flow);
     lane_pool::submit(
         Box::new(move || stream_lane_step(&b, &a, &mut backward, &parked)),

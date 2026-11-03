@@ -1542,6 +1542,8 @@ pub(crate) fn reality_server_config(
         .with_cert_resolver(Arc::new(rustls::sign::SingleCertAndKey::from(key)));
     config.alpn_protocols.clear();
     config.alpn_protocols.extend(cfg.alpn.iter().cloned());
+    // The reference's 8 KiB record is 8209 wire bytes; the five-byte header is part of this field.
+    config.max_fragment_size = Some(8197);
     // rustls sends two tickets by default; REALITY arrivals carry none.
     config.send_tls13_tickets = if cfg.send_tickets { 2 } else { 0 };
     if cfg.send_tickets {

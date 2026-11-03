@@ -1435,6 +1435,7 @@ mod tests {
     use super::*;
     use crate::tls::RecordAlignment as _;
     use std::net::{TcpListener, TcpStream};
+    use std::sync::{Arc, Mutex};
     use std::thread;
 
     const SERVER_PRIVATE: [u8; 32] = [
@@ -2361,6 +2362,166 @@ mod tests {
         client.write_all(&bytes).expect("writes");
         server.join().expect("joins").expect("authenticates");
         assert_eq!(bytes[0], 0x16);
+    }
+
+    #[derive(Debug)]
+    struct AcceptAll;
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAll {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _message: &[u8],
+            _cert: &rustls::pki_types::CertificateDer<'_>,
+            _dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::ring::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    struct Recorder {
+        inner: TcpStream,
+        seen: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Read for Recorder {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.inner.read(buf)?;
+            self.seen
+                .lock()
+                .expect("recording lock")
+                .extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+    }
+
+    impl Write for Recorder {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    fn reality_identity() -> super::super::TlsServerConfig {
+        super::super::TlsServerConfig {
+            alpn: Vec::new(),
+            min_version: None,
+            max_version: None,
+            cipher_suites: Vec::new(),
+            certs: vec![super::super::CertEntry {
+                cert_chain: vec![bound_certificate(&[9u8; 32], SNI)],
+                key_der: ed25519_pkcs8(),
+                key_kind: super::super::ServerKeyKind::Pkcs8,
+                reload: None,
+            }],
+            send_tickets: false,
+            reject_unknown_sni: false,
+            server_config_cache: Arc::default(),
+            ech_server_keys: None,
+            master_key_log: None,
+        }
+    }
+
+    fn application_records(flight: &[u8]) -> Vec<usize> {
+        let mut at = 0;
+        let mut out = Vec::new();
+        while at + 5 <= flight.len() {
+            let kind = flight[at];
+            let len = usize::from(u16::from_be_bytes([flight[at + 3], flight[at + 4]]));
+            assert!(at + 5 + len <= flight.len(), "a record is cut short");
+            if kind == 23 {
+                out.push(len);
+            }
+            at += 5 + len;
+        }
+        assert_eq!(at, flight.len(), "the capture ends on a record boundary");
+        out
+    }
+
+    #[cfg_attr(
+        miri,
+        ignore = "needs a loopback socket, and ring's assembly behind it"
+    )]
+    #[test]
+    fn the_reality_server_fragments_application_data_at_eight_kib_records() {
+        let server_config = Arc::new(
+            crate::tls::rustls_backend::reality_server_config(reality_identity())
+                .expect("server config"),
+        );
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .expect("client versions")
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAll))
+        .with_no_client_auth();
+
+        let listener = TcpListener::bind("127.0.0.1:0").expect("binds");
+        let port = listener.local_addr().expect("addr").port();
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accepts");
+            let mut session = rustls::ServerConnection::new(server_config).expect("server session");
+            let mut tls = rustls::Stream::new(&mut session, &mut stream);
+            let mut opening = [0u8; 5];
+            tls.read_exact(&mut opening).expect("reads");
+            tls.write_all(&vec![0x5au8; 65_536]).expect("writes");
+        });
+
+        let stream = TcpStream::connect(("127.0.0.1", port)).expect("connects");
+        let mut recorder = Recorder {
+            inner: stream,
+            seen: Arc::clone(&seen),
+        };
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(client_config),
+            rustls::pki_types::ServerName::try_from(SNI).expect("name"),
+        )
+        .expect("client session");
+        let mut tls = rustls::Stream::new(&mut client, &mut recorder);
+        tls.write_all(b"hello").expect("writes");
+        let mut answer = vec![0u8; 65_536];
+        tls.read_exact(&mut answer).expect("reads");
+        server.join().expect("joins");
+
+        let application = application_records(&seen.lock().expect("recording lock"));
+        assert!(
+            application.iter().all(|&len| len <= 8209),
+            "a REALITY server record is wider than the reference's 8 KiB: {application:?}"
+        );
+        assert!(
+            application.contains(&8209),
+            "the server never emitted an 8 KiB record: {application:?}"
+        );
     }
 
     #[cfg_attr(
