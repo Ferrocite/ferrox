@@ -412,7 +412,8 @@ pub(crate) struct WebRtcStream {
     pending: Arc<Mutex<(Vec<u8>, usize)>>,
     stop: Arc<AtomicBool>,
     padding_sent: Arc<AtomicBool>,
-    timeout: Arc<Mutex<Option<Duration>>>,
+    read_timeout: Arc<Mutex<Option<Duration>>>,
+    write_timeout: Arc<Mutex<Option<Duration>>>,
 }
 
 impl Clone for WebRtcStream {
@@ -423,7 +424,8 @@ impl Clone for WebRtcStream {
             pending: Arc::clone(&self.pending),
             stop: Arc::clone(&self.stop),
             padding_sent: Arc::clone(&self.padding_sent),
-            timeout: Arc::clone(&self.timeout),
+            read_timeout: Arc::clone(&self.read_timeout),
+            write_timeout: Arc::clone(&self.write_timeout),
         }
     }
 }
@@ -446,13 +448,20 @@ impl WebRtcStream {
             pending: Arc::new(Mutex::new((Vec::new(), 0))),
             stop,
             padding_sent,
-            timeout: Arc::new(Mutex::new(Some(timeout))),
+            read_timeout: Arc::new(Mutex::new(Some(timeout))),
+            write_timeout: Arc::new(Mutex::new(Some(timeout))),
         })
     }
 
     /// Set or clear the read and write timeout.
     pub(crate) fn set_timeout(&self, timeout: Option<Duration>) {
-        *lock(&self.timeout) = timeout;
+        *lock(&self.read_timeout) = timeout;
+        *lock(&self.write_timeout) = timeout;
+    }
+
+    /// Set or clear only the read timeout, leaving the write deadline in place.
+    pub(crate) fn set_read_timeout(&self, timeout: Option<Duration>) {
+        *lock(&self.read_timeout) = timeout;
     }
 
     /// End the driver and every clone of this stream.
@@ -477,7 +486,7 @@ impl Read for WebRtcStream {
             pending.0.clear();
             pending.1 = 0;
             let input = lock(&self.input);
-            let timeout = *lock(&self.timeout);
+            let timeout = *lock(&self.read_timeout);
             let received = match timeout {
                 Some(timeout) => input.recv_timeout(timeout),
                 None => input.recv().map_err(|_| RecvTimeoutError::Disconnected),
@@ -536,7 +545,7 @@ impl WebRtcStream {
 
     /// Queue one framed message, respecting the current write timeout.
     fn send(&self, message: Vec<u8>) -> io::Result<()> {
-        let timeout = *lock(&self.timeout);
+        let timeout = *lock(&self.write_timeout);
         let deadline = timeout.map(|timeout| Instant::now() + timeout);
         let mut message = message;
         loop {

@@ -102,6 +102,17 @@ impl Stream {
         }
     }
 
+    /// Set or clear only the read timeout.
+    fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        match self {
+            Self::Tcp(socket) => socket.set_read_timeout(timeout),
+            Self::WebRtc(stream) => {
+                stream.set_read_timeout(timeout);
+                Ok(())
+            }
+        }
+    }
+
     fn shutdown(&self) -> io::Result<()> {
         match self {
             Self::Tcp(socket) => socket.shutdown(Shutdown::Both),
@@ -544,41 +555,7 @@ impl Session {
                 };
                 (stream, Some(relay), destination.protocol, base)
             } else {
-                let address = SocketAddr::new(server.address, server.port);
-                let tls_direct = server.tls && server.meek.is_none();
-                let socket = match &server.meek {
-                    Some(meek) => crate::psiphon_meek::connect(meek, timeout, proxy)?,
-                    None => direct_socket(address, server, timeout, proxy)?,
-                };
-                socket
-                    .set_read_timeout(Some(timeout))
-                    .and_then(|()| socket.set_write_timeout(Some(timeout)))
-                    .and_then(|()| socket.set_nodelay(true))
-                    .map_err(|error| format!("psiphon ssh socket: {error}"))?;
-                let protocol = if tls_direct {
-                    "TLS-OSSH"
-                } else {
-                    server.meek.as_ref().map_or_else(
-                        || {
-                            if server.obfuscation_key.is_some() {
-                                "OSSH"
-                            } else {
-                                "SSH"
-                            }
-                        },
-                        |meek| tunnel_protocol_base(meek.protocol),
-                    )
-                };
-                let stream = if tls_direct {
-                    tls_tunnel(
-                        Stream::Tcp(socket),
-                        &server.host,
-                        tls_passthrough_key(server),
-                        timeout,
-                    )?
-                } else {
-                    Stream::Tcp(socket)
-                };
+                let (stream, protocol) = direct_stream(server, timeout, proxy)?;
                 (stream, None, protocol, protocol)
             };
 
@@ -1177,11 +1154,11 @@ fn tls_passthrough_key(server: &Server) -> &str {
 /// site. The key is HKDF-derived from the 20-minute time period, and the message's second half
 /// is an HMAC over its nonce.
 fn tls_passthrough(key: &str) -> Result<[u8; 32], String> {
-    let period = 20 * 60i64;
+    let period = 20 * 60u64;
     let rounded = (std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_err(|error| format!("psiphon tls clock: {error}"))?
-        .as_secs() as i64
+        .as_secs()
         + period / 2)
         / period;
     let mut salt = b"passthrough-obfuscation-key".to_vec();
@@ -1199,6 +1176,50 @@ fn tls_passthrough(key: &str) -> Result<[u8; 32], String> {
     );
     message[16..].copy_from_slice(&tag.as_ref()[..16]);
     Ok(message)
+}
+
+/// Dial a direct or unfronted transport, wrapping it in TLS when the entry names TLS-OSSH.
+fn direct_stream(
+    server: &Server,
+    timeout: Duration,
+    proxy: Option<&Proxy>,
+) -> Result<(Stream, &'static str), String> {
+    let address = SocketAddr::new(server.address, server.port);
+    let tls = server.tls && server.meek.is_none();
+    let socket = match &server.meek {
+        Some(meek) => crate::psiphon_meek::connect(meek, timeout, proxy)?,
+        None => direct_socket(address, server, timeout, proxy)?,
+    };
+    socket
+        .set_read_timeout(Some(timeout))
+        .and_then(|()| socket.set_write_timeout(Some(timeout)))
+        .and_then(|()| socket.set_nodelay(true))
+        .map_err(|error| format!("psiphon ssh socket: {error}"))?;
+    let protocol = if tls {
+        "TLS-OSSH"
+    } else {
+        server.meek.as_ref().map_or_else(
+            || {
+                if server.obfuscation_key.is_some() {
+                    "OSSH"
+                } else {
+                    "SSH"
+                }
+            },
+            |meek| tunnel_protocol_base(meek.protocol),
+        )
+    };
+    let stream = if tls {
+        tls_tunnel(
+            Stream::Tcp(socket),
+            &server.host,
+            tls_passthrough_key(server),
+            timeout,
+        )?
+    } else {
+        Stream::Tcp(socket)
+    };
+    Ok((stream, protocol))
 }
 
 fn direct_socket(
@@ -1274,7 +1295,7 @@ fn tls_tunnel(
 }
 
 fn relay_tls(mut tls: ClientSession<Stream>, mut peer: TcpStream) -> io::Result<()> {
-    tls.get_ref().set_timeout(Some(TLS_POLL))?;
+    tls.get_ref().set_read_timeout(Some(TLS_POLL))?;
     peer.set_read_timeout(Some(TLS_POLL))?;
     peer.set_write_timeout(Some(IO_TIMEOUT))?;
     let mut up = vec![0u8; TLS_BUFFER];
@@ -1309,10 +1330,7 @@ fn relay_tls(mut tls: ClientSession<Stream>, mut peer: TcpStream) -> io::Result<
 }
 
 fn idle(error: &io::Error) -> bool {
-    matches!(
-        error.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
-    )
+    io::ErrorKind::Interrupted == error.kind() || ferrox_core::tls::TlsError::is_timeout(error)
 }
 
 fn split(

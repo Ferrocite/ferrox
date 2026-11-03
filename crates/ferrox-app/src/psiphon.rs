@@ -2424,6 +2424,11 @@ fn matches_limit(server: &Server, filter: Shape, meek_named: bool, protocols: &[
 /// Whether a server's meek protocol is named by the limit.
 fn matches_meek_protocol(server: &Server, protocols: &[String]) -> bool {
     let Some(meek) = &server.meek else {
+        if server.tls {
+            return protocols
+                .iter()
+                .any(|protocol| protocol.as_str() == "TLS-OSSH");
+        }
         return protocols.iter().any(|protocol| {
             matches!(
                 protocol.as_str(),
@@ -2784,24 +2789,7 @@ fn select_protocols(
     let tls_named = normal.is_some_and(|shape| shape.tls)
         || (initial_active && initial.is_some_and(|shape| shape.tls));
     if tls_named {
-        let mut variants = Vec::new();
-        for server in &servers {
-            if server.tls
-                || !server.direct
-                || server.tls_port.is_none()
-                || server.obfuscation_key.is_none()
-            {
-                continue;
-            }
-            let mut variant = server.clone();
-            variant.tls = true;
-            variant.port = variant.tls_port.unwrap_or(variant.port);
-            variant.meek = None;
-            variant.unfronted_meek = None;
-            variant.tactics = None;
-            variants.push(variant);
-        }
-        servers.extend(variants);
+        add_tls_variants(&mut servers);
     }
     let normal_meek =
         normal.is_some() && protocols.iter().any(|protocol| is_meek_protocol(protocol));
@@ -2842,6 +2830,29 @@ fn select_protocols(
         .into_iter()
         .map(|index| servers[index].clone())
         .collect()
+}
+
+/// Add a TLS variant for each direct entry that names a TLS port.
+fn add_tls_variants(servers: &mut Vec<Server>) {
+    let variants: Vec<Server> = servers
+        .iter()
+        .filter(|server| {
+            !server.tls
+                && server.direct
+                && server.tls_port.is_some()
+                && server.obfuscation_key.is_some()
+        })
+        .map(|server| {
+            let mut variant = server.clone();
+            variant.tls = true;
+            variant.port = variant.tls_port.unwrap_or(variant.port);
+            variant.meek = None;
+            variant.unfronted_meek = None;
+            variant.tactics = None;
+            variant
+        })
+        .collect();
+    servers.extend(variants);
 }
 
 fn cache_path(settings: &Settings) -> PathBuf {
@@ -2905,6 +2916,57 @@ fn destination_port(destination: &crate::psiphon_broker::Destination) -> u16 {
         .unwrap_or(443)
 }
 
+/// The ports and keys one server entry names.
+struct EntryPorts {
+    obfuscated: Option<u16>,
+    obfuscated_key: Option<String>,
+    meek_key: Option<String>,
+    ssh: Option<u16>,
+    tls: Option<u16>,
+}
+
+/// Read the direct, meek and TLS ports from one entry.
+fn entry_ports(entry: &Json) -> EntryPorts {
+    let obfuscated = entry
+        .get("sshObfuscatedPort")
+        .and_then(Json::as_port)
+        .filter(|port| *port > 0);
+    let obfuscated_key = entry
+        .get("sshObfuscatedKey")
+        .and_then(Json::as_str)
+        .map(str::to_owned)
+        .filter(|key| !key.is_empty());
+    let meek_key = entry
+        .get("meekObfuscatedKey")
+        .and_then(Json::as_str)
+        .map(str::to_owned)
+        .filter(|key| !key.is_empty());
+    let ssh = entry
+        .get("sshPort")
+        .and_then(Json::as_port)
+        .filter(|port| *port > 0);
+    let tls = entry
+        .get("tlsOSSHPort")
+        .and_then(Json::as_port)
+        .filter(|port| *port > 0)
+        .or_else(|| {
+            if capability_protocol(entry, &[("TLS-OSSH", "TLS-OSSH")]).is_none() {
+                return None;
+            }
+            entry
+                .get("meekServerPort")
+                .and_then(Json::as_port)
+                .filter(|port| *port > 0)
+        });
+    EntryPorts {
+        obfuscated,
+        obfuscated_key,
+        meek_key,
+        ssh,
+        tls,
+    }
+}
+
 /// Decode one base64 server-list entry, optionally keeping an in-proxy-only one.
 fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
     let decoded = hex_decode(line)?;
@@ -2928,38 +2990,13 @@ fn decode_entry_with(line: &str, include_inproxy: bool) -> Option<Server> {
         .and_then(Json::as_str)
         .unwrap_or("")
         .to_owned();
-    let obfuscated_port = entry
-        .get("sshObfuscatedPort")
-        .and_then(Json::as_port)
-        .filter(|port| *port > 0);
-    let obfuscated_key = entry
-        .get("sshObfuscatedKey")
-        .and_then(Json::as_str)
-        .map(str::to_owned)
-        .filter(|key| !key.is_empty());
-    let meek_obfuscated_key = entry
-        .get("meekObfuscatedKey")
-        .and_then(Json::as_str)
-        .map(str::to_owned)
-        .filter(|key| !key.is_empty());
-    let ssh_port = entry
-        .get("sshPort")
-        .and_then(Json::as_port)
-        .filter(|port| *port > 0);
-    let tls_capable = capability_protocol(&entry, &[("TLS-OSSH", "TLS-OSSH")]).is_some();
-    let tls_port = entry
-        .get("tlsOSSHPort")
-        .and_then(Json::as_port)
-        .filter(|port| *port > 0)
-        .or_else(|| {
-            if !tls_capable {
-                return None;
-            }
-            entry
-                .get("meekServerPort")
-                .and_then(Json::as_port)
-                .filter(|port| *port > 0)
-        });
+    let EntryPorts {
+        obfuscated: obfuscated_port,
+        obfuscated_key,
+        meek_key: meek_obfuscated_key,
+        ssh: ssh_port,
+        tls: tls_port,
+    } = entry_ports(&entry);
     let protocol = meek_protocol(&entry);
     let tactics_capable = tactics_capability(&entry);
     let direct = obfuscated_port.is_some()
@@ -4620,6 +4657,30 @@ mod tests {
     }
 
     #[test]
+    fn a_mixed_limit_keeps_the_tls_variant_and_drops_direct_ossh() {
+        let mut capable = test_server(true);
+        capable.tls_port = Some(8443);
+        let selected = select_protocols(
+            vec![capable.clone(), test_server(true)],
+            &["FRONTED-MEEK-OSSH".to_owned(), "TLS-OSSH".to_owned()],
+            &[],
+            0,
+            false,
+        );
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].tls);
+        let selected = select_protocols(
+            vec![capable, test_server(true)],
+            &["SSH".to_owned()],
+            &["FRONTED-MEEK-OSSH".to_owned(), "TLS-OSSH".to_owned()],
+            1,
+            false,
+        );
+        assert_eq!(selected.len(), 1);
+        assert!(selected[0].tls);
+    }
+
+    #[test]
     fn a_tactics_entry_keeps_its_keys_and_front() {
         let entry = r#"{"ipAddress":"192.0.2.1","sshHostKey":"AAAA","capabilities":["FRONTED-MEEK-TACTICS"],"tacticsRequestPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","tacticsRequestObfuscatedKey":"dGFjdGljcw==","meekCookieEncryptionPublicKey":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=","meekObfuscatedKey":"mk","meekFrontingAddresses":["203.0.113.9"],"meekFrontingHosts":["front.example"]}"#;
         let encoded = hex(format!("0 0 0 0 {entry}").as_bytes());
@@ -4877,7 +4938,7 @@ mod tests {
             Settings::from_json(Some(&json::parse(&text).expect("settings"))).expect("settings")
         };
         assert!(
-            load_entries(&settings("TLS-OSSH")).is_err(),
+            load_entries(&settings("QUIC-OSSH")).is_err(),
             "an unsupported initial list must fall back to the normal limit"
         );
         let selected = load_entries(&settings("OSSH")).expect("the initial list names OSSH");
