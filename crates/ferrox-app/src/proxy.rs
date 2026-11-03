@@ -25198,9 +25198,14 @@ pub(crate) mod lane_pool {
             let _ = grow(pool);
         }
         if pool.workers.load(Relaxed) == 0 {
-            // A thread the process could not start still does the lane's work on the caller.
-            run_to_end(lane);
-            return Ok(());
+            drop(ready);
+            if relay {
+                // A thread the process could not start still does the relay lane's work on the caller.
+                run_to_end(lane);
+                return Ok(());
+            }
+            // A setup lane reads the body its caller demuxes, so the caller can never run it.
+            return Err(lane);
         }
         ready = pool.ready.lock().unwrap_or_else(PoisonError::into_inner);
         if pool.pending.is_some_and(|pending| ready.len() >= pending) {
@@ -25208,11 +25213,18 @@ pub(crate) mod lane_pool {
         }
         ready.push_back(lane);
         if pool.workers.load(Relaxed) == 0 {
-            // The last worker retired while this lock was held: no thread will take the queue, so the caller runs it.
+            // The last worker retired while this lock was held: no thread will take the queue.
             let orphaned: Vec<Lane> = ready.drain(..).collect();
             drop(ready);
-            for lane in orphaned {
-                run_to_end(lane);
+            if relay {
+                for lane in orphaned {
+                    run_to_end(lane);
+                }
+            } else {
+                // A setup lane reads the body its caller demuxes, so it leaves the caller's thread.
+                for lane in orphaned {
+                    thread::spawn(move || run_to_end(lane));
+                }
             }
             return Ok(());
         }
@@ -25748,8 +25760,14 @@ pub(crate) mod lane_pool {
                 Box::new(|| {}),
                 false,
             );
-            assert!(refused.is_err(), "a setup lane with no worker ran on its caller");
-            assert!(!ran.load(Ordering::SeqCst), "the setup body ran on the caller");
+            assert!(
+                refused.is_err(),
+                "a setup lane with no worker ran on its caller"
+            );
+            assert!(
+                !ran.load(Ordering::SeqCst),
+                "the setup body ran on the caller"
+            );
         }
 
         /// A relay lane is the other shape: the framed reader hands its timeout back to the step.
