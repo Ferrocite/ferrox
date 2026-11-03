@@ -71,6 +71,7 @@ const MSG_CHANNEL_FAILURE: u8 = 100;
 /// One transport below SSH: a TCP socket or an in-proxy WebRTC data channel.
 pub(crate) enum Stream {
     Tcp(TcpStream),
+    Shadowsocks(crate::psiphon_shadowsocks::Stream<TcpStream>),
     WebRtc(WebRtcStream),
 }
 
@@ -86,6 +87,7 @@ impl Stream {
     fn try_clone(&self) -> io::Result<Self> {
         match self {
             Self::Tcp(socket) => socket.try_clone().map(Self::Tcp),
+            Self::Shadowsocks(stream) => stream.try_clone().map(Self::Shadowsocks),
             Self::WebRtc(stream) => Ok(Self::WebRtc(stream.clone())),
         }
     }
@@ -95,6 +97,7 @@ impl Stream {
             Self::Tcp(socket) => socket
                 .set_read_timeout(timeout)
                 .and_then(|()| socket.set_write_timeout(timeout)),
+            Self::Shadowsocks(stream) => stream.set_timeout(timeout),
             Self::WebRtc(stream) => {
                 stream.set_timeout(timeout);
                 Ok(())
@@ -106,6 +109,7 @@ impl Stream {
     fn set_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
         match self {
             Self::Tcp(socket) => socket.set_read_timeout(timeout),
+            Self::Shadowsocks(stream) => stream.set_read_timeout(timeout),
             Self::WebRtc(stream) => {
                 stream.set_read_timeout(timeout);
                 Ok(())
@@ -116,6 +120,7 @@ impl Stream {
     fn shutdown(&self) -> io::Result<()> {
         match self {
             Self::Tcp(socket) => socket.shutdown(Shutdown::Both),
+            Self::Shadowsocks(stream) => stream.shutdown(),
             Self::WebRtc(stream) => {
                 stream.shutdown();
                 Ok(())
@@ -128,6 +133,7 @@ impl Read for Stream {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(socket) => socket.read(buf),
+            Self::Shadowsocks(stream) => stream.read(buf),
             Self::WebRtc(stream) => stream.read(buf),
         }
     }
@@ -137,6 +143,7 @@ impl Write for Stream {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self {
             Self::Tcp(socket) => socket.write(buf),
+            Self::Shadowsocks(stream) => stream.write(buf),
             Self::WebRtc(stream) => stream.write(buf),
         }
     }
@@ -144,6 +151,7 @@ impl Write for Stream {
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         match self {
             Self::Tcp(socket) => socket.write_vectored(bufs),
+            Self::Shadowsocks(stream) => stream.write_vectored(bufs),
             Self::WebRtc(stream) => {
                 let parts: Vec<&[u8]> = bufs.iter().map(|buf| &buf[..]).collect();
                 stream.write_parts(&parts)
@@ -154,9 +162,18 @@ impl Write for Stream {
     fn flush(&mut self) -> io::Result<()> {
         match self {
             Self::Tcp(socket) => socket.flush(),
+            Self::Shadowsocks(stream) => stream.flush(),
             Self::WebRtc(stream) => stream.flush(),
         }
     }
+}
+
+/// The Shadowsocks port and keys a `SHADOWSOCKS-OSSH` variant dials.
+#[derive(Debug, Clone)]
+pub(crate) struct Shadowsocks {
+    pub(crate) port: u16,
+    pub(crate) key: String,
+    pub(crate) obfuscation_key: Option<String>,
 }
 
 /// The parts of a signed server entry this transport dials.
@@ -175,6 +192,8 @@ pub(crate) struct Server {
     pub(crate) direct: bool,
     pub(crate) tls: bool,
     pub(crate) tls_port: Option<u16>,
+    pub(crate) ss: bool,
+    pub(crate) shadowsocks: Option<Shadowsocks>,
     pub(crate) meek: Option<crate::psiphon_meek::Meek>,
     pub(crate) unfronted_meek: Option<crate::psiphon_meek::Meek>,
     pub(crate) tactics: Option<crate::psiphon_tactics::Keys>,
@@ -186,7 +205,33 @@ impl Server {
     /// The obfuscated shape when the entry carries an OSSH key or a meek front, plain SSH otherwise.
     #[must_use]
     pub(crate) fn obfuscated(&self) -> bool {
-        self.obfuscation_key.is_some() || self.meek.is_some()
+        self.ss || self.obfuscation_key.is_some() || self.meek.is_some()
+    }
+
+    /// The `SHADOWSOCKS-OSSH` sibling of an entry that also names another direct port.
+    #[must_use]
+    pub(crate) fn shadowsocks_variant(&self) -> Option<Self> {
+        if self.ss {
+            return None;
+        }
+        let ss = self.shadowsocks.as_ref()?;
+        let mut variant = self.clone();
+        variant.ss = true;
+        variant.direct = true;
+        variant.port = ss.port;
+        variant.obfuscation_key = ss
+            .obfuscation_key
+            .clone()
+            .filter(|key| !key.is_empty())
+            .or_else(|| self.obfuscation_key.clone());
+        variant.tls = false;
+        variant.tls_port = None;
+        variant.meek = None;
+        variant.unfronted_meek = None;
+        variant.tactics = None;
+        variant.inproxy = None;
+        variant.tls_inproxy = None;
+        Some(variant)
     }
 }
 
@@ -761,9 +806,11 @@ impl Inner {
         if remote == NO_CHANNEL {
             return Err("psiphon channel closed".to_owned());
         }
-        writer
-            .send_channel_data(remote, data)
-            .map_err(|error| format!("psiphon ssh write: {error}"))
+        let result = writer.send_channel_data(remote, data);
+        if result.is_err() {
+            self.close();
+        }
+        result.map_err(|error| format!("psiphon ssh write: {error}"))
     }
 
     fn send_channel_data_in_place(
@@ -776,9 +823,11 @@ impl Inner {
         if remote == NO_CHANNEL {
             return Err("psiphon channel closed".to_owned());
         }
-        writer
-            .send_channel_data_in_place(remote, data)
-            .map_err(|error| format!("psiphon ssh write: {error}"))
+        let result = writer.send_channel_data_in_place(remote, data);
+        if result.is_err() {
+            self.close();
+        }
+        result.map_err(|error| format!("psiphon ssh write: {error}"))
     }
 
     /// A per-channel frame leaves only while the channel still names a remote id, read under the writer lock.
@@ -789,7 +838,11 @@ impl Inner {
             return false;
         }
         payload[1..5].copy_from_slice(&remote.to_be_bytes());
-        writer.send(payload).is_ok()
+        let sent = writer.send(payload).is_ok();
+        if !sent {
+            self.close();
+        }
+        sent
     }
 
     /// End a channel: its remote id is retired and its close frame sent under one writer lock.
@@ -1225,7 +1278,7 @@ fn direct_stream(
     proxy: Option<&Proxy>,
 ) -> Result<(Stream, &'static str), String> {
     let address = SocketAddr::new(server.address, server.port);
-    let tls = server.tls && server.meek.is_none();
+    let tls = server.tls && server.meek.is_none() && !server.ss;
     let socket = match &server.meek {
         Some(meek) => crate::psiphon_meek::connect(meek, timeout, proxy)?,
         None => direct_socket(address, server, timeout, proxy)?,
@@ -1235,7 +1288,9 @@ fn direct_stream(
         .and_then(|()| socket.set_write_timeout(Some(timeout)))
         .and_then(|()| socket.set_nodelay(true))
         .map_err(|error| format!("psiphon ssh socket: {error}"))?;
-    let protocol = if tls {
+    let protocol = if server.ss {
+        "SHADOWSOCKS-OSSH"
+    } else if tls {
         "TLS-OSSH"
     } else {
         server.meek.as_ref().map_or_else(
@@ -1249,7 +1304,15 @@ fn direct_stream(
             |meek| tunnel_protocol_base(meek.protocol),
         )
     };
-    let stream = if tls {
+    let stream = if server.ss {
+        let key = server
+            .shadowsocks
+            .as_ref()
+            .map(|ss| ss.key.as_str())
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| "psiphon ssh: shadowsocks entry has no key".to_owned())?;
+        Stream::Shadowsocks(crate::psiphon_shadowsocks::Stream::connect(socket, key))
+    } else if tls {
         tls_tunnel(
             Stream::Tcp(socket),
             &server.host,
@@ -1395,11 +1458,15 @@ fn split(
         None => server.obfuscated(),
     };
     if obfuscated {
-        let key = server
+        let key = match server
             .obfuscation_key
             .as_deref()
             .filter(|key| !key.is_empty())
-            .ok_or_else(|| "psiphon ssh: obfuscated entry has no key".to_owned())?;
+        {
+            Some(key) => key,
+            None if server.ss => "",
+            None => return Err("psiphon ssh: obfuscated entry has no key".to_owned()),
+        };
         let seed = random::<SEED_LENGTH>();
         let client = Rc4::new(&derive_key(&seed, key.as_bytes(), b"client_to_server"));
         let remote = Rc4::new(&derive_key(&seed, key.as_bytes(), b"server_to_client"));
