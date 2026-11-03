@@ -179,6 +179,7 @@ pub(crate) struct Server {
     pub(crate) unfronted_meek: Option<crate::psiphon_meek::Meek>,
     pub(crate) tactics: Option<crate::psiphon_tactics::Keys>,
     pub(crate) inproxy: Option<crate::psiphon_broker::Destination>,
+    pub(crate) tls_inproxy: Option<crate::psiphon_broker::Destination>,
 }
 
 impl Server {
