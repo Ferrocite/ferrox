@@ -22615,8 +22615,8 @@ fn serve_socks_udp_ss_mux(relay: &UdpSocket, ss: &ShadowsocksOut) -> bool {
     resize_scratch(&mut buf, crate::shadowsocks::DATAGRAM_MAX);
     let room = crate::shadowsocks::SEAL_ROOM;
     let mut header = Vec::with_capacity(64);
-    // One mux flow per destination, found in one probe; `order` keeps insertion order for the teardown ends.
-    let mut ids = ferrox_core::mux::Ids::new(0);
+    // One mux flow per destination, capped at 1024, found in one probe; `order` keeps insertion order for the teardown ends.
+    let mut ids = ferrox_core::mux::Ids::new(1_024);
     let mut lanes: HashMap<SocketAddr, u16> = HashMap::new();
     let mut order: Vec<u16> = Vec::new();
     let mut skip: Option<SsUdpLane> = None;
