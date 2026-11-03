@@ -29067,10 +29067,17 @@ fn ss2022_identities(inbound: &Json) -> Vec<(String, u32)> {
 
 /// Every email a configured user carries, across the whole config: a generated fallback name must
 /// not share a statistics key with any of them, not just with its own inbound's.
-fn configured_emails(root: &Json) -> HashSet<String> {
+pub(crate) fn configured_emails(root: &Json) -> HashSet<String> {
     let mut emails = HashSet::new();
     for inbound in root.get("inbounds").and_then(Json::as_arr).unwrap_or(&[]) {
         let settings = inbound.get("settings");
+        if let Some(email) = settings
+            .and_then(|settings| settings.get("email"))
+            .and_then(Json::as_str)
+            .filter(|email| !email.is_empty())
+        {
+            emails.insert(email.to_owned());
+        }
         for list in ["clients", "accounts", "users"] {
             for row in settings
                 .and_then(|settings| settings.get(list))
@@ -29091,7 +29098,7 @@ fn configured_emails(root: &Json) -> HashSet<String> {
 }
 
 /// An inbound's parsed accounts: 2022 reads its PSK list from the single password, everything else from the client list.
-fn ss_accounts(
+pub(crate) fn ss_accounts(
     inbound: &Json,
     address: &str,
     password: String,

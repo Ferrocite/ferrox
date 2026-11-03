@@ -2717,6 +2717,134 @@ mod tests {
         }
     }
 
+    /// Served traffic meters the generated and configured identities apart, even when a foreign inbound reserves the name the generated one would have taken.
+    #[test]
+    fn served_multi_user_traffic_counts_the_generated_and_configured_identities_apart() {
+        use base64::Engine as _;
+        let _guard = crate::stats::test_lock();
+        crate::stats::clear();
+        let stats = crate::json::parse(
+            r#"{"stats":{},"policy":{"levels":{"0":{"statsUserUplink":true,"statsUserDownlink":true}}}}"#,
+        )
+        .expect("parses");
+        crate::policy::install(&stats).expect("policy installs");
+        crate::stats::install(&stats).expect("stats installs");
+
+        let key = |b: u8| base64::engine::general_purpose::STANDARD.encode(vec![b; 32]);
+        let password = format!("{}:{}:{}", key(1), key(2), key(3));
+        let method = "2022-blake3-aes-256-gcm";
+        let root = crate::json::parse(&format!(
+            r#"{{"inbounds":[
+                {{"protocol":"shadowsocks","tag":"ss-in","settings":{{"method":"{method}","password":"{password}","users":[{{"email":"alice@example"}}]}}}},
+                {{"protocol":"trojan","settings":{{"email":"ss-in#1"}}}}]}}"#
+        ))
+        .expect("parses");
+        let inbound = crate::json::parse(&format!(
+            r#"{{"protocol":"shadowsocks","tag":"ss-in","settings":{{"method":"{method}","password":"{password}","users":[{{"email":"alice@example"}}]}}}}"#
+        ))
+        .expect("parses");
+        let reserved = crate::proxy::configured_emails(&root);
+        let accounts = crate::proxy::ss_accounts(
+            &inbound,
+            "127.0.0.1:0",
+            password.clone(),
+            method.to_owned(),
+            &reserved,
+        );
+        assert_eq!(
+            accounts.identities,
+            vec![("alice@example".to_owned(), 0), ("ss-in#1#".to_owned(), 0),]
+        );
+
+        let echo = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let target: SocketAddr = echo.local_addr().expect("addr");
+        thread::spawn(move || {
+            for stream in echo.incoming().take(2) {
+                let Ok(mut stream) = stream else { continue };
+                thread::spawn(move || {
+                    let mut buf = [0u8; 64];
+                    while let Ok(read) = stream.read(&mut buf) {
+                        if read == 0 || stream.write_all(&buf[..read]).is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        let server = crate::conn::test_bind("127.0.0.1:0").expect("binds");
+        let port = server.local_addr().expect("addr").port();
+        let identities = accounts.identities.clone();
+        let announced = password.clone();
+        thread::spawn(move || {
+            for stream in server.incoming().take(2) {
+                let Ok(stream) = stream else { continue };
+                let announced = announced.clone();
+                let identities = identities.clone();
+                thread::spawn(move || serve(stream, &announced, method, &identities, true));
+            }
+        });
+
+        for psk in [key(2), key(3)] {
+            let mut uplink = Connection::connect(("127.0.0.1", port)).expect("connects");
+            uplink
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .expect("timeout");
+            let (mut send, recv) = client_send_handshake(
+                &mut uplink,
+                &format!("{}:{psk}", key(1)),
+                method,
+                &crate::proxy::Destination::from(target),
+            )
+            .expect("handshake");
+            let mut ping = [0u8; SEAL_HEAD + 4 + TAG_LEN];
+            ping[SEAL_HEAD..SEAL_HEAD + 4].copy_from_slice(b"ping");
+            seal_all(&mut send, &mut ping, 4, &mut uplink).expect("seals");
+            let (mut recv, folded) = match recv {
+                Recv::Ready(cipher) => (cipher, None),
+                Recv::Waiting(m, p, s) => {
+                    let mut peer = vec![0u8; m.key_len()];
+                    read_exact(&mut uplink, &mut peer).expect("salt");
+                    let mut cipher = Cipher::from_psk(m, &p, &peer).expect("derives");
+                    let fixed_len = 1 + 8 + m.key_len() + 2 + TAG_LEN;
+                    let mut fixed = vec![0u8; fixed_len];
+                    read_exact(&mut uplink, &mut fixed).expect("fixed");
+                    cipher.open_in_place(&mut fixed).expect("opens");
+                    let first = usize::from(u16::from_be_bytes([
+                        fixed[9 + m.key_len()],
+                        fixed[10 + m.key_len()],
+                    ]));
+                    let head = (first > 0).then(|| {
+                        let mut chunk = vec![0u8; first + TAG_LEN];
+                        read_exact(&mut uplink, &mut chunk).expect("first");
+                        let got = cipher.open_in_place(&mut chunk).expect("opens first");
+                        chunk[..got].to_vec()
+                    });
+                    let _ = s;
+                    (cipher, head)
+                }
+            };
+            let mut buf = wire_buffer();
+            let back = match folded {
+                Some(head) => head,
+                None => open_chunk(&mut uplink, &mut recv, &mut buf)
+                    .expect("opens body")
+                    .to_vec(),
+            };
+            assert_eq!(back, b"ping"[..]);
+        }
+
+        let snapshot = crate::stats::snapshot();
+        assert_eq!(snapshot.user["alice@example"].uplink, 38);
+        assert_eq!(snapshot.user["ss-in#1#"].uplink, 38);
+        assert!(snapshot.user["alice@example"].downlink >= 4);
+        assert!(snapshot.user["ss-in#1#"].downlink >= 4);
+        assert!(
+            !snapshot.user.contains_key("ss-in#1"),
+            "the configured email of another inbound received no traffic"
+        );
+        crate::stats::clear();
+    }
+
     #[test]
     fn one_relay_read_becomes_one_write_and_reads_back_whole() {
         struct Counting<'a> {
