@@ -3703,35 +3703,40 @@ mod tests {
         (conn, written, slices)
     }
 
-    /// A SETTINGS window update must not become visible before it can adjust the stream table:
-    /// a stream inserted in between would take the new initial window and then the delta again.
+    /// A SETTINGS window update must take the stream table before it publishes the new window:
+    /// a stream inserted in between would take the new initial and then the delta again.
     #[test]
     fn a_settings_window_update_publishes_only_with_the_stream_table() {
         let (conn, _written, _slices) = bare_conn();
-        let streams = conn.streams.lock().unwrap_or_else(PoisonError::into_inner);
-        let started = Arc::new(std::sync::Barrier::new(2));
+        let peer = conn
+            .peer_initial
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         let update = {
             let conn = Arc::clone(&conn);
-            let started = Arc::clone(&started);
             std::thread::spawn(move || {
-                started.wait();
                 let mut body = Vec::with_capacity(6);
                 body.extend_from_slice(&S_WINDOW.to_be_bytes());
                 body.extend_from_slice(&100_000u32.to_be_bytes());
                 conn.apply_settings(&body)
             })
         };
-        started.wait();
-        std::thread::sleep(Duration::from_millis(250));
-        let published = conn.peer_window() != 65_535;
-        drop(streams);
+        let mut took_streams = false;
+        for _ in 0..2_000 {
+            if conn.streams.try_lock().is_err() {
+                took_streams = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(peer);
         assert!(
             update.join().expect("the settings thread"),
             "the update is acked"
         );
         assert!(
-            !published,
-            "the window was published while the stream table was locked"
+            took_streams,
+            "the window update did not take the stream table before publishing"
         );
         assert_eq!(conn.peer_window(), 100_000);
     }
