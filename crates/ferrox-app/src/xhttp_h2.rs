@@ -434,8 +434,9 @@ pub(crate) struct H2StreamReader {
     conn: Arc<H2Conn>,
     stream: Arc<H2Stream>,
     id: u32,
-    /// How much of the front frame this reader has taken: the frame is popped when it is spent,
-    /// so a short read leaves the tail where the loop put it instead of moving it to the base.
+    /// The frame the reader owns: the queue hands it over, so a window is a span of the loop's own
+    /// allocation and a short read leaves the tail at the offset it already had.
+    cur: Vec<u8>,
     at: usize,
     /// The start of the current idle stretch, so a lane's polls still end a body at the stall.
     idle_since: Option<std::time::Instant>,
@@ -463,23 +464,28 @@ impl Read for H2StreamReader {
             return Ok(0);
         }
         loop {
+            if self.at < self.cur.len() {
+                let n = (self.cur.len() - self.at).min(buf.len());
+                buf[..n].copy_from_slice(&self.cur[self.at..self.at + n]);
+                self.at += n;
+                if self.at == self.cur.len() {
+                    self.cur.clear();
+                    self.at = 0;
+                }
+                self.idle_since = None;
+                self.conn.replenish(self.id, n);
+                return Ok(n);
+            }
             let mut st = self
                 .stream
                 .state
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            if let Some(front) = st.body.front() {
-                let n = (front.len() - self.at).min(buf.len());
-                buf[..n].copy_from_slice(&front[self.at..self.at + n]);
-                self.at += n;
-                if self.at == front.len() {
-                    st.body.pop_front();
-                    self.at = 0;
-                }
-                self.idle_since = None;
+            if let Some(front) = st.body.pop_front() {
                 drop(st);
-                self.conn.replenish(self.id, n);
-                return Ok(n);
+                self.cur = front;
+                self.at = 0;
+                continue;
             }
             if st.read_ended() {
                 st.abandoned = !st.ended;
@@ -517,6 +523,94 @@ impl Read for H2StreamReader {
                 continue;
             }
             // A lane step owns its thread for one poll; a body idle for the whole stall still ends.
+            if crate::proxy::relay_step_owns_poll() {
+                let since = *self.idle_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= crate::budgets::relay_stall() {
+                    drop(st);
+                    self.conn.forget_upload(self.id);
+                    return Err(std::io::Error::other("h2 body stalled"));
+                }
+                let (_guard, wait) = self
+                    .stream
+                    .cv
+                    .wait_timeout(st, crate::budgets::RELAY_POLL)
+                    .unwrap_or_else(PoisonError::into_inner);
+                if wait.timed_out() {
+                    return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                }
+                continue;
+            }
+            let (next, wait) = self
+                .stream
+                .cv
+                .wait_timeout(st, crate::budgets::relay_stall())
+                .unwrap_or_else(PoisonError::into_inner);
+            st = next;
+            if wait.timed_out() {
+                drop(st);
+                self.conn.forget_upload(self.id);
+                return Err(std::io::Error::other("h2 body stalled"));
+            }
+        }
+    }
+}
+
+impl crate::proxy::WindowRead for H2StreamReader {
+    fn read_window(&mut self) -> std::io::Result<crate::proxy::Window<'_>> {
+        loop {
+            if self.at < self.cur.len() {
+                let start = self.at;
+                self.at = self.cur.len();
+                self.idle_since = None;
+                self.conn.replenish(self.id, self.cur.len() - start);
+                return Ok(crate::proxy::Window::one(&self.cur[start..]));
+            }
+            let mut st = self
+                .stream
+                .state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(front) = st.body.pop_front() {
+                drop(st);
+                self.cur = front;
+                self.at = 0;
+                continue;
+            }
+            if st.read_ended() {
+                st.abandoned = !st.ended;
+                drop(st);
+                self.conn.forget_upload(self.id);
+                return Ok(crate::proxy::Window::empty());
+            }
+            if st.dead || self.conn.dead.load(Ordering::SeqCst) {
+                drop(st);
+                self.conn.forget_upload(self.id);
+                return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+            }
+            if self.conn.client_read.is_some() {
+                drop(st);
+                match self.conn.pump_read(
+                    || {
+                        let st = self
+                            .stream
+                            .state
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        !st.body.is_empty() || st.read_ended() || st.dead
+                    },
+                    crate::proxy::relay_step_owns_poll(),
+                ) {
+                    Pumped::Alive => {}
+                    Pumped::Yield => {
+                        return Err(std::io::Error::from(std::io::ErrorKind::WouldBlock));
+                    }
+                    Pumped::Dead => {
+                        self.conn.forget_upload(self.id);
+                        return Err(std::io::Error::from(std::io::ErrorKind::ConnectionReset));
+                    }
+                }
+                continue;
+            }
             if crate::proxy::relay_step_owns_poll() {
                 let since = *self.idle_since.get_or_insert_with(std::time::Instant::now);
                 if since.elapsed() >= crate::budgets::relay_stall() {
@@ -1654,6 +1748,7 @@ impl H2Client {
                 stream: state,
                 id: sid,
                 at: 0,
+                cur: Vec::new(),
                 idle_since: None,
             },
             writer,
@@ -1736,6 +1831,7 @@ impl H2Conn {
                 stream: Arc::clone(&state),
                 id: sid,
                 at: 0,
+                cur: Vec::new(),
                 idle_since: None,
             },
             H2StreamWriter {
@@ -1841,7 +1937,7 @@ fn synth_head(method: &[u8], target: &[u8], lines: &[u8], end_stream: bool) -> V
 /// A served stream carries the sealed session in its body when the inbound names an engine: the
 /// engine handshake runs above the carrier framing, exactly as it does over H1.
 fn serve_stream(
-    reader: Box<dyn Read + Send>,
+    reader: Box<dyn crate::proxy::WindowRead + Send>,
     writer: crate::xhttp::XhttpWriter,
     users: &VlessUsers,
     freedom: bool,
@@ -1920,6 +2016,7 @@ fn open_stream(
         stream: Arc::clone(&state),
         id: sid,
         at: 0,
+        cur: Vec::new(),
         idle_since: None,
     };
     let h2out = H2StreamOut {
@@ -3048,21 +3145,19 @@ mod tests {
             stream: Arc::clone(&state),
             id: 1,
             at: 0,
+            cur: Vec::new(),
             idle_since: None,
         };
         let mut first = [0u8; 16];
         assert_eq!(reader.read(&mut first).unwrap(), 16);
         assert!(first.iter().copied().eq(0u8..16), "the head of the frame");
-        {
-            let st = state.state.lock().unwrap_or_else(PoisonError::into_inner);
-            let front = st.body.front().expect("still queued");
-            assert_eq!(front.as_ptr(), base, "the frame is its own allocation");
-            assert_eq!(front.len(), 64, "the frame was not shortened by the read");
-            assert_eq!(front[16], 16, "the tail sits at its own offset");
-        }
-        let mut rest = [0u8; 48];
-        assert_eq!(reader.read(&mut rest).unwrap(), 48);
-        assert!(rest.iter().copied().eq(16u8..64), "the tail of the frame");
+        assert_eq!(reader.cur.as_ptr(), base, "the frame is its own allocation");
+        assert_eq!(
+            reader.cur.len(),
+            64,
+            "the frame was not shortened by the read"
+        );
+        assert_eq!(reader.cur[16], 16, "the tail sits at its own offset");
         assert!(
             state
                 .state
@@ -3070,8 +3165,78 @@ mod tests {
                 .unwrap_or_else(PoisonError::into_inner)
                 .body
                 .is_empty(),
-            "the spent frame is popped"
+            "the queue handed the frame over"
         );
+        let mut rest = [0u8; 48];
+        assert_eq!(reader.read(&mut rest).unwrap(), 48);
+        assert!(rest.iter().copied().eq(16u8..64), "the tail of the frame");
+        assert!(reader.cur.is_empty(), "the spent frame is released");
+    }
+
+    #[test]
+    fn a_frame_window_is_the_readers_own_allocation() {
+        let (conn, _, _) = bare_conn();
+        let state = Arc::new(H2Stream {
+            state: Mutex::new(StreamState {
+                body: VecDeque::new(),
+                ended: false,
+                finished: false,
+                request_ended: false,
+                abandoned: false,
+                dead: false,
+            }),
+            cv: Condvar::new(),
+            send_window: Mutex::new(65_535),
+            responded: AtomicBool::new(false),
+        });
+        conn.streams
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(1, Arc::clone(&state));
+        let frame: Vec<u8> = (0u8..64).collect();
+        let base = frame.as_ptr();
+        state
+            .state
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .body
+            .push_back(frame);
+        let mut reader = H2StreamReader {
+            conn,
+            stream: Arc::clone(&state),
+            id: 1,
+            at: 0,
+            cur: Vec::new(),
+            idle_since: None,
+        };
+        let window = crate::proxy::WindowRead::read_window(&mut reader).unwrap();
+        assert_eq!(
+            window.bytes().as_ptr(),
+            base,
+            "the window is the frame's own allocation"
+        );
+        assert_eq!(window.bytes().len(), 64, "the whole frame is the window");
+        assert_eq!(window.parts(), &[(0, 64)]);
+    }
+
+    /// The window path drives a client connection's demux the way `Read` does: without the pump
+    /// the frame stays on the transport and the reader waits out the stall budget.
+    #[test]
+    fn a_client_frame_window_pumps_the_demux() {
+        let mut wire = Vec::new();
+        write_frame(&mut wire, T_DATA, 0, 1, b"answer");
+        let (conn, state, _) = reading_conn(Box::new(std::io::Cursor::new(wire)));
+        let mut reader = H2StreamReader {
+            conn,
+            stream: state,
+            id: 1,
+            at: 0,
+            cur: Vec::new(),
+            idle_since: None,
+        };
+        let window = crate::proxy::WindowRead::read_window(&mut reader)
+            .expect("the window pumps the client demux");
+        assert_eq!(window.bytes(), b"answer");
     }
 
     /// The response head's fields come out of one list and one pass: a hop-by-hop name is
@@ -3550,6 +3715,7 @@ mod tests {
             stream: state,
             id: 2,
             at: 0,
+            cur: Vec::new(),
             idle_since: None,
         };
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -3628,6 +3794,7 @@ mod tests {
             stream: state,
             id: 1,
             at: 0,
+            cur: Vec::new(),
             idle_since: None,
         };
         let _step = crate::proxy::RelayStep::enter();
@@ -3671,6 +3838,7 @@ mod tests {
             stream: state,
             id: 1,
             at: 0,
+            cur: Vec::new(),
             idle_since: None,
         };
         let _step = crate::proxy::RelayStep::enter();
@@ -3811,6 +3979,7 @@ mod tests {
             stream: state,
             id: 1,
             at: 0,
+            cur: Vec::new(),
             idle_since: None,
         };
         let (sender, receiver) = std::sync::mpsc::channel();
@@ -3859,6 +4028,7 @@ mod tests {
             stream: Arc::clone(&state),
             id: 1,
             at: 0,
+            cur: Vec::new(),
             idle_since: None,
         };
         assert_eq!(reader.read(&mut [0u8; 8]).expect("eof"), 0);
@@ -4736,6 +4906,7 @@ mod tests {
             stream,
             id: 1,
             at: 0,
+            cur: Vec::new(),
             idle_since: None,
         };
         let mut buf = [0u8; 8];
@@ -4771,6 +4942,7 @@ mod tests {
             stream,
             id: 1,
             at: 0,
+            cur: Vec::new(),
             idle_since: None,
         };
         let mut buf = [0u8; 8];
