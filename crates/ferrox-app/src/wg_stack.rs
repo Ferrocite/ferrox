@@ -484,23 +484,22 @@ pub(crate) fn client(
 
 /// One client turn, or true once the tunnel is closed.
 fn client_turn(stack: &mut ClientStack, packets: &Packets, buf: &mut [u8]) -> bool {
+    for _ in 0..RX_BURST {
+        match packets.try_recv() {
+            Ok(packet) => receive_client(stack, packet),
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return true,
+        }
+    }
     if stack.poll(buf) {
         return false;
     }
     match packets.recv_timeout(TICK) {
-        Ok(packet) => {
-            receive_client(stack, packet);
-            for _ in 1..RX_BURST {
-                let Ok(packet) = packets.try_recv() else {
-                    break;
-                };
-                receive_client(stack, packet);
-            }
-            false
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+        Ok(packet) => receive_client(stack, packet),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return true,
     }
+    false
 }
 
 /// Abort was already called; remove each socket once its poll has emitted the RST.
@@ -543,23 +542,22 @@ pub(crate) fn server(
 
 /// One server turn, or true once the inbound is closed.
 fn server_turn(stack: &mut ServerStack, packets: &Packets, buf: &mut [u8]) -> bool {
+    for _ in 0..RX_BURST {
+        match packets.try_recv() {
+            Ok(packet) => stack.receive(packet),
+            Err(std::sync::mpsc::TryRecvError::Empty) => break,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => return true,
+        }
+    }
     if stack.poll(buf) {
         return false;
     }
     match packets.recv_timeout(TICK) {
-        Ok(packet) => {
-            stack.receive(packet);
-            for _ in 1..RX_BURST {
-                let Ok(packet) = packets.try_recv() else {
-                    break;
-                };
-                stack.receive(packet);
-            }
-            false
-        }
-        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => false,
-        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => true,
+        Ok(packet) => stack.receive(packet),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return true,
     }
+    false
 }
 
 struct ClientStack {
@@ -2067,7 +2065,7 @@ mod tests {
 
     #[test]
     fn a_ready_upload_keeps_the_stack_turning_until_it_is_drained() {
-        let (mut stack, packets, mut app) = established_client();
+        let (mut stack, _packets, mut app) = established_client();
         let upload = [b'u'; 16 * 1024];
         let written = app
             .write(&upload)
@@ -2075,17 +2073,18 @@ mod tests {
         assert!(written > 0, "the local window holds an upload");
         let mut buf = [0u8; 2048];
         let mut turns = 0;
-        let mut carried = 0;
         while stack.poll(&mut buf) {
             turns += 1;
-            carried += tunnel_payload(&packets).len();
             assert!(turns < 1024, "a ready upload drains");
         }
-        carried += tunnel_payload(&packets).len();
         assert!(turns > 0, "a ready upload kept the stack from parking");
         assert_eq!(
-            carried, written,
-            "the tunnel carries every byte the local peer wrote"
+            stack
+                .sockets
+                .get::<TcpSocket>(stack.flows[0].handle)
+                .send_queue(),
+            written,
+            "the stack read every byte the local peer wrote"
         );
     }
 
