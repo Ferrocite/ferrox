@@ -1239,8 +1239,7 @@ impl H2Conn {
                     .clamp(16_384, 16_777_215);
             } else if id == S_WINDOW {
                 let value = u64::from(value.min((1 << 31) - 1));
-                // The stream table is the gate both sides take before they touch `peer_initial`:
-                // a snapshot and its insertion, or a delta and its adjustment, happen as one step.
+                // The stream table gates the snapshot and the delta so neither misses nor doubles the other.
                 let streams = self.streams.lock().unwrap_or_else(PoisonError::into_inner);
                 let mut previous = self
                     .peer_initial
@@ -1597,12 +1596,9 @@ impl H2Conn {
             self.reset_stream(sid);
             return None;
         }
-        let state = match self.attach_stream(sid, end_stream) {
-            Some(state) => state,
-            None => {
-                self.reset_stream(sid);
-                return None;
-            }
+        let Some(state) = self.attach_stream(sid, end_stream) else {
+            self.reset_stream(sid);
+            return None;
         };
         Some((
             H2StreamReader {
@@ -1784,12 +1780,9 @@ fn open_stream(
         conn.reset_stream(sid);
         return;
     }
-    let state = match conn.attach_stream(sid, end_stream) {
-        Some(state) => state,
-        None => {
-            conn.reset_stream(sid);
-            return;
-        }
+    let Some(state) = conn.attach_stream(sid, end_stream) else {
+        conn.reset_stream(sid);
+        return;
     };
     let head = synth_head(&method, &target, &lines, end_stream);
     let reader = H2StreamReader {
