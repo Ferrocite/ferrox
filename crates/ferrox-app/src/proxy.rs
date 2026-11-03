@@ -26307,7 +26307,7 @@ fn relay_stream_handoff<A: Read + Write + Send + 'static, B: Read + Write + Send
     flow
 }
 
-#[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 #[inline]
 fn copy_all_memcpy(from: &mut Connection, to: &mut Connection) {
     // Once per leg, outside the byte loop: a budget read per buffer would price the copy.
