@@ -5172,6 +5172,49 @@ mod tests {
         assert_eq!(&buf[..n], &packet[..], "the split packet rebuilt exactly");
     }
 
+    /// A reply split across datagrams still reassembles when the hopped dial moves every
+    /// stay: the socket the fragments landed on stays readable while the plan rotates past
+    /// it, so the reply is drained instead of stranded.
+    #[test]
+    fn a_hopped_gecko_dial_reassembles_a_split_reply() {
+        let server_sock = UdpSocket::bind("127.0.0.1:0").expect("binds");
+        let server_addr = server_sock.local_addr().expect("addr");
+        server_sock
+            .set_read_timeout(Some(Duration::from_millis(400)))
+            .expect("timeout");
+        let server =
+            Datagram::gecked(server_sock, gecko_salamander(), gecko_window()).expect("geckos");
+        let first = UdpSocket::bind("0.0.0.0:0").expect("binds");
+        let client = Datagram::gecked_hopped(
+            server_addr,
+            vec![server_addr.port()],
+            (0, 0),
+            "0.0.0.0:0",
+            &first,
+            gecko_salamander(),
+            gecko_window(),
+        )
+        .expect("geckos over a hop");
+        client
+            .set_read_timeout(Some(Duration::from_millis(10)))
+            .expect("timeout");
+
+        // A short-header packet tells the server which hopped socket to answer on.
+        client.send_to(b"hello", server_addr).expect("sends");
+        let mut room = [0u8; 64];
+        let (_, from) = server
+            .recv_from(&mut room)
+            .expect("the server reads the dial");
+        // The answer is a long header, so the server splits it across several datagrams.
+        let mut reply: Vec<u8> = (0u16..900).map(|i| (i % 251) as u8).collect();
+        reply[0] |= ferrox_core::hysteria::GECKO_FLAG;
+        server.send_to(&reply, from).expect("sends the reply");
+
+        let mut buf = [0u8; 2048];
+        let (n, _) = client.recv_from(&mut buf).expect("reassembles the reply");
+        assert_eq!(&buf[..n], &reply[..], "the split reply rebuilt exactly");
+    }
+
     /// A socket, its address and a connection that answers nothing: the pump's queue is what these witnesses read, so no peer and no handshake is needed to fill it.
     fn deaf_lane() -> (Datagram, SocketAddr, quiche::Connection) {
         let sock = Datagram::plain(bind_datagram("127.0.0.1:0").expect("binds"));
